@@ -1,0 +1,15 @@
+[package]
+name = "ostrya-cli"
+description = "Command-line front-end compatible with the ostree tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "ostree"
+path = "src/main.rs"
+
+[dependencies]
+ostrya = { path = "../ostrya" }

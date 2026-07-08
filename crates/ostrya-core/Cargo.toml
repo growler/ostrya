@@ -1,0 +1,11 @@
+[package]
+name = "ostrya-core"
+description = "ostree object model, checksums, and on-disk format primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ostrya-gvariant = { path = "../ostrya-gvariant" }

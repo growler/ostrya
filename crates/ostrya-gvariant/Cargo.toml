@@ -1,0 +1,8 @@
+[package]
+name = "ostrya-gvariant"
+description = "Byte-exact GVariant codec for the ostree on-disk format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false

@@ -1,0 +1,12 @@
+[package]
+name = "ostrya"
+description = "Pure-Rust async reimplementation of the ostree repository library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+ostrya-core = { path = "../ostrya-core" }
+thiserror = "2"

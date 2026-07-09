@@ -17,6 +17,10 @@ pub enum Error {
     /// An underlying I/O error.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    /// An error from the core format-primitive layer (checksums, keyfile
+    /// parsing, object model).
+    #[error(transparent)]
+    Core(#[from] ostrya_core::Error),
     /// On-disk data did not match the expected format.
     #[error("invalid format: {0}")]
     InvalidFormat(String),

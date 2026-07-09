@@ -147,12 +147,15 @@ cross-mode commit identity the development-to-production workflow relies on.
 Design thread across phases:
 
 - Phase 3: the `.filea` and `.fileb` encoders and the new `ObjectType::FileBlob`.
-- Phase 4: `mode=bare-user-split-attrs`; repo creation sets setgid object
-  directories, a shared group, and 0664 objects via explicit chmod (never
-  trusting umask).
+- Phase 4: `mode=bare-user-split-attrs` is accepted, validated, and written to
+  `[core] mode` on create. Objects and their `objects/xx/` directories are
+  first written by the write path, so the setgid object directories, shared
+  group, and 0664 objects land in Phase 7.
 - Phase 5: mode-aware `load_file` (read `.filea`, then `.fileb`).
 - Phase 7: `write_content` splits into blob plus attributes internally, with an
-  unchanged signature; `ostree.sizes` is enforced off.
+  unchanged signature; `ostree.sizes` is enforced off. Object directories are
+  created setgid with a shared group and objects are stored 0664 via explicit
+  chmod (never trusting umask).
 - Phase 8: copy-based checkout applying the `.filea` mode.
 - Phase 9: the `filea -> fileb` reachability edge for prune and fsck, the
   two-level integrity check, and blob-aware commit-completeness.
@@ -266,13 +269,21 @@ checksum computation (framed header + payload).
 Verify: read real objects from a tool-created repo, recompute their checksums,
 and match; reserialize and get identical bytes.
 
-### Phase 4 -- Repo open/create and config
+### Phase 4 -- Repo open/create and config (DONE)
 
 Async `Repo` handle over `rustix` fds (repo/objects/tmp/cache dir fds, boot-id
 staging prefix). Config parse for `[core]`, `[archive]`, remotes. Directory
 layout creation. No object I/O yet beyond config.
 Verify: open a tool-created repo and read its config/mode; create a repo and
 have the `ostree` tool recognize and operate on it.
+
+The handle holds the repo-root and `objects/` fds, which every repository has.
+`create` writes the full layout (`objects`, `refs/{heads,remotes,mirrors}`,
+`state`, `tmp`, `tmp/cache`, `extensions`), but the `tmp`/`tmp/cache` fds and
+the boot-id staging prefix are acquired at transaction time (Phase 6), not at
+open: the tool creates `tmp/` and reads the boot id when a transaction starts,
+and a repository served read-only can lack `tmp/` entirely, so requiring those
+fds at open would reject repositories the tool opens.
 
 ### Phase 5 -- Reading path
 

@@ -19,6 +19,12 @@ Guiding choices:
 - Cancellation is via dropping the future (smol) plus optional
   `smol::future::or` with a cancel signal, rather than a cancellable object.
 - Errors are one `ostrya::Error` enum with `thiserror`, not `glib::Error`.
+- File content is never loaded into memory whole. Content operations --
+  hashing, compression, storing, checkout, transfer -- consume and produce
+  async streams in bounded-size chunks. Whole-buffer handling is reserved
+  for metadata objects, whose size the format caps.
+- `Repo`, `Transaction`, `FileObject`, and the file content readers are
+  `Send + Sync`, pinned by compile-time assertions as each type lands.
 
 ## Core value types
 
@@ -143,6 +149,8 @@ impl Repo {
 pub struct Commit {
     pub metadata: Variant,                 // a{sv}
     pub parent: Option<Checksum>,
+    pub related: Vec<(String, Vec<u8>)>,   // written empty; retained on parse
+                                           // for byte-exact reserialization
     pub subject: String,
     pub body: String,
     pub timestamp: u64,                    // seconds UTC
@@ -171,9 +179,59 @@ pub struct FileObject {
     pub kind: FileKind,                    // Regular { size } | Symlink { target }
 }
 impl FileObject {
-    pub async fn reader(&self) -> Result<impl AsyncRead>;   // regular files
+    /// Regular files: streams the payload in bounded chunks.
+    pub async fn reader(&self) -> Result<impl AsyncRead + Send + Sync>;
 }
 ```
+
+## Borrowed object views (read path)
+
+Views decode a serialized metadata object in place, borrowing the loaded
+object buffer (the Phase 1a typed codec; see `port-plan.md`). `parse`
+validates the container framing; array iteration decodes lazily from the
+framing offsets and yields borrowed slices, so a full dirtree walk performs
+no heap allocation. Entry-level checks (checksum length, name sort order)
+run as entries are visited, which is why the iterators yield `Result`.
+`Checksum` values are yielded by copy; a 32-byte copy involves no heap.
+
+```rust
+pub struct DirTreeRef<'a>(/* &'a [u8] */);
+impl<'a> DirTreeRef<'a> {
+    pub fn parse(data: &'a [u8]) -> Result<Self>;
+    pub fn files(&self) -> impl Iterator<Item = Result<(&'a str, Checksum)>>;
+    pub fn dirs(&self) -> impl Iterator<Item = Result<(&'a str, Checksum, Checksum)>>;
+    pub fn to_owned(&self) -> Result<DirTree>;
+}
+
+pub struct DirMetaRef<'a>(/* &'a [u8] */);
+impl<'a> DirMetaRef<'a> {
+    pub fn parse(data: &'a [u8]) -> Result<Self>;
+    pub fn uid(&self) -> u32;                    // big-endian decoded
+    pub fn gid(&self) -> u32;
+    pub fn mode(&self) -> u32;
+    pub fn xattrs(&self) -> XattrsRef<'a>;
+    pub fn to_owned(&self) -> Result<DirMeta>;
+}
+
+pub struct XattrsRef<'a>(/* &'a [u8] */);
+impl<'a> XattrsRef<'a> {
+    pub fn parse(data: &'a [u8]) -> Result<Self>;
+    pub fn iter(&self) -> impl Iterator<Item = Result<(&'a [u8], &'a [u8])>>;
+    pub fn to_owned(&self) -> Result<Xattrs>;
+}
+
+impl Repo {
+    /// Serialized bytes of a metadata object; views borrow this buffer.
+    pub async fn load_object_bytes(&self, ty: ObjectType, c: &Checksum)
+        -> Result<Vec<u8>>;
+}
+```
+
+The owned `DirTree` and `DirMeta` values returned by `load_dirtree` and
+`load_dirmeta` are built through `to_owned`. Callers that only traverse --
+checkout, pull object scanning, `RepoTree::read_dir` -- hold the object
+buffer and iterate the view. `Commit` has no view type: commit objects are
+read a handful at a time and their fields are retained.
 
 ## RepoTree traversal (read-only GFile analogue)
 
@@ -203,7 +261,9 @@ pub struct Transaction { /* Repo clone + owned staging state */ }
 impl Transaction {
     // object writers (return the computed checksum)
     pub async fn write_content(&self, expected: Option<&Checksum>,
-        meta: &FileMeta, reader: impl AsyncRead) -> Result<Checksum>;
+        meta: &FileMeta, reader: impl AsyncRead + Send) -> Result<Checksum>;
+    /// Small content the caller already holds; the general path is
+    /// `write_content`, which streams.
     pub async fn write_regfile_inline(&self, expected: Option<&Checksum>,
         meta: &FileMeta, data: &[u8]) -> Result<Checksum>;
     pub async fn write_symlink(&self, target: &str, meta: &FileMeta) -> Result<Checksum>;

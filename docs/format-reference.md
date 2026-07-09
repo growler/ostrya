@@ -61,9 +61,13 @@ Port extension (bare-user-split-attrs mode, not upstream):
   reference) instead of `.file`. See the dedicated section at the end.
 
 The is-meta predicate is `t` in 2..=6. Types 7/8/9 are not "meta" despite being
-auxiliary. The `z` loose-path suffix and the checksum rules both key off the
-is-meta predicate. Object string form is `<hexchecksum>.<typestr>`. Object-name
-GVariant is `(su)` = (hex-string, objtype-as-u32).
+auxiliary. The checksum rules key off the is-meta predicate. The `z` loose-path
+suffix applies only to a `FILE` object (type 1) in archive mode, stored
+zlib-compressed as `.filez`. The auxiliary non-meta objects carry no suffix:
+`.payload-link` is a symlink, `.file-xattrs` holds an uncompressed GVariant
+blob, and `.file-xattrs-link` is a hardlink. Object string form is
+`<hexchecksum>.<typestr>`. Object-name GVariant is `(su)` = (hex-string,
+objtype-as-u32).
 
 ## Metadata object formats (GVariant type strings, verbatim)
 
@@ -93,8 +97,11 @@ by ASCII checksum:
 ```
 
 The varuint64 is protobuf-style LEB128 (little-endian base-128, high bit is
-the continuation flag). The trailing objtype byte is present on newer commits;
-parsers tolerate its absence.
+the continuation flag). The encoding is canonical: each value has one minimal
+form, so a multi-byte sequence whose terminating byte is `0x00` (contributing
+no value bits) is not accepted. Rejecting non-minimal forms keeps
+unpack-then-pack of an entry byte-identical. The trailing objtype byte is
+present on newer commits; parsers tolerate its absence.
 
 ### Dirtree -- `(a(say)a(sayay))`
 
@@ -105,6 +112,15 @@ parsers tolerate its absence.
 
 Sort order is mandatory for reproducible checksums. Each filename is validated
 (not `.`, not `..`, no `/`, valid UTF-8): this is the path-traversal defense.
+
+The two lists are independent, so a name can appear in both. The tool does not
+guard against this: observed by injecting a root dirtree that carries one name
+in both lists (built with the port's encoder so framing and per-list sort stay
+valid, then spliced into the commit and ref), `ostree fsck` reports no errors
+and `ostree ls` prints both entries, and `ostree ls -R` aborts on an internal
+assertion when it resolves the name as a directory. The port never mints such
+an object: the write path and the owned-parse path reject a name shared between
+the two lists, while the borrowed read iterators stay per-list.
 
 ### Dirmeta -- `(uuua(ayay))`
 
@@ -225,6 +241,12 @@ Representations: hex (64 chars), binary (32 bytes), GVariant `ay` (32-element),
 and modified-base64 (standard base64 with `/` replaced by `_` and trailing `=`
 dropped, 43 chars) used only for static-delta directory names.
 
+Base64 decoding of a checksum is strict and per-alphabet, so each digest has
+exactly one accepted spelling: the length is exact (44 characters ending in one
+`=` for the standard form, 43 for the modified form), the `/` and `_` glyphs at
+index 63 are accepted only for their own alphabet, and the two unused low bits
+of the final significant sextet must be zero.
+
 ## Repository modes and on-disk storage
 
 Mode strings: `bare`, `bare-user`, `bare-user-only`, `archive-z2` (alias
@@ -251,7 +273,13 @@ Mode strings: `bare`, `bare-user`, `bare-user-only`, `archive-z2` (alias
   content-addressed). See the dedicated section at the end.
 
 Metadata objects are always stored uncompressed. The `z` suffix applies only to
-non-meta content objects in archive mode.
+a `File` content object in archive mode (`.filez`). The auxiliary non-meta
+objects (`.payload-link`, `.file-xattrs`, `.file-xattrs-link`) are stored
+uncompressed and never carry it. Observed by driving the tool as a black box:
+an archive repo populated by commit, and by `pull-local` from bare and archive
+sources, holds only `.filez` content objects alongside uncompressed metadata;
+`.file-xattrs`/`.file-xattrs-link` belong to `bare-split-xattrs` mode, into
+which the tool refuses every write ("Not allowed due to repo mode").
 
 ## Object store layout
 
@@ -274,8 +302,8 @@ non-meta content objects in archive mode.
 ```
 
 Loose object path: `objects/<first 2 hex>/<remaining 62 hex>.<typestr>` with a
-trailing `z` iff not-meta and archive mode. Checksum must be exactly 64 hex
-chars.
+trailing `z` only on a `File` content object in archive mode. Checksum must be
+exactly 64 hex chars.
 
 Ref file format: 64-char hex plus a single `\n` (65 bytes). A NULL rev deletes;
 an alias is written as a relative symlink. Refspec `remote:ref` maps to
@@ -303,12 +331,54 @@ Created with `[core]` `repo_version=1`, `mode=<mode>`, optional
 `collection-id`, `sign-verify`, `verification-<engine>-key` /
 `verification-<engine>-file`.
 
+Parsing rules, recovered by feeding crafted config files to the tool, reading
+back with `ostree config get` and commands that consume config, and inspecting
+the bytes `ostree config set` writes:
+
+- Lines split on newlines; a trailing carriage return is stripped, so CRLF
+  input is accepted.
+- Whitespace handling uses ASCII space and tab only. A leading space or tab on
+  a line is ignored before the line is classified, a line of only spaces or
+  tabs is treated as blank, and a space or tab around a key is trimmed. A
+  non-breaking space (U+00A0) or other non-ASCII whitespace is kept: it is
+  never trimmed, and a line whose only content is such a character is a parse
+  error that fails the whole file.
+- A line whose first non-blank character is `#` is a comment. `;` does not
+  start a comment; a line that begins with `;` and is not a `key=value` pair
+  is a parse error.
+- A blank line is ignored.
+- A group header starts with `[`; a leading space or tab before `[` is
+  allowed. The name runs from `[` to the first `]`, and only whitespace may
+  follow that `]`; text after it (as in `[a]b]`) fails the whole file. The
+  name may not be empty (`[]` fails the whole file) and may not contain `[`
+  (as in `[a[b]`, reported as an invalid group name). A repeated header merges
+  into the existing group.
+- A `key=value` entry splits on the first `=`. The key is trimmed of
+  surrounding space and tab. In the value, leading space and tab are removed
+  and trailing whitespace is kept. A `#` inside a value is literal; there are
+  no inline comments. A repeated key takes the last value.
+- A boolean is one of `true`, `false`, `1`, `0`, matched exactly. Any other
+  spelling (`yes`, `no`, `on`, `off`, mixed case such as `True`, an
+  out-of-range number such as `2`, or the empty string) is rejected with a
+  "value that cannot be interpreted" error.
+- Writing a string value escapes a backslash as `\\`, a newline as `\n`, and a
+  carriage return as `\r` anywhere in the value; within the leading whitespace
+  run each space becomes `\s` and each tab `\t`. A space or tab elsewhere, a
+  trailing space or tab, and a `;` are written literally. Groups are written as
+  `[name]` followed by `key=value` lines, a blank line between groups, and no
+  spaces around `=`. A freshly initialized archive repo config is exactly
+  `[core]\nrepo_version=1\nmode=archive-z2\n`.
+
 ## Extended attributes
 
-Storage form is GVariant `a(ayay)`: array of (name-bytes, value-bytes). Names
-include the namespace prefix and their terminating NUL. Canonicalization sorts
-by name with byte-wise comparison and is applied before every serialization and
-hash; duplicate and empty names are rejected. Per-mode disposition: bare on the
+Storage form is GVariant `a(ayay)`: array of (name-bytes, value-bytes). A
+stored name includes the namespace prefix and a single terminating NUL, with a
+non-empty prefix and no interior NUL. Confirmed by committing a file bearing a
+`user.demo` xattr into a bare-user repo and reading its `user.ostreemeta`
+blob: the name bytes `user.demo` are followed by one `\0`. Canonicalization
+sorts by name with byte-wise comparison and is applied before every
+serialization and hash; duplicate names and names not in this stored form are
+rejected. Per-mode disposition: bare on the
 inode, bare-user inside `user.ostreemeta`, bare-user-only discarded,
 bare-split-xattrs as separate objects, archive inside the `.filez` header.
 During commit an existing `security.selinux` xattr is dropped and re-applied

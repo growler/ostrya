@@ -102,5 +102,18 @@ begins only once its dependency set is agreed.
   tool writes.
 - Follow the phased roadmap. Each phase is small and is reviewed and approved
   before the next begins.
-- `#![forbid(unsafe_code)]` everywhere except a small, audited `sys` module that
-  wraps the few `rustix` calls that require it.
+- `#![forbid(unsafe_code)]` everywhere except two audited sites: a small `sys`
+  module that wraps the few `rustix` calls that require it, and the
+  allocation-counting test harness (`crates/ostrya-gvariant/tests/alloc.rs`),
+  whose `GlobalAlloc` implementation cannot be expressed in safe Rust. That
+  harness uses `#![deny(unsafe_code)]` with a scoped `#[allow(unsafe_code)]` on
+  the single `impl`.
+- Never load an unconstrained file blob into memory. Every operation on file
+  content -- hashing, compression, storing, checkout, transfer -- is strictly
+  async and streaming, processing bounded-size chunks regardless of object
+  size. Whole-buffer handling is reserved for metadata objects, whose size the
+  format caps.
+- The core public types -- `Repo`, `Transaction`, `FileObject`, and the file
+  content readers -- must be `Send + Sync`, so they can be shared across tasks
+  and threads. Pin this with compile-time assertions in tests as each type
+  lands.

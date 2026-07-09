@@ -79,6 +79,10 @@ The port's async model:
   pool (`blocking::unblock`) at coarse granularity -- per object write, per
   checkout file -- rather than wrapping each syscall.
 - CPU-bound work (SHA-256, DEFLATE, xz) runs on the blocking pool.
+- File content is streamed in bounded-size chunks end to end: hashing,
+  compression, object store writes, checkout, and transfer never buffer an
+  unconstrained blob in memory. Whole-buffer handling is reserved for
+  metadata objects, whose size the format caps.
 
 Public entry points are `async fn`. Filter and xattr callbacks stay synchronous
 `FnMut`. The await seams sit at object load, the copy/hash/compress loops, and
@@ -98,6 +102,11 @@ the dirmeta read-cache). `Repo` is cheaply clonable (an `Arc` inner) so a
 transactions coexist, each atomic on commit via its own staging dir and the
 rename-into-objects step. Within one transaction, `&Transaction` is Send+Sync
 and concurrent object writers share it with counters behind a `Mutex`.
+
+`Repo`, `Transaction`, `FileObject`, and the file content readers are
+`Send + Sync`, so every handle moves freely across smol tasks and threads.
+Each type gains a compile-time assertion pinning this in the phase that
+introduces it.
 
 Cross-process and cross-`Repo` safety uses a two-layer lock: an in-process
 recursive counter for same-repo reentrancy, plus an OFD `fcntl(F_OFD_SETLK)`
@@ -181,14 +190,14 @@ Phases are ordered by dependency. Early phases are small and foundational;
 the large subsystems (write, checkout, pull) are split into sub-phases. Each
 phase is a reviewable unit with a stated verification gate.
 
-### Phase 0 -- Scaffolding
+### Phase 0 -- Scaffolding (DONE)
 
 Workspace, crates, `Error`/`Result` types, CI (fmt, clippy, test), the
 golden-fixture harness (a script that drives the `ostree` tool to emit reference
 bytes). No functional code.
 Verify: `cargo test` runs green on an empty skeleton; fixtures generate.
 
-### Phase 1 -- GVariant codec (`ostrya-gvariant`)
+### Phase 1 -- GVariant codec (`ostrya-gvariant`) (DONE)
 
 Byte-exact serialize and deserialize for the fixed set of type signatures
 ostree uses (`a{sv}`, `ay`, `as`, tuples, `a(say)`, `a(sayay)`, `a(ayay)`,
@@ -197,19 +206,63 @@ checksum of every metadata object is the hash of these bytes.
 Verify: round-trip and byte-equality against golden variants dumped from the
 tool for each type string.
 
-### Phase 2 -- Core primitives (`ostrya-core`, part 1)
+### Phase 1a -- Typed codec layer (`ostrya-gvariant`) (DONE)
+
+Typed encode and decode operating directly on serialized bytes: decode reads
+fields in place from the buffer, encode writes normal-form output directly.
+Two building blocks, both inside `ostrya-gvariant` and free of ostree
+knowledge:
+
+- Reader and writer primitives. A cursor over a serialized container that
+  resolves framing offsets and yields fields and elements as borrowed slices
+  (`&str`, `&[u8]`), applying the same normal-form checks as `from_bytes`. A
+  writer that appends fields with correct alignment, padding, and framing
+  offsets and produces the same normal-form bytes as `to_bytes`.
+- A pair of codec traits, `GvEncode` and `GvDecode`, each carrying the
+  GVariant type string as an associated constant, with `encode` writing
+  through the writer and `decode` reading from the cursor. Decode is
+  borrow-first: strings and byte arrays decode as `&str` and `&[u8]`
+  borrowing the input buffer, and arrays decode as lazy iterators over the
+  framing offsets, so traversal of read-heavy objects (dirtree walks during
+  checkout and pull) performs no heap allocation. Owned decode targets are
+  built only where the caller retains or mutates the data.
+
+This phase ships the primitives plus hand-written trait impls for the scalar
+and container building blocks (booleans, integers, strings, byte arrays,
+arrays, tuples, variants). The ostree object structs (dirmeta, dirtree,
+commit, file headers) implement these traits in Phase 3, which is also where
+the value-level conventions (big-endian scalar fields, empty `ay` as an
+absent parent, checksum length and sort-order validation) are applied. The
+`Value` tree stays as the representation for dynamic `a{sv}` content and for
+fixtures and tests; `from_bytes` and `to_bytes` are unchanged.
+
+All codec impls are written by hand; the object type set is small and fixed.
+A derive macro is out of scope (see Decisions).
+
+Verify: for every golden fixture, typed decode then encode is byte-identical
+to the input and agrees with the `Value` path; a counting-allocator test
+confirms borrowed dirtree and xattr traversal performs zero heap allocations.
+
+### Phase 2 -- Core primitives (`ostrya-core`, part 1) (DONE)
 
 `ObjectType`, `Checksum` (32-byte, hex/base64/modified-base64/`ay`
 conversions), LEB128 varint, loose-path derivation, `ostree.sizes` packing,
-xattr canonicalization and validation, GKeyFile/INI subset parser.
+xattr canonicalization and validation, GKeyFile/INI subset parser. `RepoMode`
+is added here as a supporting primitive because loose-path derivation and
+`ObjectType::extension` depend on it.
 Verify: unit tests for checksum and varint against captured reference vectors;
 golden loose paths.
 
-### Phase 3 -- Object model (`ostrya-core`, part 2)
+### Phase 3 -- Object model (`ostrya-core`, part 2) (DONE)
 
 Serialize and parse commit, dirtree, dirmeta, and file headers (both
-uncompressed and archive). Structural validation (path-traversal defense, mode
-and rdev checks). Content-object checksum computation (framed header + payload).
+uncompressed and archive), as typed structs implementing the Phase 1a codec
+traits: borrowed views on the read path (dirtree traversal), owned structs
+where data is retained. The value-level conventions live in these impls:
+big-endian scalar fields, empty `ay` as an absent parent, checksum length
+checks, and sort-order validation for dirtree entries and xattrs. Structural
+validation (path-traversal defense, mode and rdev checks). Content-object
+checksum computation (framed header + payload).
 Verify: read real objects from a tool-created repo, recompute their checksums,
 and match; reserialize and get identical bytes.
 
@@ -226,9 +279,12 @@ have the `ostree` tool recognize and operate on it.
 `load_variant`, `load_commit` (+ commitpartial state), `load_file` (all modes,
 including archive decompress and `user.ostreemeta` decode), ref resolution and
 listing, the `RepoTree` traversal (lazy children, binary-search child lookup)
-and enumerator (files-then-dirs, name-sorted).
+and enumerator (files-then-dirs, name-sorted). `load_file` returns file
+metadata plus a bounded-chunk async reader; the payload is never buffered
+whole (archive decompression streams).
 Verify: read objects, refs, and full trees from a tool-created repo; compare
-against `ostree ls`, `ostree cat`, `ostree show`.
+against `ostree ls`, `ostree cat`, `ostree show`; compile-time assertions
+that `FileObject` and its reader are `Send + Sync`.
 
 ### Phase 6 -- Transactions and locking
 
@@ -244,6 +300,8 @@ lock upgrade/downgrade behaves; drop aborts cleanly.
 Split into sub-phases:
 - 7a Content and metadata object writers (all modes, O_TMPFILE + linkat,
   dedup early-out, min-free-space accounting, per-mode metadata application).
+  Content ingest streams: hashing and compression run over bounded chunks as
+  the payload is copied, never over a whole in-memory blob.
 - 7b Mutable tree and `write_mtree` (sorted dirtree assembly, clean-subtree
   short-circuit).
 - 7c `write_dfd_to_mtree` (fs-tree walk, devino cache, commit modifier: filter,
@@ -386,14 +444,22 @@ Resolved:
    payload), with object identity preserved for development-to-production
    portability, `ostree.sizes` disabled, and the mode serving as the intended
    composefs backing store. See the dedicated section above.
+6. Typed codec (Phase 1a): object (de)serialization goes through hand-written
+   codec impls over in-place reader and writer primitives -- decode reads
+   fields directly from the serialized bytes with borrowed views on hot
+   paths, encode writes normal-form bytes directly. The `Value` tree serves
+   dynamic `a{sv}` content and tests. A proc-macro derive was considered and
+   set aside: the object type set is small and fixed, and a derive would add
+   a proc-macro crate plus `syn`, `quote`, and `proc-macro2`. Revisiting it
+   requires a dependency proposal per the confirmation rule.
 
 Deferred to their respective phases:
 
-6. composefs (Phase 15): reproduce the composefs/EROFS format ourselves versus
+7. composefs (Phase 15): reproduce the composefs/EROFS format ourselves versus
    depend on an emerging pure-Rust composefs crate. Feature-gated and late
    either way.
-7. HTTP client (Phase 13a): hand-roll a minimal async HTTP/1.1 client over
+8. HTTP client (Phase 13a): hand-roll a minimal async HTTP/1.1 client over
    smol + rustls versus a pure-Rust crate such as `async-h1`. No range/HTTP2
    is required, which keeps the hand-rolled option viable.
-8. spki sign engine and avahi repo-finder: deferred as optional; ed25519 and
+9. spki sign engine and avahi repo-finder: deferred as optional; ed25519 and
    gpg cover the common cases.

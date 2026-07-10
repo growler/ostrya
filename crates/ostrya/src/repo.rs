@@ -8,7 +8,7 @@
 //!
 //! The public entry points are `async fn`. The filesystem work -- the
 //! `openat`/`mkdirat` syscalls and the config read -- runs on the blocking
-//! pool via [`blocking::unblock`], so a call does not stall the async
+//! pool via [`ostrya_rt::unblock`], so a call does not stall the async
 //! executor. The config parse that follows is CPU-only and runs inline.
 //!
 //! Directory-layout creation reproduces what the `ostree` tool writes: the
@@ -88,11 +88,9 @@ pub struct Repo(Arc<RepoInner>);
 #[derive(Debug)]
 struct RepoInner {
     // The repository root and `objects/` directory fds anchor all fd-relative
-    // I/O; they are opened once here and consumed by the reading path
-    // (Phase 5) and the write path (Phase 7).
-    #[allow(dead_code)]
+    // I/O; they are opened once here and used by the reading path (Phase 5)
+    // and, later, the write path (Phase 7).
     repo_fd: OwnedFd,
-    #[allow(dead_code)]
     objects_fd: OwnedFd,
     config: RepoConfig,
 }
@@ -110,7 +108,7 @@ impl Repo {
     /// working directory.
     pub async fn open(path: &Path) -> Result<Repo> {
         let path = path.to_owned();
-        let materials = blocking::unblock(move || open_materials(rustix::fs::CWD, &path)).await?;
+        let materials = ostrya_rt::unblock(move || open_materials(rustix::fs::CWD, &path)).await?;
         Repo::assemble(materials)
     }
 
@@ -118,7 +116,7 @@ impl Repo {
     pub async fn open_at(dir: BorrowedFd<'_>, path: &Path) -> Result<Repo> {
         let dir = dir.try_clone_to_owned()?;
         let path = path.to_owned();
-        let materials = blocking::unblock(move || open_materials(&dir, &path)).await?;
+        let materials = ostrya_rt::unblock(move || open_materials(&dir, &path)).await?;
         Repo::assemble(materials)
     }
 
@@ -127,7 +125,7 @@ impl Repo {
     pub async fn create(path: &Path, opts: CreateOptions) -> Result<Repo> {
         let path = path.to_owned();
         let materials =
-            blocking::unblock(move || create_materials(rustix::fs::CWD, &path, &opts)).await?;
+            ostrya_rt::unblock(move || create_materials(rustix::fs::CWD, &path, &opts)).await?;
         Repo::assemble(materials)
     }
 
@@ -136,7 +134,7 @@ impl Repo {
     pub async fn create_at(dir: BorrowedFd<'_>, path: &Path, opts: CreateOptions) -> Result<Repo> {
         let dir = dir.try_clone_to_owned()?;
         let path = path.to_owned();
-        let materials = blocking::unblock(move || create_materials(&dir, &path, &opts)).await?;
+        let materials = ostrya_rt::unblock(move || create_materials(&dir, &path, &opts)).await?;
         Repo::assemble(materials)
     }
 
@@ -148,6 +146,17 @@ impl Repo {
     /// The parsed repository configuration.
     pub fn config(&self) -> &RepoConfig {
         &self.0.config
+    }
+
+    /// The repository root directory fd, anchoring fd-relative access to
+    /// `refs/`, `state/`, and the rest of the layout.
+    pub(crate) fn repo_fd(&self) -> BorrowedFd<'_> {
+        self.0.repo_fd.as_fd()
+    }
+
+    /// The `objects/` directory fd, anchoring loose-object access.
+    pub(crate) fn objects_fd(&self) -> BorrowedFd<'_> {
+        self.0.objects_fd.as_fd()
     }
 
     /// Parse the config bytes and assemble the handle. This step is CPU-only.

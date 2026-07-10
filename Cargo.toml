@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/ostrya-gvariant",
     "crates/ostrya-core",
+    "crates/ostrya-rt",
     "crates/ostrya",
     "crates/ostrya-cli",
 ]

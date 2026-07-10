@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use futures_lite::future::block_on;
 use ostrya::{CreateOptions, Repo, RepoMode};
+use ostrya_rt::block_on;
 
 /// Root of the tool-generated fixture repositories, one subdirectory per mode.
 fn fixture_root() -> PathBuf {

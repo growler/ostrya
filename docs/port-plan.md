@@ -14,8 +14,13 @@ library is MIT-licensed.
 
 ## Goals and constraints
 
-1. Rust-native, no C library linkage. Syscalls go through `rustix`.
-2. Async on the `smol` runtime.
+1. Rust-native, no C library linkage beyond what `std` links. `rustix`
+   handles the syscalls a portable async file API cannot express
+   (fd-relative opens and metadata, xattrs, statx, FICLONE reflink,
+   O_TMPFILE + linkat, OFD locks); streaming file I/O goes through the
+   runtime's async file.
+2. Async, with a feature-gated runtime backend behind the internal
+   `ostrya-rt` crate: `smol` by default, `tokio` optional.
 3. Multiple concurrent transactions within a single process.
 4. Capable of passing ostree's test suite, run as an external conformance gate.
 5. Extensions: commit signing via `sequoia-openpgp` (replacing gpgme),
@@ -34,12 +39,25 @@ redesigned to be idiomatic Rust (see `api-sketch.md`).
 Read as: pure Rust only, no C libraries and no `*-sys` crates that link C. The
 Rust crate ecosystem is in scope. Proposed foundation crates, all pure Rust:
 
-- `rustix` -- syscalls (openat, linkat, renameat, fsync, statvfs, xattr, flock,
-  fcntl OFD locks). No libc linkage.
-- `smol` and its parts (`async-fs`, `async-net`, `async-io`, `blocking`,
-  `futures-lite`) -- async runtime and executor.
-- `sha2` (RustCrypto) -- SHA-256.
-- `miniz_oxide` -- raw DEFLATE for archive-mode content objects.
+- `rustix` -- the syscalls a portable async file API cannot express:
+  fd-relative open/stat/link/rename/readlink/mkdir, xattrs, statx, statvfs,
+  FICLONE reflink, O_TMPFILE + linkat, flock and fcntl OFD locks,
+  fsync/syncfs. No libc linkage.
+- `smol` -- the default runtime backend (`smol::unblock`, `smol::fs::File`,
+  `smol::Timer`, and its net layer for pull).
+- `futures-io` and `futures-lite` -- the runtime-neutral async trait
+  surface and combinators the library is written against.
+- `tokio` (optional, behind the `tokio` feature) -- alternative runtime
+  backend. Pure Rust; its syscalls go through the `libc` crate, which `std`
+  already links on glibc targets.
+- `async-lock` -- runtime-neutral async locks.
+- `pin-project-lite` -- pin projection for the stream wrapper types.
+- `sha2` (RustCrypto) -- SHA-256; `digest` -- the hashing trait surface the
+  hashing streams are generic over.
+- `async-compression`, restricted to its `deflate` codec feature plus the
+  trait-family features (its zstd and xz features pull C) -- streaming raw
+  DEFLATE for archive-mode content objects, over `flate2` with the
+  pure-Rust `miniz_oxide` backend.
 - `ed25519-dalek` -- the ed25519 sign engine.
 - `sequoia-openpgp` with the RustCrypto backend (`crypto-rust`) -- GPG signing
   and verification without nettle/C.
@@ -62,23 +80,61 @@ bounded:
 - `ostrya-gvariant` -- the byte-exact GVariant codec. No ostree knowledge.
 - `ostrya-core` -- object model, checksums, varint, loose paths, xattr
   canonicalization, format (de)serialization. Depends on `ostrya-gvariant`.
+- `ostrya-rt` -- internal runtime abstraction: `rt::unblock`, `rt::File`
+  (over an already-open fd; `smol::fs::File` or `tokio::fs::File`),
+  `rt::Timer`, later `rt::spawn` and networking. The only crate that knows
+  which backend is compiled. No ostree knowledge.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs, read,
   prune, fsck, sign, summary, deltas, pull, tar, composefs. Feature-gated.
 - `ostrya-cli` -- the `ostree`-compatible binary (late phase).
 
-Feature flags on `ostrya`: `pull`, `sign-gpg`, `deltas`, `composefs`. Each
+Feature flags on `ostrya`: `pull`, `sign-gpg`, `deltas`, `composefs`, plus
+the runtime backend selectors `smol` (default) and `tokio`, forwarded to
+`ostrya-rt`. Each
 heavier or riskier subsystem is opt-in so the core stays small. Tar
 import/export is always compiled (built on `smol-tar`), not feature-gated.
 
 ### Async model
 
-The port's async model:
+The runtime backend is feature-gated and hidden behind the internal
+`ostrya-rt` crate, which exposes `rt::unblock`, `rt::File` (constructed
+from an already-open fd; read/write/seek, `sync_all`/`sync_data`,
+`into_std`; `smol::fs::File` or `tokio::fs::File` underneath), `rt::Timer`,
+and later `rt::spawn` and networking. `smol` is the default backend; the
+`tokio` feature selects tokio. Only `ostrya-rt` knows the backend: the rest
+of the library is written against `rt::*`, the `futures-io` traits,
+`async-lock`, and `futures-lite` combinators, and is runtime-neutral.
+`rt::File` presents the `futures-io` traits under both backends so that
+core code stays generic.
 
-- Network I/O in pull is genuinely async on smol (`async-net` + `rustls`).
-- Filesystem work uses synchronous `rustix` calls offloaded to the blocking
-  pool (`blocking::unblock`) at coarse granularity -- per object write, per
-  checkout file -- rather than wrapping each syscall.
-- CPU-bound work (SHA-256, DEFLATE, xz) runs on the blocking pool.
+Backend feature policy: the features are additive-safe. `smol` is on by
+default; `tokio` takes precedence when both are enabled, so Cargo feature
+unification cannot break a build; enabling neither is an explicit compile
+error. Concrete public stream types (`ContentReader`, `ContentWriter`, the
+hashing streams) implement the `futures-io` traits unconditionally and the
+tokio traits under the `tokio` feature. `AsyncRead`/`AsyncWrite` bounds in
+argument position are the `futures-io` traits; a tokio caller adapts inputs
+with `tokio_util::compat`.
+
+Division of labor between `rustix` and the runtime:
+
+- `rustix` owns namespace and metadata syscalls: fd-relative open, stat,
+  link, rename, readlink, mkdir (the `openat` family against the stored
+  repo and objects fds), xattrs, statx, FICLONE reflink, O_TMPFILE +
+  linkat, OFD locks, and the fsync/syncfs ordering. These run as
+  synchronous calls offloaded through `rt::unblock` at coarse granularity
+  -- per object write, per checkout file -- rather than wrapping each
+  syscall.
+- `rt::File` owns streaming reads and writes: payload I/O runs over fds the
+  rustix layer opened, in bounded-size chunks.
+- `rt::unblock` is the only entry to a blocking pool (`smol::unblock` under
+  smol, `tokio::task::spawn_blocking` under tokio), so each backend runs
+  exactly one pool under its own configuration.
+- Network I/O in pull is genuinely async on the backend's net layer plus
+  `rustls`.
+- CPU-bound work (SHA-256, DEFLATE, xz) runs through `rt::unblock`, except
+  bounded per-chunk work such as archive inflate, which runs in-task inside
+  `poll_read`.
 - File content is streamed in bounded-size chunks end to end: hashing,
   compression, object store writes, checkout, and transfer never buffer an
   unconstrained blob in memory. Whole-buffer handling is reserved for
@@ -98,20 +154,21 @@ The port models `Transaction` as an owned handle that carries its own staging
 directory, `object_sizes` map, devino cache, ref queue, and free-space counter.
 `Repo` holds only shared, immutable-or-mutex-guarded state (fds, parsed config,
 the dirmeta read-cache). `Repo` is cheaply clonable (an `Arc` inner) so a
-`Transaction` can be moved into a smol task without lifetime friction. Multiple
+`Transaction` can be moved into a task without lifetime friction. Multiple
 transactions coexist, each atomic on commit via its own staging dir and the
 rename-into-objects step. Within one transaction, `&Transaction` is Send+Sync
 and concurrent object writers share it with counters behind a `Mutex`.
 
-`Repo`, `Transaction`, `FileObject`, and the file content readers are
-`Send + Sync`, so every handle moves freely across smol tasks and threads.
+`Repo`, `Transaction`, `FileObject`, and the file content readers and
+writers are `Send + Sync`, so every handle moves freely across tasks and
+threads.
 Each type gains a compile-time assertion pinning this in the phase that
 introduces it.
 
 Cross-process and cross-`Repo` safety uses a two-layer lock: an in-process
 recursive counter for same-repo reentrancy, plus an OFD `fcntl(F_OFD_SETLK)`
 (falling back to `flock`) lock on `<repo>/.lock`. The reference tool's roughly
-one-second lock-acquisition retry spin becomes an async timer with retry.
+one-second lock-acquisition retry spin becomes an `rt::Timer` retry loop.
 
 ### Durability contract
 
@@ -285,7 +342,7 @@ open: the tool creates `tmp/` and reads the boot id when a transaction starts,
 and a repository served read-only can lack `tmp/` entirely, so requiring those
 fds at open would reject repositories the tool opens.
 
-### Phase 5 -- Reading path
+### Phase 5 -- Reading path (DONE)
 
 `load_variant`, `load_commit` (+ commitpartial state), `load_file` (all modes,
 including archive decompress and `user.ostreemeta` decode), ref resolution and
@@ -296,6 +353,40 @@ whole (archive decompression streams).
 Verify: read objects, refs, and full trees from a tool-created repo; compare
 against `ostree ls`, `ostree cat`, `ostree show`; compile-time assertions
 that `FileObject` and its reader are `Send + Sync`.
+
+### Phase 5a -- Runtime backend and hashing streams (DONE)
+
+The internal `ostrya-rt` crate: `rt::unblock` and `rt::File` (from an
+already-open fd; read/write/seek, `sync_all`/`sync_data`, `into_std`;
+`smol::fs::File` or `tokio::fs::File` underneath), with `smol` as the
+default backend and `tokio` behind a feature, per the Async model section.
+`rt::Timer` lands with Phase 6, `rt::spawn` and networking with Phase 13.
+All blocking-pool offload in `ostrya` goes through `rt::unblock`;
+`ContentReader` streams from `rt::File`, implements `futures_io::AsyncRead`
+unconditionally and `tokio::io::AsyncRead` under the `tokio` feature, and
+inflates archive objects through a poll-driven streaming decoder
+(`async-compression` raw DEFLATE, bounded chunks decompressed in-task).
+
+The hashing streams (in `ostrya`), the primitives the write path builds on:
+`HashingReader` and `HashingWriter` feed a digester with every byte they
+pass through, expose the byte count, and yield `(digest, size)` from a
+consuming `finalize`. The constructor takes the digester by value, possibly
+pre-seeded: a file object id covers the framed file header before the
+payload. The verifying counterpart (`VerifyingReader`) lands with pull
+(Phase 13a).
+
+Dependency set for the phase: `ostrya-rt` uses `smol`, `futures-io`, and
+optional `tokio` (features `fs`, `io-util`, `rt`, `time`); `ostrya` adds
+`pin-project-lite`, `digest`, and `async-compression` (`deflate` plus
+trait-family features only), routes all pool offload through `ostrya-rt`,
+and keeps no direct `blocking` or `miniz_oxide` dependency.
+
+Verify: the test suite passes under both backends (default features, and
+with the `tokio` feature selecting the tokio backend); reads from a
+tool-created repo are byte-identical under both; the `Send + Sync`
+compile-time assertions cover `ContentReader` and the hashing streams; unit
+tests drive the hashing streams to EOF and check digest and size, including
+the pre-seeded-digester and empty-payload cases.
 
 ### Phase 6 -- Transactions and locking
 
@@ -312,7 +403,9 @@ Split into sub-phases:
 - 7a Content and metadata object writers (all modes, O_TMPFILE + linkat,
   dedup early-out, min-free-space accounting, per-mode metadata application).
   Content ingest streams: hashing and compression run over bounded chunks as
-  the payload is copied, never over a whole in-memory blob.
+  the payload is copied, never over a whole in-memory blob. The primary
+  ingestion surface is the push-style `ContentWriter` (`api-sketch.md`),
+  with `write_content` as a pull-style convenience over it.
 - 7b Mutable tree and `write_mtree` (sorted dirtree assembly, clean-subtree
   short-circuit).
 - 7c `write_dfd_to_mtree` (fs-tree walk, devino cache, commit modifier: filter,
@@ -366,9 +459,12 @@ our deltas; `test-delta`, `test-delta-ed25519`, `test-delta-sign`.
 ### Phase 13 -- Pull
 
 Split into sub-phases:
-- 13a Async fetcher: pure-Rust HTTP/1.1 over smol + rustls, conditional GET
-  (ETag/If-Modified-Since/304), mirrorlist fallback, retry classification,
-  max-size streaming cap, priorities, client certs, basic auth. No range.
+- 13a Async fetcher: pure-Rust HTTP/1.1 over the `ostrya-rt` net layer +
+  rustls, conditional GET (ETag/If-Modified-Since/304), mirrorlist fallback,
+  retry classification, max-size streaming cap, priorities, client certs,
+  basic auth. No range. Ships `VerifyingReader`, the stream that checks an
+  expected digest at EOF and fails the final read with `InvalidData` on a
+  mismatch (the check fires only when the consumer polls through to EOF).
 - 13b Local pull (`file://`): object import (hardlink/reflink/copy),
   localcache repos.
 - 13c HTTP pull: the scan/fetch state machine (bounded fetch semaphore of 8,
@@ -464,13 +560,30 @@ Resolved:
    a proc-macro crate plus `syn`, `quote`, and `proc-macro2`. Revisiting it
    requires a dependency proposal per the confirmation rule.
 
+7. Runtime backend and streams (Phase 5a): the async runtime sits behind
+   the internal `ostrya-rt` crate -- `smol` by default (`smol::unblock`,
+   `smol::fs::File`), `tokio` behind a feature, tokio taking precedence
+   when both features are enabled, and a compile error when neither is.
+   `rustix` is scoped to fd-relative and Linux-specific syscalls offloaded
+   through `rt::unblock`, the sole blocking-pool entry; streaming file I/O
+   goes through `rt::File`. Concrete public stream types (`ContentReader`,
+   `ContentWriter`, the hashing streams) implement the `futures-io` traits
+   unconditionally and the tokio traits under the `tokio` feature;
+   `AsyncRead`/`AsyncWrite` bounds in argument position are the
+   `futures-io` traits (tokio callers adapt with `tokio_util::compat`).
+   The hashing streams are concrete types with inherent methods; a trait
+   abstraction over them waits for a second consumer. Archive DEFLATE
+   streams through `async-compression` (deflate feature only) over
+   `flate2`/`miniz_oxide`.
+
 Deferred to their respective phases:
 
-7. composefs (Phase 15): reproduce the composefs/EROFS format ourselves versus
+8. composefs (Phase 15): reproduce the composefs/EROFS format ourselves versus
    depend on an emerging pure-Rust composefs crate. Feature-gated and late
    either way.
-8. HTTP client (Phase 13a): hand-roll a minimal async HTTP/1.1 client over
-   smol + rustls versus a pure-Rust crate such as `async-h1`. No range/HTTP2
-   is required, which keeps the hand-rolled option viable.
-9. spki sign engine and avahi repo-finder: deferred as optional; ed25519 and
-   gpg cover the common cases.
+9. HTTP client (Phase 13a): hand-roll a minimal async HTTP/1.1 client over
+   the runtime's net layer + rustls versus a pure-Rust crate such as
+   `async-h1`. No range/HTTP2 is required, which keeps the hand-rolled
+   option viable.
+10. spki sign engine and avahi repo-finder: deferred as optional; ed25519
+    and gpg cover the common cases.

@@ -43,8 +43,13 @@ reference, or reading material.
 
 ## Goals
 
-1. Rust-native with no C library linkage. Syscalls go through `rustix`.
-2. Async on the `smol` runtime.
+1. Rust-native with no C library linkage beyond what `std` links. `rustix`
+   handles the syscalls a portable async file API cannot express (fd-relative
+   opens and metadata, xattrs, statx, FICLONE reflink, O_TMPFILE + linkat,
+   OFD locks); streaming file I/O goes through the runtime's async file.
+2. Async, with a feature-gated runtime backend behind the internal
+   `ostrya-rt` crate: `smol` by default, `tokio` optional. Only `ostrya-rt`
+   knows the backend.
 3. Multiple concurrent transactions within a single process.
 4. Capable of passing ostree's test suite, run as an external conformance gate
    (scope is phased: library format and format-primitive unit tests first,
@@ -114,6 +119,6 @@ begins only once its dependency set is agreed.
   size. Whole-buffer handling is reserved for metadata objects, whose size the
   format caps.
 - The core public types -- `Repo`, `Transaction`, `FileObject`, and the file
-  content readers -- must be `Send + Sync`, so they can be shared across tasks
-  and threads. Pin this with compile-time assertions in tests as each type
-  lands.
+  content readers and writers -- must be `Send + Sync`, so they can be shared
+  across tasks and threads. Pin this with compile-time assertions in tests as
+  each type lands.

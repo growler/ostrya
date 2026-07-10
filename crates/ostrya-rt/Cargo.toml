@@ -1,0 +1,25 @@
+[package]
+name = "ostrya-rt"
+description = "Internal async-runtime abstraction for ostrya (smol/tokio backends)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["smol"]
+smol = ["dep:smol"]
+tokio = ["dep:tokio"]
+
+[dependencies]
+futures-io = "0.3"
+smol = { version = "2", optional = true }
+tokio = { version = "1", optional = true, default-features = false, features = [
+    "rt",
+    "fs",
+    "io-util",
+] }
+
+[dev-dependencies]
+futures-lite = "2"

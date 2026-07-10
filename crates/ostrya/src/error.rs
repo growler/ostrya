@@ -5,6 +5,7 @@
 //! later phases add variants (object not-found, checksum mismatch, signature,
 //! lock, and so on).
 
+use ostrya_core::{Checksum, ObjectType};
 use thiserror::Error;
 
 /// Result alias used throughout the `ostrya` crate.
@@ -21,12 +22,29 @@ pub enum Error {
     /// parsing, object model).
     #[error(transparent)]
     Core(#[from] ostrya_core::Error),
+    /// A referenced object is not present in the store.
+    #[error("object not found: {ty:?} {checksum}")]
+    ObjectNotFound {
+        /// The object identity that was looked up.
+        checksum: Checksum,
+        /// The object type that was looked up.
+        ty: ObjectType,
+    },
+    /// A refspec did not resolve to a commit.
+    #[error("ref not found: {0}")]
+    RefNotFound(String),
     /// On-disk data did not match the expected format.
     #[error("invalid format: {0}")]
     InvalidFormat(String),
     /// A requested operation or repository feature is not supported.
     #[error("unsupported: {0}")]
     Unsupported(String),
+}
+
+impl From<rustix::io::Errno> for Error {
+    fn from(errno: rustix::io::Errno) -> Error {
+        Error::Io(errno.into())
+    }
 }
 
 #[cfg(test)]

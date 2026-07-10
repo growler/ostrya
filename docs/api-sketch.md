@@ -13,18 +13,27 @@ https://ostreedev.github.io/ostree/, not from the LGPL source (see CLAUDE.md,
 
 Guiding choices:
 
-- `Repo` is cheaply clonable (an `Arc` inner) so handles move freely into smol
+- `Repo` is cheaply clonable (an `Arc` inner) so handles move freely across
   tasks. Opening does the fd/config work once; clones share it.
+- The runtime backend is feature-gated behind the internal `ostrya-rt`
+  crate: `smol` by default, `tokio` optional. Concrete stream types
+  (`ContentReader`, `ContentWriter`, the hashing streams) implement the
+  `futures-io` traits unconditionally and the tokio traits under the
+  `tokio` feature, so neither backend needs a caller-side adapter.
+  `AsyncRead`/`AsyncWrite` bounds in argument position (`write_content`,
+  tar import/export) are the `futures-io` traits; a tokio caller adapts
+  those with `tokio_util::compat`.
 - I/O entry points are `async fn`. Filter/xattr callbacks are synchronous.
-- Cancellation is via dropping the future (smol) plus optional
-  `smol::future::or` with a cancel signal, rather than a cancellable object.
+- Cancellation is via dropping the future, optionally racing it against a
+  cancel signal, rather than a cancellable object.
 - Errors are one `ostrya::Error` enum with `thiserror`, not `glib::Error`.
 - File content is never loaded into memory whole. Content operations --
   hashing, compression, storing, checkout, transfer -- consume and produce
   async streams in bounded-size chunks. Whole-buffer handling is reserved
   for metadata objects, whose size the format caps.
-- `Repo`, `Transaction`, `FileObject`, and the file content readers are
-  `Send + Sync`, pinned by compile-time assertions as each type lands.
+- `Repo`, `Transaction`, `FileObject`, and the file content readers and
+  writers are `Send + Sync`, pinned by compile-time assertions as each type
+  lands.
 
 ## Core value types
 
@@ -180,9 +189,77 @@ pub struct FileObject {
 }
 impl FileObject {
     /// Regular files: streams the payload in bounded chunks.
-    pub async fn reader(&self) -> Result<impl AsyncRead + Send + Sync>;
+    pub async fn reader(&self) -> Result<ContentReader>;
 }
+
+/// Streaming reader over a regular file's payload: raw for the bare family,
+/// on-the-fly raw-DEFLATE inflate for archive (a streaming decoder over
+/// bounded chunks), empty for symlinks. Streams from `rt::File`. Implements
+/// `futures_io::AsyncRead` unconditionally and `tokio::io::AsyncRead` under
+/// the `tokio` feature, so neither backend needs a caller-side adapter.
+pub struct ContentReader { /* empty | rt::File | inflate adapter */ }
 ```
+
+## Runtime backend and streaming I/O
+
+The runtime backend is feature-gated behind the internal `ostrya-rt` crate
+(`smol` by default, `tokio` optional; policy in `port-plan.md`, "Async
+model"). It is the only crate that knows which backend is compiled.
+
+```rust
+// ostrya-rt -- the whole surface at this phase.
+pub async fn unblock<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static) -> T;   // the only pool entry
+
+pub fn block_on<F: Future>(future: F) -> F::Output; // test/doctest driver
+
+/// Async file over an already-open fd (`smol::fs::File` or
+/// `tokio::fs::File` underneath). Opens happen through rustix (fd-relative
+/// `openat`); this type only streams. Presents the `futures-io` traits
+/// under both backends; the tokio traits additionally under the `tokio`
+/// feature.
+pub struct File;    // From<std::fs::File> / From<OwnedFd>;
+                    // AsyncRead + AsyncWrite + AsyncSeek + Send + Sync
+impl File {
+    pub async fn sync_all(&mut self) -> std::io::Result<()>;
+    pub async fn sync_data(&mut self) -> std::io::Result<()>;
+    pub async fn into_std(self) -> std::fs::File;   // settles pipelined ops
+}
+
+pub struct Timer;   // lands with Phase 6 (lock retry); spawn/net with pull
+```
+
+The hashing streams live in `ostrya` and are generic over the inner stream,
+so they compose with `rt::File`, `ContentReader`, and network streams. Each
+implements the `futures-io` trait its inner type provides, plus the tokio
+counterpart under the `tokio` feature.
+
+```rust
+/// Feeds a SHA-256 digester with every byte it passes through. ostree hashes
+/// with SHA-256 throughout, so the digester is fixed. It arrives by value and
+/// may be pre-seeded: a file object id covers the framed file header before
+/// the payload.
+pub struct HashingReader<R> { /* Sha256, count, inner */ }
+impl<R> HashingReader<R> {
+    pub fn new(hasher: Sha256, inner: R) -> Self;   // hasher may be pre-seeded
+    pub fn size(&self) -> u64;                   // bytes seen so far
+    pub fn finalize(self) -> (Checksum, u64);    // digest + size, at EOF
+}
+
+/// Symmetric writer: hashes what it forwards; `finalize` after flush.
+pub struct HashingWriter<W> { /* Sha256, count, inner */ }
+
+/// Passes bytes through and checks an expected digest at EOF: the final
+/// read fails with `std::io::ErrorKind::InvalidData` on a mismatch. The
+/// check fires only when the consumer polls through to EOF; an empty-buffer
+/// read neither observes bytes nor latches EOF. Lands with pull
+/// (Phase 13a).
+pub struct VerifyingReader<D, R> { /* expected digest over a HashingReader */ }
+```
+
+`ContentWriter` (see Transactions) stages content through a `HashingWriter`
+over the staging `rt::File`; pull wraps fetched payloads in
+`VerifyingReader`.
 
 ## Borrowed object views (read path)
 
@@ -260,6 +337,12 @@ pub struct Transaction { /* Repo clone + owned staging state */ }
 
 impl Transaction {
     // object writers (return the computed checksum)
+    /// Push-style ingestion: a writer that streams one payload into the
+    /// transaction's staging area, hashing (and, in archive mode,
+    /// compressing) on the way down.
+    pub async fn content_writer(&self, expected: Option<&Checksum>,
+        meta: &FileMeta) -> Result<ContentWriter>;
+    /// Pull-style convenience over `content_writer`.
     pub async fn write_content(&self, expected: Option<&Checksum>,
         meta: &FileMeta, reader: impl AsyncRead + Send) -> Result<Checksum>;
     /// Small content the caller already holds; the general path is
@@ -284,6 +367,17 @@ impl Transaction {
 
     pub async fn commit(self) -> Result<TransactionStats>;
     pub async fn abort(self) -> Result<()>;
+}
+
+/// Streams one regular file's payload into a transaction. Implements
+/// `futures_io::AsyncWrite` unconditionally and `tokio::io::AsyncWrite`
+/// under the `tokio` feature. `finish` finalizes the digest, applies the
+/// per-mode object metadata, and stages the object under its id (a dedup
+/// hit returns the existing id). Dropping without `finish` abandons the
+/// staged temporary, which the transaction reaps.
+pub struct ContentWriter { /* HashingWriter over a staging rt::File */ }
+impl ContentWriter {
+    pub async fn finish(self) -> Result<Checksum>;
 }
 
 pub struct CommitOptions {

@@ -105,6 +105,18 @@ impl FileHeader {
         Ok(ostrya_gvariant::encode_to_vec(self)?)
     }
 
+    /// Parse the stat-metadata form `(uuua(ayay))` -- the layout dirmeta uses,
+    /// and the layout stored in the `user.ostreemeta` xattr of a bare-user
+    /// `.file` object. The three scalar fields are uid, gid, and the full
+    /// `st_mode` (big-endian); there is no rdev and no symlink-target field, so
+    /// the returned header has an empty target. A bare-user symlink carries a
+    /// symlink `st_mode` here and keeps its target in the file content, which
+    /// the caller supplies separately.
+    pub fn parse_stat_metadata(data: &[u8]) -> Result<FileHeader> {
+        let (uid, gid, mode, xattrs): (Be32, Be32, Be32, &[u8]) = GvDecode::decode(data)?;
+        FileHeader::build(uid.0, gid.0, mode.0, 0, "", xattrs)
+    }
+
     /// Parse the archive header form `(tuuuusa(ayay))`, returning the header
     /// and the uncompressed payload size.
     pub fn parse_archive(data: &[u8]) -> Result<(FileHeader, u64)> {
@@ -324,6 +336,55 @@ mod tests {
         let header = regular(0o100755);
         let bytes = header.serialize_archive(1234).unwrap();
         assert_eq!(FileHeader::parse_archive(&bytes).unwrap(), (header, 1234));
+    }
+
+    #[test]
+    fn stat_metadata_decodes_the_bare_user_ostreemeta_form() {
+        // The exact `user.ostreemeta` bytes a bare-user `.file` carries for a
+        // 0644 root-owned regular file, recovered from a tool-created repo:
+        // uid 0, gid 0, mode 0o100644 (all big-endian), no xattrs.
+        let regular = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x81, 0xa4];
+        let hdr = FileHeader::parse_stat_metadata(&regular).unwrap();
+        assert_eq!((hdr.uid, hdr.gid, hdr.mode), (0, 0, 0o100644));
+        assert!(!hdr.is_symlink());
+        assert_eq!(hdr.symlink_target, "");
+        assert!(hdr.xattrs.is_empty());
+
+        // The symlink form carries an S_IFLNK mode; the target lives in the
+        // file content, so the parsed header's target stays empty.
+        let symlink = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xa1, 0xff];
+        let hdr = FileHeader::parse_stat_metadata(&symlink).unwrap();
+        assert_eq!((hdr.uid, hdr.gid, hdr.mode), (0, 0, 0o120777));
+        assert!(hdr.is_symlink());
+        assert_eq!(hdr.symlink_target, "");
+
+        // The wire layout is exactly dirmeta's, but a directory mode names
+        // neither a regular file nor a symlink, so it is rejected: this
+        // decoder only describes `.file` objects.
+        let dir_meta = crate::DirMeta {
+            uid: 1000,
+            gid: 100,
+            mode: 0o40750,
+            xattrs: Xattrs::empty(),
+        };
+        assert_eq!(
+            FileHeader::parse_stat_metadata(&dir_meta.serialize().unwrap()),
+            Err(Error::InvalidFileHeader(
+                "mode is not a regular file or symlink"
+            ))
+        );
+
+        // A file-mode header with xattrs round-trips its fields.
+        let with_xattr = ostrya_gvariant::encode_to_vec(&(
+            Be32(0),
+            Be32(0),
+            Be32(0o100600),
+            &Xattrs::new([(b"user.a\0".to_vec(), b"v".to_vec())]).unwrap(),
+        ))
+        .unwrap();
+        let hdr = FileHeader::parse_stat_metadata(&with_xattr).unwrap();
+        assert_eq!(hdr.mode, 0o100600);
+        assert_eq!(hdr.xattrs.len(), 1);
     }
 
     #[test]

@@ -405,7 +405,9 @@ pub struct MutableTree { /* in-memory tree under construction */ }
 impl MutableTree {
     pub fn new() -> Self;
     pub async fn from_commit(repo: &Repo, rev: &str) -> Result<Self>;
-    pub fn ensure_dir(&mut self, name: &str) -> Result<&mut MutableTree>;
+    // async: descending into a lazily-loaded committed subdirectory reads its
+    // dirtree, so the hydrating descent is offloaded through the blocking pool.
+    pub async fn ensure_dir(&mut self, name: &str) -> Result<&mut MutableTree>;
     pub fn replace_file(&mut self, name: &str, checksum: Checksum) -> Result<()>;
     pub fn set_metadata_checksum(&mut self, c: Checksum);
     pub fn remove(&mut self, name: &str, allow_noent: bool) -> Result<()>;

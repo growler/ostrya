@@ -19,8 +19,10 @@
 //! object-store write layer (Phase 7a): streaming content ingestion through
 //! [`ContentWriter`], metadata and symlink writers, per-mode on-disk
 //! application, dedup, free-space accounting, and publication of staged objects
-//! into `objects/` at commit. Tree assembly, commits, checkout, and maintenance
-//! land in later phases.
+//! into `objects/` at commit. It also covers in-memory tree assembly (Phase
+//! 7b): the [`MutableTree`] with lazy hydration and dirty tracking, and
+//! [`Transaction::write_mtree`], which serializes dirty subtrees into dirtree
+//! objects. Commits, checkout, and maintenance land in later phases.
 
 pub mod config;
 pub mod error;
@@ -28,6 +30,7 @@ pub mod file;
 mod hashing;
 mod inflate;
 mod lock;
+pub mod mtree;
 mod object;
 pub mod read;
 pub mod refs;
@@ -42,6 +45,7 @@ pub use error::{Error, Result};
 pub use file::{ContentReader, FileKind, FileObject};
 pub use hashing::{HashingReader, HashingWriter};
 pub use lock::LockKind;
+pub use mtree::MutableTree;
 pub use ostrya_core::{Checksum, ObjectType, RepoMode};
 pub use read::CommitState;
 pub use repo::{CreateOptions, Repo};

@@ -577,7 +577,7 @@ artificially small budget; a compile-time assertion pins
 backends. Tool-level acceptance of whole repositories lands with 7d,
 when commits and refs exist for the tool to read.
 
-### Phase 7b -- Mutable tree and write_mtree
+### Phase 7b -- Mutable tree and write_mtree (DONE)
 
 In-memory tree construction and its serialization to dirtree and dirmeta
 objects. After 7b a full tree's object set can be staged from known
@@ -590,9 +590,13 @@ Definition:
   `replace_file`, `remove`, `set_metadata_checksum`. Names are validated
   on insertion (UTF-8, no `/`, not `.` or `..`), and one name cannot be
   both a file and a directory, matching the Phase 3 owned-parse rule.
+  `ensure_dir` is `async`: descending into a committed subdirectory reads
+  its dirtree through the blocking-pool offload, so it departs from the
+  synchronous sketch signature (the sketch is explicitly not final code);
+  the other mutators stay synchronous.
 - Lazy hydration: `from_commit` records the dirtree/dirmeta checksums
-  and loads children only when a subtree is first mutated, so editing
-  one path in a large commit reads only that path's spine.
+  and loads children only when a subtree is first descended into, so
+  editing one path in a large commit reads only that path's spine.
 - Dirty tracking and the clean-subtree short-circuit: an unmutated
   subtree keeps its known dirtree checksum and `write_mtree` reuses it
   without re-serializing or re-staging anything beneath it.

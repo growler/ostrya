@@ -61,6 +61,11 @@ pub enum Error {
         /// How many more bytes of free space the write would have needed.
         shortfall: u64,
     },
+    /// An in-memory tree could not be built or serialized: an invalid entry
+    /// name, a file/directory name collision, a directory missing its dirmeta
+    /// checksum, or removing an absent entry.
+    #[error("mutable tree: {0}")]
+    MutableTree(String),
 }
 
 impl From<rustix::io::Errno> for Error {

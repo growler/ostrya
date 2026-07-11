@@ -60,6 +60,16 @@ impl Repo {
 }
 
 impl RepoTree {
+    /// Build a handle from a repository and a directory's dirtree and dirmeta
+    /// checksums. Used by `write_mtree` to name a freshly assembled root.
+    pub(crate) fn from_parts(repo: Repo, dirtree: Checksum, dirmeta: Checksum) -> RepoTree {
+        RepoTree {
+            repo,
+            dirtree,
+            dirmeta,
+        }
+    }
+
     /// The dirtree checksum of this directory.
     pub fn dirtree_checksum(&self) -> &Checksum {
         &self.dirtree

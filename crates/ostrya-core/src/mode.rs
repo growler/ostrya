@@ -17,9 +17,9 @@ pub enum RepoMode {
     BareSplitXattrs,
     /// Content zlib-RAW-compressed as `.filez`; HTTP-servable.
     Archive,
-    /// Port extension (development-only): `File` split into `.filea`
-    /// (attributes plus a blob reference) and `.fileb` (raw payload).
-    BareUserSplitAttrs,
+    /// Port extension (development-only): `bare-user` storage with the logical
+    /// mode never applied to the inode, for group-shared repositories.
+    BareUserShared,
 }
 
 impl RepoMode {
@@ -32,7 +32,7 @@ impl RepoMode {
             "bare-user-only" => RepoMode::BareUserOnly,
             "bare-split-xattrs" => RepoMode::BareSplitXattrs,
             "archive-z2" | "archive" => RepoMode::Archive,
-            "bare-user-split-attrs" => RepoMode::BareUserSplitAttrs,
+            "bare-user-shared" => RepoMode::BareUserShared,
             _ => return None,
         })
     }
@@ -46,7 +46,7 @@ impl RepoMode {
             RepoMode::BareUserOnly => "bare-user-only",
             RepoMode::BareSplitXattrs => "bare-split-xattrs",
             RepoMode::Archive => "archive-z2",
-            RepoMode::BareUserSplitAttrs => "bare-user-split-attrs",
+            RepoMode::BareUserShared => "bare-user-shared",
         }
     }
 
@@ -80,7 +80,7 @@ mod tests {
             RepoMode::BareUserOnly,
             RepoMode::BareSplitXattrs,
             RepoMode::Archive,
-            RepoMode::BareUserSplitAttrs,
+            RepoMode::BareUserShared,
         ] {
             assert_eq!(RepoMode::from_mode_str(mode.as_mode_str()), Some(mode));
         }

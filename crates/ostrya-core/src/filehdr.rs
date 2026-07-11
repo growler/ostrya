@@ -1,14 +1,12 @@
 //! File content-object headers and the content checksum.
 //!
 //! A content object (`.file` / `.filez`) is a header GVariant followed by the
-//! payload. Three header wire forms exist:
+//! payload. Two header wire forms exist:
 //!
 //! - uncompressed `(uuuusa(ayay))` -- bare-mode streams and checksum
 //!   computation;
 //! - archive `(tuuuusa(ayay))` -- stored on disk in archive mode, with the
-//!   uncompressed payload size prepended;
-//! - split-attrs `(uuuusa(ayay)ay)` -- the port's `.filea` object, the
-//!   uncompressed header plus a `.fileb` blob reference (empty for symlinks).
+//!   uncompressed payload size prepended.
 //!
 //! The scalar fields (uid, gid, mode, rdev, size) are big-endian at the value
 //! level; [`FileHeader`] holds them in host order and the (de)serializers
@@ -146,57 +144,6 @@ impl FileHeader {
             Be32(0),
             self.symlink_target.as_str(),
             &self.xattrs,
-        ))?)
-    }
-
-    /// Parse the split-attrs `.filea` form `(uuuusa(ayay)ay)`, returning the
-    /// header and the `.fileb` blob reference (`None` for symlinks).
-    pub fn parse_split_attrs(data: &[u8]) -> Result<(FileHeader, Option<Checksum>)> {
-        let (uid, gid, mode, rdev, target, xattrs, blob): (
-            Be32,
-            Be32,
-            Be32,
-            Be32,
-            &str,
-            &[u8],
-            &[u8],
-        ) = GvDecode::decode(data)?;
-        let header = FileHeader::build(uid.0, gid.0, mode.0, rdev.0, target, xattrs)?;
-        let blob = match (header.is_symlink(), blob.len()) {
-            (true, 0) => None,
-            (true, _) => return Err(Error::InvalidFileHeader("symlink with a blob reference")),
-            (false, 32) => Some(Checksum::from_ay(blob)?),
-            (false, _) => {
-                return Err(Error::InvalidFileHeader("blob reference is not 32 bytes"));
-            }
-        };
-        Ok((header, blob))
-    }
-
-    /// Serialize the split-attrs `.filea` form `(uuuusa(ayay)ay)`. A regular
-    /// file must reference its payload blob; a symlink must not.
-    pub fn serialize_split_attrs(&self, blob: Option<&Checksum>) -> Result<Vec<u8>> {
-        self.validate()?;
-        let blob: &[u8] = match (self.is_symlink(), blob) {
-            (true, None) => &[],
-            (true, Some(_)) => {
-                return Err(Error::InvalidFileHeader("symlink with a blob reference"));
-            }
-            (false, Some(c)) => c.as_bytes(),
-            (false, None) => {
-                return Err(Error::InvalidFileHeader(
-                    "regular file without a blob reference",
-                ));
-            }
-        };
-        Ok(ostrya_gvariant::encode_to_vec(&(
-            Be32(self.uid),
-            Be32(self.gid),
-            Be32(self.mode),
-            Be32(0),
-            self.symlink_target.as_str(),
-            &self.xattrs,
-            blob,
         ))?)
     }
 }
@@ -387,36 +334,6 @@ mod tests {
         assert_eq!(hdr.xattrs.len(), 1);
     }
 
-    #[test]
-    fn split_attrs_form_round_trips() {
-        let header = regular(0o100600);
-        let blob = Checksum::sha256(b"payload");
-        let bytes = header.serialize_split_attrs(Some(&blob)).unwrap();
-        assert_eq!(
-            FileHeader::parse_split_attrs(&bytes).unwrap(),
-            (header, Some(blob))
-        );
-
-        let link = symlink("elsewhere");
-        let bytes = link.serialize_split_attrs(None).unwrap();
-        assert_eq!(FileHeader::parse_split_attrs(&bytes).unwrap(), (link, None));
-    }
-
-    #[test]
-    fn split_attrs_blob_reference_rules_are_enforced() {
-        assert_eq!(
-            regular(0o100644).serialize_split_attrs(None),
-            Err(Error::InvalidFileHeader(
-                "regular file without a blob reference"
-            ))
-        );
-        let blob = Checksum::sha256(b"");
-        assert_eq!(
-            symlink("t").serialize_split_attrs(Some(&blob)),
-            Err(Error::InvalidFileHeader("symlink with a blob reference"))
-        );
-    }
-
     /// Serialize an arbitrary uncompressed-form header through the `Value`
     /// tree, bypassing the struct's validation.
     fn craft(uid: u32, gid: u32, mode: u32, rdev: u32, target: &str) -> Vec<u8> {
@@ -518,20 +435,15 @@ mod tests {
     }
 
     #[test]
-    fn the_three_wire_forms_agree_on_the_common_fields() {
+    fn the_two_wire_forms_agree_on_the_common_fields() {
         let header = FileHeader {
             xattrs: Xattrs::new([(b"user.a\0".to_vec(), b"1".to_vec())]).unwrap(),
             ..regular(0o100640)
         };
-        let blob = Checksum::sha256(b"payload");
         let from_uncompressed = FileHeader::parse(&header.serialize().unwrap()).unwrap();
         let (from_archive, _) =
             FileHeader::parse_archive(&header.serialize_archive(4096).unwrap()).unwrap();
-        let (from_split, _) =
-            FileHeader::parse_split_attrs(&header.serialize_split_attrs(Some(&blob)).unwrap())
-                .unwrap();
         assert_eq!(from_uncompressed, header);
         assert_eq!(from_archive, header);
-        assert_eq!(from_split, header);
     }
 }

@@ -193,46 +193,48 @@ before any ref points at them. Ref writes are individually atomic (tmpfile +
 fdatasync + rename) but not atomic as a set. Honor `fsync=false` (all fsync
 becomes no-op) and `per-object-fsync`.
 
-## New repository mode: bare-user-split-attrs
+## New repository mode: bare-user-shared
 
 A development-only repository mode introduced by this port, offered as an
 optional add-on. Production repositories stay `bare`; this mode supports
-building images in a shared multi-developer repository and serving as a
-composefs backing store. The full format is in `format-reference.md`.
+building images in a group-shared repository on a multi-user build host and
+serving as a composefs backing store. The full format is in
+`format-reference.md`.
 
-Summary. A `File` is stored as two objects: `.fileb` (raw payload, named
-`SHA256(payload)`) and `.filea` (the 6-field file header plus a blob reference,
-named by the classic file identity `SHA256(header ‖ payload)`). Object
-identity, and therefore dirtree and commit hashes, are unchanged from `bare`,
-so a commit developed here is identical when pulled into a bare production
-repository. Objects are stored 0664 with setgid object directories and a shared
-group, decoupling repository at-rest permissions from logical file permissions
-(which resolves the `bare-user` lockout on restrictively-permissioned files in
-a shared repository). The logical mode, uid, gid, and xattrs live only in
-`.filea`.
+Summary. Storage is `bare-user` -- raw payload on disk, logical
+uid/gid/mode/xattrs in the `user.ostreemeta` xattr, symlinks as regular
+files -- with one behavioral difference: the logical mode is never applied to
+the inode. Objects carry a fixed mode 0644, repository directories are setgid
+2775 with a shared group, and `.lock` is group-writable. This resolves the
+`bare-user` lockout on restrictively-permissioned files in a shared
+repository (an `/etc/shadow` object stored 0600 by one user is unreadable to
+the next). Object identity, and therefore dirtree and commit hashes, are
+unchanged, so a commit developed here is identical when pulled into a bare
+production repository. The distinct mode string keeps the upstream tool from
+hardlink-checking-out inodes that do not carry logical modes.
 
-Invariant. `ostree.sizes` is hard-disabled in this mode. It is the only
-storage-dependent commit-metadata field, and leaving it off preserves the
-cross-mode commit identity the development-to-production workflow relies on.
+Invariant. `ostree.sizes` never appears in this mode, as in `bare-user`: size
+generation is an archive-only mechanism (observed: a size-generation request
+in a non-archive repo is a silent no-op in the tool), so the cross-mode commit
+identity the development-to-production workflow relies on needs no
+mode-specific handling.
 
 Design thread across phases:
 
-- Phase 3: the `.filea` and `.fileb` encoders and the new `ObjectType::FileBlob`.
-- Phase 4: `mode=bare-user-split-attrs` is accepted, validated, and written to
-  `[core] mode` on create. Objects and their `objects/xx/` directories are
-  first written by the write path, so the setgid object directories, shared
-  group, and 0664 objects land in Phase 7.
-- Phase 5: mode-aware `load_file` (read `.filea`, then `.fileb`).
-- Phase 7: `write_content` splits into blob plus attributes internally, with an
-  unchanged signature; `ostree.sizes` is enforced off. Object directories are
-  created setgid with a shared group and objects are stored 0664 via explicit
-  chmod (never trusting umask).
-- Phase 8: copy-based checkout applying the `.filea` mode.
-- Phase 9: the `filea -> fileb` reachability edge for prune and fsck, the
-  two-level integrity check, and blob-aware commit-completeness.
-- Phase 13: two-object fetch and cross-mode re-encoding on the shared identity.
-- Phase 15: composefs export uses the real `.filea` attributes and redirects to
-  `.fileb`; ownership is presented via composefs uid mapping at mount.
+- Phase 6a: `mode=bare-user-shared` is accepted, validated, and written to
+  `[core] mode` on create; reading is served by the `bare-user` loader, which
+  never consults inode permissions.
+- Phase 7: the `bare-user` writer with the inode mode application skipped:
+  objects `fchmod` 0644 (never trusting umask), repository directories
+  created setgid 2775 with the shared group, `.lock` written 0664; size
+  generation is archive-only, so a request in this mode is a no-op.
+- Phase 8: copy-based checkout (reflink where the filesystem supports it)
+  applying the `user.ostreemeta` mode; hardlink checkout refused.
+- Phase 9: fsck and prune as `bare-user`; inode permissions are not
+  authoritative and are not checked.
+- Phase 15: composefs export builds the EROFS metadata from `user.ostreemeta`
+  and redirects each regular file to its `.file` loose path; ownership is
+  presented via composefs uid mapping at mount.
 
 ## Testing strategy
 
@@ -425,6 +427,43 @@ excludes another process, and excludes and is excluded by the `ostree` tool;
 drop reaps the staging directory and releases the lock. Independent-commit
 verification arrives with the write path.
 
+### Phase 6a -- Mode refactor: bare-user-shared and bare-split-xattrs read (DONE)
+
+Supersedes the `bare-user-split-attrs` design (the `.filea`/`.fileb` object
+split); its write path was never built, so the refactor touches only the
+mode/objtype surface and the read path.
+
+- Remove the split-attrs surface: `RepoMode::BareUserSplitAttrs`,
+  `ObjectType::FileBlob`, the `.filea`/`.fileb` extensions and the
+  `(uuuusa(ayay)ay)` codec (`ostrya-core`: `mode.rs`, `objtype.rs`,
+  `filehdr.rs`), `load_split_attrs` and `blob_checksum_of` (`ostrya`), and
+  their tests and fixtures.
+- Add `RepoMode::BareUserShared` (`mode=bare-user-shared`): config parsing
+  and serialization, create/open validation, reading through the `bare-user`
+  loader.
+- Implement `bare-split-xattrs` reading (read-only; writing stays out of
+  scope, matching the tool). Publicly documented shape: `.file-xattrs`
+  objects keyed by the checksum of the xattr content, reached through the
+  `.file-xattrs-link` entry keyed by the file checksum; the reader takes the
+  bytes at the link name and never depends on hardlink topology. The exact
+  content-object layout (division of uid/gid/mode between `user.ostreemeta`
+  and the split objects, treatment of files without xattrs) is not publicly
+  documented and is recovered by observation; the recovered facts land in
+  `format-reference.md`.
+
+The tool refuses writes into `bare-split-xattrs`, so its read fixtures cannot
+be tool-generated: candidate repositories are constructed by hand from the
+public documentation and become valid fixtures only once
+`ostree fsck`/`ls`/`checkout` accepts them. `bare-user-shared` read fixtures
+derive from the bare-user fixture (objects re-chmodded, `[core] mode`
+rewritten).
+
+Verify: workspace tests green with the split-attrs surface removed; a
+`bare-user-shared` repo opens, and `load_file` returns correct metadata and
+content for objects stored 0644; the hand-built `bare-split-xattrs`
+repository is accepted by the tool and read identically by the port;
+`Send + Sync` compile-time assertions unchanged.
+
 ### Phase 7 -- Write path
 
 Split into sub-phases:
@@ -574,11 +613,18 @@ Resolved:
    track.
 4. Workspace: multi-crate (`ostrya-gvariant`, `ostrya-core`, `ostrya`,
    `ostrya-cli`), with heavier subsystems behind feature flags on `ostrya`.
-5. New `bare-user-split-attrs` development mode: a storage-layout split of
-   `File` into `.filea` (attributes plus a blob reference) and `.fileb` (raw
-   payload), with object identity preserved for development-to-production
-   portability, `ostree.sizes` disabled, and the mode serving as the intended
-   composefs backing store. See the dedicated section above.
+5. Development mode `bare-user-shared` (Phase 6a; supersedes the
+   `bare-user-split-attrs` object split, removed before its write path was
+   built): `bare-user` storage with the logical mode never applied to the
+   inode -- fixed 0644 objects, setgid shared-group directories, a
+   group-writable lock -- so a group-shared repository on a multi-user build
+   host has no lockout on restrictively-permissioned files. Object identity
+   is preserved for development-to-production portability, `ostree.sizes`
+   never appears (size generation is archive-only in the tool, a no-op
+   elsewhere), and the mode serves as the intended composefs backing store.
+   `bare-split-xattrs` support is read-only, matching the tool, specified
+   from the public documentation plus black-box observation. See the
+   dedicated section above.
 6. Typed codec (Phase 1a): object (de)serialization goes through hand-written
    codec impls over in-place reader and writer primitives -- decode reads
    fields directly from the serialized bytes with borrowed views on hot

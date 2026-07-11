@@ -1,10 +1,8 @@
 //! Reading-path tests for repository modes without checked-in fixtures.
 //!
 //! bare and bare-user-only need root or a tool to produce faithful ownership,
-//! and bare-user-split-attrs is a port extension the tool does not write, so
-//! there are no golden fixtures. These tests instead build objects directly --
-//! real inodes for the bare family, and the `.filea`/`.fileb` pair (via the
-//! core encoders) for split-attrs -- then read them back through the port.
+//! so there are no golden fixtures. These tests instead build real inodes for
+//! the bare family directly, then read them back through the port.
 
 mod common;
 
@@ -15,7 +13,7 @@ use std::path::Path;
 use common::TmpDir;
 use futures_lite::AsyncReadExt;
 use ostrya::{Checksum, CreateOptions, FileKind, Repo, RepoMode};
-use ostrya_core::{ContentHasher, FileHeader, ObjectType, Xattrs, loose_path};
+use ostrya_core::{ObjectType, loose_path};
 use ostrya_rt::block_on;
 
 fn csum(hex: &str) -> Checksum {
@@ -130,88 +128,44 @@ fn reads_bare_user_only_discarding_ownership() {
 }
 
 #[test]
-fn reads_split_attrs_via_the_blob_reference() {
+fn reads_bare_user_shared_like_bare_user() {
     block_on(async {
-        let tmp = TmpDir::new("split");
+        let tmp = TmpDir::new("bus");
         let root = tmp.path().join("repo");
-        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUserSplitAttrs))
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUserShared))
             .await
-            .expect("create split-attrs repo");
-        let mode = RepoMode::BareUserSplitAttrs;
+            .expect("create bare-user-shared repo");
 
-        // A regular file: the payload lives in a content-addressed `.fileb`, and
-        // the `.filea` holds the attributes plus the blob reference. The `.filea`
-        // is named by the classic file identity, unchanged across modes.
-        let payload = b"hello\n";
-        let blob = Checksum::sha256(payload);
-        let header = FileHeader {
-            uid: 500,
-            gid: 500,
-            mode: 0o100640,
-            symlink_target: String::new(),
-            xattrs: Xattrs::new([(b"user.k\0".to_vec(), b"val".to_vec())]).unwrap(),
-        };
-        let mut hasher = ContentHasher::new(&header).unwrap();
-        hasher.update(payload);
-        let file_id = hasher.finish();
-
-        fs::write(
-            object_path(&root, &blob, ObjectType::FileBlob, mode),
-            payload,
+        // Storage is bare-user: raw payload on the inode, logical metadata in
+        // `user.ostreemeta`. A restrictive logical mode (0600) is carried in
+        // the xattr while the inode is a plain 0644 object.
+        let reg = csum(&"11".repeat(32));
+        let reg_path = object_path(&root, &reg, ObjectType::File, RepoMode::BareUserShared);
+        fs::write(&reg_path, b"shared\n").unwrap();
+        fs::set_permissions(&reg_path, fs::Permissions::from_mode(0o644)).unwrap();
+        // The logical uid/gid/mode live in `user.ostreemeta` as the
+        // `(uuua(ayay))` stat-metadata form: three big-endian u32s, then an
+        // empty xattr array that adds no trailing bytes. The reader must report
+        // this logical 0600, never the fixed 0644 the inode carries.
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&0u32.to_be_bytes()); // uid
+        meta.extend_from_slice(&0u32.to_be_bytes()); // gid
+        meta.extend_from_slice(&0o100600u32.to_be_bytes()); // mode
+        let xattr_ok = rustix::fs::setxattr(
+            &reg_path,
+            "user.ostreemeta",
+            &meta,
+            rustix::fs::XattrFlags::empty(),
         )
-        .unwrap();
-        fs::write(
-            object_path(&root, &file_id, ObjectType::File, mode),
-            header.serialize_split_attrs(Some(&blob)).unwrap(),
-        )
-        .unwrap();
+        .is_ok();
+        if !xattr_ok {
+            eprintln!("skipping bare-user-shared read: user xattrs unsupported here");
+            return;
+        }
 
-        let file = repo.load_file(&file_id).await.unwrap();
-        assert_eq!((file.uid, file.gid, file.mode), (500, 500, 0o100640));
-        assert_eq!(file.kind, FileKind::Regular { size: 6 });
-        assert_eq!(file.xattrs.len(), 1);
-        assert_eq!(read_payload(&file).await, b"hello\n");
-        assert_eq!(repo.blob_checksum_of(&file_id).await.unwrap(), Some(blob));
-
-        // A symlink keeps its target in the `.filea` and references no blob.
-        let link_header = FileHeader {
-            uid: 0,
-            gid: 0,
-            mode: 0o120777,
-            symlink_target: "target/path".to_owned(),
-            xattrs: Xattrs::empty(),
-        };
-        let link_id = ContentHasher::new(&link_header).unwrap().finish();
-        fs::write(
-            object_path(&root, &link_id, ObjectType::File, mode),
-            link_header.serialize_split_attrs(None).unwrap(),
-        )
-        .unwrap();
-
-        let link = repo.load_file(&link_id).await.unwrap();
-        assert_eq!(
-            link.kind,
-            FileKind::Symlink {
-                target: "target/path".to_owned()
-            }
-        );
-        assert_eq!(read_payload(&link).await, b"");
-        assert_eq!(repo.blob_checksum_of(&link_id).await.unwrap(), None);
-    });
-}
-
-#[test]
-fn blob_checksum_of_requires_split_attrs_mode() {
-    block_on(async {
-        let tmp = TmpDir::new("nosplit");
-        let root = tmp.path().join("repo");
-        let repo = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
-            .await
-            .unwrap();
-        let err = repo
-            .blob_checksum_of(&csum(&"ee".repeat(32)))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ostrya::Error::Unsupported(_)));
+        let file = repo.load_file(&reg).await.unwrap();
+        assert_eq!((file.uid, file.gid, file.mode), (0, 0, 0o100600));
+        assert_eq!(file.kind, FileKind::Regular { size: 7 });
+        assert_eq!(read_payload(&file).await, b"shared\n");
     });
 }

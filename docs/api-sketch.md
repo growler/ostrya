@@ -51,16 +51,15 @@ impl Checksum {
 pub enum ObjectType {
     File = 1, DirTree = 2, DirMeta = 3, Commit = 4, TombstoneCommit = 5,
     CommitMeta = 6, PayloadLink = 7, FileXattrs = 8, FileXattrsLink = 9,
-    FileBlob = 10,   // port extension: raw payload in bare-user-split-attrs mode
 }
-// extension() is mode-aware for File: `.file` / `.filez` / `.filea`.
+// extension() is mode-aware for File: `.file` / `.filez`.
 impl ObjectType { pub fn is_meta(self) -> bool; pub fn extension(self, mode: RepoMode) -> &'static str; }
 
 pub struct ObjectName { pub checksum: Checksum, pub ty: ObjectType }
 
 pub enum RepoMode {
     Bare, BareUser, BareUserOnly, BareSplitXattrs, Archive,
-    BareUserSplitAttrs,   // port extension: dev-only split of File into .filea + .fileb
+    BareUserShared,   // port extension: bare-user storage, logical mode never on the inode
 }
 
 pub struct CollectionRef { pub collection_id: Option<String>, pub ref_name: String }
@@ -119,11 +118,6 @@ impl Repo {
 
     /// Open a committed file's metadata plus an async content reader.
     pub async fn load_file(&self, c: &Checksum) -> Result<FileObject>;
-
-    /// bare-user-split-attrs only: the payload-blob (`.fileb`) checksum a file
-    /// object references. None for symlinks. Lets external builders populate or
-    /// address blobs directly. Returns an error in other modes.
-    pub async fn blob_checksum_of(&self, file: &Checksum) -> Result<Option<Checksum>>;
 
     /// A traversable, read-only view of a commit's root tree.
     pub async fn read_commit(&self, rev: &str) -> Result<(RepoTree, Checksum)>;
@@ -549,8 +543,9 @@ impl Repo {
 impl Repo {
     /// Produce the EROFS/composefs image for a commit and its fs-verity digest.
     /// Inode metadata always comes from the real file attributes (no canonical
-    /// mode); in bare-user-split-attrs mode each regular file redirects to its
-    /// `.fileb` blob. Ownership is presented via composefs uid mapping at mount.
+    /// mode); in bare-user-shared mode metadata comes from `user.ostreemeta`
+    /// and each regular file redirects to its `.file` loose path. Ownership is
+    /// presented via composefs uid mapping at mount.
     pub async fn export_composefs(&self, commit: &Checksum, out: BorrowedFd<'_>)
         -> Result<[u8; 32]>;
     /// Compute and store `ostree.composefs.digest.v0` in the commit's metadata.

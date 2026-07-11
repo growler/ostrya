@@ -370,8 +370,7 @@ mod tests {
 
     #[test]
     fn sha256_matches_the_empty_input_vector() {
-        // The well-known SHA-256 digest of the empty input, which is also the
-        // `.fileb` blob name of an empty regular file in split-attrs mode.
+        // The well-known SHA-256 digest of the empty input.
         assert_eq!(
             Checksum::sha256(b"").to_hex(),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

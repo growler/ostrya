@@ -54,12 +54,6 @@ serialization and in `ostree.sizes`).
 - 9 `FILE_XATTRS_LINK` -- `.file-xattrs-link` -- hardlink to a `.file-xattrs`,
   keyed by the `.file` checksum.
 
-Port extension (bare-user-split-attrs mode, not upstream):
-
-- 10 `FILE_BLOB` -- `.fileb` -- raw file payload, keyed by `SHA256(payload)`.
-  In this mode a `FILE` is stored on disk as `.filea` (attributes plus a blob
-  reference) instead of `.file`. See the dedicated section at the end.
-
 The is-meta predicate is `t` in 2..=6. Types 7/8/9 are not "meta" despite being
 auxiliary. The checksum rules key off the is-meta predicate. The `z` loose-path
 suffix applies only to a `FILE` object (type 1) in archive mode, stored
@@ -102,6 +96,16 @@ form, so a multi-byte sequence whose terminating byte is `0x00` (contributing
 no value bits) is not accepted. Rejecting non-minimal forms keeps
 unpack-then-pack of an entry byte-identical. The trailing objtype byte is
 present on newer commits; parsers tolerate its absence.
+
+`ostree.sizes` is written only by archive-mode repositories; the compressed
+size is the `.filez` storage size, which makes it the only storage-dependent
+commit-metadata field. Observed on ostree 2026.1: requesting size generation
+(`commit --generate-sizes`) in a bare or bare-user repository is a silent
+no-op -- no key is written, no warning is emitted, and the commit checksum is
+byte-identical to the same commit without the request -- while in an archive
+repository it adds the key and changes the commit checksum. Cross-mode commit
+identity therefore holds exactly when size generation is off on the archive
+side.
 
 ### Dirtree -- `(a(say)a(sayay))`
 
@@ -250,8 +254,8 @@ of the final significant sextet must be zero.
 ## Repository modes and on-disk storage
 
 Mode strings: `bare`, `bare-user`, `bare-user-only`, `archive-z2` (alias
-`archive`), `bare-split-xattrs`. ARCHIVE always serializes back as
-`archive-z2`.
+`archive`), `bare-split-xattrs`, and the port extension `bare-user-shared`.
+ARCHIVE always serializes back as `archive-z2`.
 
 - bare: real files, real uid/gid/mode/xattrs on the inode; root-only for
   faithful writes; checkout hardlinks directly.
@@ -261,16 +265,20 @@ Mode strings: `bare`, `bare-user`, `bare-user-only`, `archive-z2` (alias
 - bare-user-only: no xattr metadata; uid/gid discarded (read back as 0);
   canonical mode on the inode, regular-file bits limited to 0775; works on
   filesystems without xattr support; user-checkout only.
-- bare-split-xattrs: like bare-user but xattrs live in `.file-xattrs` objects
-  with `.file-xattrs-link` hardlinks keyed by the `.file` checksum. The tool
+- bare-split-xattrs: bare inode storage (a regular file's payload on the inode,
+  the logical uid/gid/mode on the inode, symlinks as real symlinks, no
+  `user.ostreemeta`) with the logical xattrs relocated to separate objects. The
+  inode carries no xattrs; the set lives in a `.file-xattrs` object reached
+  through a `.file-xattrs-link` object keyed by the `.file` checksum. The tool
   reads this mode fully; its write support is experimental, gated, and
-  incomplete.
+  incomplete. The port reads this mode and does not write it. Recovered shape
+  is in the dedicated section below.
 - archive (archive-z2): content zlib-RAW-compressed as `.filez`; header holds
   uid/gid/mode/xattrs; object file itself is chmod 0644; HTTP-servable;
   never hardlinked on checkout.
-- bare-user-split-attrs (port extension, development-only): a `File` is split
-  into `.filea` (attributes plus a blob reference) and `.fileb` (raw payload,
-  content-addressed). See the dedicated section at the end.
+- bare-user-shared (port extension, development-only): `bare-user` storage
+  with a fixed inode mode 0644, for group-shared repositories. See the
+  dedicated section at the end.
 
 Metadata objects are always stored uncompressed. The `z` suffix applies only to
 a `File` content object in archive mode (`.filez`). The auxiliary non-meta
@@ -399,9 +407,10 @@ non-empty prefix and no interior NUL. Confirmed by committing a file bearing a
 blob: the name bytes `user.demo` are followed by one `\0`. Canonicalization
 sorts by name with byte-wise comparison and is applied before every
 serialization and hash; duplicate names and names not in this stored form are
-rejected. Per-mode disposition: bare on the
-inode, bare-user inside `user.ostreemeta`, bare-user-only discarded,
-bare-split-xattrs as separate objects, archive inside the `.filez` header.
+rejected. Per-mode disposition: bare on the inode, bare-user and
+bare-user-shared inside `user.ostreemeta`, bare-user-only discarded,
+bare-split-xattrs in separate `.file-xattrs` objects reached through
+`.file-xattrs-link`, archive inside the `.filez` header.
 During commit an existing `security.selinux` xattr is dropped and re-applied
 from the SELinux policy so it is not double-counted in the checksum.
 
@@ -494,68 +503,112 @@ to the end and optionally applying the `/etc` -> `/usr/etc` convention. The
 "ostree-in-tar" OCI format is a separate `ostree-ext` (Rust) construct and is
 out of scope here.
 
-## Port extension: bare-user-split-attrs mode
+## bare-split-xattrs mode
+
+The public documentation states that in this mode xattrs are stored as separate
+repository objects and are not reflected to the filesystem, which serves
+transport through lossy environments (tar streams, containers) and carries
+security-sensitive xattrs (SELinux labels) out of band. The byte-level layout
+below is recovered by observation: the `ostree` tool refuses to write this mode,
+so a candidate repository is built by hand and confirmed by `ostree fsck`,
+`ostree ls -X`, and `ostree checkout` accepting it and reproducing the xattrs.
+
+Object identity is unchanged from every other mode:
+`SHA256(6-field header ‖ payload)`, where the header
+`(uid, gid, mode, rdev=0, symlink-target, xattrs)` carries the logical xattrs.
+The split is a storage layout, not a new identity.
+
+Storage:
+
+- `.file`: bare inode storage. A regular file holds the raw payload on an inode
+  bearing the logical uid, gid, and mode; a symlink is a real symlink. The inode
+  carries no xattrs, and there is no `user.ostreemeta`. Because the inode carries
+  the identity's uid/gid/mode, faithful writes need the ownership the identity
+  encodes, as with `bare`.
+- `.file-xattrs`: the GVariant `a(ayay)` xattr array in normal form -- the same
+  bytes the identity header embeds -- named `SHA256` of those bytes. The empty
+  set serializes to zero bytes, so its shared object is named
+  `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
+  (`SHA256` of the empty input).
+- `.file-xattrs-link`: named by the `.file` checksum, a hardlink to the file's
+  `.file-xattrs` object. Present for every `.file`, including symlinks and files
+  with no xattrs, which link to the shared empty-set object. The link is
+  mandatory: removing it from an otherwise self-consistent commit makes
+  `ostree fsck` mark the commit partial and fail (`Repository corruption
+  encountered`) and `ostree ls -X` fail opening the object, so a missing link
+  is a corrupt repository, not an empty xattr set. A reader treats its absence
+  as a format error.
+
+Reading recovers uid, gid, mode, and kind from the inode, and the xattrs from
+the bytes at `<file-checksum>.file-xattrs-link` parsed as `a(ayay)`. Reading the
+bytes at the link name needs no knowledge of the hardlink topology.
+
+## Port extension: bare-user-shared mode
 
 A development-only repository mode introduced by this port; it is not present
 upstream. Production repositories (`/sysroot/ostree`) stay `bare`. This mode
-supports building images in a shared, multi-developer repository and serving as
-a composefs backing store.
+supports building images in a group-shared repository on a multi-user build
+host and serving as a composefs backing store.
 
-Motivation. In `bare-user`, a stored object's inode permission bits are derived
-from the file's logical mode, so that a user-mode checkout can hardlink objects
-into place. A file with a restrictive logical mode (for example `/etc/shadow`)
-therefore produces an object other developers sharing the repository cannot
-read. This mode decouples the repository's at-rest storage permissions from the
-file's logical permissions.
+Motivation. In `bare-user`, a stored object's inode permission bits are
+derived from the file's logical mode (`(mode & (S_IFREG|0775)) | S_IRUSR`), so
+a file with a restrictive logical mode (for example `/etc/shadow`, 0600)
+produces an object other users sharing the repository cannot read: an object
+one user commits cannot be loaded by the next, and the shared build fails.
+This mode decouples the repository's at-rest permissions from the file's
+logical permissions.
 
-Object split. A `File` is stored as two on-disk objects:
+Storage. Identical to `bare-user` in every byte that carries identity:
 
-- `.fileb` -- the raw payload, named `SHA256(payload)`. A content-addressed
-  blob with no header.
-- `.filea` -- the attributes variant `(uuuusa(ayay)ay)`: the classic 6-field
-  file header (uid BE, gid BE, mode BE, rdev must be 0, symlink target, xattrs)
-  plus a 7th field `ay` holding the `.fileb` name. Field 6 is present for every
-  regular file and empty for symlinks (whose target is in field 4). An empty
-  regular file references the shared empty-payload blob (`SHA256("")`).
+- Object content is the raw payload. The logical uid, gid, mode, and xattrs
+  live in the `user.ostreemeta` xattr as `(uuua(ayay))` (uid BE, gid BE, mode
+  BE, xattrs sorted), as in `bare-user`.
+- A symlink is stored as a regular file (content: target plus one NUL, as in
+  `bare-user`). This representation is forced: Linux permits `user.*` xattrs
+  only on regular files and directories (xattr(7)), so a real symlink cannot
+  carry `user.ostreemeta`.
+- Object identity is `SHA256(6-field header ‖ payload)`, unchanged from every
+  other mode, so dirtree and commit hashes are byte-identical to `bare`, and
+  a commit built in this mode and pulled into a bare production repository is
+  the same commit.
 
-Identity. The object identity, which is what a dirtree entry stores, is
-`SHA256(6-field header ‖ payload)`, unchanged from every other mode. `.filea`
-is named by that identity. The split is a storage layout, not a new identity,
-so dirtree and commit hashes are byte-identical to `bare`. A commit built in
-this mode and pulled into a bare production repository is the same commit. The
-new `FILE_BLOB` (`.fileb`) object type is keyed by payload checksum; `.filea`
-is how `FILE` is stored in this mode.
+The single behavioral difference from `bare-user`: the logical mode is never
+applied to the inode. Objects are written with a fixed mode 0644 via explicit
+`fchmod` (never trusting umask). Repository directories -- `objects/xx/`,
+`tmp/`, staging directories -- are created 2775, setgid with the shared
+group, so every group member reads and deduplicates every object. `.lock` is
+written 0664, so every group member can open it for writing and take the
+exclusive lock.
 
-Storage permissions. `.filea` and `.fileb` are written with an explicit
-`fchmod 0664`; object directories are created setgid with a shared group, so
-multiple developers read and write the same repository without lockout.
-Duplicate-blob races are harmless (`linkat` with NOREPLACE_IGNORE_EXIST). The
-logical mode, uid, gid, and xattrs are held only in `.filea` and are
-reconstructed at checkout or composefs export.
+Mode string. `[core] mode=bare-user-shared`. The distinct string is a safety
+fence: under a literal `bare-user` string the upstream tool would accept the
+repository, and its hardlink checkout would propagate the fixed 0644 inode
+mode in place of the logical mode; the unrecognized string makes the tool
+refuse the repository outright.
 
 Confidentiality. The repository does not preserve file confidentiality through
-unix permissions at rest: any user with repository access can read any blob.
-The restrictive logical permissions are restored on materialization. This is an
-accepted property of a shared development repository.
+unix permissions at rest: any user with repository access can read any object.
+The restrictive logical permissions are restored on materialization, and
+outside access is gated at the repository root directory. This is an accepted
+property of a shared development repository.
 
-`ostree.sizes`. Hard-disabled in this mode. It is the only storage-dependent
-commit-metadata field, so leaving it off preserves the cross-mode commit
-identity the development-to-production workflow relies on.
+`ostree.sizes`. As in `bare-user`: never written. Size generation is an
+archive-only mechanism (see the `ostree.sizes` notes in the commit-metadata
+section), so cross-mode commit identity needs no mode-specific handling.
 
-Checkout. Copy-based: a fresh copy is made and the `.filea` mode is applied to
-it. Hardlinking is not used, because a `chmod` on a hardlink would rewrite the
-shared blob's uniform mode.
+Checkout. Copy-based, with reflink (`FICLONE`) where the filesystem supports
+it: a fresh copy is made and the `user.ostreemeta` mode is applied to it.
+Hardlink checkout is refused, because the inode deliberately does not carry
+the logical mode.
 
-Integrity (fsck). Two levels: `SHA256(header ‖ payload) == filea-name` and
-`SHA256(payload) == blobref`.
-
-Reachability (prune). A new edge `filea -> fileb`. A blob is retained while any
-`.filea` references it; a commit is fully present only when its referenced
-blobs are present.
+Integrity (fsck) and reachability (prune). As `bare-user`:
+`SHA256(header-from-xattr ‖ payload) == object name`; no auxiliary objects
+and no extra reachability edges. The inode mode is not authoritative and is
+not checked.
 
 composefs. This mode is the intended composefs backing store. The EROFS
-metadata layer is built from the real `.filea` attributes (mode, uid, gid,
-xattrs), and each regular file redirects to its `.fileb` loose path. Per-file
-fs-verity is computed over the payload. Ownership is presented through composefs
-uid mapping at mount time, so the real root-owned metadata is correct even
-inside a rootless, non-root container.
+metadata layer is built from the `user.ostreemeta` attributes (mode, uid,
+gid, xattrs), and each regular file redirects to its `.file` loose path.
+Per-file fs-verity is computed over the payload. Ownership is presented
+through composefs uid mapping at mount time, so the real root-owned metadata
+is correct even inside a rootless, non-root container.

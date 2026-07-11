@@ -40,9 +40,9 @@ fn reconstructs_every_fixture_loose_path() {
 }
 
 /// The `z` suffix appears only on a `File` object in archive mode. The
-/// auxiliary non-meta types (payload-link, file-xattrs, file-xattrs-link) and
-/// the port's file-blob are stored uncompressed, so their loose-path extension
-/// is fixed and mode-independent and never gains a trailing `z`.
+/// auxiliary non-meta types (payload-link, file-xattrs, file-xattrs-link) are
+/// stored uncompressed, so their loose-path extension is fixed and
+/// mode-independent and never gains a trailing `z`.
 ///
 /// This pins review finding 2 (decision D1), resolved against black-box
 /// observation: an archive repo populated by commit or `pull-local` holds only
@@ -61,7 +61,7 @@ fn z_suffix_is_file_and_archive_only() {
         RepoMode::BareUserOnly,
         RepoMode::BareSplitXattrs,
         RepoMode::Archive,
-        RepoMode::BareUserSplitAttrs,
+        RepoMode::BareUserShared,
     ];
 
     // Auxiliary non-meta types keep a fixed extension in every mode.
@@ -69,7 +69,6 @@ fn z_suffix_is_file_and_archive_only() {
         (ObjectType::PayloadLink, "payload-link"),
         (ObjectType::FileXattrs, "file-xattrs"),
         (ObjectType::FileXattrsLink, "file-xattrs-link"),
-        (ObjectType::FileBlob, "fileb"),
     ];
     for (ty, ext) in aux {
         for mode in modes {

@@ -15,8 +15,13 @@
 //!   regular file whose content is the target followed by a NUL.
 //! - bare-user-only: metadata is the canonical inode mode with uid/gid read
 //!   back as 0 and no xattrs; a symlink is a real symlink.
-//! - bare-user-split-attrs: the `.filea` object holds the attributes plus a
-//!   `.fileb` blob reference; the payload is the raw `.fileb` blob.
+//! - bare-user-shared: identical to bare-user on the read path; the fixed
+//!   inode mode a writer applies is never consulted, so the same loader serves
+//!   both modes.
+//! - bare-split-xattrs: bare inode storage (real uid/gid/mode, real symlinks,
+//!   no `user.ostreemeta`); the logical xattrs live in a separate `.file-xattrs`
+//!   object reached through the `.file-xattrs-link` entry keyed by the file
+//!   checksum.
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -62,9 +67,6 @@ enum ReaderSource {
     None,
     /// The whole object file is the raw payload.
     Plain,
-    /// A split-attrs `.fileb` blob, keyed by its own checksum, is the raw
-    /// payload.
-    PlainBlob { blob: Checksum },
     /// A `.filez` object: raw-DEFLATE payload after `payload_offset` bytes.
     Archive { payload_offset: u64 },
 }
@@ -106,10 +108,6 @@ impl FileObject {
             ReaderSource::None => ContentReaderInner::Empty,
             ReaderSource::Plain => {
                 let path = loose_path(&self.checksum, ObjectType::File, mode);
-                ContentReaderInner::Plain(self.open_payload(path, 0).await?)
-            }
-            ReaderSource::PlainBlob { blob } => {
-                let path = loose_path(blob, ObjectType::FileBlob, mode);
                 ContentReaderInner::Plain(self.open_payload(path, 0).await?)
             }
             ReaderSource::Archive { payload_offset } => {
@@ -154,20 +152,6 @@ impl Repo {
             source: loaded.source,
         })
     }
-
-    /// The `.fileb` payload-blob checksum a file references in
-    /// bare-user-split-attrs mode. `None` for symlinks. An error in other
-    /// modes, where files carry no separate blob.
-    pub async fn blob_checksum_of(&self, file: &Checksum) -> Result<Option<Checksum>> {
-        if self.mode() != RepoMode::BareUserSplitAttrs {
-            return Err(Error::Unsupported(
-                "blob_checksum_of requires bare-user-split-attrs mode".into(),
-            ));
-        }
-        let bytes = self.load_object_bytes(ObjectType::File, file).await?;
-        let (_, blob) = FileHeader::parse_split_attrs(&bytes)?;
-        Ok(blob)
-    }
 }
 
 /// The fields a per-mode loader produces before a [`FileObject`] is assembled.
@@ -184,13 +168,10 @@ struct Loaded {
 fn load_by_mode(objects_fd: BorrowedFd<'_>, checksum: &Checksum, mode: RepoMode) -> Result<Loaded> {
     match mode {
         RepoMode::Archive => load_archive(objects_fd, checksum),
-        RepoMode::BareUser => load_bare_user(objects_fd, checksum),
+        RepoMode::BareUser | RepoMode::BareUserShared => load_bare_user(objects_fd, checksum),
         RepoMode::Bare => load_bare(objects_fd, checksum),
         RepoMode::BareUserOnly => load_bare_user_only(objects_fd, checksum),
-        RepoMode::BareUserSplitAttrs => load_split_attrs(objects_fd, checksum),
-        RepoMode::BareSplitXattrs => Err(Error::Unsupported(
-            "bare-split-xattrs read is not implemented".into(),
-        )),
+        RepoMode::BareSplitXattrs => load_bare_split_xattrs(objects_fd, checksum),
     }
 }
 
@@ -420,48 +401,65 @@ fn load_bare_user_only(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Resul
     }
 }
 
-fn load_split_attrs(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> {
-    let path = loose_path(checksum, ObjectType::File, RepoMode::BareUserSplitAttrs);
+fn load_bare_split_xattrs(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> {
+    // Storage is bare: the inode carries the logical uid/gid/mode, a regular
+    // file holds the raw payload, and a symlink is a real symlink. The inode
+    // holds no xattrs; the logical set lives in a separate object reached
+    // through the `.file-xattrs-link` entry keyed by the file checksum.
+    let path = loose_path(checksum, ObjectType::File, RepoMode::BareSplitXattrs);
+    let stat = stat_object(objects_fd, &path, checksum, ObjectType::File)?;
+    let uid = stat.st_uid;
+    let gid = stat.st_gid;
+    let mode = stat.st_mode;
+    let xattrs = load_split_xattrs(objects_fd, checksum)?;
+
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Symlink => Ok(Loaded {
+            uid,
+            gid,
+            mode,
+            xattrs,
+            kind: FileKind::Symlink {
+                target: read_link_target(objects_fd, &path)?,
+            },
+            source: ReaderSource::None,
+        }),
+        FileType::RegularFile => Ok(Loaded {
+            uid,
+            gid,
+            mode,
+            xattrs,
+            kind: FileKind::Regular {
+                size: stat.st_size.max(0) as u64,
+            },
+            source: ReaderSource::Plain,
+        }),
+        _ => Err(Error::InvalidFormat(
+            "bare-split-xattrs object is neither a regular file nor a symlink".into(),
+        )),
+    }
+}
+
+/// Read a file object's logical xattrs from its `.file-xattrs-link` object,
+/// whose bytes are the GVariant `a(ayay)` xattr set. The link is a hardlink to
+/// the shared `.file-xattrs` object; reading the bytes at the link name needs
+/// no knowledge of the hardlink topology. Every file object carries a link
+/// (a file with no xattrs points at the shared empty-set object), so its
+/// absence is a malformed repository.
+fn load_split_xattrs(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Xattrs> {
+    let path = loose_path(
+        checksum,
+        ObjectType::FileXattrsLink,
+        RepoMode::BareSplitXattrs,
+    );
     let bytes = object::read_meta_object(objects_fd, &path, MAX_METADATA_SIZE).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            Error::ObjectNotFound {
-                checksum: *checksum,
-                ty: ObjectType::File,
-            }
+            Error::InvalidFormat("bare-split-xattrs .file is missing its .file-xattrs-link".into())
         } else {
             Error::Io(e)
         }
     })?;
-    let (header, blob) = FileHeader::parse_split_attrs(&bytes)?;
-
-    let (kind, source) = if header.is_symlink() {
-        (
-            FileKind::Symlink {
-                target: header.symlink_target,
-            },
-            ReaderSource::None,
-        )
-    } else {
-        let blob = blob.ok_or_else(|| {
-            Error::InvalidFormat("split-attrs regular file without a blob reference".into())
-        })?;
-        let blob_path = loose_path(&blob, ObjectType::FileBlob, RepoMode::BareUserSplitAttrs);
-        let stat = stat_object(objects_fd, &blob_path, &blob, ObjectType::FileBlob)?;
-        (
-            FileKind::Regular {
-                size: stat.st_size.max(0) as u64,
-            },
-            ReaderSource::PlainBlob { blob },
-        )
-    };
-    Ok(Loaded {
-        uid: header.uid,
-        gid: header.gid,
-        mode: header.mode,
-        xattrs: header.xattrs,
-        kind,
-        source,
-    })
+    Ok(Xattrs::from_gvariant(&bytes)?)
 }
 
 /// An async reader over a file object's payload.

@@ -56,7 +56,7 @@ reference, or reading material.
    CLI-driven shell tests later, admin/sysroot optional).
 5. Extensions: commit signing via `sequoia-openpgp` (not gpgme), composefs/EROFS
    export, and tar import/export.
-6. A development-only repository mode, `bare-user-split-attrs`, as an optional
+6. A development-only repository mode, `bare-user-shared`, as an optional
    nice-to-have add-on.
 
 Faithful on disk means byte-for-byte identical format, checksums, and

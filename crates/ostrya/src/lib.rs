@@ -15,8 +15,12 @@
 //! the [`HashingReader`]/[`HashingWriter`] streams and a [`ContentReader`] that
 //! streams from `rt::File` and inflates archive objects on the fly. It also
 //! covers transactions and locking (Phase 6): the owned [`Transaction`] handle,
-//! boot-id-keyed staging directories, and the two-layer repository lock. The
-//! writing, checkout, and maintenance subsystems land in later phases.
+//! boot-id-keyed staging directories, and the two-layer repository lock, and the
+//! object-store write layer (Phase 7a): streaming content ingestion through
+//! [`ContentWriter`], metadata and symlink writers, per-mode on-disk
+//! application, dedup, free-space accounting, and publication of staged objects
+//! into `objects/` at commit. Tree assembly, commits, checkout, and maintenance
+//! land in later phases.
 
 pub mod config;
 pub mod error;
@@ -31,6 +35,7 @@ pub mod repo;
 mod staging;
 pub mod transaction;
 pub mod tree;
+mod write;
 
 pub use config::{MinFreeSpace, Remote, RepoConfig, SizeSpec, SizeUnit};
 pub use error::{Error, Result};
@@ -40,5 +45,5 @@ pub use lock::LockKind;
 pub use ostrya_core::{Checksum, ObjectType, RepoMode};
 pub use read::CommitState;
 pub use repo::{CreateOptions, Repo};
-pub use transaction::Transaction;
+pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};

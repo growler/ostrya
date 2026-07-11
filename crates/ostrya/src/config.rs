@@ -65,6 +65,25 @@ pub enum SizeUnit {
     Tera,
 }
 
+impl SizeUnit {
+    /// The byte multiplier for this unit. The `MB`/`GB`/`TB` suffixes denote
+    /// binary multiples (2^20, 2^30, 2^40).
+    pub fn multiplier(self) -> u64 {
+        match self {
+            SizeUnit::Mega => 1 << 20,
+            SizeUnit::Giga => 1 << 30,
+            SizeUnit::Tera => 1 << 40,
+        }
+    }
+}
+
+impl SizeSpec {
+    /// The value in bytes, saturating on overflow.
+    pub fn bytes(self) -> u64 {
+        self.value.saturating_mul(self.unit.multiplier())
+    }
+}
+
 impl RepoConfig {
     /// Build a typed view over an already-parsed [`KeyFile`], validating the
     /// `[core]` `repo_version` and `mode` keys.

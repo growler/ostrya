@@ -45,6 +45,22 @@ pub enum Error {
         /// The configured lock-acquisition timeout, in seconds.
         secs: i64,
     },
+    /// A written object's computed checksum did not match the caller's
+    /// expected value.
+    #[error("checksum mismatch: expected {expected}, computed {actual}")]
+    ChecksumMismatch {
+        /// The checksum the caller asserted the object would have.
+        expected: Checksum,
+        /// The checksum the write path actually computed.
+        actual: Checksum,
+    },
+    /// Staging an object would drop free space below the configured
+    /// `min-free-space-percent` / `min-free-space-size` reserve.
+    #[error("insufficient free space: short by {shortfall} bytes")]
+    InsufficientFreeSpace {
+        /// How many more bytes of free space the write would have needed.
+        shortfall: u64,
+    },
 }
 
 impl From<rustix::io::Errno> for Error {

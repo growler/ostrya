@@ -398,6 +398,76 @@ the bytes `ostree config set` writes:
   spaces around `=`. A freshly initialized archive repo config is exactly
   `[core]\nrepo_version=1\nmode=archive-z2\n`.
 
+## Write path: loose-object inode modes and durability
+
+The bytes an object hashes to are mode-independent, but the permission bits and
+ownership the tool puts on the loose object's inode, and the syscall sequence it
+uses to publish objects durably, are recovered by black-box observation:
+committing files of assorted modes and a symlink with the tool and inspecting
+the resulting objects, and tracing the commit's syscalls.
+
+Loose-object inode permission bits, by object class and repository mode:
+
+- Metadata objects (`.dirtree`, `.dirmeta`, `.commit`, and by construction the
+  other metadata types) carry mode 0644 in every repository mode.
+- `archive`: every content object (`.filez`) is 0644.
+- `bare`: a content object's inode carries the full logical uid, gid, and mode;
+  a symlink is a real symlink owned by the logical uid/gid.
+- `bare-user`: a regular-file content object's inode mode is
+  `(logical_perm & 0o775) | 0o400` -- owner bits and the group/other read and
+  execute bits are kept, owner-read is forced on, and other-write is dropped
+  (`0666` stores as `0664`, `0777` as `0775`). A symlink is stored as a regular
+  file whose inode is 0644. The inode is owned by the writing process; the
+  logical uid/gid live in `user.ostreemeta`.
+- `bare-user-shared`: every content object's inode is a fixed 0644.
+- `bare-user-only`: a regular-file content object's inode mode is the canonical
+  `logical_perm & 0o755` -- group-write and other-write are dropped and no
+  special bits are kept (`0664` stores as `0644`, `0666` as `0644`, `0775` as
+  `0755`). uid/gid are discarded and no xattrs are stored. Because this mode
+  stores no header, the object identity is computed over the canonicalized mode,
+  so a `bare-user-only` content object's checksum can differ from the same file
+  in the other modes when the input mode is not already canonical. A symlink is
+  a real symlink.
+
+Symlink storage detail (confirmed for `bare-user`): a symlink is a regular file
+whose content is the target bytes followed by one NUL; its `user.ostreemeta` is
+the `(uuua(ayay))` stat form with the symlink's uid/gid, mode `S_IFLNK | 0o777`
+(`0o120777`), and xattr set; the inode is 0644.
+
+Archive `.filez` layout (extends "File content object header"):
+
+- A regular file is the framed archive header `(tuuuusa(ayay))` followed by the
+  raw-DEFLATE payload. An empty payload compresses to the two-byte empty DEFLATE
+  stream `03 00`.
+- A symlink is the framed archive header alone (target in field 5, uncompressed
+  size 0); no payload bytes follow, not even the empty-DEFLATE stream.
+- The raw-DEFLATE bytes the port emits (via miniz_oxide) match the tool's zlib
+  output byte-for-byte for the small fixture payloads at every level 1-9. The
+  object identity is over the uncompressed bytes, so byte-identity of the stored
+  compressed payload is not required for interoperability.
+
+Object store fanout directories `objects/<xx>/` are created with request mode
+0777 (reduced by the umask); `objects/` itself is 0775. In `bare-user-shared`
+they are 02775 (setgid, shared group).
+
+Durability and staging (traced): the tool ingests each object into an unnamed
+temp file (`O_TMPFILE` in the staging directory) and materializes it with
+`linkat("/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW)`.
+
+- Default (`fsync=true`, `per-object-fsync=false`): objects are linked into the
+  staging directory under their loose path, then `syncfs(repo)` runs once, then
+  each object is `renameat`-ed into `objects/<xx>/`, then each touched
+  `objects/<xx>` and `objects/` is `fsync`-ed.
+- `per-object-fsync=true`: each object's temp file is `fsync`-ed at ingest; the
+  `syncfs(repo)` and directory `fsync`s still run at publication.
+- `fsync=false`: no `syncfs`, `fsync`, or `fdatasync` is issued.
+
+The port always stages then renames (the default path) and honors the two
+settings for the syncs it issues: `fsync=false` makes every sync a no-op,
+`per-object-fsync=true` `fsync`s each object at ingest, and otherwise a single
+`syncfs` precedes the renames with directory `fsync`s after. The staging
+directory layout is transient and is not part of the on-disk format.
+
 ## Extended attributes
 
 Storage form is GVariant `a(ayay)`: array of (name-bytes, value-bytes). A

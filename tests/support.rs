@@ -91,6 +91,13 @@ pub fn loose_objects() -> Vec<LooseObject> {
     for mode_entry in modes {
         let mode_dir = mode_entry.unwrap();
         let mode = mode_dir.file_name().to_str().unwrap().to_owned();
+        // The `bare` fixture is owned by the invoking user (see the `bare_owner`
+        // note in MANIFEST), so its object bytes are not the deterministic
+        // golden data these walkers compare against; the write-path test
+        // cross-checks bare against the tool at runtime instead.
+        if mode == "bare" {
+            continue;
+        }
         let objects = mode_dir.path().join("repo/objects");
         if !objects.is_dir() {
             continue;

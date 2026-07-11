@@ -493,7 +493,7 @@ syscall pattern -- are recovered by black-box observation in the sub-phase
 that reaches them and recorded in `format-reference.md` in the same
 change.
 
-### Phase 7a -- Object writers: content and metadata
+### Phase 7a -- Object writers: content and metadata (DONE)
 
 The object-store write layer inside `Transaction`: streaming content
 ingestion, metadata object writes, per-mode on-disk application, dedup,
@@ -544,9 +544,11 @@ Definition:
   `min-free-space-percent` / `min-free-space-size` set a byte budget;
   each staged object debits it; exhaustion fails the write with a
   dedicated error carrying the shortfall.
-- `object_sizes`: in archive mode each content write records
-  (compressed size, unpacked size, objtype) keyed by checksum, the input
-  for `ostree.sizes` in 7d.
+- `object_sizes`: in archive mode each content write records the
+  compressed size and the unpacked size keyed by checksum, the input for
+  `ostree.sizes` in 7d. Every entry is a content object, so the objtype
+  byte an `ostree.sizes` entry carries is fixed to the file type and is
+  supplied at emission rather than stored per record.
 - Object publication in `Transaction::commit()`, the object half of the
   durability contract: `syncfs` on the repo fd, rename staged objects
   into `objects/xx/` (fanout directories created on demand; 2775 in

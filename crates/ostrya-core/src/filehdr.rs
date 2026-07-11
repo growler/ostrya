@@ -115,6 +115,22 @@ impl FileHeader {
         FileHeader::build(uid.0, gid.0, mode.0, 0, "", xattrs)
     }
 
+    /// Serialize the stat-metadata form `(uuua(ayay))` -- uid, gid, and the
+    /// full `st_mode` (big-endian) followed by the sorted xattr array. This is
+    /// the layout stored in the `user.ostreemeta` xattr of a bare-user `.file`
+    /// object; a bare-user symlink carries its `S_IFLNK` mode here and keeps its
+    /// target in the file content. There is no rdev or symlink-target field.
+    /// The inverse of [`parse_stat_metadata`](Self::parse_stat_metadata).
+    pub fn serialize_stat_metadata(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        Ok(ostrya_gvariant::encode_to_vec(&(
+            Be32(self.uid),
+            Be32(self.gid),
+            Be32(self.mode),
+            &self.xattrs,
+        ))?)
+    }
+
     /// Parse the archive header form `(tuuuusa(ayay))`, returning the header
     /// and the uncompressed payload size.
     pub fn parse_archive(data: &[u8]) -> Result<(FileHeader, u64)> {
@@ -347,6 +363,51 @@ mod tests {
             Value::Array(Vec::new()),
         ]);
         to_bytes(&ty, &value).unwrap()
+    }
+
+    #[test]
+    fn stat_metadata_serialize_round_trips_and_matches_the_tool_bytes() {
+        // A 0644 root-owned regular file: the exact `user.ostreemeta` bytes a
+        // bare-user `.file` carries, recovered from a tool-created repo.
+        let header = regular(0o100644);
+        let header = FileHeader {
+            uid: 0,
+            gid: 0,
+            ..header
+        };
+        assert_eq!(
+            header.serialize_stat_metadata().unwrap(),
+            [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x81, 0xa4]
+        );
+
+        // A symlink stored as a regular file keeps mode S_IFLNK|0777 here; the
+        // tool writes these 12 bytes for a 1000:100 symlink's user.ostreemeta.
+        let link = FileHeader {
+            uid: 1000,
+            gid: 100,
+            ..symlink("hello.txt")
+        };
+        assert_eq!(
+            link.serialize_stat_metadata().unwrap(),
+            [0u8, 0, 3, 0xe8, 0, 0, 0, 0x64, 0, 0, 0xa1, 0xff]
+        );
+
+        // Round-trips through parse for a header bearing xattrs.
+        let with_xattr = FileHeader {
+            xattrs: Xattrs::new([(b"user.a\0".to_vec(), b"1".to_vec())]).unwrap(),
+            ..regular(0o100600)
+        };
+        let bytes = with_xattr.serialize_stat_metadata().unwrap();
+        let parsed = FileHeader::parse_stat_metadata(&bytes).unwrap();
+        assert_eq!(
+            (parsed.uid, parsed.gid, parsed.mode, parsed.xattrs),
+            (
+                with_xattr.uid,
+                with_xattr.gid,
+                with_xattr.mode,
+                with_xattr.xattrs
+            )
+        );
     }
 
     #[test]

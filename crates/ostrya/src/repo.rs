@@ -28,7 +28,7 @@ use ostrya_core::RepoMode;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::config::RepoConfig;
+use crate::config::{MinFreeSpace, RepoConfig};
 use crate::error::{Error, Result};
 use crate::lock::{self, LockGuard, LockKind, RepoLock};
 use crate::staging::StagingDir;
@@ -189,6 +189,7 @@ impl Repo {
         let locking = self.0.config.locking()?;
         let timeout_secs = self.0.config.lock_timeout_secs()?;
         let expiry_secs = self.0.config.tmp_expiry_secs()?;
+        let min_free = self.0.config.min_free_space()?;
 
         let guard = if locking {
             let repo = self.clone();
@@ -204,7 +205,12 @@ impl Repo {
             ostrya_rt::unblock(move || StagingDir::create(repo.0.repo_fd.as_fd(), expiry_secs))
                 .await?;
 
-        Ok(Transaction::new(guard, staging))
+        // The initial free-space budget: the bytes available above the
+        // configured reserve. Each staged object debits it.
+        let repo_fd = self.repo_fd().try_clone_to_owned()?;
+        let budget = ostrya_rt::unblock(move || free_budget(repo_fd.as_fd(), min_free)).await?;
+
+        Ok(Transaction::new(self.clone(), guard, staging, budget))
     }
 
     /// The repository root directory fd, anchoring fd-relative access to
@@ -230,6 +236,20 @@ impl Repo {
             lock: Mutex::new(None),
         })))
     }
+}
+
+/// Compute a transaction's initial free-space budget: the bytes free on the
+/// repository filesystem, less the configured `min-free-space` reserve. Runs
+/// a synchronous `fstatvfs`.
+fn free_budget(repo_fd: BorrowedFd<'_>, min_free: MinFreeSpace) -> Result<u64> {
+    let stat = rustix::fs::fstatvfs(repo_fd)?;
+    let available = stat.f_bavail.saturating_mul(stat.f_frsize);
+    let total = stat.f_blocks.saturating_mul(stat.f_frsize);
+    let reserved = match min_free {
+        MinFreeSpace::Percent(percent) => ((u128::from(total) * u128::from(percent)) / 100) as u64,
+        MinFreeSpace::Size(spec) => spec.bytes(),
+    };
+    Ok(available.saturating_sub(reserved))
 }
 
 /// Open an existing repository directory and gather its materials.

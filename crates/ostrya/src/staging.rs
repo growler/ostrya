@@ -53,9 +53,9 @@ fn active() -> &'static Mutex<HashSet<String>> {
 #[derive(Debug)]
 pub(crate) struct StagingDir {
     tmp_fd: OwnedFd,
-    /// The staging directory descriptor. Held now; read by the write path
-    /// (Phase 7) when objects are staged into it.
-    #[allow(dead_code)]
+    /// The staging directory descriptor. Objects are ingested into this
+    /// directory by the write path and renamed out of it into `objects/` at
+    /// commit.
     dir_fd: OwnedFd,
     /// The sibling lock descriptor, held for the transaction's lifetime to mark
     /// the directory as owned. Kept only for its lock; never read.
@@ -106,6 +106,12 @@ impl StagingDir {
             lock_fd,
             name,
         })
+    }
+
+    /// The staging directory descriptor. Objects are ingested here and renamed
+    /// into `objects/` at commit.
+    pub(crate) fn dir_fd(&self) -> BorrowedFd<'_> {
+        self.dir_fd.as_fd()
     }
 }
 

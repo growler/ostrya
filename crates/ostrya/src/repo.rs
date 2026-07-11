@@ -87,7 +87,9 @@ impl CreateOptions {
 
 /// A repository handle.
 #[derive(Debug, Clone)]
-pub struct Repo(Arc<RepoInner>);
+pub struct Repo {
+    inner: Arc<RepoInner>,
+}
 
 #[derive(Debug)]
 struct RepoInner {
@@ -162,12 +164,12 @@ impl Repo {
 
     /// The repository storage mode.
     pub fn mode(&self) -> RepoMode {
-        self.0.config.mode()
+        self.inner.config.mode()
     }
 
     /// The parsed repository configuration.
     pub fn config(&self) -> &RepoConfig {
-        &self.0.config
+        &self.inner.config
     }
 
     /// Begin a transaction that holds the repository lock shared.
@@ -186,14 +188,14 @@ impl Repo {
     /// `tmp/`, and stale staging directories left by dead transactions are
     /// reaped first.
     pub async fn transaction_with_lock(&self, kind: LockKind) -> Result<Transaction> {
-        let locking = self.0.config.locking()?;
-        let timeout_secs = self.0.config.lock_timeout_secs()?;
-        let expiry_secs = self.0.config.tmp_expiry_secs()?;
-        let min_free = self.0.config.min_free_space()?;
+        let locking = self.inner.config.locking()?;
+        let timeout_secs = self.inner.config.lock_timeout_secs()?;
+        let expiry_secs = self.inner.config.tmp_expiry_secs()?;
+        let min_free = self.inner.config.min_free_space()?;
 
         let guard = if locking {
             let repo = self.clone();
-            let lock = ostrya_rt::unblock(move || repo.0.repo_lock()).await?;
+            let lock = ostrya_rt::unblock(move || repo.inner.repo_lock()).await?;
             let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
             lock::acquire(lock, kind, timeout).await?
         } else {
@@ -202,7 +204,7 @@ impl Repo {
 
         let repo = self.clone();
         let staging =
-            ostrya_rt::unblock(move || StagingDir::create(repo.0.repo_fd.as_fd(), expiry_secs))
+            ostrya_rt::unblock(move || StagingDir::create(repo.inner.repo_fd.as_fd(), expiry_secs))
                 .await?;
 
         // The initial free-space budget: the bytes available above the
@@ -216,12 +218,12 @@ impl Repo {
     /// The repository root directory fd, anchoring fd-relative access to
     /// `refs/`, `state/`, and the rest of the layout.
     pub(crate) fn repo_fd(&self) -> BorrowedFd<'_> {
-        self.0.repo_fd.as_fd()
+        self.inner.repo_fd.as_fd()
     }
 
     /// The `objects/` directory fd, anchoring loose-object access.
     pub(crate) fn objects_fd(&self) -> BorrowedFd<'_> {
-        self.0.objects_fd.as_fd()
+        self.inner.objects_fd.as_fd()
     }
 
     /// Parse the config bytes and assemble the handle. This step is CPU-only.
@@ -229,12 +231,14 @@ impl Repo {
         let text = std::str::from_utf8(&materials.config)
             .map_err(|_| Error::InvalidFormat("config is not valid UTF-8".into()))?;
         let config = RepoConfig::parse(text)?;
-        Ok(Repo(Arc::new(RepoInner {
-            repo_fd: materials.repo_fd,
-            objects_fd: materials.objects_fd,
-            config,
-            lock: Mutex::new(None),
-        })))
+        Ok(Repo {
+            inner: Arc::new(RepoInner {
+                repo_fd: materials.repo_fd,
+                objects_fd: materials.objects_fd,
+                config,
+                lock: Mutex::new(None),
+            }),
+        })
     }
 }
 

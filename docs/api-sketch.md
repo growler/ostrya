@@ -350,7 +350,18 @@ impl Transaction {
     // tree building
     pub async fn write_dfd_to_mtree(&self, dfd: BorrowedFd<'_>, path: &Path,
         mtree: &mut MutableTree, modifier: Option<&CommitModifier>) -> Result<()>;
+    /// Port extension: merge an overlayfs upperdir changeset into an mtree
+    /// holding the overlay's lower layer (see "Staging tree, tree merge,
+    /// and overlay import").
+    pub async fn merge_overlay_dfd_to_mtree(&self, dfd: BorrowedFd<'_>,
+        mtree: &mut MutableTree, modifier: Option<&CommitModifier>) -> Result<()>;
     pub async fn write_mtree(&self, mtree: &mut MutableTree) -> Result<RepoTree>;
+
+    // path-addressed construction (port extension; see "Staging tree,
+    // tree merge, and overlay import")
+    pub fn staging_tree(&self, source: Option<&Commit>) -> StagingTree<'_>;
+    pub fn staging_tree_from_mutable_tree(&self, source: MutableTree)
+        -> StagingTree<'_>;
 
     // commit
     pub async fn write_commit(&self, opts: CommitOptions, root: &RepoTree) -> Result<Checksum>;
@@ -416,6 +427,105 @@ pub struct CommitModifier {
     pub sepolicy: Option<SePolicy>,
 }
 ```
+
+## Staging tree, tree merge, and overlay import (port extensions)
+
+Tree-composition surfaces with no counterpart in the C API. They add no
+on-disk state: everything they stage flows through the object writers and
+ordinary trees, and the resulting commits are ordinary commits. Their
+gates are self-consistency against the ingest path (`port-plan.md`,
+Phases 7e and 7f).
+
+`Transaction::merge_overlay_dfd_to_mtree` (see Transactions) merges an
+overlayfs upperdir changeset into an mtree holding the overlay's lower
+layer. `dfd` is the upperdir root; the overlay is expected to be
+unmounted, which is not checked. Char 0:0 whiteout devices delete the
+corresponding mtree path. Directories carrying `trusted.overlay.opaque`
+or `user.overlay.opaque` clear the mtree subtree before fresh ingest;
+both xattr namespaces are honored (rootless `userxattr` overlays write
+`user.*`). Merged directories take dirmeta from the upper inode.
+`overlay.*` xattrs are stripped from ingested entries. Entries carrying
+`overlay.metacopy` or `overlay.redirect` are errors naming the feature,
+since such entries are not self-contained. An upper directory over an
+mtree symlink is a malformed-changeset error: the VFS resolves symlinks
+at lookup, so a genuine upperdir never contains one relative to its
+base. The modifier callbacks see real entries only, never whiteouts or
+opaque markers; a filter `Skip` on an upper entry leaves the base
+version in place.
+
+```rust
+/// Path-addressed construction over a transaction. Borrowing the
+/// transaction makes close -> write_mtree -> commit the only ordering
+/// that compiles. `&StagingTree` is Send + Sync (the tree sits behind a
+/// sync mutex held only across map operations); file writes may run
+/// concurrently.
+pub struct StagingTree<'txn> { /* &'txn Transaction, Mutex<MutableTree>, writer count */ }
+
+impl StagingTree<'_> {
+    /// Hands the tree to write_mtree; fails while write_file writers
+    /// are outstanding.
+    pub fn close(self) -> Result<MutableTree>;
+
+    pub async fn merge(&self, other: &MutableTree, opts: MergeOptions) -> Result<()>;
+
+    pub async fn write_file(&self, path: &Path, meta: &FileMeta)
+        -> Result<StagedFileWriter<'_>>;
+    pub async fn write_file_content(&self, path: &Path, meta: &FileMeta,
+        content: &[u8]) -> Result<()>;
+    pub async fn make_dir(&self, path: &Path, meta: &DirMeta) -> Result<()>;
+    pub async fn make_dir_all(&self, path: &Path, meta: &DirMeta) -> Result<()>;
+    pub async fn symlink(&self, path: &Path, target: &Path, meta: &FileMeta)
+        -> Result<()>;
+    /// A second tree entry for the content object found at `target`;
+    /// the object carries all metadata, so none is taken.
+    pub async fn hardlink(&self, path: &Path, target: &Path) -> Result<()>;
+
+    /// Path resolution against the staged tree; objects load from the
+    /// transaction's staged set first, then from `objects/`.
+    pub async fn read_file(&self, path: &Path, follow_symlinks: bool)
+        -> Result<FileObject>;
+    pub async fn read_dir(&self, path: &Path, follow_symlinks: bool)
+        -> Result<Vec<StagingEntry>>;
+}
+
+/// finish() completes the content object and records it at the path.
+pub struct StagedFileWriter<'a> { /* ContentWriter + path + tree handle */ }
+impl StagedFileWriter<'_> { pub async fn finish(self) -> Result<()>; }
+
+pub enum StagingEntry {
+    File { name: String, checksum: Checksum },
+    Dir  { name: String },                     // no checksum until written
+}
+
+#[derive(Default)]
+pub struct MergeOptions { pub allow_overwrite: bool, pub follow_symlinks: bool }
+```
+
+Merge rules: entries with equal checksums merge silently; differing
+files, file-versus-directory conflicts, and dirmeta on directories
+present on both sides are errors without `allow_overwrite` and taken
+from the right side with it (a right-side file replacing a whole
+left-side subtree when it overwrites a directory). With
+`follow_symlinks`, a right-side directory at a name where the left tree
+has a symlink merges into the symlink's target directory; right-side
+files and symlinks replace the left entry under the overwrite rule and
+never write through, so a file arriving over
+`etc/localtime -> /usr/share/zoneinfo/UTC` replaces the symlink and
+leaves the zoneinfo object untouched. Resolution walks the left tree at
+every level of the descent: relative targets resolve from the symlink's
+parent, absolute targets from the tree root, `..` clamps at the root,
+chains are capped at depth 40, and a dangling target is an error naming
+the symlink and the missing target. Merge lives on `StagingTree` rather
+than `MutableTree` because resolution loads symlink content objects, and
+only transaction scope sees objects staged in the current transaction.
+
+Path semantics for the write operations: intermediate components resolve
+through symlinks with the same walker; the final component never
+follows. `write_file` and `write_file_content` replace an existing file
+or symlink entry and fail on a directory; `make_dir`, `symlink`, and
+`hardlink` fail on any existing entry; `make_dir_all` applies its
+`DirMeta` to the directories it creates and leaves existing ones
+untouched.
 
 ## Checkout options
 

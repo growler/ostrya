@@ -466,22 +466,388 @@ repository is accepted by the tool and read identically by the port;
 
 ### Phase 7 -- Write path
 
-Split into sub-phases:
-- 7a Content and metadata object writers (all modes, O_TMPFILE + linkat,
-  dedup early-out, min-free-space accounting, per-mode metadata application).
-  Content ingest streams: hashing and compression run over bounded chunks as
-  the payload is copied, never over a whole in-memory blob. The primary
-  ingestion surface is the push-style `ContentWriter` (`api-sketch.md`),
-  with `write_content` as a pull-style convenience over it.
-- 7b Mutable tree and `write_mtree` (sorted dirtree assembly, clean-subtree
-  short-circuit).
-- 7c `write_dfd_to_mtree` (fs-tree walk, devino cache, commit modifier: filter,
-  xattr callback, canonical permissions, SELinux label hook, CONSUME/adopt).
-- 7d `write_commit` (+ `ostree.sizes` auto-metadata), detached metadata, ref
-  queueing, commit ordering and durability.
-Verify: commits produced have checksums identical to the tool's for the same
-input tree; `ostree fsck` and `ostree show` accept them; run the write-side
-tests against captured references.
+Six sub-phases, each an independently reviewable unit with its own gate:
+7a is the object-store write layer, 7b in-memory tree assembly, 7c
+filesystem ingest, 7d commit assembly and durable publication, 7e
+overlay changeset import, 7f the staging tree and tree merge. Each
+sub-phase consumes only the public surface of the ones before it. The
+tool-conformance gate lands with 7d: commits with checksums identical
+to the tool's for the same input tree, accepted by `ostree fsck` and
+`ostree show`. 7e and 7f are port extensions with no tool counterpart
+and no on-disk format impact; their gates are self-consistency against
+the 7c ingest path.
+
+Dependency set for the phase: no new crates and no manifest changes.
+Staging and metadata application use `rustix` under the already-enabled
+`fs` feature (`openat` with `O_TMPFILE`, `linkat`, `symlinkat`,
+`renameat`, `fchmod`, `fchown`, `fsetxattr`, `fstatvfs`, `syncfs`, `Dir`
+iteration), offloaded through `rt::unblock` at per-object granularity;
+hashing is the Phase 5a `HashingWriter` over `sha2`; archive compression
+is the encoder half of the `async-compression` raw-DEFLATE codec whose
+decoder the read path uses.
+
+Format facts the write path needs that `format-reference.md` does not yet
+state -- the inode modes the tool gives loose metadata objects, the exact
+canonical-permissions rule, consume/adopt behavior, the per-object-fsync
+syscall pattern -- are recovered by black-box observation in the sub-phase
+that reaches them and recorded in `format-reference.md` in the same
+change.
+
+### Phase 7a -- Object writers: content and metadata
+
+The object-store write layer inside `Transaction`: streaming content
+ingestion, metadata object writes, per-mode on-disk application, dedup,
+free-space accounting, and publication of staged objects into `objects/`
+at commit. After 7a a transaction stages and publishes individual
+objects; trees and commits arrive in 7b-7d.
+
+Definition:
+
+- `FileMeta` (uid, gid, mode, xattrs): the logical metadata the writers
+  consume; header serialization is the Phase 3 `FileHeader`.
+- `ContentWriter` (from `Transaction::content_writer`), the push-style
+  primary ingestion surface: streams one regular-file payload into a
+  staging temp file (`O_TMPFILE` in the staging directory, `linkat` on
+  finish; a named temp file where the filesystem refuses `O_TMPFILE`).
+  Bytes pass through a `HashingWriter` seeded with the framed
+  uncompressed header, so the object id is complete when the stream ends;
+  in archive mode the same pass feeds the raw-DEFLATE encoder at
+  `[archive] zlib-level` and counts compressed bytes. Bounded chunks end
+  to end; the payload is never held whole in memory.
+- Archive framing: the stored `.filez` leads with the length-prefixed
+  `(tuuuusa(ayay))` header, whose byte length does not depend on the
+  payload (the size field is fixed-width), so the writer reserves the
+  header region up front and patches the final size in at finish.
+- `finish` order: finalize the digest; verify against `expected` when
+  given; if the object already exists in `objects/` or in this
+  transaction's staging set, drop the temp file and return the existing
+  id (dedup early-out); otherwise apply per-mode metadata and link the
+  object under its loose name in the staging directory. Dropping a
+  `ContentWriter` without `finish` abandons the temporary; the
+  transaction reaps abandoned named temporaries at commit and abort.
+- Per-mode application, always by explicit `fchmod`/`fchown`, never
+  umask: bare applies logical uid/gid/mode and xattrs to the inode and
+  stores symlinks as real symlinks; bare-user stores `(uuua(ayay))` in
+  `user.ostreemeta`, applies inode mode
+  `(mode & (S_IFREG|0775)) | S_IRUSR`, and stores symlinks as regular
+  files holding the target plus one NUL; bare-user-shared is bare-user
+  with a fixed inode mode 0644 and no logical mode on the inode;
+  bare-user-only applies the canonical mode capped at 0775 and discards
+  uid/gid and xattrs; archive writes `.filez` chmod 0644.
+- `write_content` (pull-style, drives a `ContentWriter` from an
+  `AsyncRead`), `write_regfile_inline` (small caller-held content),
+  `write_symlink` (framed header only, no payload).
+- `write_metadata`: whole-buffer (the format caps metadata size),
+  checksum over the normal-form bytes, `expected` verification, staged
+  uncompressed under the loose name.
+- Free-space guard: at transaction start `fstatvfs` plus
+  `min-free-space-percent` / `min-free-space-size` set a byte budget;
+  each staged object debits it; exhaustion fails the write with a
+  dedicated error carrying the shortfall.
+- `object_sizes`: in archive mode each content write records
+  (compressed size, unpacked size, objtype) keyed by checksum, the input
+  for `ostree.sizes` in 7d.
+- Object publication in `Transaction::commit()`, the object half of the
+  durability contract: `syncfs` on the repo fd, rename staged objects
+  into `objects/xx/` (fanout directories created on demand; 2775 in
+  bare-user-shared, group inherited from the setgid parent), fsync each
+  touched `objects/xx/` and `objects/`. `fsync=false` turns every sync
+  into a no-op; `per-object-fsync` follows the tool's recovered pattern.
+  `commit(self)` returns `TransactionStats` (the devino counter stays 0
+  until 7c).
+
+Deliverables: `FileMeta`, `ContentWriter`, `Transaction::{content_writer,
+write_content, write_regfile_inline, write_symlink, write_metadata}`, the
+free-space guard, the `object_sizes` map, object publication inside
+`Transaction::commit`, `TransactionStats`, and a `bare` fixture
+repository added to `tests/fixtures/generate.sh` (logical owner set to
+the invoking uid/gid so unprivileged tests can reproduce ownership
+application).
+
+Verify: for every fixture object across archive, bare, and bare-user,
+plus the bare-user-shared derivation, the port writes byte-identical
+loose objects -- payload bytes, stored header, xattr application, inode
+mode -- under identical checksums; re-writing an existing object is a
+dedup no-op visible in the stats; several tasks writing through one
+`&Transaction` stage correctly; the free-space guard trips on an
+artificially small budget; a compile-time assertion pins
+`ContentWriter: Send + Sync`; the suite passes under both runtime
+backends. Tool-level acceptance of whole repositories lands with 7d,
+when commits and refs exist for the tool to read.
+
+### Phase 7b -- Mutable tree and write_mtree
+
+In-memory tree construction and its serialization to dirtree and dirmeta
+objects. After 7b a full tree's object set can be staged from known
+checksums; walking a real filesystem is 7c.
+
+Definition:
+
+- `MutableTree` per `api-sketch.md`: name-keyed files (content checksum)
+  and subdirectories (nested trees); `new`, `from_commit`, `ensure_dir`,
+  `replace_file`, `remove`, `set_metadata_checksum`. Names are validated
+  on insertion (UTF-8, no `/`, not `.` or `..`), and one name cannot be
+  both a file and a directory, matching the Phase 3 owned-parse rule.
+- Lazy hydration: `from_commit` records the dirtree/dirmeta checksums
+  and loads children only when a subtree is first mutated, so editing
+  one path in a large commit reads only that path's spine.
+- Dirty tracking and the clean-subtree short-circuit: an unmutated
+  subtree keeps its known dirtree checksum and `write_mtree` reuses it
+  without re-serializing or re-staging anything beneath it.
+- `Transaction::write_mtree`: post-order walk over dirty subtrees; each
+  written directory requires its dirmeta checksum set (an unset checksum
+  is an error naming the path); assembles the `(a(say)a(sayay))` dirtree
+  with byte-wise-sorted entries and stages it through `write_metadata`;
+  returns the root as a `RepoTree`.
+
+Deliverables: `MutableTree` with the sketched methods, lazy hydration
+and dirty tracking, `Transaction::write_mtree`.
+
+Verify: assembling the fixture tree from its known content checksums and
+dirmeta values reproduces the fixture's dirtree and dirmeta objects
+byte-for-byte; `from_commit` followed by `write_mtree` with no mutation
+returns the original root and stages zero objects; mutating one nested
+file re-writes exactly the dirtrees on that path's spine, counted
+through the stats; invalid names and file/directory collisions are
+rejected.
+
+### Phase 7c -- Filesystem ingest: write_dfd_to_mtree and the modifier
+
+Walking an on-disk tree through fd-relative syscalls, ingesting its
+contents through the 7a writers into a 7b `MutableTree`, under the
+`CommitModifier` surface that shapes what is committed.
+
+Definition:
+
+- The walk: fd-relative directory iteration (`openat` with `O_NOFOLLOW`,
+  `rustix::fs::Dir`, `statx` per entry), offloaded through `rt::unblock`
+  at per-directory granularity; regular-file payloads stream through
+  `write_content` over `rt::File`.
+- Per entry: regular files read their xattrs (unless disabled), build a
+  `FileMeta`, and stream in; symlinks `readlinkat` into `write_symlink`;
+  directories serialize uid/gid/mode/xattrs as dirmeta through
+  `write_metadata` and set it with `set_metadata_checksum`, then recurse.
+- `CommitModifier`: `CommitModifierFlags` (SKIP_XATTRS, GENERATE_SIZES,
+  CANONICAL_PERMISSIONS, ERROR_ON_UNLABELED, CONSUME, DEVINO_CANONICAL,
+  SELINUX_LABEL_V1), the synchronous filter callback (`Allow`/`Skip`; a
+  skipped directory prunes its whole subtree), and the synchronous
+  xattr callback replacing the on-disk xattr set per path.
+- CANONICAL_PERMISSIONS zeroes uid/gid and canonicalizes the mode; the
+  exact bit rule is recovered by observation (committing crafted trees
+  with and without the tool's corresponding option and diffing object
+  ids) and recorded in `format-reference.md` before the flag lands.
+- Labeling hook: the modifier carries an optional label callback invoked
+  per path. When present, a pre-existing `security.selinux` xattr is
+  dropped before the callback's label applies, so a label is never
+  double-counted; ERROR_ON_UNLABELED makes a present-but-silent hook an
+  error. A real SELinux policy backend is out of scope for this phase.
+- `DevInoCache`: a (device, inode) to checksum map consulted before
+  hashing, so an already-known file skips ingestion; populated by
+  checkout in Phase 8, consulted here, hits counted in the stats.
+  DEVINO_CANONICAL semantics are recovered by observation alongside it.
+- CONSUME: each ingested source file is deleted as it is consumed;
+  where the source inode already satisfies the target mode's on-disk
+  form the ingest adopts it by rename instead of copying. The conditions
+  under which the tool adopts are recovered by observation and recorded.
+- GENERATE_SIZES marks the transaction so 7d emits `ostree.sizes`
+  (archive-only; elsewhere the request is the documented silent no-op).
+
+Deliverables: `Transaction::write_dfd_to_mtree`, `CommitModifier`,
+`CommitModifierFlags`, `FilterResult`, `DevInoCache`, the labeling hook,
+devino and filter statistics, and fixture variants in `generate.sh`
+covering canonical permissions and `user.*` xattr-bearing files.
+
+Verify: ingesting a source tree matching the fixture input yields the
+fixture's root dirtree and dirmeta checksums through `write_mtree`; the
+filter excludes exactly the skipped paths and stages none of their
+objects; the xattr callback's replacement set lands in the object ids;
+canonical-permissions ingest matches the checksums the tool produces
+with its corresponding option; a devino hit skips rehashing (stats, and
+no duplicate staging); CONSUME leaves the consumed source empty; the
+xattr fixture (unprivileged `user.*` names) round-trips.
+
+### Phase 7d -- Commit assembly, refs, and durable publication
+
+The commit object, detached commit metadata, the ref queue and immediate
+ref writes, and the completed transaction commit sequence. 7d closes the
+write path: the port produces complete commits the tool accepts.
+
+Definition:
+
+- `Transaction::write_commit(opts, root)` assembles
+  `(a{sv}aya(say)sstayay)`: the caller's metadata dict (GVariant
+  preserves dict insertion order, so byte-identity with a tool commit
+  requires supplying keys in the tool's observed order), parent (empty
+  `ay` for a root commit), related written empty, subject and body
+  defaulting to empty strings, timestamp from `CommitOptions` else
+  `SOURCE_DATE_EPOCH` else the current time (seconds UTC, big-endian),
+  root dirtree and dirmeta from the `RepoTree`; staged through
+  `write_metadata`.
+- Binding keys (`ostree.ref-binding`, `ostree.collection-binding`) are
+  ordinary caller-supplied metadata entries; the fixtures show which
+  keys the tool writes for a branch commit and the conformance tests
+  supply the same. `write_commit` adds nothing on its own.
+- `ostree.sizes`: when the transaction is marked GENERATE_SIZES and the
+  repository is archive mode, entries pack from the 7a `object_sizes`
+  map (checksum-sorted, LEB128 sizes, trailing objtype byte) and merge
+  into the metadata dict; in every other mode the marked commit's bytes
+  are identical to an unmarked one.
+- Detached metadata: `Repo::write_commit_detached_metadata` and
+  `read_commit_detached_metadata`; a bare `a{sv}` at the `.commitmeta`
+  loose path, replaced atomically (tmpfile, fdatasync, rename); `None`
+  writes the documented zero-length file.
+- Refs: `Transaction::set_ref` and `set_collection_ref` queue
+  refspec-to-checksum entries applied at commit;
+  `Repo::set_ref_immediate` writes outside a transaction. A ref file is
+  64 hex chars plus `\n` (65 bytes), written tmpfile + fdatasync +
+  rename, parent directories created for `/`-bearing names; a `None`
+  checksum removes the ref file.
+- The completed `Transaction::commit()`: 7a's object publication
+  followed by the ref queue, per the durability contract -- objects are
+  durable before any ref points at them; ref writes are individually
+  atomic and not atomic as a set; `fsync=false` and `per-object-fsync`
+  behave as in 7a. The Phase 6 concurrency promise completes: concurrent
+  transactions publish their staged sets and refs independently.
+
+Deliverables: `Transaction::write_commit`, `CommitOptions`,
+`ostree.sizes` emission, detached-metadata read and write on `Repo`,
+`Transaction::{set_ref, set_collection_ref}`, `Repo::set_ref_immediate`,
+the completed commit sequence, final `TransactionStats`.
+
+Verify: for each fixture mode, replaying the fixture input through 7a-7d
+end to end produces a commit object byte-identical to the tool's, the
+MANIFEST commit checksum, and a ref file the tool resolves;
+`ostree fsck`, `ostree show`, `ostree ls -R`, and `ostree checkout`
+accept a repository the port created and populated; the archive
+size-generation fixture matches GENERATE_SIZES output byte-for-byte
+while bare and bare-user commits are byte-identical with and without the
+request; `SOURCE_DATE_EPOCH` pins the timestamp; two transactions in one
+process commit concurrently with both commits and refs intact; detached
+metadata written by the port is read back by the tool and the reverse;
+the suite passes under both runtime backends.
+
+### Phase 7e -- Overlay changeset import (port extension)
+
+`Transaction::merge_overlay_dfd_to_mtree`: merging an overlayfs
+upperdir changeset into a `MutableTree` holding the tree the overlay
+was mounted over. A port extension with no tool counterpart and no
+on-disk format impact -- deletions apply to the mtree during the walk
+and never serialize. It is a separate walk rather than sugar over 7c
+plus a tree merge because a `MutableTree` has no tombstone
+representation; it reuses the 7c walk machinery and the 7a writers.
+
+Definition:
+
+- Signature per `api-sketch.md`: `dfd` is the upperdir root; the
+  overlay is expected to be unmounted, unchecked.
+- Whiteouts: a char 0:0 device removes the corresponding mtree path.
+  Other upper entries ingest through the 7c machinery and replace or
+  extend the mtree.
+- Opaque directories: `trusted.overlay.opaque` or
+  `user.overlay.opaque` clears the mtree subtree before ingesting.
+  Both namespaces are honored: rootless `userxattr` overlays write
+  `user.*`, and `trusted.*` is invisible to an unprivileged reader.
+- Merged (non-opaque) directories take dirmeta from the upper inode;
+  overlayfs copies directories up with their metadata, so an upper
+  entry is authoritative.
+- `overlay.*` xattrs are stripped from ingested entries.
+- Entries carrying `overlay.metacopy` or `overlay.redirect` are a hard
+  error naming the feature: such an entry is not self-contained, and
+  the overlay must be mounted with these features off.
+- An upper directory over an mtree symlink is a malformed-changeset
+  error: the VFS resolves symlinks at lookup, so a genuine upperdir
+  never contains one relative to its base.
+- Whiteouts and opaque markers are merge mechanics, not content: the
+  modifier callbacks never see them, and a filter `Skip` on an upper
+  entry leaves the base version in place.
+- Fixtures are synthesized unprivileged: whiteout devices through
+  `rustix::fs::mknodat` (char 0:0 creation requires no capability) and
+  opacity through `user.overlay.opaque`. No new crates, no manifest
+  changes.
+
+Deliverables: `Transaction::merge_overlay_dfd_to_mtree`, the
+malformed-changeset and unsupported-feature error variants, upperdir
+fixture builders in the test suite.
+
+Verify: merging a synthesized changeset over a base mtree yields the
+same root checksum as applying the same changeset to a scratch checkout
+by hand (copy, delete, opaque-replace) and ingesting the result through
+`write_dfd_to_mtree`; whiteouts remove exactly the whited-out paths; an
+opaque directory drops base-only entries beneath it; `overlay.*`
+xattrs appear in no staged object; metacopy, redirect, and
+dir-over-symlink inputs fail with their dedicated errors; the modifier
+filter skips upper entries without disturbing base ones.
+
+### Phase 7f -- Staging tree and tree merge (port extension)
+
+Path-addressed tree construction over a transaction: `StagingTree`, its
+file and directory operations, tree merge with symlink resolution, and
+reading back through the transaction's staged objects. A port extension
+with no tool counterpart and no format impact; everything it stages
+flows through the 7a writers and 7b trees.
+
+Definition:
+
+- `StagingTree<'txn>` per `api-sketch.md`: borrows the transaction, so
+  close, `write_mtree`, commit is the only ordering that compiles; the
+  tree sits behind a sync mutex held only across map operations,
+  `&StagingTree` is `Send + Sync`, and file writes may run
+  concurrently. `close` returns the `MutableTree` and fails while
+  `write_file` writers are outstanding (a counter).
+- Constructors on `Transaction`: `staging_tree` (empty, or lazily
+  hydrated from a `Commit`'s root checksums) and
+  `staging_tree_from_mutable_tree`.
+- Path operations: `write_file` (returns `StagedFileWriter`, whose
+  `finish` completes the content object and records the entry),
+  `write_file_content`, `make_dir`, `make_dir_all`, `symlink`
+  (`FileMeta`; the mode is fixed by the object model), `hardlink` (a
+  second entry for the content object at the target path; no metadata
+  taken). Intermediate path components resolve through symlinks; the
+  final component never follows: `write_file` and `write_file_content`
+  replace an existing file or symlink and fail on a directory;
+  `make_dir`, `symlink`, and `hardlink` fail on any existing entry;
+  `make_dir_all` applies its `DirMeta` to directories it creates and
+  leaves existing ones untouched.
+- Staged-first object lookup on `Transaction`: `read_file` and
+  `read_dir` resolve paths against the staged tree and load objects
+  from the transaction's staged set before `objects/`. `read_dir`
+  returns `StagingEntry`; a dirty directory has no checksum, so
+  `TreeEntry` cannot represent it.
+- Symlink resolution (`follow_symlinks` on the read operations and in
+  `MergeOptions`) walks the staged tree component-wise: relative
+  targets resolve from the symlink's parent, absolute targets from the
+  tree root, `..` clamps at the root, chains are capped at depth 40,
+  and a dangling target is an error naming the symlink and the missing
+  target.
+- `StagingTree::merge(other, MergeOptions)`: equal checksums merge
+  silently; differing files, file-versus-directory conflicts, and
+  dirmeta on shared directories are errors without `allow_overwrite`
+  and taken from the right side with it. With `follow_symlinks`, a
+  right-side directory over a left-side symlink merges into the
+  symlink's target directory; right-side files and symlinks replace
+  the left entry and never write through. Merge lives here and not on
+  `MutableTree` because resolution loads symlink content objects, and
+  only transaction scope sees objects staged in the current
+  transaction.
+
+Deliverables: `StagingTree`, `StagedFileWriter`, `StagingEntry`,
+`MergeOptions`, the constructors on `Transaction`, the staged-first
+object lookup, the merge and resolution error variants.
+
+Verify: a tree built through staging-tree operations alone produces the
+same root checksum as ingesting the equivalent scratch directory
+through `write_dfd_to_mtree`; hardlinked paths share one content
+object; `read_file` and `read_dir` see staged-and-unpublished content
+and follow symlink chains, failing on loops and dangling targets; a
+package-layer tree merged over a base holding `/opt -> usr/opt` lands
+files under `usr/opt` with `follow_symlinks`; a file merged over
+`etc/localtime -> /usr/share/zoneinfo/UTC` replaces the symlink and
+leaves the target object untouched; a left-tree symlink staged in the
+same transaction resolves during merge through the staged-first lookup;
+conflicts without `allow_overwrite` fail naming the path; concurrent
+`write_file` streams through one `&StagingTree` land correctly;
+compile-time assertions pin the new types `Send + Sync`; the suite
+passes under both runtime backends.
 
 ### Phase 8 -- Checkout path
 

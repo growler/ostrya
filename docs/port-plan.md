@@ -165,10 +165,24 @@ threads.
 Each type gains a compile-time assertion pinning this in the phase that
 introduces it.
 
-Cross-process and cross-`Repo` safety uses a two-layer lock: an in-process
-recursive counter for same-repo reentrancy, plus an OFD `fcntl(F_OFD_SETLK)`
-(falling back to `flock`) lock on `<repo>/.lock`. The reference tool's roughly
-one-second lock-acquisition retry spin becomes an `rt::Timer` retry loop.
+Cross-process and cross-`Repo` safety uses a two-layer lock on `<repo>/.lock`.
+The outer layer is a classic `fcntl` record lock (`F_SETLK`, via
+`rustix::fs::fcntl_lock`), which shares a lock space with the OFD locks the
+`ostree` tool takes, so the library and the tool exclude each other on the same
+repository. The inner layer is a per-repository reference count that supports
+same-repo reentrancy and shared-to-exclusive upgrade and downgrade, touching the
+descriptor only at the transitions that change the effective lock. A normal
+transaction takes the lock shared, matching the read lock the tool holds during
+a commit; destructive maintenance takes it exclusive.
+
+Record locks are process-associated: two descriptors in one process do not
+conflict, and closing any one descriptor to the file drops every lock the
+process holds on it. A process-global registry keyed by the lock file's
+`(device, inode)` gives every handle to one repository -- clones and independent
+opens alike -- the same descriptor and reference count, so exactly one `.lock`
+descriptor exists per repository per process. The reference tool's roughly
+one-second lock-acquisition retry spin becomes an `rt::Timer` retry loop bounded
+by `lock-timeout-secs`.
 
 ### Durability contract
 
@@ -388,14 +402,28 @@ compile-time assertions cover `ContentReader` and the hashing streams; unit
 tests drive the hashing streams to EOF and check digest and size, including
 the pre-seeded-digester and empty-payload cases.
 
-### Phase 6 -- Transactions and locking
+### Phase 6 -- Transactions and locking (DONE)
 
-Owned `Transaction` handles, staging dir allocation and reuse (boot-id keyed),
-OFD file lock with async acquisition, the two-layer in-process counters, RAII
-auto-abort on drop. Concurrency test: two transactions progressing in one
-process; cross-process lock contention.
-Verify: concurrent transactions each produce correct independent commits;
-lock upgrade/downgrade behaves; drop aborts cleanly.
+Owned `Transaction` handles, staging dir allocation and reaping (boot-id keyed),
+a classic `fcntl` record lock (`F_SETLK`) with async acquisition, the two-layer
+in-process counter, RAII auto-abort on drop. Concurrency test: two transactions
+progressing in one process; cross-process lock contention.
+
+The lock is a record lock rather than an OFD lock because `rustix` does not
+expose the OFD `fcntl` commands and a raw call would need the C `libc` crate and
+`unsafe`. A record lock shares a lock space with the tool's OFD locks, so the
+two exclude each other; the process-global registry keyed by the lock file's
+`(device, inode)` keeps a single descriptor per repository per process, which
+the process-associated record-lock semantics require (see "Concurrency"). Object
+and ref writing and commit assembly land with the write path (Phase 7), so at
+this phase a transaction owns its lock hold and staging directory, and
+`commit`/`abort` release the lock and remove the staging directory.
+
+Verify: concurrent transactions each hold an independent staging directory;
+the shared lock lets many transactions proceed in one process; an exclusive lock
+excludes another process, and excludes and is excluded by the `ostree` tool;
+drop reaps the staging directory and releases the lock. Independent-commit
+verification arrives with the write path.
 
 ### Phase 7 -- Write path
 
@@ -576,14 +604,29 @@ Resolved:
    streams through `async-compression` (deflate feature only) over
    `flate2`/`miniz_oxide`.
 
+8. Repository lock and transactions (Phase 6): the lock on `<repo>/.lock` is a
+   classic `fcntl` record lock (`F_SETLK`, via `rustix::fs::fcntl_lock`), chosen
+   over an OFD `fcntl` lock because `rustix` does not expose the OFD commands and
+   a raw OFD call would need the C `libc` crate and `unsafe`, both excluded by
+   constraint 1. A record lock shares a lock space with the tool's OFD locks, so
+   the library and the tool exclude each other on the same repository (verified
+   by holding each side's lock while the other acquires). Record locks are
+   process-associated, so a process-global registry keyed by the lock file's
+   `(device, inode)` keeps one descriptor and one reference count per repository
+   per process; the reference count also serves same-repo reentrancy and
+   shared-to-exclusive upgrade and downgrade. Acquisition is a non-blocking
+   attempt plus an `rt::Timer` retry loop bounded by `lock-timeout-secs`. No new
+   external crates: `rt::Timer` wraps the existing backends (`smol::Timer`,
+   `tokio::time`) and the in-process coordination uses `std::sync::Mutex`.
+
 Deferred to their respective phases:
 
-8. composefs (Phase 15): reproduce the composefs/EROFS format ourselves versus
+9. composefs (Phase 15): reproduce the composefs/EROFS format ourselves versus
    depend on an emerging pure-Rust composefs crate. Feature-gated and late
    either way.
-9. HTTP client (Phase 13a): hand-roll a minimal async HTTP/1.1 client over
-   the runtime's net layer + rustls versus a pure-Rust crate such as
-   `async-h1`. No range/HTTP2 is required, which keeps the hand-rolled
-   option viable.
-10. spki sign engine and avahi repo-finder: deferred as optional; ed25519
+10. HTTP client (Phase 13a): hand-roll a minimal async HTTP/1.1 client over
+    the runtime's net layer + rustls versus a pure-Rust crate such as
+    `async-h1`. No range/HTTP2 is required, which keeps the hand-rolled
+    option viable.
+11. spki sign engine and avahi repo-finder: deferred as optional; ed25519
     and gpg cover the common cases.

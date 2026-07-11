@@ -21,7 +21,8 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ostrya_core::RepoMode;
 use rustix::fs::{Mode, OFlags};
@@ -29,6 +30,9 @@ use rustix::io::Errno;
 
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
+use crate::lock::{self, LockGuard, LockKind, RepoLock};
+use crate::staging::StagingDir;
+use crate::transaction::Transaction;
 
 /// The path of the config file within a repository.
 const CONFIG: &str = "config";
@@ -93,6 +97,24 @@ struct RepoInner {
     repo_fd: OwnedFd,
     objects_fd: OwnedFd,
     config: RepoConfig,
+    // The repository lock, created on the first transaction and held for the
+    // handle's lifetime so every clone of this handle shares one `.lock`
+    // descriptor and one in-process hold count.
+    lock: Mutex<Option<Arc<RepoLock>>>,
+}
+
+impl RepoInner {
+    /// The shared [`RepoLock`] for this repository, creating and registering
+    /// `<repo>/.lock` on first use. Runs synchronous filesystem calls.
+    fn repo_lock(&self) -> std::io::Result<Arc<RepoLock>> {
+        let mut slot = self.lock.lock().unwrap();
+        if let Some(existing) = slot.as_ref() {
+            return Ok(existing.clone());
+        }
+        let lock = RepoLock::get_or_create(self.repo_fd.as_fd())?;
+        *slot = Some(lock.clone());
+        Ok(lock)
+    }
 }
 
 /// The filesystem-derived materials for a handle, produced on the blocking
@@ -148,6 +170,43 @@ impl Repo {
         &self.0.config
     }
 
+    /// Begin a transaction that holds the repository lock shared.
+    ///
+    /// A shared lock matches the read lock the tool holds during a commit, so
+    /// many transactions commit at once, in this process and across processes.
+    pub async fn transaction(&self) -> Result<Transaction> {
+        self.transaction_with_lock(LockKind::Shared).await
+    }
+
+    /// Begin a transaction that holds the repository lock in `kind`.
+    ///
+    /// Acquisition retries until `lock-timeout-secs` elapses, then fails with
+    /// [`Error::LockTimeout`]. With `[core] locking` disabled the transaction
+    /// takes no repository lock. A fresh staging directory is allocated under
+    /// `tmp/`, and stale staging directories left by dead transactions are
+    /// reaped first.
+    pub async fn transaction_with_lock(&self, kind: LockKind) -> Result<Transaction> {
+        let locking = self.0.config.locking()?;
+        let timeout_secs = self.0.config.lock_timeout_secs()?;
+        let expiry_secs = self.0.config.tmp_expiry_secs()?;
+
+        let guard = if locking {
+            let repo = self.clone();
+            let lock = ostrya_rt::unblock(move || repo.0.repo_lock()).await?;
+            let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
+            lock::acquire(lock, kind, timeout).await?
+        } else {
+            LockGuard::disabled()
+        };
+
+        let repo = self.clone();
+        let staging =
+            ostrya_rt::unblock(move || StagingDir::create(repo.0.repo_fd.as_fd(), expiry_secs))
+                .await?;
+
+        Ok(Transaction::new(guard, staging))
+    }
+
     /// The repository root directory fd, anchoring fd-relative access to
     /// `refs/`, `state/`, and the rest of the layout.
     pub(crate) fn repo_fd(&self) -> BorrowedFd<'_> {
@@ -168,6 +227,7 @@ impl Repo {
             repo_fd: materials.repo_fd,
             objects_fd: materials.objects_fd,
             config,
+            lock: Mutex::new(None),
         })))
     }
 }

@@ -39,6 +39,12 @@ pub enum Error {
     /// A requested operation or repository feature is not supported.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// Acquiring the repository lock timed out under contention.
+    #[error("timed out acquiring repository lock after {secs}s")]
+    LockTimeout {
+        /// The configured lock-acquisition timeout, in seconds.
+        secs: i64,
+    },
 }
 
 impl From<rustix::io::Errno> for Error {

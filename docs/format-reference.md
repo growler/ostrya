@@ -286,12 +286,13 @@ which the tool refuses every write ("Not allowed due to repo mode").
 ```
 <repo>/
   config                          GKeyFile INI, repo root
+  .lock                           repository lock file (advisory)
   objects/<c0c1>/<c2..c63>.<ext>[z]   loose objects
   refs/heads/<ref>                local refs (ref may contain '/')
   refs/remotes/<remote>/<ref>     remote refs
   refs/mirrors/<collection>/<ref> collection refs (lazy)
   state/<checksum>.commitpartial  incomplete-commit markers
-  tmp/                            staging (staging-<bootid>-XXXXXX), cache/
+  tmp/                            staging (staging-<bootid>-XXXXXX + -lock), cache/
   tmp/cache/summaries/            summary cache
   extensions/                     reserved, created empty
   deltas/                         static deltas (lazy)
@@ -309,6 +310,26 @@ Ref file format: 64-char hex plus a single `\n` (65 bytes). A NULL rev deletes;
 an alias is written as a relative symlink. Refspec `remote:ref` maps to
 `refs/remotes/remote/ref`; a bare `ref` maps to `refs/heads/ref`. Every ref is
 an individual loose file; there is no packed-refs mechanism.
+
+Repository lock and staging (recovered by tracing the tool). The tool opens
+`<repo>/.lock` `O_RDWR|O_CREAT` mode `0660` and takes an `fcntl` OFD lock on it,
+shared (`F_RDLCK`) for the duration of a commit and exclusive (`F_WRLCK`) for
+destructive maintenance, releasing it (`F_UNLCK`) at the end. A transaction
+stages objects in `tmp/staging-<bootid>-XXXXXX` (mode `0775`), where `<bootid>`
+is `/proc/sys/kernel/random/boot_id` verbatim, dashes kept, and `XXXXXX` is a
+six-character `mkdtemp` suffix. A sibling file `tmp/staging-<bootid>-XXXXXX-lock`
+(mode `0600`) is held with an exclusive OFD lock while the staging directory is
+in use, so a later transaction can tell a live staging directory from one left
+by a dead transaction. These locks are advisory and cross-process; the checksums
+and object bytes do not depend on them.
+
+A leftover directory under `tmp/` whose lock can be taken, or that has no lock
+sibling, is removed once its age exceeds `tmp-expiry-secs`. The age test is
+strict on whole seconds: feeding the tool aged and freshly created `tmp/`
+entries shows that at `tmp-expiry-secs=0` an entry created in the current second
+survives and only entries at least one second old are removed, and at
+`tmp-expiry-secs=5` an entry aged three seconds survives while one aged eight
+seconds is removed.
 
 Static delta directories use base64-checksum fanout. From-scratch:
 `deltas/<to_b64[0:2]>/<to_b64[2:]>/<target>`. From->to:

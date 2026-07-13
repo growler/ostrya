@@ -284,7 +284,11 @@ fn devino_hit(
 /// carries the empty flag set, making this a no-op. A symlink's mode is fixed
 /// by the object model, so only regular-file and directory permission bits are
 /// canonicalized.
-fn apply_canonical(flags: CommitModifierFlags, mut meta: FileMeta, is_symlink: bool) -> FileMeta {
+pub(crate) fn apply_canonical(
+    flags: CommitModifierFlags,
+    mut meta: FileMeta,
+    is_symlink: bool,
+) -> FileMeta {
     if flags.contains(CommitModifierFlags::CANONICAL_PERMISSIONS) {
         meta.uid = 0;
         meta.gid = 0;
@@ -323,7 +327,7 @@ fn apply_callbacks(m: &mut CommitModifier, path: &Path, mut meta: FileMeta) -> R
 
 /// Run the modifier's user callbacks over `meta`, returning it unchanged when no
 /// modifier is attached.
-fn finalize_meta(
+pub(crate) fn finalize_meta(
     modifier: Option<&mut CommitModifier>,
     path: &Path,
     meta: FileMeta,
@@ -335,7 +339,7 @@ fn finalize_meta(
 }
 
 /// Build a directory-metadata object from an adjusted entry's metadata.
-fn to_dirmeta(meta: &FileMeta) -> DirMeta {
+pub(crate) fn to_dirmeta(meta: &FileMeta) -> DirMeta {
     DirMeta {
         uid: meta.uid,
         gid: meta.gid,
@@ -464,7 +468,7 @@ fn unlink(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
 }
 
 /// Join a walk path and an entry name into the modifier callback path.
-fn join_path(parent: &str, name: &str) -> String {
+pub(crate) fn join_path(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
     } else {

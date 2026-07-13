@@ -756,7 +756,7 @@ process commit concurrently with both commits and refs intact; detached
 metadata written by the port is read back by the tool and the reverse;
 the suite passes under both runtime backends.
 
-### Phase 7e -- Overlay changeset import (port extension)
+### Phase 7e -- Overlay changeset import (port extension) (DONE)
 
 `Transaction::merge_overlay_dfd_to_mtree`: merging an overlayfs
 upperdir changeset into a `MutableTree` holding the tree the overlay
@@ -784,9 +784,13 @@ Definition:
 - Entries carrying `overlay.metacopy` or `overlay.redirect` are a hard
   error naming the feature: such an entry is not self-contained, and
   the overlay must be mounted with these features off.
-- An upper directory over an mtree symlink is a malformed-changeset
-  error: the VFS resolves symlinks at lookup, so a genuine upperdir
-  never contains one relative to its base.
+- A cross-type replacement drops the base entry and applies the upper
+  one: an upper file or symlink over a base directory removes the
+  directory, and an upper directory over a base file or symlink removes
+  the leaf and creates a fresh directory. A non-directory upper entry
+  shadows a lower entry of any type, so overlayfs records a
+  directory-to-symlink migration as a plain non-opaque leaf, without a
+  whiteout or opaque marker.
 - Whiteouts and opaque markers are merge mechanics, not content: the
   modifier callbacks never see them, and a filter `Skip` on an upper
   entry leaves the base version in place.
@@ -796,17 +800,18 @@ Definition:
   changes.
 
 Deliverables: `Transaction::merge_overlay_dfd_to_mtree`, the
-malformed-changeset and unsupported-feature error variants, upperdir
-fixture builders in the test suite.
+unsupported-feature error variant, upperdir fixture builders in the
+test suite.
 
 Verify: merging a synthesized changeset over a base mtree yields the
 same root checksum as applying the same changeset to a scratch checkout
 by hand (copy, delete, opaque-replace) and ingesting the result through
 `write_dfd_to_mtree`; whiteouts remove exactly the whited-out paths; an
 opaque directory drops base-only entries beneath it; `overlay.*`
-xattrs appear in no staged object; metacopy, redirect, and
-dir-over-symlink inputs fail with their dedicated errors; the modifier
-filter skips upper entries without disturbing base ones.
+xattrs appear in no staged object; metacopy and redirect inputs fail
+with their dedicated errors; an upper directory over a base symlink and
+upper leaves over base directories apply as cross-type replacements;
+the modifier filter skips upper entries without disturbing base ones.
 
 ### Phase 7f -- Staging tree and tree merge (port extension)
 

@@ -32,8 +32,11 @@
 //! metadata on [`Repo`], the ref queue ([`Transaction::set_ref`],
 //! [`Transaction::set_collection_ref`]) and immediate ref writes
 //! ([`Repo::set_ref_immediate`]), and the completed transaction commit
-//! sequence -- objects published, then refs written. Checkout and maintenance
-//! land in later phases.
+//! sequence -- objects published, then refs written. It also covers overlay
+//! changeset import (Phase 7e): [`Transaction::merge_overlay_dfd_to_mtree`],
+//! which merges an overlayfs upperdir into a [`MutableTree`] holding the lower
+//! layer, applying whiteouts and opaque directories as it walks. Checkout and
+//! maintenance land in later phases.
 
 pub mod commit;
 pub mod config;
@@ -46,6 +49,7 @@ mod lock;
 pub mod modifier;
 pub mod mtree;
 mod object;
+mod overlay;
 pub mod read;
 pub mod refs;
 pub mod repo;

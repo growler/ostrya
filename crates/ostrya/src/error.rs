@@ -66,6 +66,11 @@ pub enum Error {
     /// checksum, or removing an absent entry.
     #[error("mutable tree: {0}")]
     MutableTree(String),
+    /// An overlayfs upperdir uses a feature the merge cannot honor because the
+    /// entry is not self-contained (`overlay.metacopy` or `overlay.redirect`);
+    /// the overlay must be mounted with that feature disabled.
+    #[error("unsupported overlay feature: {0}")]
+    UnsupportedOverlayFeature(String),
 }
 
 impl From<rustix::io::Errno> for Error {

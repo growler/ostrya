@@ -214,6 +214,24 @@ impl MutableTree {
         Ok(())
     }
 
+    /// The content checksum recorded for the file (or symlink) entry `name`, if
+    /// one is present. A directory entry of that name yields `None`. Used by the
+    /// overlay merge to detect a base leaf an upper directory must replace.
+    pub(crate) fn file_checksum(&self, name: &str) -> Option<Checksum> {
+        self.files.get(name).copied()
+    }
+
+    /// Remove every file and subdirectory, marking the directory dirty. Used by
+    /// the overlay merge to clear an opaque directory before ingesting the
+    /// upper entries fresh.
+    pub(crate) fn clear_children(&mut self) {
+        if !self.files.is_empty() || !self.dirs.is_empty() {
+            self.files.clear();
+            self.dirs.clear();
+            self.clean = None;
+        }
+    }
+
     /// Remove the file or subdirectory named `name`. With `allow_noent`, an
     /// absent entry is not an error.
     pub fn remove(&mut self, name: &str, allow_noent: bool) -> Result<()> {

@@ -13,7 +13,7 @@ use std::process::Command;
 
 use common::{
     EMPTY_TXT, HELLO_TXT, LINK, NESTED_TXT, ROOT_DIRMETA, ROOT_DIRTREE, SUBDIR_DIRTREE, TmpDir,
-    fixture_root,
+    fixture_repo,
 };
 use futures_lite::io::Cursor;
 use ostrya::{Checksum, CreateOptions, Error, FileMeta, MutableTree, Repo, RepoMode};
@@ -42,18 +42,18 @@ fn object_bytes(root: &Path, hex: &str, ty: ObjectType, mode: RepoMode) -> Vec<u
 
 /// The bytes of a loose object in the checked-in bare-user fixture repository.
 fn fixture_bytes(hex: &str, ty: ObjectType) -> Vec<u8> {
-    std::fs::read(
-        fixture_root()
-            .join("bare-user/repo/objects")
-            .join(loose_path(&csum(hex), ty, RepoMode::BareUser)),
-    )
+    std::fs::read(fixture_repo("bare-user").join("objects").join(loose_path(
+        &csum(hex),
+        ty,
+        RepoMode::BareUser,
+    )))
     .unwrap()
 }
 
 /// Copy the bare-user fixture repository into `dst`, giving a writable repo that
 /// already holds a committed tree resolvable as `test/main`.
 fn copy_bare_user_fixture(dst: &Path) {
-    let src = fixture_root().join("bare-user/repo");
+    let src = fixture_repo("bare-user");
     let status = Command::new("cp")
         .arg("-a")
         .arg(&src)

@@ -13,6 +13,12 @@
 # epoch form `--timestamp=1700000000` is rejected by the tool; the `@epoch`
 # form is used instead.)
 #
+# Storage. Archive and bare fixtures are emitted as plain trees. The
+# bare-user-family fixtures (bare-user, canon, xattr) store each file's logical
+# metadata in a user.ostreemeta xattr, which git does not track, so they are
+# emitted as xattr-preserving tarballs (generated/<name>.tar). A fresh checkout
+# unpacks the tarball rather than regenerating, so consumers need no ostree.
+#
 # Invariant. Object identity, and therefore the dirtree and commit checksums,
 # are independent of repository mode. The script commits the same tree in each
 # mode and fails if the resulting commit checksums are not identical.
@@ -58,6 +64,39 @@ chmod 0755 "$SRC/subdir"
 rm -rf "$OUT_DIR"
 mkdir -p "$OUT_DIR"
 
+# Emit a repository's deterministic parts (config, objects, refs) as a plain
+# tree under generated/<name>/repo. The lock file and tmp staging are transient
+# and are left out.
+emit_tree() {
+    local src="$1" name="$2"
+    local dst="$OUT_DIR/$name/repo"
+    mkdir -p "$dst"
+    cp -a "$src/config" "$dst/config"
+    cp -a "$src/objects" "$dst/objects"
+    cp -a "$src/refs" "$dst/refs"
+}
+
+# Emit a repository's deterministic parts as an xattr-preserving tarball at
+# generated/<name>.tar, with the same config/objects/refs selection as
+# emit_tree. The tarball is byte-reproducible: a fixed mtime, owner 0:0,
+# name-sorted entries, and dropped volatile pax timestamps make regeneration on
+# any host yield an identical archive. cp -a preserves the user.ostreemeta xattr
+# into the staging tree, and --xattrs stores it in the archive.
+emit_tar() {
+    local src="$1" name="$2"
+    local stage
+    stage="$(mktemp -d)"
+    mkdir -p "$stage/repo"
+    cp -a "$src/config" "$stage/repo/config"
+    cp -a "$src/objects" "$stage/repo/objects"
+    cp -a "$src/refs" "$stage/repo/refs"
+    tar --xattrs --xattrs-include='user.*' --sort=name --format=posix \
+        --mtime="$TIMESTAMP" --owner=0 --group=0 --numeric-owner \
+        --pax-option='exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime' \
+        -C "$stage" -cf "$OUT_DIR/$name.tar" repo
+    rm -rf "$stage"
+}
+
 declare -A CHECKSUM
 for mode in "${MODES[@]}"; do
     repo="$WORK/repo-$mode"
@@ -68,13 +107,12 @@ for mode in "${MODES[@]}"; do
         --no-xattrs --timestamp="$TIMESTAMP" "$SRC")"
     CHECKSUM["$mode"]="$checksum"
 
-    # Copy the deterministic parts only; the lock file and tmp staging are
-    # transient and are left out.
-    dst="$OUT_DIR/$mode/repo"
-    mkdir -p "$dst"
-    cp -a "$repo/config" "$dst/config"
-    cp -a "$repo/objects" "$dst/objects"
-    cp -a "$repo/refs" "$dst/refs"
+    # archive is a plain tree; bare-user stores logical metadata in
+    # user.ostreemeta and is tarred.
+    case "$mode" in
+        bare-user) emit_tar "$repo" "$mode" ;;
+        *) emit_tree "$repo" "$mode" ;;
+    esac
 done
 
 # --- assert the cross-mode commit-identity invariant ---
@@ -102,11 +140,46 @@ ostree --repo="$bare_repo" commit \
     --branch="$BRANCH" --subject="$SUBJECT" \
     --owner-uid="$BARE_UID" --owner-gid="$BARE_GID" \
     --no-xattrs --timestamp="$TIMESTAMP" "$SRC" >/dev/null
-bare_dst="$OUT_DIR/bare/repo"
-mkdir -p "$bare_dst"
-cp -a "$bare_repo/config" "$bare_dst/config"
-cp -a "$bare_repo/objects" "$bare_dst/objects"
-cp -a "$bare_repo/refs" "$bare_dst/refs"
+emit_tree "$bare_repo" "bare"
+
+# --- canonical-permissions fixture (Phase 7c) ---
+# A tree of assorted modes committed with --canonical-permissions. The tool
+# forces owner 0:0 and reduces each permission set to `perm & 0755` (group and
+# other write and the setuid/setgid/sticky bits are dropped), so the objects are
+# deterministic and owner-independent. --no-xattrs keeps them free of host
+# SELinux labels. See format-reference.md, "Commit modifier".
+CANON_SRC="$WORK/canon-src"
+mkdir -p "$CANON_SRC/dir0775"
+printf 'a' >"$CANON_SRC/f0664"
+printf 'b' >"$CANON_SRC/f0755"
+printf 'c' >"$CANON_SRC/f4755"
+chmod 0664 "$CANON_SRC/f0664"
+chmod 0755 "$CANON_SRC/f0755"
+chmod 4755 "$CANON_SRC/f4755"
+chmod 0775 "$CANON_SRC/dir0775"
+ln -s f0664 "$CANON_SRC/link"
+canon_repo="$WORK/repo-canon"
+ostree --repo="$canon_repo" init --mode=bare-user >/dev/null
+CANON_COMMIT="$(ostree --repo="$canon_repo" commit \
+    --branch="$BRANCH" --subject="$SUBJECT" \
+    --canonical-permissions --no-xattrs --timestamp="$TIMESTAMP" "$CANON_SRC")"
+emit_tar "$canon_repo" "canon"
+
+# --- user.* xattr fixture (Phase 7c) ---
+# A bare-user commit capturing a user.demo xattr (committed without --no-xattrs).
+# Owner is fixed to 0:0 so the object identity is host-independent. Generated on
+# a host without SELinux labeling, so the only captured xattr is user.demo.
+XATTR_SRC="$WORK/xattr-src"
+mkdir -p "$XATTR_SRC"
+printf 'labeled\n' >"$XATTR_SRC/hello.txt"
+chmod 0644 "$XATTR_SRC/hello.txt"
+setfattr -n user.demo -v value "$XATTR_SRC/hello.txt"
+xattr_repo="$WORK/repo-xattr"
+ostree --repo="$xattr_repo" init --mode=bare-user >/dev/null
+XATTR_COMMIT="$(ostree --repo="$xattr_repo" commit \
+    --branch="$BRANCH" --subject="$SUBJECT" \
+    --owner-uid=0 --owner-gid=0 --timestamp="$TIMESTAMP" "$XATTR_SRC")"
+emit_tar "$xattr_repo" "xattr"
 
 COMMIT="${CHECKSUM[$first]}"
 CONTENT="$(ostree --repo="$WORK/repo-$first" show "$COMMIT" |
@@ -124,6 +197,8 @@ commit=${COMMIT}
 content_checksum=${CONTENT}
 modes=${MODES[*]}
 bare_owner=${BARE_UID}:${BARE_GID}
+canon_commit=${CANON_COMMIT}
+xattr_commit=${XATTR_COMMIT}
 EOF
 
 echo "generated fixtures in ${OUT_DIR}"

@@ -7,8 +7,11 @@
 //! carries a `dead_code` allowance.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use ostrya_gvariant::{ArrayIter, Variant};
 
@@ -59,6 +62,38 @@ pub fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/generated")
 }
 
+/// Unpack the xattr-preserving fixture tarball `<fixture_root>/<name>.tar` once
+/// per test process and return the directory holding its `repo/`.
+///
+/// The bare-user-family fixtures store each file's logical metadata in a
+/// `user.ostreemeta` xattr, which git does not track, so they ship as tarballs
+/// (see tests/fixtures/generate.sh). The unpack is memoized and persists for the
+/// process, so the returned paths stay valid for the whole test run.
+pub fn unpack_fixture(name: &str) -> PathBuf {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry.lock().unwrap();
+    if let Some(dir) = map.get(name) {
+        return dir.clone();
+    }
+    let dir = std::env::temp_dir()
+        .join(format!("ostrya-fixtures-{}", std::process::id()))
+        .join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create fixture unpack dir");
+    let tar = fixture_root().join(format!("{name}.tar"));
+    let status = Command::new("tar")
+        .args(["--xattrs", "--xattrs-include=user.*", "-xf"])
+        .arg(&tar)
+        .arg("-C")
+        .arg(&dir)
+        .status()
+        .expect("run tar to unpack fixture");
+    assert!(status.success(), "tar failed to unpack {}", tar.display());
+    map.insert(name.to_owned(), dir.clone());
+    dir
+}
+
 /// A loose object located at `<mode>/repo/objects/<prefix>/<stem>.<ext>`.
 pub struct LooseObject {
     /// Repository-mode directory name, for example `archive` or `bare-user`.
@@ -80,25 +115,27 @@ impl LooseObject {
     }
 }
 
-/// Walk every fixture repository and return each loose object it holds.
+/// Walk the deterministic golden fixture repositories and return each loose
+/// object they hold.
+///
+/// The golden data these walkers compare against lives in two fixtures: the
+/// `archive` plain tree and the `bare-user` tarball (unpacked on demand, so its
+/// `user.ostreemeta` xattrs are present). The other fixtures are cross-checked
+/// elsewhere: `bare` is owned by the invoking user (see the `bare_owner` note in
+/// MANIFEST) and the write-path test checks it against the tool at runtime, and
+/// `canon`/`xattr` are Phase 7c ingest fixtures with a different tree shape,
+/// checked by the `ostrya` crate's ingest tests.
 ///
 /// This is the single fixture-directory traversal for the golden tests: a
 /// broken layout surfaces here in one place rather than in each test.
 pub fn loose_objects() -> Vec<LooseObject> {
+    let sources = [
+        ("archive".to_owned(), fixture_root().join("archive")),
+        ("bare-user".to_owned(), unpack_fixture("bare-user")),
+    ];
     let mut found = Vec::new();
-    let root = fixture_root();
-    let modes = fs::read_dir(&root).expect("fixtures exist; run tests/fixtures/generate.sh");
-    for mode_entry in modes {
-        let mode_dir = mode_entry.unwrap();
-        let mode = mode_dir.file_name().to_str().unwrap().to_owned();
-        // The `bare` fixture is owned by the invoking user (see the `bare_owner`
-        // note in MANIFEST), so its object bytes are not the deterministic
-        // golden data these walkers compare against; the write-path test
-        // cross-checks bare against the tool at runtime instead.
-        if mode == "bare" {
-            continue;
-        }
-        let objects = mode_dir.path().join("repo/objects");
+    for (mode, base) in sources {
+        let objects = base.join("repo/objects");
         if !objects.is_dir() {
             continue;
         }

@@ -665,7 +665,9 @@ impl<'b> TupleWriter<'b> {
     }
 
     pub(crate) fn field<T: GvEncode>(&mut self, value: &T, is_last: bool) -> Result<()> {
-        self.field_dyn(T::ALIGNMENT, T::FIXED_SIZE, is_last, |out| value.encode(out))
+        self.field_dyn(T::ALIGNMENT, T::FIXED_SIZE, is_last, |out| {
+            value.encode(out)
+        })
     }
 
     pub(crate) fn finish(self, fixed_size: Option<usize>) {
@@ -780,9 +782,12 @@ mod tests {
         check("b", &true, &Value::Bool(true), |b: &[u8]| {
             encode_to_vec(&<bool>::decode(b)?)
         });
-        check("u", &0x0102_0304u32, &Value::U32(0x0102_0304), |b: &[u8]| {
-            encode_to_vec(&<u32>::decode(b)?)
-        });
+        check(
+            "u",
+            &0x0102_0304u32,
+            &Value::U32(0x0102_0304),
+            |b: &[u8]| encode_to_vec(&<u32>::decode(b)?),
+        );
         check(
             "t",
             &0x0102_0304_0506_0708u64,
@@ -793,9 +798,12 @@ mod tests {
             encode_to_vec(&<&str>::decode(b)?)
         });
         let bytes: &[u8] = &[0, 1, 2, 0, 4];
-        check("ay", &bytes, &Value::Bytes(vec![0, 1, 2, 0, 4]), |b: &[u8]| {
-            encode_to_vec(&<&[u8]>::decode(b)?)
-        });
+        check(
+            "ay",
+            &bytes,
+            &Value::Bytes(vec![0, 1, 2, 0, 4]),
+            |b: &[u8]| encode_to_vec(&<&[u8]>::decode(b)?),
+        );
     }
 
     #[test]

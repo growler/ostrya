@@ -27,7 +27,9 @@ mod ser;
 mod ty;
 mod value;
 
-pub use codec::{ArrayIter, GvDecode, GvEncode, GvType, Slice, Variant, encode_to_vec, write_array};
+pub use codec::{
+    ArrayIter, GvDecode, GvEncode, GvType, Slice, Variant, encode_to_vec, write_array,
+};
 pub use de::from_bytes;
 pub use error::{Error, Result};
 pub use ser::to_bytes;

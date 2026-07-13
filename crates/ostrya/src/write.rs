@@ -510,6 +510,9 @@ pub(crate) fn stage_symlink_blocking(
                     Some(gid(header.gid)),
                     AtFlags::SYMLINK_NOFOLLOW,
                 )?;
+                for (name, value) in header.xattrs.iter() {
+                    set_link_xattr(staging_fd, &staging_name, name, value)?;
+                }
             }
             target.len() as u64
         }
@@ -699,6 +702,23 @@ fn set_inode_xattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8]) -> Result<()> 
     let name = std::str::from_utf8(name)
         .map_err(|_| Error::InvalidFormat("xattr name is not valid UTF-8".into()))?;
     rustix::fs::fsetxattr(fd, name, value, XattrFlags::empty())?;
+    Ok(())
+}
+
+/// Set one xattr on a staged symlink inode, stripping the stored name's
+/// terminating NUL. A symlink cannot be opened for an fd, so the attribute is
+/// set no-follow through the `/proc/self/fd` path of the staging directory.
+fn set_link_xattr(
+    dir: BorrowedFd<'_>,
+    staging_name: &str,
+    name: &[u8],
+    value: &[u8],
+) -> Result<()> {
+    let name = name.strip_suffix(&[0]).unwrap_or(name);
+    let name = std::str::from_utf8(name)
+        .map_err(|_| Error::InvalidFormat("xattr name is not valid UTF-8".into()))?;
+    let link = format!("/proc/self/fd/{}/{}", dir.as_raw_fd(), staging_name);
+    rustix::fs::lsetxattr(link.as_str(), name, value, XattrFlags::empty())?;
     Ok(())
 }
 

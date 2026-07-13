@@ -349,12 +349,12 @@ impl Transaction {
 
     // tree building
     pub async fn write_dfd_to_mtree(&self, dfd: BorrowedFd<'_>, path: &Path,
-        mtree: &mut MutableTree, modifier: Option<&CommitModifier>) -> Result<()>;
+        mtree: &mut MutableTree, modifier: Option<&mut CommitModifier>) -> Result<()>;
     /// Port extension: merge an overlayfs upperdir changeset into an mtree
     /// holding the overlay's lower layer (see "Staging tree, tree merge,
     /// and overlay import").
     pub async fn merge_overlay_dfd_to_mtree(&self, dfd: BorrowedFd<'_>,
-        mtree: &mut MutableTree, modifier: Option<&CommitModifier>) -> Result<()>;
+        mtree: &mut MutableTree, modifier: Option<&mut CommitModifier>) -> Result<()>;
     pub async fn write_mtree(&self, mtree: &mut MutableTree) -> Result<RepoTree>;
 
     // path-addressed construction (port extension; see "Staging tree,
@@ -421,12 +421,15 @@ bitflags! { pub struct CommitModifierFlags: u32 {
 
 pub enum FilterResult { Allow, Skip }
 
+// The walk takes the modifier as `Option<&mut CommitModifier>`: the FnMut
+// callbacks run through the exclusive borrow, and the Send bound on each
+// box keeps the walk future Send.
 pub struct CommitModifier {
     pub flags: CommitModifierFlags,
-    pub filter: Option<Box<dyn FnMut(&Path, &FileMeta) -> FilterResult>>,
-    pub xattr_callback: Option<Box<dyn FnMut(&Path, &FileMeta) -> Xattrs>>,
+    pub filter: Option<Box<dyn FnMut(&Path, &FileMeta) -> FilterResult + Send>>,
+    pub xattr_callback: Option<Box<dyn FnMut(&Path, &FileMeta) -> Xattrs + Send>>,
+    pub label_callback: Option<Box<dyn FnMut(&Path, &FileMeta) -> Option<Vec<u8>> + Send>>,
     pub devino_cache: Option<DevInoCache>,
-    pub sepolicy: Option<SePolicy>,
 }
 ```
 

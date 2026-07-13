@@ -1,0 +1,3 @@
+# Fixture tarballs carry user.* xattrs and must not be line-ending normalized
+# or diffed as text.
+*.tar binary

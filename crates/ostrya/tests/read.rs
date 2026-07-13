@@ -3,10 +3,9 @@
 //! These exercise the Phase 5 gate: read objects, refs, and full trees from a
 //! tool-created repository and match the tool's own view. The metadata and
 //! traversal assertions are mode-independent (the fixtures share object bytes),
-//! so they run for both fixture repositories. The archive `load_file` path is
-//! fully self-contained and is the CI gate for file reading. The bare-user
-//! `load_file` path depends on the `user.ostreemeta` xattr, which git does not
-//! preserve, so its assertions run only when the xattr is present.
+//! so they run for both fixture repositories. The bare-user `load_file` path
+//! depends on the `user.ostreemeta` xattr; the bare-user fixture ships as a
+//! tarball that carries it (unpacked on demand), so these assertions always run.
 
 mod common;
 
@@ -19,7 +18,7 @@ use ostrya_core::{ContentHasher, FileHeader};
 use ostrya_rt::block_on;
 
 fn repo_path(mode_dir: &str) -> PathBuf {
-    fixture_root().join(mode_dir).join("repo")
+    fixture_repo(mode_dir)
 }
 
 fn csum(hex: &str) -> Checksum {
@@ -242,18 +241,8 @@ fn reads_archive_file_content() {
 
 #[test]
 fn reads_bare_user_file_content() {
-    // git does not preserve the `user.ostreemeta` xattr the bare-user objects
-    // rely on, so this cross-check runs only when the xattr survived (e.g. right
-    // after generate.sh). Otherwise it is skipped.
-    let hello_obj = repo_path("bare-user")
-        .join("objects")
-        .join(&HELLO_TXT[..2])
-        .join(format!("{}.file", &HELLO_TXT[2..]));
-    if !xattr_present(&hello_obj) {
-        eprintln!("skipping bare-user load_file: user.ostreemeta xattr not present");
-        return;
-    }
-
+    // The bare-user fixture tarball carries the `user.ostreemeta` xattr these
+    // objects rely on, so this cross-check always runs.
     block_on(async {
         let repo = Repo::open(&repo_path("bare-user"))
             .await
@@ -336,17 +325,4 @@ fn matches_the_tool_cat_and_ls() {
             }
         );
     });
-}
-
-/// Whether the object carries a `user.ostreemeta` xattr, growing the buffer as
-/// needed.
-fn xattr_present(path: &Path) -> bool {
-    let mut buf = vec![0u8; 256];
-    loop {
-        match rustix::fs::getxattr(path, "user.ostreemeta", &mut buf[..]) {
-            Ok(_) => return true,
-            Err(rustix::io::Errno::RANGE) => buf.resize(buf.len() * 2, 0),
-            Err(_) => return false,
-        }
-    }
 }

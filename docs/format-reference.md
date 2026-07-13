@@ -468,6 +468,59 @@ settings for the syncs it issues: `fsync=false` makes every sync a no-op,
 `syncfs` precedes the renames with directory `fsync`s after. The staging
 directory layout is transient and is not part of the on-disk format.
 
+## Commit modifier: canonical permissions, consume, and devino
+
+A filesystem tree is ingested into a repository under a set of options the
+tool exposes on `ostree commit` and the port models as a commit modifier.
+Two of these options change the object bytes and are recovered by black-box
+observation; the rest are ingest mechanics with no on-disk effect.
+
+Canonical permissions. The tool's `--canonical-permissions` option (the port's
+`CANONICAL_PERMISSIONS`) forces owner 0:0 and reduces each permission set to a
+canonical form. Recovered by committing files and directories of assorted modes
+with and without the option into an archive repository and reading the modes
+back with `ostree ls -R`:
+
+- uid and gid become 0. The tool refuses a non-zero `--owner-uid`/`--owner-gid`
+  together with `--canonical-permissions`, so canonical ingest always owns
+  objects 0:0.
+- A regular file's or directory's permission bits become `perm & 0o755`: the
+  owner bits and the group and other read and execute bits are kept, the group
+  and other write bits are dropped, and the setuid, setgid, and sticky bits are
+  dropped. Observed regular-file mappings: `0664`, `0666`, `01644`, and `02644`
+  all become `0644`; `0775`, `0777`, and `04755` become `0755`; `0640` stays
+  `0640`; `0600`, `0644`, `0700`, and `0755` are unchanged. Directory mappings
+  match: `0775`, `0777`, and `02755` become `0755`; `0700` stays `0700`.
+- A symlink is unchanged; its mode stays `S_IFLNK | 0o777`.
+
+This is the same permission rule `bare-user-only` applies to its inodes
+(`perm & 0o755`, see the loose-object inode-mode notes above). Because the
+canonicalized mode enters the file-content header, canonical ingest changes an
+object's identity, and therefore the dirtree and commit checksums, whenever an
+input mode is not already canonical (confirmed: the canonical commit checksum
+differs from the same tree committed 0:0 without the option).
+
+Consume. The tool's `--consume` option (the port's `CONSUME`) deletes the
+source content after it is committed. Recovered by committing `--consume base/src`:
+each file is removed as it is ingested and each directory is removed once its
+entries are gone, bottom-up, including the walk-root directory itself; the
+parent of the walk root is left in place. The tool adopts a source inode by
+rename into the object store where the inode already satisfies the target
+mode's on-disk form and the source shares a filesystem with the store, which
+avoids a copy; adoption is a performance optimization with no on-disk effect,
+so the port ingests by copy and then unlinks the source, producing byte-identical
+objects.
+
+Devino cache. The tool's `--link-checkout-speedup` builds a `(device, inode)`
+to checksum map so a source file that is a hardlink to an existing repository
+object is matched by its inode without being re-read, and `--devino-canonical`
+(`-I`, which implies the speedup) additionally assumes a matched object is
+unmodified and trusts the mapped checksum outright. The cache is populated by
+checkout (which records the inode of each object it writes) and consulted at
+ingest. A cache hit contributes the mapped checksum and stages no object. The
+mapping is a hashing shortcut with no on-disk effect: the object it names is
+identical to what re-hashing the file would produce.
+
 ## Extended attributes
 
 Storage form is GVariant `a(ayay)`: array of (name-bytes, value-bytes). A

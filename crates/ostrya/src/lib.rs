@@ -22,14 +22,21 @@
 //! into `objects/` at commit. It also covers in-memory tree assembly (Phase
 //! 7b): the [`MutableTree`] with lazy hydration and dirty tracking, and
 //! [`Transaction::write_mtree`], which serializes dirty subtrees into dirtree
-//! objects. Commits, checkout, and maintenance land in later phases.
+//! objects. It also covers filesystem ingest (Phase 7c):
+//! [`Transaction::write_dfd_to_mtree`], which walks an on-disk tree into a
+//! [`MutableTree`] under a [`CommitModifier`] that shapes what is committed
+//! (canonical permissions, an include/prune filter, xattr and SELinux label
+//! callbacks, a [`DevInoCache`], and source consumption). Commits, checkout,
+//! and maintenance land in later phases.
 
 pub mod config;
 pub mod error;
 pub mod file;
 mod hashing;
 mod inflate;
+mod ingest;
 mod lock;
+pub mod modifier;
 pub mod mtree;
 mod object;
 pub mod read;
@@ -45,6 +52,9 @@ pub use error::{Error, Result};
 pub use file::{ContentReader, FileKind, FileObject};
 pub use hashing::{HashingReader, HashingWriter};
 pub use lock::LockKind;
+pub use modifier::{
+    CommitModifier, CommitModifierFlags, DevInoCache, FilterFn, FilterResult, LabelFn, XattrFn,
+};
 pub use mtree::MutableTree;
 pub use ostrya_core::{Checksum, ObjectType, RepoMode};
 pub use read::CommitState;

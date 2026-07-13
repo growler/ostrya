@@ -51,9 +51,8 @@ fn reconstructs_every_fixture_loose_path() {
 /// archive mode.
 #[test]
 fn z_suffix_is_file_and_archive_only() {
-    let c =
-        Checksum::from_hex("b3c8e8525e8a5c3409bf6e6db5f5d656da77ae76d08cbc4f8b75b71879757a89")
-            .unwrap();
+    let c = Checksum::from_hex("b3c8e8525e8a5c3409bf6e6db5f5d656da77ae76d08cbc4f8b75b71879757a89")
+        .unwrap();
 
     let modes = [
         RepoMode::Bare,

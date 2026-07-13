@@ -88,12 +88,16 @@ fn dirmeta_shape_agrees() {
             Value::Array(
                 xattrs
                     .iter()
-                    .map(|(k, v)| Value::Tuple(vec![Value::from(k.clone()), Value::from(v.clone())]))
+                    .map(|(k, v)| {
+                        Value::Tuple(vec![Value::from(k.clone()), Value::from(v.clone())])
+                    })
                     .collect(),
             ),
         ]);
-        let entries: Vec<(&[u8], &[u8])> =
-            xattrs.iter().map(|(k, v)| (k.as_slice(), v.as_slice())).collect();
+        let entries: Vec<(&[u8], &[u8])> = xattrs
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
         let typed = (0u32, 0u32, 0o40755u32.swap_bytes(), Slice(&entries));
         let bytes = assert_typed_encode(DIRMETA_SIG, &typed, &value);
         assert_paths_agree::<DirMetaView>(DIRMETA_SIG, &value, &bytes);
@@ -138,8 +142,10 @@ fn dirtree_shape_agrees() {
                     .collect(),
             ),
         ]);
-        let file_refs: Vec<(&str, &[u8])> =
-            files.iter().map(|(n, c)| (n.as_str(), c.as_slice())).collect();
+        let file_refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.as_slice()))
+            .collect();
         let dir_refs: Vec<(&str, &[u8], &[u8])> = dirs
             .iter()
             .map(|(n, t, m)| (n.as_str(), t.as_slice(), m.as_slice()))
@@ -217,7 +223,11 @@ fn metadata_variants_agree() {
             .collect(),
     );
     let bytes = to_bytes(&ty, &value).unwrap();
-    assert_eq!(from_bytes(&ty, &bytes).unwrap(), value, "a{{sv}} Value decode");
+    assert_eq!(
+        from_bytes(&ty, &bytes).unwrap(),
+        value,
+        "a{{sv}} Value decode"
+    );
 
     let typed = <MetadataView as GvDecode>::decode(&bytes).unwrap();
     assert_eq!(

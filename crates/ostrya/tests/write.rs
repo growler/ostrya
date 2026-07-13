@@ -11,7 +11,7 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::{TmpDir, fixture_root, ostree_available};
+use common::{TmpDir, fixture_repo, ostree_available};
 use futures_lite::AsyncReadExt;
 use futures_lite::io::Cursor;
 use ostrya::{
@@ -81,9 +81,8 @@ fn object_bytes(root: &Path, hex: &str, ty: ObjectType, mode: RepoMode) -> Vec<u
 /// The bytes of a loose object in the checked-in fixture repository for `mode`.
 fn fixture_bytes(mode_dir: &str, hex: &str, ty: ObjectType, mode: RepoMode) -> Vec<u8> {
     std::fs::read(
-        fixture_root()
-            .join(mode_dir)
-            .join("repo/objects")
+        fixture_repo(mode_dir)
+            .join("objects")
             .join(loose_path(&csum(hex), ty, mode)),
     )
     .unwrap()
@@ -178,10 +177,11 @@ fn bare_user_objects_match_the_fixture() {
 
 /// The `user.ostreemeta` of a fixture object.
 fn fixture_ostreemeta(mode_dir: &str, hex: &str) -> Vec<u8> {
-    let path = fixture_root()
-        .join(mode_dir)
-        .join("repo/objects")
-        .join(loose_path(&csum(hex), ObjectType::File, RepoMode::BareUser));
+    let path = fixture_repo(mode_dir).join("objects").join(loose_path(
+        &csum(hex),
+        ObjectType::File,
+        RepoMode::BareUser,
+    ));
     let mut buf = vec![0u8; 256];
     let n = rustix::fs::getxattr(&path, "user.ostreemeta", &mut buf).unwrap();
     buf.truncate(n);

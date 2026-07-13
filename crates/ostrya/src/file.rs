@@ -336,7 +336,7 @@ fn load_bare(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> 
             uid,
             gid,
             mode,
-            xattrs: Xattrs::empty(),
+            xattrs: object::read_link_xattrs(objects_fd, &path)?,
             kind: FileKind::Symlink {
                 target: read_link_target(objects_fd, &path)?,
             },

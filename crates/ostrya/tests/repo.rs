@@ -5,18 +5,16 @@
 //! what the `ostree` tool writes; and cross-check that the tool opens and
 //! operates on a repository this crate creates.
 
+mod common;
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use common::fixture_repo;
 use ostrya::{CreateOptions, Repo, RepoMode};
 use ostrya_rt::block_on;
-
-/// Root of the tool-generated fixture repositories, one subdirectory per mode.
-fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/generated")
-}
 
 /// A throwaway directory removed when dropped.
 struct TmpDir(PathBuf);
@@ -58,7 +56,7 @@ fn opens_fixture_repos_and_reads_mode() {
         ("archive", RepoMode::Archive),
         ("bare-user", RepoMode::BareUser),
     ] {
-        let repo_path = fixture_root().join(mode_dir).join("repo");
+        let repo_path = fixture_repo(mode_dir);
         let repo = block_on(Repo::open(&repo_path)).expect("open fixture repo");
         assert_eq!(repo.mode(), expected, "mode for {mode_dir}");
         assert_eq!(repo.config().repo_version(), 1);

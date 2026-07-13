@@ -244,7 +244,13 @@ sysroot/deployment (admin), ~20-25% is network/gpg/tar/composefs.
 - Every phase ships unit tests plus golden-byte fixtures produced by running the
   `ostree` tool (checked into the repo). Byte-exactness is verified against
   these fixtures and cross-checked by having the tool read what the port writes
-  and vice versa.
+  and vice versa. The archive and bare fixtures are checked in as plain trees.
+  The bare-user-family fixtures (bare-user, canon, xattr) store each file's
+  logical metadata in a `user.ostreemeta` xattr, which git does not track, so
+  they are checked in as xattr-preserving tarballs under
+  `tests/fixtures/generated/<name>.tar` and unpacked on demand by the test
+  harness. Generating the fixtures needs the `ostree` tool; consuming them from
+  a fresh checkout does not.
 - Unit tests for the format-layer primitives (checksum, varint, mutable-tree,
   bloom, rollsum, dates, utf8, keyfile, etc.) are written early against
   reference vectors captured from the tool; they validate the format layer
@@ -617,7 +623,7 @@ file re-writes exactly the dirtrees on that path's spine, counted
 through the stats; invalid names and file/directory collisions are
 rejected.
 
-### Phase 7c -- Filesystem ingest: write_dfd_to_mtree and the modifier
+### Phase 7c -- Filesystem ingest: write_dfd_to_mtree and the modifier (DONE)
 
 Walking an on-disk tree through fd-relative syscalls, ingesting its
 contents through the 7a writers into a 7b `MutableTree`, under the

@@ -152,12 +152,12 @@ fn base64_decode_checksum(s: &str, alphabet: &[u8; 64], padded: bool) -> Result<
     let bytes = s.as_bytes();
     let expected = if padded { 44 } else { 43 };
     if bytes.len() != expected {
-        return Err(Error::InvalidChecksum("base64 checksum has the wrong length"));
+        return Err(Error::InvalidChecksum(
+            "base64 checksum has the wrong length",
+        ));
     }
     if padded && bytes[43] != b'=' {
-        return Err(Error::InvalidChecksum(
-            "base64 checksum is missing its pad",
-        ));
+        return Err(Error::InvalidChecksum("base64 checksum is missing its pad"));
     }
     let data = &bytes[..43];
     let mut out = [0u8; 32];

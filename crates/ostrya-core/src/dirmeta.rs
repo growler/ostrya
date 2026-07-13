@@ -55,7 +55,13 @@ impl GvType for DirMeta {
 /// [`DirMeta::serialize`], the only caller.
 impl GvEncode for DirMeta {
     fn encode(&self, out: &mut Vec<u8>) -> ostrya_gvariant::Result<()> {
-        (Be32(self.uid), Be32(self.gid), Be32(self.mode), &self.xattrs).encode(out)
+        (
+            Be32(self.uid),
+            Be32(self.gid),
+            Be32(self.mode),
+            &self.xattrs,
+        )
+            .encode(out)
     }
 }
 

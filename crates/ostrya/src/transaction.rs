@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ostrya_core::{Checksum, ObjectType, RepoMode};
 
@@ -42,9 +43,12 @@ pub struct TransactionStats {
     pub content_written: u32,
     /// The total on-disk size of the freshly staged content objects.
     pub content_bytes_written: u64,
-    /// Content objects skipped because their (device, inode) was already known.
-    /// The devino cache lands with checkout (Phase 8), so this stays 0 here.
+    /// Content objects skipped because their (device, inode) was already known
+    /// through a [`DevInoCache`](crate::DevInoCache) hit during a filesystem
+    /// ingest.
     pub devino_cache_hits: u32,
+    /// Entries a commit-modifier filter excluded during a filesystem ingest.
+    pub filtered: u32,
 }
 
 /// One object staged in a transaction, awaiting publication.
@@ -90,6 +94,10 @@ struct Staged {
 /// nothing behind.
 pub struct Transaction {
     repo: Repo,
+    /// Set by a filesystem ingest under
+    /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES). Read by
+    /// commit assembly (Phase 7d) to decide whether to emit `ostree.sizes`.
+    generate_sizes: AtomicBool,
     // Dropped in declaration order: the staged state and staging directory are
     // released, then the lock.
     staged: Mutex<Staged>,
@@ -111,6 +119,7 @@ impl Transaction {
     ) -> Transaction {
         Transaction {
             repo,
+            generate_sizes: AtomicBool::new(false),
             staged: Mutex::new(Staged {
                 objects: HashMap::new(),
                 sizes: HashMap::new(),
@@ -133,6 +142,30 @@ impl Transaction {
             .as_ref()
             .expect("staging directory present during the transaction")
             .dir_fd()
+    }
+
+    /// Mark that this transaction should emit `ostree.sizes` at commit. Set by
+    /// a filesystem ingest under
+    /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES).
+    pub(crate) fn mark_generate_sizes(&self) {
+        self.generate_sizes.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether size generation was requested. Read by commit assembly in Phase
+    /// 7d, which is the first non-test caller.
+    #[allow(dead_code)]
+    pub(crate) fn generate_sizes(&self) -> bool {
+        self.generate_sizes.load(Ordering::Relaxed)
+    }
+
+    /// Count one content object skipped through a devino-cache hit.
+    pub(crate) fn note_devino_hit(&self) {
+        self.staged.lock().unwrap().stats.devino_cache_hits += 1;
+    }
+
+    /// Count one entry excluded by a commit-modifier filter.
+    pub(crate) fn note_filtered(&self) {
+        self.staged.lock().unwrap().stats.filtered += 1;
     }
 
     /// Stage a regular-file content object whose payload is already written to

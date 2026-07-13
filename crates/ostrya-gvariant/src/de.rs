@@ -32,7 +32,9 @@ fn parse(ty: &Type, data: &[u8], depth: usize) -> Result<Value> {
         Type::Array(elem) if **elem == Type::Byte => Ok(Value::Bytes(data.to_vec())),
         Type::Array(elem) => parse_array(elem, data, depth),
         Type::Tuple(members) => parse_struct(ty, members.iter(), data, depth),
-        Type::DictEntry(key, value) => parse_struct(ty, [&**key, &**value].into_iter(), data, depth),
+        Type::DictEntry(key, value) => {
+            parse_struct(ty, [&**key, &**value].into_iter(), data, depth)
+        }
         Type::Variant => {
             let (child, _, child_ty) = split_variant(data)?;
             let value = parse(&child_ty, child, depth + 1)?;

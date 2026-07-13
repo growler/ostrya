@@ -68,6 +68,13 @@ pub(crate) fn object_exists(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> Resu
     }
 }
 
+/// The on-disk size in bytes of a loose object at `path` relative to `dir`. A
+/// missing object surfaces as `ErrorKind::NotFound`.
+pub(crate) fn object_size(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<u64> {
+    let stat = rustix::fs::statat(dir, path, AtFlags::SYMLINK_NOFOLLOW)?;
+    Ok(stat.st_size.max(0) as u64)
+}
+
 /// Open a content object as a positioned [`std::fs::File`], seeking past
 /// `skip` bytes (the framed header, for archive objects). The returned file is
 /// handed to a streaming reader.

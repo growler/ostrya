@@ -97,6 +97,21 @@ no value bits) is not accepted. Rejecting non-minimal forms keeps
 unpack-then-pack of an entry byte-identical. The trailing objtype byte is
 present on newer commits; parsers tolerate its absence.
 
+The key holds an entry for every object reachable in the commit, not only
+content objects. Recovered by decoding a `commit --generate-sizes` commit on
+ostree 2026.1: the entries cover the content objects and the dirtree and
+dirmeta metadata objects, sorted together by ASCII checksum, and each entry's
+trailing byte carries that object's own type (`File`=1, `DirTree`=2,
+`DirMeta`=3). The commit object itself is absent, as it does not exist when the
+key is computed. The compressed size is the object's on-disk size (a content
+object's `.filez` storage size, a metadata object's serialized byte length);
+the unpacked size is the object's logical `st_size` -- a regular file's payload
+length, a symlink's target length, and a metadata object's serialized byte
+length -- so for a metadata object, stored uncompressed, the compressed and
+unpacked sizes are equal. When the commit carries caller-supplied metadata,
+`ostree.sizes` is appended after it (observed: a branch commit's
+`ostree.ref-binding` precedes the `ostree.sizes` the tool adds).
+
 `ostree.sizes` is written only by archive-mode repositories; the compressed
 size is the `.filez` storage size, which makes it the only storage-dependent
 commit-metadata field. Observed on ostree 2026.1: requesting size generation
@@ -319,6 +334,14 @@ an alias is written as a relative symlink. Refspec `remote:ref` maps to
 `refs/remotes/remote/ref`; a bare `ref` maps to `refs/heads/ref`. Every ref is
 an individual loose file; there is no packed-refs mechanism.
 
+Writing a ref whose file is an alias symlink replaces the symlink with a regular
+ref file; the alias target is left unchanged. Observed with the tool by
+committing onto an alias and by `ostree refs --create --force`: in both cases
+`refs/heads/foo` (a relative symlink to sibling `bar`) became a 65-byte regular
+file holding the new checksum, and `refs/heads/bar` kept its old checksum. The
+tool writes the ref by renaming a fresh temp file over the target name, and the
+rename replaces the symlink at that name instead of following it.
+
 Repository lock and staging (recovered by tracing the tool). The tool opens
 `<repo>/.lock` `O_RDWR|O_CREAT` mode `0660` and takes an `fcntl` OFD lock on it,
 shared (`F_RDLCK`) for the duration of a commit and exclusive (`F_WRLCK`) for
@@ -447,8 +470,12 @@ Archive `.filez` layout (extends "File content object header"):
   compressed payload is not required for interoperability.
 
 Object store fanout directories `objects/<xx>/` are created with request mode
-0777 (reduced by the umask); `objects/` itself is 0775. In `bare-user-shared`
-they are 02775 (setgid, shared group).
+0777 (reduced by the umask); `objects/` itself is 0775. This is the same in
+every mode. Group sharing of a `bare-user-shared` repository is arranged at the
+filesystem level (see the bare-user-shared section): with the repository
+directory setgid and carrying a default group ACL, the OS propagates the group,
+the setgid bit, and the group-write permission to each fanout directory as it is
+created.
 
 Durability and staging (traced): the tool ingests each object into an unnamed
 temp file (`O_TMPFILE` in the staging directory) and materializes it with
@@ -698,10 +725,14 @@ Storage. Identical to `bare-user` in every byte that carries identity:
 The single behavioral difference from `bare-user`: the logical mode is never
 applied to the inode. Objects are written with a fixed mode 0644 via explicit
 `fchmod` (never trusting umask). Repository directories -- `objects/xx/`,
-`tmp/`, staging directories -- are created 2775, setgid with the shared
-group, so every group member reads and deduplicates every object. `.lock` is
-written 0664, so every group member can open it for writing and take the
-exclusive lock.
+`tmp/`, staging directories -- are created with request mode 0777 reduced by
+the umask. Group sharing of these directories is arranged at the filesystem
+level: the operator sets the repository directory setgid 2775 with a default
+group ACL (`setfacl -d -m g::rwx`) before `init`, and the OS propagates the
+group, the setgid bit, and the group-write permission to every directory
+created underneath, so every group member can read, deduplicate, and write
+objects. `.lock` is written 0664, so every group member can open it for writing
+and take the exclusive lock.
 
 Mode string. `[core] mode=bare-user-shared`. The distinct string is a safety
 fence: under a literal `bare-user` string the upstream tool would accept the

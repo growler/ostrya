@@ -59,15 +59,20 @@ struct StagedObject {
     dest: String,
 }
 
-/// The archive size record for a content object, the input for `ostree.sizes`
-/// in Phase 7d, which is where these fields are first read.
+/// The archive size record for one staged object, the input for `ostree.sizes`
+/// emission in [`write_commit`](crate::Transaction::write_commit). The tool's
+/// `ostree.sizes` covers every object in the commit -- content and metadata
+/// alike -- so a record is kept per object type, not only for content.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct SizeRecord {
-    /// The on-disk (compressed) size of the `.filez`.
+    /// The on-disk size: the `.filez` storage size for archive content, the
+    /// serialized byte length for a metadata object.
     pub(crate) compressed: u64,
-    /// The uncompressed payload size.
+    /// The logical (unpacked) size: a file's payload length, a symlink's
+    /// target length, or a metadata object's byte length.
     pub(crate) unpacked: u64,
+    /// The object type, written as the trailing `ostree.sizes` entry byte.
+    pub(crate) objtype: ObjectType,
 }
 
 /// The mutable state shared by concurrent writers on one transaction.
@@ -75,7 +80,8 @@ struct Staged {
     /// Objects staged so far, keyed by identity and type for in-transaction
     /// dedup and for publication at commit.
     objects: HashMap<(Checksum, ObjectType), StagedObject>,
-    /// Per-content-object size records (archive mode), keyed by checksum.
+    /// Per-object size records (archive mode), keyed by checksum. Covers
+    /// content and metadata objects, the input for `ostree.sizes`.
     sizes: HashMap<Checksum, SizeRecord>,
     /// Remaining write budget in bytes before the configured free-space reserve
     /// is breached.
@@ -101,6 +107,10 @@ pub struct Transaction {
     // Dropped in declaration order: the staged state and staging directory are
     // released, then the lock.
     staged: Mutex<Staged>,
+    /// Refspec-to-checksum writes queued by [`set_ref`](Transaction::set_ref)
+    /// and applied at [`commit`](Transaction::commit), after object
+    /// publication, per the durability contract.
+    pub(crate) refs: Mutex<Vec<crate::refs::RefWrite>>,
     staging: Option<StagingDir>,
     /// The repository lock hold, kept for the transaction's lifetime and
     /// released when this field drops. Never read.
@@ -126,6 +136,7 @@ impl Transaction {
                 free_budget,
                 stats: TransactionStats::default(),
             }),
+            refs: Mutex::new(Vec::new()),
             staging: Some(staging),
             lock,
         }
@@ -151,11 +162,33 @@ impl Transaction {
         self.generate_sizes.store(true, Ordering::Relaxed);
     }
 
-    /// Whether size generation was requested. Read by commit assembly in Phase
-    /// 7d, which is the first non-test caller.
-    #[allow(dead_code)]
+    /// Whether size generation was requested. Read by
+    /// [`write_commit`](Transaction::write_commit) to decide whether to emit
+    /// `ostree.sizes`.
     pub(crate) fn generate_sizes(&self) -> bool {
         self.generate_sizes.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot the archive size records for the objects freshly staged so far,
+    /// as `ostree.sizes` entries. Read by
+    /// [`write_commit`](Transaction::write_commit) before it stages the commit
+    /// object, so the commit's own size is never among them; `write_commit`
+    /// looks each reachable object up in this snapshot and recovers the sizes of
+    /// any it does not find (an object that deduplicated against `objects/`)
+    /// from disk, so a multi-commit transaction gives each commit its own
+    /// reachable-scoped key.
+    pub(crate) fn size_entries(&self) -> Vec<ostrya_core::sizes::SizeEntry> {
+        let staged = self.staged.lock().unwrap();
+        staged
+            .sizes
+            .iter()
+            .map(|(checksum, rec)| ostrya_core::sizes::SizeEntry {
+                checksum: *checksum,
+                compressed: rec.compressed,
+                unpacked: rec.unpacked,
+                objtype: Some(rec.objtype),
+            })
+            .collect()
     }
 
     /// Count one content object skipped through a devino-cache hit.
@@ -281,18 +314,27 @@ impl Transaction {
                 dest: outcome.dest,
             },
         );
+        // In archive mode every staged object -- content and metadata alike --
+        // contributes an `ostree.sizes` record. A metadata object is stored
+        // raw, so its unpacked size equals its on-disk size.
+        if mode.is_archive() {
+            let unpacked = if ty == ObjectType::File {
+                outcome.unpacked
+            } else {
+                outcome.on_disk_size
+            };
+            staged.sizes.insert(
+                checksum,
+                SizeRecord {
+                    compressed: outcome.on_disk_size,
+                    unpacked,
+                    objtype: ty,
+                },
+            );
+        }
         if ty == ObjectType::File {
             staged.stats.content_written += 1;
             staged.stats.content_bytes_written += outcome.on_disk_size;
-            if mode.is_archive() {
-                staged.sizes.insert(
-                    checksum,
-                    SizeRecord {
-                        compressed: outcome.on_disk_size,
-                        unpacked: outcome.unpacked,
-                    },
-                );
-            }
         } else {
             staged.stats.metadata_written += 1;
         }
@@ -305,15 +347,23 @@ impl Transaction {
         Ok((config.fsync()?, config.per_object_fsync()?))
     }
 
-    /// Finish the transaction, publishing its staged objects into `objects/`.
+    /// Finish the transaction, publishing its staged objects into `objects/`
+    /// and then applying the queued ref writes.
     ///
     /// Publication follows the durability contract: with fsync enabled, the
     /// repository is `syncfs`-ed before the staged objects are renamed into
     /// `objects/<xx>/`, and each touched fanout directory and `objects/` is
-    /// `fsync`-ed afterward. The staging directory is then reaped and the lock
+    /// `fsync`-ed afterward. Only then are the queued refs written, each
+    /// individually atomic (tmpfile, fdatasync, rename), so every object a ref
+    /// names is durable before the ref points at it; the set of ref writes is
+    /// not atomic as a whole. Queued refspecs are validated up front, before
+    /// any object is published, so a malformed refspec fails the commit with
+    /// nothing written. The staging directory is then reaped and the lock
     /// released.
     pub async fn commit(mut self) -> Result<TransactionStats> {
+        let refs = self.resolve_ref_queue()?;
         self.publish().await?;
+        self.write_resolved_refs(&refs).await?;
         let stats = self.staged.lock().unwrap().stats;
         self.reap_staging().await;
         Ok(stats)
@@ -327,7 +377,6 @@ impl Transaction {
 
     /// Rename every staged object into `objects/` on the blocking pool.
     async fn publish(&self) -> Result<()> {
-        let mode = self.repo.mode();
         let objects: Vec<(String, String)> = {
             let staged = self.staged.lock().unwrap();
             staged
@@ -348,7 +397,6 @@ impl Transaction {
                 repo_fd.as_fd(),
                 objects_fd.as_fd(),
                 staging_fd.as_fd(),
-                mode,
                 &objects,
                 fsync,
             )

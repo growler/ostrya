@@ -181,6 +181,22 @@ XATTR_COMMIT="$(ostree --repo="$xattr_repo" commit \
     --owner-uid=0 --owner-gid=0 --timestamp="$TIMESTAMP" "$XATTR_SRC")"
 emit_tar "$xattr_repo" "xattr"
 
+# --- archive size-generation fixture (Phase 7d) ---
+# The deterministic source tree committed into an archive repo with
+# --generate-sizes. The tool records an ostree.sizes metadata key covering every
+# object reachable in the commit -- content objects and the dirtree/dirmeta
+# metadata objects alike, each carrying its own object-type byte -- so the commit
+# object differs from the sizes-free archive fixture. Archive mode stores no
+# xattrs, so this is a plain tree. See format-reference.md, "Commit -- the
+# ostree.sizes key".
+sizes_repo="$WORK/repo-sizes"
+ostree --repo="$sizes_repo" init --mode=archive-z2 >/dev/null
+SIZES_COMMIT="$(ostree --repo="$sizes_repo" commit \
+    --branch="$BRANCH" --subject="$SUBJECT" \
+    --owner-uid="$OWNER_UID" --owner-gid="$OWNER_GID" \
+    --no-xattrs --generate-sizes --timestamp="$TIMESTAMP" "$SRC")"
+emit_tree "$sizes_repo" "sizes"
+
 COMMIT="${CHECKSUM[$first]}"
 CONTENT="$(ostree --repo="$WORK/repo-$first" show "$COMMIT" |
     sed -n 's/^ContentChecksum:[[:space:]]*//p')"
@@ -199,6 +215,7 @@ modes=${MODES[*]}
 bare_owner=${BARE_UID}:${BARE_GID}
 canon_commit=${CANON_COMMIT}
 xattr_commit=${XATTR_COMMIT}
+sizes_commit=${SIZES_COMMIT}
 EOF
 
 echo "generated fixtures in ${OUT_DIR}"

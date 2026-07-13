@@ -204,8 +204,11 @@ serving as a composefs backing store. The full format is in
 Summary. Storage is `bare-user` -- raw payload on disk, logical
 uid/gid/mode/xattrs in the `user.ostreemeta` xattr, symlinks as regular
 files -- with one behavioral difference: the logical mode is never applied to
-the inode. Objects carry a fixed mode 0644, repository directories are setgid
-2775 with a shared group, and `.lock` is group-writable. This resolves the
+the inode. Objects carry a fixed mode 0644, and `.lock` is group-writable;
+group sharing of the repository directories is arranged at the filesystem
+level, with the repository directory made setgid 2775 and given a default group
+ACL before `init` so the OS propagates the group to everything created
+underneath. This resolves the
 `bare-user` lockout on restrictively-permissioned files in a shared
 repository (an `/etc/shadow` object stored 0600 by one user is unreadable to
 the next). Object identity, and therefore dirtree and commit hashes, are
@@ -226,8 +229,10 @@ Design thread across phases:
   never consults inode permissions.
 - Phase 7: the `bare-user` writer with the inode mode application skipped:
   objects `fchmod` 0644 (never trusting umask), repository directories
-  created setgid 2775 with the shared group, `.lock` written 0664; size
-  generation is archive-only, so a request in this mode is a no-op.
+  created 0777 reduced by the umask (a group-shared repository relies on a
+  setgid parent and default group ACL set by the operator before `init`),
+  `.lock` written 0664; size generation is archive-only, so a request in this
+  mode is a no-op.
 - Phase 8: copy-based checkout (reflink where the filesystem supports it)
   applying the `user.ostreemeta` mode; hardlink checkout refused.
 - Phase 9: fsck and prune as `bare-user`; inode permissions are not
@@ -550,15 +555,18 @@ Definition:
   `min-free-space-percent` / `min-free-space-size` set a byte budget;
   each staged object debits it; exhaustion fails the write with a
   dedicated error carrying the shortfall.
-- `object_sizes`: in archive mode each content write records the
-  compressed size and the unpacked size keyed by checksum, the input for
-  `ostree.sizes` in 7d. Every entry is a content object, so the objtype
-  byte an `ostree.sizes` entry carries is fixed to the file type and is
-  supplied at emission rather than stored per record.
+- `object_sizes`: in archive mode each staged object records its on-disk
+  (compressed) size and its logical (unpacked) size keyed by checksum, the
+  input for `ostree.sizes` in 7d. The tool's `ostree.sizes` covers every
+  object in the commit -- content objects and the dirtree/dirmeta metadata
+  objects alike -- so a record is kept for metadata as well as content, and
+  each carries its own object-type byte (recovered by observation; see
+  `format-reference.md`, "Commit -- the ostree.sizes key").
 - Object publication in `Transaction::commit()`, the object half of the
   durability contract: `syncfs` on the repo fd, rename staged objects
-  into `objects/xx/` (fanout directories created on demand; 2775 in
-  bare-user-shared, group inherited from the setgid parent), fsync each
+  into `objects/xx/` (fanout directories created on demand at 0777 reduced by
+  the umask; in a group-shared repository the group and setgid bit are
+  inherited from the operator-configured parent), fsync each
   touched `objects/xx/` and `objects/`. `fsync=false` turns every sync
   into a no-op; `per-object-fsync` follows the tool's recovered pattern.
   `commit(self)` returns `TransactionStats` (the devino counter stays 0
@@ -678,7 +686,7 @@ with its corresponding option; a devino hit skips rehashing (stats, and
 no duplicate staging); CONSUME leaves the consumed source empty; the
 xattr fixture (unprivileged `user.*` names) round-trips.
 
-### Phase 7d -- Commit assembly, refs, and durable publication
+### Phase 7d -- Commit assembly, refs, and durable publication (DONE)
 
 The commit object, detached commit metadata, the ref queue and immediate
 ref writes, and the completed transaction commit sequence. 7d closes the
@@ -700,10 +708,20 @@ Definition:
   keys the tool writes for a branch commit and the conformance tests
   supply the same. `write_commit` adds nothing on its own.
 - `ostree.sizes`: when the transaction is marked GENERATE_SIZES and the
-  repository is archive mode, entries pack from the 7a `object_sizes`
-  map (checksum-sorted, LEB128 sizes, trailing objtype byte) and merge
-  into the metadata dict; in every other mode the marked commit's bytes
-  are identical to an unmarked one.
+  repository is archive mode, `write_commit` walks the committed tree to
+  find the objects reachable from its root (root dirmeta, each dirtree,
+  each subdirectory dirmeta, each file entry) and packs one entry per
+  reachable object (checksum-sorted, LEB128 sizes, trailing objtype byte)
+  into the metadata dict. A freshly staged object uses the 7a
+  `object_sizes` record; an object that already existed in `objects/` and
+  deduplicated has its sizes recovered from its loose object (on-disk size
+  for the compressed size, the file header's uncompressed size or a
+  symlink target length for the unpacked size, a metadata object's byte
+  length for both). The walk descends into pre-existing subtrees, so an
+  incremental commit that reaches objects from an earlier commit lists
+  them too. Scoping to the reachable set gives each commit its own key
+  when one transaction stages more than one commit; in every other mode
+  the marked commit's bytes are identical to an unmarked one.
 - Detached metadata: `Repo::write_commit_detached_metadata` and
   `read_commit_detached_metadata`; a bare `a{sv}` at the `.commitmeta`
   loose path, replaced atomically (tmpfile, fdatasync, rename); `None`
@@ -994,8 +1012,9 @@ Resolved:
 5. Development mode `bare-user-shared` (Phase 6a; supersedes the
    `bare-user-split-attrs` object split, removed before its write path was
    built): `bare-user` storage with the logical mode never applied to the
-   inode -- fixed 0644 objects, setgid shared-group directories, a
-   group-writable lock -- so a group-shared repository on a multi-user build
+   inode -- fixed 0644 objects and a group-writable lock, with directory group
+   sharing arranged at the filesystem level (an operator-set setgid parent and
+   default group ACL) -- so a group-shared repository on a multi-user build
    host has no lockout on restrictively-permissioned files. Object identity
    is preserved for development-to-production portability, `ostree.sizes`
    never appears (size generation is archive-only in the tool, a no-op

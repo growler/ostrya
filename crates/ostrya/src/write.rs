@@ -409,10 +409,16 @@ fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind)> {
 
 /// A per-process-unique ingestion temp file name.
 fn temp_name() -> String {
+    format!(".ostrya-tmp-{}-{}", std::process::id(), unique())
+}
+
+/// A per-process-unique counter value for temp file names. Every temp-name
+/// helper in the crate draws from this single counter, so the suffixes they
+/// format stay unique within the process.
+pub(crate) fn unique() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(".ostrya-tmp-{}-{n}", std::process::id())
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The shared context for the blocking staging helpers: the directory fds, the
@@ -437,10 +443,11 @@ pub(crate) struct StageOutcome {
     /// The staged file's on-disk size in bytes, when freshly staged. In archive
     /// mode this is the compressed `.filez` storage size.
     pub(crate) on_disk_size: u64,
-    /// The uncompressed payload size in bytes. Equal to `on_disk_size` in the
-    /// bare family, where the payload is stored raw; in archive mode it is the
-    /// pre-compression size. Zero for objects with no regular-file payload
-    /// (symlinks and metadata). Carried into the archive size map.
+    /// The logical (unpacked) content size in bytes: a regular file's
+    /// pre-compression payload length, a symlink's target length, and zero for
+    /// a metadata object (whose size the caller fills from `on_disk_size`).
+    /// This is the `st_size` the tool records for the object in `ostree.sizes`.
+    /// Carried into the archive size map.
     pub(crate) unpacked: u64,
     /// The flat staging name the object was linked under, when freshly staged.
     pub(crate) staging_name: String,
@@ -548,7 +555,9 @@ pub(crate) fn stage_symlink_blocking(
     Ok(StageOutcome {
         deduped: false,
         on_disk_size,
-        unpacked: 0,
+        // The logical (unpacked) size of a symlink object is its target length,
+        // matching the `st_size` the tool records for it in `ostree.sizes`.
+        unpacked: target.len() as u64,
         staging_name,
         dest,
     })
@@ -591,7 +600,6 @@ pub(crate) fn publish_blocking(
     repo_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
     staging_fd: BorrowedFd<'_>,
-    mode: RepoMode,
     objects: &[(String, String)],
     fsync: bool,
 ) -> Result<()> {
@@ -601,7 +609,7 @@ pub(crate) fn publish_blocking(
     let mut fanouts: Vec<String> = Vec::new();
     for (staging_name, dest) in objects {
         let fanout = &dest[..2];
-        ensure_fanout(objects_fd, fanout, mode)?;
+        ensure_fanout(objects_fd, fanout)?;
         rustix::fs::renameat(staging_fd, staging_name.as_str(), objects_fd, dest.as_str())?;
         if !fanouts.iter().any(|f| f == fanout) {
             fanouts.push(fanout.to_owned());
@@ -623,14 +631,13 @@ pub(crate) fn publish_blocking(
 }
 
 /// Create a fanout directory `objects/<xx>/` on demand, ignoring a race that
-/// already created it. bare-user-shared uses a setgid, group-shared directory.
-fn ensure_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, mode: RepoMode) -> Result<()> {
-    let dir_mode = if mode == RepoMode::BareUserShared {
-        0o2775
-    } else {
-        0o777
-    };
-    match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(dir_mode)) {
+/// already created it. The request mode is `0777` reduced by the umask. A
+/// group-shared repository is arranged at the filesystem level, not here: an
+/// operator sets the repository directory setgid `2775` with a default group
+/// ACL (`setfacl -d -m g::rwx`) before `init`, and the OS propagates the group,
+/// setgid bit, and permissions to every directory created underneath.
+fn ensure_fanout(objects_fd: BorrowedFd<'_>, fanout: &str) -> Result<()> {
+    match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(0o777)) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -649,7 +656,7 @@ fn dedup(dest: String) -> StageOutcome {
 
 /// The flat staging name for an object: its full hex checksum plus the loose
 /// extension, holding the whole object in one staging-directory entry.
-fn flat_name(checksum: &Checksum, ty: ObjectType, mode: RepoMode) -> String {
+pub(crate) fn flat_name(checksum: &Checksum, ty: ObjectType, mode: RepoMode) -> String {
     format!("{}.{}", checksum.to_hex(), ty.extension(mode))
 }
 

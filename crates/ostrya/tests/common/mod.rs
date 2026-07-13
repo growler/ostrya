@@ -67,6 +67,9 @@ pub const HELLO_TXT: &str = "cfffd52f38d14c87cf46e18d5260074421ba5961f0895954e99
 pub const LINK: &str = "f66efa496a72379413c44593de510dc344beb045294f1a543da87b2b6118db35";
 pub const SUBDIR_DIRTREE: &str = "78154b9650d2a28716fd4a83584a2d9cba1833be4851714d8a0e89e8933c875a";
 pub const NESTED_TXT: &str = "a4d80a620354908d76238bea8185775d2f6d60f55a1506d16ee06af212b4a125";
+/// The commit of the archive `--generate-sizes` fixture (its metadata carries
+/// the `ostree.sizes` key, so it differs from the sizes-free [`COMMIT`]).
+pub const SIZES_COMMIT: &str = "3ecadc59022c36743e1b233afbf3bde7b25239b77035185a3acc2af9d84478f0";
 
 /// A throwaway directory removed when dropped.
 pub struct TmpDir(PathBuf);

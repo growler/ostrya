@@ -1,14 +1,23 @@
-//! Ref resolution and listing.
+//! Ref resolution, listing, and writing.
 //!
 //! A ref is a loose file under `refs/` holding a 64-char hex checksum and a
-//! trailing newline. A local ref `name` maps to `refs/heads/name`; a refspec
-//! `remote:name` maps to `refs/remotes/remote/name`. A ref may be a relative
-//! symlink aliasing another ref; opening follows the link and reads the target
-//! ref's checksum. Refspec components are validated to keep resolution inside
-//! the `refs/` tree.
+//! trailing newline (65 bytes). A local ref `name` maps to `refs/heads/name`; a
+//! refspec `remote:name` maps to `refs/remotes/remote/name`; a collection ref
+//! maps to `refs/mirrors/collection/name`. A ref may be a relative symlink
+//! aliasing another ref; opening follows the link and reads the target ref's
+//! checksum. Refspec components are validated to keep resolution inside the
+//! `refs/` tree.
+//!
+//! Writes are individually atomic -- a fresh file written, `fdatasync`-ed when
+//! fsync is enabled, and renamed over the target, with the parent directories
+//! created for a `/`-bearing name. A `None` checksum removes the ref file. A
+//! transaction queues its ref writes with [`Transaction::set_ref`] and applies
+//! them at commit after object publication;
+//! [`Repo::set_ref_immediate`](Repo::set_ref_immediate) writes one outside a
+//! transaction.
 
-use std::io::Read;
-use std::os::fd::{AsFd, OwnedFd};
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use ostrya_core::Checksum;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -16,6 +25,115 @@ use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::repo::Repo;
+use crate::transaction::Transaction;
+
+/// A collection-qualified ref: a ref name optionally bound to a collection id.
+///
+/// A ref with a collection id maps to `refs/mirrors/<collection>/<name>`; one
+/// without maps to a local `refs/heads/<name>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRef {
+    /// The collection id, or `None` for a local ref.
+    pub collection_id: Option<String>,
+    /// The ref name, which may contain `/`.
+    pub ref_name: String,
+}
+
+impl CollectionRef {
+    /// A ref bound to a collection id.
+    pub fn new(collection_id: impl Into<String>, ref_name: impl Into<String>) -> CollectionRef {
+        CollectionRef {
+            collection_id: Some(collection_id.into()),
+            ref_name: ref_name.into(),
+        }
+    }
+
+    /// A local ref with no collection id.
+    pub fn local(ref_name: impl Into<String>) -> CollectionRef {
+        CollectionRef {
+            collection_id: None,
+            ref_name: ref_name.into(),
+        }
+    }
+}
+
+/// A queued ref target: either a refspec or a collection ref.
+enum QueuedRef {
+    Ref(String),
+    Collection(CollectionRef),
+}
+
+impl QueuedRef {
+    /// The path under `refs/` this target writes to, rejecting a name that
+    /// would escape the tree.
+    fn relpath(&self) -> Result<String> {
+        match self {
+            QueuedRef::Ref(refspec) => refspec_to_relpath(refspec),
+            QueuedRef::Collection(cref) => collection_ref_to_relpath(cref),
+        }
+    }
+}
+
+/// One queued ref write: a target and the checksum to point it at (`None`
+/// removes the ref).
+pub(crate) struct RefWrite {
+    target: QueuedRef,
+    checksum: Option<Checksum>,
+}
+
+impl Transaction {
+    /// Queue a refspec-to-checksum write, applied at
+    /// [`commit`](Transaction::commit) after object publication. A `None`
+    /// checksum queues the ref's removal. The refspec is validated at commit,
+    /// before any object is published.
+    pub fn set_ref(&self, refspec: &str, checksum: Option<&Checksum>) {
+        self.refs.lock().unwrap().push(RefWrite {
+            target: QueuedRef::Ref(refspec.to_owned()),
+            checksum: checksum.copied(),
+        });
+    }
+
+    /// Queue a collection-ref write, applied at
+    /// [`commit`](Transaction::commit). A `None` checksum queues the ref's
+    /// removal.
+    pub fn set_collection_ref(&self, cref: &CollectionRef, checksum: Option<&Checksum>) {
+        self.refs.lock().unwrap().push(RefWrite {
+            target: QueuedRef::Collection(cref.clone()),
+            checksum: checksum.copied(),
+        });
+    }
+
+    /// Map every queued ref to its path under `refs/`, failing on a malformed
+    /// refspec. Called at the start of [`commit`](Transaction::commit) so a bad
+    /// refspec fails before any object is published.
+    pub(crate) fn resolve_ref_queue(&self) -> Result<Vec<(String, Option<Checksum>)>> {
+        let queue = self.refs.lock().unwrap();
+        queue
+            .iter()
+            .map(|w| Ok((w.target.relpath()?, w.checksum)))
+            .collect()
+    }
+
+    /// Write the resolved refs on the blocking pool, each atomically.
+    pub(crate) async fn write_resolved_refs(
+        &self,
+        refs: &[(String, Option<Checksum>)],
+    ) -> Result<()> {
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let fsync = self.repo().config().fsync()?;
+        let repo_fd = self.repo().repo_fd().try_clone_to_owned()?;
+        let refs = refs.to_vec();
+        ostrya_rt::unblock(move || {
+            for (relpath, checksum) in &refs {
+                write_ref_blocking(repo_fd.as_fd(), relpath, *checksum, fsync)?;
+            }
+            Ok(())
+        })
+        .await
+    }
+}
 
 /// The largest ref file the reader will load; a ref is 65 bytes.
 const REF_READ_CAP: u64 = 4096;
@@ -53,6 +171,22 @@ impl Repo {
         }
         refs.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(refs)
+    }
+
+    /// Write one ref outside a transaction, atomically. A `None` checksum
+    /// removes the ref file. The write follows the same tmpfile, `fdatasync`,
+    /// rename sequence a transaction uses, honoring `[core] fsync`.
+    pub async fn set_ref_immediate(
+        &self,
+        refspec: &str,
+        checksum: Option<&Checksum>,
+    ) -> Result<()> {
+        let relpath = refspec_to_relpath(refspec)?;
+        let fsync = self.config().fsync()?;
+        let checksum = checksum.copied();
+        let repo_fd = self.repo_fd().try_clone_to_owned()?;
+        ostrya_rt::unblock(move || write_ref_blocking(repo_fd.as_fd(), &relpath, checksum, fsync))
+            .await
     }
 }
 
@@ -182,6 +316,100 @@ fn check_component(component: &str) -> Result<()> {
         return Err(Error::InvalidFormat(format!(
             "invalid refspec component '{component}'"
         )));
+    }
+    Ok(())
+}
+
+/// Map a collection ref to its path under `refs/`. A collection id places the
+/// ref under `refs/mirrors/<collection>/`; a `None` id is a local
+/// `refs/heads/` ref. The collection id is a single component (dots allowed, no
+/// slash or traversal).
+fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> {
+    check_ref_path(&cref.ref_name)?;
+    match &cref.collection_id {
+        Some(collection_id) => {
+            check_component(collection_id)?;
+            Ok(format!("refs/mirrors/{collection_id}/{}", cref.ref_name))
+        }
+        None => Ok(format!("refs/heads/{}", cref.ref_name)),
+    }
+}
+
+/// The permission bits forced on a ref file, independent of the umask, matching
+/// the tool's `0644` ref files.
+const REF_FILE_MODE: u32 = 0o644;
+/// The request mode for a created ref parent directory, reduced by the umask
+/// (the tool's ref subdirectories are `0755` under a `022` umask). A
+/// group-shared repository is arranged at the filesystem level, not here: an
+/// operator sets the repository directory `2775` with a default group ACL
+/// (`setfacl -d -m g::rwx`) before `init`, and the OS propagates the setgid bit
+/// and group permissions to every directory created underneath, refs included.
+const REF_DIR_MODE: u32 = 0o777;
+
+/// Write or remove one ref file relative to `repo_fd`, atomically.
+///
+/// `Some(checksum)` writes the 65-byte `<hex>\n` content to a fresh temp file
+/// in the target's parent directory (created as needed), `fdatasync`-es it when
+/// `fsync` is set, and renames it over the target. `None` unlinks the ref,
+/// treating an already-absent file as success.
+fn write_ref_blocking(
+    repo_fd: BorrowedFd<'_>,
+    relpath: &str,
+    checksum: Option<Checksum>,
+    fsync: bool,
+) -> Result<()> {
+    let Some(checksum) = checksum else {
+        return match rustix::fs::unlinkat(repo_fd, relpath, AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
+        };
+    };
+
+    create_ref_parents(repo_fd, relpath)?;
+    let content = format!("{}\n", checksum.to_hex());
+    let tmp = format!(
+        "{relpath}.tmp-{}-{}",
+        std::process::id(),
+        crate::write::unique()
+    );
+    let fd = rustix::fs::openat(
+        repo_fd,
+        tmp.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(REF_FILE_MODE),
+    )?;
+    let write_and_rename = || -> Result<()> {
+        let mut file = std::fs::File::from(fd);
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(REF_FILE_MODE))?;
+        if fsync {
+            rustix::fs::fdatasync(file.as_fd())?;
+        }
+        drop(file);
+        rustix::fs::renameat(repo_fd, tmp.as_str(), repo_fd, relpath)?;
+        Ok(())
+    };
+    write_and_rename().inspect_err(|_| {
+        let _ = rustix::fs::unlinkat(repo_fd, tmp.as_str(), AtFlags::empty());
+    })
+}
+
+/// Create the parent directories of a ref path, idempotently. Every component
+/// but the last is created; existing directories are left in place.
+fn create_ref_parents(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<()> {
+    let mut acc = String::new();
+    let mut components: Vec<&str> = relpath.split('/').collect();
+    components.pop(); // the final component is the ref file itself
+    for component in components {
+        if !acc.is_empty() {
+            acc.push('/');
+        }
+        acc.push_str(component);
+        match rustix::fs::mkdirat(repo_fd, acc.as_str(), Mode::from_raw_mode(REF_DIR_MODE)) {
+            Ok(()) | Err(Errno::EXIST) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     Ok(())
 }

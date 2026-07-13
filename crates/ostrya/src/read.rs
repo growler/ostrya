@@ -95,6 +95,26 @@ impl Repo {
         Ok(DirMeta::parse(&bytes)?)
     }
 
+    /// The on-disk (compressed) size of a loose object, used to recover an
+    /// `ostree.sizes` record for an object that deduplicated against `objects/`.
+    pub(crate) async fn loose_object_size(
+        &self,
+        ty: ObjectType,
+        checksum: &Checksum,
+    ) -> Result<u64> {
+        let path = loose_path(checksum, ty, self.mode());
+        let repo = self.clone();
+        let key = *checksum;
+        let res = ostrya_rt::unblock(move || object::object_size(repo.objects_fd(), &path)).await;
+        match res {
+            Ok(size) => Ok(size),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::ObjectNotFound { checksum: key, ty })
+            }
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
     /// Whether a loose object of the given type is present.
     pub async fn has_object(&self, ty: ObjectType, checksum: &Checksum) -> Result<bool> {
         let path = loose_path(checksum, ty, self.mode());

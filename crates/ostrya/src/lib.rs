@@ -26,9 +26,16 @@
 //! [`Transaction::write_dfd_to_mtree`], which walks an on-disk tree into a
 //! [`MutableTree`] under a [`CommitModifier`] that shapes what is committed
 //! (canonical permissions, an include/prune filter, xattr and SELinux label
-//! callbacks, a [`DevInoCache`], and source consumption). Commits, checkout,
-//! and maintenance land in later phases.
+//! callbacks, a [`DevInoCache`], and source consumption). It also covers commit
+//! assembly and durable publication (Phase 7d): [`Transaction::write_commit`]
+//! and [`CommitOptions`] (with `ostree.sizes` emission), detached commit
+//! metadata on [`Repo`], the ref queue ([`Transaction::set_ref`],
+//! [`Transaction::set_collection_ref`]) and immediate ref writes
+//! ([`Repo::set_ref_immediate`]), and the completed transaction commit
+//! sequence -- objects published, then refs written. Checkout and maintenance
+//! land in later phases.
 
+pub mod commit;
 pub mod config;
 pub mod error;
 pub mod file;
@@ -47,6 +54,7 @@ pub mod transaction;
 pub mod tree;
 mod write;
 
+pub use commit::CommitOptions;
 pub use config::{MinFreeSpace, Remote, RepoConfig, SizeSpec, SizeUnit};
 pub use error::{Error, Result};
 pub use file::{ContentReader, FileKind, FileObject};
@@ -56,8 +64,9 @@ pub use modifier::{
     CommitModifier, CommitModifierFlags, DevInoCache, FilterFn, FilterResult, LabelFn, XattrFn,
 };
 pub use mtree::MutableTree;
-pub use ostrya_core::{Checksum, ObjectType, RepoMode};
+pub use ostrya_core::{Checksum, Commit, DirMeta, DirTree, ObjectType, RepoMode, Type, Value};
 pub use read::CommitState;
+pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};

@@ -393,6 +393,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostrya-composefs"
+version = "0.0.0"
+dependencies = [
+ "sha2",
+]
+
+[[package]]
 name = "ostrya-core"
 version = "0.0.0"
 dependencies = [

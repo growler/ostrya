@@ -197,6 +197,111 @@ SIZES_COMMIT="$(ostree --repo="$sizes_repo" commit \
     --no-xattrs --generate-sizes --timestamp="$TIMESTAMP" "$SRC")"
 emit_tree "$sizes_repo" "sizes"
 
+# --- composefs / EROFS export fixture (Phase 9) ---
+# ostree built with composefs exports a commit's tree to an EROFS image whose
+# fs-verity digest (SHA-256, 4096-byte block, 0 salt) is the value it stores in
+# commit metadata under ostree.composefs.digest.v0 and verifies at boot. The
+# image is derived from the commit's tree alone: it is byte-identical whether or
+# not the commit carries the digest metadata. This fixture commits with
+# --generate-composefs-metadata so the commit's stored digest cross-checks the
+# image's measured fs-verity digest. See format-reference.md, "composefs".
+#
+# --composefs writes the verity image (the boot-verified artifact); it computes
+# the backing-object digests in-process, so it needs no kernel fs-verity
+# support. ostree opens the export's O_TMPFILE relative to the current directory
+# and links it next to the destination, so the checkout must run with a working
+# directory on the destination's filesystem; it runs inside $WORK, and the
+# finished image is copied into the project tree afterward.
+COMPOSEFS_COMMIT=""
+COMPOSEFS_DIGEST=""
+COMPOSEFS_RICH_COMMIT=""
+COMPOSEFS_RICH_DIGEST=""
+if ostree --version | grep -q composefs && command -v composefs-info >/dev/null 2>&1; then
+    mkdir -p "$OUT_DIR/composefs"
+
+    cfs_repo="$WORK/repo-composefs"
+    ostree --repo="$cfs_repo" init --mode=bare-user >/dev/null
+    COMPOSEFS_COMMIT="$(ostree --repo="$cfs_repo" commit \
+        --branch="$BRANCH" --subject="$SUBJECT" \
+        --owner-uid="$OWNER_UID" --owner-gid="$OWNER_GID" \
+        --no-xattrs --timestamp="$TIMESTAMP" \
+        --generate-composefs-metadata "$SRC")"
+    ( cd "$WORK" && TMPDIR="$WORK" \
+        ostree --repo="$cfs_repo" checkout --composefs \
+        "$COMPOSEFS_COMMIT" "$WORK/tree.cfs" )
+    cp "$WORK/tree.cfs" "$OUT_DIR/composefs/tree.cfs"
+    composefs-info dump "$WORK/tree.cfs" >"$OUT_DIR/composefs/tree.dump"
+    COMPOSEFS_DIGEST="$(composefs-info measure-file "$WORK/tree.cfs")"
+
+    # --- rich composefs fixture ---
+    # A second export that drives the writer branches the minimal tree above
+    # leaves untested: shared xattrs promoted to the shared table, inline
+    # xattrs, a multi-block directory with an inline dirent tail, and a long
+    # inline symlink near the block boundary. It is committed without
+    # --no-xattrs so the user.* xattrs are captured, so like the xattr fixture
+    # it must be generated on a host that applies no SELinux labels; owner 0:0
+    # keeps the object identity host-independent. The symlink target is 4063
+    # bytes, the largest the tool accepts before it aborts promoting a no-xattr
+    # symlink to a data block, so the fixture bounds the symlink at the
+    # reachable inline maximum.
+    CFS_RICH="$WORK/cfs-rich"
+    mkdir -p "$CFS_RICH/bigdir" "$CFS_RICH/shared" "$CFS_RICH/nested/deep" \
+        "$CFS_RICH/attrs"
+    # A multi-block directory: 300 identical-content files (one backing object,
+    # heavily shared metacopy/redirect xattrs) whose dirents span two blocks.
+    for i in $(seq -w 0 299); do
+        printf 'x' >"$CFS_RICH/bigdir/d$i"
+        chmod 0644 "$CFS_RICH/bigdir/d$i"
+    done
+    chmod 0755 "$CFS_RICH/bigdir"
+    setfattr -n user.dirattr -v bigdirvalue "$CFS_RICH/bigdir"
+    # user.shared on six inodes across three directories -> shared table.
+    for f in s1 s2 s3 s4; do
+        printf '%s\n' "$f" >"$CFS_RICH/shared/$f.txt"
+        chmod 0644 "$CFS_RICH/shared/$f.txt"
+        setfattr -n user.shared -v commonvalue "$CFS_RICH/shared/$f.txt"
+    done
+    printf 'deep\n' >"$CFS_RICH/nested/deep/g.txt"
+    chmod 0644 "$CFS_RICH/nested/deep/g.txt"
+    setfattr -n user.shared -v commonvalue "$CFS_RICH/nested/deep/g.txt"
+    printf 'top\n' >"$CFS_RICH/shared.txt"
+    chmod 0644 "$CFS_RICH/shared.txt"
+    setfattr -n user.shared -v commonvalue "$CFS_RICH/shared.txt"
+    # Mixed shared+local on one inode, and an inline-only xattr on another.
+    setfattr -n user.uniq -v onlyhere "$CFS_RICH/shared/s1.txt"
+    printf 'u\n' >"$CFS_RICH/uniq.txt"
+    chmod 0644 "$CFS_RICH/uniq.txt"
+    setfattr -n user.uniq -v onlyhere "$CFS_RICH/uniq.txt"
+    # Small dirs whose xattr values vary in length (varying xattr_size mod 32).
+    for n in 1 5 13 21 29; do
+        d="$CFS_RICH/attrs/a$n"
+        mkdir -p "$d"
+        chmod 0755 "$d"
+        printf 'c' >"$d/f"
+        chmod 0644 "$d/f"
+        setfattr -n user.v -v "$(printf 'v%.0s' $(seq 1 "$n"))" "$d/f"
+    done
+    # A long inline symlink near the block boundary.
+    ln -s "$(printf 'z%.0s' $(seq 1 4063))" "$CFS_RICH/longlink"
+
+    rich_repo="$WORK/repo-composefs-rich"
+    ostree --repo="$rich_repo" init --mode=bare-user >/dev/null
+    COMPOSEFS_RICH_COMMIT="$(ostree --repo="$rich_repo" commit \
+        --branch="$BRANCH" --subject="$SUBJECT" \
+        --owner-uid="$OWNER_UID" --owner-gid="$OWNER_GID" \
+        --timestamp="$TIMESTAMP" \
+        --generate-composefs-metadata "$CFS_RICH")"
+    ( cd "$WORK" && TMPDIR="$WORK" \
+        ostree --repo="$rich_repo" checkout --composefs \
+        "$COMPOSEFS_RICH_COMMIT" "$WORK/tree-rich.cfs" )
+    cp "$WORK/tree-rich.cfs" "$OUT_DIR/composefs/tree-rich.cfs"
+    composefs-info dump "$WORK/tree-rich.cfs" >"$OUT_DIR/composefs/tree-rich.dump"
+    COMPOSEFS_RICH_DIGEST="$(composefs-info measure-file "$WORK/tree-rich.cfs")"
+else
+    echo "warning: ostree lacks composefs or composefs-info missing;" \
+         "skipping composefs fixture" >&2
+fi
+
 COMMIT="${CHECKSUM[$first]}"
 CONTENT="$(ostree --repo="$WORK/repo-$first" show "$COMMIT" |
     sed -n 's/^ContentChecksum:[[:space:]]*//p')"
@@ -216,6 +321,20 @@ bare_owner=${BARE_UID}:${BARE_GID}
 canon_commit=${CANON_COMMIT}
 xattr_commit=${XATTR_COMMIT}
 sizes_commit=${SIZES_COMMIT}
+composefs_commit=${COMPOSEFS_COMMIT}
+composefs_digest=${COMPOSEFS_DIGEST}
+composefs_rich_commit=${COMPOSEFS_RICH_COMMIT}
+composefs_rich_digest=${COMPOSEFS_RICH_DIGEST}
+EOF
+
+# The generator wipes and rebuilds OUT_DIR, so it also writes the .gitattributes
+# that marks the binary fixtures (xattr tarballs and the composefs image).
+cat >"$OUT_DIR/.gitattributes" <<'EOF'
+# Fixture tarballs carry user.* xattrs and must not be line-ending normalized
+# or diffed as text.
+*.tar binary
+# The composefs EROFS image is a binary golden fixture.
+*.cfs binary
 EOF
 
 echo "generated fixtures in ${OUT_DIR}"

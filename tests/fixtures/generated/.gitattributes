@@ -1,3 +1,5 @@
 # Fixture tarballs carry user.* xattrs and must not be line-ending normalized
 # or diffed as text.
 *.tar binary
+# The composefs EROFS image is a binary golden fixture.
+*.cfs binary

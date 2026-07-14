@@ -762,16 +762,224 @@ dir is `<datadir>/ostree/trusted.gpg.d/`.
 
 ## composefs
 
-ostree generates EROFS/composefs images via the external composefs project's
-format (EROFS, format version 0). A pure-Rust port must reproduce that output
-byte-for-byte because the resulting image's fs-verity digest is stored in commit
-metadata under `ostree.composefs.digest.v0` (type `ay`, 32 bytes) and verified
-at boot. The image filename is `.ostree.cfs`. Per-file backing is by
-`trusted.overlay.redirect` to the bare loose path `<xx>/<rest>.file`; fs-verity
-params are SHA-256, block size 4096, salt size 0. This is the highest-risk
-sub-project and depends on the EROFS on-disk format and the composefs metadata
-layout, both defined by the composefs and EROFS projects rather than by ostree's
-public docs.
+ostree built with composefs exports a commit's tree to an EROFS image in the
+composefs project's format (EROFS, format version 0). The deployed image
+filename is `.ostree.cfs`. A pure-Rust port reproduces this output byte-for-byte
+because the image's fs-verity digest is stored in commit metadata under
+`ostree.composefs.digest.v0` (type `ay`, 32 bytes) and verified at boot.
+
+The EROFS and composefs on-disk formats are defined by the EROFS and composefs
+projects, not by ostree's documentation. The layout recorded here is recovered
+by observing the images the `ostree` tool produces (composefs 1.0.8 under ostree
+2026.1), reading them back with `composefs-info`, and inspecting the raw bytes.
+The checked-in golden image is the authoritative byte contract; the field-level
+notes below describe what that image contains.
+
+### Export path
+
+`ostree checkout --composefs COMMIT DESTINATION` writes the image at
+DESTINATION. `--composefs-noverity` writes the same structure without the
+per-file fs-verity digests. `ostree commit --generate-composefs-metadata` stores
+the image's fs-verity digest in the commit's `ostree.composefs.digest.v0` key.
+The image is derived from the commit's tree alone: it is byte-identical whether
+or not the commit carries that metadata.
+
+The tool builds the image in an anonymous temporary file (`O_TMPFILE`) opened
+relative to the current directory and links it into place next to the
+destination, so the export runs with a working directory on the destination's
+filesystem.
+
+### fs-verity digest
+
+The digest is fs-verity with SHA-256, 4096-byte blocks, and a zero-length salt.
+`composefs-info measure-file <image>` reports it, and it equals the
+`ostree.composefs.digest.v0` value the tool stores. For the golden fixture (the
+deterministic source tree) it is
+`c91bad0285efab4453562cadf7a22f2dc3714dee81dbe002ded71318e18384d9`.
+
+The digest is a Merkle tree over the data. Each 4096-byte block is hashed with
+SHA-256, the final block zero-padded to 4096. Block hashes are concatenated,
+grouped into 4096-byte parent blocks (128 SHA-256 hashes per block, the tail
+parent zero-padded), and hashed again, up to a single root hash. Data of one
+block or less has that block's hash as the root; empty data has an all-zero
+root. The digest is the SHA-256 of a 256-byte little-endian descriptor:
+
+- version byte 1, hash-algorithm byte 1 (SHA-256), log2-block-size byte 12,
+  salt-size byte 0;
+- 4 reserved bytes 0;
+- data size, 8 bytes, the byte length of the data;
+- the 32-byte root hash, followed by 32 zero bytes (the root-hash field is 64
+  bytes wide);
+- 32 zero salt bytes;
+- 144 reserved bytes 0.
+
+The same primitive computes the digest of each backing object, over the raw
+object bytes.
+
+### Injected top-level directories
+
+The image root holds, alongside the commit's own entries, five empty directories
+the tool injects: `boot`, `etc`, `sysroot`, `usr`, `var`, each mode 040755 with
+owner 0:0. They are absent from the commit tree (`ostree ls` does not list them)
+and present in every exported image.
+
+### Image layout and the composefs header
+
+The image is composefs format version 0. Bytes 0..1024 hold a 32-byte composefs
+header, zero-padded to 1024:
+
+- magic, 4 bytes, `9a 62 78 d0` (little-endian `0xD078629A`);
+- version 1, 4 bytes;
+- flags, 4 bytes, `0x00000001` when any inode carries a POSIX ACL xattr and 0
+  otherwise;
+- composefs version 0, 4 bytes;
+- 16 reserved bytes 0.
+
+The regions follow in order: the composefs header and its padding, the EROFS
+superblock, the inode table, the shared-xattr area, and the directory and file
+data blocks. Node ids are byte offset divided by 32.
+
+### EROFS superblock
+
+The superblock sits at byte offset 1024 and is 128 bytes. Observed fields:
+
+- magic, 4 bytes, `e2 e1 f5 e0` (little-endian `0xE0F5E1E2`);
+- checksum 0 (unused);
+- feature_compat `0x06` (MTIME `0x02` and XATTR_FILTER `0x04`);
+- blkszbits 12 (block size 4096), extra superblock slots 0;
+- root_nid, the node id of the root inode;
+- inos, the total inode count, including the overlay whiteout stubs;
+- build_time and build-time nanoseconds, the minimum inode mtime, 0 for an
+  exported commit (the tool sets every inode mtime to 0);
+- blocks, the image size in 4096-byte blocks;
+- meta_blkaddr 0, xattr_blkaddr the block holding the shared-xattr area (the
+  block that contains the end of the inode table);
+- UUID all zero.
+
+The zero UUID and zero build times make the image deterministic for a fixed
+input tree and composefs version.
+
+### Inodes
+
+Inodes are collected breadth-first from the root: the root first, then every
+directory's children in name-sorted order, each directory's children before the
+next directory's. The `i_ino` field is the collection index (root 0). Inodes
+are written in that order, so node id increases with `i_ino`.
+
+An inode is compact (32 bytes) when its mtime equals the superblock build_time,
+its nlink and ownership fit 16 bits, and its size fits 32 bits; otherwise it is
+extended (64 bytes). An exported commit uses compact inodes throughout unless an
+id exceeds 16 bits or a file exceeds 4 GiB. The format field's low bit selects
+compact (0) or extended (1); bits 1..3 hold the datalayout: 0 flat-plain, 4
+flat-inline, 8 chunk-based. Inode mode is the EROFS file-type bits combined with
+the logical permission bits.
+
+Directory inodes are flat-inline when their entries fit within one block after
+the inode header and xattrs, and flat-plain when the entries occupy one or more
+whole blocks. Empty regular files are flat-plain with size 0. Symlinks are
+flat-inline with the target stored inline, promoted to a data block only when
+the inode header, xattrs, and target would fill a block. Whiteout stubs are
+character devices, flat-plain, `i_u` 0.
+
+### Overlay whiteout table
+
+The image writer adds a 256-entry overlay whiteout table to the root: one
+character-device inode, device 0:0, mode 0644, owned like the root and sharing
+its mtime, for each two-digit lowercase hex name `00` through `ff`. Any name
+already present in the root is skipped. It also sets `trusted.overlay.opaque` to
+`y` on the root. `composefs-info dump` hides these entries, so they do not
+appear in `tree.dump`, but they are inodes and root directory entries in the
+image, and the superblock `inos` counts them.
+
+### Directory blocks and dirents
+
+A directory's entries include `.` (the directory) and `..` (the parent), then
+the children, sorted by name as raw bytes. Entries are packed into 4096-byte
+blocks: whole blocks are emitted as data blocks, and a tail of 2048 bytes or
+less is stored inline after the inode; a larger tail is promoted to its own data
+block. A directory's size is the whole-block byte count plus the inline tail.
+Its nlink is the count of directory-typed entries, which is 2 plus the number of
+child subdirectories.
+
+Within a block, the fixed-size dirent headers come first, then the names with no
+separators. Each dirent header is 12 bytes:
+
+- node id, 8 bytes;
+- name offset within the block, 2 bytes;
+- file type, 1 byte (1 regular, 2 directory, 3 character device, 7 symlink);
+- 1 reserved byte.
+
+The first dirent's name offset divided by 12 gives the entry count.
+
+### Inode extended attributes and the name filter
+
+An inode's xattr area, present only when the inode has at least one xattr,
+follows the inode header:
+
+- a 12-byte header: a 4-byte name filter, a shared-count byte, 7 reserved bytes;
+- shared-xattr references, 4 bytes each;
+- inline entries, sorted by full name then by value length then by value bytes.
+
+`i_xattr_icount` encodes the area size: 0 when absent, otherwise
+`1 + (size - 12) / 4`. Each inline entry is a 4-byte header (name-length byte,
+name-index byte, 2-byte value size), then the name suffix, then the value,
+padded to a 4-byte boundary.
+
+Names are stored with a prefix index and the remaining suffix. The prefixes are:
+0 empty (full name in the suffix), 1 `user.`, 2 `system.posix_acl_access`, 3
+`system.posix_acl_default`, 4 `trusted.`, 6 `security.`. Index 5 (`lustre.`) is
+absent from the version-0 prefix table, so `lustre.` names use prefix 0. The
+longest matching prefix wins. A name beginning with `trusted.overlay.` is
+escaped to `trusted.overlay.overlay.` before indexing.
+
+The name filter is a 32-bit Bloom filter over the inode's xattr names. Each name
+sets the bit `xxh32(suffix, seed) % 32`, where `suffix` is the name after its
+prefix and `seed` is `0x25BBE08F` plus the prefix index. The stored word is the
+bitwise complement of the filter, so a cleared bit means the name is present.
+An xattr value shared by more than one inode is moved to the shared-xattr area
+after the inode table; the inode holds a reference in place of the inline entry.
+
+### File backing
+
+A regular file with content is backed by a bare loose object referenced through
+overlay xattrs (name index 4, the `trusted.` prefix). The inode is chunk-based:
+the datalayout is 8, the size is the logical file size, and `i_u` holds the
+chunk format derived from the size. The inline data is one 4-byte chunk index of
+`0xffffffff` per chunk (one chunk for a file of 4096 bytes or less). The xattrs
+are:
+
+- `trusted.overlay.redirect`, the backing object's loose path with a leading
+  slash, `/<xx>/<rest>.file` (for example
+  `/cf/ffd52f38d14c87cf46e18d5260074421ba5961f0895954e9921f165f9c91db.file`);
+- `trusted.overlay.metacopy`, a 36-byte record in the verity image: version
+  byte 0, length byte 36, flags byte 0, digest-algorithm byte 1 (SHA-256), then
+  the 32-byte fs-verity digest of the backing object.
+  `composefs-info measure-file <object>.file` reports the same 32 bytes. The
+  noverity image writes an empty metacopy value.
+
+Empty regular files carry no overlay xattrs and no backing object. Symlinks
+store their target inline (mode 0120777) and are not redirected.
+`composefs-info objects <image>` lists exactly the backing `.file` paths, one
+per distinct redirected content object.
+
+### Golden fixtures
+
+`tests/fixtures/generated/composefs/tree.cfs` is the verity image of the
+deterministic source tree, and `tree.dump` is its `composefs-info dump`. The
+MANIFEST records `composefs_commit` (the commit made with
+`--generate-composefs-metadata`) and `composefs_digest` (the image's fs-verity
+digest, equal to that commit's stored `ostree.composefs.digest.v0`).
+
+`tree-rich.cfs` is a second verity image whose source tree carries user
+xattrs, and `tree-rich.dump` is its `composefs-info dump` (xattrs appear as
+trailing `name=value` tokens). Its commit is made without `--no-xattrs`, so it
+is generated on a host that applies no SELinux labels. The MANIFEST records
+`composefs_rich_commit` and `composefs_rich_digest`. The tree exercises
+shared-xattr promotion (`user.shared` on six inodes), inline xattrs, a
+multi-block directory with an inline dirent tail, xattr values of varied length,
+and a 4063-byte inline symlink. A 4064-byte symlink target is the point at which
+the tool aborts rather than promote a no-xattr symlink to a data block, so 4063
+is the largest reachable inline target.
 
 ## tar
 

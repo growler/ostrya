@@ -89,8 +89,14 @@ bounded:
   (over an already-open fd; `smol::fs::File` or `tokio::fs::File`),
   `rt::Timer`, later `rt::spawn` and networking. The only crate that knows
   which backend is compiled. No ostree knowledge.
+- `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the
+  fs-verity digest. Standalone and free of ostree and repository knowledge,
+  like `ostrya-gvariant`: it takes a tree model and emits the image bytes and
+  the image's fs-verity digest. Reproduces only the metadata subset composefs
+  uses, with no EROFS compression. Synchronous, with no runtime dependency.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs, read,
-  prune, fsck, sign, summary, deltas, pull, tar, composefs. Feature-gated.
+  prune, fsck, sign, summary, deltas, pull, tar, composefs export over
+  `ostrya-composefs`. Feature-gated.
 - `ostrya-cli` -- the CLI crate, building the `ostrya` binary: a minimal
   command set once the ingest and checkout paths land (Phase 11), grown
   incrementally; the `ostree`-compatible surface arrives with the
@@ -912,12 +918,107 @@ a reflink-capable filesystem the copy path clones instead of copying bytes.
 
 Highest risk, scheduled directly after the checkout path so the riskiest
 format work is confronted early and the Phase 11 CLI can emit composefs
-images. Always compiled, not feature-gated. Reproduce the EROFS output
-byte-for-byte: EROFS superblock/inodes/dirents/xattrs, composefs redirect
-and verity xattrs, the fs-verity Merkle digest (SHA-256, 4096 block, 0
-salt). Store `ostree.composefs.digest.v0` in commit metadata.
-Verify: the fs-verity digest matches what the tool (with composefs) produces
-for the same commit; the generated `.ostree.cfs` mounts and verifies.
+images. Always compiled, not feature-gated. Split into sub-phases:
+
+- 9a (DONE) Investigate the tool as a black box: what `ostree` (built with
+  composefs) writes when it exports a commit, and how the exported EROFS
+  image is arranged. Dump the produced images with `composefs-info` and
+  inspect the raw EROFS structures, capturing golden fixtures for the
+  superblock, inode table, dirents, xattrs, the composefs redirect and
+  verity xattrs, and the fs-verity Merkle digest (SHA-256, 4096-byte
+  block, 0 salt). The EROFS and composefs formats are defined by those
+  projects, not by ostree's docs, so the observed layout becomes the
+  fixture contract for 9c.
+  Delivered: the verity image and its `composefs-info dump` at
+  `tests/fixtures/generated/composefs/tree.cfs` and `tree.dump`, produced
+  by `generate.sh` from a `--generate-composefs-metadata` commit, with the
+  MANIFEST recording `composefs_commit` and `composefs_digest` (the image's
+  fs-verity digest, equal to the commit's stored `ostree.composefs.digest.v0`).
+  The observed export path, superblock, injected top-level directories,
+  redirect and metacopy xattrs, and digest relationship are recorded in
+  `format-reference.md`, "composefs".
+- 9b (DONE) Survey pure-Rust EROFS/composefs implementations and decide
+  build versus depend. Evaluated against the 9a fixtures and the
+  no-C-linkage rule:
+  - `erofs-rs`, both the official `erofs/erofs-rs` and the crates.io
+    `Dreamacro/erofs-rs`, are read-only EROFS parsers. Neither emits images
+    (the official `mkfs` workspace member is a stub, and the crates.io crate
+    lists image building as an unimplemented TODO), and neither knows
+    composefs. Unusable for the write path.
+  - `containers/composefs-rs` (crate `composefs`, MIT OR Apache-2.0) writes
+    the format: `erofs::writer::mkfs_erofs` produces byte-for-byte identical
+    output to C `mkcomposefs` for the default format version, verified in its
+    own test suite against the C binary, and it computes the fs-verity digest
+    in pure Rust. Its writer, fs-verity, and dumpfile modules are
+    self-contained pure Rust. It cannot be a dependency as published: the
+    `composefs` crate carries a non-optional `zstd` (which links C through
+    `zstd-sys`) and a full `tokio`, with no feature to disable either, so
+    adding it violates the no-C-linkage rule and the smol-default runtime
+    policy.
+  - `am-fs-erofs` (MIT) is a pure-Rust generic EROFS writer with no composefs
+    awareness (no overlay redirect/metacopy/opaque xattrs, no fs-verity) and
+    byte choices that do not match composefs. `lamfold-erofs`,
+    `gobblytes-erofs*`, `liberofs`/`erofs`, and `nydus-rs` are read-only,
+    stubs, or unrelated container-image stacks.
+  - The fs-verity digest is a self-contained SHA-256 Merkle computation over
+    the image bytes (4096-byte blocks, zero salt, 256-byte descriptor) needing
+    no kernel call. The `fs-verity` crate pulls an unconditional `libc`, so the
+    digest is hand-rolled over the existing `sha2` dependency.
+
+  Decision: reproduce the composefs EROFS format in-tree in a new standalone
+  crate `ostrya-composefs` (the EROFS/composefs counterpart to
+  `ostrya-gvariant`), reproducing only the metadata subset composefs uses,
+  with no EROFS compression. No pure-Rust crate writes byte-exact composefs
+  images under the no-C rule. Phase 9c builds the crate and Phase 9d wires it
+  into `ostrya`, adding no new crates. `composefs-rs`, permissively licensed
+  and safe to read, serves as a clean-room reference and a second cross-check
+  oracle alongside the `ostree`/`mkcomposefs` black box.
+- 9c (DONE) The `ostrya-composefs` crate: the pure-Rust EROFS/composefs image
+  writer and the fs-verity digest, standalone and free of ostree and repository
+  knowledge (the composefs counterpart to `ostrya-gvariant`). It takes a tree
+  model -- directories, symlinks, and regular-file entries carrying logical
+  metadata, xattrs, a backing loose path, and a backing fs-verity digest --
+  and emits the EROFS image bytes plus the image's fs-verity digest. The
+  writer reproduces only the metadata subset composefs uses: the superblock,
+  compact and extended inodes, tail-packed directory blocks, inline symlink
+  targets, chunk-based backing-file inodes with placeholder chunk indices, the
+  256-entry overlay whiteout table injected into the root, and the
+  trusted-namespace overlay xattrs (`overlay.redirect`, `overlay.metacopy`,
+  `overlay.opaque`) with the shared-xattr area and the XATTR_FILTER field. It
+  needs no EROFS compression, fragments, or multi-device support. The fs-verity
+  digest is a streaming SHA-256 Merkle primitive (4096-byte blocks, zero salt,
+  256-byte descriptor), reused for both the whole image and each backing
+  object. Byte assembly is hand-rolled; the digest is computed over `sha2`. The
+  crate is synchronous and builds the image in a single in-memory buffer, as
+  the tool does, so it takes no runtime dependency. The field-level layout is
+  recorded in `format-reference.md` as it is verified against the golden bytes.
+  Dependency set: `sha2` (an approved foundation crate, already used) for the
+  fs-verity digest. The XATTR_FILTER field hashes each xattr-name suffix with
+  xxHash32, seeded by `0x25BBE08F` plus the prefix index; xxHash32 is
+  hand-rolled (`src/xxhash.rs`), verified against the golden filter bytes, so
+  no new crate is added.
+  Verify: a tree model reconstructed from the 9a `tree.dump` produces an image
+  byte-identical to `tree.cfs`, and its fs-verity digest equals the MANIFEST
+  `composefs_digest`; the `composefs-rs` writer run over the same input agrees
+  byte-for-byte as a second oracle; compile-time assertions pin the public
+  writer types `Send + Sync`. A richer fixture, `tree-rich.cfs` with
+  `composefs_rich_digest`, is reconstructed from `tree-rich.dump` (whose dump
+  lines carry xattrs) and locks in shared-xattr promotion, inline xattrs, a
+  multi-block directory with an inline dirent tail, and a long inline symlink
+  near the block boundary.
+- 9d Wire `ostrya-composefs` into `ostrya`: build the writer's tree model from
+  a commit's `RepoTree`, inject the five top-level directories (`boot`, `etc`,
+  `sysroot`, `usr`, `var`), resolve each regular file to its `.file` loose path
+  and stream the loose object through the fs-verity digester to fill the
+  metacopy digest, drive the writer, and store the image's fs-verity digest in
+  the commit's `ostree.composefs.digest.v0` metadata. Ownership is presented
+  through composefs uid mapping at mount. Backing objects stream through
+  `rt::unblock` so no unconstrained blob is buffered, and the in-memory image
+  build is offloaded to the blocking pool.
+  Verify: the fs-verity digest matches what the tool (built with composefs)
+  produces for the same commit; the generated `.ostree.cfs` mounts and
+  verifies; the digest the port stores in `ostree.composefs.digest.v0` equals
+  the tool's for the same tree; the suite passes under both runtime backends.
 
 ### Phase 10 -- Tar import/export
 
@@ -1063,8 +1164,13 @@ admin tests. Recommend deferring or descoping unless explicitly required.
 - composefs/EROFS byte-exactness (Phase 9): the EROFS and composefs on-disk
   formats are defined by the composefs and EROFS projects, not by ostree's
   public docs; reproduction is substantial, and the phase sits early in the
-  roadmap on the critical path to the Phase 11 CLI. Mitigation: consider an
-  existing pure-Rust composefs crate if its output matches.
+  roadmap on the critical path to the Phase 11 CLI. Mitigation: 9a captures
+  golden fixtures, 9b surveyed the pure-Rust EROFS/composefs crates and found
+  none depend-able under the no-C rule (reproducing the format in-tree in the
+  standalone `ostrya-composefs` crate, built in 9c and wired into `ostrya` in
+  9d, which isolates the byte-exact work behind a small tree-model surface),
+  and the permissively-licensed `composefs-rs`, which emits byte-identical
+  images, is available as a second cross-check oracle alongside the tool.
 - GVariant byte-exactness (Phase 1): everything downstream depends on it.
   Mitigation: extensive golden fixtures before building on it.
 - xz encoding in pure Rust (Phase 15): decode is well-supported; encode is
@@ -1094,8 +1200,9 @@ Resolved:
    format-primitive unit tests first; add CLI-driven shell tests through
    Phase 17; treat the admin/sysroot tier (Phase 20) as a separate, optional
    track.
-4. Workspace: multi-crate (`ostrya-gvariant`, `ostrya-core`, `ostrya`,
-   `ostrya-cli`), with heavier subsystems behind feature flags on `ostrya`.
+4. Workspace: multi-crate (`ostrya-gvariant`, `ostrya-core`, `ostrya-rt`,
+   `ostrya-composefs`, `ostrya`, `ostrya-cli`), with heavier subsystems
+   behind feature flags on `ostrya`.
 5. Development mode `bare-user-shared` (Phase 6a; supersedes the
    `bare-user-split-attrs` object split, removed before its write path was
    built): `bare-user` storage with the logical mode never applied to the
@@ -1154,10 +1261,21 @@ Resolved:
 10. HTTP/2: required for pull. The fetcher is built on a pure-Rust HTTP
     crate speaking HTTP/1.1 and HTTP/2 with ALPN over rustls; the concrete
     crate is proposed at Phase 16a per the dependency rule.
+11. composefs export (Phase 9b): reproduce the composefs/EROFS format in a new
+    standalone crate `ostrya-composefs` rather than depend on a crate. No
+    pure-Rust crate writes byte-exact composefs EROFS images under the
+    no-C-linkage rule -- the `erofs-rs` projects are read-only, `am-fs-erofs`
+    is composefs-unaware, and `composefs-rs`, which does emit byte-identical
+    images and is permissively licensed, forces a non-optional C-linking
+    `zstd` and a full `tokio` with no feature to disable them.
+    `ostrya-composefs` reproduces only the metadata subset composefs uses,
+    with no EROFS compression, and hand-rolls the fs-verity digest over the
+    existing `sha2` dependency. Phase 9c builds the crate; Phase 9d wires it
+    into `ostrya`. Neither adds a new crate. `composefs-rs`, permissively
+    licensed, serves as a clean-room reference and cross-check oracle. See the
+    Phase 9b survey above.
 
 Deferred to their respective phases:
 
-11. composefs (Phase 9): reproduce the composefs/EROFS format ourselves
-    versus depend on an emerging pure-Rust composefs crate.
 12. spki sign engine: deferred as optional; ed25519 and gpg cover the
     common cases.

@@ -11,6 +11,7 @@ async, clean-room reimplementation of ostree
 supports multiple concurrent transactions within a single process, which the
 reference tool does not allow. It is not a drop-in replacement for the `ostree`
 tool;
+a minimal `ostrya` CLI lands once the ingest and checkout paths are ready, and
 a command-line-compatible CLI is a late phase, built only to run the upstream
 shell test suite as an external conformance check. The `ostree` tool is treated
 as a black box: its observed behavior and the public documentation are the only
@@ -55,7 +56,7 @@ reference, or reading material.
    (scope is phased: library format and format-primitive unit tests first,
    CLI-driven shell tests later, admin/sysroot optional).
 5. Extensions: commit signing via `sequoia-openpgp` (not gpgme), composefs/EROFS
-   export, and tar import/export.
+   export, tar import/export, AWS S3 push/pull, and ssh git-style push/pull.
 6. A development-only repository mode, `bare-user-shared`, as an optional
    nice-to-have add-on.
 

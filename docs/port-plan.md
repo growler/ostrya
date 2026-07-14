@@ -24,11 +24,14 @@ library is MIT-licensed.
 3. Multiple concurrent transactions within a single process.
 4. Capable of passing ostree's test suite, run as an external conformance gate.
 5. Extensions: commit signing via `sequoia-openpgp` (replacing gpgme),
-   composefs/EROFS export, tar import/export.
+   composefs/EROFS export, tar import/export, AWS S3 push/pull, ssh
+   git-style push/pull.
 
-The port is a library. It is not a drop-in replacement for the `ostree` tool,
-though a compatible CLI is planned as a late phase specifically to unlock the
-shell-driven part of the test suite.
+The port is a library. It is not a drop-in replacement for the `ostree` tool.
+A minimal `ostrya` binary lands once the ingest and checkout paths are ready
+(Phase 11); `ostree`-compatible command-line behavior is a late phase
+(Phase 17), built specifically to unlock the shell-driven part of the test
+suite.
 
 Faithful means: byte-for-byte identical on-disk format, identical checksums,
 identical algorithms. It does not mean mirroring the C API shape. The API is
@@ -63,6 +66,8 @@ Rust crate ecosystem is in scope. Proposed foundation crates, all pure Rust:
   and verification without nettle/C.
 - `rustls` plus `webpki-roots` / `rustls-native-certs` -- TLS for pull.
 - `smol-tar` -- async tar import/export in the smol ecosystem.
+- `clap` -- command-line argument parsing for the `ostrya` binary
+  (`ostrya-cli` only).
 - LZMA/xz, HTTP client, INI parsing, fs-verity, and EROFS: see the Decisions
   section; each has a pure-Rust path.
 
@@ -86,13 +91,17 @@ bounded:
   which backend is compiled. No ostree knowledge.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs, read,
   prune, fsck, sign, summary, deltas, pull, tar, composefs. Feature-gated.
-- `ostrya-cli` -- the `ostree`-compatible binary (late phase).
+- `ostrya-cli` -- the CLI crate, building the `ostrya` binary: a minimal
+  command set once the ingest and checkout paths land (Phase 11), grown
+  incrementally; the `ostree`-compatible surface arrives with the
+  shell-test harness (Phase 17).
 
-Feature flags on `ostrya`: `pull`, `sign-gpg`, `deltas`, `composefs`, plus
+Feature flags on `ostrya`: `pull`, `sign-gpg`, `deltas`, `s3`, `ssh`, plus
 the runtime backend selectors `smol` (default) and `tokio`, forwarded to
 `ostrya-rt`. Each
 heavier or riskier subsystem is opt-in so the core stays small. Tar
-import/export is always compiled (built on `smol-tar`), not feature-gated.
+import/export (built on `smol-tar`) and composefs export are always
+compiled, not feature-gated.
 
 ### Async model
 
@@ -235,11 +244,11 @@ Design thread across phases:
   mode is a no-op.
 - Phase 8: copy-based checkout (reflink where the filesystem supports it)
   applying the `user.ostreemeta` mode; hardlink checkout refused.
-- Phase 9: fsck and prune as `bare-user`; inode permissions are not
-  authoritative and are not checked.
-- Phase 15: composefs export builds the EROFS metadata from `user.ostreemeta`
+- Phase 9: composefs export builds the EROFS metadata from `user.ostreemeta`
   and redirects each regular file to its `.file` loose path; ownership is
   presented via composefs uid mapping at mount.
+- Phase 12: fsck and prune as `bare-user`; inode permissions are not
+  authoritative and are not checked.
 
 ## Testing strategy
 
@@ -273,7 +282,8 @@ phase.
 
 ## Phased roadmap
 
-Phases are ordered by dependency. Early phases are small and foundational;
+Phases are ordered by dependency and priority. Early phases are small and
+foundational;
 the large subsystems (write, checkout, pull) are split into sub-phases. Each
 phase is a reviewable unit with a stated verification gate.
 
@@ -387,7 +397,7 @@ The internal `ostrya-rt` crate: `rt::unblock` and `rt::File` (from an
 already-open fd; read/write/seek, `sync_all`/`sync_data`, `into_std`;
 `smol::fs::File` or `tokio::fs::File` underneath), with `smol` as the
 default backend and `tokio` behind a feature, per the Async model section.
-`rt::Timer` lands with Phase 6, `rt::spawn` and networking with Phase 13.
+`rt::Timer` lands with Phase 6, `rt::spawn` and networking with Phase 16.
 All blocking-pool offload in `ostrya` goes through `rt::unblock`;
 `ContentReader` streams from `rt::File`, implements `futures_io::AsyncRead`
 unconditionally and `tokio::io::AsyncRead` under the `tokio` feature, and
@@ -400,7 +410,7 @@ pass through, expose the byte count, and yield `(digest, size)` from a
 consuming `finalize`. The constructor takes the digester by value, possibly
 pre-seeded: a file object id covers the framed file header before the
 payload. The verifying counterpart (`VerifyingReader`) lands with pull
-(Phase 13a).
+(Phase 16a).
 
 Dependency set for the phase: `ostrya-rt` uses `smol`, `futures-io`, and
 optional `tokio` (features `fs`, `io-util`, `rt`, `time`); `ostrya` adds
@@ -890,63 +900,26 @@ passes under both runtime backends.
 ### Phase 8 -- Checkout path
 
 `checkout_at` for all modes; overwrite modes (none/union-files/add-files/
-union-identical); hardlink vs copy decision and fallbacks; devino cache;
-whiteout handling; per-file/dir metadata finalize and optional fsync.
+union-identical); hardlink vs copy decision and fallbacks, with the copy
+path attempting a FICLONE reflink before falling back to a byte copy;
+devino cache; whiteout handling; per-file/dir metadata finalize and
+optional fsync.
 Verify: checkout of a tool-created commit matches the tool's checkout (mode,
-perms, xattrs, hardlink counts); round-trip commit -> checkout is stable.
+perms, xattrs, hardlink counts); round-trip commit -> checkout is stable; on
+a reflink-capable filesystem the copy path clones instead of copying bytes.
 
-### Phase 9 -- Prune, fsck, traverse, diff
+### Phase 9 -- composefs / EROFS export
 
-Reachability traversal, prune (refs-only, depth, delete-commit), fsck (object
-integrity, partial-commit detection), diff.
-Verify: the published `test-prune`, `test-fsck-*`, and `test-corruption`
-subsets via the CLI harness.
+Highest risk, scheduled directly after the checkout path so the riskiest
+format work is confronted early and the Phase 11 CLI can emit composefs
+images. Always compiled, not feature-gated. Reproduce the EROFS output
+byte-for-byte: EROFS superblock/inodes/dirents/xattrs, composefs redirect
+and verity xattrs, the fs-verity Merkle digest (SHA-256, 4096 block, 0
+salt). Store `ostree.composefs.digest.v0` in commit metadata.
+Verify: the fs-verity digest matches what the tool (with composefs) produces
+for the same commit; the generated `.ostree.cfs` mounts and verifies.
 
-### Phase 10 -- Signing
-
-`Signer`/`Verifier` traits; ed25519 engine (ed25519-dalek); dummy engine; spki
-engine (pure-Rust X.509/ECDSA, optional); detached-metadata append; commit
-sign and verify. GPG via sequoia-openpgp (RustCrypto backend): keyring loading
-(binary and armored), detached verify, per-signature metadata.
-Verify: signatures produced verify under the `ostree` tool and the reverse;
-`test-signed-commit-{ed25519,spki,dummy}`; `test-gpg-signed-commit` and
-`test-commit-sign` once GPG verify lands.
-
-### Phase 11 -- Summary generation and signing
-
-Summary assembly (sorted refs, the host-order size asymmetry, big-endian
-timestamps), summary signing and verification, summary cache.
-Verify: byte-identical summary versus the tool for the same repo; the tool
-verifies our signed summary.
-
-### Phase 12 -- Static deltas
-
-GVariant superblock/part/fallback formats, LEB128 op stream, the endianness
-byte handling, rollsum (bupsplit) and bsdiff (pure Rust), xz encode/decode,
-delta generation and offline application, indexes, signed deltas.
-Verify: apply tool-generated deltas and get correct objects; the tool applies
-our deltas; `test-delta`, `test-delta-ed25519`, `test-delta-sign`.
-
-### Phase 13 -- Pull
-
-Split into sub-phases:
-- 13a Async fetcher: pure-Rust HTTP/1.1 over the `ostrya-rt` net layer +
-  rustls, conditional GET (ETag/If-Modified-Since/304), mirrorlist fallback,
-  retry classification, max-size streaming cap, priorities, client certs,
-  basic auth. No range. Ships `VerifyingReader`, the stream that checks an
-  expected digest at EOF and fails the final read with `InvalidData` on a
-  mismatch (the check fires only when the consumer polls through to EOF).
-- 13b Local pull (`file://`): object import (hardlink/reflink/copy),
-  localcache repos.
-- 13c HTTP pull: the scan/fetch state machine (bounded fetch semaphore of 8,
-  delta-part cap of 2, write throttle of 3, fixed priority drain order),
-  summary/sig verification, commit and content verification, bindings and
-  timestamp checks, commitpartial, mirror mode.
-- 13d Delta-accelerated pull and repo finders (config/mount; avahi optional).
-Verify: pull from a local trivial httpd; the `test-pull-*`, `test-local-pull*`,
-`test-signed-pull*` clusters via the harness.
-
-### Phase 14 -- Tar import/export
+### Phase 10 -- Tar import/export
 
 Built on `smol-tar` (always compiled, not feature-gated). GNU tar with SCHILY
 xattr PAX records, numeric ids, commit-timestamp mtimes, content-checksum
@@ -957,25 +930,128 @@ cannot.
 Verify: `test-export`, `test-libarchive`; extract our tar with GNU tar and
 re-import into the `ostree` tool.
 
-### Phase 15 -- composefs / EROFS export
+### Phase 11 -- Minimal CLI (`ostrya`)
 
-Highest risk, isolated behind the `composefs` feature. Reproduce the EROFS
-output byte-for-byte: EROFS superblock/inodes/dirents/xattrs, composefs redirect
-and verity xattrs, the fs-verity Merkle digest (SHA-256, 4096 block, 0 salt).
-Store `ostree.composefs.digest.v0` in commit metadata.
-Verify: the fs-verity digest matches what the tool (with composefs) produces for
-the same commit; the generated `.ostree.cfs` mounts and verifies.
+The first binary: the `ostrya-cli` crate builds a tool named `ostrya`, a
+thin front-end over the ingest, checkout, and export paths, which are all in
+place by this phase. Its command surface is its own; `ostree`-compatible
+behavior is Phase 17. Initial subcommands:
 
-### Phase 16 -- CLI front-end (`ostrya-cli`)
+- `ostrya commit [--repo <repo>] [--parent <commit>] [-b|--branch <branch>]
+  [-s|--subject <subject>] [path]` -- commit the tree at `path` and print
+  the new commit checksum; `--branch` points the ref at the new commit;
+  with no path, read a tar stream from stdin (Phase 10 import).
+- `ostrya checkout [--repo <repo>] [-H|--require-hardlinks]
+  [-C|--force-copy] [--composefs] <commit> <destination>` -- Phase 8
+  checkout; `--composefs` writes the Phase 9 EROFS image to `destination`
+  instead of a tree.
+- `ostrya export [--repo <repo>] <commit>` -- write the commit to stdout as
+  a tar stream (Phase 10 export).
 
-Incremental, driven by which shell tests are targeted. Command-line and
-stdout/stderr compatibility with the `ostree` tool for the exercised subcommands
-(commit, checkout, refs, rev-parse, ls, cat, show, log, config, prune, fsck,
-summary, sign, gpg-sign, static-delta, pull, pull-local, remote, init, export,
-diff). Provide a compatible shell-test harness and a TAP producer.
+Further subcommands arrive with the phases that provide their machinery.
+Argument and option parsing uses `clap`, scoped to the `ostrya-cli` crate;
+anything further is settled at phase start per the dependency rule.
+
+Verify: committing a fixture tree through the binary yields the fixture
+commit id, a repository the tool accepts, and, with `--branch`, a ref the
+tool resolves to the new commit; a tar stream on stdin commits
+the same tree as its unpacked form ingested from disk; checkout through the
+binary matches the tool's checkout of the same commit, and `--composefs`
+emits the Phase 9 image; exported tar re-imported through `commit`
+reproduces the root tree.
+
+### Phase 12 -- Prune, fsck, traverse, diff
+
+Reachability traversal, prune (refs-only, depth, delete-commit), fsck (object
+integrity, partial-commit detection), diff.
+Verify: the published `test-prune`, `test-fsck-*`, and `test-corruption`
+subsets via the CLI harness.
+
+### Phase 13 -- Signing
+
+`Signer`/`Verifier` traits; ed25519 engine (ed25519-dalek); dummy engine; spki
+engine (pure-Rust X.509/ECDSA, optional); detached-metadata append; commit
+sign and verify. GPG via sequoia-openpgp (RustCrypto backend): keyring loading
+(binary and armored), detached verify, per-signature metadata.
+Verify: signatures produced verify under the `ostree` tool and the reverse;
+`test-signed-commit-{ed25519,spki,dummy}`; `test-gpg-signed-commit` and
+`test-commit-sign` once GPG verify lands.
+
+### Phase 14 -- Summary generation and signing
+
+Summary assembly (sorted refs, the host-order size asymmetry, big-endian
+timestamps), summary signing and verification, summary cache.
+Verify: byte-identical summary versus the tool for the same repo; the tool
+verifies our signed summary.
+
+### Phase 15 -- Static deltas
+
+GVariant superblock/part/fallback formats, LEB128 op stream, the endianness
+byte handling, rollsum (bupsplit) and bsdiff (pure Rust), xz encode/decode,
+delta generation and offline application, indexes, signed deltas.
+Verify: apply tool-generated deltas and get correct objects; the tool applies
+our deltas; `test-delta`, `test-delta-ed25519`, `test-delta-sign`.
+
+### Phase 16 -- Pull
+
+Split into sub-phases:
+- 16a Async fetcher: pure-Rust HTTP/1.1 and HTTP/2 over the `ostrya-rt` net
+  layer + rustls, with ALPN selecting the version. HTTP/2 support is
+  required, so the fetcher builds on a pure-Rust HTTP crate proposed at
+  phase start rather than a hand-rolled client. Conditional GET
+  (ETag/If-Modified-Since/304), mirrorlist fallback, retry classification,
+  max-size streaming cap, priorities, client certs, basic auth. No range.
+  Ships `VerifyingReader`, the stream that checks an expected digest at EOF
+  and fails the final read with `InvalidData` on a mismatch (the check
+  fires only when the consumer polls through to EOF).
+- 16b Local pull (`file://`): object import (hardlink/reflink/copy),
+  localcache repos.
+- 16c HTTP pull: the scan/fetch state machine (bounded fetch semaphore of 8,
+  delta-part cap of 2, write throttle of 3, fixed priority drain order),
+  summary/sig verification, commit and content verification, bindings and
+  timestamp checks, commitpartial, mirror mode.
+- 16d Delta-accelerated pull and the config and mount repo finders.
+Verify: pull from a local trivial httpd over both HTTP/1.1 and HTTP/2; the
+`test-pull-*`, `test-local-pull*`, `test-signed-pull*` clusters via the
+harness.
+
+### Phase 17 -- `ostree`-compatible CLI (`ostrya-cli`)
+
+Incremental, driven by which shell tests are targeted; extends the Phase 11
+`ostrya` binary. Command-line and stdout/stderr compatibility with the
+`ostree` tool for the exercised subcommands (commit, checkout, refs,
+rev-parse, ls, cat, show, log, config, prune, fsck, summary, sign, gpg-sign,
+static-delta, pull, pull-local, remote, init, export, diff). Provide a
+compatible shell-test harness and a TAP producer.
 Verify: growing subsets of the shell suite pass unmodified.
 
-### Phase 17 -- Sysroot / deployment (optional, separate track)
+### Phase 18 -- S3 push/pull extension
+
+Feature-gated (`s3`). Push publishes a repository -- objects, refs, summary
+-- to an S3 bucket; pull fetches directly from one. Push is a port extension
+(the tool has no push); a pushed bucket is a plain static repository, so the
+tool can pull from it over the bucket's HTTP endpoint. The S3-specific work
+is SigV4 request signing, bucket/prefix addressing, and multipart upload for
+large objects, over the Phase 16a fetcher; credentials come from the
+standard AWS environment and profile chain. The dependency set (a pure-Rust
+SigV4 signer versus hand-rolled signing) is settled at phase start.
+Verify: push a fixture repository to an S3-compatible test server and pull
+it back intact; the tool pulls the pushed bucket over plain HTTP.
+
+### Phase 19 -- SSH push/pull extension
+
+Feature-gated (`ssh`). Git-style transport: the client spawns the system
+`ssh` as a subprocess (a child process, not a linked library, so the no-C
+constraint holds) and runs `ostrya` on the remote side; the two ends speak
+a pack protocol over stdin/stdout. Push uploads missing objects and updates
+refs inside a normal transaction on the remote repository; pull is the
+reverse. The remote end is the Phase 11 binary grown a serve subcommand.
+Protocol framing and the object-negotiation design are specified at phase
+start.
+Verify: push and pull between two port repositories over ssh to localhost;
+the receiving repository passes `ostree fsck` and resolves the pushed refs.
+
+### Phase 20 -- Sysroot / deployment (optional, separate track)
 
 Out of the core library scope. If pursued: sysroot layout, deployments, boot
 config parsing, bootloader integration, `admin` subcommands. This is the
@@ -984,18 +1060,21 @@ admin tests. Recommend deferring or descoping unless explicitly required.
 
 ## Risk register
 
-- composefs/EROFS byte-exactness (Phase 15): the EROFS and composefs on-disk
+- composefs/EROFS byte-exactness (Phase 9): the EROFS and composefs on-disk
   formats are defined by the composefs and EROFS projects, not by ostree's
-  public docs; reproduction is substantial. Mitigation: isolate behind a
-  feature, and consider an existing pure-Rust composefs crate if its output
-  matches.
+  public docs; reproduction is substantial, and the phase sits early in the
+  roadmap on the critical path to the Phase 11 CLI. Mitigation: consider an
+  existing pure-Rust composefs crate if its output matches.
 - GVariant byte-exactness (Phase 1): everything downstream depends on it.
   Mitigation: extensive golden fixtures before building on it.
-- xz encoding in pure Rust (Phase 12): decode is well-supported; encode is
+- xz encoding in pure Rust (Phase 15): decode is well-supported; encode is
   weaker. Mitigation: delta parts need only valid xz that round-trips (the part
   checksum is over our own compressed bytes), not byte-identity with liblzma.
-- HTTP client (Phase 13a): no range/resume is needed, which keeps a hand-rolled
-  or small pure-Rust client viable; HTTP/2 multiplexing is optional.
+- HTTP client (Phase 16a): HTTP/2 support is required, which puts a
+  pure-Rust HTTP/2 implementation on the dependency surface; candidate
+  crates couple to tokio-flavored I/O traits that need adapting to
+  `ostrya-rt`. Mitigation: ALPN via rustls, the `tokio_util::compat`-style
+  adapter pattern already in use, and a crate proposal at phase start.
 - sequoia RustCrypto backend maturity for the exact GPG verify semantics
   ostree needs (revocation, expiry, primary-fingerprint mapping).
 - "Pass the test suite" scope: the shell tier requires a compatible CLI; the
@@ -1013,7 +1092,7 @@ Resolved:
    ostree's fixed type set, fuzzed against golden bytes from the tool.
 3. Test-suite scope: phased. Target the library-format-testable subset plus
    format-primitive unit tests first; add CLI-driven shell tests through
-   Phase 16; treat the admin/sysroot tier (Phase 17) as a separate, optional
+   Phase 17; treat the admin/sysroot tier (Phase 20) as a separate, optional
    track.
 4. Workspace: multi-crate (`ostrya-gvariant`, `ostrya-core`, `ostrya`,
    `ostrya-cli`), with heavier subsystems behind feature flags on `ostrya`.
@@ -1070,14 +1149,15 @@ Resolved:
    external crates: `rt::Timer` wraps the existing backends (`smol::Timer`,
    `tokio::time`) and the in-process coordination uses `std::sync::Mutex`.
 
+9. Repo finders: the config and mount finders land with pull (Phase 16d);
+   avahi discovery is out of scope.
+10. HTTP/2: required for pull. The fetcher is built on a pure-Rust HTTP
+    crate speaking HTTP/1.1 and HTTP/2 with ALPN over rustls; the concrete
+    crate is proposed at Phase 16a per the dependency rule.
+
 Deferred to their respective phases:
 
-9. composefs (Phase 15): reproduce the composefs/EROFS format ourselves versus
-   depend on an emerging pure-Rust composefs crate. Feature-gated and late
-   either way.
-10. HTTP client (Phase 13a): hand-roll a minimal async HTTP/1.1 client over
-    the runtime's net layer + rustls versus a pure-Rust crate such as
-    `async-h1`. No range/HTTP2 is required, which keeps the hand-rolled
-    option viable.
-11. spki sign engine and avahi repo-finder: deferred as optional; ed25519
-    and gpg cover the common cases.
+11. composefs (Phase 9): reproduce the composefs/EROFS format ourselves
+    versus depend on an emerging pure-Rust composefs crate.
+12. spki sign engine: deferred as optional; ed25519 and gpg cover the
+    common cases.

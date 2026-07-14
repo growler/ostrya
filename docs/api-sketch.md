@@ -247,7 +247,7 @@ pub struct HashingWriter<W> { /* Sha256, count, inner */ }
 /// read fails with `std::io::ErrorKind::InvalidData` on a mismatch. The
 /// check fires only when the consumer polls through to EOF; an empty-buffer
 /// read neither observes bytes nor latches EOF. Lands with pull
-/// (Phase 13a).
+/// (Phase 16a).
 pub struct VerifyingReader<D, R> { /* expected digest over a HashingReader */ }
 ```
 

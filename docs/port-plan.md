@@ -1006,7 +1006,7 @@ images. Always compiled, not feature-gated. Split into sub-phases:
   lines carry xattrs) and locks in shared-xattr promotion, inline xattrs, a
   multi-block directory with an inline dirent tail, and a long inline symlink
   near the block boundary.
-- 9d Wire `ostrya-composefs` into `ostrya`: build the writer's tree model from
+- 9d (DONE) Wire `ostrya-composefs` into `ostrya`: build the writer's tree model from
   a commit's `RepoTree`, inject the five top-level directories (`boot`, `etc`,
   `sysroot`, `usr`, `var`), resolve each regular file to its `.file` loose path
   and stream the loose object through the fs-verity digester to fill the

@@ -47,10 +47,18 @@
 //! unprivileged), the [`OverwriteMode`] over an existing destination, an
 //! optional subpath, hardlink-versus-copy with a `FICLONE` reflink on the copy
 //! path, Docker-style whiteouts, a populated [`DevInoCache`], and an optional
-//! filter. Maintenance lands in later phases.
+//! filter. It also covers composefs export (Phase 9d):
+//! [`Repo::export_composefs`], which builds the EROFS/composefs image for a
+//! commit over the [`ostrya_composefs`] writer -- the tree model comes from the
+//! commit's [`RepoTree`], the five top-level directories are injected, and each
+//! regular file redirects to its `.file` loose object and carries that object's
+//! fs-verity digest -- and [`Repo::commit_add_composefs_metadata`], which stores
+//! the image digest in a commit's `ostree.composefs.digest.v0` metadata.
+//! Maintenance lands in later phases.
 
 pub mod checkout;
 pub mod commit;
+pub mod composefs;
 pub mod config;
 pub mod error;
 pub mod file;
@@ -82,6 +90,7 @@ pub use modifier::{
     CommitModifier, CommitModifierFlags, DevInoCache, FilterFn, FilterResult, LabelFn, XattrFn,
 };
 pub use mtree::MutableTree;
+pub use ostrya_composefs::Image;
 pub use ostrya_core::{Checksum, Commit, DirMeta, DirTree, ObjectType, RepoMode, Type, Value};
 pub use read::CommitState;
 pub use refs::CollectionRef;

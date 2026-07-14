@@ -303,7 +303,7 @@ fn resolve_timestamp(explicit: Option<u64>) -> Result<u64> {
 }
 
 /// Append one entry to an `a{sv}` dict value, preserving insertion order.
-fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -> Result<()> {
+pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -> Result<()> {
     match metadata {
         Value::Array(entries) => {
             entries.push(Value::Tuple(vec![Value::Str(key.to_owned()), value]));

@@ -377,6 +377,7 @@ dependencies = [
  "async-compression",
  "futures-io",
  "futures-lite",
+ "ostrya-composefs",
  "ostrya-core",
  "ostrya-rt",
  "pin-project-lite",

@@ -14,6 +14,7 @@ tokio = ["ostrya-rt/tokio"]
 
 [dependencies]
 ostrya-core = { path = "../ostrya-core" }
+ostrya-composefs = { path = "../ostrya-composefs" }
 ostrya-rt = { path = "../ostrya-rt", default-features = false }
 thiserror = "2"
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }

@@ -813,7 +813,7 @@ with their dedicated errors; an upper directory over a base symlink and
 upper leaves over base directories apply as cross-type replacements;
 the modifier filter skips upper entries without disturbing base ones.
 
-### Phase 7f -- Staging tree and tree merge (port extension)
+### Phase 7f -- Staging tree and tree merge (port extension) (DONE)
 
 Path-addressed tree construction over a transaction: `StagingTree`, its
 file and directory operations, tree merge with symlink resolution, and
@@ -829,9 +829,11 @@ Definition:
   `&StagingTree` is `Send + Sync`, and file writes may run
   concurrently. `close` returns the `MutableTree` and fails while
   `write_file` writers are outstanding (a counter).
-- Constructors on `Transaction`: `staging_tree` (empty, or lazily
-  hydrated from a `Commit`'s root checksums) and
-  `staging_tree_from_mutable_tree`.
+- Constructors on `Transaction`: `staging_tree` (empty, or hydrated
+  from a `Commit`'s root checksums) and `staging_tree_from_mutable_tree`.
+  `staging_tree` is `async`, since hydrating from a commit reads its
+  root dirtree, departing from the synchronous sketch the same way
+  `MutableTree::ensure_dir` does.
 - Path operations: `write_file` (returns `StagedFileWriter`, whose
   `finish` completes the content object and records the entry),
   `write_file_content`, `make_dir`, `make_dir_all`, `symlink`
@@ -843,11 +845,12 @@ Definition:
   `make_dir`, `symlink`, and `hardlink` fail on any existing entry;
   `make_dir_all` applies its `DirMeta` to directories it creates and
   leaves existing ones untouched.
-- Staged-first object lookup on `Transaction`: `read_file` and
-  `read_dir` resolve paths against the staged tree and load objects
-  from the transaction's staged set before `objects/`. `read_dir`
-  returns `StagingEntry`; a dirty directory has no checksum, so
-  `TreeEntry` cannot represent it.
+- Staged-first reads: `StagingTree::read_file` and `read_dir` resolve
+  paths against the staged tree and load objects through the
+  transaction's staged-first object lookup, which reads the
+  transaction's staged set before `objects/`. `read_dir` returns
+  `StagingEntry`; a dirty directory has no checksum, so `TreeEntry`
+  cannot represent it.
 - Symlink resolution (`follow_symlinks` on the read operations and in
   `MergeOptions`) walks the staged tree component-wise: relative
   targets resolve from the symlink's parent, absolute targets from the

@@ -74,6 +74,37 @@ enum Child {
     Loaded(MutableTree),
 }
 
+/// What a directory holds at a given name, for the staging-tree path walker.
+pub(crate) enum ChildKind {
+    /// No entry with that name.
+    Absent,
+    /// A file or symlink, named by its content checksum.
+    File(Checksum),
+    /// A materialized (loaded) subdirectory.
+    Dir,
+    /// A committed subdirectory not yet read; hydrate before descending.
+    LazyDir {
+        /// The subdirectory's dirtree checksum.
+        dirtree: Checksum,
+        /// The subdirectory's dirmeta checksum.
+        dirmeta: Checksum,
+    },
+}
+
+/// A borrowed view of a subdirectory entry, for reading a tree without mutating
+/// it (the right side of a [`merge`](crate::StagingTree::merge)).
+pub(crate) enum ChildRef<'a> {
+    /// A materialized subtree, borrowed in place.
+    Loaded(&'a MutableTree),
+    /// A committed subtree named by its dirtree and dirmeta checksums.
+    Lazy {
+        /// The subdirectory's dirtree checksum.
+        dirtree: Checksum,
+        /// The subdirectory's dirmeta checksum.
+        dirmeta: Checksum,
+    },
+}
+
 /// The checksums a written directory contributes to its parent's dirtree entry.
 struct Emitted {
     dirtree: Checksum,
@@ -123,7 +154,11 @@ impl MutableTree {
 
     /// Read one committed dirtree into a loaded tree; its subdirectories become
     /// lazy children carrying the same repository handle.
-    async fn hydrate(repo: &Repo, dirtree: Checksum, dirmeta: Checksum) -> Result<MutableTree> {
+    pub(crate) async fn hydrate(
+        repo: &Repo,
+        dirtree: Checksum,
+        dirmeta: Checksum,
+    ) -> Result<MutableTree> {
         let loaded = repo.load_dirtree(&dirtree).await?;
         let mut files = BTreeMap::new();
         for (name, csum) in loaded.files {
@@ -244,6 +279,101 @@ impl MutableTree {
             )));
         }
         Ok(())
+    }
+
+    /// This directory's dirmeta checksum, if set.
+    pub(crate) fn metadata_checksum(&self) -> Option<Checksum> {
+        self.metadata_checksum
+    }
+
+    /// The repository this tree hydrates lazy children from, if any.
+    pub(crate) fn repo(&self) -> Option<Repo> {
+        self.repo.clone()
+    }
+
+    /// What this directory holds at `name`, for the staging-tree path walker.
+    pub(crate) fn child_kind(&self, name: &str) -> ChildKind {
+        if let Some(checksum) = self.files.get(name) {
+            return ChildKind::File(*checksum);
+        }
+        match self.dirs.get(name) {
+            Some(Child::Loaded(_)) => ChildKind::Dir,
+            Some(Child::Lazy { dirtree, dirmeta }) => ChildKind::LazyDir {
+                dirtree: *dirtree,
+                dirmeta: *dirmeta,
+            },
+            None => ChildKind::Absent,
+        }
+    }
+
+    /// Navigate to the loaded directory at the literal component `path`, or
+    /// `None` if any component is missing or is not a loaded directory. Lazy
+    /// children must be hydrated by the caller before they can be traversed.
+    pub(crate) fn dir_at(&self, path: &[String]) -> Option<&MutableTree> {
+        let mut cur = self;
+        for name in path {
+            match cur.dirs.get(name) {
+                Some(Child::Loaded(child)) => cur = child,
+                _ => return None,
+            }
+        }
+        Some(cur)
+    }
+
+    /// The mutable counterpart of [`dir_at`](MutableTree::dir_at).
+    pub(crate) fn dir_at_mut(&mut self, path: &[String]) -> Option<&mut MutableTree> {
+        let mut cur = self;
+        for name in path {
+            match cur.dirs.get_mut(name) {
+                Some(Child::Loaded(child)) => cur = child,
+                _ => return None,
+            }
+        }
+        Some(cur)
+    }
+
+    /// Replace a lazy child `name` with its hydrated subtree. The directory's
+    /// own dirtree is unchanged, so `clean` stays as it was.
+    pub(crate) fn install_hydrated_child(&mut self, name: &str, loaded: MutableTree) {
+        self.dirs.insert(name.to_owned(), Child::Loaded(loaded));
+    }
+
+    /// Insert a fresh empty loaded subdirectory named `name` with the given
+    /// dirmeta checksum, replacing any existing entry of that name. Marks this
+    /// directory dirty.
+    pub(crate) fn insert_empty_dir(&mut self, name: &str, dirmeta: Option<Checksum>) {
+        let child = MutableTree {
+            metadata_checksum: dirmeta,
+            files: BTreeMap::new(),
+            dirs: BTreeMap::new(),
+            clean: None,
+            repo: self.repo.clone(),
+        };
+        self.files.remove(name);
+        self.dirs.insert(name.to_owned(), Child::Loaded(child));
+        self.clean = None;
+    }
+
+    /// The file entries of this directory, byte-wise name-sorted.
+    pub(crate) fn file_entries(&self) -> impl Iterator<Item = (&str, Checksum)> {
+        self.files
+            .iter()
+            .map(|(name, checksum)| (name.as_str(), *checksum))
+    }
+
+    /// The subdirectory entries of this directory as borrowed views, byte-wise
+    /// name-sorted.
+    pub(crate) fn dir_entries(&self) -> impl Iterator<Item = (&str, ChildRef<'_>)> {
+        self.dirs.iter().map(|(name, child)| {
+            let view = match child {
+                Child::Loaded(tree) => ChildRef::Loaded(tree),
+                Child::Lazy { dirtree, dirmeta } => ChildRef::Lazy {
+                    dirtree: *dirtree,
+                    dirmeta: *dirmeta,
+                },
+            };
+            (name.as_str(), view)
+        })
     }
 }
 

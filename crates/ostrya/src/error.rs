@@ -71,6 +71,16 @@ pub enum Error {
     /// the overlay must be mounted with that feature disabled.
     #[error("unsupported overlay feature: {0}")]
     UnsupportedOverlayFeature(String),
+    /// A staging-tree path could not be resolved: a missing component, a
+    /// non-directory where a directory was expected, an existing entry where a
+    /// fresh one was required, or a dangling or looping symlink.
+    #[error("staging tree: {0}")]
+    Staging(String),
+    /// A staging-tree merge hit a conflict the [`MergeOptions`](crate::MergeOptions)
+    /// did not permit: differing files, a file-versus-directory clash, or
+    /// differing directory metadata, without `allow_overwrite`.
+    #[error("merge conflict: {0}")]
+    MergeConflict(String),
 }
 
 impl From<rustix::io::Errno> for Error {

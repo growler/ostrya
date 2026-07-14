@@ -35,8 +35,14 @@
 //! sequence -- objects published, then refs written. It also covers overlay
 //! changeset import (Phase 7e): [`Transaction::merge_overlay_dfd_to_mtree`],
 //! which merges an overlayfs upperdir into a [`MutableTree`] holding the lower
-//! layer, applying whiteouts and opaque directories as it walks. Checkout and
-//! maintenance land in later phases.
+//! layer, applying whiteouts and opaque directories as it walks. It also covers
+//! path-addressed tree construction (Phase 7f): the [`StagingTree`] built over a
+//! transaction, with file, symlink, directory, and hardlink operations that
+//! resolve paths through symlinks, tree [`merge`](StagingTree::merge) with
+//! symlink resolution, and staged-first [`read_file`](StagingTree::read_file) /
+//! [`read_dir`](StagingTree::read_dir) that see objects staged in the current
+//! transaction before they publish. Checkout and maintenance land in later
+//! phases.
 
 pub mod commit;
 pub mod config;
@@ -54,6 +60,7 @@ pub mod read;
 pub mod refs;
 pub mod repo;
 mod staging;
+pub mod staging_tree;
 pub mod transaction;
 pub mod tree;
 mod write;
@@ -72,5 +79,6 @@ pub use ostrya_core::{Checksum, Commit, DirMeta, DirTree, ObjectType, RepoMode, 
 pub use read::CommitState;
 pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};
+pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};

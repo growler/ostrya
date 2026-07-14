@@ -358,8 +358,10 @@ impl Transaction {
     pub async fn write_mtree(&self, mtree: &mut MutableTree) -> Result<RepoTree>;
 
     // path-addressed construction (port extension; see "Staging tree,
-    // tree merge, and overlay import")
-    pub fn staging_tree(&self, source: Option<&Commit>) -> StagingTree<'_>;
+    // tree merge, and overlay import"). staging_tree is async: hydrating
+    // from a commit reads its root dirtree.
+    pub async fn staging_tree(&self, source: Option<&Commit>)
+        -> Result<StagingTree<'_>>;
     pub fn staging_tree_from_mutable_tree(&self, source: MutableTree)
         -> StagingTree<'_>;
 

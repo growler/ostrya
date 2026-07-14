@@ -26,6 +26,7 @@
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use ostrya_core::{Checksum, FileHeader, ObjectType, RepoMode, Xattrs, loose_path};
@@ -71,6 +72,25 @@ enum ReaderSource {
     Archive { payload_offset: u64 },
 }
 
+/// Where a file object's bytes live, so [`FileObject::reader`] can open a fresh
+/// stream on demand from either the repository's `objects/` or a transaction's
+/// staging directory.
+#[derive(Debug, Clone)]
+enum ObjectStore {
+    /// A loose object under the repository's `objects/` directory; the path is
+    /// derived from the checksum and mode at read time.
+    Repo,
+    /// A flat-named object in a transaction staging directory, not yet
+    /// published. The directory fd is `Arc`-shared so the object stays `Clone`
+    /// and self-contained.
+    Staging {
+        /// The staging directory the object is ingested into.
+        dir: Arc<OwnedFd>,
+        /// The object's flat staging name (`<hex>.file` / `<hex>.filez`).
+        name: String,
+    },
+}
+
 /// A file object's logical metadata plus a handle for streaming its payload.
 #[derive(Debug, Clone)]
 pub struct FileObject {
@@ -87,6 +107,7 @@ pub struct FileObject {
     /// Whether this is a regular file or a symlink.
     pub kind: FileKind,
     source: ReaderSource,
+    store: ObjectStore,
 }
 
 impl FileObject {
@@ -103,28 +124,37 @@ impl FileObject {
     /// Open an async reader over the file's payload, streaming it in bounded
     /// chunks. A symlink has no payload, so its reader yields no bytes.
     pub async fn reader(&self) -> Result<ContentReader> {
-        let mode = self.repo.mode();
         let inner = match &self.source {
             ReaderSource::None => ContentReaderInner::Empty,
-            ReaderSource::Plain => {
-                let path = loose_path(&self.checksum, ObjectType::File, mode);
-                ContentReaderInner::Plain(self.open_payload(path, 0).await?)
-            }
+            ReaderSource::Plain => ContentReaderInner::Plain(self.open_payload(0).await?),
             ReaderSource::Archive { payload_offset } => {
-                let path = loose_path(&self.checksum, ObjectType::File, mode);
-                let file = self.open_payload(path, *payload_offset).await?;
+                let file = self.open_payload(*payload_offset).await?;
                 ContentReaderInner::Inflate(archive_decoder(file))
             }
         };
         Ok(ContentReader { inner })
     }
 
-    /// Open the object file at `path`, positioned past `payload_offset` bytes,
-    /// off the blocking pool.
-    async fn open_payload(&self, path: String, payload_offset: u64) -> Result<RtFile> {
-        let repo = self.repo.clone();
+    /// The directory fd and path the payload is read from: a loose path under
+    /// `objects/`, or the flat staging name for a not-yet-published object.
+    fn payload_location(&self) -> Result<(OwnedFd, String)> {
+        match &self.store {
+            ObjectStore::Repo => {
+                let path = loose_path(&self.checksum, ObjectType::File, self.repo.mode());
+                Ok((self.repo.objects_fd().try_clone_to_owned()?, path))
+            }
+            ObjectStore::Staging { dir, name } => {
+                Ok((dir.as_fd().try_clone_to_owned()?, name.clone()))
+            }
+        }
+    }
+
+    /// Open the object file positioned past `payload_offset` bytes, off the
+    /// blocking pool.
+    async fn open_payload(&self, payload_offset: u64) -> Result<RtFile> {
+        let (dir, path) = self.payload_location()?;
         let file = ostrya_rt::unblock(move || {
-            object::open_content_file(repo.objects_fd(), &path, payload_offset)
+            object::open_content_file(dir.as_fd(), &path, payload_offset)
         })
         .await
         .map_err(Error::Io)?;
@@ -137,10 +167,11 @@ impl Repo {
     /// stream its payload. The interpretation follows the repository mode.
     pub async fn load_file(&self, checksum: &Checksum) -> Result<FileObject> {
         let mode = self.mode();
+        let path = loose_path(checksum, ObjectType::File, mode);
         let repo = self.clone();
         let key = *checksum;
         let loaded =
-            ostrya_rt::unblock(move || load_by_mode(repo.objects_fd(), &key, mode)).await?;
+            ostrya_rt::unblock(move || load_by_mode(repo.objects_fd(), &path, &key, mode)).await?;
         Ok(FileObject {
             repo: self.clone(),
             checksum: *checksum,
@@ -150,8 +181,40 @@ impl Repo {
             xattrs: loaded.xattrs,
             kind: loaded.kind,
             source: loaded.source,
+            store: ObjectStore::Repo,
         })
     }
+}
+
+/// Load a file object from a transaction staging directory by its flat name,
+/// used for the staged-first lookup that reads objects staged in the current
+/// transaction before they publish into `objects/`. The metadata is decoded the
+/// same per-mode way as a loose object; the payload streams from the staging
+/// directory.
+pub(crate) async fn load_staged_file(
+    repo: &Repo,
+    staging_fd: BorrowedFd<'_>,
+    checksum: &Checksum,
+) -> Result<FileObject> {
+    let mode = repo.mode();
+    let name = crate::write::flat_name(checksum, ObjectType::File, mode);
+    let dir = Arc::new(staging_fd.try_clone_to_owned()?);
+    let key = *checksum;
+    let load_dir = dir.clone();
+    let load_name = name.clone();
+    let loaded =
+        ostrya_rt::unblock(move || load_by_mode(load_dir.as_fd(), &load_name, &key, mode)).await?;
+    Ok(FileObject {
+        repo: repo.clone(),
+        checksum: *checksum,
+        uid: loaded.uid,
+        gid: loaded.gid,
+        mode: loaded.mode,
+        xattrs: loaded.xattrs,
+        kind: loaded.kind,
+        source: loaded.source,
+        store: ObjectStore::Staging { dir, name },
+    })
 }
 
 /// The fields a per-mode loader produces before a [`FileObject`] is assembled.
@@ -164,14 +227,23 @@ struct Loaded {
     source: ReaderSource,
 }
 
-/// Dispatch to the loader for the repository mode.
-fn load_by_mode(objects_fd: BorrowedFd<'_>, checksum: &Checksum, mode: RepoMode) -> Result<Loaded> {
+/// Dispatch to the loader for the repository mode. `object_path` locates the
+/// object relative to `dir_fd`: a loose path under `objects/`, or a flat name in
+/// a staging directory.
+fn load_by_mode(
+    dir_fd: BorrowedFd<'_>,
+    object_path: &str,
+    checksum: &Checksum,
+    mode: RepoMode,
+) -> Result<Loaded> {
     match mode {
-        RepoMode::Archive => load_archive(objects_fd, checksum),
-        RepoMode::BareUser | RepoMode::BareUserShared => load_bare_user(objects_fd, checksum),
-        RepoMode::Bare => load_bare(objects_fd, checksum),
-        RepoMode::BareUserOnly => load_bare_user_only(objects_fd, checksum),
-        RepoMode::BareSplitXattrs => load_bare_split_xattrs(objects_fd, checksum),
+        RepoMode::Archive => load_archive(dir_fd, object_path, checksum),
+        RepoMode::BareUser | RepoMode::BareUserShared => {
+            load_bare_user(dir_fd, object_path, checksum)
+        }
+        RepoMode::Bare => load_bare(dir_fd, object_path, checksum),
+        RepoMode::BareUserOnly => load_bare_user_only(dir_fd, object_path, checksum),
+        RepoMode::BareSplitXattrs => load_bare_split_xattrs(dir_fd, object_path, checksum),
     }
 }
 
@@ -231,11 +303,10 @@ fn symlink_target_from_content(content: &[u8]) -> Result<String> {
         .map_err(|_| Error::InvalidFormat("symlink target is not valid UTF-8".into()))
 }
 
-fn load_archive(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> {
+fn load_archive(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<Loaded> {
     use std::io::Read;
 
-    let path = loose_path(checksum, ObjectType::File, RepoMode::Archive);
-    let fd = open_object(objects_fd, &path, checksum)?;
+    let fd = open_object(dir_fd, path, checksum)?;
     let mut file = std::fs::File::from(fd);
 
     let mut prefix = [0u8; 8];
@@ -282,11 +353,10 @@ fn load_archive(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loade
     })
 }
 
-fn load_bare_user(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> {
+fn load_bare_user(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<Loaded> {
     use std::io::Read;
 
-    let path = loose_path(checksum, ObjectType::File, RepoMode::BareUser);
-    let fd = open_object(objects_fd, &path, checksum)?;
+    let fd = open_object(dir_fd, path, checksum)?;
     let meta = object::read_xattr(fd.as_fd(), "user.ostreemeta")
         .map_err(Error::Io)?
         .ok_or_else(|| {
@@ -324,9 +394,8 @@ fn load_bare_user(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loa
     })
 }
 
-fn load_bare(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> {
-    let path = loose_path(checksum, ObjectType::File, RepoMode::Bare);
-    let stat = stat_object(objects_fd, &path, checksum, ObjectType::File)?;
+fn load_bare(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<Loaded> {
+    let stat = stat_object(dir_fd, path, checksum, ObjectType::File)?;
     let uid = stat.st_uid;
     let gid = stat.st_gid;
     let mode = stat.st_mode;
@@ -336,16 +405,16 @@ fn load_bare(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> 
             uid,
             gid,
             mode,
-            xattrs: object::read_link_xattrs(objects_fd, &path)?,
+            xattrs: object::read_link_xattrs(dir_fd, path)?,
             kind: FileKind::Symlink {
-                target: read_link_target(objects_fd, &path)?,
+                target: read_link_target(dir_fd, path)?,
             },
             source: ReaderSource::None,
         }),
         FileType::RegularFile => {
             let fd = rustix::fs::openat(
-                objects_fd,
-                &path,
+                dir_fd,
+                path,
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
@@ -368,9 +437,8 @@ fn load_bare(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> 
     }
 }
 
-fn load_bare_user_only(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> {
-    let path = loose_path(checksum, ObjectType::File, RepoMode::BareUserOnly);
-    let stat = stat_object(objects_fd, &path, checksum, ObjectType::File)?;
+fn load_bare_user_only(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<Loaded> {
+    let stat = stat_object(dir_fd, path, checksum, ObjectType::File)?;
     // uid/gid are discarded in this mode and read back as 0; the mode is the
     // canonical mode carried on the inode; no xattrs are stored.
     let mode = stat.st_mode;
@@ -381,7 +449,7 @@ fn load_bare_user_only(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Resul
             mode,
             xattrs: Xattrs::empty(),
             kind: FileKind::Symlink {
-                target: read_link_target(objects_fd, &path)?,
+                target: read_link_target(dir_fd, path)?,
             },
             source: ReaderSource::None,
         }),
@@ -401,17 +469,23 @@ fn load_bare_user_only(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Resul
     }
 }
 
-fn load_bare_split_xattrs(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Loaded> {
+fn load_bare_split_xattrs(
+    dir_fd: BorrowedFd<'_>,
+    path: &str,
+    checksum: &Checksum,
+) -> Result<Loaded> {
     // Storage is bare: the inode carries the logical uid/gid/mode, a regular
     // file holds the raw payload, and a symlink is a real symlink. The inode
     // holds no xattrs; the logical set lives in a separate object reached
     // through the `.file-xattrs-link` entry keyed by the file checksum.
-    let path = loose_path(checksum, ObjectType::File, RepoMode::BareSplitXattrs);
-    let stat = stat_object(objects_fd, &path, checksum, ObjectType::File)?;
+    // bare-split-xattrs is read-only and never staged, so `dir_fd` is always the
+    // repository's `objects/`; the split-xattrs link is resolved by its own
+    // loose path from the checksum.
+    let stat = stat_object(dir_fd, path, checksum, ObjectType::File)?;
     let uid = stat.st_uid;
     let gid = stat.st_gid;
     let mode = stat.st_mode;
-    let xattrs = load_split_xattrs(objects_fd, checksum)?;
+    let xattrs = load_split_xattrs(dir_fd, checksum)?;
 
     match FileType::from_raw_mode(stat.st_mode) {
         FileType::Symlink => Ok(Loaded {
@@ -420,7 +494,7 @@ fn load_bare_split_xattrs(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Re
             mode,
             xattrs,
             kind: FileKind::Symlink {
-                target: read_link_target(objects_fd, &path)?,
+                target: read_link_target(dir_fd, path)?,
             },
             source: ReaderSource::None,
         }),

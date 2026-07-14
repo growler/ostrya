@@ -201,6 +201,59 @@ impl Transaction {
         self.staged.lock().unwrap().stats.filtered += 1;
     }
 
+    /// Whether an object of the given identity and type is staged in this
+    /// transaction (present in the staging directory, not yet published into
+    /// `objects/`).
+    pub(crate) fn is_staged(&self, checksum: &Checksum, ty: ObjectType) -> bool {
+        self.staged
+            .lock()
+            .unwrap()
+            .objects
+            .contains_key(&(*checksum, ty))
+    }
+
+    /// Load a file object, checking this transaction's staged set before the
+    /// repository's `objects/`. Used by the staging-tree read and merge paths so
+    /// content staged in the current transaction is visible before it publishes.
+    pub(crate) async fn load_file_staged_first(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<crate::file::FileObject> {
+        if self.is_staged(checksum, ObjectType::File) {
+            crate::file::load_staged_file(&self.repo, self.staging_fd(), checksum).await
+        } else {
+            self.repo.load_file(checksum).await
+        }
+    }
+
+    /// Load a dirtree object, checking this transaction's staged set before the
+    /// repository's `objects/`. Mirrors [`load_file_staged_first`] for the
+    /// merge path's right side, so a dirtree staged in the current transaction
+    /// is visible before it publishes.
+    ///
+    /// [`load_file_staged_first`]: Transaction::load_file_staged_first
+    pub(crate) async fn load_dirtree_staged_first(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<ostrya_core::DirTree> {
+        if self.is_staged(checksum, ObjectType::DirTree) {
+            let name = crate::write::flat_name(checksum, ObjectType::DirTree, self.repo.mode());
+            let staging = self.staging_fd().try_clone_to_owned()?;
+            let bytes = ostrya_rt::unblock(move || {
+                crate::object::read_meta_object(
+                    staging.as_fd(),
+                    &name,
+                    crate::object::MAX_METADATA_SIZE,
+                )
+            })
+            .await
+            .map_err(Error::Io)?;
+            Ok(ostrya_core::DirTree::parse(&bytes)?)
+        } else {
+            self.repo.load_dirtree(checksum).await
+        }
+    }
+
     /// Stage a regular-file content object whose payload is already written to
     /// `file`. Called by [`ContentWriter::finish`](crate::ContentWriter::finish).
     pub(crate) async fn stage_regular(

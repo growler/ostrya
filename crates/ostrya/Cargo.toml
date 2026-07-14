@@ -5,7 +5,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+readme.workspace = true
 
 [features]
 default = ["smol"]
@@ -13,9 +14,9 @@ smol = ["ostrya-rt/smol"]
 tokio = ["ostrya-rt/tokio"]
 
 [dependencies]
-ostrya-core = { path = "../ostrya-core" }
-ostrya-composefs = { path = "../ostrya-composefs" }
-ostrya-rt = { path = "../ostrya-rt", default-features = false }
+ostrya-core = { workspace = true }
+ostrya-composefs = { workspace = true }
+ostrya-rt = { workspace = true }
 thiserror = "2"
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
@@ -27,5 +28,5 @@ pin-project-lite = "0.2"
 futures-io = "0.3"
 
 [dev-dependencies]
-ostrya-rt = { path = "../ostrya-rt", default-features = false }
+ostrya-rt = { workspace = true }
 futures-lite = "2"

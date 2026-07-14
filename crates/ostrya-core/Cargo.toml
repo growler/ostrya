@@ -5,8 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-publish = false
+repository.workspace = true
+readme.workspace = true
 
 [dependencies]
-ostrya-gvariant = { path = "../ostrya-gvariant" }
+ostrya-gvariant = { workspace = true }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }

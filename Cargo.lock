@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "ostrya"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "async-compression",
  "futures-io",
@@ -388,21 +388,21 @@ dependencies = [
 
 [[package]]
 name = "ostrya-cli"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "ostrya",
 ]
 
 [[package]]
 name = "ostrya-composefs"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "ostrya-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "ostrya-gvariant",
  "sha2",
@@ -410,11 +410,11 @@ dependencies = [
 
 [[package]]
 name = "ostrya-gvariant"
-version = "0.0.0"
+version = "0.0.1"
 
 [[package]]
 name = "ostrya-rt"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "futures-io",
  "futures-lite",

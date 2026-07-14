@@ -383,8 +383,10 @@ fn archive_level(zlib_level: i64) -> Level {
 }
 
 /// Open an ingestion temp file in the staging directory: `O_TMPFILE` where the
-/// filesystem allows it, a named temp file otherwise.
-fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind)> {
+/// filesystem allows it, a named temp file otherwise. Reused by the checkout
+/// copy path, which opens its temporaries in the destination directory the same
+/// way.
+pub(crate) fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind)> {
     match rustix::fs::openat(
         staging_fd,
         ".",
@@ -703,8 +705,9 @@ fn set_ostreemeta(fd: BorrowedFd<'_>, header: &FileHeader) -> Result<()> {
     Ok(())
 }
 
-/// Set one inode xattr, stripping the stored name's terminating NUL.
-fn set_inode_xattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8]) -> Result<()> {
+/// Set one inode xattr, stripping the stored name's terminating NUL. Reused by
+/// the checkout copy path to apply a file object's logical xattrs.
+pub(crate) fn set_inode_xattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8]) -> Result<()> {
     let name = name.strip_suffix(&[0]).unwrap_or(name);
     let name = std::str::from_utf8(name)
         .map_err(|_| Error::InvalidFormat("xattr name is not valid UTF-8".into()))?;
@@ -714,8 +717,9 @@ fn set_inode_xattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8]) -> Result<()> 
 
 /// Set one xattr on a staged symlink inode, stripping the stored name's
 /// terminating NUL. A symlink cannot be opened for an fd, so the attribute is
-/// set no-follow through the `/proc/self/fd` path of the staging directory.
-fn set_link_xattr(
+/// set no-follow through the `/proc/self/fd` path of the directory. Reused by
+/// the checkout path to apply a symlink object's link xattrs.
+pub(crate) fn set_link_xattr(
     dir: BorrowedFd<'_>,
     staging_name: &str,
     name: &[u8],
@@ -896,7 +900,7 @@ async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, mut buf: &[u8]) -> io::Resu
     .await
 }
 
-async fn flush<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
+pub(crate) async fn flush<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {
     poll_fn(|cx| Pin::new(&mut *w).poll_flush(cx)).await
 }
 
@@ -913,7 +917,9 @@ async fn read_some<R: AsyncRead + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Resul
 }
 
 /// Stream `reader` into `writer` in bounded chunks; no whole blob is buffered.
-async fn copy_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+/// Reused by the checkout copy path to stream a file object's payload into a
+/// destination temp file.
+pub(crate) async fn copy_stream<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut reader: R,
     writer: &mut W,
 ) -> io::Result<()> {

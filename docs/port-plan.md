@@ -897,7 +897,7 @@ conflicts without `allow_overwrite` fail naming the path; concurrent
 compile-time assertions pin the new types `Send + Sync`; the suite
 passes under both runtime backends.
 
-### Phase 8 -- Checkout path
+### Phase 8 -- Checkout path (DONE)
 
 `checkout_at` for all modes; overwrite modes (none/union-files/add-files/
 union-identical); hardlink vs copy decision and fallbacks, with the copy

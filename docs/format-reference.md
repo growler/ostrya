@@ -548,6 +548,138 @@ ingest. A cache hit contributes the mapped checksum and stages no object. The
 mapping is a hashing shortcut with no on-disk effect: the object it names is
 identical to what re-hashing the file would produce.
 
+## Checkout
+
+Checkout materializes a commit's tree onto a filesystem. The destination is
+arbitrary and is not part of the on-disk format, so the durability choices
+(whether to fsync) carry no byte-exact requirement. The metadata each checkout
+writes, and the decision to hardlink a loose object rather than copy it, are
+recovered by black-box observation: checking out tool-created commits of assorted
+modes with `ostree checkout`, `ostree checkout -U`, and `ostree checkout -C`, and
+inspecting the destination trees (`stat`, `getfattr`, `readlink`) and the object
+inodes' link counts.
+
+Checkout modes. The faithful checkout (`ostree checkout`) restores full metadata;
+the unprivileged checkout (`ostree checkout -U`) restores no ownership and no
+xattrs.
+
+- Faithful: a regular file is chowned to the logical uid/gid, chmodded to the
+  full logical permission bits (`mode & 0o7777`), and given the logical xattrs. A
+  symlink is a real symlink lchowned to the logical uid/gid with the logical link
+  xattrs. A directory is chowned to the logical uid/gid, chmodded to the full
+  logical mode (`mode & 0o7777`), and given the logical xattrs.
+- Unprivileged: no chown and no xattrs. A regular file's mode is `mode & 0o777`,
+  so the setuid, setgid, and sticky bits are dropped and the rwx bits including
+  group- and other-write are kept (`4755` becomes `0755`, `0666` stays `0666`). A
+  directory's mode is the full `mode & 0o7777`, so its special bits are kept
+  (`2755` stays `2755`). A symlink is a real symlink with no chown and no xattrs.
+
+Observed on a `bare` repository holding a tree of assorted modes: `f0666` checks
+out `0666` under both modes; `f4755` checks out `4755` faithful and `0755`
+unprivileged; `d2755` checks out `2755` under both; a `user.demo` xattr on a file
+is present after a faithful checkout and absent after an unprivileged one.
+
+Hardlink versus copy. The tool hardlinks the loose object directly into the
+destination -- raising the object inode's link count -- exactly when the object's
+stored inode form is already byte-identical to what the checkout would otherwise
+write; otherwise it copies. Regular files, by storage mode and checkout mode:
+
+- `bare` + faithful: hardlink. `bare` + unprivileged: copy.
+- `bare-user` + faithful: copy. `bare-user` + unprivileged: hardlink. The
+  hardlinked file carries `user.ostreemeta` as a side effect of sharing the
+  object inode, which is why a byte-exact unprivileged checkout of a `bare-user`
+  repository requires the hardlink: a copy would omit that xattr.
+- `bare-user-only` + faithful or unprivileged: hardlink. The object carries no
+  ownership and no xattrs and its inode mode is the canonical `perm & 0o755`, so
+  the tool never chowns the checked-out file (it stays owned by the object
+  writer, not 0:0), and a faithful and an unprivileged checkout of a
+  `bare-user-only` repository produce identical trees. Checkout therefore treats
+  `bare-user-only` storage as forcing unprivileged semantics regardless of the
+  requested mode.
+- `bare-user-shared`: copy under both modes. The object inode is a fixed 0644
+  that matches no checkout form, so it never hardlinks; the copy applies the
+  logical mode from `user.ostreemeta`.
+- `archive`: copy under both modes. Under unprivileged checkout the tool
+  hardlinks from an `uncompressed-objects-cache/` it maintains outside the
+  on-disk format; a checkout that does not maintain that cache copies instead and
+  differs from the tool only in the object's link count, never in content or
+  metadata.
+
+Symlinks are hardlinked only under `bare` + faithful (destination link count 2
+observed). Everywhere else the symlink is recreated fresh (link count 1),
+including `bare-user-only`, whose object is a real symlink. `bare-user` and
+`bare-user-shared` store symlinks as regular files, so a real destination symlink
+cannot share their inode.
+
+The unifying rule is: hardlink iff the object inode is already exactly the target
+inode. Forcing a copy (`ostree checkout -C`) suppresses every hardlink; the copy
+path still attempts a reflink. A hardlink that would cross a filesystem (`EXDEV`)
+falls back to a copy.
+
+The copy path writes into a temp file in the destination directory, applies the
+checkout-mode metadata, and materializes it under the destination name. For a
+non-archive regular file, whose on-disk bytes are exactly the raw payload
+(`bare`, `bare-user`, `bare-user-shared`, `bare-user-only`), the copy attempts a
+`FICLONE` reflink of the object's extents before falling back to a streamed byte
+copy; an archive object is always streamed through its inflating reader. A
+hardlink applies no metadata, since it shares the object inode by construction.
+
+Destination directories. A directory is always created fresh, never hardlinked,
+and receives its full logical mode under both checkout modes; the metadata is
+applied after the directory's children are materialized, so a restrictive mode
+does not block writing them. The destination root receives the checked-out
+(sub)tree root's dirmeta: committing a root at mode `0750` and checking it out
+yields a destination root at `0750`; a subpath to a directory at `0755` yields a
+destination root at `0755`.
+
+Overwrite policy over an existing destination:
+
+- Default (`ostree checkout`): the destination is created fresh, and any
+  pre-existing destination directory is an error (`mkdirat: File exists`). Each
+  subdirectory is created with `mkdirat`, and an existing one is an error.
+- Union files (`ostree checkout --union`): an existing directory is reused
+  without re-applying its metadata, an existing file is overwritten, new entries
+  are added, and existing entries not in the commit are left in place.
+- Add files (`ostree checkout --union-add`): only entries that do not already
+  exist are written; an existing file or directory is kept.
+- Union identical (`ostree checkout --union-identical`): new entries are added
+  and an existing entry identical to the object it would receive is left in
+  place, while a differing existing entry is an error. The tool establishes
+  identity by hardlink; identity is equivalently an existing entry whose
+  `(st_dev, st_ino)` equals the repository object it would link. The tool
+  accepts `--union-identical` only together with `--require-hardlinks`, since the
+  hardlink is what establishes identity. Checkout therefore requires a
+  hardlink-eligible repository mode and checkout mode with no forced copy for
+  this policy, and rejects it up front otherwise.
+
+A type conflict between the destination and the commit stops the checkout, and
+no mode changes an entry's type:
+
+- A destination name held by a non-directory (a file or symlink) when the commit
+  carries a directory of that name is a conflict in every mode. The tool errors
+  (`opendir(<name>): Not a directory`), since it descends into the existing name
+  to merge the committed directory's children.
+- A destination directory when the commit carries a non-directory of that name is
+  a conflict under the default, union-files, and union-identical modes; the tool
+  errors (`renameat(...): Is a directory` under union-files). Under add-files the
+  existing directory is kept and nothing is written for that name.
+
+Whiteouts. With whiteout processing enabled (`ostree checkout --whiteouts`),
+within each directory an entry named `.wh..wh..opq` marks the directory opaque, so
+the destination directory's pre-existing entries are removed before the committed
+entries are written, and the marker itself is not materialized; an entry named
+`.wh.<name>` removes `<name>` from the destination directory and is not
+materialized; all other entries check out normally. With whiteout processing off,
+`.wh.`-prefixed entries check out as ordinary files. The
+`--process-passthrough-whiteouts` option (extracting overlayfs char 0:0 devices,
+which needs `CAP_MKNOD`) is a distinct mechanism and is out of scope here.
+
+Subpath. A subpath resolves a node within the commit tree and checks that node
+out as the destination root. A subpath to a directory makes its dirmeta the
+destination root's metadata and materializes its children. A subpath to a regular
+file or symlink creates the destination directory (a default `0700` observed) and
+places the single object inside it under its name. A missing subpath is an error.
+
 ## Extended attributes
 
 Storage form is GVariant `a(ayay)`: array of (name-bytes, value-bytes). A

@@ -81,6 +81,12 @@ pub enum Error {
     /// differing directory metadata, without `allow_overwrite`.
     #[error("merge conflict: {0}")]
     MergeConflict(String),
+    /// A checkout could not proceed: a collision under
+    /// [`OverwriteMode::None`](crate::OverwriteMode::None), a
+    /// [`UnionIdentical`](crate::OverwriteMode::UnionIdentical) mismatch, a
+    /// missing subpath, or an unsupported combination of options.
+    #[error("checkout: {0}")]
+    Checkout(String),
 }
 
 impl From<rustix::io::Errno> for Error {

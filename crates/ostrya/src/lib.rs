@@ -41,9 +41,15 @@
 //! resolve paths through symlinks, tree [`merge`](StagingTree::merge) with
 //! symlink resolution, and staged-first [`read_file`](StagingTree::read_file) /
 //! [`read_dir`](StagingTree::read_dir) that see objects staged in the current
-//! transaction before they publish. Checkout and maintenance land in later
-//! phases.
+//! transaction before they publish. It also covers the checkout path (Phase 8):
+//! [`Repo::checkout_at`], which materializes a commit's tree onto a filesystem
+//! under a [`CheckoutOptions`] -- the [`CheckoutMode`] (faithful or
+//! unprivileged), the [`OverwriteMode`] over an existing destination, an
+//! optional subpath, hardlink-versus-copy with a `FICLONE` reflink on the copy
+//! path, Docker-style whiteouts, a populated [`DevInoCache`], and an optional
+//! filter. Maintenance lands in later phases.
 
+pub mod checkout;
 pub mod commit;
 pub mod config;
 pub mod error;
@@ -65,6 +71,7 @@ pub mod transaction;
 pub mod tree;
 mod write;
 
+pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 pub use commit::CommitOptions;
 pub use config::{MinFreeSpace, Remote, RepoConfig, SizeSpec, SizeUnit};
 pub use error::{Error, Result};

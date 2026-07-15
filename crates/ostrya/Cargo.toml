@@ -26,7 +26,10 @@ async-compression = { version = "0.4", default-features = false, features = [
 ] }
 pin-project-lite = "0.2"
 futures-io = "0.3"
+futures-lite = "2"
+smol-tar = { version = "0.1", default-features = false, features = ["smol"] }
 
 [dev-dependencies]
 ostrya-rt = { workspace = true }
 futures-lite = "2"
+smol-tar = { version = "0.1", default-features = false, features = ["smol"] }

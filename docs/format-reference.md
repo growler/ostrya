@@ -983,15 +983,52 @@ is the largest reachable inline target.
 
 ## tar
 
-The `ostree export` command produces a plain GNU-format tar of a checked-out
-tree, not an object-embedding format. Member names are relative paths (root
-becomes `.`), numeric uid/gid/mode, all timestamps set to the commit timestamp
-with nanoseconds 0, xattrs as `SCHILY.xattr.*` PAX records, and identical
-content objects coalesced into tar hardlinks keyed by content checksum. Import
-commits an arbitrary filesystem tar into the repo, deferring hardlink resolution
-to the end and optionally applying the `/etc` -> `/usr/etc` convention. The
-"ostree-in-tar" OCI format is a separate `ostree-ext` (Rust) construct and is
-out of scope here.
+The `ostree export` command produces a plain filesystem tar of a commit's tree,
+not an object-embedding format. The "ostree-in-tar" OCI format is a separate
+`ostree-ext` (Rust) construct and is out of scope here.
+
+Tar is a transport interface, not a content-addressed store: the correctness
+contract is interoperability -- GNU tar and the `ostree` tool read what the port
+writes, and the port reads what they write -- and round-trip stability, not
+byte-identity of the tar stream. The tool and the port differ in tar dialect
+(see below), so the same tree yields different bytes through each.
+
+Observed `ostree export` output (tool version 2026.1, black-box):
+
+- The archive is old-GNU-format tar: the header magic field at offset 257 is
+  `ustar\x20\x20\x00` (`ustar` followed by two spaces and a NUL), not the POSIX
+  `ustar\x00` plus `00` version.
+- The tree root is the member `./`. Every other member is a bare relative path
+  with no `./` prefix; directories carry a trailing slash.
+- uid and gid are numeric; the octal mode field holds the permission bits only
+  (the type is the tar typeflag). Every member's mtime is the commit timestamp,
+  with a zero nanosecond part.
+- Identical content is coalesced into hardlinks: the first member for a given
+  content object is written in full (typeflag `0`), and a later member with the
+  same content is a hardlink (typeflag `1`) whose link name is the first member.
+  Symlinks are typeflag `2` with the target in the link name.
+- This version emitted no PAX extended headers and no xattrs, even for a file
+  that carried a `user.demo` xattr committed without `--no-xattrs`: the exported
+  stream contained no `SCHILY.xattr.*` record by any encoding.
+- The stream is padded to a full 10240-byte tar record (more than the two
+  trailing zero blocks POSIX requires).
+
+`ostree` import (`ostree commit --tree=tar=FILE`) commits an arbitrary
+filesystem tar into the repository, deferring hardlink resolution to the end and
+optionally applying the `/etc` -> `/usr/etc` convention.
+
+Port export (`Repo::export_tar`) writes POSIX ustar/pax through the `smol-tar`
+writer. It reproduces the tool's member naming (`./` root, bare relative names,
+trailing slash on directories), numeric ownership, commit-timestamp mtimes, and
+content-checksum hardlink coalescing (regular files only; symlinks are never
+coalesced). It additionally emits each entry's extended attributes as
+`SCHILY.xattr.<name>` PAX records with byte-exact values, so an xattr-bearing
+tree survives an export/import round trip; a stored xattr name drops its
+terminating NUL for the record and regains it on import. The `ostree` tool
+re-imports a port export into a byte-identical tree (same dirtree and dirmeta
+objects). Members the ostree object model cannot represent -- device nodes and
+FIFOs -- are rejected on import, since a tree stores only regular files,
+symlinks, and directories.
 
 ## bare-split-xattrs mode
 

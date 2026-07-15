@@ -333,6 +333,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures-sink"
+version = "0.3.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c39754e157331b013978ec91992bde1ac089843443c49cbc7f46150b0fad0893"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -383,6 +389,7 @@ dependencies = [
  "pin-project-lite",
  "rustix",
  "sha2",
+ "smol-tar",
  "thiserror",
 ]
 
@@ -538,6 +545,19 @@ dependencies = [
  "async-process",
  "blocking",
  "futures-lite",
+]
+
+[[package]]
+name = "smol-tar"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f52667e55e7c7e8c0cd550b11c797ce2adf1df5c2f2a6089b2925c62b07259b"
+dependencies = [
+ "async-lock",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "pin-project-lite",
 ]
 
 [[package]]

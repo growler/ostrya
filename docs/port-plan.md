@@ -1020,16 +1020,39 @@ images. Always compiled, not feature-gated. Split into sub-phases:
   verifies; the digest the port stores in `ostree.composefs.digest.v0` equals
   the tool's for the same tree; the suite passes under both runtime backends.
 
-### Phase 10 -- Tar import/export
+### Phase 10 -- Tar import/export (DONE)
 
-Built on `smol-tar` (always compiled, not feature-gated). GNU tar with SCHILY
-xattr PAX records, numeric ids, commit-timestamp mtimes, content-checksum
-hardlink dedup, `/etc` -> `/usr/etc` convention on import, deferred hardlink
-resolution. Early task: confirm `smol-tar` can emit and parse the exact
-GNU/SCHILY conventions the tool uses; extend or drive headers manually where it
-cannot.
-Verify: `test-export`, `test-libarchive`; extract our tar with GNU tar and
-re-import into the `ostree` tool.
+Built on `smol-tar` (always compiled, not feature-gated), driven through its
+`futures-io` flavor so it works under both runtime backends and adds no runtime
+coupling. `Repo::export_tar` writes a commit's tree as a filesystem tar
+(numeric ids, commit-timestamp mtimes, `SCHILY.xattr.*` PAX records,
+content-checksum hardlink coalescing, `./` root and bare relative member names).
+`Repo::import_tar` reads a filesystem tar into a `MutableTree` with deferred
+hardlink resolution, an optional `/etc` -> `/usr/etc` remap, and rejection of
+device and FIFO members. `TarExportOptions` and `TarImportOptions` carry the
+option surface. The recovered facts are recorded in `format-reference.md`,
+"tar".
+
+Scope decisions taken with the maintainer, recorded there:
+
+- The correctness gate is interoperability and round-trip stability, not
+  byte-identity with `ostree export`. The tool emits old-GNU-magic tar; the
+  port emits POSIX ustar/pax through `smol-tar`, so the two dialects differ by
+  design.
+- The port emits `SCHILY.xattr.*` records for xattr-bearing entries so trees
+  round-trip losslessly. The observed 2026.1 tool export emitted none; the
+  divergence is recorded in `format-reference.md`.
+- `smol-tar` was made additive-safe upstream (its `smol`/`tokio` features gained
+  tokio precedence rather than a hard mutual-exclusion), matching `ostrya-rt`.
+
+Verify (met): a checked-in `export.tar` fixture from the tool imports into the
+fixture commit's exact root dirtree and dirmeta; a port export/import round trip
+reproduces a tree including its `user.demo` xattr; identical files import to one
+object and export as a hardlink; the `/etc` -> `/usr/etc` remap lands entries
+under `usr/etc`; device and FIFO members are rejected; GNU tar reads a port
+export and the `ostree` tool re-imports it into a byte-identical tree; the suite
+passes under both runtime backends. The shell-suite gates (`test-export`,
+`test-libarchive`) arrive with the Phase 17 CLI.
 
 ### Phase 11 -- Minimal CLI (`ostrya`)
 

@@ -125,6 +125,13 @@ for mode in "${MODES[@]}"; do
     fi
 done
 
+# --- tar export fixture (Phase 10) ---
+# The tool's `ostree export` of the shared commit: a plain filesystem tar of the
+# tree (the root is the member `./`, every other member a bare relative path,
+# every mtime the commit timestamp, identical content coalesced into hardlinks).
+# The Phase 10 import path reads this to prove tool -> port tree fidelity.
+ostree --repo="$WORK/repo-$first" export "${CHECKSUM[$first]}" >"$OUT_DIR/export.tar"
+
 # --- bare fixture for the write path ---
 # Bare mode stores the logical uid/gid/mode on the object inode, so a faithful
 # write needs to own those ids. The owner is the invoking uid/gid so that an

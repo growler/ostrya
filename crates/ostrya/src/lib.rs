@@ -53,8 +53,13 @@
 //! commit's [`RepoTree`], the five top-level directories are injected, and each
 //! regular file redirects to its `.file` loose object and carries that object's
 //! fs-verity digest -- and [`Repo::commit_add_composefs_metadata`], which stores
-//! the image digest in a commit's `ostree.composefs.digest.v0` metadata.
-//! Maintenance lands in later phases.
+//! the image digest in a commit's `ostree.composefs.digest.v0` metadata. It
+//! also covers tar import and export (Phase 10): [`Repo::export_tar`], which
+//! writes a commit's tree as a filesystem tar stream (numeric ownership,
+//! commit-timestamp mtimes, `SCHILY.xattr.*` PAX records, content-checksum
+//! hardlink coalescing), and [`Repo::import_tar`], which reads a filesystem tar
+//! into a [`MutableTree`] with deferred hardlink resolution and an optional
+//! `/etc` -> `/usr/etc` remap. Maintenance lands in later phases.
 
 pub mod checkout;
 pub mod commit;
@@ -75,6 +80,7 @@ pub mod refs;
 pub mod repo;
 mod staging;
 pub mod staging_tree;
+pub mod tar;
 pub mod transaction;
 pub mod tree;
 mod write;
@@ -96,5 +102,6 @@ pub use read::CommitState;
 pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};
 pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
+pub use tar::{TarExportOptions, TarImportOptions};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};

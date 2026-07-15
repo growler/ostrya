@@ -87,6 +87,11 @@ pub enum Error {
     /// missing subpath, or an unsupported combination of options.
     #[error("checkout: {0}")]
     Checkout(String),
+    /// A tar import or export could not proceed: an entry type ostree cannot
+    /// store (a device node or FIFO), a path with a `..` component, a hardlink
+    /// with no target in the archive, or a non-UTF-8 xattr name.
+    #[error("tar: {0}")]
+    Tar(String),
 }
 
 impl From<rustix::io::Errno> for Error {

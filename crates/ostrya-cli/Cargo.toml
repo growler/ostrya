@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-cli"
-description = "Command-line front-end compatible with the ostree tool"
+description = "Command-line front-end for the ostrya library"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,8 +8,15 @@ license.workspace = true
 publish = false
 
 [[bin]]
-name = "ostree"
+name = "ostrya"
 path = "src/main.rs"
 
+[features]
+default = ["smol"]
+smol = ["ostrya/smol", "ostrya-rt/smol"]
+tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
+
 [dependencies]
-ostrya = { path = "../ostrya" }
+ostrya = { path = "../ostrya", default-features = false }
+ostrya-rt = { workspace = true }
+clap = { version = "4", features = ["derive"] }

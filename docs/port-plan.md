@@ -1054,26 +1054,36 @@ export and the `ostree` tool re-imports it into a byte-identical tree; the suite
 passes under both runtime backends. The shell-suite gates (`test-export`,
 `test-libarchive`) arrive with the Phase 17 CLI.
 
-### Phase 11 -- Minimal CLI (`ostrya`)
+### Phase 11 -- Minimal CLI (`ostrya`) (DONE)
 
 The first binary: the `ostrya-cli` crate builds a tool named `ostrya`, a
 thin front-end over the ingest, checkout, and export paths, which are all in
-place by this phase. Its command surface is its own; `ostree`-compatible
-behavior is Phase 17. Initial subcommands:
+place by this phase. The binary is synchronous and drives the async library
+through `ostrya_rt::block_on`; the stdin/stdout tar streams flow through
+`ostrya_rt::File` over a duplicated descriptor, so no unbounded stream is
+buffered. Its command surface is its own; `ostree`-compatible behavior is
+Phase 17. Subcommands:
 
 - `ostrya commit [--repo <repo>] [--parent <commit>] [-b|--branch <branch>]
-  [-s|--subject <subject>] [path]` -- commit the tree at `path` and print
-  the new commit checksum; `--branch` points the ref at the new commit;
-  with no path, read a tar stream from stdin (Phase 10 import).
+  [-s|--subject <subject>] [--canonical-permissions] [path]` -- commit the
+  tree at `path` and print the new commit checksum; `--branch` points the ref
+  at the new commit and binds it into the commit as `ostree.ref-binding`;
+  `--canonical-permissions` forces owner 0:0, canonicalizes the mode to
+  `perm & 0755`, and drops xattrs, for an owner- and host-independent commit;
+  with no path, read a tar stream from stdin (Phase 10 import). The timestamp
+  comes from `SOURCE_DATE_EPOCH` when set, else the current time.
 - `ostrya checkout [--repo <repo>] [-H|--require-hardlinks]
   [-C|--force-copy] [--composefs] <commit> <destination>` -- Phase 8
-  checkout; `--composefs` writes the Phase 9 EROFS image to `destination`
-  instead of a tree.
+  faithful checkout; `-C` forces copies, `-H` (its conflicting opposite)
+  requests the hardlink-preferring default path; `--composefs` writes the
+  Phase 9 EROFS image to `destination` instead of a tree.
 - `ostrya export [--repo <repo>] <commit>` -- write the commit to stdout as
   a tar stream (Phase 10 export).
 
-Further subcommands arrive with the phases that provide their machinery.
-Argument and option parsing uses `clap`, scoped to the `ostrya-cli` crate;
+`<commit>` and `--parent` accept a checksum or a ref. Further subcommands
+arrive with the phases that provide their machinery. Argument and option
+parsing uses `clap` (derive), scoped to the `ostrya-cli` crate, which also
+depends on `ostrya-rt` for the runtime driver and streaming descriptor;
 anything further is settled at phase start per the dependency rule.
 
 Verify: committing a fixture tree through the binary yields the fixture

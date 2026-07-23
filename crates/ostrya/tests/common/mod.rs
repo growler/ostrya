@@ -104,3 +104,12 @@ pub fn ostree_available() -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
+/// Whether the `openssl` tool is available for cross-check tests.
+pub fn openssl_available() -> bool {
+    Command::new("openssl")
+        .arg("version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}

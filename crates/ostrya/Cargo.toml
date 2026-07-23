@@ -12,6 +12,7 @@ readme.workspace = true
 default = ["smol"]
 smol = ["ostrya-rt/smol"]
 tokio = ["ostrya-rt/tokio"]
+sign-spki = ["dep:p256"]
 
 [dependencies]
 ostrya-core = { workspace = true }
@@ -33,6 +34,12 @@ ed25519-dalek = { version = "2", default-features = false, features = [
     "std",
     "zeroize",
 ] }
+p256 = { version = "0.13.2", default-features = false, features = [
+    "ecdsa",
+    "pem",
+    "pkcs8",
+    "std",
+], optional = true }
 
 [dev-dependencies]
 ostrya-rt = { workspace = true }

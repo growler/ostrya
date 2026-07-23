@@ -834,6 +834,27 @@ seed followed by 32-byte public key). Keys are passed as base64 strings or raw
 present in both the trusted and revoked sets is rejected: the effective trusted
 set is the trusted set minus the revoked set.
 
+spki (signature key `ostree.sign.spki`). ECDSA over NIST P-256 with SHA-256.
+The signed payload is the same commit bytes as the other engines; the engine
+hashes them with SHA-256 and produces a DER-encoded ECDSA signature (an ASN.1
+`SEQUENCE` of the two integers `r` and `s`, roughly 70 to 72 bytes). Public keys
+are the X.509 SubjectPublicKeyInfo DER, the base64 body of a PEM `PUBLIC KEY`
+block. Secret keys are base64; the decoded bytes are a PKCS#8 `PrivateKeyInfo`
+DER, a SEC1 `ECPrivateKey` DER, or a raw 32-byte scalar. The key store mirrors
+ed25519: files `trusted.spki` and `revoked.spki` and their `.d` directories
+under `/etc/ostree` and `<datadir>/ostree`, one base64 SubjectPublicKeyInfo per
+line, and the effective trusted set is the trusted set minus the revoked set.
+
+The reference tool gates spki on OpenSSL and the build under observation
+(libostree 2026.1) was compiled without it, so these spki facts are the design
+target: the public key container and the key-store layout are from the public
+ostree documentation, and the curve, hash, DER signature encoding, and key DER
+containers are the standard OpenSSL/RFC forms confirmed against `openssl`
+(a general tool, run as a black box) but not yet cross-verified against an
+spki-capable `ostree`. When such a build is available, generate a key pair with
+the tool, sign a commit, inspect the PEM and the signature bytes, and reconcile
+any difference here.
+
 GPG verification (to be reimplemented with sequoia): load N keyrings (binary
 and ASCII-armored) into one certificate store, parse the `aay` list of detached
 OpenPGP signature packets (concatenated), detached-verify against the signed

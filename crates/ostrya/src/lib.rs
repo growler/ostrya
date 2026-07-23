@@ -80,7 +80,11 @@
 //! key store (Phase 13b): [`Ed25519Signer`] / [`Ed25519Verifier`] over
 //! deterministic ed25519 signatures, and [`load_sign_keys`], which reads the
 //! `trusted.<type>` / `revoked.<type>` files and `.d` directories (a verifier
-//! trusts the loaded set minus the revoked set).
+//! trusts the loaded set minus the revoked set). Under the `sign-spki` feature
+//! it also covers the spki engine (Phase 13c): [`SpkiSigner`] / [`SpkiVerifier`]
+//! over ECDSA on NIST P-256 with SHA-256, DER-encoded signatures, and
+//! SubjectPublicKeyInfo public keys, reusing the sign-api key store as
+//! `trusted.spki` / `revoked.spki`.
 
 pub mod checkout;
 pub mod commit;
@@ -103,6 +107,8 @@ pub mod read;
 pub mod refs;
 pub mod repo;
 pub mod sign;
+#[cfg(feature = "sign-spki")]
+pub mod spki;
 mod staging;
 pub mod staging_tree;
 pub mod tar;
@@ -137,6 +143,8 @@ pub use sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, SignFuture, SignKeys,
     SignatureInfo, Signer, Verifier, VerifyOutcome, load_sign_keys, load_sign_keys_from,
 };
+#[cfg(feature = "sign-spki")]
+pub use spki::{SpkiSigner, SpkiVerifier};
 pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
 pub use tar::{TarExportOptions, TarImportOptions};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};

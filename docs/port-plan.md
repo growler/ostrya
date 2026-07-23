@@ -1302,10 +1302,28 @@ convention resolves keys as the tool does, and a revoked key fails;
 `test-signed-commit-ed25519` targeted through the harness when the CLI lands;
 the suite passes under both runtime backends.
 
-### Phase 13c -- spki engine (ECDSA / SPKI)
+### Phase 13c -- spki engine (ECDSA / SPKI) (DONE)
 
 The required spki engine: pure-Rust ECDSA over SubjectPublicKeyInfo public
 keys, reusing the 13b key store.
+
+Delivered as `SpkiSigner` / `SpkiVerifier` behind the `sign-spki` feature over
+`p256` 0.13.2 (RustCrypto, pure Rust): deterministic ECDSA on NIST P-256 with
+SHA-256, DER-encoded signatures, SubjectPublicKeyInfo public keys, and secret
+keys accepted as base64 of a PKCS#8 DER, a SEC1 DER, or a raw 32-byte scalar.
+The key store reuses the 13b `load_sign_keys` as `trusted.spki` /
+`revoked.spki`, each line the base64 of a SubjectPublicKeyInfo.
+
+Deviation from the verify gate: the reference tool gates spki on OpenSSL and the
+available build (libostree 2026.1) was compiled without it, so the
+recovery-by-observation and the `ostree sign --verify --sign-type=spki`
+cross-verification cannot run. Per the maintainer's decision the engine targets
+the documented containers and the standard OpenSSL/RFC forms, cross-checked
+against `openssl` (a general tool, run as a black box) in both directions in
+place of the tool. The spki facts in `format-reference.md` are marked "design
+target, tool cross-verification pending"; the `spki_tool_cross_verify_pending`
+test skips when the tool lacks spki and performs the real check once a
+spki-capable build is available.
 
 Definition:
 

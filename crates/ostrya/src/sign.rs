@@ -14,7 +14,10 @@
 //! `a{sv}` dict. Each engine owns one key whose value is an `aay` (an array of
 //! signature blobs); signing appends one `ay` element, creating the array when
 //! absent and leaving other engines' arrays untouched. [`Repo::sign_commit`]
-//! and [`Repo::verify_commit`] tie the engine to the detached-metadata I/O.
+//! and [`Repo::verify_commit`] tie the engine to the detached-metadata I/O, and
+//! [`Repo::delete_signatures`] removes stored blobs an engine no longer wants,
+//! dropping the entry when its array empties and clearing the metadata when the
+//! dict empties.
 //!
 //! The dummy engine ([`DummySigner`] / [`DummyVerifier`]) carries no crypto: a
 //! signature is the raw bytes of its key identifier, and verification matches a
@@ -178,6 +181,46 @@ impl Repo {
         }
         Ok(outcome)
     }
+
+    /// Delete signatures from a commit's detached metadata.
+    ///
+    /// Removes every blob stored under `metadata_key` for which
+    /// `remove(payload, blob)` returns true, where `payload` is the commit's
+    /// canonical bytes (the same payload [`sign_commit`](Self::sign_commit)
+    /// signs) and `blob` is one stored signature. The predicate lets a caller
+    /// match a signature to a key -- by re-verifying it for the sign-api
+    /// engines, or by issuer fingerprint for GPG.
+    ///
+    /// The `.commitmeta` file is rewritten atomically: an emptied engine array
+    /// drops its dict entry, and an emptied dict is written as the zero-length
+    /// "no metadata" marker. Other engines' arrays are left in place. A commit
+    /// with no detached metadata, or no entry for `metadata_key`, removes
+    /// nothing and leaves the file untouched. Returns the number of signatures
+    /// removed.
+    ///
+    /// Like [`sign_commit`](Self::sign_commit), this is a read-modify-write that
+    /// is not serialized across calls; edit a given commit's signatures from a
+    /// single task at a time.
+    pub async fn delete_signatures(
+        &self,
+        checksum: &Checksum,
+        metadata_key: &str,
+        mut remove: impl FnMut(&[u8], &[u8]) -> bool,
+    ) -> Result<usize> {
+        let mut dict = match self.read_commit_detached_metadata(checksum).await? {
+            Some(dict) => dict,
+            None => return Ok(0),
+        };
+        let payload = self.load_object_bytes(ObjectType::Commit, checksum).await?;
+        let removed = remove_signatures(&mut dict, metadata_key, &payload, &mut remove)?;
+        if removed == 0 {
+            return Ok(0);
+        }
+        let empty = matches!(&dict, Value::Array(entries) if entries.is_empty());
+        self.write_commit_detached_metadata(checksum, (!empty).then_some(&dict))
+            .await?;
+        Ok(removed)
+    }
 }
 
 /// Append `signature` to the `metadata_key` engine's `aay` array in the `a{sv}`
@@ -249,6 +292,62 @@ pub(crate) fn signatures_for(dict: &Value, metadata_key: &str) -> Vec<Vec<u8>> {
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// Remove from the `a{sv}` dict `dict` every signature blob stored under
+/// `metadata_key` for which `remove(payload, blob)` returns true, dropping the
+/// engine entry when its array empties. Returns the number of blobs removed.
+/// Non-byte elements are kept, and other engines' entries are left untouched.
+pub(crate) fn remove_signatures(
+    dict: &mut Value,
+    metadata_key: &str,
+    payload: &[u8],
+    remove: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+) -> Result<usize> {
+    let entries = match dict {
+        Value::Array(entries) => entries,
+        _ => {
+            return Err(Error::InvalidFormat(
+                "detached metadata must be an a{sv} dict".into(),
+            ));
+        }
+    };
+    let mut removed = 0usize;
+    let mut emptied = false;
+    for entry in entries.iter_mut() {
+        if let Value::Tuple(fields) = entry
+            && let [key, value] = fields.as_mut_slice()
+            && key.as_str() == Some(metadata_key)
+        {
+            let array = match value {
+                Value::Variant(inner) => &mut inner.1,
+                other => other,
+            };
+            let Value::Array(blobs) = array else {
+                return Err(Error::InvalidFormat(
+                    "detached-metadata signature value is not an array".into(),
+                ));
+            };
+            let before = blobs.len();
+            blobs.retain(|blob| match blob.as_bytes() {
+                Some(bytes) => !remove(payload, bytes),
+                None => true,
+            });
+            removed = before - blobs.len();
+            emptied = blobs.is_empty();
+            break;
+        }
+    }
+    if emptied {
+        entries.retain(|entry| {
+            entry
+                .as_tuple()
+                .and_then(<[Value]>::first)
+                .and_then(Value::as_str)
+                != Some(metadata_key)
+        });
+    }
+    Ok(removed)
 }
 
 /// The test-only dummy signer. Its signature is the raw bytes of its key

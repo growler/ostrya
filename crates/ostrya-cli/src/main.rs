@@ -4,8 +4,8 @@
 //!
 //! A thin binary over the ingest, checkout, and export paths of the `ostrya`
 //! library (Phase 11 of `docs/port-plan.md`). Its command surface is its own; a
-//! command-line-compatible `ostree` surface arrives in a later phase. Three
-//! subcommands are implemented:
+//! command-line-compatible `ostree` surface arrives in a later phase. The
+//! subcommands are:
 //!
 //! - `commit` -- ingest a tree from a path, or a tar stream on stdin, into a
 //!   commit and print its checksum.
@@ -14,6 +14,8 @@
 //! - `prune` -- delete unreachable objects.
 //! - `fsck` -- verify object integrity and completeness.
 //! - `diff` -- report the paths that changed between two commits.
+//! - `sign` -- add, verify, or delete commit signatures under one of the
+//!   ed25519, spki, or gpg engines.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams to and from stdin/stdout flow through
@@ -21,14 +23,19 @@
 //! buffered in memory.
 
 use std::os::fd::AsFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CommitModifier, CommitModifierFlags, CommitOptions,
-    DiffChange, Error, FsckOptions, MutableTree, PruneOptions, Repo, Result, TarExportOptions,
-    TarImportOptions, Type, Value,
+    DiffChange, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, MutableTree, ObjectType,
+    PruneOptions, Repo, Result, TarExportOptions, TarImportOptions, Type, Value, Verifier,
+    VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
 };
+#[cfg(feature = "gpg")]
+use ostrya::{GpgSigner, GpgVerifier};
+#[cfg(feature = "spki")]
+use ostrya::{SpkiSigner, SpkiVerifier};
 
 /// A pure-Rust front-end over the ostrya repository library.
 #[derive(Parser)]
@@ -52,6 +59,8 @@ enum Command {
     Fsck(FsckArgs),
     /// Report the paths that changed between two commits.
     Diff(DiffArgs),
+    /// Add, verify, or delete signatures on a commit.
+    Sign(SignArgs),
 }
 
 #[derive(Args)]
@@ -148,6 +157,55 @@ struct DiffArgs {
     to: Option<String>,
 }
 
+/// The signature engine selected by `--sign-type`.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SignType {
+    /// ed25519 detached signatures (the sign-api default).
+    #[value(name = "ed25519")]
+    Ed25519,
+    /// spki: ECDSA over NIST P-256 with SHA-256.
+    #[value(name = "spki")]
+    Spki,
+    /// GPG (OpenPGP) detached signatures.
+    #[value(name = "gpg")]
+    Gpg,
+}
+
+#[derive(Args)]
+struct SignArgs {
+    /// The repository holding the commit.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Delete stored signatures matching the given KEY-IDs.
+    #[arg(short, long, conflicts_with = "verify")]
+    delete: bool,
+    /// Verify the commit's signatures instead of adding one.
+    #[arg(long)]
+    verify: bool,
+    /// The signature engine to use.
+    #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
+    sign_type: SignType,
+    /// Read key(s) from a file; repeatable. For ed25519/spki: base64 secret
+    /// keys (signing) or public keys (verify), one per line. For gpg: a
+    /// keyring, binary or armored (verify and delete).
+    #[arg(long)]
+    keys_file: Vec<PathBuf>,
+    /// Override the system trusted/revoked key directories for ed25519/spki
+    /// verification; repeatable. Not used by the gpg engine.
+    #[arg(long)]
+    keys_dir: Vec<PathBuf>,
+    /// The GnuPG home directory gpg resolves signing keys in (default: gpg's
+    /// own resolution). Only for the gpg engine.
+    #[arg(long)]
+    gpg_homedir: Option<PathBuf>,
+    /// The commit to operate on (a checksum or a ref).
+    commit: String,
+    /// Key identifiers: base64 keys for ed25519/spki. For gpg: the signing
+    /// key gpg resolves (a fingerprint, key id, or user id), or, with
+    /// --delete, the fingerprints to remove.
+    key_id: Vec<String>,
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match ostrya_rt::block_on(run(cli)) {
@@ -167,6 +225,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Prune(args) => prune(args).await,
         Command::Fsck(args) => fsck(args).await,
         Command::Diff(args) => diff(args).await,
+        Command::Sign(args) => sign(args).await,
     }
 }
 
@@ -333,6 +392,381 @@ async fn diff(args: DiffArgs) -> Result<()> {
         println!("{code}    {}", entry.path);
     }
     Ok(())
+}
+
+async fn sign(args: SignArgs) -> Result<()> {
+    let repo = Repo::open(&args.repo).await?;
+    let commit = resolve(&repo, &args.commit).await?;
+    if args.sign_type == SignType::Gpg && !args.keys_dir.is_empty() {
+        return Err(Error::Signature(
+            "--keys-dir is not used by the gpg engine; supply keyrings with --keys-file".into(),
+        ));
+    }
+    if args.sign_type != SignType::Gpg && args.gpg_homedir.is_some() {
+        return Err(Error::Signature(
+            "--gpg-homedir applies only to the gpg engine".into(),
+        ));
+    }
+    if args.verify {
+        verify_signatures(&repo, &commit, &args).await
+    } else if args.delete {
+        delete_signatures(&repo, &commit, &args).await
+    } else {
+        add_signatures(&repo, &commit, &args).await
+    }
+}
+
+/// Sign the commit once per supplied key.
+async fn add_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
+    match args.sign_type {
+        SignType::Ed25519 => {
+            for key in secret_key_lines(args)? {
+                repo.sign_commit(commit, &Ed25519Signer::from_base64(&key)?)
+                    .await?;
+            }
+            Ok(())
+        }
+        SignType::Spki => sign_spki(repo, commit, args).await,
+        SignType::Gpg => sign_gpg(repo, commit, args).await,
+    }
+}
+
+#[cfg(feature = "spki")]
+async fn sign_spki(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
+    for key in secret_key_lines(args)? {
+        repo.sign_commit(commit, &SpkiSigner::from_base64(&key)?)
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "spki"))]
+async fn sign_spki(_: &Repo, _: &Checksum, _: &SignArgs) -> Result<()> {
+    Err(unsupported_type("spki"))
+}
+
+/// Sign with keys the `gpg` binary resolves: each KEY-ID is a fingerprint,
+/// key id, or user id, looked up in the default GnuPG home directory or the
+/// `--gpg-homedir` override. The private key stays with gpg and its agent,
+/// including a key on a hardware token.
+#[cfg(feature = "gpg")]
+async fn sign_gpg(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
+    if !args.keys_file.is_empty() {
+        return Err(Error::Signature(
+            "gpg signing takes KEY-ID arguments; --keys-file keyrings serve verify and delete"
+                .into(),
+        ));
+    }
+    if args.key_id.is_empty() {
+        return Err(Error::Signature(
+            "gpg signing requires at least one KEY-ID (a fingerprint, key id, or user id)".into(),
+        ));
+    }
+    for key in &args.key_id {
+        let mut signer = GpgSigner::new(key);
+        if let Some(dir) = &args.gpg_homedir {
+            signer = signer.with_homedir(dir);
+        }
+        repo.sign_commit(commit, &signer).await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "gpg"))]
+async fn sign_gpg(_: &Repo, _: &Checksum, _: &SignArgs) -> Result<()> {
+    Err(unsupported_type("gpg"))
+}
+
+/// Verify the commit under the selected engine, print each signature, and exit
+/// nonzero when no signature is valid.
+async fn verify_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
+    let verifier = match args.sign_type {
+        SignType::Gpg => gpg_verifier(args)?,
+        engine => sign_api_verifier(engine, args)?,
+    };
+    let outcome = repo.verify_commit(commit, &[verifier.as_ref()]).await?;
+    report_verify(&outcome);
+    if !outcome.valid {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Delete signatures the given KEY-IDs match, and report the count removed.
+async fn delete_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
+    if args.key_id.is_empty() {
+        return Err(Error::Signature(
+            "delete requires at least one KEY-ID".into(),
+        ));
+    }
+    let removed = match args.sign_type {
+        SignType::Gpg => gpg_delete(repo, commit, args).await?,
+        engine => {
+            // A sign-api blob belongs to a KEY-ID when it verifies under that
+            // public key. Verification is async, so the blobs to remove are
+            // decided up front and the predicate matches by bytes.
+            let verifier = build_sign_api_verifier(engine, public_key_bytes(args)?, Vec::new())?;
+            let key = sign_metadata_key(engine);
+            let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
+            let mut doomed: Vec<Vec<u8>> = Vec::new();
+            for blob in stored_signatures(repo, commit, key).await? {
+                let valid = verifier
+                    .verify(&payload, std::slice::from_ref(&blob))
+                    .await
+                    .map(|o| o.valid)
+                    .unwrap_or(false);
+                if valid {
+                    doomed.push(blob);
+                }
+            }
+            repo.delete_signatures(commit, key, |_, blob| doomed.iter().any(|d| d == blob))
+                .await?
+        }
+    };
+    println!("Deleted {removed} signature(s)");
+    Ok(())
+}
+
+/// The signature blobs stored under `key` in the commit's detached metadata,
+/// in stored order. Missing metadata, a missing key, or non-byte elements
+/// yield an empty set.
+async fn stored_signatures(repo: &Repo, commit: &Checksum, key: &str) -> Result<Vec<Vec<u8>>> {
+    let Some(dict) = repo.read_commit_detached_metadata(commit).await? else {
+        return Ok(Vec::new());
+    };
+    let Some(value) = dict.dict_get(key) else {
+        return Ok(Vec::new());
+    };
+    let array = match value.as_variant() {
+        Some((_, inner)) => inner,
+        None => value,
+    };
+    Ok(array
+        .as_array()
+        .map(|blobs| {
+            blobs
+                .iter()
+                .filter_map(|blob| blob.as_bytes().map(<[u8]>::to_vec))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Delete GPG signatures whose issuer or primary-key fingerprint matches a
+/// KEY-ID. The issuer fingerprint is reported even for a key absent from the
+/// keyrings; a keyring in `--keys-file` lets a match also consider the
+/// primary-key fingerprint of a verified signature.
+#[cfg(feature = "gpg")]
+async fn gpg_delete(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<usize> {
+    let wanted: Vec<String> = args
+        .key_id
+        .iter()
+        .map(|k| normalize_fingerprint(k))
+        .collect();
+    let verifier = GpgVerifier::from_keyring_files(&args.keys_file)?;
+    let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
+    let mut doomed: Vec<Vec<u8>> = Vec::new();
+    for blob in stored_signatures(repo, commit, "ostree.gpgsigs").await? {
+        let matches = match verifier.verify(&payload, std::slice::from_ref(&blob)).await {
+            Ok(outcome) => outcome.signatures.iter().any(|s| {
+                fingerprint_matches(s.fingerprint.as_deref(), &wanted)
+                    || fingerprint_matches(s.primary_fingerprint.as_deref(), &wanted)
+            }),
+            Err(_) => false,
+        };
+        if matches {
+            doomed.push(blob);
+        }
+    }
+    repo.delete_signatures(commit, "ostree.gpgsigs", |_, blob| {
+        doomed.iter().any(|d| d == blob)
+    })
+    .await
+}
+
+#[cfg(not(feature = "gpg"))]
+async fn gpg_delete(_: &Repo, _: &Checksum, _: &SignArgs) -> Result<usize> {
+    Err(unsupported_type("gpg"))
+}
+
+/// Build a sign-api (ed25519/spki) verifier from the KEY-IDs, the `--keys-file`
+/// keys, and the trusted/revoked key directories: `--keys-dir` if given,
+/// otherwise the system store when nothing was supplied inline.
+fn sign_api_verifier(engine: SignType, args: &SignArgs) -> Result<Box<dyn Verifier>> {
+    let name = sign_type_name(engine);
+    let mut trusted = public_key_bytes(args)?;
+    let mut revoked: Vec<Vec<u8>> = Vec::new();
+    if !args.keys_dir.is_empty() {
+        let roots: Vec<&Path> = args.keys_dir.iter().map(PathBuf::as_path).collect();
+        let keys = load_sign_keys_from(&roots, name)?;
+        trusted.extend(keys.trusted);
+        revoked.extend(keys.revoked);
+    } else if trusted.is_empty() {
+        let keys = load_sign_keys(name)?;
+        trusted.extend(keys.trusted);
+        revoked.extend(keys.revoked);
+    }
+    build_sign_api_verifier(engine, trusted, revoked)
+}
+
+fn build_sign_api_verifier(
+    engine: SignType,
+    trusted: Vec<Vec<u8>>,
+    revoked: Vec<Vec<u8>>,
+) -> Result<Box<dyn Verifier>> {
+    match engine {
+        SignType::Ed25519 => Ok(Box::new(Ed25519Verifier::new(trusted, revoked)?)),
+        #[cfg(feature = "spki")]
+        SignType::Spki => Ok(Box::new(SpkiVerifier::new(trusted, revoked)?)),
+        #[cfg(not(feature = "spki"))]
+        SignType::Spki => Err(unsupported_type("spki")),
+        SignType::Gpg => Err(Error::Signature("gpg is not a sign-api engine".into())),
+    }
+}
+
+#[cfg(feature = "gpg")]
+fn gpg_verifier(args: &SignArgs) -> Result<Box<dyn Verifier>> {
+    if args.keys_file.is_empty() {
+        return Err(Error::Signature(
+            "gpg verification requires --keys-file with a keyring".into(),
+        ));
+    }
+    Ok(Box::new(GpgVerifier::from_keyring_files(&args.keys_file)?))
+}
+
+#[cfg(not(feature = "gpg"))]
+fn gpg_verifier(_: &SignArgs) -> Result<Box<dyn Verifier>> {
+    Err(unsupported_type("gpg"))
+}
+
+/// The base64 secret keys for a sign-api signing run: the KEY-IDs plus the
+/// non-blank lines of each `--keys-file`. At least one key is required.
+fn secret_key_lines(args: &SignArgs) -> Result<Vec<String>> {
+    let mut keys = args.key_id.clone();
+    for path in &args.keys_file {
+        keys.extend(read_key_lines(path)?);
+    }
+    if keys.is_empty() {
+        return Err(Error::Signature(
+            "no signing key given; pass a key argument or --keys-file".into(),
+        ));
+    }
+    Ok(keys)
+}
+
+/// The decoded public keys for sign-api verify/delete: the KEY-IDs and the
+/// `--keys-file` lines, each a base64-encoded key.
+fn public_key_bytes(args: &SignArgs) -> Result<Vec<Vec<u8>>> {
+    let mut keys = Vec::new();
+    for key in &args.key_id {
+        keys.push(base64::decode(key.trim())?);
+    }
+    for path in &args.keys_file {
+        for line in read_key_lines(path)? {
+            keys.push(base64::decode(&line)?);
+        }
+    }
+    Ok(keys)
+}
+
+/// The non-blank, trimmed lines of a key file.
+fn read_key_lines(path: &Path) -> Result<Vec<String>> {
+    let content = std::fs::read_to_string(path).map_err(Error::Io)?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The engine's short name, used for the `trusted.<name>` / `revoked.<name>`
+/// key-store files.
+fn sign_type_name(engine: SignType) -> &'static str {
+    match engine {
+        SignType::Ed25519 => "ed25519",
+        SignType::Spki => "spki",
+        SignType::Gpg => "gpg",
+    }
+}
+
+/// The detached-metadata dict key each engine's signatures accumulate under.
+fn sign_metadata_key(engine: SignType) -> &'static str {
+    match engine {
+        SignType::Ed25519 => "ostree.sign.ed25519",
+        SignType::Spki => "ostree.sign.spki",
+        SignType::Gpg => "ostree.gpgsigs",
+    }
+}
+
+/// Normalize a GPG fingerprint or key id for suffix matching: drop a `0x`
+/// prefix and internal spaces, and upper-case the hex.
+#[cfg(feature = "gpg")]
+fn normalize_fingerprint(id: &str) -> String {
+    id.trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .replace(' ', "")
+        .to_uppercase()
+}
+
+/// Whether a stored fingerprint ends with any of the wanted key ids (so a short
+/// key id matches the tail of a full fingerprint).
+#[cfg(feature = "gpg")]
+fn fingerprint_matches(stored: Option<&str>, wanted: &[String]) -> bool {
+    match stored {
+        Some(fpr) => {
+            let fpr = fpr.to_uppercase();
+            wanted
+                .iter()
+                .any(|w| !w.is_empty() && fpr.ends_with(w.as_str()))
+        }
+        None => false,
+    }
+}
+
+/// An error reported when a sign-type's engine was compiled out of this binary.
+#[cfg_attr(all(feature = "spki", feature = "gpg"), allow(dead_code))]
+fn unsupported_type(name: &str) -> Error {
+    Error::Unsupported(format!(
+        "sign-type '{name}' requires building ostrya-cli with the '{name}' feature"
+    ))
+}
+
+/// Print one line per examined signature and a final verdict.
+fn report_verify(outcome: &VerifyOutcome) {
+    if outcome.signatures.is_empty() {
+        println!("no signatures found");
+        return;
+    }
+    for (i, sig) in outcome.signatures.iter().enumerate() {
+        let status = if sig.valid {
+            "good"
+        } else if sig.key_missing {
+            "no public key"
+        } else {
+            "BAD"
+        };
+        let mut line = format!("signature {}: {status}", i + 1);
+        if let Some(fpr) = &sig.fingerprint {
+            line.push_str(&format!(" key {fpr}"));
+        }
+        match (&sig.user_name, &sig.user_email) {
+            (Some(name), Some(email)) => line.push_str(&format!(" ({name} <{email}>)")),
+            (Some(name), None) => line.push_str(&format!(" ({name})")),
+            (None, Some(email)) => line.push_str(&format!(" (<{email}>)")),
+            (None, None) => {}
+        }
+        println!("{line}");
+    }
+    println!(
+        "{}",
+        if outcome.valid {
+            "verification OK"
+        } else {
+            "verification FAILED"
+        }
+    );
 }
 
 /// Resolve a checksum or ref to a commit checksum. `resolve_rev` with

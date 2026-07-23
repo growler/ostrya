@@ -12,9 +12,11 @@ name = "ostrya"
 path = "src/main.rs"
 
 [features]
-default = ["smol"]
+default = ["smol", "spki", "gpg"]
 smol = ["ostrya/smol", "ostrya-rt/smol"]
 tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
+spki = ["ostrya/sign-spki"]
+gpg = ["ostrya/sign-gpg"]
 
 [dependencies]
 ostrya = { path = "../ostrya", default-features = false }

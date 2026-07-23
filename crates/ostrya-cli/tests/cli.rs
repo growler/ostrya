@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use ostrya::{CreateOptions, Repo, RepoMode};
+use ostrya::{CreateOptions, Repo, RepoMode, base64};
 use ostrya_rt::block_on;
 
 /// The fixture commit id, branch, and timestamp from `generate.sh`/MANIFEST.
@@ -24,6 +24,93 @@ const COMMIT: &str = "b3c8e8525e8a5c3409bf6e6db5f5d656da77ae76d08cbc4f8b75b71879
 const BRANCH: &str = "test/main";
 const SUBJECT: &str = "fixture commit";
 const SOURCE_DATE_EPOCH: &str = "1700000000";
+
+/// ed25519 sign fixture (shared with the library `sign_ed25519` test): the
+/// base64 of the 64-byte secret key and the matching 32-byte public key.
+const ED25519_SECRET_B64: &str =
+    "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+const ED25519_PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+
+/// Whether the gpg and gpgv binaries are available.
+#[cfg(feature = "gpg")]
+fn gpg_available() -> bool {
+    let has = |program: &str| {
+        Command::new(program)
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    has("gpg") && has("gpgv")
+}
+
+/// A private GnuPG home directory holding one freshly generated,
+/// passphrase-free ed25519 signing key. Dropping the fixture kills the
+/// gpg-agent GnuPG auto-started for the directory.
+#[cfg(feature = "gpg")]
+struct GpgHome {
+    dir: PathBuf,
+}
+
+#[cfg(feature = "gpg")]
+impl GpgHome {
+    /// Generate a signing key for `uid` in a new home directory under `base`.
+    fn create(base: &Path, uid: &str) -> GpgHome {
+        let dir = base.join("gnupghome");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let home = GpgHome { dir };
+        let status = home
+            .gpg()
+            .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+            .args(["--quick-gen-key", uid, "ed25519", "sign", "never"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "gpg --quick-gen-key failed");
+        home
+    }
+
+    /// A gpg command bound to this home directory, batch mode.
+    fn gpg(&self) -> Command {
+        let mut cmd = Command::new("gpg");
+        cmd.arg("--homedir").arg(&self.dir).arg("--batch");
+        cmd
+    }
+
+    /// The primary-key fingerprint, as uppercase hex.
+    fn fingerprint(&self) -> String {
+        let out = self
+            .gpg()
+            .args(["--with-colons", "--list-keys"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        text.lines()
+            .find_map(|line| {
+                let mut fields = line.split(':');
+                (fields.next() == Some("fpr")).then(|| fields.nth(8).unwrap().to_owned())
+            })
+            .expect("a fpr record in the key listing")
+    }
+
+    /// Export the public keyring to `path`.
+    fn export_to(&self, path: &Path) {
+        let out = self.gpg().arg("--export").output().unwrap();
+        assert!(out.status.success() && !out.stdout.is_empty());
+        std::fs::write(path, out.stdout).unwrap();
+    }
+}
+
+#[cfg(feature = "gpg")]
+impl Drop for GpgHome {
+    fn drop(&mut self) {
+        let _ = Command::new("gpgconf")
+            .arg("--homedir")
+            .arg(&self.dir)
+            .args(["--kill", "gpg-agent"])
+            .status();
+    }
+}
 
 // --- temp-dir helper ---------------------------------------------------------
 
@@ -462,4 +549,269 @@ fn composefs_checkout_matches_library() {
         "--composefs writes the library's EROFS image bytes",
     );
     assert!(!cli_bytes.is_empty(), "composefs image is non-empty");
+}
+
+/// Commit the fixture tree into a fresh archive repo and return its path.
+fn commit_fixture(base: &Path) -> PathBuf {
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let src = base.join("src");
+    let commit = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--canonical-permissions",
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[("SOURCE_DATE_EPOCH", SOURCE_DATE_EPOCH)],
+    );
+    assert_eq!(commit.ok().stdout_trimmed(), COMMIT, "fixture commit id");
+    repo
+}
+
+#[test]
+fn sign_verify_delete_ed25519() {
+    let tmp = TmpDir::new("sign-ed25519");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+
+    // Sign with the default (ed25519) engine using the base64 secret key.
+    ostrya(
+        &["sign", "--repo", repo_s, COMMIT, ED25519_SECRET_B64],
+        None,
+        &[],
+    )
+    .ok();
+
+    // The public key verifies; a wrong key does not.
+    let good = ostrya(
+        &[
+            "sign",
+            "--verify",
+            "--repo",
+            repo_s,
+            COMMIT,
+            ED25519_PUBLIC_B64,
+        ],
+        None,
+        &[],
+    );
+    good.ok();
+    assert!(good.stdout_trimmed().contains("verification OK"));
+    let wrong = base64::encode(&[0u8; 32]);
+    let bad = ostrya(
+        &["sign", "--verify", "--repo", repo_s, COMMIT, wrong.as_str()],
+        None,
+        &[],
+    );
+    assert!(!bad.status.success(), "a wrong key must not verify");
+
+    // The tool verifies the port-written signature.
+    if ostree_available() {
+        let out = Command::new("ostree")
+            .arg(format!("--repo={}", repo.display()))
+            .args([
+                "sign",
+                "--verify",
+                "--sign-type=ed25519",
+                COMMIT,
+                ED25519_PUBLIC_B64,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "tool rejected the port's ed25519 signature:\n{}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    // Delete by the public key; verification then fails.
+    let del = ostrya(
+        &[
+            "sign",
+            "-d",
+            "--repo",
+            repo_s,
+            "-s",
+            "ed25519",
+            COMMIT,
+            ED25519_PUBLIC_B64,
+        ],
+        None,
+        &[],
+    );
+    assert!(del.ok().stdout_trimmed().contains("Deleted 1"));
+    let after = ostrya(
+        &[
+            "sign",
+            "--verify",
+            "--repo",
+            repo_s,
+            COMMIT,
+            ED25519_PUBLIC_B64,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        !after.status.success(),
+        "verification must fail after deletion"
+    );
+}
+
+#[cfg(feature = "spki")]
+#[test]
+fn sign_verify_spki_selects_the_engine() {
+    // The base64 PKCS#8 secret key and SubjectPublicKeyInfo public key shared
+    // with the library `sign_spki` test.
+    const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+
+    let tmp = TmpDir::new("sign-spki");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+
+    ostrya(
+        &[
+            "sign",
+            "--repo",
+            repo_s,
+            "-s",
+            "spki",
+            COMMIT,
+            SECRET_PKCS8_B64,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let verified = ostrya(
+        &[
+            "sign",
+            "--verify",
+            "--repo",
+            repo_s,
+            "-s",
+            "spki",
+            COMMIT,
+            PUBLIC_SPKI_B64,
+        ],
+        None,
+        &[],
+    );
+    verified.ok();
+    assert!(verified.stdout_trimmed().contains("verification OK"));
+}
+
+#[cfg(feature = "gpg")]
+#[test]
+fn sign_verify_delete_gpg() {
+    if !gpg_available() {
+        eprintln!("skipping: gpg/gpgv not available");
+        return;
+    }
+    let tmp = TmpDir::new("sign-gpg");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let home = GpgHome::create(base, "Ostrya CLI Test <cli-gpg@ostrya.example>");
+    let fpr = home.fingerprint();
+    let home_s = home.dir.to_str().unwrap().to_owned();
+
+    // gpg signing needs a KEY-ID.
+    let missing = ostrya(&["sign", "--repo", repo_s, "-s", "gpg", COMMIT], None, &[]);
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("KEY-ID"),
+        "gpg without a key should mention KEY-ID"
+    );
+
+    // Export the public keyring for verify and delete.
+    let public = base.join("public.gpg");
+    home.export_to(&public);
+    let public_s = public.to_str().unwrap();
+
+    // Sign with the key gpg resolves in the fixture home directory.
+    ostrya(
+        &[
+            "sign",
+            "--repo",
+            repo_s,
+            "-s",
+            "gpg",
+            "--gpg-homedir",
+            &home_s,
+            COMMIT,
+            &fpr,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+
+    // The exported keyring verifies the signature.
+    let verified = ostrya(
+        &[
+            "sign",
+            "--verify",
+            "--repo",
+            repo_s,
+            "-s",
+            "gpg",
+            "--keys-file",
+            public_s,
+            COMMIT,
+        ],
+        None,
+        &[],
+    );
+    verified.ok();
+    assert!(verified.stdout_trimmed().contains("verification OK"));
+
+    // Delete by the key's fingerprint, then verification fails.
+    let del = ostrya(
+        &[
+            "sign",
+            "-d",
+            "--repo",
+            repo_s,
+            "-s",
+            "gpg",
+            "--keys-file",
+            public_s,
+            COMMIT,
+            &fpr,
+        ],
+        None,
+        &[],
+    );
+    assert!(del.ok().stdout_trimmed().contains("Deleted 1"));
+    let after = ostrya(
+        &[
+            "sign",
+            "--verify",
+            "--repo",
+            repo_s,
+            "-s",
+            "gpg",
+            "--keys-file",
+            public_s,
+            COMMIT,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        !after.status.success(),
+        "verification must fail after deletion"
+    );
 }

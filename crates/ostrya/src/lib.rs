@@ -75,8 +75,9 @@
 //! framework (Phase 13a): the [`Signer`]/[`Verifier`] engine surface,
 //! [`Repo::sign_commit`] and [`Repo::verify_commit`], which sign and verify a
 //! commit's canonical bytes and accumulate signatures in the per-engine `aay`
-//! array of the commit's detached metadata, and the test-only [`DummySigner`] /
-//! [`DummyVerifier`] engine. It also covers the ed25519 engine and the sign-api
+//! array of the commit's detached metadata, [`Repo::delete_signatures`], which
+//! removes stored blobs from an engine's array, and the test-only
+//! [`DummySigner`] / [`DummyVerifier`] engine. It also covers the ed25519 engine and the sign-api
 //! key store (Phase 13b): [`Ed25519Signer`] / [`Ed25519Verifier`] over
 //! deterministic ed25519 signatures, and [`load_sign_keys`], which reads the
 //! `trusted.<type>` / `revoked.<type>` files and `.d` directories (a verifier

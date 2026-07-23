@@ -1419,6 +1419,53 @@ streams; the suite passes under both runtime backends, with and without
 `test-gpg-signed-commit`, `test-commit-sign`) runs through the harness when
 the CLI-compatible surface lands (Phase 17).
 
+### Phase 13f -- Native `ostrya sign` command (DONE)
+
+A `sign` subcommand on the Phase 11 `ostrya` binary, over the 13a framework and
+its engines. Its command surface is the native one; the `ostree`-compatible
+`sign` / `gpg-sign` surface for the shell suite remains Phase 17. One command
+covers the three engines through `-s|--sign-type` (`ed25519` default, `spki`,
+`gpg`), each in three modes:
+
+- add (the default): sign the commit once per key and append each signature;
+- `--verify`: check the commit's signatures and exit nonzero when none is valid;
+- `-d|--delete`: remove stored signatures the given KEY-IDs match.
+
+```
+ostrya sign [--repo <repo>] [-d|--delete] [--verify]
+            [-s|--sign-type ed25519|spki|gpg] [--gpg-homedir <dir>]
+            [--keys-file <path>]... [--keys-dir <path>]... <commit> [key-id]...
+```
+
+For ed25519 and spki the KEY-IDs are base64 keys, as the tool treats them: a
+secret key for signing, a public key for verify and delete. `--keys-file` adds
+keys of the same kind, one base64 per line. `--keys-dir` overrides the
+`trusted.<type>[.d]` / `revoked.<type>[.d]` system search roots for verify; with
+nothing supplied inline, verify falls back to the system store. A delete matches
+a stored blob to a KEY-ID by re-verifying it under that public key.
+
+For gpg the KEY-IDs name the signing keys the way `gpg --local-user` resolves
+them -- a fingerprint, a key id, or a user id -- in the default GnuPG home
+directory or the `--gpg-homedir` override; the private key stays with `gpg`
+and its agent, a hardware token included, and `gpg` may start its own agent
+for the selected home directory. Verify loads keyrings (binary or armored)
+from `--keys-file` and runs `gpgv`, which starts no agent. A delete matches
+by the signature's issuer or primary-key fingerprint; the issuer fingerprint
+is reported even for a key absent from the keyrings, and a keyring in
+`--keys-file` lets the match consider the primary-key fingerprint.
+
+Delete is backed by `Repo::delete_signatures(checksum, metadata_key, predicate)`,
+which rewrites `.commitmeta`: an emptied engine array drops its dict entry, and
+an emptied dict is written as the zero-length marker, leaving other engines'
+arrays in place. The `spki` and `gpg` engines are enabled in the `ostrya-cli`
+build by default, so all three sign-types work without a rebuild.
+
+Verify: through the built binary, a commit it signs with ed25519 verifies under
+the same public key and is rejected by a wrong one; the `ostree` tool verifies
+that signature; a delete by the public key makes verification fail. The spki and
+gpg engines sign and verify through the same command, and a gpg delete by
+fingerprint clears the signature.
+
 ### Phase 14 -- Summary generation and signing
 
 Summary assembly (sorted refs, the host-order size asymmetry, big-endian

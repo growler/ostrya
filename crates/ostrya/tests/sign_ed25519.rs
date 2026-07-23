@@ -22,7 +22,7 @@ use std::process::Command;
 use common::{TmpDir, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Ed25519Signer,
-    Ed25519Verifier, MutableTree, Repo, RepoMode, base64, load_sign_keys_from,
+    Ed25519Verifier, MutableTree, ObjectType, Repo, RepoMode, Signer, base64, load_sign_keys_from,
 };
 use ostrya_rt::block_on;
 
@@ -194,6 +194,78 @@ fn port_verifies_an_ed25519_signature_the_tool_wrote() {
         assert!(!rejected.signatures[0].valid);
         assert!(rejected.signatures[0].key_missing);
     });
+}
+
+#[test]
+fn delete_by_key_removes_the_ed25519_signature() {
+    let tmp = TmpDir::new("ed25519-delete");
+    let base = tmp.path();
+    let repo_arg = format!("--repo={}", base.join("repo").display());
+    let commit = block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        repo.sign_commit(&commit, &Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+
+        // A signature made by the matching key is deleted. ed25519 is
+        // deterministic, so the blob to remove is recomputed from the same
+        // key and payload and matched by bytes.
+        let verifier = Ed25519Verifier::new([public_key()], Vec::<Vec<u8>>::new()).unwrap();
+        assert!(
+            repo.verify_commit(&commit, &[&verifier])
+                .await
+                .unwrap()
+                .valid
+        );
+
+        let payload = repo
+            .load_object_bytes(ObjectType::Commit, &commit)
+            .await
+            .unwrap();
+        let expected = Ed25519Signer::from_base64(SECRET_B64)
+            .unwrap()
+            .sign(&payload)
+            .await
+            .unwrap();
+        let removed = repo
+            .delete_signatures(&commit, "ostree.sign.ed25519", |_, blob| blob == expected)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            repo.read_commit_detached_metadata(&commit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !repo
+                .verify_commit(&commit, &[&verifier])
+                .await
+                .unwrap()
+                .valid
+        );
+        commit
+    });
+
+    // The tool no longer verifies the deleted signature.
+    if ostree_available() {
+        let out = Command::new("ostree")
+            .args([
+                &repo_arg,
+                "sign",
+                "--verify",
+                "--sign-type=ed25519",
+                &commit.to_hex(),
+                PUBLIC_B64,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "tool verified a signature the port deleted"
+        );
+    }
 }
 
 #[test]

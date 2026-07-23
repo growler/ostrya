@@ -290,6 +290,170 @@ fn appending_dummy_signature_leaves_a_foreign_engine_array_intact() {
 }
 
 #[test]
+fn delete_signatures_removes_matching_and_empties() {
+    let tmp = TmpDir::new("sign-delete");
+    let base = tmp.path();
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        repo.sign_commit(&commit, &DummySigner::new("key-a"))
+            .await
+            .unwrap();
+        repo.sign_commit(&commit, &DummySigner::new("key-b"))
+            .await
+            .unwrap();
+
+        // Remove only the blob matching key-a.
+        let removed = repo
+            .delete_signatures(&commit, "ostree.sign.dummy", |_payload, blob| {
+                blob == b"key-a"
+            })
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        // key-b's signature survives; key-a's is gone.
+        let dict = repo
+            .read_commit_detached_metadata(&commit)
+            .await
+            .unwrap()
+            .expect("detached metadata present");
+        let blobs = dict
+            .dict_get("ostree.sign.dummy")
+            .and_then(Value::as_variant)
+            .unwrap()
+            .1
+            .as_array()
+            .unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].as_bytes(), Some(b"key-b".as_slice()));
+        assert!(
+            repo.verify_commit(&commit, &[&DummyVerifier::new(["key-b"])])
+                .await
+                .unwrap()
+                .valid
+        );
+        assert!(
+            !repo
+                .verify_commit(&commit, &[&DummyVerifier::new(["key-a"])])
+                .await
+                .unwrap()
+                .valid
+        );
+
+        // Removing the survivor empties the dict, leaving no detached metadata.
+        let removed = repo
+            .delete_signatures(&commit, "ostree.sign.dummy", |_payload, _blob| true)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert!(
+            repo.read_commit_detached_metadata(&commit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
+fn delete_signatures_preserves_other_engines() {
+    let tmp = TmpDir::new("sign-delete-foreign");
+    let base = tmp.path();
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+
+        // Seed a foreign engine's array, then add dummy signatures alongside it.
+        let ed_key = "ostree.sign.ed25519";
+        let ed_sig = vec![0x11u8; 64];
+        let seeded = Value::Array(vec![Value::Tuple(vec![
+            Value::Str(ed_key.to_owned()),
+            Value::variant(
+                Type::parse("aay").unwrap(),
+                Value::Array(vec![Value::Bytes(ed_sig.clone())]),
+            ),
+        ])]);
+        repo.write_commit_detached_metadata(&commit, Some(&seeded))
+            .await
+            .unwrap();
+        repo.sign_commit(&commit, &DummySigner::new("key-a"))
+            .await
+            .unwrap();
+
+        // Deleting every dummy signature drops the dummy entry but keeps the
+        // foreign engine's array, so the metadata is not cleared.
+        let removed = repo
+            .delete_signatures(&commit, "ostree.sign.dummy", |_payload, _blob| true)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        let dict = repo
+            .read_commit_detached_metadata(&commit)
+            .await
+            .unwrap()
+            .expect("foreign metadata is retained");
+        assert!(dict.dict_get("ostree.sign.dummy").is_none());
+        let ed = dict.dict_get(ed_key).and_then(Value::as_variant).unwrap().1;
+        assert_eq!(
+            ed.as_array().unwrap()[0].as_bytes(),
+            Some(ed_sig.as_slice())
+        );
+    });
+}
+
+#[test]
+fn delete_signatures_without_a_match_is_a_noop() {
+    let tmp = TmpDir::new("sign-delete-noop");
+    let base = tmp.path();
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        repo.sign_commit(&commit, &DummySigner::new("key-a"))
+            .await
+            .unwrap();
+
+        // A non-matching key, and an engine key with no entry, remove nothing.
+        assert_eq!(
+            repo.delete_signatures(&commit, "ostree.sign.dummy", |_p, b| b == b"nope")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            repo.delete_signatures(&commit, "ostree.sign.ed25519", |_p, _b| true)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            repo.verify_commit(&commit, &[&DummyVerifier::new(["key-a"])])
+                .await
+                .unwrap()
+                .valid
+        );
+    });
+}
+
+#[test]
+fn delete_signatures_on_an_unsigned_commit_is_a_noop() {
+    let tmp = TmpDir::new("sign-delete-unsigned");
+    let base = tmp.path();
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        assert_eq!(
+            repo.delete_signatures(&commit, "ostree.sign.dummy", |_p, _b| true)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            repo.read_commit_detached_metadata(&commit)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[test]
 fn verifying_an_unsigned_commit_is_not_valid() {
     let tmp = TmpDir::new("sign-unsigned");
     let base = tmp.path();

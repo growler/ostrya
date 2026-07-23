@@ -13,6 +13,7 @@ default = ["smol"]
 smol = ["ostrya-rt/smol"]
 tokio = ["ostrya-rt/tokio"]
 sign-spki = ["dep:p256"]
+sign-gpg = []
 
 [dependencies]
 ostrya-core = { workspace = true }

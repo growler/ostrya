@@ -855,14 +855,28 @@ spki-capable `ostree`. When such a build is available, generate a key pair with
 the tool, sign a commit, inspect the PEM and the signature bytes, and reconcile
 any difference here.
 
-GPG verification (to be reimplemented with sequoia): load N keyrings (binary
-and ASCII-armored) into one certificate store, parse the `aay` list of detached
-OpenPGP signature packets (concatenated), detached-verify against the signed
-bytes, and surface per-signature: valid flag, fingerprint, primary fingerprint,
-creation/expiry timestamps, key expiry, revoked/expired/missing state, algorithm
-names, user name and email. Trusted keyring for a remote is
-`<remote>.trustedkeys.gpg` in the repo or `/etc/ostree/remotes.d/`; the global
-dir is `<datadir>/ostree/trusted.gpg.d/`.
+GPG (signature key `ostree.gpgsigs`). Each `ay` element is one detached
+OpenPGP signature: the binary signature packet stream, unarmored. A blob may
+hold more than one signature packet, and each packet is verified
+independently. The port signs and verifies through the system GnuPG
+installation (`gpg --detach-sign` and `gpgv`, driven over the machine-readable
+`--status-fd` interface), so the stored blobs are the OpenPGP interchange form
+GnuPG itself produces and consumes. A signature is reported valid only when
+GnuPG reports a good signature; a signature by an expired, revoked, or unknown
+key is invalid, with the state surfaced per signature: the signing-key and
+primary-key fingerprints, the creation and expiry timestamps, the key's expiry
+time when it has passed, the expired/revoked/missing flags, the public-key and
+digest algorithm names, and the signer's user id split into name and email.
+Trust is membership in the supplied keyrings; GnuPG's ownertrust model does
+not participate.
+
+GPG keyrings are binary or ASCII-armored, each holding one or more
+certificates, all merged into one trusted set. The keyring trusted for a
+remote is `<remote>.trustedkeys.gpg` in the repo or under
+`/etc/ostree/remotes.d/`; every keyring in the global
+`<datadir>/ostree/trusted.gpg.d/` directory is trusted for all remotes.
+End-to-end cross-verification against `ostree gpg-sign` runs with the upstream
+shell tests at the CLI-compatibility phase.
 
 Dummy engine (test only). Signature key `ostree.sign.dummy`, value `aay` like
 the other engines. The engine is gated in the tool behind the

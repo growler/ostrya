@@ -23,9 +23,9 @@ library is MIT-licensed.
    `ostrya-rt` crate: `smol` by default, `tokio` optional.
 3. Multiple concurrent transactions within a single process.
 4. Capable of passing ostree's test suite, run as an external conformance gate.
-5. Extensions: commit signing via `sequoia-openpgp` (replacing gpgme),
-   composefs/EROFS export, tar import/export, AWS S3 push/pull, ssh
-   git-style push/pull.
+5. Extensions: GPG commit signing through the system GnuPG binaries (no
+   gpgme linkage), composefs/EROFS export, tar import/export, AWS S3
+   push/pull, ssh git-style push/pull.
 
 The port is a library. It is not a drop-in replacement for the `ostree` tool.
 A minimal `ostrya` binary lands once the ingest and checkout paths are ready
@@ -62,8 +62,8 @@ Rust crate ecosystem is in scope. Proposed foundation crates, all pure Rust:
   DEFLATE for archive-mode content objects, over `flate2` with the
   pure-Rust `miniz_oxide` backend.
 - `ed25519-dalek` -- the ed25519 sign engine.
-- `sequoia-openpgp` with the RustCrypto backend (`crypto-rust`) -- GPG signing
-  and verification without nettle/C.
+- GPG signing and verification: no crate -- the engine runs the system
+  `gpg`/`gpgv` binaries as subprocesses (see Decisions).
 - `rustls` plus `webpki-roots` / `rustls-native-certs` -- TLS for pull.
 - `smol-tar` -- async tar import/export in the smol ecosystem.
 - `clap` -- command-line argument parsing for the `ostrya` binary
@@ -87,8 +87,9 @@ bounded:
   canonicalization, format (de)serialization. Depends on `ostrya-gvariant`.
 - `ostrya-rt` -- internal runtime abstraction: `rt::unblock`, `rt::File`
   (over an already-open fd; `smol::fs::File` or `tokio::fs::File`),
-  `rt::Timer`, later `rt::spawn` and networking. The only crate that knows
-  which backend is compiled. No ostree knowledge.
+  `rt::Timer`, `rt::Command` (a short-lived helper process with piped
+  standard streams), later `rt::spawn` and networking. The only crate that
+  knows which backend is compiled. No ostree knowledge.
 - `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the
   fs-verity digest. Standalone and free of ostree and repository knowledge,
   like `ostrya-gvariant`: it takes a tree model and emits the image bytes and
@@ -1193,9 +1194,9 @@ elsewhere. The suite passes under both runtime backends.
 
 Four sub-phases, each an independently reviewable unit with its own gate: 13a
 is the signing framework and the dummy test engine, 13b the ed25519 engine and
-the sign-api key store, 13c the spki (ECDSA/SPKI) engine, 13d GPG over
-sequoia-openpgp. Each sub-phase consumes only the public surface of the ones
-before it. All four engines sign and verify commit objects through the shared
+the sign-api key store, 13c the spki (ECDSA/SPKI) engine, 13d GPG over the
+system GnuPG binaries. Each sub-phase consumes only the public surface of the
+ones before it. All four engines sign and verify commit objects through the shared
 13a framework; summary signing (Phase 14) reuses the same engines on the
 summary bytes.
 
@@ -1357,45 +1358,66 @@ convention resolves spki keys; `test-signed-commit-spki` targeted through the
 harness when the CLI lands; the suite passes under both runtime backends, with
 and without the `sign-spki` feature.
 
-### Phase 13d -- GPG signing and verification (sequoia-openpgp)
+### Phase 13d -- GPG signing and verification (system GnuPG) (DONE)
 
-GPG commit signing and verification over `sequoia-openpgp` with the RustCrypto
-backend, behind the `sign-gpg` feature. The heaviest engine, isolated last.
+GPG commit signing and verification over the system GnuPG installation,
+behind the `sign-gpg` feature: the engine runs the `gpg` and `gpgv` binaries
+as short-lived subprocesses, the way git drives them, and reads results from
+the machine-readable `--status-fd` line protocol. No OpenPGP implementation
+is linked into the library, and the private key never passes through it --
+`gpg` performs the private-key operation itself, consulting its `gpg-agent`
+(and any hardware token behind it) as needed, so agent-held keys work with
+no dedicated code path.
 
 Definition:
 
-- `GpgSigner` / `GpgVerifier` over `sequoia-openpgp` (`crypto-rust` backend),
-  gated on the `sign-gpg` feature.
-- Keyring loading: N keyrings, binary and ASCII-armored, into one certificate
-  store; the per-remote `<remote>.trustedkeys.gpg` and `/etc/ostree/remotes.d/`
-  resolution and the global `<datadir>/ostree/trusted.gpg.d/` directory, per
-  `format-reference.md`.
-- Detached verify: the `ostree.gpgsigs` value is an `aay` of concatenated
-  detached OpenPGP signature packets; parse each blob, detached-verify against
-  the signed commit bytes, and surface per-signature `SignatureInfo` -- valid
-  flag, fingerprint, primary fingerprint, creation and expiry, key expiry,
-  revoked/expired/missing state, algorithm names, user name and email, the
-  documented GPG verify result fields.
-- Signing appends a detached OpenPGP signature blob to `ostree.gpgsigs`
-  through the 13a append path.
-- The CPU-bound OpenPGP crypto offloads through `rt::unblock`.
+- `GpgSigner` names its key the way `gpg --local-user` resolves it -- a
+  fingerprint, a key id, or a user id -- with an optional GnuPG home
+  directory override. Signing runs `gpg --batch --detach-sign` with the
+  commit bytes on stdin and appends the binary signature from stdout to
+  `ostree.gpgsigs` through the 13a append path.
+- `GpgVerifier` holds binary keyring blobs; armored input is decoded to the
+  binary form on load by a hand-rolled RFC 4880 radix-64 decoder, since
+  `gpgv` reads only binary keyrings. Keyring resolution: N keyrings from
+  bytes or files, the per-remote `<remote>.trustedkeys.gpg` and
+  `/etc/ostree/remotes.d/` resolution, and the global
+  `<datadir>/ostree/trusted.gpg.d/` directory, per `format-reference.md`.
+- Verification materializes the merged keyring in a private scratch
+  directory and runs `gpgv --keyring` once per stored blob with the payload
+  on stdin. `gpgv` performs public-key operations only and starts no agent.
+  A blob may hold several signature packets; each `NEWSIG` status group
+  yields one `SignatureInfo`.
+- Validity is `GOODSIG` alone. `EXPKEYSIG`, `REVKEYSIG`, `BADSIG`, and
+  `ERRSIG`/`NO_PUBKEY` map to the expired, revoked, and missing flags;
+  `VALIDSIG` supplies the fingerprints, timestamps, and algorithm ids;
+  `KEYEXPIRED` supplies the key expiry. The vocabulary was pinned by
+  black-box observation of GnuPG 2.4 (good, bad, unknown-key, expired-key,
+  revoked-key, and multi-packet cases); unit tests parse the captured
+  streams verbatim.
+- `Verifier::verify` is async (a boxed `VerifyFuture` mirroring
+  `SignFuture`), so a verifying engine can await a subprocess; the
+  in-process engines resolve immediately.
+- Subprocess plumbing is `rt::Command` in `ostrya-rt`: piped standard
+  streams over `smol::process` (part of the `smol` facade) or
+  `tokio::process` (the `process` feature on the existing tokio
+  dependency). No new crate enters the lockfile.
 
-Dependency set: `sequoia-openpgp` (2.x; exact pin confirmed at phase start)
-with `default-features = false` and the `crypto-rust` backend plus the
-experimental and variable-time-crypto opt-ins the RustCrypto backend requires,
-pure Rust with no nettle or other C linkage; behind the `sign-gpg` feature.
-The exact feature set is settled at phase start (see the risk register on
-RustCrypto-backend maturity).
+Dependency set: none. The engine adds a runtime tool dependency on `gpg`
+and `gpgv`; a missing binary surfaces as a signature error naming the
+program.
 
-Deliverables: `GpgSigner`, `GpgVerifier`, keyring loading (binary and armored),
-detached verify with per-signature metadata, the `sign-gpg` feature wiring.
+Deliverables: `GpgSigner`, `GpgVerifier`, keyring loading (binary and
+armored), per-signature `SignatureInfo` from the status stream,
+`rt::Command`, the async `Verifier` trait, the `sign-gpg` feature wiring.
 
-Verify: a commit the port GPG-signs verifies under `ostree` with the same
-public keyring, and the port verifies a commit the tool GPG-signed;
-`SignatureInfo` reports fingerprint, validity, and expiry matching the tool's
-signature output; `test-gpg-signed-commit` and `test-commit-sign` targeted
-through the harness when the CLI lands; the suite passes under both runtime
-backends, with and without the `sign-gpg` feature.
+Verify: a commit the port signs round-trips through `gpgv` with the exported
+keyring and is rejected under an empty trusted set; armored and file
+keyrings load; a wrong payload reports `BADSIG`; GPG and dummy signatures
+coexist on one commit; the status parser reproduces the observed GnuPG 2.4
+streams; the suite passes under both runtime backends, with and without
+`sign-gpg`. Tool cross-verification (`ostree gpg-sign` in both directions,
+`test-gpg-signed-commit`, `test-commit-sign`) runs through the harness when
+the CLI-compatible surface lands (Phase 17).
 
 ### Phase 14 -- Summary generation and signing
 
@@ -1500,8 +1522,10 @@ admin tests. Recommend deferring or descoping unless explicitly required.
   crates couple to tokio-flavored I/O traits that need adapting to
   `ostrya-rt`. Mitigation: ALPN via rustls, the `tokio_util::compat`-style
   adapter pattern already in use, and a crate proposal at phase start.
-- sequoia RustCrypto backend maturity for the exact GPG verify semantics
-  ostree needs (revocation, expiry, primary-fingerprint mapping).
+- GPG semantics ride on the installed GnuPG: the engine drives `gpg`/`gpgv`
+  through the documented, stable `--status-fd` interface and pins no
+  version; a vocabulary change in a future GnuPG would surface in the
+  round-trip tests.
 - "Pass the test suite" scope: the shell tier requires a compatible CLI; the
   admin tier requires the sysroot track. Scope must be agreed (see decisions).
 
@@ -1511,8 +1535,7 @@ Resolved:
 
 1. Dependency policy: pure Rust only, no C libraries and no C-linking `*-sys`
    crates. The pure-Rust crate ecosystem is in scope (rustix, smol, sha2,
-   ed25519-dalek, sequoia-openpgp with the RustCrypto backend, rustls,
-   miniz_oxide, lzma-rs, and so on).
+   ed25519-dalek, rustls, miniz_oxide, lzma-rs, and so on).
 2. GVariant: hand-roll a minimal codec (`ostrya-gvariant`) tailored to
    ostree's fixed type set, fuzzed against golden bytes from the tool.
 3. Test-suite scope: phased. Target the library-format-testable subset plus
@@ -1600,4 +1623,17 @@ Resolved:
     SubjectPublicKeyInfo PEM public keys) in Phase 13c. The ed25519 and
     dummy engines are always compiled; spki is behind the `sign-spki`
     feature and GPG behind `sign-gpg`, so the core stays free of the
-    ECDSA/SPKI and OpenPGP crate trees unless opted in.
+    ECDSA/SPKI crate tree unless opted in (the GPG engine adds no crates;
+    see decision 13).
+
+13. GPG engine (Phase 13d): signing and verification run the system `gpg`
+    and `gpgv` binaries as short-lived subprocesses over the documented
+    `--status-fd` interface, the way git drives them. No OpenPGP crate is
+    linked: `sequoia-openpgp` was considered and set aside -- LGPL
+    licensing, a heavy transitive tree, and no agent surface, whereas
+    agent-held and hardware-token keys work through `gpg` itself with no
+    dedicated code path. `Verifier::verify` is async so a verifying engine
+    can await a subprocess. Subprocesses go through `rt::Command`
+    (`smol::process` / `tokio::process`, no new lockfile crates); the
+    `gpg` and `gpgv` binaries are a runtime tool dependency of the
+    `sign-gpg` feature only.

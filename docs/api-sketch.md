@@ -567,15 +567,18 @@ pub trait Verifier {
 
 pub struct Ed25519Signer { /* 64-byte secret */ }
 pub struct Ed25519Verifier { /* trusted + revoked 32-byte keys */ }
-pub struct GpgSigner { /* sequoia cert + secret */ }
-pub struct GpgVerifier { /* sequoia cert store from keyrings */ }
+pub struct GpgSigner { /* key id/fingerprint + optional GNUPGHOME; signs via gpg */ }
+pub struct GpgVerifier { /* binary keyring blobs; verifies via gpgv */ }
 pub struct SpkiSigner;   pub struct SpkiVerifier;    // optional
 pub struct DummySigner;  pub struct DummyVerifier;   // test-only
 
 pub struct VerifyOutcome { pub valid: bool, pub signatures: Vec<SignatureInfo> }
 pub struct SignatureInfo {
-    pub valid: bool, pub fingerprint: Option<String>,
-    pub created: Option<u64>, pub expired: bool, pub key_missing: bool,
+    pub valid: bool,
+    pub fingerprint: Option<String>, pub primary_fingerprint: Option<String>,
+    pub created: Option<u64>, pub expires: Option<u64>, pub key_expires: Option<u64>,
+    pub expired: bool, pub revoked: bool, pub key_missing: bool,
+    pub pubkey_algorithm: Option<String>, pub hash_algorithm: Option<String>,
     pub user_name: Option<String>, pub user_email: Option<String>,
     // mirrors the documented GPG verify result fields
 }

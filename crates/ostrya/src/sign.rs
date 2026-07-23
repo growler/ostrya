@@ -98,12 +98,28 @@ pub struct SignatureInfo {
     pub valid: bool,
     /// The signing key fingerprint, when the engine exposes one.
     pub fingerprint: Option<String>,
+    /// The primary-key fingerprint of the signer's certificate, when the
+    /// signing key is a subkey (GPG). Equal to [`fingerprint`](Self::fingerprint)
+    /// when the primary key signed.
+    pub primary_fingerprint: Option<String>,
     /// The signature creation time (seconds since the Unix epoch), when known.
     pub created: Option<u64>,
+    /// The signature expiry time (seconds since the Unix epoch), when the
+    /// signature carries one.
+    pub expires: Option<u64>,
+    /// The signing key's expiry time (seconds since the Unix epoch), when the
+    /// key carries one and it has passed.
+    pub key_expires: Option<u64>,
     /// Whether the signing key had expired.
     pub expired: bool,
+    /// Whether the signing key was revoked.
+    pub revoked: bool,
     /// Whether the signing key was absent from the trusted set.
     pub key_missing: bool,
+    /// The public-key algorithm name, when the engine exposes one (GPG).
+    pub pubkey_algorithm: Option<String>,
+    /// The digest algorithm name, when the engine exposes one (GPG).
+    pub hash_algorithm: Option<String>,
     /// The signer's user name, when the engine exposes one.
     pub user_name: Option<String>,
     /// The signer's user email, when the engine exposes one.

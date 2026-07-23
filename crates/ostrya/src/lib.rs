@@ -84,7 +84,14 @@
 //! it also covers the spki engine (Phase 13c): [`SpkiSigner`] / [`SpkiVerifier`]
 //! over ECDSA on NIST P-256 with SHA-256, DER-encoded signatures, and
 //! SubjectPublicKeyInfo public keys, reusing the sign-api key store as
-//! `trusted.spki` / `revoked.spki`.
+//! `trusted.spki` / `revoked.spki`. Under the `sign-gpg` feature it also covers
+//! the GPG engine (Phase 13d): [`GpgSigner`] / [`GpgVerifier`] over the system
+//! GnuPG binaries -- signing runs `gpg --detach-sign` with the key resolved by
+//! fingerprint, key id, or user id in an optional GnuPG home directory
+//! (agent-held and hardware-token keys included), verification runs `gpgv`
+//! over binary or armored keyrings, and detached OpenPGP signatures accumulate
+//! under `ostree.gpgsigs` with per-signature metadata parsed from the
+//! `--status-fd` stream.
 
 pub mod checkout;
 pub mod commit;
@@ -94,6 +101,8 @@ pub mod diff;
 pub mod error;
 pub mod file;
 pub mod fsck;
+#[cfg(feature = "sign-gpg")]
+pub mod gpg;
 mod hashing;
 mod inflate;
 mod ingest;
@@ -124,6 +133,8 @@ pub use diff::{DiffChange, DiffEntry};
 pub use error::{Error, Result};
 pub use file::{ContentReader, FileKind, FileObject};
 pub use fsck::{FsckError, FsckErrorKind, FsckOptions, FsckReport};
+#[cfg(feature = "sign-gpg")]
+pub use gpg::{GpgSigner, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter};
 pub use lock::LockKind;
 pub use modifier::{

@@ -22,6 +22,7 @@ pub mod filehdr;
 mod keyfile;
 mod loosepath;
 mod mode;
+mod objname;
 mod objtype;
 pub mod sizes;
 mod valiter;
@@ -37,6 +38,7 @@ pub use filehdr::{ContentHasher, FileHeader};
 pub use keyfile::KeyFile;
 pub use loosepath::loose_path;
 pub use mode::RepoMode;
+pub use objname::ObjectName;
 pub use objtype::ObjectType;
 pub use xattr::{Xattrs, XattrsRef};
 

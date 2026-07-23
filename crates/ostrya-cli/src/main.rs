@@ -11,6 +11,9 @@
 //!   commit and print its checksum.
 //! - `checkout` -- materialize a commit's tree, or write its composefs image.
 //! - `export` -- write a commit's tree to stdout as a tar stream.
+//! - `prune` -- delete unreachable objects.
+//! - `fsck` -- verify object integrity and completeness.
+//! - `diff` -- report the paths that changed between two commits.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams to and from stdin/stdout flow through
@@ -23,7 +26,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CommitModifier, CommitModifierFlags, CommitOptions,
-    Error, MutableTree, Repo, Result, TarExportOptions, TarImportOptions, Type, Value,
+    DiffChange, Error, FsckOptions, MutableTree, PruneOptions, Repo, Result, TarExportOptions,
+    TarImportOptions, Type, Value,
 };
 
 /// A pure-Rust front-end over the ostrya repository library.
@@ -42,6 +46,12 @@ enum Command {
     Checkout(CheckoutArgs),
     /// Write a commit's tree to stdout as a tar stream.
     Export(ExportArgs),
+    /// Delete objects unreachable from the repository's refs and commits.
+    Prune(PruneArgs),
+    /// Verify object integrity and completeness across every commit.
+    Fsck(FsckArgs),
+    /// Report the paths that changed between two commits.
+    Diff(DiffArgs),
 }
 
 #[derive(Args)]
@@ -96,6 +106,48 @@ struct ExportArgs {
     commit: String,
 }
 
+#[derive(Args)]
+struct PruneArgs {
+    /// The repository to prune.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Keep only objects reachable from refs; also prune unreferenced commits.
+    #[arg(long)]
+    refs_only: bool,
+    /// Parents of each ref to keep: -1 for all history, 0 for only the head.
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    depth: i32,
+    /// Compute and print the statistics without deleting anything.
+    #[arg(long)]
+    no_prune: bool,
+    /// Delete this specific, unreferenced commit before sweeping.
+    #[arg(long)]
+    delete_commit: Option<String>,
+}
+
+#[derive(Args)]
+struct FsckArgs {
+    /// The repository to check.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Do not mark commits partial when a referenced object is missing.
+    #[arg(long)]
+    no_mark_partial: bool,
+}
+
+#[derive(Args)]
+struct DiffArgs {
+    /// The repository to read from.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// The first revision. With no second revision, its parent is compared
+    /// against it.
+    from: String,
+    /// The second revision; when omitted, `from` is compared against its
+    /// parent.
+    to: Option<String>,
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match ostrya_rt::block_on(run(cli)) {
@@ -112,6 +164,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Commit(args) => commit(args).await,
         Command::Checkout(args) => checkout(args).await,
         Command::Export(args) => export(args).await,
+        Command::Prune(args) => prune(args).await,
+        Command::Fsck(args) => fsck(args).await,
+        Command::Diff(args) => diff(args).await,
     }
 }
 
@@ -196,6 +251,88 @@ async fn export(args: ExportArgs) -> Result<()> {
     let stdout = stdout_file()?;
     repo.export_tar(&commit, TarExportOptions::new(), stdout)
         .await
+}
+
+async fn prune(args: PruneArgs) -> Result<()> {
+    let repo = Repo::open(&args.repo).await?;
+    let delete_commit = match args.delete_commit.as_deref() {
+        Some(rev) => Some(resolve(&repo, rev).await?),
+        None => None,
+    };
+    let opts = PruneOptions {
+        refs_only: args.refs_only,
+        depth: args.depth,
+        no_prune: args.no_prune,
+        delete_commit,
+    };
+    let stats = repo.prune(&opts).await?;
+    println!("Total objects: {}", stats.total_objects);
+    if stats.pruned_objects == 0 {
+        println!("No unreachable objects");
+    } else if args.no_prune {
+        println!(
+            "Would delete: {} objects, freeing {} bytes",
+            stats.pruned_objects, stats.freed_bytes
+        );
+    } else {
+        println!(
+            "Deleted {} objects, {} bytes freed",
+            stats.pruned_objects, stats.freed_bytes
+        );
+    }
+    Ok(())
+}
+
+async fn fsck(args: FsckArgs) -> Result<()> {
+    use std::io::Write;
+    let repo = Repo::open(&args.repo).await?;
+    let opts = FsckOptions {
+        mark_partial: !args.no_mark_partial,
+    };
+    let report = repo.fsck(&opts).await?;
+    for error in &report.errors {
+        eprintln!("{error}");
+    }
+    println!(
+        "fsck: {} commits, {} objects checked, {} error(s)",
+        report.commits_checked,
+        report.objects_checked,
+        report.errors.len()
+    );
+    // Match the tool's convention: a repository with faults exits nonzero.
+    std::io::stdout().flush().ok();
+    if !report.is_ok() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn diff(args: DiffArgs) -> Result<()> {
+    let repo = Repo::open(&args.repo).await?;
+    let (from, to) = match args.to.as_deref() {
+        Some(second) => (
+            resolve(&repo, &args.from).await?,
+            resolve(&repo, second).await?,
+        ),
+        None => {
+            // With one revision, compare its parent against it.
+            let rev = resolve(&repo, &args.from).await?;
+            let (commit, _) = repo.load_commit(&rev).await?;
+            let parent = commit.parent.ok_or_else(|| {
+                Error::InvalidFormat("commit has no parent to diff against".into())
+            })?;
+            (parent, rev)
+        }
+    };
+    for entry in repo.diff_commits(&from, &to).await? {
+        let code = match entry.change {
+            DiffChange::Added => 'A',
+            DiffChange::Removed => 'D',
+            DiffChange::Modified => 'M',
+        };
+        println!("{code}    {}", entry.path);
+    }
+    Ok(())
 }
 
 /// Resolve a checksum or ref to a commit checksum. `resolve_rev` with

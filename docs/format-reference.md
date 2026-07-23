@@ -354,6 +354,13 @@ in use, so a later transaction can tell a live staging directory from one left
 by a dead transaction. These locks are advisory and cross-process; the checksums
 and object bytes do not depend on them.
 
+Commit-state markers live at `state/<checksum>.commitpartial`. The reader only
+tests the marker's presence, which makes a commit `Partial`. When `fsck` finds a
+commit missing a referenced object it writes the marker as a single byte `0x66`
+(recovered by observation: feeding the tool a repository with a deleted
+referenced object and inspecting the marker it writes shows a 1-byte file
+holding `0x66`). The marker is local state and does not enter any checksum.
+
 A leftover directory under `tmp/` whose lock can be taken, or that has no lock
 sibling, is removed once its age exceeds `tmp-expiry-secs`. The age test is
 strict on whole seconds: feeding the tool aged and freshly created `tmp/`

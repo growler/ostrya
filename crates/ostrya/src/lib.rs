@@ -59,14 +59,24 @@
 //! commit-timestamp mtimes, `SCHILY.xattr.*` PAX records, content-checksum
 //! hardlink coalescing), and [`Repo::import_tar`], which reads a filesystem tar
 //! into a [`MutableTree`] with deferred hardlink resolution and an optional
-//! `/etc` -> `/usr/etc` remap. Maintenance lands in later phases.
+//! `/etc` -> `/usr/etc` remap. It also covers maintenance (Phase 12):
+//! [`Repo::list_objects`] and the reachability walks
+//! [`Repo::traverse_commit`]/[`Repo::traverse_reachable`], [`Repo::prune`]
+//! ([`PruneOptions`]/[`PruneStats`]) which deletes objects unreachable from the
+//! chosen roots (refs, optionally every commit, to a depth, with an optional
+//! `delete_commit`), [`Repo::fsck`] ([`FsckOptions`]/[`FsckReport`]) which
+//! verifies object integrity and completeness and marks incomplete commits
+//! partial, and [`Repo::diff_commits`] ([`DiffEntry`]/[`DiffChange`]) which
+//! reports the paths that changed between two commits.
 
 pub mod checkout;
 pub mod commit;
 pub mod composefs;
 pub mod config;
+pub mod diff;
 pub mod error;
 pub mod file;
+pub mod fsck;
 mod hashing;
 mod inflate;
 mod ingest;
@@ -75,6 +85,7 @@ pub mod modifier;
 pub mod mtree;
 mod object;
 mod overlay;
+pub mod prune;
 pub mod read;
 pub mod refs;
 pub mod repo;
@@ -82,14 +93,17 @@ mod staging;
 pub mod staging_tree;
 pub mod tar;
 pub mod transaction;
+pub mod traverse;
 pub mod tree;
 mod write;
 
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 pub use commit::CommitOptions;
 pub use config::{MinFreeSpace, Remote, RepoConfig, SizeSpec, SizeUnit};
+pub use diff::{DiffChange, DiffEntry};
 pub use error::{Error, Result};
 pub use file::{ContentReader, FileKind, FileObject};
+pub use fsck::{FsckError, FsckErrorKind, FsckOptions, FsckReport};
 pub use hashing::{HashingReader, HashingWriter};
 pub use lock::LockKind;
 pub use modifier::{
@@ -97,7 +111,10 @@ pub use modifier::{
 };
 pub use mtree::MutableTree;
 pub use ostrya_composefs::Image;
-pub use ostrya_core::{Checksum, Commit, DirMeta, DirTree, ObjectType, RepoMode, Type, Value};
+pub use ostrya_core::{
+    Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Type, Value,
+};
+pub use prune::{PruneOptions, PruneStats};
 pub use read::CommitState;
 pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};

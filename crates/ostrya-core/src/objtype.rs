@@ -94,6 +94,16 @@ impl ObjectType {
         }
     }
 
+    /// The mode-independent type string used in an object's string form
+    /// (`<hexchecksum>.<typestr>`). A `File` object is always `file` here,
+    /// including in archive mode where the loose path carries the `z` suffix;
+    /// the tool prints the `z`-less form in its object references.
+    pub fn type_str(self) -> &'static str {
+        // Every extension but the archive `File` suffix is mode-independent,
+        // so the bare-mode extension is the canonical type string.
+        self.extension(RepoMode::Bare)
+    }
+
     /// Recover the type from a loose-path extension (without the leading dot),
     /// or `None` for an unrecognized extension. The inverse of
     /// [`extension`](Self::extension): both mode-specific `File` spellings

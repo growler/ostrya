@@ -1094,12 +1094,35 @@ binary matches the tool's checkout of the same commit, and `--composefs`
 emits the Phase 9 image; exported tar re-imported through `commit`
 reproduces the root tree.
 
-### Phase 12 -- Prune, fsck, traverse, diff
+### Phase 12 -- Prune, fsck, traverse, diff (DONE)
 
 Reachability traversal, prune (refs-only, depth, delete-commit), fsck (object
 integrity, partial-commit detection), diff.
-Verify: the published `test-prune`, `test-fsck-*`, and `test-corruption`
-subsets via the CLI harness.
+
+Delivered: `Repo::list_objects` (loose-object enumeration), `traverse_commit`
+and `traverse_reachable` (the Merkle-DAG walk, following parents to a depth,
+lenient on absent objects), `Repo::prune` (`PruneOptions`/`PruneStats`) with the
+tool's observed depth semantics (`-1` keeps all history, `0` only the head), the
+refs-only-versus-all-commits root choice, `no_prune` dry runs, `delete_commit`,
+kept-commit `.commitmeta` retention and pruned-commit `.commitpartial` removal,
+`Repo::fsck` (`FsckOptions`/`FsckReport`/`FsckError`) verifying metadata and
+content-object checksums and completeness and marking missing-object commits
+partial, `Repo::diff_commits` (`DiffEntry`/`DiffChange`) reproducing
+`ostree diff`, the `ObjectName` core type, and the `ostrya` CLI subcommands
+`prune`, `fsck`, and `diff`. Observed facts recorded in `format-reference.md`
+(the `.commitpartial` fsck state byte).
+
+Verify: done through Rust integration tests cross-checked against the `ostree`
+tool (the CLI shell harness is Phase 17). The port and the tool prune identical
+copies of a multi-commit repository and agree on the surviving object set, the
+deleted-object count, and the bytes freed; the tool's `fsck` accepts a
+port-pruned repository; the port's `diff_commits` matches `ostree diff`
+byte-for-byte on added/removed/modified/type-change/dirmeta-change cases; fsck
+detects injected content corruption, metadata corruption, and a deleted
+referenced object (marking the commit partial with the tool's state byte); the
+suite passes under both runtime backends. The published `test-prune`,
+`test-fsck-*`, and `test-corruption` shell tests run once the Phase 17 CLI
+harness lands.
 
 ### Phase 13 -- Signing
 

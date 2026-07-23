@@ -17,6 +17,7 @@ tokio = ["ostrya-rt/tokio"]
 ostrya-core = { workspace = true }
 ostrya-composefs = { workspace = true }
 ostrya-rt = { workspace = true }
+ostrya-sys = { workspace = true }
 thiserror = "2"
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }

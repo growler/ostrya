@@ -502,6 +502,80 @@ settings for the syncs it issues: `fsync=false` makes every sync a no-op,
 `syncfs` precedes the renames with directory `fsync`s after. The staging
 directory layout is transient and is not part of the on-disk format.
 
+## Write path: fs-verity (ex-integrity)
+
+A repository can seal its loose objects with fs-verity as they are written. The
+behavior was recovered by tracing `ostree` 2026.1 (built with `ex-fsverity`) on
+a btrfs repository, probing objects on a verity-capable and a non-capable
+filesystem, and cross-checking the kernel's measured digest against the port's
+`FsVerityHasher`. fs-verity enablement seals an inode against modification and
+gives the kernel a digest it can enforce on reads; the object bytes and their
+checksums are unchanged, so a verity repository is byte-for-byte a normal
+repository whose regular-file objects happen to be sealed.
+
+Config. The `[ex-integrity]` group carries two tri-state keys, each spelled
+`no`, `maybe`, or `yes`:
+
+- `fsverity` -- whether loose objects are sealed. Defaults to `no`.
+- `composefs` -- governs deployment behavior elsewhere; here it is read only for
+  its effect on the `fsverity` default. `composefs` set to `yes` or `maybe`
+  raises the `fsverity` default to `maybe`.
+
+An explicit `fsverity` value overrides the composefs-derived default. A value
+that is not `no`/`maybe`/`yes` is a malformed-config error.
+
+Scope. Verity is enabled on every loose object stored as a regular file, in
+every repository mode including archive-z2:
+
+- content objects: `.file` (bare family) and `.filez` (archive),
+- metadata objects: `.dirtree`, `.dirmeta`, and `.commit`,
+- symlink objects stored as regular files: bare-user, bare-user-shared, and
+  archive keep a symlink's content in a regular file, so those objects are
+  sealed.
+
+Only real symlink objects are skipped, because fs-verity applies to regular
+files. Real symlink objects occur in `bare` and `bare-user-only`. A deduplicated
+write (the object already present in `objects/`) is left untouched.
+
+Semantics.
+
+- `no`: nothing is sealed; the staging path is unchanged.
+- `maybe`: best effort. Every `FS_IOC_ENABLE_VERITY` failure is swallowed, so a
+  filesystem without verity (which returns `ENOTTY`) commits normally with
+  objects left unsealed.
+- `yes`: required. An enable failure fails the write, matching the tool, which
+  reports that fsverity is required but the filesystem does not support it.
+
+Digest parameters. SHA-256, 4096-byte blocks, and a zero-length salt. The
+enable argument is `fsverity_enable_arg { version 1, hash_algorithm 1 (SHA-256),
+block_size 4096, salt_size 0 }`, a 128-byte struct with the remaining fields
+zero. The kernel's `FS_IOC_MEASURE_VERITY` result for a sealed object equals the
+`FsVerityHasher` digest of that object's on-disk bytes, which is the same value
+the composefs export records per backing file. For a bare-user or
+bare-user-shared `.file`, whose on-disk bytes are the raw payload, that digest
+is the fs-verity digest of the payload.
+
+Write-path order, per object, while the inode is still an anonymous `O_TMPFILE`
+staging file:
+
+1. open `O_TMPFILE|O_WRONLY` in the staging directory,
+2. write or reflink the payload,
+3. apply `fchmod`/`fchown` and xattrs,
+4. reopen the inode read-only through `/proc/self/fd/N`,
+5. close the writable descriptor (the kernel refuses `FS_IOC_ENABLE_VERITY`
+   while any writable descriptor to the inode is open),
+6. `ioctl(ro_fd, FS_IOC_ENABLE_VERITY)`,
+7. `linkat` the read-only descriptor into the staging directory.
+
+A named temp file (used where the filesystem refuses `O_TMPFILE`, and for the
+small caller-held bodies of symlink and metadata objects) follows the same
+close-reopen-seal ordering and is then renamed into place rather than linked.
+Publication into `objects/` is unchanged.
+
+The `FS_IOC_ENABLE_VERITY` and `FS_IOC_MEASURE_VERITY` ioctls are the only
+syscalls in the write path that require `unsafe`; they live in the audited
+`ostrya-sys` crate.
+
 ## Commit modifier: canonical permissions, consume, and devino
 
 A filesystem tree is ingested into a repository under a set of options the

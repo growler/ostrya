@@ -20,6 +20,7 @@ use crate::error::{Error, Result};
 
 const CORE: &str = "core";
 const ARCHIVE: &str = "archive";
+const EX_INTEGRITY: &str = "ex-integrity";
 
 /// A parsed repository configuration.
 #[derive(Debug, Clone)]
@@ -81,6 +82,33 @@ impl SizeSpec {
     /// The value in bytes, saturating on overflow.
     pub fn bytes(self) -> u64 {
         self.value.saturating_mul(self.unit.multiplier())
+    }
+}
+
+/// A tri-state repository setting, spelled `no`, `maybe`, or `yes`.
+///
+/// The `[ex-integrity]` keys use this form: `No` disables the feature, `Maybe`
+/// enables it best-effort (ignoring a filesystem that cannot provide it), and
+/// `Yes` requires it (failing where it cannot be provided).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tristate {
+    /// The feature is disabled.
+    No,
+    /// Best effort: enable where supported, ignore where not.
+    Maybe,
+    /// Required: fail where the feature cannot be provided.
+    Yes,
+}
+
+impl Tristate {
+    /// Parse the `no`/`maybe`/`yes` spelling the tool writes.
+    fn parse(raw: &str) -> Option<Tristate> {
+        match raw {
+            "no" => Some(Tristate::No),
+            "maybe" => Some(Tristate::Maybe),
+            "yes" => Some(Tristate::Yes),
+            _ => None,
+        }
     }
 }
 
@@ -243,6 +271,45 @@ impl RepoConfig {
             .keyfile
             .get_integer(ARCHIVE, "zlib-level")?
             .unwrap_or(6))
+    }
+
+    /// The `[ex-integrity] composefs` setting. Default `No`.
+    ///
+    /// This is read to compute the [`fsverity`](RepoConfig::fsverity) default.
+    /// The composefs deployment behavior the key otherwise governs is out of
+    /// scope for the write path.
+    pub fn composefs(&self) -> Result<Tristate> {
+        Ok(self
+            .tristate(EX_INTEGRITY, "composefs")?
+            .unwrap_or(Tristate::No))
+    }
+
+    /// The `[ex-integrity] fsverity` setting: whether loose objects are sealed
+    /// with fs-verity as they are written.
+    ///
+    /// An explicit value is honored as written. When the key is absent it
+    /// defaults to `No`, raised to `Maybe` when
+    /// [`composefs`](RepoConfig::composefs) is `Yes` or `Maybe`; `composefs` is
+    /// read only in that fallback.
+    pub fn fsverity(&self) -> Result<Tristate> {
+        if let Some(explicit) = self.tristate(EX_INTEGRITY, "fsverity")? {
+            return Ok(explicit);
+        }
+        Ok(match self.composefs()? {
+            Tristate::No => Tristate::No,
+            Tristate::Maybe | Tristate::Yes => Tristate::Maybe,
+        })
+    }
+
+    /// Read a tri-state key, returning `None` when it is absent and reporting a
+    /// value that is not `no`/`maybe`/`yes` as a malformed config error.
+    fn tristate(&self, group: &str, key: &str) -> Result<Option<Tristate>> {
+        match self.keyfile.get_string(group, key)? {
+            None => Ok(None),
+            Some(raw) => Tristate::parse(&raw).map(Some).ok_or_else(|| {
+                Error::InvalidFormat(format!("malformed [{group}] {key} value '{raw}'"))
+            }),
+        }
     }
 
     /// The parsed key file backing this view.
@@ -458,6 +525,62 @@ mod tests {
         for bad in ["1G", "GB", "1KB", "1gb", "1GB ", "", "1.5GB"] {
             assert!(parse_size(bad).is_none(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn ex_integrity_defaults_off() {
+        let cfg = RepoConfig::parse(ARCHIVE_CONFIG).unwrap();
+        assert_eq!(cfg.composefs().unwrap(), Tristate::No);
+        assert_eq!(cfg.fsverity().unwrap(), Tristate::No);
+    }
+
+    #[test]
+    fn composefs_raises_fsverity_default_to_maybe() {
+        for composefs in ["yes", "maybe"] {
+            let text = format!(
+                "[core]\nrepo_version=1\nmode=bare\n[ex-integrity]\ncomposefs={composefs}\n"
+            );
+            let cfg = RepoConfig::parse(&text).unwrap();
+            assert_eq!(
+                cfg.fsverity().unwrap(),
+                Tristate::Maybe,
+                "composefs={composefs}"
+            );
+        }
+        // composefs=no leaves fsverity off.
+        let text = "[core]\nrepo_version=1\nmode=bare\n[ex-integrity]\ncomposefs=no\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        assert_eq!(cfg.fsverity().unwrap(), Tristate::No);
+    }
+
+    #[test]
+    fn explicit_fsverity_overrides_the_composefs_default() {
+        // An explicit fsverity value wins over the composefs-derived default.
+        let text = "[core]\nrepo_version=1\nmode=bare\n\
+                    [ex-integrity]\ncomposefs=yes\nfsverity=no\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        assert_eq!(cfg.fsverity().unwrap(), Tristate::No);
+
+        let text = "[core]\nrepo_version=1\nmode=bare\n[ex-integrity]\nfsverity=yes\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        assert_eq!(cfg.fsverity().unwrap(), Tristate::Yes);
+    }
+
+    #[test]
+    fn malformed_tristate_is_an_error() {
+        let text = "[core]\nrepo_version=1\nmode=bare\n[ex-integrity]\nfsverity=true\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        assert!(cfg.fsverity().is_err());
+    }
+
+    #[test]
+    fn explicit_fsverity_ignores_a_malformed_composefs() {
+        // An explicit fsverity value is honored without consulting composefs, so
+        // a malformed composefs does not fail the fsverity read.
+        let text = "[core]\nrepo_version=1\nmode=bare\n\
+                    [ex-integrity]\ncomposefs=perhaps\nfsverity=no\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        assert_eq!(cfg.fsverity().unwrap(), Tristate::No);
     }
 
     #[test]

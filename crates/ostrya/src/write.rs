@@ -34,6 +34,7 @@ use ostrya_rt::File as RtFile;
 use rustix::fs::{AtFlags, Gid, Mode, OFlags, Uid, XattrFlags};
 use sha2::{Digest, Sha256};
 
+use crate::config::Tristate;
 use crate::error::{Error, Result};
 use crate::transaction::Transaction;
 
@@ -436,6 +437,10 @@ pub(crate) struct StageCtx<'a> {
     pub(crate) fsync: bool,
     /// Whether each object is fsynced individually at ingest.
     pub(crate) per_object_fsync: bool,
+    /// The effective `[ex-integrity] fsverity` setting. Each freshly staged
+    /// regular-file object is sealed with fs-verity unless this is
+    /// [`Tristate::No`].
+    pub(crate) verity: Tristate,
 }
 
 /// The outcome of staging one object.
@@ -479,8 +484,22 @@ pub(crate) fn stage_content_blocking(
     }
     let on_disk_size = size_of(file.as_fd())?;
     let staging_name = flat_name(checksum, ObjectType::File, ctx.mode);
-    materialize(ctx.staging_fd, &file, &temp, &staging_name)?;
-    drop(file);
+    // Seal with fs-verity while the inode is still anonymous, then link it from
+    // the descriptor that owns it: with verity off, the writable one; with
+    // verity on, a fresh read-only reopen after the writable descriptor closes.
+    let link_fd = if ctx.verity == Tristate::No {
+        OwnedFd::from(file)
+    } else {
+        let ro = reopen_ro(file.as_fd())?;
+        drop(file);
+        if let Err(e) = seal_regular(ro.as_fd(), ctx.verity) {
+            cleanup_temp(ctx.staging_fd, &temp);
+            return Err(e);
+        }
+        ro
+    };
+    materialize(ctx.staging_fd, link_fd.as_fd(), &temp, &staging_name)?;
+    drop(link_fd);
     Ok(StageOutcome {
         deduped: false,
         on_disk_size,
@@ -541,12 +560,21 @@ pub(crate) fn stage_symlink_blocking(
                 FIXED_MODE,
                 Some(&header.serialize_stat_metadata()?),
                 do_fsync,
+                ctx.verity,
             )?
         }
         RepoMode::Archive => {
             // A payloadless framed archive header.
             let body = frame(&header.serialize_archive(0)?)?;
-            stage_named_regular(staging_fd, &staging_name, &body, FIXED_MODE, None, do_fsync)?
+            stage_named_regular(
+                staging_fd,
+                &staging_name,
+                &body,
+                FIXED_MODE,
+                None,
+                do_fsync,
+                ctx.verity,
+            )?
         }
         RepoMode::BareSplitXattrs => {
             return Err(Error::Unsupported(
@@ -585,6 +613,7 @@ pub(crate) fn stage_metadata_blocking(
         FIXED_MODE,
         None,
         ctx.fsync && ctx.per_object_fsync,
+        ctx.verity,
     )?;
     Ok(StageOutcome {
         deduped: false,
@@ -734,9 +763,9 @@ pub(crate) fn set_link_xattr(
 }
 
 /// Write `content` into a fresh named temp file, `fchmod` it, optionally set
-/// `user.ostreemeta`, optionally fsync it, and rename it to `staging_name`.
-/// Returns the on-disk size. Used for small caller-held bodies (symlinks and
-/// metadata objects).
+/// `user.ostreemeta`, optionally fsync it, seal it with fs-verity per `verity`,
+/// and rename it to `staging_name`. Returns the on-disk size. Used for small
+/// caller-held bodies (symlinks stored as regular files and metadata objects).
 fn stage_named_regular(
     staging_fd: BorrowedFd<'_>,
     staging_name: &str,
@@ -744,6 +773,7 @@ fn stage_named_regular(
     perm: u32,
     ostreemeta: Option<&[u8]>,
     do_fsync: bool,
+    verity: Tristate,
 ) -> Result<u64> {
     use std::io::Write;
 
@@ -765,7 +795,25 @@ fn stage_named_regular(
         rustix::fs::fsync(file.as_fd())?;
     }
     let size = size_of(file.as_fd())?;
-    drop(file);
+    // Seal with fs-verity before the rename, once the writable descriptor is
+    // closed. On any failure the named temp is removed so nothing is left
+    // behind.
+    if verity != Tristate::No {
+        let ro = match reopen_ro(file.as_fd()) {
+            Ok(ro) => ro,
+            Err(e) => {
+                let _ = rustix::fs::unlinkat(staging_fd, tmp.as_str(), AtFlags::empty());
+                return Err(e);
+            }
+        };
+        drop(file);
+        if let Err(e) = seal_regular(ro.as_fd(), verity) {
+            let _ = rustix::fs::unlinkat(staging_fd, tmp.as_str(), AtFlags::empty());
+            return Err(e);
+        }
+    } else {
+        drop(file);
+    }
     match rustix::fs::renameat(staging_fd, tmp.as_str(), staging_fd, staging_name) {
         Ok(()) => {}
         Err(e) => {
@@ -776,17 +824,45 @@ fn stage_named_regular(
     Ok(size)
 }
 
+/// Reopen an open file read-only through `/proc/self/fd`, so the writable
+/// descriptor to the same inode can be closed before `FS_IOC_ENABLE_VERITY`,
+/// which the kernel refuses while any writable descriptor to the inode is open.
+/// The reopened descriptor also links an anonymous `O_TMPFILE` inode into place.
+fn reopen_ro(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
+    let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+    Ok(rustix::fs::open(
+        proc_path.as_str(),
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)
+}
+
+/// Enable fs-verity on a read-only descriptor per the configured tri-state.
+/// [`Tristate::Maybe`] is best effort and swallows every enable error (a
+/// filesystem without verity returns `ENOTTY`); [`Tristate::Yes`] fails the
+/// write. Never called for [`Tristate::No`].
+fn seal_regular(fd: BorrowedFd<'_>, verity: Tristate) -> Result<()> {
+    match ostrya_sys::enable_verity(fd) {
+        Ok(()) => Ok(()),
+        Err(_) if verity == Tristate::Maybe => Ok(()),
+        Err(e) => Err(Error::Unsupported(format!(
+            "fsverity required but could not be enabled: {e}"
+        ))),
+    }
+}
+
 /// Materialize an ingestion temp file under `staging_name` in the staging
-/// directory: link the anonymous inode into place, or rename the named temp.
+/// directory: link the anonymous inode (referenced through `link_fd`) into
+/// place, or rename the named temp. For a named temp `link_fd` is unused.
 fn materialize(
     staging_fd: BorrowedFd<'_>,
-    file: &std::fs::File,
+    link_fd: BorrowedFd<'_>,
     temp: &TempKind,
     staging_name: &str,
 ) -> Result<()> {
     match temp {
         TempKind::Anonymous => {
-            let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
+            let proc_path = format!("/proc/self/fd/{}", link_fd.as_raw_fd());
             match rustix::fs::linkat(
                 rustix::fs::CWD,
                 proc_path.as_str(),
@@ -946,3 +1022,69 @@ const _: fn() = || {
     fn assert_tokio_write<T: ostrya_rt::tokio_io::AsyncWrite>() {}
     assert_tokio_write::<ContentWriter<'static>>();
 };
+
+#[cfg(test)]
+mod verity_tests {
+    use crate::{CreateOptions, FileMeta, Repo};
+    use ostrya_composefs::FsVerityHasher;
+    use ostrya_core::{ObjectType, RepoMode, loose_path};
+    use ostrya_rt::block_on;
+    use std::os::fd::AsFd;
+
+    /// The kernel's measured fs-verity digest of a written content object equals
+    /// the port's `FsVerityHasher` over the same payload, confirming the digest
+    /// parameters (SHA-256, 4096-byte blocks, zero salt) the two share. A
+    /// bare-user-shared `.file` stores the raw payload on disk, so the object's
+    /// digest is the digest of the payload bytes. Skips where the filesystem
+    /// does not support fs-verity.
+    #[test]
+    fn kernel_digest_matches_fsverity_hasher() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-verity-measure-{}-{}",
+            std::process::id(),
+            super::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("repo");
+        // A payload spanning several verity blocks (> 4096 bytes).
+        let payload = b"fs-verity measure cross-check payload\n".repeat(300);
+
+        block_on(async {
+            drop(
+                Repo::create(&root, CreateOptions::new(RepoMode::BareUserShared))
+                    .await
+                    .unwrap(),
+            );
+            let cfg = root.join("config");
+            let mut text = std::fs::read_to_string(&cfg).unwrap();
+            text.push_str("[ex-integrity]\nfsverity=maybe\n");
+            std::fs::write(&cfg, text).unwrap();
+            let repo = Repo::open(&root).await.unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            let checksum = txn
+                .write_regfile_inline(None, &FileMeta::regular(0, 0, 0o644), &payload)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+
+            let object = root.join("objects").join(loose_path(
+                &checksum,
+                ObjectType::File,
+                RepoMode::BareUserShared,
+            ));
+            let file = std::fs::File::open(&object).unwrap();
+            match ostrya_sys::measure_verity(file.as_fd()) {
+                Ok(measured) => assert_eq!(
+                    measured,
+                    FsVerityHasher::hash(&payload),
+                    "kernel-measured digest equals the FsVerityHasher digest"
+                ),
+                // A filesystem without fs-verity sealed nothing to measure.
+                Err(_) => eprintln!("skipping digest check: filesystem lacks fs-verity"),
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -1124,6 +1124,71 @@ suite passes under both runtime backends. The published `test-prune`,
 `test-fsck-*`, and `test-corruption` shell tests run once the Phase 17 CLI
 harness lands.
 
+### Phase pre13 -- Repository fs-verity (ex-integrity) (DONE)
+
+Enable fs-verity on loose objects as they are written, controlled by the
+repository `[ex-integrity]` config section. It belongs to the write path that
+later phases build on, and the composefs export (Phase 9) already computes the
+same fs-verity digest in userspace, so the two share the digest parameters.
+
+The `ostree` tool (2026.1, built with `ex-fsverity`) was observed as a black box
+on a btrfs `target/test-repo`: a commit was straced, objects were probed on a
+verity-capable and a non-capable filesystem, and the kernel's measured digest
+was cross-checked against the port's `FsVerityHasher`. The recovered contract:
+
+- Config: an `[ex-integrity]` group with keys `fsverity` and `composefs`, each a
+  tri-state `yes`, `no`, or `maybe`. `fsverity` defaults to off. `composefs` set
+  to `yes` or `maybe` raises the `fsverity` default to `maybe`. The `composefs`
+  knob otherwise governs deployment and is out of scope here; it is read only to
+  compute the `fsverity` default.
+- Scope: verity is enabled on every loose object stored as a regular file --
+  content objects (`.file` and `.filez`) and metadata objects (`.dirtree`,
+  `.dirmeta`, `.commit`) -- in every repository mode, archive-z2 included. Real
+  symlink objects (bare and bare-user-only) are the only objects skipped,
+  because fs-verity applies to regular files; bare-user stores symlinks as
+  regular files, so those objects are sealed.
+- Semantics: `maybe` is best-effort and swallows every `FS_IOC_ENABLE_VERITY`
+  error (a filesystem without verity returns `ENOTTY`); `yes` propagates the
+  error and fails the write (the tool reports "fsverity required but filesystem
+  does not support it").
+- Digest parameters: SHA-256, 4096-byte blocks, zero salt. The kernel's
+  `FS_IOC_MEASURE_VERITY` result for a bare-user `.file` object equals the
+  port's `FsVerityHasher` output for the same payload, confirming the enable
+  argument `{version 1, hash_algorithm 1, block_size 4096, salt_size 0}`.
+- Write-path order, per object, while the inode is still an anonymous
+  `O_TMPFILE`: open `O_TMPFILE|O_WRONLY`, write or reflink the payload, apply
+  `fchmod`/`fchown`/xattrs, reopen the inode read-only through `/proc/self/fd/N`,
+  close the writable descriptor, call `ioctl(ro_fd, FS_IOC_ENABLE_VERITY)`, then
+  `linkat` the read-only descriptor into the staging directory. Publication
+  (rename into `objects/`) is unchanged.
+
+Plan:
+
+- A new workspace crate `ostrya-sys` holds the audited `unsafe` site the project
+  guide reserves for the few `rustix` calls that require it. It is
+  `#![deny(unsafe_code)]` with a single scoped `#[allow(unsafe_code)]`, matching
+  the allocation-counting harness, so `ostrya` keeps `#![forbid(unsafe_code)]`.
+  It exposes `enable_verity(fd)`, issuing the ioctl through `rustix::ioctl`
+  (`opcode::write::<FsverityEnableArg>(b'f', 133)` fed to a `Setter`) over a
+  `#[repr(C)]` 128-byte `fsverity_enable_arg`. Its only dependency is `rustix`,
+  already a foundation crate, so no new external dependency is added.
+- `RepoConfig` gains a `Tristate` type and `fsverity()` and `composefs()`
+  accessors applying the default rule above.
+- The staging context carries the effective `Tristate`. The content, metadata,
+  and regular-file symlink staging paths seal each fresh object in the recovered
+  order; real-symlink paths skip it; dedup hits are untouched. With `fsverity`
+  off, the staging path is unchanged.
+- `format-reference.md` gains a "Write path: fs-verity (ex-integrity)" section
+  recording the config, scope, ordering, and semantics.
+
+Verify: on a verity-capable filesystem, a commit with `fsverity=yes` seals every
+regular-file object and each object's kernel-measured digest equals the port's
+`FsVerityHasher`; the tool reads a port-written verity repository and the port
+reads the tool's; `maybe` on a filesystem without verity succeeds while `yes`
+fails; the digest the kernel measures matches the value the composefs export
+stores. Tests are gated on filesystem verity support so the suite passes
+elsewhere. The suite passes under both runtime backends.
+
 ### Phase 13 -- Signing
 
 `Signer`/`Verifier` traits; ed25519 engine (ed25519-dalek); dummy engine; spki

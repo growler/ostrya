@@ -500,6 +500,7 @@ dependencies = [
  "ostrya-composefs",
  "ostrya-core",
  "ostrya-rt",
+ "ostrya-sys",
  "pin-project-lite",
  "rustix",
  "sha2",
@@ -543,6 +544,13 @@ dependencies = [
  "futures-lite",
  "smol",
  "tokio",
+]
+
+[[package]]
+name = "ostrya-sys"
+version = "0.0.1"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

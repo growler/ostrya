@@ -67,7 +67,11 @@
 //! `delete_commit`), [`Repo::fsck`] ([`FsckOptions`]/[`FsckReport`]) which
 //! verifies object integrity and completeness and marks incomplete commits
 //! partial, and [`Repo::diff_commits`] ([`DiffEntry`]/[`DiffChange`]) which
-//! reports the paths that changed between two commits.
+//! reports the paths that changed between two commits. It also covers
+//! repository fs-verity (Phase pre13): with `[ex-integrity] fsverity` set to
+//! `maybe` or `yes` (see [`RepoConfig::fsverity`] and [`Tristate`]), each loose
+//! object stored as a regular file is sealed with fs-verity as it is staged,
+//! through the audited `ostrya-sys` ioctl wrappers.
 
 pub mod checkout;
 pub mod commit;
@@ -99,7 +103,7 @@ mod write;
 
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 pub use commit::CommitOptions;
-pub use config::{MinFreeSpace, Remote, RepoConfig, SizeSpec, SizeUnit};
+pub use config::{MinFreeSpace, Remote, RepoConfig, SizeSpec, SizeUnit, Tristate};
 pub use diff::{DiffChange, DiffEntry};
 pub use error::{Error, Result};
 pub use file::{ContentReader, FileKind, FileObject};

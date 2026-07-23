@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ostrya_core::{Checksum, ObjectType, RepoMode};
 
+use crate::config::Tristate;
 use crate::error::{Error, Result};
 use crate::lock::LockGuard;
 use crate::repo::Repo;
@@ -266,6 +267,7 @@ impl Transaction {
     ) -> Result<Checksum> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
+        let verity = self.verity()?;
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
         let key = checksum;
@@ -276,6 +278,7 @@ impl Transaction {
                 mode,
                 fsync,
                 per_object_fsync,
+                verity,
             };
             stage_content_blocking(&ctx, &key, &header, file, temp, unpacked)
         })
@@ -292,6 +295,7 @@ impl Transaction {
     ) -> Result<Checksum> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
+        let verity = self.verity()?;
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
         let key = checksum;
@@ -302,6 +306,7 @@ impl Transaction {
                 mode,
                 fsync,
                 per_object_fsync,
+                verity,
             };
             stage_symlink_blocking(&ctx, &key, &header)
         })
@@ -319,6 +324,7 @@ impl Transaction {
     ) -> Result<Checksum> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
+        let verity = self.verity()?;
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
         let key = checksum;
@@ -329,6 +335,7 @@ impl Transaction {
                 mode,
                 fsync,
                 per_object_fsync,
+                verity,
             };
             stage_metadata_blocking(&ctx, &key, ty, &bytes)
         })
@@ -398,6 +405,12 @@ impl Transaction {
     fn fsync_flags(&self) -> Result<(bool, bool)> {
         let config = self.repo.config();
         Ok((config.fsync()?, config.per_object_fsync()?))
+    }
+
+    /// The effective `[ex-integrity] fsverity` setting from the repository
+    /// config, applied when staging each regular-file object.
+    fn verity(&self) -> Result<Tristate> {
+        self.repo.config().fsverity()
     }
 
     /// Finish the transaction, publishing its staged objects into `objects/`

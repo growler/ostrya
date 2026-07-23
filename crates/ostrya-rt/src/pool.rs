@@ -40,6 +40,7 @@ where
 pub fn block_on<F: Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_time()
+        .enable_io()
         .build()
         .expect("build tokio current-thread runtime")
         .block_on(future)

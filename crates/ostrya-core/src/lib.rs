@@ -12,6 +12,7 @@
 //! paths, sizes, xattrs, keyfile) and the typed object structs (commit,
 //! dirtree, dirmeta, file headers) with their borrowed read-path views.
 
+pub mod base64;
 mod be;
 mod checksum;
 mod commit;

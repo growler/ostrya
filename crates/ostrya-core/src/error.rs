@@ -14,6 +14,8 @@ pub enum Error {
     Gvariant(ostrya_gvariant::Error),
     /// A checksum string or byte sequence was malformed.
     InvalidChecksum(&'static str),
+    /// A base64 string was malformed (invalid character or truncated group).
+    InvalidBase64(&'static str),
     /// An object-type numeric tag did not name a known type.
     InvalidObjectType(u32),
     /// A LEB128 varint was truncated or overflowed 64 bits.
@@ -41,6 +43,7 @@ impl fmt::Display for Error {
         match self {
             Error::Gvariant(e) => write!(f, "gvariant: {e}"),
             Error::InvalidChecksum(reason) => write!(f, "invalid checksum: {reason}"),
+            Error::InvalidBase64(reason) => write!(f, "invalid base64: {reason}"),
             Error::InvalidObjectType(v) => write!(f, "invalid object type tag {v}"),
             Error::InvalidVarint(reason) => write!(f, "invalid varint: {reason}"),
             Error::InvalidXattrs(reason) => write!(f, "invalid xattrs: {reason}"),

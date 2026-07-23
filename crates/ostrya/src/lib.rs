@@ -76,7 +76,11 @@
 //! [`Repo::sign_commit`] and [`Repo::verify_commit`], which sign and verify a
 //! commit's canonical bytes and accumulate signatures in the per-engine `aay`
 //! array of the commit's detached metadata, and the test-only [`DummySigner`] /
-//! [`DummyVerifier`] engine.
+//! [`DummyVerifier`] engine. It also covers the ed25519 engine and the sign-api
+//! key store (Phase 13b): [`Ed25519Signer`] / [`Ed25519Verifier`] over
+//! deterministic ed25519 signatures, and [`load_sign_keys`], which reads the
+//! `trusted.<type>` / `revoked.<type>` files and `.d` directories (a verifier
+//! trusts the loaded set minus the revoked set).
 
 pub mod checkout;
 pub mod commit;
@@ -121,6 +125,7 @@ pub use modifier::{
 };
 pub use mtree::MutableTree;
 pub use ostrya_composefs::Image;
+pub use ostrya_core::base64;
 pub use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Type, Value,
 };
@@ -129,7 +134,8 @@ pub use read::CommitState;
 pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};
 pub use sign::{
-    DummySigner, DummyVerifier, SignFuture, SignatureInfo, Signer, Verifier, VerifyOutcome,
+    DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, SignFuture, SignKeys,
+    SignatureInfo, Signer, Verifier, VerifyOutcome, load_sign_keys, load_sign_keys_from,
 };
 pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
 pub use tar::{TarExportOptions, TarImportOptions};

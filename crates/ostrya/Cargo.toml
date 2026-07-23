@@ -29,6 +29,10 @@ pin-project-lite = "0.2"
 futures-io = "0.3"
 futures-lite = "2"
 smol-tar = { version = "0.1", default-features = false, features = ["smol"] }
+ed25519-dalek = { version = "2", default-features = false, features = [
+    "std",
+    "zeroize",
+] }
 
 [dev-dependencies]
 ostrya-rt = { workspace = true }

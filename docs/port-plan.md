@@ -1264,7 +1264,7 @@ first engine's array intact; verifying an unsigned commit yields a not-valid
 outcome; `Send + Sync` compile-time assertions on the new public types; the
 suite passes under both runtime backends.
 
-### Phase 13b -- ed25519 engine and the sign-api key store
+### Phase 13b -- ed25519 engine and the sign-api key store (DONE)
 
 The ed25519 engine and the shared sign-api key-file and key-directory loading,
 which 13c reuses for spki.

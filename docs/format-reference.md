@@ -830,7 +830,9 @@ ed25519: 32-byte public key, 64-byte signature, 64-byte secret key (32-byte
 seed followed by 32-byte public key). Keys are passed as base64 strings or raw
 `ay`. Key files hold one base64 key per line. System key directories are
 `/etc/ostree` and `<datadir>/ostree`, files `trusted.ed25519` and
-`trusted.ed25519.d/`, plus `revoked.ed25519` and `revoked.ed25519.d/`.
+`trusted.ed25519.d/`, plus `revoked.ed25519` and `revoked.ed25519.d/`. A key
+present in both the trusted and revoked sets is rejected: the effective trusted
+set is the trusted set minus the revoked set.
 
 GPG verification (to be reimplemented with sequoia): load N keyrings (binary
 and ASCII-armored) into one certificate store, parse the `aay` list of detached

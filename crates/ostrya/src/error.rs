@@ -92,6 +92,11 @@ pub enum Error {
     /// with no target in the archive, or a non-UTF-8 xattr name.
     #[error("tar: {0}")]
     Tar(String),
+    /// A signing engine rejected its key material or a signature blob: a
+    /// wrong-length key, a public key that is not a valid curve point, or a
+    /// malformed secret key.
+    #[error("signature: {0}")]
+    Signature(String),
 }
 
 impl From<rustix::io::Errno> for Error {

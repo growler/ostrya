@@ -20,11 +20,23 @@
 //! signature is the raw bytes of its key identifier, and verification matches a
 //! stored blob against a trusted key byte string. It exercises the framework
 //! and cross-checks against the tool's `ostree.sign.dummy` engine.
+//!
+//! The ed25519 engine ([`Ed25519Signer`] / [`Ed25519Verifier`], Phase 13b) is
+//! the first real engine: a 32-byte public key, a 64-byte signature, and a
+//! 64-byte secret key (32-byte seed followed by the 32-byte public key), all per
+//! `format-reference.md`. ed25519 is deterministic, so signing needs no RNG and
+//! the same key over the same commit yields byte-identical detached metadata.
+//! [`load_sign_keys`] loads the sign-api key store -- base64-one-key-per-line
+//! `trusted.<type>` and `revoked.<type>` files and their `.d` directories under
+//! a system search path -- parameterized by sign-type name so the spki engine
+//! reuses it; a verifier trusts the loaded set minus the revoked set.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
-use ostrya_core::{Checksum, ObjectType, Type, Value};
+use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
+use ostrya_core::{Checksum, ObjectType, Type, Value, base64};
 
 use crate::error::{Error, Result};
 use crate::repo::Repo;
@@ -287,6 +299,232 @@ impl Verifier for DummyVerifier {
     }
 }
 
+/// The ed25519 sign-type name, used both as the engine name and as the base
+/// name of its key-store files (`trusted.ed25519`, `revoked.ed25519`).
+const ED25519_SIGN_TYPE: &str = "ed25519";
+/// The ed25519 engine's detached-metadata dict key.
+const ED25519_METADATA_KEY: &str = "ostree.sign.ed25519";
+/// The raw byte length of an ed25519 public key.
+const ED25519_PUBLIC_KEY_LEN: usize = 32;
+/// The raw byte length of an ed25519 secret key (seed followed by public key).
+const ED25519_SECRET_KEY_LEN: usize = 64;
+
+/// The ed25519 commit-signing engine.
+///
+/// The secret key is the 64-byte seed-plus-public-key form the tool uses;
+/// [`from_keypair_bytes`](SigningKey::from_keypair_bytes) checks that the stored
+/// public half matches the seed. Signing is deterministic (RFC 8032), so it
+/// needs no RNG and completes in-task without offloading to the blocking pool.
+#[derive(Debug, Clone)]
+pub struct Ed25519Signer {
+    signing_key: SigningKey,
+}
+
+impl Ed25519Signer {
+    /// Build a signer from a 64-byte secret key (32-byte seed followed by the
+    /// 32-byte public key). Accepts the raw bytes or an `ay` payload.
+    pub fn from_secret_key(secret: &[u8]) -> Result<Ed25519Signer> {
+        let bytes: [u8; ED25519_SECRET_KEY_LEN] = secret.try_into().map_err(|_| {
+            Error::Signature(format!(
+                "ed25519 secret key must be {ED25519_SECRET_KEY_LEN} bytes, got {}",
+                secret.len()
+            ))
+        })?;
+        let signing_key = SigningKey::from_keypair_bytes(&bytes)
+            .map_err(|e| Error::Signature(format!("ed25519 secret key: {e}")))?;
+        Ok(Ed25519Signer { signing_key })
+    }
+
+    /// Build a signer from a base64-encoded 64-byte secret key. Surrounding
+    /// whitespace (a trailing newline from a key file) is ignored.
+    pub fn from_base64(secret_b64: &str) -> Result<Ed25519Signer> {
+        Ed25519Signer::from_secret_key(&base64::decode(secret_b64.trim())?)
+    }
+}
+
+impl Signer for Ed25519Signer {
+    fn name(&self) -> &str {
+        ED25519_SIGN_TYPE
+    }
+
+    fn metadata_key(&self) -> &str {
+        ED25519_METADATA_KEY
+    }
+
+    fn sign<'a>(&'a self, data: &'a [u8]) -> SignFuture<'a> {
+        let signature = self.signing_key.sign(data).to_bytes().to_vec();
+        Box::pin(async move { Ok(signature) })
+    }
+}
+
+/// The ed25519 commit-verifying engine, holding the effective trusted key set.
+///
+/// A signature verifies when any trusted key accepts it. Verification uses the
+/// lenient (cofactored) equation, matching the acceptance the tool's libsodium
+/// backend applies, so a valid signature written by either side verifies on the
+/// other.
+#[derive(Debug, Clone)]
+pub struct Ed25519Verifier {
+    trusted: Vec<VerifyingKey>,
+}
+
+impl Ed25519Verifier {
+    /// Build a verifier trusting each key in `trusted` except those also in
+    /// `revoked`. Keys are 32-byte public keys, as raw bytes or `ay` payloads.
+    /// A trusted key that is not a valid curve point is an error; a revoked key
+    /// need only match by bytes and is not validated as a point.
+    pub fn new<T, R>(trusted: T, revoked: R) -> Result<Ed25519Verifier>
+    where
+        T: IntoIterator,
+        T::Item: AsRef<[u8]>,
+        R: IntoIterator,
+        R::Item: AsRef<[u8]>,
+    {
+        let revoked: Vec<[u8; ED25519_PUBLIC_KEY_LEN]> = revoked
+            .into_iter()
+            .map(|k| ed25519_public_bytes(k.as_ref()))
+            .collect::<Result<_>>()?;
+        let mut keys = Vec::new();
+        for key in trusted {
+            let raw = ed25519_public_bytes(key.as_ref())?;
+            if revoked.contains(&raw) {
+                continue;
+            }
+            let vk = VerifyingKey::from_bytes(&raw)
+                .map_err(|e| Error::Signature(format!("ed25519 public key: {e}")))?;
+            keys.push(vk);
+        }
+        Ok(Ed25519Verifier { trusted: keys })
+    }
+
+    /// Build a verifier from a loaded [`SignKeys`] set (trusted minus revoked).
+    pub fn from_sign_keys(keys: SignKeys) -> Result<Ed25519Verifier> {
+        Ed25519Verifier::new(keys.trusted, keys.revoked)
+    }
+
+    /// Build a verifier from the system sign-api key store: `trusted.ed25519`
+    /// and `revoked.ed25519` and their `.d` directories under the system search
+    /// path (see [`load_sign_keys`]).
+    pub fn from_system_keys() -> Result<Ed25519Verifier> {
+        Ed25519Verifier::from_sign_keys(load_sign_keys(ED25519_SIGN_TYPE)?)
+    }
+}
+
+impl Verifier for Ed25519Verifier {
+    fn metadata_key(&self) -> &str {
+        ED25519_METADATA_KEY
+    }
+
+    fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome> {
+        let mut outcome = VerifyOutcome::default();
+        for blob in signatures {
+            let valid = match <[u8; 64]>::try_from(blob.as_slice()) {
+                Ok(sig_bytes) => {
+                    let sig = Signature::from_bytes(&sig_bytes);
+                    self.trusted.iter().any(|k| k.verify(data, &sig).is_ok())
+                }
+                // A blob that is not 64 bytes cannot be an ed25519 signature.
+                Err(_) => false,
+            };
+            outcome.valid |= valid;
+            outcome.signatures.push(SignatureInfo {
+                valid,
+                key_missing: !valid,
+                ..SignatureInfo::default()
+            });
+        }
+        Ok(outcome)
+    }
+}
+
+/// Interpret a byte slice as a 32-byte ed25519 public key.
+fn ed25519_public_bytes(key: &[u8]) -> Result<[u8; ED25519_PUBLIC_KEY_LEN]> {
+    key.try_into().map_err(|_| {
+        Error::Signature(format!(
+            "ed25519 public key must be {ED25519_PUBLIC_KEY_LEN} bytes, got {}",
+            key.len()
+        ))
+    })
+}
+
+/// The trusted and revoked key sets loaded from a sign-api key store, as raw
+/// decoded key bytes. The engine that consumes them validates their length.
+#[derive(Debug, Clone, Default)]
+pub struct SignKeys {
+    /// Keys from the `trusted.<type>` files and directories.
+    pub trusted: Vec<Vec<u8>>,
+    /// Keys from the `revoked.<type>` files and directories.
+    pub revoked: Vec<Vec<u8>>,
+}
+
+/// The system directories searched for sign-api keys, in order. The second is
+/// `<datadir>/ostree`.
+const SYSTEM_KEY_ROOTS: [&str; 2] = ["/etc/ostree", "/usr/share/ostree"];
+
+/// Load the sign-api key store for `sign_type` from the system search path
+/// (`/etc/ostree` and `/usr/share/ostree`).
+pub fn load_sign_keys(sign_type: &str) -> Result<SignKeys> {
+    let roots: Vec<PathBuf> = SYSTEM_KEY_ROOTS.iter().map(PathBuf::from).collect();
+    let refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+    load_sign_keys_from(&refs, sign_type)
+}
+
+/// Load the sign-api key store for `sign_type` from the given search roots.
+///
+/// Under each root, reads the `trusted.<type>` file and every file in the
+/// `trusted.<type>.d/` directory, and likewise `revoked.<type>` and
+/// `revoked.<type>.d/`. Each line is one base64 key; blank and whitespace-only
+/// lines are skipped and any other line must decode. A missing file or
+/// directory is not an error. Directory entries are read in sorted name order.
+pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> Result<SignKeys> {
+    let mut keys = SignKeys::default();
+    for root in roots {
+        collect_keys(root, &format!("trusted.{sign_type}"), &mut keys.trusted)?;
+        collect_keys(root, &format!("revoked.{sign_type}"), &mut keys.revoked)?;
+    }
+    Ok(keys)
+}
+
+/// Read `<root>/<base>` and every file in `<root>/<base>.d/` into `out`.
+fn collect_keys(root: &Path, base: &str, out: &mut Vec<Vec<u8>>) -> Result<()> {
+    read_key_file(&root.join(base), out)?;
+    let dir = root.join(format!("{base}.d"));
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+    for file in files {
+        read_key_file(&file, out)?;
+    }
+    Ok(())
+}
+
+/// Read one base64-per-line key file into `out`. A missing file is not an error.
+fn read_key_file(path: &Path, out: &mut Vec<Vec<u8>>) -> Result<()> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        out.push(base64::decode(line)?);
+    }
+    Ok(())
+}
+
 /// The signing public types move freely across tasks and threads. The trait
 /// objects the `Repo` entry points accept are `Send + Sync` through the
 /// supertrait bounds; their dyn-compatibility is enforced by the `&dyn Signer`
@@ -296,6 +534,8 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<DummySigner>();
     assert_send_sync::<DummyVerifier>();
+    assert_send_sync::<Ed25519Signer>();
+    assert_send_sync::<Ed25519Verifier>();
     assert_send_sync::<VerifyOutcome>();
     assert_send_sync::<SignatureInfo>();
 };

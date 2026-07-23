@@ -71,7 +71,12 @@
 //! repository fs-verity (Phase pre13): with `[ex-integrity] fsverity` set to
 //! `maybe` or `yes` (see [`RepoConfig::fsverity`] and [`Tristate`]), each loose
 //! object stored as a regular file is sealed with fs-verity as it is staged,
-//! through the audited `ostrya-sys` ioctl wrappers.
+//! through the audited `ostrya-sys` ioctl wrappers. It also covers the signing
+//! framework (Phase 13a): the [`Signer`]/[`Verifier`] engine surface,
+//! [`Repo::sign_commit`] and [`Repo::verify_commit`], which sign and verify a
+//! commit's canonical bytes and accumulate signatures in the per-engine `aay`
+//! array of the commit's detached metadata, and the test-only [`DummySigner`] /
+//! [`DummyVerifier`] engine.
 
 pub mod checkout;
 pub mod commit;
@@ -93,6 +98,7 @@ pub mod prune;
 pub mod read;
 pub mod refs;
 pub mod repo;
+pub mod sign;
 mod staging;
 pub mod staging_tree;
 pub mod tar;
@@ -122,6 +128,9 @@ pub use prune::{PruneOptions, PruneStats};
 pub use read::CommitState;
 pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};
+pub use sign::{
+    DummySigner, DummyVerifier, SignFuture, SignatureInfo, Signer, Verifier, VerifyOutcome,
+};
 pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
 pub use tar::{TarExportOptions, TarImportOptions};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};

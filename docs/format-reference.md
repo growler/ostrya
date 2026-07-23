@@ -841,6 +841,19 @@ names, user name and email. Trusted keyring for a remote is
 `<remote>.trustedkeys.gpg` in the repo or `/etc/ostree/remotes.d/`; the global
 dir is `<datadir>/ostree/trusted.gpg.d/`.
 
+Dummy engine (test only). Signature key `ostree.sign.dummy`, value `aay` like
+the other engines. The engine is gated in the tool behind the
+`OSTREE_DUMMY_SIGN_ENABLED` environment variable; with the variable unset the
+tool refuses every dummy operation with "dummy signature type is only for
+ostree testing". A dummy signature is the raw bytes of the key identifier: the
+secret key and the public key are the same byte string, signing appends those
+bytes verbatim as one `ay` signature blob, and the signed payload is ignored.
+Verification succeeds when any stored signature blob equals a trusted
+public-key byte string. These bytes were recovered by signing a commit with the
+tool (`ostree sign --sign-type=dummy COMMIT KEY-ID`) and reading the
+`.commitmeta` object: the blob for key `mysecretkey` is exactly the 11 ASCII
+bytes `mysecretkey`, with no trailing NUL, independent of the commit.
+
 ## composefs
 
 ostree built with composefs exports a commit's tree to an EROFS image in the

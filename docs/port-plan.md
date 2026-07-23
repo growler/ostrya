@@ -102,9 +102,9 @@ bounded:
   incrementally; the `ostree`-compatible surface arrives with the
   shell-test harness (Phase 17).
 
-Feature flags on `ostrya`: `pull`, `sign-gpg`, `deltas`, `s3`, `ssh`, plus
-the runtime backend selectors `smol` (default) and `tokio`, forwarded to
-`ostrya-rt`. Each
+Feature flags on `ostrya`: `pull`, `sign-spki`, `sign-gpg`, `deltas`, `s3`,
+`ssh`, plus the runtime backend selectors `smol` (default) and `tokio`,
+forwarded to `ostrya-rt`. Each
 heavier or riskier subsystem is opt-in so the core stays small. Tar
 import/export (built on `smol-tar`) and composefs export are always
 compiled, not feature-gated.
@@ -1191,13 +1191,193 @@ elsewhere. The suite passes under both runtime backends.
 
 ### Phase 13 -- Signing
 
-`Signer`/`Verifier` traits; ed25519 engine (ed25519-dalek); dummy engine; spki
-engine (pure-Rust X.509/ECDSA, optional); detached-metadata append; commit
-sign and verify. GPG via sequoia-openpgp (RustCrypto backend): keyring loading
-(binary and armored), detached verify, per-signature metadata.
-Verify: signatures produced verify under the `ostree` tool and the reverse;
-`test-signed-commit-{ed25519,spki,dummy}`; `test-gpg-signed-commit` and
-`test-commit-sign` once GPG verify lands.
+Four sub-phases, each an independently reviewable unit with its own gate: 13a
+is the signing framework and the dummy test engine, 13b the ed25519 engine and
+the sign-api key store, 13c the spki (ECDSA/SPKI) engine, 13d GPG over
+sequoia-openpgp. Each sub-phase consumes only the public surface of the ones
+before it. All four engines sign and verify commit objects through the shared
+13a framework; summary signing (Phase 14) reuses the same engines on the
+summary bytes.
+
+The ed25519 and dummy engines are always compiled; spki is behind the
+`sign-spki` feature and GPG behind `sign-gpg`. spki is a required engine, not
+deferred: the reference tool gates it on OpenSSL, the port implements it in
+pure Rust behind its own feature so the core stays free of the ECDSA/SPKI crate
+tree (see Decisions).
+
+The per-engine tool-conformance gate is cross-verification -- the `ostree`
+tool verifies a signature the port wrote and the port verifies the tool's, for
+that engine. The named shell tests
+(`test-signed-commit-{ed25519,spki,dummy}`, `test-gpg-signed-commit`,
+`test-commit-sign`) run through the harness once the CLI `sign` subcommand
+lands (Phase 17).
+
+Format facts the signing path needs that `format-reference.md` does not yet
+state -- the spki curve, hash, signature encoding, and secret-key encoding,
+and the dummy engine's signature and verification bytes -- are recovered by
+black-box observation in the sub-phase that reaches them and recorded in
+`format-reference.md` in the same change.
+
+### Phase 13a -- Signing framework and the dummy engine (DONE)
+
+The `Signer`/`Verifier` surface, the detached-metadata signature append, and
+`Repo` commit sign and verify, exercised end to end by the trivial dummy
+engine with no crypto dependency. After 13a the framework is complete and the
+crypto engines drop in behind it.
+
+Definition:
+
+- `Signer` and `Verifier` traits per `api-sketch.md`: `Signer` carries the
+  engine name and its detached-metadata key and signs an opaque byte payload;
+  `Verifier` verifies a set of signature blobs against a payload and yields a
+  `VerifyOutcome`. Both take opaque bytes so the commit path here and the
+  summary path in Phase 14 share one surface.
+- The signed payload for a commit is the canonical serialized commit GVariant
+  bytes -- the same normal-form bytes that hash to the commit checksum, per
+  `format-reference.md`, "Signing details".
+- Detached-metadata append: signatures accumulate as `ay` elements appended to
+  the per-engine `aay` value in the `.commitmeta` `a{sv}` dict, over the
+  Phase 7d `read_commit_detached_metadata` / `write_commit_detached_metadata`
+  (load the dict, append to the engine's array creating it if absent, rewrite
+  atomically). GPG and sign-api keys coexist in one dict.
+- `Repo::sign_commit(checksum, signer)` and
+  `Repo::verify_commit(checksum, verifiers)`: load the commit bytes, invoke the
+  engine, and on the sign side append the signature to detached metadata; on
+  the verify side collect each engine's signature array and run its verifier.
+- `VerifyOutcome` and `SignatureInfo` per `api-sketch.md`.
+- The dummy engine (`DummySigner` / `DummyVerifier`): the test engine whose
+  secret and public keys are ASCII strings, whose signature and verification
+  bytes are recovered by observation and recorded in `format-reference.md`. It
+  validates the framework with no crypto crate.
+
+Dependency set: no new crates. The dict manipulation uses `ostrya-gvariant`'s
+`a{sv}` support and the Phase 7d detached-metadata I/O.
+
+Deliverables: `Signer`, `Verifier`, `VerifyOutcome`, `SignatureInfo`, the
+detached-metadata signature append and read helpers, `Repo::sign_commit`,
+`Repo::verify_commit`, `DummySigner`, `DummyVerifier`.
+
+Verify: a dummy signature the port appends is accepted by
+`ostree sign --verify --sign-type=dummy`, and `verify_commit` accepts a dummy
+signature the tool wrote; appending a second engine's signatures leaves the
+first engine's array intact; verifying an unsigned commit yields a not-valid
+outcome; `Send + Sync` compile-time assertions on the new public types; the
+suite passes under both runtime backends.
+
+### Phase 13b -- ed25519 engine and the sign-api key store
+
+The ed25519 engine and the shared sign-api key-file and key-directory loading,
+which 13c reuses for spki.
+
+Definition:
+
+- `Ed25519Signer` / `Ed25519Verifier` over `ed25519-dalek`: 32-byte public
+  key, 64-byte signature, 64-byte secret key (32-byte seed followed by the
+  32-byte public key), per `format-reference.md`. ed25519 is deterministic, so
+  the sign path needs no RNG.
+- A general base64 codec in `ostrya-core`: the existing checksum base64 is
+  fixed to 32-byte digests, while sign-api keys and signature blobs are
+  arbitrary-length, so a general standard-alphabet encoder and decoder lands
+  here and is reused by 13c for PEM.
+- The sign-api key store: base64-one-key-per-line files, the `trusted.<type>`
+  and `revoked.<type>` files and the `trusted.<type>.d` and `revoked.<type>.d`
+  directories, and the system search path (`/etc/ostree`,
+  `/usr/share/ostree`), parameterized by sign-type name so 13c reuses it for
+  spki. A verifier is built from a trusted set minus a revoked set.
+- Key input: secret keys for signing and public keys for verifying, accepted
+  as base64 strings or raw `ay`.
+
+Dependency set: `ed25519-dalek` (a foundation crate; exact pin confirmed at
+phase start), pure Rust over `curve25519-dalek`, `ed25519`, and `signature`,
+with the existing `sha2`; the general base64 is hand-rolled in `ostrya-core`,
+no crate. Always compiled, not feature-gated.
+
+Deliverables: `Ed25519Signer`, `Ed25519Verifier`, the general base64 codec, the
+sign-api key store loader.
+
+Verify: a commit the port signs with ed25519 verifies under
+`ostree sign --verify --sign-type=ed25519`, and the port verifies an ed25519
+signature the tool wrote for the same key; the trusted and revoked directory
+convention resolves keys as the tool does, and a revoked key fails;
+`test-signed-commit-ed25519` targeted through the harness when the CLI lands;
+the suite passes under both runtime backends.
+
+### Phase 13c -- spki engine (ECDSA / SPKI)
+
+The required spki engine: pure-Rust ECDSA over SubjectPublicKeyInfo public
+keys, reusing the 13b key store.
+
+Definition:
+
+- `SpkiSigner` / `SpkiVerifier`: ECDSA over the NIST curve the tool uses,
+  public keys in the SPKI SubjectPublicKeyInfo PEM "PUBLIC KEY" encoding,
+  secret keys base64-encoded. The exact curve, hash, ECDSA signature encoding
+  (fixed-width versus DER), and secret-key encoding are recovered by
+  observation -- generate a key pair with the tool, sign a commit, inspect the
+  PEM and the signature bytes -- and recorded in `format-reference.md` before
+  the engine lands. The design target is NIST P-256 with SHA-256.
+- Reuses the 13b sign-api key store: files `trusted.spki` and `revoked.spki`
+  and the `.d` directories under the same system search path, decoding PEM
+  public keys through the general base64 plus SPKI/DER parsing.
+
+Dependency set: `p256` (RustCrypto; features `ecdsa`, `pem`, `pkcs8`, `std`;
+exact pin confirmed at phase start), pure Rust, pulling `ecdsa`,
+`elliptic-curve`, `sec1`, `spki`, `der`, `pem-rfc7468`, and `signature` -- all
+pure Rust with no C or `*-sys` linkage -- with the existing `sha2` for the
+digest. Behind the `sign-spki` feature. If observation shows a curve other
+than P-256, the sibling `p384` from the same family is proposed instead, with
+no structural change.
+
+Deliverables: `SpkiSigner`, `SpkiVerifier`, the SPKI PEM key decode, and the
+`format-reference.md` "Signing details" update recording the recovered spki
+facts.
+
+Verify: a commit the port signs with spki verifies under
+`ostree sign --verify --sign-type=spki`, and the port verifies an spki
+signature the tool wrote for the same key pair; the trusted and revoked
+convention resolves spki keys; `test-signed-commit-spki` targeted through the
+harness when the CLI lands; the suite passes under both runtime backends, with
+and without the `sign-spki` feature.
+
+### Phase 13d -- GPG signing and verification (sequoia-openpgp)
+
+GPG commit signing and verification over `sequoia-openpgp` with the RustCrypto
+backend, behind the `sign-gpg` feature. The heaviest engine, isolated last.
+
+Definition:
+
+- `GpgSigner` / `GpgVerifier` over `sequoia-openpgp` (`crypto-rust` backend),
+  gated on the `sign-gpg` feature.
+- Keyring loading: N keyrings, binary and ASCII-armored, into one certificate
+  store; the per-remote `<remote>.trustedkeys.gpg` and `/etc/ostree/remotes.d/`
+  resolution and the global `<datadir>/ostree/trusted.gpg.d/` directory, per
+  `format-reference.md`.
+- Detached verify: the `ostree.gpgsigs` value is an `aay` of concatenated
+  detached OpenPGP signature packets; parse each blob, detached-verify against
+  the signed commit bytes, and surface per-signature `SignatureInfo` -- valid
+  flag, fingerprint, primary fingerprint, creation and expiry, key expiry,
+  revoked/expired/missing state, algorithm names, user name and email, the
+  documented GPG verify result fields.
+- Signing appends a detached OpenPGP signature blob to `ostree.gpgsigs`
+  through the 13a append path.
+- The CPU-bound OpenPGP crypto offloads through `rt::unblock`.
+
+Dependency set: `sequoia-openpgp` (2.x; exact pin confirmed at phase start)
+with `default-features = false` and the `crypto-rust` backend plus the
+experimental and variable-time-crypto opt-ins the RustCrypto backend requires,
+pure Rust with no nettle or other C linkage; behind the `sign-gpg` feature.
+The exact feature set is settled at phase start (see the risk register on
+RustCrypto-backend maturity).
+
+Deliverables: `GpgSigner`, `GpgVerifier`, keyring loading (binary and armored),
+detached verify with per-signature metadata, the `sign-gpg` feature wiring.
+
+Verify: a commit the port GPG-signs verifies under `ostree` with the same
+public keyring, and the port verifies a commit the tool GPG-signed;
+`SignatureInfo` reports fingerprint, validity, and expiry matching the tool's
+signature output; `test-gpg-signed-commit` and `test-commit-sign` targeted
+through the harness when the CLI lands; the suite passes under both runtime
+backends, with and without the `sign-gpg` feature.
 
 ### Phase 14 -- Summary generation and signing
 
@@ -1396,7 +1576,10 @@ Resolved:
     licensed, serves as a clean-room reference and cross-check oracle. See the
     Phase 9b survey above.
 
-Deferred to their respective phases:
-
-12. spki sign engine: deferred as optional; ed25519 and gpg cover the
-    common cases.
+12. spki sign engine: a required signing engine, not deferred. The
+    reference tool gates spki on OpenSSL; the port implements it in pure
+    Rust (RustCrypto ECDSA over the NIST curve the tool uses, with SPKI
+    SubjectPublicKeyInfo PEM public keys) in Phase 13c. The ed25519 and
+    dummy engines are always compiled; spki is behind the `sign-spki`
+    feature and GPG behind `sign-gpg`, so the core stays free of the
+    ECDSA/SPKI and OpenPGP crate trees unless opted in.

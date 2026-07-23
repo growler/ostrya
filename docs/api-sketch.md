@@ -562,7 +562,7 @@ pub trait Signer {
 }
 pub trait Verifier {
     fn metadata_key(&self) -> &str;
-    fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome>;
+    async fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome>;
 }
 
 pub struct Ed25519Signer { /* 64-byte secret */ }

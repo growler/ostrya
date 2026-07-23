@@ -141,7 +141,8 @@ pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};
 pub use sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, SignFuture, SignKeys,
-    SignatureInfo, Signer, Verifier, VerifyOutcome, load_sign_keys, load_sign_keys_from,
+    SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, load_sign_keys,
+    load_sign_keys_from,
 };
 #[cfg(feature = "sign-spki")]
 pub use spki::{SpkiSigner, SpkiVerifier};

@@ -50,6 +50,12 @@ const SIGNATURE_ARRAY_SIGNATURE: &str = "aay";
 /// decides internally whether to offload heavy work to the blocking pool.
 pub type SignFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 
+/// The future returned by [`Verifier::verify`]. A boxed future keeps `Verifier`
+/// dyn-compatible, so [`Repo::verify_commit`] can take `&dyn Verifier`; an
+/// engine that delegates to an external helper awaits it internally, while the
+/// in-process engines resolve immediately.
+pub type VerifyFuture<'a> = Pin<Box<dyn Future<Output = Result<VerifyOutcome>> + Send + 'a>>;
+
 /// An engine that produces a detached signature over an opaque payload.
 pub trait Signer: Send + Sync {
     /// The engine's short name (`"ed25519"`, `"spki"`, `"gpg"`, `"dummy"`).
@@ -72,7 +78,7 @@ pub trait Verifier: Send + Sync {
     /// Verify `signatures` against `data`. The outcome is valid when at least
     /// one blob verifies; the per-signature detail is reported in
     /// [`VerifyOutcome::signatures`].
-    fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome>;
+    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a>;
 }
 
 /// The result of verifying a payload against one or more engines.
@@ -150,7 +156,7 @@ impl Repo {
                 Some(dict) => signatures_for(dict, verifier.metadata_key()),
                 None => Vec::new(),
             };
-            let result = verifier.verify(&data, &signatures)?;
+            let result = verifier.verify(&data, &signatures).await?;
             outcome.valid |= result.valid;
             outcome.signatures.extend(result.signatures);
         }
@@ -284,7 +290,7 @@ impl Verifier for DummyVerifier {
         "ostree.sign.dummy"
     }
 
-    fn verify(&self, _data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome> {
+    fn verify<'a>(&'a self, _data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
         let mut outcome = VerifyOutcome::default();
         for signature in signatures {
             let valid = self.trusted.iter().any(|key| key == signature);
@@ -295,7 +301,7 @@ impl Verifier for DummyVerifier {
                 ..SignatureInfo::default()
             });
         }
-        Ok(outcome)
+        Box::pin(async move { Ok(outcome) })
     }
 }
 
@@ -415,7 +421,7 @@ impl Verifier for Ed25519Verifier {
         ED25519_METADATA_KEY
     }
 
-    fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome> {
+    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
         let mut outcome = VerifyOutcome::default();
         for blob in signatures {
             let valid = match <[u8; 64]>::try_from(blob.as_slice()) {
@@ -433,7 +439,7 @@ impl Verifier for Ed25519Verifier {
                 ..SignatureInfo::default()
             });
         }
-        Ok(outcome)
+        Box::pin(async move { Ok(outcome) })
     }
 }
 

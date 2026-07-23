@@ -34,7 +34,8 @@ use p256::{EncodedPoint, SecretKey};
 
 use crate::error::{Error, Result};
 use crate::sign::{
-    SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyOutcome, load_sign_keys,
+    SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome,
+    load_sign_keys,
 };
 
 /// The spki sign-type name, used both as the engine name and as the base name of
@@ -168,7 +169,7 @@ impl Verifier for SpkiVerifier {
         SPKI_METADATA_KEY
     }
 
-    fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome> {
+    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
         let mut outcome = VerifyOutcome::default();
         for blob in signatures {
             // Accept a DER-encoded signature (the tool's and this engine's form)
@@ -185,7 +186,7 @@ impl Verifier for SpkiVerifier {
                 ..SignatureInfo::default()
             });
         }
-        Ok(outcome)
+        Box::pin(async move { Ok(outcome) })
     }
 }
 

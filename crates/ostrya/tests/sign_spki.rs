@@ -300,7 +300,7 @@ fn spki_openssl_interop() {
         );
         let sig_bytes = std::fs::read(&os_sig).unwrap();
         let verifier = SpkiVerifier::from_pem(&pub_pem_text).unwrap();
-        let outcome = verifier.verify(&payload, &[sig_bytes]).unwrap();
+        let outcome = verifier.verify(&payload, &[sig_bytes]).await.unwrap();
         assert!(
             outcome.valid,
             "port rejected an openssl-written spki signature"

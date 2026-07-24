@@ -815,3 +815,66 @@ fn sign_verify_delete_gpg() {
         "verification must fail after deletion"
     );
 }
+
+/// gpg verify with no `--keys-file` falls back to the default trusted set:
+/// the `*.gpg` keyrings in the directory named by `OSTREE_GPG_HOME`.
+#[cfg(feature = "gpg")]
+#[test]
+fn sign_verify_gpg_default_trust() {
+    if !gpg_available() {
+        eprintln!("skipping: gpg/gpgv not available");
+        return;
+    }
+    let tmp = TmpDir::new("sign-gpg-default");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let home = GpgHome::create(base, "Ostrya Default Trust <default-gpg@ostrya.example>");
+    let fpr = home.fingerprint();
+    let home_s = home.dir.to_str().unwrap().to_owned();
+
+    // Sign, then publish the public keyring as `*.gpg` in a trusted.gpg.d dir.
+    ostrya(
+        &[
+            "sign",
+            "--repo",
+            repo_s,
+            "-s",
+            "gpg",
+            "--gpg-homedir",
+            &home_s,
+            COMMIT,
+            &fpr,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let trusted = base.join("trusted.gpg.d");
+    std::fs::create_dir(&trusted).unwrap();
+    home.export_to(&trusted.join("key.gpg"));
+    let trusted_s = trusted.to_str().unwrap();
+
+    // With OSTREE_GPG_HOME pointing at that directory and no --keys-file,
+    // verification succeeds against the discovered keyring.
+    let verified = ostrya(
+        &["sign", "--verify", "--repo", repo_s, "-s", "gpg", COMMIT],
+        None,
+        &[("OSTREE_GPG_HOME", trusted_s)],
+    );
+    verified.ok();
+    assert!(verified.stdout_trimmed().contains("verification OK"));
+
+    // An OSTREE_GPG_HOME with no keyrings trusts nothing, so verify fails.
+    let empty = base.join("empty.gpg.d");
+    std::fs::create_dir(&empty).unwrap();
+    let failed = ostrya(
+        &["sign", "--verify", "--repo", repo_s, "-s", "gpg", COMMIT],
+        None,
+        &[("OSTREE_GPG_HOME", empty.to_str().unwrap())],
+    );
+    assert!(
+        !failed.status.success(),
+        "verify must fail with an empty trusted set"
+    );
+}

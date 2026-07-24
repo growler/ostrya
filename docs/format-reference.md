@@ -873,8 +873,12 @@ not participate.
 GPG keyrings are binary or ASCII-armored, each holding one or more
 certificates, all merged into one trusted set. The keyring trusted for a
 remote is `<remote>.trustedkeys.gpg` in the repo or under
-`/etc/ostree/remotes.d/`; every keyring in the global
-`<datadir>/ostree/trusted.gpg.d/` directory is trusted for all remotes.
+`/etc/ostree/remotes.d/`; every `*.gpg` keyring in the global trusted-keyring
+directory is trusted for all remotes. That directory is
+`<datadir>/ostree/trusted.gpg.d/` (`/usr/share/ostree/trusted.gpg.d/`), and
+the `OSTREE_GPG_HOME` environment variable overrides it with the directory it
+names, observed by running `ostree show` on a signed commit with
+`OSTREE_GPG_HOME` set to a directory holding the exported keyring.
 End-to-end cross-verification against `ostree gpg-sign` runs with the upstream
 shell tests at the CLI-compatibility phase.
 

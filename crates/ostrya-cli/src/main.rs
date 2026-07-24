@@ -198,6 +198,12 @@ struct SignArgs {
     /// own resolution). Only for the gpg engine.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
+    /// The remote whose trusted keyring to add for gpg verify and delete:
+    /// `<remote>.trustedkeys.gpg` in the repo and under
+    /// `/etc/ostree/remotes.d/`, on top of the global trusted set. Only for
+    /// the gpg engine.
+    #[arg(long)]
+    remote: Option<String>,
     /// The commit to operate on (a checksum or a ref).
     commit: String,
     /// Key identifiers: base64 keys for ed25519/spki. For gpg: the signing
@@ -407,6 +413,11 @@ async fn sign(args: SignArgs) -> Result<()> {
             "--gpg-homedir applies only to the gpg engine".into(),
         ));
     }
+    if args.sign_type != SignType::Gpg && args.remote.is_some() {
+        return Err(Error::Signature(
+            "--remote applies only to the gpg engine".into(),
+        ));
+    }
     if args.verify {
         verify_signatures(&repo, &commit, &args).await
     } else if args.delete {
@@ -554,8 +565,9 @@ async fn stored_signatures(repo: &Repo, commit: &Checksum, key: &str) -> Result<
 
 /// Delete GPG signatures whose issuer or primary-key fingerprint matches a
 /// KEY-ID. The issuer fingerprint is reported even for a key absent from the
-/// keyrings; a keyring in `--keys-file` lets a match also consider the
-/// primary-key fingerprint of a verified signature.
+/// keyrings; a keyring in the trusted set (`--keys-file`, `--remote`, or the
+/// default `trusted.gpg.d`) lets a match also consider the primary-key
+/// fingerprint of a verified signature.
 #[cfg(feature = "gpg")]
 async fn gpg_delete(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<usize> {
     let wanted: Vec<String> = args
@@ -563,7 +575,7 @@ async fn gpg_delete(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<u
         .iter()
         .map(|k| normalize_fingerprint(k))
         .collect();
-    let verifier = GpgVerifier::from_keyring_files(&args.keys_file)?;
+    let verifier = gpg_trust(args)?;
     let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
     let mut doomed: Vec<Vec<u8>> = Vec::new();
     for blob in stored_signatures(repo, commit, "ostree.gpgsigs").await? {
@@ -626,17 +638,27 @@ fn build_sign_api_verifier(
 
 #[cfg(feature = "gpg")]
 fn gpg_verifier(args: &SignArgs) -> Result<Box<dyn Verifier>> {
-    if args.keys_file.is_empty() {
-        return Err(Error::Signature(
-            "gpg verification requires --keys-file with a keyring".into(),
-        ));
-    }
-    Ok(Box::new(GpgVerifier::from_keyring_files(&args.keys_file)?))
+    Ok(Box::new(gpg_trust(args)?))
 }
 
 #[cfg(not(feature = "gpg"))]
 fn gpg_verifier(_: &SignArgs) -> Result<Box<dyn Verifier>> {
     Err(unsupported_type("gpg"))
+}
+
+/// The gpg trusted keyring set for verify and delete: the `--keys-file`
+/// keyrings when any are given, otherwise the default ostree trust -- the
+/// global `trusted.gpg.d` directory (or `$OSTREE_GPG_HOME`) plus, when
+/// `--remote` names a remote, that remote's `trustedkeys.gpg`.
+#[cfg(feature = "gpg")]
+fn gpg_trust(args: &SignArgs) -> Result<GpgVerifier> {
+    if !args.keys_file.is_empty() {
+        return GpgVerifier::from_keyring_files(&args.keys_file);
+    }
+    match &args.remote {
+        Some(remote) => GpgVerifier::for_remote(&args.repo, remote),
+        None => GpgVerifier::from_system_trust(),
+    }
 }
 
 /// The base64 secret keys for a sign-api signing run: the KEY-IDs plus the

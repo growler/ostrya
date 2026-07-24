@@ -1434,7 +1434,8 @@ covers the three engines through `-s|--sign-type` (`ed25519` default, `spki`,
 ```
 ostrya sign [--repo <repo>] [-d|--delete] [--verify]
             [-s|--sign-type ed25519|spki|gpg] [--gpg-homedir <dir>]
-            [--keys-file <path>]... [--keys-dir <path>]... <commit> [key-id]...
+            [--remote <name>] [--keys-file <path>]... [--keys-dir <path>]...
+            <commit> [key-id]...
 ```
 
 For ed25519 and spki the KEY-IDs are base64 keys, as the tool treats them: a
@@ -1448,11 +1449,17 @@ For gpg the KEY-IDs name the signing keys the way `gpg --local-user` resolves
 them -- a fingerprint, a key id, or a user id -- in the default GnuPG home
 directory or the `--gpg-homedir` override; the private key stays with `gpg`
 and its agent, a hardware token included, and `gpg` may start its own agent
-for the selected home directory. Verify loads keyrings (binary or armored)
-from `--keys-file` and runs `gpgv`, which starts no agent. A delete matches
-by the signature's issuer or primary-key fingerprint; the issuer fingerprint
-is reported even for a key absent from the keyrings, and a keyring in
-`--keys-file` lets the match consider the primary-key fingerprint.
+for the selected home directory. Verify and delete load keyrings (binary or
+armored) from `--keys-file` when any are given; otherwise they fall back to
+the default trusted set the `ostree` tool uses -- every `*.gpg` keyring in the
+directory named by `OSTREE_GPG_HOME`, or `/usr/share/ostree/trusted.gpg.d/`
+when that variable is unset, plus, when `--remote <name>` is given, that
+remote's `<name>.trustedkeys.gpg` in the repo and under
+`/etc/ostree/remotes.d/`. Verify runs `gpgv`, which starts no agent, and exits
+nonzero when no signature is valid, including when the trusted set is empty. A
+delete matches by the signature's issuer or primary-key fingerprint; the issuer
+fingerprint is reported even for a key absent from the keyrings, and a keyring
+in the trusted set lets the match consider the primary-key fingerprint.
 
 Delete is backed by `Repo::delete_signatures(checksum, metadata_key, predicate)`,
 which rewrites `.commitmeta`: an emptied engine array drops its dict entry, and
@@ -1464,7 +1471,9 @@ Verify: through the built binary, a commit it signs with ed25519 verifies under
 the same public key and is rejected by a wrong one; the `ostree` tool verifies
 that signature; a delete by the public key makes verification fail. The spki and
 gpg engines sign and verify through the same command, and a gpg delete by
-fingerprint clears the signature.
+fingerprint clears the signature. A gpg commit verifies with no `--keys-file`
+when `OSTREE_GPG_HOME` names a directory holding the exported `*.gpg` keyring,
+and fails when that directory holds none.
 
 ### Phase 14 -- Summary generation and signing
 

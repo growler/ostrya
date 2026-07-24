@@ -24,11 +24,13 @@
 //! [`from_keyring_bytes`](GpgVerifier::from_keyring_bytes) and
 //! [`from_keyring_files`](GpgVerifier::from_keyring_files) (armored input is
 //! decoded to the binary form on load, since `gpgv` reads only binary
-//! keyrings). [`for_remote`](GpgVerifier::for_remote) resolves the documented
+//! keyrings). [`from_system_trust`](GpgVerifier::from_system_trust) loads the
+//! global trusted set -- every `*.gpg` keyring in the directory named by the
+//! `OSTREE_GPG_HOME` environment variable, or `<datadir>/ostree/trusted.gpg.d/`
+//! when it is unset. [`for_remote`](GpgVerifier::for_remote) adds the
 //! per-remote keyring (`<remote>.trustedkeys.gpg` in the repo or under
-//! `/etc/ostree/remotes.d/`) together with the global
-//! `<datadir>/ostree/trusted.gpg.d/` directory. Verification writes the
-//! merged keyring to a private scratch directory and runs `gpgv` once per
+//! `/etc/ostree/remotes.d/`) on top of that global set. Verification writes
+//! the merged keyring to a private scratch directory and runs `gpgv` once per
 //! stored blob; `gpgv` performs public-key operations only and starts no
 //! agent.
 //!
@@ -53,6 +55,9 @@ const GPG_SIGN_TYPE: &str = "gpg";
 const GPG_METADATA_KEY: &str = "ostree.gpgsigs";
 /// The system directory holding keyrings trusted for every remote.
 const GLOBAL_TRUSTED_GPG_D: &str = "/usr/share/ostree/trusted.gpg.d";
+/// The environment variable that overrides the global trusted-keyring
+/// directory, as the `ostree` tool honors it.
+const OSTREE_GPG_HOME_ENV: &str = "OSTREE_GPG_HOME";
 /// The system directory holding per-remote configuration and keyrings.
 const SYSTEM_REMOTES_D: &str = "/etc/ostree/remotes.d";
 /// The prefix of a machine-readable status line on the status fd.
@@ -166,16 +171,26 @@ impl GpgVerifier {
 
     /// Build a verifier from the keyrings trusted for `remote` in the
     /// repository at `repo_path`: `<remote>.trustedkeys.gpg` in the repository
-    /// and under `/etc/ostree/remotes.d/`, plus every keyring in the global
-    /// `/usr/share/ostree/trusted.gpg.d/` directory. Missing paths are
-    /// skipped.
+    /// and under `/etc/ostree/remotes.d/`, plus the global trusted set
+    /// (see [`from_system_trust`](GpgVerifier::from_system_trust)). Missing
+    /// paths are skipped.
     pub fn for_remote(repo_path: &Path, remote: &str) -> Result<GpgVerifier> {
         let mut paths: Vec<PathBuf> = Vec::new();
         let keyring = format!("{remote}.trustedkeys.gpg");
         paths.push(repo_path.join(&keyring));
         paths.push(Path::new(SYSTEM_REMOTES_D).join(&keyring));
-        paths.extend(keyring_files_in(Path::new(GLOBAL_TRUSTED_GPG_D))?);
+        paths.extend(keyring_files_in(&global_trusted_dir())?);
         GpgVerifier::from_keyring_files(paths)
+    }
+
+    /// Build a verifier from the global trusted keyrings alone: every `*.gpg`
+    /// keyring in the directory named by the `OSTREE_GPG_HOME` environment
+    /// variable, or, when that variable is unset or empty, the system
+    /// `/usr/share/ostree/trusted.gpg.d/` directory. No per-remote keyring
+    /// participates. This is the trust applied to a commit named with no
+    /// remote. A missing directory yields an empty trusted set.
+    pub fn from_system_trust() -> Result<GpgVerifier> {
+        GpgVerifier::from_keyring_files(keyring_files_in(&global_trusted_dir())?)
     }
 }
 
@@ -441,8 +456,18 @@ fn dearmor(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// The regular files in `dir`, sorted by name. A missing directory yields an
-/// empty list rather than an error.
+/// The directory of keyrings trusted for every remote: the value of the
+/// `OSTREE_GPG_HOME` environment variable when set to a non-empty value,
+/// otherwise the system `/usr/share/ostree/trusted.gpg.d` directory.
+fn global_trusted_dir() -> PathBuf {
+    match std::env::var_os(OSTREE_GPG_HOME_ENV) {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(GLOBAL_TRUSTED_GPG_D),
+    }
+}
+
+/// The `*.gpg` keyring files in `dir`, sorted by name. A missing directory
+/// yields an empty list rather than an error.
 fn keyring_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -452,7 +477,8 @@ fn keyring_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if entry.file_type()?.is_file() {
+        if entry.file_type()?.is_file() && entry.path().extension().is_some_and(|ext| ext == "gpg")
+        {
             files.push(entry.path());
         }
     }
@@ -664,5 +690,26 @@ bG8=\n\
 IHdvcmxk\n\
 -----END PGP PUBLIC KEY BLOCK-----\n";
         assert_eq!(dearmor(armored.as_bytes()).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn keyring_files_in_selects_gpg_and_sorts() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["b.gpg", "a.gpg", "notes.txt", "keyring"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let names: Vec<String> = keyring_files_in(&dir)
+            .unwrap()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names, ["a.gpg", "b.gpg"]);
+    }
+
+    #[test]
+    fn keyring_files_in_missing_dir_is_empty() {
+        assert!(keyring_files_in(&scratch_dir()).unwrap().is_empty());
     }
 }

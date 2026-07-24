@@ -55,8 +55,9 @@ reference, or reading material.
 4. Capable of passing ostree's test suite, run as an external conformance gate
    (scope is phased: library format and format-primitive unit tests first,
    CLI-driven shell tests later, admin/sysroot optional).
-5. Extensions: commit signing via `sequoia-openpgp` (not gpgme), composefs/EROFS
-   export, tar import/export, AWS S3 push/pull, and ssh git-style push/pull.
+5. Extensions: GPG commit signing through the system GnuPG binaries (no gpgme
+   linkage, no OpenPGP crate), composefs/EROFS export, tar import/export,
+   AWS S3 push/pull, and ssh git-style push/pull.
 6. A development-only repository mode, `bare-user-shared`, as an optional
    nice-to-have add-on.
 

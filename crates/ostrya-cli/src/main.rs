@@ -16,6 +16,7 @@
 //! - `diff` -- report the paths that changed between two commits.
 //! - `sign` -- add, verify, or delete commit signatures under one of the
 //!   ed25519, spki, or gpg engines.
+//! - `summary` -- regenerate, sign, or verify the repository summary.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams to and from stdin/stdout flow through
@@ -29,8 +30,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CommitModifier, CommitModifierFlags, CommitOptions,
     DiffChange, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, MutableTree, ObjectType,
-    PruneOptions, Repo, Result, TarExportOptions, TarImportOptions, Type, Value, Verifier,
-    VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
+    PruneOptions, Repo, Result, SummaryOptions, TarExportOptions, TarImportOptions, Type, Value,
+    Verifier, VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -61,6 +62,8 @@ enum Command {
     Diff(DiffArgs),
     /// Add, verify, or delete signatures on a commit.
     Sign(SignArgs),
+    /// Regenerate, sign, or verify the repository summary.
+    Summary(SummaryArgs),
 }
 
 #[derive(Args)]
@@ -212,6 +215,47 @@ struct SignArgs {
     key_id: Vec<String>,
 }
 
+#[derive(Args)]
+struct SummaryArgs {
+    /// The repository whose summary to operate on.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Regenerate the summary from the repository's refs.
+    #[arg(short = 'u', long)]
+    update: bool,
+    /// Verify the summary's signatures instead of regenerating or signing.
+    #[arg(long)]
+    verify: bool,
+    /// The signature engine to use for --verify or signing.
+    #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
+    sign_type: SignType,
+    /// Override `ostree.summary.last-modified` (seconds since the Unix epoch)
+    /// for reproducible output; defaults to the current time.
+    #[arg(long)]
+    last_modified: Option<u64>,
+    /// The timestamp of the collection anchor commit (seconds since the Unix
+    /// epoch); defaults to SOURCE_DATE_EPOCH or the current time. Only used for
+    /// a collection repository.
+    #[arg(long)]
+    metadata_commit_timestamp: Option<u64>,
+    /// Read key(s) from a file; repeatable, same format as `ostrya sign`.
+    #[arg(long)]
+    keys_file: Vec<PathBuf>,
+    /// Override the system trusted/revoked key directories for ed25519/spki
+    /// verification; repeatable.
+    #[arg(long)]
+    keys_dir: Vec<PathBuf>,
+    /// The GnuPG home directory gpg resolves signing keys in. Only for gpg.
+    #[arg(long)]
+    gpg_homedir: Option<PathBuf>,
+    /// The remote whose trusted gpg keyring to add for verification. Only for
+    /// the gpg engine.
+    #[arg(long)]
+    remote: Option<String>,
+    /// Signing or verification key identifiers, same format as `ostrya sign`.
+    key_id: Vec<String>,
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match ostrya_rt::block_on(run(cli)) {
@@ -232,6 +276,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Fsck(args) => fsck(args).await,
         Command::Diff(args) => diff(args).await,
         Command::Sign(args) => sign(args).await,
+        Command::Summary(args) => summary(args).await,
     }
 }
 
@@ -425,6 +470,156 @@ async fn sign(args: SignArgs) -> Result<()> {
     } else {
         add_signatures(&repo, &commit, &args).await
     }
+}
+
+async fn summary(args: SummaryArgs) -> Result<()> {
+    let repo = Repo::open(&args.repo).await?;
+
+    if args.verify {
+        let verifier = summary_verifier(&args)?;
+        let outcome = repo.verify_summary(&[verifier.as_ref()]).await?;
+        report_verify(&outcome);
+        if !outcome.valid {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if args.update {
+        repo.regenerate_summary(&SummaryOptions {
+            last_modified: args.last_modified,
+            metadata_commit_timestamp: args.metadata_commit_timestamp,
+        })
+        .await?;
+    }
+
+    let signing = !args.key_id.is_empty() || !args.keys_file.is_empty();
+    if signing {
+        summary_sign(&repo, &args).await?;
+    } else if !args.update {
+        return Err(Error::InvalidFormat(
+            "nothing to do: pass --update, --verify, or a signing key".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Sign the summary once per supplied key, under the selected engine.
+async fn summary_sign(repo: &Repo, args: &SummaryArgs) -> Result<()> {
+    match args.sign_type {
+        SignType::Ed25519 => {
+            for key in summary_secret_keys(args)? {
+                repo.sign_summary(&Ed25519Signer::from_base64(&key)?)
+                    .await?;
+            }
+            Ok(())
+        }
+        SignType::Spki => summary_sign_spki(repo, args).await,
+        SignType::Gpg => summary_sign_gpg(repo, args).await,
+    }
+}
+
+#[cfg(feature = "spki")]
+async fn summary_sign_spki(repo: &Repo, args: &SummaryArgs) -> Result<()> {
+    for key in summary_secret_keys(args)? {
+        repo.sign_summary(&SpkiSigner::from_base64(&key)?).await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "spki"))]
+async fn summary_sign_spki(_: &Repo, _: &SummaryArgs) -> Result<()> {
+    Err(unsupported_type("spki"))
+}
+
+#[cfg(feature = "gpg")]
+async fn summary_sign_gpg(repo: &Repo, args: &SummaryArgs) -> Result<()> {
+    if !args.keys_file.is_empty() {
+        return Err(Error::Signature(
+            "gpg signing takes KEY-ID arguments; --keys-file keyrings serve verify".into(),
+        ));
+    }
+    if args.key_id.is_empty() {
+        return Err(Error::Signature(
+            "gpg signing requires at least one KEY-ID (a fingerprint, key id, or user id)".into(),
+        ));
+    }
+    for key in &args.key_id {
+        let mut signer = GpgSigner::new(key);
+        if let Some(dir) = &args.gpg_homedir {
+            signer = signer.with_homedir(dir);
+        }
+        repo.sign_summary(&signer).await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "gpg"))]
+async fn summary_sign_gpg(_: &Repo, _: &SummaryArgs) -> Result<()> {
+    Err(unsupported_type("gpg"))
+}
+
+/// The base64 secret keys for a summary signing run: the KEY-IDs plus the
+/// non-blank lines of each `--keys-file`.
+fn summary_secret_keys(args: &SummaryArgs) -> Result<Vec<String>> {
+    let mut keys = args.key_id.clone();
+    for path in &args.keys_file {
+        keys.extend(read_key_lines(path)?);
+    }
+    if keys.is_empty() {
+        return Err(Error::Signature(
+            "no signing key given; pass a key argument or --keys-file".into(),
+        ));
+    }
+    Ok(keys)
+}
+
+/// Build the verifier for `ostrya summary --verify`, mirroring `ostrya sign`.
+fn summary_verifier(args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
+    match args.sign_type {
+        SignType::Gpg => summary_gpg_verifier(args),
+        engine => {
+            let name = sign_type_name(engine);
+            let mut trusted = Vec::new();
+            for key in &args.key_id {
+                trusted.push(base64::decode(key.trim())?);
+            }
+            for path in &args.keys_file {
+                for line in read_key_lines(path)? {
+                    trusted.push(base64::decode(&line)?);
+                }
+            }
+            let mut revoked = Vec::new();
+            if !args.keys_dir.is_empty() {
+                let roots: Vec<&Path> = args.keys_dir.iter().map(PathBuf::as_path).collect();
+                let keys = load_sign_keys_from(&roots, name)?;
+                trusted.extend(keys.trusted);
+                revoked.extend(keys.revoked);
+            } else if trusted.is_empty() {
+                let keys = load_sign_keys(name)?;
+                trusted.extend(keys.trusted);
+                revoked.extend(keys.revoked);
+            }
+            build_sign_api_verifier(engine, trusted, revoked)
+        }
+    }
+}
+
+#[cfg(feature = "gpg")]
+fn summary_gpg_verifier(args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
+    let verifier = if !args.keys_file.is_empty() {
+        GpgVerifier::from_keyring_files(&args.keys_file)?
+    } else if let Some(remote) = &args.remote {
+        GpgVerifier::for_remote(&args.repo, remote)?
+    } else {
+        GpgVerifier::from_system_trust()?
+    };
+    Ok(Box::new(verifier))
+}
+
+#[cfg(not(feature = "gpg"))]
+fn summary_gpg_verifier(_: &SummaryArgs) -> Result<Box<dyn Verifier>> {
+    Err(unsupported_type("gpg"))
 }
 
 /// Sign the commit once per supplied key.

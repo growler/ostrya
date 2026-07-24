@@ -121,6 +121,7 @@ pub mod sign;
 pub mod spki;
 mod staging;
 pub mod staging_tree;
+pub mod summary;
 pub mod tar;
 pub mod transaction;
 pub mod traverse;
@@ -159,6 +160,7 @@ pub use sign::{
 #[cfg(feature = "sign-spki")]
 pub use spki::{SpkiSigner, SpkiVerifier};
 pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
+pub use summary::SummaryOptions;
 pub use tar::{TarExportOptions, TarImportOptions};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};

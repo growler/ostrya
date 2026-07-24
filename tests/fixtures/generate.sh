@@ -309,6 +309,62 @@ else
          "skipping composefs fixture" >&2
 fi
 
+# --- summary fixtures (Phase 14) ---
+# Two golden summaries the tool wrote, for the byte-identity gate. The tool's
+# ostree.summary.last-modified is wall-clock, so it is patched to the fixed
+# TIMESTAMP epoch to keep regeneration byte-reproducible; the port is asked to
+# reproduce that same epoch. Each fixture ships the repository as a plain tree
+# (config/objects/refs, no summary) so the port regenerates the summary itself.
+SUMMARY_EPOCH="${TIMESTAMP#@}"
+
+# Rewrite the 8-byte big-endian ostree.summary.last-modified value in place.
+patch_summary_last_modified() { # file epoch
+    python3 - "$1" "$2" <<'PY'
+import struct, sys
+path, epoch = sys.argv[1], int(sys.argv[2])
+data = bytearray(open(path, "rb").read())
+key = b"ostree.summary.last-modified"
+i = data.find(key)
+assert i >= 0, "last-modified key not found in summary"
+# The variant value is the 8 bytes preceding the "\x00t" variant type marker.
+j = data.find(b"\x00\x74", i)
+assert j >= 0, "last-modified variant marker not found"
+data[j - 8:j] = struct.pack(">Q", epoch)
+open(path, "wb").write(data)
+PY
+}
+
+# Non-collection: two refs (one carrying a version), plain archive tree.
+summary_repo="$WORK/repo-summary"
+ostree --repo="$summary_repo" init --mode=archive-z2 >/dev/null
+ostree --repo="$summary_repo" commit --branch=main --subject="$SUBJECT" \
+    --add-metadata-string=version=1.0 --owner-uid="$OWNER_UID" \
+    --owner-gid="$OWNER_GID" --no-xattrs --timestamp="$TIMESTAMP" "$SRC" >/dev/null
+ostree --repo="$summary_repo" commit --branch=other --subject="$SUBJECT" \
+    --owner-uid="$OWNER_UID" --owner-gid="$OWNER_GID" \
+    --no-xattrs --timestamp="$TIMESTAMP" "$SRC" >/dev/null
+emit_tree "$summary_repo" summary
+ostree --repo="$summary_repo" summary -u >/dev/null
+cp "$summary_repo/summary" "$OUT_DIR/summary/summary"
+patch_summary_last_modified "$OUT_DIR/summary/summary" "$SUMMARY_EPOCH"
+
+# Collection: the repository is captured before `summary -u`, so the port
+# generates the ostree-metadata anchor commit (first generation, parentless).
+# The anchor commit timestamp is pinned with SOURCE_DATE_EPOCH.
+SUMMARY_COLLECTION_ID="org.ostrya.Test"
+summary_coll_repo="$WORK/repo-summary-collection"
+ostree --repo="$summary_coll_repo" init --mode=archive-z2 \
+    --collection-id="$SUMMARY_COLLECTION_ID" >/dev/null
+ostree --repo="$summary_coll_repo" commit --branch=main --subject="$SUBJECT" \
+    --owner-uid="$OWNER_UID" --owner-gid="$OWNER_GID" \
+    --no-xattrs --timestamp="$TIMESTAMP" "$SRC" >/dev/null
+emit_tree "$summary_coll_repo" summary-collection
+SOURCE_DATE_EPOCH="$SUMMARY_EPOCH" \
+    ostree --repo="$summary_coll_repo" summary -u >/dev/null
+cp "$summary_coll_repo/summary" "$OUT_DIR/summary-collection/summary"
+patch_summary_last_modified "$OUT_DIR/summary-collection/summary" "$SUMMARY_EPOCH"
+SUMMARY_ANCHOR_COMMIT="$(cat "$summary_coll_repo/refs/heads/ostree-metadata")"
+
 COMMIT="${CHECKSUM[$first]}"
 CONTENT="$(ostree --repo="$WORK/repo-$first" show "$COMMIT" |
     sed -n 's/^ContentChecksum:[[:space:]]*//p')"
@@ -332,6 +388,9 @@ composefs_commit=${COMPOSEFS_COMMIT}
 composefs_digest=${COMPOSEFS_DIGEST}
 composefs_rich_commit=${COMPOSEFS_RICH_COMMIT}
 composefs_rich_digest=${COMPOSEFS_RICH_DIGEST}
+summary_last_modified=${SUMMARY_EPOCH}
+summary_collection_id=${SUMMARY_COLLECTION_ID}
+summary_anchor_commit=${SUMMARY_ANCHOR_COMMIT}
 EOF
 
 # The generator wipes and rebuilds OUT_DIR, so it also writes the .gitattributes
@@ -342,6 +401,9 @@ cat >"$OUT_DIR/.gitattributes" <<'EOF'
 *.tar binary
 # The composefs EROFS image is a binary golden fixture.
 *.cfs binary
+# The golden summaries are serialized GVariant, not text.
+summary/summary binary
+summary-collection/summary binary
 EOF
 
 echo "generated fixtures in ${OUT_DIR}"

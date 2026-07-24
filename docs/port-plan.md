@@ -1475,12 +1475,33 @@ fingerprint clears the signature. A gpg commit verifies with no `--keys-file`
 when `OSTREE_GPG_HOME` names a directory holding the exported `*.gpg` keyring,
 and fails when that directory holds none.
 
-### Phase 14 -- Summary generation and signing
+### Phase 14 -- Summary generation and signing (DONE)
 
 Summary assembly (sorted refs, the host-order size asymmetry, big-endian
-timestamps), summary signing and verification, summary cache.
-Verify: byte-identical summary versus the tool for the same repo; the tool
-verifies our signed summary.
+timestamps), summary signing and verification.
+
+`Repo::regenerate_summary` assembles `(a(s(taya{sv}))a{sv})` from `refs/heads`
+(byte-wise sorted, remotes excluded) with per-ref size/checksum/version/
+timestamp and the fixed-order global metadata, writes `summary` atomically at
+the repo root, and drops any stale `summary.sig`. `SummaryOptions` overrides the
+wall-clock `last-modified` (not pinned by `SOURCE_DATE_EPOCH`) for reproducible
+output. Collection repositories are supported in full: regeneration refreshes
+the empty-tree `ostree-metadata` anchor commit (collection/ref bindings,
+parent-chained onto the previous anchor) and groups mirror refs into
+`ostree.summary.collection-map`. `Repo::sign_summary` and
+`Repo::verify_summary` reuse the Phase 13 signing framework over the exact
+`summary` bytes, storing signatures in the `summary.sig` `a{sv}`. A native
+`ostrya summary` subcommand exposes update, sign, and verify. The recovered
+format facts (metadata key order, the anchor commit shape and its
+parent-chaining, the empty-tree constants) are in `format-reference.md`.
+
+The summary cache (`tmp/cache/summaries/`) caches fetched remote summaries and
+lands with pull (Phase 16); local generation needs no cache.
+
+Verify: byte-identical summary versus the tool for the same repo, for a
+non-collection repo and a first-generation collection repo (the anchor commit
+checksum matches the tool's); the tool verifies our port-signed summary via
+`ostree remote summary --sign-verify`; sign/verify round-trips under ed25519.
 
 ### Phase 15 -- Static deltas
 

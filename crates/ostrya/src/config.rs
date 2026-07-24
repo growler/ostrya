@@ -222,6 +222,25 @@ impl RepoConfig {
             .unwrap_or(86400))
     }
 
+    /// Whether the repository advertises tombstone commits in its summary.
+    /// Default `false`. The summary emits `ostree.summary.tombstone-commits`
+    /// with this value.
+    pub fn tombstone_commits(&self) -> Result<bool> {
+        Ok(self
+            .keyfile
+            .get_bool(CORE, "tombstone-commits")?
+            .unwrap_or(false))
+    }
+
+    /// Whether the repository indexes its static deltas. Default `true`. The
+    /// summary emits `ostree.summary.indexed-deltas` with this value.
+    pub fn indexed_deltas(&self) -> Result<bool> {
+        Ok(self
+            .keyfile
+            .get_bool(CORE, "indexed-deltas")?
+            .unwrap_or(true))
+    }
+
     /// Whether xattr storage is disabled. Default `false`.
     pub fn disable_xattrs(&self) -> Result<bool> {
         Ok(self

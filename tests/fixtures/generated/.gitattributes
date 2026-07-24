@@ -3,3 +3,6 @@
 *.tar binary
 # The composefs EROFS image is a binary golden fixture.
 *.cfs binary
+# The golden summaries are serialized GVariant, not text.
+summary/summary binary
+summary-collection/summary binary

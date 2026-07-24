@@ -173,6 +173,16 @@ impl Repo {
         Ok(refs)
     }
 
+    /// List collection-mirror refs (under `refs/mirrors`) as
+    /// `(collection_id, ref_name, commit)` triples. The first path component
+    /// under `refs/mirrors` is the collection id; the remainder is the ref
+    /// name, which may contain `/`. Results are unsorted; callers that need a
+    /// stable order sort them.
+    pub async fn list_mirror_refs(&self) -> Result<Vec<(String, String, Checksum)>> {
+        let repo = self.clone();
+        ostrya_rt::unblock(move || collect_mirrors(&repo)).await
+    }
+
     /// Write one ref outside a transaction, atomically. A `None` checksum
     /// removes the ref file. The write follows the same tmpfile, `fdatasync`,
     /// rename sequence a transaction uses, honoring `[core] fsync`.
@@ -204,6 +214,35 @@ fn collect_heads(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     };
     let mut out = Vec::new();
     walk_refs(heads, "", &mut out)?;
+    Ok(out)
+}
+
+/// Collect every ref under `refs/mirrors`, splitting each into its collection
+/// id (the first path component) and ref name (the remainder).
+fn collect_mirrors(repo: &Repo) -> Result<Vec<(String, String, Checksum)>> {
+    let mirrors = match rustix::fs::openat(
+        repo.repo_fd(),
+        "refs/mirrors",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    let mut walked = Vec::new();
+    walk_refs(mirrors, "", &mut walked)?;
+    let mut out = Vec::with_capacity(walked.len());
+    for (path, checksum) in walked {
+        // A mirror ref is <collection>/<ref>; the collection id is a single
+        // component, the ref name is everything after the first slash.
+        let Some((collection, ref_name)) = path.split_once('/') else {
+            // A file directly under refs/mirrors has no collection component;
+            // ignore it, matching the tool's collection-qualified layout.
+            continue;
+        };
+        out.push((collection.to_owned(), ref_name.to_owned(), checksum));
+    }
     Ok(out)
 }
 

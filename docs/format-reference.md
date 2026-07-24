@@ -202,38 +202,68 @@ produces a zero-length file (deletion). Signature keys, all value type `aay`
 
 Lives at repo root as `summary`. Outer tuple `(refs, global_metadata)`.
 
-Field 0 `a(s(taya{sv}))` ref array, sorted by ref name with byte-wise
-comparison, remote refs excluded. Each entry `(s, (t, ay, a{sv}))`:
+Field 0 `a(s(taya{sv}))` ref array holds the local refs (`refs/heads`), sorted
+by ref name with byte-wise comparison; remote refs are excluded. Each entry
+`(s, (t, ay, a{sv}))`:
 
 - `s` ref name.
 - `t` size of the commit object in bytes, written host-order (NOT
   byte-swapped). This is the one asymmetry versus the big-endian timestamps.
+  The commit object is stored uncompressed, so this equals its on-disk length.
 - `ay` commit checksum, 32 raw bytes.
-- `a{sv}` per-ref metadata: `ostree.commit.timestamp` (`t`, big-endian),
-  `ostree.commit.version` (`s`).
+- `a{sv}` per-ref metadata, in insertion order: `ostree.commit.version` (`s`),
+  present only when the commit records a `version` metadata key, then
+  `ostree.commit.timestamp` (`t`, big-endian), always present.
 
-Field 1 `a{sv}` global metadata:
+Field 1 `a{sv}` global metadata, written in this insertion order (a key is
+absent when its condition does not hold; GVariant does not re-sort dicts, so
+insertion order is the on-disk order):
 
-- `ostree.static-deltas` -> `a{sv}`: delta-name (`FROM-TO` or `TO`) -> `ay`
-  32-byte superblock digest.
-- `ostree.summary.last-modified` -> `t` big-endian.
-- `ostree.summary.expires` -> `t` big-endian.
-- `ostree.summary.mode` -> `s` (default `bare`).
-- `ostree.summary.tombstone-commits` -> `b`.
-- `ostree.summary.indexed-deltas` -> `b` (currently always true).
-- `ostree.summary.collection-id` -> `s`.
-- `ostree.summary.collection-map` -> `a{sa(s(taya{sv}))}`, both levels
+- `ostree.summary.mode` -> `s`, the repository mode string (for example
+  `archive-z2`, `bare`, `bare-user`).
+- `ostree.summary.last-modified` -> `t` big-endian, the generation time. It is
+  wall-clock and is NOT pinned by `SOURCE_DATE_EPOCH`.
+- `ostree.summary.tombstone-commits` -> `b`, the `[core] tombstone-commits`
+  value (default false); always emitted.
+- `ostree.summary.collection-map` -> `a{sa(s(taya{sv}))}`, present only when
+  the repository holds mirror refs (`refs/mirrors/<collection>/<ref>`). It maps
+  each collection id to a ref array shaped exactly like field 0. Both levels are
   byte-wise sorted.
+- `ostree.summary.indexed-deltas` -> `b`, the `[core] indexed-deltas` value
+  (default true); always emitted.
+- `ostree.summary.collection-id` -> `s`, present only when
+  `[core] collection-id` is set.
+- `ostree.static-deltas` -> `a{sv}`: delta-name (`FROM-TO` or `TO`) -> `ay`
+  32-byte superblock digest. Present only when the repository has static deltas.
+- `ostree.summary.expires` -> `t` big-endian. Emitted only when an expiry is
+  requested.
 
 Endianness summary: all `t` timestamps and `expires` are big-endian; the
-per-ref commit-object size `t` is host-order. GVariant does not re-sort dicts,
-so insertion order is the on-disk order.
+per-ref commit-object size `t` is host-order.
+
+### The `ostree-metadata` anchor commit
+
+When `[core] collection-id` is set, regenerating the summary first refreshes an
+anchor commit on `refs/heads/ostree-metadata`. The anchor is an empty-tree
+commit: root dirtree `6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d`
+(no entries) and root dirmeta
+`446a0ef11b7cc167f3b603e585c7eeeeb675faa412d5ec73f62988eb0b6c5488`
+(uid 0, gid 0, mode `040755`, no xattrs). Its metadata dict carries, in this
+order, `ostree.collection-binding` (`s`, the repository's collection id) and
+`ostree.ref-binding` (`as`, the single element `ostree-metadata`); subject and
+body are empty. The timestamp resolves like any commit (explicit,
+`SOURCE_DATE_EPOCH`, then the current time). Each regeneration commits a new
+anchor with the previous anchor as its parent, so the checksum advances on every
+run; the first generation on a fresh repository is parentless and reproducible.
+The anchor ref appears in field 0 by name like any other local ref.
 
 ### Summary signature -- `a{sv}`
 
-File `summary.sig` at repo root. Same signature keys as detached commit
-metadata. The signed payload is the exact byte content of the `summary` file.
-Summary and summary.sig are staged and renamed together so they always match.
+File `summary.sig` at repo root, a bare `a{sv}` with the same signature keys as
+detached commit metadata. The signed payload is the exact byte content of the
+`summary` file. Regenerating the summary removes any existing `summary.sig`,
+since a new summary invalidates the old signature; a caller that wants a signed
+summary regenerates and then signs.
 
 ## Checksum computation
 

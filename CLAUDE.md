@@ -89,6 +89,8 @@ When proposing a dependency, state:
 - exactly what it is used for and where;
 - that it is pure Rust with no C or `*-sys` linkage, and the same for its
   transitive dependencies as far as is knowable;
+- that its license and the licenses of its transitive dependencies are all
+  permissive (see "Requirement: permissive licenses only");
 - any lighter alternative considered, including hand-rolling.
 
 This keeps the dependency surface small and preserves the no-C-linkage
@@ -99,6 +101,30 @@ confirming note.
 At the start of each phase, before writing any code, list the crates that phase
 is expected to need and discuss them with the maintainer. Coding for a phase
 begins only once its dependency set is agreed.
+
+## Requirement: permissive licenses only
+
+The library and everything it links -- every crate in the dependency graph,
+across all workspace crates and every feature combination -- must be under a
+permissive license. This keeps the MIT library free of copyleft obligations
+for downstream consumers.
+
+Permissive licenses are: MIT, Apache-2.0 (including the
+`Apache-2.0 WITH LLVM-exception` variant), the BSD family (0BSD, BSD-1-Clause,
+BSD-2-Clause, BSD-3-Clause), ISC, Zlib, Unlicense, BSL-1.0, and Unicode-3.0. A
+crate whose SPDX expression offers a choice (for example `MIT OR Apache-2.0` or
+`MIT OR Apache-2.0 OR LGPL-2.1-or-later`) qualifies when at least one option is
+permissive.
+
+Copyleft and weak-copyleft licenses are prohibited: GPL, LGPL, AGPL, MPL, EUPL,
+CDDL, CeCILL, and any license with comparable reciprocal terms. A crate offered
+only under such a license must not enter the graph, not even behind an optional
+feature.
+
+This is verifiable with `cargo metadata`: the `license` field of every package
+in `cargo metadata --format-version 1 --all-features` must be permissive by the
+rule above. Any crate with a null or empty `license` field must be inspected
+by hand before it is accepted.
 
 ## Working conventions
 

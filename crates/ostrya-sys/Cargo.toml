@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-sys"
-description = "Audited unsafe rustix syscall wrappers for ostrya (fs-verity ioctls)"
+description = "Audited unsafe rustix syscall wrappers for ostrya (fs-verity ioctls, read-only mmap)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +9,8 @@ repository.workspace = true
 readme.workspace = true
 
 [dependencies]
-rustix = { version = "1", default-features = false, features = ["std"] }
+rustix = { version = "1", default-features = false, features = [
+    "std",
+    "mm",
+    "fs",
+] }

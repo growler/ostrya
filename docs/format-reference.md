@@ -831,18 +831,98 @@ byte plus body. Compression: 0 = none, `x` = xz/lzma (the only real
 compression written; the reader accepts only 0 and `x`).
 
 Constants: objtype+csum stride is 33 bytes (1 objtype + 32 csum). Part max size
-16 MiB (advisory). Delta part version 0.
+16 MiB (advisory). Delta part version 0. The `SIGNED_FORMAT` magic is the eight
+ASCII bytes `OSTSGNDT`; read as a little-endian `t` that is `0x54444E475354534F`,
+read big-endian it is `0x4F535453474E4454`. A superblock file that begins with
+those eight bytes is a signed envelope: the `ay` it wraps is the raw
+`SUPERBLOCK_FORMAT` bytes (the payload the signatures cover), and the trailing
+`a{sv}` holds signatures under the per-engine keys (for example
+`ostree.sign.ed25519 -> aay`), the same framing commit and summary signing use.
+An unsigned delta stores the raw `SUPERBLOCK_FORMAT` bytes directly.
+
+Object delivery. The target commit object is embedded whole in the superblock
+(the `(a{sv}aya(say)sstayay)` field); it is not carried in any part, and
+re-serializing it hashes to the `to` checksum. Every other object is produced by
+a part. A part's meta-entry carries the ordered objtype+csum array; the
+operation stream produces objects in that order, and the object type at the
+current position selects how an operation is decoded. The `part-checksum` is the
+SHA-256 of the on-disk part file (the `(y@ay)` framing bytes). Fallback objects
+are delivered outside the parts as plain loose objects.
+
+Fallback selection (generation-side; recovered by observing the tool). An object
+is delivered as a fallback when its uncompressed size is at least
+`--min-fallback-size` megabytes, and is packed into a part otherwise. The unit
+is decimal megabytes (a factor of 1,000,000, not 1,048,576) and the default is
+4, so the default threshold is 4,000,000 bytes, and an object whose size equals
+the threshold is a fallback. The size compared is the object's uncompressed
+stream size -- the file header plus content -- not the content alone: with a
+25-byte regular-file header
+(uid/gid/mode, empty xattrs, empty symlink target for a `uid=gid=0`, no-xattr
+file), the largest packed content run is 3,999,974 bytes and 3,999,975 bytes
+becomes a fallback, and the same 25-byte offset holds when the threshold is set
+elsewhere (for example 2,000,000). Applying a delta does not use this threshold:
+the reader delivers whatever the superblock's fallback array lists and requires
+those objects to be present already. A generator reproduces the rule to choose
+fallbacks the way the tool does.
 
 Opcodes (ASCII): `S` open-splice-and-close, `o` open, `w` write, `r`
 set-read-source, `R` unset-read-source, `c` close, `B` bspatch. Operands are
-LEB128 varints. The `c` (close) opcode asserts the produced object's SHA-256
-equals the expected checksum: this is the end-to-end integrity gate.
+LEB128 varints; offsets are absolute byte offsets into the part's
+raw-data-source blob. The `c` (close) opcode takes no operand and asserts the
+produced object's SHA-256 equals the expected checksum: this is the end-to-end
+integrity gate.
+
+Operand grammar (recovered by observing the tool):
+
+- `S` for a metadata object (dirtree/dirmeta): `(length, offset)` -- splice
+  `length` bytes at `offset` in the data source as the object's serialized
+  bytes, and close.
+- `S` for a content object (file/symlink): `(mode-index, xattr-index, length,
+  offset)` -- the mode and xattr tables supply the object's metadata; a symlink
+  (mode `S_IFLNK`) takes the spliced bytes as its target, a regular file as its
+  content.
+- `o` (open) for a content object: `(mode-index, xattr-index, output-size)`.
+- `r` (set-read-source): `(offset)` -- at `offset` in the data source lie the 32
+  bytes of a source object's checksum; that object's content becomes the read
+  source for the following `B` or `w` ops.
+- The tool emits one `r`/`R` pair per contiguous run it copies out of a source
+  object, so an object reconstructed from scattered runs names the same source
+  checksum once per run: a 4 MiB object with forty scattered 512-byte edits
+  carries 41 `r` ops and 41 `R` ops against one source object.
+- `R` (unset-read-source): no operand.
+- `B` (bspatch): `(stream-offset, stream-length)` -- the bspatch stream is
+  `stream-length` bytes at `stream-offset` (which is the preceding `r` offset
+  plus 32), applied against the read source to fill the open object; `c` then
+  closes it.
+- `w` (write, rollsum): `(length, offset)` -- append `length` bytes to the open
+  object, read at `offset` in the current source: the read-source object when a
+  preceding `r` set one, the part's data source otherwise. The output is written
+  strictly forward, so the destination is the implicit output cursor and only the
+  read offset is carried. Emitted for from->to deltas of larger objects, where
+  the tool prefers rollsum chunking to bsdiff (smaller objects still use bsdiff
+  or splice): a run of `w` ops with a read source set copies the unchanged
+  content-defined chunks out of the source object, and a `w` with no read source
+  writes the changed run from the payload. A rollsum object's stream is `o`, then
+  `r`/`w`.../`R` groups interleaved with payload `w` ops, then `c`.
+
+bspatch stream. The embedded bspatch stream is the classic bsdiff patch with its
+three streams interleaved and stored uncompressed (the enclosing part is xz'd as
+a whole). It is a sequence of blocks, consumed until the output reaches the
+opened object's size, each: a 24-byte control block of three signed 64-bit
+integers in bsdiff `offtin` sign-magnitude little-endian encoding (`diff-length`,
+`extra-length`, source `seek`); `diff-length` bytes each added, wrapping, to the
+source bytes at the current source position; then `extra-length` verbatim bytes;
+after which the source position advances by `diff-length` and then by `seek`.
 
 Endianness hazard: the `u`/`t` fields in meta entries, fallbacks, and fallback
 headers are host byte order gated by an `ostree.endianness` byte (`l`/`B`) in
 superblock metadata (a historical inconsistency, with a size-ratio heuristic
 fallback when the byte is missing). The superblock timestamp is always BE; the
-`(uuu)` mode triple is always BE.
+`(uuu)` mode triple is always BE regardless of that byte. Applying a delta reads
+none of the host-order-gated fields -- parts are read by name and checked by
+their SHA-256, the modes are swapped from their fixed big-endian form, and the
+embedded commit is normal-form little-endian -- so a big-endian delta applies
+through the same path.
 
 ## Signing details
 

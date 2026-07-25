@@ -44,10 +44,12 @@ reference, or reading material.
 
 ## Goals
 
-1. Rust-native with no C library linkage beyond what `std` links. `rustix`
-   handles the syscalls a portable async file API cannot express (fd-relative
-   opens and metadata, xattrs, statx, FICLONE reflink, O_TMPFILE + linkat,
-   OFD locks); streaming file I/O goes through the runtime's async file.
+1. Rust-native. `liblzma` is the one C library linked: statically built from
+   source for xz in static deltas, requiring no C runtime of its own beyond the
+   libc `std` already links. Nothing else links C. `rustix` handles the
+   syscalls a portable async file API cannot express (fd-relative opens and
+   metadata, xattrs, statx, FICLONE reflink, O_TMPFILE + linkat, OFD locks);
+   streaming file I/O goes through the runtime's async file.
 2. Async, with a feature-gated runtime backend behind the internal
    `ostrya-rt` crate: `smol` by default, `tokio` optional. Only `ostrya-rt`
    knows the backend.
@@ -128,7 +130,10 @@ by hand before it is accepted.
 
 ## Working conventions
 
-- Pure Rust only. No C libraries and no C-linking `*-sys` crates.
+- Every added crate must be authorized by the operator before it enters any
+  manifest. Do not suggest a crate that links a C library unless that library
+  is statically linked and requires no C runtime of its own beyond the libc
+  `std` already links (as `liblzma` does).
 - Byte-exact format fidelity is non-negotiable. Verify against golden fixtures
   produced by running the `ostree` tool as a black box, and cross-check both
   directions: the tool reads what the port writes, and the port reads what the

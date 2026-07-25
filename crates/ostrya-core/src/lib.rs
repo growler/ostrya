@@ -46,7 +46,7 @@ pub use xattr::{Xattrs, XattrsRef};
 // The dynamic GVariant value tree and its codec entry points. `Commit::metadata`
 // is a `Value`, so consuming crates need these to inspect, load, and serialize
 // arbitrary metadata dicts without depending on `ostrya-gvariant` directly.
-pub use ostrya_gvariant::{Type, Value, from_bytes, to_bytes};
+pub use ostrya_gvariant::{ArrayIter, GvDecode, GvType, Type, Value, from_bytes, to_bytes};
 
 #[cfg(test)]
 mod tests {

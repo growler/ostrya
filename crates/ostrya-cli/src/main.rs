@@ -17,6 +17,8 @@
 //! - `sign` -- add, verify, or delete commit signatures under one of the
 //!   ed25519, spki, or gpg engines.
 //! - `summary` -- regenerate, sign, or verify the repository summary.
+//! - `static-delta` -- list the repository's static deltas, or apply one
+//!   offline.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams to and from stdin/stdout flow through
@@ -64,6 +66,9 @@ enum Command {
     Sign(SignArgs),
     /// Regenerate, sign, or verify the repository summary.
     Summary(SummaryArgs),
+    /// List static deltas, or apply one offline.
+    #[command(name = "static-delta")]
+    StaticDelta(StaticDeltaArgs),
 }
 
 #[derive(Args)]
@@ -256,6 +261,27 @@ struct SummaryArgs {
     key_id: Vec<String>,
 }
 
+#[derive(Args)]
+struct StaticDeltaArgs {
+    /// The repository to operate on.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    #[command(subcommand)]
+    command: StaticDeltaCommand,
+}
+
+#[derive(Subcommand)]
+enum StaticDeltaCommand {
+    /// List the repository's static deltas.
+    List,
+    /// Apply a static delta from a directory offline, producing the target
+    /// commit's objects, and print the target commit checksum.
+    ApplyOffline {
+        /// The delta directory (holding `superblock` and numbered part files).
+        dir: PathBuf,
+    },
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match ostrya_rt::block_on(run(cli)) {
@@ -277,6 +303,25 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Diff(args) => diff(args).await,
         Command::Sign(args) => sign(args).await,
         Command::Summary(args) => summary(args).await,
+        Command::StaticDelta(args) => static_delta(args).await,
+    }
+}
+
+/// List the repository's static deltas, or apply one offline.
+async fn static_delta(args: StaticDeltaArgs) -> Result<()> {
+    let repo = Repo::open(&args.repo).await?;
+    match args.command {
+        StaticDeltaCommand::List => {
+            for name in repo.list_static_deltas().await? {
+                println!("{name}");
+            }
+            Ok(())
+        }
+        StaticDeltaCommand::ApplyOffline { dir } => {
+            let to = repo.apply_static_delta_offline(&dir).await?;
+            println!("{}", to.to_hex());
+            Ok(())
+        }
     }
 }
 

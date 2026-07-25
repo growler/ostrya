@@ -14,11 +14,12 @@ library is MIT-licensed.
 
 ## Goals and constraints
 
-1. Rust-native, no C library linkage beyond what `std` links. `rustix`
-   handles the syscalls a portable async file API cannot express
-   (fd-relative opens and metadata, xattrs, statx, FICLONE reflink,
-   O_TMPFILE + linkat, OFD locks); streaming file I/O goes through the
-   runtime's async file.
+1. Rust-native. `liblzma` is the one C library linked: statically built from
+   source for xz in static deltas, requiring no C runtime of its own beyond the
+   libc `std` already links. Nothing else links C. `rustix` handles the
+   syscalls a portable async file API cannot express (fd-relative opens and
+   metadata, xattrs, statx, FICLONE reflink, O_TMPFILE + linkat, OFD locks);
+   streaming file I/O goes through the runtime's async file.
 2. Async, with a feature-gated runtime backend behind the internal
    `ostrya-rt` crate: `smol` by default, `tokio` optional.
 3. Multiple concurrent transactions within a single process.
@@ -39,8 +40,11 @@ redesigned to be idiomatic Rust (see `api-sketch.md`).
 
 ## Interpretation of "no dependencies except rust"
 
-Read as: pure Rust only, no C libraries and no `*-sys` crates that link C. The
-Rust crate ecosystem is in scope. Proposed foundation crates, all pure Rust:
+Read as: the Rust crate ecosystem is in scope and C libraries are avoided. The
+one exception is `liblzma`, statically linked for xz (see the Decisions
+section); it requires no C runtime beyond the libc `std` already links. Every
+crate is authorized by the operator before it enters a manifest. The foundation
+crates below are all pure Rust:
 
 - `rustix` -- the syscalls a portable async file API cannot express:
   fd-relative open/stat/link/rename/readlink/mkdir, xattrs, statx, statvfs,
@@ -57,10 +61,10 @@ Rust crate ecosystem is in scope. Proposed foundation crates, all pure Rust:
 - `pin-project-lite` -- pin projection for the stream wrapper types.
 - `sha2` (RustCrypto) -- SHA-256; `digest` -- the hashing trait surface the
   hashing streams are generic over.
-- `async-compression`, restricted to its `deflate` codec feature plus the
-  trait-family features (its zstd and xz features pull C) -- streaming raw
-  DEFLATE for archive-mode content objects, over `flate2` with the
-  pure-Rust `miniz_oxide` backend.
+- `async-compression`, with its `deflate` and `xz` codec features plus the
+  trait-family features -- streaming raw DEFLATE for archive-mode content
+  objects (over `flate2` with the pure-Rust `miniz_oxide` backend) and
+  streaming xz for static-delta parts (over statically-linked `liblzma`).
 - `ed25519-dalek` -- the ed25519 sign engine.
 - GPG signing and verification: no crate -- the engine runs the system
   `gpg`/`gpgv` binaries as subprocesses (see Decisions).
@@ -68,12 +72,13 @@ Rust crate ecosystem is in scope. Proposed foundation crates, all pure Rust:
 - `smol-tar` -- async tar import/export in the smol ecosystem.
 - `clap` -- command-line argument parsing for the `ostrya` binary
   (`ostrya-cli` only).
-- LZMA/xz, HTTP client, INI parsing, fs-verity, and EROFS: see the Decisions
-  section; each has a pure-Rust path.
+- HTTP client, INI parsing, fs-verity, and EROFS: see the Decisions section;
+  each has a pure-Rust path. LZMA/xz links `liblzma` statically (see the
+  Decisions section).
 
-Anything that would pull in C (openssl-sys, libgpg-error/gpgme, libcurl,
-libsoup, liblzma via xz2, libarchive, libcomposefs, glib) is excluded by
-constraint 1.
+Anything else that would pull in C (openssl-sys, libgpg-error/gpgme, libcurl,
+libsoup, libarchive, libcomposefs, glib) is excluded by constraint 1;
+statically-linked `liblzma` is the sole authorized exception.
 
 ## Architecture
 
@@ -1505,11 +1510,83 @@ checksum matches the tool's); the tool verifies our port-signed summary via
 
 ### Phase 15 -- Static deltas
 
-GVariant superblock/part/fallback formats, LEB128 op stream, the endianness
-byte handling, rollsum (bupsplit) and bsdiff (pure Rust), xz encode/decode,
-delta generation and offline application, indexes, signed deltas.
-Verify: apply tool-generated deltas and get correct objects; the tool applies
-our deltas; `test-delta`, `test-delta-ed25519`, `test-delta-sign`.
+Split into sub-phases, mirroring the interop directions:
+
+#### Phase 15a -- Reading and offline application (DONE)
+
+GVariant superblock/part/fallback/signed formats, the LEB128 operation VM,
+xz decode, bspatch, offline application, local delta listing, and signed-delta
+verification. `Repo::apply_static_delta_offline` reads a delta the tool wrote --
+the superblock (with the target commit embedded whole), the xz-compressed parts,
+the mode/xattr tables, the data-source blob, and the operation stream (`S`
+splice, `o`/`c` open/close, `r`/`R` read-source, `w` rollsum write, `B` bspatch)
+-- and produces the target commit's objects, asserting each object's SHA-256 as
+it is written (the `c`/`S` close is the integrity gate). The `w` op appends
+`length` bytes read at `offset` in the current source (the read-source object
+when one is set, the part's data source otherwise), which reconstructs a rollsum
+object by copying its unchanged content-defined chunks out of the source object
+and carrying only the changed runs in the payload. bspatch is hand-rolled over
+the interleaved bsdiff control/diff/extra layout with `offtin` sign-magnitude
+integers. `Repo::verify_static_delta` checks a signed delta's signatures with the
+Phase 13 engines over the raw superblock bytes, and `Repo::list_static_deltas`
+lists the deltas under `deltas/`. A native `ostrya static-delta` subcommand
+exposes `list` and `apply-offline`. The recovered operand grammar and bspatch
+layout are in `format-reference.md`. xz decode streams through
+`async-compression`'s xz codec; xz encode, the same codec's other half, lands
+with generation. Application is memory-bounded: the superblock is read whole
+(bounded metadata, capped at the metadata ceiling), parts decompress into
+anonymous temp files in the repo, part payloads and source objects at or below
+128 KiB stay on the heap and larger ones are read-only mmapped, and objects
+stream through the content writer rather than materializing whole. A part names
+its read source once per contiguous run it copies, so the reader holds the loaded
+source across the `R` that ends a run and reuses it when a later `r` names the
+same checksum; objects are content-addressed, so a checksum match means
+identical bytes. One source object is held at a time.
+
+Dependency: `liblzma` (MIT/Apache-2.0), statically linked and built from source
+(bundled xz 5.8, no runtime liblzma), backing `async-compression`'s xz codec in
+both directions. It is the sole authorized C-linking exception (see the
+Interpretation section and decision #1).
+
+Verify: the port applies the tool's from-scratch, from->to bspatch, and from->to
+rollsum deltas and reproduces the target commit's objects, the tool's `fsck` and
+`ls -R` validate the objects the port wrote, and ed25519-signed deltas verify
+against a trusted key and are rejected under a foreign key (`tests/delta.rs`,
+`static_delta_list_and_apply_offline` in the CLI tests). The from-scratch fixture
+carries a 512 KiB object to exercise the temp-file + mmap part-payload path; the
+bspatch case uses a 20 KiB object; and the rollsum case edits a 2 MiB file in
+place, which the tool expresses with `r`/`w`/`R` copy-from-source ops (the test
+asserts the tool emitted rollsum writes before applying).
+
+#### Phase 15b -- Generation (pending)
+
+rollsum (bupsplit) chunking and the `write` op, bsdiff generation, xz encode
+(via `async-compression`'s xz codec, already linked in 15a), superblock/part/
+index writing, `delta-indexes` cache, and signed-delta generation. The
+bsdiff-generate approach (hand-roll versus a crate) is settled at 15b start.
+
+Object-selection thresholds (the `ostree static-delta generate` knobs, defaults
+recovered by observing the tool). All three take a value in decimal megabytes (a
+factor of 1,000,000). The generator reproduces them so it packs, patches, and
+falls back the way the tool does:
+
+- `--min-fallback-size`, default 4 (4,000,000 bytes). An object whose
+  uncompressed size (file header plus content) is at least the threshold is
+  delivered as a fallback loose object rather than packed into a part. The full
+  rule is in `format-reference.md`, "Static delta wire format".
+- `--max-bsdiff-size`, default 64 (64,000,000 bytes). bsdiff is considered for a
+  modified object only when the input file content size is at most the threshold;
+  a larger input skips bsdiff, leaving rollsum or fallback. The comparison is on
+  the content size and is inclusive: content of exactly 64,000,000 still uses
+  bsdiff, 64,000,001 does not.
+- `--max-chunk-size`, default 32 (32,000,000 bytes). A part's payload is capped
+  near the threshold; once the accumulated payload would exceed it the generator
+  starts a new part. The default packs about 31 one-megabyte objects per part and
+  splits at the 32nd; `--max-chunk-size=8` splits at the eighth, confirming the
+  decimal-megabyte unit.
+
+Verify: the tool applies our deltas; `test-delta`, `test-delta-ed25519`,
+`test-delta-sign`.
 
 ### Phase 16 -- Pull
 
@@ -1591,9 +1668,10 @@ admin tests. Recommend deferring or descoping unless explicitly required.
   images, is available as a second cross-check oracle alongside the tool.
 - GVariant byte-exactness (Phase 1): everything downstream depends on it.
   Mitigation: extensive golden fixtures before building on it.
-- xz encoding in pure Rust (Phase 15): decode is well-supported; encode is
-  weaker. Mitigation: delta parts need only valid xz that round-trips (the part
-  checksum is over our own compressed bytes), not byte-identity with liblzma.
+- xz coding (Phases 15a/15b): resolved. Decode (15a) and encode (15b) both go
+  through `async-compression`'s xz codec over statically-linked `liblzma`, the
+  reference implementation the tool itself uses, so the parts we write are
+  ordinary liblzma-produced xz the tool decodes.
 - HTTP client (Phase 16a): HTTP/2 support is required, which puts a
   pure-Rust HTTP/2 implementation on the dependency surface; candidate
   crates couple to tokio-flavored I/O traits that need adapting to
@@ -1610,9 +1688,11 @@ admin tests. Recommend deferring or descoping unless explicitly required.
 
 Resolved:
 
-1. Dependency policy: pure Rust only, no C libraries and no C-linking `*-sys`
-   crates. The pure-Rust crate ecosystem is in scope (rustix, smol, sha2,
-   ed25519-dalek, rustls, miniz_oxide, lzma-rs, and so on).
+1. Dependency policy: every crate is authorized by the operator before it
+   enters a manifest. C libraries are avoided; the sole exception is `liblzma`,
+   statically linked for xz (bundled and built from source, needing no C
+   runtime beyond the libc `std` links). The Rust crate ecosystem is in scope
+   (rustix, smol, sha2, ed25519-dalek, rustls, miniz_oxide, and so on).
 2. GVariant: hand-roll a minimal codec (`ostrya-gvariant`) tailored to
    ostree's fixed type set, fuzzed against golden bytes from the tool.
 3. Test-suite scope: phased. Target the library-format-testable subset plus

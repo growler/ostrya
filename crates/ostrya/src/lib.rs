@@ -92,12 +92,20 @@
 //! (agent-held and hardware-token keys included), verification runs `gpgv`
 //! over binary or armored keyrings, and detached OpenPGP signatures accumulate
 //! under `ostree.gpgsigs` with per-signature metadata parsed from the
-//! `--status-fd` stream.
+//! `--status-fd` stream. It also covers static-delta reading and offline
+//! application (Phase 15a): [`Repo::apply_static_delta_offline`] reads a delta
+//! the tool wrote -- the superblock, the xz-compressed parts, and the operation
+//! stream (splice, open/close, set-read-source, rollsum write, and bspatch) --
+//! and produces the target commit's objects, asserting each checksum as written,
+//! and [`Repo::verify_static_delta`] checks a signed delta's signatures with the
+//! signing engines over the raw superblock bytes.
 
+mod bspatch;
 pub mod checkout;
 pub mod commit;
 pub mod composefs;
 pub mod config;
+mod delta;
 pub mod diff;
 pub mod error;
 pub mod file;

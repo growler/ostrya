@@ -878,3 +878,80 @@ fn sign_verify_gpg_default_trust() {
         "verify must fail with an empty trusted set"
     );
 }
+
+/// Find the single delta directory under `repo/deltas`.
+fn only_delta_dir(repo: &Path) -> PathBuf {
+    let deltas = repo.join("deltas");
+    std::fs::read_dir(&deltas)
+        .unwrap()
+        .flat_map(|fanout| std::fs::read_dir(fanout.unwrap().path()).unwrap())
+        .map(|leaf| leaf.unwrap().path())
+        .next()
+        .unwrap_or_else(|| panic!("no delta directory under {}", deltas.display()))
+}
+
+#[test]
+fn static_delta_list_and_apply_offline() {
+    if !ostree_available() {
+        eprintln!("skipping: ostree tool not available");
+        return;
+    }
+    let tmp = TmpDir::new("static-delta");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = format!("--repo={}", repo.display());
+
+    // The tool generates a from-scratch delta to the fixture commit.
+    let generated = Command::new("ostree")
+        .args([
+            &repo_arg,
+            "static-delta",
+            "generate",
+            "--empty",
+            "--to",
+            COMMIT,
+        ])
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "tool delta generate failed");
+
+    // `list` prints the delta names, matching the tool.
+    let listed = ostrya(
+        &["static-delta", "--repo", repo.to_str().unwrap(), "list"],
+        None,
+        &[],
+    );
+    assert_eq!(listed.ok().stdout_trimmed(), COMMIT);
+
+    // `apply-offline` reproduces the target commit in a fresh repository.
+    let dst = base.join("dst");
+    block_on(async {
+        Repo::create(&dst, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+    });
+    let delta_dir = only_delta_dir(&repo);
+    let applied = ostrya(
+        &[
+            "static-delta",
+            "--repo",
+            dst.to_str().unwrap(),
+            "apply-offline",
+            delta_dir.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(applied.ok().stdout_trimmed(), COMMIT, "apply prints target");
+
+    // The tool reads the tree the port produced.
+    let ls = Command::new("ostree")
+        .args([&format!("--repo={}", dst.display()), "ls", "-R", COMMIT])
+        .output()
+        .unwrap();
+    assert!(
+        ls.status.success(),
+        "tool could not read the applied tree:\n{}",
+        String::from_utf8_lossy(&ls.stderr)
+    );
+}

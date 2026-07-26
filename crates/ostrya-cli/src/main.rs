@@ -17,8 +17,8 @@
 //! - `sign` -- add, verify, or delete commit signatures under one of the
 //!   ed25519, spki, or gpg engines.
 //! - `summary` -- regenerate, sign, or verify the repository summary.
-//! - `static-delta` -- list the repository's static deltas, or apply one
-//!   offline.
+//! - `static-delta` -- list the repository's static deltas, apply one offline,
+//!   generate one, or rebuild the delta index cache.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams to and from stdin/stdout flow through
@@ -31,9 +31,9 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CommitModifier, CommitModifierFlags, CommitOptions,
-    DiffChange, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, MutableTree, ObjectType,
-    PruneOptions, Repo, Result, SummaryOptions, TarExportOptions, TarImportOptions, Type, Value,
-    Verifier, VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
+    DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, MutableTree,
+    ObjectType, PruneOptions, Repo, Result, SummaryOptions, TarExportOptions, TarImportOptions,
+    Type, Value, Verifier, VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -66,7 +66,7 @@ enum Command {
     Sign(SignArgs),
     /// Regenerate, sign, or verify the repository summary.
     Summary(SummaryArgs),
-    /// List static deltas, or apply one offline.
+    /// List, generate, apply, or index static deltas.
     #[command(name = "static-delta")]
     StaticDelta(StaticDeltaArgs),
 }
@@ -280,6 +280,63 @@ enum StaticDeltaCommand {
         /// The delta directory (holding `superblock` and numbered part files).
         dir: PathBuf,
     },
+    /// Generate a static delta and print the directory it was written to.
+    ///
+    /// The three size thresholds take a count of bytes. The same-named `ostree`
+    /// options take decimal megabytes, so pass 4000000 where `ostree` takes 4.
+    Generate(DeltaGenerateArgs),
+    /// Rebuild the `delta-indexes/` cache from the deltas present.
+    Reindex,
+}
+
+#[derive(Args)]
+struct DeltaGenerateArgs {
+    /// The source commit (a checksum or a ref); omit for a delta from scratch.
+    #[arg(long)]
+    from: Option<String>,
+    /// The target commit (a checksum or a ref).
+    #[arg(long)]
+    to: String,
+    /// Deliver an object whose stream reaches this many bytes as a loose
+    /// fallback instead of packing it into a part.
+    #[arg(long, default_value_t = 4_000_000)]
+    min_fallback_size: u64,
+    /// The largest content size a bspatch stream is attempted for.
+    #[arg(long, default_value_t = 64_000_000)]
+    max_bsdiff_size: u64,
+    /// Close a part once its payload would pass this many bytes.
+    #[arg(long, default_value_t = 32_000_000)]
+    max_chunk_size: u64,
+    /// Never emit bspatch streams; splice what chunking cannot express.
+    #[arg(long)]
+    disable_bsdiff: bool,
+    /// Pin the superblock timestamp (seconds since the Unix epoch) for
+    /// reproducible output; defaults to the current time.
+    #[arg(long)]
+    timestamp: Option<u64>,
+    /// Write the delta's files here instead of into the repository's `deltas/`.
+    /// The directory's other contents are left alone, so part files of a longer
+    /// delta written here before stay behind.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+    /// Sign the generated delta with this key; repeatable. A base64 secret key
+    /// for ed25519 and spki, a KEY-ID for gpg, as `ostrya sign` takes them.
+    #[arg(long = "sign")]
+    sign: Vec<String>,
+    /// The signature engine used for --sign.
+    #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
+    sign_type: SignType,
+    /// Read signing key(s) from a file; repeatable, same format as
+    /// `ostrya sign`.
+    #[arg(long)]
+    keys_file: Vec<PathBuf>,
+    /// The GnuPG home directory gpg resolves signing keys in. Only for gpg.
+    #[arg(long)]
+    gpg_homedir: Option<PathBuf>,
+    /// Rebuild the index cache after generating. Covers the deltas under the
+    /// repository's `deltas/` tree, so it cannot be combined with --output-dir.
+    #[arg(long)]
+    reindex: bool,
 }
 
 fn main() -> std::process::ExitCode {
@@ -307,7 +364,8 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-/// List the repository's static deltas, or apply one offline.
+/// List the repository's static deltas, apply one offline, generate one, or
+/// rebuild the index cache.
 async fn static_delta(args: StaticDeltaArgs) -> Result<()> {
     let repo = Repo::open(&args.repo).await?;
     match args.command {
@@ -322,7 +380,122 @@ async fn static_delta(args: StaticDeltaArgs) -> Result<()> {
             println!("{}", to.to_hex());
             Ok(())
         }
+        StaticDeltaCommand::Generate(generate) => delta_generate(&repo, &args.repo, generate).await,
+        StaticDeltaCommand::Reindex => repo.reindex_static_deltas().await,
     }
+}
+
+/// Generate a static delta, optionally sign it, and print its directory.
+async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) -> Result<()> {
+    // Indexing rebuilds the cache from the deltas present under the
+    // repository's `deltas/` tree, which a delta written elsewhere is not part
+    // of, so the pair would silently index nothing.
+    if args.reindex && args.output_dir.is_some() {
+        return Err(Error::InvalidFormat(
+            "--reindex covers the deltas under the repository's deltas/ tree, so it \
+             cannot be combined with --output-dir"
+                .into(),
+        ));
+    }
+    let from = match args.from.as_deref() {
+        Some(rev) => Some(resolve(repo, rev).await?),
+        None => None,
+    };
+    let to = resolve(repo, &args.to).await?;
+
+    let opts = DeltaOptions {
+        min_fallback_size: args.min_fallback_size,
+        max_bsdiff_size: args.max_bsdiff_size,
+        max_chunk_size: args.max_chunk_size,
+        bsdiff: !args.disable_bsdiff,
+        timestamp: args.timestamp,
+        output_dir: args.output_dir.clone(),
+    };
+    let written = repo
+        .generate_static_delta(from.as_ref(), &to, &opts)
+        .await?;
+    // The default location is repository-relative; an output directory is
+    // already resolved against this process's working directory.
+    let dir = match &args.output_dir {
+        Some(dir) => dir.clone(),
+        None => repo_path.join(written),
+    };
+
+    if !args.sign.is_empty() || !args.keys_file.is_empty() {
+        delta_sign(repo, &dir, &args).await?;
+    }
+    if args.reindex {
+        repo.reindex_static_deltas().await?;
+    }
+    println!("{}", dir.display());
+    Ok(())
+}
+
+/// Sign a generated delta once per requested key, under the chosen engine.
+async fn delta_sign(repo: &Repo, dir: &Path, args: &DeltaGenerateArgs) -> Result<()> {
+    match args.sign_type {
+        SignType::Ed25519 => {
+            for key in delta_secret_keys(args)? {
+                repo.sign_static_delta(dir, &Ed25519Signer::from_base64(&key)?)
+                    .await?;
+            }
+            Ok(())
+        }
+        SignType::Spki => delta_sign_spki(repo, dir, args).await,
+        SignType::Gpg => delta_sign_gpg(repo, dir, args).await,
+    }
+}
+
+#[cfg(feature = "spki")]
+async fn delta_sign_spki(repo: &Repo, dir: &Path, args: &DeltaGenerateArgs) -> Result<()> {
+    for key in delta_secret_keys(args)? {
+        repo.sign_static_delta(dir, &SpkiSigner::from_base64(&key)?)
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "spki"))]
+async fn delta_sign_spki(_: &Repo, _: &Path, _: &DeltaGenerateArgs) -> Result<()> {
+    Err(unsupported_type("spki"))
+}
+
+#[cfg(feature = "gpg")]
+async fn delta_sign_gpg(repo: &Repo, dir: &Path, args: &DeltaGenerateArgs) -> Result<()> {
+    if !args.keys_file.is_empty() {
+        return Err(Error::Signature(
+            "gpg signing takes --sign KEY-ID arguments; --keys-file serves the other engines"
+                .into(),
+        ));
+    }
+    for key in &args.sign {
+        let mut signer = GpgSigner::new(key);
+        if let Some(dir) = &args.gpg_homedir {
+            signer = signer.with_homedir(dir);
+        }
+        repo.sign_static_delta(dir, &signer).await?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "gpg"))]
+async fn delta_sign_gpg(_: &Repo, _: &Path, _: &DeltaGenerateArgs) -> Result<()> {
+    Err(unsupported_type("gpg"))
+}
+
+/// The base64 secret keys for a delta signing run: the `--sign` values plus the
+/// non-blank lines of each `--keys-file`.
+fn delta_secret_keys(args: &DeltaGenerateArgs) -> Result<Vec<String>> {
+    let mut keys = args.sign.clone();
+    for path in &args.keys_file {
+        keys.extend(read_key_lines(path)?);
+    }
+    if keys.is_empty() {
+        return Err(Error::Signature(
+            "no signing key given; pass --sign or --keys-file".into(),
+        ));
+    }
+    Ok(keys)
 }
 
 async fn commit(args: CommitArgs) -> Result<()> {

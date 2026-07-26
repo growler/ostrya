@@ -14,7 +14,10 @@ use crate::error::{Error, Result};
 use crate::valiter::ValidatedIter;
 
 /// A canonical, sorted xattr set.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// The set is canonical, so equal sets hold equal bytes in equal order and
+/// hashing agrees with equality: a set serves as a lookup key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Xattrs(Vec<(Vec<u8>, Vec<u8>)>);
 
 impl Xattrs {

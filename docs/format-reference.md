@@ -225,6 +225,12 @@ insertion order is the on-disk order):
   wall-clock and is NOT pinned by `SOURCE_DATE_EPOCH`.
 - `ostree.summary.tombstone-commits` -> `b`, the `[core] tombstone-commits`
   value (default false); always emitted.
+- `ostree.static-deltas` -> `a{sv}`: delta-name (`FROM-TO` or `TO`) -> `ay`
+  32-byte superblock digest. Present only when the repository has static deltas.
+  Observed here, between `tombstone-commits` and `indexed-deltas`, by running
+  `ostree summary -u` on a repository holding one from-scratch and one from-to
+  delta. Its order relative to `ostree.summary.collection-map` is not yet
+  observed, since that needs a collection repository carrying deltas.
 - `ostree.summary.collection-map` -> `a{sa(s(taya{sv}))}`, present only when
   the repository holds mirror refs (`refs/mirrors/<collection>/<ref>`). It maps
   each collection id to a ref array shaped exactly like field 0. Both levels are
@@ -233,8 +239,6 @@ insertion order is the on-disk order):
   (default true); always emitted.
 - `ostree.summary.collection-id` -> `s`, present only when
   `[core] collection-id` is set.
-- `ostree.static-deltas` -> `a{sv}`: delta-name (`FROM-TO` or `TO`) -> `ay`
-  32-byte superblock digest. Present only when the repository has static deltas.
 - `ostree.summary.expires` -> `t` big-endian. Emitted only when an expiry is
   requested.
 
@@ -402,8 +406,27 @@ seconds is removed.
 Static delta directories use base64-checksum fanout. From-scratch:
 `deltas/<to_b64[0:2]>/<to_b64[2:]>/<target>`. From->to:
 `deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/<target>`. Targets are
-`superblock`, `meta`, and numeric part files `0`, `1`, .... Indexes live at
+`superblock` and one numeric part file per part, `0`, `1`, ..., and nothing else:
+the listing holds exactly those names for a from-scratch delta, a from->to
+delta, a four-part delta (`--max-chunk-size=0.1`), and a delta whose largest
+object went to a fallback (`--min-fallback-size=1`). Fallback objects are
+fetched loose from the repository and add no file here. Indexes live at
 `delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index`.
+
+An index file is an `a{sv}` holding one entry, `ostree.static-deltas`, whose
+variant is the `a{sv}` map the summary carries under the same key: delta name
+(`TO` or `FROM-TO`, in hex) to a 32-byte `ay`, the SHA-256 of that delta's
+`superblock` file. One index file per target commit lists every delta producing
+it. Recovered by running `ostree static-delta reindex` on a repository with two
+deltas and decoding the files it wrote; the digests match `sha256sum` over the
+superblocks. `static-delta generate` does not write or refresh an index --
+`reindex` does, and `ostree static-delta indexes` lists the indexed targets, one
+commit hex per line.
+
+`reindex` rebuilds the cache from the deltas present: after one of two delta
+directories is deleted, the pass removes that target's `.index` file and
+`static-delta indexes` lists only the remaining target. The fanout directory the
+removal empties stays in place.
 
 ### Config file (`<repo>/config`, GKeyFile / INI)
 
@@ -850,20 +873,106 @@ SHA-256 of the on-disk part file (the `(y@ay)` framing bytes). Fallback objects
 are delivered outside the parts as plain loose objects.
 
 Fallback selection (generation-side; recovered by observing the tool). An object
-is delivered as a fallback when its uncompressed size is at least
-`--min-fallback-size` megabytes, and is packed into a part otherwise. The unit
-is decimal megabytes (a factor of 1,000,000, not 1,048,576) and the default is
-4, so the default threshold is 4,000,000 bytes, and an object whose size equals
-the threshold is a fallback. The size compared is the object's uncompressed
-stream size -- the file header plus content -- not the content alone: with a
-25-byte regular-file header
-(uid/gid/mode, empty xattrs, empty symlink target for a `uid=gid=0`, no-xattr
-file), the largest packed content run is 3,999,974 bytes and 3,999,975 bytes
-becomes a fallback, and the same 25-byte offset holds when the threshold is set
-elsewhere (for example 2,000,000). Applying a delta does not use this threshold:
-the reader delivers whatever the superblock's fallback array lists and requires
-those objects to be present already. A generator reproduces the rule to choose
-fallbacks the way the tool does.
+is delivered as a fallback when the size compared against `--min-fallback-size`
+is at least the threshold, and is packed into a part otherwise. The unit is
+decimal megabytes (a factor of 1,000,000, not 1,048,576) and the default is 4, so
+the default threshold is 4,000,000 bytes, and an object whose size equals the
+threshold is a fallback. The value is read as a whole number of megabytes:
+`--min-fallback-size=0.1` over a commit holding one 5,000,000-byte object reports
+`Number of fallback entries: 0`, where `--min-fallback-size=1` over the same
+commit reports 1. A threshold of 0 turns fallbacks off: `--min-fallback-size=0`
+over that commit packs the object (`PartMeta0: nobjects=3 size=5000405
+usize=5000055`).
+
+The size compared is the object's file header variant, seven bytes, and the
+content -- not the content alone. Recovered by finding the content size at which
+an object switches sides. At a 4,000,000-byte threshold the largest packed content
+is 3,999,974 bytes and 3,999,975 becomes a fallback, an overhead of 25 bytes over
+the 18-byte header of a `uid=gid=0` no-xattr regular file, and the same offset
+holds at other thresholds (for example 2,000,000). At a 1,000,000-byte threshold
+over three header shapes: 999,974/999,975 for that same 18-byte header, an
+overhead of 25; 999,953/999,954 for a file carrying one 8-byte xattr, whose header
+is 39 bytes, an overhead of 46; and 999,658/999,659 for one carrying a 300-byte
+xattr, whose 334-byte header crosses the GVariant offset-width boundary, an
+overhead of 341. The overhead is seven bytes over the header variant in every
+case, so the header's own offset table counts and the constant does not move with
+the header's size. The on-disk content-stream framing is eight bytes (a big-endian
+`u32` length and four NUL bytes), one more than the count compared here.
+
+Applying a delta does not use this threshold: the reader delivers whatever the
+superblock's fallback array lists and requires those objects to be present
+already. The port compares the same size (`FALLBACK_FRAMING` in `deltagen.rs`), so
+it classifies every object as the tool does, including one sitting exactly on the
+threshold: `the_fallback_threshold_classifies_an_object_as_the_tool_does` runs the
+tool's own generation over both sides of the boundary and compares the fallback
+count.
+
+A fallback entry's two sizes (recovered by generating a delta over a 5,000,000-
+byte object and reading `static-delta show`): the compressed size is the loose
+object's on-disk size in the source repository (5,001,564 bytes for the `.filez`
+of that object in an archive repo, matching the file), and the uncompressed size
+is the content size alone (5,000,000), with no header included.
+
+Part meta-entry sizes. `size` is the part file's on-disk byte size, compression
+byte included. `usize` is the uncompressed payload the part delivers, summed over
+its objects: a metadata object's serialized length, a file's content length, a
+symlink's target length -- the file header is not counted. Recovered by
+comparing `static-delta show` against the objects a part carries: a part
+delivering one 8,192-byte file plus its one-entry dirtree (41 bytes, with dirmeta
+12) reports `usize=8233`, and a part of two 1,000,000-byte splices reports
+`usize=2000000`. For an all-splice part this equals the data-source blob size,
+which is why the two coincide there; for a rollsum or bspatch part it does not,
+since the blob then holds patch streams rather than content.
+
+Part packing. Objects accumulate into one part until adding the next would push
+the payload past `--max-chunk-size` (decimal megabytes, default 32), then a new
+part starts; metadata objects come before content objects. Observed with
+`--max-chunk-size=2` over five 1,000,000-byte objects: payloads of 1,000,218
+(the two metadata objects plus one file), 2,000,000, and 2,000,000.
+
+The port applies the rule with the incoming object's content size as the estimate,
+which is exact for a spliced object and an upper bound for a diffed one, and
+decides before the object is appended, so a part's payload never passes the
+ceiling. A diffed object whose payload comes out small therefore still closes the
+part it would have fit in, costing one extra xz stream and one extra pair of mode
+and xattr tables, and the port's part boundaries differ from the tool's for such an
+object. Both layouts are valid: a part's contents are named by its meta-entry, so
+where the boundaries fall decides a delta's size, not whether it applies.
+
+Superblock fields the tool writes. The metadata dict holds exactly one entry,
+`ostree.endianness` as a byte (`l` on a little-endian host). The timestamp is the
+generation wall-clock time, big-endian. `from` is an empty `ay` for a
+from-scratch delta. The recursion array is always empty. A meta-entry's version
+field is 0.
+
+Diff-source pairing (generation-side). The tool pairs a modified content object
+with the object at the same path in the source commit: a file that was renamed
+and edited is not paired (`modified: 0`) and travels whole. Pairing is also
+skipped when the two sizes differ substantially -- a 40,000-byte object paired
+after growing to 40,800 or 56,000 bytes, but not after growing to 59,600 or
+shrinking to 26,800. When a pair is found, the tool prefers rollsum chunking
+whenever chunking finds any shared chunk at all, however little: an 8,192-byte
+object whose chunking matched 1,133 bytes still went to rollsum. bsdiff appears
+only where chunking finds nothing, such as a 1,024-byte object with a small edit.
+
+The port pairs by path alone and does not reproduce the size-ratio rule. Pairing
+decides how large a delta is, not whether it is valid: a pair the ratio rule
+would have skipped costs a diff attempt whose result is discarded, and the object
+then travels whole exactly as it would have. This is the port's own choice in the
+same sense as the chunker's parameters. What the port bounds instead is the diff
+attempt itself, by the chunker's maximum chunk size, so an unrelated same-path
+rewrite of a large object is spliced without paying for a suffix sort first.
+
+Offline application limits in the tool (observed while applying port-generated
+deltas). `ostree static-delta apply-offline` refuses any delta whose fallback
+array is non-empty: "Cannot execute delta offline: contains nonempty http
+fallback entries" -- fallbacks are a pull-time mechanism. Its `open` opcode
+dispatch also asserts a bare-family repository, so a delta carrying rollsum or
+bspatch objects applies offline only into `bare`, `bare-user`, or
+`bare-user-only`, not into `archive`; a splice-only delta applies into any mode.
+The port's reader has neither restriction: it applies rollsum and bspatch
+deltas into an archive repository, and fallbacks apply as long as the objects
+they name are already present.
 
 Opcodes (ASCII): `S` open-splice-and-close, `o` open, `w` write, `r`
 set-read-source, `R` unset-read-source, `c` close, `B` bspatch. Operands are

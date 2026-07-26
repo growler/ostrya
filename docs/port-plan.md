@@ -66,6 +66,9 @@ crates below are all pure Rust:
   objects (over `flate2` with the pure-Rust `miniz_oxide` backend) and
   streaming xz for static-delta parts (over statically-linked `liblzma`).
 - `ed25519-dalek` -- the ed25519 sign engine.
+- `bsdiff` (BSD-2-Clause, no dependencies of its own) -- bspatch stream
+  generation for static deltas. Its output is the interleaved
+  control/diff/extra layout the port's own bspatch reads.
 - GPG signing and verification: no crate -- the engine runs the system
   `gpg`/`gpgv` binaries as subprocesses (see Decisions).
 - `rustls` plus `webpki-roots` / `rustls-native-certs` -- TLS for pull.
@@ -1558,35 +1561,197 @@ bspatch case uses a 20 KiB object; and the rollsum case edits a 2 MiB file in
 place, which the tool expresses with `r`/`w`/`R` copy-from-source ops (the test
 asserts the tool emitted rollsum writes before applying).
 
-#### Phase 15b -- Generation (pending)
+#### Phase 15b -- Generation (DONE)
 
-rollsum (bupsplit) chunking and the `write` op, bsdiff generation, xz encode
-(via `async-compression`'s xz codec, already linked in 15a), superblock/part/
-index writing, `delta-indexes` cache, and signed-delta generation. The
-bsdiff-generate approach (hand-roll versus a crate) is settled at 15b start.
+`Repo::generate_static_delta` writes a delta the tool applies: the superblock
+(the target commit embedded whole, `ostree.endianness` metadata, a wall-clock
+big-endian timestamp, per-part meta-entries, and the fallback array) and the
+xz-compressed numbered parts. `Repo::sign_static_delta` wraps a written
+superblock in the `OSTSGNDT` envelope through the Phase 13 engines, once per
+engine, and `Repo::reindex_static_deltas` rebuilds `delta-indexes/`. A native
+`ostrya static-delta generate` exposes the knobs, `--sign`, and `--reindex`, and
+`ostrya static-delta reindex` the index pass. Newly recovered format facts -- the
+meta-entry `size`/`usize` accounting, the fallback entry's two sizes, the part
+packing rule, the index file's `a{sv}` shape, and the tool's offline-application
+limits -- are in `format-reference.md`.
+
+Each object takes one of four routes, decided per object: a loose fallback past
+`min_fallback_size`; a rollsum copy-from-source stream (`o`, then `r`/`w`/`R`
+groups interleaved with payload `w` ops, then `c`) when content-defined chunking
+finds shared chunks with the object at the same path in the source commit; a
+bspatch stream against that same source when chunking finds nothing; or a splice
+otherwise, which is also the only route for metadata objects and symlinks.
+Chunking is this port's own (a 64-byte rolling window, 8 KiB average chunks
+bounded to 2 KiB..64 KiB) rather than a reproduction of the tool's: the receiver
+never sees the parameters, so they decide delta size, not validity. Repetitive
+content collapses the chunk digests -- zero padding triggers no boundary, so it
+cuts into identical maximum-size chunks under one digest -- and a chunk match
+prefers the source offset that continues the copy run in progress, which keeps
+such a stretch a single copy run and stops the candidate scan at its first byte
+comparison. That offset is decided by comparing the source bytes there, which
+costs no digest and requires no chunk boundary at the offset, since a copy run is
+a length the receiver reads out of the source object. A target chunk whose digest
+is absent from the index therefore still copies when the run in progress carries
+its bytes.
+
+bsdiff is attempted only where both objects are at or below the chunker's maximum
+chunk size (the suffix sort is over the source, and pairing by path can hand a
+small object a large predecessor), taking the tighter of that bound and
+`max_bsdiff_size`. Chunking having found nothing shared means
+different things at different sizes: across many chunks it means no chunk-sized
+window of the target occurs anywhere in the source, which is evidence the two
+objects are unrelated, while a one-chunk object is defeated by an edit anywhere.
+Bounding the attempt by the chunker's own granularity confines it to the second
+case, which is also where the tool emits bspatch. A patch that is produced is
+kept only when its novel data -- the nonzero bytes of the patch stream, since the
+enclosing xz reduces the zero runs of a diff against a near-identical source to
+almost nothing -- comes to under half the content it replaces. The bound has to
+be a fraction: a diff against unrelated content is nonzero except where the two
+bytes coincide, about 1 byte in 256 of high-entropy content, so it counts near
+0.996 of the output size and clears any bound at 1.0 while producing a larger
+delta for several times the CPU.
+
+A delta's files are written parts first, so an interrupted generation leaves no
+superblock for a reader to trust, and regenerating at an existing location unlinks
+that delta's superblock before the first part is overwritten. Each file is written
+under a temp name held by a drop guard that unlinks it until the rename putting the
+file in place disarms it, so a write that fails part-way -- an `ENOSPC` while a part
+is being compressed, say -- and a generation future dropped mid-await both take
+their temp file with them, leaving the sweep below what a killed process abandoned.
+Once the new superblock is in place, that sweep removes numbered parts past the new
+part count and temp files that have aged past an hour. Age is what keeps two runs
+out of each other's way: a generation renames each of its own temp files into place
+as it goes, so every temp file the sweep meets belongs to another run, and the
+process id in the name does not separate an abandoned leftover from a file a
+generation running right now is still writing, since two generations in one process
+share it.
+Unlinking a file still being written would fail that run's rename. The sweep
+recognizes what it removes by name, so it covers the repository's own `deltas/`
+tree alone: a directory named through `output_dir` is the caller's, nothing in it
+is removed, and a longer previous delta's extra parts stay there, costing disk
+rather than correctness since a reader takes the parts the superblock lists.
+Generating one delta twice at once into one directory is unsupported either way,
+as both runs write the same names; generating different deltas concurrently is
+supported, each having its own directory.
+
+Object order is metadata-then-content, each by checksum, so a given input
+produces a given delta; with `timestamp` pinned, generation is byte-reproducible
+for a given liblzma, since the part bytes are that library's output and a version
+change can move them. That guarantee also rests on the part compressor being
+pinned: parts are xz at preset 8, non-extreme, with the CRC64 check, which gives
+the 32 MiB LZMA2 dictionary the tool's parts carry, 370 MiB of encoder memory per
+concurrent part and 33 MiB to decode (`PART_XZ_LEVEL` in `deltagen.rs`, measured
+with `xz -8 -T1 -vv`).
+
+Generation is memory-bounded like application. A part's data source accumulates
+in a spill buffer that moves to an anonymous temp file past 128 KiB, spliced
+content streams into it in bounded chunks, and the part payload is serialized
+straight into the xz encoder: the GVariant framing is written around the two
+large byte arrays, whose lengths are known before the first byte, so the payload
+is never buffered whole (`ostrya-gvariant` exposes `choose_offset_size` and
+`write_offset` for that). Those lengths are also what the framing offsets are
+derived from, so the data source is held to them: the handover to the blocking
+side flushes the spill file, since the async file performs its writes on a
+background task and reports a failed one at the next flush rather than from
+`write_all`, and the payload stage counts what it streams out of the spill file
+and refuses a count other than the length recorded. An `ENOSPC` on the spill
+filesystem then fails generation instead of producing a part that verifies its own
+checksum and fails when it is applied.
+
+Diffing is the exception to the streaming rule -- both objects need random access,
+so they load through the same heap-or-mmap path the reader uses, and chunking scans
+both end to end, so every page of both is resident while a pair is planned. Peak
+resident set size therefore tracks the two objects' sizes together, in mapped
+temp-file pages rather than heap: measured at 305 MB for a 150 MB object with 512
+bytes zeroed in the middle, diffed against its predecessor at
+`--min-fallback-size=0`, where the part carrying it came to 31 KB. The same run
+shows the packing estimate at work -- the object closed the part holding the two
+metadata objects at 109 bytes and travelled in the next one. `min_fallback_size`
+bounds the target, since an object at or past it is handed over loose and never
+diffed, so the default caps that term near 4 MB and `--min-fallback-size=0` removes
+the cap; the source it pairs with is whatever object sits at the same path in the
+source commit and carries no bound of its own, so a target that replaced a much
+larger object costs that object's size too. `max_bsdiff_size` bounds the patch
+attempt alone, whose suffix sort costs about sixteen times the source size on top
+of the pair.
+
+The dominant term in the measured footprint is the xz encoder rather than the
+delta code: the 370 MiB of liblzma state above is per part being compressed, so a
+process compressing N parts side by side holds N times it. Measured peak resident
+set size is 5.6 MB for a one-file delta, and 389 MB for a 40 MB part and 390 MB
+for a 200 MB part -- a 5x payload for 0.2% more memory, which is the spill
+buffer's contribution being flat and the encoder's being fixed.
+
+The CPU-bound stages run on the blocking pool, not on an executor thread:
+chunking and hashing a diff candidate's two objects, bsdiff's suffix sort, and
+each part's compression. `XzEncoder` compresses inside `poll_write` and never
+yields, and a 40 MB part costs 11.5 s of CPU, so driving it from a task would
+hold an executor thread for the duration and N concurrent generations would hold
+N of them. The encoder stays the streaming one, so the payload is still never
+buffered whole: `compress_part` drives it with `block_on` over a blocking file
+handle whose I/O completes in place, so the future never parks and needs no
+executor behind it. The 15a read path's `XzDecoder` remains inline, where
+decoding costs one to two orders of magnitude less CPU per byte.
+
+Dependency: `bsdiff` 0.2.1 (BSD-2-Clause, no dependencies of its own, no
+`unsafe`), for patch generation only; the port's own bspatch applies them.
 
 Object-selection thresholds (the `ostree static-delta generate` knobs, defaults
 recovered by observing the tool). All three take a value in decimal megabytes (a
-factor of 1,000,000). The generator reproduces them so it packs, patches, and
-falls back the way the tool does:
+factor of 1,000,000); `DeltaOptions` takes the same values in bytes. The
+generator reproduces them so it packs, patches, and falls back the way the tool
+does:
 
-- `--min-fallback-size`, default 4 (4,000,000 bytes). An object whose
-  uncompressed size (file header plus content) is at least the threshold is
-  delivered as a fallback loose object rather than packed into a part. The full
-  rule is in `format-reference.md`, "Static delta wire format".
+- `--min-fallback-size`, default 4 (4,000,000 bytes). An object whose file header
+  variant plus seven bytes plus content reaches the threshold is delivered as a
+  fallback loose object rather than packed into a part. The seven bytes are the
+  tool's count, one below the eight-byte on-disk content-stream framing, measured
+  at three header shapes spanning the GVariant offset-width boundary; the full
+  rule and the measurements are in `format-reference.md`, "Static delta wire
+  format".
 - `--max-bsdiff-size`, default 64 (64,000,000 bytes). bsdiff is considered for a
   modified object only when the input file content size is at most the threshold;
   a larger input skips bsdiff, leaving rollsum or fallback. The comparison is on
   the content size and is inclusive: content of exactly 64,000,000 still uses
-  bsdiff, 64,000,001 does not.
+  bsdiff, 64,000,001 does not. The port takes the tighter of this knob and the
+  chunker-derived bound above, so at the default the chunker's 64 KiB is what
+  binds and the knob decides only when it is set below that.
 - `--max-chunk-size`, default 32 (32,000,000 bytes). A part's payload is capped
   near the threshold; once the accumulated payload would exceed it the generator
   starts a new part. The default packs about 31 one-megabyte objects per part and
   splits at the 32nd; `--max-chunk-size=8` splits at the eighth, confirming the
-  decimal-megabyte unit.
+  decimal-megabyte unit. The port decides with the incoming object's content size,
+  an upper bound for a diffed object, and decides before appending it, so a part's
+  payload never passes the ceiling and a diffed object that comes out small still
+  closes the part it would have fit in.
 
-Verify: the tool applies our deltas; `test-delta`, `test-delta-ed25519`,
-`test-delta-sign`.
+Verify: the tool applies the port's deltas and `fsck` validates the objects it
+wrote, for a splice-only from-scratch delta, a rollsum from-to delta, a bspatch
+from-to delta, and a multi-part delta; `ostree static-delta show` confirms which
+operations each delta carries, so a test cannot pass by silently splicing;
+`ostree static-delta verify` accepts the port's ed25519 signature and rejects it
+under a foreign key; `ostree static-delta indexes` lists a target the port
+indexed; the port applies its own deltas and reproduces the objects, including
+the fallback route the tool refuses offline; the fallback threshold is checked at
+both sides of its boundary against the tool's own generation over the same commit
+at the same threshold, so the compared size is pinned to the tool's byte for byte;
+a temp file aged past the sweep's hour is removed while a fresh one survives; a
+caller's files named `0` and `.notes.tmp-1-1` in an `output_dir` are left alone;
+and generation is byte-identical across two runs over one input
+(`tests/delta_generate.rs`, `static_delta_generate_signs_and_indexes` in the CLI
+tests). Unit tests cover the data source's two failure modes: a spill write the
+async file defers fails the handover to the blocking side, and a data source
+holding fewer bytes than the framing counts fails the part. That second failure
+also drives a whole `write_part`, which fails after its temp file exists and has to
+leave the delta directory empty, pinning the guard. The chunker's own tests cover
+the plans it produces, including a target ending inside a source chunk, whose short
+last chunk carries a digest the index does not hold and copies on the byte
+comparison alone. The upstream `test-delta`, `test-delta-ed25519`, and
+`test-delta-sign` shell tests run at the CLI-compatibility phase.
+
+Deferred: the summary's `ostree.static-deltas` map, which advertises a
+repository's deltas to a fetcher, lands with pull (Phase 16); the key's position
+in the metadata dict is recorded in `format-reference.md`.
 
 ### Phase 16 -- Pull
 

@@ -112,7 +112,12 @@ fn serialize_struct<'t>(
 /// The smallest offset size whose representable range covers the container's
 /// total size (data plus the framing offsets themselves). The parser derives
 /// the same size from the total, so both sides agree.
-pub(crate) fn choose_offset_size(data_len: usize, n_offsets: usize) -> usize {
+///
+/// Public alongside [`write_offset`] so a caller that emits a container too
+/// large to buffer -- a static-delta part payload, whose two trailing byte
+/// arrays stream from disk -- can write the same framing this serializer does
+/// once it knows each member's length.
+pub fn choose_offset_size(data_len: usize, n_offsets: usize) -> usize {
     for z in [1usize, 2, 4] {
         if data_len + n_offsets * z <= offset_max(z) {
             return z;
@@ -130,7 +135,10 @@ pub(crate) fn offset_max(z: usize) -> usize {
     }
 }
 
-pub(crate) fn write_offset(buf: &mut Vec<u8>, value: usize, z: usize) {
+/// Append one framing offset of width `z` (as chosen by
+/// [`choose_offset_size`]). A container's offsets are written after its data,
+/// in reverse member order for a tuple and in member order for an array.
+pub fn write_offset(buf: &mut Vec<u8>, value: usize, z: usize) {
     buf.extend_from_slice(&value.to_le_bytes()[..z]);
 }
 

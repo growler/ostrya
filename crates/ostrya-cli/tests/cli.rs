@@ -194,7 +194,16 @@ impl Run {
 
 /// Run the `ostrya` binary with `args`, optional `stdin`, and extra env.
 fn ostrya(args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Run {
+    ostrya_in(None, args, stdin, env)
+}
+
+/// Run the `ostrya` binary from `cwd`, for the cases where a relative path
+/// argument makes the working directory part of the behaviour under test.
+fn ostrya_in(cwd: Option<&Path>, args: &[&str], stdin: Option<&[u8]>, env: &[(&str, &str)]) -> Run {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ostrya"));
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
     cmd.args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -953,5 +962,186 @@ fn static_delta_list_and_apply_offline() {
         ls.status.success(),
         "tool could not read the applied tree:\n{}",
         String::from_utf8_lossy(&ls.stderr)
+    );
+}
+
+#[test]
+fn static_delta_generate_signs_and_indexes() {
+    if !ostree_available() {
+        eprintln!("skipping: ostree tool not available");
+        return;
+    }
+    let tmp = TmpDir::new("static-delta-generate");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = repo.to_str().unwrap().to_owned();
+
+    // `generate` prints the directory it wrote, signs it, and indexes it.
+    let generated = ostrya(
+        &[
+            "static-delta",
+            "--repo",
+            &repo_arg,
+            "generate",
+            "--to",
+            COMMIT,
+            "--sign",
+            ED25519_SECRET_B64,
+            "--reindex",
+        ],
+        None,
+        &[],
+    );
+    let dir = PathBuf::from(generated.ok().stdout_trimmed());
+    assert!(dir.join("superblock").exists(), "no superblock at {dir:?}");
+    assert_eq!(dir, only_delta_dir(&repo), "delta written outside deltas/");
+
+    // The tool verifies the signature the port wrote and applies the delta.
+    let verified = Command::new("ostree")
+        .args([
+            &format!("--repo={}", repo.display()),
+            "static-delta",
+            "verify",
+            COMMIT,
+            ED25519_PUBLIC_B64,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        verified.status.success(),
+        "tool rejected the port's delta signature:\n{}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+
+    let indexes = Command::new("ostree")
+        .args([
+            &format!("--repo={}", repo.display()),
+            "static-delta",
+            "indexes",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&indexes.stdout)
+            .lines()
+            .any(|line| line.trim() == COMMIT),
+        "the index does not list the target commit"
+    );
+
+    let dst = base.join("dst");
+    block_on(async {
+        Repo::create(&dst, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+    });
+    let applied = ostrya(
+        &[
+            "static-delta",
+            "--repo",
+            dst.to_str().unwrap(),
+            "apply-offline",
+            dir.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(applied.ok().stdout_trimmed(), COMMIT);
+}
+
+#[test]
+fn static_delta_generate_relative_output_dir() {
+    let tmp = TmpDir::new("static-delta-output-dir");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+
+    // `--output-dir` resolves against the working directory, so the delta lands
+    // at base/rel and signing reaches the same files.
+    let generated = ostrya_in(
+        Some(base),
+        &[
+            "static-delta",
+            "--repo",
+            repo.to_str().unwrap(),
+            "generate",
+            "--to",
+            COMMIT,
+            "--output-dir",
+            "rel",
+            "--sign",
+            ED25519_SECRET_B64,
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(generated.ok().stdout_trimmed(), "rel");
+    let dir = base.join("rel");
+    assert!(dir.join("superblock").exists(), "no superblock at {dir:?}");
+    assert!(
+        !repo.join("rel").exists(),
+        "the output directory was resolved against the repository too"
+    );
+    assert!(
+        std::fs::read(dir.join("superblock"))
+            .unwrap()
+            .starts_with(b"OSTSGNDT"),
+        "the delta at {dir:?} is unsigned"
+    );
+
+    // The signed delta applies into a fresh repository.
+    let dst = base.join("dst");
+    block_on(async {
+        Repo::create(&dst, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+    });
+    let applied = ostrya(
+        &[
+            "static-delta",
+            "--repo",
+            dst.to_str().unwrap(),
+            "apply-offline",
+            dir.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(applied.ok().stdout_trimmed(), COMMIT);
+}
+
+#[test]
+fn static_delta_generate_refuses_output_dir_with_reindex() {
+    let tmp = TmpDir::new("static-delta-output-dir-reindex");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let out = base.join("out");
+
+    // Indexing covers the deltas under the repository's `deltas/` tree, so the
+    // pair would write a delta and index nothing. It is refused instead, before
+    // anything is written.
+    let refused = ostrya(
+        &[
+            "static-delta",
+            "--repo",
+            repo.to_str().unwrap(),
+            "generate",
+            "--to",
+            COMMIT,
+            "--output-dir",
+            out.to_str().unwrap(),
+            "--reindex",
+        ],
+        None,
+        &[],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--output-dir"),
+        "the refusal does not name the conflicting flag: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!out.exists(), "the output directory was created anyway");
+    assert!(
+        !repo.join("delta-indexes").exists(),
+        "the index cache was rebuilt anyway"
     );
 }

@@ -4,8 +4,8 @@
 //! commit, optionally expressed as a patch against a source commit. The format
 //! this module reads was recovered by observing the `ostree` tool as a black box
 //! (see `format-reference.md`, "Static delta wire format"). This module reads a
-//! delta the tool wrote and applies it offline, producing the target commit's
-//! objects into the repository; generating deltas is a later phase.
+//! delta -- one the tool wrote or one [`crate::deltagen`] wrote -- and applies it
+//! offline, producing the target commit's objects into the repository.
 //!
 //! A delta directory holds a `superblock` and numbered part files `0`, `1`, ...
 //! The superblock is a GVariant listing the target commit (embedded whole),
@@ -55,26 +55,26 @@ use crate::write::{ContentWriter, FileMeta};
 /// The superblock GVariant type: metadata, timestamp, from/to checksums, the
 /// embedded target commit, an (always empty) recursion array, the per-part
 /// meta-entry array, and the fallback array.
-const SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))";
+pub(crate) const SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))";
 /// The signed-delta envelope type: magic, raw superblock bytes, signatures.
-const SIGNED_SIG: &str = "(taya{sv})";
+pub(crate) const SIGNED_SIG: &str = "(taya{sv})";
 /// The commit object type, used to re-serialize the embedded target commit.
-const COMMIT_SIG: &str = "(a{sv}aya(say)sstayay)";
+pub(crate) const COMMIT_SIG: &str = "(a{sv}aya(say)sstayay)";
 /// The signed-delta magic. Stored as the eight ASCII bytes "OSTSGNDT".
-const SIGNED_MAGIC: &[u8; 8] = b"OSTSGNDT";
+pub(crate) const SIGNED_MAGIC: &[u8; 8] = b"OSTSGNDT";
 
 /// No compression: the part body is the payload verbatim.
 const COMPRESSION_NONE: u8 = 0;
 /// xz compression: the part body is a standard `.xz` stream.
-const COMPRESSION_XZ: u8 = b'x';
+pub(crate) const COMPRESSION_XZ: u8 = b'x';
 
-const OP_OPEN_SPLICE_CLOSE: u8 = b'S';
-const OP_OPEN: u8 = b'o';
-const OP_WRITE: u8 = b'w';
-const OP_SET_READ_SOURCE: u8 = b'r';
-const OP_UNSET_READ_SOURCE: u8 = b'R';
-const OP_CLOSE: u8 = b'c';
-const OP_BSPATCH: u8 = b'B';
+pub(crate) const OP_OPEN_SPLICE_CLOSE: u8 = b'S';
+pub(crate) const OP_OPEN: u8 = b'o';
+pub(crate) const OP_WRITE: u8 = b'w';
+pub(crate) const OP_SET_READ_SOURCE: u8 = b'r';
+pub(crate) const OP_UNSET_READ_SOURCE: u8 = b'R';
+pub(crate) const OP_CLOSE: u8 = b'c';
+pub(crate) const OP_BSPATCH: u8 = b'B';
 
 /// The file-type mask of an `st_mode`.
 const S_IFMT: u32 = 0o170000;
@@ -85,21 +85,21 @@ const S_IFLNK: u32 = 0o120000;
 /// since it is parsed as one GVariant tree, so it is capped at the metadata
 /// ceiling: it holds the embedded target commit (a metadata object) plus the
 /// per-part and fallback tables, all bounded metadata.
-const MAX_SUPERBLOCK: u64 = crate::object::MAX_METADATA_SIZE;
+pub(crate) const MAX_SUPERBLOCK: u64 = crate::object::MAX_METADATA_SIZE;
 
 /// A decompressed part payload or source object at or below this size is kept on
 /// the heap; a larger one is spilled to a temp file and read-only mmapped, so it
 /// costs address space and demand-paged file cache rather than resident heap.
-const MMAP_THRESHOLD: usize = 128 * 1024;
+pub(crate) const MMAP_THRESHOLD: usize = 128 * 1024;
 
 /// The chunk size for streaming object payloads to and from disk.
-const IO_CHUNK: usize = 128 * 1024;
+pub(crate) const IO_CHUNK: usize = 128 * 1024;
 
 /// The largest combined heap footprint accepted for a part's mode and xattr
 /// tables. They are bounded metadata, so they are collected onto the heap and
 /// capped at the metadata ceiling, turning a hostile table size into a
 /// bounded-size failure rather than an unbounded copy.
-const MAX_TABLE_BYTES: usize = crate::object::MAX_METADATA_SIZE as usize;
+pub(crate) const MAX_TABLE_BYTES: usize = crate::object::MAX_METADATA_SIZE as usize;
 
 /// The zero-copy view of a decompressed part payload
 /// `(a(uuu) aa(ayay) ay ay)`: the mode table, the xattr table, the data-source
@@ -143,13 +143,13 @@ struct Fallback {
 
 /// Random-access backing for a decompressed part payload or a source object: on
 /// the heap when small, a read-only memory map of a temp file when large.
-enum Blob {
+pub(crate) enum Blob {
     Ram(Vec<u8>),
     Mapped(ostrya_sys::Mmap),
 }
 
 impl Blob {
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         match self {
             Blob::Ram(v) => v,
             Blob::Mapped(m) => m.as_slice(),
@@ -239,6 +239,25 @@ impl Repo {
 
 /// Scan `deltas/<fanout>/<leaf>` and reconstruct each delta's tool name.
 fn list_static_deltas_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<String>> {
+    let mut names = scan_deltas(repo_fd, delta_name)?;
+    names.sort();
+    Ok(names)
+}
+
+/// Scan `deltas/<fanout>/<leaf>` and collect the source and target commit of
+/// every delta present, for the index cache.
+pub(crate) fn list_delta_targets(
+    repo_fd: BorrowedFd<'_>,
+) -> Result<Vec<(Option<Checksum>, Checksum)>> {
+    scan_deltas(repo_fd, parse_delta_dir)
+}
+
+/// Walk the two-level `deltas/` tree, applying `parse` to each delta's fanout
+/// and leaf directory names. A repository with no `deltas/` yields nothing.
+fn scan_deltas<T>(
+    repo_fd: BorrowedFd<'_>,
+    parse: impl Fn(&str, &str) -> Result<T>,
+) -> Result<Vec<T>> {
     use rustix::fs::{Mode, OFlags, openat};
 
     let deltas = match openat(
@@ -252,7 +271,7 @@ fn list_static_deltas_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<String>> {
         Err(e) => return Err(Error::Io(e.into())),
     };
 
-    let mut names = Vec::new();
+    let mut out = Vec::new();
     for fanout in dir_child_names(&deltas)? {
         let fan_fd = openat(
             &deltas,
@@ -262,16 +281,15 @@ fn list_static_deltas_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<String>> {
         )
         .map_err(|e| Error::Io(e.into()))?;
         for leaf in dir_child_names(&fan_fd)? {
-            names.push(delta_name(&fanout, &leaf)?);
+            out.push(parse(&fanout, &leaf)?);
         }
     }
-    names.sort();
-    Ok(names)
+    Ok(out)
 }
 
 /// Collect the child names of an open directory, dropping `.` and `..` and any
 /// non-UTF-8 name (delta directory names are base64, so always UTF-8).
-fn dir_child_names(dir: &OwnedFd) -> Result<Vec<String>> {
+pub(crate) fn dir_child_names(dir: &OwnedFd) -> Result<Vec<String>> {
     let reader = rustix::fs::Dir::read_from(dir).map_err(|e| Error::Io(e.into()))?;
     let mut out = Vec::new();
     for entry in reader {
@@ -287,20 +305,29 @@ fn dir_child_names(dir: &OwnedFd) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Reconstruct a delta's hex name from its `deltas/<fanout>/<leaf>` directory.
-/// The leaf carries a `-` (which never occurs in base64) exactly when the delta
-/// is from a source commit.
-fn delta_name(fanout: &str, leaf: &str) -> Result<String> {
+/// Recover a delta's source and target commit from its
+/// `deltas/<fanout>/<leaf>` directory names. The leaf carries a `-` (which never
+/// occurs in base64) exactly when the delta is from a source commit.
+fn parse_delta_dir(fanout: &str, leaf: &str) -> Result<(Option<Checksum>, Checksum)> {
     match leaf.split_once('-') {
-        Some((from_rest, to_b64)) => {
-            let from = Checksum::from_base64_modified(&format!("{fanout}{from_rest}"))?;
-            let to = Checksum::from_base64_modified(to_b64)?;
-            Ok(format!("{}-{}", from.to_hex(), to.to_hex()))
-        }
-        None => {
-            let to = Checksum::from_base64_modified(&format!("{fanout}{leaf}"))?;
-            Ok(to.to_hex())
-        }
+        Some((from_rest, to_b64)) => Ok((
+            Some(Checksum::from_base64_modified(&format!(
+                "{fanout}{from_rest}"
+            ))?),
+            Checksum::from_base64_modified(to_b64)?,
+        )),
+        None => Ok((
+            None,
+            Checksum::from_base64_modified(&format!("{fanout}{leaf}"))?,
+        )),
+    }
+}
+
+/// Reconstruct a delta's hex name from its `deltas/<fanout>/<leaf>` directory.
+fn delta_name(fanout: &str, leaf: &str) -> Result<String> {
+    match parse_delta_dir(fanout, leaf)? {
+        (Some(from), to) => Ok(format!("{}-{}", from.to_hex(), to.to_hex())),
+        (None, to) => Ok(to.to_hex()),
     }
 }
 
@@ -448,7 +475,10 @@ async fn decode_part(part_path: PathBuf, expected: &Checksum, staging: &OwnedFd)
 /// address space, not resident heap, so the size it accepts is bounded by free
 /// disk the way the reference tool is: a spill that would exhaust the filesystem
 /// fails when the write returns `ENOSPC`, not at a fixed ceiling.
-async fn spill_to_blob<R: AsyncRead + Unpin>(mut reader: R, staging: &OwnedFd) -> Result<Blob> {
+pub(crate) async fn spill_to_blob<R: AsyncRead + Unpin>(
+    mut reader: R,
+    staging: &OwnedFd,
+) -> Result<Blob> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; IO_CHUNK];
     let mut total = 0usize;
@@ -494,7 +524,7 @@ async fn spill_to_blob<R: AsyncRead + Unpin>(mut reader: R, staging: &OwnedFd) -
 /// Open an anonymous read-write temp file on the staging filesystem: `O_TMPFILE`
 /// where supported, a named temp unlinked immediately otherwise. Both yield a
 /// readable-writable descriptor that needs no later cleanup.
-fn open_rw_temp(staging: BorrowedFd<'_>) -> Result<OwnedFd> {
+pub(crate) fn open_rw_temp(staging: BorrowedFd<'_>) -> Result<OwnedFd> {
     use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
 
     let mode = Mode::from_raw_mode(0o600);
@@ -944,7 +974,7 @@ async fn load_source_blob(
 
 /// Read a whole file into a size-bounded buffer, off the async thread. Used for
 /// the superblock, which is bounded metadata.
-async fn read_capped(path: PathBuf) -> Result<Vec<u8>> {
+pub(crate) async fn read_capped(path: PathBuf) -> Result<Vec<u8>> {
     ostrya_rt::unblock(move || {
         let meta = std::fs::metadata(&path)?;
         if meta.len() > MAX_SUPERBLOCK {
@@ -998,7 +1028,7 @@ fn bump_table(total: usize, n: usize) -> Result<usize> {
 
 // --- Value tree accessors ------------------------------------------------
 
-fn tuple(value: &Value) -> Result<&[Value]> {
+pub(crate) fn tuple(value: &Value) -> Result<&[Value]> {
     match value {
         Value::Tuple(fields) => Ok(fields),
         _ => Err(Error::InvalidFormat("expected a GVariant tuple".to_owned())),
@@ -1012,7 +1042,7 @@ fn array(value: &Value) -> Result<&[Value]> {
     }
 }
 
-fn bytes_field<'a>(value: &'a Value, what: &str) -> Result<&'a [u8]> {
+pub(crate) fn bytes_field<'a>(value: &'a Value, what: &str) -> Result<&'a [u8]> {
     value
         .as_bytes()
         .ok_or_else(|| Error::InvalidFormat(format!("expected {what} to be a byte array")))

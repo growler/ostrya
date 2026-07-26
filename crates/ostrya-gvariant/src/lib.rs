@@ -32,6 +32,6 @@ pub use codec::{
 };
 pub use de::from_bytes;
 pub use error::{Error, Result};
-pub use ser::to_bytes;
+pub use ser::{choose_offset_size, to_bytes, write_offset};
 pub use ty::Type;
 pub use value::Value;

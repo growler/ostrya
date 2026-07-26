@@ -33,6 +33,10 @@ async-compression = { version = "0.4", default-features = false, features = [
 # unification: bundled xz built from source, no runtime liblzma, no C runtime
 # beyond the libc std already links.
 liblzma = { version = "0.4", features = ["static"] }
+# bsdiff patch generation for static-delta `B` ops. Zero dependencies, no
+# unsafe, and its output is the interleaved control/diff/extra layout
+# `bspatch.rs` reads.
+bsdiff = "0.2.1"
 pin-project-lite = "0.2"
 futures-io = "0.3"
 futures-lite = "2"

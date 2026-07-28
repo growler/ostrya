@@ -412,7 +412,8 @@ The internal `ostrya-rt` crate: `rt::unblock` and `rt::File` (from an
 already-open fd; read/write/seek, `sync_all`/`sync_data`, `into_std`;
 `smol::fs::File` or `tokio::fs::File` underneath), with `smol` as the
 default backend and `tokio` behind a feature, per the Async model section.
-`rt::Timer` lands with Phase 6, `rt::spawn` and networking with Phase 16.
+`rt::Timer` lands with Phase 6, `rt::spawn`, `rt::Deadline`, and networking with
+Phase 16a.
 All blocking-pool offload in `ostrya` goes through `rt::unblock`;
 `ContentReader` streams from `rt::File`, implements `futures_io::AsyncRead`
 unconditionally and `tokio::io::AsyncRead` under the `tokio` feature, and
@@ -424,8 +425,8 @@ The hashing streams (in `ostrya`), the primitives the write path builds on:
 pass through, expose the byte count, and yield `(digest, size)` from a
 consuming `finalize`. The constructor takes the digester by value, possibly
 pre-seeded: a file object id covers the framed file header before the
-payload. The verifying counterpart (`VerifyingReader`) lands with pull
-(Phase 16a).
+payload. The verifying counterpart (`VerifyingReader`) landed with the
+fetcher (Phase 16a).
 
 Dependency set for the phase: `ostrya-rt` uses `smol`, `futures-io`, and
 optional `tokio` (features `fs`, `io-util`, `rt`, `time`); `ostrya` adds
@@ -1756,25 +1757,280 @@ in the metadata dict is recorded in `format-reference.md`.
 ### Phase 16 -- Pull
 
 Split into sub-phases:
-- 16a Async fetcher: pure-Rust HTTP/1.1 and HTTP/2 over the `ostrya-rt` net
-  layer + rustls, with ALPN selecting the version. HTTP/2 support is
-  required, so the fetcher builds on a pure-Rust HTTP crate proposed at
-  phase start rather than a hand-rolled client. Conditional GET
-  (ETag/If-Modified-Since/304), mirrorlist fallback, retry classification,
-  max-size streaming cap, priorities, client certs, basic auth. No range.
-  Ships `VerifyingReader`, the stream that checks an expected digest at EOF
-  and fails the final read with `InvalidData` on a mismatch (the check
-  fires only when the consumer polls through to EOF).
+- 16a Async fetcher (DONE, see below).
 - 16b Local pull (`file://`): object import (hardlink/reflink/copy),
   localcache repos.
-- 16c HTTP pull: the scan/fetch state machine (bounded fetch semaphore of 8,
-  delta-part cap of 2, write throttle of 3, fixed priority drain order),
-  summary/sig verification, commit and content verification, bindings and
+- 16c HTTP pull (see below): the scan/fetch state machine (bounded fetch
+  semaphore of 8, delta-part cap of 2, write throttle of 3, fixed priority drain
+  order), summary/sig verification, commit and content verification, bindings and
   timestamp checks, commitpartial, mirror mode.
 - 16d Delta-accelerated pull and the config and mount repo finders.
 Verify: pull from a local trivial httpd over both HTTP/1.1 and HTTP/2; the
 `test-pull-*`, `test-local-pull*`, `test-signed-pull*` clusters via the
 harness.
+
+#### Phase 16a -- Async fetcher (DONE)
+
+`ostrya-rt` grows the network and task layer pull needs: `rt::TcpStream` and
+`rt::TcpListener` over the backend's TCP types, presenting the `futures-io`
+traits under both backends and the tokio traits under the `tokio` feature, with
+Nagle's algorithm off and vectored writes forwarded to the backend socket so a
+slice list reaches it in one syscall; and `rt::spawn` with a `JoinHandle` whose
+semantics are
+uniform across backends -- the task keeps running when the handle drops
+(`smol::Task::detach` under smol, tokio's own behavior under tokio) and awaiting
+the handle yields the task's output, propagating a panic. A task that ended
+cancelled instead, which under tokio is what awaiting through a runtime shutdown
+produces, panics the awaiting side with a message naming the cancellation.
+`rt::Deadline` joins
+`rt::Timer`: a restartable window a `poll_*` method checks, over
+`smol::Timer::set_after` or `tokio::time::Sleep::reset`, whose expiry sticks
+until the next restart so both backends report it the same way on every poll.
+
+`Fetcher` in `ostrya` is the HTTP client for one remote: `FetcherOptions` holds
+the ordered mirror list, extra headers, basic-auth credentials, the TLS options,
+whether HTTP/2 is offered, the retry count (5), the in-flight limit (8), the
+connect deadline (30s) and the progress deadline (60s). `Fetcher::new` is async:
+`TrustRoots::System`, the default, reads the host trust store, which goes to the
+blocking pool through `rt::unblock`, keeping that the only door to it. The TLS
+configuration is built whatever the mirrors' scheme is, so a cleartext-only
+fetcher reads the store as well; under `TrustRoots::Pem` the constructor stays in
+memory and never yields. A system store holding no certificate fails the
+constructor only when at least one mirror is `https`, whose handshake needs the
+anchors, so a host without a CA bundle -- a container without ca-certificates --
+still builds a fetcher for a cleartext remote. Credentials are the one thing a
+cleartext mirror is refused for: `basic_auth`, and an `Authorization`,
+`Proxy-Authorization`, or `Cookie` entry in `headers`, are sent with every
+request to every mirror, so one `http` entry in the list fails the constructor
+with `Error::Fetch` naming that mirror. Withholding the credential from that one
+mirror instead would answer 401 and name nothing, and those three are the header
+names whose value is a secret whatever it holds -- any other header is sent as
+written.
+`Fetcher::fetch` takes a `FetchRequest` -- a path relative to each mirror, a
+`Priority`, optional `Validators`, an optional size cap -- and resolves to
+`Fetched::Body` or `Fetched::NotModified`.
+
+- Protocol selection is the TLS handshake's: ALPN offers `h2` then `http/1.1`,
+  and the connection speaks what the server chose. A cleartext origin speaks
+  HTTP/1.1, since cleartext HTTP/2 needs prior knowledge or an upgrade.
+  `FetcherOptions::http2 = false` drops `h2` from the offer.
+- Connections are pooled per origin (scheme, host, port). An HTTP/2 connection
+  multiplexes concurrent requests; an HTTP/1.1 connection returns to the pool
+  when its body reaches the end, and a body dropped early closes its connection
+  instead, because the rest of the response is still in flight.
+- An HTTP/1.1 request carries the origin-form target (the path alone) and a
+  `Host` header built from the mirror's authority; the absolute form belongs to
+  proxy requests, and a plain static-file server -- how an ostree repository is
+  usually published -- answers 404 to it. An HTTP/2 request carries the absolute
+  URL, from which the `:scheme` and `:authority` pseudo-headers are filled. A
+  caller-supplied `host` header is rejected at construction, since it would
+  collide.
+- Conditional GET replays `ETag` as `If-None-Match` and `Last-Modified` as
+  `If-Modified-Since`; the stored values are the server's own strings, so no
+  date parsing enters the fetcher. A 304 resolves to `NotModified` and its
+  connection is reusable at once.
+- Every mirror is tried in order before anything is retried. Transport failures
+  and the statuses 408, 429, and 5xx are retryable, and a round holding one
+  repeats after a delay doubling from 250ms to a two-second cap; any other
+  unsuccessful status fails once the mirrors are exhausted, as
+  `Error::HttpStatus`, which is how a caller sees a 404 for an absent object.
+  A repeated round asks only the mirrors whose failure was retryable: a mirror
+  that answered definitively answers the same in every round, so it is asked
+  once per fetch, and the first such answer received is the one the fetch reports
+  when nothing retryable is left.
+- Two deadlines bound what one attempt against one mirror can cost.
+  `connect_timeout` (30s) covers opening a connection: the TCP connect, the TLS
+  handshake, and the HTTP handshake together. `progress_timeout` (60s) covers a
+  response delivering bytes -- the wait for the response head, then each stall
+  while the body streams. That window runs from the read that finds nothing until
+  bytes arrive, so it caps how long a peer may stay silent and leaves the
+  transfer time of a large object unbounded. What it measures is silence since a
+  read wanted bytes: once a read has found nothing the window runs whether or not
+  a read is outstanding, and a body no read has yet found empty is not on the
+  clock at all. That distinction becomes observable in 16c, which interleaves body
+  reads with a write throttle. Both expire as transport failures, so the next
+  mirror is tried; a stalled body fails the read with `io::ErrorKind::TimedOut`,
+  and keeps failing it.
+- `fetch_timeout` (300s) bounds the fetch as a whole: every mirror round, every
+  retry, and the delays between them, from the moment the fetch is admitted until
+  the response head arrives. Without it the bound is the product of the mirror
+  count, the retry count, and the two per-attempt deadlines -- with the defaults,
+  545s for a single mirror that accepts connections and then goes silent -- and
+  the admission permit is held for all of it. Expiry drops the attempt in flight
+  and the permit with it, and reports `Error::Fetch` naming the path and the
+  limit; no mirror is tried afterwards. The body that follows a response is
+  bounded by `progress_timeout` alone, so a large object's transfer time stays
+  unbounded. `None` applies no cap. 16c sizes this against `max_outstanding`.
+- The size cap is enforced twice: a declared `Content-Length` over the cap fails
+  the fetch with `Error::FetchTooLarge` before any body is read, and a body that
+  outgrows the cap mid-stream fails the read with `io::ErrorKind::FileTooLarge`.
+- A failure ends the body. The size cap, the progress deadline, and a transport
+  failure mid-body are each latched and replayed on every later read, so a
+  consumer reading past a failure never observes a clean end of stream and cannot
+  mistake a truncated object for a complete one -- which matters most for the
+  paths fetched without an expected digest, since a payload with one is also
+  caught by `VerifyingReader`. hyper reports a body error once and then reports
+  that body as ended, so the latch is what stands between a cut connection and a
+  short object read as whole. The connection and the permit are released on the
+  drop path, which closes the connection rather than pooling a response still in
+  flight.
+- Requests carry a priority. The fetcher admits `max_outstanding` at a time
+  through an admission gate that hands a released permit directly to the
+  highest-priority waiter, ties in arrival order; the permit is held until the
+  body reaches its end or is dropped, since a body in flight occupies a
+  connection, and a failure ends the body with both still held, so they go on the
+  drop path. A queued waiter is guaranteed only that no later arrival of its own
+  priority is served first: the order across priorities is strict, so a steady
+  arrival of higher-priority waiters keeps a lower-priority one queued, and what
+  bounds that is the caller's mix of priorities. 16c's state machine sets the
+  limit and assigns the priorities.
+- Range requests are not used, and redirects are not followed.
+- A mirror URL is a scheme, an authority, and a base path. A request target is
+  that base path with the object path appended, so a URL carrying a query string
+  or userinfo is rejected at construction with `Error::Fetch` naming the part:
+  serving it with that part missing turns a presigned URL into a 403 and
+  credentials into a 401, neither of which points back at the URL. Phase 18
+  carries a presigned query per target or signs each request itself. A host
+  given as an IPv6 literal keeps its brackets in the `Host` header and in the
+  absolute URLs, and is held bare in the origin, which is what the connect
+  resolves and the TLS server name is built from; both reject the bracketed
+  form.
+- A request path is appended to the base path as written, carrying the escaping
+  the server is meant to see, and holds no query and no fragment: a `?` or a `#`
+  in it fails the fetch with `Error::Fetch` naming the character. Either one
+  delimits rather than names -- the tail of a `?` reaches the server as a query
+  string it matches on, and the tail of a `#` is dropped at URL assembly, so a
+  different resource is requested. The path is the same whichever mirror serves
+  it, so the check runs once, before the fetch is admitted: no permit is taken
+  and no connection is opened for a path that cannot be served. 16c builds every
+  path from hex object names and ref names.
+
+`VerifyingReader` lands with the phase: it wraps a `HashingReader` and fails the
+read that reaches EOF with `InvalidData` when the stream did not hash to the
+expected digest. The mismatch is latched and replayed by every later read. A
+consumer that stops early never observes EOF and so never verifies, and a read
+into an empty buffer touches neither the stream nor the check.
+
+Dependency set for the phase, all pure Rust with no C in the graph (verified
+with `cargo tree -e normal,build`: the only `cc` in the workspace remains
+liblzma's): `hyper` 1.11 (`client`, `http1`, `http2`) as the HTTP engine, with
+the `http` and `bytes` types taken from its re-exports; `rustls` 0.23 with
+`rustls-graviola` 0.4 as the crypto provider -- Rust plus formally-verified
+assembly from s2n-bignum, so no C compiler and no `cc` build dependency, at the
+cost of supporting only x86_64 and aarch64; `futures-rustls` 0.26 for the
+handshake over `futures-io` streams; `rustls-native-certs` 0.8 for the system
+trust store (`webpki-roots` was rejected: CDLA-Permissive-2.0 is not on the
+permitted list); and `rustls-pemfile` 2 for CA and client-certificate material.
+hyper's `server` feature is a dev-dependency for the test server. `h2` brings
+`tokio` and `tokio-util` into the graph even under the smol backend, where only
+their I/O traits and codec framing are used and no tokio runtime is driven. Two
+crates from the proposal turned out unnecessary: `http-body-util` (the fetcher's
+request body is a hand-rolled empty `Body`, ~15 lines) and a base64 crate
+(`ostrya-core::base64` encodes the basic-auth header). The glue hyper needs --
+`hyper::rt::Read`/`Write` over `futures-io` and `hyper::rt::Executor` over
+`rt::spawn` -- is ~90 lines in `fetch/io.rs` and holds `forbid(unsafe_code)`:
+hyper's read cursor is filled through its safe `put_slice`, which costs one
+extra copy per read, since exposing the uninitialized buffer to `poll_read`
+would need `unsafe`. What the adapter tells hyper about vectored writes comes
+from the stream it wraps, through a `WriteVectored` trait the adapter defines:
+the `futures-io` write trait carries no `is_write_vectored`, and hyper coalesces
+the slices itself when the answer is no, so answering for a stream that takes
+only the first slice would cost a syscall per slice.
+
+Verify: `tests/fetch.rs` runs an in-process hyper server over cleartext
+HTTP/1.1 and over TLS with the committed fixture certificates
+(`tests/fixtures/tls/`, an authority signing a `localhost`/`127.0.0.1` server
+leaf and a client leaf, regenerated by `generate.sh`), covering ALPN selecting
+HTTP/2, HTTP/2 disabled negotiating HTTP/1.1, conditional GET through to 304
+with both validators replayed, a 404 reported without a retry, a retryable
+status retried and then succeeding, retries stopping at the configured count,
+three mirrors tried in order until one answers, a mirror that answered
+definitively asked once while the retryable one is asked every round, a
+definitive answer from an earlier round reported once the last mirror settles,
+both halves of the size cap,
+basic auth and extra headers arriving at a TLS server while a cleartext mirror
+alongside one fails the constructor with neither server reached, mutual TLS with
+and without the client certificate, HTTP/1.1 keep-alive reuse and HTTP/2
+multiplexing over a single connection (asserted on the server's connection
+count), an abandoned body not being pooled, and a fetched body checked through
+`VerifyingReader` both ways. Three tests read past a terminal failure and assert
+the same error comes back: a body read on after it outgrew its cap, a body read on
+after a peer closed the connection eight bytes into a 64-byte response, and a
+`VerifyingReader` read on after a digest mismatch. Three tests point the fetcher at a peer that
+accepts a connection and then goes silent, one per deadline: a TLS handshake that
+never answers, a request whose response head never arrives, and a body that
+stops after eight of its declared bytes, the last asserting that the second read
+reports the same timeout. Two tests pin what the progress window measures: a body
+nobody has read yet reads fine after the window has passed, and a read abandoned
+while the peer is silent leaves the window running, so the next read fails at
+once -- raced against a timer shorter than the window, which a read that started a
+fresh window would outlast. Two more cover the whole-fetch deadline: one gives a
+silent peer two hundred retry rounds, a 300ms `fetch_timeout`, and a gate of one
+permit, asserting that the fetch fails naming the deadline and that the next
+fetch is admitted, which happens only if the cancelled attempt released its
+permit; the other clears `fetch_timeout` and asserts a response arrives
+unaffected. One test reads the request bytes off a raw socket
+and pins the HTTP/1.1 wire format -- origin-form target, `Host` header -- which
+is the property that decides whether an ordinary static-file server answers at
+all. One test fetches from a server bound to `[::1]`, asserting that the
+bracketed literal reaches the `Host` header while the connect reaches the
+listener. One test re-executes its own test
+binary with `SSL_CERT_FILE` and `SSL_CERT_DIR` pointed at paths that do not
+exist, presenting the child with the store of a host without a CA bundle, and
+asserts that a cleartext-only fetcher is built while one with an `https` mirror
+fails with `no trusted certificates` (`tests/fetch_no_trust_store.rs`). The
+child half is `#[ignore]`d and returns without asserting when the environment is
+absent, so the store that trusts nothing reaches no other test and no
+`set_var` is called. Unit tests cover mirror-URL parsing and
+validation, the request paths a target is refused for, retry classification,
+the backoff schedule, header assembly, the
+TLS configuration (ALPN, client identity, rejected material), the hyper I/O
+adapter, and the admission gate's five orderings. The whole suite passes under
+both backends.
+
+#### Phase 16c -- HTTP pull
+
+Four fetcher changes carried in from the 16a review land with this phase, which
+is the first caller to exercise them.
+
+- An unsuccessful status closes the HTTP/1.1 connection it arrived on. `attempt`
+  fails as soon as it reads the status, so the pooled sender and the undrained
+  response go with it, and four sequential 404s against one origin open four
+  connections. A 404 is the ordinary answer for an object a remote does not
+  hold, so a scan pays a connection setup per absent object. A `Content-Length`
+  over the request's size cap fails the same way, on the same path, and gets the
+  same treatment: both are an attempt that ends with a response body still in
+  flight. When the response declares a `Content-Length` at or below a small
+  bound, read the body to the end and return the sender to the pool before
+  failing the attempt; above that bound, or with no declared length, close it as
+  now. Verify on the server's connection count staying at one across several
+  404s, and across several responses over the cap.
+- The HTTP/2 flow-control window and keep-alive are hyper's defaults: 64 KiB
+  stream and connection windows, and no ping. A 64 KiB window caps single-stream
+  throughput on a link with a high bandwidth-delay product, and a peer that has
+  gone away is not noticed until the progress deadline expires. Set
+  `initial_stream_window_size` and `initial_connection_window_size`, or enable
+  `adaptive_window`, and set `keep_alive_interval` with `keep_alive_timeout`,
+  measuring against the in-process test server before fixing values. Reaching
+  those knobs means `handshake_h2` moving from the free
+  `hyper::client::conn::http2::handshake` function, which takes no settings, to
+  `hyper::client::conn::http2::Builder`, so this is a change of how the
+  connection is built rather than a few added lines. The concurrency limits this
+  phase sets are the same tuning pass.
+- Two concurrent connects to one origin can each open an HTTP/2 connection:
+  `put_h2` overwrites the pool entry, so the connection that loses the race
+  stays alive until its senders drop and is never reused. It is bounded by
+  `max_outstanding` and clears itself. Keep the entry already present when it is
+  not closed, and let the new sender serve only the request that opened it.
+- A fetch that runs out of rounds reports the last retryable error it saw, while
+  one that runs out of mirrors reports the first definitive answer it received.
+  Pick one rule for both -- first failure matches the mirror order the fetcher
+  otherwise honors -- and state it in the module doc.
+
+One test carries over as well: priority ordering end to end through
+`Fetcher::fetch`, which the gate's unit tests reach only in isolation. Saturate
+`max_outstanding` with held bodies, queue a low- and a high-priority fetch, and
+assert the order the server sees.
 
 ### Phase 17 -- `ostree`-compatible CLI (`ostrya-cli`)
 
@@ -1837,11 +2093,15 @@ admin tests. Recommend deferring or descoping unless explicitly required.
   through `async-compression`'s xz codec over statically-linked `liblzma`, the
   reference implementation the tool itself uses, so the parts we write are
   ordinary liblzma-produced xz the tool decodes.
-- HTTP client (Phase 16a): HTTP/2 support is required, which puts a
-  pure-Rust HTTP/2 implementation on the dependency surface; candidate
-  crates couple to tokio-flavored I/O traits that need adapting to
-  `ostrya-rt`. Mitigation: ALPN via rustls, the `tokio_util::compat`-style
-  adapter pattern already in use, and a crate proposal at phase start.
+- HTTP client (Phase 16a): resolved. `hyper` speaks both versions over its own
+  I/O traits, which a ~90-line safe adapter bridges to `futures-io`, so
+  `ostrya-rt` stays the only crate that knows the backend. `h2` pulls `tokio`
+  and `tokio-util` into the graph under either backend for their I/O traits and
+  codec framing; no tokio runtime is driven under smol. The rustls crypto
+  provider is `rustls-graviola`, which keeps the no-C rule intact and limits
+  supported architectures to x86_64 and aarch64 -- a Linux target outside those
+  two needs a provider swap, which is a `ClientConfig` change confined to
+  `fetch/tls.rs`.
 - GPG semantics ride on the installed GnuPG: the engine drives `gpg`/`gpgv`
   through the documented, stable `--status-fd` interface and pins no
   version; a vocabulary change in a future GnuPG would surface in the
@@ -1922,9 +2182,12 @@ Resolved:
 
 9. Repo finders: the config and mount finders land with pull (Phase 16d);
    avahi discovery is out of scope.
-10. HTTP/2: required for pull. The fetcher is built on a pure-Rust HTTP
-    crate speaking HTTP/1.1 and HTTP/2 with ALPN over rustls; the concrete
-    crate is proposed at Phase 16a per the dependency rule.
+10. HTTP/2: required for pull. The fetcher is built on `hyper` 1.11
+    (`client`, `http1`, `http2`) with ALPN over `rustls` 0.23, the crypto
+    provider being `rustls-graviola` (Rust plus formally-verified assembly, no
+    C compiler); `futures-rustls` runs the handshake over the `futures-io`
+    streams `ostrya-rt` exposes. See Phase 16a for the full set and what it
+    rules out.
 11. composefs export (Phase 9b): reproduce the composefs/EROFS format in a new
     standalone crate `ostrya-composefs` rather than depend on a crate. No
     pure-Rust crate writes byte-exact composefs EROFS images under the

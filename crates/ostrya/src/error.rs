@@ -97,6 +97,33 @@ pub enum Error {
     /// malformed secret key.
     #[error("signature: {0}")]
     Signature(String),
+    /// A fetch could not be set up or carried out: an unusable mirror URL,
+    /// header, or TLS configuration, or a transport failure that outlived its
+    /// retries.
+    #[error("fetch: {0}")]
+    Fetch(String),
+    /// Every mirror answered the request with an unsuccessful HTTP status. A
+    /// 404 here means the object is absent from the remote, which pull treats
+    /// as a normal answer for optional objects.
+    ///
+    /// One mirror's answer is reported: the first status received that is not
+    /// retried, from whichever round it came, unless the rounds ran out with a
+    /// retryable status outstanding, in which case the last mirror to give one.
+    #[error("http status {status} for {url}")]
+    HttpStatus {
+        /// The status that mirror returned.
+        status: u16,
+        /// The URL requested of it.
+        url: String,
+    },
+    /// A response declared more bytes than the caller's cap allows. A body that
+    /// outgrows the cap while streaming fails the read with
+    /// [`FileTooLarge`](std::io::ErrorKind::FileTooLarge) instead.
+    #[error("fetched object exceeds the {limit}-byte cap")]
+    FetchTooLarge {
+        /// The cap the caller set on the request.
+        limit: u64,
+    },
 }
 
 impl From<rustix::io::Errno> for Error {

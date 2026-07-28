@@ -244,11 +244,16 @@ impl<R> HashingReader<R> {
 pub struct HashingWriter<W> { /* Sha256, count, inner */ }
 
 /// Passes bytes through and checks an expected digest at EOF: the final
-/// read fails with `std::io::ErrorKind::InvalidData` on a mismatch. The
-/// check fires only when the consumer polls through to EOF; an empty-buffer
-/// read neither observes bytes nor latches EOF. Lands with pull
-/// (Phase 16a).
-pub struct VerifyingReader<D, R> { /* expected digest over a HashingReader */ }
+/// read fails with `std::io::ErrorKind::InvalidData` on a mismatch, and so
+/// does every read after it. The check fires only when the consumer polls
+/// through to EOF; an empty-buffer read neither observes bytes nor latches
+/// EOF.
+pub struct VerifyingReader<R> { /* expected Checksum over a HashingReader */ }
+impl<R> VerifyingReader<R> {
+    pub fn new(expected: Checksum, hasher: Sha256, inner: R) -> Self;
+    pub fn expected(&self) -> &Checksum;
+    pub fn size(&self) -> u64;
+}
 ```
 
 `ContentWriter` (see Transactions) stages content through a `HashingWriter`
@@ -594,6 +599,83 @@ Key loading helpers (ed25519 base64-per-line files and the
 `trusted.ed25519[.d]` / `revoked.ed25519[.d]` directory convention; GPG keyring
 files binary and armored) are free functions or `impl` on the concrete signer
 types.
+
+## Fetcher
+
+The HTTP client pull is built on. One `Fetcher` serves one remote: it holds the
+mirrors, headers, credentials, and TLS configuration, pools connections per
+origin, and admits a bounded number of requests at a time in priority order.
+Protocol selection is the TLS handshake's -- ALPN offers `h2` and `http/1.1`.
+Two deadlines bound one attempt's cost: `connect_timeout` over opening a
+connection, and `progress_timeout` over a response delivering bytes, restarted
+whenever bytes arrive. A body that stalls fails the read with
+`io::ErrorKind::TimedOut`. `fetch_timeout` bounds the mirror rounds and the
+retries together, from admission to the response head, which is what caps how
+long one fetch holds an admission permit. A credential is sent to every mirror,
+so `basic_auth` and an `Authorization`, `Proxy-Authorization`, or `Cookie` entry
+in `headers` require every mirror to be `https`; a cleartext mirror alongside one
+fails `Fetcher::new`.
+
+```rust
+pub struct FetcherOptions {
+    pub mirrors: Vec<String>,             // base URLs, tried in order; a query
+                                          // string or userinfo is rejected
+    pub headers: Vec<(String, String)>,   // an Authorization, Proxy-Authorization,
+                                          // or Cookie entry needs https mirrors
+    pub basic_auth: Option<BasicAuth>,    // needs https mirrors
+    pub tls: TlsOptions,                  // trust roots, client identity
+    pub http2: bool,                      // default true
+    pub max_retries: u32,                 // default 5
+    pub max_outstanding: usize,           // default 8
+    pub connect_timeout: Duration,        // default 30s: connect + TLS + handshake
+    pub progress_timeout: Duration,       // default 60s: silence, not transfer time
+    pub fetch_timeout: Option<Duration>,  // default 300s: mirrors and retries
+                                          // together, up to the response head
+}
+
+pub enum TrustRoots { System, Pem(Vec<u8>) }
+pub struct ClientIdentity { pub cert_chain_pem: Vec<u8>, pub key_pem: Vec<u8> }
+pub struct TlsOptions { pub roots: TrustRoots, pub client_identity: Option<ClientIdentity> }
+
+pub enum Priority { Low, Normal, High }
+pub enum Protocol { Http11, Http2 }
+
+/// The server's own validator strings, replayed to make a fetch conditional.
+pub struct Validators { pub etag: Option<String>, pub last_modified: Option<String> }
+
+pub struct FetchRequest<'a> {
+    pub path: &'a str,                    // relative to each mirror, appended
+                                          // as written; no query, no fragment
+    pub priority: Priority,
+    pub validators: Option<&'a Validators>,
+    pub max_size: Option<u64>,
+}
+
+pub enum Fetched { Body(Body), NotModified }
+
+/// A streaming response body; implements `futures-io` `AsyncRead` (and the
+/// tokio trait under the `tokio` feature). Reaching the end of the body
+/// releases the connection and the concurrency permit, and so does dropping
+/// it. Outgrowing `max_size` fails the read with
+/// `std::io::ErrorKind::FileTooLarge`, and every read after it replays that
+/// error.
+pub struct Body { /* ... */ }
+impl Body {
+    pub fn validators(&self) -> &Validators;
+    pub fn content_length(&self) -> Option<u64>;
+    pub fn protocol(&self) -> Protocol;
+    pub fn received(&self) -> u64;        // bytes off the connection, which
+                                          // leads the caller by up to a chunk
+}
+
+impl Fetcher {
+    // Async: TrustRoots::System, the default, reads the host trust store on
+    // the blocking pool, whatever the mirrors' scheme. A store holding no
+    // certificate fails only when a mirror is https. Clone, Send + Sync.
+    pub async fn new(options: FetcherOptions) -> Result<Fetcher>;
+    pub async fn fetch(&self, request: FetchRequest<'_>) -> Result<Fetched>;
+}
+```
 
 ## Pull
 

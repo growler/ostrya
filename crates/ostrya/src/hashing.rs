@@ -10,10 +10,16 @@
 //! identity covers the framed file header before the raw payload, so the write
 //! path seeds the header bytes and then streams the payload through the reader.
 //!
-//! Both wrappers implement the `futures-io` traits when their inner stream
-//! does, and the tokio I/O traits under the `tokio` feature, so they compose
-//! with `rt::File`, [`ContentReader`](crate::ContentReader), and network
-//! streams without a caller-side adapter.
+//! [`VerifyingReader`] is the checking counterpart: it hashes what it passes
+//! through and fails the read that reaches EOF, and every read after it, when
+//! the result differs from the digest the caller expected. Pull wraps fetched
+//! payloads in one, so a body that does not hash to the object's identity
+//! cannot be stored.
+//!
+//! All three implement the `futures-io` traits when their inner stream does,
+//! and the tokio I/O traits under the `tokio` feature, so they compose with
+//! `rt::File`, [`ContentReader`](crate::ContentReader), and network streams
+//! without a caller-side adapter.
 
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -57,6 +63,13 @@ impl<R> HashingReader<R> {
             self.count,
         )
     }
+
+    /// The digest of the bytes hashed so far, leaving the reader usable.
+    /// [`VerifyingReader`] checks this at EOF, where consuming the reader is
+    /// not an option.
+    fn digest_now(&self) -> Checksum {
+        Checksum::from_bytes(self.hasher.clone().finalize().into())
+    }
 }
 
 pin_project! {
@@ -93,6 +106,129 @@ impl<W> HashingWriter<W> {
             Checksum::from_bytes(self.hasher.finalize().into()),
             self.count,
         )
+    }
+}
+
+/// Where a [`VerifyingReader`]'s digest check stands.
+enum Checked {
+    /// EOF has not been reached, so no comparison has run.
+    Pending,
+    /// The stream hashed to the expected digest.
+    Passed,
+    /// The stream hashed to the digest held here, which is not the expected
+    /// one.
+    Failed(Checksum),
+}
+
+pin_project! {
+    /// An async reader that checks the stream against an expected digest.
+    ///
+    /// Bytes pass through unchanged. The check happens at EOF: the final read,
+    /// the one that yields zero bytes, fails with
+    /// [`InvalidData`](std::io::ErrorKind::InvalidData) when the digest of what
+    /// was read differs from the expected one, and every read after it fails
+    /// the same way, so a consumer that keeps reading past the mismatch never
+    /// sees a clean end of stream. A consumer that stops early never observes
+    /// EOF and so never verifies -- the checked property is "this stream, read
+    /// whole, hashed to this" -- and a read into an empty buffer touches
+    /// neither the stream nor the check.
+    pub struct VerifyingReader<R> {
+        expected: Checksum,
+        checked: Checked,
+        #[pin]
+        inner: HashingReader<R>,
+    }
+}
+
+impl<R> VerifyingReader<R> {
+    /// Wrap `inner`, expecting its contents to hash to `expected`. As with
+    /// [`HashingReader::new`], `hasher` may be pre-seeded to cover leading
+    /// bytes -- a content object's framed header, for instance -- that the
+    /// stream itself does not carry.
+    pub fn new(expected: Checksum, hasher: Sha256, inner: R) -> VerifyingReader<R> {
+        VerifyingReader {
+            expected,
+            checked: Checked::Pending,
+            inner: HashingReader::new(hasher, inner),
+        }
+    }
+
+    /// The digest the stream is checked against.
+    pub fn expected(&self) -> &Checksum {
+        &self.expected
+    }
+
+    /// The number of stream bytes read so far.
+    pub fn size(&self) -> u64 {
+        self.inner.size()
+    }
+}
+
+/// The mismatch reported by the read that reaches EOF.
+fn mismatch(expected: &Checksum, actual: &Checksum) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("checksum mismatch: expected {expected}, computed {actual}"),
+    )
+}
+
+impl<R: futures_io::AsyncRead> futures_io::AsyncRead for VerifyingReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let mut me = self.project();
+        match me.checked {
+            Checked::Pending => {}
+            Checked::Passed => return Poll::Ready(Ok(0)),
+            Checked::Failed(actual) => return Poll::Ready(Err(mismatch(me.expected, actual))),
+        }
+        let n = ready!(me.inner.as_mut().poll_read(cx, buf))?;
+        if n == 0 {
+            let actual = me.inner.digest_now();
+            if actual != *me.expected {
+                let error = mismatch(me.expected, &actual);
+                *me.checked = Checked::Failed(actual);
+                return Poll::Ready(Err(error));
+            }
+            *me.checked = Checked::Passed;
+        }
+        Poll::Ready(Ok(n))
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl<R: ostrya_rt::tokio_io::AsyncRead> ostrya_rt::tokio_io::AsyncRead for VerifyingReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ostrya_rt::tokio_io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let mut me = self.project();
+        match me.checked {
+            Checked::Pending => {}
+            Checked::Passed => return Poll::Ready(Ok(())),
+            Checked::Failed(actual) => return Poll::Ready(Err(mismatch(me.expected, actual))),
+        }
+        let before = buf.filled().len();
+        ready!(me.inner.as_mut().poll_read(cx, buf))?;
+        if buf.filled().len() == before {
+            let actual = me.inner.digest_now();
+            if actual != *me.expected {
+                let error = mismatch(me.expected, &actual);
+                *me.checked = Checked::Failed(actual);
+                return Poll::Ready(Err(error));
+            }
+            *me.checked = Checked::Passed;
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -177,6 +313,7 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<HashingReader<ostrya_rt::File>>();
     assert_send_sync::<HashingWriter<ostrya_rt::File>>();
+    assert_send_sync::<VerifyingReader<ostrya_rt::File>>();
 };
 
 /// Under the `tokio` feature the hashing streams speak the tokio I/O traits
@@ -263,6 +400,115 @@ mod tests {
             let (digest, size) = reader.finalize();
             assert_eq!(size, 0);
             assert_eq!(digest, Checksum::sha256(b""));
+        });
+    }
+
+    #[test]
+    fn verifying_reader_passes_a_matching_stream_through() {
+        block_on(async {
+            let data = b"verified payload";
+            let mut reader = VerifyingReader::new(
+                Checksum::sha256(data),
+                Sha256::new(),
+                futures_lite::io::Cursor::new(data),
+            );
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, data);
+            assert_eq!(reader.size(), data.len() as u64);
+            assert_eq!(reader.expected(), &Checksum::sha256(data));
+        });
+    }
+
+    #[test]
+    fn verifying_reader_fails_the_final_read_on_a_mismatch() {
+        block_on(async {
+            let data = b"payload as delivered";
+            let mut reader = VerifyingReader::new(
+                Checksum::sha256(b"payload as promised"),
+                Sha256::new(),
+                futures_lite::io::Cursor::new(data),
+            );
+            let mut out = Vec::new();
+            let err = reader.read_to_end(&mut out).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("checksum mismatch"), "{err}");
+            // The bytes were delivered before the check fired at EOF.
+            assert_eq!(out, data);
+        });
+    }
+
+    #[test]
+    fn verifying_reader_repeats_the_mismatch_on_every_later_read() {
+        block_on(async {
+            let data = b"payload as delivered";
+            let mut reader = VerifyingReader::new(
+                Checksum::sha256(b"payload as promised"),
+                Sha256::new(),
+                futures_lite::io::Cursor::new(data),
+            );
+            let mut out = Vec::new();
+            let first = reader.read_to_end(&mut out).await.unwrap_err();
+
+            // Reading past the failure reports it again rather than EOF.
+            let mut buf = [0u8; 8];
+            for _ in 0..2 {
+                let err = reader.read(&mut buf).await.unwrap_err();
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(err.to_string(), first.to_string());
+            }
+            let err = reader.read_to_end(&mut out).await.unwrap_err();
+            assert_eq!(err.to_string(), first.to_string());
+        });
+    }
+
+    #[test]
+    fn verifying_reader_checks_a_preseeded_digester_and_an_empty_stream() {
+        block_on(async {
+            let header = b"framed-header";
+            let payload = b"payload-bytes";
+            let mut whole = header.to_vec();
+            whole.extend_from_slice(payload);
+            let mut seeded = Sha256::new();
+            seeded.update(header);
+            let mut reader = VerifyingReader::new(
+                Checksum::sha256(&whole),
+                seeded,
+                futures_lite::io::Cursor::new(payload),
+            );
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, payload);
+
+            // An empty stream verifies against the digest of no bytes.
+            let mut reader = VerifyingReader::new(
+                Checksum::sha256(b""),
+                Sha256::new(),
+                futures_lite::io::Cursor::new(&[]),
+            );
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.unwrap();
+            assert!(out.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_reader_stopped_before_eof_never_verifies() {
+        block_on(async {
+            let data = b"a longer payload than the caller reads";
+            let mut reader = VerifyingReader::new(
+                // A digest that cannot match, to prove no check fires.
+                Checksum::sha256(b"something else"),
+                Sha256::new(),
+                futures_lite::io::Cursor::new(data),
+            );
+            let mut head = [0u8; 8];
+            reader.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head, b"a longer");
+
+            // An empty buffer neither reads bytes nor latches EOF.
+            assert_eq!(reader.read(&mut []).await.unwrap(), 0);
+            assert_eq!(reader.size(), 8);
         });
     }
 

@@ -50,6 +50,14 @@ const PERM_MASK: u32 = 0o7777;
 const FIXED_MODE: u32 = 0o644;
 /// The chunk size for the streaming copy in [`Transaction::write_content`].
 const COPY_CHUNK: usize = 64 * 1024;
+/// Attempts made at an `ETXTBSY` fs-verity enable before it is reported. The
+/// kernel refuses to seal an inode any writable descriptor still holds, and
+/// `fork` copies the file descriptor table, so a child carries a copy of the
+/// writable staging descriptor until its `exec` closes it. The retry outlasts
+/// that fork-to-exec window while a genuine refusal still fails inside 50 ms.
+const SEAL_ATTEMPTS: u32 = 50;
+/// The pause between fs-verity enable attempts.
+const SEAL_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// The logical metadata a content writer applies to an object.
 ///
@@ -846,13 +854,23 @@ fn reopen_ro(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
 /// filesystem without verity returns `ENOTTY`); [`Tristate::Yes`] fails the
 /// write. Never called for [`Tristate::No`].
 fn seal_regular(fd: BorrowedFd<'_>, verity: Tristate) -> Result<()> {
-    match ostrya_sys::enable_verity(fd) {
-        Ok(()) => Ok(()),
-        Err(_) if verity == Tristate::Maybe => Ok(()),
-        Err(e) => Err(Error::Unsupported(format!(
-            "fsverity required but could not be enabled: {e}"
-        ))),
+    let mut attempts = 0;
+    let err = loop {
+        attempts += 1;
+        match ostrya_sys::enable_verity(fd) {
+            Ok(()) => return Ok(()),
+            Err(rustix::io::Errno::TXTBSY) if attempts < SEAL_ATTEMPTS => {
+                std::thread::sleep(SEAL_PAUSE);
+            }
+            Err(e) => break e,
+        }
+    };
+    if verity == Tristate::Maybe {
+        return Ok(());
     }
+    Err(Error::Unsupported(format!(
+        "fsverity required but could not be enabled: {err}"
+    )))
 }
 
 /// Materialize an ingestion temp file under `staging_name` in the staging

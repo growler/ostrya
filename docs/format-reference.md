@@ -628,6 +628,14 @@ small caller-held bodies of symlink and metadata objects) follows the same
 close-reopen-seal ordering and is then renamed into place rather than linked.
 Publication into `objects/` is unchanged.
 
+Closing the writable descriptor is not by itself enough to guarantee the enable
+succeeds: `fork` copies the file descriptor table, so a child process carries a
+copy of the writable staging descriptor until its `exec` closes it, and the
+kernel refuses the enable with `ETXTBSY` while that copy lives. Any process that
+spawns children from one thread while another stages objects meets this window.
+The port retries an `ETXTBSY` enable for up to 50 ms, which outlasts a
+fork-to-exec gap; every other error is reported on the first attempt.
+
 The `FS_IOC_ENABLE_VERITY` and `FS_IOC_MEASURE_VERITY` ioctls are the only
 syscalls in the write path that require `unsafe`; they live in the audited
 `ostrya-sys` crate.

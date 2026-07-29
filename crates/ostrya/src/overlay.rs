@@ -44,7 +44,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::pin::Pin;
 
-use ostrya_core::{ObjectType, RepoMode, Xattrs};
+use ostrya_core::{RepoMode, Xattrs};
 use ostrya_rt::File as RtFile;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 
@@ -163,10 +163,7 @@ fn merge_dir<'a>(
         let skip_xattrs = flags.contains(CommitModifierFlags::SKIP_XATTRS);
 
         // This directory's dirmeta comes from the upper inode.
-        let dirmeta_bytes = to_dirmeta(&dir_meta).serialize()?;
-        let dirmeta = txn
-            .write_metadata(ObjectType::DirMeta, None, &dirmeta_bytes)
-            .await?;
+        let dirmeta = txn.write_dirmeta(&to_dirmeta(&dir_meta)).await?;
         node.set_metadata_checksum(dirmeta);
 
         // Read the upper directory in one blocking pass, always with xattrs and

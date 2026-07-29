@@ -20,7 +20,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::pin::Pin;
 
-use ostrya_core::{DirMeta, ObjectType, RepoMode, Xattrs};
+use ostrya_core::{DirMeta, RepoMode, Xattrs};
 use ostrya_rt::File as RtFile;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use rustix::io::Errno;
@@ -152,10 +152,7 @@ fn walk_dir<'a>(
                 finalize_meta(modifier.as_deref_mut(), Path::new(&path), canon)?
             }
         };
-        let dirmeta_bytes = to_dirmeta(&dir_meta).serialize()?;
-        let dirmeta = txn
-            .write_metadata(ObjectType::DirMeta, None, &dirmeta_bytes)
-            .await?;
+        let dirmeta = txn.write_dirmeta(&to_dirmeta(&dir_meta)).await?;
         node.set_metadata_checksum(dirmeta);
 
         let consume = flags.contains(CommitModifierFlags::CONSUME);

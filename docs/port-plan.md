@@ -569,8 +569,10 @@ Definition:
   `(mode & (S_IFREG|0775)) | S_IRUSR`, and stores symlinks as regular
   files holding the target plus one NUL; bare-user-shared is bare-user
   with a fixed inode mode 0644 and no logical mode on the inode;
-  bare-user-only applies the canonical mode capped at 0775 and discards
-  uid/gid and xattrs; archive writes `.filez` chmod 0644.
+  bare-user-only applies the canonical mode `perm & 0o755` and discards
+  uid/gid and xattrs, and records that canonical header in the object's
+  identity, dirmeta included, since it stores no header of its own;
+  archive writes `.filez` chmod 0644.
 - `write_content` (pull-style, drives a `ContentWriter` from an
   `AsyncRead`), `write_regfile_inline` (small caller-held content),
   `write_symlink` (framed header only, no payload).
@@ -618,7 +620,10 @@ loose objects -- payload bytes, stored header, xattr application, inode
 mode -- under identical checksums; re-writing an existing object is a
 dedup no-op visible in the stats; several tasks writing through one
 `&Transaction` stage correctly; the free-space guard trips on an
-artificially small budget; a compile-time assertion pins
+artificially small budget; a bare-user-only write of an entry carrying
+ownership, an xattr, and a mode the mode reduces lands under the identity
+its canonical header has in the other modes, reads back as that header,
+and passes `fsck`; a compile-time assertion pins
 `ContentWriter: Send + Sync`; the suite passes under both runtime
 backends. Tool-level acceptance of whole repositories lands with 7d,
 when commits and refs exist for the tool to read.
@@ -785,7 +790,10 @@ size-generation fixture matches GENERATE_SIZES output byte-for-byte
 while bare and bare-user commits are byte-identical with and without the
 request; `SOURCE_DATE_EPOCH` pins the timestamp; two transactions in one
 process commit concurrently with both commits and refs intact; detached
-metadata written by the port is read back by the tool and the reverse;
+metadata written by the port is read back by the tool and the reverse; a
+bare-user-only commit of a source tree whose ownership, modes, and xattrs are all
+outside what the mode stores produces the tool's own content, dirmeta, and
+dirtree object names for that tree and passes the tool's `fsck`;
 the suite passes under both runtime backends.
 
 ### Phase 7e -- Overlay changeset import (port extension) (DONE)
@@ -2183,9 +2191,14 @@ it shares the source's bytes and its inode.
   `.commitpartial` markers in place. A later full pull completes them and
   removes the markers.
 - `BAREUSERONLY_FILES` rejects a regular-file content object whose logical mode
-  has bits outside `0775`. A bare-user-only destination applies the check
-  whether or not the flag is set, matching the tool, which refuses such an
-  object on every write into that mode.
+  has bits outside `0775`, in any destination. A bare-user-only destination
+  applies a rule of its own on top of that, whether or not the flag is set: a
+  write into that mode records the canonical header and names the object for it,
+  while an import keeps the name the object arrives under, so an object whose
+  header is not already canonical -- a non-zero uid or gid, an xattr, or a
+  regular-file mode with bits outside `0755` -- is refused with `Error::Pull`. The
+  destination could otherwise hold it under a name its stored form does not hash
+  to. This is a divergence from the tool, described below.
 - `DISABLE_VERIFY_BINDINGS` skips the `ostree.ref-binding` check. Otherwise a
   commit carrying the key must list the ref it is pulled under; a commit
   carrying no binding key at all predates the convention and passes, while one
@@ -2224,10 +2237,13 @@ from a bare-user source into a bare-user-only destination, which shares an inode
 whose mode and `user.ostreemeta` xattr the destination mode does not describe, and
 the result fails the tool's own `fsck` (verified by observation: `pull-local`
 between the two modes, then `ostree fsck`, reports the imported object
-corrupt). The port treats the two as different modes, so it clones the payload
-onto a fresh inode carrying bare-user-only's own policy -- the canonical mode
-and no xattr -- and the bare-user-only mode check rejects what that mode cannot
-store.
+corrupt; the tool takes the object with no flag given and whatever the source
+object's mode and ownership). The port treats the two as different modes, so it
+clones the payload onto a fresh inode carrying bare-user-only's own policy -- the
+canonical mode and no xattr -- and refuses an object whose logical header is not
+already that canonical form, since it would land under a name its stored form
+does not hash to. What the port imports into a bare-user-only destination passes
+its own `fsck` and the tool's.
 
 The second is fs-verity. The tool hardlinks into a destination that seals its own
 writes and leaves the imported objects unsealed (verified by observation on btrfs
@@ -2274,10 +2290,12 @@ process to belong to a second group and skip where it does not, and between them
 they are the whole of the gate's coverage, so `OSTRYA_REQUIRE_MULTIGROUP` turns
 that skip into a failure; the CI job sets it, its runner belonging to several
 groups.
-Within the bare family: a bare-user to bare-user-only pull
-gives each regular file a fresh inode holding the source bytes under the
-canonical mode with no xattr, which the destination reads back with its own
-semantics; a bare-user to bare-user-shared pull hardlinks the symlink object,
+Within the bare family: a bare-user to bare-user-only pull of a canonically
+committed source gives each regular file a fresh inode holding the source bytes
+under the canonical mode with no xattr, which the destination reads back as the
+header the object is named for and which passes its `fsck`, while the same pull
+from a source committed under the process's own ownership is refused with
+`Error::Pull`, publishing no ref; a bare-user to bare-user-shared pull hardlinks the symlink object,
 whose representation the two modes share, and clones the regular files, whose
 inode mode they do not; a bare-split-xattrs destination is refused with
 `Unsupported` on both import paths, the link path under a commit-only pull and
@@ -2306,8 +2324,8 @@ is what lets the flag leave that path its own read;
 a ref
 binding that omits the pulled ref is rejected and `DISABLE_VERIFY_BINDINGS`
 accepts it; a commit with no binding key is accepted; a world-writable mode is
-rejected under `BAREUSERONLY_FILES` and by a bare-user-only destination, and
-accepted by an archive destination without the flag. Detached metadata travels
+rejected under `BAREUSERONLY_FILES` and by a bare-user-only destination under its
+own rule, and accepted by an archive destination without the flag. Detached metadata travels
 with its commit; a localcache repository supplies an object the source no
 longer holds, and supplies a dirtree it no longer holds, whose subtree the walk
 enumerates from the cache and imports whole, while the same pull without the

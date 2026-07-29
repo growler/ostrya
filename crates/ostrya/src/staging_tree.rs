@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use futures_io::AsyncWrite;
-use ostrya_core::{Checksum, Commit, DirMeta, ObjectType};
+use ostrya_core::{Checksum, Commit, DirMeta};
 
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
@@ -408,10 +408,7 @@ impl<'txn> StagingTree<'txn> {
 
     /// Stage a directory-metadata object and return its checksum.
     async fn stage_dirmeta(&self, meta: &DirMeta) -> Result<Checksum> {
-        let bytes = meta.serialize()?;
-        self.txn
-            .write_metadata(ObjectType::DirMeta, None, &bytes)
-            .await
+        self.txn.write_dirmeta(meta).await
     }
 
     /// Fail if a write to a leaf at `parent/name` would clobber a directory. A

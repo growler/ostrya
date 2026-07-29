@@ -72,6 +72,16 @@
 //! (uid, gid, mode, xattrs, and payload) and written afresh through the ordinary
 //! ingest path, which stores them the way the destination mode requires.
 //!
+//! A bare-user-only destination refuses a content object whose logical header is
+//! not the one it stores. That mode records neither ownership nor xattrs and
+//! reduces a regular file's permission bits to `perm & 0o755`, so a commit into it
+//! names each object for the canonical header, while an import keeps the name the
+//! object arrives under. A non-zero uid or gid, an xattr, and a regular-file mode
+//! with bits outside `0755` are each rejected with [`Error::Pull`], since the
+//! destination could hold such an object only under a name its stored form does
+//! not hash to. This is a divergence from the tool, which hardlinks the object in
+//! and leaves a repository its own fsck reports corrupt.
+//!
 //! Free space: the transaction's `min-free-space` budget is charged for the
 //! blocks an import allocates. A hardlinked object allocates none and a reflinked
 //! payload shares the source extents, so a pull whose objects the destination
@@ -157,8 +167,8 @@ impl PullFlags {
     pub const COMMIT_ONLY: PullFlags = PullFlags(1 << 1);
     /// Reject a regular-file content object whose logical mode has bits outside
     /// `0775` -- world-writable, setuid, setgid, or sticky. A bare-user-only
-    /// destination applies this check whether or not the flag is set, since the
-    /// mode it can store is already narrower than that.
+    /// destination applies a stricter rule of its own, described in the module
+    /// documentation, whether or not this flag is set.
     pub const BAREUSERONLY_FILES: PullFlags = PullFlags(1 << 2);
     /// Skip the `ostree.ref-binding` check that a pulled commit names the ref it
     /// is being pulled under.
@@ -369,21 +379,24 @@ impl Repo {
         }
 
         let same_mode = src.mode() == self.mode();
-        let checked =
-            flags.contains(PullFlags::BAREUSERONLY_FILES) || self.mode() == RepoMode::BareUserOnly;
+        let flag_check = flags.contains(PullFlags::BAREUSERONLY_FILES);
+        let dest_check = self.mode() == RepoMode::BareUserOnly;
         let untrusted = flags.contains(PullFlags::UNTRUSTED);
 
-        // The mode check reads the object's logical form and runs before the
+        // The header checks read the object's logical form and run before the
         // object is imported by any path. An untrusted verification reads the same
         // form and is deferred to the path the import takes: the link and the
         // clone move bytes without hashing them and are verified here, while a
         // re-ingest hashes the object as it writes it and compares the result
         // against its name itself, so verifying ahead of that would read the
         // payload twice.
-        let loaded = if checked || untrusted {
+        let loaded = if flag_check || dest_check || untrusted {
             let file = src.load_file(&name.checksum).await?;
-            if checked {
+            if flag_check {
                 check_bareuseronly(&name.checksum, &file)?;
+            }
+            if dest_check {
+                check_canonical(&name.checksum, &file)?;
             }
             Some(file)
         } else {
@@ -767,6 +780,36 @@ fn symlink_shared(src: RepoMode, dest: RepoMode) -> bool {
         (RepoMode::BareUser, RepoMode::BareUserShared)
             | (RepoMode::BareUserShared, RepoMode::BareUser)
     )
+}
+
+/// Reject a content object whose logical header is not the one a
+/// `bare-user-only` destination stores.
+///
+/// That mode records neither ownership nor xattrs and reduces a regular file's
+/// permission bits to `perm & 0o755`, so a write into it canonicalizes the header
+/// and names the object for the result. An import keeps the name the object
+/// arrives under, which it can do only where that name already covers the
+/// canonical header; anything else would land under a name its stored form does
+/// not hash to. A symlink's mode is fixed by the object model and is exempt.
+fn check_canonical(checksum: &Checksum, file: &crate::file::FileObject) -> Result<()> {
+    let extra = if file.is_symlink() {
+        0
+    } else {
+        // S_IFREG plus the permission bits the mode keeps.
+        file.mode & !0o100755
+    };
+    if extra == 0 && file.uid == 0 && file.gid == 0 && file.xattrs.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Pull(format!(
+        "content object {checksum}: a bare-user-only repository stores neither \
+         ownership nor xattrs and reduces the mode to 0755, so this object -- uid \
+         {}, gid {}, mode 0{:o}, {} xattr(s) -- cannot be imported under its own name",
+        file.uid,
+        file.gid,
+        file.mode,
+        file.xattrs.len()
+    )))
 }
 
 /// Reject a regular-file content object whose logical mode has bits outside

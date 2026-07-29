@@ -74,9 +74,29 @@ async fn commit_tree(
     branch: &str,
     parent: Option<Checksum>,
 ) -> Checksum {
+    commit_tree_with(
+        repo,
+        base,
+        sub,
+        branch,
+        parent,
+        CommitModifierFlags::SKIP_XATTRS,
+    )
+    .await
+}
+
+/// Commit subtree `sub` as [`commit_tree`] does, under the given modifier flags.
+async fn commit_tree_with(
+    repo: &Repo,
+    base: &Path,
+    sub: &str,
+    branch: &str,
+    parent: Option<Checksum>,
+    flags: CommitModifierFlags,
+) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
-    let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+    let mut modifier = CommitModifier::new(flags);
     let dfd = std::fs::File::open(base).unwrap();
     txn.write_dfd_to_mtree(dfd.as_fd(), Path::new(sub), &mut mtree, Some(&mut modifier))
         .await
@@ -129,6 +149,19 @@ async fn source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, Checksum, C
     let (path, repo) = make_repo(base, "src", mode).await;
     let c1 = commit_tree(&repo, base, "v1", "main", None).await;
     let c2 = commit_tree(&repo, base, "v2", "main", Some(c1)).await;
+    (path, repo, c1, c2)
+}
+
+/// A source repository as [`source_repo`], committed with canonical permissions
+/// so every object it holds carries the header a bare-user-only destination
+/// stores and can therefore be imported under its own name.
+async fn canonical_source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, Checksum, Checksum) {
+    build_tree(&base.join("v1"), b"hello one\n");
+    build_tree(&base.join("v2"), b"hello two\n");
+    let (path, repo) = make_repo(base, "src", mode).await;
+    let flags = CommitModifierFlags::SKIP_XATTRS | CommitModifierFlags::CANONICAL_PERMISSIONS;
+    let c1 = commit_tree_with(&repo, base, "v1", "main", None, flags).await;
+    let c2 = commit_tree_with(&repo, base, "v2", "main", Some(c1), flags).await;
     (path, repo, c1, c2)
 }
 
@@ -1032,7 +1065,9 @@ fn a_bare_family_cross_mode_pull_clones_the_content() {
     let tmp = TmpDir::new("pull-bare-family");
     block_on(async {
         let base = tmp.path();
-        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
+        // A bare-user-only destination imports an object only under the name its
+        // own stored form hashes to, so the source is committed canonically.
+        let (src_dir, src, _c1, c2) = canonical_source_repo(base, RepoMode::BareUser).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUserOnly).await;
 
         dst.pull_local(
@@ -1074,12 +1109,8 @@ fn a_bare_family_cross_mode_pull_clones_the_content() {
             logical & 0o755
         );
 
-        // The destination reads the object back with its own mode's semantics:
-        // bare-user-only discards ownership, so the logical uid and gid come
-        // back as 0. That loss is the mode's, not the import path's -- a commit
-        // written into bare-user-only directly loses them the same way -- so a
-        // bare-user-only repository holding objects committed under a non-zero
-        // uid does not pass fsck whichever path imported them.
+        // The object reads back as the header it is named for, which is what the
+        // destination's own writer would have stored for it.
         let landed = dst.load_file(&content.checksum).await.unwrap();
         assert_eq!((landed.uid, landed.gid), (0, 0));
         assert_eq!(landed.mode, (logical & 0o755) | 0o100000);
@@ -1088,6 +1119,38 @@ fn a_bare_family_cross_mode_pull_clones_the_content() {
         for name in src.traverse_commit(&c2, 0).await.unwrap() {
             assert!(dst.has_object(name.ty, &name.checksum).await.unwrap());
         }
+        let report = dst.fsck(&ostrya::FsckOptions::new()).await.unwrap();
+        assert!(report.is_ok(), "fsck reported {:?}", report.errors);
+    });
+}
+
+#[test]
+fn a_bare_user_only_destination_refuses_a_header_it_cannot_store() {
+    let tmp = TmpDir::new("pull-buo-header");
+    block_on(async {
+        let base = tmp.path();
+        // Committed without canonical permissions, so every object carries the
+        // committing process's uid and gid, which this mode discards.
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::BareUser).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUserOnly).await;
+
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Pull(_)), "{err}");
+        assert!(
+            err.to_string()
+                .contains("cannot be imported under its own name"),
+            "{err}"
+        );
+        assert_eq!(dst.resolve_rev("main", true).await.unwrap(), None);
     });
 }
 
@@ -1847,7 +1910,8 @@ fn bareuseronly_files_rejects_a_world_writable_mode() {
         assert!(matches!(err, Error::Pull(_)), "{err}");
         assert!(err.to_string().contains("invalid mode"));
 
-        // A bare-user-only destination applies it on its own.
+        // A bare-user-only destination refuses the same object without the flag,
+        // under its own rule: that mode cannot store this mode's bits.
         let (_buo_dir, buo) = make_repo(base, "buo", RepoMode::BareUserOnly).await;
         let err = buo
             .pull_local(

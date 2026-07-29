@@ -29,7 +29,7 @@ use async_compression::Level;
 use async_compression::futures::write::DeflateEncoder;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use ostrya_core::filehdr::frame;
-use ostrya_core::{Checksum, FileHeader, ObjectType, RepoMode, Xattrs, loose_path};
+use ostrya_core::{Checksum, DirMeta, FileHeader, ObjectType, RepoMode, Xattrs, loose_path};
 use ostrya_rt::File as RtFile;
 use rustix::fs::{AtFlags, Gid, Mode, OFlags, Uid, XattrFlags};
 use sha2::{Digest, Sha256};
@@ -46,6 +46,11 @@ const S_IFLNK: u32 = 0o120000;
 const SYMLINK_MODE: u32 = S_IFLNK | 0o777;
 /// The permission-bit mask of an `st_mode`.
 const PERM_MASK: u32 = 0o7777;
+/// The file-type mask of an `st_mode`.
+const S_IFMT: u32 = 0o170000;
+/// The permission bits `bare-user-only` keeps: the owner bits and the group and
+/// other read and execute bits.
+const CANONICAL_PERM_MASK: u32 = 0o755;
 /// The fixed inode mode metadata objects and archive/shared content take.
 const FIXED_MODE: u32 = 0o644;
 /// The chunk size for the streaming copy in [`Transaction::write_content`].
@@ -110,6 +115,39 @@ impl FileMeta {
             symlink_target: target.to_owned(),
             xattrs: self.xattrs.clone(),
         }
+    }
+}
+
+/// The logical header a repository of `mode` records for a content object.
+///
+/// Every mode but `bare-user-only` records the header it is given.
+/// `bare-user-only` stores neither ownership nor xattrs and reduces a regular
+/// file's permission bits to `perm & 0o755`, so the header it records is that
+/// reduced form, and an object's identity covers the reduced header rather than
+/// the one the writer supplied. A symlink's mode is fixed by the object model
+/// and is left alone; its ownership and xattrs are discarded like a regular
+/// file's. See `format-reference.md`, "Write path: loose-object inode modes and
+/// durability".
+fn canonical_header(mode: RepoMode, mut header: FileHeader) -> FileHeader {
+    if mode == RepoMode::BareUserOnly {
+        header.uid = 0;
+        header.gid = 0;
+        header.xattrs = Xattrs::empty();
+        if header.mode & S_IFMT != S_IFLNK {
+            header.mode = (header.mode & S_IFMT) | (header.mode & CANONICAL_PERM_MASK);
+        }
+    }
+    header
+}
+
+/// The directory metadata `bare-user-only` records: no ownership, no xattrs,
+/// and the permission bits reduced the same way a regular file's are.
+fn canonical_dirmeta(meta: &DirMeta) -> DirMeta {
+    DirMeta {
+        uid: 0,
+        gid: 0,
+        mode: (meta.mode & S_IFMT) | (meta.mode & CANONICAL_PERM_MASK),
+        xattrs: Xattrs::empty(),
     }
 }
 
@@ -268,7 +306,7 @@ impl Transaction {
                 "bare-split-xattrs is read-only; the port does not write it".into(),
             ));
         }
-        let header = meta.regular_header();
+        let header = canonical_header(mode, meta.regular_header());
         // Validate the regular-file mode up front and seed the identity with
         // the framed uncompressed header.
         let framed = frame(&header.serialize()?)?;
@@ -341,7 +379,7 @@ impl Transaction {
                 "bare-split-xattrs is read-only; the port does not write it".into(),
             ));
         }
-        let header = meta.symlink_header(target);
+        let header = canonical_header(mode, meta.symlink_header(target));
         let checksum = Checksum::from_bytes(Sha256::digest(frame(&header.serialize()?)?).into());
         if let Some(expected) = expected
             && *expected != checksum
@@ -352,6 +390,24 @@ impl Transaction {
             });
         }
         self.stage_symlink(checksum, header).await
+    }
+
+    /// Write a directory-metadata object for `meta`, recording what the
+    /// repository mode stores for a directory: `bare-user-only` discards
+    /// ownership and xattrs and reduces the permission bits, so a commit into it
+    /// records the canonical form and the dirmeta's identity covers that form.
+    /// Every other mode records `meta` as given.
+    ///
+    /// This is the path a commit's own directories take. A dirmeta arriving from
+    /// elsewhere -- a pull or a delta -- keeps the bytes it is named for and goes
+    /// through [`write_metadata`](Transaction::write_metadata).
+    pub(crate) async fn write_dirmeta(&self, meta: &DirMeta) -> Result<Checksum> {
+        let bytes = if self.repo().mode() == RepoMode::BareUserOnly {
+            canonical_dirmeta(meta).serialize()?
+        } else {
+            meta.serialize()?
+        };
+        self.write_metadata(ObjectType::DirMeta, None, &bytes).await
     }
 
     /// Write a metadata object from its normal-form serialized bytes. The

@@ -5,7 +5,8 @@
 //! commit across archive, bare-user, and bare-user-shared (the commit object is
 //! mode-independent), the archive `--generate-sizes` commit, the ref files the
 //! tool resolves, detached-metadata round-trips, immediate ref writes,
-//! concurrent commits, and tool acceptance of a port-built repository.
+//! concurrent commits, tool acceptance of a port-built repository, and a
+//! bare-user-only commit of a non-canonical tree against the tool's own objects.
 
 mod common;
 
@@ -437,6 +438,116 @@ fn two_transactions_commit_concurrently() {
         repo.load_commit(&a).await.unwrap();
         repo.load_commit(&b).await.unwrap();
     });
+}
+
+#[test]
+fn bare_user_only_commit_matches_the_tool() {
+    if !ostree_available() {
+        eprintln!(
+            "skipping bare_user_only_commit_matches_the_tool: the ostree tool is unavailable"
+        );
+        return;
+    }
+    // bare-user-only records what it can store -- no ownership, no xattrs, and
+    // permission bits reduced to `perm & 0o755` -- for content objects and
+    // directory metadata alike, and the identities follow from those headers. A
+    // tree whose ownership, modes, and xattrs are all outside what the mode
+    // stores therefore produces the tool's own object names, and the tool's fsck
+    // accepts the result.
+    let tmp = TmpDir::new("commit-buo-tool");
+    let base = tmp.path();
+    build_noncanonical_source(base);
+
+    let port_root = base.join("port");
+    block_on(async {
+        let repo = Repo::create(&port_root, CreateOptions::new(RepoMode::BareUserOnly))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let mut mtree = MutableTree::new();
+        let dfd = std::fs::File::open(base).unwrap();
+        txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("src"), &mut mtree, None)
+            .await
+            .unwrap();
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let commit = txn
+            .write_commit(fixture_commit_options(), &root)
+            .await
+            .unwrap();
+        txn.set_ref("test/main", Some(&commit));
+        txn.commit().await.unwrap();
+    });
+
+    let tool_root = base.join("tool");
+    let tool_arg = format!("--repo={}", tool_root.display());
+    run_ostree(&[&tool_arg, "init", "--mode=bare-user-only"]);
+    run_ostree(&[
+        &tool_arg,
+        "commit",
+        "--branch=test/main",
+        &format!("--subject={SUBJECT}"),
+        "--timestamp=@1700000000",
+        base.join("src").to_str().unwrap(),
+    ]);
+
+    // The commit object carries the tool's own metadata, so the comparison is
+    // over the objects the tree itself produces.
+    assert_eq!(
+        tree_object_names(&tool_root),
+        tree_object_names(&port_root),
+        "tree objects of a non-canonical source in bare-user-only"
+    );
+
+    let port_arg = format!("--repo={}", port_root.display());
+    run_ostree(&[&port_arg, "fsck"]);
+    run_ostree(&[&port_arg, "ls", "-R", "test/main"]);
+}
+
+/// Build a source tree under `base/src` whose ownership, modes, and xattrs are
+/// all outside what `bare-user-only` stores: a world-writable file carrying an
+/// xattr, a setuid file, a world-writable directory, and a symlink. The process
+/// owns every entry, so a commit reads a non-zero uid and gid for each.
+fn build_noncanonical_source(base: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let set_mode = |p: &Path, m: u32| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("subdir")).unwrap();
+    std::fs::write(src.join("hello.txt"), b"hello ostree\n").unwrap();
+    std::fs::write(src.join("exec.sh"), b"#!/bin/sh\necho hi\n").unwrap();
+    std::fs::write(src.join("subdir/nested.txt"), b"nested\n").unwrap();
+    std::os::unix::fs::symlink("hello.txt", src.join("link")).unwrap();
+    rustix::fs::setxattr(
+        src.join("hello.txt"),
+        "user.demo",
+        b"value",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .unwrap();
+    set_mode(&src.join("hello.txt"), 0o777);
+    set_mode(&src.join("exec.sh"), 0o4755);
+    set_mode(&src.join("subdir/nested.txt"), 0o640);
+    set_mode(&src.join("subdir"), 0o777);
+    set_mode(&src, 0o755);
+}
+
+/// The loose-object names of the dirtree, dirmeta, and content objects in a
+/// repository, as `<fanout>/<rest>` strings. Commit objects are excluded.
+fn tree_object_names(root: &Path) -> HashSet<String> {
+    let objects = root.join("objects");
+    let mut out = HashSet::new();
+    for fanout in std::fs::read_dir(&objects).unwrap().flatten() {
+        let prefix = fanout.file_name().to_string_lossy().into_owned();
+        for obj in std::fs::read_dir(fanout.path()).unwrap().flatten() {
+            let name = obj.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".commit") {
+                continue;
+            }
+            out.insert(format!("{prefix}/{name}"));
+        }
+    }
+    out
 }
 
 #[test]

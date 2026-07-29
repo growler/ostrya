@@ -4,7 +4,8 @@
 //! byte-identical loose objects versus the checked-in fixtures for archive and
 //! bare-user (plus the bare-user-shared derivation), a tool cross-check for
 //! bare, the dedup no-op, the free-space guard, concurrent writers on one
-//! `&Transaction`, and read-back through `load_file`.
+//! `&Transaction`, read-back through `load_file`, and the canonical header
+//! bare-user-only records and names its objects for.
 
 mod common;
 
@@ -15,7 +16,7 @@ use common::{TmpDir, fixture_repo, ostree_available};
 use futures_lite::AsyncReadExt;
 use futures_lite::io::Cursor;
 use ostrya::{
-    Checksum, CreateOptions, Error, FileKind, FileMeta, Repo, RepoMode, Transaction,
+    Checksum, CreateOptions, Error, FileKind, FileMeta, FsckOptions, Repo, RepoMode, Transaction,
     TransactionStats,
 };
 use ostrya_core::{ObjectType, loose_path};
@@ -672,6 +673,70 @@ fn bare_objects_match_the_tool() {
             );
         }
     }
+}
+
+#[test]
+fn bare_user_only_hashes_the_canonical_header() {
+    // bare-user-only stores neither ownership nor xattrs and reduces a regular
+    // file's permission bits to `perm & 0o755`, and an object's identity covers
+    // that reduced header: the object is named for what the mode stores, so it
+    // reads back as it was named and passes fsck. The identity is therefore the
+    // one the same canonical entry has in any other mode, which is what this
+    // compares against. Pinned to the tool by
+    // `bare_user_only_objects_match_the_tool`.
+    let tmp = TmpDir::new("write-buo-canon");
+    let buo_root = tmp.path().join("buo");
+    let bu_root = tmp.path().join("bu");
+    block_on(async {
+        // A non-canonical entry: owned by ids the mode discards, a mode with
+        // group-write and other-write set, and one xattr.
+        let mut meta = FileMeta::regular(4242, 4242, 0o777);
+        meta.xattrs =
+            ostrya_core::Xattrs::new([(b"user.demo\0".to_vec(), b"value".to_vec())]).unwrap();
+
+        let repo = Repo::create(&buo_root, CreateOptions::new(RepoMode::BareUserOnly))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let inline = txn.write_regfile_inline(None, &meta, HELLO).await.unwrap();
+        let streamed = txn
+            .write_content(None, &meta, Cursor::new(NESTED.to_vec()))
+            .await
+            .unwrap();
+        let link = txn.write_symlink("hello.txt", &meta, None).await.unwrap();
+        txn.commit().await.unwrap();
+
+        // The identity of the canonical form of each entry, taken from a mode
+        // that stores the header it is given.
+        let canon = FileMeta::regular(0, 0, 0o755);
+        let bu = Repo::create(&bu_root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = bu.transaction().await.unwrap();
+        let canon_inline = txn.write_regfile_inline(None, &canon, HELLO).await.unwrap();
+        let canon_streamed = txn
+            .write_content(None, &canon, Cursor::new(NESTED.to_vec()))
+            .await
+            .unwrap();
+        let canon_link = txn.write_symlink("hello.txt", &canon, None).await.unwrap();
+        txn.commit().await.unwrap();
+
+        assert_eq!(inline, canon_inline, "inline regular-file identity");
+        assert_eq!(streamed, canon_streamed, "streamed regular-file identity");
+        assert_eq!(link, canon_link, "symlink identity");
+
+        // Each object reads back as the header it is named for.
+        for checksum in [inline, streamed] {
+            let file = repo.load_file(&checksum).await.unwrap();
+            assert_eq!((file.uid, file.gid, file.mode), (0, 0, 0o100755));
+            assert!(file.xattrs.is_empty(), "xattrs of {checksum}");
+        }
+        let file = repo.load_file(&link).await.unwrap();
+        assert_eq!((file.uid, file.gid), (0, 0));
+
+        let report = repo.fsck(&FsckOptions::default()).await.unwrap();
+        assert!(report.is_ok(), "fsck reported {:?}", report.errors);
+    });
 }
 
 fn run_ostree(args: &[&str]) {

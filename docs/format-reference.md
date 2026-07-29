@@ -535,11 +535,26 @@ Loose-object inode permission bits, by object class and repository mode:
 - `bare-user-only`: a regular-file content object's inode mode is the canonical
   `logical_perm & 0o755` -- group-write and other-write are dropped and no
   special bits are kept (`0664` stores as `0644`, `0666` as `0644`, `0775` as
-  `0755`). uid/gid are discarded and no xattrs are stored. Because this mode
-  stores no header, the object identity is computed over the canonicalized mode,
-  so a `bare-user-only` content object's checksum can differ from the same file
-  in the other modes when the input mode is not already canonical. A symlink is
-  a real symlink.
+  `0755`). uid/gid are discarded and no xattrs are stored. A symlink is a real
+  symlink, and its mode stays `S_IFLNK | 0o777`.
+
+  This mode stores no header, so a write into it records the header it can
+  store -- uid 0, gid 0, no xattrs, and a non-symlink's permission bits reduced as
+  above -- and an object's identity covers that recorded header rather than the one
+  the writer supplied. A directory's metadata is recorded the same way, so a
+  commit's dirmeta and dirtree checksums follow from the reduced form too. An
+  entry already in that form keeps the identity it has in the other modes; any
+  other entry takes a different one.
+
+  Observed: a tree holding a 0777 file carrying a `user.demo` xattr, a 04755
+  file, a 0640 file, and a 0777 subdirectory, committed by a non-root user with
+  no ownership options, produces in `bare-user-only` exactly the content,
+  dirmeta, and dirtree checksums the same tree produces in `bare-user` when its
+  modes are already canonical and it is committed 0:0 -- the 0777 file lands as
+  0755 under the 0755 file's checksum, and the xattr-bearing file lands under the
+  checksum of the same file without the xattr. Committing that tree with and
+  without `--owner-uid`/`--owner-gid` gives identical checksums, which is the
+  discarded ownership.
 
 Symlink storage detail (confirmed for `bare-user`): a symlink is a regular file
 whose content is the target bytes followed by one NUL; its `user.ostreemeta` is
@@ -700,12 +715,13 @@ back with `ostree ls -R`:
   match: `0775`, `0777`, and `02755` become `0755`; `0700` stays `0700`.
 - A symlink is unchanged; its mode stays `S_IFLNK | 0o777`.
 
-This is the same permission rule `bare-user-only` applies to its inodes
-(`perm & 0o755`, see the loose-object inode-mode notes above). Because the
-canonicalized mode enters the file-content header, canonical ingest changes an
-object's identity, and therefore the dirtree and commit checksums, whenever an
-input mode is not already canonical (confirmed: the canonical commit checksum
-differs from the same tree committed 0:0 without the option).
+This is the ownership and permission rule `bare-user-only` applies to everything
+it records, with or without the option (`perm & 0o755`, see the loose-object
+inode-mode notes above). Because the canonicalized mode enters the file-content
+header, canonical ingest changes an object's identity, and therefore the dirtree
+and commit checksums, whenever an input mode is not already canonical (confirmed:
+the canonical commit checksum differs from the same tree committed 0:0 without
+the option).
 
 Consume. The tool's `--consume` option (the port's `CONSUME`) deletes the
 source content after it is committed. Recovered by committing `--consume base/src`:

@@ -35,7 +35,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::StreamExt;
-use ostrya_core::{Checksum, DirMeta, ObjectType, Xattrs};
+use ostrya_core::{Checksum, DirMeta, Xattrs};
 use smol_tar::{
     AttrList, TarDirectory, TarEntry, TarLink, TarReader, TarRegularFile, TarSymlink, TarWriter,
 };
@@ -329,10 +329,9 @@ impl Repo {
         Ok(root)
     }
 
-    /// Serialize a dirmeta and stage it as a metadata object.
+    /// Stage a dirmeta as a metadata object.
     async fn stage_dirmeta(&self, txn: &Transaction, meta: &DirMeta) -> Result<Checksum> {
-        let bytes = meta.serialize()?;
-        txn.write_metadata(ObjectType::DirMeta, None, &bytes).await
+        txn.write_dirmeta(meta).await
     }
 }
 

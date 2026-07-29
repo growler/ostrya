@@ -191,7 +191,7 @@ impl Repo {
 /// Whether a commit already expanded at remaining depth `prev` follows at least
 /// as many parents as a fresh arrival at remaining depth `depth`. A negative
 /// depth is unbounded and dominates any finite depth.
-fn reaches_at_least(prev: i32, depth: i32) -> bool {
+pub(crate) fn reaches_at_least(prev: i32, depth: i32) -> bool {
     if prev < 0 {
         true
     } else if depth < 0 {

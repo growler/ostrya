@@ -16,8 +16,8 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use ostrya_core::{Checksum, ObjectType, RepoMode};
 
@@ -27,7 +27,8 @@ use crate::lock::LockGuard;
 use crate::repo::Repo;
 use crate::staging::StagingDir;
 use crate::write::{
-    StageCtx, StageOutcome, TempKind, publish_blocking, stage_content_blocking,
+    Blocks, StageCtx, StageOutcome, TempKind, probe_fresh_owner, publish_blocking,
+    stage_clone_content_blocking, stage_content_blocking, stage_import_blocking,
     stage_metadata_blocking, stage_symlink_blocking,
 };
 
@@ -42,7 +43,10 @@ pub struct TransactionStats {
     pub metadata_written: u32,
     /// Content objects freshly staged. A dedup hit does not count.
     pub content_written: u32,
-    /// The total on-disk size of the freshly staged content objects.
+    /// The total on-disk size of the freshly staged content objects. An object
+    /// imported from another repository counts its size whether its bytes were
+    /// written, shared by reflink, or shared by hardlink, so this is the storage
+    /// the objects occupy and not the space the transaction consumed.
     pub content_bytes_written: u64,
     /// Content objects skipped because their (device, inode) was already known
     /// through a [`DevInoCache`](crate::DevInoCache) hit during a filesystem
@@ -112,6 +116,9 @@ pub struct Transaction {
     /// and applied at [`commit`](Transaction::commit), after object
     /// publication, per the durability contract.
     pub(crate) refs: Mutex<Vec<crate::refs::RefWrite>>,
+    /// The uid and gid an object freshly staged in this transaction takes,
+    /// measured once on first use by [`fresh_owner`](Transaction::fresh_owner).
+    fresh_owner: OnceLock<(u32, u32)>,
     staging: Option<StagingDir>,
     /// The repository lock hold, kept for the transaction's lifetime and
     /// released when this field drops. Never read.
@@ -138,6 +145,7 @@ impl Transaction {
                 stats: TransactionStats::default(),
             }),
             refs: Mutex::new(Vec::new()),
+            fresh_owner: OnceLock::new(),
             staging: Some(staging),
             lock,
         }
@@ -154,6 +162,20 @@ impl Transaction {
             .as_ref()
             .expect("staging directory present during the transaction")
             .dir_fd()
+    }
+
+    /// The uid and gid an object freshly staged in this transaction takes,
+    /// measured on first use and held for the transaction's lifetime. Read by the
+    /// import path, which admits a hardlink only where the source inode's
+    /// ownership is already this pair. Two callers racing the first read measure
+    /// the same directory and one of the two results is kept.
+    pub(crate) async fn fresh_owner(&self) -> Result<(u32, u32)> {
+        if let Some(owner) = self.fresh_owner.get() {
+            return Ok(*owner);
+        }
+        let staging = self.staging_fd().try_clone_to_owned()?;
+        let owner = ostrya_rt::unblock(move || probe_fresh_owner(staging.as_fd())).await?;
+        Ok(*self.fresh_owner.get_or_init(|| owner))
     }
 
     /// Mark that this transaction should emit `ostree.sizes` at commit. Set by
@@ -343,15 +365,126 @@ impl Transaction {
         self.record(checksum, ty, mode, outcome)
     }
 
-    /// Record a staged object's outcome: debit the free-space budget, insert it
-    /// into the staged set, and update the statistics. Idempotent by identity,
-    /// so restaging an object already staged in this transaction is a no-op.
+    /// Import one object from another local repository's `objects/` directory by
+    /// hardlinking it, which shares the source inode. The two repositories must
+    /// store the object identically, and the source inode must already carry the
+    /// ownership a write here produces; see [`stage_import_blocking`]. Called by
+    /// the local pull path.
+    ///
+    /// Returns whether the object is staged. `false` is a content object whose
+    /// link was refused, which the caller imports through the object's logical
+    /// header instead; a metadata object is always staged, by link or by copy.
+    pub(crate) async fn stage_import(
+        &self,
+        src_objects_fd: BorrowedFd<'_>,
+        checksum: Checksum,
+        ty: ObjectType,
+        src_mode: RepoMode,
+        force_copy: bool,
+    ) -> Result<bool> {
+        let mode = self.repo.mode();
+        let (fsync, per_object_fsync) = self.fsync_flags()?;
+        let verity = self.verity()?;
+        let objects = self.repo.objects_fd().try_clone_to_owned()?;
+        let staging = self.staging_fd().try_clone_to_owned()?;
+        let source = src_objects_fd.try_clone_to_owned()?;
+        // The ownership a link must match, withheld where no link is attempted:
+        // measuring it creates and removes a staging temporary, which a forced
+        // copy and a sealing repository would never read.
+        let link_owner = if force_copy || verity != Tristate::No {
+            None
+        } else {
+            Some(self.fresh_owner().await?)
+        };
+        let outcome = ostrya_rt::unblock(move || {
+            let ctx = StageCtx {
+                objects_fd: objects.as_fd(),
+                staging_fd: staging.as_fd(),
+                mode,
+                fsync,
+                per_object_fsync,
+                verity,
+            };
+            stage_import_blocking(&ctx, source.as_fd(), &checksum, ty, src_mode, link_owner)
+        })
+        .await?;
+        let Some(outcome) = outcome else {
+            return Ok(false);
+        };
+        // An imported object carries no size record: a pull writes no commit, so
+        // `ostree.sizes` is never emitted from this transaction, and the payload
+        // is never read, so its unpacked length is unknown anyway.
+        self.record_object(checksum, ty, mode, outcome, false)?;
+        Ok(true)
+    }
+
+    /// Import one regular-file content object from another local repository by
+    /// cloning its payload and applying this repository's inode policy from the
+    /// object's logical header. The two modes must store the payload the same
+    /// way; see [`stage_clone_content_blocking`]. Called by the local pull path.
+    pub(crate) async fn stage_clone_content(
+        &self,
+        src_objects_fd: BorrowedFd<'_>,
+        checksum: Checksum,
+        src_mode: RepoMode,
+        header: ostrya_core::FileHeader,
+        unpacked: u64,
+    ) -> Result<()> {
+        let mode = self.repo.mode();
+        let (fsync, per_object_fsync) = self.fsync_flags()?;
+        let verity = self.verity()?;
+        let objects = self.repo.objects_fd().try_clone_to_owned()?;
+        let staging = self.staging_fd().try_clone_to_owned()?;
+        let source = src_objects_fd.try_clone_to_owned()?;
+        let outcome = ostrya_rt::unblock(move || {
+            let ctx = StageCtx {
+                objects_fd: objects.as_fd(),
+                staging_fd: staging.as_fd(),
+                mode,
+                fsync,
+                per_object_fsync,
+                verity,
+            };
+            stage_clone_content_blocking(
+                &ctx,
+                source.as_fd(),
+                &checksum,
+                src_mode,
+                &header,
+                unpacked,
+            )
+        })
+        .await?;
+        // An imported object carries no size record: a pull writes no commit, so
+        // `ostree.sizes` is never emitted from this transaction.
+        self.record_object(checksum, ObjectType::File, mode, outcome, false)?;
+        Ok(())
+    }
+
+    /// Record a staged object's outcome: debit the free-space budget by the
+    /// blocks the object allocated, insert it into the staged set, and update the
+    /// statistics. Idempotent by identity, so restaging an object already staged
+    /// in this transaction is a no-op.
     fn record(
         &self,
         checksum: Checksum,
         ty: ObjectType,
         mode: RepoMode,
         outcome: StageOutcome,
+    ) -> Result<Checksum> {
+        self.record_object(checksum, ty, mode, outcome, true)
+    }
+
+    /// The body of [`record`](Transaction::record). `with_size` chooses whether
+    /// the object contributes an archive size record; an import contributes none,
+    /// since the pull that imports it writes no commit to carry one.
+    fn record_object(
+        &self,
+        checksum: Checksum,
+        ty: ObjectType,
+        mode: RepoMode,
+        outcome: StageOutcome,
+        with_size: bool,
     ) -> Result<Checksum> {
         if outcome.deduped {
             return Ok(checksum);
@@ -361,12 +494,20 @@ impl Transaction {
             // Already staged in this transaction: idempotent no-op.
             return Ok(checksum);
         }
-        if outcome.on_disk_size > staged.free_budget {
+        // Only freshly written blocks come off the budget. An imported object
+        // that shares the source inode by hardlink allocates nothing, and one
+        // whose payload came from a `FICLONE` reflink shares the source extents,
+        // so neither reduces the bytes free on the filesystem.
+        let allocated = match outcome.blocks {
+            Blocks::Written => outcome.on_disk_size,
+            Blocks::Linked | Blocks::Reflinked => 0,
+        };
+        if allocated > staged.free_budget {
             return Err(Error::InsufficientFreeSpace {
-                shortfall: outcome.on_disk_size - staged.free_budget,
+                shortfall: allocated - staged.free_budget,
             });
         }
-        staged.free_budget -= outcome.on_disk_size;
+        staged.free_budget -= allocated;
         staged.objects.insert(
             (checksum, ty),
             StagedObject {
@@ -377,7 +518,7 @@ impl Transaction {
         // In archive mode every staged object -- content and metadata alike --
         // contributes an `ostree.sizes` record. A metadata object is stored
         // raw, so its unpacked size equals its on-disk size.
-        if mode.is_archive() {
+        if with_size && mode.is_archive() {
             let unpacked = if ty == ObjectType::File {
                 outcome.unpacked
             } else {
@@ -554,6 +695,49 @@ mod tests {
                  compressed={} unpacked={}",
                 record.compressed,
                 record.unpacked,
+            );
+            txn.abort().await.unwrap();
+        });
+    }
+
+    /// A source object the clone path cannot open because it is gone is reported
+    /// as the missing object it is, the answer the link path gives for the same
+    /// condition.
+    #[test]
+    fn a_clone_of_an_absent_source_object_reports_it_missing() {
+        let scratch = Scratch::new("clone-missing");
+        block_on(async {
+            let src = crate::Repo::create(
+                &scratch.0.join("src"),
+                CreateOptions::new(RepoMode::BareUserShared),
+            )
+            .await
+            .unwrap();
+            let dst = crate::Repo::create(
+                &scratch.0.join("dst"),
+                CreateOptions::new(RepoMode::BareUser),
+            )
+            .await
+            .unwrap();
+            let txn = dst.transaction().await.unwrap();
+            let checksum = Checksum::from_bytes([0x11; 32]);
+            let err = txn
+                .stage_clone_content(
+                    src.objects_fd(),
+                    checksum,
+                    src.mode(),
+                    FileMeta::regular(0, 0, 0o644).regular_header(),
+                    0,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::ObjectNotFound { checksum: c, ty }
+                        if c == checksum && ty == ObjectType::File
+                ),
+                "unexpected error: {err}"
             );
             txn.abort().await.unwrap();
         });

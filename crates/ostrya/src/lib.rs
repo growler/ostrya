@@ -110,7 +110,20 @@
 //! conditional requests resolve to [`Fetched::NotModified`], retryable
 //! failures are repeated across mirrors, and a response arrives as a streaming
 //! [`Body`] under an optional size cap -- and [`VerifyingReader`], the stream
-//! that checks a payload against its expected digest at EOF.
+//! that checks a payload against its expected digest at EOF. It also covers
+//! local pull (Phase 16b): [`Repo::pull_local`] imports refs, their commit
+//! chains, and every object those commits reach out of another local
+//! repository under a [`PullOptions`] -- an object the two repositories store
+//! identically, inode included, is hardlinked where the source inode already
+//! carries the ownership a write here produces; a refused link takes a metadata
+//! object to a reflink-then-copy and a content object to its logical header; a
+//! content object crossing modes within the bare family has its payload cloned
+//! under this repository's own inode policy; one crossing the archive boundary
+//! is re-ingested through the ordinary write path; [`PullFlags`] selects
+//! checksum verification, commit-metadata-only pulls, copying instead of
+//! linking, and the mode and binding checks; and
+//! [`localcache_repos`](PullOptions::localcache_repos) adds further local
+//! repositories to source objects from.
 
 mod bspatch;
 pub mod checkout;
@@ -135,6 +148,7 @@ pub mod mtree;
 mod object;
 mod overlay;
 pub mod prune;
+pub mod pull;
 pub mod read;
 pub mod refs;
 pub mod repo;
@@ -177,6 +191,7 @@ pub use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Type, Value,
 };
 pub use prune::{PruneOptions, PruneStats};
+pub use pull::{PullFlags, PullOptions, PullStats};
 pub use read::CommitState;
 pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};

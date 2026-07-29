@@ -148,7 +148,7 @@ impl Repo {
             unlink_optional(repo.objects_fd(), &commit_path)?;
             let meta_path = loose_path(&commit, ObjectType::CommitMeta, mode);
             unlink_optional(repo.objects_fd(), &meta_path)?;
-            let partial = format!("state/{}.commitpartial", commit.to_hex());
+            let partial = crate::pull::partial_path(&commit);
             unlink_optional(repo.repo_fd(), &partial)?;
             Ok(())
         })
@@ -178,7 +178,7 @@ fn sweep_blocking(
         if !no_prune {
             unlink_optional(objects_fd, &path)?;
             if name.ty == ObjectType::Commit {
-                let partial = format!("state/{}.commitpartial", name.checksum.to_hex());
+                let partial = crate::pull::partial_path(&name.checksum);
                 unlink_optional(repo.repo_fd(), &partial)?;
             }
         }

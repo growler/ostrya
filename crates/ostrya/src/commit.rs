@@ -272,6 +272,17 @@ impl Repo {
             }
             None => Vec::new(),
         };
+        self.write_commit_detached_bytes(checksum, bytes).await
+    }
+
+    /// Write a commit's detached metadata from its serialized bytes, replaced
+    /// atomically. Used by the pull path, which copies a source repository's
+    /// `.commitmeta` verbatim rather than re-serializing a decoded dict.
+    pub(crate) async fn write_commit_detached_bytes(
+        &self,
+        checksum: &Checksum,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
         let dest = loose_path(checksum, ObjectType::CommitMeta, self.mode());
         let fsync = self.config().fsync()?;
         let objects_fd = self.objects_fd().try_clone_to_owned()?;

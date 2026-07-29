@@ -126,7 +126,7 @@ impl Repo {
     /// when a `.commitpartial` marker is present, else
     /// [`Normal`](CommitState::Normal).
     pub async fn commit_state(&self, checksum: &Checksum) -> Result<CommitState> {
-        let path = format!("state/{}.commitpartial", checksum.to_hex());
+        let path = crate::pull::partial_path(checksum);
         let repo = self.clone();
         let partial =
             ostrya_rt::unblock(move || object::object_exists(repo.repo_fd(), &path)).await?;

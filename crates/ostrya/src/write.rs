@@ -90,7 +90,7 @@ impl FileMeta {
     }
 
     /// The header for a regular-file content object built from this metadata.
-    fn regular_header(&self) -> FileHeader {
+    pub(crate) fn regular_header(&self) -> FileHeader {
         FileHeader {
             uid: self.uid,
             gid: self.gid,
@@ -418,6 +418,24 @@ pub(crate) fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind
     }
 }
 
+/// The uid and gid an object freshly staged in `staging_fd` takes, measured by
+/// creating a temporary there the way every staged object is created and reading
+/// its inode.
+///
+/// Measured rather than derived: the group a created inode receives is the
+/// directory's group when the directory is setgid and the process's effective
+/// group otherwise, and a filesystem mounted with group inheritance gives the
+/// directory's group either way. Creating one costs the same syscalls as reading
+/// the rule's inputs and answers for the filesystem the staging directory is
+/// actually on.
+pub(crate) fn probe_fresh_owner(staging_fd: BorrowedFd<'_>) -> Result<(u32, u32)> {
+    let (fd, temp) = open_temp(staging_fd)?;
+    let stat = rustix::fs::fstat(&fd);
+    cleanup_temp(staging_fd, &temp);
+    let stat = stat?;
+    Ok((stat.st_uid, stat.st_gid))
+}
+
 /// A per-process-unique ingestion temp file name.
 fn temp_name() -> String {
     format!(".ostrya-tmp-{}-{}", std::process::id(), unique())
@@ -451,6 +469,24 @@ pub(crate) struct StageCtx<'a> {
     pub(crate) verity: Tristate,
 }
 
+/// How a staged object's bytes reached the staging directory, which decides
+/// whether the object consumes free space on the repository filesystem.
+#[derive(Clone, Copy)]
+pub(crate) enum Blocks {
+    /// Data blocks freshly allocated: a fresh ingest, or a byte copy of another
+    /// repository's object where a reflink was refused. Charged against the
+    /// transaction's free-space budget.
+    Written,
+    /// The source inode shared by hardlink, which allocates no blocks and no
+    /// inode.
+    Linked,
+    /// The source extents shared by a `FICLONE` reflink, which allocates no
+    /// data blocks. Writing to either copy would allocate then, which no path
+    /// in the port does: a loose object is content-addressed and never
+    /// rewritten in place.
+    Reflinked,
+}
+
 /// The outcome of staging one object.
 pub(crate) struct StageOutcome {
     /// Whether the object was already present in `objects/` (a dedup hit).
@@ -458,6 +494,10 @@ pub(crate) struct StageOutcome {
     /// The staged file's on-disk size in bytes, when freshly staged. In archive
     /// mode this is the compressed `.filez` storage size.
     pub(crate) on_disk_size: u64,
+    /// How the staged bytes reached the staging directory. Read when the
+    /// transaction records the object, which charges its free-space budget for
+    /// the objects that allocate blocks and not for the ones that share them.
+    pub(crate) blocks: Blocks,
     /// The logical (unpacked) content size in bytes: a regular file's
     /// pre-compression payload length, a symlink's target length, and zero for
     /// a metadata object (whose size the caller fills from `on_disk_size`).
@@ -511,6 +551,9 @@ pub(crate) fn stage_content_blocking(
     Ok(StageOutcome {
         deduped: false,
         on_disk_size,
+        // The payload arrived in the temp file the caller opened. A caller that
+        // filled it by reflink says so on the outcome it returns.
+        blocks: Blocks::Written,
         unpacked,
         staging_name,
         dest,
@@ -593,6 +636,7 @@ pub(crate) fn stage_symlink_blocking(
     Ok(StageOutcome {
         deduped: false,
         on_disk_size,
+        blocks: Blocks::Written,
         // The logical (unpacked) size of a symlink object is its target length,
         // matching the `st_size` the tool records for it in `ostree.sizes`.
         unpacked: target.len() as u64,
@@ -626,10 +670,302 @@ pub(crate) fn stage_metadata_blocking(
     Ok(StageOutcome {
         deduped: false,
         on_disk_size,
+        blocks: Blocks::Written,
         unpacked: 0,
         staging_name,
         dest,
     })
+}
+
+/// Import one loose object from another repository's `objects/` directory into
+/// the staging directory by sharing the source inode, without reading its
+/// payload.
+///
+/// The object is hardlinked, which carries the source inode's mode, ownership,
+/// and xattrs unchanged. A link is therefore admitted only where that inode is
+/// the inode a write into this repository would have produced, which holds in two
+/// cases: a content object into a bare destination, whose uid, gid, permission
+/// bits, and xattrs are all a function of the header the object's checksum covers;
+/// and a source inode already owned by `fresh_owner`, the uid and gid an object
+/// freshly staged here takes. In every other mode the permission bits and xattrs
+/// stay a function of the header while the ownership becomes a function of the
+/// writer, which is what the second case tests.
+///
+/// The gate reads the source inode's ownership alone. The permission bits and the
+/// xattrs are trusted to match the object's header rather than checked, since for
+/// a content object outside bare mode the header is the read this path exists to
+/// avoid. An inode rewritten out of band therefore carries its state across, and
+/// so do attributes the destination's environment assigns rather than its writer
+/// -- a default POSIX ACL on its directories, a security label -- which a fresh
+/// write inherits and a link keeps the source's copy of.
+///
+/// `link_owner` is the uid and gid an object freshly staged here takes, the pair
+/// the second case tests against, or `None` where no link is to be attempted at
+/// all. The caller passes `None` for a forced copy and for a repository sealing
+/// its objects, so the pair, which costs a probe of the staging directory to
+/// measure, is measured only where the gate reads it.
+///
+/// `Ok(None)` reports a content object that is not staged -- its link refused by
+/// the ownership gate, by an absent `link_owner`, or by the filesystem (the two
+/// repositories on different filesystems, the source inode at its link limit, a
+/// filesystem with no hardlinks, the kernel's protected-hardlink rules) --
+/// leaving the caller to import it through its logical header, the one path that
+/// applies this repository's own inode policy. A link that fails for any other
+/// reason -- no space, a quota, an I/O error -- fails the import with that errno
+/// rather than falling back to a copy that would fail the same way and report a
+/// less specific cause.
+///
+/// A metadata object has no header, so its refused link is served here: the
+/// bytes are copied with a `FICLONE` reflink where the filesystem supports one
+/// and byte by byte otherwise, and the copy carries this repository's own
+/// metadata-object inode -- 0644, no xattrs, and the writing process's
+/// ownership.
+///
+/// The caller guarantees the two repositories store this object identically:
+/// metadata objects are mode-independent, and a content object is imported this
+/// way only between repositories that store it the same way.
+///
+/// A link is taken only where `[ex-integrity] fsverity` is [`Tristate::No`],
+/// which the caller expresses by withholding `link_owner`. fs-verity is a
+/// per-inode property, so sealing a hardlinked object would seal the source
+/// repository's copy of it as well and make that copy immutable there; leaving it
+/// unsealed would break this repository's own rule that every object stored as a
+/// regular file is sealed. A repository that seals its writes therefore copies
+/// every object instead, and the copy is sealed as any fresh write is.
+pub(crate) fn stage_import_blocking(
+    ctx: &StageCtx<'_>,
+    src_objects_fd: BorrowedFd<'_>,
+    checksum: &Checksum,
+    ty: ObjectType,
+    src_mode: RepoMode,
+    link_owner: Option<(u32, u32)>,
+) -> Result<Option<StageOutcome>> {
+    // An import is a write like any other: a bare-split-xattrs destination needs
+    // the `.file-xattrs` and `.file-xattrs-link` sidecars, which no import path
+    // produces.
+    if ctx.mode == RepoMode::BareSplitXattrs {
+        return Err(Error::Unsupported(
+            "bare-split-xattrs is read-only; the port does not write it".into(),
+        ));
+    }
+    let dest = loose_path(checksum, ty, ctx.mode);
+    if crate::object::object_exists(ctx.objects_fd, &dest)? {
+        return Ok(Some(dedup(dest)));
+    }
+    let src_path = loose_path(checksum, ty, src_mode);
+    let staging_name = flat_name(checksum, ty, ctx.mode);
+
+    if let Some(fresh_owner) = link_owner {
+        // The source stat decides whether the link is admissible and supplies the
+        // staged object's size, since a hardlink is the inode it stats.
+        let stat = match rustix::fs::statat(
+            src_objects_fd,
+            src_path.as_str(),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => stat,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(Error::ObjectNotFound {
+                    checksum: *checksum,
+                    ty,
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let owned_as_written = (ty == ObjectType::File && ctx.mode == RepoMode::Bare)
+            || (stat.st_uid, stat.st_gid) == fresh_owner;
+        if owned_as_written {
+            match rustix::fs::linkat(
+                src_objects_fd,
+                src_path.as_str(),
+                ctx.staging_fd,
+                staging_name.as_str(),
+                AtFlags::empty(),
+            ) {
+                // An entry already under this name is the same object staged
+                // earlier in this transaction.
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {
+                    return Ok(Some(StageOutcome {
+                        deduped: false,
+                        on_disk_size: stat.st_size.max(0) as u64,
+                        blocks: Blocks::Linked,
+                        unpacked: 0,
+                        staging_name,
+                        dest,
+                    }));
+                }
+                Err(rustix::io::Errno::NOENT) => {
+                    return Err(Error::ObjectNotFound {
+                        checksum: *checksum,
+                        ty,
+                    });
+                }
+                // A refusal the filesystem or the kernel imposes -- the two
+                // repositories on different filesystems, the source inode at its
+                // link limit, a filesystem that has no hardlinks, the kernel's
+                // protected-hardlink rules -- leaves the object unstaged, to be
+                // copied below or reported to the caller. Any other failure is
+                // the import's own and carries its errno out: the copy that
+                // follows would fail the same way and report a less specific
+                // cause.
+                Err(
+                    rustix::io::Errno::XDEV
+                    | rustix::io::Errno::MLINK
+                    | rustix::io::Errno::OPNOTSUPP
+                    | rustix::io::Errno::PERM,
+                ) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    // A content object's inode metadata is the destination mode's to decide, and
+    // the header it is decided from is what the caller reads.
+    if ty == ObjectType::File {
+        return Ok(None);
+    }
+
+    let (on_disk_size, blocks) = clone_metadata(ctx, src_objects_fd, &src_path, &staging_name)?;
+    Ok(Some(StageOutcome {
+        deduped: false,
+        on_disk_size,
+        blocks,
+        unpacked: 0,
+        staging_name,
+        dest,
+    }))
+}
+
+/// Import one regular-file content object between two repositories that store
+/// its payload identically and its inode metadata differently, which is any two
+/// modes of the bare family.
+///
+/// The payload is cloned -- a `FICLONE` reflink where the filesystem supports
+/// one, a byte copy otherwise -- and the destination's own inode policy applied
+/// from the object's logical header, so nothing of the source inode carries
+/// over. The payload is neither read into memory nor re-hashed; a caller that
+/// needs the checksum checked reads the object before calling.
+pub(crate) fn stage_clone_content_blocking(
+    ctx: &StageCtx<'_>,
+    src_objects_fd: BorrowedFd<'_>,
+    checksum: &Checksum,
+    src_mode: RepoMode,
+    header: &FileHeader,
+    unpacked: u64,
+) -> Result<StageOutcome> {
+    // An import is a write like any other, and a content object crossing modes
+    // reaches this path without passing through `stage_import_blocking`: a
+    // bare-split-xattrs destination needs the `.file-xattrs` and
+    // `.file-xattrs-link` sidecars, which no import path produces. Refused before
+    // the source is opened and its payload cloned.
+    if ctx.mode == RepoMode::BareSplitXattrs {
+        return Err(Error::Unsupported(
+            "bare-split-xattrs is read-only; the port does not write it".into(),
+        ));
+    }
+    let src_path = loose_path(checksum, ObjectType::File, src_mode);
+    let src = match rustix::fs::openat(
+        src_objects_fd,
+        src_path.as_str(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(src) => src,
+        // A source object that vanished between the plan and the import is
+        // reported as the missing object it is, as the link path reports it.
+        Err(rustix::io::Errno::NOENT) => {
+            return Err(Error::ObjectNotFound {
+                checksum: *checksum,
+                ty: ObjectType::File,
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let (file, temp, blocks) = clone_payload(ctx.staging_fd, src.as_fd())?;
+    let mut outcome = stage_content_blocking(ctx, checksum, header, file, temp, unpacked)?;
+    outcome.blocks = blocks;
+    Ok(outcome)
+}
+
+/// Move a regular-file object's bytes into a fresh temp file in the staging
+/// directory, applying no metadata: a `FICLONE` reflink where the filesystem
+/// supports one, a byte copy otherwise. Returns the open temp file, the handle
+/// it materializes under, and which of the two moved the bytes, cleaning the
+/// temp up if the copy fails.
+///
+/// The byte copy is `std::io::copy`, which for a `File` to `File` transfer on
+/// Linux specializes to `copy_file_range` and moves the payload inside the
+/// kernel, falling back to a fixed stack buffer where the kernel refuses that.
+/// The payload is therefore never buffered whatever its size, which is the
+/// property that matters, and a reflink-less filesystem still gets a kernel-side
+/// copy. The cost of the choice is that the transfer holds one blocking-pool
+/// thread for its duration and cannot be cancelled: dropping the future that
+/// awaits it leaves the copy running to completion, writing into a staging temp
+/// the reaper collects.
+fn clone_payload(
+    staging_fd: BorrowedFd<'_>,
+    src: BorrowedFd<'_>,
+) -> Result<(std::fs::File, TempKind, Blocks)> {
+    let (fd, temp) = open_temp(staging_fd)?;
+    let mut dst = std::fs::File::from(fd);
+    // A reflink shares the source extents outright; on any refusal (a
+    // filesystem without reflink, a cross-filesystem source) nothing is
+    // written, so the byte copy starts from an empty file.
+    let copy = |dst: &mut std::fs::File| -> Result<Blocks> {
+        if rustix::fs::ioctl_ficlone(dst.as_fd(), src).is_ok() {
+            return Ok(Blocks::Reflinked);
+        }
+        let mut reader = std::fs::File::from(src.try_clone_to_owned()?);
+        std::io::copy(&mut reader, dst)?;
+        Ok(Blocks::Written)
+    };
+    match copy(&mut dst) {
+        Ok(blocks) => Ok((dst, temp, blocks)),
+        Err(e) => {
+            cleanup_temp(staging_fd, &temp);
+            Err(e)
+        }
+    }
+}
+
+/// Copy one loose metadata object into the staging directory under
+/// `staging_name`. The bytes move by `FICLONE` reflink where the filesystem
+/// allows and byte by byte otherwise; the copy carries the inode a metadata
+/// object written into this repository carries in every mode -- 0644, no
+/// xattrs, and the writing process's uid and gid, which the staging temporary
+/// holds by construction. Returns the on-disk size and which of the two moves
+/// the bytes took.
+fn clone_metadata(
+    ctx: &StageCtx<'_>,
+    src_dir: BorrowedFd<'_>,
+    src_path: &str,
+    staging_name: &str,
+) -> Result<(u64, Blocks)> {
+    let src = rustix::fs::openat(
+        src_dir,
+        src_path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    let (dst, temp, blocks) = clone_payload(ctx.staging_fd, src.as_fd())?;
+    let apply = || -> Result<(u64, Blocks)> {
+        rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(FIXED_MODE))?;
+        if ctx.fsync && ctx.per_object_fsync {
+            rustix::fs::fsync(dst.as_fd())?;
+        }
+        let on_disk_size = size_of(dst.as_fd())?;
+        let link_fd = if ctx.verity == Tristate::No {
+            OwnedFd::from(dst)
+        } else {
+            let ro = reopen_ro(dst.as_fd())?;
+            drop(dst);
+            seal_regular(ro.as_fd(), ctx.verity)?;
+            ro
+        };
+        materialize(ctx.staging_fd, link_fd.as_fd(), &temp, staging_name)?;
+        Ok((on_disk_size, blocks))
+    };
+    apply().inspect_err(|_| cleanup_temp(ctx.staging_fd, &temp))
 }
 
 /// Publish staged objects into `objects/` per the durability contract: with
@@ -687,6 +1023,9 @@ fn dedup(dest: String) -> StageOutcome {
     StageOutcome {
         deduped: true,
         on_disk_size: 0,
+        // Nothing was staged, so nothing moved bytes; the record path returns on
+        // `deduped` before it reads either field.
+        blocks: Blocks::Written,
         unpacked: 0,
         staging_name: String::new(),
         dest,

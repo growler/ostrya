@@ -343,7 +343,7 @@ impl Repo {
 
     /// Write a commit's `state/<commit>.commitpartial` marker.
     async fn mark_commit_partial(&self, commit: &Checksum) -> Result<()> {
-        let path = format!("state/{}.commitpartial", commit.to_hex());
+        let path = crate::pull::partial_path(commit);
         let repo = self.clone();
         ostrya_rt::unblock(move || write_partial_marker(repo.repo_fd(), &path)).await
     }

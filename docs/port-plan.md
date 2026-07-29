@@ -579,8 +579,14 @@ Definition:
   uncompressed under the loose name.
 - Free-space guard: at transaction start `fstatvfs` plus
   `min-free-space-percent` / `min-free-space-size` set a byte budget;
-  each staged object debits it; exhaustion fails the write with a
-  dedicated error carrying the shortfall.
+  each staged object debits it by the blocks it allocates; exhaustion
+  fails the write with a dedicated error carrying the shortfall. Every
+  object an ingest writes allocates its stored size. An object imported
+  from another repository allocates nothing when it shares the source
+  inode by hardlink and nothing when its payload came from a `FICLONE`
+  reflink, so those debit the budget by zero (Phase 16b); the statistics
+  keep counting their stored size, which is the storage the objects
+  occupy rather than the space the transaction consumed.
 - `object_sizes`: in archive mode each staged object records its on-disk
   (compressed) size and its logical (unpacked) size keyed by checksum, the
   input for `ostree.sizes` in 7d. The tool's `ostree.sizes` covers every
@@ -1188,6 +1194,16 @@ Plan:
   and regular-file symlink staging paths seal each fresh object in the recovered
   order; real-symlink paths skip it; dedup hits are untouched. With `fsverity`
   off, the staging path is unchanged.
+- An `ETXTBSY` enable is retried for up to 50 ms, 1 ms apart. Closing the
+  writable descriptor before the ioctl is necessary but not sufficient: `fork`
+  copies the file descriptor table, so a child process holds a copy of the
+  writable staging descriptor until its `exec` closes it, and the kernel refuses
+  to seal an inode any writable descriptor still holds. A process that spawns a
+  child from one thread while another stages objects hits that window, which the
+  retry outlasts (reproduced by the pull suite, whose interop tests run the
+  `ostree` binary while a sealing pull runs alongside them). Every other error is
+  reported on the first attempt, so `maybe` on a filesystem without verity still
+  returns at once.
 - `format-reference.md` gains a "Write path: fs-verity (ex-integrity)" section
   recording the config, scope, ordering, and semantics.
 
@@ -1758,12 +1774,13 @@ in the metadata dict is recorded in `format-reference.md`.
 
 Split into sub-phases:
 - 16a Async fetcher (DONE, see below).
-- 16b Local pull (`file://`): object import (hardlink/reflink/copy),
-  localcache repos.
+- 16b Local pull (`file://`) (DONE, see below): object import
+  (hardlink/reflink/copy), localcache repos.
 - 16c HTTP pull (see below): the scan/fetch state machine (bounded fetch
   semaphore of 8, delta-part cap of 2, write throttle of 3, fixed priority drain
-  order), summary/sig verification, commit and content verification, bindings and
-  timestamp checks, commitpartial, mirror mode.
+  order), summary/sig verification, commit and content verification, timestamp
+  checks, mirror mode. The ref-binding check and the commitpartial markers
+  landed with 16b, which is source-agnostic; 16c reuses them.
 - 16d Delta-accelerated pull and the config and mount repo finders.
 Verify: pull from a local trivial httpd over both HTTP/1.1 and HTTP/2; the
 `test-pull-*`, `test-local-pull*`, `test-signed-pull*` clusters via the
@@ -1987,6 +2004,332 @@ the backoff schedule, header assembly, the
 TLS configuration (ALPN, client identity, rejected material), the hyper I/O
 adapter, and the admission gate's five orderings. The whole suite passes under
 both backends.
+
+#### Phase 16b -- Local pull (DONE)
+
+`Repo::pull_local(&src, PullOptions)` copies refs, the commits they name, and
+every object those commits reach out of another local repository, and returns a
+`PullStats`. `PullOptions` carries the ref names (empty for every ref under the
+source's `refs/heads`), an optional remote name, a `PullFlags` bitset, the
+parent depth, and the localcache repositories. The objects are imported in one
+transaction, so a failure publishes none of them and writes no ref. A commit's
+detached metadata is written as its objects are imported, ahead of the ref that
+names it, so a verifier never sees a commit whose signatures have not arrived;
+a failed pull can leave a `.commitmeta` for a commit it did not publish, which
+prune sweeps.
+
+The order is: resolve every requested ref in the source, check each tip's ref
+binding, follow each tip's parents to `depth`, write the commitpartial markers,
+import every object, copy each commit's detached metadata, publish, write the
+refs, remove the markers. Ref writes come last through the transaction's ref
+queue, so no ref names a commit whose objects are not yet durable, matching the
+durability contract Phase 7d set.
+
+Each tip is followed to `depth` on its own. The chain walk records the number of
+parents a commit still had to follow when it was reached, and a chain arriving at
+a commit with more parents left than a previous one had is walked on from rather
+than stopped at, the way `traverse_reachable` treats a commit reached from two
+roots. The commits a pull collects therefore depend on the refs and the depth
+alone and not on the order the refs are listed; only their import order follows
+that order, each commit imported once.
+
+Object import, the phase's core. The contract has two parts, in this order: an
+imported object carries the filesystem metadata -- unix mode, ownership, and
+xattrs -- a commit into the destination would have given it, and subject to that
+it shares the source's bytes and its inode.
+
+- A metadata object has one representation in every mode -- its serialized
+  bytes in a plain file, and a loose path the mode does not change -- so it is a
+  hardlink candidate everywhere. A content object has one representation across
+  repositories of the same mode, so it is a candidate too, as is a symlink object
+  between bare-user and bare-user-shared: those two store one identically, a
+  0644 regular file of the target plus a NUL with the logical metadata in
+  `user.ostreemeta`.
+- A hardlink shares the source inode entire, ownership included, so a candidate
+  is admitted only where that ownership is what a write into the destination
+  produces. A content object into a bare destination is admitted outright: its
+  uid, gid, permission bits, and xattrs are all a function of the header its
+  checksum covers, so two bare repositories agree on the inode byte for byte. In
+  every other mode ownership becomes a function of the writer while the mode bits
+  and xattrs stay a function of the header, so the source inode's uid and gid are
+  compared against the pair an object freshly staged in this transaction takes.
+  That pair is measured once per transaction, by creating a temporary in the
+  staging directory the way every staged object is created and reading its inode:
+  a created inode's group is the directory's when the directory is setgid and the
+  process's otherwise, and a filesystem mounted with group inheritance gives the
+  directory's group either way, so measuring answers for the filesystem the
+  staging directory is on. The pair is measured only where a link may be
+  attempted, so a pull under `FORCE_COPY` and a pull into a destination that
+  seals its objects take no probe at all. A pull between repositories owned
+  differently -- two
+  group-shared repositories of differing groups, for one -- therefore stops
+  hardlinking and writes its objects afresh, sharing the source extents by
+  reflink where the filesystem has one.
+- Ownership is all the gate reads. A link trusts the source inode to match the
+  object's header in its other attributes: the permission bits and the xattrs
+  arrive as the source holds them, and for a content object outside bare mode the
+  header is the read the link path exists to avoid. In archive, bare-user, and
+  bare-user-shared neither the permission bits nor the xattrs beyond
+  `user.ostreemeta` are covered by the object's checksum, so a source whose inodes
+  were rewritten out of band -- a copy that dropped modes, a `chmod` over
+  `objects/` -- carries that state into the destination undetected. No writer
+  produces such a source: the tool and the port agree on the canonical inode mode
+  for every logical mode and neither varies with the umask. The tool's
+  `pull-local` links the same inodes, so the destination holds what the tool would
+  have given it. Attributes the destination's environment assigns rather than its
+  writer -- a default POSIX ACL on its directories, a security label -- are not
+  reapplied either: an object written there inherits them and a linked one keeps
+  the source's, which is again what the tool does.
+- A hardlink refused, by that gate or by the filesystem -- a source and
+  destination on different filesystems, a source inode at its link limit, the
+  kernel's protected-hardlink rules, or `PullFlags::FORCE_COPY`, which refuses
+  every link and is what makes the path testable on one filesystem -- routes by
+  object type. A metadata object, which has no header, is copied in place of its
+  link: the source is opened, a `FICLONE` reflink attempted into a fresh staging
+  temp, a byte copy run when the reflink is refused, and the inode a metadata
+  object written into the destination carries applied -- 0644, no xattrs, and the
+  staging temporary's own ownership, which is the destination's fresh-write pair
+  by construction. A content object is reported unstaged to the pull, which
+  imports it through its logical header instead -- `stage_clone_content` for a
+  regular file, `write_symlink` for a symlink -- so it lands with the mode,
+  ownership, and xattrs a commit into the destination would have written. That
+  costs one metadata read on a path that is already moving the whole payload.
+- A destination whose `[ex-integrity] fsverity` is `maybe` or `yes` does not
+  hardlink at all: it refuses every candidate the way `FORCE_COPY` does, so each
+  object arrives on a fresh inode that the copy and header paths seal. fs-verity
+  is a per-inode property, so sealing a hardlinked object would seal the source
+  repository's copy of it and make that copy immutable there, and leaving it
+  unsealed would break the scope `format-reference.md` records: every loose object
+  stored as a regular file is sealed, in every mode. The whole of the destination
+  is therefore sealed or none of it is. The cost is that such a pull copies where
+  it could have linked, including under `maybe` on a filesystem with no verity,
+  where the copy seals nothing.
+- The bare family stores a regular file's payload as its raw bytes, so any two
+  of its modes share the payload and differ only on the inode. Such an object is
+  imported by a `FICLONE`-then-copy move of the payload, with the destination's
+  inode policy applied afresh from the object's logical header --
+  `stage_clone_content_blocking`, which hands the cloned temp to the ordinary
+  `stage_content_blocking` tail, so mode, ownership, `user.ostreemeta`, xattrs,
+  fs-verity, and durability all follow the destination's own rules. The header
+  comes from `load_file`, which reads the object's metadata and not its payload,
+  so the cost of the import is one metadata read in place of a full read, hash,
+  and write. This covers bare-user to bare-user-only, the pair named in the
+  divergence below, and a same-mode object of the bare family whose link was
+  refused. The byte copy a refused reflink falls back to is `std::io::copy`,
+  which for a `File` to `File` transfer on Linux moves the payload inside the
+  kernel through `copy_file_range` and drops to a fixed stack buffer only where
+  the kernel refuses that, so no object is buffered whatever its size. It runs
+  inside the blocking closure rather than through the crate's async
+  `copy_stream`: the choice keeps the kernel-side copy on the filesystems that
+  reach it, the ones with no reflink, and its cost is that the transfer holds one
+  blocking-pool thread for its duration and cannot be cancelled -- a dropped pull
+  leaves the copy running into a staging temp the staging reaper collects.
+- A content object crossing the archive boundary shares nothing: archive stores
+  a framed, deflated form. It is read back into its logical form -- uid, gid,
+  mode, xattrs, and payload -- and written afresh through `write_content` /
+  `write_symlink`, which stores it the way the destination mode requires. The
+  write path computes the checksum as it streams, so this path always compares
+  it against the object's name. A symlink between two modes that store it
+  differently takes the same route, at the cost of a header hash alone.
+- The transaction's free-space budget is charged for the blocks an import
+  allocates and not for the bytes it shares. A hardlinked object allocates
+  neither blocks nor an inode, and a payload moved by `FICLONE` shares the source
+  extents, so a pull whose objects the destination shares with the source runs on
+  a filesystem with no room for a second copy of them, which is the case local
+  pull exists for. A byte copy and a re-ingest across the archive boundary are
+  each charged the object's full stored size. `PullStats::content_bytes_written`
+  counts every imported content object's stored size whichever path moved it, so
+  it reports the storage those objects occupy rather than the space the pull
+  consumed. All three counters cover the objects the pull staged, so an object
+  the destination already held is absent from each and a `COMMIT_ONLY` pull
+  reports its commit objects and no content at all.
+- Every import path tests the destination mode before it touches the source.
+  `bare-split-xattrs` needs the `.file-xattrs` and `.file-xattrs-link` sidecars,
+  which no import path produces, so `stage_import_blocking` and
+  `stage_clone_content_blocking` each refuse that destination with `Unsupported`
+  ahead of any stat, open, or payload clone, the way the rest of the write
+  surface refuses the mode.
+- Objects are sourced from the source repository first and then each
+  localcache repository in order, the first holder winning. The tool consults
+  its `-L` caches only on an HTTP pull, where the primary source is remote;
+  the port consults them on a local pull too, so a source with a hole is
+  completed rather than failed. The walk that decides what to import resolves
+  each commit and each dirtree through the same order, so the objects under a
+  subtree the source has lost are enumerated from the cache that holds it. A
+  dirtree no source holds contributes its own name and nothing beneath it, which
+  fails the pull when the import reaches that name, so a commit this repository
+  publishes is complete.
+- The commits of one pull are planned as one walk: a dirtree descended into for
+  one commit is not descended into again for another, so a `depth = -1` pull of a
+  chain of near-identical trees reads each dirtree once, and each commit's plan
+  carries the objects the commits ahead of it did not.
+
+`PullFlags` (a hand-rolled bitset, as `CommitModifierFlags` is):
+
+- `UNTRUSTED` fails the pull on a mismatch between an imported object and its
+  name. The read it adds follows the path the import took: the link and clone
+  paths move bytes without hashing them, so an object either of them imports is
+  read once and hashed, while a re-ingested object is not read for the flag at
+  all, since that path hashes the object as it writes it and compares the result
+  against its name whatever the flags say -- a corrupt source is rejected on it
+  with or without the flag. Which path an object takes is settled by attempting
+  it, since a link the filesystem refuses sends a same-mode object on to a clone
+  or a re-ingest, so the flag's read follows the attempt rather than predicting
+  it, and an untrusted pull reads each object exactly once. Without the flag an
+  object is linked or cloned without being read at all, which is what makes those
+  paths possible. Both match the tool, which propagates a corrupt object on a
+  trusted local import.
+- `COMMIT_ONLY` imports the commit objects alone and leaves their
+  `.commitpartial` markers in place. A later full pull completes them and
+  removes the markers.
+- `BAREUSERONLY_FILES` rejects a regular-file content object whose logical mode
+  has bits outside `0775`. A bare-user-only destination applies the check
+  whether or not the flag is set, matching the tool, which refuses such an
+  object on every write into that mode.
+- `DISABLE_VERIFY_BINDINGS` skips the `ostree.ref-binding` check. Otherwise a
+  commit carrying the key must list the ref it is pulled under; a commit
+  carrying no binding key at all predates the convention and passes, while one
+  carrying an empty list fails, which is what the tool does.
+- `FORCE_COPY` is described above.
+
+Commit state: a commit gets a zero-length `state/<commit>.commitpartial` marker
+before its objects are imported, removed once they are published, so an
+interrupted pull leaves the commit marked partial. The marker a pull writes is
+zero-length, unlike the one-byte `0x66` fsck writes (see
+`format-reference.md`). A commit this repository already holds without a marker
+is not marked, so an unrelated failure elsewhere in the pull cannot demote a
+commit that was already complete. A marker already present is left as it stands:
+the create uses `O_EXCL` and treats `EEXIST` as success, so a pull over a commit
+fsck marked keeps fsck's state byte, which is what the tool's `pull-local` does.
+
+Marker durability follows the tool, which syncs neither the marker nor `state/`
+on either side (both recovered by tracing its syscalls; see
+`format-reference.md`). Every marker of a pull is written before the transaction
+stages an object, so the `syncfs` that opens publication makes it durable ahead
+of the first object rename, and the marker is on disk before any object of the
+commit it guards. The removal is the pull's last operation with no barrier after
+it, so a crash immediately after a successful pull can leave the marker on a
+commit that is complete. That direction costs availability rather than integrity:
+checkout refuses the commit, `commit_state` reports it partial, and the next pull
+of that commit or a prune of it clears the marker. The durability of the create
+rests on all marking preceding the transaction's first staged object, so moving
+the marking into the import loop or into a second transaction would need an
+explicit `fsync` of `state/` in its place.
+
+Two divergences from the tool, both byte-for-byte irrelevant and both strictly
+safer.
+
+The first is bare-user to bare-user-only: the tool hardlinks a content object
+from a bare-user source into a bare-user-only destination, which shares an inode
+whose mode and `user.ostreemeta` xattr the destination mode does not describe, and
+the result fails the tool's own `fsck` (verified by observation: `pull-local`
+between the two modes, then `ostree fsck`, reports the imported object
+corrupt). The port treats the two as different modes, so it clones the payload
+onto a fresh inode carrying bare-user-only's own policy -- the canonical mode
+and no xattr -- and the bare-user-only mode check rejects what that mode cannot
+store.
+
+The second is fs-verity. The tool hardlinks into a destination that seals its own
+writes and leaves the imported objects unsealed (verified by observation on btrfs
+with `ostree` 2026.1 built with `ex-fsverity`: a `bare-user` destination carrying
+`[ex-integrity] fsverity=yes` takes 7 objects from a `pull-local` on the source's
+own inodes, none of them sealed, while a commit written into that same repository
+directly is sealed). A repository sealed in part is a repository whose integrity
+guarantee holds only for the objects it happened to write itself, so the port
+copies instead, as the bullet above describes.
+
+No new crates: the import path is `rustix` `linkat`, `ioctl_ficlone`, and the
+existing staging helpers.
+
+Verify (`tests/pull_local.rs`, 38 tests): a ref, its commit, and its tree
+arrive with nothing else, and a second pull imports nothing; an empty ref list
+pulls every ref, including a `/`-bearing name; a remote name writes
+`refs/remotes/<remote>/<ref>` and nothing under `refs/heads`; `depth` follows
+parents and a parent the source lacks ends the chain without error; two refs on
+one chain, the second three commits behind the first, collect the same commits at
+`depth = 1` whichever order they are listed in, and neither order reaches past the
+depth; a deep pull
+lands both commits' trees whole, which is what the one-visit dirtree walk has to
+enumerate from a chain whose commits share a subtree; a missing
+ref fails before anything is imported. Import: a same-mode pull shares the
+source inode for every object reached; `FORCE_COPY` produces fresh inodes whose
+bytes and permission bits match the source and whose bare-user objects still
+pass `fsck`, which is only possible if the clone carried the
+`user.ostreemeta` xattr; an archive-to-bare-user pull lands the same checksums
+and passes `fsck`. Inode policy on the paths a link does not take, each pinned by
+drifting the source object's inode away from what a write produces and asserting
+the drift does not arrive: a content object whose link `FORCE_COPY` refuses lands
+the bare-user mode derived from its header with `user.ostreemeta` and without the
+source's stray xattr, and a cloned metadata object lands the permission bits,
+uid, and gid of an object the destination wrote itself. The ownership gate, with
+the destination inside a setgid directory of a second group the process belongs
+to, which is the group-shared arrangement: a bare-user-shared pull hardlinks
+nothing and gives every object the destination's own uid and gid, while a bare
+pull hardlinks every content object, whose ownership its header fixes, and clones
+the metadata objects alone. The bare case also passes the tool's own `fsck` where
+the tool is installed, which for bare mode recomputes each checksum from the inode
+the link shared; the bare-user-shared case rests on the port's `fsck`, since the
+tool refuses to open a repository of that mode. Both ownership tests need the
+process to belong to a second group and skip where it does not, and between them
+they are the whole of the gate's coverage, so `OSTRYA_REQUIRE_MULTIGROUP` turns
+that skip into a failure; the CI job sets it, its runner belonging to several
+groups.
+Within the bare family: a bare-user to bare-user-only pull
+gives each regular file a fresh inode holding the source bytes under the
+canonical mode with no xattr, which the destination reads back with its own
+semantics; a bare-user to bare-user-shared pull hardlinks the symlink object,
+whose representation the two modes share, and clones the regular files, whose
+inode mode they do not; a bare-split-xattrs destination is refused with
+`Unsupported` on both import paths, the link path under a commit-only pull and
+the clone path under a full pull of a branch whose tree is one regular file, each
+publishing no object and writing no ref. fs-verity, on a filesystem that supports
+it and skipped where it does not: a same-mode bare-user pull into a destination
+carrying `fsverity=yes` lands every object sealed on a fresh inode, leaves the
+source's objects unsealed, and passes the port's `fsck`, which the link path
+cannot do. Free space, with the destination reserving the whole filesystem
+through `min-free-space-percent=100`, which leaves a zero write budget: a
+same-mode pull imports every object on the source's inodes and reports their
+stored size in its statistics, while the same destination in archive mode, where
+each content object is re-ingested, fails with `InsufficientFreeSpace`,
+publishes no object, writes no ref, and leaves the marker. State: `COMMIT_ONLY`
+imports exactly
+the commit object,
+leaves a zero-length marker, and reports the commit partial, and completing the
+pull clears it; a pull that reaches an absent source object publishes no
+object, writes no ref, and leaves the marker. Trust and checks: a corrupt
+content object and a corrupt commit object each travel on the trusted path and
+each fail `UNTRUSTED` with `ChecksumMismatch`, with nothing published, and a
+corrupt payload crossing the bare family behaves the same way on the clone path;
+a corrupt payload crossing into archive, which is the re-ingest path, fails with
+`ChecksumMismatch` and publishes nothing whether or not `UNTRUSTED` is set, which
+is what lets the flag leave that path its own read;
+a ref
+binding that omits the pulled ref is rejected and `DISABLE_VERIFY_BINDINGS`
+accepts it; a commit with no binding key is accepted; a world-writable mode is
+rejected under `BAREUSERONLY_FILES` and by a bare-user-only destination, and
+accepted by an archive destination without the flag. Detached metadata travels
+with its commit; a localcache repository supplies an object the source no
+longer holds, and supplies a dirtree it no longer holds, whose subtree the walk
+enumerates from the cache and imports whole, while the same pull without the
+cache fails with `ObjectNotFound`, publishes no ref, and leaves the marker. Three interop tests need the tool: the port pulls a tool-built
+archive repository into an archive and a bare-user destination, and the tool
+then resolves the ref, passes `fsck`, and reads the tree back; the port pulls
+its own bare repository into a bare-user destination, where every regular file
+crosses on the clone path, and the tool's `fsck` accepts what the destination's
+inode policy wrote, which it can only do if the clone applied
+`user.ostreemeta` from the object's logical header rather than reproducing the
+source inode; and the tool's `pull-local` reads a port-written repository into a
+bare-user destination that passes its `fsck`. Unit tests cover the refspec mapping and the flag bitset.
+
+The CLI grows `ostrya pull-local`, with `--remote`, `--depth`,
+`--commit-metadata-only`, `--untrusted`, `--bareuseronly-files`,
+`--disable-verify-bindings`, `--force-copy`, and repeatable
+`-L/--localcache-repo`. The upstream `test-local-pull*` shell tests run at the
+CLI-compatibility phase.
+
+Deferred to 16c and 16d: the summary and its signature, mirror mode, the
+timestamp checks, collection refs and `refs/mirrors`, GPG and sign-engine
+commit verification during a pull, subpath pulls, and delta-accelerated pull.
 
 #### Phase 16c -- HTTP pull
 

@@ -97,6 +97,11 @@ pub enum Error {
     /// malformed secret key.
     #[error("signature: {0}")]
     Signature(String),
+    /// A pull refused an object or a commit: a commit whose
+    /// `ostree.ref-binding` does not name the ref it is being pulled under, or
+    /// a content object whose mode the destination repository may not store.
+    #[error("pull: {0}")]
+    Pull(String),
     /// A fetch could not be set up or carried out: an unusable mirror URL,
     /// header, or TLS configuration, or a transport failure that outlived its
     /// retries.

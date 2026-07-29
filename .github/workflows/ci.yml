@@ -23,5 +23,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # The local-pull ownership-gate tests need the process to belong to more
+      # than one group, and skip themselves where it does not. The runner user
+      # belongs to several, so this job demands the coverage rather than
+      # accepting a silent skip: OSTRYA_REQUIRE_MULTIGROUP turns that skip into
+      # a failure.
       - name: Test
         run: cargo test --workspace --all-features
+        env:
+          OSTRYA_REQUIRE_MULTIGROUP: "1"

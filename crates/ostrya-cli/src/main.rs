@@ -19,6 +19,8 @@
 //! - `summary` -- regenerate, sign, or verify the repository summary.
 //! - `static-delta` -- list the repository's static deltas, apply one offline,
 //!   generate one, or rebuild the delta index cache.
+//! - `pull-local` -- import refs and their objects from another local
+//!   repository.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams to and from stdin/stdout flow through
@@ -32,8 +34,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CommitModifier, CommitModifierFlags, CommitOptions,
     DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, MutableTree,
-    ObjectType, PruneOptions, Repo, Result, SummaryOptions, TarExportOptions, TarImportOptions,
-    Type, Value, Verifier, VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
+    ObjectType, PruneOptions, PullFlags, PullOptions, Repo, Result, SummaryOptions,
+    TarExportOptions, TarImportOptions, Type, Value, Verifier, VerifyOutcome, base64,
+    load_sign_keys, load_sign_keys_from,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -69,6 +72,9 @@ enum Command {
     /// List, generate, apply, or index static deltas.
     #[command(name = "static-delta")]
     StaticDelta(StaticDeltaArgs),
+    /// Import refs and their objects from another local repository.
+    #[command(name = "pull-local")]
+    PullLocal(PullLocalArgs),
 }
 
 #[derive(Args)]
@@ -339,6 +345,45 @@ struct DeltaGenerateArgs {
     reindex: bool,
 }
 
+#[derive(Args)]
+struct PullLocalArgs {
+    /// The repository to pull into.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Write the pulled refs under this remote (`refs/remotes/<remote>/<ref>`)
+    /// instead of as local refs.
+    #[arg(long)]
+    remote: Option<String>,
+    /// Parents of each pulled commit to follow: 0 for the commit alone, -1 for
+    /// the whole ancestry the source holds.
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    depth: i32,
+    /// Import only the commit objects, leaving each commit marked partial.
+    #[arg(long)]
+    commit_metadata_only: bool,
+    /// Verify every imported object's checksum against its name.
+    #[arg(long)]
+    untrusted: bool,
+    /// Reject regular files whose mode has bits outside 0775.
+    #[arg(long)]
+    bareuseronly_files: bool,
+    /// Do not check that a pulled commit's ostree.ref-binding names the ref it
+    /// is pulled under.
+    #[arg(long)]
+    disable_verify_bindings: bool,
+    /// Copy every object instead of hardlinking it.
+    #[arg(long)]
+    force_copy: bool,
+    /// Consult this repository for objects the source does not hold;
+    /// repeatable.
+    #[arg(short = 'L', long = "localcache-repo")]
+    localcache_repo: Vec<PathBuf>,
+    /// The repository to pull from.
+    src_repo: PathBuf,
+    /// The refs to pull; with none, every ref the source holds.
+    refs: Vec<String>,
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     match ostrya_rt::block_on(run(cli)) {
@@ -361,7 +406,53 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Sign(args) => sign(args).await,
         Command::Summary(args) => summary(args).await,
         Command::StaticDelta(args) => static_delta(args).await,
+        Command::PullLocal(args) => pull_local(args).await,
     }
+}
+
+/// Import refs and their objects from another local repository.
+async fn pull_local(args: PullLocalArgs) -> Result<()> {
+    let repo = Repo::open(&args.repo).await?;
+    let src = Repo::open(&args.src_repo).await?;
+    let mut localcache_repos = Vec::with_capacity(args.localcache_repo.len());
+    for path in &args.localcache_repo {
+        localcache_repos.push(Repo::open(path).await?);
+    }
+
+    let mut flags = PullFlags::empty();
+    if args.commit_metadata_only {
+        flags |= PullFlags::COMMIT_ONLY;
+    }
+    if args.untrusted {
+        flags |= PullFlags::UNTRUSTED;
+    }
+    if args.bareuseronly_files {
+        flags |= PullFlags::BAREUSERONLY_FILES;
+    }
+    if args.disable_verify_bindings {
+        flags |= PullFlags::DISABLE_VERIFY_BINDINGS;
+    }
+    if args.force_copy {
+        flags |= PullFlags::FORCE_COPY;
+    }
+
+    let stats = repo
+        .pull_local(
+            &src,
+            PullOptions {
+                refs: args.refs,
+                remote: args.remote,
+                flags,
+                depth: args.depth,
+                localcache_repos,
+            },
+        )
+        .await?;
+    println!(
+        "{} metadata, {} content objects imported; {} bytes content written",
+        stats.metadata_imported, stats.content_imported, stats.content_bytes_written
+    );
+    Ok(())
 }
 
 /// List the repository's static deltas, apply one offline, generate one, or

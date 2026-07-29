@@ -393,7 +393,29 @@ tests the marker's presence, which makes a commit `Partial`. When `fsck` finds a
 commit missing a referenced object it writes the marker as a single byte `0x66`
 (recovered by observation: feeding the tool a repository with a deleted
 referenced object and inspecting the marker it writes shows a 1-byte file
-holding `0x66`). The marker is local state and does not enter any checksum.
+holding `0x66`). A pull writes the marker zero-length instead, and removes it
+once the commit's objects are published (observed by running the tool's
+`pull-local --commit-metadata-only`, which leaves a 0-byte marker, and then
+completing the pull, which removes it; a pull that fails part way leaves the
+marker behind). A marker already present is not rewritten: a pull over a commit
+`fsck` marked keeps the one-byte state (observed by running `fsck` on a
+repository with a deleted referenced object, then `pull-local` from a source
+missing that same object, after which the marker still holds `0x66`). The marker
+is local state and does not enter any checksum.
+
+No writer syncs a marker or the `state/` directory. A pull creates every marker
+before its transaction stages an object, so the `syncfs` that opens publication
+makes the marker durable ahead of the first object rename; the removal is the
+pull's last operation and no barrier follows it, so a crash immediately after a
+successful pull can restore the marker of a commit that is complete. An `fsck`
+marker is written with no barrier at all, and re-running `fsck` writes it again.
+Recovered by tracing the tool's syscalls: `pull-local` issues
+`openat(state/<checksum>.commitpartial, O_WRONLY|O_CREAT|O_EXCL, 0644)`,
+`syncfs` of the repository, the object renames into `objects/`, an `fsync` of
+each touched fanout and of `objects/`, the ref write, then `unlinkat` of the
+marker as its last syscall, with no `fsync` of the marker or of `state/`
+anywhere; `ostree fsck` writing a marker issues no `fsync`, `fdatasync`, or
+`syncfs` in the entire run.
 
 A leftover directory under `tmp/` whose lock can be taken, or that has no lock
 sibling, is removed once its age exceeds `tmp-expiry-secs`. The age test is
@@ -592,6 +614,15 @@ every repository mode including archive-z2:
 Only real symlink objects are skipped, because fs-verity applies to regular
 files. Real symlink objects occur in `bare` and `bare-user-only`. A deduplicated
 write (the object already present in `objects/`) is left untouched.
+
+The scope above is what the tool's write path does. Its local-import path leaves
+sealing out: `ostree pull-local` into a repository carrying `fsverity=yes`
+hardlinks the source's objects and seals none of them, while a commit written into
+that same repository is sealed (observed on btrfs with `ostree` 2026.1 built with
+`ex-fsverity`). fs-verity is a per-inode property, so a hardlinked object cannot
+be sealed without sealing the source repository's copy. The port applies the scope
+to every write including an import, which means it copies where the tool links;
+see `port-plan.md`, Phase 16b.
 
 Semantics.
 

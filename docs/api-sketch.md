@@ -679,32 +679,68 @@ impl Fetcher {
 
 ## Pull
 
+`pull_local` copies refs, the commits they name, and every object those commits
+reach out of another local repository, in one transaction. An object stored the
+same way in both repositories, inode included, is hardlinked; a metadata object
+whose link is refused falls back to a `FICLONE` reflink and then a byte copy. A
+regular file whose payload bytes the two modes share and whose inode metadata
+they do not -- any pair within the bare family -- has its payload cloned and the
+destination's inode policy applied from the object's logical header, which is
+also where a content object whose link was refused goes. What crosses the archive
+boundary is read back into its logical form and written afresh through the
+ordinary ingest path. What an import shares -- a hardlinked inode, a reflinked
+payload -- allocates no blocks and is not charged against the `min-free-space`
+budget, so such a pull needs no room for a second copy of those objects;
+`content_bytes_written` counts their stored size all the same. The three
+`PullStats` counters cover the objects the pull staged, so an object the
+destination already held is absent from each and a `COMMIT_ONLY` pull reports its
+commit objects alone. Objects are
+sourced from `src` first and then each of
+`localcache_repos` in order, and the walk that decides what to import resolves
+each commit and dirtree through the same order, so a subtree `src` has lost is
+enumerated from a cache that holds it. Refs are written after the objects are
+published.
+
+The fields below are what the local pull uses. The HTTP pull adds the
+remote-only ones (`subdirs`, the static-delta switches,
+`override_commit_ids`, `http_headers`, `max_outstanding_fetches`,
+`n_network_retries`, `gpg_verify`, `sign_verifiers`), a `MIRROR` flag, and a
+progress callback.
+
 ```rust
-pub struct PullOptions {
-    pub refs: Vec<String>,
-    pub flags: PullFlags,                 // MIRROR, COMMIT_ONLY, UNTRUSTED, ...
-    pub depth: i32,
-    pub subdirs: Vec<PathBuf>,
-    pub disable_static_deltas: bool,
-    pub require_static_deltas: bool,
-    pub override_commit_ids: Vec<Checksum>,
-    pub http_headers: Vec<(String, String)>,
-    pub max_outstanding_fetches: u32,     // default 8
-    pub n_network_retries: u32,           // default 5
-    pub localcache_repos: Vec<Repo>,
-    pub gpg_verify: Option<bool>,
-    pub sign_verifiers: Vec<Box<dyn Verifier>>,
-    // builder-style; not a GVariant dict
+pub struct PullFlags(u32);                // a bitset, as CommitModifierFlags is
+impl PullFlags {
+    pub const NONE: PullFlags;
+    pub const UNTRUSTED: PullFlags;       // verify every imported object
+    pub const COMMIT_ONLY: PullFlags;     // commit objects only; stays partial
+    pub const BAREUSERONLY_FILES: PullFlags;      // reject modes outside 0775
+    pub const DISABLE_VERIFY_BINDINGS: PullFlags; // skip the ref-binding check
+    pub const FORCE_COPY: PullFlags;      // never hardlink
+    pub const fn empty() -> PullFlags;
+    pub const fn contains(self, other: PullFlags) -> bool;
+    pub const fn bits(self) -> u32;
 }
 
-pub trait Progress {                      // replaces OstreeAsyncProgress
-    fn on_update(&self, status: &PullStatus);
+#[derive(Default)]
+pub struct PullOptions {
+    pub refs: Vec<String>,                // empty: every ref under refs/heads
+    pub remote: Option<String>,           // refs/remotes/<remote>/<ref>
+    pub flags: PullFlags,
+    pub depth: i32,                       // 0 = the commit alone, -1 = all
+    pub localcache_repos: Vec<Repo>,
+}
+
+pub struct PullStats {
+    pub metadata_imported: u32,
+    pub content_imported: u32,
+    pub content_bytes_written: u64,
 }
 
 impl Repo {
-    pub async fn pull(&self, remote: &str, opts: PullOptions,
-        progress: Option<&dyn Progress>) -> Result<()>;
-    pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<()>;
+    pub async fn pull_local(&self, src: &Repo, opts: PullOptions)
+        -> Result<PullStats>;
+    pub async fn pull(&self, remote: &str, opts: PullOptions)
+        -> Result<PullStats>;
     pub async fn remote_fetch_summary(&self, remote: &str)
         -> Result<(Variant, Option<Variant>)>;
 }

@@ -543,6 +543,44 @@ fn a_read_only_mode_is_stored_in_bare_user() {
 }
 
 #[test]
+fn a_read_only_mode_with_an_xattr_is_stored_in_bare() {
+    // Bare carries a content object's logical xattrs on the inode, which the
+    // kernel checks a `user.*` name against the inode's write permission for. A
+    // logical mode with no owner-write bit is storable together with such an
+    // entry. Both content writers are exercised, since each stages its own temp
+    // before the inode policy is applied.
+    let tmp = TmpDir::new("write-bare-readonly");
+    // Bare writes logical ownership to the inode, so use ids the process owns
+    // and set only `user.*` names, both applicable unprivileged.
+    let owned = rustix::fs::stat(tmp.path()).unwrap();
+    let uid = owned.st_uid;
+    let gid = owned.st_gid;
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let mut meta = FileMeta::regular(uid, gid, 0o444);
+        meta.xattrs =
+            ostrya_core::Xattrs::new([(b"user.demo\0".to_vec(), b"value".to_vec())]).unwrap();
+        let inline = txn.write_regfile_inline(None, &meta, HELLO).await.unwrap();
+        let streamed = txn
+            .write_content(None, &meta, Cursor::new(NESTED.to_vec()))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        for checksum in [inline, streamed] {
+            let hex = checksum.to_hex();
+            assert_eq!(inode_xattr(&root, &hex, "user.demo"), b"value");
+            let file = repo.load_file(&checksum).await.unwrap();
+            assert_eq!((file.uid, file.gid, file.mode), (uid, gid, 0o100444));
+        }
+    });
+}
+
+#[test]
 fn bare_objects_match_the_tool() {
     if !ostree_available() {
         eprintln!("skipping bare_objects_match_the_tool: the ostree tool is unavailable");

@@ -1043,11 +1043,15 @@ fn apply_content_metadata(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHeade
     let perm = header.mode & PERM_MASK;
     match mode {
         RepoMode::Bare => {
-            rustix::fs::fchown(fd, Some(uid(header.uid)), Some(gid(header.gid)))?;
-            rustix::fs::fchmod(fd, Mode::from_raw_mode(perm))?;
+            // The xattrs go on before the chown and the mode: the kernel checks
+            // a `user.*` xattr against the inode's write permission, which a
+            // logical mode without an owner-write bit (0444, 0555) does not
+            // grant, and a chown to another uid takes the ability away as well.
             for (name, value) in header.xattrs.iter() {
                 set_inode_xattr(fd, name, value)?;
             }
+            rustix::fs::fchown(fd, Some(uid(header.uid)), Some(gid(header.gid)))?;
+            rustix::fs::fchmod(fd, Mode::from_raw_mode(perm))?;
         }
         RepoMode::BareUser => {
             // The xattr goes on before the mode: the kernel checks a `user.*`

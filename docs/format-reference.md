@@ -516,8 +516,12 @@ Loose-object inode permission bits, by object class and repository mode:
 - Metadata objects (`.dirtree`, `.dirmeta`, `.commit`, and by construction the
   other metadata types) carry mode 0644 in every repository mode.
 - `archive`: every content object (`.filez`) is 0644.
-- `bare`: a content object's inode carries the full logical uid, gid, and mode;
-  a symlink is a real symlink owned by the logical uid/gid.
+- `bare`: a content object's inode carries the full logical uid, gid, mode, and
+  xattrs; a symlink is a real symlink owned by the logical uid/gid. The xattrs
+  are written before the chown and the mode: the kernel checks a `user.*` xattr
+  against the inode's write permission, which a logical mode with no owner-write
+  bit (0444, 0555) does not grant, and a chown to another uid takes the ability
+  away as well.
 - `bare-user`: a regular-file content object's inode mode is
   `(logical_perm & 0o775) | 0o400` -- owner bits and the group/other read and
   execute bits are kept, owner-read is forced on, and other-write is dropped

@@ -689,10 +689,13 @@ Definition:
   SELINUX_LABEL_V1), the synchronous filter callback (`Allow`/`Skip`; a
   skipped directory prunes its whole subtree), and the synchronous
   xattr callback replacing the on-disk xattr set per path.
-- CANONICAL_PERMISSIONS zeroes uid/gid and canonicalizes the mode; the
-  exact bit rule is recovered by observation (committing crafted trees
-  with and without the tool's corresponding option and diffing object
-  ids) and recorded in `format-reference.md` before the flag lands.
+- CANONICAL_PERMISSIONS zeroes uid/gid, canonicalizes the mode, and
+  empties the xattr set; the exact rule is recovered by observation
+  (committing crafted trees with and without the tool's corresponding
+  option and diffing object ids) and recorded in
+  `format-reference.md` before the flag lands. The xattr set is emptied
+  ahead of the callbacks, so an xattr or label callback still lands its
+  own set.
 - Labeling hook: the modifier carries an optional label callback invoked
   per path. When present, a pre-existing `security.selinux` xattr is
   dropped before the callback's label applies, so a label is never
@@ -719,8 +722,11 @@ fixture's root dirtree and dirmeta checksums through `write_mtree`; the
 filter excludes exactly the skipped paths and stages none of their
 objects; the xattr callback's replacement set lands in the object ids;
 canonical-permissions ingest matches the checksums the tool produces
-with its corresponding option; a devino hit skips rehashing (stats, and
-no duplicate staging); CONSUME leaves the consumed source empty; the
+with its corresponding option, over a tree of assorted modes and over one
+carrying `user.*` xattrs on a file and a directory, where the port's root
+dirtree and dirmeta equal the tool's and the xattr-bearing tree takes the
+identity of the same tree without xattrs; a devino hit skips rehashing
+(stats, and no duplicate staging); CONSUME leaves the consumed source empty; the
 xattr fixture (unprivileged `user.*` names) round-trips.
 
 ### Phase 7d -- Commit assembly, refs, and durable publication (DONE)

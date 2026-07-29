@@ -101,14 +101,13 @@ async fn commit_tree(repo: &Repo, tree: &Path, parent: Option<Checksum>) -> Chec
     commit
 }
 
-/// Commit `tree` into `repo` on branch `test` keeping the tree's xattrs, with
-/// canonical permissions so only the xattrs depend on the tree.
+/// Commit `tree` into `repo` on branch `test` keeping the tree's xattrs. The
+/// walk runs under no flags: canonical permissions would record no xattrs, and
+/// `SKIP_XATTRS` would not read them.
 async fn commit_tree_with_xattrs(repo: &Repo, tree: &Path, parent: Option<Checksum>) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let dfd = std::fs::File::open(tree).unwrap();
-    let mut modifier = Some(CommitModifier::new(
-        CommitModifierFlags::CANONICAL_PERMISSIONS,
-    ));
+    let mut modifier: Option<CommitModifier> = None;
     let mut mtree = MutableTree::new();
     txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), &mut mtree, modifier.as_mut())
         .await

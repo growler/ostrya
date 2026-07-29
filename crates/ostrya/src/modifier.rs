@@ -37,8 +37,11 @@ impl CommitModifierFlags {
     /// Mark the transaction to emit `ostree.sizes` at commit. Archive-only:
     /// elsewhere the request is a silent no-op.
     pub const GENERATE_SIZES: CommitModifierFlags = CommitModifierFlags(1 << 1);
-    /// Force owner 0:0 and canonicalize each permission set (`perm & 0o755` for
-    /// regular files and directories; symlinks unchanged).
+    /// Force owner 0:0, canonicalize each permission set (`perm & 0o755` for
+    /// regular files and directories; symlinks unchanged), and record no
+    /// extended attributes. The xattr set is emptied before the callbacks run,
+    /// so a callback may still add to it, as under
+    /// [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS).
     pub const CANONICAL_PERMISSIONS: CommitModifierFlags = CommitModifierFlags(1 << 2);
     /// With a label callback present, treat a path the callback leaves
     /// unlabeled as an error.

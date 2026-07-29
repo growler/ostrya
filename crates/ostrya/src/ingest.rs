@@ -275,12 +275,16 @@ fn devino_hit(
     Some(checksum)
 }
 
-/// Force owner 0:0 and canonicalize the permission bits under
-/// [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS). Cheap
-/// and deterministic; runs no user callbacks. A walk without a modifier
+/// Force owner 0:0, canonicalize the permission bits, and empty the xattr set
+/// under [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS).
+/// Cheap and deterministic; runs no user callbacks. A walk without a modifier
 /// carries the empty flag set, making this a no-op. A symlink's mode is fixed
 /// by the object model, so only regular-file and directory permission bits are
 /// canonicalized.
+///
+/// The xattr set is emptied here, ahead of the callbacks, so a callback that
+/// supplies xattrs or an SELinux label still lands them, as it does under
+/// [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS).
 pub(crate) fn apply_canonical(
     flags: CommitModifierFlags,
     mut meta: FileMeta,
@@ -289,6 +293,7 @@ pub(crate) fn apply_canonical(
     if flags.contains(CommitModifierFlags::CANONICAL_PERMISSIONS) {
         meta.uid = 0;
         meta.gid = 0;
+        meta.xattrs = Xattrs::empty();
         if !is_symlink {
             meta.mode = (meta.mode & S_IFMT) | (meta.mode & CANONICAL_PERM_MASK);
         }

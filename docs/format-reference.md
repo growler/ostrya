@@ -698,10 +698,11 @@ Two of these options change the object bytes and are recovered by black-box
 observation; the rest are ingest mechanics with no on-disk effect.
 
 Canonical permissions. The tool's `--canonical-permissions` option (the port's
-`CANONICAL_PERMISSIONS`) forces owner 0:0 and reduces each permission set to a
-canonical form. Recovered by committing files and directories of assorted modes
-with and without the option into an archive repository and reading the modes
-back with `ostree ls -R`:
+`CANONICAL_PERMISSIONS`) forces owner 0:0, reduces each permission set to a
+canonical form, and records no extended attributes. Recovered by committing files
+and directories of assorted modes and xattr sets with and without the option into
+an archive repository, reading the modes back with `ostree ls -R`, and comparing
+object checksums:
 
 - uid and gid become 0. The tool refuses a non-zero `--owner-uid`/`--owner-gid`
   together with `--canonical-permissions`, so canonical ingest always owns
@@ -714,14 +715,21 @@ back with `ostree ls -R`:
   `0640`; `0600`, `0644`, `0700`, and `0755` are unchanged. Directory mappings
   match: `0775`, `0777`, and `02755` become `0755`; `0700` stays `0700`.
 - A symlink is unchanged; its mode stays `S_IFLNK | 0o777`.
+- The recorded xattr set is empty. Observed on a 0644 file carrying
+  `user.demo=1`: its checksum is `a5ee0b1b...` under
+  `--owner-uid=0 --owner-gid=0` and `fe042781...` under
+  `--canonical-permissions`, and `fe042781...` is the checksum the same file
+  without the xattr takes under `--owner-uid=0 --owner-gid=0`. A directory's
+  xattr goes the same way: the dirmeta is `6c9fefc6...` with the xattr kept and
+  the canonical `446a0ef1...` under the option.
 
-This is the ownership and permission rule `bare-user-only` applies to everything
-it records, with or without the option (`perm & 0o755`, see the loose-object
-inode-mode notes above). Because the canonicalized mode enters the file-content
-header, canonical ingest changes an object's identity, and therefore the dirtree
-and commit checksums, whenever an input mode is not already canonical (confirmed:
-the canonical commit checksum differs from the same tree committed 0:0 without
-the option).
+This is the ownership, permission, and xattr rule `bare-user-only` applies to
+everything it records, with or without the option (see the loose-object
+inode-mode notes above). Because the canonicalized header enters the
+file-content header and the dirmeta, canonical ingest changes an object's
+identity, and therefore the dirtree and commit checksums, whenever an input entry
+is not already in that form (confirmed: the canonical commit checksum differs
+from the same tree committed 0:0 without the option).
 
 Consume. The tool's `--consume` option (the port's `CONSUME`) deletes the
 source content after it is committed. Recovered by committing `--consume base/src`:

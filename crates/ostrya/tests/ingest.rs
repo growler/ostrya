@@ -2,17 +2,17 @@
 //!
 //! These build source trees on disk and ingest them through
 //! `write_dfd_to_mtree` under a `CommitModifier`: reproducing the fixture
-//! tree's checksums, matching the tool's canonical-permissions output, the
-//! filter's subtree pruning, an xattr callback landing in the object id, a
-//! devino-cache hit skipping ingestion, source consumption, and a `user.*`
-//! xattr round-trip.
+//! tree's checksums, matching the tool's canonical-permissions output for modes
+//! and for xattrs, the filter's subtree pruning, an xattr callback landing in the
+//! object id, a devino-cache hit skipping ingestion, source consumption, and a
+//! `user.*` xattr round-trip.
 
 mod common;
 
 use std::os::fd::AsFd;
 use std::path::Path;
 
-use common::{ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, fixture_repo};
+use common::{ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, fixture_repo, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CreateOptions, DevInoCache, FileKind, FileMeta,
     FilterResult, MutableTree, Repo, RepoMode, TreeEntry,
@@ -204,6 +204,156 @@ fn canonical_permissions_apply_the_recovered_mode_rule() {
             assert_eq!((file.uid, file.gid), (0, 0), "{name} owner forced to 0:0");
         }
     });
+}
+
+#[test]
+fn canonical_permissions_records_no_xattrs() {
+    // Canonical ingest records no xattrs, so an entry carrying one takes the
+    // identity of the same entry without it -- for a file and for a directory's
+    // metadata alike. Pinned to the tool by
+    // `canonical_permissions_match_the_tool_over_xattrs`.
+    let tmp = TmpDir::new("ingest-canon-xattr");
+    let base = tmp.path();
+    // Two copies of one tree, identical but for the xattrs one of them carries.
+    for variant in ["with", "without"] {
+        let src = base.join(variant).join("src");
+        std::fs::create_dir_all(src.join("subdir")).unwrap();
+        std::fs::write(src.join("hello.txt"), b"labeled\n").unwrap();
+        set_mode(&src.join("hello.txt"), 0o644);
+        set_mode(&src.join("subdir"), 0o755);
+        set_mode(&src, 0o755);
+    }
+    let labeled = base.join("with").join("src");
+    for path in [labeled.join("hello.txt"), labeled.join("subdir")] {
+        rustix::fs::setxattr(
+            &path,
+            "user.demo",
+            b"value",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+    }
+
+    block_on(async {
+        let root = base.join("repo");
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let mut ingested = Vec::new();
+        for variant in ["with", "without"] {
+            let txn = repo.transaction().await.unwrap();
+            // No SKIP_XATTRS: the walk captures the on-disk set, and canonical
+            // ingest is what drops it.
+            let mut modifier = CommitModifier::new(CommitModifierFlags::CANONICAL_PERMISSIONS);
+            let mut mtree = MutableTree::new();
+            let dfd = std::fs::File::open(base.join(variant)).unwrap();
+            txn.write_dfd_to_mtree(
+                dfd.as_fd(),
+                Path::new("src"),
+                &mut mtree,
+                Some(&mut modifier),
+            )
+            .await
+            .unwrap();
+            let rt = txn.write_mtree(&mut mtree).await.unwrap();
+            ingested.push((*rt.dirtree_checksum(), *rt.dirmeta_checksum()));
+            txn.commit().await.unwrap();
+        }
+        assert_eq!(
+            ingested[0], ingested[1],
+            "the xattr-bearing tree has the identity of the tree without xattrs"
+        );
+
+        // The recorded file header carries no xattr either.
+        let tree = repo.load_dirtree(&ingested[0].0).await.unwrap();
+        let hello = tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1;
+        let file = repo.load_file(&hello).await.unwrap();
+        assert!(file.xattrs.is_empty(), "file xattrs: {:?}", file.xattrs);
+        let sub = tree.dirs.iter().find(|(n, _, _)| n == "subdir").unwrap();
+        let dirmeta = repo.load_dirmeta(&sub.2).await.unwrap();
+        assert!(dirmeta.xattrs.is_empty(), "dirmeta xattrs: {:?}", dirmeta);
+    });
+}
+
+#[test]
+fn canonical_permissions_match_the_tool_over_xattrs() {
+    if !ostree_available() {
+        eprintln!(
+            "skipping canonical_permissions_match_the_tool_over_xattrs: the ostree tool is \
+             unavailable"
+        );
+        return;
+    }
+    // The tool's `--canonical-permissions` records no xattrs, so the port's
+    // canonical ingest of an xattr-bearing tree has to produce the tool's own
+    // object names for it.
+    let tmp = TmpDir::new("ingest-canon-tool");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("subdir")).unwrap();
+    std::fs::write(src.join("hello.txt"), b"labeled\n").unwrap();
+    std::fs::write(src.join("subdir/nested.txt"), b"nested\n").unwrap();
+    set_mode(&src.join("hello.txt"), 0o664);
+    set_mode(&src.join("subdir/nested.txt"), 0o644);
+    set_mode(&src.join("subdir"), 0o775);
+    set_mode(&src, 0o755);
+    for path in [src.join("hello.txt"), src.join("subdir")] {
+        rustix::fs::setxattr(
+            &path,
+            "user.demo",
+            b"value",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .unwrap();
+    }
+
+    block_on(async {
+        let repo = Repo::create(&base.join("port"), CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let mut modifier = CommitModifier::new(CommitModifierFlags::CANONICAL_PERMISSIONS);
+        let mut mtree = MutableTree::new();
+        let dfd = std::fs::File::open(base).unwrap();
+        txn.write_dfd_to_mtree(
+            dfd.as_fd(),
+            Path::new("src"),
+            &mut mtree,
+            Some(&mut modifier),
+        )
+        .await
+        .unwrap();
+        let rt = txn.write_mtree(&mut mtree).await.unwrap();
+        let (dirtree, dirmeta) = (*rt.dirtree_checksum(), *rt.dirmeta_checksum());
+        txn.abort().await.unwrap();
+
+        let tool_root = base.join("tool");
+        let repo_arg = format!("--repo={}", tool_root.display());
+        run_ostree(&[&repo_arg, "init", "--mode=bare-user"]);
+        run_ostree(&[
+            &repo_arg,
+            "commit",
+            "--branch=t",
+            "--subject=x",
+            "--canonical-permissions",
+            "--timestamp=@1700000000",
+            src.to_str().unwrap(),
+        ]);
+        let tool = Repo::open(&tool_root).await.unwrap();
+        let (want, _) = tool.read_commit("t").await.unwrap();
+        assert_eq!(&dirtree, want.dirtree_checksum(), "root dirtree");
+        assert_eq!(&dirmeta, want.dirmeta_checksum(), "root dirmeta");
+    });
+}
+
+fn run_ostree(args: &[&str]) {
+    let status = std::process::Command::new("ostree")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run ostree");
+    assert!(status.success(), "ostree {args:?} failed");
 }
 
 #[test]

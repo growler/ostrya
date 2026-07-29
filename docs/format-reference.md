@@ -501,7 +501,10 @@ Loose-object inode permission bits, by object class and repository mode:
   execute bits are kept, owner-read is forced on, and other-write is dropped
   (`0666` stores as `0664`, `0777` as `0775`). A symlink is stored as a regular
   file whose inode is 0644. The inode is owned by the writing process; the
-  logical uid/gid live in `user.ostreemeta`.
+  logical uid/gid live in `user.ostreemeta`. A logical mode with no owner-write
+  bit (0444, 0555) leaves that inode without write permission, and the kernel
+  checks a `user.*` xattr against it, so `user.ostreemeta` is written before the
+  mode is applied.
 - `bare-user-shared`: every content object's inode is a fixed 0644.
 - `bare-user-only`: a regular-file content object's inode mode is the canonical
   `logical_perm & 0o755` -- group-write and other-write are dropped and no

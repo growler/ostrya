@@ -860,11 +860,14 @@ fn apply_regular_metadata(
 ) -> Result<()> {
     match effective {
         CheckoutMode::None => {
-            rustix::fs::fchown(fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
-            rustix::fs::fchmod(fd, Mode::from_raw_mode(mode & PERM_MASK))?;
+            // The xattrs go on before the mode: the kernel checks a `user.*`
+            // xattr against the inode's write permission, which a logical mode
+            // without an owner-write bit (0444, 0555) does not grant.
             for (name, value) in xattrs.iter() {
                 crate::write::set_inode_xattr(fd, name, value)?;
             }
+            rustix::fs::fchown(fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
+            rustix::fs::fchmod(fd, Mode::from_raw_mode(mode & PERM_MASK))?;
         }
         CheckoutMode::User => {
             rustix::fs::fchmod(fd, Mode::from_raw_mode(mode & USER_PERM_MASK))?;
@@ -875,17 +878,16 @@ fn apply_regular_metadata(
 
 /// Apply a directory's checkout-mode metadata to its fd. The full logical mode
 /// (`mode & 0o7777`, special bits kept) is applied under both checkout modes;
-/// only the chown and xattrs differ.
+/// only the chown and xattrs differ. The mode is applied last, since a `user.*`
+/// xattr needs write permission on the inode.
 fn apply_dir_metadata(fd: BorrowedFd<'_>, effective: CheckoutMode, dm: &DirMeta) -> Result<()> {
-    if effective == CheckoutMode::None {
-        rustix::fs::fchown(fd, Some(Uid::from_raw(dm.uid)), Some(Gid::from_raw(dm.gid)))?;
-    }
-    rustix::fs::fchmod(fd, Mode::from_raw_mode(dm.mode & PERM_MASK))?;
     if effective == CheckoutMode::None {
         for (name, value) in dm.xattrs.iter() {
             crate::write::set_inode_xattr(fd, name, value)?;
         }
+        rustix::fs::fchown(fd, Some(Uid::from_raw(dm.uid)), Some(Gid::from_raw(dm.gid)))?;
     }
+    rustix::fs::fchmod(fd, Mode::from_raw_mode(dm.mode & PERM_MASK))?;
     Ok(())
 }
 

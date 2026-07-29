@@ -703,8 +703,12 @@ fn apply_content_metadata(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHeade
             }
         }
         RepoMode::BareUser => {
-            rustix::fs::fchmod(fd, Mode::from_raw_mode((perm & 0o775) | 0o400))?;
+            // The xattr goes on before the mode: the kernel checks a `user.*`
+            // xattr against the inode's write permission, and this mode's
+            // canonical inode mode leaves no owner-write bit for a logical mode
+            // that has none (0444, 0555).
             set_ostreemeta(fd, header)?;
+            rustix::fs::fchmod(fd, Mode::from_raw_mode((perm & 0o775) | 0o400))?;
         }
         RepoMode::BareUserShared => {
             rustix::fs::fchmod(fd, Mode::from_raw_mode(FIXED_MODE))?;

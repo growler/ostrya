@@ -505,6 +505,44 @@ fn content_reads_back_through_load_file() {
 }
 
 #[test]
+fn a_read_only_mode_is_stored_in_bare_user() {
+    // A logical mode with no owner-write bit -- 0444 is ordinary in a system
+    // tree -- is storable in bare-user, where the logical metadata lives in a
+    // `user.ostreemeta` xattr the kernel checks against the inode's write
+    // permission. Both content writers are exercised, since each stages its own
+    // temp before the inode policy is applied.
+    let tmp = TmpDir::new("write-readonly");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let meta = FileMeta::regular(0, 0, 0o444);
+        let inline = txn.write_regfile_inline(None, &meta, HELLO).await.unwrap();
+        let streamed = txn
+            .write_content(None, &meta, Cursor::new(NESTED.to_vec()))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        for checksum in [inline, streamed] {
+            // bare-user's canonical inode mode for a 0444 file is 0444 itself,
+            // and the logical mode reads back from the xattr.
+            let path = root.join("objects").join(loose_path(
+                &checksum,
+                ObjectType::File,
+                RepoMode::BareUser,
+            ));
+            let stored = rustix::fs::stat(&path).unwrap();
+            assert_eq!(stored.st_mode & 0o7777, 0o444, "stored mode of {checksum}");
+            let file = repo.load_file(&checksum).await.unwrap();
+            assert_eq!((file.uid, file.gid, file.mode), (0, 0, 0o100444));
+        }
+    });
+}
+
+#[test]
 fn bare_objects_match_the_tool() {
     if !ostree_available() {
         eprintln!("skipping bare_objects_match_the_tool: the ostree tool is unavailable");

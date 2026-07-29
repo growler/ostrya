@@ -590,6 +590,88 @@ fn checkout_applies_logical_xattrs() {
     });
 }
 
+#[test]
+fn checkout_applies_xattrs_to_read_only_entries() {
+    // A file and a directory whose logical modes carry no owner-write bit, each
+    // with a `user.*` xattr. The kernel checks a `user.*` xattr against the
+    // inode's write permission, so the xattrs are applied before the mode. The
+    // repository is archive, which stores the logical metadata in the object
+    // header and so holds entries of any mode.
+    let tmp = TmpDir::new("co-readonly");
+    let base = tmp.path();
+    let repo_dir = base.join("repo");
+    let (uid, gid) = self_owner(base);
+
+    block_on(async {
+        let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let commit = {
+            let txn = repo.transaction().await.unwrap();
+            let meta = FileMeta {
+                uid,
+                gid,
+                mode: S_IFREG | 0o444,
+                xattrs: Xattrs::new([(b"user.demo\0".to_vec(), b"value".to_vec())]).unwrap(),
+            };
+            let file = txn
+                .write_regfile_inline(None, &meta, b"read only\n")
+                .await
+                .unwrap();
+            let dirmeta = DirMeta {
+                uid,
+                gid,
+                mode: S_IFDIR | 0o555,
+                xattrs: Xattrs::new([(b"user.dir\0".to_vec(), b"d".to_vec())]).unwrap(),
+            };
+            let dm = txn
+                .write_metadata(ObjectType::DirMeta, None, &dirmeta.serialize().unwrap())
+                .await
+                .unwrap();
+            let mut mtree = MutableTree::new();
+            mtree.set_metadata_checksum(dm);
+            mtree.replace_file("ro.txt", file).unwrap();
+            let root = txn.write_mtree(&mut mtree).await.unwrap();
+            let commit = txn
+                .write_commit(CommitOptions::default(), &root)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            commit
+        };
+
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        let base_fd = std::fs::File::open(base).unwrap();
+        repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("co"), &commit)
+            .await
+            .unwrap();
+
+        let dir = base.join("co");
+        let file = dir.join("ro.txt");
+        assert_eq!(mode_of(&dir), 0o555, "directory mode");
+        assert_eq!(mode_of(&file), 0o444, "file mode");
+        assert_eq!(xattr_of(&dir, "user.dir"), b"d", "directory xattr");
+        assert_eq!(xattr_of(&file, "user.demo"), b"value", "file xattr");
+
+        // The checked-out directory is read-only, which its own cleanup needs
+        // reversed.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    });
+}
+
+/// The permission bits of a checked-out path.
+fn mode_of(path: &Path) -> u32 {
+    std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+}
+
+/// The value of a checked-out path's named xattr.
+fn xattr_of(path: &Path, name: &str) -> Vec<u8> {
+    let mut buf = [0u8; 256];
+    let n = rustix::fs::getxattr(path, name, &mut buf)
+        .unwrap_or_else(|e| panic!("getxattr({name}) on {}: {e}", path.display()));
+    buf[..n].to_vec()
+}
+
 // --- reflink / force-copy ------------------------------------------------
 
 #[test]

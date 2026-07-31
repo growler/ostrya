@@ -23,11 +23,10 @@ use std::os::fd::BorrowedFd;
 use std::pin::Pin;
 
 use futures_lite::AsyncReadExt;
-use ostrya_core::{Checksum, Commit, ContentHasher, DirTree, FileHeader, ObjectName, ObjectType};
+use ostrya_core::{Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType};
 use rustix::fs::{Mode, OFlags};
 
 use crate::error::{Error, Result};
-use crate::file::FileKind;
 use crate::repo::Repo;
 
 /// The single byte the tool writes into a `.commitpartial` marker when fsck
@@ -305,18 +304,7 @@ impl Repo {
             Err(e) => return Err(e),
         };
 
-        let symlink_target = match &file.kind {
-            FileKind::Symlink { target } => target.clone(),
-            FileKind::Regular { .. } => String::new(),
-        };
-        let header = FileHeader {
-            uid: file.uid,
-            gid: file.gid,
-            mode: file.mode,
-            symlink_target,
-            xattrs: file.xattrs.clone(),
-        };
-        let mut hasher = ContentHasher::new(&header)?;
+        let mut hasher = ContentHasher::new(&file.header())?;
 
         let mut reader = file.reader().await?;
         let mut buf = vec![0u8; READ_CHUNK];

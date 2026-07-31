@@ -445,6 +445,7 @@ async fn pull_local(args: PullLocalArgs) -> Result<()> {
                 flags,
                 depth: args.depth,
                 localcache_repos,
+                ..PullOptions::default()
             },
         )
         .await?;

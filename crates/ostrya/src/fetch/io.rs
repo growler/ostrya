@@ -1,16 +1,18 @@
 //! Glue between hyper and the runtime-neutral stream surface.
 //!
-//! hyper drives its connections over its own I/O traits and spawns its
-//! background work through its own executor trait. [`FuturesIo`] presents a
-//! `futures-io` stream -- a plain TCP stream or a TLS session over one -- as a
-//! hyper stream, and [`RtExecutor`] hands hyper's tasks to `rt::spawn`. Both are
-//! thin: the fetcher, the TLS layer, and every stream below them stay written
-//! against `futures-io` and `ostrya-rt`.
+//! hyper drives its connections over its own I/O traits, spawns its background
+//! work through its own executor trait, and schedules its HTTP/2 keep-alive
+//! pings through its own timer trait. [`FuturesIo`] presents a `futures-io`
+//! stream -- a plain TCP stream or a TLS session over one -- as a hyper stream,
+//! [`RtExecutor`] hands hyper's tasks to `rt::spawn`, and [`RtTimer`] hands its
+//! delays to `rt::Deadline`. All three are thin: the fetcher, the TLS layer, and
+//! every stream below them stay written against `futures-io` and `ostrya-rt`.
 
 use std::future::Future;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
+use std::time::{Duration, Instant};
 
 use futures_io::{AsyncRead, AsyncWrite};
 
@@ -136,6 +138,40 @@ where
         drop(ostrya_rt::spawn(future));
     }
 }
+
+/// Hands hyper's delays to the runtime backend. An HTTP/2 connection needs one
+/// to schedule its keep-alive ping and the wait for the reply.
+#[derive(Clone, Copy)]
+pub(crate) struct RtTimer;
+
+impl hyper::rt::Timer for RtTimer {
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(RtSleep {
+            deadline: ostrya_rt::Deadline::new(duration),
+        })
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        // A deadline already past is a zero-length window, which expires on its
+        // first poll.
+        self.sleep(deadline.saturating_duration_since(Instant::now()))
+    }
+}
+
+/// One delay, as a future hyper can hold.
+struct RtSleep {
+    deadline: ostrya_rt::Deadline,
+}
+
+impl Future for RtSleep {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.get_mut().deadline.poll_expired(cx)
+    }
+}
+
+impl hyper::rt::Sleep for RtSleep {}
 
 #[cfg(test)]
 mod tests {

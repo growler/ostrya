@@ -1,4 +1,9 @@
-//! Local pull: importing refs and their objects from another local repository.
+//! Pull: importing refs and their objects from another repository.
+//!
+//! [`Repo::pull_local`] reads a local repository directly, described below;
+//! [`Repo::pull`] fetches from an HTTP remote, described in
+//! [`pull::http`](self::http). The two share the options, the flags, the
+//! statistics, the ref-binding check, and the `.commitpartial` markers.
 //!
 //! [`Repo::pull_local`] copies a set of refs, the commits they name, and every
 //! object those commits reach out of a source repository and into this one. The
@@ -102,8 +107,8 @@
 //! carries the objects the commits ahead of it did not.
 //!
 //! Commit state: each commit being pulled gets a zero-length
-//! `state/<commit>.commitpartial` marker before its objects are imported,
-//! removed once they are published. An interrupted pull therefore leaves the
+//! `state/<commit>.commitpartial` marker before the commit object is stored,
+//! removed once its objects are published. An interrupted pull therefore leaves the
 //! commit marked partial, and a [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull
 //! leaves the marker in place, since the commit's content was never fetched.
 //! Both match the markers the `ostree` tool leaves behind. A marker already
@@ -111,10 +116,13 @@
 //! fsck writes survives a pull over the commit it marked.
 //!
 //! Marker durability: no marker is fsynced and neither is `state/`, which is
-//! what the tool does. Every marker of a pull is written before the transaction
-//! stages an object, so the `syncfs` that opens publication makes it durable
-//! ahead of the first object rename; the marker is on disk before any object of
-//! the commit it guards. The removal is the pull's last operation and no barrier
+//! what the tool does. Every marker of a pull is written before
+//! `Transaction::commit`, so the `syncfs` that opens publication makes it durable
+//! ahead of the first object rename; a staged object enters `objects/` in that
+//! rename, so no object a pull stages is reachable before the marker guarding it
+//! is durable. A local pull writes all of its markers before the first import,
+//! and an HTTP pull writes each commit's marker in the step that fetched that
+//! commit. The removal is the pull's last operation and no barrier
 //! follows it, so a crash immediately after a successful pull can leave a marker
 //! on a commit that is complete. That direction costs availability rather than
 //! integrity: checkout refuses the commit until the next pull of it, or a prune
@@ -144,6 +152,9 @@ use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
+
+mod drive;
+pub mod http;
 
 /// The chunk size for streaming a content object's payload.
 const READ_CHUNK: usize = 128 * 1024;
@@ -177,6 +188,16 @@ impl PullFlags {
     /// a source on another filesystem does on its own. A content object is copied
     /// through its header, so it lands with this repository's own inode policy.
     pub const FORCE_COPY: PullFlags = PullFlags(1 << 4);
+    /// [`Repo::pull`] only. Write the pulled refs as local refs under
+    /// `refs/heads/`, take every ref the remote's summary lists when
+    /// [`refs`](PullOptions::refs) is empty, and copy the remote's `summary` and
+    /// `summary.sig` bytes to this repository when the pull took every such ref.
+    ///
+    /// [`Repo::pull_local`] ignores this flag. It writes the pulled refs under
+    /// the prefix [`remote`](PullOptions::remote) names, as local refs when that
+    /// is `None`, and an empty [`refs`](PullOptions::refs) list takes every ref
+    /// the source holds under `refs/heads`.
+    pub const MIRROR: PullFlags = PullFlags(1 << 5);
 
     /// The empty flag set.
     pub const fn empty() -> PullFlags {
@@ -208,15 +229,38 @@ impl std::ops::BitOrAssign for PullFlags {
     }
 }
 
+/// What a fetched tip's timestamp is required to be no older than.
+///
+/// A pull that would move a ref backwards in time is refused, which is what
+/// keeps a downgrade from arriving as an ordinary update. The comparison is
+/// strict: an equal timestamp passes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum TimestampCheck {
+    /// No check.
+    #[default]
+    Off,
+    /// Compare against the commit the ref currently names in this repository.
+    /// A ref this repository does not hold passes.
+    CurrentRef,
+    /// Compare against a given commit, which this repository must hold.
+    Rev(Checksum),
+}
+
 /// What to pull and how.
+///
+/// The defaults are what [`Repo::pull_local`] does; the fields an HTTP pull adds
+/// each default to the behavior a local pull has.
 #[derive(Debug, Clone, Default)]
 pub struct PullOptions {
     /// The ref names to pull. An empty list pulls every ref the source holds
-    /// under `refs/heads`.
+    /// under `refs/heads`; over HTTP it resolves through the remote's summary
+    /// under [`MIRROR`](PullFlags::MIRROR) and through the remote's configured
+    /// `branches` otherwise.
     pub refs: Vec<String>,
     /// The remote name the pulled refs are written under
     /// (`refs/remotes/<remote>/<ref>`). `None` writes them as local refs under
-    /// `refs/heads/`.
+    /// `refs/heads/` for a local pull, and under the remote's own name for an
+    /// HTTP pull.
     pub remote: Option<String>,
     /// The flag set.
     pub flags: PullFlags,
@@ -228,6 +272,18 @@ pub struct PullOptions {
     /// Extra local repositories consulted for an object the source does not
     /// hold, in order.
     pub localcache_repos: Vec<Repo>,
+    /// The base URL an HTTP pull fetches from, overriding the remote's
+    /// configured `url`. `None` uses the configuration.
+    pub url: Option<String>,
+    /// Extra headers an HTTP pull sends with every request.
+    pub http_headers: Vec<(String, String)>,
+    /// How many fetches an HTTP pull keeps in flight. `None` is 8.
+    pub max_outstanding_fetches: Option<usize>,
+    /// How many times an HTTP pull repeats a round of mirrors after a retryable
+    /// failure. `None` is 5.
+    pub n_network_retries: Option<u32>,
+    /// What a fetched tip's timestamp is required to be no older than.
+    pub timestamp_check: TimestampCheck,
 }
 
 /// What a pull imported.
@@ -392,11 +448,14 @@ impl Repo {
         // payload twice.
         let loaded = if flag_check || dest_check || untrusted {
             let file = src.load_file(&name.checksum).await?;
-            if flag_check {
-                check_bareuseronly(&name.checksum, &file)?;
-            }
-            if dest_check {
-                check_canonical(&name.checksum, &file)?;
+            if flag_check || dest_check {
+                let header = file.header();
+                if flag_check {
+                    check_bareuseronly(&name.checksum, &header)?;
+                }
+                if dest_check {
+                    check_canonical(&name.checksum, &header)?;
+                }
             }
             Some(file)
         } else {
@@ -486,9 +545,13 @@ impl Repo {
     /// its `pull-local` opens an existing marker read-only and creates one with
     /// `O_EXCL`.
     ///
-    /// The marker is not fsynced and neither is `state/`. Every marker is written
-    /// before the transaction stages anything, so the `syncfs` that opens
-    /// publication makes it durable ahead of the first object rename.
+    /// The marker is not fsynced and neither is `state/`. Every marker of a pull
+    /// is written before `Transaction::commit`, so the `syncfs` that opens
+    /// publication makes it durable ahead of the first object rename. A staged
+    /// object enters `objects/` in that rename, so no object a pull stages is
+    /// reachable before the marker guarding it is durable. A local pull writes all
+    /// of its markers before the first import, and an HTTP pull writes each
+    /// commit's marker in the step that fetched that commit.
     async fn write_partial_marker(&self, commit: &Checksum) -> Result<()> {
         let path = partial_path(commit);
         let repo = self.clone();
@@ -791,40 +854,40 @@ fn symlink_shared(src: RepoMode, dest: RepoMode) -> bool {
 /// arrives under, which it can do only where that name already covers the
 /// canonical header; anything else would land under a name its stored form does
 /// not hash to. A symlink's mode is fixed by the object model and is exempt.
-fn check_canonical(checksum: &Checksum, file: &crate::file::FileObject) -> Result<()> {
-    let extra = if file.is_symlink() {
+pub(crate) fn check_canonical(checksum: &Checksum, header: &FileHeader) -> Result<()> {
+    let extra = if header.is_symlink() {
         0
     } else {
         // S_IFREG plus the permission bits the mode keeps.
-        file.mode & !0o100755
+        header.mode & !0o100755
     };
-    if extra == 0 && file.uid == 0 && file.gid == 0 && file.xattrs.is_empty() {
+    if extra == 0 && header.uid == 0 && header.gid == 0 && header.xattrs.is_empty() {
         return Ok(());
     }
     Err(Error::Pull(format!(
         "content object {checksum}: a bare-user-only repository stores neither \
          ownership nor xattrs and reduces the mode to 0755, so this object -- uid \
          {}, gid {}, mode 0{:o}, {} xattr(s) -- cannot be imported under its own name",
-        file.uid,
-        file.gid,
-        file.mode,
-        file.xattrs.len()
+        header.uid,
+        header.gid,
+        header.mode,
+        header.xattrs.len()
     )))
 }
 
 /// Reject a regular-file content object whose logical mode has bits outside
 /// `0775`. Symlinks carry a fixed mode and are exempt.
-fn check_bareuseronly(checksum: &Checksum, file: &crate::file::FileObject) -> Result<()> {
-    if file.is_symlink() {
+pub(crate) fn check_bareuseronly(checksum: &Checksum, header: &FileHeader) -> Result<()> {
+    if header.is_symlink() {
         return Ok(());
     }
-    let extra = file.mode & !0o100775;
+    let extra = header.mode & !0o100775;
     if extra == 0 {
         return Ok(());
     }
     Err(Error::Pull(format!(
         "content object {checksum}: invalid mode 0{:o} with bits 0{:o}",
-        file.mode, extra
+        header.mode, extra
     )))
 }
 
@@ -851,18 +914,7 @@ async fn verify_content(
     file: &crate::file::FileObject,
     buf: &mut Vec<u8>,
 ) -> Result<()> {
-    let symlink_target = match &file.kind {
-        FileKind::Symlink { target } => target.clone(),
-        FileKind::Regular { .. } => String::new(),
-    };
-    let header = FileHeader {
-        uid: file.uid,
-        gid: file.gid,
-        mode: file.mode,
-        symlink_target,
-        xattrs: file.xattrs.clone(),
-    };
-    let mut hasher = ContentHasher::new(&header)?;
+    let mut hasher = ContentHasher::new(&file.header())?;
     let mut reader = file.reader().await?;
     if buf.len() < READ_CHUNK {
         buf.resize(READ_CHUNK, 0);
@@ -882,6 +934,14 @@ async fn verify_content(
     }
     Ok(())
 }
+
+/// The pull options and the timestamp check move freely across tasks and
+/// threads.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<PullOptions>();
+    assert_send_sync::<TimestampCheck>();
+};
 
 #[cfg(test)]
 mod tests {

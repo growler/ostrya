@@ -701,11 +701,33 @@ each commit and dirtree through the same order, so a subtree `src` has lost is
 enumerated from a cache that holds it. Refs are written after the objects are
 published.
 
-The fields below are what the local pull uses. The HTTP pull adds the
-remote-only ones (`subdirs`, the static-delta switches,
-`override_commit_ids`, `http_headers`, `max_outstanding_fetches`,
-`n_network_retries`, `gpg_verify`, `sign_verifiers`), a `MIRROR` flag, and a
-progress callback.
+`pull` fetches the same thing from an HTTP remote named in the repository's
+config, into one transaction, with up to `max_outstanding_fetches` objects in
+flight. The plan is drained commits first, then the dirtree and dirmeta objects
+the scan is blocked on, then the content, and each class carries the matching
+fetch priority. A commit object is fetched before the objects it references and
+staged where it arrives, checked there against the name it was requested by; a
+commit whose tree is not yet complete is covered by its `.commitpartial` marker,
+which is removed after the transaction publishes. Three write permits bound how
+many fetched payloads stream into the
+object store at once; a permit is taken before the response body is read, which
+keeps a waiting step off the fetcher's progress clock. Every fetched object is
+stored under the name it was requested by and the write path compares what it
+hashed against that name, so an HTTP pull verifies whatever the flags say.
+`localcache_repos` are consulted before the network, per object.
+
+Each requested ref resolves against the remote's summary first and then
+`refs/heads/<ref>`, the name percent-encoded where it becomes that path. An empty
+ref list takes every summary ref under `MIRROR` and the remote's configured
+`branches` otherwise. Whichever of the three a name comes from, it is held to the
+ref store's rule -- no empty, `.`, or `..` component -- before any object is
+requested. Refs are written under
+`refs/remotes/<remote>/<ref>`, or as local refs under `MIRROR`, which also copies
+the remote's `summary` and `summary.sig` bytes to this repository when the pull
+took every ref.
+
+Still remote-only and unimplemented: `subdirs`, the static-delta switches,
+`override_commit_ids`, `gpg_verify`, `sign_verifiers`, and a progress callback.
 
 ```rust
 pub struct PullFlags(u32);                // a bitset, as CommitModifierFlags is
@@ -716,18 +738,35 @@ impl PullFlags {
     pub const BAREUSERONLY_FILES: PullFlags;      // reject modes outside 0775
     pub const DISABLE_VERIFY_BINDINGS: PullFlags; // skip the ref-binding check
     pub const FORCE_COPY: PullFlags;      // never hardlink
+    pub const MIRROR: PullFlags;          // local refs; every summary ref
     pub const fn empty() -> PullFlags;
     pub const fn contains(self, other: PullFlags) -> bool;
     pub const fn bits(self) -> u32;
 }
 
+/// What a fetched tip's timestamp must be no older than. The comparison is
+/// strict: an equal timestamp passes.
+#[derive(Default)]
+pub enum TimestampCheck {
+    #[default] Off,
+    CurrentRef,                           // the commit the ref names here
+    Rev(Checksum),                        // a given commit
+}
+
 #[derive(Default)]
 pub struct PullOptions {
-    pub refs: Vec<String>,                // empty: every ref under refs/heads
+    pub refs: Vec<String>,                // empty: every ref under refs/heads,
+                                          // or the summary / `branches` remotely
     pub remote: Option<String>,           // refs/remotes/<remote>/<ref>
     pub flags: PullFlags,
     pub depth: i32,                       // 0 = the commit alone, -1 = all
     pub localcache_repos: Vec<Repo>,
+    // The rest are the HTTP pull's; each defaults to what a local pull does.
+    pub url: Option<String>,              // overrides the remote's configured url
+    pub http_headers: Vec<(String, String)>,
+    pub max_outstanding_fetches: Option<usize>,  // None is 8
+    pub n_network_retries: Option<u32>,          // None is 5
+    pub timestamp_check: TimestampCheck,
 }
 
 pub struct PullStats {
@@ -736,13 +775,22 @@ pub struct PullStats {
     pub content_bytes_written: u64,
 }
 
+/// The read side of a `summary` file: the ref list a pull resolves against, and
+/// the global metadata dict verbatim.
+pub struct Summary { pub refs: Vec<(String, Checksum)>, pub metadata: Value }
+impl Summary {
+    pub fn parse(bytes: &[u8]) -> Result<Summary>;
+    pub fn lookup(&self, ref_name: &str) -> Option<Checksum>;
+}
+
 impl Repo {
     pub async fn pull_local(&self, src: &Repo, opts: PullOptions)
         -> Result<PullStats>;
     pub async fn pull(&self, remote: &str, opts: PullOptions)
         -> Result<PullStats>;
+    /// The remote's `summary` and `summary.sig` bytes, an absent one as None.
     pub async fn remote_fetch_summary(&self, remote: &str)
-        -> Result<(Variant, Option<Variant>)>;
+        -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>;
 }
 ```
 

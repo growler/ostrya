@@ -63,8 +63,8 @@ use async_compression::Level;
 use async_compression::futures::write::XzEncoder;
 use futures_lite::AsyncWriteExt;
 use ostrya_core::{
-    Checksum, FileHeader, ObjectType, Type, Value, Xattrs, choose_offset_size, from_bytes,
-    to_bytes, varint, write_offset,
+    Checksum, ObjectType, Type, Value, Xattrs, choose_offset_size, from_bytes, to_bytes, varint,
+    write_offset,
 };
 use ostrya_rt::File as RtFile;
 use sha2::{Digest, Sha256};
@@ -1273,16 +1273,7 @@ const FALLBACK_FRAMING: u64 = 7;
 /// the file header variant, [`FALLBACK_FRAMING`], and the payload. A large object
 /// travels as a loose object instead of inflating a part.
 fn stream_size(file: &FileObject) -> Result<u64> {
-    let header = FileHeader {
-        uid: file.uid,
-        gid: file.gid,
-        mode: file.mode,
-        symlink_target: match &file.kind {
-            FileKind::Symlink { target } => target.clone(),
-            FileKind::Regular { .. } => String::new(),
-        },
-        xattrs: file.xattrs.clone(),
-    };
+    let header = file.header();
     Ok(FALLBACK_FRAMING + header.serialize()?.len() as u64 + content_size(file))
 }
 

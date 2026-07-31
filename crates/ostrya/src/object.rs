@@ -19,6 +19,19 @@ use crate::error::{Error, Result};
 /// format's 128 MiB metadata cap.
 pub(crate) const MAX_METADATA_SIZE: u64 = 128 * 1024 * 1024;
 
+/// The maximum size of a content object's framed file header the reader will
+/// load, for the archive form on disk and for the same framing received over
+/// HTTP.
+///
+/// A header holds uid, gid, mode, rdev, a symlink target, and the xattr array,
+/// which puts a real header at a few hundred bytes and a header with large
+/// xattrs at a few kilobytes. Linux caps one xattr value at 64 KiB, so 1 MiB
+/// holds a header carrying many of them. The bound sits far below
+/// [`MAX_METADATA_SIZE`] because the header length arrives from the object
+/// stream and the receive path holds one header buffer for each fetch in
+/// flight.
+pub(crate) const MAX_FILE_HEADER_SIZE: u64 = 1024 * 1024;
+
 /// Open a loose object for reading, relative to a directory fd.
 fn open_object(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<OwnedFd> {
     Ok(rustix::fs::openat(

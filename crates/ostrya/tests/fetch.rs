@@ -26,7 +26,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::{
     BasicAuth, Checksum, ClientIdentity, Error, FetchRequest, Fetched, Fetcher, FetcherOptions,
-    Protocol, TlsOptions, TrustRoots, VerifyingReader,
+    Priority, Protocol, TlsOptions, TrustRoots, VerifyingReader,
 };
 use ostrya_rt::{TcpListener, Timer, block_on, spawn};
 use sha2::{Digest, Sha256};
@@ -423,6 +423,23 @@ fn tls_options(identity: Option<ClientIdentity>) -> TlsOptions {
     }
 }
 
+/// Fetch `path` at `priority`, reading the body out so the permit is released.
+/// Owned arguments, so the whole thing can be spawned.
+async fn queued(fetcher: Fetcher, path: &'static str, priority: Priority) {
+    let fetched = fetcher
+        .fetch(FetchRequest {
+            priority,
+            ..FetchRequest::new(path)
+        })
+        .await
+        .unwrap();
+    let Fetched::Body(mut body) = fetched else {
+        panic!("unexpected 304 for {path}");
+    };
+    let mut out = Vec::new();
+    body.read_to_end(&mut out).await.unwrap();
+}
+
 /// Fetch `path` and return the body's bytes with the protocol that carried it.
 async fn fetch_bytes(fetcher: &Fetcher, path: &str) -> (Vec<u8>, Protocol) {
     match fetcher.fetch(FetchRequest::new(path)).await.unwrap() {
@@ -698,9 +715,9 @@ fn retries_stop_at_the_configured_count() {
 }
 
 /// A mirror that answered definitively answers the same in every round, so a
-/// repeated round asks only the mirrors that failed retryably. The definitive
-/// answer still outlives the round it came from: it is what the fetch reports
-/// once nothing retryable is left.
+/// repeated round asks only the mirrors that failed retryably. Running out of
+/// rounds reports the same thing running out of mirrors does: the earliest
+/// definitive answer, which here is the first mirror's, from the first round.
 #[test]
 fn a_mirror_that_answered_definitively_is_not_asked_again() {
     block_on(async {
@@ -718,10 +735,9 @@ fn a_mirror_that_answered_definitively_is_not_asked_again() {
             .fetch(FetchRequest::new("objects/ab/cd.dirtree"))
             .await
             .unwrap_err();
-        // The rounds ran out with the flapping mirror still retryable, so its
-        // status is the one reported.
+        // The first mirror in the list is the first that had something to say.
         assert!(
-            matches!(err, Error::HttpStatus { status: 503, .. }),
+            matches!(err, Error::HttpStatus { status: 404, .. }),
             "{err}"
         );
         // Three rounds for the mirror whose answer another attempt may change,
@@ -732,8 +748,9 @@ fn a_mirror_that_answered_definitively_is_not_asked_again() {
     });
 }
 
-/// Once nothing retryable is left, the fetch reports the first definitive answer
-/// it received, from whichever round it came.
+/// The earliest definitive answer is what a fetch reports, from whichever round
+/// it came, so an answer given in an earlier round outlives the round it came
+/// from.
 #[test]
 fn a_definitive_answer_from_an_earlier_round_is_reported() {
     block_on(async {
@@ -764,6 +781,38 @@ fn a_definitive_answer_from_an_earlier_round_is_reported() {
         // The second round asked only the mirror that was still retryable, and
         // its definitive answer left nothing to repeat.
         assert_eq!(absent.requests(), 1);
+        assert_eq!(turning.requests(), 2);
+    });
+}
+
+/// A definitive answer is reported even when a retryable failure came first, so
+/// a caller that reads 404 as absence reads it through a flaky link.
+#[test]
+fn a_definitive_answer_after_a_retryable_failure_is_reported() {
+    block_on(async {
+        // Retryable in the first round, absent in the second.
+        let handler: Handler = Arc::new(|_seen, count| {
+            let status = if count == 1 { 503 } else { 404 };
+            Response::builder()
+                .status(StatusCode::from_u16(status).unwrap())
+                .body(TestBody::empty())
+                .unwrap()
+        });
+        let turning = TestServer::start(Transport::Cleartext, handler).await;
+        let mut options = FetcherOptions::new(turning.url(false));
+        options.max_retries = 3;
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        let err = fetcher
+            .fetch(FetchRequest::new("summary"))
+            .await
+            .unwrap_err();
+        // The 503 of the first round does not hide the answer of the second.
+        assert!(
+            matches!(err, Error::HttpStatus { status: 404, .. }),
+            "{err}"
+        );
+        // The 404 settled the one mirror, so the remaining rounds were not run.
         assert_eq!(turning.requests(), 2);
     });
 }
@@ -1105,6 +1154,132 @@ fn an_abandoned_body_is_not_pooled() {
         let (bytes, _) = fetch_bytes(&fetcher, "big").await;
         assert_eq!(bytes.len(), 64 * 1024);
         assert_eq!(server.connections(), 2);
+    });
+}
+
+/// A 404 is the ordinary answer for an object a remote does not hold, so an
+/// attempt that ends on one drains the short body it declares and keeps the
+/// connection. Otherwise a scan would pay a connection setup per absent object.
+#[test]
+fn an_unsuccessful_status_with_a_short_body_keeps_its_connection() {
+    block_on(async {
+        let handler: Handler = Arc::new(|_seen, _count| {
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(TestBody::measured(b"<html>not found</html>"))
+                .unwrap()
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            let err = fetcher
+                .fetch(FetchRequest::new("objects/ab/cd.filez"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::HttpStatus { status: 404, .. }),
+                "{err}"
+            );
+        }
+        assert_eq!(server.requests(), 4);
+        assert_eq!(server.connections(), 1);
+    });
+}
+
+/// A declared body over the request's cap is the same shape of failure and gets
+/// the same treatment, as long as what it declares is small enough to drain.
+#[test]
+fn an_over_cap_response_with_a_short_body_keeps_its_connection() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"more than asked for")).await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+
+        for _ in 0..4 {
+            let err = fetcher
+                .fetch(FetchRequest {
+                    max_size: Some(4),
+                    ..FetchRequest::new("summary")
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::FetchTooLarge { limit: 4 }), "{err}");
+        }
+        assert_eq!(server.requests(), 4);
+        assert_eq!(server.connections(), 1);
+    });
+}
+
+/// A body with no declared length is not drained: the rest of the response is
+/// still in flight and its size is unknown, so the connection is closed instead.
+#[test]
+fn an_unsuccessful_status_with_an_undeclared_body_closes_its_connection() {
+    block_on(async {
+        let handler: Handler = Arc::new(|_seen, _count| {
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(TestBody::chunked(&vec![b'z'; 4096], 8))
+                .unwrap()
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            assert!(
+                fetcher
+                    .fetch(FetchRequest::new("objects/ab/cd.filez"))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(server.connections(), 3);
+    });
+}
+
+/// The fetcher's admission gate serves the queue highest priority first, which
+/// the state machine of a pull relies on: the metadata its scan is blocked on
+/// overtakes queued bulk content.
+#[test]
+fn a_queued_high_priority_fetch_is_served_before_a_low_priority_one() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"served")).await;
+        let mut options = FetcherOptions::new(server.url(false));
+        options.max_outstanding = 1;
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        // The one permit is held by a body that has not been read to the end.
+        let Fetched::Body(held) = fetcher.fetch(FetchRequest::new("held")).await.unwrap() else {
+            panic!("unexpected 304");
+        };
+
+        // Queue the low-priority fetch first, so priority and not arrival order
+        // is what decides which the freed permit goes to.
+        let low = spawn(queued(fetcher.clone(), "objects/low.filez", Priority::Low));
+        Timer::after(Duration::from_millis(50)).await;
+        let high = spawn(queued(
+            fetcher.clone(),
+            "objects/high.dirtree",
+            Priority::High,
+        ));
+        Timer::after(Duration::from_millis(50)).await;
+        // Neither has reached the server: the permit is still held.
+        assert_eq!(server.requests(), 1);
+
+        drop(held);
+        high.await;
+        low.await;
+
+        let paths: Vec<String> = server.seen().iter().map(|s| s.path.clone()).collect();
+        assert_eq!(
+            paths,
+            ["/held", "/objects/high.dirtree", "/objects/low.filez"]
+        );
     });
 }
 

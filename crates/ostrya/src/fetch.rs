@@ -27,10 +27,24 @@
 //!   [`max_retries`](FetcherOptions::max_retries) times, with a doubling delay
 //!   starting at 250ms and capped at two seconds. A repeated round asks only the
 //!   mirrors whose failure was retryable.
-//! - Every other unsuccessful status fails the fetch as soon as the mirrors are
-//!   exhausted. A mirror that answered that way is not asked again, its answer
-//!   being the same whichever round asks, and the first such answer the fetch
-//!   received is the one it reports.
+//! - Every other unsuccessful status is definitive: the mirror that answered it
+//!   is not asked again, its answer being the same whichever round asks.
+//! - A fetch runs out either of mirrors to ask or of rounds to repeat, and both
+//!   report a definitive answer when the fetch received one, and the first
+//!   retryable failure otherwise. A definitive answer is what a caller can act
+//!   on -- a 404 is how absence reads -- so it is reported whichever round it
+//!   came from, and a retryable failure seen before it does not hide it. Among
+//!   definitive answers the earliest is reported, which is the mirror order the
+//!   fetcher honors everywhere else: the earliest entry in the list that had
+//!   something definitive to say about the request is what the caller hears.
+//!
+//! An attempt that ends on an unsuccessful status, or on a `Content-Length`
+//! over the request's cap, leaves a response body in flight. A body whose
+//! declared length is at or below 64 KiB is read to the end so its HTTP/1.1
+//! connection returns to the pool; a larger declared length, or none at all,
+//! closes the connection instead. A 404 is the ordinary answer for an object a
+//! remote does not hold, so without this a scan would pay a connection setup per
+//! absent object.
 //!
 //! Two deadlines bound one attempt against one mirror:
 //!
@@ -78,7 +92,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 use hyper::body::{Body as _, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::http::uri::Scheme;
-use hyper::{Method, Request, StatusCode, Uri, Version};
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use ostrya_rt as rt;
 use std::pin::Pin;
 #[cfg(feature = "tokio")]
@@ -87,17 +101,37 @@ use std::task::{Context, Poll};
 
 use crate::error::{Error, Result};
 
-mod gate;
+pub(crate) mod gate;
 mod io;
 mod tls;
 
 use gate::{Gate, Permit};
-use io::{FuturesIo, RtExecutor, WriteVectored};
+use io::{FuturesIo, RtExecutor, RtTimer, WriteVectored};
 use tls::client_config;
 pub use tls::{ClientIdentity, TlsOptions, TrustRoots};
 
 /// The user agent every request carries.
 const USER_AGENT: &str = concat!("ostrya/", env!("CARGO_PKG_VERSION"));
+
+/// The largest declared response body a failed attempt reads to the end so its
+/// HTTP/1.1 connection can go back to the pool. Above this, and with no declared
+/// length at all, the connection is closed rather than drained.
+const DRAIN_LIMIT: u64 = 64 * 1024;
+
+/// The HTTP/2 per-stream flow-control window. hyper's default is 64 KiB, which
+/// caps single-stream throughput on a link with a high bandwidth-delay product;
+/// an object fetch is one stream, so the window is what bounds it.
+const H2_STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+
+/// The largest flow-control window the protocol allows, 2^31 - 1.
+const H2_MAX_WINDOW: u32 = i32::MAX as u32;
+
+/// How often an HTTP/2 connection with an open stream pings its peer, and how
+/// long it waits for the reply. Both sit inside the default
+/// [`progress_timeout`](FetcherOptions::progress_timeout), so a peer that has
+/// gone away is reported by the ping rather than by a read that never returns.
+const H2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const H2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How urgently a request is served when the fetcher is at its limit.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
@@ -363,7 +397,28 @@ struct Inner {
     progress_timeout: Duration,
     fetch_timeout: Option<Duration>,
     gate: Arc<Gate>,
+    h2_connection_window: u32,
     pool: Mutex<HashMap<Origin, PoolEntry>>,
+}
+
+/// The HTTP/2 connection flow-control window for a fetcher admitting
+/// `max_outstanding` requests: one per-stream window for each of them.
+///
+/// A receiver credits a window back when the data is consumed, so a stream whose
+/// body the caller has received and not yet read holds its own credit for as long
+/// as it is parked. Giving the connection the sum of the stream windows keeps that
+/// credit the parked stream's own: whatever a caller parks, every other stream it
+/// has open still has a full window to receive over. An HTTP pull parks content
+/// bodies while they wait for a write permit, and the metadata object its scan is
+/// blocked on travels over the same connection.
+///
+/// The cost is the data one connection may hold received and unread, which is
+/// this window: 16 MiB at the default limit of 8.
+fn h2_connection_window(max_outstanding: usize) -> u32 {
+    u32::try_from(max_outstanding)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(H2_STREAM_WINDOW)
+        .min(H2_MAX_WINDOW)
 }
 
 /// A failed attempt, and whether trying again could help.
@@ -477,6 +532,7 @@ impl Fetcher {
                 progress_timeout: options.progress_timeout,
                 fetch_timeout: options.fetch_timeout,
                 gate: Arc::new(Gate::new(max_outstanding)),
+                h2_connection_window: h2_connection_window(max_outstanding),
                 pool: Mutex::new(HashMap::new()),
             }),
         })
@@ -510,45 +566,53 @@ impl Fetcher {
     async fn rounds(&self, request: &FetchRequest<'_>, permit: Permit) -> Result<Fetched> {
         // A mirror that answered definitively answers the same in every round,
         // so it is asked once: a repeated round asks only the mirrors whose
-        // failure another attempt may not repeat. Its answer outlives the round
-        // it came from, since it is what the fetch reports once nothing
-        // retryable is left.
+        // failure another attempt may not repeat.
         let mut settled = vec![false; self.inner.mirrors.len()];
-        let mut fatal: Option<Error> = None;
+        // The failure both exhaustion paths report. A definitive answer is what
+        // a caller can act on, so it outranks a retryable failure whichever
+        // round each came from: a mirror that fails transiently and then answers
+        // 404 reports the 404. Among failures of one kind the earliest is kept,
+        // which is the mirror order the fetcher honors everywhere else.
+        let mut reported: Option<Error> = None;
+        let mut definitive = false;
         let mut round = 0;
         loop {
-            let mut retryable: Option<Error> = None;
+            let mut retryable = false;
             for (mirror, settled) in self.inner.mirrors.iter().zip(&mut settled) {
                 if *settled {
                     continue;
                 }
-                match self.attempt(mirror, request).await {
+                let failure = match self.attempt(mirror, request).await {
                     Ok(Attempted::Body(mut body)) => {
                         body.permit = Some(permit);
                         return Ok(Fetched::Body(body));
                     }
                     Ok(Attempted::NotModified) => return Ok(Fetched::NotModified),
-                    Err(Failure::Retry(e)) => retryable = Some(e),
-                    Err(Failure::Fatal(e)) => {
+                    Err(failure) => failure,
+                };
+                match failure {
+                    Failure::Retry(e) => {
+                        retryable = true;
+                        if reported.is_none() {
+                            reported = Some(e);
+                        }
+                    }
+                    Failure::Fatal(e) => {
                         *settled = true;
-                        if fatal.is_none() {
-                            fatal = Some(e);
+                        if !definitive {
+                            reported = Some(e);
+                            definitive = true;
                         }
                     }
                 }
             }
-            match retryable {
-                // At least one mirror failed in a way a later attempt may not.
-                Some(err) => {
-                    if round >= self.inner.max_retries {
-                        return Err(err);
-                    }
-                    round += 1;
-                    rt::Timer::after(backoff(round)).await;
-                }
-                // Every mirror has answered definitively.
-                None => return Err(fatal.expect("a failed round holds a failure")),
+            // At least one mirror failed in a way a later attempt may not;
+            // otherwise every mirror has answered definitively.
+            if !retryable || round >= self.inner.max_retries {
+                return Err(reported.expect("a failed round holds a failure"));
             }
+            round += 1;
+            rt::Timer::after(backoff(round)).await;
         }
     }
 
@@ -564,7 +628,14 @@ impl Fetcher {
         let sender = match self.inner.take_conn(&mirror.origin) {
             Some(sender) => sender,
             None => {
-                let opened = within(connect_timeout, self.connect(&mirror.origin)).await;
+                // Opening a connection is by far the largest state a fetch
+                // holds -- the TLS handshake and hyper's own -- and it is the
+                // rarest, taken only when the pool has nothing for this origin.
+                // Boxing it keeps that state off the fetch future, which every
+                // caller nests inside its own: a fetch is ten times smaller
+                // this way, and a pull that wraps several helpers around one
+                // multiplies what it saves.
+                let opened = within(connect_timeout, Box::pin(self.connect(&mirror.origin))).await;
                 match opened {
                     Some(result) => result.map_err(Failure::Retry)?,
                     None => {
@@ -620,17 +691,16 @@ impl Fetcher {
             return Ok(Attempted::NotModified);
         }
         if status != StatusCode::OK {
-            return Err(classify(status, &url));
+            let failure = classify(status, &url);
+            self.discard(&mirror.origin, response, reuse).await;
+            return Err(failure);
         }
         let validators = read_validators(response.headers());
-        let content_length = response
-            .headers()
-            .get(hyper::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
+        let content_length = content_length(response.headers());
         if let (Some(limit), Some(length)) = (request.max_size, content_length)
             && length > limit
         {
+            self.discard(&mirror.origin, response, reuse).await;
             return Err(Failure::Fatal(Error::FetchTooLarge { limit }));
         }
         let protocol = match response.version() {
@@ -654,6 +724,44 @@ impl Fetcher {
             deadline: rt::Deadline::new(progress_timeout),
             waiting: false,
         }))
+    }
+
+    /// End an attempt whose response is not the one the caller asked for.
+    ///
+    /// A response that declares a body of at most [`DRAIN_LIMIT`] bytes is read
+    /// to the end, which frees its HTTP/1.1 connection for the next request; a
+    /// larger declared body, or one with no declared length, is dropped, closing
+    /// the connection, since the rest of the response is still in flight. An
+    /// HTTP/2 stream carries no such cost -- its connection stays pooled
+    /// whatever the stream did -- so there is nothing to drain.
+    async fn discard(
+        &self,
+        origin: &Origin,
+        response: Response<Incoming>,
+        reuse: Option<H1Sender>,
+    ) {
+        let Some(sender) = reuse else { return };
+        if content_length(response.headers()).is_none_or(|length| length > DRAIN_LIMIT) {
+            return;
+        }
+        let mut body = response.into_body();
+        // The drain runs under the progress window, so a peer that declares a
+        // short body and then stops sending costs the attempt no more than a
+        // stalled body would.
+        let drained = within(self.inner.progress_timeout, async {
+            loop {
+                let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+                match frame {
+                    Some(Ok(_)) => continue,
+                    Some(Err(_)) => return false,
+                    None => return true,
+                }
+            }
+        })
+        .await;
+        if drained == Some(true) {
+            self.inner.put_h1(origin, sender);
+        }
     }
 
     /// Assemble the GET for `request` against `mirror`.
@@ -750,11 +858,21 @@ impl Fetcher {
 
     /// Complete an HTTP/2 handshake, drive the connection in its own task, and
     /// pool it: further requests to this origin multiplex over it.
+    ///
+    /// The connection is built rather than handshaken free-standing, since the
+    /// flow-control windows and the keep-alive ping are settings only the
+    /// builder reaches.
     async fn handshake_h2<S>(&self, origin: &Origin, io: FuturesIo<S>) -> Result<Sender>
     where
         S: AsyncRead + AsyncWrite + WriteVectored + Send + Unpin + 'static,
     {
-        let (sender, connection) = hyper::client::conn::http2::handshake(RtExecutor, io)
+        let (sender, connection) = hyper::client::conn::http2::Builder::new(RtExecutor)
+            .timer(RtTimer)
+            .initial_stream_window_size(H2_STREAM_WINDOW)
+            .initial_connection_window_size(self.inner.h2_connection_window)
+            .keep_alive_interval(H2_KEEP_ALIVE_INTERVAL)
+            .keep_alive_timeout(H2_KEEP_ALIVE_TIMEOUT)
+            .handshake(io)
             .await
             .map_err(|e| {
                 Error::Fetch(format!("http/2 handshake with {} failed: {e}", origin.host))
@@ -796,10 +914,21 @@ impl Inner {
         pool.entry(origin.clone()).or_default().h1.push(sender);
     }
 
-    /// Record the origin's HTTP/2 connection.
+    /// Record the origin's HTTP/2 connection, keeping a usable one already
+    /// pooled.
+    ///
+    /// Two concurrent connects to one origin each complete a handshake. The
+    /// connection that loses the race would otherwise replace a pooled entry
+    /// other requests are already multiplexing over, and stay alive unreferenced
+    /// until its own senders drop; instead it serves only the request that
+    /// opened it and closes with that request.
     fn put_h2(&self, origin: &Origin, sender: H2Sender) {
         let mut pool = self.pool.lock().expect("fetcher pool mutex");
-        pool.entry(origin.clone()).or_default().h2 = Some(sender);
+        let entry = pool.entry(origin.clone()).or_default();
+        match &entry.h2 {
+            Some(pooled) if !pooled.is_closed() => {}
+            _ => entry.h2 = Some(sender),
+        }
     }
 }
 
@@ -1107,6 +1236,16 @@ fn parse_mirror(url: &str) -> Result<Mirror> {
     })
 }
 
+/// The `Content-Length` a response declared, when it declared a usable one.
+fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
+    headers
+        .get(hyper::header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
 /// Read the cache validators out of a response.
 fn read_validators(headers: &hyper::HeaderMap) -> Validators {
     let text = |name: HeaderName| {
@@ -1174,6 +1313,15 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The connection window holds one stream window for every request the
+    /// fetcher admits, and stops at the protocol's own ceiling.
+    #[test]
+    fn the_connection_window_covers_every_admitted_stream() {
+        assert_eq!(h2_connection_window(1), H2_STREAM_WINDOW);
+        assert_eq!(h2_connection_window(8), 8 * H2_STREAM_WINDOW);
+        assert_eq!(h2_connection_window(usize::MAX), H2_MAX_WINDOW);
+    }
 
     #[test]
     fn mirror_urls_join_base_and_path() {

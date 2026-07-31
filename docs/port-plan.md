@@ -1790,12 +1790,17 @@ Split into sub-phases:
 - 16a Async fetcher (DONE, see below).
 - 16b Local pull (`file://`) (DONE, see below): object import
   (hardlink/reflink/copy), localcache repos.
-- 16c HTTP pull (see below): the scan/fetch state machine (bounded fetch
-  semaphore of 8, delta-part cap of 2, write throttle of 3, fixed priority drain
-  order), summary/sig verification, commit and content verification, timestamp
-  checks, mirror mode. The ref-binding check and the commitpartial markers
-  landed with 16b, which is source-agnostic; 16c reuses them.
-- 16d Delta-accelerated pull and the config and mount repo finders.
+- 16c HTTP pull (DONE, see below): the scan/fetch state machine (bounded fetch
+  semaphore of 8, write throttle of 3, fixed priority drain order), summary
+  reading, content and commit verification, timestamp checks, mirror mode. The
+  ref-binding check and the commitpartial markers landed with 16b, which is
+  source-agnostic; 16c reuses them.
+- 16d Delta-accelerated pull, the delta-part cap of 2, and the config and mount
+  repo finders.
+- 16e Commit and summary signature verification during a pull.
+- 16f The `ostrya pull` CLI command.
+- 16g Archive-to-archive pass-through: store a fetched `.filez` verbatim instead
+  of inflating and deflating it again (see below).
 Verify: pull from a local trivial httpd over both HTTP/1.1 and HTTP/2; the
 `test-pull-*`, `test-local-pull*`, `test-signed-pull*` clusters via the
 harness.
@@ -2351,53 +2356,280 @@ The CLI grows `ostrya pull-local`, with `--remote`, `--depth`,
 `-L/--localcache-repo`. The upstream `test-local-pull*` shell tests run at the
 CLI-compatibility phase.
 
-Deferred to 16c and 16d: the summary and its signature, mirror mode, the
-timestamp checks, collection refs and `refs/mirrors`, GPG and sign-engine
-commit verification during a pull, subpath pulls, and delta-accelerated pull.
+Deferred past 16b: the summary, mirror mode, and the timestamp checks land in
+16c; delta-accelerated pull in 16d; GPG and sign-engine commit verification in
+16e; collection refs, `refs/mirrors`, and subpath pulls are not yet scheduled.
 
-#### Phase 16c -- HTTP pull
+#### Phase 16c -- HTTP pull (DONE)
 
-Four fetcher changes carried in from the 16a review land with this phase, which
+`Repo::pull(remote, PullOptions)` fetches a set of refs, the commits they name,
+and every object those commits reach from an HTTP remote, into one transaction.
+What the transaction publishes, when the refs are written, and what the
+`.commitpartial` markers mean is 16b's contract unchanged; the phase adds where
+the objects come from and how many are fetched at once.
+`Repo::remote_fetch_summary(remote)` reports the remote's `summary` and
+`summary.sig` bytes on their own.
+
+What a pull asks for, in the order it first asks: `summary.sig`, `summary`,
+`config`, then the objects. A remote with no summary answers 404 and each
+requested ref resolves through `refs/heads/<ref>` instead. A content object is
+requested as `objects/<..>.filez` whatever the remote stores on its own disk,
+since the framed, deflated form is the one an HTTP client can read; `config` is
+fetched to establish that before the first object is requested, so a non-archive
+remote is refused with `Unsupported` naming its mode rather than surfacing as a
+404 on the first content object, and a remote serving no `config` is treated as
+archive.
+
+Concurrency. A pull holds up to `max_outstanding_fetches` (8) steps in flight,
+each a future that fetches one object and stores it, over an in-tree poll core
+(`pull/drive.rs`) rather than `FuturesUnordered`: `futures-lite` carries no
+unordered join and `futures-util` is not in the graph. The plan the slots are
+refilled from holds three classes, drained in this order and carrying the
+matching fetch priority -- the commits (the tips, and their parents under
+`depth`), the scan (dirtree and dirmeta), and the content (file objects). That
+drain order is what orders a pull's requests: the fetcher admits as many requests
+at once as the pull has slots and a slot has one fetch outstanding at a time, so
+the admission gate a priority is weighed at never queues inside one pull. The
+priority a class carries decides the order where a `Fetcher` is shared by more
+callers than it admits. The
+plan is owned by the loop, so it needs no lock, and nothing is spawned: the step
+futures borrow the repository, the transaction, and the fetcher, so a failure
+returns from the loop and drops every step still in flight, closing their
+connections and releasing their fetcher permits. Above one slot the request order
+is not fixed; the request set and the class order between them are.
+
+A commit object is fetched before the objects it references, since its tree is
+unknown until it arrives, and staged where it arrives: the write path hashes the
+bytes there and compares the result against the name they were requested by, so a
+commit stored under the wrong name fails the pull before its tree is asked for,
+and nothing is held past the step. What covers a reader against a commit whose
+tree is not yet complete is the commit's `.commitpartial` marker, written when the
+commit is fetched and removed after the transaction publishes; publication renames
+the staged objects in an unspecified order, so a staging order is not something a
+reader observes. An object several commits reach is fetched
+once. A commit already here complete has no object of its tree queued, since
+what it references is present, and its parent is followed all the same, so a pull
+extends the history a shallower pull left. A commit's `.commitmeta` is requested ahead of the commit object and written
+once that object is here, so the detached metadata precedes the ref naming its
+commit and a parent the remote answers 404 for leaves none behind; the file is
+outside the transaction, so a pull that fails after a commit object landed leaves
+the copy it wrote, which prune sweeps. Writing is throttled separately: a content step
+takes one of three write permits once the response head has arrived and holds it
+for the whole body -- the archive header read, the payload streaming into the
+object store, and the read that settles the end of the stream. The header arrives
+inside the first frame in the ordinary case, so what the permit spans beside the
+payload is that frame and the byte that ends the stream. The permit is taken
+before the body is read, which keeps a step waiting for one off the fetcher's
+progress clock -- the distinction 16a recorded and deferred to this phase. A body
+waiting for a permit holds what it has received unread, and over HTTP/2 that is
+flow-control credit, which is why the connection window is one stream window per
+admitted request: the credit a parked body holds is its own, and the metadata
+stream a scan is blocked on receives over a window of its own.
+
+Every fetched object is stored under the name it was requested by, and the write
+path hashes what it stores and compares the result against that name, so
+verification is inherent and there is no trusted variant: the write path cannot
+store an object without naming it. The mode checks are 16b's, made over the
+header a content object arrives with. The remote states that header's length
+ahead of its bytes, so a length above 1 MiB is refused before the buffer for it
+is allocated: a real header is a few hundred bytes, large xattrs put it at a few
+kilobytes, and the receive path holds one header for each fetch in flight. The
+local archive read path holds the same bound. A fetched metadata object -- a
+commit, a dirtree, a dirmeta, or a `.commitmeta` -- is read whole, which is this
+project's rule for metadata, under the format's 128 MiB cap
+(`MAX_METADATA_SIZE`). The cap is applied to a declared `Content-Length` before
+the body is read and to the bytes as they arrive, so an undeclared body stops one
+frame past it. The buffer is sized from that declared length, one spare byte
+above it so the read that finds the end of the stream does not grow it, which
+holds the resident peak of one object to its own size instead of the capacity a
+regrowing vector reaches. One such buffer belongs to each step in flight, which puts the
+receive path's metadata ceiling at `max_outstanding_fetches` times the cap, 1 GiB
+at the default 8; a local pull imports one object at a time, so its ceiling is
+the cap itself. A slot holds kilobytes in practice: `ostree` 2026.1 writes a
+118-byte commit and a 12-byte dirmeta, and a dirtree of a 10,000-entry directory
+measures 710 KB, or 71 bytes an entry, so the cap stands as the format's ceiling.
+That header also declares the
+payload's uncompressed size, which bounds both sides of the stream. A payload that passes it
+is refused with `InvalidFormat` naming the object, so the bytes written before the
+checksum comparison at the end of the payload are bounded by what the object
+declared. The compressed side is bounded against the same declaration, at
+`declared + declared/1024 + 64 KiB`, and refused the same way: an empty non-final
+DEFLATE block is five bytes that decompress to nothing, so the decompressed bound
+alone leaves the time and the bandwidth of a pull to the remote, and the progress
+deadline measures silence, which a stream that keeps delivering never falls into.
+That bound sits under the decoder, in the read the decoder makes of its input,
+because a decoder whose input keeps yielding does not return to its caller.
+After the payload, a content step reads its response
+to the end. One byte settles it, since nothing follows an object's final DEFLATE
+block. That read returns the connection to the pool, so a pull reuses one
+connection per slot rather than opening one per object; at one slot that is one
+connection for the whole pull, and at the default eight it is up to eight, since
+HTTP/1.1 carries one request at a time. Bytes after the payload are refused with
+`InvalidFormat`, and a symlink's stored form is held to the same rule. A
+localcache repository is consulted before the network, per object, through 16b's
+import path with its checksum verified. Every content object reads through a
+128 KiB buffer the loop hands to the step and takes back with its outcome -- the
+payload of a fetched object as it streams into the object store, and the
+verification of one a localcache repository supplied -- so a pull holds one such
+buffer per slot whatever its objects come from. What one in-flight content object
+allocates for itself is the 16 KiB read-ahead the decoder consumes its compressed
+input through.
+
+Refs and options. Each requested ref resolves against the fetched summary first
+and then `refs/heads/<ref>`; a ref neither yields is `RefNotFound`. An empty ref
+list takes every summary ref under `MIRROR` and the remote's configured
+`branches` otherwise, each missing case failing with `Pull`. Every name is held
+to the ref store's rule -- no empty, `.`, or `..` component -- where the targets
+are resolved, whether it was requested, configured, or read from the summary, so
+a malformed name fails before the first object request. The name reaches the wire
+percent-encoded outside the unreserved set, `/` excepted, so a name carrying `%`,
+`?`, or `#` asks for the ref rather than for an escape, a query, or a fragment. Refs are written to
+`refs/remotes/<prefix>/<ref>`, where `prefix` is `PullOptions::remote` when set
+and the remote argument otherwise, or as local refs under `MIRROR`; a mirror pull
+of every ref also copies the remote's summary bytes verbatim to `<repo>/summary`,
+and the `summary.sig` bytes with them, so a client pulling from the mirror with
+`gpg-verify-summary=true` reads the pair.
+`TimestampCheck` refuses a fetched tip strictly older than the commit the ref
+currently names here (`CurrentRef`, where an absent ref passes) or than a given
+commit (`Rev`), naming both revisions and both timestamps. The ref-binding check
+and the timestamp check are made for every requested ref that names a commit, so
+two refs at one commit are both checked while the commit is fetched once.
+`PullOptions` grows
+`url`, `http_headers`, `max_outstanding_fetches`, `n_network_retries`, and
+`timestamp_check`; `config.rs` grows `Remote::branches` and the TLS keys
+`tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path`, with
+`tls-permissive=true` refused as `Unsupported` -- the fetcher has no way to skip
+verification, and verifying anyway would misreport the configuration.
+`summary.rs` grows `Summary::parse`/`Summary::lookup`, the read side ref
+resolution needs.
+
+Four fetcher changes carried in from the 16a review landed with the phase, which
 is the first caller to exercise them.
 
-- An unsuccessful status closes the HTTP/1.1 connection it arrived on. `attempt`
-  fails as soon as it reads the status, so the pooled sender and the undrained
-  response go with it, and four sequential 404s against one origin open four
-  connections. A 404 is the ordinary answer for an object a remote does not
-  hold, so a scan pays a connection setup per absent object. A `Content-Length`
-  over the request's size cap fails the same way, on the same path, and gets the
-  same treatment: both are an attempt that ends with a response body still in
-  flight. When the response declares a `Content-Length` at or below a small
-  bound, read the body to the end and return the sender to the pool before
-  failing the attempt; above that bound, or with no declared length, close it as
-  now. Verify on the server's connection count staying at one across several
-  404s, and across several responses over the cap.
-- The HTTP/2 flow-control window and keep-alive are hyper's defaults: 64 KiB
-  stream and connection windows, and no ping. A 64 KiB window caps single-stream
-  throughput on a link with a high bandwidth-delay product, and a peer that has
-  gone away is not noticed until the progress deadline expires. Set
-  `initial_stream_window_size` and `initial_connection_window_size`, or enable
-  `adaptive_window`, and set `keep_alive_interval` with `keep_alive_timeout`,
-  measuring against the in-process test server before fixing values. Reaching
-  those knobs means `handshake_h2` moving from the free
-  `hyper::client::conn::http2::handshake` function, which takes no settings, to
-  `hyper::client::conn::http2::Builder`, so this is a change of how the
-  connection is built rather than a few added lines. The concurrency limits this
-  phase sets are the same tuning pass.
-- Two concurrent connects to one origin can each open an HTTP/2 connection:
-  `put_h2` overwrites the pool entry, so the connection that loses the race
-  stays alive until its senders drop and is never reused. It is bounded by
-  `max_outstanding` and clears itself. Keep the entry already present when it is
-  not closed, and let the new sender serve only the request that opened it.
-- A fetch that runs out of rounds reports the last retryable error it saw, while
-  one that runs out of mirrors reports the first definitive answer it received.
-  Pick one rule for both -- first failure matches the mirror order the fetcher
-  otherwise honors -- and state it in the module doc.
+- An attempt that ends on an unsuccessful status, or on a `Content-Length` over
+  the request's cap, leaves a response body in flight. One whose declared length
+  is at or below 64 KiB is now read to the end and its HTTP/1.1 sender returned
+  to the pool before the attempt fails; a larger declared length, or none at all,
+  closes the connection as before. A 404 is the ordinary answer for an object a
+  remote does not hold, so without this a scan paid a connection setup per absent
+  object.
+- `handshake_h2` moved from the free `hyper::client::conn::http2::handshake` to
+  `hyper::client::conn::http2::Builder`, which is what reaches
+  `initial_stream_window_size` (2 MiB), `initial_connection_window_size`, and
+  `keep_alive_interval`/`keep_alive_timeout` (15s each, both inside the
+  60s progress deadline, so a peer that has gone away is reported by the ping
+  rather than by a read that never returns). The builder needs a
+  `hyper::rt::Timer`, which `fetch/io.rs` supplies over `rt::Deadline`. The
+  connection window is the stream window times `max_outstanding`, capped at the
+  protocol's 2^31 - 1 and 16 MiB at the default limit of 8: a receiver credits a
+  window back when the data is consumed, so a stream whose body the caller has
+  received and not yet read holds credit for as long as it is parked, and giving
+  the connection the sum of the stream windows keeps that credit the parked
+  stream's own. The cost is the data one connection may hold received and unread,
+  which is that window.
+- `put_h2` keeps a pooled HTTP/2 entry that is not closed, so the connection that
+  loses a concurrent-connect race serves only the request that opened it instead
+  of replacing an entry other requests are multiplexing over.
+- One error rule for both exhaustion paths: whether a fetch runs out of mirrors
+  or of rounds, it reports a definitive answer when it received one, and the
+  first retryable failure otherwise. A definitive answer is what a caller acts
+  on -- the HTTP pull reads 404 as absence for the summary, an optional parent
+  commit, an absent `.commitmeta`, and the remote config -- so a retryable
+  failure seen before it does not hide it. Among definitive answers the earliest
+  is reported, which is the mirror order the fetcher honors everywhere else. The
+  module doc states it.
 
-One test carries over as well: priority ordering end to end through
-`Fetcher::fetch`, which the gate's unit tests reach only in isolation. Saturate
-`max_outstanding` with held bodies, queue a low- and a high-priority fetch, and
-assert the order the server sees.
+One more change followed from the phase rather than the review: `attempt` boxes
+the connect future. Opening a connection is the largest state a fetch holds --
+the TLS handshake and hyper's own -- and the rarest, taken only when the pool has
+nothing for the origin. Boxing it takes `Fetcher::fetch` from 76 KB to 6.6 KB,
+which matters because a pull nests several helpers around one fetch and a debug
+build overflowed a 2 MiB test stack without it.
+
+Verify (`crates/ostrya/tests/pull_http.rs`, which serves a repository directory
+from an in-process static file server over cleartext HTTP/1.1 and over TLS where
+ALPN selects HTTP/2, using the committed fixture certificates): a ref, its
+commit, and its whole tree arrive, the ref lands under `refs/remotes`, the
+request order opens `summary.sig`, `summary`, `config`, and a second pull of the
+unchanged ref stops after the commit's `.commitmeta`; the same pull over HTTP/2;
+an archive remote into archive, bare-user, bare-user-only, and bare destinations,
+each passing the port's `fsck` and reading its tree back, with the bare case
+skipped off root since it writes each object's own uid and gid; the tool resolves
+the ref, passes its own `fsck`, and reads the tree back out of a bare-user
+destination the port pulled into; a symlink object and an xattr-bearing object
+both cross; a remote with no summary resolving through `refs/heads/<ref>`, and a
+ref neither source yields failing with `RefNotFound` before anything is fetched;
+an empty ref list through `branches` and through mirror plus summary, and each of
+the two failures; mirror mode writing `refs/heads` and copying the summary and
+`summary.sig` bytes verbatim, a remote holding no `summary.sig` leaving the
+destination's own file as it stands, and a mirror pull of named refs writing
+neither file; `depth` following
+parents, a 404 parent ending the chain without error and leaving no detached
+metadata for the commit it does not hold, and a deep pull after a shallow one
+fetching the parent the shallow pull left; a non-archive remote
+refused on its config mode with nothing beyond the three root files requested; a
+corrupt object failing with `ChecksumMismatch` and a missing one with
+`ObjectNotFound`, each publishing nothing, the second leaving the marker;
+`COMMIT_ONLY` leaving a zero-length marker and reporting the commit partial,
+which completing the pull clears; the timestamp check at older, equal, and `Rev`;
+a bare-user-only destination refusing a non-canonical object and
+`BAREUSERONLY_FILES` refusing a mode outside `0775`; a localcache repository
+supplying an object the remote answers 404 for, where the same pull without it
+fails; `max_outstanding_fetches = Some(1)` pinning the request order to the
+plan's drain order, and the default limit reaching the same request set with more
+than one fetch in flight; a connection cut mid-object failing the pull with
+nothing published; a `tls-permissive` remote refused; and
+`remote_fetch_summary` reporting both files. Unit tests cover `Summary::parse`,
+the `.filez` stream parser, and the driver (slot refill from the plan, the first
+ready slot returned, and an error dropping every slot still in flight). The
+fetcher tests grew the drain-and-pool cases, the undrained-body case, and
+priority ordering end to end through `Fetcher::fetch`. The upstream `test-pull-*`
+shell tests run at the CLI-compatibility phase.
+
+Deferred: `contenturl`, `metalink`, and mirrorlists; subpath pulls; collection
+refs and `refs/mirrors`; the summary cache under `tmp/cache/summaries/`; the
+archive-to-archive pass-through, which is 16g.
+
+#### Phase 16g -- Archive-to-archive pass-through
+
+A content object arrives deflated and reaches the object store through
+`ContentWriter`, which digests the bytes written to it. An archive destination
+deflates those bytes again at its `[archive] zlib-level`, so a pull from an
+archive remote into an archive repository inflates the payload and compresses it
+a second time.
+
+The stored object is correct: the checksum covers the framed uncompressed header
+and the raw uncompressed payload, so the compressed form carries no part of the
+identity. Two consequences follow from the second compression.
+
+- Deflate costs about ten times what inflate costs, so the recompression is the
+  larger part of the CPU a full-tree pull spends per object.
+- The stored bytes differ from the bytes the remote holds. A byte-level
+  differential mirror reports every content object as changed. The tool copies
+  the fetched bytes to disk unchanged: an `ostree` pull between two archive
+  repositories was measured with `cmp` and reproduced all four content objects
+  byte for byte, where the port reproduces only the objects small enough for any
+  deflate encoder to agree on.
+
+The phase adds a pass-through path for an archive destination. The fetched bytes
+go to the staging file as they arrive. A second branch inflates them to feed the
+digester, so the object is still stored under a name the write path hashed. Both
+branches read bounded chunks, so the receive path stays streaming.
+
+Two points of design:
+
+- `ContentWriter` digests and compresses one stream. The pass-through needs a
+  sink that writes one stream and digests another.
+- The header is stored as the remote wrote it, including the uncompressed size it
+  declares, rather than patched at `finish`. The receive path treats that
+  declaration as a ceiling, so the pass-through has to hold it to equality.
+  Otherwise a stored header can declare a size its own payload does not have.
+
+Verify: an archive remote pulled into an archive destination reproduces every
+`.filez` byte for byte, against a remote the port built and a remote the `ostree`
+tool built; the destination passes `fsck` and the tool reads its tree; a payload
+whose declared size does not match what it inflates to is refused; a bare-family
+destination still stores the inflated payload.
 
 ### Phase 17 -- `ostree`-compatible CLI (`ostrya-cli`)
 

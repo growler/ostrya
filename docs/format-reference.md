@@ -450,6 +450,59 @@ directories is deleted, the pass removes that target's `.index` file and
 `static-delta indexes` lists only the remaining target. The fanout directory the
 removal empties stays in place.
 
+### HTTP pull surface
+
+A repository published over HTTP is served as the directory tree above. What a
+pull requests, and in what order, was recovered by running `ostree` 2026.1
+against a static HTTP server over a tool-built archive repository and reading the
+server's request log.
+
+One pull of one ref, with a summary present on the remote:
+
+```
+summary.sig
+summary
+config
+delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index
+objects/<commit>.commitmeta
+objects/<commit>.commit
+objects/<...>.dirtree, .dirmeta, .filez, .filez, .dirtree, .filez
+```
+
+- `summary.sig` is requested before `summary`, and both before `config`.
+- With no summary on the remote, `summary` answers 404 and `refs/heads/<ref>` is
+  fetched in its place. The delta probe becomes `deltas/<b64>/superblock` rather
+  than the index, so a summary advertising `indexed-deltas` is what selects the
+  index path.
+- A content object is always requested as `objects/<..>.filez`, whatever mode the
+  remote actually stores. Metadata keeps `.commit`, `.dirtree`, and `.dirmeta`.
+  Detached metadata is `.commitmeta`, requested before the commit object it
+  belongs to, with a 404 treated as the commit carrying none.
+- `config` is requested after a summary arrives, and its `[core] mode` decides
+  whether the pull proceeds: a `bare-user` remote produces `error: Can't pull
+  from archives with mode "bare-user"`. The same remote with no summary, where no
+  config is fetched, instead fails on a 404 for an `objects/<...>.filez` request.
+- An empty ref list resolves differently per mode. A plain pull uses the remote's
+  `branches` config key and fails with `error: No configured branches for remote
+  origin` when it is absent. A mirror pull takes every ref the summary lists and
+  fails with `error: Fetching all refs was requested in mirror mode, but remote
+  repository does not have a summary`.
+- `--mirror` writes `refs/heads/<ref>`; a plain pull writes
+  `refs/remotes/<remote>/<ref>`.
+- A mirror pull that fetched every ref copies the remote summary bytes verbatim
+  to `<repo>/summary`, confirmed byte-identical with `cmp`, and copies the remote
+  `summary.sig` bytes to `<repo>/summary.sig` the same way. Where the remote
+  holds no `summary.sig`, the pull writes `<repo>/summary` alone and leaves a
+  `<repo>/summary.sig` an earlier pull wrote as it stands. A mirror pull of named
+  refs writes neither file, and a plain pull writes neither.
+- A repeat pull of an unchanged ref re-fetches `summary.sig`, `summary`,
+  `config`, the delta index, and `.commitmeta`, then stops.
+- `-T` fails only on a strictly older timestamp; an equal timestamp passes.
+  `--timestamp-check-from-rev=REV` compares against REV and implies the check.
+  The message names both revisions and both timestamps.
+- HTTP pulls always verify checksums. The tool's `--untrusted` help reads "Verify
+  checksums of local sources (always enabled for HTTP pulls)".
+
 ### Config file (`<repo>/config`, GKeyFile / INI)
 
 Created with `[core]` `repo_version=1`, `mode=<mode>`, optional

@@ -36,7 +36,7 @@ use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::inflate::{ArchiveDecoder, archive_decoder};
-use crate::object::{self, MAX_METADATA_SIZE};
+use crate::object::{self, MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::repo::Repo;
 
 /// The largest bare-user symlink target the reader will load. Targets are
@@ -119,6 +119,21 @@ impl FileObject {
     /// Whether the object is a symlink.
     pub fn is_symlink(&self) -> bool {
         matches!(self.kind, FileKind::Symlink { .. })
+    }
+
+    /// The object's logical header: the form its checksum covers, which is what
+    /// the identity is recomputed from and what the mode checks read.
+    pub fn header(&self) -> FileHeader {
+        FileHeader {
+            uid: self.uid,
+            gid: self.gid,
+            mode: self.mode,
+            symlink_target: match &self.kind {
+                FileKind::Symlink { target } => target.clone(),
+                FileKind::Regular { .. } => String::new(),
+            },
+            xattrs: self.xattrs.clone(),
+        }
     }
 
     /// Open an async reader over the file's payload, streaming it in bounded
@@ -317,7 +332,7 @@ fn load_archive(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Resu
         ));
     }
     let header_len = u32::from_be_bytes(prefix[..4].try_into().unwrap()) as u64;
-    if header_len > MAX_METADATA_SIZE {
+    if header_len > MAX_FILE_HEADER_SIZE {
         return Err(Error::InvalidFormat(
             "content header exceeds the size cap".into(),
         ));

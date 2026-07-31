@@ -123,7 +123,23 @@
 //! checksum verification, commit-metadata-only pulls, copying instead of
 //! linking, and the mode and binding checks; and
 //! [`localcache_repos`](PullOptions::localcache_repos) adds further local
-//! repositories to source objects from.
+//! repositories to source objects from. It also covers HTTP pull (Phase 16c):
+//! [`Repo::pull`] fetches refs, their commit chains, and every object those
+//! commits reach from an archive remote named in this repository's config --
+//! `summary.sig`, `summary`, and `config` first, then the objects, with a
+//! content object always requested in the `.filez` form an HTTP client can read
+//! and a non-archive remote refused on its config mode. Up to
+//! [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches) objects are
+//! in flight over a plan drained commits first, then the metadata the scan is
+//! blocked on, then the content; a commit object is staged where it arrives,
+//! behind its own `.commitpartial` marker and ahead of its tree, and the marker
+//! is removed after the transaction publishes; three write permits bound the
+//! concurrent writers on the destination; every object is stored under the name
+//! it was requested by, which is what verifies it;
+//! [`MIRROR`](PullFlags::MIRROR) writes local refs and copies the remote's
+//! summary and its signature; and [`TimestampCheck`] refuses a tip older than
+//! what the ref already names. [`Repo::remote_fetch_summary`] reads a remote's
+//! `summary` and `summary.sig` on their own, and [`Summary`] parses one.
 
 mod bspatch;
 pub mod checkout;
@@ -191,7 +207,7 @@ pub use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Type, Value,
 };
 pub use prune::{PruneOptions, PruneStats};
-pub use pull::{PullFlags, PullOptions, PullStats};
+pub use pull::{PullFlags, PullOptions, PullStats, TimestampCheck};
 pub use read::CommitState;
 pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};
@@ -203,7 +219,7 @@ pub use sign::{
 #[cfg(feature = "sign-spki")]
 pub use spki::{SpkiSigner, SpkiVerifier};
 pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
-pub use summary::SummaryOptions;
+pub use summary::{Summary, SummaryOptions};
 pub use tar::{TarExportOptions, TarImportOptions};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};

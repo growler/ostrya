@@ -339,7 +339,11 @@ fn refspec_to_relpath(refspec: &str) -> Result<String> {
 
 /// A ref name may contain `/` but no empty, `.`, or `..` components, and no
 /// interior NUL.
-fn check_ref_path(name: &str) -> Result<()> {
+///
+/// An HTTP pull applies the same rule before a ref name becomes a request path:
+/// a traversal component there asks the server for a different resource, the way
+/// it would name a different file here.
+pub(crate) fn check_ref_path(name: &str) -> Result<()> {
     if name.is_empty() || name.contains('\0') {
         return Err(Error::InvalidFormat(format!("invalid refspec '{name}'")));
     }

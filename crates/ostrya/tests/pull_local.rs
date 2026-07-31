@@ -498,6 +498,37 @@ fn a_remote_name_writes_the_ref_under_refs_remotes() {
 }
 
 #[test]
+fn a_local_pull_ignores_the_mirror_flag() {
+    let tmp = TmpDir::new("pull-mirror");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        // The flag belongs to `Repo::pull`. A local pull writes its refs under
+        // the prefix `remote` names whether or not the flag is set.
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                remote: Some("origin".to_owned()),
+                flags: PullFlags::MIRROR,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(dst_dir.join("refs/remotes/origin/main").exists());
+        assert!(!dst_dir.join("refs/heads/main").exists());
+        assert_eq!(
+            dst.resolve_rev("origin:main", false).await.unwrap(),
+            Some(c2)
+        );
+    });
+}
+
+#[test]
 fn depth_follows_parent_commits() {
     let tmp = TmpDir::new("pull-depth");
     block_on(async {

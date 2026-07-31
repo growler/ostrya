@@ -29,6 +29,9 @@
 //! [`Repo::verify_summary`] reuse the Phase 13 signing framework over the exact
 //! `summary` bytes; the signatures live in `summary.sig`, a bare `a{sv}` with the
 //! same engine keys as detached commit metadata.
+//!
+//! [`Summary`] is the read side of the same file: the ref list a pull resolves
+//! its targets against, and the global metadata dict verbatim.
 
 use std::os::fd::{AsFd, BorrowedFd};
 
@@ -51,7 +54,7 @@ const METADATA_SIGNATURE: &str = "a{sv}";
 const COLLECTION_MAP_SIGNATURE: &str = "a{sa(s(taya{sv}))}";
 
 /// The summary file name at the repository root.
-const SUMMARY_FILE: &str = "summary";
+pub(crate) const SUMMARY_FILE: &str = "summary";
 /// The summary signature file name at the repository root.
 const SUMMARY_SIG_FILE: &str = "summary.sig";
 /// The permission bits forced on `summary` and `summary.sig`, matching the
@@ -73,6 +76,85 @@ const COMMIT_VERSION_KEY: &str = "ostree.commit.version";
 const COMMIT_TIMESTAMP_KEY: &str = "ostree.commit.timestamp";
 const COLLECTION_BINDING_KEY: &str = "ostree.collection-binding";
 const REF_BINDING_KEY: &str = "ostree.ref-binding";
+
+/// A parsed repository summary.
+///
+/// Field 0 of the summary is the remote's ref list, which is what a pull
+/// resolves a requested ref against before falling back to `refs/heads/<ref>`,
+/// and what a mirror pull of every ref takes its targets from. The per-ref
+/// commit size and metadata the file also carries are not retained: a pull reads
+/// the commit object itself for both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    /// The refs the summary lists, in the order it lists them (byte-wise sorted
+    /// by name, as the writer produced them).
+    pub refs: Vec<(String, Checksum)>,
+    /// The global metadata dict, as the `a{sv}` [`Value`] the file holds.
+    pub metadata: Value,
+}
+
+impl Summary {
+    /// Parse the bytes of a `summary` file.
+    ///
+    /// Bytes the codec cannot read as the summary type fail as the codec's own
+    /// error; bytes that decode but do not hold the shape the type promises --
+    /// a ref naming a checksum that is not 32 bytes, for one -- fail with
+    /// [`Error::InvalidFormat`].
+    pub fn parse(bytes: &[u8]) -> Result<Summary> {
+        let ty = Type::parse(SUMMARY_SIGNATURE).map_err(ostrya_core::Error::from)?;
+        let value = from_bytes(&ty, bytes).map_err(ostrya_core::Error::from)?;
+        let Value::Tuple(mut fields) = value else {
+            return Err(malformed("summary is not a tuple"));
+        };
+        if fields.len() != 2 {
+            return Err(malformed("summary does not hold two fields"));
+        }
+        let metadata = fields.pop().expect("the summary tuple holds two fields");
+        let entries = fields.pop().expect("the summary tuple holds two fields");
+        let Value::Array(entries) = entries else {
+            return Err(malformed("summary field 0 is not an array"));
+        };
+        let mut refs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            refs.push(parse_ref_entry(entry)?);
+        }
+        Ok(Summary { refs, metadata })
+    }
+
+    /// The commit a ref names, or `None` when the summary does not list it.
+    pub fn lookup(&self, ref_name: &str) -> Option<Checksum> {
+        self.refs
+            .iter()
+            .find(|(name, _)| name == ref_name)
+            .map(|(_, commit)| *commit)
+    }
+}
+
+/// One field-0 entry `(s, (t, ay, a{sv}))`, reduced to the ref name and the
+/// commit it names.
+fn parse_ref_entry(entry: Value) -> Result<(String, Checksum)> {
+    let Value::Tuple(fields) = entry else {
+        return Err(malformed("a summary ref entry is not a tuple"));
+    };
+    let [Value::Str(name), Value::Tuple(inner)] = &fields[..] else {
+        return Err(malformed("a summary ref entry is not (name, details)"));
+    };
+    let Some(Value::Bytes(checksum)) = inner.get(1) else {
+        return Err(malformed("a summary ref entry holds no commit checksum"));
+    };
+    let raw: [u8; 32] = checksum.as_slice().try_into().map_err(|_| {
+        malformed(&format!(
+            "the summary ref '{name}' names a {}-byte checksum",
+            checksum.len()
+        ))
+    })?;
+    Ok((name.clone(), Checksum::from_bytes(raw)))
+}
+
+/// A summary that does not hold the shape its type promises.
+fn malformed(what: &str) -> Error {
+    Error::InvalidFormat(format!("malformed summary: {what}"))
+}
 
 /// Options for [`Repo::regenerate_summary`].
 #[derive(Debug, Default, Clone)]
@@ -344,8 +426,14 @@ impl Repo {
         ostrya_rt::unblock(move || read_root_file_blocking(repo_fd.as_fd(), &name)).await
     }
 
-    /// Write `bytes` to a file at the repository root, atomically.
-    async fn write_root_file(&self, name: &str, bytes: Vec<u8>, fsync: bool) -> Result<()> {
+    /// Write `bytes` to a file at the repository root, atomically. A mirror pull
+    /// writes the remote's summary here verbatim.
+    pub(crate) async fn write_root_file(
+        &self,
+        name: &str,
+        bytes: Vec<u8>,
+        fsync: bool,
+    ) -> Result<()> {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         let name = name.to_owned();
         ostrya_rt::unblock(move || write_root_file_blocking(repo_fd.as_fd(), &name, &bytes, fsync))
@@ -493,8 +581,93 @@ fn write_root_file_blocking(
     })
 }
 
-/// `SummaryOptions` moves freely across tasks and threads.
+/// `SummaryOptions` and the parsed summary move freely across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SummaryOptions>();
+    assert_send_sync::<Summary>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checksum(byte: u8) -> Checksum {
+        Checksum::from_bytes([byte; 32])
+    }
+
+    /// Serialize a summary of `refs` with an empty metadata dict, the way
+    /// [`Repo::regenerate_summary`] assembles one.
+    fn encode(refs: &[(&str, Checksum)]) -> Vec<u8> {
+        let entries = refs
+            .iter()
+            .map(|(name, commit)| ref_entry(name, 100, commit, None, 7).unwrap())
+            .collect();
+        let value = Value::Tuple(vec![Value::Array(entries), Value::Array(Vec::new())]);
+        let ty = Type::parse(SUMMARY_SIGNATURE).unwrap();
+        to_bytes(&ty, &value).unwrap()
+    }
+
+    #[test]
+    fn parses_the_ref_list_and_looks_names_up() {
+        let bytes = encode(&[("test/main", checksum(1)), ("other", checksum(2))]);
+        let summary = Summary::parse(&bytes).unwrap();
+        assert_eq!(
+            summary.refs,
+            vec![
+                ("test/main".to_owned(), checksum(1)),
+                ("other".to_owned(), checksum(2)),
+            ]
+        );
+        assert_eq!(summary.lookup("test/main"), Some(checksum(1)));
+        assert_eq!(summary.lookup("absent"), None);
+    }
+
+    #[test]
+    fn parses_a_summary_listing_no_refs() {
+        let summary = Summary::parse(&encode(&[])).unwrap();
+        assert!(summary.refs.is_empty());
+        assert_eq!(summary.metadata, Value::Array(Vec::new()));
+    }
+
+    /// The metadata dict is retained as written, so a caller reading a key the
+    /// port does not model sees the bytes the remote published.
+    #[test]
+    fn retains_the_global_metadata_dict() {
+        let mut metadata = Value::Array(Vec::new());
+        append_dict_entry(
+            &mut metadata,
+            INDEXED_DELTAS_KEY,
+            variant("b", Value::Bool(true)).unwrap(),
+        )
+        .unwrap();
+        let value = Value::Tuple(vec![Value::Array(Vec::new()), metadata.clone()]);
+        let ty = Type::parse(SUMMARY_SIGNATURE).unwrap();
+        let bytes = to_bytes(&ty, &value).unwrap();
+        assert_eq!(Summary::parse(&bytes).unwrap().metadata, metadata);
+    }
+
+    #[test]
+    fn rejects_bytes_that_are_not_a_summary() {
+        let err = Summary::parse(b"not a summary at all").unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "{err}");
+    }
+
+    /// A ref entry whose `ay` is not 32 bytes names no commit, and the message
+    /// says which ref it was.
+    #[test]
+    fn rejects_a_ref_naming_a_short_checksum() {
+        let inner = Value::Tuple(vec![
+            Value::U64(0),
+            Value::Bytes(vec![0u8; 16]),
+            Value::Array(Vec::new()),
+        ]);
+        let entry = Value::Tuple(vec![Value::Str("short".to_owned()), inner]);
+        let value = Value::Tuple(vec![Value::Array(vec![entry]), Value::Array(Vec::new())]);
+        let ty = Type::parse(SUMMARY_SIGNATURE).unwrap();
+        let bytes = to_bytes(&ty, &value).unwrap();
+        let err = Summary::parse(&bytes).unwrap_err();
+        assert!(err.to_string().contains("'short'"), "{err}");
+        assert!(err.to_string().contains("16-byte"), "{err}");
+    }
+}

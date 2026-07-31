@@ -387,6 +387,40 @@ impl Remote<'_> {
         self.string("collection-id")
     }
 
+    /// The refs a pull of this remote takes when it is asked for none.
+    pub fn branches(&self) -> Result<Option<Vec<String>>> {
+        self.keyfile
+            .get_string_list(&self.group, "branches")
+            .map_err(Error::from)
+    }
+
+    /// The path to a PEM file of trust anchors for this remote's TLS, replacing
+    /// the host trust store.
+    pub fn tls_ca_path(&self) -> Result<Option<String>> {
+        self.string("tls-ca-path")
+    }
+
+    /// The path to the PEM client certificate chain presented to this remote.
+    pub fn tls_client_cert_path(&self) -> Result<Option<String>> {
+        self.string("tls-client-cert-path")
+    }
+
+    /// The path to the PEM private key of
+    /// [`tls_client_cert_path`](Remote::tls_client_cert_path).
+    pub fn tls_client_key_path(&self) -> Result<Option<String>> {
+        self.string("tls-client-key-path")
+    }
+
+    /// Whether this remote's TLS certificate is accepted unverified. Default
+    /// `false`. The fetcher has no way to skip verification, so a pull refuses a
+    /// remote that sets this rather than verifying against the configuration.
+    pub fn tls_permissive(&self) -> Result<bool> {
+        Ok(self
+            .keyfile
+            .get_bool(&self.group, "tls-permissive")?
+            .unwrap_or(false))
+    }
+
     /// The raw value of an arbitrary key in this remote's section.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.keyfile.get_value(&self.group, key)
@@ -619,6 +653,9 @@ mod tests {
         assert!(!origin.gpg_verify().unwrap());
         assert!(!origin.gpg_verify_summary().unwrap());
         assert_eq!(origin.get("branches"), Some("main;"));
+        assert_eq!(origin.branches().unwrap(), Some(vec!["main".to_owned()]));
+        assert!(!origin.tls_permissive().unwrap());
+        assert_eq!(origin.tls_ca_path().unwrap(), None);
 
         let withkey = cfg.remote("withkey").unwrap();
         assert!(withkey.gpg_verify().unwrap()); // default true
@@ -628,5 +665,30 @@ mod tests {
         );
 
         assert!(cfg.remote("absent").is_none());
+    }
+
+    /// The TLS keys a pull fills its fetcher's options from, and the one it
+    /// refuses rather than misrepresent.
+    #[test]
+    fn reads_remote_tls_keys() {
+        let text = "[core]\nrepo_version=1\nmode=archive-z2\n\n\
+                    [remote \"secure\"]\nurl=https://ex.com/r\ntls-ca-path=/etc/ca.pem\n\
+                    tls-client-cert-path=/etc/client.pem\ntls-client-key-path=/etc/client.key\n\
+                    tls-permissive=true\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        let remote = cfg.remote("secure").unwrap();
+        assert_eq!(
+            remote.tls_ca_path().unwrap().as_deref(),
+            Some("/etc/ca.pem")
+        );
+        assert_eq!(
+            remote.tls_client_cert_path().unwrap().as_deref(),
+            Some("/etc/client.pem")
+        );
+        assert_eq!(
+            remote.tls_client_key_path().unwrap().as_deref(),
+            Some("/etc/client.key")
+        );
+        assert!(remote.tls_permissive().unwrap());
     }
 }

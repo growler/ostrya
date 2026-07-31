@@ -10,6 +10,10 @@
 //!
 //! A released permit is handed to the best waiter directly rather than returned
 //! to a counter, so the woken waiter cannot lose it to a newcomer.
+//!
+//! Two callers hold one: the fetcher, whose gate bounds requests in flight, and
+//! the HTTP pull, whose gate bounds the fetched content objects being written at
+//! once.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
@@ -56,13 +60,13 @@ impl State {
 }
 
 /// A bounded, priority-ordered admission gate.
-pub(super) struct Gate {
+pub(crate) struct Gate {
     state: Mutex<State>,
 }
 
 impl Gate {
     /// A gate admitting `limit` holders at a time.
-    pub(super) fn new(limit: usize) -> Gate {
+    pub(crate) fn new(limit: usize) -> Gate {
         Gate {
             state: Mutex::new(State {
                 free: limit,
@@ -74,7 +78,7 @@ impl Gate {
     }
 
     /// Wait for a permit at `priority`.
-    pub(super) fn acquire(self: &Arc<Gate>, priority: Priority) -> Acquire {
+    pub(crate) fn acquire(self: &Arc<Gate>, priority: Priority) -> Acquire {
         Acquire {
             gate: self.clone(),
             priority,
@@ -94,7 +98,7 @@ impl Gate {
 }
 
 /// The future returned by [`Gate::acquire`].
-pub(super) struct Acquire {
+pub(crate) struct Acquire {
     gate: Arc<Gate>,
     priority: Priority,
     /// This waiter's queue position, once it has queued.
@@ -163,7 +167,7 @@ impl Drop for Acquire {
 }
 
 /// Admission to run one fetch, released on drop.
-pub(super) struct Permit {
+pub(crate) struct Permit {
     gate: Arc<Gate>,
 }
 

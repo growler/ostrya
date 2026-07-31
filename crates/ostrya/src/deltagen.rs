@@ -69,11 +69,12 @@ use ostrya_core::{
 use ostrya_rt::File as RtFile;
 use sha2::{Digest, Sha256};
 
+use crate::commit::append_dict_entry;
 use crate::delta::{
-    Blob, COMMIT_SIG, COMPRESSION_XZ, IO_CHUNK, MAX_SUPERBLOCK, MAX_TABLE_BYTES, MMAP_THRESHOLD,
-    OP_BSPATCH, OP_CLOSE, OP_OPEN, OP_OPEN_SPLICE_CLOSE, OP_SET_READ_SOURCE, OP_UNSET_READ_SOURCE,
-    OP_WRITE, SIGNED_MAGIC, SIGNED_SIG, SUPERBLOCK_SIG, dir_child_names, open_rw_temp, read_capped,
-    spill_to_blob,
+    Blob, COMMIT_SIG, COMPRESSION_XZ, ENDIANNESS_KEY, ENDIANNESS_LITTLE, IO_CHUNK, MAX_SUPERBLOCK,
+    MAX_TABLE_BYTES, MMAP_THRESHOLD, OP_BSPATCH, OP_CLOSE, OP_OPEN, OP_OPEN_SPLICE_CLOSE,
+    OP_SET_READ_SOURCE, OP_UNSET_READ_SOURCE, OP_WRITE, SIGNED_MAGIC, SIGNED_SIG, SUPERBLOCK_SIG,
+    dir_child_names, open_rw_temp, read_capped, spill_to_blob,
 };
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
@@ -111,15 +112,8 @@ const PART_XZ_LEVEL: i32 = 8;
 /// paired with a large one it replaced.
 const BSDIFF_CONTENT_LIMIT: u64 = rollsum::MAX_CHUNK as u64;
 
-/// The superblock metadata key holding the byte order of the host-order size
-/// fields. The serializer emits little-endian scalars, so the value is always
-/// `l`.
-const ENDIANNESS_KEY: &str = "ostree.endianness";
-/// The little-endian marker the `ostree.endianness` byte carries.
-const ENDIANNESS_LITTLE: u8 = b'l';
-
 /// The superblock file name inside a delta directory.
-const SUPERBLOCK_FILE: &str = "superblock";
+pub(crate) const SUPERBLOCK_FILE: &str = "superblock";
 /// The delta directory tree, relative to the repository root.
 const DELTAS_DIR: &str = "deltas";
 /// The delta index tree, relative to the repository root.
@@ -127,7 +121,7 @@ const DELTA_INDEXES_DIR: &str = "delta-indexes";
 /// The suffix of an index file under `delta-indexes/`.
 const INDEX_SUFFIX: &str = ".index";
 /// The `a{sv}` key an index file (and the summary) stores the delta map under.
-const STATIC_DELTAS_KEY: &str = "ostree.static-deltas";
+pub(crate) const STATIC_DELTAS_KEY: &str = "ostree.static-deltas";
 
 /// The mode delta files and directories are created with, matching the tool.
 const DELTA_FILE_MODE: u32 = 0o644;
@@ -331,6 +325,36 @@ impl Repo {
     /// delta does not fail the pass.
     pub async fn reindex_static_deltas(&self) -> Result<()> {
         let mut by_target: BTreeMap<Checksum, BTreeMap<String, Checksum>> = BTreeMap::new();
+        for entry in self.static_delta_digests().await? {
+            by_target
+                .entry(entry.to)
+                .or_default()
+                .insert(entry.name, entry.digest);
+        }
+
+        let fsync = self.config().fsync()?;
+        let mut written: BTreeSet<String> = BTreeSet::new();
+        for (to, deltas) in &by_target {
+            let (fanout, name) = delta_index_parts(to);
+            let dir_fd = self
+                .open_repo_subdir(&format!("{DELTA_INDEXES_DIR}/{fanout}"))
+                .await?;
+            let index = index_value(deltas)?;
+            write_delta_file(&dir_fd, &name, &index, fsync).await?;
+            written.insert(format!("{fanout}/{name}"));
+        }
+        self.prune_delta_indexes(written).await
+    }
+
+    /// Every delta under `deltas/`, in delta-name order, with the SHA-256 of its
+    /// superblock.
+    ///
+    /// This is what the `delta-indexes/` cache and the summary's
+    /// `ostree.static-deltas` map both advertise, so both are built from it. A
+    /// delta whose superblock is missing is skipped, which leaves a half-written
+    /// delta unadvertised rather than failing the caller.
+    pub(crate) async fn static_delta_digests(&self) -> Result<Vec<DeltaDigest>> {
+        let mut out = Vec::new();
         for (from, to) in self.list_static_delta_targets().await? {
             let relative = format!(
                 "{}/{SUPERBLOCK_FILE}",
@@ -339,30 +363,34 @@ impl Repo {
             let Some(bytes) = self.read_repo_file(&relative).await? else {
                 continue;
             };
-            let name = match from {
-                Some(from) => format!("{}-{}", from.to_hex(), to.to_hex()),
-                None => to.to_hex(),
-            };
-            by_target
-                .entry(to)
-                .or_default()
-                .insert(name, Checksum::sha256(&bytes));
+            out.push(DeltaDigest {
+                name: delta_name(from.as_ref(), &to),
+                to,
+                digest: Checksum::sha256(&bytes),
+            });
         }
+        // The `deltas/` tree is walked in directory order, which is the order the
+        // filesystem hands back. Sorting by name gives the index files and the
+        // summary map one order whatever that was.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
 
-        let fsync = self.config().fsync()?;
-        let mut written: BTreeSet<String> = BTreeSet::new();
-        for (to, deltas) in &by_target {
-            let b64 = to.to_base64_modified();
-            let (fanout, rest) = b64.split_at(2);
-            let dir_fd = self
-                .open_repo_subdir(&format!("{DELTA_INDEXES_DIR}/{fanout}"))
-                .await?;
-            let index = index_value(deltas)?;
-            let name = format!("{rest}{INDEX_SUFFIX}");
-            write_delta_file(&dir_fd, &name, &index, fsync).await?;
-            written.insert(format!("{fanout}/{name}"));
+    /// The summary's `ostree.static-deltas` value: an `a{sv}` mapping each
+    /// delta's name to its 32-byte superblock digest, or `None` when the
+    /// repository holds no delta.
+    pub(crate) async fn static_deltas_summary_value(&self) -> Result<Option<Value>> {
+        let entries = self.static_delta_digests().await?;
+        if entries.is_empty() {
+            return Ok(None);
         }
-        self.prune_delta_indexes(written).await
+        let map = delta_map_value(
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), &entry.digest)),
+        )?;
+        let map_ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
+        Ok(Some(Value::variant(map_ty, map)))
     }
 
     /// Remove the index files under `delta-indexes/` that this pass did not
@@ -631,7 +659,7 @@ impl Repo {
     async fn load_content_blob(&self, file: &FileObject, tmp: BorrowedFd<'_>) -> Result<Blob> {
         let reader = file.reader().await?;
         let owned = tmp.try_clone_to_owned()?;
-        spill_to_blob(reader, &owned).await
+        spill_to_blob(reader, &owned, None).await
     }
 
     /// Assemble the superblock GVariant.
@@ -1299,21 +1327,40 @@ fn split_envelope(bytes: Vec<u8>) -> Result<(Vec<u8>, Value)> {
     Ok((payload, fields[2].clone()))
 }
 
-/// Build an index file's `a{sv}`: the delta map under the shared
-/// `ostree.static-deltas` key, each delta naming its superblock's digest.
-fn index_value(deltas: &BTreeMap<String, Checksum>) -> Result<Vec<u8>> {
-    let mut map = Value::Array(Vec::new());
+/// One delta present under `deltas/`: its name, its target commit, and the
+/// SHA-256 of its superblock, which is what both advertisements carry.
+pub(crate) struct DeltaDigest {
+    /// The delta's tool name: `<to>` for a from-scratch delta, `<from>-<to>`
+    /// otherwise, in hex.
+    pub(crate) name: String,
+    /// The target commit, which the index files are keyed by.
+    pub(crate) to: Checksum,
+    /// The SHA-256 of the delta's `superblock` file.
+    pub(crate) digest: Checksum,
+}
+
+/// The `a{sv}` map both advertisements carry: each delta's name to the 32-byte
+/// digest of its superblock, in the order the entries arrive.
+fn delta_map_value<'a>(deltas: impl Iterator<Item = (&'a str, &'a Checksum)>) -> Result<Value> {
     let ay = Type::parse("ay").map_err(ostrya_core::Error::from)?;
+    let mut map = Value::Array(Vec::new());
     for (name, digest) in deltas {
-        crate::commit::append_dict_entry(
+        append_dict_entry(
             &mut map,
             name,
             Value::variant(ay.clone(), Value::Bytes(digest.as_bytes().to_vec())),
         )?;
     }
+    Ok(map)
+}
+
+/// Build an index file's `a{sv}`: the delta map under the shared
+/// `ostree.static-deltas` key, each delta naming its superblock's digest.
+fn index_value(deltas: &BTreeMap<String, Checksum>) -> Result<Vec<u8>> {
+    let map = delta_map_value(deltas.iter().map(|(name, digest)| (name.as_str(), digest)))?;
     let mut dict = Value::Array(Vec::new());
     let map_ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
-    crate::commit::append_dict_entry(
+    append_dict_entry(
         &mut dict,
         STATIC_DELTAS_KEY,
         Value::variant(map_ty.clone(), map),
@@ -1321,9 +1368,38 @@ fn index_value(deltas: &BTreeMap<String, Checksum>) -> Result<Vec<u8>> {
     Ok(to_bytes(&map_ty, &dict).map_err(ostrya_core::Error::from)?)
 }
 
+/// A delta's name as an advertisement keys it and as a message names it: the
+/// target commit's hex for a from-scratch delta, `<from>-<to>` otherwise.
+pub(crate) fn delta_name(from: Option<&Checksum>, to: &Checksum) -> String {
+    match from {
+        Some(from) => format!("{}-{}", from.to_hex(), to.to_hex()),
+        None => to.to_hex(),
+    }
+}
+
+/// The delta index of one target commit, split into the fanout directory under
+/// [`DELTA_INDEXES_DIR`] that holds it and its file name.
+fn delta_index_parts(to: &Checksum) -> (String, String) {
+    let b64 = to.to_base64_modified();
+    let (fanout, rest) = b64.split_at(2);
+    (fanout.to_owned(), format!("{rest}{INDEX_SUFFIX}"))
+}
+
+/// The delta index of one target commit, relative to the repository root:
+/// `delta-indexes/<fanout>/<rest>.index`.
+pub(crate) fn delta_index_relative_path(to: &Checksum) -> String {
+    let (fanout, name) = delta_index_parts(to);
+    format!("{DELTA_INDEXES_DIR}/{fanout}/{name}")
+}
+
 /// The delta's directory relative to the repository root: base64-checksum
 /// fanout, with the source checksum leading a from-to delta's name.
-fn delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> String {
+///
+/// The names reach the wire as written when a pull requests this path. Modified
+/// base64 replaces `/` with `_` and keeps `+`, which is a path character, so no
+/// escaping enters here -- the tool was observed to request these paths with `+`
+/// unencoded.
+pub(crate) fn delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> String {
     let to_b64 = to.to_base64_modified();
     match from {
         Some(from) => {
@@ -1668,6 +1744,45 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn checksum(byte: u8) -> Checksum {
+        Checksum::from_bytes([byte; 32])
+    }
+
+    /// The two path shapes, against the paths the tool was observed to write
+    /// and to request. A pull requests these same names on the wire.
+    #[test]
+    fn delta_paths_take_the_base64_fanout() {
+        let to = checksum(0x11);
+        let from = checksum(0x22);
+        let to_b64 = to.to_base64_modified();
+        let from_b64 = from.to_base64_modified();
+
+        assert_eq!(
+            delta_relative_dir(None, &to),
+            format!("deltas/{}/{}", &to_b64[..2], &to_b64[2..])
+        );
+        assert_eq!(
+            delta_relative_dir(Some(&from), &to),
+            format!("deltas/{}/{}-{to_b64}", &from_b64[..2], &from_b64[2..])
+        );
+        assert_eq!(
+            delta_index_relative_path(&to),
+            format!("delta-indexes/{}/{}.index", &to_b64[..2], &to_b64[2..])
+        );
+    }
+
+    /// A delta is keyed by hex in the advertisement, whichever shape it has.
+    #[test]
+    fn delta_names_are_hex() {
+        let to = checksum(0x11);
+        let from = checksum(0x22);
+        assert_eq!(delta_name(None, &to), to.to_hex());
+        assert_eq!(
+            delta_name(Some(&from), &to),
+            format!("{}-{}", from.to_hex(), to.to_hex())
+        );
+    }
 
     #[test]
     fn the_superblock_ceiling_names_the_size_it_rejects() {

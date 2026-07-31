@@ -94,6 +94,11 @@ impl FileMeta {
         }
     }
 
+    /// Whether the mode names a symlink.
+    pub(crate) fn is_symlink(&self) -> bool {
+        self.mode & S_IFMT == S_IFLNK
+    }
+
     /// The header for a regular-file content object built from this metadata.
     pub(crate) fn regular_header(&self) -> FileHeader {
         FileHeader {

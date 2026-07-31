@@ -125,6 +125,24 @@
 //! Sources. A [`localcache_repos`](PullOptions::localcache_repos) repository is
 //! consulted before the network, per object, through the local pull's import
 //! path with its checksum verified.
+//!
+//! Static deltas. A remote that publishes them delivers a commit as one delta
+//! instead of one request per object, which a pull looks for before it asks for
+//! the first object: the delta index for the target commit, then the summary's own
+//! `ostree.static-deltas` map where the remote serves no index. One delta is
+//! considered per tip -- from the commit the ref names in this repository, or from
+//! scratch where it names none -- and the superblock is checked against the digest
+//! the advertisement carried. The target commit rides in that superblock, so no
+//! `.commit` is requested; the objects the delta hands over loose are queued at
+//! once, two part fetches run at a time, and the commit's tree is walked once the
+//! last part is applied, so an object no part delivered is fetched loose.
+//! [`disable_static_deltas`](PullOptions::disable_static_deltas) asks for no
+//! delta, and [`require_static_deltas`](PullOptions::require_static_deltas)
+//! refuses a remote that advertises none. What a delta costs in memory per part
+//! in flight is one xz decoder and two blobs: the verified part body, which is
+//! hashed against the superblock's entry for it before the decoder runs, and the
+//! payload it decompresses to. Each blob is on the heap while it is small and a
+//! mapped temp file past its heap threshold.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -154,10 +172,11 @@ use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
+use super::delta::{self, DeltaJob, PART_CAP};
 use super::drive::Slots;
 use super::{
-    PullFlags, PullOptions, PullStats, READ_CHUNK, TimestampCheck, check_bareuseronly,
-    check_canonical, check_ref_binding, refspec,
+    ModeChecks, PullFlags, PullOptions, PullStats, READ_CHUNK, TimestampCheck, check_ref_binding,
+    refspec,
 };
 
 /// How many fetches are in flight when the caller names no limit.
@@ -220,8 +239,16 @@ impl Repo {
             Some(opts.remote.as_deref().unwrap_or(remote))
         };
 
+        // The deltas the remote can deliver these commits with, found before the
+        // first object is asked for: a commit a delta carries has no `.commit`
+        // request of its own.
+        let deltas =
+            delta::discover(self, &fetcher, summary.as_ref(), &targets, &opts, prefix).await?;
+
         let txn = self.transaction().await?;
-        let marked = self.drive(&txn, &fetcher, &opts, prefix, &targets).await?;
+        let marked = self
+            .drive(&txn, &fetcher, &opts, prefix, &targets, &deltas)
+            .await?;
         for (name, tip) in &targets {
             txn.set_ref(&refspec(prefix, name), Some(tip));
         }
@@ -366,6 +393,7 @@ impl Repo {
         opts: &PullOptions,
         ref_prefix: Option<&str>,
         targets: &[(String, Checksum)],
+        deltas: &HashMap<Checksum, DeltaJob>,
     ) -> Result<Vec<Checksum>> {
         // The refs each requested tip is the tip of. The binding and timestamp
         // checks are per ref, and the plan fetches one commit once however many
@@ -381,9 +409,11 @@ impl Repo {
             writes: Arc::new(Gate::new(WRITE_THROTTLE)),
             sources: &opts.localcache_repos,
             flags: opts.flags,
+            checks: ModeChecks::new(opts.flags, self.mode()),
             ref_prefix,
             timestamp_check: &opts.timestamp_check,
             tips: &tips,
+            deltas,
         };
         let mut plan = Plan::default();
         for (_, tip) in targets {
@@ -438,6 +468,14 @@ impl Repo {
                 self.fetch_content(ctx, name, &mut read_buf).await?
             }
             Item::Object(name) => self.fetch_metadata(ctx, name, &mut read_buf).await?,
+            Item::Part(part) => {
+                let job = ctx
+                    .deltas
+                    .get(&part.commit)
+                    .expect("a queued part belongs to a delta this pull found");
+                delta::fetch_part(ctx.txn, ctx.fetcher, job, part.index, ctx.checks).await?;
+                Step::Part(part.commit)
+            }
         };
         Ok((step, read_buf))
     }
@@ -479,6 +517,13 @@ impl Repo {
             )
             .await?;
             src.load_object_bytes(ObjectType::Commit, &checksum).await?
+        } else if let Some(job) = ctx.deltas.get(&checksum) {
+            // A delta carries the target commit inside its superblock, which is
+            // where these bytes come from; the superblock's own parse has already
+            // established that they hash to this checksum, and staging them
+            // establishes it again.
+            stage = true;
+            job.commit_bytes.clone()
         } else {
             let path = object_path(&checksum, ObjectType::Commit);
             match fetch_whole(ctx.fetcher, &path, Priority::High, MAX_METADATA_SIZE).await {
@@ -534,21 +579,32 @@ impl Repo {
         if let Some(meta) = detached {
             self.write_commit_detached_bytes(&checksum, meta).await?;
         }
-        // A commit already complete here needs no object of its tree: what it
-        // references is present. Its parent is a separate question, since the
-        // depth an earlier pull ran at may be shallower than this one's, so the
-        // chain walks on and the parent's own step decides what it needs.
-        let tree = if complete || ctx.flags.contains(PullFlags::COMMIT_ONLY) {
-            Vec::new()
+        // Where the commit's objects come from. A commit already complete here
+        // needs none of them: what it references is present. Its parent is a
+        // separate question, since the depth an earlier pull ran at may be
+        // shallower than this one's, so the chain walks on and the parent's own
+        // step decides what it needs.
+        let tree = vec![
+            ObjectName::new(commit.root_dirmeta, ObjectType::DirMeta),
+            ObjectName::new(commit.root_dirtree, ObjectType::DirTree),
+        ];
+        let next = if complete || ctx.flags.contains(PullFlags::COMMIT_ONLY) {
+            CommitNext::Nothing
+        } else if let Some(job) = ctx.deltas.get(&checksum) {
+            // A delta delivers the tree: its parts, and the objects it names but
+            // hands over loose. The tree walk follows the last part, so what no
+            // part delivered is found there and fetched loose.
+            CommitNext::Delta {
+                parts: job.parts(),
+                fallbacks: job.fallbacks(),
+                tree,
+            }
         } else {
-            vec![
-                ObjectName::new(commit.root_dirmeta, ObjectType::DirMeta),
-                ObjectName::new(commit.root_dirtree, ObjectType::DirTree),
-            ]
+            CommitNext::Scan(tree)
         };
         Ok(Step::Commit(CommitOutcome {
             checksum,
-            tree,
+            next,
             parent: commit.parent,
             marked: !complete,
         }))
@@ -702,14 +758,6 @@ impl Repo {
         read_buf: &mut Vec<u8>,
     ) -> Result<()> {
         let (header, declared, mut body) = read_archive_header(body).await?;
-        // The same mode checks a local pull makes, over the header the object
-        // arrives with rather than the one a source repository stored.
-        if ctx.flags.contains(PullFlags::BAREUSERONLY_FILES) {
-            check_bareuseronly(expected, &header)?;
-        }
-        if self.mode() == RepoMode::BareUserOnly {
-            check_canonical(expected, &header)?;
-        }
         let symlink = header.is_symlink();
         let FileHeader {
             uid,
@@ -724,6 +772,9 @@ impl Repo {
             mode,
             xattrs,
         };
+        // The same mode checks a local pull makes, over the metadata the object
+        // arrives with rather than the one a source repository stored.
+        ctx.checks.check(expected, &meta)?;
         if symlink {
             check_stream_end(expected, "symlink header", &mut body).await?;
             ctx.txn
@@ -796,6 +847,10 @@ struct StepCtx<'a> {
     /// Repositories consulted for an object before the network, in order.
     sources: &'a [Repo],
     flags: PullFlags,
+    /// The mode checks every content object this pull writes is held to,
+    /// whichever path it arrives by: a loose fetch, a localcache import, or a
+    /// static delta's parts.
+    checks: ModeChecks,
     /// The prefix the pulled refs are written under, which the timestamp check
     /// resolves the ref's current tip through. `None` is a local ref.
     ref_prefix: Option<&'a str>,
@@ -804,6 +859,9 @@ struct StepCtx<'a> {
     /// timestamp checks are made against. A commit with no entry is a parent
     /// reached under `depth`, which no ref names.
     tips: &'a HashMap<Checksum, Vec<String>>,
+    /// The static delta each target commit is delivered by, where the remote
+    /// publishes one. A commit with no entry is fetched object by object.
+    deltas: &'a HashMap<Checksum, DeltaJob>,
 }
 
 /// One commit to fetch.
@@ -816,10 +874,20 @@ struct CommitItem {
     optional: bool,
 }
 
+/// One part of one commit's delta.
+struct PartItem {
+    /// The commit the delta produces, which the job is keyed by.
+    commit: Checksum,
+    /// The part's index, which is both its position in the superblock's entry
+    /// list and its file name on the remote.
+    index: usize,
+}
+
 /// One unit of work a slot runs.
 enum Item {
     Commit(CommitItem),
     Object(ObjectName),
+    Part(PartItem),
 }
 
 /// What one step produced.
@@ -828,6 +896,8 @@ enum Step {
     Commit(CommitOutcome),
     /// A dirtree is stored; these are the objects it references.
     DirTree(Vec<ObjectName>),
+    /// A delta part is applied; this is the commit it belongs to.
+    Part(Checksum),
     /// Nothing follows: a dirmeta or content object is stored, or a parent the
     /// remote does not hold ended its chain.
     Done,
@@ -836,12 +906,28 @@ enum Step {
 /// What a commit contributes to the plan.
 struct CommitOutcome {
     checksum: Checksum,
-    /// The commit's root dirmeta and dirtree, empty when its tree is not walked.
-    tree: Vec<ObjectName>,
+    /// What the commit's objects are fetched by.
+    next: CommitNext,
     /// The parent to follow under `depth`.
     parent: Option<Checksum>,
     /// Whether this pull wrote the commit's `.commitpartial` marker.
     marked: bool,
+}
+
+/// How a commit's objects reach this repository.
+enum CommitNext {
+    /// Object by object: the commit's root dirmeta and dirtree, walked from
+    /// there.
+    Scan(Vec<ObjectName>),
+    /// By static delta: the delta's parts, the objects it hands over loose, and
+    /// the tree walk that follows the last part.
+    Delta {
+        parts: usize,
+        fallbacks: Vec<ObjectName>,
+        tree: Vec<ObjectName>,
+    },
+    /// Nothing: the commit is complete here, or the pull is commit-only.
+    Nothing,
 }
 
 /// What the pull still has to do, and what it has done.
@@ -851,7 +937,16 @@ struct CommitOutcome {
 struct Plan {
     /// The commits, drained first and fetched at high priority.
     commits: VecDeque<CommitItem>,
-    /// The dirtree and dirmeta objects the walk is blocked on, drained second
+    /// The delta parts, drained second, fetched at high priority, and held to
+    /// [`PART_CAP`] in flight whatever the pull's slot count is.
+    parts: VecDeque<PartItem>,
+    /// How many part fetches are in flight.
+    parts_in_flight: usize,
+    /// How many parts of each commit's delta have still to be applied, and the
+    /// tree walk queued once that count reaches zero.
+    delta_parts: HashMap<Checksum, usize>,
+    delta_trees: HashMap<Checksum, Vec<ObjectName>>,
+    /// The dirtree and dirmeta objects the walk is blocked on, drained third
     /// and fetched at high priority.
     scan: VecDeque<ObjectName>,
     /// The content objects, drained last and fetched at low priority.
@@ -911,10 +1006,23 @@ impl Plan {
         }
     }
 
-    /// The next unit of work: the commits, then the scan, then the content.
+    /// The next unit of work: the commits, then the delta parts, then the scan,
+    /// then the content.
+    ///
+    /// A queued part is held back while [`PART_CAP`] of them are in flight, so a
+    /// pull with more slots than that spends the rest on the scan and the content
+    /// rather than on a third part. The loop can therefore run out of work while
+    /// parts are queued, which is safe: a part is held back only when one is in
+    /// flight, and that one occupies a slot the loop is waiting on.
     fn next(&mut self) -> Option<Item> {
         if let Some(commit) = self.commits.pop_front() {
             return Some(Item::Commit(commit));
+        }
+        if self.parts_in_flight < PART_CAP
+            && let Some(part) = self.parts.pop_front()
+        {
+            self.parts_in_flight += 1;
+            return Some(Item::Part(part));
         }
         if let Some(name) = self.scan.pop_front() {
             return Some(Item::Object(name));
@@ -931,7 +1039,28 @@ impl Plan {
                     self.push_object(child);
                 }
             }
+            Step::Part(commit) => self.apply_part(commit),
             Step::Done => {}
+        }
+    }
+
+    /// Record an applied delta part, and queue its commit's tree walk once the
+    /// delta's last part is applied.
+    fn apply_part(&mut self, commit: Checksum) {
+        self.parts_in_flight -= 1;
+        let left = self
+            .delta_parts
+            .get_mut(&commit)
+            .expect("an applied part belongs to a commit whose delta is counted");
+        *left -= 1;
+        if *left > 0 {
+            return;
+        }
+        self.delta_parts.remove(&commit);
+        // Every object the delta carries is staged now, so the walk reads what is
+        // here and asks the network only for what the delta left out.
+        for name in self.delta_trees.remove(&commit).unwrap_or_default() {
+            self.push_object(name);
         }
     }
 
@@ -941,8 +1070,39 @@ impl Plan {
             marked.push(outcome.checksum);
         }
         self.parents.insert(outcome.checksum, outcome.parent);
-        for name in outcome.tree {
-            self.push_object(name);
+        match outcome.next {
+            CommitNext::Nothing => {}
+            CommitNext::Scan(tree) => {
+                for name in tree {
+                    self.push_object(name);
+                }
+            }
+            CommitNext::Delta {
+                parts,
+                fallbacks,
+                tree,
+            } => {
+                // The objects the delta hands over loose are queued at once, so
+                // they travel alongside the parts rather than after them.
+                for name in fallbacks {
+                    self.push_object(name);
+                }
+                if parts == 0 {
+                    // A delta of fallbacks alone has no part to wait for.
+                    for name in tree {
+                        self.push_object(name);
+                    }
+                } else {
+                    self.delta_parts.insert(outcome.checksum, parts);
+                    self.delta_trees.insert(outcome.checksum, tree);
+                    for index in 0..parts {
+                        self.parts.push_back(PartItem {
+                            commit: outcome.checksum,
+                            index,
+                        });
+                    }
+                }
+            }
         }
         // The depth comes from the plan and not from the item: a later chain may
         // have reached this commit with further to go while it was in flight.
@@ -1078,7 +1238,7 @@ fn ref_request_path(name: &str) -> String {
 }
 
 /// Fetch a path whole, or `None` when the remote answers 404.
-async fn fetch_optional(
+pub(crate) async fn fetch_optional(
     fetcher: &Fetcher,
     path: &str,
     priority: Priority,
@@ -1718,8 +1878,27 @@ mod tests {
     fn fetched(checksum: Checksum, tree: Vec<ObjectName>, parent: Option<Checksum>) -> Step {
         Step::Commit(CommitOutcome {
             checksum,
-            tree,
+            next: CommitNext::Scan(tree),
             parent,
+            marked: true,
+        })
+    }
+
+    /// The outcome of a commit a delta delivers.
+    fn by_delta(
+        checksum: Checksum,
+        parts: usize,
+        fallbacks: Vec<ObjectName>,
+        tree: Vec<ObjectName>,
+    ) -> Step {
+        Step::Commit(CommitOutcome {
+            checksum,
+            next: CommitNext::Delta {
+                parts,
+                fallbacks,
+                tree,
+            },
+            parent: None,
             marked: true,
         })
     }
@@ -1731,6 +1910,7 @@ mod tests {
             let step = match item {
                 Item::Object(name) if name.ty == ObjectType::DirTree => Step::DirTree(Vec::new()),
                 Item::Object(_) => Step::Done,
+                Item::Part(part) => Step::Part(part.commit),
                 Item::Commit(_) => panic!("the test queues no further commits"),
             };
             plan.apply(step, marked);
@@ -1842,8 +2022,89 @@ mod tests {
             drained.push(match item {
                 Item::Commit(commit) => commit.checksum,
                 Item::Object(name) => name.checksum,
+                Item::Part(part) => part.commit,
             });
         }
         assert_eq!(drained, [csum(5), csum(2), csum(3), csum(4)]);
+    }
+
+    /// A delta queues its parts and the objects it hands over loose, and the
+    /// commit's tree walk waits for the last part.
+    #[test]
+    fn a_delta_queues_its_parts_before_the_tree() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        let fallback = object(7, ObjectType::File);
+        let tree = vec![
+            object(2, ObjectType::DirMeta),
+            object(3, ObjectType::DirTree),
+        ];
+        plan.apply(by_delta(csum(1), 2, vec![fallback], tree), &mut marked);
+
+        // The parts come before the fallback, which is content.
+        assert!(matches!(plan.next(), Some(Item::Part(_))));
+        assert!(matches!(plan.next(), Some(Item::Part(_))));
+        let Some(Item::Object(name)) = plan.next() else {
+            panic!("the fallback was not queued");
+        };
+        assert_eq!(name, fallback);
+        // The tree is not queued while a part is outstanding.
+        assert!(plan.next().is_none());
+
+        plan.apply(Step::Part(csum(1)), &mut marked);
+        assert!(plan.next().is_none());
+        plan.apply(Step::Part(csum(1)), &mut marked);
+        let Some(Item::Object(name)) = plan.next() else {
+            panic!("the tree was not queued after the last part");
+        };
+        assert_eq!(name, object(2, ObjectType::DirMeta));
+    }
+
+    /// No more than [`PART_CAP`] parts are handed out at once, however many the
+    /// delta has and however many slots the pull holds.
+    #[test]
+    fn the_part_cap_holds_however_many_parts_a_delta_has() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        plan.apply(by_delta(csum(1), 5, Vec::new(), Vec::new()), &mut marked);
+
+        let mut in_flight = 0;
+        let mut high_water = 0;
+        let mut applied = 0;
+        loop {
+            while let Some(item) = plan.next() {
+                assert!(matches!(item, Item::Part(_)));
+                in_flight += 1;
+                high_water = high_water.max(in_flight);
+            }
+            if in_flight == 0 {
+                break;
+            }
+            plan.apply(Step::Part(csum(1)), &mut marked);
+            in_flight -= 1;
+            applied += 1;
+        }
+        assert_eq!(high_water, PART_CAP);
+        assert_eq!(applied, 5);
+    }
+
+    /// A delta whose objects all went to fallbacks has no part to wait for, so
+    /// its tree walk is queued at once.
+    #[test]
+    fn a_delta_with_no_parts_queues_its_tree_at_once() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        plan.apply(
+            by_delta(
+                csum(1),
+                0,
+                vec![object(7, ObjectType::File)],
+                vec![object(2, ObjectType::DirMeta)],
+            ),
+            &mut marked,
+        );
+        assert_eq!(plan.scan.len(), 1);
+        assert_eq!(plan.content.len(), 1);
+        assert!(plan.parts.is_empty());
     }
 }

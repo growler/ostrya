@@ -9,8 +9,16 @@
 //! global metadata dict, whose entries appear in a fixed insertion order that
 //! byte identity relies on: `ostree.summary.mode`, `ostree.summary.last-modified`
 //! (big-endian), `ostree.summary.tombstone-commits`, the optional
-//! `ostree.summary.collection-map`, `ostree.summary.indexed-deltas`, and the
-//! optional `ostree.summary.collection-id`.
+//! `ostree.static-deltas`, the optional `ostree.summary.collection-map`,
+//! `ostree.summary.indexed-deltas`, and the optional
+//! `ostree.summary.collection-id`.
+//!
+//! `ostree.static-deltas` maps each delta under `deltas/` to the SHA-256 of its
+//! `superblock`, which is what lets a pull find a delta and check the superblock
+//! it fetches. It is present only when the repository holds a delta, and its
+//! entries are ordered by delta name. The tool emits the same map in the order it
+//! walked `deltas/`, which is the order its filesystem returned, so the two
+//! writers agree on the entries and not on their order.
 //!
 //! When the repository sets `[core] collection-id`, regeneration first refreshes
 //! the `ostree-metadata` anchor commit: an empty-tree commit bound to the
@@ -40,6 +48,7 @@ use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::commit::{CommitOptions, append_dict_entry};
+use crate::deltagen::STATIC_DELTAS_KEY;
 use crate::error::{Error, Result};
 use crate::mtree::MutableTree;
 use crate::repo::Repo;
@@ -70,7 +79,8 @@ const MODE_KEY: &str = "ostree.summary.mode";
 const LAST_MODIFIED_KEY: &str = "ostree.summary.last-modified";
 const TOMBSTONE_KEY: &str = "ostree.summary.tombstone-commits";
 const COLLECTION_MAP_KEY: &str = "ostree.summary.collection-map";
-const INDEXED_DELTAS_KEY: &str = "ostree.summary.indexed-deltas";
+/// The summary key stating whether the remote indexes its deltas.
+pub(crate) const INDEXED_DELTAS_KEY: &str = "ostree.summary.indexed-deltas";
 const COLLECTION_ID_KEY: &str = "ostree.summary.collection-id";
 const COMMIT_VERSION_KEY: &str = "ostree.commit.version";
 const COMMIT_TIMESTAMP_KEY: &str = "ostree.commit.timestamp";
@@ -119,6 +129,19 @@ impl Summary {
             refs.push(parse_ref_entry(entry)?);
         }
         Ok(Summary { refs, metadata })
+    }
+
+    /// The value stored under `key` in the global metadata dict, unwrapped from
+    /// the variant the dict holds it in.
+    ///
+    /// This is how a pull reads what the remote states about itself:
+    /// `ostree.static-deltas` names the deltas it publishes, and
+    /// `ostree.summary.indexed-deltas` states whether it keeps a delta index.
+    pub fn metadata_value(&self, key: &str) -> Option<&Value> {
+        self.metadata
+            .dict_get(key)?
+            .as_variant()
+            .map(|(_, value)| value)
     }
 
     /// The commit a ref names, or `None` when the summary does not list it.
@@ -220,6 +243,11 @@ impl Repo {
             TOMBSTONE_KEY,
             variant("b", Value::Bool(self.config().tombstone_commits()?))?,
         )?;
+        // The deltas this repository holds, so a fetcher can find them without
+        // asking for an index file. Absent when the repository holds none.
+        if let Some(deltas) = self.static_deltas_summary_value().await? {
+            append_dict_entry(&mut metadata, STATIC_DELTAS_KEY, deltas)?;
+        }
         if let Some(map) = collection_map {
             append_dict_entry(&mut metadata, COLLECTION_MAP_KEY, map)?;
         }

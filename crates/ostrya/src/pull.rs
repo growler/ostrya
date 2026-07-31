@@ -140,9 +140,7 @@
 use std::collections::{HashMap, HashSet};
 
 use futures_lite::AsyncReadExt;
-use ostrya_core::{
-    Checksum, Commit, ContentHasher, DirTree, FileHeader, ObjectName, ObjectType, RepoMode,
-};
+use ostrya_core::{Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType, RepoMode};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
@@ -153,6 +151,7 @@ use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
+mod delta;
 mod drive;
 pub mod http;
 
@@ -284,6 +283,18 @@ pub struct PullOptions {
     pub n_network_retries: Option<u32>,
     /// What a fetched tip's timestamp is required to be no older than.
     pub timestamp_check: TimestampCheck,
+    /// Fetch every object loose, ignoring any static delta the remote
+    /// advertises. This wins over
+    /// [`require_static_deltas`](PullOptions::require_static_deltas): a pull that
+    /// asks for no delta looks for none and so finds nothing to require.
+    pub disable_static_deltas: bool,
+    /// Refuse a remote that advertises no static delta at all, which is a remote
+    /// serving neither a delta index nor a summary carrying
+    /// `ostree.static-deltas`. A remote that advertises deltas but none for the
+    /// commit being pulled passes, and that pull fetches its objects loose. A
+    /// commit this repository already holds complete is not looked for at all, so
+    /// a pull with nothing to fetch is not refused.
+    pub require_static_deltas: bool,
 }
 
 /// What a pull imported.
@@ -435,27 +446,20 @@ impl Repo {
         }
 
         let same_mode = src.mode() == self.mode();
-        let flag_check = flags.contains(PullFlags::BAREUSERONLY_FILES);
-        let dest_check = self.mode() == RepoMode::BareUserOnly;
+        let checks = ModeChecks::new(flags, self.mode());
         let untrusted = flags.contains(PullFlags::UNTRUSTED);
 
-        // The header checks read the object's logical form and run before the
+        // The mode checks read the object's logical form and run before the
         // object is imported by any path. An untrusted verification reads the same
         // form and is deferred to the path the import takes: the link and the
         // clone move bytes without hashing them and are verified here, while a
         // re-ingest hashes the object as it writes it and compares the result
         // against its name itself, so verifying ahead of that would read the
         // payload twice.
-        let loaded = if flag_check || dest_check || untrusted {
+        let loaded = if checks.any() || untrusted {
             let file = src.load_file(&name.checksum).await?;
-            if flag_check || dest_check {
-                let header = file.header();
-                if flag_check {
-                    check_bareuseronly(&name.checksum, &header)?;
-                }
-                if dest_check {
-                    check_canonical(&name.checksum, &header)?;
-                }
+            if checks.any() {
+                checks.check(&name.checksum, &file.meta())?;
             }
             Some(file)
         } else {
@@ -478,12 +482,7 @@ impl Repo {
             Some(file) => file,
             None => src.load_file(&name.checksum).await?,
         };
-        let meta = FileMeta {
-            uid: file.uid,
-            gid: file.gid,
-            mode: file.mode,
-            xattrs: file.xattrs.clone(),
-        };
+        let meta = file.meta();
         match &file.kind {
             FileKind::Symlink { target } => {
                 if symlink_shared(src.mode(), self.mode())
@@ -845,7 +844,55 @@ fn symlink_shared(src: RepoMode, dest: RepoMode) -> bool {
     )
 }
 
-/// Reject a content object whose logical header is not the one a
+/// The mode checks a content object is held to before it is written.
+///
+/// Two rules apply to a content object arriving from anywhere:
+/// [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) bounds a regular file's
+/// logical mode, and a `bare-user-only` destination takes only an object whose
+/// logical form is the one it stores. Both read the logical metadata alone, so
+/// one value carries them and every path an object reaches the object store by
+/// makes the same checks: a local import, a fetched loose object, and the objects
+/// a static delta's parts produce.
+#[derive(Clone, Copy)]
+pub(crate) struct ModeChecks {
+    /// [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) was requested.
+    bareuseronly_files: bool,
+    /// The destination is `bare-user-only`.
+    canonical: bool,
+}
+
+impl ModeChecks {
+    /// The checks an import under `flags` into a repository of mode `dest` makes.
+    /// A path with no pull flags of its own -- offline static-delta application --
+    /// passes [`PullFlags::empty()`], which leaves the destination's own rule.
+    pub(crate) fn new(flags: PullFlags, dest: RepoMode) -> ModeChecks {
+        ModeChecks {
+            bareuseronly_files: flags.contains(PullFlags::BAREUSERONLY_FILES),
+            canonical: dest == RepoMode::BareUserOnly,
+        }
+    }
+
+    /// Whether any check applies. A path that would otherwise not read an
+    /// object's logical metadata reads it only when this holds.
+    pub(crate) fn any(&self) -> bool {
+        self.bareuseronly_files || self.canonical
+    }
+
+    /// Refuse a content object whose logical metadata fails a check that
+    /// applies. Called before the object's bytes are written, so a refused
+    /// object leaves nothing behind.
+    pub(crate) fn check(&self, checksum: &Checksum, meta: &FileMeta) -> Result<()> {
+        if self.bareuseronly_files {
+            check_bareuseronly(checksum, meta)?;
+        }
+        if self.canonical {
+            check_canonical(checksum, meta)?;
+        }
+        Ok(())
+    }
+}
+
+/// Reject a content object whose logical metadata is not what a
 /// `bare-user-only` destination stores.
 ///
 /// That mode records neither ownership nor xattrs and reduces a regular file's
@@ -854,40 +901,40 @@ fn symlink_shared(src: RepoMode, dest: RepoMode) -> bool {
 /// arrives under, which it can do only where that name already covers the
 /// canonical header; anything else would land under a name its stored form does
 /// not hash to. A symlink's mode is fixed by the object model and is exempt.
-pub(crate) fn check_canonical(checksum: &Checksum, header: &FileHeader) -> Result<()> {
-    let extra = if header.is_symlink() {
+fn check_canonical(checksum: &Checksum, meta: &FileMeta) -> Result<()> {
+    let extra = if meta.is_symlink() {
         0
     } else {
         // S_IFREG plus the permission bits the mode keeps.
-        header.mode & !0o100755
+        meta.mode & !0o100755
     };
-    if extra == 0 && header.uid == 0 && header.gid == 0 && header.xattrs.is_empty() {
+    if extra == 0 && meta.uid == 0 && meta.gid == 0 && meta.xattrs.is_empty() {
         return Ok(());
     }
     Err(Error::Pull(format!(
         "content object {checksum}: a bare-user-only repository stores neither \
          ownership nor xattrs and reduces the mode to 0755, so this object -- uid \
          {}, gid {}, mode 0{:o}, {} xattr(s) -- cannot be imported under its own name",
-        header.uid,
-        header.gid,
-        header.mode,
-        header.xattrs.len()
+        meta.uid,
+        meta.gid,
+        meta.mode,
+        meta.xattrs.len()
     )))
 }
 
 /// Reject a regular-file content object whose logical mode has bits outside
 /// `0775`. Symlinks carry a fixed mode and are exempt.
-pub(crate) fn check_bareuseronly(checksum: &Checksum, header: &FileHeader) -> Result<()> {
-    if header.is_symlink() {
+fn check_bareuseronly(checksum: &Checksum, meta: &FileMeta) -> Result<()> {
+    if meta.is_symlink() {
         return Ok(());
     }
-    let extra = header.mode & !0o100775;
+    let extra = meta.mode & !0o100775;
     if extra == 0 {
         return Ok(());
     }
     Err(Error::Pull(format!(
         "content object {checksum}: invalid mode 0{:o} with bits 0{:o}",
-        header.mode, extra
+        meta.mode, extra
     )))
 }
 

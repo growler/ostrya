@@ -230,7 +230,14 @@ insertion order is the on-disk order):
   Observed here, between `tombstone-commits` and `indexed-deltas`, by running
   `ostree summary -u` on a repository holding one from-scratch and one from-to
   delta. Its order relative to `ostree.summary.collection-map` is not yet
-  observed, since that needs a collection repository carrying deltas.
+  observed, since that needs a collection repository carrying deltas. The map's
+  own entry order is the order the writer walked `deltas/`, which is the order
+  the filesystem returned: a repository holding four deltas of one target lists
+  them in neither name order nor any other stable one, so the entries of a
+  summary carrying deltas are reproducible and their order is not. The digest is
+  the SHA-256 of the delta's `superblock` file, confirmed against `sha256sum`.
+  `ostree summary -u` does not write or refresh `delta-indexes/`, so a repository
+  can advertise deltas in its summary while serving no index at all.
 - `ostree.summary.collection-map` -> `a{sa(s(taya{sv}))}`, present only when
   the repository holds mirror refs (`refs/mirrors/<collection>/<ref>`). It maps
   each collection id to a ref array shaped exactly like field 0. Both levels are
@@ -474,6 +481,48 @@ objects/<...>.dirtree, .dirmeta, .filez, .filez, .dirtree, .filez
   fetched in its place. The delta probe becomes `deltas/<b64>/superblock` rather
   than the index, so a summary advertising `indexed-deltas` is what selects the
   index path.
+
+A delta-accelerated pull, recovered the same way -- one static file server, one
+request log -- against a client holding the ref's previous commit:
+
+```
+summary.sig
+summary
+config
+delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index
+deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/superblock
+objects/<fallback>.filez          (only where the delta names fallbacks)
+deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/0
+objects/<commit>.commitmeta
+```
+
+- The delta name is `<from>-<to>` when the client holds a commit for the ref being
+  pulled, and `<to>` when it holds none. Exactly one name is tried: a client
+  holding the ref's commit against a remote advertising only the from-scratch
+  delta fetches every object loose, and so does a fresh client against a remote
+  advertising only the from-to delta.
+- The index is requested whenever a summary is present. Where it answers 404 the
+  pull reads the summary's own `ostree.static-deltas` map instead and fetches the
+  superblock the map names. Where neither names the delta, no superblock is
+  requested.
+- No `objects/<commit>.commit` request follows a delta: the target commit rides in
+  the superblock. The `.commitmeta` is still fetched, after the parts rather than
+  before the commit.
+- The objects a delta hands over as fallbacks are fetched loose as
+  `objects/<..>.filez`, queued as soon as the superblock is read. No dirtree,
+  dirmeta, or content object of the delta's own contents is requested, so the tool
+  does not walk the target commit's tree after applying a delta.
+- A superblock whose bytes do not hash to the digest the summary advertised fails
+  the pull: `error: Invalid checksum for static delta <name>`, with no part
+  requested. A superblock the remote does not hold answers 404 and the pull
+  continues with loose objects, with no error.
+- `--require-static-deltas` fails only where the remote advertises no delta at
+  all: `error: Fetch configured to require static deltas, but no summary deltas or
+  delta index found`, which is what a remote serving no summary produces, and no
+  delta probe is made in that case. A remote that advertises deltas satisfies it
+  even where none of them produces the commit being pulled.
+- The destination has to be non-archive: an archive client refuses with `error:
+  Can't use static deltas in an archive repo` before any request is made.
 - A content object is always requested as `objects/<..>.filez`, whatever mode the
   remote actually stores. Metadata keeps `.commit`, `.dirtree`, and `.dirmeta`.
   Detached metadata is `.commitmeta`, requested before the commit object it
@@ -1047,6 +1096,14 @@ delivering one 8,192-byte file plus its one-entry dirtree (41 bytes, with dirmet
 which is why the two coincide there; for a rollsum or bspatch part it does not,
 since the blob then holds patch streams rather than content.
 
+`usize` states what the part's objects add up to, which is under the size of the
+part payload that carries them: a from-scratch part of three files (8,192, 20,000
+and 6 bytes), one symlink and three metadata objects reports `usize=28453` where
+its payload decompresses to 28,531 bytes -- the data-source blob (28,462, which
+holds the 9-byte symlink target `usize` leaves out), the operation stream (38),
+the mode table (24), the xattr table, and the tuple framing. `size` is the field
+that bounds a part: it is the length of the file the part checksum is taken over.
+
 Part packing. Objects accumulate into one part until adding the next would push
 the payload past `--max-chunk-size` (decimal megabytes, default 32), then a new
 part starts; metadata objects come before content objects. Observed with
@@ -1151,10 +1208,12 @@ headers are host byte order gated by an `ostree.endianness` byte (`l`/`B`) in
 superblock metadata (a historical inconsistency, with a size-ratio heuristic
 fallback when the byte is missing). The superblock timestamp is always BE; the
 `(uuu)` mode triple is always BE regardless of that byte. Applying a delta reads
-none of the host-order-gated fields -- parts are read by name and checked by
-their SHA-256, the modes are swapped from their fixed big-endian form, and the
-embedded commit is normal-form little-endian -- so a big-endian delta applies
-through the same path.
+one host-order-gated field, a meta-entry's `size`, which is the ceiling a part is
+read under: the port swaps it where the byte states `B` and reads it as
+little-endian where the byte is absent. The rest go unread -- parts are read by
+name and checked by their SHA-256, the modes are swapped from their fixed
+big-endian form, and the embedded commit is normal-form little-endian -- so a
+big-endian delta applies through the same path.
 
 ## Signing details
 

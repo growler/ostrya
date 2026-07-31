@@ -34,8 +34,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState, CreateOptions,
-    Error, FsckOptions, MutableTree, PullFlags, PullOptions, Repo, RepoMode, SummaryOptions,
-    TimestampCheck, TreeEntry, Type, Value,
+    DeltaOptions, Error, FsckOptions, MutableTree, PullFlags, PullOptions, Repo, RepoMode,
+    SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 
@@ -2596,5 +2596,322 @@ fn bareuseronly_files_rejects_a_mode_outside_0775() {
         .await
         .unwrap();
         assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// The request path of one part of the single delta a served repository holds,
+/// found by walking `deltas/<fanout>/<leaf>/` rather than rebuilding the name.
+fn served_part_path(root: &Path, index: usize) -> String {
+    let deltas = root.join("deltas");
+    let fanout = std::fs::read_dir(&deltas)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let leaf = std::fs::read_dir(&fanout).unwrap().next().unwrap().unwrap();
+    let dir = leaf.path().strip_prefix(root).unwrap().to_owned();
+    format!("{}/{index}", dir.display())
+}
+
+/// A remote answering a part request with more than the part is gets no further
+/// than the size the superblock declares for that part: the fetcher refuses the
+/// oversized body and the pull publishes nothing.
+#[test]
+fn a_part_larger_than_the_superblock_declares_is_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-delta-part-size");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        let remote_path = dir.path().join("remote");
+        let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let tip = commit_tree_with(
+            &remote,
+            dir.path(),
+            "src",
+            "test/main",
+            None,
+            FIXED_TS,
+            CommitModifierFlags::SKIP_XATTRS,
+        )
+        .await;
+        remote
+            .generate_static_delta(
+                None,
+                &tip,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // The part the superblock declares, served four times over.
+        let part = served_part_path(&remote_path, 0);
+        let declared = std::fs::metadata(remote_path.join(&part)).unwrap().len();
+        let server = RepoServer::start(&remote_path, false).await;
+        server.tamper(&part, vec![0u8; declared as usize * 4]);
+
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::FetchTooLarge { limit } if limit == declared),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+        assert!(
+            server.seen().contains(&part),
+            "the part was requested: {:?}",
+            server.seen()
+        );
+    });
+}
+
+/// `BAREUSERONLY_FILES` reaches an object a static delta delivers: the mode a
+/// part's table names is checked before the object is written, so a remote
+/// publishing a delta cannot hand over what a loose fetch of the same object
+/// would be refused.
+#[test]
+fn bareuseronly_files_rejects_a_delta_delivered_mode_outside_0775() {
+    block_on(async {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TmpDir::new("pull-http-delta-mode-bits");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        std::fs::set_permissions(src.join("exec.sh"), std::fs::Permissions::from_mode(0o4755))
+            .unwrap();
+        let remote = Repo::create(
+            &dir.path().join("remote"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let tip = commit_tree_with(
+            &remote,
+            dir.path(),
+            "src",
+            "test/main",
+            None,
+            FIXED_TS,
+            CommitModifierFlags::SKIP_XATTRS,
+        )
+        .await;
+        // A from-scratch delta of the commit, which a fresh destination is what
+        // the remote publishes for. The remote serves no summary, so the delta is
+        // asked for by name.
+        remote
+            .generate_static_delta(
+                None,
+                &tip,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    flags: PullFlags::BAREUSERONLY_FILES,
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid mode"), "{err}");
+        assert_nothing_published(&dest).await;
+        assert!(
+            server
+                .seen()
+                .iter()
+                .any(|path| path.ends_with("/superblock")),
+            "the pull took the delta: {:?}",
+            server.seen()
+        );
+
+        // Without the flag the same delta delivers the object, so the refusal is
+        // the flag's and not the delta path failing to apply.
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        server.forget();
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            server
+                .seen()
+                .iter()
+                .any(|path| path.ends_with("/superblock")),
+            "the second pull took the delta as well: {:?}",
+            server.seen()
+        );
+        assert_eq!(
+            dest.commit_state(&tip).await.unwrap(),
+            CommitState::Normal,
+            "the delta delivered the whole commit"
+        );
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// A delta into each destination mode. The destination is one commit behind, so
+/// the delta patches against objects it already stores: the applier reads a
+/// source object in the destination's own storage form -- a deflated `.filez`
+/// for an archive destination -- and writes what the part produces back in that
+/// same form. Every mode lands the target commit whole and passes its own fsck.
+#[test]
+fn a_delta_delivers_a_commit_into_every_destination_mode() {
+    block_on(async {
+        for mode in [
+            RepoMode::Archive,
+            RepoMode::BareUser,
+            RepoMode::BareUserOnly,
+        ] {
+            let dir = TmpDir::new(&format!("pull-http-delta-dest-{}", mode.as_mode_str()));
+            let src = dir.path().join("src");
+            build_tree(&src, b"hello\n");
+            // A file spanning several chunks, so the edit below leaves most of
+            // it to be copied out of the object the destination already holds.
+            let mut bulk = incompressible(256 * 1024);
+            std::fs::write(src.join("bulk.bin"), &bulk).unwrap();
+
+            let remote_path = dir.path().join("remote");
+            let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            let first = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+
+            // The destination takes the first commit loose: the remote holds no
+            // delta yet, so its superblock request is a 404.
+            let server = RepoServer::start(&remote_path, false).await;
+            let dest = build_dest(dir.path(), mode, &server.url(), "").await;
+            dest.pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                dest.resolve_rev("origin:test/main", true).await.unwrap(),
+                Some(first),
+                "{mode:?}"
+            );
+
+            // The remote moves on by one commit -- one file edited, one added --
+            // and publishes the delta that produces it from the commit the
+            // destination holds.
+            bulk[128 * 1024..128 * 1024 + 4].copy_from_slice(b"edit");
+            std::fs::write(src.join("bulk.bin"), &bulk).unwrap();
+            std::fs::write(src.join("added.txt"), b"added\n").unwrap();
+            let second = commit_tree(
+                &remote,
+                dir.path(),
+                "src",
+                "test/main",
+                Some(first),
+                FIXED_TS + 1,
+            )
+            .await;
+            remote
+                .generate_static_delta(
+                    Some(&first),
+                    &second,
+                    &DeltaOptions {
+                        timestamp: Some(FIXED_TS),
+                        ..DeltaOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            server.forget();
+            dest.pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            // The delta carried the content: the superblock was requested and no
+            // content object was.
+            let seen = server.seen();
+            assert!(
+                seen.iter().any(|path| path.ends_with("/superblock")),
+                "{mode:?}: the pull took the delta: {seen:?}"
+            );
+            assert!(
+                !seen.iter().any(|path| path.ends_with(".filez")),
+                "{mode:?}: a content object was fetched loose: {seen:?}"
+            );
+
+            assert_eq!(
+                dest.resolve_rev("origin:test/main", true).await.unwrap(),
+                Some(second),
+                "{mode:?}"
+            );
+            assert_eq!(
+                dest.commit_state(&second).await.unwrap(),
+                CommitState::Normal,
+                "{mode:?}"
+            );
+            let report = dest.fsck(&FsckOptions::default()).await.unwrap();
+            assert!(report.is_ok(), "{mode:?}: {:?}", report.errors);
+
+            // The tree reads back with both the edited and the added file.
+            let (tree, _) = dest.read_commit(&second.to_hex()).await.unwrap();
+            let mut names: Vec<String> = tree
+                .read_dir()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| match entry {
+                    TreeEntry::File { name, .. } | TreeEntry::Dir { name, .. } => name,
+                })
+                .collect();
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    "added.txt",
+                    "bulk.bin",
+                    "exec.sh",
+                    "hello.txt",
+                    "link",
+                    "subdir"
+                ],
+                "{mode:?}"
+            );
+        }
     });
 }

@@ -38,6 +38,7 @@ use crate::error::{Error, Result};
 use crate::inflate::{ArchiveDecoder, archive_decoder};
 use crate::object::{self, MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::repo::Repo;
+use crate::write::FileMeta;
 
 /// The largest bare-user symlink target the reader will load. Targets are
 /// paths, comfortably under this bound.
@@ -132,6 +133,17 @@ impl FileObject {
                 FileKind::Symlink { target } => target.clone(),
                 FileKind::Regular { .. } => String::new(),
             },
+            xattrs: self.xattrs.clone(),
+        }
+    }
+
+    /// The object's logical metadata: the uid, gid, mode, and xattrs a write of
+    /// this object applies, and what the mode checks read.
+    pub(crate) fn meta(&self) -> FileMeta {
+        FileMeta {
+            uid: self.uid,
+            gid: self.gid,
+            mode: self.mode,
             xattrs: self.xattrs.clone(),
         }
     }

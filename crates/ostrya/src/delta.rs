@@ -1,4 +1,5 @@
-//! Static-delta reading and offline application (Phase 15a).
+//! Static-delta reading and offline application (Phase 15a), and the reading a
+//! delta-accelerated pull does over the network (Phase 16d).
 //!
 //! A static delta is a compact description of the objects that make up a target
 //! commit, optionally expressed as a patch against a source commit. The format
@@ -16,17 +17,24 @@
 //! object's checksum is asserted as it is written, so a malformed or misapplied
 //! delta fails rather than storing a wrong object.
 //!
-//! Application is memory-bounded. A part decompresses through
-//! `async-compression`'s xz codec straight into an anonymous temp file in the
-//! repository; the decompressed payload stays on the heap when it is at or below
-//! [`MMAP_THRESHOLD`] and is read-only mmapped otherwise, so a large part costs
-//! address space rather than resident heap. Splice and bspatch output streams
-//! through the transaction's content writer, and a bspatch source object is
-//! spilled to a temp file the same way, so no whole object is materialized.
+//! Application is memory-bounded, and a part is checked before it is expanded.
+//! The part file is taken in under the size its meta-entry declares and hashed
+//! against the checksum that entry names; the verified bytes then decompress
+//! through `async-compression`'s xz codec into the payload the operations read.
+//! Each blob stays on the heap at or below [`MMAP_THRESHOLD`] and is spilled to a
+//! read-only mmapped temp file above it, so a large part costs address space and
+//! staging space rather than resident heap, and a body that passes its declared
+//! size never reaches the decoder. Splice and bspatch output streams through the
+//! transaction's content writer, and a bspatch source object is spilled to a temp
+//! file the same way, so no whole object is materialized.
 //!
 //! Signed deltas wrap the superblock in a magic-prefixed envelope carrying the
 //! detached signatures; [`Repo::verify_static_delta`] checks them with the
 //! Phase 13 signing engines over the raw superblock bytes.
+//!
+//! An HTTP pull reads a delta through the same superblock parse and part
+//! application, over a fetched response body rather than a part file, and applies
+//! it into the pull's own transaction.
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -36,7 +44,7 @@ use std::task::{Context, Poll, ready};
 
 use async_compression::futures::bufread::XzDecoder;
 use futures_io::{AsyncRead, AsyncWrite};
-use futures_lite::io::BufReader;
+use futures_lite::io::Cursor;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use ostrya_core::{
     ArrayIter, Checksum, GvDecode, ObjectType, Type, Value, Xattrs, from_bytes, to_bytes, varint,
@@ -47,6 +55,7 @@ use sha2::{Digest, Sha256};
 use crate::bspatch::bspatch;
 use crate::error::{Error, Result};
 use crate::hashing::HashingReader;
+use crate::pull::{ModeChecks, PullFlags};
 use crate::repo::Repo;
 use crate::sign::{Verifier, VerifyOutcome, signatures_for};
 use crate::transaction::Transaction;
@@ -62,6 +71,13 @@ pub(crate) const SIGNED_SIG: &str = "(taya{sv})";
 pub(crate) const COMMIT_SIG: &str = "(a{sv}aya(say)sstayay)";
 /// The signed-delta magic. Stored as the eight ASCII bytes "OSTSGNDT".
 pub(crate) const SIGNED_MAGIC: &[u8; 8] = b"OSTSGNDT";
+
+/// The superblock metadata key stating the byte order of its host-order fields.
+pub(crate) const ENDIANNESS_KEY: &str = "ostree.endianness";
+/// The little-endian marker the `ostree.endianness` byte carries.
+pub(crate) const ENDIANNESS_LITTLE: u8 = b'l';
+/// The big-endian marker the `ostree.endianness` byte carries.
+const ENDIANNESS_BIG: u8 = b'B';
 
 /// No compression: the part body is the payload verbatim.
 const COMPRESSION_NONE: u8 = 0;
@@ -113,32 +129,38 @@ type PartView<'a> = (
 );
 
 /// A parsed static-delta superblock.
-struct Superblock {
+pub(crate) struct Superblock {
+    /// The source commit checksum, `None` for a from-scratch delta.
+    pub(crate) from: Option<Checksum>,
     /// The target commit checksum.
-    to: Checksum,
+    pub(crate) to: Checksum,
     /// The normal-form bytes of the embedded target commit object.
-    commit_bytes: Vec<u8>,
+    pub(crate) commit_bytes: Vec<u8>,
     /// The per-part meta-entries, in part order.
-    meta_entries: Vec<MetaEntry>,
+    pub(crate) meta_entries: Vec<MetaEntry>,
     /// The fallback objects the delta references but does not carry.
-    fallbacks: Vec<Fallback>,
+    pub(crate) fallbacks: Vec<Fallback>,
     /// The detached signatures when the delta is signed.
-    signatures: Option<Value>,
+    pub(crate) signatures: Option<Value>,
     /// The raw superblock bytes: the payload signatures cover.
-    superblock_bytes: Vec<u8>,
+    pub(crate) superblock_bytes: Vec<u8>,
 }
 
-/// One part's meta-entry: its part-file checksum and the ordered list of objects
-/// the part produces.
-struct MetaEntry {
-    part_csum: Checksum,
-    objects: Vec<(ObjectType, Checksum)>,
+/// One part's meta-entry: its part-file checksum, the part file's size, and the
+/// ordered list of objects the part produces.
+pub(crate) struct MetaEntry {
+    pub(crate) part_csum: Checksum,
+    /// The part file's on-disk size, the compression byte included. It bounds
+    /// what a part fetch takes off the connection and what a part read takes in
+    /// before the checksum above is asserted.
+    pub(crate) size: u64,
+    pub(crate) objects: Vec<(ObjectType, Checksum)>,
 }
 
 /// A fallback object: one delivered outside the parts (as a plain loose object).
-struct Fallback {
-    objtype: ObjectType,
-    checksum: Checksum,
+pub(crate) struct Fallback {
+    pub(crate) objtype: ObjectType,
+    pub(crate) checksum: Checksum,
 }
 
 /// Random-access backing for a decompressed part payload or a source object: on
@@ -190,9 +212,14 @@ impl Repo {
         txn.write_metadata(ObjectType::Commit, Some(&sb.to), &sb.commit_bytes)
             .await?;
 
+        // Offline application carries no pull flags, so the checks are the
+        // destination's own: a bare-user-only repository stores an object under a
+        // name that covers the canonical form alone, which it states here rather
+        // than through the checksum the content writer would miss.
+        let checks = ModeChecks::new(PullFlags::empty(), self.mode());
         for (i, entry) in sb.meta_entries.iter().enumerate() {
-            let blob = decode_part(dir.join(i.to_string()), &entry.part_csum, &staging).await?;
-            apply_part(&txn, &blob, &entry.objects, &staging).await?;
+            let blob = decode_part(dir.join(i.to_string()), entry, &staging).await?;
+            apply_part(&txn, &blob, &entry.objects, &staging, checks).await?;
         }
 
         txn.commit().await?;
@@ -229,8 +256,9 @@ impl Repo {
     ///
     /// Each is named as the tool names it: the target commit hex for a
     /// from-scratch delta, or `<from-hex>-<to-hex>` for a delta against a source
-    /// commit. Reading the `delta-indexes/` cache used for remote discovery
-    /// lands with pull.
+    /// commit. The `delta-indexes/` cache that advertises these deltas to a
+    /// fetcher is written by
+    /// [`reindex_static_deltas`](Repo::reindex_static_deltas) and read by a pull.
     pub async fn list_static_deltas(&self) -> Result<Vec<String>> {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || list_static_deltas_blocking(repo_fd.as_fd())).await
@@ -334,7 +362,7 @@ fn delta_name(fanout: &str, leaf: &str) -> Result<String> {
 impl Superblock {
     /// Parse a superblock file's bytes, detecting and unwrapping the signed
     /// envelope.
-    fn parse(bytes: Vec<u8>) -> Result<Superblock> {
+    pub(crate) fn parse(bytes: Vec<u8>) -> Result<Superblock> {
         let (superblock_bytes, signatures) = if bytes.starts_with(SIGNED_MAGIC) {
             let ty = Type::parse(SIGNED_SIG).map_err(ostrya_core::Error::from)?;
             let value = from_bytes(&ty, &bytes).map_err(ostrya_core::Error::from)?;
@@ -349,13 +377,21 @@ impl Superblock {
         let value = from_bytes(&ty, &superblock_bytes).map_err(ostrya_core::Error::from)?;
         let fields = tuple(&value)?;
 
-        // The `ostree.endianness` metadata byte gates only the superblock
-        // timestamp and the meta-entry/fallback size fields, none of which
-        // application reads: parts are read by name and checked by checksum, the
-        // `(uuu)` modes are always big-endian, and the embedded commit is
-        // normal-form little-endian. A big-endian delta therefore applies
-        // through the same path with no byte-order handling here.
+        // The `ostree.endianness` metadata byte gates the superblock timestamp
+        // and the meta-entry/fallback size fields. Application reads one of
+        // them, a part's declared size, so the byte is read here and that field
+        // is swapped for a big-endian producer. The `(uuu)` modes are always
+        // big-endian and the embedded commit is normal-form little-endian, so
+        // nothing else here turns on it.
+        let big_endian = declares_big_endian(&fields[0]);
         let to = Checksum::from_ay(bytes_field(&fields[3], "superblock to")?)?;
+        // The source commit is a zero-length `ay` for a from-scratch delta.
+        let from_bytes = bytes_field(&fields[2], "superblock from")?;
+        let from = if from_bytes.is_empty() {
+            None
+        } else {
+            Some(Checksum::from_ay(from_bytes)?)
+        };
 
         // Re-serialize the embedded commit to its normal-form bytes and assert
         // the target checksum, closing the loop on the commit the delta carries.
@@ -367,10 +403,11 @@ impl Superblock {
             ));
         }
 
-        let meta_entries = parse_meta_entries(array(&fields[6])?)?;
+        let meta_entries = parse_meta_entries(array(&fields[6])?, big_endian)?;
         let fallbacks = parse_fallbacks(array(&fields[7])?)?;
 
         Ok(Superblock {
+            from,
             to,
             commit_bytes,
             meta_entries,
@@ -381,19 +418,44 @@ impl Superblock {
     }
 }
 
-/// Parse the meta-entry array `a(uayttay)`. The `size`/`usize` fields are not
-/// needed to apply a delta (each part is read by name and checked by its
-/// checksum), so the host-order size fields are skipped and the endianness byte
-/// does not affect application.
-fn parse_meta_entries(entries: &[Value]) -> Result<Vec<MetaEntry>> {
+/// Parse the meta-entry array `a(uayttay)`. The `size` field is the ceiling a
+/// part is read under; the `usize` field states what the part's objects add up
+/// to, which application does not need, so it is skipped.
+fn parse_meta_entries(entries: &[Value], big_endian: bool) -> Result<Vec<MetaEntry>> {
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         let fields = tuple(entry)?;
         let part_csum = Checksum::from_ay(bytes_field(&fields[1], "part checksum")?)?;
+        let size = size_field(&fields[2], "part size", big_endian)?;
         let objects = parse_object_array(bytes_field(&fields[4], "object array")?)?;
-        out.push(MetaEntry { part_csum, objects });
+        out.push(MetaEntry {
+            part_csum,
+            size,
+            objects,
+        });
     }
     Ok(out)
+}
+
+/// Whether the superblock's metadata dict states big-endian host order. A
+/// superblock carrying no `ostree.endianness` byte is read as little-endian,
+/// which is what every producer of these deltas writes.
+fn declares_big_endian(metadata: &Value) -> bool {
+    metadata
+        .dict_get(ENDIANNESS_KEY)
+        .and_then(Value::as_variant)
+        .and_then(|(_, value)| value.as_byte())
+        == Some(ENDIANNESS_BIG)
+}
+
+/// Read one host-order `t` field. GVariant decodes it little-endian, which is the
+/// order a little-endian producer wrote it in, so a big-endian producer's field is
+/// swapped back.
+fn size_field(value: &Value, what: &str, big_endian: bool) -> Result<u64> {
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| Error::InvalidFormat(format!("expected {what} to be a u64")))?;
+    Ok(if big_endian { raw.swap_bytes() } else { raw })
 }
 
 /// Parse the stride-33 `objtype + 32-byte checksum` object array that gives each
@@ -426,58 +488,80 @@ fn parse_fallbacks(entries: &[Value]) -> Result<Vec<Fallback>> {
 }
 
 /// Decode a part file into a random-access [`Blob`], verifying the part
-/// checksum over the whole on-disk file as it streams.
-///
-/// The `(yay)` part frame is a compression byte followed by the body to EOF (a
-/// tuple whose fixed `y` sits at offset 0 and whose trailing `ay` runs to the
-/// end). The whole file feeds a SHA-256 as it is read, and the decompressed
-/// payload spills through [`spill_to_blob`], so neither the compressed part nor
-/// the payload is buffered beyond the streaming window and [`MMAP_THRESHOLD`].
-async fn decode_part(part_path: PathBuf, expected: &Checksum, staging: &OwnedFd) -> Result<Blob> {
+/// checksum over the whole on-disk file before the payload is expanded.
+async fn decode_part(part_path: PathBuf, entry: &MetaEntry, staging: &OwnedFd) -> Result<Blob> {
     let std_file = ostrya_rt::unblock(move || std::fs::File::open(&part_path))
         .await
         .map_err(Error::Io)?;
-    let mut reader = HashingReader::new(Sha256::new(), RtFile::from(std_file));
+    decode_part_stream(RtFile::from(std_file), entry, staging).await
+}
 
+/// Decode a part stream into a random-access [`Blob`], verifying the part
+/// checksum over the whole stream before any of it is decompressed.
+///
+/// The `(yay)` part frame is a compression byte followed by the body to EOF (a
+/// tuple whose fixed `y` sits at offset 0 and whose trailing `ay` runs to the
+/// end). The stream is a part file for an offline application and a fetched
+/// response body for a pull.
+///
+/// The body is taken in under the size `entry` declares for the part file and
+/// hashed as it arrives, and the part checksum is asserted before the decoder
+/// runs. What the payload decompresses to is therefore bounded by a stream that
+/// hashes to the checksum the superblock names: a body that grew, shrank, or was
+/// swapped is refused having written at most the declared size, and a payload
+/// that expands without bound is one the delta's own publisher wrote. Both blobs
+/// spill through [`spill_to_blob`], so neither the body nor the payload is held
+/// beyond [`MMAP_THRESHOLD`] on the heap.
+pub(crate) async fn decode_part_stream<R: AsyncRead + Unpin>(
+    mut stream: R,
+    entry: &MetaEntry,
+    staging: &OwnedFd,
+) -> Result<Blob> {
     let mut first = [0u8; 1];
-    reader.read_exact(&mut first).await.map_err(Error::Io)?;
-    let compression = first[0];
+    stream.read_exact(&mut first).await.map_err(Error::Io)?;
+    // The checksum covers the whole part file, so the framing byte seeds the
+    // digest the body streams into.
+    let mut hasher = Sha256::new();
+    hasher.update(first);
+    let mut reader = HashingReader::new(hasher, stream);
 
-    let blob = match compression {
-        COMPRESSION_NONE => spill_to_blob(&mut reader, staging).await?,
-        COMPRESSION_XZ => {
-            let decoder = XzDecoder::new(BufReader::new(&mut reader));
-            spill_to_blob(decoder, staging).await?
-        }
-        other => {
-            return Err(Error::InvalidFormat(format!(
-                "static delta part compression byte {other:#x} is not supported"
-            )));
-        }
-    };
-
-    // Draw any bytes the decoder left unread so the part checksum covers the
-    // whole on-disk file, then assert it.
-    let mut scratch = [0u8; 4096];
-    while reader.read(&mut scratch).await.map_err(Error::Io)? != 0 {}
+    // What the declared size leaves for the body, the framing byte spent.
+    let body_limit = entry.size.saturating_sub(1);
+    let body = spill_to_blob(&mut reader, staging, Some(body_limit)).await?;
     let (part_csum, _size) = reader.finalize();
-    if part_csum != *expected {
+    if part_csum != entry.part_csum {
         return Err(Error::InvalidFormat(
             "static delta part checksum mismatch".to_owned(),
         ));
     }
-    Ok(blob)
+
+    match first[0] {
+        COMPRESSION_NONE => Ok(body),
+        COMPRESSION_XZ => {
+            let decoder = XzDecoder::new(Cursor::new(body.as_slice()));
+            spill_to_blob(decoder, staging, None).await
+        }
+        other => Err(Error::InvalidFormat(format!(
+            "static delta part compression byte {other:#x} is not supported"
+        ))),
+    }
 }
 
 /// Drain `reader` into a [`Blob`], keeping bytes on the heap until they exceed
 /// [`MMAP_THRESHOLD`], then spilling to an anonymous temp file that is mmapped
 /// read-only. A blob past the heap threshold costs staging-filesystem space and
-/// address space, not resident heap, so the size it accepts is bounded by free
-/// disk the way the reference tool is: a spill that would exhaust the filesystem
-/// fails when the write returns `ENOSPC`, not at a fixed ceiling.
+/// address space, not resident heap.
+///
+/// `limit` is the number of bytes the stream is allowed to deliver, for a stream
+/// whose length is declared ahead of it: a part file's body is read under the size
+/// its meta-entry states, so a body that grew is refused at that ceiling instead
+/// of filling the staging filesystem. A stream with nothing declared for it takes
+/// `None` and is bounded by free disk the way the reference tool is: a spill that
+/// would exhaust the filesystem fails when the write returns `ENOSPC`.
 pub(crate) async fn spill_to_blob<R: AsyncRead + Unpin>(
     mut reader: R,
     staging: &OwnedFd,
+    limit: Option<u64>,
 ) -> Result<Blob> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; IO_CHUNK];
@@ -492,6 +576,13 @@ pub(crate) async fn spill_to_blob<R: AsyncRead + Unpin>(
         total = total
             .checked_add(n)
             .ok_or_else(|| op_error("blob size overflows usize"))?;
+        if let Some(limit) = limit
+            && total as u64 > limit
+        {
+            return Err(op_error(&format!(
+                "a stream passed the {limit} byte(s) declared for it"
+            )));
+        }
         match &mut spilled {
             Some(file) => file.write_all(&chunk[..n]).await.map_err(Error::Io)?,
             None if buf.len() + n <= MMAP_THRESHOLD => buf.extend_from_slice(&chunk[..n]),
@@ -563,11 +654,18 @@ pub(crate) fn open_rw_temp(staging: BorrowedFd<'_>) -> Result<OwnedFd> {
 /// wrong object. The mode and xattr tables are small (format-bounded) and are
 /// collected up front; the data source and operation stream borrow the part
 /// blob, and object payloads stream to disk without buffering the whole object.
-async fn apply_part(
+///
+/// `checks` holds the mode checks a content object this part produces is subject
+/// to: what the caller's flags require and what the destination mode requires.
+/// They are made on the part's own mode and xattr tables, before the object's
+/// bytes are written, so a delta delivers no object a loose fetch of the same
+/// object would be refused.
+pub(crate) async fn apply_part(
     txn: &Transaction,
     blob: &Blob,
     objects: &[(ObjectType, Checksum)],
     staging: &OwnedFd,
+    checks: ModeChecks,
 ) -> Result<()> {
     let view: PartView<'_> = GvDecode::decode(blob.as_slice()).map_err(ostrya_core::Error::from)?;
     let (mode_it, xattr_it, data_source, ops) = view;
@@ -627,8 +725,10 @@ async fn apply_part(
                     let len = take_leb(ops, &mut cur)? as usize;
                     let off = take_leb(ops, &mut cur)? as usize;
                     let bytes = slice(data_source, off, len)?;
-                    write_content_slice(txn, &modes, &xattrs, mode_idx, xattr_idx, bytes, &csum)
-                        .await?;
+                    write_content_slice(
+                        txn, &modes, &xattrs, mode_idx, xattr_idx, bytes, &csum, checks,
+                    )
+                    .await?;
                 }
                 index += 1;
             }
@@ -640,7 +740,11 @@ async fn apply_part(
                 let meta = if objtype.is_meta() {
                     None
                 } else {
-                    Some(file_meta(&modes, &xattrs, mode_idx, xattr_idx)?)
+                    let meta = file_meta(&modes, &xattrs, mode_idx, xattr_idx)?;
+                    // Before the content writer opens, so a refused object
+                    // writes nothing.
+                    checks.check(&csum, &meta)?;
+                    Some(meta)
                 };
                 // A metadata object or a symlink target buffers whole on the
                 // heap ([`Sink::Buffer`]), so its declared size is held to the
@@ -856,6 +960,7 @@ async fn close_object(txn: &Transaction, obj: OpenState<'_>) -> Result<()> {
 /// Write a content object (a regular file or a symlink) spliced from `content`,
 /// with the mode and xattrs the part's tables supply. A regular file streams to
 /// disk in bounded chunks; a symlink takes the bytes as its target.
+#[allow(clippy::too_many_arguments)]
 async fn write_content_slice(
     txn: &Transaction,
     modes: &[(u32, u32, u32)],
@@ -864,8 +969,11 @@ async fn write_content_slice(
     xattr_idx: usize,
     content: &[u8],
     expected: &Checksum,
+    checks: ModeChecks,
 ) -> Result<()> {
     let meta = file_meta(modes, xattrs, mode_idx, xattr_idx)?;
+    // Before either writer opens, so a refused object writes nothing.
+    checks.check(expected, &meta)?;
     if meta.mode & S_IFMT == S_IFLNK {
         let target = std::str::from_utf8(content)
             .map_err(|_| op_error("symlink target is not valid UTF-8"))?;
@@ -969,7 +1077,7 @@ async fn load_source_blob(
 ) -> Result<Blob> {
     let file = txn.load_file_staged_first(checksum).await?;
     let reader = file.reader().await?;
-    spill_to_blob(reader, staging).await
+    spill_to_blob(reader, staging, None).await
 }
 
 /// Read a whole file into a size-bounded buffer, off the async thread. Used for
@@ -1052,4 +1160,118 @@ fn byte_field(value: &Value, what: &str) -> Result<u8> {
     value
         .as_byte()
         .ok_or_else(|| Error::InvalidFormat(format!("expected {what} to be a byte")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ostrya_rt::block_on;
+
+    /// A directory descriptor for the spill path. Every part here is far below
+    /// [`MMAP_THRESHOLD`], so no temp file is opened through it.
+    fn staging_fd() -> OwnedFd {
+        use rustix::fs::{Mode, OFlags, open};
+        open(
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap()
+    }
+
+    /// A meta-entry naming a part file of `file` bytes, declaring `size` for it.
+    fn meta_entry(file: &[u8], size: u64) -> MetaEntry {
+        MetaEntry {
+            part_csum: Checksum::sha256(file),
+            size,
+            objects: Vec::new(),
+        }
+    }
+
+    /// One meta-entry tuple `(uayttay)` declaring `size`.
+    fn meta_entry_value(size: u64) -> Value {
+        Value::Tuple(vec![
+            Value::U32(0),
+            Value::Bytes(Checksum::from_bytes([0x11; 32]).as_bytes().to_vec()),
+            Value::U64(size),
+            Value::U64(0),
+            Value::Bytes(Vec::new()),
+        ])
+    }
+
+    /// A superblock metadata dict carrying one `ostree.endianness` byte.
+    fn endianness_dict(byte: u8) -> Value {
+        let mut dict = Value::Array(Vec::new());
+        crate::commit::append_dict_entry(
+            &mut dict,
+            ENDIANNESS_KEY,
+            Value::variant(Type::parse("y").unwrap(), Value::Byte(byte)),
+        )
+        .unwrap();
+        dict
+    }
+
+    /// An uncompressed part reads back as its payload, and a body longer than the
+    /// meta-entry declares is refused at that ceiling -- here with a checksum that
+    /// covers the longer body, so the size is what stops it.
+    #[test]
+    fn a_part_body_is_read_under_the_declared_size() {
+        block_on(async {
+            let staging = staging_fd();
+            let payload = b"a part payload";
+            let mut file = vec![COMPRESSION_NONE];
+            file.extend_from_slice(payload);
+            let declared = file.len() as u64;
+
+            let entry = meta_entry(&file, declared);
+            let blob = decode_part_stream(Cursor::new(file.clone()), &entry, &staging)
+                .await
+                .unwrap();
+            assert_eq!(blob.as_slice(), payload);
+
+            let mut longer = file;
+            longer.extend_from_slice(b"and more");
+            let entry = meta_entry(&longer, declared);
+            let Err(err) = decode_part_stream(Cursor::new(longer), &entry, &staging).await else {
+                panic!("a body past the declared size was accepted");
+            };
+            assert!(
+                err.to_string()
+                    .contains(&format!("{} byte(s) declared", payload.len())),
+                "{err}"
+            );
+        });
+    }
+
+    /// The part checksum is asserted before the decoder runs: a part declaring xz
+    /// whose body is not an xz stream is refused for what it is, and the decoder
+    /// never sees the body.
+    #[test]
+    fn a_swapped_part_body_fails_its_checksum_before_the_decoder_runs() {
+        block_on(async {
+            let staging = staging_fd();
+            let mut file = vec![COMPRESSION_XZ];
+            file.extend_from_slice(b"not an xz stream at all");
+            let entry = meta_entry(b"a different part file", file.len() as u64);
+            let Err(err) = decode_part_stream(Cursor::new(file), &entry, &staging).await else {
+                panic!("a part whose body was swapped was accepted");
+            };
+            assert!(err.to_string().contains("part checksum mismatch"), "{err}");
+        });
+    }
+
+    /// A meta-entry's size is host order, which the `ostree.endianness` byte
+    /// declares, so a big-endian producer's field is swapped back.
+    #[test]
+    fn a_meta_entry_size_follows_the_endianness_byte() {
+        let little = parse_meta_entries(&[meta_entry_value(8733)], false).unwrap();
+        assert_eq!(little[0].size, 8733);
+        let big = parse_meta_entries(&[meta_entry_value(8733u64.swap_bytes())], true).unwrap();
+        assert_eq!(big[0].size, 8733);
+
+        assert!(declares_big_endian(&endianness_dict(ENDIANNESS_BIG)));
+        assert!(!declares_big_endian(&endianness_dict(ENDIANNESS_LITTLE)));
+        // A superblock stating nothing reads as little-endian.
+        assert!(!declares_big_endian(&Value::Array(Vec::new())));
+    }
 }

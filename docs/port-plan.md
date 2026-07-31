@@ -1568,10 +1568,12 @@ exposes `list` and `apply-offline`. The recovered operand grammar and bspatch
 layout are in `format-reference.md`. xz decode streams through
 `async-compression`'s xz codec; xz encode, the same codec's other half, lands
 with generation. Application is memory-bounded: the superblock is read whole
-(bounded metadata, capped at the metadata ceiling), parts decompress into
-anonymous temp files in the repo, part payloads and source objects at or below
-128 KiB stay on the heap and larger ones are read-only mmapped, and objects
-stream through the content writer rather than materializing whole. A part names
+(bounded metadata, capped at the metadata ceiling), a part file is read in under
+the size its meta-entry declares and checked against its part checksum before it
+decompresses into an anonymous temp file in the repo, part bodies, payloads and
+source objects at or below 128 KiB stay on the heap and larger ones are read-only
+mmapped, and objects stream through the content writer rather than materializing
+whole. A part names
 its read source once per contiguous run it copies, so the reader holds the loaded
 source across the `R` that ends a run and reuses it when a later `r` names the
 same checksum; objects are content-addressed, so a checksum match means
@@ -1780,9 +1782,9 @@ last chunk carries a digest the index does not hold and copies on the byte
 comparison alone. The upstream `test-delta`, `test-delta-ed25519`, and
 `test-delta-sign` shell tests run at the CLI-compatibility phase.
 
-Deferred: the summary's `ostree.static-deltas` map, which advertises a
-repository's deltas to a fetcher, lands with pull (Phase 16); the key's position
-in the metadata dict is recorded in `format-reference.md`.
+The summary's `ostree.static-deltas` map, which advertises a repository's deltas
+to a fetcher, landed with the delta-accelerated pull in Phase 16d; the key's
+position in the metadata dict is recorded in `format-reference.md`.
 
 ### Phase 16 -- Pull
 
@@ -1795,8 +1797,9 @@ Split into sub-phases:
   reading, content and commit verification, timestamp checks, mirror mode. The
   ref-binding check and the commitpartial markers landed with 16b, which is
   source-agnostic; 16c reuses them.
-- 16d Delta-accelerated pull, the delta-part cap of 2, and the config and mount
-  repo finders.
+- 16d Delta-accelerated pull and the delta-part cap of 2 (DONE, see below). The
+  config and mount repo finders moved out of this sub-phase: a finder resolves a
+  collection ref, and collection refs are not yet scheduled.
 - 16e Commit and summary signature verification during a pull.
 - 16f The `ostrya pull` CLI command.
 - 16g Archive-to-archive pass-through: store a fetched `.filez` verbatim instead
@@ -2590,6 +2593,187 @@ Deferred: `contenturl`, `metalink`, and mirrorlists; subpath pulls; collection
 refs and `refs/mirrors`; the summary cache under `tmp/cache/summaries/`; the
 archive-to-archive pass-through, which is 16g.
 
+#### Phase 16d -- Delta-accelerated pull (DONE)
+
+A remote that publishes static deltas delivers a commit as one delta instead of
+one request per object. `Repo::pull` looks for such a delta for each requested
+tip, applies it into the pull's transaction through the Phase 15a read path, and
+falls back to loose objects wherever a delta is not to be had. The write side of
+the advertisement lands here too: the summary's `ostree.static-deltas` map,
+deferred from 15b.
+
+Which delta a pull takes. Exactly one candidate per tip: `<from>-<to>`, where
+`from` is the commit the ref being pulled names in this repository, and the
+from-scratch `<to>` where the ref names none. A from-to delta patches against the
+source commit's objects, so the source commit has to be here complete; a ref
+whose commit is absent or partial, or which already names the target, is read as
+naming none. A repository holding the ref's commit therefore does not take a
+from-scratch delta, which would re-deliver every object of the target including
+the ones it holds -- what it is missing arrives loose instead. The tool was
+observed to make the same single choice: a client holding the ref's commit
+against a remote advertising only the from-scratch delta fetches loose, and a
+fresh client against a remote advertising only the from-to delta does the same.
+
+Where a delta is advertised, in the order a pull reads them:
+`delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index` whenever the summary states
+`indexed-deltas` (the default a summary that omits the key carries), then the
+summary's own `ostree.static-deltas` map when the index answers 404 -- which is
+what a repository holding deltas that was never reindexed serves. Both hold the
+same thing, a delta name mapped to the SHA-256 of that delta's superblock. A
+candidate the map does not name is not asked for. A remote serving no summary
+advertises nothing and the superblock is requested by name, which the tool was
+observed to do as well.
+
+What is checked. A superblock the remote advertised a digest for is hashed and
+compared against it before it is parsed, so a delta swapped underneath a signed
+summary fails the pull with `ChecksumMismatch` and no part is fetched; the tool
+refuses the same case with `error: Invalid checksum for static delta <name>`. The
+parsed superblock has to name the commit being pulled and the source commit its
+name claims. The delta's own signatures are checked next, over the raw superblock
+bytes and ahead of any part request, so a delta that fails verification costs no
+part bytes, which is the property the digest check has. That check is the seam
+`verify_fetched_delta` in `crates/ostrya/src/pull/delta.rs`; Phase 16d has no
+verification policy to apply and accepts every delta there, and 16e supplies the
+body. Each part file is hashed against the superblock's entry for it, and
+every object a part produces is written under the checksum the superblock names,
+which is the read path's own rule. A superblock the remote does not hold is a
+404: the advertisement is stale, and the pull fetches the objects loose.
+
+What a part costs to receive. A part is fetched under the size its meta-entry
+declares, so the fetcher refuses a `Content-Length` above that size before the
+body arrives and stops a body that passes it as the bytes land; the offline path
+reads the part file in under the same size. The part checksum is asserted over the
+body before the xz decoder runs, so a body that hashes to anything else is refused
+having written at most the declared size to the staging filesystem, and what the
+payload expands to is bounded by a stream that hashes to the checksum the
+superblock names -- a decompression bomb has to be one the delta's own publisher
+wrote and advertised. Each part in flight therefore holds two blobs, the verified
+body and the payload, each on the heap at or below the 128 KiB threshold and
+spilled to a mapped temp file above it.
+
+What a pull retains per delta, for the length of the pull: the target commit's
+bytes, the per-part meta-entries, and the fallback list. The raw superblock bytes
+and the signature array are read by the verification above and dropped there, so
+what stays resident is proportional to the target commit's object count -- 33
+bytes per object across the meta-entries -- rather than to the superblock size the
+remote chose. A pull of N tips holds N such jobs at once.
+
+A meta-entry's `size` is host order, which
+the superblock's `ostree.endianness` byte declares: it is swapped where the byte
+states `B` and read as little-endian where the byte is absent, which is what every
+producer of these deltas writes. The `usize` field goes unread, since it counts
+what the part's objects add up to rather than the size of the payload that carries
+them.
+
+A content object a part produces is held to the same mode checks a loose one is:
+`BAREUSERONLY_FILES` bounds a regular file's logical mode, and a bare-user-only
+destination takes only an object whose logical form is the one it stores. Both
+read the mode and xattr tables the part carries, and both run before the object's
+writer opens, so a delta delivers no object a loose fetch of the same object
+would be refused and a refused object writes nothing. Offline application carries
+no pull flags and makes the destination's check alone, which states a
+bare-user-only refusal in the destination's own terms rather than as the checksum
+mismatch the canonicalized write would produce.
+
+`PullOptions` grows `disable_static_deltas`, which asks for no delta at all, and
+`require_static_deltas`, which refuses a remote advertising none -- no summary, or
+a summary with neither an index nor the delta map. A remote that advertises deltas
+satisfies the requirement even where none of them produces the commit being
+pulled, and that pull fetches its objects loose; this is the tool's own rule,
+whose message names the same two sources ("no summary deltas or delta index
+found"). A tip this repository already holds complete is not looked for, so a pull
+with nothing to fetch is not refused, and `disable_static_deltas` wins over the
+requirement, since a pull that asks for no delta finds none to require.
+
+The plan grows a part class, drained after the commits and before the scan,
+fetched at high priority, and held to two in flight whatever
+`max_outstanding_fetches` is. Each part in flight costs an xz decoder, the
+verified part body, and the decompressed payload, each blob spilling to a temp
+file past its heap threshold, and the cap is the reference tool's own. The loop can therefore run out of work while
+parts are queued, which is safe: a part is held back only when another is in
+flight, and that one occupies a slot the loop is waiting on. Parts are applied as
+they arrive rather than in part order, which the format allows -- a part patches
+against the source commit's objects, present before the delta is applied, and
+never against another part's output. The write throttle does not cover a part: by
+the time a part is applied its payload is a local blob, and the cap of two is what
+bounds concurrent part writers.
+
+What a delta contributes to the plan. The target commit rides in the superblock
+and is staged from there, so no `.commit` is requested; its `.commitmeta` travels
+as it does for any commit. The objects the delta hands over loose are queued at
+once, so they travel alongside the parts rather than after them. The commit's tree
+walk is queued once the delta's last part is applied: it reads what the delta
+staged, asks the network for nothing when the delta was complete, and fetches
+loose whatever no part delivered. That is a divergence from the tool, which takes
+the delta plus its fallback list as the whole of what a commit needs and does not
+walk; the walk is what keeps this pull's invariant that a published commit is
+whole. A commit-only pull takes no delta, since its plan is the commit objects
+alone.
+
+Summary write side: `ostree.static-deltas` maps each delta under `deltas/` to the
+SHA-256 of its superblock, emitted between `ostree.summary.tombstone-commits` and
+`ostree.summary.collection-map` and present only when the repository holds a
+delta. The port emits the entries ordered by delta name. The tool emits them in
+the order it walked `deltas/`, which is the order its filesystem returned -- shown
+by four deltas of one target coming back in neither name order nor any other
+stable one -- so the two writers agree on the entries of the map and not on their
+order, and a summary carrying deltas is not byte-comparable against the tool's.
+
+One capability difference: the tool refuses a delta-accelerated pull into an
+archive repository (`error: Can't use static deltas in an archive repo`). The port
+applies a delta into any destination mode, since its applier writes through the
+transaction's content writer, which stores what each mode requires.
+
+Verify (`crates/ostrya/tests/pull_http.rs`, over the same in-process file server
+16c uses): a destination one update behind takes the from-to delta -- the index,
+the superblock, and the part are requested, no `.commit` and no `.filez` are, the
+`.commitmeta` still travels, and the commit is complete and passes fsck; that same
+from-to shape into an archive, a bare-user, and a bare-user-only destination lands
+the target commit whole and passes each destination's own fsck, the part copying
+most of a 256 KiB edited file out of the source object that destination already
+holds in its own storage form; a fresh
+destination takes the from-scratch delta; a destination holding the ref's commit
+leaves an advertised from-scratch delta alone and fetches loose; a remote with no
+index falls back to the summary map; a remote with no summary is probed by name; a
+stale advertisement falls back to loose objects; a superblock that misses its
+advertised digest fails with `ChecksumMismatch`, leaves the ref where it was, and
+fetches no part; `require_static_deltas` refuses a remote advertising none and
+accepts one advertising a delta that does not cover the commit; `disable_static_deltas`
+asks for neither the index nor a superblock; a multi-part delta (`max_chunk_size`
+of one byte, one object per part) has every part fetched and applied; a delta
+whose largest object went to a fallback has that object fetched loose; two
+refs pulled in one call each take a delta of their own, whose overlapping trees
+stage the same objects twice in one transaction and publish each once; and
+`BAREUSERONLY_FILES` refuses an object a part delivers at mode `04755`, publishing
+nothing, where the same delta pulled without the flag delivers that object and the
+destination passes fsck; and a remote answering a part request with four times the
+part fails the pull with `FetchTooLarge` at the size the superblock declares,
+publishing nothing. Two interop
+tests need the tool: the port applies a delta the tool generated and indexed, and
+the tool's fsck and `cat` accept the result; and the tool pulls a delta the port
+generated over the port's own server with `--require-static-deltas`, resolves the
+ref, passes its own fsck, and reads the changed file back. Unit tests cover the
+request paths, the delta names, the digest lookup, and the plan: a delta queues
+its parts before its tree, the cap of two holds however many parts a delta has,
+and a delta of fallbacks alone queues its tree at once. Three more cover what a
+part is read under: a body past the size its meta-entry declares is refused at
+that ceiling, carrying a checksum that covers the longer body so the size is what
+stops it; a part declaring xz whose body is not an xz stream is refused for its
+checksum, which places the check ahead of the decoder; and a meta-entry size reads
+back in host order through the endianness byte, an absent byte included.
+`crates/ostrya/tests/summary.rs`
+covers the map: absent without deltas, naming a delta of each shape -- from
+scratch and from a source commit -- each under its own superblock's digest,
+positioned between `tombstone-commits` and `indexed-deltas`, and read back by the
+tool's `summary --print-metadata-key`.
+
+Deferred: the body of the delta signature check, which travels with commit and
+summary verification in 16e. Phase 16d verifies no delta signature: the seam runs
+on every fetched delta and accepts it. Also deferred:
+`ostrya pull --disable-static-deltas` and
+`--require-static-deltas`, which land with the CLI command in 16f; and inline
+delta parts, which no remote the port pulls from publishes.
+
 #### Phase 16g -- Archive-to-archive pass-through
 
 A content object arrives deflated and reaches the object store through
@@ -2779,8 +2963,10 @@ Resolved:
    external crates: `rt::Timer` wraps the existing backends (`smol::Timer`,
    `tokio::time`) and the in-process coordination uses `std::sync::Mutex`.
 
-9. Repo finders: the config and mount finders land with pull (Phase 16d);
-   avahi discovery is out of scope.
+9. Repo finders: the config and mount finders land with the phase that brings
+   collection refs, which a finder resolves and which is not yet scheduled; they
+   were originally slated for Phase 16d and moved out of it. Avahi discovery is
+   out of scope.
 10. HTTP/2: required for pull. The fetcher is built on `hyper` 1.11
     (`client`, `http1`, `http2`) with ALPN over `rustls` 0.23, the crypto
     provider being `rustls-graviola` (Rust plus formally-verified assembly, no

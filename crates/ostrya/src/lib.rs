@@ -139,7 +139,17 @@
 //! [`MIRROR`](PullFlags::MIRROR) writes local refs and copies the remote's
 //! summary and its signature; and [`TimestampCheck`] refuses a tip older than
 //! what the ref already names. [`Repo::remote_fetch_summary`] reads a remote's
-//! `summary` and `summary.sig` on their own, and [`Summary`] parses one.
+//! `summary` and `summary.sig` on their own, and [`Summary`] parses one. A pull
+//! also takes a static delta where the remote publishes one (Phase 16d): the
+//! delta index, or the summary's `ostree.static-deltas` map, names the delta from
+//! the commit the ref holds here (or from scratch), its superblock is checked
+//! against the advertised digest, its parts are fetched two at a time and applied
+//! into the pull's transaction, and the objects it hands over loose are fetched as
+//! ordinary content objects;
+//! [`disable_static_deltas`](PullOptions::disable_static_deltas) and
+//! [`require_static_deltas`](PullOptions::require_static_deltas) control it, and
+//! [`Repo::regenerate_summary`] writes the map that advertises this repository's
+//! own deltas.
 
 mod bspatch;
 pub mod checkout;

@@ -726,8 +726,23 @@ requested. Refs are written under
 the remote's `summary` and `summary.sig` bytes to this repository when the pull
 took every ref.
 
-Still remote-only and unimplemented: `subdirs`, the static-delta switches,
-`override_commit_ids`, `gpg_verify`, `sign_verifiers`, and a progress callback.
+A remote that publishes static deltas delivers a commit as one delta instead of
+one request per object. A pull looks for one delta per tip: `<from>-<to>`, where
+`from` is the commit the ref names in this repository and holds complete, and the
+from-scratch `<to>` where the ref names none. The delta index for the target
+commit is read first and the summary's own `ostree.static-deltas` map where the
+remote serves no index; a remote serving no summary is asked for the superblock by
+name. A superblock the remote advertised a digest for is checked against it, the
+part files are checked against the superblock, and every object a part produces is
+written under the checksum the superblock names. Two part fetches are in flight at
+once whatever `max_outstanding_fetches` is. The objects the delta hands over loose
+are fetched as ordinary content objects, and the commit's tree is walked once the
+last part is applied, so an object no part delivered is fetched loose and a
+published commit is whole. `disable_static_deltas` asks for no delta;
+`require_static_deltas` refuses a remote that advertises none.
+
+Still remote-only and unimplemented: `subdirs`, `override_commit_ids`,
+`gpg_verify`, `sign_verifiers`, and a progress callback.
 
 ```rust
 pub struct PullFlags(u32);                // a bitset, as CommitModifierFlags is
@@ -767,6 +782,8 @@ pub struct PullOptions {
     pub max_outstanding_fetches: Option<usize>,  // None is 8
     pub n_network_retries: Option<u32>,          // None is 5
     pub timestamp_check: TimestampCheck,
+    pub disable_static_deltas: bool,      // fetch every object loose
+    pub require_static_deltas: bool,      // refuse a remote advertising none
 }
 
 pub struct PullStats {

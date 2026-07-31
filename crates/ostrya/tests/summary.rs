@@ -16,7 +16,9 @@ use std::process::Command;
 
 use common::{TmpDir, fixture_root, ostree_available};
 use ostrya::base64;
-use ostrya::{Ed25519Signer, Ed25519Verifier, Repo, SummaryOptions};
+use ostrya::{
+    Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, Repo, Summary, SummaryOptions, Value,
+};
 use ostrya_rt::block_on;
 
 /// The fixed epoch patched into both golden summaries' `last-modified` and used
@@ -214,5 +216,145 @@ fn tool_verifies_a_port_signed_summary() {
     assert!(
         remote_summary("good"),
         "the tool must verify a summary the port signed"
+    );
+}
+
+/// A repository holding static deltas advertises them in its summary:
+/// `ostree.static-deltas` maps each delta's name to the SHA-256 of its
+/// superblock, and the key sits between `tombstone-commits` and
+/// `indexed-deltas`, which is where the tool was observed to write it.
+#[test]
+fn the_summary_advertises_the_deltas_the_repository_holds() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-deltas");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+
+        // Without a delta the key is absent.
+        repo.regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_EPOCH),
+            metadata_commit_timestamp: None,
+        })
+        .await
+        .unwrap();
+        let bytes = repo.read_summary().await.unwrap().unwrap();
+        let summary = Summary::parse(&bytes).unwrap();
+        assert!(summary.metadata_value("ostree.static-deltas").is_none());
+
+        // One delta of each shape: from scratch, and from a source commit.
+        let refs = repo.list_refs(None).await.unwrap();
+        let (_, to) = refs.first().expect("the fixture holds a ref");
+        let (_, from) = refs.get(1).expect("the fixture holds a second ref");
+        let opts = DeltaOptions {
+            timestamp: Some(FIXED_EPOCH),
+            ..DeltaOptions::default()
+        };
+        let scratch_dir = repo.generate_static_delta(None, to, &opts).await.unwrap();
+        let from_to_dir = repo
+            .generate_static_delta(Some(from), to, &opts)
+            .await
+            .unwrap();
+        repo.regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_EPOCH),
+            metadata_commit_timestamp: None,
+        })
+        .await
+        .unwrap();
+
+        let bytes = repo.read_summary().await.unwrap().unwrap();
+        let summary = Summary::parse(&bytes).unwrap();
+        let map = summary
+            .metadata_value("ostree.static-deltas")
+            .expect("the summary advertises the deltas");
+        // Each delta the repository holds is named in the map under the digest of
+        // its own superblock.
+        let advertised = |name: &str| {
+            map.dict_get(name)
+                .and_then(Value::as_variant)
+                .and_then(|(_, value)| value.as_bytes())
+                .unwrap_or_else(|| panic!("the map must name delta {name}"))
+        };
+        let digest_of = |dir: &Path| {
+            let superblock = std::fs::read(repo_dir.join(dir).join("superblock")).unwrap();
+            Checksum::sha256(&superblock)
+        };
+        assert_eq!(
+            advertised(&to.to_hex()),
+            digest_of(&scratch_dir).as_bytes(),
+            "the map must carry the from-scratch delta's superblock digest"
+        );
+        assert_eq!(
+            advertised(&format!("{}-{}", from.to_hex(), to.to_hex())),
+            digest_of(&from_to_dir).as_bytes(),
+            "the map must carry the from-to delta's superblock digest"
+        );
+
+        // The key's neighbours: the entries appear in the order byte identity
+        // relies on.
+        let keys: Vec<String> = match &summary.metadata {
+            Value::Array(entries) => entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    Value::Tuple(fields) => fields.first()?.as_str().map(str::to_owned),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("the summary metadata is not a dict: {other:?}"),
+        };
+        let position = |key: &str| keys.iter().position(|k| k == key).expect(key);
+        assert!(
+            position("ostree.summary.tombstone-commits") < position("ostree.static-deltas")
+                && position("ostree.static-deltas") < position("ostree.summary.indexed-deltas"),
+            "{keys:?}"
+        );
+    });
+}
+
+/// The `ostree` tool reads the delta map the port wrote, which is the
+/// interoperability the advertisement exists for: a fetcher finds the deltas
+/// through it.
+#[test]
+fn the_tool_reads_the_port_written_delta_map() {
+    if !ostree_available() {
+        eprintln!("skipping: ostree tool not available");
+        return;
+    }
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-deltas-tool");
+    let to = block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let refs = repo.list_refs(None).await.unwrap();
+        let (_, to) = *refs.first().expect("the fixture holds a ref");
+        repo.generate_static_delta(
+            None,
+            &to,
+            &DeltaOptions {
+                timestamp: Some(FIXED_EPOCH),
+                ..DeltaOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        repo.regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_EPOCH),
+            metadata_commit_timestamp: None,
+        })
+        .await
+        .unwrap();
+        to
+    });
+
+    let printed = Command::new("ostree")
+        .arg(format!("--repo={}", repo_dir.display()))
+        .args(["summary", "--print-metadata-key=ostree.static-deltas"])
+        .output()
+        .expect("run ostree summary");
+    assert!(
+        printed.status.success(),
+        "the tool must read the port's summary: {}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    let text = String::from_utf8_lossy(&printed.stdout);
+    assert!(
+        text.contains(&to.to_hex()),
+        "the tool must list the delta the port advertised: {text}"
     );
 }

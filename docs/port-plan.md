@@ -1811,8 +1811,8 @@ Split into sub-phases:
   below): the GPG and sign-api axes, their configuration keys and key sources,
   and the delta signature check 16d left open.
 - 16f The `ostrya pull` CLI command (DONE, see below).
-- 16g Archive-to-archive pass-through: store a fetched `.filez` verbatim instead
-  of inflating and deflating it again (see below).
+- 16g Archive-to-archive pass-through (DONE, see below): store a fetched
+  `.filez` verbatim instead of inflating and deflating it again.
 Verify: pull from a local trivial httpd over both HTTP/1.1 and HTTP/2; the
 `test-pull-*`, `test-local-pull*`, `test-signed-pull*` clusters via the
 harness.
@@ -3058,7 +3058,7 @@ library does not have; the `--gpg-verify` and `--gpg-verify-summary` switches on
 supplies the prefix; and the `ostree`-compatible spellings, exit codes, and
 progress output, which are Phase 17.
 
-#### Phase 16g -- Archive-to-archive pass-through
+#### Phase 16g -- Archive-to-archive pass-through (DONE)
 
 A content object arrives deflated and reaches the object store through
 `ContentWriter`, which digests the bytes written to it. An archive destination

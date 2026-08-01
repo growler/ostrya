@@ -933,6 +933,300 @@ fn pulls_a_multi_read_payload_from_a_tool_built_remote() {
     });
 }
 
+/// An archive-to-archive pull stores every `.filez` object exactly as the
+/// remote holds it, rather than inflating and recompressing it at the
+/// destination's own `zlib-level` (Phase 16g). The destination is configured
+/// with a level far from the remote's default, over a payload long and
+/// repetitive enough that recompressing it at a different level would leave a
+/// visibly different byte sequence: a match here can only mean the fetched
+/// bytes were stored verbatim.
+#[test]
+fn an_archive_pull_reproduces_filez_bytes_at_a_different_zlib_level() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-passthrough-level");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        let big = "the quick brown fox jumps over the lazy dog\n".repeat(4000);
+        std::fs::write(src.join("big.txt"), big.as_bytes()).unwrap();
+        let remote_path = dir.path().join("remote");
+        let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let commit = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+
+        let server = RepoServer::start(&remote_path, false).await;
+
+        let dest_path = dir.path().join("dest");
+        let dest_repo = Repo::create(&dest_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        drop(dest_repo);
+        let config = dest_path.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "\n[archive]\nzlib-level=1\n[remote \"origin\"]\nurl={}\ngpg-verify=false\n",
+            server.url()
+        ));
+        std::fs::write(&config, text).unwrap();
+        let dest = Repo::open(&dest_path).await.unwrap();
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let checksums = content_checksums(&remote, &commit).await;
+        assert!(!checksums.is_empty());
+        for checksum in checksums {
+            let path = filez_path(&checksum.to_hex());
+            let remote_bytes = std::fs::read(remote_path.join(&path)).unwrap();
+            let dest_bytes = std::fs::read(dest_path.join(&path)).unwrap();
+            assert_eq!(
+                dest_bytes, remote_bytes,
+                "{checksum}: the destination's .filez bytes differ from the remote's"
+            );
+        }
+    });
+}
+
+/// An archive-to-archive pull from a remote the `ostree` tool built stores
+/// every `.filez` object exactly as the tool wrote it (Phase 16g). The tool's
+/// zlib encoder and the port's own raw-DEFLATE encoder are different
+/// implementations, so bytes that match can only mean the destination stored
+/// the fetched bytes verbatim rather than inflating and recompressing them.
+#[test]
+fn an_archive_pull_reproduces_filez_bytes_from_a_tool_built_remote() {
+    if !ostree_available() {
+        eprintln!("skipping: the ostree tool is not installed");
+        return;
+    }
+    block_on(async {
+        let dir = TmpDir::new("pull-http-passthrough-tool-remote");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        let payload = incompressible(256 * 1024);
+        std::fs::write(src.join("big.bin"), &payload).unwrap();
+
+        let remote_path = dir.path().join("remote");
+        let remote_arg = format!("--repo={}", remote_path.display());
+        ostree(&[&remote_arg, "init", "--mode=archive"]);
+        let commit = String::from_utf8(ostree(&[
+            &remote_arg,
+            "commit",
+            "-b",
+            "test/main",
+            "--timestamp=2020-01-01 00:00:00 +0000",
+            &format!("--tree=dir={}", src.display()),
+        ]))
+        .unwrap()
+        .trim()
+        .to_owned();
+        ostree(&[&remote_arg, "summary", "-u"]);
+
+        let server = RepoServer::start(&remote_path, false).await;
+        let dest_path = dir.path().join("dest");
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let commit_checksum = Checksum::from_hex(&commit).unwrap();
+        let checksums = content_checksums(&dest, &commit_checksum).await;
+        assert!(!checksums.is_empty());
+        for checksum in checksums {
+            let path = filez_path(&checksum.to_hex());
+            let remote_bytes = std::fs::read(remote_path.join(&path)).unwrap();
+            let dest_bytes = std::fs::read(dest_path.join(&path)).unwrap();
+            assert_eq!(
+                dest_bytes, remote_bytes,
+                "{checksum}: the destination's .filez bytes differ from the tool-built remote's"
+            );
+        }
+
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        let dest_arg = format!("--repo={}", dest_path.display());
+        ostree(&[&dest_arg, "fsck"]);
+        let read_back = ostree(&[&dest_arg, "cat", &commit, "/big.bin"]);
+        assert!(
+            read_back == payload,
+            "the payload the tool read back differs"
+        );
+    });
+}
+
+/// A bare-family destination still stores the inflated payload (Phase 16g):
+/// the pass-through path applies only to an archive destination, so a
+/// bare-user destination's content object holds the plain, uncompressed bytes
+/// rather than the remote's raw-DEFLATE ones.
+#[test]
+fn a_bare_family_destination_still_stores_the_inflated_payload() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-passthrough-bare");
+        let (remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let (tree, _) = remote.read_commit(&commit.to_hex()).await.unwrap();
+        let mut content = None;
+        for entry in tree.read_dir().await.unwrap() {
+            if let TreeEntry::File { name, checksum } = entry
+                && name == "hello.txt"
+            {
+                content = Some(checksum);
+            }
+        }
+        let hex = content.expect("hello.txt").to_hex();
+        let stored = std::fs::read(
+            dir.path()
+                .join("dest")
+                .join("objects")
+                .join(&hex[..2])
+                .join(format!("{}.file", &hex[2..])),
+        )
+        .unwrap();
+        assert_eq!(stored, b"hello\n");
+    });
+}
+
+/// The declared size the pass-through path stores is held to equality, not
+/// treated as a ceiling (Phase 16g): a payload that inflates to fewer bytes
+/// than its header declares is refused just as one that inflates to more is.
+#[test]
+fn a_payload_underrunning_its_declared_size_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-declared-size-under");
+        let (remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        // Replace a payload-bearing object's compressed bytes with a final
+        // stored DEFLATE block of one byte, leaving the header -- and the
+        // size it declares -- as they were.
+        let mut victim = None;
+        for checksum in content_checksums(&remote, &commit).await {
+            let path = filez_path(&checksum.to_hex());
+            let stored = std::fs::read(dir.path().join("remote").join(&path)).unwrap();
+            let declared = u64::from_be_bytes(stored[8..16].try_into().unwrap());
+            if declared > 1 {
+                victim = Some((path, stored));
+                break;
+            }
+        }
+        let (path, stored) = victim.expect("the fixture tree holds a payload-bearing file");
+        let header_len = u32::from_be_bytes(stored[..4].try_into().unwrap()) as usize;
+        let mut tampered = stored[..8 + header_len].to_vec();
+        // A final stored block: BFINAL=1, BTYPE=00, then LEN=1, NLEN=!LEN, one
+        // byte of content.
+        tampered.extend_from_slice(&[0x01, 0x01, 0x00, 0xfe, 0xff, b'x']);
+        server.tamper(&path, tampered);
+
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
+        assert!(err.to_string().contains("inflates to 1 byte"), "{err}");
+        assert_nothing_published(&dest).await;
+    });
+}
+
+/// The overrun check reports its own message even when the compressed payload
+/// is long enough to arrive over more than one read (Phase 16g): the
+/// pass-through path decodes into a decoder that buffers decoded bytes and
+/// only forwards them on a later call, so a small fixture object -- one read,
+/// one decode, one forward -- cannot tell an overrun's own message apart from
+/// one folded into a generic "trailing bytes" report the way a multi-read
+/// object can.
+#[test]
+fn an_overrunning_payload_over_multiple_reads_reports_the_overrun() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-declared-size-over-multiread");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        std::fs::write(src.join("big.bin"), incompressible(200 * 1024)).unwrap();
+        let remote_path = dir.path().join("remote");
+        let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let commit = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+
+        let server = RepoServer::start(&remote_path, false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        // Declare a size well past what one read off the connection covers
+        // (`COPY_CHUNK` is 64 KiB) but short of the object's real, larger
+        // uncompressed size, so decoding it spans more than one read.
+        let mut victim = None;
+        for checksum in content_checksums(&remote, &commit).await {
+            let path = filez_path(&checksum.to_hex());
+            let stored = std::fs::read(remote_path.join(&path)).unwrap();
+            let declared = u64::from_be_bytes(stored[8..16].try_into().unwrap());
+            if declared > 150_000 {
+                victim = Some((path, stored));
+                break;
+            }
+        }
+        let (path, mut stored) = victim.expect("the fixture tree holds a large payload object");
+        stored[8..16].copy_from_slice(&150_000u64.to_be_bytes());
+        server.tamper(&path, stored);
+
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
+        assert!(err.to_string().contains("outgrew the 150000 byte"), "{err}");
+        assert_nothing_published(&dest).await;
+    });
+}
+
 /// A remote serving no summary answers 404 for it, and each requested ref
 /// resolves through `refs/heads/<ref>` instead.
 #[test]

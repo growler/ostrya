@@ -837,7 +837,7 @@ impl Repo {
         body: Body,
         read_buf: &mut Vec<u8>,
     ) -> Result<()> {
-        let (header, declared, mut body) = read_archive_header(body).await?;
+        let (header, declared, framed_header, mut body) = read_archive_header(body).await?;
         let symlink = header.is_symlink();
         let FileHeader {
             uid,
@@ -845,7 +845,7 @@ impl Repo {
             mode,
             symlink_target,
             xattrs,
-        } = header;
+        } = header.clone();
         let meta = FileMeta {
             uid,
             gid,
@@ -862,10 +862,27 @@ impl Repo {
                 .await?;
             return Ok(());
         }
-        let mut writer = ctx.txn.content_writer(Some(expected), &meta).await?;
         // The declared size bounds both sides of the payload: what it may
         // decompress to, and what may come off the connection to produce that.
         let source = BoundedInput::new(body, *expected, compressed_bound(declared));
+        if ctx.txn.repo().mode().is_archive() {
+            // The remote already stores this object deflated in the same wire
+            // form this destination writes: store the fetched bytes verbatim
+            // instead of inflating and recompressing them.
+            ctx.txn
+                .write_archive_payload(
+                    expected,
+                    &header,
+                    &framed_header,
+                    declared,
+                    source,
+                    read_buf,
+                )
+                .await
+                .map_err(payload_refusal)?;
+            return Ok(());
+        }
+        let mut writer = ctx.txn.content_writer(Some(expected), &meta).await?;
         let mut payload = DeflateDecoder::new(BufSource::new(source));
         copy_bounded(&mut payload, &mut writer, read_buf, expected, declared)
             .await
@@ -1390,13 +1407,18 @@ async fn fetch_whole(
 /// What remains of the stream is the raw-DEFLATE payload.
 ///
 /// The size the header declares for that payload is returned with it, and bounds
-/// what the payload is allowed to decompress to.
+/// what the payload is allowed to decompress to. The raw framed bytes -- the
+/// length prefix and the header variant, exactly as the remote sent them -- are
+/// returned too, for a caller that stores them verbatim rather than
+/// re-serializing the parsed header.
 ///
 /// The remote states the header length and supplies the bytes behind it, so a
 /// length above [`MAX_FILE_HEADER_SIZE`] is refused before the buffer for it is
 /// allocated. That bound holds for each fetch in flight, since one header is
 /// read per content object.
-async fn read_archive_header<R: AsyncRead + Unpin>(mut stream: R) -> Result<(FileHeader, u64, R)> {
+async fn read_archive_header<R: AsyncRead + Unpin>(
+    mut stream: R,
+) -> Result<(FileHeader, u64, Vec<u8>, R)> {
     let mut prefix = [0u8; 8];
     stream.read_exact(&mut prefix).await?;
     if prefix[4..] != [0u8; 4] {
@@ -1414,7 +1436,9 @@ async fn read_archive_header<R: AsyncRead + Unpin>(mut stream: R) -> Result<(Fil
     let mut bytes = vec![0u8; header_len as usize];
     stream.read_exact(&mut bytes).await?;
     let (header, uncompressed) = FileHeader::parse_archive(&bytes)?;
-    Ok((header, uncompressed, stream))
+    let mut framed = prefix.to_vec();
+    framed.extend_from_slice(&bytes);
+    Ok((header, uncompressed, framed, stream))
 }
 
 /// Stream a content object's payload into `writer`, stopping if it outgrows the
@@ -1658,10 +1682,13 @@ mod tests {
     fn the_header_is_read_off_the_front_and_the_payload_is_left() {
         block_on(async {
             let stored = framed(&regular_header(), 4, b"payload bytes");
-            let (header, declared, mut rest) =
-                read_archive_header(Cursor::new(stored)).await.unwrap();
+            let (header, declared, raw, mut rest) =
+                read_archive_header(Cursor::new(stored.clone()))
+                    .await
+                    .unwrap();
             assert_eq!(header, regular_header());
             assert_eq!(declared, 4);
+            assert_eq!(raw, stored[..stored.len() - b"payload bytes".len()]);
             let mut payload = Vec::new();
             rest.read_to_end(&mut payload).await.unwrap();
             assert_eq!(payload, b"payload bytes");
@@ -1681,7 +1708,7 @@ mod tests {
                 xattrs: Xattrs::default(),
             };
             let stored = framed(&header, 0, b"");
-            let (parsed, _declared, mut rest) =
+            let (parsed, _declared, _raw, mut rest) =
                 read_archive_header(Cursor::new(stored)).await.unwrap();
             assert!(parsed.is_symlink());
             assert_eq!(parsed.symlink_target, "hello.txt");

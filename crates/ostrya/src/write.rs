@@ -26,10 +26,12 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use async_compression::Level;
-use async_compression::futures::write::DeflateEncoder;
+use async_compression::futures::write::{DeflateDecoder, DeflateEncoder};
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use ostrya_core::filehdr::frame;
-use ostrya_core::{Checksum, DirMeta, FileHeader, ObjectType, RepoMode, Xattrs, loose_path};
+use ostrya_core::{
+    Checksum, ContentHasher, DirMeta, FileHeader, ObjectType, RepoMode, Xattrs, loose_path,
+};
 use ostrya_rt::File as RtFile;
 use rustix::fs::{AtFlags, Gid, Mode, OFlags, Uid, XattrFlags};
 use sha2::{Digest, Sha256};
@@ -368,6 +370,95 @@ impl Transaction {
         let mut writer = self.content_writer(expected, meta).await?;
         write_all(&mut writer, data).await?;
         writer.finish().await
+    }
+
+    /// Store a content object whose payload already arrives DEFLATE-compressed
+    /// in the archive wire form -- an archive remote's own `.filez` bytes --
+    /// writing the fetched bytes to the staging file verbatim instead of
+    /// inflating and recompressing them.
+    ///
+    /// `framed_header` is stored exactly as given, including the uncompressed
+    /// size it declares, rather than patched to match what `payload` actually
+    /// inflates to. The payload is inflated on a second, discarded branch to
+    /// feed the digest that establishes the object's identity, and the
+    /// inflated byte count is held to equal `declared` rather than treated as
+    /// a ceiling, so a header that over- or understates its payload is
+    /// refused rather than silently stored wrong.
+    ///
+    /// Valid only for an archive-mode repository. `header` must not be a
+    /// symlink's, which carries no payload -- see
+    /// [`write_symlink`](Transaction::write_symlink).
+    pub(crate) async fn write_archive_payload<R: AsyncRead + Unpin>(
+        &self,
+        expected: &Checksum,
+        header: &FileHeader,
+        framed_header: &[u8],
+        declared: u64,
+        mut payload: R,
+        buf: &mut Vec<u8>,
+    ) -> Result<Checksum> {
+        if !self.repo().mode().is_archive() {
+            return Err(Error::Unsupported(
+                "write_archive_payload stores an archive-form payload; the destination is not \
+                 archive"
+                    .into(),
+            ));
+        }
+
+        let staging = self.staging_fd().try_clone_to_owned()?;
+        let (fd, temp) = ostrya_rt::unblock(move || open_temp(staging.as_fd())).await?;
+        let mut file = RtFile::from(fd);
+        write_all(&mut file, framed_header).await?;
+
+        let mut inflate = DeflateDecoder::new(InflatedDigest::new(header, *expected, declared)?);
+        if buf.len() < COPY_CHUNK {
+            buf.resize(COPY_CHUNK, 0);
+        }
+        // Once the decoder reports a short write, its DEFLATE stream has ended
+        // within this chunk: it takes no more input, so nothing after that
+        // point is fed to it, only drained to return the connection to the
+        // pool. Anything left unconsumed, here or later in the stream, is
+        // bytes trailing the object. A write error is not a short write: it
+        // means the sink itself refused the payload (an inflated-size
+        // overrun), and `?` lets that failure's own message reach the caller.
+        let mut trailing = false;
+        loop {
+            let n = read_some(&mut payload, buf).await?;
+            if n == 0 {
+                break;
+            }
+            write_all(&mut file, &buf[..n]).await?;
+            if !trailing && write_up_to(&mut inflate, &buf[..n]).await? < n {
+                trailing = true;
+            }
+        }
+        if trailing {
+            return Err(Error::InvalidFormat(format!(
+                "content object {expected}: bytes follow the deflated payload"
+            )));
+        }
+        close(&mut inflate).await?;
+
+        let digest = inflate.into_inner();
+        if digest.seen != declared {
+            return Err(Error::InvalidFormat(format!(
+                "content object {expected}: the payload inflates to {} byte(s), not the \
+                 {declared} its header declares",
+                digest.seen
+            )));
+        }
+        let checksum = digest.hasher.finish();
+        if checksum != *expected {
+            return Err(Error::ChecksumMismatch {
+                expected: *expected,
+                actual: checksum,
+            });
+        }
+
+        flush(&mut file).await?;
+        let std_file = file.into_std().await;
+        self.stage_regular(checksum, header.clone(), std_file, temp, declared)
+            .await
     }
 
     /// Write a symlink content object. The identity is the framed header alone
@@ -1380,6 +1471,57 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for NoClose<W> {
     }
 }
 
+/// The write-side sink an archive pass-through's payload is inflated into: it
+/// hashes and counts the inflated bytes without storing them, refusing once
+/// the count passes `declared` so a payload built to inflate past what its
+/// header states cannot do unbounded work before
+/// [`write_archive_payload`](Transaction::write_archive_payload) checks the
+/// final count against it.
+struct InflatedDigest {
+    hasher: ContentHasher,
+    checksum: Checksum,
+    declared: u64,
+    seen: u64,
+}
+
+impl InflatedDigest {
+    fn new(header: &FileHeader, checksum: Checksum, declared: u64) -> Result<InflatedDigest> {
+        Ok(InflatedDigest {
+            hasher: ContentHasher::new(header)?,
+            checksum,
+            declared,
+            seen: 0,
+        })
+    }
+}
+
+impl AsyncWrite for InflatedDigest {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        me.seen += buf.len() as u64;
+        if me.seen > me.declared {
+            return Poll::Ready(Err(io::Error::other(Error::InvalidFormat(format!(
+                "content object {}: the payload outgrew the {} byte(s) its header declares",
+                me.checksum, me.declared
+            )))));
+        }
+        me.hasher.update(buf);
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 // --- minimal poll_fn combinators, so the write path needs no futures-lite ---
 
 async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, mut buf: &[u8]) -> io::Result<()> {
@@ -1400,6 +1542,38 @@ async fn write_all<W: AsyncWrite + Unpin>(w: &mut W, mut buf: &[u8]) -> io::Resu
         Poll::Ready(Ok(()))
     })
     .await
+}
+
+/// Feed as much of `buf` into `w` as it accepts, stopping at the first short
+/// write rather than retrying the rest: for the inflating decoder under
+/// [`write_archive_payload`](Transaction::write_archive_payload), a short
+/// write means its DEFLATE stream already ended within this call, and
+/// retrying the remainder would just ask a finished decoder for more --
+/// which it refuses with a hard error of its own, rather than the graceful
+/// `Ok(0)` many `AsyncWrite` implementations give a post-close write. That
+/// retry-after-short-write error is expected and is folded into the short
+/// write it followed, not surfaced. The caller compares the `Ok` value
+/// against `buf.len()` to tell whether anything went unconsumed.
+///
+/// An error on the first attempt for `buf` -- nothing yet written this call
+/// -- is a different case: the inflating sink under
+/// [`write_archive_payload`](Transaction::write_archive_payload) fails once
+/// bytes it buffers are actually forwarded, which can happen well after the
+/// chunk that overran it, so this may be the first the failure is seen at
+/// all. That error is returned rather than folded away, so its message
+/// reaches the caller instead of being replaced by a generic "trailing
+/// bytes" one.
+async fn write_up_to<W: AsyncWrite + Unpin>(w: &mut W, buf: &[u8]) -> io::Result<usize> {
+    let mut written = 0;
+    while written < buf.len() {
+        match poll_fn(|cx| Pin::new(&mut *w).poll_write(cx, &buf[written..])).await {
+            Ok(0) => break,
+            Ok(n) => written += n,
+            Err(e) if written == 0 => return Err(e),
+            Err(_) => break,
+        }
+    }
+    Ok(written)
 }
 
 pub(crate) async fn flush<W: AsyncWrite + Unpin>(w: &mut W) -> io::Result<()> {

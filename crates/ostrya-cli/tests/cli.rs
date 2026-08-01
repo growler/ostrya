@@ -10,11 +10,13 @@
 //! `--canonical-permissions` (owner 0:0, `perm & 0755`, no xattrs) and
 //! `SOURCE_DATE_EPOCH=1700000000` reproduces the fixture commit id.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ostrya::{CreateOptions, Repo, RepoMode, base64};
 use ostrya_rt::block_on;
@@ -1143,5 +1145,766 @@ fn static_delta_generate_refuses_output_dir_with_reindex() {
     assert!(
         !repo.join("delta-indexes").exists(),
         "the index cache was rebuilt anyway"
+    );
+}
+
+// --- pull over HTTP (Phase 16f) ----------------------------------------------
+
+/// A static file server over HTTP/1.1, serving one directory. The threads are
+/// detached and the listener closes with the process.
+///
+/// It answers `GET /<path>` with the file's bytes and 404 where the directory
+/// holds no such regular file, which is the whole of what a repository fetch
+/// reads. Each accepted connection runs in its own thread and stays open for as
+/// many requests as the client sends, so a pull holding several fetches at once
+/// is served without ordering them.
+struct FileServer {
+    port: u16,
+    log: Arc<Mutex<Vec<ServedRequest>>>,
+}
+
+/// One request the server answered.
+#[derive(Clone)]
+struct ServedRequest {
+    /// The request path with its leading `/` removed.
+    path: String,
+    /// The header lines, as sent.
+    headers: Vec<String>,
+}
+
+impl FileServer {
+    fn start(root: &Path) -> FileServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let port = listener.local_addr().unwrap().port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let root = root.to_owned();
+        let thread_log = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let root = root.clone();
+                let log = Arc::clone(&thread_log);
+                std::thread::spawn(move || serve_connection(stream, &root, &log));
+            }
+        });
+        FileServer { port, log }
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The paths served so far, in the order they arrived.
+    fn seen(&self) -> Vec<String> {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.path.clone())
+            .collect()
+    }
+
+    /// Whether every request served so far carried `line` among its headers.
+    fn every_request_carried(&self, line: &str) -> bool {
+        let log = self.log.lock().unwrap();
+        !log.is_empty() && log.iter().all(|r| r.headers.iter().any(|h| h == line))
+    }
+
+    /// Drop the record, so a second pull's requests are read on their own.
+    fn clear(&self) {
+        self.log.lock().unwrap().clear();
+    }
+}
+
+/// Answer requests on one connection until the client closes it.
+fn serve_connection(stream: TcpStream, root: &Path, log: &Mutex<Vec<ServedRequest>>) {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone connection"));
+    let mut writer = stream;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let path = match line.split_whitespace().nth(1) {
+            Some(target) => target.trim_start_matches('/').to_owned(),
+            None => return,
+        };
+        // The requests a pull sends carry no body, so the head ends the request.
+        let mut headers = Vec::new();
+        loop {
+            let mut header = String::new();
+            match reader.read_line(&mut header) {
+                Ok(0) | Err(_) => return,
+                Ok(_) if header == "\r\n" || header == "\n" => break,
+                Ok(_) => headers.push(header.trim_end().to_owned()),
+            }
+        }
+        log.lock().unwrap().push(ServedRequest {
+            path: path.clone(),
+            headers,
+        });
+
+        let body = served_path(root, &path).and_then(|p| std::fs::read(p).ok());
+        let head = match &body {
+            Some(bytes) => format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()),
+            None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned(),
+        };
+        if writer.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        if let Some(bytes) = body
+            && writer.write_all(&bytes).is_err()
+        {
+            return;
+        }
+    }
+}
+
+/// The file a request path names under `root`, or `None` where the path names
+/// no regular file or would leave the directory.
+fn served_path(root: &Path, path: &str) -> Option<PathBuf> {
+    if path.is_empty() || path.split('/').any(|part| part == ".." || part == ".") {
+        return None;
+    }
+    let joined = root.join(path);
+    joined.is_file().then_some(joined)
+}
+
+/// Append `[remote "origin"]` with `url` and the extra keys `extra` supplies to
+/// a repository's config.
+fn configure_remote(repo: &Path, url: &str, extra: &str) {
+    let config = repo.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("\n[remote \"origin\"]\nurl={url}\n{extra}"));
+    std::fs::write(&config, text).unwrap();
+}
+
+/// A remote archive repository under `base/<name>` holding the fixture commit
+/// on `test/main`, with a summary.
+fn build_remote(base: &Path, name: &str) -> PathBuf {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo = commit_fixture(&dir);
+    ostrya(
+        &["summary", "--repo", repo.to_str().unwrap(), "-u"],
+        None,
+        &[],
+    )
+    .ok();
+    repo
+}
+
+/// An empty archive repository under `base/<name>`, the destination of a pull.
+fn build_dest(base: &Path, name: &str) -> PathBuf {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    create_repo(&dir, RepoMode::Archive)
+}
+
+#[test]
+fn pull_over_http_reproduces_the_remote_tree() {
+    let tmp = TmpDir::new("pull-http");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    // bare-user-only discards ownership, so the checkout below applies no chown
+    // and runs unprivileged. The fixture is committed under canonical
+    // permissions, which is the form that destination stores.
+    let dest_dir = base.join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let dest = create_repo(&dest_dir, RepoMode::BareUserOnly);
+    // The remotes these tests serve publish unsigned commits, and `gpg-verify`
+    // defaults to on, so the section states the policy the pull runs under.
+    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+
+    let pulled = ostrya(
+        &[
+            "pull",
+            "--repo",
+            dest.to_str().unwrap(),
+            "--http-header",
+            "X-Ostrya-Test=on",
+            "--http-header",
+            "X-Trace=a=b=c",
+            "origin",
+            BRANCH,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        pulled
+            .ok()
+            .stdout_trimmed()
+            .ends_with("bytes content written"),
+        "unexpected stats line: {}",
+        pulled.stdout_trimmed()
+    );
+
+    // The ref lands under the remote's own name, and the tree it names checks
+    // out as the tree the fixture committed.
+    assert_eq!(
+        resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
+    );
+    let out = base.join("checkout");
+    ostrya(
+        &[
+            "checkout",
+            "--repo",
+            dest.to_str().unwrap(),
+            COMMIT,
+            out.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(describe_tree(&out), describe_tree(&base.join("remote/src")));
+
+    // The header reached every request the fetcher sent.
+    assert!(
+        server.every_request_carried("x-ostrya-test: on"),
+        "the extra header did not reach every request: {:?}",
+        server.seen()
+    );
+    // A header value holding an `=` arrives whole, split only at the first one.
+    assert!(
+        server.every_request_carried("x-trace: a=b=c"),
+        "the header with an `=` in its value did not reach every request: {:?}",
+        server.seen()
+    );
+    assert!(
+        server.seen().contains(&"config".to_owned()),
+        "the remote's config was not read: {:?}",
+        server.seen()
+    );
+}
+
+#[test]
+fn pull_rejects_a_header_without_a_value() {
+    let run = ostrya(&["pull", "--http-header", "X-Bad", "origin"], None, &[]);
+    assert!(!run.status.success(), "a header with no value was accepted");
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("expected NAME=VALUE"),
+        "the refusal does not name the format: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn pull_url_override_states_its_own_policy() {
+    let tmp = TmpDir::new("pull-url");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let dest = build_dest(base, "dest");
+    let dest_s = dest.to_str().unwrap();
+    let url = server.url();
+
+    // No `[remote "origin"]` section describes this remote, so the pull takes
+    // the configuration defaults. `gpg-verify` is on by default and the remote
+    // holds no keys, so the pull is refused and publishes nothing.
+    let refused = ostrya(
+        &["pull", "--repo", dest_s, "--url", &url, "origin", BRANCH],
+        None,
+        &[],
+    );
+    assert!(!refused.status.success(), "an unsigned commit was accepted");
+    assert_eq!(resolve(&dest, &format!("origin:{BRANCH}")), None);
+
+    // Turning the check off on the command line states the policy the absent
+    // section cannot.
+    ostrya(
+        &[
+            "pull",
+            "--repo",
+            dest_s,
+            "--url",
+            &url,
+            "--gpg-verify=false",
+            "origin",
+            BRANCH,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
+    );
+}
+
+#[test]
+fn pull_mirror_writes_local_refs_and_copies_the_summary() {
+    let tmp = TmpDir::new("pull-mirror");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let dest = build_dest(base, "dest");
+    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+
+    // A mirror pull naming no ref takes every ref the summary lists.
+    ostrya(
+        &[
+            "pull",
+            "--repo",
+            dest.to_str().unwrap(),
+            "--mirror",
+            "origin",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+
+    assert_eq!(resolve(&dest, BRANCH).as_deref(), Some(COMMIT));
+    assert_eq!(resolve(&dest, &format!("origin:{BRANCH}")), None);
+    assert_eq!(
+        std::fs::read(dest.join("summary")).unwrap(),
+        std::fs::read(remote.join("summary")).unwrap(),
+        "the mirror did not copy the remote's summary"
+    );
+}
+
+#[test]
+fn pull_depth_and_commit_metadata_only() {
+    let tmp = TmpDir::new("pull-depth");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let remote_s = remote.to_str().unwrap().to_owned();
+
+    // A second commit on the same branch, so the ref names a chain of two.
+    std::fs::write(base.join("remote/src/hello.txt"), b"hello again\n").unwrap();
+    let child = ostrya(
+        &[
+            "commit",
+            "--repo",
+            &remote_s,
+            "-b",
+            BRANCH,
+            "--parent",
+            COMMIT,
+            "--canonical-permissions",
+            base.join("remote/src").to_str().unwrap(),
+        ],
+        None,
+        &[("SOURCE_DATE_EPOCH", "1700000100")],
+    )
+    .ok()
+    .stdout_trimmed();
+    ostrya(&["summary", "--repo", &remote_s, "-u"], None, &[]).ok();
+
+    let server = FileServer::start(&remote);
+    let dest = build_dest(base, "dest");
+    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+
+    ostrya(
+        &[
+            "pull",
+            "--repo",
+            dest.to_str().unwrap(),
+            "--depth=-1",
+            "--commit-metadata-only",
+            "origin",
+            BRANCH,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+
+    // Both commits of the chain are here, each still marked partial, and no
+    // content object was fetched.
+    for commit in [child.as_str(), COMMIT] {
+        let object = dest.join(format!("objects/{}/{}.commit", &commit[..2], &commit[2..]));
+        assert!(object.is_file(), "commit {commit} was not imported");
+        let marker = dest.join(format!(
+            "state/{}{}.commitpartial",
+            &commit[..2],
+            &commit[2..]
+        ));
+        assert!(marker.is_file(), "commit {commit} is not marked partial");
+    }
+    assert!(
+        !server.seen().iter().any(|path| path.ends_with(".filez")),
+        "a commit-only pull fetched content: {:?}",
+        server.seen()
+    );
+}
+
+#[test]
+fn pull_timestamp_check_refuses_an_older_tip() {
+    let tmp = TmpDir::new("pull-timestamp");
+    let base = tmp.path();
+    let newer = build_remote(base, "newer");
+
+    // A second remote publishing the same branch at an earlier timestamp, which
+    // is the downgrade the check exists to refuse.
+    let older_dir = base.join("older");
+    std::fs::create_dir_all(&older_dir).unwrap();
+    let older = create_repo(&older_dir, RepoMode::Archive);
+    let older_s = older.to_str().unwrap().to_owned();
+    let older_commit = ostrya(
+        &[
+            "commit",
+            "--repo",
+            &older_s,
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--canonical-permissions",
+            base.join("newer/src").to_str().unwrap(),
+        ],
+        None,
+        &[("SOURCE_DATE_EPOCH", "1600000000")],
+    )
+    .ok()
+    .stdout_trimmed();
+    ostrya(&["summary", "--repo", &older_s, "-u"], None, &[]).ok();
+
+    let newer_server = FileServer::start(&newer);
+    let older_server = FileServer::start(&older);
+    let dest = build_dest(base, "dest");
+    let dest_s = dest.to_str().unwrap();
+    configure_remote(&dest, &newer_server.url(), "gpg-verify=false\n");
+
+    ostrya(&["pull", "--repo", dest_s, "origin", BRANCH], None, &[]).ok();
+    assert_eq!(
+        resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
+    );
+
+    let older_url = older_server.url();
+    let refused = ostrya(
+        &[
+            "pull", "--repo", dest_s, "--url", &older_url, "-T", "origin", BRANCH,
+        ],
+        None,
+        &[],
+    );
+    assert!(!refused.status.success(), "a downgrade was accepted");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("older"),
+        "the refusal does not name the timestamp: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(
+        resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT),
+        "the refused pull moved the ref"
+    );
+
+    // Without the check the same pull moves the ref back.
+    ostrya(
+        &[
+            "pull", "--repo", dest_s, "--url", &older_url, "origin", BRANCH,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
+        Some(older_commit.as_str())
+    );
+}
+
+#[test]
+fn pull_timestamp_check_from_rev_refuses_an_older_tip() {
+    let tmp = TmpDir::new("pull-timestamp-rev");
+    let base = tmp.path();
+    let newer = build_remote(base, "newer");
+
+    // A second remote publishing the same branch at an earlier timestamp, which
+    // is the downgrade the check exists to refuse.
+    let older_dir = base.join("older");
+    std::fs::create_dir_all(&older_dir).unwrap();
+    let older = create_repo(&older_dir, RepoMode::Archive);
+    let older_s = older.to_str().unwrap().to_owned();
+    ostrya(
+        &[
+            "commit",
+            "--repo",
+            &older_s,
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--canonical-permissions",
+            base.join("newer/src").to_str().unwrap(),
+        ],
+        None,
+        &[("SOURCE_DATE_EPOCH", "1600000000")],
+    )
+    .ok();
+    ostrya(&["summary", "--repo", &older_s, "-u"], None, &[]).ok();
+
+    let newer_server = FileServer::start(&newer);
+    let older_server = FileServer::start(&older);
+    let dest = build_dest(base, "dest");
+    let dest_s = dest.to_str().unwrap();
+    configure_remote(&dest, &newer_server.url(), "gpg-verify=false\n");
+
+    ostrya(&["pull", "--repo", dest_s, "origin", BRANCH], None, &[]).ok();
+    assert_eq!(
+        resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
+    );
+
+    // `origin:test/main` names the ref the destination now holds, so the rev
+    // resolves to the newer tip pulled above.
+    let older_url = older_server.url();
+    let from_rev = format!("origin:{BRANCH}");
+    let refused = ostrya(
+        &[
+            "pull",
+            "--repo",
+            dest_s,
+            "--url",
+            &older_url,
+            "--timestamp-check-from-rev",
+            &from_rev,
+            "origin",
+            BRANCH,
+        ],
+        None,
+        &[],
+    );
+    assert!(!refused.status.success(), "a downgrade was accepted");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("older"),
+        "the refusal does not name the timestamp: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(
+        resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT),
+        "the refused pull moved the ref"
+    );
+}
+
+#[test]
+fn pull_static_delta_switches() {
+    let tmp = TmpDir::new("pull-delta");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let remote_s = remote.to_str().unwrap().to_owned();
+
+    // A from-scratch delta to the fixture commit, indexed, so a pull into an
+    // empty destination finds one.
+    ostrya(
+        &[
+            "static-delta",
+            "--repo",
+            &remote_s,
+            "generate",
+            "--to",
+            COMMIT,
+            "--reindex",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    ostrya(&["summary", "--repo", &remote_s, "-u"], None, &[]).ok();
+
+    let server = FileServer::start(&remote);
+    let url = server.url();
+    let dest = build_dest(base, "dest");
+    configure_remote(&dest, &url, "gpg-verify=false\n");
+
+    // The default pull takes the delta: its superblock is fetched, and the
+    // objects it carries are never asked for loose.
+    ostrya(
+        &["pull", "--repo", dest.to_str().unwrap(), "origin", BRANCH],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
+    );
+    assert!(
+        server
+            .seen()
+            .iter()
+            .any(|path| path.ends_with("/superblock")),
+        "no delta superblock was fetched: {:?}",
+        server.seen()
+    );
+    assert!(
+        !server.seen().iter().any(|path| path.ends_with(".filez")),
+        "the delta's own objects were fetched loose: {:?}",
+        server.seen()
+    );
+
+    // The same pull with deltas off asks for the objects loose instead.
+    server.clear();
+    let plain = build_dest(base, "plain");
+    configure_remote(&plain, &url, "gpg-verify=false\n");
+    ostrya(
+        &[
+            "pull",
+            "--repo",
+            plain.to_str().unwrap(),
+            "--disable-static-deltas",
+            "origin",
+            BRANCH,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        resolve(&plain, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
+    );
+    assert!(
+        !server
+            .seen()
+            .iter()
+            .any(|path| path.ends_with("/superblock")),
+        "a delta was fetched with --disable-static-deltas: {:?}",
+        server.seen()
+    );
+    assert!(
+        server.seen().iter().any(|path| path.ends_with(".filez")),
+        "no object was fetched loose: {:?}",
+        server.seen()
+    );
+
+    // A remote advertising no delta at all is refused when one is required.
+    let bare_remote = build_remote(base, "nodelta");
+    let bare_server = FileServer::start(&bare_remote);
+    let required = build_dest(base, "required");
+    configure_remote(&required, &bare_server.url(), "gpg-verify=false\n");
+    let refused = ostrya(
+        &[
+            "pull",
+            "--repo",
+            required.to_str().unwrap(),
+            "--require-static-deltas",
+            "origin",
+            BRANCH,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        !refused.status.success(),
+        "a delta-less remote was accepted"
+    );
+    assert_eq!(resolve(&required, &format!("origin:{BRANCH}")), None);
+}
+
+#[test]
+fn pull_localcache_repo_supplies_the_objects() {
+    let tmp = TmpDir::new("pull-localcache");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let dest = build_dest(base, "dest");
+    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+
+    // A cache holding everything the commit reaches, which is the remote's own
+    // directory read as a local repository.
+    ostrya(
+        &[
+            "pull",
+            "--repo",
+            dest.to_str().unwrap(),
+            "-L",
+            remote.to_str().unwrap(),
+            "origin",
+            BRANCH,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+
+    assert_eq!(
+        resolve(&dest, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
+    );
+    assert!(
+        !server.seen().iter().any(|path| path.ends_with(".filez")),
+        "the cache was not consulted before the network: {:?}",
+        server.seen()
+    );
+}
+
+#[test]
+fn pull_sign_verify_switch_overrides_the_configuration() {
+    let tmp = TmpDir::new("pull-sign-verify");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let remote_s = remote.to_str().unwrap().to_owned();
+    ostrya(
+        &["sign", "--repo", &remote_s, COMMIT, ED25519_SECRET_B64],
+        None,
+        &[],
+    )
+    .ok();
+    let server = FileServer::start(&remote);
+    let url = server.url();
+
+    // A destination asking for the sign-api axis, with the key that signed the
+    // commit: the pull carries a signature the policy accepts.
+    let signed = build_dest(base, "signed");
+    configure_remote(
+        &signed,
+        &url,
+        &format!(
+            "gpg-verify=false\nsign-verify=ed25519\nverification-ed25519-key={ED25519_PUBLIC_B64}\n"
+        ),
+    );
+    ostrya(
+        &["pull", "--repo", signed.to_str().unwrap(), "origin", BRANCH],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        resolve(&signed, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
+    );
+
+    // The same configuration with another key refuses the commit, and the
+    // switch turning the axis off on the command line accepts it.
+    let other = base64::encode(&[0u8; 32]);
+    let overridden = build_dest(base, "overridden");
+    configure_remote(
+        &overridden,
+        &url,
+        &format!("gpg-verify=false\nsign-verify=ed25519\nverification-ed25519-key={other}\n"),
+    );
+    let dest_s = overridden.to_str().unwrap();
+    let refused = ostrya(&["pull", "--repo", dest_s, "origin", BRANCH], None, &[]);
+    assert!(
+        !refused.status.success(),
+        "a foreign key accepted the signature"
+    );
+    ostrya(
+        &[
+            "pull",
+            "--repo",
+            dest_s,
+            "--sign-verify=false",
+            "origin",
+            BRANCH,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        resolve(&overridden, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
     );
 }

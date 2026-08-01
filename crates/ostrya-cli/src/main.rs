@@ -19,6 +19,7 @@
 //! - `summary` -- regenerate, sign, or verify the repository summary.
 //! - `static-delta` -- list the repository's static deltas, apply one offline,
 //!   generate one, or rebuild the delta index cache.
+//! - `pull` -- fetch refs and their objects from an HTTP remote.
 //! - `pull-local` -- import refs and their objects from another local
 //!   repository.
 //!
@@ -34,9 +35,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CommitModifier, CommitModifierFlags, CommitOptions,
     DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, MutableTree,
-    ObjectType, PruneOptions, PullFlags, PullOptions, Repo, Result, SummaryOptions,
-    TarExportOptions, TarImportOptions, Type, Value, Verifier, VerifyOutcome, base64,
-    load_sign_keys, load_sign_keys_from,
+    ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, Repo, Result,
+    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Type, Value, Verifier,
+    VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -72,6 +73,8 @@ enum Command {
     /// List, generate, apply, or index static deltas.
     #[command(name = "static-delta")]
     StaticDelta(StaticDeltaArgs),
+    /// Fetch refs and their objects from an HTTP remote.
+    Pull(PullArgs),
     /// Import refs and their objects from another local repository.
     #[command(name = "pull-local")]
     PullLocal(PullLocalArgs),
@@ -346,6 +349,97 @@ struct DeltaGenerateArgs {
 }
 
 #[derive(Args)]
+struct PullArgs {
+    /// The repository to pull into.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Fetch from this URL instead of the remote's configured `url`. A remote
+    /// the config does not describe can be pulled from this way; it supplies no
+    /// keys, so such a pull states its own signature policy or is refused.
+    #[arg(long)]
+    url: Option<String>,
+    /// Write the pulled refs as local refs, take every ref the remote's summary
+    /// lists when none are named, and copy the remote's summary here.
+    #[arg(long)]
+    mirror: bool,
+    /// Parents of each pulled commit to follow: 0 for the commit alone, -1 for
+    /// the whole ancestry the remote holds.
+    #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
+    depth: i32,
+    /// Fetch only the commit objects, leaving each commit marked partial.
+    #[arg(long)]
+    commit_metadata_only: bool,
+    /// Reject regular files whose mode has bits outside 0775.
+    #[arg(long)]
+    bareuseronly_files: bool,
+    /// Do not check that a pulled commit's ostree.ref-binding names the ref it
+    /// is pulled under.
+    #[arg(long)]
+    disable_verify_bindings: bool,
+    /// Copy each object a localcache repository supplies instead of
+    /// hardlinking it.
+    #[arg(long)]
+    force_copy: bool,
+    /// Consult this repository for an object before the network; repeatable.
+    #[arg(short = 'L', long = "localcache-repo")]
+    localcache_repo: Vec<PathBuf>,
+    /// Send NAME=VALUE as an HTTP header with every request; repeatable.
+    #[arg(long = "http-header", value_name = "NAME=VALUE", value_parser = parse_http_header)]
+    http_header: Vec<(String, String)>,
+    /// How many fetches to keep in flight (default: 8).
+    #[arg(long, value_name = "N")]
+    max_outstanding_fetcher_requests: Option<usize>,
+    /// How many times to repeat a round of mirrors after a retryable failure
+    /// (default: 5).
+    #[arg(long, value_name = "N")]
+    network_retries: Option<u32>,
+    /// Require each fetched tip to be no older than the commit its ref names in
+    /// this repository.
+    #[arg(short = 'T', long)]
+    timestamp_check: bool,
+    /// Require each fetched tip to be no older than this commit, which this
+    /// repository must hold.
+    #[arg(long, value_name = "REV", conflicts_with = "timestamp_check")]
+    timestamp_check_from_rev: Option<String>,
+    /// Fetch every object loose, ignoring any static delta the remote
+    /// advertises. This wins over --require-static-deltas.
+    #[arg(long)]
+    disable_static_deltas: bool,
+    /// Refuse a remote that advertises no static delta at all.
+    #[arg(long)]
+    require_static_deltas: bool,
+    /// Require a GPG signature on every commit the pull carries. Absent, the
+    /// remote's `gpg-verify` applies (default true); `--gpg-verify` requires
+    /// one; `--gpg-verify=false` requires none.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    gpg_verify: Option<bool>,
+    /// Require a GPG signature on the remote's summary. Absent, the remote's
+    /// `gpg-verify-summary` applies (default false); `--gpg-verify-summary`
+    /// requires one; `--gpg-verify-summary=false` requires none.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    gpg_verify_summary: Option<bool>,
+    /// Require a sign-api signature on every commit the pull carries. Absent,
+    /// the remote's `sign-verify` applies (default off); `--sign-verify`
+    /// requires one, selecting every engine this build has;
+    /// `--sign-verify=false` requires none.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    sign_verify: Option<bool>,
+    /// Require a sign-api signature on the remote's summary. Absent, the
+    /// remote's `sign-verify-summary` applies (default off);
+    /// `--sign-verify-summary` requires one; `--sign-verify-summary=false`
+    /// requires none.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    sign_verify_summary: Option<bool>,
+    /// The remote to pull from: a `[remote "<name>"]` section of this
+    /// repository's config, which also names the prefix the refs are written
+    /// under.
+    remote: String,
+    /// The refs to pull; with none, the remote's configured `branches`, or
+    /// every ref its summary lists under --mirror.
+    refs: Vec<String>,
+}
+
+#[derive(Args)]
 struct PullLocalArgs {
     /// The repository to pull into.
     #[arg(long, default_value = ".")]
@@ -406,8 +500,85 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Sign(args) => sign(args).await,
         Command::Summary(args) => summary(args).await,
         Command::StaticDelta(args) => static_delta(args).await,
+        Command::Pull(args) => pull(args).await,
         Command::PullLocal(args) => pull_local(args).await,
     }
+}
+
+/// Fetch refs and their objects from an HTTP remote.
+async fn pull(args: PullArgs) -> Result<()> {
+    let repo = Repo::open(&args.repo).await?;
+    let mut localcache_repos = Vec::with_capacity(args.localcache_repo.len());
+    for path in &args.localcache_repo {
+        localcache_repos.push(Repo::open(path).await?);
+    }
+
+    let mut flags = PullFlags::empty();
+    if args.mirror {
+        flags |= PullFlags::MIRROR;
+    }
+    if args.commit_metadata_only {
+        flags |= PullFlags::COMMIT_ONLY;
+    }
+    if args.bareuseronly_files {
+        flags |= PullFlags::BAREUSERONLY_FILES;
+    }
+    if args.disable_verify_bindings {
+        flags |= PullFlags::DISABLE_VERIFY_BINDINGS;
+    }
+    if args.force_copy {
+        flags |= PullFlags::FORCE_COPY;
+    }
+
+    let timestamp_check = match args.timestamp_check_from_rev.as_deref() {
+        Some(rev) => TimestampCheck::Rev(resolve(&repo, rev).await?),
+        None if args.timestamp_check => TimestampCheck::CurrentRef,
+        None => TimestampCheck::Off,
+    };
+
+    let stats = repo
+        .pull(
+            &args.remote,
+            PullOptions {
+                refs: args.refs,
+                flags,
+                depth: args.depth,
+                localcache_repos,
+                url: args.url,
+                http_headers: args.http_header,
+                max_outstanding_fetches: args.max_outstanding_fetcher_requests,
+                n_network_retries: args.network_retries,
+                timestamp_check,
+                disable_static_deltas: args.disable_static_deltas,
+                require_static_deltas: args.require_static_deltas,
+                verify: PullVerify {
+                    gpg: args.gpg_verify,
+                    gpg_summary: args.gpg_verify_summary,
+                    sign: args.sign_verify,
+                    sign_summary: args.sign_verify_summary,
+                },
+                ..PullOptions::default()
+            },
+        )
+        .await?;
+    report_pull(&stats);
+    Ok(())
+}
+
+/// Split a `NAME=VALUE` header argument at its first `=`.
+fn parse_http_header(arg: &str) -> std::result::Result<(String, String), String> {
+    match arg.split_once('=') {
+        Some((name, value)) if !name.is_empty() => Ok((name.to_owned(), value.to_owned())),
+        _ => Err("expected NAME=VALUE".to_owned()),
+    }
+}
+
+/// Print what a pull imported.
+fn report_pull(stats: &PullStats) {
+    println!(
+        "{} metadata, {} content objects imported; {} bytes content written",
+        stats.metadata_imported, stats.content_imported, stats.content_bytes_written
+    );
 }
 
 /// Import refs and their objects from another local repository.
@@ -449,10 +620,7 @@ async fn pull_local(args: PullLocalArgs) -> Result<()> {
             },
         )
         .await?;
-    println!(
-        "{} metadata, {} content objects imported; {} bytes content written",
-        stats.metadata_imported, stats.content_imported, stats.content_bytes_written
-    );
+    report_pull(&stats);
     Ok(())
 }
 

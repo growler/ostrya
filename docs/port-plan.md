@@ -1810,7 +1810,7 @@ Split into sub-phases:
 - 16e Commit and summary signature verification during a pull (DONE, see
   below): the GPG and sign-api axes, their configuration keys and key sources,
   and the delta signature check 16d left open.
-- 16f The `ostrya pull` CLI command.
+- 16f The `ostrya pull` CLI command (DONE, see below).
 - 16g Archive-to-archive pass-through: store a fetched `.filez` verbatim instead
   of inflating and deflating it again (see below).
 Verify: pull from a local trivial httpd over both HTTP/1.1 and HTTP/2; the
@@ -2792,10 +2792,10 @@ scratch and from a source commit -- each under its own superblock's digest,
 positioned between `tombstone-commits` and `indexed-deltas`, and read back by the
 tool's `summary --print-metadata-key`.
 
-Deferred: `ostrya pull --disable-static-deltas` and `--require-static-deltas`,
-which land with the CLI command in 16f; and inline delta parts, which no remote
-the port pulls from publishes. The body of the delta signature check landed in
-16e, which supplies the policy the seam applies.
+Deferred: inline delta parts, which no remote the port pulls from publishes.
+`ostrya pull --disable-static-deltas` and `--require-static-deltas` landed with
+the CLI command in 16f. The body of the delta signature check landed in 16e,
+which supplies the policy the seam applies.
 
 #### Phase 16e -- Signature verification during a pull (DONE)
 
@@ -2980,6 +2980,83 @@ Deferred: `verification-<engine>-file` for an engine whose keys are not base64
 lines, which no engine this build verifies with has; and the system sign-api key
 store's participation, which is implemented but not observable on a host with no
 `/etc/ostree` or `/usr/share/ostree`.
+
+#### Phase 16f -- The `ostrya pull` CLI command (DONE)
+
+The CLI grows `ostrya pull [OPTIONS] <REMOTE> [REFS...]`, which drives
+`Repo::pull`. `<REMOTE>` names a `[remote "<name>"]` section of the destination's
+config and is also the prefix the refs are written under; naming no ref takes the
+remote's configured `branches`, or every ref its summary lists under `--mirror`.
+The command prints the line `pull-local` prints, which reports what the pull
+imported.
+
+The options and the `PullOptions` field each sets:
+
+- `--repo <PATH>` -- the destination, defaulting to the working directory, as
+  every other subcommand takes it.
+- `--url <URL>` -- `url`. A remote the config does not describe is reachable this
+  way. Such a remote supplies no keys and takes the configuration defaults,
+  `gpg-verify` among them, so a pull naming one states its own policy or is
+  refused.
+- `--mirror`, `--commit-metadata-only`, `--bareuseronly-files`,
+  `--disable-verify-bindings`, `--force-copy` -- the `PullFlags` bits of the same
+  names. `UNTRUSTED` has no switch: an HTTP pull hashes every object it stores
+  whatever the flag says, and the localcache import it reaches sets the bit
+  itself.
+- `--depth <N>` -- `depth`, defaulting to 0.
+- `-L`/`--localcache-repo <REPO>`, repeatable -- `localcache_repos`, opened in the
+  order given.
+- `--http-header NAME=VALUE`, repeatable -- `http_headers`. The value splits at
+  the first `=`, so a header value carrying one arrives whole.
+- `--max-outstanding-fetcher-requests <N>`, `--network-retries <N>` -- the two
+  fetcher limits, each left at the library's default when absent.
+- `-T`/`--timestamp-check` and `--timestamp-check-from-rev <REV>` -- the two
+  `TimestampCheck` variants, which conflict with each other since the field holds
+  one. A refspec resolves against the destination; a bare checksum is taken as
+  given, and the destination's own check applies when the pull loads the commit
+  to compare against.
+- `--disable-static-deltas` and `--require-static-deltas` -- the pair 16d
+  deferred here. They do not conflict: the library states that disabling wins,
+  since a pull that asks for no delta finds none to require.
+- `--gpg-verify[=BOOL]`, `--gpg-verify-summary[=BOOL]`, `--sign-verify[=BOOL]`,
+  and `--sign-verify-summary[=BOOL]` -- the four `PullVerify` switches. Each takes
+  an optional value after `=`: absent is `None` and reads the remote's
+  configuration, the bare switch is `Some(true)`, and `=false` is `Some(false)`.
+  That is the tri-state the field holds, which a plain on/off flag cannot express.
+  Turning a sign-api switch on here selects every engine the build has, as
+  `sign-verify=true` does.
+
+Verify (`crates/ostrya-cli/tests/cli.rs`): every test serves a repository
+directory over HTTP/1.1 from a static file server the test file builds on
+`std::net::TcpListener`, one thread per connection so a pull holding several
+fetches at once is served without ordering them; the server records the path and
+the header lines of each request it answers, which is what the request-set
+assertions read. A configured remote pulls a named ref, prints the stats line,
+writes the ref under the remote's name, and checks out the tree the fixture
+committed, with an `--http-header` value reaching every request; `--url` against a
+destination whose config describes no such remote is refused and publishes
+nothing, and the same pull with `--gpg-verify=false` lands the ref; `--mirror`
+naming no ref writes a local ref and copies the remote's summary byte for byte;
+`--depth=-1 --commit-metadata-only` imports both commits of a chain, leaves each
+marked partial, and fetches no content; a second remote publishing the same branch
+at an earlier timestamp is refused under `-T`, which leaves the ref where it was,
+and lands when the switch is absent; a remote publishing an indexed delta is
+pulled through its superblock with nothing fetched loose, the same remote under
+`--disable-static-deltas` is pulled loose with no superblock fetched, and a remote
+advertising no delta is refused under `--require-static-deltas`; `-L` naming a
+repository that holds everything the commit reaches leaves the network unasked for
+any content object; and a signed commit is accepted by a destination configured
+with the key that signed it, refused by one configured with another, and accepted
+by that second destination when `--sign-verify=false` overrides it. The suite runs
+under both runtime backends.
+
+Deferred: `--subpath`, `--dry-run`, and `--cache-dir`, which name machinery the
+library does not have; the `--gpg-verify` and `--gpg-verify-summary` switches on
+`ostrya pull-local`, which the library accepts and the CLI does not yet pass;
+`PullOptions::remote`, the ref-prefix override `pull-local` exposes as
+`--remote`, which has no switch on `pull` since the positional `<REMOTE>`
+supplies the prefix; and the `ostree`-compatible spellings, exit codes, and
+progress output, which are Phase 17.
 
 #### Phase 16g -- Archive-to-archive pass-through
 

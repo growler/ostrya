@@ -85,6 +85,23 @@ impl SizeSpec {
     }
 }
 
+/// The `sign-verify` remote setting: which sign-api engines a pull checks the
+/// signatures of the commits it fetches with.
+///
+/// The value is either a boolean, spelled the way the key file spells one, or a
+/// list of engine names separated by `,` or `;`. A name is taken as written: the
+/// space in `ed25519, ed25519` belongs to the second name, which no engine
+/// answers to, and the tool refuses that value as well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignVerify {
+    /// No sign-api check: the key is absent, `false`, or names nothing.
+    Off,
+    /// Every engine this build has, which is what `true` selects.
+    All,
+    /// The engines the value names, in the order it names them.
+    Engines(Vec<String>),
+}
+
 /// A tri-state repository setting, spelled `no`, `maybe`, or `yes`.
 ///
 /// The `[ex-integrity]` keys use this form: `No` disables the feature, `Maybe`
@@ -377,9 +394,46 @@ impl Remote<'_> {
             .unwrap_or(false))
     }
 
-    /// The path to a GPG keyring file or directory for this remote.
-    pub fn gpgkeypath(&self) -> Result<Option<String>> {
-        self.string("gpgkeypath")
+    /// The GPG keyrings this remote trusts beyond the repository's own
+    /// `<remote>.trustedkeys.gpg` and the system trusted set: the `;`-separated
+    /// entries of `gpgkeypath`, each a keyring file or a directory of them.
+    pub fn gpgkeypath(&self) -> Result<Vec<String>> {
+        Ok(self
+            .string("gpgkeypath")?
+            .map(|raw| {
+                raw.split(';')
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Which sign-api engines a pull checks the commits of this remote with.
+    /// Default [`SignVerify::Off`].
+    pub fn sign_verify(&self) -> Result<SignVerify> {
+        Ok(parse_sign_verify(self.string("sign-verify")?.as_deref()))
+    }
+
+    /// Which sign-api engines a pull checks this remote's summary with. Default
+    /// [`SignVerify::Off`]. This is read on its own: `sign-verify=false` leaves
+    /// a summary check the key asks for in place.
+    pub fn sign_verify_summary(&self) -> Result<SignVerify> {
+        Ok(parse_sign_verify(
+            self.string("sign-verify-summary")?.as_deref(),
+        ))
+    }
+
+    /// The inline trusted key for one sign-api engine,
+    /// `verification-<engine>-key`. One key, not a list.
+    pub fn verification_key(&self, engine: &str) -> Result<Option<String>> {
+        self.string(&format!("verification-{engine}-key"))
+    }
+
+    /// The path to a file of trusted keys for one sign-api engine,
+    /// `verification-<engine>-file`, holding one key per line.
+    pub fn verification_file(&self, engine: &str) -> Result<Option<String>> {
+        self.string(&format!("verification-{engine}-file"))
     }
 
     /// The collection id bound to this remote, if set.
@@ -431,6 +485,28 @@ impl Remote<'_> {
             .get_string(&self.group, key)
             .map_err(Error::from)
     }
+}
+
+/// Read a `sign-verify` or `sign-verify-summary` value: a boolean in the key
+/// file's own spelling, or a list of engine names separated by `,` or `;`.
+fn parse_sign_verify(raw: Option<&str>) -> SignVerify {
+    let Some(raw) = raw else {
+        return SignVerify::Off;
+    };
+    match raw {
+        "true" | "1" => return SignVerify::All,
+        "false" | "0" => return SignVerify::Off,
+        _ => {}
+    }
+    let engines: Vec<String> = raw
+        .split([',', ';'])
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if engines.is_empty() {
+        return SignVerify::Off;
+    }
+    SignVerify::Engines(engines)
 }
 
 /// The key-file group name for a remote: `remote "<name>"`.
@@ -665,6 +741,75 @@ mod tests {
         );
 
         assert!(cfg.remote("absent").is_none());
+    }
+
+    /// The verification keys a pull reads its policy from: the two sign-api
+    /// switches, the per-engine key sources, and the GPG keyring list.
+    #[test]
+    fn reads_remote_verification_keys() {
+        let text = "[core]\nrepo_version=1\nmode=archive-z2\n\n\
+                    [remote \"signed\"]\nurl=https://ex.com/r\nsign-verify=ed25519\n\
+                    sign-verify-summary=true\nverification-ed25519-key=AAAA\n\
+                    verification-ed25519-file=/etc/keys.ed25519\n\
+                    gpgkeypath=/etc/one.gpg;/etc/keys.d\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        let remote = cfg.remote("signed").unwrap();
+        assert_eq!(
+            remote.sign_verify().unwrap(),
+            SignVerify::Engines(vec!["ed25519".to_owned()])
+        );
+        assert_eq!(remote.sign_verify_summary().unwrap(), SignVerify::All);
+        assert_eq!(
+            remote.verification_key("ed25519").unwrap().as_deref(),
+            Some("AAAA")
+        );
+        assert_eq!(
+            remote.verification_file("ed25519").unwrap().as_deref(),
+            Some("/etc/keys.ed25519")
+        );
+        assert_eq!(remote.verification_key("spki").unwrap(), None);
+        assert_eq!(
+            remote.gpgkeypath().unwrap(),
+            vec!["/etc/one.gpg".to_owned(), "/etc/keys.d".to_owned()]
+        );
+
+        // The defaults: no sign-api check and no extra keyring.
+        let plain = cfg.remote("signed").unwrap();
+        assert!(plain.gpg_verify().unwrap());
+        let bare = RepoConfig::parse(
+            "[core]\nrepo_version=1\nmode=bare\n\n[remote \"plain\"]\nurl=http://ex/r\n",
+        )
+        .unwrap();
+        let bare = bare.remote("plain").unwrap();
+        assert_eq!(bare.sign_verify().unwrap(), SignVerify::Off);
+        assert_eq!(bare.sign_verify_summary().unwrap(), SignVerify::Off);
+        assert!(bare.gpgkeypath().unwrap().is_empty());
+    }
+
+    /// `sign-verify` is a boolean or a list of engine names, split on `,` and
+    /// `;`, each name taken as written.
+    #[test]
+    fn parses_the_sign_verify_spellings() {
+        assert_eq!(parse_sign_verify(None), SignVerify::Off);
+        assert_eq!(parse_sign_verify(Some("true")), SignVerify::All);
+        assert_eq!(parse_sign_verify(Some("1")), SignVerify::All);
+        assert_eq!(parse_sign_verify(Some("false")), SignVerify::Off);
+        assert_eq!(parse_sign_verify(Some("0")), SignVerify::Off);
+        assert_eq!(parse_sign_verify(Some("")), SignVerify::Off);
+        assert_eq!(
+            parse_sign_verify(Some("ed25519")),
+            SignVerify::Engines(vec!["ed25519".to_owned()])
+        );
+        // Both separators, and an empty element dropped.
+        assert_eq!(
+            parse_sign_verify(Some("ed25519;spki,")),
+            SignVerify::Engines(vec!["ed25519".to_owned(), "spki".to_owned()])
+        );
+        // A name is not trimmed: the tool refuses this value too.
+        assert_eq!(
+            parse_sign_verify(Some("ed25519, ed25519")),
+            SignVerify::Engines(vec!["ed25519".to_owned(), " ed25519".to_owned()])
+        );
     }
 
     /// The TLS keys a pull fills its fetcher's options from, and the one it

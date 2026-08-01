@@ -552,6 +552,85 @@ objects/<commit>.commitmeta
 - HTTP pulls always verify checksums. The tool's `--untrusted` help reads "Verify
   checksums of local sources (always enabled for HTTP pulls)".
 
+### Signature verification during a pull
+
+Recovered by running `ostree` 2026.1 against a static HTTP server over a
+tool-built archive repository, with the destination's remote section written by
+`ostree remote add` and by `ostree config set`. Every refusal below leaves the
+destination with no ref and no object.
+
+What each configuration key selects:
+
+- `gpg-verify`, default true. Every commit the pull carries has to have a GPG
+  signature from the remote's trusted keyrings. A commit with none:
+  `error: Commit <hex>: GPG verification enabled, but no signatures found (use
+  gpg-verify=false in remote config to disable)`. A commit signed by a key the
+  keyrings do not hold: `error: Commit <hex>: Signature made <date> using EdDSA
+  key ID <keyid>` followed by `Can't check signature: public key not found`.
+- `gpg-verify-summary`, default false. `summary.sig` has to hold a valid GPG
+  signature over the summary bytes. A remote serving no summary: `error: GPG
+  verification enabled, but no summary found`. One serving a summary and no
+  `summary.sig`, or a `summary.sig` holding no GPG signature: `error: GPG
+  verification enabled, but no signatures found`.
+- `sign-verify`, default off. Either a boolean or a list of engine names split
+  on `,` and `;`. `ostree remote add --sign-verify=ed25519=inline:<key>` writes
+  `verification-ed25519-key=<key>` and `sign-verify=ed25519`; the `file:` form
+  writes `verification-ed25519-file=<path>`; `--no-sign-verify` writes
+  `sign-verify=false`; the same engine given twice writes it twice
+  (`sign-verify=ed25519,ed25519`), which is accepted. A name is not trimmed:
+  `sign-verify=ed25519, ed25519` fails with `error: Requested signature type is
+  not implemented`, as does any name no engine answers to. A commit with no
+  signature under the named engines: `error: Can't verify commit: No signatures
+  found`. One signed by an untrusted key: `error: Can't verify commit: ed25519:
+  Signature couldn't be verified with: key '<hex of the trusted key>'`.
+- `sign-verify-summary`, default off, and read on its own: `sign-verify=false`
+  alongside it still verifies the summary. A `summary.sig` the trusted keys do
+  not verify fails with the engine message above and no `Can't verify commit`
+  prefix. No `summary.sig` at all: `error: Signatures verification enabled, but
+  no summary.sig found (use sign-verify-summary=false in remote config to
+  disable)`, which is also what a remote serving no summary produces.
+- `verification-<engine>-key` holds one key. A list under either separator fails
+  with `error: Failed loading 'ed25519' keys from inline verification-key`.
+  `verification-<engine>-file` holds one key per line and accepts the commit any
+  line's key signed.
+- `gpgkeypath` is a `;`-separated list of keyring files and directories, added
+  to the trusted set rather than replacing it: a remote with an imported
+  `<remote>.trustedkeys.gpg` and a `gpgkeypath` naming an empty directory still
+  accepts the imported key's commit. An entry that does not exist fails the pull
+  with `error: Commit <hex>: opendir(<entry>): No such file or directory`.
+
+Behavior common to the axes:
+
+- The axes are independent and both apply: a remote with `gpg-verify` left at its
+  default and `sign-verify=ed25519` configured with the right key still fails on
+  GPG. Within `sign-verify` one engine is enough: `sign-verify=ed25519;dummy`
+  with a key for each accepts a commit signed by ed25519 alone.
+- An engine named by hand with no key fails with `error: No keys found for
+  required signapi type <engine>`, while `sign-verify=true` with no key for any
+  engine fails with `error: Can't verify commit: signature: ed25519: no keys
+  loaded`.
+- `verification-<engine>-key` alone verifies nothing: the check runs only where
+  `sign-verify` or `sign-verify-summary` asks for it.
+- Every commit the pull carries is checked, the parents `--depth` follows
+  included, and a commit the destination already holds is checked again on a
+  repeat pull.
+- `pull-local` makes no check unless asked: it has `--gpg-verify` and
+  `--gpg-verify-summary` flags, each needing `--remote` (`error: Must specify
+  remote name to enable gpg verification`), and the named remote's own
+  `gpg-verify=true` does not turn a check on by itself. The summary check reads
+  the source repository's `summary` and `summary.sig`.
+- A static delta carries a copy of the target commit's detached metadata in its
+  superblock metadata dict, under the key `deltas/<fanout>/<rest>/commitmeta`
+  holding the same `a{sv}` the `.commitmeta` file holds. A delta pull checks the
+  commit against that copy while storing the `.commitmeta` it fetched: a delta
+  generated while the commit carried an older signature fails the pull under a
+  policy the current `.commitmeta` satisfies.
+- `ostree` 2026.1 cannot pull a signed delta. A from-scratch and a from-to delta
+  signed with `static-delta generate --sign` both fail the pull with `error:
+  Invalid checksum of length 0 expected 32`, with verification configured or off,
+  while `static-delta apply-offline` applies the same delta and
+  `static-delta show` reports `Signed: yes`.
+
 ### Config file (`<repo>/config`, GKeyFile / INI)
 
 Created with `[core]` `repo_version=1`, `mode=<mode>`, optional
@@ -564,8 +643,10 @@ Created with `[core]` `repo_version=1`, `mode=<mode>`, optional
 `config;mount`). `[archive] zlib-level` (1-9, default 6). Remote sections are
 `[remote "<name>"]` with keys `url`, `contenturl`, `metalink`, `gpg-verify`
 (default true), `gpg-verify-summary` (default false), `gpgkeypath`, TLS keys,
-`collection-id`, `sign-verify`, `verification-<engine>-key` /
-`verification-<engine>-file`.
+`collection-id`, `sign-verify`, `sign-verify-summary` (both default off),
+`verification-<engine>-key` / `verification-<engine>-file`. What the
+verification keys select, and how each value is spelled, is in "Signature
+verification during a pull".
 
 Parsing rules, recovered by feeding crafted config files to the tool, reading
 back with `ostree config get` and commands that consume config, and inspecting
@@ -1034,6 +1115,15 @@ those eight bytes is a signed envelope: the `ay` it wraps is the raw
 `a{sv}` holds signatures under the per-engine keys (for example
 `ostree.sign.ed25519 -> aay`), the same framing commit and summary signing use.
 An unsigned delta stores the raw `SUPERBLOCK_FORMAT` bytes directly.
+
+The superblock's leading `a{sv}` carries `ostree.endianness` and, where the
+target commit has detached metadata, a copy of it under the key
+`deltas/<fanout>/<rest>/commitmeta` -- the delta's own relative directory with
+`/commitmeta` appended -- holding the same `a{sv}` the `.commitmeta` file holds.
+Recovered by signing a commit and reading the superblock the tool then generated:
+its bytes carry `ostree.sign.ed25519` inside that key. A tool pull checks a
+delta-delivered commit against this copy rather than against the `.commitmeta`
+it fetches and stores.
 
 Object delivery. The target commit object is embedded whole in the superblock
 (the `(a{sv}aya(say)sstayay)` field); it is not carried in any part, and

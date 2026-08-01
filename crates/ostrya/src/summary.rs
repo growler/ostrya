@@ -65,7 +65,7 @@ const COLLECTION_MAP_SIGNATURE: &str = "a{sa(s(taya{sv}))}";
 /// The summary file name at the repository root.
 pub(crate) const SUMMARY_FILE: &str = "summary";
 /// The summary signature file name at the repository root.
-const SUMMARY_SIG_FILE: &str = "summary.sig";
+pub(crate) const SUMMARY_SIG_FILE: &str = "summary.sig";
 /// The permission bits forced on `summary` and `summary.sig`, matching the
 /// tool's `0644`.
 const SUMMARY_MODE: u32 = 0o644;
@@ -284,13 +284,7 @@ impl Repo {
         let Some(bytes) = self.read_root_file(SUMMARY_SIG_FILE).await? else {
             return Ok(None);
         };
-        if bytes.is_empty() {
-            return Ok(None);
-        }
-        let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
-        Ok(Some(
-            from_bytes(&ty, &bytes).map_err(ostrya_core::Error::from)?,
-        ))
+        parse_signature_dict(&bytes)
     }
 
     /// Sign the summary with `signer`, appending the signature to `summary.sig`.
@@ -448,7 +442,7 @@ impl Repo {
     }
 
     /// Read a whole file at the repository root, or `None` when it does not exist.
-    async fn read_root_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn read_root_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         let name = name.to_owned();
         ostrya_rt::unblock(move || read_root_file_blocking(repo_fd.as_fd(), &name)).await
@@ -480,6 +474,19 @@ impl Repo {
         })
         .await
     }
+}
+
+/// Read the signature dict a `summary.sig` file holds, an `a{sv}` of one
+/// signature array per engine. The zero-length marker the writer uses for an
+/// empty dict reads back as `None`.
+pub(crate) fn parse_signature_dict(bytes: &[u8]) -> Result<Option<Value>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
+    Ok(Some(
+        from_bytes(&ty, bytes).map_err(ostrya_core::Error::from)?,
+    ))
 }
 
 /// Build one ref-array entry `(s, (t, ay, a{sv}))`: the ref name, the commit

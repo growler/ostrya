@@ -34,8 +34,8 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState, CreateOptions,
-    DeltaOptions, Error, FsckOptions, MutableTree, PullFlags, PullOptions, Repo, RepoMode,
-    SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
+    DeltaOptions, Ed25519Signer, Error, FsckOptions, MutableTree, PullFlags, PullOptions,
+    PullStats, PullVerify, Repo, RepoMode, SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 
@@ -587,14 +587,37 @@ async fn build_remote_two_refs(dir: &Path) -> (Repo, Checksum) {
 
 /// A destination repository under `dir/dest` whose config names `origin` at
 /// `url`, with the extra `[remote]` keys `extra` supplies.
+///
+/// The section turns `gpg-verify` off, since the default is on and these
+/// remotes publish unsigned commits; `extra` is written after it, so a
+/// verification test states its own policy there and the repeated key takes the
+/// last value.
 async fn build_dest(dir: &Path, mode: RepoMode, url: &str, extra: &str) -> Repo {
     let path = dir.join("dest");
     let repo = Repo::create(&path, CreateOptions::new(mode)).await.unwrap();
     drop(repo);
     let config = path.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str(&format!("\n[remote \"origin\"]\nurl={url}\n{extra}"));
+    text.push_str(&format!(
+        "\n[remote \"origin\"]\nurl={url}\ngpg-verify=false\n{extra}"
+    ));
     std::fs::write(&config, text).unwrap();
+    Repo::open(&path).await.unwrap()
+}
+
+/// Rewrite the `origin` section of the destination at `dir/dest` and reopen it,
+/// which is how a test states a second policy over a repository that already
+/// holds what an earlier pull landed.
+async fn reconfigure_dest(dir: &Path, url: &str, extra: &str) -> Repo {
+    let path = dir.join("dest");
+    let config = path.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let core = text.split("\n[remote").next().unwrap().to_owned();
+    std::fs::write(
+        &config,
+        format!("{core}\n[remote \"origin\"]\nurl={url}\ngpg-verify=false\n{extra}"),
+    )
+    .unwrap();
     Repo::open(&path).await.unwrap()
 }
 
@@ -1714,10 +1737,10 @@ fn a_substituted_commit_object_fails_before_its_tree_is_fetched() {
     });
 }
 
-/// An object the remote does not hold fails the pull, publishing nothing and
-/// leaving the commit's marker behind.
+/// An object the remote does not hold fails the pull, which publishes nothing
+/// and takes back the marker it wrote for the commit it did not publish.
 #[test]
-fn a_missing_object_fails_the_pull_and_leaves_the_marker() {
+fn a_missing_object_fails_the_pull_and_clears_the_marker() {
     block_on(async {
         let dir = TmpDir::new("pull-http-missing");
         let (remote, commit) = build_remote(dir.path()).await;
@@ -1743,7 +1766,58 @@ fn a_missing_object_fails_the_pull_and_leaves_the_marker() {
             .path()
             .join("dest/state")
             .join(format!("{}.commitpartial", commit.to_hex()));
-        assert!(marker.exists(), "the marker was not left behind");
+        assert!(!marker.exists(), "the marker was left behind");
+    });
+}
+
+/// The marker of a commit this repository holds survives a failed pull: that
+/// commit was partial before the pull ran, so the marker is one the pull found
+/// in place rather than one it wrote.
+#[test]
+fn a_failed_pull_keeps_the_marker_of_a_commit_it_holds() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-keeps-marker");
+        let (remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        // A commit-only pull publishes the commit object and leaves its marker.
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                flags: PullFlags::COMMIT_ONLY,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let marker = dir
+            .path()
+            .join("dest/state")
+            .join(format!("{}.commitpartial", commit.to_hex()));
+        assert!(marker.exists());
+
+        // The pull that would complete it fails on an object the remote stopped
+        // serving.
+        let contents = content_checksums(&remote, &commit).await;
+        server.hide(&filez_path(&contents[0].to_hex()));
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ObjectNotFound { .. }), "{err}");
+        assert!(marker.exists(), "the marker of a held commit was removed");
+        assert_eq!(
+            dest.commit_state(&commit).await.unwrap(),
+            CommitState::Partial
+        );
     });
 }
 
@@ -2372,11 +2446,18 @@ fn an_unconfigured_remote_needs_a_url() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
+        // A remote the config does not describe takes the configuration
+        // defaults, `gpg-verify` among them, so both pulls of this unsigned
+        // commit state their own policy.
         let err = dest
             .pull(
                 "elsewhere",
                 PullOptions {
                     refs: vec!["test/main".to_owned()],
+                    verify: PullVerify {
+                        gpg: Some(false),
+                        ..PullVerify::default()
+                    },
                     ..PullOptions::default()
                 },
             )
@@ -2391,6 +2472,10 @@ fn an_unconfigured_remote_needs_a_url() {
             PullOptions {
                 refs: vec!["test/main".to_owned()],
                 url: Some(server.url()),
+                verify: PullVerify {
+                    gpg: Some(false),
+                    ..PullVerify::default()
+                },
                 ..PullOptions::default()
             },
         )
@@ -2913,5 +2998,619 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
                 "{mode:?}"
             );
         }
+    });
+}
+
+// --- signature verification (Phase 16e) -------------------------------------
+
+/// A fixed ed25519 keypair the remotes sign with.
+const SECRET_B64: &str =
+    "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+/// A second keypair, standing for one a destination does not trust.
+const OTHER_SECRET_B64: &str =
+    "5ILWxT+l9G/u3h0BptRpmSi35C9uog7YDdD+Fp1Xk+Hz52p0NlYh6xBA73kJEJKhKbbnjcE0rsWA5XA/K5Sq5Q==";
+const OTHER_PUBLIC_B64: &str = "8+dqdDZWIesQQO95CRCSoSm2543BNK7FgOVwPyuUquU=";
+
+/// Whether this host has a sign-api key store of its own, whose keys would join
+/// every trusted set a test builds.
+fn system_sign_keys() -> bool {
+    !ostrya::load_sign_keys("ed25519")
+        .unwrap()
+        .trusted
+        .is_empty()
+}
+
+/// A remote holding `test/main` whose commit and summary are signed with
+/// `secret`, or left unsigned where it is `None`.
+async fn build_signed_remote(dir: &Path, secret: Option<&str>) -> (Repo, Checksum) {
+    let (remote, commit) = build_remote(dir).await;
+    if let Some(secret) = secret {
+        let signer = Ed25519Signer::from_base64(secret).unwrap();
+        remote.sign_commit(&commit, &signer).await.unwrap();
+        remote.sign_summary(&signer).await.unwrap();
+    }
+    (remote, commit)
+}
+
+/// Pull `test/main` from `origin` with the options `opts` supplies.
+async fn pull_main(dest: &Repo, opts: PullOptions) -> Result<PullStats, Error> {
+    dest.pull(
+        "origin",
+        PullOptions {
+            refs: vec!["test/main".to_owned()],
+            ..opts
+        },
+    )
+    .await
+}
+
+/// The default policy is the tool's: `gpg-verify` is on unless the remote turns
+/// it off, so a remote publishing unsigned commits is refused and publishes
+/// nothing. A build without the GPG engine refuses the same pull for want of an
+/// engine to make the check with, which is the fail-closed side of the same
+/// rule.
+#[test]
+fn an_unsigned_commit_is_refused_under_the_default_policy() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-gpg-default");
+        let (_remote, _commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            "gpg-verify=true\n",
+        )
+        .await;
+
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        if cfg!(feature = "sign-gpg") {
+            assert!(
+                matches!(&err, Error::Signature(m) if m.contains("carries no signature")),
+                "{err}"
+            );
+        } else {
+            assert!(
+                matches!(&err, Error::Unsupported(m) if m.contains("sign-gpg")),
+                "{err}"
+            );
+        }
+        assert_nothing_published(&dest).await;
+    });
+}
+
+/// `sign-verify` with the key that signed the commit accepts it; the same pull
+/// under another key is refused and publishes nothing.
+#[test]
+fn sign_verify_accepts_the_configured_key_and_refuses_another() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-sign-verify");
+        let (_remote, commit) = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"),
+        )
+        .await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        drop(dest);
+
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("sign-verify=ed25519\nverification-ed25519-key={OTHER_PUBLIC_B64}\n"),
+        )
+        .await;
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+    });
+}
+
+/// The trusted set of an engine comes from both key sources: a
+/// `verification-ed25519-file` holding several keys accepts a commit any one of
+/// them signed, and an engine no source holds a key for is refused before a
+/// signature is read.
+#[test]
+fn a_key_file_supplies_the_trusted_keys() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-key-file");
+        let (_remote, commit) = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+
+        let keys = dir.path().join("keys.ed25519");
+        std::fs::write(&keys, format!("{OTHER_PUBLIC_B64}\n\n{PUBLIC_B64}\n")).unwrap();
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!(
+                "sign-verify=ed25519\nverification-ed25519-file={}\n",
+                keys.display()
+            ),
+        )
+        .await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        drop(dest);
+
+        if system_sign_keys() {
+            eprintln!("skipping the keyless half: this host has a sign-api key store");
+            return;
+        }
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            "sign-verify=ed25519\n",
+        )
+        .await;
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no trusted key")),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+    });
+}
+
+/// `sign-verify=true` names every engine this build has, and a name no engine
+/// answers to is refused rather than quietly skipped.
+#[test]
+fn sign_verify_true_selects_every_engine_and_an_unknown_name_is_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-sign-verify-true");
+        let (_remote, commit) = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("sign-verify=true\nverification-ed25519-key={PUBLIC_B64}\n"),
+        )
+        .await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        drop(dest);
+
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("sign-verify=ed25519;bogus\nverification-ed25519-key={PUBLIC_B64}\n"),
+        )
+        .await;
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("'bogus'")),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+    });
+}
+
+/// `sign-verify-summary` holds the remote's summary to the same keys. A summary
+/// another key signed is refused before the first object is requested, and one
+/// the remote publishes no signature for is refused by name. The switch is read
+/// on its own: `sign-verify=false` leaves it in place.
+#[test]
+fn the_summary_signature_is_checked_when_the_remote_asks_for_it() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-summary-sig");
+        let (remote, commit) = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let extra = format!(
+            "sign-verify=false\nsign-verify-summary=true\n\
+             verification-ed25519-key={PUBLIC_B64}\n"
+        );
+
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        drop(dest);
+
+        // The same summary signed by a key the destination does not trust.
+        // Regeneration drops the signature the trusted key left, so the file
+        // holds the other key's alone. The refusal comes before the remote is
+        // asked for anything else.
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        remote
+            .sign_summary(&Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
+        server.forget();
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+        assert_eq!(
+            server.seen_set(),
+            HashSet::from(["summary.sig".to_owned(), "summary".to_owned()]),
+            "the summary is checked before anything else is requested"
+        );
+        drop(dest);
+
+        // A remote publishing no signature at all is refused by name.
+        server.hide("summary.sig");
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no summary.sig")),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+    });
+}
+
+/// Every commit a pull carries is checked, the parents a depth pull follows
+/// included: a signed tip over an unsigned parent is refused at the parent.
+#[test]
+fn a_parent_reached_under_depth_is_checked_too() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-depth-verify");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        let remote = Repo::create(
+            &dir.path().join("remote"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let parent = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        let tip = commit_tree(
+            &remote,
+            dir.path(),
+            "src",
+            "test/main",
+            Some(parent),
+            FIXED_TS + 1,
+        )
+        .await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        remote.sign_commit(&tip, &signer).await.unwrap();
+
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let extra = format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
+
+        // The tip alone is signed, so a depth-0 pull passes.
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(tip)
+        );
+        drop(dest);
+
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
+        let err = pull_main(
+            &dest,
+            PullOptions {
+                depth: 1,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains(&parent.to_hex())),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+        // The tip passed the policy and was marked before the parent was
+        // refused. The failed pull published neither commit, so it takes that
+        // marker back.
+        let marker = dir
+            .path()
+            .join("dest/state")
+            .join(format!("{}.commitpartial", tip.to_hex()));
+        assert!(!marker.exists(), "the tip's marker was left behind");
+    });
+}
+
+/// A commit this repository already holds is checked again: the policy the pull
+/// states is what decides, not what an earlier pull accepted.
+#[test]
+fn a_commit_already_here_is_checked_again() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-recheck");
+        let (_remote, commit) = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"),
+        )
+        .await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+
+        // The same repository, now holding the commit, under a policy naming a
+        // key that did not sign it.
+        drop(dest);
+        let dest = reconfigure_dest(
+            dir.path(),
+            &server.url(),
+            &format!("sign-verify=ed25519\nverification-ed25519-key={OTHER_PUBLIC_B64}\n"),
+        )
+        .await;
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(matches!(&err, Error::Signature(_)), "{err}");
+    });
+}
+
+/// The pull's own switches win over the remote's configuration, in both
+/// directions.
+#[test]
+fn the_options_override_the_configured_policy() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-verify-override");
+        let (_remote, commit) = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+
+        // Configured to check with a key that did not sign the commit; the pull
+        // asks for no check and lands the ref.
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("sign-verify=ed25519\nverification-ed25519-key={OTHER_PUBLIC_B64}\n"),
+        )
+        .await;
+        pull_main(
+            &dest,
+            PullOptions {
+                verify: PullVerify {
+                    sign: Some(false),
+                    ..PullVerify::default()
+                },
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+
+        // Configured to check nothing; the pull asks for every engine and the
+        // key the configuration names is the wrong one.
+        drop(dest);
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("verification-ed25519-key={OTHER_PUBLIC_B64}\n"),
+        )
+        .await;
+        let err = pull_main(
+            &dest,
+            PullOptions {
+                verify: PullVerify {
+                    sign: Some(true),
+                    ..PullVerify::default()
+                },
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(&err, Error::Signature(_)), "{err}");
+        assert_nothing_published(&dest).await;
+    });
+}
+
+/// A static delta is held to the sign-api engines the commit policy names: one
+/// signed by a trusted key is applied, and one signed by another key fails
+/// before a part is fetched.
+#[test]
+fn a_delta_is_held_to_the_pulls_signature_policy() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-delta-verify");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        let remote_path = dir.path().join("remote");
+        let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let tip = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        remote.sign_commit(&tip, &signer).await.unwrap();
+        let delta = remote_path.join(
+            remote
+                .generate_static_delta(
+                    None,
+                    &tip,
+                    &DeltaOptions {
+                        timestamp: Some(FIXED_TS),
+                        ..DeltaOptions::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        // Signed by a key the destination does not trust. The remote serves no
+        // summary, so the superblock is asked for by name.
+        remote
+            .sign_static_delta(
+                &delta,
+                &Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let server = RepoServer::start(&remote_path, false).await;
+        let extra = format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), &extra).await;
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("static delta")),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+        assert!(
+            !server.seen().iter().any(|path| path.ends_with("/0")),
+            "no part was fetched: {:?}",
+            server.seen()
+        );
+        drop(dest);
+
+        // The same delta signed by the trusted key is applied, and the commit it
+        // delivers passes the commit policy on its own signature.
+        std::fs::remove_dir_all(&delta).unwrap();
+        let delta = remote_path.join(
+            remote
+                .generate_static_delta(
+                    None,
+                    &tip,
+                    &DeltaOptions {
+                        timestamp: Some(FIXED_TS),
+                        ..DeltaOptions::default()
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        remote.sign_static_delta(&delta, &signer).await.unwrap();
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), &extra).await;
+        server.forget();
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(tip)
+        );
+        assert!(
+            server.seen().iter().any(|path| path.ends_with("/0")),
+            "the delta's part was fetched: {:?}",
+            server.seen()
+        );
+    });
+}
+
+/// Interop: the port's pull reads the signatures the `ostree` tool wrote. The
+/// tool builds the remote, signs its commit and its summary with ed25519, and
+/// the port pulls it under a policy naming that key -- and refuses the same
+/// remote under another key.
+#[test]
+fn a_pull_verifies_what_the_tool_signed() {
+    if !ostree_available() {
+        eprintln!("skipping: the ostree tool is not installed");
+        return;
+    }
+    block_on(async {
+        let dir = TmpDir::new("pull-http-tool-signed");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+
+        let remote = dir.path().join("remote");
+        let remote_arg = format!("--repo={}", remote.display());
+        ostree(&[&remote_arg, "init", "--mode=archive"]);
+        let commit = String::from_utf8(ostree(&[
+            &remote_arg,
+            "commit",
+            "-b",
+            "test/main",
+            "--timestamp=2020-01-01 00:00:00 +0000",
+            &format!("--tree=dir={}", src.display()),
+        ]))
+        .unwrap()
+        .trim()
+        .to_owned();
+        ostree(&[
+            &remote_arg,
+            "sign",
+            "--sign-type=ed25519",
+            &commit,
+            SECRET_B64,
+        ]);
+        ostree(&[
+            &remote_arg,
+            "summary",
+            "-u",
+            "--sign-type=ed25519",
+            &format!("--sign={SECRET_B64}"),
+        ]);
+
+        let server = RepoServer::start(&remote, false).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::BareUser,
+            &server.url(),
+            &format!(
+                "sign-verify=ed25519\nsign-verify-summary=true\n\
+                 verification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        )
+        .await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true)
+                .await
+                .unwrap()
+                .map(|c| c.to_hex()),
+            Some(commit)
+        );
+        drop(dest);
+
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::BareUser,
+            &server.url(),
+            &format!(
+                "sign-verify=ed25519\nsign-verify-summary=true\n\
+                 verification-ed25519-key={OTHER_PUBLIC_B64}\n"
+            ),
+        )
+        .await;
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
     });
 }

@@ -741,8 +741,20 @@ last part is applied, so an object no part delivered is fetched loose and a
 published commit is whole. `disable_static_deltas` asks for no delta;
 `require_static_deltas` refuses a remote that advertises none.
 
-Still remote-only and unimplemented: `subdirs`, `override_commit_ids`,
-`gpg_verify`, `sign_verifiers`, and a progress callback.
+A pull checks the signatures on the commits it carries and on the remote's
+summary. `verify` holds four switches, each overriding the remote configuration
+key of the same name; a switch left `None` reads that configuration for `pull`
+and is off for `pull_local`. The GPG axis takes the remote's trusted keyrings and
+the sign-api axis takes the engines `sign-verify` names, with their keys from
+`verification-<engine>-key`, `verification-<engine>-file`, and the system key
+store. Each axis that applies has to find a valid signature, and within the
+sign-api axis one engine is enough. The summary is checked before it is read and
+a commit before its bytes are staged, so a refusal costs no object fetch. A
+fetched static delta is held to the sign-api axis over its raw superblock bytes
+before any part is requested.
+
+Still remote-only and unimplemented: `subdirs`, `override_commit_ids`, and a
+progress callback.
 
 ```rust
 pub struct PullFlags(u32);                // a bitset, as CommitModifierFlags is
@@ -784,6 +796,18 @@ pub struct PullOptions {
     pub timestamp_check: TimestampCheck,
     pub disable_static_deltas: bool,      // fetch every object loose
     pub require_static_deltas: bool,      // refuse a remote advertising none
+    pub verify: PullVerify,               // the signature checks to make
+}
+
+/// The signature checks a pull makes. `None` reads the remote's configuration
+/// for `pull` and checks nothing for `pull_local`; `Some(true)` on a sign-api
+/// field selects every engine the build has, as `sign-verify=true` does.
+#[derive(Default)]
+pub struct PullVerify {
+    pub gpg: Option<bool>,                // gpg-verify, default true
+    pub gpg_summary: Option<bool>,        // gpg-verify-summary, default false
+    pub sign: Option<bool>,               // sign-verify, default off
+    pub sign_summary: Option<bool>,       // sign-verify-summary, default off
 }
 
 pub struct PullStats {

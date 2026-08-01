@@ -228,8 +228,15 @@ impl Repo {
             ));
         }
         // The target commit is embedded in the superblock whole, so it is
-        // loaded (and its presence required) before anything is written.
+        // loaded (and its presence required) before anything is written. Its
+        // detached metadata rides in the superblock beside it, since that copy
+        // is what a verifying tool pull checks the delivered commit against.
         let commit_bytes = self.load_object_bytes(ObjectType::Commit, to).await?;
+        let detached = self.read_commit_detached_metadata(to).await?;
+        let target = Target {
+            bytes: &commit_bytes,
+            detached: detached.as_ref(),
+        };
         if let Some(from) = from
             && !self.has_object(ObjectType::Commit, from).await?
         {
@@ -269,8 +276,7 @@ impl Repo {
             entries.push(write_part(&dir_fd, entries.len(), part, fsync).await?);
         }
 
-        let superblock =
-            self.build_superblock(from, to, &commit_bytes, &entries, &selection, opts)?;
+        let superblock = self.build_superblock(from, to, &target, &entries, &selection, opts)?;
         write_delta_file(&dir_fd, SUPERBLOCK_FILE, &superblock, fsync).await?;
         // The sweep recognizes what it removes by name, which holds only where
         // every entry is this code's own: an output directory the caller named can
@@ -663,11 +669,17 @@ impl Repo {
     }
 
     /// Assemble the superblock GVariant.
+    ///
+    /// The target commit's detached metadata is copied into the metadata dict
+    /// under the delta's own directory with `/commitmeta` appended. A tool pull
+    /// checks a delta-delivered commit against that copy, so a signed commit
+    /// reaches a verifying destination only where the copy is here. A commit
+    /// holding no detached metadata gets no entry.
     fn build_superblock(
         &self,
         from: Option<&Checksum>,
         to: &Checksum,
-        commit_bytes: &[u8],
+        target: &Target<'_>,
         entries: &[PartEntry],
         selection: &Selection,
         opts: &DeltaOptions,
@@ -681,9 +693,19 @@ impl Repo {
                 Value::Byte(ENDIANNESS_LITTLE),
             ),
         )?;
+        if let Some(detached) = target.detached {
+            crate::commit::append_dict_entry(
+                &mut metadata,
+                &format!("{}/commitmeta", delta_relative_dir(from, to)),
+                Value::variant(
+                    Type::parse("a{sv}").map_err(ostrya_core::Error::from)?,
+                    detached.clone(),
+                ),
+            )?;
+        }
 
         let commit_ty = Type::parse(COMMIT_SIG).map_err(ostrya_core::Error::from)?;
-        let commit = from_bytes(&commit_ty, commit_bytes).map_err(ostrya_core::Error::from)?;
+        let commit = from_bytes(&commit_ty, target.bytes).map_err(ostrya_core::Error::from)?;
 
         let meta_entries = entries
             .iter()
@@ -805,6 +827,13 @@ impl Repo {
             }
         }
     }
+}
+
+/// The target commit as the superblock carries it: the commit object's
+/// serialized bytes, and its detached metadata where it has any.
+struct Target<'a> {
+    bytes: &'a [u8],
+    detached: Option<&'a Value>,
 }
 
 /// The objects a delta delivers, split by how they travel.

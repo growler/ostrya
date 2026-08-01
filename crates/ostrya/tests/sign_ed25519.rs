@@ -22,7 +22,8 @@ use std::process::Command;
 use common::{TmpDir, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Ed25519Signer,
-    Ed25519Verifier, MutableTree, ObjectType, Repo, RepoMode, Signer, base64, load_sign_keys_from,
+    Ed25519Verifier, Error, MutableTree, ObjectType, Repo, RepoMode, Signer, base64,
+    load_sign_keys_from,
 };
 use ostrya_rt::block_on;
 
@@ -470,6 +471,55 @@ fn sign_key_store_reads_files_dirs_and_tolerates_missing() {
     assert_eq!(keys.trusted.len(), 3, "two file keys plus one drop-in key");
     assert_eq!(keys.revoked.len(), 1);
     assert_eq!(keys.trusted[0], public_key());
+}
+
+/// A fifo at a key store file's name is refused by that name. What a fifo
+/// answers a read with is what its writers sent, so a load reading one would
+/// take its trusted set from them. This test returns only because the read
+/// refuses the kind before it reads.
+#[test]
+fn sign_key_store_refuses_a_fifo_by_name() {
+    let tmp = TmpDir::new("ed25519-store-fifo");
+    let root = tmp.path();
+
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        root.join("trusted.ed25519"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+
+    let err = load_sign_keys_from(&[root], "ed25519").unwrap_err();
+    assert!(
+        matches!(&err, Error::Signature(m) if m.contains("trusted.ed25519")
+            && m.contains("regular file")),
+        "{err}"
+    );
+}
+
+/// A key store file over the ceiling is refused by its own name, so its size
+/// cannot decide an allocation.
+#[test]
+fn sign_key_store_refuses_an_oversized_file_by_name() {
+    /// The ceiling `sign.rs` holds every key file to.
+    const MAX_KEY_FILE: u64 = 1024 * 1024;
+
+    let tmp = TmpDir::new("ed25519-store-size");
+    let root = tmp.path();
+
+    std::fs::File::create(root.join("revoked.ed25519"))
+        .unwrap()
+        .set_len(MAX_KEY_FILE + 1)
+        .unwrap();
+
+    let err = load_sign_keys_from(&[root], "ed25519").unwrap_err();
+    assert!(
+        matches!(&err, Error::Signature(m) if m.contains("revoked.ed25519")
+            && m.contains("ceiling")),
+        "{err}"
+    );
 }
 
 #[test]

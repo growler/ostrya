@@ -49,7 +49,9 @@
 //! its tree is asked for, and nothing is held in memory past the step. A reader
 //! is covered against a commit whose tree is not yet complete by the commit's
 //! `.commitpartial` marker, which is written when the commit is fetched and
-//! removed after the transaction publishes. An object several commits reach is
+//! removed after the transaction publishes. A pull that fails removes the
+//! markers it wrote for commits this repository does not hold, so a refused
+//! commit leaves the destination as it stood. An object several commits reach is
 //! fetched once, and the step that fetches a commit makes the ref-binding and
 //! timestamp checks of every requested ref naming it, so two refs at one commit
 //! are both checked. A commit this repository already holds complete has no
@@ -104,6 +106,13 @@
 //! arrives with: [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) rejects a
 //! regular file whose mode has bits outside `0775`, and a bare-user-only
 //! destination rejects one whose header is not the canonical form it stores.
+//!
+//! Signatures are a policy of their own, described in
+//! [`verify`](super::verify): the remote's configuration states it and
+//! [`PullVerify`](super::PullVerify) overrides it. The summary is checked as
+//! soon as it and its signature are here, before the refs it resolves or the
+//! deltas it advertises are read; a commit is checked in the step that fetched
+//! it, before its bytes are staged and before its tree is asked for.
 //!
 //! That header also declares what the payload decompresses to, which bounds the
 //! stream on both sides. A payload that outgrows the declaration is refused with
@@ -167,13 +176,14 @@ use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::CommitState;
 use crate::repo::Repo;
-use crate::summary::{SUMMARY_FILE, Summary};
+use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary};
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
 use super::delta::{self, DeltaJob, PART_CAP};
 use super::drive::Slots;
+use super::verify::{Defaults, Verification};
 use super::{
     ModeChecks, PullFlags, PullOptions, PullStats, READ_CHUNK, TimestampCheck, check_ref_binding,
     refspec,
@@ -193,8 +203,6 @@ const MAX_ROOT_FILE: u64 = 64 * 1024 * 1024;
 /// and a newline.
 const MAX_REF_FILE: u64 = 1024;
 
-/// The summary signature file name at the repository root.
-const SUMMARY_SIG_FILE: &str = "summary.sig";
 /// The repository config file name at the repository root.
 const CONFIG_FILE: &str = "config";
 
@@ -221,8 +229,21 @@ impl Repo {
     /// summary bytes to this repository's `summary`, and its `summary.sig` bytes
     /// where the remote holds them.
     pub async fn pull(&self, remote: &str, opts: PullOptions) -> Result<PullStats> {
+        // The fetcher is built first, so a remote the config does not describe
+        // reports that before a policy is resolved for it. `remote_fetcher`
+        // reads the config section, the URL, and the TLS material; it sends no
+        // request, so a refused policy still stops the pull before its first
+        // fetch.
         let fetcher = self.remote_fetcher(remote, &opts).await?;
+        let verification =
+            Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
         let (summary_bytes, signature) = fetch_summary(&fetcher).await?;
+        // The summary is checked before it is read: the refs it resolves and the
+        // deltas it advertises are what a pull acts on, so a summary the policy
+        // refuses stops the pull before its first object request.
+        verification
+            .check_summary(summary_bytes.as_deref(), signature.as_deref())
+            .await?;
         let summary = match summary_bytes.as_deref() {
             Some(bytes) => Some(Summary::parse(bytes)?),
             None => None,
@@ -242,17 +263,46 @@ impl Repo {
         // The deltas the remote can deliver these commits with, found before the
         // first object is asked for: a commit a delta carries has no `.commit`
         // request of its own.
-        let deltas =
-            delta::discover(self, &fetcher, summary.as_ref(), &targets, &opts, prefix).await?;
+        let deltas = delta::discover(
+            self,
+            &fetcher,
+            summary.as_ref(),
+            &targets,
+            &opts,
+            prefix,
+            &verification,
+        )
+        .await?;
 
         let txn = self.transaction().await?;
-        let marked = self
-            .drive(&txn, &fetcher, &opts, prefix, &targets, &deltas)
+        // The markers the pull writes, held outside the span that writes them so
+        // a failure in that span clears the ones it left behind.
+        let mut marked = Vec::new();
+        let published = async {
+            self.drive(
+                &txn,
+                &fetcher,
+                &opts,
+                prefix,
+                &targets,
+                &deltas,
+                &verification,
+                &mut marked,
+            )
             .await?;
-        for (name, tip) in &targets {
-            txn.set_ref(&refspec(prefix, name), Some(tip));
+            for (name, tip) in &targets {
+                txn.set_ref(&refspec(prefix, name), Some(tip));
+            }
+            txn.commit().await
         }
-        let stats = txn.commit().await?;
+        .await;
+        let stats = match published {
+            Ok(stats) => stats,
+            Err(e) => {
+                self.clear_markers_for_absent_commits(&marked).await;
+                return Err(e);
+            }
+        };
 
         // The content a marker guarded is published; a commit-only pull keeps
         // its markers, since the trees were never fetched.
@@ -384,8 +434,12 @@ impl Repo {
         Ok(out)
     }
 
-    /// Run the plan to completion, returning the commits whose `.commitpartial`
-    /// marker this pull wrote and has to clear.
+    /// Run the plan to completion, collecting into `marked` the commits whose
+    /// `.commitpartial` marker this pull wrote and has to clear.
+    ///
+    /// `marked` is an argument rather than the return value so the caller holds
+    /// what was written when a step fails.
+    #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
         txn: &Transaction,
@@ -394,7 +448,9 @@ impl Repo {
         ref_prefix: Option<&str>,
         targets: &[(String, Checksum)],
         deltas: &HashMap<Checksum, DeltaJob>,
-    ) -> Result<Vec<Checksum>> {
+        verification: &Verification,
+        marked: &mut Vec<Checksum>,
+    ) -> Result<()> {
         // The refs each requested tip is the tip of. The binding and timestamp
         // checks are per ref, and the plan fetches one commit once however many
         // refs name it, so the step that fetches a commit runs the checks of every
@@ -414,6 +470,7 @@ impl Repo {
             timestamp_check: &opts.timestamp_check,
             tips: &tips,
             deltas,
+            verification,
         };
         let mut plan = Plan::default();
         for (_, tip) in targets {
@@ -424,7 +481,6 @@ impl Repo {
             });
         }
 
-        let mut marked = Vec::new();
         let mut slots = Slots::new(opts.max_outstanding_fetches.unwrap_or(DEFAULT_OUTSTANDING));
         // The read buffers a content object passes through, whichever source it
         // comes from: a localcache import verifies its payload through one, and a
@@ -445,9 +501,9 @@ impl Repo {
             };
             let (step, buffer) = outcome?;
             buffers.push(buffer);
-            plan.apply(step, &mut marked);
+            plan.apply(step, marked);
         }
-        Ok(marked)
+        Ok(())
     }
 
     /// Run one unit of work: fetch an object and store it.
@@ -500,35 +556,30 @@ impl Repo {
 
         let present = self.has_object(ObjectType::Commit, &checksum).await?;
         let complete = present && self.commit_state(&checksum).await? == CommitState::Normal;
-        // Whether the commit object still has to be staged. A commit this
-        // repository holds, and one a localcache repository supplied, are both
-        // already accounted for.
-        let mut stage = false;
+        // How the commit object reaches the object store, acted on once the
+        // checks have passed. A commit this repository holds is there already.
+        let mut staging = CommitStaging::Held;
         let bytes = if present {
             self.load_object_bytes(ObjectType::Commit, &checksum)
                 .await?
         } else if let Some(src) = cached_source(ctx.sources, name).await? {
-            self.import_from(
-                ctx.txn,
-                src,
-                name,
-                ctx.flags | PullFlags::UNTRUSTED,
-                read_buf,
-            )
-            .await?;
+            // A localcache source holds the object, so the bytes are read from
+            // there and the import runs after the checks, the order the fetched
+            // branches take.
+            staging = CommitStaging::Import(src);
             src.load_object_bytes(ObjectType::Commit, &checksum).await?
         } else if let Some(job) = ctx.deltas.get(&checksum) {
             // A delta carries the target commit inside its superblock, which is
             // where these bytes come from; the superblock's own parse has already
             // established that they hash to this checksum, and staging them
             // establishes it again.
-            stage = true;
+            staging = CommitStaging::Write;
             job.commit_bytes.clone()
         } else {
             let path = object_path(&checksum, ObjectType::Commit);
             match fetch_whole(ctx.fetcher, &path, Priority::High, MAX_METADATA_SIZE).await {
                 Ok(bytes) => {
-                    stage = true;
+                    staging = CommitStaging::Write;
                     bytes
                 }
                 // A parent the remote does not hold ends that chain, the way a
@@ -543,6 +594,21 @@ impl Repo {
         };
 
         let commit = Commit::parse(&bytes)?;
+        // The signature check runs before the commit is staged and before its
+        // tree is asked for, so a commit the policy refuses costs no object
+        // fetch. It reads the detached metadata this pull puts in place: the
+        // remote's copy where it served one, and this repository's own where it
+        // did not, which is the metadata a later verify of the stored commit
+        // reads.
+        if ctx.verification.checks_commits() {
+            let dict = match &detached {
+                Some(bytes) => crate::summary::parse_signature_dict(bytes)?,
+                None => self.read_commit_detached_metadata(&checksum).await?,
+            };
+            ctx.verification
+                .check_commit(&checksum, &bytes, dict.as_ref())
+                .await?;
+        }
         // Every requested ref naming this commit is checked here. The plan fetches
         // one commit once, so a second ref at the same commit has no step of its
         // own to be checked in.
@@ -560,16 +626,30 @@ impl Repo {
             self.write_partial_marker(&checksum).await?;
         }
         // The commit is staged where it arrived, behind its own marker and ahead
-        // of its tree. The write path hashes the bytes and compares the result
-        // against the name they were requested by, so a commit stored under the
-        // wrong name fails here rather than after its tree has been fetched, and
-        // nothing is held past the step. What covers a reader against a commit
-        // whose tree is not yet complete is the marker, cleared once the
-        // transaction has published.
-        if stage {
-            ctx.txn
-                .write_metadata(ObjectType::Commit, Some(&checksum), &bytes)
+        // of its tree. Either path hashes the bytes and compares the result
+        // against the name they were requested by -- the write path for bytes in
+        // hand, the untrusted import for a localcache source's object -- so a
+        // commit stored under the wrong name fails here rather than after its tree
+        // has been fetched, and nothing is held past the step. What covers a
+        // reader against a commit whose tree is not yet complete is the marker,
+        // cleared once the transaction has published.
+        match staging {
+            CommitStaging::Held => {}
+            CommitStaging::Import(src) => {
+                self.import_from(
+                    ctx.txn,
+                    src,
+                    name,
+                    ctx.flags | PullFlags::UNTRUSTED,
+                    read_buf,
+                )
                 .await?;
+            }
+            CommitStaging::Write => {
+                ctx.txn
+                    .write_metadata(ObjectType::Commit, Some(&checksum), &bytes)
+                    .await?;
+            }
         }
         // The commit object is here, so its detached metadata is written now,
         // ahead of the ref that names it, which is what a verifier reading the
@@ -862,6 +942,9 @@ struct StepCtx<'a> {
     /// The static delta each target commit is delivered by, where the remote
     /// publishes one. A commit with no entry is fetched object by object.
     deltas: &'a HashMap<Checksum, DeltaJob>,
+    /// The signature checks this pull makes, which every commit a step carries
+    /// is held to before its bytes are staged.
+    verification: &'a Verification,
 }
 
 /// One commit to fetch.
@@ -912,6 +995,17 @@ struct CommitOutcome {
     parent: Option<Checksum>,
     /// Whether this pull wrote the commit's `.commitpartial` marker.
     marked: bool,
+}
+
+/// How a commit object reaches the object store, once the commit has passed the
+/// checks its step makes.
+enum CommitStaging<'a> {
+    /// This repository holds it.
+    Held,
+    /// A localcache repository holds it, to import from there.
+    Import(&'a Repo),
+    /// Its bytes are in hand, to write into the transaction.
+    Write,
 }
 
 /// How a commit's objects reach this repository.

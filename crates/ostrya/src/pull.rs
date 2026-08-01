@@ -115,6 +115,13 @@
 //! present is left as it stands rather than rewritten, so the one-byte state
 //! fsck writes survives a pull over the commit it marked.
 //!
+//! A pull that returns an error removes the markers it wrote for commits this
+//! repository does not hold. Its transaction published no object, so such a
+//! marker guards nothing and nothing else reaches it: prune removes a marker for
+//! a commit it prunes, and a commit that was never written is in no doomed set.
+//! A commit this repository does hold keeps its marker, which is the marker the
+//! pull found in place over a partial commit.
+//!
 //! Marker durability: no marker is fsynced and neither is `state/`, which is
 //! what the tool does. Every marker of a pull is written before
 //! `Transaction::commit`, so the `syncfs` that opens publication makes it durable
@@ -136,6 +143,14 @@
 //! rejected on that path with or without the flag; every other path moves bytes
 //! without hashing them, and the flag adds their one read. An untrusted pull
 //! therefore reads each object exactly once.
+//!
+//! Signatures: [`PullVerify`] states which of the four checks a pull makes over
+//! the commits it carries and the source's summary, described in
+//! [`verify`](self::verify). A local pull makes none unless one is asked for,
+//! and every check reads its keys from the configuration of the remote
+//! [`PullOptions::remote`] names, so a check asked for without one is refused.
+//! The commits and the summary are checked before the transaction opens, so a
+//! source the policy refuses imports nothing.
 
 use std::collections::{HashMap, HashSet};
 
@@ -154,6 +169,7 @@ use crate::write::FileMeta;
 mod delta;
 mod drive;
 pub mod http;
+mod verify;
 
 /// The chunk size for streaming a content object's payload.
 const READ_CHUNK: usize = 128 * 1024;
@@ -245,6 +261,34 @@ pub enum TimestampCheck {
     Rev(Checksum),
 }
 
+/// The signature checks a pull makes, each field overriding the remote
+/// configuration key of the same name.
+///
+/// A field left `None` takes the remote's configuration for [`Repo::pull`] --
+/// `gpg-verify` (default true), `gpg-verify-summary` (default false),
+/// `sign-verify` and `sign-verify-summary` (both default off) -- and is off for
+/// [`Repo::pull_local`], which checks nothing unless it is asked to. A `Some`
+/// field states the policy whatever the configuration says, and `Some(true)` on
+/// a sign-api field selects every engine this build has, as `sign-verify=true`
+/// does.
+///
+/// The keys of every check come from a remote's configuration section, so a
+/// check asked for by a pull that names no remote is refused before anything is
+/// fetched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PullVerify {
+    /// Every commit the pull carries has a GPG signature from the remote's
+    /// trusted keyrings.
+    pub gpg: Option<bool>,
+    /// The remote's summary has a GPG signature from those keyrings.
+    pub gpg_summary: Option<bool>,
+    /// Every commit the pull carries has a sign-api signature from a key the
+    /// remote's configuration or the system key store trusts.
+    pub sign: Option<bool>,
+    /// The remote's summary has such a signature.
+    pub sign_summary: Option<bool>,
+}
+
 /// What to pull and how.
 ///
 /// The defaults are what [`Repo::pull_local`] does; the fields an HTTP pull adds
@@ -295,6 +339,9 @@ pub struct PullOptions {
     /// commit this repository already holds complete is not looked for at all, so
     /// a pull with nothing to fetch is not refused.
     pub require_static_deltas: bool,
+    /// The signature checks this pull makes, over the remote's configured
+    /// policy.
+    pub verify: PullVerify,
 }
 
 /// What a pull imported.
@@ -331,6 +378,16 @@ impl Repo {
     /// source does not hold ends that chain without error, so a source with
     /// truncated history pulls what it has.
     pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<PullStats> {
+        // The signature policy is built before the source is read: a check the
+        // options ask for with no remote to take keys from is refused here,
+        // rather than after a chain has been walked.
+        let verification = verify::Verification::build(
+            self,
+            opts.remote.as_deref(),
+            &opts.verify,
+            verify::Defaults::Off,
+        )
+        .await?;
         let targets = resolve_targets(src, &opts).await?;
         let flags = opts.flags;
         let verify_bindings = !flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS);
@@ -346,42 +403,88 @@ impl Repo {
             collect_chain(src, *tip, commit, opts.depth, &mut commits, &mut seen).await?;
         }
 
-        let txn = self.transaction().await?;
-
-        // Mark each commit partial before its objects are imported, skipping one
-        // this repository already holds intact: a pull that fails leaves its
-        // markers behind, and a commit that was already complete must not be
-        // demoted by an unrelated failure.
-        let mut marked: Vec<Checksum> = Vec::new();
-        for commit in &commits {
-            if !self.has_object(ObjectType::Commit, commit).await?
-                || self.commit_state(commit).await? == crate::read::CommitState::Partial
-            {
-                self.write_partial_marker(commit).await?;
-                marked.push(*commit);
-            }
-        }
-
         let sources: Vec<&Repo> = std::iter::once(src)
             .chain(opts.localcache_repos.iter())
             .collect();
 
-        let mut plan = PlanState::default();
-        // The read buffer an untrusted verification streams through, reused
-        // across every object of the pull and sized on its first use, so a pull
-        // that verifies nothing allocates nothing.
-        let mut verify_buf: Vec<u8> = Vec::new();
-        for commit in &commits {
-            for name in plan_commit(&sources, *commit, flags, &mut plan).await? {
-                self.import_object(&txn, &sources, name, flags, &mut verify_buf)
+        // The summary and every commit of the chain are checked before the
+        // transaction opens, so a source whose signatures do not satisfy the
+        // policy imports nothing at all. A check binds to the source objects as
+        // they stand while it runs. The import loop reads them a second time: a
+        // commit where it walks the tree, and the `.commitmeta` where it copies
+        // the bytes. A source rewritten between the check and the import is
+        // imported as it stands at the import, and a concurrent sign of the
+        // source commit is the writer that replaces a `.commitmeta` in place.
+        // Carrying the checked bytes to the import would hold one entry per
+        // commit of the chain, which a `depth=-1` pull leaves unbounded, so the
+        // metadata is read twice instead.
+        if verification.checks_summary() {
+            let summary = src.read_root_file(crate::summary::SUMMARY_FILE).await?;
+            let signature = src.read_root_file(crate::summary::SUMMARY_SIG_FILE).await?;
+            verification
+                .check_summary(summary.as_deref(), signature.as_deref())
+                .await?;
+        }
+        if verification.checks_commits() {
+            for commit in &commits {
+                let bytes = load_object_from(&sources, ObjectType::Commit, commit).await?;
+                // The check reads the detached metadata this pull leaves in
+                // place: a source's `.commitmeta` where one holds it, and this
+                // repository's own where none does, which is the metadata a
+                // later verify of the stored commit reads.
+                let detached = match detached_bytes_from(&sources, commit).await? {
+                    Some(bytes) => crate::summary::parse_signature_dict(&bytes)?,
+                    None => self.read_commit_detached_metadata(commit).await?,
+                };
+                verification
+                    .check_commit(commit, &bytes, detached.as_ref())
                     .await?;
             }
-            self.import_detached_metadata(&sources, commit).await?;
         }
-        for (ref_name, tip) in &targets {
-            txn.set_ref(&refspec(opts.remote.as_deref(), ref_name), Some(tip));
+
+        let txn = self.transaction().await?;
+
+        // The markers the pull writes, held outside the span that writes them so
+        // a failure in that span clears the ones it left behind.
+        let mut marked: Vec<Checksum> = Vec::new();
+        let published = async {
+            // Mark each commit partial before its objects are imported, skipping
+            // one this repository already holds intact: a commit that was
+            // already complete must not be demoted by an unrelated failure.
+            for commit in &commits {
+                if !self.has_object(ObjectType::Commit, commit).await?
+                    || self.commit_state(commit).await? == crate::read::CommitState::Partial
+                {
+                    self.write_partial_marker(commit).await?;
+                    marked.push(*commit);
+                }
+            }
+
+            let mut plan = PlanState::default();
+            // The read buffer an untrusted verification streams through, reused
+            // across every object of the pull and sized on its first use, so a
+            // pull that verifies nothing allocates nothing.
+            let mut verify_buf: Vec<u8> = Vec::new();
+            for commit in &commits {
+                for name in plan_commit(&sources, *commit, flags, &mut plan).await? {
+                    self.import_object(&txn, &sources, name, flags, &mut verify_buf)
+                        .await?;
+                }
+                self.import_detached_metadata(&sources, commit).await?;
+            }
+            for (ref_name, tip) in &targets {
+                txn.set_ref(&refspec(opts.remote.as_deref(), ref_name), Some(tip));
+            }
+            txn.commit().await
         }
-        let stats = txn.commit().await?;
+        .await;
+        let stats = match published {
+            Ok(stats) => stats,
+            Err(e) => {
+                self.clear_markers_for_absent_commits(&marked).await;
+                return Err(e);
+            }
+        };
 
         // The content a marker guarded is published; a commit-only pull keeps
         // its markers, since the trees were never walked.
@@ -526,12 +629,8 @@ impl Repo {
     /// stored bytes are copied verbatim; a source with no `.commitmeta` leaves
     /// the destination's alone.
     async fn import_detached_metadata(&self, sources: &[&Repo], commit: &Checksum) -> Result<()> {
-        for src in sources {
-            match src.load_object_bytes(ObjectType::CommitMeta, commit).await {
-                Ok(bytes) => return self.write_commit_detached_bytes(commit, bytes).await,
-                Err(Error::ObjectNotFound { .. }) => continue,
-                Err(e) => return Err(e),
-            }
+        if let Some(bytes) = detached_bytes_from(sources, commit).await? {
+            self.write_commit_detached_bytes(commit, bytes).await?;
         }
         Ok(())
     }
@@ -585,6 +684,26 @@ impl Repo {
             }
         })
         .await
+    }
+
+    /// Remove the markers a failed pull wrote for commits this repository does
+    /// not hold, taking `marked` as the list the pull wrote.
+    ///
+    /// A pull publishes its objects through one transaction, so a failure leaves
+    /// the commit object it marked unwritten. The marker then guards nothing and
+    /// nothing reaches it: prune removes a marker for a commit it prunes, and a
+    /// commit that was never written is in no doomed set. A commit this
+    /// repository does hold keeps its marker. The pull found that one partial and
+    /// left the marker as it stood, so the state byte fsck writes is in it.
+    ///
+    /// This runs on the error path. A marker that cannot be removed is left
+    /// where it is, so the error the pull reports is the one that ended it.
+    async fn clear_markers_for_absent_commits(&self, marked: &[Checksum]) {
+        for commit in marked {
+            if matches!(self.has_object(ObjectType::Commit, commit).await, Ok(false)) {
+                let _ = self.remove_partial_marker(commit).await;
+            }
+        }
     }
 }
 
@@ -764,6 +883,45 @@ async fn load_commit_from(sources: &[&Repo], checksum: &Checksum) -> Result<Comm
         checksum: *checksum,
         ty: ObjectType::Commit,
     })
+}
+
+/// Load an object's bytes from the first source holding it.
+async fn load_object_from(
+    sources: &[&Repo],
+    ty: ObjectType,
+    checksum: &Checksum,
+) -> Result<Vec<u8>> {
+    for src in sources {
+        match src.load_object_bytes(ty, checksum).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(Error::ObjectNotFound { .. }) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::ObjectNotFound {
+        checksum: *checksum,
+        ty,
+    })
+}
+
+/// Read a commit's `.commitmeta` bytes from the first source holding that
+/// object, or `None` when no source holds one.
+///
+/// This is the one decision about which detached metadata a local pull puts in
+/// place: the signature check reads these bytes and
+/// [`Repo::import_detached_metadata`] writes them, so what the pull checks and
+/// what it stores cannot disagree. A zero-length file counts as a source holding
+/// one, since that is the documented "no metadata" marker and it replaces the
+/// destination's copy.
+async fn detached_bytes_from(sources: &[&Repo], commit: &Checksum) -> Result<Option<Vec<u8>>> {
+    for src in sources {
+        match src.load_object_bytes(ObjectType::CommitMeta, commit).await {
+            Ok(bytes) => return Ok(Some(bytes)),
+            Err(Error::ObjectNotFound { .. }) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
 }
 
 /// Load a dirtree from the first source holding it, `None` when none does.

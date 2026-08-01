@@ -1597,9 +1597,13 @@ asserts the tool emitted rollsum writes before applying).
 #### Phase 15b -- Generation (DONE)
 
 `Repo::generate_static_delta` writes a delta the tool applies: the superblock
-(the target commit embedded whole, `ostree.endianness` metadata, a wall-clock
-big-endian timestamp, per-part meta-entries, and the fallback array) and the
-xz-compressed numbered parts. `Repo::sign_static_delta` wraps a written
+(the target commit embedded whole, `ostree.endianness` metadata, a copy of the
+target commit's detached metadata where it has any, a wall-clock big-endian
+timestamp, per-part meta-entries, and the fallback array) and the xz-compressed
+numbered parts. The detached-metadata copy sits under the delta's own relative
+directory with `/commitmeta` appended, which is where a tool pull reads the
+signatures it holds a delta-delivered commit to; a commit with no detached
+metadata gets no entry. `Repo::sign_static_delta` wraps a written
 superblock in the `OSTSGNDT` envelope through the Phase 13 engines, once per
 engine, and `Repo::reindex_static_deltas` rebuilds `delta-indexes/`. A native
 `ostrya static-delta generate` exposes the knobs, `--sign`, and `--reindex`, and
@@ -1764,13 +1768,16 @@ from-to delta, and a multi-part delta; `ostree static-delta show` confirms which
 operations each delta carries, so a test cannot pass by silently splicing;
 `ostree static-delta verify` accepts the port's ed25519 signature and rejects it
 under a foreign key; `ostree static-delta indexes` lists a target the port
-indexed; the port applies its own deltas and reproduces the objects, including
-the fallback route the tool refuses offline; the fallback threshold is checked at
-both sides of its boundary against the tool's own generation over the same commit
-at the same threshold, so the compared size is pinned to the tool's byte for byte;
-a temp file aged past the sweep's hour is removed while a fresh one survives; a
-caller's files named `0` and `.notes.tmp-1-1` in an `output_dir` are left alone;
-and generation is byte-identical across two runs over one input
+indexed; a tool pull under `sign-verify=ed25519` takes the port's delta for a
+signed commit, over a `file://` remote with `--require-static-deltas`, and takes
+a delta for an unsigned commit whose superblock carries no `commitmeta` entry;
+the port applies its own deltas and reproduces the objects, including the
+fallback route the tool refuses offline; the fallback threshold is checked at
+both sides of its boundary against the tool's own generation over the same
+commit at the same threshold, so the compared size is pinned to the tool's byte
+for byte; a temp file aged past the sweep's hour is removed while a fresh one
+survives; a caller's files named `0` and `.notes.tmp-1-1` in an `output_dir` are
+left alone; and generation is byte-identical across two runs over one input
 (`tests/delta_generate.rs`, `static_delta_generate_signs_and_indexes` in the CLI
 tests). Unit tests cover the data source's two failure modes: a spill write the
 async file defers fails the handover to the blocking side, and a data source
@@ -1800,7 +1807,9 @@ Split into sub-phases:
 - 16d Delta-accelerated pull and the delta-part cap of 2 (DONE, see below). The
   config and mount repo finders moved out of this sub-phase: a finder resolves a
   collection ref, and collection refs are not yet scheduled.
-- 16e Commit and summary signature verification during a pull.
+- 16e Commit and summary signature verification during a pull (DONE, see
+  below): the GPG and sign-api axes, their configuration keys and key sources,
+  and the delta signature check 16d left open.
 - 16f The `ostrya pull` CLI command.
 - 16g Archive-to-archive pass-through: store a fetched `.filez` verbatim instead
   of inflating and deflating it again (see below).
@@ -2229,6 +2238,17 @@ commit that was already complete. A marker already present is left as it stands:
 the create uses `O_EXCL` and treats `EEXIST` as success, so a pull over a commit
 fsck marked keeps fsck's state byte, which is what the tool's `pull-local` does.
 
+A pull that returns an error removes the markers it wrote for commits this
+repository does not hold, leaving the destination as it stood. The objects of a
+pull are published by its one transaction or by nothing at all, so a marker over
+an absent commit guards nothing and nothing else reaches it: prune removes a
+marker for a commit it prunes, and a commit that was never written is in no
+doomed set. A commit this repository does hold keeps its marker -- that one was
+partial before the pull ran, and fsck's state byte is in that file. The removal
+is best-effort: a marker that cannot be unlinked stays, so the error the pull
+reports is the one that ended it. Both pull paths do this, the HTTP path over
+the markers its slots wrote (see 16c).
+
 Marker durability follows the tool, which syncs neither the marker nor `state/`
 on either side (both recovered by tracing its syscalls; see
 `format-reference.md`). Every marker of a pull is written before the transaction
@@ -2323,12 +2343,14 @@ through `min-free-space-percent=100`, which leaves a zero write budget: a
 same-mode pull imports every object on the source's inodes and reports their
 stored size in its statistics, while the same destination in archive mode, where
 each content object is re-ingested, fails with `InsufficientFreeSpace`,
-publishes no object, writes no ref, and leaves the marker. State: `COMMIT_ONLY`
+publishes no object, writes no ref, and clears the marker. State: `COMMIT_ONLY`
 imports exactly
 the commit object,
 leaves a zero-length marker, and reports the commit partial, and completing the
 pull clears it; a pull that reaches an absent source object publishes no
-object, writes no ref, and leaves the marker. Trust and checks: a corrupt
+object, writes no ref, and clears the marker it wrote; a repair pull over a
+commit fsck marked keeps that marker, state byte and all, since the destination
+holds the commit. Trust and checks: a corrupt
 content object and a corrupt commit object each travel on the trusted path and
 each fail `UNTRUSTED` with `ChecksumMismatch`, with nothing published, and a
 corrupt payload crossing the bare family behaves the same way on the clone path;
@@ -2343,7 +2365,7 @@ own rule, and accepted by an archive destination without the flag. Detached meta
 with its commit; a localcache repository supplies an object the source no
 longer holds, and supplies a dirtree it no longer holds, whose subtree the walk
 enumerates from the cache and imports whole, while the same pull without the
-cache fails with `ObjectNotFound`, publishes no ref, and leaves the marker. Three interop tests need the tool: the port pulls a tool-built
+cache fails with `ObjectNotFound`, publishes no ref, and clears the marker. Three interop tests need the tool: the port pulls a tool-built
 archive repository into an archive and a bare-user destination, and the tool
 then resolves the ref, passes `fsck`, and reads the tree back; the port pulls
 its own bare repository into a bare-user destination, where every regular file
@@ -2409,7 +2431,9 @@ and nothing is held past the step. What covers a reader against a commit whose
 tree is not yet complete is the commit's `.commitpartial` marker, written when the
 commit is fetched and removed after the transaction publishes; publication renames
 the staged objects in an unspecified order, so a staging order is not something a
-reader observes. An object several commits reach is fetched
+reader observes. The markers a failed pull wrote for commits this repository
+does not hold are removed on the way out, under 16b's rule, so a commit a later
+step refuses leaves nothing behind. An object several commits reach is fetched
 once. A commit already here complete has no object of its tree queued, since
 what it references is present, and its parent is followed all the same, so a pull
 extends the history a shallower pull left. A commit's `.commitmeta` is requested ahead of the commit object and written
@@ -2572,7 +2596,9 @@ metadata for the commit it does not hold, and a deep pull after a shallow one
 fetching the parent the shallow pull left; a non-archive remote
 refused on its config mode with nothing beyond the three root files requested; a
 corrupt object failing with `ChecksumMismatch` and a missing one with
-`ObjectNotFound`, each publishing nothing, the second leaving the marker;
+`ObjectNotFound`, each publishing nothing, the second clearing the marker it
+wrote, while the same failure over a commit the destination already holds
+partial keeps that commit's marker;
 `COMMIT_ONLY` leaving a zero-length marker and reporting the commit partial,
 which completing the pull clears; the timestamp check at older, equal, and `Rev`;
 a bare-user-only destination refusing a non-canonical object and
@@ -2632,9 +2658,8 @@ parsed superblock has to name the commit being pulled and the source commit its
 name claims. The delta's own signatures are checked next, over the raw superblock
 bytes and ahead of any part request, so a delta that fails verification costs no
 part bytes, which is the property the digest check has. That check is the seam
-`verify_fetched_delta` in `crates/ostrya/src/pull/delta.rs`; Phase 16d has no
-verification policy to apply and accepts every delta there, and 16e supplies the
-body. Each part file is hashed against the superblock's entry for it, and
+`verify_fetched_delta` in `crates/ostrya/src/pull/delta.rs`, whose policy Phase
+16e supplies. Each part file is hashed against the superblock's entry for it, and
 every object a part produces is written under the checksum the superblock names,
 which is the read path's own rule. A superblock the remote does not hold is a
 404: the advertisement is stale, and the pull fetches the objects loose.
@@ -2767,12 +2792,194 @@ scratch and from a source commit -- each under its own superblock's digest,
 positioned between `tombstone-commits` and `indexed-deltas`, and read back by the
 tool's `summary --print-metadata-key`.
 
-Deferred: the body of the delta signature check, which travels with commit and
-summary verification in 16e. Phase 16d verifies no delta signature: the seam runs
-on every fetched delta and accepts it. Also deferred:
-`ostrya pull --disable-static-deltas` and
-`--require-static-deltas`, which land with the CLI command in 16f; and inline
-delta parts, which no remote the port pulls from publishes.
+Deferred: `ostrya pull --disable-static-deltas` and `--require-static-deltas`,
+which land with the CLI command in 16f; and inline delta parts, which no remote
+the port pulls from publishes. The body of the delta signature check landed in
+16e, which supplies the policy the seam applies.
+
+#### Phase 16e -- Signature verification during a pull (DONE)
+
+A pull checks the signatures on the commits it carries and on the remote's
+summary. `PullOptions` grows `verify: PullVerify`, four `Option<bool>` switches
+that override the remote configuration keys of the same name; a switch left
+`None` reads the configuration for `Repo::pull` and is off for
+`Repo::pull_local`, which is the split the tool makes between `pull` and
+`pull-local`. Every check takes its keys from a remote's configuration section,
+so a local pull that asks for one and names no remote is refused before the
+source is read, as the tool refuses `pull-local --gpg-verify` with no `--remote`.
+
+Two axes, each independent of the other and each having to find a valid
+signature where it applies.
+
+- GPG, selected by `gpg-verify` (default true) for the commits and
+  `gpg-verify-summary` (default false) for the summary. The trusted set is the
+  remote's: the repository's own `<remote>.trustedkeys.gpg`, read through the
+  repository descriptor, `/etc/ostree/remotes.d/<remote>.trustedkeys.gpg`, the
+  global trusted directory Phase 13d already reads, and the keyrings
+  `gpgkeypath` names. `gpgkeypath` is a `;`-separated list of keyring files and
+  directories of `*.gpg` keyrings, added to the set rather than replacing it,
+  and an entry that names neither a file nor a directory fails the pull rather
+  than quietly reducing what is trusted. The tool was observed to do all four: a
+  keyring imported with `remote add --gpg-import` lands in the repository as
+  that file and accepts the commit it signed, an empty `gpgkeypath` directory
+  alongside it leaves the import trusted, and `gpgkeypath=/nonexistent;<file>`
+  fails with an `opendir` error.
+- The sign api, selected by `sign-verify` for the commits and
+  `sign-verify-summary` for the summary, both default off. Each value is a
+  boolean in the key file's own spelling or a list of engine names split on `,`
+  and `;`, a name taken as written -- the tool refuses `ed25519, ed25519`, whose
+  second name carries the space. `true` selects every engine this build has,
+  which is `ed25519` and, under the `sign-spki` feature, `spki`. Within the axis
+  one engine reporting a valid signature is enough: the tool accepts a commit
+  signed by ed25519 alone under `sign-verify=ed25519;dummy`. That value fails on
+  the port, which leaves the dummy engine out of what `true` selects and out of
+  what a name resolves to: the dummy signature is the bytes of the dummy key, so
+  a commit held to it passes a check that read nothing. A name the value carries
+  twice, which `remote add` writes for an engine given twice
+  (`sign-verify=ed25519,ed25519`), builds one verifier, so each signature is
+  held to that engine's keys once. An engine's trusted keys are its
+  `verification-<engine>-key` (one base64 key, not a list, which the tool
+  refuses) and every line of its `verification-<engine>-file`, plus the system
+  sign-api key store, whose revoked set applies to all of them. The set left
+  after the revoked set is applied is what decides whether an engine has a key,
+  each engine by its own key equality, so an engine whose every key the store
+  revokes has none. An engine the configuration names by hand and no source
+  holds a key for fails the pull, which is the tool's "No keys found for
+  required signapi type"; an engine reached by naming every engine is passed
+  over instead, and only a policy left with no engine at all fails, which is
+  the tool's "no keys loaded". The two switches are read separately:
+  `sign-verify=false` leaves a `sign-verify-summary=true` check in place, which
+  the tool was observed to do.
+
+Where the checks run. The summary is checked as soon as it and its `summary.sig`
+are here and before either is read, so a refused summary costs no object request
+and no delta probe; a policy that applies needs both files, and a remote serving
+neither is refused by name. A commit is checked in the step that fetched it,
+after its detached metadata is here and before its bytes are staged or its tree
+is asked for. That holds for whichever source supplied the bytes: a loose fetch,
+a localcache repository the step imports the object from, and a delta superblock
+each hand the bytes to the check first and stage them after it. Every commit a
+pull carries is checked, the parents a depth pull follows included, and so is a
+commit this repository already holds, since the pull's policy is what decides
+rather than what an earlier pull accepted. The tool makes the same three
+choices.
+
+A local pull checks the summary and every commit of the chain before it opens
+its transaction, so a source the policy refuses imports nothing at all. Such a
+check binds to the source objects as they stand while it runs. The import reads
+them a second time, a commit where it walks the tree and the `.commitmeta` where
+it copies the bytes, and a trusted local import shares a source object by
+hardlink or reflink without hashing it. A source rewritten between the check and
+the import is stored as it stands at the import; a concurrent sign of the source
+commit is the writer that replaces a `.commitmeta` in place. Carrying the checked
+bytes to the import would hold one entry per commit of the chain, which a
+`depth=-1` pull leaves unbounded, so the metadata is read twice.
+
+What a commit is checked against is the detached metadata the pull puts in
+place: the source's `.commitmeta` where one carries it, and this repository's
+own where none does, which holds for a local pull and a pull over HTTP alike.
+That is the metadata a later verify of the stored commit reads. A static delta
+carries a copy of the commit's detached metadata in its superblock metadata,
+under the key `deltas/<fanout>/<rest>/commitmeta`, and the tool checks a
+delta-delivered commit against that copy while storing the `.commitmeta` it
+fetched separately; a delta generated before a commit was re-signed therefore
+fails a tool pull that the current `.commitmeta` satisfies. The port checks what
+it stores. The port's generation writes that copy (Phase 15b), so a verifying
+tool pull accepts a delta the port produced for a signed commit.
+
+A fetched delta is held to the commit policy's sign-api axis, over the raw
+superblock bytes, before any part is requested. A delta carrying no signature
+under those engines is accepted: what it produces is named by the superblock, the
+superblock is named by the advertisement the summary carries, and the commit it
+delivers is checked like any other, so stripping a delta signature buys nothing.
+A delta that does carry one has to have it from a trusted key. There is no tool
+behavior to reproduce here: `ostree` 2026.1 cannot pull a signed delta at all,
+failing with `error: Invalid checksum of length 0 expected 32` for a from-scratch
+and a from-to delta alike, with verification configured or off, while
+`static-delta apply-offline` applies the same delta.
+
+Two more port rules with no tool behavior behind them. A remote the configuration
+does not describe, which only the port can pull from (`PullOptions::url`), takes
+the configuration defaults, `gpg-verify` among them, so such a pull states its own
+policy or is refused. A build without the `sign-gpg` feature refuses a pull whose
+policy asks for the GPG axis, naming the feature, rather than passing a commit it
+did not check.
+
+Config reading grows `SignVerify` and the `Remote` accessors `sign_verify`,
+`sign_verify_summary`, `verification_key`, and `verification_file`;
+`gpgkeypath` now reports the parsed list. `GpgVerifier::for_remote_keyrings`
+takes the repository's keyring as bytes, which is what a caller holding a
+descriptor rather than a path has.
+
+Both axes read their keys through `rt::unblock`, so a path a configuration file
+names holds a pool thread rather than an executor thread. Every sign-api key
+file is read whole under one ceiling of a mebibyte -- some twenty thousand
+base64 ed25519 keys: the `verification-<engine>-file` a remote names, and each
+file of the system key store, which is the `trusted.<type>` and
+`revoked.<type>` files and the entries of their `.d` directories. The path is
+opened once and read through that ceiling, so the bytes the ceiling admits are
+the bytes the keys come from, and a file that carries more fails by the file's
+name. Only a regular file is read: a path naming a fifo, a directory, or a
+device fails by name as well, since a fifo reports a length its content does
+not have and reading one holds the pool thread until a writer opens it. The
+system store's paths are root-owned, and it is read under the same rule as the
+paths a remote names, so one rule covers every key source.
+
+Every keyring file the GPG trusted set is built from goes through that same
+reader, whichever source names it: the repository's own
+`<remote>.trustedkeys.gpg`, the system
+`/etc/ostree/remotes.d/<remote>.trustedkeys.gpg`, each `*.gpg` file of the
+global trusted directory, and each `gpgkeypath` entry. A keyring's ceiling is
+its own, four mebibytes, which holds thousands of exported certificates. A
+keyring over it fails the pull by the file's name rather than being read in
+part, since the part a ceiling admits is a trusted set the operator never
+placed there; this is the rule `gpgkeypath` states for an entry that names
+nothing. Only a regular file is read, since what a fifo answers a read with is
+what its writers sent and an open fifo holds the reading thread until a writer
+arrives. A symlink at a keyring's name is followed, which the
+tool was observed to do: a destination whose `origin.trustedkeys.gpg` is a
+symlink to an exported keyring accepts the commit that keyring's key signed, and
+one holding no keyring at all refuses the same commit. The commit policy and the
+summary policy take their keys from the same remote, so a verifier both ask for
+is built from one read of its key sources and held by both.
+
+Verify (`crates/ostrya/tests/pull_http.rs`, `pull_local.rs`, and
+`pull_verify_gpg.rs`): an unsigned commit is refused under the default policy
+and publishes nothing; `sign-verify` with the key that signed the commit accepts
+it and another key refuses it; a `verification-ed25519-file` of several keys
+accepts a commit any one of them signed, and an engine with no key at all is
+refused; `sign-verify=true` accepts the commit the one configured engine's key
+signed, and a name no engine answers to is refused; a summary another key signed
+is refused with only `summary.sig` and `summary` requested, and a remote serving
+no `summary.sig` is refused by name; a parent reached under `depth` is checked
+and refused where the tip alone is signed; a commit this repository already
+holds is checked again under a new policy; the options override the
+configuration in both directions; a delta signed by a foreign key fails with no
+part fetched and the same delta signed by the trusted key is applied; a local
+pull checks nothing by default even where the remote it writes under asks for
+both axes, checks the commits and the source's own summary when asked, and
+refuses a check that names no remote. Behind the `sign-gpg` feature, over a
+generated GnuPG home: the repository's `<remote>.trustedkeys.gpg` is what a
+remote trusts, a symlink at that name is followed to the keyring it names, an
+unsigned commit and one signed by another key are each refused, `gpgkeypath`
+adds a keyring by file and by directory, and a `gpgkeypath` entry that names
+neither fails the pull. One interop test needs the tool: it builds an archive
+remote, signs the commit and the summary with ed25519, and the port pulls it
+under a policy naming that key and refuses it under another. Unit tests cover
+the `sign-verify` spellings, the switch resolution, how an unknown engine and an
+engine with no key are told apart, that a configuration naming the dummy engine
+is refused by that name, that an engine both targets ask for yields one shared
+verifier, that an engine the value names twice builds one verifier, and that a
+key file over the ceiling and a fifo at a key file's name are each refused by
+that name, as are a repository keyring over its ceiling and a fifo at a
+keyring's name. In `sign_ed25519.rs`, a key store file over the ceiling and a
+fifo at a store file's name are refused by name as well, through the same reader
+`load_sign_keys` reaches.
+
+Deferred: `verification-<engine>-file` for an engine whose keys are not base64
+lines, which no engine this build verifies with has; and the system sign-api key
+store's participation, which is implemented but not observable on a host with no
+`/etc/ostree` or `/usr/share/ostree`.
 
 #### Phase 16g -- Archive-to-archive pass-through
 

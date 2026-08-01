@@ -149,7 +149,10 @@
 //! [`disable_static_deltas`](PullOptions::disable_static_deltas) and
 //! [`require_static_deltas`](PullOptions::require_static_deltas) control it, and
 //! [`Repo::regenerate_summary`] writes the map that advertises this repository's
-//! own deltas.
+//! own deltas. Either pull checks signatures (Phase 16e): the remote's
+//! `gpg-verify`, `gpg-verify-summary`, `sign-verify`, and `sign-verify-summary`
+//! keys state the policy, [`PullVerify`] overrides it, and the keys come from
+//! that remote's trusted keyrings and its `verification-<engine>-*` entries.
 
 mod bspatch;
 pub mod checkout;
@@ -193,7 +196,7 @@ mod write;
 
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 pub use commit::CommitOptions;
-pub use config::{MinFreeSpace, Remote, RepoConfig, SizeSpec, SizeUnit, Tristate};
+pub use config::{MinFreeSpace, Remote, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate};
 pub use deltagen::DeltaOptions;
 pub use diff::{DiffChange, DiffEntry};
 pub use error::{Error, Result};
@@ -217,7 +220,7 @@ pub use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Type, Value,
 };
 pub use prune::{PruneOptions, PruneStats};
-pub use pull::{PullFlags, PullOptions, PullStats, TimestampCheck};
+pub use pull::{PullFlags, PullOptions, PullStats, PullVerify, TimestampCheck};
 pub use read::CommitState;
 pub use refs::CollectionRef;
 pub use repo::{CreateOptions, Repo};

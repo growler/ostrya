@@ -15,7 +15,8 @@ use std::process::Command;
 use common::{TmpDir, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState, CreateOptions,
-    Error, MutableTree, PullFlags, PullOptions, Repo, RepoMode, Type, Value,
+    Ed25519Signer, Error, MutableTree, PullFlags, PullOptions, PullVerify, Repo, RepoMode, Type,
+    Value,
 };
 use ostrya_rt::block_on;
 
@@ -1473,7 +1474,7 @@ fn a_reingested_import_debits_the_free_space_budget() {
         );
         assert!(object_names(&dst_dir).is_empty());
         assert!(dst.resolve_rev("main", true).await.unwrap().is_none());
-        assert!(has_partial_marker(&dst_dir, &c2));
+        assert!(!has_partial_marker(&dst_dir, &c2));
     });
 }
 
@@ -1528,7 +1529,7 @@ fn commit_metadata_only_leaves_the_commit_partial() {
 }
 
 #[test]
-fn a_failed_pull_publishes_nothing_and_leaves_the_marker() {
+fn a_failed_pull_publishes_nothing_and_clears_the_marker() {
     let tmp = TmpDir::new("pull-failed");
     block_on(async {
         let base = tmp.path();
@@ -1559,7 +1560,9 @@ fn a_failed_pull_publishes_nothing_and_leaves_the_marker() {
 
         assert!(object_names(&dst_dir).is_empty());
         assert!(dst.resolve_rev("main", true).await.unwrap().is_none());
-        assert!(has_partial_marker(&dst_dir, &c2));
+        // The commit was never published, so the marker the pull wrote for it
+        // goes with the objects the transaction discarded.
+        assert!(!has_partial_marker(&dst_dir, &c2));
     });
 }
 
@@ -2122,7 +2125,7 @@ fn a_localcache_supplied_dirtree_is_descended_into() {
             .unwrap_err();
         assert!(matches!(err, Error::ObjectNotFound { .. }));
         assert!(bare.resolve_rev("main", true).await.unwrap().is_none());
-        assert!(has_partial_marker(&bare_dir, &c2));
+        assert!(!has_partial_marker(&bare_dir, &c2));
     });
 }
 
@@ -2242,5 +2245,255 @@ fn the_tool_pulls_from_a_repository_the_port_wrote() {
         let resolved = String::from_utf8(ostree(&[&dst_arg, "rev-parse", "main"])).unwrap();
         assert_eq!(resolved.trim(), c2.to_hex());
         ostree(&[&dst_arg, "fsck"]);
+    });
+}
+
+// --- signature verification (Phase 16e) -------------------------------------
+
+/// The fixed ed25519 keypair the signed sources sign with.
+const SECRET_B64: &str =
+    "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+/// A second public key, standing for one the destination does not trust.
+const OTHER_PUBLIC_B64: &str = "8+dqdDZWIesQQO95CRCSoSm2543BNK7FgOVwPyuUquU=";
+
+/// A destination repository under `base/dst` whose config names the remote
+/// `origin`, with the `[remote]` keys `extra` supplies. A local pull reads no
+/// URL, so the section states the verification policy alone.
+async fn dest_with_remote(base: &Path, extra: &str) -> Repo {
+    let (path, repo) = make_repo(base, "dst", RepoMode::Archive).await;
+    drop(repo);
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "\n[remote \"origin\"]\nurl=file:///dev/null\n{extra}"
+    ));
+    std::fs::write(&config, text).unwrap();
+    Repo::open(&path).await.unwrap()
+}
+
+/// Pull `main` from `src` into `dst` with the options `opts` supplies.
+async fn pull_main_with(dst: &Repo, src: &Repo, opts: PullOptions) -> Result<(), Error> {
+    dst.pull_local(
+        src,
+        PullOptions {
+            refs: vec!["main".to_owned()],
+            ..opts
+        },
+    )
+    .await
+    .map(|_| ())
+}
+
+/// A local pull checks nothing unless it is asked to, even where the remote it
+/// writes its refs under asks for GPG verification. This is what the tool's
+/// `pull-local` does: the checks are its own flags, not the remote's config.
+#[test]
+fn a_local_pull_checks_nothing_by_default() {
+    let tmp = TmpDir::new("pull-local-verify-default");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let dst = dest_with_remote(base, "gpg-verify=true\nsign-verify=true\n").await;
+
+        pull_main_with(
+            &dst,
+            &src,
+            PullOptions {
+                remote: Some("origin".to_owned()),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+    });
+}
+
+/// A local pull asked to check reads the keys from the remote it names: the
+/// source's signed commits pass under the key that signed them, and the same
+/// pull under another key is refused with nothing imported.
+#[test]
+fn a_local_pull_checks_the_commits_when_asked() {
+    let tmp = TmpDir::new("pull-local-verify-asked");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        src.sign_commit(&c1, &signer).await.unwrap();
+        src.sign_commit(&c2, &signer).await.unwrap();
+
+        let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+        let asked = PullOptions {
+            remote: Some("origin".to_owned()),
+            verify: PullVerify {
+                sign: Some(true),
+                ..PullVerify::default()
+            },
+            depth: -1,
+            ..PullOptions::default()
+        };
+        pull_main_with(&dst, &src, asked.clone()).await.unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+        drop(dst);
+
+        std::fs::remove_dir_all(base.join("dst")).unwrap();
+        let dst = dest_with_remote(
+            base,
+            &format!("verification-ed25519-key={OTHER_PUBLIC_B64}\n"),
+        )
+        .await;
+        let err = pull_main_with(&dst, &src, asked).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert!(
+            !dst.has_object(ostrya::ObjectType::Commit, &c2)
+                .await
+                .unwrap()
+        );
+    });
+}
+
+/// The summary check reads the source repository's own `summary` and
+/// `summary.sig`, and a source publishing no signature is refused by name.
+#[test]
+fn a_local_pull_checks_the_source_summary_when_asked() {
+    let tmp = TmpDir::new("pull-local-verify-summary");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.regenerate_summary(&ostrya::SummaryOptions {
+            last_modified: Some(FIXED_TS),
+            ..ostrya::SummaryOptions::default()
+        })
+        .await
+        .unwrap();
+
+        let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+        let asked = PullOptions {
+            remote: Some("origin".to_owned()),
+            verify: PullVerify {
+                sign_summary: Some(true),
+                ..PullVerify::default()
+            },
+            ..PullOptions::default()
+        };
+        let err = pull_main_with(&dst, &src, asked.clone()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no summary.sig")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+
+        src.sign_summary(&Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        pull_main_with(&dst, &src, asked).await.unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+    });
+}
+
+/// A local pull checks the detached metadata it leaves in place. A source
+/// holding no `.commitmeta` leaves this repository's own alone, so the stored
+/// signature is what the check reads; a source holding the zero-length "no
+/// metadata" marker replaces it, so that pull is refused.
+#[test]
+fn a_local_pull_checks_the_metadata_it_leaves_in_place() {
+    let tmp = TmpDir::new("pull-local-verify-stored-meta");
+    let base = tmp.path();
+    block_on(async {
+        let (src_path, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        src.sign_commit(&c1, &signer).await.unwrap();
+        src.sign_commit(&c2, &signer).await.unwrap();
+
+        let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+        let asked = PullOptions {
+            remote: Some("origin".to_owned()),
+            verify: PullVerify {
+                sign: Some(true),
+                ..PullVerify::default()
+            },
+            depth: -1,
+            ..PullOptions::default()
+        };
+        pull_main_with(&dst, &src, asked.clone()).await.unwrap();
+        assert!(
+            dst.read_commit_detached_metadata(&c2)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // The source drops both signatures, file and all. The destination's own
+        // copies stay in place, so the second pull passes on them.
+        for commit in [c1, c2] {
+            let hex = commit.to_hex();
+            let path = src_path
+                .join("objects")
+                .join(&hex[..2])
+                .join(format!("{}.commitmeta", &hex[2..]));
+            std::fs::remove_file(&path).unwrap();
+        }
+        pull_main_with(&dst, &src, asked.clone()).await.unwrap();
+        assert!(
+            dst.read_commit_detached_metadata(&c2)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // The source now holds the zero-length marker, which the pull would copy
+        // over the destination's signature, so it is refused instead.
+        src.write_commit_detached_metadata(&c2, None).await.unwrap();
+        let err = pull_main_with(&dst, &src, asked).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("carries no signature")),
+            "{err}"
+        );
+    });
+}
+
+/// The keys of every check come from a remote's configuration, so a pull that
+/// asks for one and names no remote is refused before the source is read. The
+/// tool refuses the same combination.
+#[test]
+fn a_check_without_a_remote_name_is_refused() {
+    let tmp = TmpDir::new("pull-local-verify-no-remote");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let (_dst_path, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        let err = pull_main_with(
+            &dst,
+            &src,
+            PullOptions {
+                verify: PullVerify {
+                    sign: Some(true),
+                    ..PullVerify::default()
+                },
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("name a remote")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
     });
 }

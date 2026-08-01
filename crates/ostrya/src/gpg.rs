@@ -29,7 +29,13 @@
 //! `OSTREE_GPG_HOME` environment variable, or `<datadir>/ostree/trusted.gpg.d/`
 //! when it is unset. [`for_remote`](GpgVerifier::for_remote) adds the
 //! per-remote keyring (`<remote>.trustedkeys.gpg` in the repo or under
-//! `/etc/ostree/remotes.d/`) on top of that global set. Verification writes
+//! `/etc/ostree/remotes.d/`) on top of that global set, and
+//! [`for_remote_keyrings`](GpgVerifier::for_remote_keyrings) takes the
+//! repository's keyring as bytes and adds the keyrings a remote's `gpgkeypath`
+//! names, which is what a pull trusts. Every keyring file reaches the trusted
+//! set through one reader: only a regular file is read, and only up to four
+//! mebibytes, so a path naming a fifo and a keyring over that ceiling are each
+//! refused by that path's own name. Verification writes
 //! the merged keyring to a private scratch directory and runs `gpgv` once per
 //! stored blob; `gpgv` performs public-key operations only and starts no
 //! agent.
@@ -40,13 +46,17 @@
 //! [`SignatureInfo`]. Trust is membership in the verifier's keyrings; GnuPG's
 //! ownertrust model plays no part.
 
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ostrya_core::base64;
 
 use crate::error::{Error, Result};
-use crate::sign::{SignFuture, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome};
+use crate::sign::{
+    SignFuture, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, read_key_path,
+    read_key_source,
+};
 
 /// The GPG engine's short name.
 const GPG_SIGN_TYPE: &str = "gpg";
@@ -62,6 +72,10 @@ const OSTREE_GPG_HOME_ENV: &str = "OSTREE_GPG_HOME";
 const SYSTEM_REMOTES_D: &str = "/etc/ostree/remotes.d";
 /// The prefix of a machine-readable status line on the status fd.
 const STATUS_PREFIX: &str = "[GNUPG:] ";
+/// The ceiling on one keyring file, whose whole content is read into memory.
+/// One exported ed25519 certificate is a few hundred bytes, so four mebibytes
+/// holds thousands of them, and a remote's trusted set is a handful.
+pub(crate) const MAX_KEYRING: u64 = 4 * 1024 * 1024;
 
 /// The GPG commit-signing engine.
 ///
@@ -152,7 +166,9 @@ impl GpgVerifier {
 
     /// Build a verifier from keyring files on disk (binary or armored). A
     /// missing file is skipped rather than an error, so an absent optional
-    /// keyring does not fail the build.
+    /// keyring does not fail the build. Only a regular file is read, and only
+    /// up to four mebibytes; a path of another kind and a keyring over that
+    /// ceiling are each refused by the path's own name.
     pub fn from_keyring_files<I, P>(paths: I) -> Result<GpgVerifier>
     where
         I: IntoIterator<Item = P>,
@@ -160,10 +176,8 @@ impl GpgVerifier {
     {
         let mut blobs: Vec<Vec<u8>> = Vec::new();
         for path in paths {
-            match std::fs::read(path.as_ref()) {
-                Ok(bytes) => blobs.push(bytes),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
+            if let Some(bytes) = read_keyring_path(path.as_ref())? {
+                blobs.push(bytes);
             }
         }
         GpgVerifier::from_keyring_bytes(blobs)
@@ -175,12 +189,49 @@ impl GpgVerifier {
     /// (see [`from_system_trust`](GpgVerifier::from_system_trust)). Missing
     /// paths are skipped.
     pub fn for_remote(repo_path: &Path, remote: &str) -> Result<GpgVerifier> {
+        let keyring = repo_path.join(format!("{remote}.trustedkeys.gpg"));
+        let repo_keyring = read_keyring_path(&keyring)?;
+        GpgVerifier::for_remote_keyrings(repo_keyring, remote, &[])
+    }
+
+    /// Build a verifier from a remote's whole trusted set, with the
+    /// repository's own keyring supplied as bytes.
+    ///
+    /// `repo_keyring` is the repository's `<remote>.trustedkeys.gpg`, which a
+    /// caller holding a descriptor rather than a path reads for itself. On top
+    /// of it come the system per-remote keyring
+    /// (`/etc/ostree/remotes.d/<remote>.trustedkeys.gpg`), the global trusted
+    /// set (see [`from_system_trust`](GpgVerifier::from_system_trust)), and
+    /// every entry of `keypath`, which is what a remote's `gpgkeypath` names.
+    ///
+    /// A `keypath` entry is a keyring file or a directory of `*.gpg` keyrings,
+    /// and an entry that names neither fails the build, so a keyring path that
+    /// has gone missing is reported rather than silently reducing the trusted
+    /// set. The other sources are optional and a missing one is skipped.
+    pub fn for_remote_keyrings(
+        repo_keyring: Option<Vec<u8>>,
+        remote: &str,
+        keypath: &[String],
+    ) -> Result<GpgVerifier> {
         let mut paths: Vec<PathBuf> = Vec::new();
-        let keyring = format!("{remote}.trustedkeys.gpg");
-        paths.push(repo_path.join(&keyring));
-        paths.push(Path::new(SYSTEM_REMOTES_D).join(&keyring));
+        paths.push(Path::new(SYSTEM_REMOTES_D).join(format!("{remote}.trustedkeys.gpg")));
         paths.extend(keyring_files_in(&global_trusted_dir())?);
-        GpgVerifier::from_keyring_files(paths)
+        for entry in keypath {
+            let path = Path::new(entry);
+            let meta = std::fs::metadata(path).map_err(|e| {
+                Error::Signature(format!("gpgkeypath entry '{entry}' cannot be read: {e}"))
+            })?;
+            if meta.is_dir() {
+                paths.extend(keyring_files_in(path)?);
+            } else {
+                paths.push(path.to_owned());
+            }
+        }
+        let mut verifier = GpgVerifier::from_keyring_files(paths)?;
+        if let Some(bytes) = repo_keyring {
+            verifier.keyrings.insert(0, dearmor(&bytes)?);
+        }
+        Ok(verifier)
     }
 
     /// Build a verifier from the global trusted keyrings alone: every `*.gpg`
@@ -484,6 +535,25 @@ fn keyring_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     files.sort();
     Ok(files)
+}
+
+/// Read the keyring at `path`, up to [`MAX_KEYRING`], or `None` where no file
+/// is there. This is how every keyring source reaches the trusted set.
+fn read_keyring_path(path: &Path) -> Result<Option<Vec<u8>>> {
+    let subject = format!("the keyring '{}'", path.display());
+    read_key_path(path, &subject, MAX_KEYRING)
+}
+
+/// Read an opened keyring, holding it to its kind and to [`MAX_KEYRING`] through
+/// [`read_key_source`], the reader every key source is read under. `name` is
+/// what a refusal reports, so an operator can find the entry that named it.
+///
+/// The ceiling a keyring is held to is its own: a keyring carries certificates
+/// rather than base64 lines, and refusing one over the ceiling by name rather
+/// than reading the part it admits is the rule `gpgkeypath` already states for
+/// an entry that names nothing.
+pub(crate) fn read_keyring_fd(fd: OwnedFd, name: &str) -> Result<Vec<u8>> {
+    read_key_source(fd, &format!("the keyring '{name}'"), MAX_KEYRING)
 }
 
 /// A process-unique scratch directory path for one verification run.

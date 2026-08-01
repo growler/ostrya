@@ -35,11 +35,15 @@
 //! reuses it; a verifier trusts the loaded set minus the revoked set.
 
 use std::future::Future;
+use std::io::Read;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use ostrya_core::{Checksum, ObjectType, Type, Value, base64};
+use rustix::fs::{FileType, Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::repo::Repo;
@@ -529,6 +533,12 @@ impl Ed25519Verifier {
     pub fn from_system_keys() -> Result<Ed25519Verifier> {
         Ed25519Verifier::from_sign_keys(load_sign_keys(ED25519_SIGN_TYPE)?)
     }
+
+    /// Whether the effective trusted set is empty: no key was given, or the
+    /// revoked set removed every one. Such a verifier refuses every signature.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.trusted.is_empty()
+    }
 }
 
 impl Verifier for Ed25519Verifier {
@@ -597,6 +607,10 @@ pub fn load_sign_keys(sign_type: &str) -> Result<SignKeys> {
 /// `revoked.<type>.d/`. Each line is one base64 key; blank and whitespace-only
 /// lines are skipped and any other line must decode. A missing file or
 /// directory is not an error. Directory entries are read in sorted name order.
+///
+/// Every file is read under the rule [`read_key_source`] states: only a regular
+/// file, and only up to [`MAX_KEY_FILE`]. A path of another kind and a file over
+/// the ceiling are each refused by that file's own name.
 pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> Result<SignKeys> {
     let mut keys = SignKeys::default();
     for root in roots {
@@ -608,7 +622,7 @@ pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> Result<SignKeys>
 
 /// Read `<root>/<base>` and every file in `<root>/<base>.d/` into `out`.
 fn collect_keys(root: &Path, base: &str, out: &mut Vec<Vec<u8>>) -> Result<()> {
-    read_key_file(&root.join(base), out)?;
+    read_key_lines(&root.join(base), out)?;
     let dir = root.join(format!("{base}.d"));
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -624,19 +638,19 @@ fn collect_keys(root: &Path, base: &str, out: &mut Vec<Vec<u8>>) -> Result<()> {
     }
     files.sort();
     for file in files {
-        read_key_file(&file, out)?;
+        read_key_lines(&file, out)?;
     }
     Ok(())
 }
 
-/// Read one base64-per-line key file into `out`. A missing file is not an error.
-fn read_key_file(path: &Path, out: &mut Vec<Vec<u8>>) -> Result<()> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
+/// Read one base64-per-line key file of the store into `out`, under the rule
+/// [`read_key_source`] states. A missing file is not an error.
+fn read_key_lines(path: &Path, out: &mut Vec<Vec<u8>>) -> Result<()> {
+    let subject = format!("the key file '{}'", path.display());
+    let Some(bytes) = read_key_path(path, &subject, MAX_KEY_FILE)? else {
+        return Ok(());
     };
-    for line in content.lines() {
+    for line in key_text(bytes, &subject)?.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -644,6 +658,61 @@ fn read_key_file(path: &Path, out: &mut Vec<Vec<u8>>) -> Result<()> {
         out.push(base64::decode(line)?);
     }
     Ok(())
+}
+
+/// The ceiling on one key file, whose whole content is read into memory. A
+/// mebibyte holds some twenty thousand base64 ed25519 keys.
+pub(crate) const MAX_KEY_FILE: u64 = 1024 * 1024;
+
+/// Read the key source at `path` whole, up to `ceiling`, or `None` where no file
+/// is there. `subject` is what a refusal names the source by, so an operator can
+/// find the entry that named it.
+pub(crate) fn read_key_path(path: &Path, subject: &str, ceiling: u64) -> Result<Option<Vec<u8>>> {
+    // `NONBLOCK` so a fifo answers the open rather than waiting for a writer.
+    // On a regular file the flag has no effect on the read below.
+    let fd = match rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(Error::Signature(format!("{subject} cannot be opened: {e}"))),
+    };
+    read_key_source(fd, subject, ceiling).map(Some)
+}
+
+/// Read an opened key source whole, holding it to its kind and to `ceiling`.
+/// This is the reader every keyring and every key file reaches a trusted set
+/// through, whichever source names it.
+///
+/// A source over the ceiling is refused by its own name: reading the part the
+/// ceiling admits would leave the trusted set smaller than the one the operator
+/// placed there, with nothing said about it. Only a regular file is read: what a
+/// fifo answers a read with is what its writers sent, which for key material is
+/// a trusted set of their own making, and an open fifo holds the reading thread
+/// until a writer arrives.
+pub(crate) fn read_key_source(fd: OwnedFd, subject: &str, ceiling: u64) -> Result<Vec<u8>> {
+    let refuse = |what: &str| Error::Signature(format!("{subject} {what}"));
+    let stat = rustix::fs::fstat(&fd).map_err(|e| refuse(&format!("cannot be read: {e}")))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(refuse("is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::from(fd)
+        .take(ceiling + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| refuse(&format!("cannot be read: {e}")))?;
+    if bytes.len() as u64 > ceiling {
+        return Err(refuse(&format!("is over the {ceiling}-byte ceiling")));
+    }
+    Ok(bytes)
+}
+
+/// The text of a key source read under [`read_key_source`], for a source whose
+/// keys are base64 lines.
+pub(crate) fn key_text(bytes: Vec<u8>, subject: &str) -> Result<String> {
+    String::from_utf8(bytes).map_err(|_| Error::Signature(format!("{subject} is not valid UTF-8")))
 }
 
 /// The signing public types move freely across tasks and threads. The trait

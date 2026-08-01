@@ -33,9 +33,8 @@
 //! superblock has to name the commit being pulled and the source commit the
 //! delta's name claims. The delta's own signatures are then checked over the raw
 //! superblock bytes, ahead of any part request, so a delta that fails
-//! verification costs no part bytes; Phase 16d has no verification policy to
-//! apply and accepts every delta there, and Phase 16e supplies the body of that
-//! check. Every object a part produces is written with its
+//! verification costs no part bytes; the policy is the pull's own, described in
+//! [`verify`](super::verify). Every object a part produces is written with its
 //! expected checksum asserted, which is the read path's own rule. Each part is
 //! taken off the connection under the size its meta-entry declares and hashed
 //! against the checksum that entry names before it is decompressed, so what a
@@ -72,6 +71,7 @@ use crate::deltagen::{
 use crate::error::{Error, Result};
 use crate::fetch::{FetchRequest, Fetched, Fetcher, Priority};
 use crate::object::MAX_METADATA_SIZE;
+use crate::pull::verify::Verification;
 use crate::pull::{ModeChecks, PullFlags, PullOptions, refspec};
 use crate::read::CommitState;
 use crate::repo::Repo;
@@ -142,6 +142,7 @@ pub(crate) async fn discover(
     targets: &[(String, Checksum)],
     opts: &PullOptions,
     ref_prefix: Option<&str>,
+    verification: &Verification,
 ) -> Result<HashMap<Checksum, DeltaJob>> {
     let mut jobs = HashMap::new();
     if opts.disable_static_deltas || opts.flags.contains(PullFlags::COMMIT_ONLY) {
@@ -152,7 +153,7 @@ pub(crate) async fn discover(
             continue;
         }
         let from = source_commit(repo, ref_name, to, ref_prefix).await?;
-        if let Some(job) = discover_one(fetcher, summary, from, *to, opts).await? {
+        if let Some(job) = discover_one(fetcher, summary, from, *to, opts, verification).await? {
             jobs.insert(*to, job);
         }
     }
@@ -212,6 +213,7 @@ async fn discover_one(
     from: Option<Checksum>,
     to: Checksum,
     opts: &PullOptions,
+    verification: &Verification,
 ) -> Result<Option<DeltaJob>> {
     let name = delta_name(from.as_ref(), &to);
     let advertised = match summary {
@@ -281,7 +283,7 @@ async fn discover_one(
         superblock_bytes,
         ..
     } = superblock;
-    verify_fetched_delta(&name, &superblock_bytes, signatures.as_ref()).await?;
+    verify_fetched_delta(verification, &name, &superblock_bytes, signatures.as_ref()).await?;
     Ok(Some(DeltaJob {
         dir: delta_relative_dir(from.as_ref(), &to),
         name,
@@ -293,19 +295,22 @@ async fn discover_one(
 
 /// Verify a fetched delta's detached signatures over the raw superblock bytes.
 ///
-/// Phase 16e fills this in, with the verifiers a pull's options and the remote's
-/// configuration supply. Today it accepts every delta: [`PullOptions`] carries
-/// neither a verification switch nor a verifier list, so a pull has no policy to
-/// apply. The call sits here so the superblock's raw bytes and its signature
-/// array are read where they are available and dropped afterwards, rather than
-/// held for the length of the pull.
+/// The pull's own policy decides: the sign-api engines it checks a commit with
+/// check the delta too, since a delta carries sign-api signatures alone. A delta
+/// carrying none of those signatures is accepted, and the commit it delivers is
+/// held to the commit policy like any other. The call sits here so the
+/// superblock's raw bytes and its signature array are read where they are
+/// available and dropped afterwards, rather than held for the length of the
+/// pull.
 async fn verify_fetched_delta(
+    verification: &Verification,
     name: &str,
     superblock_bytes: &[u8],
     signatures: Option<&Value>,
 ) -> Result<()> {
-    let _ = (name, superblock_bytes, signatures);
-    Ok(())
+    verification
+        .check_delta(name, superblock_bytes, signatures)
+        .await
 }
 
 /// The delta map the remote advertises for `to`: the index file when it serves

@@ -162,6 +162,12 @@ impl SpkiVerifier {
             .map_err(|e| Error::Signature(format!("spki public key: {e}")))?;
         Ok(SpkiVerifier { trusted: vec![vk] })
     }
+
+    /// Whether the effective trusted set is empty: no key was given, or the
+    /// revoked set removed every one. Such a verifier refuses every signature.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.trusted.is_empty()
+    }
 }
 
 impl Verifier for SpkiVerifier {

@@ -23,7 +23,7 @@ use common::{TmpDir, ostree_available};
 use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    Ed25519Signer, Ed25519Verifier, MutableTree, Repo, RepoMode, TreeEntry, base64,
+    Ed25519Signer, Ed25519Verifier, MutableTree, Repo, RepoMode, SummaryOptions, TreeEntry, base64,
 };
 use ostrya_rt::block_on;
 
@@ -198,6 +198,11 @@ fn op_count(show: &str, key: &str) -> u64 {
     show.split_whitespace()
         .filter_map(|token| token.strip_prefix(key).and_then(|n| n.parse::<u64>().ok()))
         .sum()
+}
+
+/// Whether `haystack` holds `needle` as a run of bytes.
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|run| run == needle)
 }
 
 /// `ostree static-delta show` for a delta in `repo`.
@@ -1209,6 +1214,123 @@ fn a_signed_delta_verifies_and_indexes() {
         &delta.to_string_lossy(),
     ]);
     ostree(&[&dst_arg, "fsck"]);
+}
+
+/// A delta carries a copy of the target commit's detached metadata in its
+/// superblock, keyed by the delta's own directory with `/commitmeta` appended,
+/// and that copy is what a tool pull checks the delivered commit against. The
+/// tool pulls the port's delta under `sign-verify=ed25519`, over a `file://`
+/// remote with `--require-static-deltas`, so the delta path is the one under
+/// test. A delta over a commit with no detached metadata carries no such entry
+/// and still delivers its commit.
+#[test]
+fn a_delta_carries_the_target_commits_detached_metadata() {
+    let tmp = TmpDir::new("gen-commitmeta");
+    let base = tmp.path();
+    let signed_tree = base.join("signed-tree");
+    let plain_tree = base.join("plain-tree");
+    std::fs::create_dir_all(&signed_tree).unwrap();
+    std::fs::create_dir_all(&plain_tree).unwrap();
+    std::fs::write(signed_tree.join("a.txt"), b"signed content\n").unwrap();
+    std::fs::write(plain_tree.join("a.txt"), b"unsigned content\n").unwrap();
+
+    let signed_src = base.join("signed");
+    let plain_src = base.join("plain");
+    let (signed_delta, signed_commit, plain_delta, plain_commit) = block_on(async {
+        let mut built = Vec::new();
+        for (path, tree, sign) in [
+            (&signed_src, &signed_tree, true),
+            (&plain_src, &plain_tree, false),
+        ] {
+            let repo = Repo::create(path, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            let commit = commit_tree(&repo, tree, None).await;
+            if sign {
+                let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+                repo.sign_commit(&commit, &signer).await.unwrap();
+            }
+            let relative = repo
+                .generate_static_delta(None, &commit, &DeltaOptions::default())
+                .await
+                .unwrap();
+            // The tool discovers a delta through the summary and the index, so
+            // both are written before it pulls.
+            repo.reindex_static_deltas().await.unwrap();
+            repo.regenerate_summary(&SummaryOptions::default())
+                .await
+                .unwrap();
+            built.push((relative, commit));
+        }
+        let plain = built.pop().unwrap();
+        let signed = built.pop().unwrap();
+        (signed.0, signed.1, plain.0, plain.1)
+    });
+
+    // The signed commit's copy is the `.commitmeta` file's own bytes, under the
+    // delta's directory.
+    let superblock = std::fs::read(signed_src.join(&signed_delta).join("superblock")).unwrap();
+    let key = format!("{}/commitmeta", signed_delta.display());
+    assert!(
+        holds(&superblock, key.as_bytes()),
+        "the superblock carries no {key} entry"
+    );
+    let hex = signed_commit.to_hex();
+    let detached = signed_src
+        .join("objects")
+        .join(&hex[..2])
+        .join(format!("{}.commitmeta", &hex[2..]));
+    assert!(
+        holds(&superblock, &std::fs::read(&detached).unwrap()),
+        "the superblock does not carry the .commitmeta bytes verbatim"
+    );
+
+    // The unsigned commit has no detached metadata, so its delta gets no entry.
+    let plain_superblock = std::fs::read(plain_src.join(&plain_delta).join("superblock")).unwrap();
+    assert!(
+        !holds(&plain_superblock, b"/commitmeta"),
+        "a commit with no detached metadata got a commitmeta entry"
+    );
+
+    if !ostree_available() {
+        eprintln!("skipping: ostree not available");
+        return;
+    }
+    // A delta destination has to be bare-user: the tool refuses static deltas in
+    // an archive repository.
+    for (src, commit, verify) in [
+        (&signed_src, &signed_commit, true),
+        (&plain_src, &plain_commit, false),
+    ] {
+        let dest = base.join(format!("dest-{}", src.file_name().unwrap().display()));
+        let dest_arg = format!("--repo={}", dest.display());
+        ostree(&[&dest_arg, "init", "--mode=bare-user"]);
+        let url = format!("file://{}", src.display());
+        let mut add = vec![
+            &dest_arg,
+            "remote",
+            "add",
+            "origin",
+            &url,
+            "--no-gpg-verify",
+        ];
+        let key_arg = format!("--set=verification-ed25519-key={PUBLIC_B64}");
+        if verify {
+            add.push("--set=sign-verify=ed25519");
+            add.push(&key_arg);
+        }
+        ostree(&add);
+        ostree(&[
+            &dest_arg,
+            "pull",
+            "--require-static-deltas",
+            "origin",
+            "test",
+        ]);
+        let resolved = String::from_utf8(ostree(&[&dest_arg, "rev-parse", "origin:test"])).unwrap();
+        assert_eq!(resolved.trim(), commit.to_hex());
+        ostree(&[&dest_arg, "fsck"]);
+    }
 }
 
 #[test]

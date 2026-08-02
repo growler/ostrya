@@ -971,6 +971,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostrya-conformance"
+version = "0.0.1"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
 name = "ostrya-core"
 version = "0.0.1"
 dependencies = [

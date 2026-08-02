@@ -1,0 +1,475 @@
+# M1 -- operating a repository the other implementation created and populated.
+#
+# Two directions:
+#   D1  created-by t, populated-by t, operated-by p
+#   D2  created-by p, populated-by p, operated-by t
+#
+# Every cell carries one uniform postcondition in addition to its own outcome:
+# after the operator finishes, the producing implementation still finds the
+# repository valid, and its ref list and commit checksums are unchanged except as
+# the operation intended.
+#
+# Operation tokens:
+#   read-metadata          resolve a ref, read a commit, list refs, read history
+#   read-content           list a tree, read file content
+#   fsck                   verify object integrity and completeness
+#   diff                   report changed paths between two commits
+#   config-read            read the repository config
+#   checkout-copy          check out a commit by copy or reflink
+#   checkout-hardlink      check out a commit by hardlinking the objects
+#   commit-into            add a new commit to the existing repository
+#   refs-update            create, delete, or alias a ref
+#   prune                  delete unreachable objects
+#   summary-regenerate     rewrite the summary from the refs
+#   sign-verify            sign a commit, and verify a signature the other made
+#   static-delta-generate  generate a delta between two commits
+#   static-delta-apply     apply a delta the other implementation generated
+#   tar-export             write the commit tree as a tar stream
+#   composefs-export       write the commit's composefs image
+#   lock-exclusion         acquire the repository lock while the other holds it
+#
+# The corpus for M1 is C0 unless a record names another. Cells that depend on
+# corpus content are covered in m0-content.matrix.
+#
+# Field reference and the outcome vocabulary are in README.md.
+
+# ---------------------------------------------------------------------------
+# D1 -- the tool creates and populates, the port operates.
+# ---------------------------------------------------------------------------
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: read-metadata read-content fsck diff config-read checkout-copy
+ checkout-hardlink commit-into refs-update prune summary-regenerate sign-verify
+ static-delta-generate static-delta-apply tar-export composefs-export
+ lock-exclusion
+modes: bare-user-shared
+tier: T0
+outcome: impossible
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: -
+spec: format-reference.md#port-extension-bare-user-shared-mode
+note: The mode is a port extension. The tool rejects it when the repository is
+ opened, so it can neither create nor populate one, and this column has no
+ producer. The reverse direction is covered in D2 below.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: read-metadata read-content fsck diff config-read checkout-copy tar-export
+modes: bare-split-xattrs
+tier: T0
+outcome: unobserved
+severity: interop
+identity: n-a
+oracle: manifest checksum-agreement
+evidence: ostrya::read_split_xattrs
+spec: format-reference.md#bare-split-xattrs-mode
+question: Establish first whether the tool can populate a repository in this mode
+ at all, and by which gate. Its write support is experimental and gated. The
+ port's read support is currently proven against hand-built objects rather than
+ tool output, so the oracle for these cells does not yet involve the tool.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: commit-into prune summary-regenerate sign-verify static-delta-generate
+ static-delta-apply
+modes: bare-split-xattrs
+tier: T0
+outcome: refused-both
+severity: interop
+identity: n-a
+oracle: exit-status stderr-text
+evidence: -
+spec: format-reference.md#repository-modes-and-on-disk-storage
+question: Record both refusal texts. The tool answers "Not allowed due to repo
+ mode" for writes into this mode. Confirm the port refuses the same set of
+ operations.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: refs-update lock-exclusion
+modes: bare-split-xattrs
+tier: T0
+outcome: unobserved
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: -
+question: A ref update and a lock acquisition write no objects. Observe whether
+ the tool's mode gate covers them or admits them.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: checkout-hardlink composefs-export
+modes: bare-split-xattrs
+tier: T0
+outcome: impossible
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: -
+note: Hardlink checkout applies to bare mode only. The composefs export path
+ reads the bare-user family metadata form.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: read-metadata read-content checkout-copy tar-export static-delta-apply
+modes: archive bare-user
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: manifest checksum-agreement
+evidence: ostrya::read, ostrya::read_modes, ostrya::checkout, ostrya::tar,
+ ostrya::delta
+spec: format-reference.md#object-store-layout
+note: These are the paths the checked-in golden fixtures already exercise: the
+ port reads the tool's archive tree and bare-user tarball, imports the tool's tar
+ export, and applies a tool-generated delta.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: lock-exclusion
+modes: archive bare bare-user bare-user-only
+tier: T0
+outcome: full
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: port-plan.md decision 8
+spec: port-plan.md#decisions
+note: The port takes a classic fcntl record lock, which shares a lock space with
+ the tool's OFD locks, so the two exclude each other. Verified by holding each
+ side's lock while the other acquires.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: fsck diff config-read commit-into refs-update prune summary-regenerate
+ sign-verify static-delta-generate
+modes: archive bare-user
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: exit-status checksum-agreement inventory
+evidence: -
+question: The port has all of these operations in its library, and the existing
+ tests compare them against the tool on repositories the port itself built. Run
+ them against a repository the tool created and populated, and confirm the
+ uniform postcondition: the tool still fscks the repository clean afterwards.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: read-metadata read-content fsck diff config-read checkout-copy commit-into
+ refs-update prune summary-regenerate sign-verify static-delta-generate
+ static-delta-apply tar-export
+modes: bare
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: manifest checksum-agreement
+evidence: -
+question: Confirm each operation against a tool-made bare repository. Tier T0
+ covers a repository whose recorded ids are the invoking user's. A repository
+ holding foreign ids raises the tier to T3 for every write path, because the ids
+ sit on the object inode.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: read-metadata read-content fsck diff config-read checkout-copy commit-into
+ refs-update prune summary-regenerate sign-verify static-delta-generate
+ static-delta-apply tar-export
+modes: bare-user-only
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: manifest checksum-agreement
+evidence: ostrya::read_modes (read paths only)
+question: Confirm each operation against a tool-made bare-user-only repository.
+ The read paths have partial coverage; the write paths have none in this
+ direction.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: checkout-hardlink
+modes: bare
+tier: T0
+outcome: unobserved
+severity: interop
+identity: n-a
+oracle: manifest
+evidence: -
+spec: format-reference.md#checkout
+question: Bare mode is the one mode whose objects are hardlinked directly on
+ checkout. Confirm the checked-out path shares the object inode, and that the
+ ownership and mode presented are the object's. Foreign ids raise the tier to T3.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: checkout-hardlink
+modes: archive
+tier: T0
+outcome: impossible
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: -
+spec: format-reference.md#repository-modes-and-on-disk-storage
+note: Archive content objects are compressed, so a hardlink cannot present the
+ file content.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: checkout-hardlink
+modes: bare-user bare-user-only
+tier: T0
+outcome: refused-both
+severity: interop
+identity: n-a
+oracle: exit-status stderr-text
+evidence: -
+spec: format-reference.md#checkout
+question: The logical mode and ownership live outside the inode in these modes,
+ so a hardlink cannot present them. Record both refusal texts for a checkout that
+ requires hardlinks.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: composefs-export
+modes: bare-user
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement
+evidence: ostrya::composefs (against the golden image and digest)
+spec: format-reference.md#composefs
+question: The golden fixture proves the port reproduces the tool's image for one
+ tree. Confirm it for a repository the tool created and populated, comparing the
+ fs-verity digest.
+
+family: M1
+created-by: t
+populated-by: t
+operated-by: p
+op: composefs-export
+modes: archive bare bare-user-only
+tier: T0
+outcome: unobserved
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: -
+spec: format-reference.md#composefs
+question: The port requires a bare-user or bare-user-shared repository for this
+ export. Record whether the tool exports a composefs image from these three
+ modes, and if it refuses, record the text so the port can match it.
+
+# ---------------------------------------------------------------------------
+# D2 -- the port creates and populates, the tool operates.
+# ---------------------------------------------------------------------------
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: read-metadata read-content fsck diff config-read checkout-copy
+ checkout-hardlink commit-into refs-update prune summary-regenerate sign-verify
+ static-delta-generate static-delta-apply tar-export composefs-export
+ lock-exclusion
+modes: bare-user-shared
+tier: T0
+outcome: refused-clean
+severity: interop
+identity: n-a
+oracle: exit-status stderr-text
+evidence: -
+spec: format-reference.md#port-extension-bare-user-shared-mode
+note: Observed with ostree 2026.1. Every subcommand fails when the repository is
+ opened, before the operation runs, with "error: opening repo: Invalid mode
+ 'bare-user-shared' in repository configuration" and exit status 1. The
+ repository is left unmodified. The route to the tool for this mode is a port-run
+ pull-local into a tool-readable mode; object identity is preserved by design so
+ that the migration is lossless. That migration is a cell in m2-pull-local.
+question: Add a test that pins this message and the exit status, so a future tool
+ release that changes the refusal is caught.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: read-metadata read-content fsck diff config-read checkout-copy
+ checkout-hardlink commit-into refs-update prune summary-regenerate sign-verify
+ static-delta-generate static-delta-apply tar-export composefs-export
+ lock-exclusion
+modes: bare-split-xattrs
+tier: T0
+outcome: impossible
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: -
+spec: format-reference.md#bare-split-xattrs-mode
+note: The port does not write this mode, so this column has no producer.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: read-metadata read-content checkout-copy fsck
+modes: archive bare-user bare-user-only
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: manifest checksum-agreement exit-status
+evidence: ostrya::commit::tool_accepts_a_port_created_commit,
+ ostrya::commit::bare_user_only_commit_matches_the_tool, ostrya::checkout
+spec: format-reference.md#object-store-layout
+note: The tool reads, checks out, and fscks a repository the port created and
+ populated in these three modes.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: read-metadata read-content checkout-copy checkout-hardlink fsck
+modes: bare
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: manifest checksum-agreement exit-status
+evidence: ostrya::write::bare_objects_match_the_tool
+spec: format-reference.md#repository-modes-and-on-disk-storage
+note: Tier T0 covers a repository whose recorded ids are the invoking user's.
+ Foreign ids raise the tier to T3.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: commit-into refs-update prune summary-regenerate sign-verify
+ static-delta-generate static-delta-apply tar-export diff config-read
+modes: archive bare bare-user bare-user-only
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: exit-status checksum-agreement inventory
+evidence: ostrya::summary, ostrya::delta_generate, ostrya::sign (partial, on
+ port-made repositories)
+question: Hand a port-made repository to the tool and have the tool mutate it,
+ then confirm the uniform postcondition from the port's side. The existing
+ signature, summary, and delta tests already have the tool verify port output;
+ extend them to the tool writing into the repository afterwards. This group is
+ where an interleaved-mutation defect would first appear, and m8-custody covers
+ the longer sequences.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: lock-exclusion
+modes: archive bare bare-user bare-user-only
+tier: T0
+outcome: full
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: port-plan.md decision 8
+spec: port-plan.md#decisions
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: composefs-export
+modes: bare-user
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement
+evidence: ostrya::composefs
+spec: format-reference.md#composefs
+question: Have the tool export the composefs image from a port-made bare-user
+ repository and compare the fs-verity digest with the port's own export.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: composefs-export
+modes: archive bare bare-user-only
+tier: T0
+outcome: unobserved
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: -
+question: As the matching D1 record: establish whether the tool exports from
+ these modes at all before deciding whether the cell is a refusal or a result.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: checkout-hardlink
+modes: archive
+tier: T0
+outcome: impossible
+severity: interop
+identity: n-a
+oracle: exit-status
+evidence: -
+spec: format-reference.md#repository-modes-and-on-disk-storage
+note: Archive content objects are compressed, so a hardlink cannot present the
+ file content.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: checkout-hardlink
+modes: bare-user bare-user-only
+tier: T0
+outcome: refused-both
+severity: interop
+identity: n-a
+oracle: exit-status stderr-text
+evidence: -
+spec: format-reference.md#checkout
+question: Record both refusal texts, as in the matching D1 record.

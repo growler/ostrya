@@ -1,0 +1,28 @@
+[package]
+name = "ostrya-conformance"
+description = "Runner for the interoperability conformance matrix in docs/conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "ostrya_conformance"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ostrya-conformance"
+path = "src/main.rs"
+
+# Tier detection calls `process::geteuid` and `process::getgroups`; the
+# `manifest` oracle and the xattr, device-node, and ownership corpora call the
+# `fs` xattr, `mknodat`, and `chownat` entry points. `crates/ostrya` and
+# `crates/ostrya-sys` already declare rustix at this major version with `fs`,
+# so no package joins the dependency graph.
+[dependencies]
+rustix = { version = "1", default-features = false, features = [
+    "std",
+    "fs",
+    "process",
+] }

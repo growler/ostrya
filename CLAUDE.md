@@ -12,10 +12,13 @@ supports multiple concurrent transactions within a single process, which the
 reference tool does not allow. It is not a drop-in replacement for the `ostree`
 tool;
 a minimal `ostrya` CLI lands once the ingest and checkout paths are ready, and
-a command-line-compatible CLI is a late phase, built only to run the upstream
-shell test suite as an external conformance check. The `ostree` tool is treated
+a command-line-compatible CLI is a late phase, built only to carry the
+project's own CLI-behavior conformance suite as an external conformance
+check; the upstream shell test suite ships as part of libostree's LGPL
+source and is never read, run, or vendored (see
+"Licensing and clean-room discipline"). The `ostree` tool is treated
 as a black box: its observed behavior and the public documentation are the only
-inputs (see "Licensing and clean-room discipline").
+inputs.
 
 ## Licensing and clean-room discipline
 
@@ -54,9 +57,11 @@ reference, or reading material.
    `ostrya-rt` crate: `smol` by default, `tokio` optional. Only `ostrya-rt`
    knows the backend.
 3. Multiple concurrent transactions within a single process.
-4. Capable of passing ostree's test suite, run as an external conformance gate
-   (scope is phased: library format and format-primitive unit tests first,
-   CLI-driven shell tests later, admin/sysroot optional).
+4. Capable of an external conformance gate matching the scope of ostree's own
+   test suite, authored from scratch from black-box observation, never by
+   running or vendoring the upstream suite (scope is phased: library format
+   and format-primitive unit tests first, the port's own CLI-driven
+   conformance suite later, admin/sysroot optional).
 5. Extensions: GPG commit signing through the system GnuPG binaries (no gpgme
    linkage, no OpenPGP crate), composefs/EROFS export, tar import/export,
    AWS S3 push/pull, and ssh git-style push/pull.

@@ -8,6 +8,7 @@ members = [
     "crates/ostrya-sys",
     "crates/ostrya",
     "crates/ostrya-cli",
+    "crates/ostrya-conformance",
 ]
 
 [workspace.package]

@@ -1,0 +1,376 @@
+# M0 -- content fidelity.
+#
+# One implementation commits a corpus into a mode, the other commits the same
+# corpus into the same mode, and the commit checksums are compared. Object
+# identity is independent of repository mode, so a disagreement names the corpus
+# feature that diverged.
+#
+# Both implementations run in the same environment, so a corpus that records the
+# invoking user's ids compares validly without canonical ownership.
+#
+# Field reference and the outcome vocabulary are in README.md.
+
+family: M0
+corpus: C0 C1 C2 C3 C4 C5 C6 C7 C8 C9 C10 C11 C12 C13
+modes: bare-split-xattrs
+tier: T0
+outcome: refused-both
+severity: interop
+identity: n-a
+oracle: exit-status stderr-text
+evidence: -
+spec: format-reference.md#repository-modes-and-on-disk-storage
+question: Record both refusal texts. The tool answers "Not allowed due to repo
+ mode" for every write. Confirm the port refuses when the transaction opens
+ rather than failing later in the write.
+note: The tool's write support for this mode is gated and incomplete, and the
+ port does not write it. Read-side interoperability for a repository the tool
+ produced is covered in m1-operate.matrix.
+
+family: M0
+corpus: C0
+modes: archive bare-user
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: checksum-agreement inventory
+evidence: ostrya::commit::commit_object_is_byte_identical_across_modes,
+ ostrya::write::archive_objects_are_byte_identical_to_the_fixture,
+ tests/fixtures/generated/MANIFEST
+spec: format-reference.md#checksum-computation
+
+family: M0
+corpus: C0
+modes: bare-user-only
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: checksum-agreement
+evidence: ostrya::commit::bare_user_only_commit_matches_the_tool
+spec: format-reference.md#repository-modes-and-on-disk-storage
+note: The corpus records the invoking user's ids, which this mode discards. The
+ loss becomes visible with C3 and C13.
+
+family: M0
+corpus: C0
+modes: bare
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: checksum-agreement inventory
+evidence: ostrya::write::bare_objects_match_the_tool
+spec: format-reference.md#repository-modes-and-on-disk-storage
+note: The recorded ids are the invoking user's, which the writer owns, so no
+ privilege is needed. The checked-in bare fixture is owner-specific for the same
+ reason (MANIFEST bare_owner).
+
+family: M0
+corpus: C0
+modes: bare-user-shared
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: checksum-agreement
+evidence: ostrya::commit (cross-mode commit identity across archive, bare-user,
+ and bare-user-shared)
+spec: format-reference.md#port-extension-bare-user-shared-mode
+note: The tool cannot read this mode, so the oracle is the cross-mode identity
+ invariant rather than a direct comparison. Object bytes match the bare-user
+ form; only the inode mode differs.
+
+family: M0
+corpus: C1
+modes: archive bare bare-user bare-user-only bare-user-shared
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement manifest
+evidence: -
+question: Confirm every mode bit in the corpus round-trips. All five values lie
+ within 0775, so bare-user-only should lose nothing; confirm that it does not.
+
+family: M0
+corpus: C2
+modes: archive bare bare-user bare-user-shared
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement manifest
+evidence: -
+spec: format-reference.md#repository-modes-and-on-disk-storage
+question: Confirm setuid, setgid, and the sticky bit survive a commit and a
+ checkout in each mode. In bare-user the logical mode lives in
+ user.ostreemeta while the inode mode is forced, so the bit should survive
+ logically; confirm it does.
+
+family: M0
+corpus: C2
+modes: bare-user-only
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: exit-status checksum-agreement
+evidence: -
+spec: format-reference.md#repository-modes-and-on-disk-storage
+question: This mode limits regular-file bits to 0775, so the setuid, setgid, and
+ sticky bits have nowhere to live. Observe whether the tool refuses the commit,
+ drops the bits silently, or stores them, and whether directories behave the same
+ as regular files. The tool offers a --bareuseronly-files option on pull that
+ rejects files with bits outside 0775, which suggests rejection is at least one
+ available behavior.
+
+family: M0
+corpus: C3
+modes: archive bare-user bare-user-shared
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement
+evidence: tests/fixtures/generated/MANIFEST (the archive and bare-user fixtures
+ are generated with owner 0:0)
+question: The fixture generator already commits owner 0:0 into archive and
+ bare-user unprivileged, so this should hold. Confirm it, and extend to
+ bare-user-shared.
+
+family: M0
+corpus: C3
+modes: bare-user-only
+tier: T0
+outcome: lossy
+severity: interop
+identity: not-required
+oracle: manifest
+loss: The uid and gid are discarded and read back as 0. The mode stores no
+ user.ostreemeta.
+evidence: -
+spec: format-reference.md#repository-modes-and-on-disk-storage
+question: Confirm the read-back value is 0 for both ids, and confirm the commit
+ checksum still records the declared ids so that a pull into a
+ checksum-preserving mode recovers them.
+
+family: M0
+corpus: C3
+modes: bare
+tier: T3
+outcome: needs-priv
+severity: interop
+identity: unobserved
+oracle: checksum-agreement exit-status
+evidence: -
+spec: format-reference.md#repository-modes-and-on-disk-storage
+question: Record what each implementation does when a non-root writer commits
+ declared ids it does not own. The ids go on the object inode, so the chown
+ fails. Capture both refusal texts and exit statuses, then confirm agreement at
+ real root.
+
+family: M0
+corpus: C4
+modes: bare-user
+tier: T0
+outcome: full
+severity: interop
+identity: full
+oracle: checksum-agreement
+evidence: ostrya::ingest (against the xattr fixture),
+ tests/fixtures/generated/MANIFEST xattr_commit
+spec: format-reference.md#extended-attributes
+
+family: M0
+corpus: C4
+modes: archive bare bare-user-shared
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement manifest
+evidence: -
+spec: format-reference.md#extended-attributes
+question: Confirm the stored xattr set is byte-wise name-sorted in each mode, and
+ that the empty value and the 1024-byte value survive. In bare mode the set
+ lives on the object inode rather than in a header.
+
+family: M0
+corpus: C4
+modes: bare-user-only
+tier: T0
+outcome: lossy
+severity: interop
+identity: not-required
+oracle: manifest
+loss: Every xattr is discarded. The mode stores no xattr metadata.
+evidence: -
+spec: format-reference.md#extended-attributes
+
+family: M0
+corpus: C5 C6
+modes: archive bare bare-user bare-user-shared
+tier: T3
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement manifest
+evidence: -
+spec: format-reference.md#extended-attributes
+question: Confirm the capability and trusted xattrs are stored and hashed
+ identically by both implementations. Build and run these cells at real root
+ only: a capability xattr written from a user namespace is stored in a
+ namespaced revision carrying a rootid, so its bytes and the object checksum
+ differ from the real-root form.
+
+family: M0
+corpus: C5 C6
+modes: bare-user-only
+tier: T3
+outcome: lossy
+severity: interop
+identity: not-required
+oracle: manifest
+loss: Every xattr is discarded, including the security and trusted namespaces.
+evidence: -
+spec: format-reference.md#extended-attributes
+
+family: M0
+corpus: C7
+modes: archive bare bare-user bare-user-shared
+tier: T4
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement manifest
+evidence: -
+spec: format-reference.md#extended-attributes
+question: The reference behavior drops an existing security.selinux xattr at
+ commit and re-applies the policy label, so the label is not counted twice in the
+ checksum. Confirm both implementations agree on the resulting checksum. Blocked
+ on this development host, which runs no SELinux kernel; needs a Fedora or
+ CentOS Stream environment.
+
+family: M0
+corpus: C7
+modes: bare-user-only
+tier: T4
+outcome: lossy
+severity: interop
+identity: not-required
+oracle: manifest
+loss: Every xattr is discarded, including the SELinux label.
+evidence: -
+spec: format-reference.md#extended-attributes
+
+family: M0
+corpus: C8
+modes: archive bare bare-user bare-user-only bare-user-shared
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement inventory
+evidence: -
+spec: format-reference.md#commit-modifier-canonical-permissions-consume-and-devino
+question: Two paths sharing one inode and a third path with the same content on
+ a separate inode all hash to one content object. Confirm the object inventory
+ holds exactly one content object for the three paths in each mode, and that the
+ devino cache does not change the result.
+
+family: M0
+corpus: C9
+modes: archive bare bare-user bare-user-only bare-user-shared
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement inventory
+evidence: -
+question: Observe the payload-link threshold behavior. Record whether the tool
+ writes a .payload-link object for the over-threshold file in each mode, at what
+ size, and which config key sets it. The port's config parser does not yet know
+ a payload-link-threshold key. Record also how a sparse file is stored and
+ whether the hole survives a checkout.
+
+family: M0
+corpus: C10
+modes: archive bare bare-user bare-user-only bare-user-shared
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement inventory
+evidence: -
+question: Confirm a non-UTF8 name, a 255-byte name, a name holding a newline, a
+ name holding a quote and a backslash, and a 40-level path all commit and check
+ out identically. Record whether the tool refuses any of them, and record the
+ dirtree sort order for the non-UTF8 name.
+
+family: M0
+corpus: C11
+modes: archive bare bare-user bare-user-only bare-user-shared
+tier: T0
+outcome: unobserved
+severity: interop
+identity: n-a
+oracle: exit-status stderr-text
+evidence: -
+question: The expected result is a refusal from both implementations, because
+ the format holds regular files, symlinks, and directories only. Record each
+ refusal text and exit status for a fifo and for a unix socket, and confirm the
+ repository is left unmodified.
+
+family: M0
+corpus: C12
+modes: archive bare bare-user bare-user-only bare-user-shared
+tier: T3
+outcome: unobserved
+severity: interop
+identity: n-a
+oracle: exit-status stderr-text
+evidence: -
+question: As C11, for a character device and a block device. Real root is needed
+ to create the nodes even though the expected result is a refusal. Whether a
+ user namespace permits the mknod is probed, not assumed.
+
+family: M0
+corpus: C13
+modes: archive bare-user bare-user-shared
+tier: T2
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: checksum-agreement manifest
+evidence: -
+question: Confirm the ingest path reads real uid and gid values from the inodes
+ and records them unchanged. These modes hold the ids in a header or an xattr, so
+ no privilege is needed to store them; the privilege is needed only to build the
+ tree.
+
+family: M0
+corpus: C13
+modes: bare-user-only
+tier: T2
+outcome: lossy
+severity: interop
+identity: not-required
+oracle: manifest
+loss: The uid and gid are discarded and read back as 0.
+evidence: -
+spec: format-reference.md#repository-modes-and-on-disk-storage
+
+family: M0
+corpus: C13
+modes: bare
+tier: T3
+outcome: needs-priv
+severity: interop
+identity: unobserved
+oracle: checksum-agreement manifest
+evidence: -
+question: Confirm both implementations place the real ids on the object inode
+ and agree on the checksum. Real root is needed both to build the tree and to
+ store ids the writer does not own.

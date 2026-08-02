@@ -23,7 +23,10 @@ library is MIT-licensed.
 2. Async, with a feature-gated runtime backend behind the internal
    `ostrya-rt` crate: `smol` by default, `tokio` optional.
 3. Multiple concurrent transactions within a single process.
-4. Capable of passing ostree's test suite, run as an external conformance gate.
+4. Capable of an external conformance gate matching the scope of ostree's own
+   test suite. The gate is authored from scratch, from black-box observation
+   of the `ostree` tool; the upstream test suite is LGPL source and is never
+   run or vendored.
 5. Extensions: GPG commit signing through the system GnuPG binaries (no
    gpgme linkage), composefs/EROFS export, tar import/export, AWS S3
    push/pull, ssh git-style push/pull.
@@ -31,8 +34,8 @@ library is MIT-licensed.
 The port is a library. It is not a drop-in replacement for the `ostree` tool.
 A minimal `ostrya` binary lands once the ingest and checkout paths are ready
 (Phase 11); `ostree`-compatible command-line behavior is a late phase
-(Phase 17), built specifically to unlock the shell-driven part of the test
-suite.
+(Phase 17), built specifically to carry the port's own CLI-driven conformance
+suite, recorded in `conformance/` (see `conformance/README.md`).
 
 Faithful means: byte-for-byte identical on-disk format, identical checksums,
 identical algorithms. It does not mean mirroring the C API shape. The API is
@@ -108,8 +111,13 @@ bounded:
   `ostrya-composefs`. Feature-gated.
 - `ostrya-cli` -- the CLI crate, building the `ostrya` binary: a minimal
   command set once the ingest and checkout paths land (Phase 11), grown
-  incrementally; the `ostree`-compatible surface arrives with the
-  shell-test harness (Phase 17).
+  incrementally; the `ostree`-compatible surface arrives with the port's own
+  CLI-behavior conformance suite (Phase 17).
+- `ostrya-conformance` -- the runner for the interoperability matrix in
+  `conformance/`, building the `ostrya-conformance` binary. It links neither
+  the library nor the CLI: it drives both the `ostrya` and the `ostree`
+  binaries as subprocesses, so it observes the surface a user observes. Its
+  design is `conformance/harness.md`.
 
 Feature flags on `ostrya`: `pull`, `sign-spki`, `sign-gpg`, `deltas`, `s3`,
 `ssh`, plus the runtime backend selectors `smol` (default) and `tokio`,
@@ -284,9 +292,12 @@ sysroot/deployment (admin), ~20-25% is network/gpg/tar/composefs.
   bloom, rollsum, dates, utf8, keyfile, etc.) are written early against
   reference vectors captured from the tool; they validate the format layer
   without any CLI.
-- A compatible shell-test harness plus a growing `ostree`-compatible CLI unlock
-  the published shell conformance tests incrementally, targeted phase by phase
-  (commit/checkout, then refs/prune/fsck, then signing, then deltas, then pull).
+- A growing `ostree`-compatible CLI carries the port's own from-scratch
+  CLI-behavior conformance suite (`conformance/`), targeted phase by phase
+  (commit/checkout, then refs/prune/fsck, then signing, then deltas, then
+  pull). The suite is authored from black-box observation of the `ostree`
+  tool; the upstream shell tests are LGPL source and are never run or
+  vendored.
 - Sysroot/deployment (admin) is treated as a separate, later, optional track.
   A repo-operations library does not inherently need the boot/deploy machinery,
   and that cluster is the heaviest (root, bootloaders, `/ostree` layout).
@@ -1143,16 +1154,16 @@ partial, `Repo::diff_commits` (`DiffEntry`/`DiffChange`) reproducing
 (the `.commitpartial` fsck state byte).
 
 Verify: done through Rust integration tests cross-checked against the `ostree`
-tool (the CLI shell harness is Phase 17). The port and the tool prune identical
-copies of a multi-commit repository and agree on the surviving object set, the
-deleted-object count, and the bytes freed; the tool's `fsck` accepts a
-port-pruned repository; the port's `diff_commits` matches `ostree diff`
-byte-for-byte on added/removed/modified/type-change/dirmeta-change cases; fsck
-detects injected content corruption, metadata corruption, and a deleted
-referenced object (marking the commit partial with the tool's state byte); the
-suite passes under both runtime backends. The published `test-prune`,
-`test-fsck-*`, and `test-corruption` shell tests run once the Phase 17 CLI
-harness lands.
+tool (the CLI-behavior conformance suite is Phase 17). The port and the tool
+prune identical copies of a multi-commit repository and agree on the
+surviving object set, the deleted-object count, and the bytes freed; the
+tool's `fsck` accepts a port-pruned repository; the port's `diff_commits`
+matches `ostree diff` byte-for-byte on added/removed/modified/type-change/
+dirmeta-change cases; fsck detects injected content corruption, metadata
+corruption, and a deleted referenced object (marking the commit partial with
+the tool's state byte); the suite passes under both runtime backends.
+Equivalent prune/fsck/diff conformance cases land in
+`conformance/m10-cli-behavior.matrix` once the Phase 17 CLI lands.
 
 ### Phase pre13 -- Repository fs-verity (ex-integrity) (DONE)
 
@@ -1246,11 +1257,10 @@ pure Rust behind its own feature so the core stays free of the ECDSA/SPKI crate
 tree (see Decisions).
 
 The per-engine tool-conformance gate is cross-verification -- the `ostree`
-tool verifies a signature the port wrote and the port verifies the tool's, for
-that engine. The named shell tests
-(`test-signed-commit-{ed25519,spki,dummy}`, `test-gpg-signed-commit`,
-`test-commit-sign`) run through the harness once the CLI `sign` subcommand
-lands (Phase 17).
+tool verifies a signature the port wrote and the port verifies the tool's,
+for that engine. Equivalent sign/verify conformance cases land in
+`conformance/m10-cli-behavior.matrix` once the CLI `sign` subcommand lands
+(Phase 17).
 
 Format facts the signing path needs that `format-reference.md` does not yet
 state -- the spki curve, hash, signature encoding, and secret-key encoding,
@@ -1454,15 +1464,15 @@ keyring and is rejected under an empty trusted set; armored and file
 keyrings load; a wrong payload reports `BADSIG`; GPG and dummy signatures
 coexist on one commit; the status parser reproduces the observed GnuPG 2.4
 streams; the suite passes under both runtime backends, with and without
-`sign-gpg`. Tool cross-verification (`ostree gpg-sign` in both directions,
-`test-gpg-signed-commit`, `test-commit-sign`) runs through the harness when
-the CLI-compatible surface lands (Phase 17).
+`sign-gpg`. Tool cross-verification (`ostree gpg-sign` in both directions)
+lands in `conformance/m10-cli-behavior.matrix` once the CLI-compatible
+surface lands (Phase 17).
 
 ### Phase 13f -- Native `ostrya sign` command (DONE)
 
 A `sign` subcommand on the Phase 11 `ostrya` binary, over the 13a framework and
 its engines. Its command surface is the native one; the `ostree`-compatible
-`sign` / `gpg-sign` surface for the shell suite remains Phase 17. One command
+`sign` / `gpg-sign` surface remains Phase 17. One command
 covers the three engines through `-s|--sign-type` (`ed25519` default, `spki`,
 `gpg`), each in three modes:
 
@@ -1786,8 +1796,8 @@ also drives a whole `write_part`, which fails after its temp file exists and has
 leave the delta directory empty, pinning the guard. The chunker's own tests cover
 the plans it produces, including a target ending inside a source chunk, whose short
 last chunk carries a digest the index does not hold and copies on the byte
-comparison alone. The upstream `test-delta`, `test-delta-ed25519`, and
-`test-delta-sign` shell tests run at the CLI-compatibility phase.
+comparison alone. Equivalent static-delta conformance cases land in
+`conformance/m10-cli-behavior.matrix` at the CLI-compatibility phase.
 
 The summary's `ostree.static-deltas` map, which advertises a repository's deltas
 to a fetcher, landed with the delta-accelerated pull in Phase 16d; the key's
@@ -2378,8 +2388,8 @@ bare-user destination that passes its `fsck`. Unit tests cover the refspec mappi
 The CLI grows `ostrya pull-local`, with `--remote`, `--depth`,
 `--commit-metadata-only`, `--untrusted`, `--bareuseronly-files`,
 `--disable-verify-bindings`, `--force-copy`, and repeatable
-`-L/--localcache-repo`. The upstream `test-local-pull*` shell tests run at the
-CLI-compatibility phase.
+`-L/--localcache-repo`. Equivalent pull-local conformance cases land in
+`conformance/m10-cli-behavior.matrix` at the CLI-compatibility phase.
 
 Deferred past 16b: the summary, mirror mode, and the timestamp checks land in
 16c; delta-accelerated pull in 16d; GPG and sign-engine commit verification in
@@ -2612,8 +2622,9 @@ nothing published; a `tls-permissive` remote refused; and
 the `.filez` stream parser, and the driver (slot refill from the plan, the first
 ready slot returned, and an error dropping every slot still in flight). The
 fetcher tests grew the drain-and-pool cases, the undrained-body case, and
-priority ordering end to end through `Fetcher::fetch`. The upstream `test-pull-*`
-shell tests run at the CLI-compatibility phase.
+priority ordering end to end through `Fetcher::fetch`. Equivalent pull
+conformance cases land in `conformance/m10-cli-behavior.matrix` at the
+CLI-compatibility phase.
 
 Deferred: `contenturl`, `metalink`, and mirrorlists; subpath pulls; collection
 refs and `refs/mirrors`; the summary cache under `tmp/cache/summaries/`; the
@@ -3173,8 +3184,10 @@ admin tests. Recommend deferring or descoping unless explicitly required.
   through the documented, stable `--status-fd` interface and pins no
   version; a vocabulary change in a future GnuPG would surface in the
   round-trip tests.
-- "Pass the test suite" scope: the shell tier requires a compatible CLI; the
-  admin tier requires the sysroot track. Scope must be agreed (see decisions).
+- Conformance scope: the CLI-behavior tier requires a compatible CLI (Phase
+  17) and is authored from scratch, since the upstream shell suite is LGPL
+  source and out of scope; the admin tier requires the sysroot track
+  (Phase 20).
 
 ## Decisions
 
@@ -3188,9 +3201,10 @@ Resolved:
 2. GVariant: hand-roll a minimal codec (`ostrya-gvariant`) tailored to
    ostree's fixed type set, fuzzed against golden bytes from the tool.
 3. Test-suite scope: phased. Target the library-format-testable subset plus
-   format-primitive unit tests first; add CLI-driven shell tests through
-   Phase 17; treat the admin/sysroot tier (Phase 20) as a separate, optional
-   track.
+   format-primitive unit tests first; add the port's own CLI-driven
+   conformance suite through Phase 17 (never the upstream shell suite, which
+   is LGPL source); treat the admin/sysroot tier (Phase 20) as a separate,
+   optional track.
 4. Workspace: multi-crate (`ostrya-gvariant`, `ostrya-core`, `ostrya-rt`,
    `ostrya-composefs`, `ostrya`, `ostrya-cli`), with heavier subsystems
    behind feature flags on `ostrya`.

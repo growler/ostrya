@@ -1,0 +1,188 @@
+# M10 -- ostrya's CLI surface against the ostree tool's.
+#
+# A cell is one CLI invocation, so each record names a subcommand, a `cell`
+# identifier tail, and the command line itself, in place of M0/M1's
+# `modes`/`corpus` product. See README.md, "M10 record format", for the field
+# reference and the outcome/oracle vocabulary, and harness.md for the setup
+# vocabulary, the placeholders, and the assertion forms.
+#
+# The harness gives each implementation its own scratch subtree and runs the
+# `run:` line in it, so `$REPO` is that side's own repository path. Two cells
+# control the working directory and the environment of the invocation, which a
+# `run:` line does not state; each names a probe.
+#
+# This file carries Phase 17a's own cases: `init` and the global `--repo`
+# conventions (`../port-plan.md`, "Phase 17a"). Later sub-phases add records
+# here as their own subcommands and options land.
+
+# ---------------------------------------------------------------------------
+# init -- mode acceptance.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: init
+cell: init/mode=bare
+setup: empty-dir
+run: init --repo=$REPO --mode=bare
+expect-exit: 0
+oracle: exit-status config-bytes
+outcome: full
+severity: interop
+spec: cli-surface.md#p0-blocks-the-harness
+
+family: M10
+subcommand: init
+cell: init/mode=bare-user
+setup: empty-dir
+run: init --repo=$REPO --mode=bare-user
+expect-exit: 0
+oracle: exit-status config-bytes
+outcome: full
+severity: interop
+spec: cli-surface.md#p0-blocks-the-harness
+
+family: M10
+subcommand: init
+cell: init/mode=bare-user-only
+setup: empty-dir
+run: init --repo=$REPO --mode=bare-user-only
+expect-exit: 0
+oracle: exit-status config-bytes
+outcome: full
+severity: interop
+spec: cli-surface.md#p0-blocks-the-harness
+
+family: M10
+subcommand: init
+cell: init/mode=archive
+setup: empty-dir
+run: init --repo=$REPO --mode=archive
+expect-exit: 0
+oracle: exit-status config-bytes
+outcome: full
+severity: interop
+spec: cli-surface.md#p0-blocks-the-harness
+note: `--mode=archive` and `--mode=archive-z2` name the same mode; both
+ implementations always serialize the config's `mode` key as `archive-z2`,
+ which the `config-bytes` oracle states by comparing the two config files.
+
+family: M10
+subcommand: init
+cell: init/mode=bare-user-shared
+setup: empty-dir
+run: init --repo=$REPO --mode=bare-user-shared
+ref-run: n-a
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#port-extension-bare-user-shared-mode
+note: `bare-user-shared` is a port extension the tool has no `--mode` value
+ for; the tool refuses to even open a repository ostrya created in this mode
+ (`error: opening repo: Invalid mode 'bare-user-shared' in repository
+ configuration`), already covered by the D2 direction of
+ `m1-operate.matrix`. `ref-run: n-a` leaves the port's own claims as the
+ cell's only assertions: the mode is accepted and the repository is created.
+ The oracles record the port's artifacts and compare nothing.
+
+# ---------------------------------------------------------------------------
+# init -- rejection, and the cwd/OSTREE_REPO fallback it shares with every
+# other subcommand.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: init
+cell: init/mode=bogus
+setup: empty-dir
+run: init --repo=$REPO --mode=bogus
+expect-exit: 1
+expect-stderr: contains "error: Invalid mode 'bogus' in repository configuration"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid mode 'bogus' in repository configuration"
+oracle: exit-status stderr-text
+outcome: full
+severity: interop
+spec: cli-surface.md#global-conventions
+note: both implementations write that one line to standard error and leave no
+ repository behind, so the `stderr-text` oracle compares the whole stream.
+
+family: M10
+subcommand: init
+cell: init/fallback-reuse
+setup: empty-dir
+probe: init-reuse-via-cwd-and-env
+outcome: full
+severity: interop
+spec: cli-surface.md#global-conventions
+note: the probe runs `init` with the repository as the current directory, and
+ again through `OSTREE_REPO` with a non-repository current directory. Both
+ implementations reuse the existing repository idempotently (exit 0, config
+ unchanged) rather than requiring an explicit `--repo`: `init` shares the
+ cwd/`OSTREE_REPO` precedence every other subcommand uses. The probe builds
+ the repository with `collection-id` set, so the cell does not also exercise
+ the tool's fallback-only crash on a repository lacking one (`error: Key file
+ does not have key "collection-id" in group "core"`), which the identical
+ reuse through an explicit `--repo` does not produce and which the port does
+ not reproduce (cli-surface.md, "Global conventions"). The cell carries no
+ claim about that divergence either way. A probe states this cell because the
+ working directory and the environment are what it varies, and a `run:` line
+ states neither.
+
+# ---------------------------------------------------------------------------
+# Global --repo/OSTREE_REPO conventions, exercised through subcommands Phase
+# 12 and earlier already implement, since Phase 17a adds no reading
+# subcommand of its own.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: prune
+cell: prune/repo-position-precedence
+setup: repo
+probe: repo-position-precedence
+outcome: full
+severity: interop
+spec: cli-surface.md#global-conventions
+note: the same repository resolves whether `--repo` is given before the
+ subcommand, after it, or via `OSTREE_REPO` with no `--repo` at all and a
+ non-repository current directory; all three forms report the same object
+ count, for both implementations. A probe states this cell for the same
+ reason as `init/fallback-reuse`.
+
+family: M10
+subcommand: export
+cell: export/trailing-repo-wins
+setup: two-repos
+run: --repo=$REPO export --repo=$REPO2 $BRANCH
+expect-exit: 0
+expect-stdout: contains "distinguish-repo-2"
+ref-expect-exit: 0
+ref-expect-stdout: contains "distinguish-repo-2"
+oracle: exit-status
+outcome: full
+severity: interop
+spec: cli-surface.md#global-conventions
+note: the `two-repos` setup commits a distinguishing marker into each
+ repository under one branch name. Both implementations export the
+ subcommand-position repository, so the tar stream on standard output holds
+ the second marker and not the first. The two streams are not compared: the
+ claim is which repository was read, and the tar bytes carry more than that.
+
+family: M10
+subcommand: prune
+cell: prune/no-repo-resolvable
+run: prune
+expect-exit: 1
+expect-stderr: contains "error: Command requires a --repo argument"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Command requires a --repo argument"
+oracle: exit-status
+outcome: full
+severity: interop
+spec: cli-surface.md#global-conventions
+note: the cell runs in its own scratch root, which is not a repository, with
+ no `--repo` and no `OSTREE_REPO`. Both implementations print the
+ subcommand's usage text to standard error, then that error line, and exit 1.
+ The port's usage text is clap's own rendering and the tool's is GOption's, so
+ the shared claim is the shape -- usage, then the error line, then exit 1 --
+ which is why `stderr-text` is not an oracle here.

@@ -22,3 +22,9 @@ gpg = ["ostrya/sign-gpg"]
 ostrya = { path = "../ostrya", default-features = false }
 ostrya-rt = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+
+# `tests/conformance.rs` runs the conformance matrix against the binary this
+# crate builds (`docs/conformance/harness.md`, "Cargo and CI wiring"). The
+# harness links no library of the port; it drives the built binary.
+[dev-dependencies]
+ostrya-conformance = { path = "../ostrya-conformance" }

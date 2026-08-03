@@ -3112,13 +3112,282 @@ destination still stores the inflated payload.
 
 ### Phase 17 -- `ostree`-compatible CLI (`ostrya-cli`)
 
-Incremental, driven by which shell tests are targeted; extends the Phase 11
-`ostrya` binary. Command-line and stdout/stderr compatibility with the
-`ostree` tool for the exercised subcommands (commit, checkout, refs,
+Incremental, driven by which conformance cases are targeted; extends the
+Phase 11 `ostrya` binary. Command-line and stdout/stderr compatibility with
+the `ostree` tool for the exercised subcommands (commit, checkout, refs,
 rev-parse, ls, cat, show, log, config, prune, fsck, summary, sign, gpg-sign,
-static-delta, pull, pull-local, remote, init, export, diff). Provide a
-compatible shell-test harness and a TAP producer.
-Verify: growing subsets of the shell suite pass unmodified.
+static-delta, pull, pull-local, remote, init, export, diff). The upstream
+shell test suite is part of libostree's LGPL source distribution and stays
+out of scope like the rest of that source: it is never read, run, or
+vendored (see CLAUDE.md, "Licensing and clean-room discipline"). In its
+place, Phase 17 grows `conformance/m10-cli-behavior.matrix`, a family in the
+same interoperability-matrix system as `m0`/`m1`, authored from black-box
+observation of the `ostree` tool, executed by the record-driven runner
+`conformance/harness.md` specifies.
+
+The command-surface scope is stated in `conformance/cli-surface.md`, which
+lists the absent commands, the missing options on the commands that exist,
+the global option conventions, and the output formats still to be recovered,
+ordered by what each unblocks. `init` is the one gap that blocks the
+interoperability harness outright.
+
+The phase is split into sub-phases so each is independently reviewable; the
+split follows `cli-surface.md`'s own ordering, with the matrix and its runner
+moved to the front (17a) so every later sub-phase has a Verify gate to grow
+against, matching this phase's "incremental" framing.
+
+#### Phase 17a -- `init`, global `--repo` conventions, and the matrix harness (DONE)
+
+`ostrya init --repo=PATH --mode=MODE --collection-id=ID` wires the already
+existing `Repo::create`. The accepted `--mode` values are `archive`,
+`archive-z2` (an alias, always serialized back as `archive-z2`), `bare`,
+`bare-user`, `bare-user-only`, and the port extension `bare-user-shared`;
+`bare-split-xattrs` is excluded, since the port reads that mode and does not
+write it. An unrecognized mode is rejected with the tool's own text, `error:
+Invalid mode '<mode>' in repository configuration`, and exit 1, before
+anything is written.
+
+`--repo`, `-v`/`--verbose`, and `--version` are global `clap` options
+(`global = true`), so each is accepted both before and after the subcommand
+name; the subcommand-position value wins when both are given, matching the
+tool. With no `--repo`, the current directory is used when it opens as a
+repository, else `OSTREE_REPO`; with neither, the failing subcommand's usage
+text and `error: Command requires a --repo argument` go to standard error and
+the process exits 1 -- the same shape the tool uses, though the port's usage
+text is `clap`'s own rendering, not byte-identical to the tool's GOption text.
+`init` shares this precedence rather than special-casing it: a cwd/
+`OSTREE_REPO` target that already opens as a repository is reused (an
+idempotent re-init, matching `Repo::create`); one that does not falls through
+to the same usage-text-plus-error form, so `init` never creates a brand-new
+repository except at an explicit `--repo`. Every top-level error, including a
+`clap` argument-parsing failure, prints with an `error: ` prefix and exits 1
+(`-h`/`--help` still exits 0). A nested subcommand left unnamed
+(`static-delta` with no list/apply-offline/generate/reindex) is optional at
+the `clap` layer and is checked in the port's own dispatch, before the
+repository resolves, matching the tool's order: it prints `static-delta`'s
+usage text and `error: No command specified` and exits 1, for every
+combination of the global options and whether or not a repository could have
+resolved. Leaving the check to `clap` would hold only for the argument-free
+form, since `clap` reports a missing subcommand under one error kind when the
+command level received no argument at all and under another when a global
+option accompanied it.
+
+For `export`, `diff`, `sign`, `pull`, and `pull-local`, the repo check also
+comes before the check for each subcommand's required positional operand,
+matching the tool: the positional is optional at the `clap` layer and is
+checked, with the tool's own message, only once the repository has resolved
+(`error: A COMMIT argument is required` for `export`; `error: REV must be
+specified` for `diff`; `error: Need a COMMIT to sign or verify` for `sign`;
+`error: REMOTE must be specified` for `pull`; `error: DESTINATION must be
+specified` for `pull-local`). `checkout` is not fixed the same way: the tool
+defaults its second positional, `DESTINATION`, from `COMMIT` rather than
+requiring it, a distinct behavior `cli-surface.md`'s "Global conventions"
+records but the port does not yet reproduce.
+
+Two observed tool quirks are recorded in `cli-surface.md` and not reproduced:
+the leading (pre-subcommand) `--repo` accepts only the `=`-joined form on the
+tool (`ostree --repo R` fails, `ostree --repo=R` works), while the port
+accepts both forms in both positions; and reusing an existing repository
+through the cwd/`OSTREE_REPO` fallback for `init` crashes the tool with
+`error: Key file does not have key "collection-id" in group "core"` when
+that repository's config has no `collection-id`, even though the identical
+reuse through an explicit `--repo` succeeds -- the port's fallback and
+explicit-`--repo` paths share one idempotent `Repo::create` call, so both
+succeed uniformly.
+
+`conformance/m10-cli-behavior.matrix` is the new record family: a cell is one
+CLI invocation, stated by `subcommand`, a `cell` identifier tail, a `setup`,
+the `run` line itself, its `expect-*` claims, and the shared
+`outcome`/`oracle`/`spec` fields, documented in `conformance/README.md`'s
+"Families" and "M10 record format" sections.
+
+`crates/ostrya-conformance` is the runner `conformance/harness.md` specifies:
+a workspace member building a library and a standalone binary, with `rustix`
+as its one dependency. The record is the program -- the runner reads the
+invocation, the setups, the oracles, and the expected results from the
+record, gives each implementation its own scratch subtree, runs the line in
+both, compares the artifacts the `oracle` field names, and reports one of
+pass, fail, or skip-with-reason per cell. A cell the run could not observe
+reports as skipped and never as a pass, so a machine with no `ostree`
+installed reports `skip: reference-absent` for every cell that needs the
+tool; `--require tool=ostree` turns those skips into failures where the tool
+is installed. Two cells vary the working directory and the environment, which
+a `run:` line does not state, so each names a registered probe.
+
+Verify: `cargo test --workspace --all-features` runs two new test targets and
+one new unit test. `crates/ostrya-conformance/tests/check.rs` statically
+validates all three record files (63 records, 300 cells) and needs no binary.
+`crates/ostrya-cli/tests/conformance.rs` runs the T0 selection against the
+`ostrya` binary this workspace builds, and against `ostree` 2026.1 where it is
+installed: all twelve M10 cells pass, and the remaining 288 cells report as
+skipped: 150 as declarations, 31 filtered out by the T0 tier selection (cells
+whose corpus needs a higher tier, declarations in substance), and 107 as
+proved elsewhere by a library test. The unit test in `main.rs` holds the
+subcommand names the error paths render usage text by against `clap`'s own
+set, in both directions, so a renamed or an added subcommand fails a test
+rather than the name lookup on an error path.
+The twelve: `init` creates a repository in `bare`, `bare-user`,
+`bare-user-only`, `archive`, and `archive-z2`, with the `config` bytes of the
+two implementations compared byte-for-byte for each; the two archive spellings
+state between them that the port normalizes each one the way the tool does,
+`format-reference.md` being what states that the normalized value is
+`archive-z2`;
+`init --mode=bare-user-shared` is accepted by the port, with
+`ref-run: n-a` recording that the tool has no such mode value (its refusal to
+open the result is `m1-operate.matrix`'s D2 direction); an unrecognized mode
+is rejected by both with the same standard-error text and exit 1 (that
+neither leaves a repository behind is an observation the record notes, not a
+claim its oracles state, since no oracle reads an absence); `--repo` before
+the subcommand, after it, and via `OSTREE_REPO` all resolve the same
+repository, for both implementations; a trailing `--repo` wins over a leading
+one, confirmed for both through `export` reading the marker of the second
+repository; `static-delta` with no nested subcommand reports the missing
+subcommand, and not the unopenable `--repo` it was also given, for both; a
+subcommand with no `--repo`, no `OSTREE_REPO`, and a non-repository current
+directory gets the usage-text-plus-error form from both; and `init`'s
+cwd/`OSTREE_REPO` reuse succeeds idempotently for both on a repository
+carrying a `collection-id`, with the config untouched.
+
+#### Phase 17b -- `refs`, `rev-parse`, `cat`
+
+Wiring the already existing `Repo::list_refs`, `Repo::list_mirror_refs`, and
+`Repo::resolve_rev`, plus recovering their exact output text.
+
+- `refs`: `--list` (the default), `--delete`, `--create=NEWREF`,
+  `-r/--revision`, `-A/--alias`, `-c/--collections`, `--force`, and the
+  optional `PREFIX` positional.
+- `rev-parse`: `-S/--single`.
+- `cat`: no options beyond the common set; streams a file object's content
+  to stdout over the existing read path.
+
+Deliverables: the three subcommands, their output-format recovery folded
+into `format-reference.md`, and `m10` records for each.
+
+Verify: `refs --list`/`-r`/`--create`/`--delete` against a fixture repository
+match the tool's own text and leave the same ref files; `rev-parse` resolves
+a bare checksum, a refspec, and (if the tool supports it, to confirm by
+observation) an ancestry suffix identically to the tool; `cat` reproduces a
+fixture file's content byte for byte.
+
+#### Phase 17c -- `commit`/`checkout`: the corpus-priority option gaps
+
+Exactly the flags `cli-surface.md` orders first because the interop corpora
+need them: on `commit`, `--owner-uid`, `--owner-gid`, `--timestamp`,
+`--no-xattrs`; on `checkout`, `-U/--user-mode`, `--subpath=PATH`.
+
+Deliverables: the six flags, each backed by library surface Phase 7
+already has (ownership override, `CommitOptions` timestamp, the
+`SKIP_XATTRS` modifier flag, bare-user checkout, a tree-lookup-scoped
+checkout).
+
+Verify: corpus `C3` (declared ownership) and every reproducible-timestamp
+`m0`/`m1` cell stop depending on the interop harness's own out-of-band setup
+and go through the CLI directly; `checkout -U` and `--subpath` against a
+fixture commit match the tool's own checkout of the same commit, file for
+file.
+
+#### Phase 17d -- `show`, `log`, `ls`, `config get`, and the GVariant text-form printer
+
+The GVariant text-form printer is its own distinct deliverable inside this
+sub-phase, flagged separately in `cli-surface.md` as easy to overlook: it
+reproduces the tool's GLib "print" convention (type annotations, the byte
+array literal form, floating point, nested containers) for `show --raw`,
+every `show --print-*` form, and `summary --raw`. It belongs in
+`ostrya-gvariant`, next to the `Value` type it prints, since the convention
+is GVariant's own rather than ostree-specific, matching that crate's
+"no ostree knowledge" charter. Recovered fact by fact against the tool's
+output across every metadata object type in the fixture set, with the
+recovered rules landing in `format-reference.md`.
+
+- `show`: `--raw`, `--print-related`, `--print-variant-type=TYPE`,
+  `--list-metadata-keys`, `--print-metadata-key=KEY`, `--print-hex`,
+  `--list-detached-metadata-keys`, `--print-detached-metadata-key=KEY`,
+  `--print-sizes`, `-B/--no-byteswap`, `--gpg-homedir=HOMEDIR`,
+  `--gpg-verify-remote=REMOTE`.
+- `log`: the default form, a parent-chain walk through the existing
+  `Repo::load_commit` (no reachability traversal needed), and `--raw`.
+- `ls`: `-d/--dironly`, `-R/--recursive`, `-C/--checksum`, `-X/--xattrs`,
+  `--nul-filenames-only`, over the existing `RepoTree::read_dir`/`lookup`.
+- `config get`, over the existing `RepoConfig`/`KeyFile` read accessors.
+  `config set`/`unset` need a config-write path the library does not have
+  yet and are deferred to 17e.
+
+Deliverables: the GVariant printer (`ostrya-gvariant`), `show`, `log`, `ls`,
+`config get`, and their output-format recovery folded into
+`format-reference.md`.
+
+Verify: the printer's output matches the tool's byte for byte across the
+golden fixture set for every metadata object type; each `show`/`log`/`ls`
+form's stdout matches the tool's for the same commit or tree; `config get`
+matches the tool's for every key class `format-reference.md` documents.
+
+#### Phase 17e -- `config set`/`unset`, `remote` (excluding cookies), `gpg-import`/`gpg-list-keys`
+
+New library work, not just CLI wiring:
+
+- `ostrya-core`'s `KeyFile` gains an unset/remove operation and a
+  serializer that round-trips a file it did not fully rewrite (preserves
+  groups and keys it did not touch); `ostrya`'s `Repo` gains a durable
+  config rewrite (tmpfile, fdatasync, rename), matching the durability
+  conventions the rest of the write path already follows.
+- `remote add/delete/list/show-url/refs/summary`: `add`/`delete` mutate a
+  `[remote "name"]` group through the same config-write path; `refs` and
+  `summary` reuse the pull machinery's existing remote resolution against a
+  live remote.
+- `gpg-import`/`gpg-list-keys`: thin wrappers over the `gpg` subprocess
+  plumbing `gpg.rs` already runs for signing and verification, importing
+  into or listing a remote's `trustedkeys.gpg`.
+- Excluded: `remote add-cookie`/`delete-cookie`/`list-cookies`. `fetch.rs`
+  currently refuses any `Cookie` header at construction whenever a mirror is
+  cleartext `http`, as a deliberate choice (a cookie's value is a secret
+  regardless of what it holds). Cookie-jar support needs its own design
+  discussion against that existing refusal before it gets a phase slot; it
+  carries no matrix weight (`cli-surface.md` P3), so it is left out of this
+  decomposition rather than decided here.
+
+Deliverables: `KeyFile` unset and serialization, `Repo`'s config rewrite,
+`config set`/`unset`, `remote add/delete/list/show-url/refs/summary`,
+`gpg-import`/`gpg-list-keys`.
+
+Verify: `config set` followed by `config get` round-trips, and the tool
+reads the resulting file unchanged; `remote add` followed by the tool's own
+`remote list` agree, and the reverse; a key imported by `gpg-import` verifies
+a commit the tool signed with it; `gpg-list-keys` matches the tool's listing
+of the same keyring.
+
+#### Phase 17f -- the remaining P2 option gaps
+
+Everything `cli-surface.md`'s P2 section lists that 17c/17d/17e do not
+already cover: the rest of `commit`'s and `checkout`'s missing options,
+`export --no-xattrs/--subpath/--prefix/-o`, the remaining `prune`, `fsck`,
+`diff`, and `summary` flags, and `static-delta show/delete/indexes`. The
+`static-delta` additions need new public accessors into the
+superblock/part/index structures `delta.rs` already parses internally but
+does not yet expose.
+
+Deliverables: the remaining flags on each command, and read-only
+superblock/index accessors on `delta.rs` for `static-delta show`/`indexes`.
+
+Verify: each option's `m10` record and the option's owning `m0`/`m1` cells
+move from `unimplemented-cli`/`unobserved` to `full` (or a named, justified
+`lossy`/`needs-priv`) as it lands.
+
+#### Phase 17g -- P3 commands with no matrix weight
+
+`reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and
+`gpg-sign` (an alias for `sign --sign-type=gpg`, per `cli-surface.md`).
+`remote add-cookie`/`delete-cookie`/`list-cookies` stay out, per 17e.
+
+- `find-remotes` needs the repo-finder machinery Phase 16d already carries
+  for collection-ref-based pull; check whether its public surface covers a
+  finder invoked standalone, or add a thin new entry point if not.
+- `create-usb` layers `pull-local`/mirror onto a destination-repo target; no
+  new library primitive is expected.
+
+Deliverables: the five commands.
+
+Verify: each command's basic form is wired and matches the tool's for a case
+the matrix does not otherwise cover.
 
 ### Phase 18 -- S3 push/pull extension
 

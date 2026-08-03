@@ -3,10 +3,20 @@
 //! The `ostrya` command-line front-end.
 //!
 //! A thin binary over the ingest, checkout, and export paths of the `ostrya`
-//! library (Phase 11 of `docs/port-plan.md`). Its command surface is its own; a
-//! command-line-compatible `ostree` surface arrives in a later phase. The
-//! subcommands are:
+//! library (Phase 11 of `docs/port-plan.md`), growing an `ostree`-compatible
+//! surface since Phase 17. `--repo`, `-v`/`--verbose`, and `--version` are
+//! global: each is accepted both before and after the subcommand name, the
+//! subcommand-position value winning when both are given, matching the tool
+//! (`docs/conformance/cli-surface.md`, "Global conventions"). With no `--repo`
+//! given, the current directory is used when it opens as a repository,
+//! otherwise `OSTREE_REPO`; with neither, the subcommand's usage text and
+//! `error: Command requires a --repo argument` go to standard error and the
+//! process exits 1. `init` shares this precedence: a cwd/`OSTREE_REPO` target
+//! that already opens as a repository is reused (an idempotent re-init); a
+//! target that does not never gets created by the fallback, only by an
+//! explicit `--repo`. The subcommands are:
 //!
+//! - `init` -- create a repository in the given mode.
 //! - `commit` -- ingest a tree from a path, or a tar stream on stdin, into a
 //!   commit and print its checksum.
 //! - `checkout` -- materialize a commit's tree, or write its composefs image.
@@ -31,13 +41,13 @@
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CommitModifier, CommitModifierFlags, CommitOptions,
-    DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, MutableTree,
-    ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, Repo, Result,
-    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Type, Value, Verifier,
-    VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
+    CreateOptions, DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error, FsckOptions,
+    MutableTree, ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, Repo,
+    RepoMode, Result, SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Type,
+    Value, Verifier, VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -46,14 +56,30 @@ use ostrya::{SpkiSigner, SpkiVerifier};
 
 /// A pure-Rust front-end over the ostrya repository library.
 #[derive(Parser)]
-#[command(name = "ostrya", version, about, long_about = None)]
+#[command(name = "ostrya", about, long_about = None)]
 struct Cli {
+    /// The repository to operate on; accepted before or after the subcommand
+    /// name, with the subcommand-position value winning when both are given.
+    /// With neither, the current directory is used when it opens as a
+    /// repository, else the `OSTREE_REPO` environment variable (`init`
+    /// reuses an existing repository resolved this way, but never creates a
+    /// new one without this option).
+    #[arg(long, global = true)]
+    repo: Option<PathBuf>,
+    /// Print debug information during command processing.
+    #[arg(short, long, global = true)]
+    verbose: bool,
+    /// Print version information and exit.
+    #[arg(long, global = true)]
+    version: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Initialize a new empty repository.
+    Init(InitArgs),
     /// Commit a tree into the repository and print the new commit checksum.
     Commit(CommitArgs),
     /// Check a commit out onto the filesystem, or write its composefs image.
@@ -80,11 +106,61 @@ enum Command {
     PullLocal(PullLocalArgs),
 }
 
+impl Command {
+    /// Every name [`Command::name`] returns. The test at the end of this file
+    /// holds this list and `clap`'s own subcommand set to each other, so a
+    /// renamed or an added subcommand fails a test rather than the
+    /// usage-text lookup on an error path.
+    #[cfg(test)]
+    const NAMES: &'static [&'static str] = &[
+        "init",
+        "commit",
+        "checkout",
+        "export",
+        "prune",
+        "fsck",
+        "diff",
+        "sign",
+        "summary",
+        "static-delta",
+        "pull",
+        "pull-local",
+    ];
+
+    /// The name `clap` registered this subcommand under, which the error paths
+    /// use to render its usage text.
+    fn name(&self) -> &'static str {
+        match self {
+            Command::Init(_) => "init",
+            Command::Commit(_) => "commit",
+            Command::Checkout(_) => "checkout",
+            Command::Export(_) => "export",
+            Command::Prune(_) => "prune",
+            Command::Fsck(_) => "fsck",
+            Command::Diff(_) => "diff",
+            Command::Sign(_) => "sign",
+            Command::Summary(_) => "summary",
+            Command::StaticDelta(_) => "static-delta",
+            Command::Pull(_) => "pull",
+            Command::PullLocal(_) => "pull-local",
+        }
+    }
+}
+
+#[derive(Args)]
+struct InitArgs {
+    /// The repository mode: archive (an alias for archive-z2), archive-z2,
+    /// bare, bare-user, bare-user-only, or the port extension
+    /// bare-user-shared.
+    #[arg(long, default_value = "bare")]
+    mode: String,
+    /// A globally unique id for this repository as a collection of refs.
+    #[arg(long = "collection-id")]
+    collection_id: Option<String>,
+}
+
 #[derive(Args)]
 struct CommitArgs {
-    /// The repository to commit into.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     /// The parent commit (a checksum or a ref); none for a root commit.
     #[arg(long)]
     parent: Option<String>,
@@ -104,9 +180,6 @@ struct CommitArgs {
 
 #[derive(Args)]
 struct CheckoutArgs {
-    /// The repository to check out from.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     /// Prefer hardlinks where the repository mode allows (the default path).
     #[arg(short = 'H', long)]
     require_hardlinks: bool,
@@ -125,18 +198,14 @@ struct CheckoutArgs {
 
 #[derive(Args)]
 struct ExportArgs {
-    /// The repository to export from.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
-    /// The commit to export (a checksum or a ref).
-    commit: String,
+    /// The commit to export (a checksum or a ref). Required; checked after
+    /// the repository resolves, matching the tool's error-ordering
+    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    commit: Option<String>,
 }
 
 #[derive(Args)]
 struct PruneArgs {
-    /// The repository to prune.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     /// Keep only objects reachable from refs; also prune unreferenced commits.
     #[arg(long)]
     refs_only: bool,
@@ -153,9 +222,6 @@ struct PruneArgs {
 
 #[derive(Args)]
 struct FsckArgs {
-    /// The repository to check.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     /// Do not mark commits partial when a referenced object is missing.
     #[arg(long)]
     no_mark_partial: bool,
@@ -163,12 +229,11 @@ struct FsckArgs {
 
 #[derive(Args)]
 struct DiffArgs {
-    /// The repository to read from.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     /// The first revision. With no second revision, its parent is compared
-    /// against it.
-    from: String,
+    /// against it. Required; checked after the repository resolves, matching
+    /// the tool's error-ordering (`docs/conformance/cli-surface.md`, "Global
+    /// conventions").
+    from: Option<String>,
     /// The second revision; when omitted, `from` is compared against its
     /// parent.
     to: Option<String>,
@@ -190,9 +255,6 @@ enum SignType {
 
 #[derive(Args)]
 struct SignArgs {
-    /// The repository holding the commit.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     /// Delete stored signatures matching the given KEY-IDs.
     #[arg(short, long, conflicts_with = "verify")]
     delete: bool,
@@ -221,8 +283,10 @@ struct SignArgs {
     /// the gpg engine.
     #[arg(long)]
     remote: Option<String>,
-    /// The commit to operate on (a checksum or a ref).
-    commit: String,
+    /// The commit to operate on (a checksum or a ref). Required; checked
+    /// after the repository resolves, matching the tool's error-ordering
+    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    commit: Option<String>,
     /// Key identifiers: base64 keys for ed25519/spki. For gpg: the signing
     /// key gpg resolves (a fingerprint, key id, or user id), or, with
     /// --delete, the fingerprints to remove.
@@ -231,9 +295,6 @@ struct SignArgs {
 
 #[derive(Args)]
 struct SummaryArgs {
-    /// The repository whose summary to operate on.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     /// Regenerate the summary from the repository's refs.
     #[arg(short = 'u', long)]
     update: bool,
@@ -272,11 +333,12 @@ struct SummaryArgs {
 
 #[derive(Args)]
 struct StaticDeltaArgs {
-    /// The repository to operate on.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
+    /// Optional at the argument-parsing layer so a missing one is reported
+    /// with the tool's own text, before the repository resolves, matching the
+    /// tool's error-ordering (`docs/conformance/cli-surface.md`, "Global
+    /// conventions").
     #[command(subcommand)]
-    command: StaticDeltaCommand,
+    command: Option<StaticDeltaCommand>,
 }
 
 #[derive(Subcommand)]
@@ -350,9 +412,6 @@ struct DeltaGenerateArgs {
 
 #[derive(Args)]
 struct PullArgs {
-    /// The repository to pull into.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     /// Fetch from this URL instead of the remote's configured `url`. A remote
     /// the config does not describe can be pulled from this way; it supplies no
     /// keys, so such a pull states its own signature policy or is refused.
@@ -432,8 +491,10 @@ struct PullArgs {
     sign_verify_summary: Option<bool>,
     /// The remote to pull from: a `[remote "<name>"]` section of this
     /// repository's config, which also names the prefix the refs are written
-    /// under.
-    remote: String,
+    /// under. Required; checked after the repository resolves, matching the
+    /// tool's error-ordering (`docs/conformance/cli-surface.md`, "Global
+    /// conventions").
+    remote: Option<String>,
     /// The refs to pull; with none, the remote's configured `branches`, or
     /// every ref its summary lists under --mirror.
     refs: Vec<String>,
@@ -441,9 +502,6 @@ struct PullArgs {
 
 #[derive(Args)]
 struct PullLocalArgs {
-    /// The repository to pull into.
-    #[arg(long, default_value = ".")]
-    repo: PathBuf,
     /// Write the pulled refs under this remote (`refs/remotes/<remote>/<ref>`)
     /// instead of as local refs.
     #[arg(long)]
@@ -472,42 +530,237 @@ struct PullLocalArgs {
     /// repeatable.
     #[arg(short = 'L', long = "localcache-repo")]
     localcache_repo: Vec<PathBuf>,
-    /// The repository to pull from.
-    src_repo: PathBuf,
+    /// The repository to pull from. Required; checked after the repository
+    /// resolves, matching the tool's error-ordering
+    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    src_repo: Option<PathBuf>,
     /// The refs to pull; with none, every ref the source holds.
     refs: Vec<String>,
 }
 
 fn main() -> std::process::ExitCode {
-    let cli = Cli::parse();
-    match ostrya_rt::block_on(run(cli)) {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            err.print().ok();
+            let code = match err.kind() {
+                clap::error::ErrorKind::DisplayHelp => 0,
+                _ => 1,
+            };
+            return std::process::ExitCode::from(code);
+        }
+    };
+    if cli.version {
+        println!("ostrya {}", env!("CARGO_PKG_VERSION"));
+        return std::process::ExitCode::SUCCESS;
+    }
+    let Some(command) = cli.command else {
+        exit_no_command();
+    };
+    match ostrya_rt::block_on(run(cli.repo.as_deref(), cli.verbose, command)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("ostrya: {err}");
+            eprintln!("error: {err}");
             std::process::ExitCode::FAILURE
         }
     }
 }
 
-async fn run(cli: Cli) -> Result<()> {
-    match cli.command {
-        Command::Commit(args) => commit(args).await,
-        Command::Checkout(args) => checkout(args).await,
-        Command::Export(args) => export(args).await,
-        Command::Prune(args) => prune(args).await,
-        Command::Fsck(args) => fsck(args).await,
-        Command::Diff(args) => diff(args).await,
-        Command::Sign(args) => sign(args).await,
-        Command::Summary(args) => summary(args).await,
-        Command::StaticDelta(args) => static_delta(args).await,
-        Command::Pull(args) => pull(args).await,
-        Command::PullLocal(args) => pull_local(args).await,
+async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()> {
+    let name = command.name();
+    match command {
+        Command::Init(args) => init(repo, verbose, name, args).await,
+        Command::Commit(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            commit(repo, args).await
+        }
+        Command::Checkout(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            checkout(repo, args).await
+        }
+        Command::Export(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            export(repo, name, args).await
+        }
+        Command::Prune(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            prune(repo, args).await
+        }
+        Command::Fsck(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            fsck(repo, args).await
+        }
+        Command::Diff(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            diff(repo, name, args).await
+        }
+        Command::Sign(args) => {
+            let (repo, path) = resolve_repo(repo, verbose, name).await;
+            sign(repo, path, name, args).await
+        }
+        Command::Summary(args) => {
+            let (repo, path) = resolve_repo(repo, verbose, name).await;
+            summary(repo, path, args).await
+        }
+        Command::StaticDelta(args) => {
+            // The tool reports a missing nested subcommand before it resolves
+            // the repository, so this check comes first.
+            let Some(sub) = args.command else {
+                exit_with_error(name, "No command specified");
+            };
+            let (repo, path) = resolve_repo(repo, verbose, name).await;
+            static_delta(repo, path, sub).await
+        }
+        Command::Pull(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            pull(repo, name, args).await
+        }
+        Command::PullLocal(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            pull_local(repo, name, args).await
+        }
+    }
+}
+
+/// Print the top-level usage text and the tool's own error line for a bare
+/// invocation, and exit like the tool does.
+fn exit_no_command() -> ! {
+    eprint!("{}", <Cli as CommandFactory>::command().render_help());
+    eprintln!("error: No command specified");
+    std::process::exit(1);
+}
+
+/// Print `subcommand`'s usage text and `error: {message}`, then exit 1,
+/// matching the tool's own two-line error shape (usage block, then an
+/// `error: ` line) for a missing repository, a missing required operand, and a
+/// missing nested subcommand (`docs/conformance/cli-surface.md`, "Global
+/// conventions").
+fn exit_with_error(subcommand: &str, message: &str) -> ! {
+    let mut top = <Cli as CommandFactory>::command();
+    let sub = top
+        .find_subcommand_mut(subcommand)
+        .expect("subcommand name matches a defined command");
+    eprint!("{}", sub.render_help());
+    eprintln!("error: {message}");
+    std::process::exit(1);
+}
+
+/// Print `subcommand`'s usage text and the tool's own "no repo" error line,
+/// then exit 1, matching the tool's behavior when no repository can be
+/// resolved (`docs/conformance/cli-surface.md`, "Global conventions").
+fn exit_requires_repo(subcommand: &str) -> ! {
+    exit_with_error(subcommand, "Command requires a --repo argument")
+}
+
+/// Resolve the repository a subcommand operates on and the filesystem path
+/// used to reach it, applying the tool's precedence: an explicit `--repo`
+/// (either position) first; then the current directory, if it opens as a
+/// repository; then `OSTREE_REPO`. With none of those, print `subcommand`'s
+/// usage text and the tool's error line and exit. `init` shares this
+/// precedence too, through `resolve_init_path`, below, which resolves to a
+/// path rather than an opened `Repo` since its explicit-`--repo` tier need
+/// not already exist.
+async fn resolve_repo(repo: Option<&Path>, verbose: bool, subcommand: &str) -> (Repo, PathBuf) {
+    if let Some(path) = repo {
+        match Repo::open(path).await {
+            Ok(repo) => {
+                if verbose {
+                    eprintln!("ostrya: using repository {}", path.display());
+                }
+                return (repo, path.to_owned());
+            }
+            Err(err) => {
+                eprintln!("error: opening repo: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let cwd = Path::new(".");
+    if let Ok(repo) = Repo::open(cwd).await {
+        if verbose {
+            eprintln!("ostrya: using repository {}", cwd.display());
+        }
+        return (repo, cwd.to_owned());
+    }
+    if let Ok(val) = std::env::var("OSTREE_REPO") {
+        let path = PathBuf::from(val);
+        if let Ok(repo) = Repo::open(&path).await {
+            if verbose {
+                eprintln!("ostrya: using repository {}", path.display());
+            }
+            return (repo, path);
+        }
+    }
+    exit_requires_repo(subcommand);
+}
+
+/// Resolve the path `init` creates or reuses a repository at. The precedence
+/// matches `resolve_repo`, but an explicit `--repo` is used as given, valid or
+/// not, since a freshly created repository need not already exist there; only
+/// the cwd and `OSTREE_REPO` fallbacks require the path to already open as a
+/// repository (an idempotent re-init), since `init` never creates a
+/// brand-new repository at a path it did not receive explicitly.
+async fn resolve_init_path(repo: Option<&Path>, subcommand: &str) -> PathBuf {
+    if let Some(path) = repo {
+        return path.to_owned();
+    }
+    let cwd = Path::new(".");
+    if Repo::open(cwd).await.is_ok() {
+        return cwd.to_owned();
+    }
+    if let Ok(val) = std::env::var("OSTREE_REPO") {
+        let path = PathBuf::from(val);
+        if Repo::open(&path).await.is_ok() {
+            return path;
+        }
+    }
+    exit_requires_repo(subcommand);
+}
+
+/// Create a new empty repository, or idempotently reuse one that already
+/// exists at the resolved path, matching `Repo::create`'s own idempotence.
+async fn init(repo: Option<&Path>, verbose: bool, name: &str, args: InitArgs) -> Result<()> {
+    let path = resolve_init_path(repo, name).await;
+    let mode = parse_init_mode(&args.mode);
+    Repo::create(
+        &path,
+        CreateOptions {
+            mode,
+            collection_id: args.collection_id,
+        },
+    )
+    .await?;
+    if verbose {
+        eprintln!("ostrya: using repository {}", path.display());
+    }
+    Ok(())
+}
+
+/// The repository modes `ostrya init --mode` accepts, matching the tool's set
+/// for the modes both implementations support. `bare-split-xattrs` is
+/// excluded even though the tool's own `init --mode` accepts it: the port
+/// reads that mode and does not write it (`format-reference.md`, "Repository
+/// modes and on-disk storage"), so exposing it here would create a repository
+/// nothing in the port could subsequently commit into.
+fn parse_init_mode(mode: &str) -> RepoMode {
+    match mode {
+        "bare" => RepoMode::Bare,
+        "bare-user" => RepoMode::BareUser,
+        "bare-user-only" => RepoMode::BareUserOnly,
+        "archive" | "archive-z2" => RepoMode::Archive,
+        "bare-user-shared" => RepoMode::BareUserShared,
+        _ => {
+            eprintln!("error: Invalid mode '{mode}' in repository configuration");
+            std::process::exit(1);
+        }
     }
 }
 
 /// Fetch refs and their objects from an HTTP remote.
-async fn pull(args: PullArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
+async fn pull(repo: Repo, name: &str, args: PullArgs) -> Result<()> {
+    let Some(remote) = args.remote.as_deref() else {
+        exit_with_error(name, "REMOTE must be specified");
+    };
     let mut localcache_repos = Vec::with_capacity(args.localcache_repo.len());
     for path in &args.localcache_repo {
         localcache_repos.push(Repo::open(path).await?);
@@ -538,7 +791,7 @@ async fn pull(args: PullArgs) -> Result<()> {
 
     let stats = repo
         .pull(
-            &args.remote,
+            remote,
             PullOptions {
                 refs: args.refs,
                 flags,
@@ -582,9 +835,13 @@ fn report_pull(stats: &PullStats) {
 }
 
 /// Import refs and their objects from another local repository.
-async fn pull_local(args: PullLocalArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
-    let src = Repo::open(&args.src_repo).await?;
+async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
+    let Some(src_repo) = args.src_repo.as_deref() else {
+        // The tool's own message names DESTINATION, not SRC_REPO, for this
+        // case -- an observed quirk, not a transcription error here.
+        exit_with_error(name, "DESTINATION must be specified");
+    };
+    let src = Repo::open(src_repo).await?;
     let mut localcache_repos = Vec::with_capacity(args.localcache_repo.len());
     for path in &args.localcache_repo {
         localcache_repos.push(Repo::open(path).await?);
@@ -626,9 +883,8 @@ async fn pull_local(args: PullLocalArgs) -> Result<()> {
 
 /// List the repository's static deltas, apply one offline, generate one, or
 /// rebuild the index cache.
-async fn static_delta(args: StaticDeltaArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
-    match args.command {
+async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaCommand) -> Result<()> {
+    match command {
         StaticDeltaCommand::List => {
             for name in repo.list_static_deltas().await? {
                 println!("{name}");
@@ -640,7 +896,7 @@ async fn static_delta(args: StaticDeltaArgs) -> Result<()> {
             println!("{}", to.to_hex());
             Ok(())
         }
-        StaticDeltaCommand::Generate(generate) => delta_generate(&repo, &args.repo, generate).await,
+        StaticDeltaCommand::Generate(generate) => delta_generate(&repo, &repo_path, generate).await,
         StaticDeltaCommand::Reindex => repo.reindex_static_deltas().await,
     }
 }
@@ -758,8 +1014,7 @@ fn delta_secret_keys(args: &DeltaGenerateArgs) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-async fn commit(args: CommitArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
+async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
     let txn = repo.transaction().await?;
 
     let parent = match args.parent.as_deref() {
@@ -811,8 +1066,7 @@ async fn commit(args: CommitArgs) -> Result<()> {
     Ok(())
 }
 
-async fn checkout(args: CheckoutArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
+async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     let commit = resolve(&repo, &args.commit).await?;
 
     if args.composefs {
@@ -833,16 +1087,17 @@ async fn checkout(args: CheckoutArgs) -> Result<()> {
         .await
 }
 
-async fn export(args: ExportArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
-    let commit = resolve(&repo, &args.commit).await?;
+async fn export(repo: Repo, name: &str, args: ExportArgs) -> Result<()> {
+    let Some(commit) = args.commit.as_deref() else {
+        exit_with_error(name, "A COMMIT argument is required");
+    };
+    let commit = resolve(&repo, commit).await?;
     let stdout = stdout_file()?;
     repo.export_tar(&commit, TarExportOptions::new(), stdout)
         .await
 }
 
-async fn prune(args: PruneArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
+async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     let delete_commit = match args.delete_commit.as_deref() {
         Some(rev) => Some(resolve(&repo, rev).await?),
         None => None,
@@ -871,9 +1126,8 @@ async fn prune(args: PruneArgs) -> Result<()> {
     Ok(())
 }
 
-async fn fsck(args: FsckArgs) -> Result<()> {
+async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     use std::io::Write;
-    let repo = Repo::open(&args.repo).await?;
     let opts = FsckOptions {
         mark_partial: !args.no_mark_partial,
     };
@@ -895,16 +1149,18 @@ async fn fsck(args: FsckArgs) -> Result<()> {
     Ok(())
 }
 
-async fn diff(args: DiffArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
+async fn diff(repo: Repo, name: &str, args: DiffArgs) -> Result<()> {
+    let Some(from_rev) = args.from.as_deref() else {
+        exit_with_error(name, "REV must be specified");
+    };
     let (from, to) = match args.to.as_deref() {
         Some(second) => (
-            resolve(&repo, &args.from).await?,
+            resolve(&repo, from_rev).await?,
             resolve(&repo, second).await?,
         ),
         None => {
             // With one revision, compare its parent against it.
-            let rev = resolve(&repo, &args.from).await?;
+            let rev = resolve(&repo, from_rev).await?;
             let (commit, _) = repo.load_commit(&rev).await?;
             let parent = commit.parent.ok_or_else(|| {
                 Error::InvalidFormat("commit has no parent to diff against".into())
@@ -923,9 +1179,11 @@ async fn diff(args: DiffArgs) -> Result<()> {
     Ok(())
 }
 
-async fn sign(args: SignArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
-    let commit = resolve(&repo, &args.commit).await?;
+async fn sign(repo: Repo, repo_path: PathBuf, name: &str, args: SignArgs) -> Result<()> {
+    let Some(commit_rev) = args.commit.as_deref() else {
+        exit_with_error(name, "Need a COMMIT to sign or verify");
+    };
+    let commit = resolve(&repo, commit_rev).await?;
     if args.sign_type == SignType::Gpg && !args.keys_dir.is_empty() {
         return Err(Error::Signature(
             "--keys-dir is not used by the gpg engine; supply keyrings with --keys-file".into(),
@@ -942,19 +1200,17 @@ async fn sign(args: SignArgs) -> Result<()> {
         ));
     }
     if args.verify {
-        verify_signatures(&repo, &commit, &args).await
+        verify_signatures(&repo, &commit, &repo_path, &args).await
     } else if args.delete {
-        delete_signatures(&repo, &commit, &args).await
+        delete_signatures(&repo, &commit, &repo_path, &args).await
     } else {
         add_signatures(&repo, &commit, &args).await
     }
 }
 
-async fn summary(args: SummaryArgs) -> Result<()> {
-    let repo = Repo::open(&args.repo).await?;
-
+async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()> {
     if args.verify {
-        let verifier = summary_verifier(&args)?;
+        let verifier = summary_verifier(&repo_path, &args)?;
         let outcome = repo.verify_summary(&[verifier.as_ref()]).await?;
         report_verify(&outcome);
         if !outcome.valid {
@@ -1053,9 +1309,9 @@ fn summary_secret_keys(args: &SummaryArgs) -> Result<Vec<String>> {
 }
 
 /// Build the verifier for `ostrya summary --verify`, mirroring `ostrya sign`.
-fn summary_verifier(args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
+fn summary_verifier(repo_path: &Path, args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
     match args.sign_type {
-        SignType::Gpg => summary_gpg_verifier(args),
+        SignType::Gpg => summary_gpg_verifier(repo_path, args),
         engine => {
             let name = sign_type_name(engine);
             let mut trusted = Vec::new();
@@ -1084,11 +1340,11 @@ fn summary_verifier(args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
 }
 
 #[cfg(feature = "gpg")]
-fn summary_gpg_verifier(args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
+fn summary_gpg_verifier(repo_path: &Path, args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
     let verifier = if !args.keys_file.is_empty() {
         GpgVerifier::from_keyring_files(&args.keys_file)?
     } else if let Some(remote) = &args.remote {
-        GpgVerifier::for_remote(&args.repo, remote)?
+        GpgVerifier::for_remote(repo_path, remote)?
     } else {
         GpgVerifier::from_system_trust()?
     };
@@ -1096,7 +1352,7 @@ fn summary_gpg_verifier(args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
 }
 
 #[cfg(not(feature = "gpg"))]
-fn summary_gpg_verifier(_: &SummaryArgs) -> Result<Box<dyn Verifier>> {
+fn summary_gpg_verifier(_: &Path, _: &SummaryArgs) -> Result<Box<dyn Verifier>> {
     Err(unsupported_type("gpg"))
 }
 
@@ -1163,9 +1419,14 @@ async fn sign_gpg(_: &Repo, _: &Checksum, _: &SignArgs) -> Result<()> {
 
 /// Verify the commit under the selected engine, print each signature, and exit
 /// nonzero when no signature is valid.
-async fn verify_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
+async fn verify_signatures(
+    repo: &Repo,
+    commit: &Checksum,
+    repo_path: &Path,
+    args: &SignArgs,
+) -> Result<()> {
     let verifier = match args.sign_type {
-        SignType::Gpg => gpg_verifier(args)?,
+        SignType::Gpg => gpg_verifier(repo_path, args)?,
         engine => sign_api_verifier(engine, args)?,
     };
     let outcome = repo.verify_commit(commit, &[verifier.as_ref()]).await?;
@@ -1177,14 +1438,19 @@ async fn verify_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> R
 }
 
 /// Delete signatures the given KEY-IDs match, and report the count removed.
-async fn delete_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
+async fn delete_signatures(
+    repo: &Repo,
+    commit: &Checksum,
+    repo_path: &Path,
+    args: &SignArgs,
+) -> Result<()> {
     if args.key_id.is_empty() {
         return Err(Error::Signature(
             "delete requires at least one KEY-ID".into(),
         ));
     }
     let removed = match args.sign_type {
-        SignType::Gpg => gpg_delete(repo, commit, args).await?,
+        SignType::Gpg => gpg_delete(repo, commit, repo_path, args).await?,
         engine => {
             // A sign-api blob belongs to a KEY-ID when it verifies under that
             // public key. Verification is async, so the blobs to remove are
@@ -1242,13 +1508,18 @@ async fn stored_signatures(repo: &Repo, commit: &Checksum, key: &str) -> Result<
 /// default `trusted.gpg.d`) lets a match also consider the primary-key
 /// fingerprint of a verified signature.
 #[cfg(feature = "gpg")]
-async fn gpg_delete(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<usize> {
+async fn gpg_delete(
+    repo: &Repo,
+    commit: &Checksum,
+    repo_path: &Path,
+    args: &SignArgs,
+) -> Result<usize> {
     let wanted: Vec<String> = args
         .key_id
         .iter()
         .map(|k| normalize_fingerprint(k))
         .collect();
-    let verifier = gpg_trust(args)?;
+    let verifier = gpg_trust(repo_path, args)?;
     let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
     let mut doomed: Vec<Vec<u8>> = Vec::new();
     for blob in stored_signatures(repo, commit, "ostree.gpgsigs").await? {
@@ -1270,7 +1541,7 @@ async fn gpg_delete(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<u
 }
 
 #[cfg(not(feature = "gpg"))]
-async fn gpg_delete(_: &Repo, _: &Checksum, _: &SignArgs) -> Result<usize> {
+async fn gpg_delete(_: &Repo, _: &Checksum, _: &Path, _: &SignArgs) -> Result<usize> {
     Err(unsupported_type("gpg"))
 }
 
@@ -1310,12 +1581,12 @@ fn build_sign_api_verifier(
 }
 
 #[cfg(feature = "gpg")]
-fn gpg_verifier(args: &SignArgs) -> Result<Box<dyn Verifier>> {
-    Ok(Box::new(gpg_trust(args)?))
+fn gpg_verifier(repo_path: &Path, args: &SignArgs) -> Result<Box<dyn Verifier>> {
+    Ok(Box::new(gpg_trust(repo_path, args)?))
 }
 
 #[cfg(not(feature = "gpg"))]
-fn gpg_verifier(_: &SignArgs) -> Result<Box<dyn Verifier>> {
+fn gpg_verifier(_: &Path, _: &SignArgs) -> Result<Box<dyn Verifier>> {
     Err(unsupported_type("gpg"))
 }
 
@@ -1324,12 +1595,12 @@ fn gpg_verifier(_: &SignArgs) -> Result<Box<dyn Verifier>> {
 /// global `trusted.gpg.d` directory (or `$OSTREE_GPG_HOME`) plus, when
 /// `--remote` names a remote, that remote's `trustedkeys.gpg`.
 #[cfg(feature = "gpg")]
-fn gpg_trust(args: &SignArgs) -> Result<GpgVerifier> {
+fn gpg_trust(repo_path: &Path, args: &SignArgs) -> Result<GpgVerifier> {
     if !args.keys_file.is_empty() {
         return GpgVerifier::from_keyring_files(&args.keys_file);
     }
     match &args.remote {
-        Some(remote) => GpgVerifier::for_remote(&args.repo, remote),
+        Some(remote) => GpgVerifier::for_remote(repo_path, remote),
         None => GpgVerifier::from_system_trust(),
     }
 }
@@ -1502,4 +1773,36 @@ fn stdout_file() -> Result<ostrya_rt::File> {
         .try_clone_to_owned()
         .map_err(Error::Io)?;
     Ok(ostrya_rt::File::from(fd))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The error paths render a subcommand's usage text by name, so a name
+    /// `clap` does not know would abort the process instead of printing. This
+    /// holds [`Command::NAMES`] and `clap`'s own set to each other in both
+    /// directions, so a renamed or an added subcommand fails here.
+    #[test]
+    fn every_subcommand_name_renders_its_usage_text() {
+        let mut top = <Cli as CommandFactory>::command();
+        let registered: Vec<String> = top
+            .get_subcommands()
+            .map(|sub| sub.get_name().to_owned())
+            .filter(|name| name != "help")
+            .collect();
+        for name in Command::NAMES {
+            assert!(
+                top.find_subcommand_mut(name).is_some(),
+                "`{name}` names no defined subcommand"
+            );
+        }
+        for name in &registered {
+            assert!(
+                Command::NAMES.contains(&name.as_str()),
+                "subcommand `{name}` is missing from Command::NAMES"
+            );
+        }
+        assert_eq!(registered.len(), Command::NAMES.len());
+    }
 }

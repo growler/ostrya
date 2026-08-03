@@ -62,9 +62,27 @@ oracle: exit-status config-bytes
 outcome: full
 severity: interop
 spec: cli-surface.md#p0-blocks-the-harness
-note: `--mode=archive` and `--mode=archive-z2` name the same mode; both
- implementations always serialize the config's `mode` key as `archive-z2`,
- which the `config-bytes` oracle states by comparing the two config files.
+note: `--mode=archive` and `--mode=archive-z2` name the same mode, which both
+ implementations serialize as `archive-z2`. The `config-bytes` oracle states
+ that the port's config equals the tool's for this spelling, and the
+ `init/mode=archive-z2` cell below states the same for the other one, so the
+ two cells together state that the port normalizes each spelling the way the
+ tool does. Neither cell reads the `mode` value itself; that the value is
+ `archive-z2` is `format-reference.md`'s claim.
+
+family: M10
+subcommand: init
+cell: init/mode=archive-z2
+setup: empty-dir
+run: init --repo=$REPO --mode=archive-z2
+expect-exit: 0
+oracle: exit-status config-bytes
+outcome: full
+severity: interop
+spec: cli-surface.md#p0-blocks-the-harness
+note: the alias both implementations accept alongside `archive`. The cell
+ pairs with `init/mode=archive` above: each states that the port's config
+ equals the tool's for one spelling.
 
 family: M10
 subcommand: init
@@ -167,6 +185,27 @@ note: the `two-repos` setup commits a distinguishing marker into each
  subcommand-position repository, so the tar stream on standard output holds
  the second marker and not the first. The two streams are not compared: the
  claim is which repository was read, and the tar bytes carry more than that.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/no-subcommand
+setup: empty-dir
+run: static-delta --repo=$REPO
+expect-exit: 1
+expect-stderr: contains "error: No command specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: No command specified"
+oracle: exit-status
+outcome: full
+severity: interop
+spec: cli-surface.md#global-conventions
+note: `static-delta` takes a nested subcommand, and leaving it unnamed is
+ reported before the repository is resolved. `empty-dir` binds `$REPO` to a
+ path that does not exist, so a repository check running first would report
+ `error: opening repo` instead; both implementations report the missing
+ subcommand. Each prints the subcommand's usage text before the error line,
+ which `stderr-text` is not an oracle for here, for the same reason as
+ `prune/no-repo-resolvable` below.
 
 family: M10
 subcommand: prune

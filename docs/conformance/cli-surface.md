@@ -204,12 +204,46 @@ Observed by running the tool (2026.1).
   not accept as an `--mode` value at all (`--help` documents `bare`,
   `bare-user`, `bare-user-only`, `archive`; `archive-z2` and
   `bare-split-xattrs` are also accepted though undocumented in `--help`).
+- A subcommand that takes a nested subcommand (`static-delta`) reports a
+  missing one with its own usage text and `error: No command specified`, exit
+  1, the same shape a bare `ostree` gets. That check comes before the
+  repository check: `ostree static-delta --repo=<missing path>` reports the
+  missing subcommand, not `opening repo`. The port matches this order and this
+  text, for every combination of the global options.
 - Options are not abbreviated. `--rep=PATH` fails with `error: Unknown option
   --rep=PATH`.
 - Every subcommand accepts `-v/--verbose` and `--version`.
 - An error goes to standard error with an `error: ` prefix, and the exit status
   is 1. Confirmed for a repository whose mode the tool rejects, and for a
   command-line syntax error (`error: Unknown option --rep=PATH`).
+- `ostree --version` prints a multi-line block: a `libostree:` header, a
+  `Version:` line, and a `Features:` list naming the C build's own options
+  (`gpgme`, `selinux`, `libcurl`, and so on). The port's `--version` prints one
+  line, `ostrya <version>`, and does not replicate the tool's block: the
+  feature list names libostree's C build options, which the port does not
+  share, so matching it byte for byte would not carry meaning.
+- For every subcommand with a required positional (`checkout`, `export`,
+  `diff`, `sign`, `pull`, `pull-local`), the tool checks for a resolvable
+  repository before it checks that the positional was given: omitting both
+  reports `error: Command requires a --repo argument`, the same as omitting
+  only the repository. The port matches this order for `export`, `diff`,
+  `sign`, `pull`, and `pull-local`: each subcommand's positional is optional at
+  the argument-parsing layer and is checked only after the repository
+  resolves, printing the tool's own message (`error: A COMMIT argument is
+  required` for `export`; `error: REV must be specified` for `diff`; `error:
+  Need a COMMIT to sign or verify` for `sign`; `error: REMOTE must be
+  specified` for `pull`; `error: DESTINATION must be specified` for
+  `pull-local` -- the tool's own message names DESTINATION there even though
+  the missing positional is SRC_REPO, an observed quirk in the tool, not a
+  transcription error here). `checkout` is deliberately left unfixed: its
+  second positional, DESTINATION, is not simply required in the tool -- given
+  a COMMIT but no DESTINATION and a resolvable repository, the tool succeeds
+  and checks the commit out into a directory it names after the COMMIT
+  argument in the current directory, rather than erroring. Reproducing that
+  needs its own black-box observation and design pass (does the tool use the
+  given revision string verbatim, or its resolved checksum; how is a ref name
+  with slashes handled), so `checkout` still reports the same clap-generated,
+  repo-check-comes-second error as the other five did before this fix.
 
 ## Output formats to recover before Phase 17
 

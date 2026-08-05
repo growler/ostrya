@@ -222,7 +222,7 @@ pub use ostrya_core::{
 pub use prune::{PruneOptions, PruneStats};
 pub use pull::{PullFlags, PullOptions, PullStats, PullVerify, TimestampCheck};
 pub use read::CommitState;
-pub use refs::CollectionRef;
+pub use refs::{CollectionRef, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};
 pub use sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, SignFuture, SignKeys,

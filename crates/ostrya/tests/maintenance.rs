@@ -528,6 +528,32 @@ fn fsck_passes_on_a_healthy_repo() {
 }
 
 #[test]
+fn fsck_refuses_a_ref_symlink_naming_a_directory() {
+    // fsck and prune seed themselves from the refs, and the ref walk reads a
+    // symlink as an alias rather than descending into it. A link naming a
+    // directory therefore fails the read with EISDIR, which is the tool's own
+    // `Listing refs: Is a directory` refusal; a self-link is the case that
+    // would otherwise recurse without end. See docs/format-reference.md,
+    // "refs".
+    let tmp = TmpDir::new("maint-fsck-dirlink");
+    block_on(async {
+        let (repo, _commit) = build_library_repo(tmp.path()).await;
+        let heads = tmp.path().join("repo/refs/heads");
+        std::os::unix::fs::symlink(".", heads.join("selfdir")).unwrap();
+        let err = repo.fsck(&FsckOptions::new()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Is a directory"),
+            "fsck is refused, got {err}"
+        );
+        let err = repo.prune(&ostrya::PruneOptions::new()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Is a directory"),
+            "prune is refused, got {err}"
+        );
+    });
+}
+
+#[test]
 fn fsck_detects_content_corruption() {
     let tmp = TmpDir::new("maint-fsck-content");
     block_on(async {

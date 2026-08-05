@@ -24,10 +24,11 @@ use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, BorrowedFd};
 
 use ostrya_core::{Checksum, Commit, ObjectName, ObjectType};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
+use crate::refs::walk_ref_dir;
 use crate::repo::Repo;
 
 impl Repo {
@@ -246,7 +247,7 @@ fn parse_object_entry(fanout: &str, entry: &str) -> Option<ObjectName> {
 }
 
 /// Read the entry names of an open directory, skipping `.` and `..`.
-fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
+pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
     let reader = rustix::fs::Dir::read_from(dir).map_err(|e| Error::Io(e.into()))?;
     let mut names = Vec::new();
     for entry in reader {
@@ -255,8 +256,8 @@ fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
         if bytes == b"." || bytes == b".." {
             continue;
         }
-        // Object and fanout names are ASCII; anything else is not a loose
-        // object.
+        // Object and fanout names are ASCII and a ref name is UTF-8; anything
+        // else is neither a loose object nor a ref.
         if let Ok(name) = std::str::from_utf8(bytes) {
             names.push(name.to_owned());
         }
@@ -278,32 +279,12 @@ fn collect_ref_targets(repo_fd: BorrowedFd<'_>, top: &str, out: &mut Vec<Checksu
         Err(Errno::NOENT) => return Ok(()),
         Err(e) => return Err(Error::Io(e.into())),
     };
-    walk_ref_targets(dir.as_fd(), out)
-}
-
-/// Walk an open `refs/` subdirectory, recursing into subdirectories and reading
-/// each ref file's target checksum.
-fn walk_ref_targets(dir: BorrowedFd<'_>, out: &mut Vec<Checksum>) -> Result<()> {
-    for name in read_dir_names(dir)? {
-        let stat = match rustix::fs::statat(dir, name.as_str(), AtFlags::empty()) {
-            Ok(stat) => stat,
-            Err(Errno::NOENT) => continue, // dangling alias
-            Err(e) => return Err(Error::Io(e.into())),
-        };
-        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
-            let sub = rustix::fs::openat(
-                dir,
-                name.as_str(),
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|e| Error::Io(e.into()))?;
-            walk_ref_targets(sub.as_fd(), out)?;
-        } else if let Some(checksum) = read_ref_target(dir, name.as_str())? {
+    walk_ref_dir(dir.as_fd(), "", &mut |entry| {
+        if let Some(checksum) = read_ref_target(entry.dir, entry.name)? {
             out.push(checksum);
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The largest ref file the reader will load; a ref is 65 bytes.

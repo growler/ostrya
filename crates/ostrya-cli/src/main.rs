@@ -21,6 +21,9 @@
 //!   commit and print its checksum.
 //! - `checkout` -- materialize a commit's tree, or write its composefs image.
 //! - `export` -- write a commit's tree to stdout as a tar stream.
+//! - `refs` -- list, create, or delete refs, aliases, and collection refs.
+//! - `rev-parse` -- print the commit a revision names.
+//! - `cat` -- write a commit's files to stdout.
 //! - `prune` -- delete unreachable objects.
 //! - `fsck` -- verify object integrity and completeness.
 //! - `diff` -- report the paths that changed between two commits.
@@ -43,11 +46,12 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
-    CheckoutMode, CheckoutOptions, Checksum, CommitModifier, CommitModifierFlags, CommitOptions,
-    CreateOptions, DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error, FsckOptions,
-    MutableTree, ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, Repo,
-    RepoMode, Result, SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Type,
-    Value, Verifier, VerifyOutcome, base64, load_sign_keys, load_sign_keys_from,
+    CheckoutMode, CheckoutOptions, Checksum, CollectionRef, CommitModifier, CommitModifierFlags,
+    CommitOptions, CreateOptions, DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error,
+    FileKind, FileObject, FsckOptions, MutableTree, ObjectType, PruneOptions, PullFlags,
+    PullOptions, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, SummaryOptions,
+    TarExportOptions, TarImportOptions, TimestampCheck, TreeEntry, Type, Value, Verifier,
+    VerifyOutcome, base64, load_sign_keys, load_sign_keys_from, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -86,6 +90,13 @@ enum Command {
     Checkout(CheckoutArgs),
     /// Write a commit's tree to stdout as a tar stream.
     Export(ExportArgs),
+    /// List, create, or delete refs.
+    Refs(RefsArgs),
+    /// Print the commit checksum a revision names.
+    #[command(name = "rev-parse")]
+    RevParse(RevParseArgs),
+    /// Write the contents of a commit's files to stdout.
+    Cat(CatArgs),
     /// Delete objects unreachable from the repository's refs and commits.
     Prune(PruneArgs),
     /// Verify object integrity and completeness across every commit.
@@ -117,6 +128,9 @@ impl Command {
         "commit",
         "checkout",
         "export",
+        "refs",
+        "rev-parse",
+        "cat",
         "prune",
         "fsck",
         "diff",
@@ -135,6 +149,9 @@ impl Command {
             Command::Commit(_) => "commit",
             Command::Checkout(_) => "checkout",
             Command::Export(_) => "export",
+            Command::Refs(_) => "refs",
+            Command::RevParse(_) => "rev-parse",
+            Command::Cat(_) => "cat",
             Command::Prune(_) => "prune",
             Command::Fsck(_) => "fsck",
             Command::Diff(_) => "diff",
@@ -202,6 +219,62 @@ struct ExportArgs {
     /// the repository resolves, matching the tool's error-ordering
     /// (`docs/conformance/cli-surface.md`, "Global conventions").
     commit: Option<String>,
+}
+
+#[derive(Args)]
+struct RefsArgs {
+    /// Delete the refs each PREFIX matches instead of listing them.
+    #[arg(long)]
+    delete: bool,
+    /// Print each ref under its whole name, leaving the matched PREFIX in
+    /// place.
+    #[arg(long)]
+    list: bool,
+    /// Print each ref's commit checksum after a tab.
+    #[arg(short = 'r', long)]
+    revision: bool,
+    /// List the aliases alone; with --create, create an alias instead of a ref.
+    #[arg(short = 'A', long)]
+    alias: bool,
+    /// Create this ref, pointing it at the commit the single PREFIX argument
+    /// names.
+    #[arg(long, value_name = "NEWREF")]
+    create: Option<String>,
+    /// List collection refs as `(collection-id, ref)` pairs, and read each
+    /// PREFIX as a collection id rather than a ref-name prefix.
+    #[arg(short = 'c', long)]
+    collections: bool,
+    /// Replace an existing ref when creating.
+    #[arg(long)]
+    force: bool,
+    /// The ref-name prefixes to match, or the collection ids under
+    /// --collections. With none, every ref is listed.
+    prefix: Vec<String>,
+}
+
+#[derive(Args)]
+struct RevParseArgs {
+    /// Print the repository's one commit. An empty repository, and one holding
+    /// more than one commit, are both errors.
+    #[arg(short = 'S', long)]
+    single: bool,
+    /// The revisions to resolve: a checksum, a refspec, or either with a
+    /// trailing `^` per generation of ancestry. Required unless --single;
+    /// checked after the repository resolves, matching the tool's
+    /// error-ordering (`docs/conformance/cli-surface.md`, "Global
+    /// conventions").
+    rev: Vec<String>,
+}
+
+#[derive(Args)]
+struct CatArgs {
+    /// The commit to read (a checksum or a ref). Required, with at least one
+    /// PATH; both are checked after the repository resolves, matching the
+    /// tool's error-ordering (`docs/conformance/cli-surface.md`, "Global
+    /// conventions").
+    commit: Option<String>,
+    /// The paths to write, in order. A leading `/` is optional.
+    path: Vec<String>,
 }
 
 #[derive(Args)]
@@ -560,9 +633,21 @@ fn main() -> std::process::ExitCode {
     match ostrya_rt::block_on(run(cli.repo.as_deref(), cli.verbose, command)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("error: {err}");
+            eprintln!("error: {}", error_line(&err));
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// The text a library error reaches standard error as. A refspec the ref rule
+/// refuses is reported in the tool's own words, wherever a revision, a NEWREF,
+/// or a branch name reaches the library, so one condition has one message
+/// (`docs/format-reference.md`, "Ref name validation"). Every other error
+/// carries the library's own `Display`.
+fn error_line(err: &Error) -> String {
+    match err {
+        Error::InvalidRefspec(refspec) => format!("Invalid refspec {refspec}"),
+        other => other.to_string(),
     }
 }
 
@@ -581,6 +666,18 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         Command::Export(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             export(repo, name, args).await
+        }
+        Command::Refs(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            refs(repo, args).await
+        }
+        Command::RevParse(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            rev_parse(repo, name, args).await
+        }
+        Command::Cat(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            cat(repo, name, args).await
         }
         Command::Prune(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
@@ -641,6 +738,13 @@ fn exit_with_error(subcommand: &str, message: &str) -> ! {
         .find_subcommand_mut(subcommand)
         .expect("subcommand name matches a defined command");
     eprint!("{}", sub.render_help());
+    eprintln!("error: {message}");
+    std::process::exit(1);
+}
+
+/// Print `error: {message}` with no usage text and exit 1, the shape the tool
+/// uses once a subcommand is running and its arguments are in hand.
+fn exit_error(message: &str) -> ! {
     eprintln!("error: {message}");
     std::process::exit(1);
 }
@@ -1017,8 +1121,19 @@ fn delta_secret_keys(args: &DeltaGenerateArgs) -> Result<Vec<String>> {
 async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
     let txn = repo.transaction().await?;
 
+    // `--parent` takes a revision, so it carries the resolution wording every
+    // subcommand taking one gives (`docs/port-plan.md`, Phase 17b).
+    // `report_resolution_failure` reports through `exit_error`, which runs no
+    // destructor, so the staging directory is reaped ahead of it, the way the
+    // branch-name guard below does it.
     let parent = match args.parent.as_deref() {
-        Some(rev) => repo.resolve_rev(rev, false).await?,
+        Some(rev) => match repo.resolve_rev(rev, false).await {
+            Ok(found) => found,
+            Err(err) => {
+                txn.abort().await?;
+                return Err(report_resolution_failure(err));
+            }
+        },
         None => None,
     };
 
@@ -1058,6 +1173,24 @@ async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
     };
     let checksum = txn.write_commit(opts, &root).await?;
     if let Some(branch) = args.branch.as_deref() {
+        // The two shapes the revision syntax shadows are refused at the ref
+        // write, after the commit is written: resolution reads a trailing run
+        // of `^` as ancestry and a name of 64 lowercase hex characters as a
+        // checksum, so a ref carrying either is reachable by no revision
+        // (`docs/format-reference.md`, "Revision syntax"). Each carries the
+        // wording the port already gives that shape -- the ancestry name at
+        // `refs --create`, the checksum name at the tool's own guard -- and the
+        // two are disjoint, a 64-character hex name holding no `^`.
+        // `exit_error` runs no destructor, so the staging directory is reaped
+        // ahead of it.
+        if branch.ends_with('^') {
+            txn.abort().await?;
+            exit_error(&format!("Invalid refspec {branch}"));
+        }
+        if Checksum::from_hex_lower(branch).is_ok() {
+            txn.abort().await?;
+            exit_error(&format!("Rev name '{branch}' looks like a checksum"));
+        }
         txn.set_ref(branch, Some(&checksum));
     }
     txn.commit().await?;
@@ -1095,6 +1228,818 @@ async fn export(repo: Repo, name: &str, args: ExportArgs) -> Result<()> {
     let stdout = stdout_file()?;
     repo.export_tar(&commit, TarExportOptions::new(), stdout)
         .await
+}
+
+/// List, create, or delete refs. `--create` wins over `--delete`, and
+/// `--collections` wins over `--alias`, matching the tool's own precedence
+/// (`docs/format-reference.md`, "CLI output formats").
+async fn refs(repo: Repo, args: RefsArgs) -> Result<()> {
+    if let Some(newref) = args.create.as_deref() {
+        refs_create(&repo, newref, &args).await
+    } else if args.delete {
+        refs_delete(&repo, &args).await
+    } else if args.collections {
+        refs_list_collections(&repo, &args).await
+    } else if args.alias {
+        refs_list_aliases(&repo, &args).await
+    } else {
+        refs_list(&repo, &args).await
+    }
+}
+
+/// Point a new ref, a new collection ref, or a new alias, at what the single
+/// PREFIX argument names. `-c` wins over `-A` here the way it does in a
+/// listing.
+async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
+    let existing = match args.prefix.len() {
+        1 => args.prefix[0].as_str(),
+        0 => exit_error("You must specify a revision when creating a new ref"),
+        _ => exit_error("You must specify only 1 existing ref when creating a new ref"),
+    };
+    // The existence check resolves NEWREF as a revision in every case; `--force`
+    // suppresses the refusal a resolved NEWREF draws and not the resolution
+    // itself (`format-reference.md`, "refs"). So `--create=NAME^ --force` where
+    // NAME's base is a root commit stops here with `Commit <checksum> has no
+    // parent`, the words `report_resolution_failure` gives that failure.
+    let resolved = resolve_optional(repo, newref).await?;
+    if !args.force && resolved.is_some() {
+        exit_error(&format!(
+            "--create specified but ref {newref} already exists"
+        ));
+    }
+    // NEWREF is validated as a ref name here: after the existence check and
+    // before the positional resolves, which is the order the tool takes it in
+    // (`format-reference.md`, "refs"). A trailing `^` fails this step, since a
+    // ref name carries no ancestry suffix -- it names a commit, and a ref written
+    // under that name is one the existence check reads as a revision.
+    if validate_refspec(newref).is_err() || newref.ends_with('^') {
+        exit_error(&format!("Invalid refspec {newref}"));
+    }
+    if args.collections {
+        return refs_create_collection(repo, newref, existing).await;
+    }
+    if args.alias {
+        // An alias lives under `refs/heads`, so a NEWREF naming a remote is
+        // refused, and the message names the remote half alone, whether or not
+        // that remote exists. The step sits after the three NEWREF checks and
+        // before the positional resolves, so `--create=origin:al nosuch`
+        // reports the remote and not the positional, and `--force` leaves it in
+        // place (`docs/format-reference.md`, "refs").
+        if let Some((remote, _)) = newref.split_once(':') {
+            exit_error(&format!("Cannot create alias to remote ref: {remote}"));
+        }
+        // An alias records a name, so its target has to be a ref: a checksum
+        // and an ancestry suffix each name a commit and no ref file.
+        if !names_a_ref(repo, existing).await? {
+            exit_error(&format!(
+                "Cannot create alias to non-existent ref: {existing}"
+            ));
+        }
+        return repo.set_ref_alias_immediate(newref, existing).await;
+    }
+    let commit = resolve(repo, existing).await?;
+    repo.set_ref_immediate(newref, Some(&commit)).await
+}
+
+/// Write a collection ref under `-c`, where NEWREF is a
+/// `<collection-id>:<ref>` pair naming `refs/mirrors/<collection-id>/<ref>`.
+///
+/// The steps run in the tool's order (`docs/format-reference.md`, "refs"): the
+/// pair shape, then the revision, then the collection id. An empty half is
+/// refused a step earlier, by the ref-name check every NEWREF passes. A NEWREF
+/// holding no `:` names no ref, so the whole argument is read as the collection
+/// id and the missing name is reported once that id holds.
+async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Result<()> {
+    let pair = match newref.split_once(':') {
+        // A `^` is refused with the pair's own message here, and a trailing one
+        // is the case the tool crashes on under `-c`
+        // (`docs/conformance/cli-surface.md`, "P1").
+        Some((_, ref_name)) if ref_name.contains(':') || newref.contains('^') => {
+            exit_error(&format!("Invalid refspec {newref}"))
+        }
+        pair => pair,
+    };
+    let commit = resolve(repo, existing).await?;
+    let Some((collection_id, ref_name)) = pair else {
+        if !is_collection_id(newref) {
+            exit_error(&format!("Invalid collection ID {newref}"));
+        }
+        exit_error("Invalid ref name (null)");
+    };
+    if !is_collection_id(collection_id) {
+        exit_error(&format!("Invalid collection ID {collection_id}"));
+    }
+    let cref = CollectionRef::new(collection_id, ref_name);
+    repo.set_collection_ref_immediate(&cref, Some(&commit))
+        .await
+}
+
+/// Whether `id` is a collection id: two or more `.`-separated elements, each
+/// starting with an ASCII letter or `_` and continuing with ASCII letters,
+/// digits, or `_`.
+///
+/// Recovered by observation: the tool writes `a.b`, `A.b`, `_a.b`, `a._b`,
+/// `a_b.c`, and `a.b.c.d`, and refuses `fresh`, `a..b`, `a.b.`, `1a.b`,
+/// `a.1b`, `a-b.c`, and `a.b-c` with `error: Invalid collection ID <id>`. The
+/// length is bounded by the filesystem alone, the id being one path component.
+fn is_collection_id(id: &str) -> bool {
+    id.split('.').count() >= 2
+        && id.split('.').all(|element| {
+            let mut chars = element.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// The commit a ref name resolves to, or `None` when the name names no ref: a
+/// bare checksum and an ancestry suffix each name a commit and no ref file, and
+/// a name no ref file can carry names no ref either, which is the answer the
+/// alias refusal reports, the way the tool reports it for `..` and for an empty
+/// target. An i/o error reaching the ref file is returned, so the caller
+/// decides whether a name that is a directory, or a path through a ref file, is
+/// a refusal or a miss.
+async fn resolve_ref_name(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
+    // A 64-character name is a checksum in lowercase hex alone, the split
+    // resolution takes, so an uppercase one is looked up as a ref name and an
+    // alias to it is written (`docs/format-reference.md`, "Revision syntax").
+    if rev.ends_with('^') || Checksum::from_hex_lower(rev).is_ok() {
+        return Ok(None);
+    }
+    match repo.resolve_rev(rev, true).await {
+        Ok(found) => Ok(found),
+        Err(Error::InvalidRefspec(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// Whether `rev` names a ref file rather than a commit.
+async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
+    Ok(resolve_ref_name(repo, rev).await?.is_some())
+}
+
+/// Delete every ref the prefixes match. A prefix matching nothing is not an
+/// error, and the parent directories a removal empties are left in place,
+/// matching the tool.
+///
+/// A whole-remote prefix that matches at least one ref ends the invocation with
+/// exit 1 and removes none of what it matched, which is the tool's outcome: the
+/// tool names each ref it deletes by joining the prefix's ref half with the name
+/// below it, and the `.` that join carries is a refspec its own rule then
+/// refuses. The prefixes ahead of it keep their effect, and a whole-remote
+/// prefix matching no ref exits 0. The two word the refusal differently
+/// (`docs/conformance/cli-surface.md`, "P1").
+///
+/// A ref under `refs/heads` that an alias names is refused with exit 1, and the
+/// prefix that matched it removes nothing. The guard runs per prefix, after the
+/// whole-remote refusal, so `refs --delete deep test` removes what `deep`
+/// matched and then reports the refusal for `test`. It is the ref set and the
+/// alias set as the prefixes ahead left them that each prefix reads, so
+/// `refs --delete alal test/al` removes the alias and then the ref it named. `-c`
+/// takes no part in it (`docs/format-reference.md`, "refs").
+///
+/// Each prefix is matched against the ref set as the prefixes ahead of it left
+/// it, so a prefix that removes a remote's last ref leaves a whole-remote prefix
+/// behind it matching nothing, which exits 0 in both.
+///
+/// With `-A` the set each prefix selects is the one a `-A` listing prints: the
+/// ref the prefix names exactly, or the aliases nested under it. `-c` wins over
+/// `-A`, and the prefix rules, the whole-remote refusal, and the alias guard all
+/// apply to whichever set the prefix selected (`docs/format-reference.md`,
+/// "refs").
+///
+/// With `-c` the prefixes are collection ids, and the id equal to the
+/// repository's own `collection-id` removes the refs under `refs/heads` alone,
+/// keeping the mirror refs that carry that id.
+async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
+    if args.prefix.is_empty() {
+        exit_error("At least one PREFIX is required when deleting refs");
+    }
+    if args.collections {
+        // An id equal to the repository's own `collection-id` removes the refs
+        // under `refs/heads` alone: the mirror refs carrying that same id stand,
+        // where a foreign id removes the mirror refs it names
+        // (`docs/format-reference.md`, "refs").
+        let own = repo.config().collection_id().map(str::to_owned);
+        for entry in select_collection_refs(repo, &args.prefix).await? {
+            if entry.local {
+                repo.set_ref_immediate(&entry.name, None).await?;
+            } else if own.as_deref() != Some(entry.collection.as_str()) {
+                let cref = CollectionRef::new(entry.collection, entry.name);
+                repo.set_collection_ref_immediate(&cref, None).await?;
+            }
+        }
+        return Ok(());
+    }
+    let listed = repo.list_ref_aliases().await?;
+    let mut aliases = active_aliases(&listed);
+    // Every alias, local and remote alike, which is the set a `-A` prefix
+    // filters and a `-A --delete` removes from.
+    let mut alias_names: Vec<String> = listed.into_iter().map(|alias| alias.refspec).collect();
+    let mut all = all_refs(repo).await?;
+    for prefix in prefixes(&args.prefix) {
+        check_prefix(repo, prefix).await?;
+        let selected: Vec<String> = if args.alias {
+            select_aliases(repo, &alias_names, prefix).await?
+        } else {
+            all.iter()
+                .filter(|(name, _)| matches_prefix(name, prefix))
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        if let Some(given) = prefix
+            && whole_remote(given).is_some()
+            && !selected.is_empty()
+        {
+            return Err(Error::InvalidRefspec(given.to_owned()));
+        }
+        for refspec in &selected {
+            // A ref under `refs/remotes` is removed with an alias naming it, so
+            // the guard reads the refs under `refs/heads` alone -- the ones a
+            // refspec holding no `:` names. Where more than one guarded ref
+            // matches, the port names the first in refspec order and the tool
+            // names the first its own enumeration reaches
+            // (`docs/conformance/cli-surface.md`, "P1").
+            if refspec.contains(':') {
+                continue;
+            }
+            if let Some((alias, _)) = aliases.iter().find(|(_, named)| named == refspec) {
+                exit_error(&format!("Ref '{refspec}' has an active alias: '{alias}'"));
+            }
+        }
+        for refspec in &selected {
+            repo.set_ref_immediate(refspec, None).await?;
+        }
+        all.retain(|(name, _)| !selected.contains(name));
+        aliases.retain(|(alias, _)| !selected.contains(alias));
+        alias_names.retain(|alias| !selected.contains(alias));
+    }
+    Ok(())
+}
+
+/// The aliases one `-A --delete` prefix removes, which is the set a `-A` listing
+/// prints for it: the ref the prefix names exactly, whether or not that ref is an
+/// alias, or the aliases nested under it.
+///
+/// A remote alias is removed by a prefix naming it exactly and by no other, since
+/// the tool deletes each nested alias by the name it prints for it, which for a
+/// remote alias drops the remote and names no ref of that remote. The port
+/// removes the alias its own listing names, so a remote prefix holding an alias
+/// diverges (`docs/conformance/cli-surface.md`, "P1").
+async fn select_aliases(
+    repo: &Repo,
+    aliases: &[String],
+    prefix: Option<&str>,
+) -> Result<Vec<String>> {
+    if let Some(prefix) = prefix
+        && alias_prefix_commit(repo, prefix).await?.is_some()
+    {
+        return Ok(vec![prefix.to_owned()]);
+    }
+    Ok(aliases
+        .iter()
+        .filter(|refspec| nested_under_prefix(refspec, prefix))
+        .cloned()
+        .collect())
+}
+
+/// The aliases that can name a local ref, as `(alias refspec, the ref name its
+/// link body gives)` pairs sorted by alias refspec.
+///
+/// An alias names a ref under `refs/heads` by that ref's own name: the link body
+/// with its leading `../` components removed, read from the `refs/heads` root and
+/// not from the alias's own directory. So an alias at `refs/heads/test/al2` whose
+/// body is `other` names the ref `other`, where the link itself resolves to
+/// `refs/heads/test/other`. An alias under `refs/remotes` names nothing here, and
+/// a body reaching outside `refs/heads` matches no local refspec, a local ref
+/// name holding no `:` (`docs/format-reference.md`, "refs").
+fn active_aliases(listed: &[RefAlias]) -> Vec<(String, String)> {
+    listed
+        .iter()
+        .filter(|alias| !alias.refspec.contains(':'))
+        .map(|alias| {
+            let named = alias_body_name(&alias.target).to_owned();
+            (alias.refspec.clone(), named)
+        })
+        .collect()
+}
+
+/// Print the local and remote refs the prefixes match, one per line, with the
+/// commit checksum after a tab under `-r`. A ref two prefixes match is printed
+/// once per match, and the name a row carries is stripped by the prefix that
+/// selected it -- `refs test test/main` prints `main` and then `test/main`.
+async fn refs_list(repo: &Repo, args: &RefsArgs) -> Result<()> {
+    let all = all_refs(repo).await?;
+    for prefix in prefixes(&args.prefix) {
+        check_prefix(repo, prefix).await?;
+        for (refspec, commit) in all.iter().filter(|(name, _)| matches_prefix(name, prefix)) {
+            let name = if args.list {
+                refspec.clone()
+            } else {
+                strip_prefix_from(refspec, prefix)
+            };
+            if args.revision {
+                println!("{name}\t{}", commit.to_hex());
+            } else {
+                println!("{name}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Print the aliases the prefixes match, as `name -> target`. A `PREFIX` that
+/// names a ref is answered by that one ref, with the commit checksum in the
+/// target position; every other prefix keeps the aliases nested under it. The
+/// name is never stripped and `-r` adds nothing, matching the tool.
+async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
+    let aliases = repo.list_ref_aliases().await?;
+    for prefix in prefixes(&args.prefix) {
+        check_prefix(repo, prefix).await?;
+        if let Some(prefix) = prefix
+            && let Some(commit) = alias_prefix_commit(repo, prefix).await?
+        {
+            println!("{prefix} -> {}", commit.to_hex());
+            continue;
+        }
+        for alias in &aliases {
+            if nested_under_prefix(&alias.refspec, prefix) {
+                println!(
+                    "{} -> {}",
+                    alias.refspec,
+                    alias_target(&alias.refspec, &alias.target)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The commit a `-A` PREFIX names as a ref, whether or not that ref is an
+/// alias. A prefix reaching no ref file -- a directory holding refs, a path
+/// through a ref file, an alias whose target ref is missing -- names no ref, so
+/// it filters the alias listing instead. `EISDIR` and `ENOTDIR` are the two
+/// errnos those paths draw; every other read failure is returned, so a
+/// permission fault reaches the caller rather than reading as an empty listing.
+async fn alias_prefix_commit(repo: &Repo, prefix: &str) -> Result<Option<Checksum>> {
+    match resolve_ref_name(repo, prefix).await {
+        Err(Error::Io(err))
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        other => other,
+    }
+}
+
+/// Print the collection refs, as `(collection-id, ref)`, with the commit
+/// checksum after a tab under `-r`.
+async fn refs_list_collections(repo: &Repo, args: &RefsArgs) -> Result<()> {
+    for entry in select_collection_refs(repo, &args.prefix).await? {
+        let pair = format!("({}, {})", entry.collection, entry.name);
+        if args.revision {
+            println!("{pair}\t{}", entry.commit.to_hex());
+        } else {
+            println!("{pair}");
+        }
+    }
+    Ok(())
+}
+
+/// One collection-qualified ref, as `refs -c` lists it.
+#[derive(Clone)]
+struct CollectionEntry {
+    collection: String,
+    /// The ref name, which for a local ref is its refspec.
+    name: String,
+    commit: Checksum,
+    /// Whether the ref lives under `refs/heads`, qualified by the repository's
+    /// own collection id, rather than under `refs/mirrors`.
+    local: bool,
+}
+
+/// Every local and remote ref, sorted by refspec, which is the order a listing
+/// prints and the set each prefix filters.
+async fn all_refs(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
+    let mut all = repo.list_refs(None).await?;
+    all.extend(repo.list_remote_refs().await?);
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(all)
+}
+
+/// The collection refs the collection ids select, grouped the same way a
+/// listing groups ref-name prefixes. The repository's own
+/// `collection-id` qualifies its local refs; the mirror refs carry theirs in
+/// the path.
+async fn select_collection_refs(repo: &Repo, ids: &[String]) -> Result<Vec<CollectionEntry>> {
+    let mut all = Vec::new();
+    if let Some(collection) = repo.config().collection_id().map(str::to_owned) {
+        for (name, commit) in repo.list_refs(None).await? {
+            all.push(CollectionEntry {
+                collection: collection.clone(),
+                name,
+                commit,
+                local: true,
+            });
+        }
+    }
+    for (collection, name, commit) in repo.list_mirror_refs().await? {
+        all.push(CollectionEntry {
+            collection,
+            name,
+            commit,
+            local: false,
+        });
+    }
+    all.sort_by(|a, b| (&a.collection, &a.name).cmp(&(&b.collection, &b.name)));
+
+    let mut out = Vec::new();
+    for id in prefixes(ids) {
+        out.extend(
+            all.iter()
+                .filter(|entry| id.is_none_or(|id| entry.collection == id))
+                .cloned(),
+        );
+    }
+    Ok(out)
+}
+
+/// The prefixes to iterate: each one given, or a single `None` standing for
+/// "every ref" when none were.
+fn prefixes(given: &[String]) -> Vec<Option<&str>> {
+    if given.is_empty() {
+        return vec![None];
+    }
+    given.iter().map(|prefix| Some(prefix.as_str())).collect()
+}
+
+/// Refuse a PREFIX that no ref name can hold, and a PREFIX whose path under
+/// `refs/` runs through a ref file, both of which the tool refuses before the
+/// prefix filters anything. The check runs where each prefix is taken, so the
+/// rows an earlier prefix printed and the refs it deleted stand, matching the
+/// tool: `refs test 'bad/'` prints the `test` rows and then reports the refusal.
+///
+/// The refspec rule comes first, so a prefix that breaks both rules -- `plain/x/`
+/// over the ref file `plain` -- draws the refspec message in both
+/// implementations.
+///
+/// The path probe reads the prefix as the directory a listing enumerates, the
+/// path the tool itself reads: `ENOTDIR` ends the invocation, with the port's one
+/// message for that condition where the tool names the path and the syscall. A
+/// path naming nothing continues, since a prefix matching no ref exits 0 in both
+/// (`docs/format-reference.md`, "refs"). The probe runs through
+/// [`Repo::check_refs_path`], one fd-relative call inside the repository the
+/// handle holds open.
+async fn check_prefix(repo: &Repo, prefix: Option<&str>) -> Result<()> {
+    let Some(prefix) = prefix else {
+        return Ok(());
+    };
+    check_prefix_name(prefix)?;
+    repo.check_refs_path(&prefix_path(prefix)).await
+}
+
+/// The refspec rule a PREFIX passes, reported with the prefix as given.
+///
+/// A whole-remote prefix passes the rule: the rule reads an empty ref name as a
+/// refusal, so [`whole_remote`] hands it the remote name alone -- one component,
+/// which the rule reads as a name holding no `/`.
+///
+/// The tool's ref-name character class is narrower than the port's rule, so a
+/// prefix such as `tes~t` passes here and the tool refuses it
+/// (`docs/conformance/cli-surface.md`, "P1").
+fn check_prefix_name(prefix: &str) -> Result<()> {
+    let checked = whole_remote(prefix).unwrap_or(prefix);
+    validate_refspec(checked).map_err(|_| Error::InvalidRefspec(prefix.to_owned()))
+}
+
+/// The path a PREFIX names below `refs/`: the ref file or directory a listing
+/// enumerates. A whole-remote prefix names the remote's own directory, its ref
+/// half standing for the remote's root.
+fn prefix_path(prefix: &str) -> String {
+    match whole_remote(prefix) {
+        Some(remote) => format!("remotes/{remote}"),
+        None => ref_path(prefix).join("/"),
+    }
+}
+
+/// The remote a whole-remote prefix names: a `<remote>:` prefix whose ref half
+/// is empty or `.`, which names every ref of that remote. A remote name holds no
+/// `/`, so a prefix such as `or/igin:` is not one and reaches the refspec rule
+/// whole.
+fn whole_remote(prefix: &str) -> Option<&str> {
+    match prefix.split_once(':') {
+        Some((remote, "" | ".")) if !remote.contains('/') => Some(remote),
+        _ => None,
+    }
+}
+
+/// Whether a refspec is the prefix itself or is nested under it. `None`
+/// matches every refspec.
+fn matches_prefix(refspec: &str, prefix: Option<&str>) -> bool {
+    prefix == Some(refspec) || nested_under_prefix(refspec, prefix)
+}
+
+/// Whether a refspec is nested under the prefix, with an exact match excluded.
+/// `None` matches every refspec. This is the `-A` filter: a prefix equal to an
+/// alias's own name is answered by resolving that name, so the filter reads a
+/// prefix as a directory alone. A whole-remote prefix keeps every ref of the
+/// remote it names, since its ref half stands for the remote's root.
+fn nested_under_prefix(refspec: &str, prefix: Option<&str>) -> bool {
+    let Some(prefix) = prefix else {
+        return true;
+    };
+    match whole_remote(prefix) {
+        Some(remote) => refspec
+            .strip_prefix(remote)
+            .is_some_and(|rest| rest.starts_with(':')),
+        None => refspec
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/')),
+    }
+}
+
+/// The name a listing prints for a refspec the given prefix selected: the part
+/// below the prefix, or the whole refspec when the match is exact, when the
+/// prefix names a remote in whole, or when no prefix applied. A remote's refspec
+/// keeps its `remote:` part, since the tool strips within the ref name and
+/// renders the refspec again -- `refs origin:rr` prints `origin:x` for
+/// `origin:rr/x`.
+fn strip_prefix_from(refspec: &str, prefix: Option<&str>) -> String {
+    let nested = prefix
+        .and_then(|prefix| refspec.strip_prefix(prefix))
+        .and_then(|rest| rest.strip_prefix('/'));
+    match (prefix, nested) {
+        (Some(prefix), Some(nested)) => match prefix.split_once(':') {
+            Some((remote, _)) => format!("{remote}:{nested}"),
+            None => nested.to_owned(),
+        },
+        _ => refspec.to_owned(),
+    }
+}
+
+/// The target an alias listing prints: the symlink body with its leading `../`
+/// components removed, which is the form the tool prints, or the target ref's
+/// refspec where the link leaves the alias's own ref root -- `refs/heads` for a
+/// local alias, `refs/remotes/<remote>` for a remote one.
+/// `refs -A --create=xal origin:rr/x` writes `../remotes/origin/rr/x`, so the
+/// listing prints `origin:rr/x`, a name the port resolves, in place of the path
+/// below `refs/` (`docs/conformance/cli-surface.md`, "P1").
+fn alias_target(refspec: &str, target: &str) -> String {
+    let path = ref_path(refspec);
+    let root = path_refspec(&path).map(|(root, _)| root);
+    let crossed = link_path(&path[..path.len() - 1], target)
+        .and_then(|path| path_refspec(&path))
+        .filter(|(target_root, _)| Some(target_root) != root.as_ref())
+        .map(|(_, refspec)| refspec);
+    crossed.unwrap_or_else(|| alias_body_name(target).to_owned())
+}
+
+/// The ref name an alias's link body gives: the body with its leading `../`
+/// components removed, which is the form an `-A` listing prints and the name the
+/// `--delete` guard reads.
+fn alias_body_name(target: &str) -> &str {
+    let mut rest = target;
+    while let Some(stripped) = rest.strip_prefix("../") {
+        rest = stripped;
+    }
+    rest
+}
+
+/// The components below `refs/` of the file one refspec names: `heads` and the
+/// ref name for a local refspec, `remotes`, the remote, and the ref name for a
+/// remote one.
+fn ref_path(refspec: &str) -> Vec<&str> {
+    let (mut path, name) = match refspec.split_once(':') {
+        Some((remote, name)) => (vec!["remotes", remote], name),
+        None => (vec!["heads"], refspec),
+    };
+    path.extend(name.split('/'));
+    path
+}
+
+/// The ref root one path below `refs/` lives in, and the refspec it names.
+/// `None` where the path names no ref file: a root with no name below it, or a
+/// path under neither `refs/heads` nor `refs/remotes`.
+fn path_refspec(path: &[&str]) -> Option<(String, String)> {
+    match path {
+        ["heads", name @ ..] if !name.is_empty() => Some(("heads".to_owned(), name.join("/"))),
+        ["remotes", remote, name @ ..] if !name.is_empty() => Some((
+            format!("remotes/{remote}"),
+            format!("{remote}:{}", name.join("/")),
+        )),
+        _ => None,
+    }
+}
+
+/// The path below `refs/` a symlink body names, read from `dir`, the directory
+/// holding the link: each `..` drops one component. `None` where the body
+/// reaches above `refs/`.
+fn link_path<'a>(dir: &[&'a str], body: &'a str) -> Option<Vec<&'a str>> {
+    let mut path = dir.to_vec();
+    for part in body.split('/') {
+        match part {
+            ".." => {
+                path.pop()?;
+            }
+            "." | "" => {}
+            name => path.push(name),
+        }
+    }
+    Some(path)
+}
+
+/// Print the commit each revision names, or the repository's single commit
+/// under `-S`.
+async fn rev_parse(repo: Repo, name: &str, args: RevParseArgs) -> Result<()> {
+    if args.single {
+        if !args.rev.is_empty() {
+            exit_with_error(name, "Cannot specify arguments with --single");
+        }
+        let mut commits: Vec<Checksum> = repo
+            .list_objects()
+            .await?
+            .into_iter()
+            .filter(|object| object.ty == ObjectType::Commit)
+            .map(|object| object.checksum)
+            .collect();
+        match commits.len() {
+            0 => exit_error("No commit objects found"),
+            1 => {
+                println!("{}", commits.pop().expect("one commit").to_hex());
+                return Ok(());
+            }
+            _ => exit_error("Multiple commit objects found"),
+        }
+    }
+    if args.rev.is_empty() {
+        exit_with_error(name, "REV must be specified");
+    }
+    for rev in &args.rev {
+        println!("{}", resolve(&repo, rev).await?.to_hex());
+    }
+    Ok(())
+}
+
+/// How many symlinks one `cat` path may follow before the port gives up: a
+/// chain this deep resolves and one link deeper is refused. The tool bounds the
+/// depth nowhere -- 20000 links resolve, and a self-referencing link recurses
+/// until the process dies (`docs/conformance/cli-surface.md`, "P1 -- reading
+/// and resolution").
+const CAT_SYMLINK_LIMIT: usize = 256;
+
+/// Why a `cat` path wrote nothing: a refusal the port reports in the tool's own
+/// words and exits 1 on, or a library error the top-level renderer prints. Both
+/// travel back to [`cat`] as values, so the stdout writer settles before the
+/// process leaves the command.
+enum CatFailure {
+    Refused(String),
+    Failed(Error),
+}
+
+impl From<Error> for CatFailure {
+    fn from(err: Error) -> Self {
+        Self::Failed(err)
+    }
+}
+
+/// Write each named file's content to stdout, in order, streaming it.
+async fn cat(repo: Repo, name: &str, args: CatArgs) -> Result<()> {
+    let Some(rev) = args.commit.as_deref().filter(|_| !args.path.is_empty()) else {
+        exit_with_error(name, "A COMMIT and at least one PATH argument are required");
+    };
+    let commit = resolve(&repo, rev).await?;
+    let (root, _) = repo.read_commit(&commit.to_hex()).await?;
+    let mut stdout = stdout_file()?;
+    let written = cat_paths(&repo, &root, &args.path, &mut stdout).await;
+    // The async writer over the duplicated stdout descriptor holds the bytes
+    // its blocking worker has not taken, so the tail of a large payload is lost
+    // unless the writes settle before the process exits. A refusal and an I/O
+    // error leave the command through here as well, so each one settles the
+    // bytes already written before it is reported.
+    let settled = stdout.flush().await.map_err(Error::Io);
+    // Where a path failed and the flush failed with it, the path failure is the
+    // one reported: it names the condition the invocation is measured on. The
+    // two failure branches therefore drop `settled`.
+    match written {
+        Ok(()) => settled,
+        Err(CatFailure::Refused(message)) => exit_error(&message),
+        Err(CatFailure::Failed(err)) => Err(err),
+    }
+}
+
+/// Write each path's content to `out`, in order, stopping at the first failure.
+async fn cat_paths(
+    repo: &Repo,
+    root: &RepoTree,
+    paths: &[String],
+    out: &mut ostrya_rt::File,
+) -> std::result::Result<(), CatFailure> {
+    for path in paths {
+        let file = cat_lookup(repo, root, path).await?;
+        file.write_to(out).await?;
+    }
+    Ok(())
+}
+
+/// Resolve one `cat` path to the regular file it names.
+///
+/// The path is split on `/` and each component looked up on its own, so `.`,
+/// `..`, and an empty component each name nothing, which is what the tool does
+/// with them. A symlink in the final position is followed, its target read
+/// relative to the link's own directory; a symlink in any other position is
+/// not followed, and reports `Not a directory` the way the tool does.
+///
+/// An empty argument reaches no component at all and reports the commit root as
+/// absent, which is what the tool does with it; `/` reaches the root and is
+/// refused as a directory.
+async fn cat_lookup(
+    repo: &Repo,
+    root: &RepoTree,
+    path: &str,
+) -> std::result::Result<FileObject, CatFailure> {
+    if path.is_empty() {
+        return Err(cat_refusal("No such file or directory: /"));
+    }
+    let mut components = split_cat_path(path);
+    // One iteration per link followed, plus the one that reads the file the
+    // last link names.
+    for _ in 0..=CAT_SYMLINK_LIMIT {
+        let file = match lookup_components(root, &components).await? {
+            TreeEntry::File { checksum, .. } => repo.load_file(&checksum).await?,
+            TreeEntry::Dir { .. } => return Err(cat_refusal("Can't open directory")),
+        };
+        match &file.kind {
+            FileKind::Symlink { target } => components = follow_link(&components, target),
+            FileKind::Regular { .. } => return Ok(file),
+        }
+    }
+    Err(cat_refusal("Too many levels of symbolic links"))
+}
+
+/// One `cat` refusal, held as a value until the stdout writer settles.
+fn cat_refusal(message: &str) -> CatFailure {
+    CatFailure::Refused(message.to_owned())
+}
+
+/// Walk `components` from `root`, one component at a time, to the entry they
+/// name. An empty component list names the commit root, which is a directory
+/// and so the same refusal a directory path gets.
+async fn lookup_components(
+    root: &RepoTree,
+    components: &[String],
+) -> std::result::Result<TreeEntry, CatFailure> {
+    let mut current = root.clone();
+    for (index, component) in components.iter().enumerate() {
+        let last = index + 1 == components.len();
+        match current.lookup(Path::new(component)).await? {
+            Some(TreeEntry::Dir { name, tree }) => {
+                if last {
+                    return Ok(TreeEntry::Dir { name, tree });
+                }
+                current = tree;
+            }
+            Some(entry @ TreeEntry::File { .. }) => {
+                if last {
+                    return Ok(entry);
+                }
+                return Err(cat_refusal("Not a directory"));
+            }
+            None => {
+                return Err(cat_refusal(&format!(
+                    "No such file or directory: /{}",
+                    components[..=index].join("/")
+                )));
+            }
+        }
+    }
+    Err(cat_refusal("Can't open directory"))
+}
+
+/// Split a `cat` path into the components to look up: one optional leading `/`
+/// is dropped and the rest split on `/`, keeping every other component
+/// verbatim so `.`, `..`, and an empty one are looked up and not found.
+fn split_cat_path(path: &str) -> Vec<String> {
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    if rest.is_empty() {
+        return Vec::new();
+    }
+    rest.split('/').map(str::to_owned).collect()
+}
+
+/// The components a symlink's target names: relative to the link's own
+/// directory, or to the commit root for an absolute target.
+fn follow_link(components: &[String], target: &str) -> Vec<String> {
+    let mut out = if target.starts_with('/') {
+        Vec::new()
+    } else {
+        components[..components.len() - 1].to_vec()
+    };
+    out.extend(split_cat_path(target));
+    out
 }
 
 async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
@@ -1735,13 +2680,40 @@ fn report_verify(outcome: &VerifyOutcome) {
     );
 }
 
-/// Resolve a checksum or ref to a commit checksum. `resolve_rev` with
+/// Resolve a revision -- a checksum, a refspec, or either with a trailing `^`
+/// per generation of ancestry -- to a commit checksum, reporting the two
+/// resolution failures in the tool's own words. `resolve_rev` with
 /// `allow_noent = false` returns `Some` or an error, never `None`.
 async fn resolve(repo: &Repo, rev: &str) -> Result<Checksum> {
-    Ok(repo
-        .resolve_rev(rev, false)
-        .await?
-        .expect("resolve_rev with allow_noent=false returns Some or errors"))
+    match repo.resolve_rev(rev, false).await {
+        Ok(checksum) => {
+            Ok(checksum.expect("resolve_rev with allow_noent=false returns Some or errors"))
+        }
+        Err(err) => Err(report_resolution_failure(err)),
+    }
+}
+
+/// The same for a revision that may be absent: `None` states that nothing of
+/// that name is in the repository, and a resolution failure carries the same
+/// words [`resolve`] gives it.
+async fn resolve_optional(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
+    match repo.resolve_rev(rev, true).await {
+        Ok(found) => Ok(found),
+        Err(err) => Err(report_resolution_failure(err)),
+    }
+}
+
+/// Report the two resolution failures in the tool's own words, so one condition
+/// has one message wherever a revision is resolved, and hand every other error
+/// back to the caller.
+fn report_resolution_failure(err: Error) -> Error {
+    match err {
+        Error::RefNotFound(refspec) => exit_error(&format!("Refspec '{refspec}' not found")),
+        Error::NoParentCommit(commit) => {
+            exit_error(&format!("Commit {} has no parent", commit.to_hex()))
+        }
+        other => other,
+    }
 }
 
 /// The `ostree.ref-binding` metadata dict binding a commit to `branch`: a single
@@ -1804,5 +2776,141 @@ mod tests {
             );
         }
         assert_eq!(registered.len(), Command::NAMES.len());
+    }
+
+    /// The two prefix filters differ on the exact match alone: a listing keeps
+    /// the ref a prefix names, and the `-A` filter leaves it to the resolution
+    /// step, so an alias whose name a prefix gives exactly is filtered out.
+    #[test]
+    fn the_alias_filter_excludes_the_exact_match() {
+        for prefix in [None, Some("grp"), Some("grp/deep")] {
+            assert!(matches_prefix("grp/deep/z", prefix));
+            assert!(nested_under_prefix("grp/deep/z", prefix));
+        }
+        assert!(matches_prefix("grp/deep/z", Some("grp/deep/z")));
+        assert!(!nested_under_prefix("grp/deep/z", Some("grp/deep/z")));
+        for prefix in [Some("grp/dee"), Some("other"), Some("grp/deep/z/x")] {
+            assert!(!matches_prefix("grp/deep/z", prefix));
+            assert!(!nested_under_prefix("grp/deep/z", prefix));
+        }
+    }
+
+    /// A whole-remote prefix -- a `<remote>:` prefix whose ref half is empty or
+    /// `.` -- selects every ref of that remote and no other, in a listing and in
+    /// the `-A` filter alike, and the row keeps the whole refspec since there is
+    /// no ref name to strip.
+    #[test]
+    fn a_whole_remote_prefix_selects_that_remote() {
+        assert_eq!(whole_remote("origin:"), Some("origin"));
+        assert_eq!(whole_remote("origin:."), Some("origin"));
+        for prefix in ["origin:rr", "origin", "origin::", "origin:./x"] {
+            assert_eq!(
+                whole_remote(prefix),
+                None,
+                "`{prefix}` read as whole-remote"
+            );
+        }
+        for prefix in [Some("origin:"), Some("origin:.")] {
+            for refspec in ["origin:x", "origin:rr/x", "origin:rr/deep/y"] {
+                assert!(matches_prefix(refspec, prefix));
+                assert!(nested_under_prefix(refspec, prefix));
+                assert_eq!(strip_prefix_from(refspec, prefix), refspec);
+            }
+            for refspec in ["test/main", "origin", "originx:rr/x", "other:rr/x"] {
+                assert!(!matches_prefix(refspec, prefix));
+                assert!(!nested_under_prefix(refspec, prefix));
+            }
+        }
+    }
+
+    /// A PREFIX is refused by the refspec rule, and is reported as given. The
+    /// two whole-remote forms pass, since a `<remote>:` prefix whose ref half is
+    /// empty or `.` names every ref of that remote.
+    #[test]
+    fn a_prefix_no_ref_name_can_hold_is_refused() {
+        for prefix in [
+            "test/",
+            "/test",
+            "a//b",
+            ".",
+            "..",
+            "test/main/",
+            "test/../main",
+            "test/./main",
+            "",
+            ":",
+            ":rr",
+            "origin:rr/",
+            "origin:..",
+            "or/igin:rr",
+            "or/igin:",
+            ".:",
+        ] {
+            match check_prefix_name(prefix) {
+                Err(Error::InvalidRefspec(name)) if name == prefix => {}
+                other => panic!("`{prefix}` was not refused as given: {other:?}"),
+            }
+        }
+        for prefix in [
+            "test",
+            "test/main",
+            "origin:rr",
+            "origin:",
+            "origin:.",
+            // The port's ref rule reads a second `:` as part of the ref name and
+            // the tool refuses it, which is the character-class divergence
+            // `docs/conformance/cli-surface.md`, "P1" records.
+            "origin::rr",
+        ] {
+            check_prefix_name(prefix).expect("the prefix was refused");
+        }
+    }
+
+    /// The path a PREFIX names below `refs/`: the ref name under `heads`, the ref
+    /// name under `remotes/<remote>`, and the remote's own directory for a
+    /// whole-remote prefix.
+    #[test]
+    fn a_prefix_names_its_path_under_refs() {
+        for (prefix, path) in [
+            ("plain", "heads/plain"),
+            ("test/main", "heads/test/main"),
+            ("deep/nest/ing", "heads/deep/nest/ing"),
+            ("origin:rr", "remotes/origin/rr"),
+            ("origin:rr/deep/y", "remotes/origin/rr/deep/y"),
+            ("origin:", "remotes/origin"),
+            ("origin:.", "remotes/origin"),
+        ] {
+            assert_eq!(prefix_path(prefix), path, "`{prefix}`");
+        }
+    }
+
+    /// The `-A` target column: the link body with its leading `../` components
+    /// removed while the link stays in the alias's own ref root, and the target
+    /// ref's refspec once it leaves that root, which is the form the port's own
+    /// resolver reads.
+    #[test]
+    fn a_cross_root_alias_target_prints_the_refspec() {
+        for (refspec, body, printed) in [
+            // Within one root, the stripped body is what both implementations
+            // print.
+            ("al", "test/main", "test/main"),
+            ("nested/q", "../plain", "plain"),
+            ("origin:rr/remal", "x", "x"),
+            ("origin:rr/deep/remal", "../x", "x"),
+            // Across roots, the stripped path below `refs/` names no ref.
+            ("xal", "../remotes/origin/rr/x", "origin:rr/x"),
+            ("origin:rr/toheads", "../../../heads/plain", "plain"),
+            ("origin:rr/oal", "../../other/z/y", "other:z/y"),
+            // A body naming no ref file keeps the stripped form: one reaching
+            // above `refs/`, and one landing on a root itself.
+            ("al", "../../objects/ab/cd", "objects/ab/cd"),
+            ("al", "../remotes", "remotes"),
+        ] {
+            assert_eq!(
+                alias_target(refspec, body),
+                printed,
+                "`{refspec} -> {body}` printed the wrong target",
+            );
+        }
     }
 }

@@ -96,13 +96,28 @@ impl Drop for TmpDir {
     }
 }
 
-/// Whether the `ostree` tool is available for cross-check tests.
+/// The environment variable that turns the reference-absent skip into a
+/// failure. A harness setting it declares that `ostree` is installed, so a run
+/// where it is not is a broken harness rather than a test to pass over.
+pub const REQUIRE_OSTREE: &str = "OSTRYA_REQUIRE_OSTREE";
+
+/// Whether the `ostree` tool is available for cross-check tests. Some of these
+/// tests are the proof a matrix record cites with `evidence:`, so a harness
+/// without the tool would otherwise report the cited cells as covered while no
+/// assertion ran. With [`REQUIRE_OSTREE`] set the absence fails; without it the
+/// caller skips and says so.
 pub fn ostree_available() -> bool {
-    Command::new("ostree")
+    let found = Command::new("ostree")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        found || std::env::var_os(REQUIRE_OSTREE).is_none(),
+        "{REQUIRE_OSTREE} is set and `ostree` is not installed, so the \
+         tool-comparison tests cannot run"
+    );
+    found
 }
 
 /// Whether the `openssl` tool is available for cross-check tests.

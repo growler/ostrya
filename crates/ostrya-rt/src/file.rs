@@ -57,6 +57,29 @@ impl From<OwnedFd> for File {
 }
 
 impl File {
+    /// Settle queued writes into the descriptor.
+    ///
+    /// The backend hands a write to a blocking worker and holds what the worker
+    /// has not taken yet, so a file dropped at process exit loses that tail.
+    /// This asks for the held bytes and nothing further, which is what a
+    /// descriptor that refuses a sync -- a pipe, a terminal -- accepts;
+    /// [`sync_all`](File::sync_all) and [`sync_data`](File::sync_data) ask for
+    /// durability as well.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        #[cfg(feature = "tokio")]
+        {
+            use tokio::io::AsyncWriteExt;
+
+            self.inner.flush().await
+        }
+        #[cfg(all(feature = "smol", not(feature = "tokio")))]
+        {
+            use smol::io::AsyncWriteExt;
+
+            self.inner.flush().await
+        }
+    }
+
     /// Flush queued writes and durably sync contents and metadata.
     pub async fn sync_all(&mut self) -> io::Result<()> {
         self.inner.sync_all().await

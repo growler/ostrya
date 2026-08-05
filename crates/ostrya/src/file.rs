@@ -162,6 +162,21 @@ impl FileObject {
         Ok(ContentReader { inner })
     }
 
+    /// Stream the file's payload into `writer` in bounded chunks, buffering no
+    /// whole blob whatever the file's size. A symlink has no payload and
+    /// writes nothing.
+    ///
+    /// The writer is left unflushed. A sink takes as many payloads as its owner
+    /// sends it, and a framing or compressing sink emits on a flush, so the
+    /// flush belongs to the caller: one whose writer buffers -- the async file
+    /// over a descriptor does -- settles it once when it has written everything.
+    pub async fn write_to<W: futures_io::AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        let reader = self.reader().await?;
+        crate::write::copy_stream(reader, writer)
+            .await
+            .map_err(Error::Io)
+    }
+
     /// The directory fd and path the payload is read from: a loose path under
     /// `objects/`, or the flat staging name for a not-yet-published object.
     fn payload_location(&self) -> Result<(OwnedFd, String)> {

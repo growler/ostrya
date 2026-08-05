@@ -41,7 +41,8 @@ Guiding choices:
 /// 32-byte SHA-256 object id.
 pub struct Checksum([u8; 32]);
 impl Checksum {
-    pub fn from_hex(s: &str) -> Result<Self>;
+    pub fn from_hex(s: &str) -> Result<Self>;       // either case
+    pub fn from_hex_lower(s: &str) -> Result<Self>; // the rule a revision takes
     pub fn from_bytes(b: [u8; 32]) -> Self;
     pub fn to_hex(&self) -> String;                 // 64 lowercase hex
     pub fn to_base64_modified(&self) -> String;     // delta dir naming
@@ -103,12 +104,26 @@ impl Repo {
     pub fn is_writable(&self) -> bool;
 
     // --- reading ---
-    pub async fn resolve_rev(&self, refspec: &str, allow_noent: bool)
+    /// A refspec, a 64-char lowercase checksum, or either with a trailing run
+    /// of `^`, each stepping one generation back along `parent`. A 64-char name
+    /// holding an uppercase character is a refspec.
+    pub async fn resolve_rev(&self, rev: &str, allow_noent: bool)
         -> Result<Option<Checksum>>;
-    pub async fn list_refs(&self, prefix: Option<&str>)
+    pub async fn list_refs(&self, prefix: Option<&str>)            // refs/heads
         -> Result<Vec<(String, Checksum)>>;
     pub async fn list_refs_ext(&self, prefix: Option<&str>, flags: ListRefsFlags)
         -> Result<Vec<(String, Checksum)>>;
+    /// refs/remotes, each named by its `remote:name` refspec.
+    pub async fn list_remote_refs(&self) -> Result<Vec<(String, Checksum)>>;
+    /// refs/mirrors, as (collection_id, ref_name, commit).
+    pub async fn list_mirror_refs(&self) -> Result<Vec<(String, String, Checksum)>>;
+    /// The refs stored as alias symlinks, under heads and remotes, with each
+    /// link body verbatim.
+    pub async fn list_ref_aliases(&self) -> Result<Vec<RefAlias>>;
+    /// Probe one path below `refs/`, as a listing prefix names it: `ENOTDIR`
+    /// where a component above the last is not a directory, `Ok` for a path
+    /// naming nothing.
+    pub async fn check_refs_path(&self, relpath: &str) -> Result<()>;
 
     pub async fn load_commit(&self, c: &Checksum) -> Result<(Commit, CommitState)>;
     pub async fn load_dirtree(&self, c: &Checksum) -> Result<DirTree>;
@@ -135,7 +150,13 @@ impl Repo {
         dest_dir: BorrowedFd<'_>, dest_path: &Path, commit: &Checksum) -> Result<()>;
 
     // --- immediate ref writes (outside a transaction) ---
+    // Each honors `[core] fsync`: the ref file is `fdatasync`-ed and the
+    // directory holding it is `fsync`-ed after the rename or the unlink.
     pub async fn set_ref_immediate(&self, refspec: &str, checksum: Option<&Checksum>) -> Result<()>;
+    pub async fn set_collection_ref_immediate(&self, cref: &CollectionRef,
+        checksum: Option<&Checksum>) -> Result<()>;
+    /// Write `refspec` as a relative symlink to `target`'s ref file.
+    pub async fn set_ref_alias_immediate(&self, refspec: &str, target: &str) -> Result<()>;
 
     // --- maintenance ---
     pub async fn prune(&self, opts: &PruneOptions) -> Result<PruneStats>;
@@ -184,7 +205,24 @@ pub struct FileObject {
 impl FileObject {
     /// Regular files: streams the payload in bounded chunks.
     pub async fn reader(&self) -> Result<ContentReader>;
+    /// The same stream written into `writer`, for a caller that has a sink
+    /// rather than a read loop. A symlink writes nothing. The writer is left
+    /// unflushed: a sink takes as many payloads as its owner sends it, and a
+    /// framing or compressing sink emits on a flush, so the caller settles its
+    /// own sink once.
+    pub async fn write_to<W: futures_io::AsyncWrite + Unpin>(&self, writer: &mut W)
+        -> Result<()>;
 }
+
+/// One ref stored as an alias.
+pub struct RefAlias { pub refspec: String, pub target: String }
+
+/// Whether a refspec names a path under `refs/`: a ref name, optionally
+/// preceded by a `<remote>:` prefix. A refspec that would leave the tree is
+/// `Error::InvalidRefspec`, holding the refspec as given, which is the one
+/// error a caller reporting a refused name needs the name from. Every ref
+/// write and every resolution applies the same rule.
+pub fn validate_refspec(refspec: &str) -> Result<()>;
 
 /// Streaming reader over a regular file's payload: raw for the bare family,
 /// on-the-fly raw-DEFLATE inflate for archive (a streaming decoder over

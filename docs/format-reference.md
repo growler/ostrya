@@ -370,10 +370,207 @@ Loose object path: `objects/<first 2 hex>/<remaining 62 hex>.<typestr>` with a
 trailing `z` only on a `File` content object in archive mode. Checksum must be
 exactly 64 hex chars.
 
-Ref file format: 64-char hex plus a single `\n` (65 bytes). A NULL rev deletes;
+Ref file format: 64 lowercase hex chars plus a single `\n` (65 bytes). A NULL rev deletes;
 an alias is written as a relative symlink. Refspec `remote:ref` maps to
 `refs/remotes/remote/ref`; a bare `ref` maps to `refs/heads/ref`. Every ref is
 an individual loose file; there is no packed-refs mechanism.
+
+Ref name validation. A ref name is one or more `/`-separated components. Each
+component is non-empty, does not begin with `-` or `.`, and holds only
+alphanumerics, `-`, `.`, `_`, and bytes at or above `0x80`. One optional `:`
+separates a remote name from the ref name, and a second `:` is invalid.
+Recovered by feeding `ostree rev-parse` one candidate name per ASCII
+punctuation character: the tool accepts `a-b`, `a.b`, `a_b`, `a..b`, `a.`,
+`0ab`, and `té`, and rejects each of `! " # $ % & ' ( ) * + , ; < = > ? @ [ \ ]
+^ ` { | } ~` and space in a component, `-a` and `.a` and `~a` and `+a` at the
+start of one, an empty component (`a//b`, `/a`, `a/`), and `a:b:c`, each with
+`error: Invalid refspec <name>` and exit 1. The remote is one component, so
+`a/b:x` is refused too. The port's own check is narrower -- it rejects an empty
+name, an empty, `.`, or `..` component, a `/` in the remote name or in the
+collection id, and an interior NUL, and accepts the rest -- so `ostrya refs
+--create` writes some names the tool then refuses to resolve
+(`conformance/cli-surface.md`, "P1 -- reading and resolution").
+
+Both implementations report a name they refuse as `error: Invalid refspec
+<refspec>` and exit 1, wherever the name is taken: a revision, a NEWREF, or the
+`-b` branch of a commit. The refspec is reported as given, holding the
+`<remote>:` or `<collection-id>:` prefix and dropping a trailing run of `^`, so
+`rev-parse a/../b^` and `rev-parse a/../b` report the same line. The target of
+`refs -A --create` is the one site the rule does not report at, an existence
+check standing ahead of it there, so a refused name is reported as a name no ref
+holds, in the words "refs" below states.
+
+A ref name that passes the rule also names a path below `refs/`, and that path
+is opened where the name is resolved or written. A path running through a ref
+file ends the invocation with exit 1 in both implementations, and neither writes
+a ref: `rev-parse <name>`, `cat <name> PATH`, the positional revision of `refs
+--create`, `refs --create=<name>`, and `refs -A --create=<name>`. The tool names
+the path below the repository and the syscall -- `error:
+openat(refs/heads/plain/x): Not a directory` for the name `plain/x` over the ref
+`plain`, the same line for a name reaching the ref file through an alias
+symlink, and `error: openat(refs/remotes/origin/rr/x/y): Not a directory` for
+`origin:rr/x/y` over the remote ref `origin:rr/x`. Under `-c
+--create=<id>:<ref>` the existence check reads the absent
+`refs/remotes/<id>/<ref>` and the write reaches the mirror path, so the tool
+reports `error: open(O_TMPFILE): Not a directory` and names no path. The port
+reports `error: i/o error: Not a directory (os error 20)` at every one of those
+sites, the one message it gives that condition. The target of `refs -A --create`
+is answered by the existence check ahead of the rule, so the tool reports the
+target as a name no ref holds there and the port reports its own `Not a
+directory` line (`conformance/cli-surface.md`, "P1").
+
+A ref name that names a directory under `refs/` is refused at those same sites in
+the port, with `error: i/o error: Is a directory (os error 21)`. The tool refuses
+it where the name is resolved and where `-A --create` writes a link, in three
+messages of its own, and its plain `--create` refuses a directory under
+`refs/heads` that holds a ref below the name: `refs --create=deep plain` over the
+ref `deep/nest/ing` reports `error: Conflict: nest/ing exists under deep when
+attempting write`, with `--force` and without it
+(`conformance/cli-surface.md`, "P1"). Where that scan reaches no ref below the
+name, the tool's write replaces the directory, removes what stood below it, and
+exits 0 printing nothing. Four shapes take that path:
+
+- an empty directory, which `refs --delete` leaves behind in both implementations
+  when it removes a directory's last ref, so `refs --delete deep/nest/ing` and
+  then `refs --create=deep/nest plain` writes the ref file over
+  `refs/heads/deep/nest`;
+- a directory holding directories alone, so after that same delete
+  `refs --create=deep plain` replaces `deep` and removes `nest`;
+- any directory under `refs/remotes`, so `refs --create=origin:rr plain` over the
+  refs `origin:rr/x` and `origin:rr/deep/y` leaves the ref file
+  `refs/remotes/origin/rr` alone in their place;
+- any directory under `refs/mirrors`, which `-c --create=<id>:<name>` reaches the
+  same way.
+
+The port refuses all four and writes nothing. A directory named as the target of
+`refs -A --create` reaches the same existence check, so the tool reports the
+target as a name no ref holds and the port reports its `Is a directory` line
+(`conformance/cli-surface.md`, "P1"). The `PREFIX` form of the path rule is under
+"CLI output formats", "refs".
+
+An empty refspec is a search of the ref store in the tool rather than a name: it
+resolves to the repository's one ref where exactly one exists, reports `error:
+Refspec  not unique` where more than one does, and reports `error: Invalid
+refspec ` in an empty repository. The port refuses the empty name in every
+repository (`conformance/cli-surface.md`, "P1 -- reading and resolution").
+
+Revision syntax. A revision names a commit three ways: a 64-character lowercase
+hex checksum, a refspec, or either of those followed by one or more `^` characters,
+each stepping one generation back along the commit's `parent` field. `~N` and
+`^N` are not revision syntax: `ostree rev-parse test/main~1` and
+`test/main^2` each report `error: Invalid refspec <rev>`. The port's ref rule
+accepts both names, so it reads the whole revision as a refspec and reports
+`error: Refspec '<rev>' not found`, the message the two implementations share
+for a name that resolves to nothing, wherever a revision is taken: `rev-parse`,
+`cat`, and the positional of `refs --create`. A checksum carrying either suffix
+takes that same path, the name holding more than 64 characters. Both
+implementations exit 1 and write nothing, and the wording follows from the
+ref-name character class the port does not validate
+(`conformance/cli-surface.md`, "P1"). Walking past a root
+commit reports `error: Commit <checksum> has no parent` and exits 1. The tool
+also resolves an abbreviated checksum -- a hex prefix as short as one character
+resolves when exactly one commit object's name starts with it, and a prefix
+matching only a dirtree, dirmeta, or file object does not resolve at all
+(recovered by resolving each one-character prefix present in a two-commit
+repository's `objects/` tree). The port does not resolve an abbreviated
+checksum; it requires the full 64 characters.
+
+The case of those 64 characters is part of the rule: a name is a checksum in
+lowercase hex alone, and one uppercase character makes it a ref name. Both
+implementations therefore report `error: Refspec '<rev>' not found` for
+`rev-parse <UPPER>`, `cat <UPPER> PATH`, `checkout <UPPER> DEST`, and
+`rev-parse <UPPER>^`, where the same 64 characters in lowercase resolve, and a
+name holding one raised character reads as the uppercase one does. The split runs
+wherever a 64-character name is taken:
+
+- the positional revision of `refs --create` reports the not-found line, so
+  `refs --create=fresh <UPPER>` writes nothing;
+- the existence check of `refs --create=NEWREF` resolves NEWREF, so a NEWREF of
+  64 lowercase hex characters is a checksum and reports `error: --create
+  specified but ref <NEWREF> already exists` whether or not the store holds that
+  commit, and an uppercase NEWREF is a free ref name whose write lands at
+  `refs/heads/<NEWREF>`. A revision of that name then resolves through the ref
+  file, `refs -A --create` records an alias to it, and `refs --delete` guards it
+  under the name the alias body carries;
+- `refs -A --create` holds a lowercase name to name no ref, reporting `error:
+  Cannot create alias to non-existent ref: <rev>`;
+- a `PREFIX` is matched and not resolved, so neither case matches a ref there;
+- `commit -b` refuses a branch name of 64 lowercase hex characters with `error:
+  Rev name '<name>' looks like a checksum`, naming the branch as given. The rule
+  guards the one name this case rule shadows: a ref of that shape is read as a
+  checksum wherever a revision is taken, so no revision reaches the commit
+  behind it. Every other name of that length is written -- one character short
+  or long, one outside the hex class, an uppercase rendering, and one holding a
+  single raised character. The refusal runs at the ref write, so a fault ahead of
+  it is reported instead: an unresolvable `--parent` and a tree path that does
+  not open each end the invocation first, in each implementation's own words
+  (`conformance/cli-surface.md`, "P2"). The tool's `--orphan`, which the port
+  does not carry, leaves the refusal standing, since `-b` writes the ref under it
+  too.
+
+The revision syntax shadows two branch-name shapes, and `commit -b` guards both.
+Beside the checksum shape above stands a name ending in `^`, which resolution
+reads as ancestry, so no revision reaches the commit a ref of that name holds.
+The port refuses it with `error: Invalid refspec <name>`, the message it gives
+that same shape at `refs --create`, at the step the checksum guard runs at: the
+ref write, after `--parent` resolves and after the tree is read. The tool refuses
+it a step earlier, reading the branch name as a revision before it commits the
+tree, and reports what that walk found. Three outcomes follow from the base the
+suffix names:
+
+- a base resolving to a commit that has a parent: `error: Invalid refspec
+  <name>`, exit 1, which is the port's own line;
+- a base resolving to a root commit: `error: Commit <checksum> has no parent`,
+  exit 1;
+- a base naming no ref: the tool dies on a signal
+  (`conformance/cli-surface.md`, "P2").
+
+An empty base is a refspec the tool searches its ref store for, so `-b '^'`
+reports `error: Invalid refspec ` against a repository holding no ref, naming
+the empty base, and the walk's own line against one holding a single ref. Since
+the tool reads the name before the tree, a tree path that does not open is
+reported by the port and reached by the tool only after the name it already
+refused, and neither implementation publishes an object for the refusal, where
+the checksum guard leaves the tool's tree and commit objects in `objects/`.
+A `^` inside the name is a separate rule: the tool refuses `a^b` as a ref name
+whatever the store holds, and the port writes it, which is the ref-name
+character class `conformance/cli-surface.md`, "P1" records.
+
+A ref of either refused shape therefore arrives by an out-of-band write alone.
+Where a checksum-shaped one stands, the tool's listings enumerate it, its `fsck`
+validates it, and its `prune --refs-only` reads the commit that ref holds as
+reachable and keeps it, while its `pull-local` over that source reads the ref
+name as a checksum and reports `error: Importing <name>.commit: linkat: No such
+file or directory`, where the port copies the ref. Where an ancestry-shaped one
+stands, the tool's ref enumeration skips it without a word, so `refs` prints
+nothing and `prune --refs-only` reads the commit as unreachable and deletes it,
+leaving the ref file over an absent object; the port enumerates the name. That
+is the same destructive class the ref-name character class carries
+(`conformance/cli-surface.md`, "P1").
+
+Ref file content is read by a parser that takes either case. Both
+implementations write the 64 lowercase hex characters, and the tool refuses a
+file holding any other rendering with `error: Invalid character '<byte>' in rev
+'<content>'`, naming the first character it refuses by byte value, where the
+port's reader resolves it (`conformance/cli-surface.md`, "P1"). Only an
+out-of-band write puts such content in a ref file. The tool's `commit --parent`
+reads its value with that same parser, so `--parent=<UPPER>` reports that line
+where the port reads the value as a revision and reports the ref as missing
+(`conformance/cli-surface.md`, "P2").
+
+A revision resolves whether or not the commit it names is in the store, so an
+absent commit is reported where the commit is read. The tool names the loose
+object file it looked for, `error: No such metadata object <checksum>.commit`,
+and the port names the object type the library looked up, `error: object not
+found: Commit <checksum>`; both exit 1 and write nothing
+(`conformance/cli-surface.md`, "P1"). The sites that read the commit are `cat`,
+`checkout`, and `export`, and a revision carrying a `^` suffix, whose walk loads
+the base commit. The sites that take a checksum without reading it accept an
+absent one at exit 0: `rev-parse <checksum>` prints it, the positional revision
+of `refs --create` writes a ref file holding it, and `commit
+--parent=<checksum>` writes a commit naming it. A ref pointing at an absent
+commit therefore arrives through either CLI, and reading a revision through that
+ref reports the same two messages the checksum reports.
 
 Writing a ref whose file is an alias symlink replaces the symlink with a regular
 ref file; the alias target is left unchanged. Observed with the tool by
@@ -382,6 +579,20 @@ committing onto an alias and by `ostree refs --create --force`: in both cases
 file holding the new checksum, and `refs/heads/bar` kept its old checksum. The
 tool writes the ref by renaming a fresh temp file over the target name, and the
 rename replaces the symlink at that name instead of following it.
+
+Ref durability (traced). The tool's ref write issues `fdatasync` of the temp
+file, then `renameat` over the ref name, and no directory sync anywhere: not of
+the ref's own parent, of `refs/heads`, or of the repository root. This is the
+same sequence for `refs --create` and for a commit's ref write, and
+`fsync=false` drops the `fdatasync`, leaving the rename alone. An alias write
+(`refs -A --create`) issues `symlinkat` into `<repo>/tmp` and `renameat` over
+the ref name, with no sync at all, and `refs --delete` issues `unlinkat` alone.
+The port `fdatasync`-es the ref file the same way and adds an `fsync` of the
+directory holding the ref after the rename, after an alias rename, and after a
+removal, so the name the operation created or removed survives a crash and not
+only the file's content. `fsync=false` turns all of that into a no-op. The
+syscall sequence carries no byte-exact requirement, and the ref bytes are
+identical either way.
 
 Repository lock and staging (recovered by tracing the tool). The tool opens
 `<repo>/.lock` `O_RDWR|O_CREAT` mode `0660` and takes an `fcntl` OFD lock on it,
@@ -1769,3 +1980,450 @@ gid, xattrs), and each regular file redirects to its `.file` loose path.
 Per-file fs-verity is computed over the payload. Ownership is presented
 through composefs uid mapping at mount time, so the real root-owned metadata
 is correct even inside a rootless, non-root container.
+
+## CLI output formats
+
+The reading commands write to standard output, so their format is part of the
+interoperability surface a script depends on. Each format below was recovered by
+running `ostree` 2026.1 as a black box against repositories built for the
+purpose, and `conformance/m10-cli-behavior.matrix` states the cells that hold
+the port's output to the tool's. `conformance/cli-surface.md` lists the commands
+whose formats are still to be recovered.
+
+### `refs`
+
+The default form prints one refspec per line. The listing covers `refs/heads`,
+named by the ref name, and `refs/remotes`, named `remote:name`; `refs/mirrors`
+is excluded. A ref stored as an alias is listed by its own name, resolved
+through the link. The whole set is sorted by refspec, so `alias1`,
+`deep/nest/ing`, `origin:test/main`, `other`, and `test/main` print in that
+order: one plain byte-wise ordering over the refspec strings, with no grouping
+by ref root.
+
+A `PREFIX` argument keeps the refs equal to it or nested under it, and the
+printed name drops the prefix and the `/` after it. An exact match prints the
+whole refspec: `refs test` prints `main` for `test/main`, and `refs test/main`
+prints `test/main`. A remote's refspec keeps its `remote:` part while the ref
+name below it is stripped, so `refs origin:rr` prints `origin:x` for
+`origin:rr/x` and `origin:deep/y` for `origin:rr/deep/y` -- neither of which
+names a ref. `--list` suppresses the stripping and prints the whole refspec.
+
+More than one `PREFIX` is accepted. The output is grouped by prefix in the order
+the prefixes were given, sorted within each group, and a ref two prefixes match
+prints once per match: `refs mid zulu alpha` prints `one`, `two`, `zulu`,
+`alpha`, and `refs mid mid` prints `one`, `two`, `one`, `two`. The prefix that
+stripped a name is the one that selected that row, not the first one matching
+it, so `refs test test/main` prints `main` and then `test/main`. A prefix
+matching nothing prints nothing and exits 0.
+
+Each `PREFIX` is validated as a refspec, in the default listing, `--list`, `-r`,
+`-A`, and `--delete`. A name the ref rule refuses ends the invocation with exit
+1: the tool reports `error: Listing refs: Invalid refspec <PREFIX>`, and the port
+reports `error: Invalid refspec <PREFIX>`, the one message it gives that rule
+wherever a name reaches it. The refusals observed are `test/`, `/test`, `a//b`,
+`.`, `..`, `test/main/`, `test/../main`, an empty argument, `:`, `:rr`,
+`origin:rr/`, `origin:..`, and a remote half holding a `/` such as `or/igin:rr`.
+The tool applies the narrower ref-name class "Ref name validation" above records,
+so it also refuses `tes~t`, `te st`, `.test`, and `origin::rr`, which the port's
+rule accepts.
+
+The check runs where each prefix is taken, so a valid prefix ahead of a refused
+one keeps its effect: `refs test 'bad/'` prints the rows `test` matched and then
+the refusal, and `refs --delete deep 'bad/'` removes what `deep` matched and
+leaves the rest.
+
+A `PREFIX` also names a path below `refs/`: the ref name under `refs/heads`, the
+ref name under `refs/remotes/<remote>`, or the remote's own directory for a
+whole-remote prefix. That path is the directory a listing enumerates, and it is
+read before the prefix filters anything, in the default listing, `--list`, `-r`,
+`-A`, and `--delete`. A path that runs through a ref file ends the invocation
+with exit 1: the tool reports `error: Listing refs: fstatat(<path>): Not a
+directory`, naming the path below the repository, and the port reports `error:
+i/o error: Not a directory (os error 20)`, the one message it gives that
+condition (`conformance/cli-surface.md`, "P1"). Both print the same standard
+output and leave the same refs tree. The refusals observed are a prefix whose
+last component sits under a ref file (`plain/x` over the ref `plain`), one whose
+inner component does (`plain/x/y`), one reaching the ref file through an alias
+symlink (`al/x`, where `refs/heads/al` links to `test/main`), and the same forms
+under `refs/remotes/<remote>` (`origin:rr/x/y` over the ref `origin:rr/x`). A
+path naming nothing prints nothing and exits 0, which is what a prefix matching
+no ref does. This check runs per prefix too, and after the refspec rule, so
+`refs test plain/x` prints the `test` rows and then the refusal, and `plain/x/`
+reports the refspec refusal in both.
+
+With `-c` a positional argument is a collection id, so no path is read.
+
+A whole-remote prefix -- a `<remote>:` prefix whose ref half is empty or `.` --
+names every ref of that remote, so `refs origin:` and `refs origin:.` each print
+every ref of `origin`. The ref half stands for the remote's root, so no ref name
+is stripped and every row keeps its whole refspec. A whole-remote prefix matching
+no ref prints nothing and exits 0.
+
+Under `--delete` each prefix is matched against the ref set as the prefixes ahead
+of it left it: `refs --delete origin:rr origin:` empties the remote with the first
+prefix, so the whole-remote prefix matches nothing and the invocation exits 0,
+while `refs --delete origin:rr/deep origin:` leaves `origin:rr/x` for the
+whole-remote prefix to match and is refused.
+
+For such a prefix the tool builds each name it prints or deletes by joining the
+ref half with the name below it, and the `.` of that join stays in the name:
+`refs --list origin:` prints `origin:./rr/x`, `refs -A origin:` prints
+`./rr/remal`, and `refs --delete origin:` reports `error: Invalid refspec
+origin:./rr/x` and exits 1 after removing nothing, naming one matched ref in its
+own directory order. The port prints the refspec `origin:rr/x` in both listings,
+and refuses the same delete naming the prefix as given (`error: Invalid refspec
+origin:`), which leaves the refs tree the tool leaves
+(`conformance/cli-surface.md`, "P1").
+
+With `-c` a positional argument is a collection id, and the tool validates it
+under the collection-id rule instead (`error: Listing refs: Invalid collection ID
+<id>`).
+
+`-r`/`--revision` appends a single tab and the 64-character commit checksum to
+each line.
+
+`-A`/`--alias` lists the aliases alone, as `<name> -> <target>`. The target is
+the symlink body with its leading `../` components removed, so an alias at
+`refs/heads/test/al2` pointing at `../zulu` prints `zulu` and one pointing at
+`sub/deep` prints `sub/deep`. The name is never stripped, and `-r` adds nothing.
+
+A `PREFIX` that names a ref exactly is answered by that one ref, printed as
+`<PREFIX> -> <commit checksum>`, for every kind of ref: `refs -A al` prints
+`al -> <checksum>` for an alias, and `refs -A test/main` and
+`refs -A origin:rr/x` print the same shape for a plain ref and for a remote ref,
+neither of which is an alias. A bare 64-character checksum resolves to no ref
+here, so it prints nothing. Every other prefix filters, keeping the aliases
+nested under it: with an alias at `grp/deep/z`, both `refs -A grp` and
+`refs -A grp/deep` print `grp/deep/z -> test/other`. A prefix naming an alias
+whose target ref is missing resolves to no ref and holds no alias below itself,
+so it prints nothing.
+
+The tool names an alias under `refs/remotes/<remote>/` by its path below the
+remote, so an alias at `refs/remotes/origin/rr/remal` prints as `rr/remal`,
+dropping the remote and producing a name that resolves to nothing; the port
+prints the `origin:rr/remal` refspec instead. Such an alias arrives by
+out-of-band mutation alone, since `-A --create` refuses a NEWREF naming a remote
+in both implementations.
+
+The port applies that rule to the target as well, once the link leaves the
+alias's own ref root -- `refs/heads` for a local alias,
+`refs/remotes/<remote>` for a remote one -- and prints the target ref's refspec:
+an alias at `refs/heads/xal` pointing at `../remotes/origin/rr/x` prints
+`origin:rr/x`, where the stripped body `remotes/origin/rr/x` names no ref. A link
+that stays inside its own root keeps the stripped body under both
+implementations. Each implementation writing such an alias with
+`refs -A --create` and reading its own repository back prints `xal ->
+origin:rr/x`.
+
+`-c`/`--collections` lists the collection refs as `(<collection-id>, <ref>)`,
+sorted by collection id and then by ref name. The set is the repository's own
+refs under `refs/heads` qualified by its `[core] collection-id`, plus every ref
+under `refs/mirrors` qualified by the collection component of its path;
+`refs/remotes` is excluded, and a repository with no `collection-id` lists its
+mirror refs alone. With `-c`, a positional argument is a collection id and not a
+ref-name prefix. `-c` wins over `-A`: the two together list collection refs.
+
+`--create=NEWREF` points a new ref at the commit the single positional argument
+names, and writes `refs/heads/<NEWREF>` (or `refs/remotes/<remote>/<name>` for
+a `remote:name` NEWREF), creating the parent directories. With `-A` it writes a
+relative symlink instead. For a target under `refs/heads` the link body is the
+path from the alias's own directory to the target ref's file, so `--create=p/q`
+aliasing `one` writes `../one` and `--create=al` aliasing `test/main` writes
+`test/main`. For a target under `refs/remotes` the tool writes the `remote:name`
+refspec verbatim, so `--create=xal` aliasing `origin:rr/x` writes
+`refs/heads/xal -> origin:rr/x`, a body naming no file under `refs/heads`: the
+tool's own `rev-parse xal` then reports `error: Refspec 'xal' not found` and its
+own default listing stops on the link with `error: Listing refs: openat(xal): No
+such file or directory`. The port writes the path to the target ref's file for
+every target, so the same invocation writes `../remotes/origin/rr/x`, which
+resolves under both implementations. `--create` wins over `--delete` when both
+are given. The errors, each exit 1:
+
+- no positional argument -- `error: You must specify a revision when creating a
+  new ref`;
+- more than one -- `error: You must specify only 1 existing ref when creating a
+  new ref`;
+- an unresolvable positional -- `error: Refspec '<rev>' not found`;
+- an existing NEWREF without `--force` -- `error: --create specified but ref
+  <NEWREF> already exists`;
+- with `-A`, a NEWREF naming a remote -- `error: Cannot create alias to remote
+  ref: <remote>`. The message names the remote half alone, so `--create=origin:al`
+  and `--create=origin:rr/al` both report `origin`, and it names that half as
+  given whether the repository holds refs for the remote or none;
+- with `-A`, a positional that names anything other than an existing ref --
+  `error: Cannot create alias to non-existent ref: <rev>`. The check that reports
+  it stands ahead of ref-name validation at this one site, so it answers for a
+  bare checksum, an ancestry suffix, a name no ref holds, and every name the ref
+  rule refuses: `a/../b`, `a//b`, `.`, `..`, the empty argument, `origin:`,
+  `a:b:c`, `a/b:x`, `te st`, `.test`, `origin::rr`, and `tes~t` each report the
+  target as given. The tool answers the two i/o conditions with that same line,
+  where the port reports the message it gives each of them, and a target the
+  tool's narrower character class refuses parts the two where the ref exists
+  (`conformance/cli-surface.md`, "P1").
+
+A NEWREF whose path under `refs/` runs through a ref file, or names a directory,
+and a positional revision of either shape, are refused before anything is
+written, in the words "Ref name validation" above records, which also states the
+directory shapes the tool's own write replaces.
+
+NEWREF is checked in three steps, and all three precede the resolution of the
+positional, so a NEWREF fault is reported over an unresolvable revision. The
+first step is the positional count. The second is the existence check, which
+resolves NEWREF as a revision in every case; `--force` suppresses the refusal a
+resolved NEWREF draws and leaves the resolution itself in place. That resolution
+takes the case rule "Revision syntax" above states, so a NEWREF of 64 lowercase
+hex characters is read as a checksum and reported as an existing ref, while an
+uppercase one is looked up as a ref name and written. That step reads
+a trailing `^` as ancestry, so `--create=NAME^` reports `error: --create
+specified but ref NAME^ already exists` where the base resolves to a commit
+holding a parent, and `error: Commit <checksum> has no parent` where the base is
+a root commit; `--create=NAME^ --force` reports that same `has no parent` line
+where the base is a root commit. The third step validates NEWREF as a ref name,
+by the rule "Ref name validation" above states, and refuses a `^` in it:
+`--create=NAME^ --force` reports `error: Invalid refspec NAME^` where the
+ancestry resolves, and `--create=a/../b --force nosuch` reports `error: Invalid
+refspec a/../b` rather than the unresolvable positional -- a name a traversal
+component makes invalid draws those same words from the second step, so which of
+the two answers it is not observable.
+A `^` inside the name carries the same message with and without `--force`, since
+the second step reads no ancestry there: `--create=a^b` reports `error: Invalid
+refspec a^b`. `-A` takes the same three steps in the same order and adds a fourth
+of its own, the remote refusal, which also precedes the resolution of the
+positional: `-A --create=origin:al nosuch` reports `error: Cannot create alias to
+remote ref: origin` and `-A --create=origin:rr/x --force test/main` reports it
+where the existence check `--force` suppressed would have named the ref, while
+`-A --create=origin:bad/ test/main` stops one step earlier with `error: Invalid
+refspec origin:bad/`. With `-c` the fourth step is absent, `-c` winning over `-A`,
+so `-c -A --create=<id>:<ref>` writes a collection ref in either flag order. A
+NEWREF holding a second `:` reaches the fourth step in the port and the third in
+the tool, the port's ref rule being the wider one, so `-A --create=a:b:c` reports
+`error: Cannot create alias to remote ref: a` from the port and `error: Invalid
+refspec a:b:c` from the tool; both exit 1 and write nothing
+(`conformance/cli-surface.md`, "P1"). The port refuses a
+NEWREF ending in `^` with that message; a `^` elsewhere in a ref name belongs to
+the character class the port does not validate
+(`conformance/cli-surface.md`, "P1").
+
+Under `-A` the target is checked in a fifth step, after the remote refusal: the
+existence check that reports `error: Cannot create alias to non-existent ref:
+<rev>`. That check stands ahead of ref-name validation, which is why the target is
+the one site a refused name draws no `Invalid refspec` line, and it is reached
+last, so a NEWREF fault is reported over a refused target:
+`-A --create=origin:al a/../b` names the remote and `-A --create=a/../b a/../b`
+names the NEWREF.
+
+With `-c`, `--create=NEWREF` writes a collection ref: NEWREF is a
+`<collection-id>:<ref>` pair and the write lands at
+`refs/mirrors/<collection-id>/<ref>`, with the parent directories created. `-c`
+wins over `-A` here as it does in a listing, so the two together write a ref
+file. The steps are the positional count, the existence check, the pair shape,
+the resolution of the positional, and the collection id, in that order, which
+puts the shape before the revision and the collection id after it:
+
+- a NEWREF holding no `:` names no ref, and the whole argument is read as the
+  collection id -- `--create=fresh` reports `error: Invalid collection ID
+  fresh`, and `--create=org.example.Foo`, whose text is a collection id,
+  reports `error: Invalid ref name (null)`;
+- a pair with an empty half, a second `:`, a `^` in either half, or a ref half
+  that fails ref-name validation reports `error: Invalid refspec <NEWREF>`,
+  before the positional resolves. The whole pair is the name the message
+  carries, so `--create=<id>:a/../b` names both halves;
+- a collection id is two or more `.`-separated elements, each starting with an
+  ASCII letter or `_` and continuing with ASCII letters, digits, or `_`. So
+  `a.b`, `A.b`, `_a.b`, `a._b`, `a_b.c`, and `a.b.c.d` are written, and
+  `fresh`, `a..b`, `a.b.`, `1a.b`, `a.1b`, `a-b.c`, and `a.b-c` report `error:
+  Invalid collection ID <id>`. The length is bounded by the filesystem alone,
+  the id being one path component;
+- the existence check reads NEWREF as an ordinary refspec, so `<id>:<ref>` is
+  looked up under `refs/remotes/<id>/<ref>` and a collection ref of the same
+  spelling does not count as existing. `--create=<id>:<ref>` therefore repeats
+  without `--force`, while a remote ref of that spelling reports `error:
+  --create specified but ref <NEWREF> already exists`.
+
+`--force` replaces an existing ref, including replacing a regular ref file with
+an alias symlink and the reverse.
+
+`--delete` removes every ref its prefixes match, prints nothing, and exits 0
+even when a prefix matches nothing. With `-c` the prefixes are collection ids
+and the whole collection's refs are removed. The parent directories a removal
+empties are left in place. With no prefix it reports `error: At least one PREFIX
+is required when deleting refs` and exits 1. A whole-remote prefix matching a ref
+is refused by both implementations and removes nothing, as "refs" above records.
+
+Under `-c`, the id equal to the repository's own `[core] collection-id` removes
+the refs under `refs/heads` alone and keeps the mirror refs carrying that id, so
+`refs -c --delete org.example.Coll` over a repository whose `collection-id` is
+`org.example.Coll` leaves `refs/mirrors/org.example.Coll/mm` in place. A foreign
+id removes the mirror refs of that id, and a repository with no `collection-id`
+owns no id, so every mirror ref a prefix names is removed. The `-c` listing
+prints both sets for either id, so the two ids share one selection and differ in
+the removal. An id equal to the own id where the local refs are absent removes
+nothing and exits 0, and a local ref carrying a mirror ref's name is removed
+while the mirror ref of that name stands.
+
+With `-A` the set each prefix removes is the set a `-A` listing prints for it:
+the ref the prefix names exactly, or the aliases nested under it. So against the
+refs `test/main` and `test/other` and the alias `test/al`, `refs -A --delete
+test` removes `test/al` and leaves both refs, where `refs --delete test` removes
+all three. A prefix naming a ref exactly removes that one ref for every kind of
+ref, the way the listing answers such a prefix: `refs -A --delete test/al`
+removes the alias, and `refs -A --delete other` and
+`refs -A --delete origin:rr/x` remove a plain ref and a remote ref, neither of
+which is an alias. A prefix holding no alias below itself removes nothing and
+exits 0, so `refs -A --delete deep` leaves `deep/nest/ing` in place. The prefix
+rules, the whole-remote refusal, and the alias guard all read whichever set the
+prefix selected, and each prefix reads the aliases as the prefixes ahead of it
+left them. With no prefix the message is the one the plain form gives. `-c` wins
+over `-A` here as it does in a listing, in either flag order.
+
+The tool removes each alias nested under a prefix by the name it prints for that
+alias, and for an alias under `refs/remotes` that name drops the remote, so
+`refs -A --delete origin:rr` removes no alias of `origin` and instead removes a
+local ref carrying that name where one exists: against the remote alias
+`refs/remotes/origin/zz/q` and the local ref `refs/heads/zz/q`, the tool removes
+the local ref and keeps the alias. The port removes the alias its own listing
+names (`conformance/cli-surface.md`, "P1"). A whole-remote prefix holding an
+alias is refused by both, the tool on the joined name (`error: Invalid refspec
+./rr/remal`) and the port on the prefix as given, and neither removes anything.
+
+An alias holds the ref it names in place. A prefix matching a ref under
+`refs/heads` that an alias names ends the invocation with `error: Ref '<refspec>'
+has an active alias: '<alias>'` and exit 1. In the port that prefix removes
+nothing, in the plain form and in the `-A` form alike. The tool removes the
+members of the selected set its own removal order reached ahead of the guarded
+one, so the two leave different refs trees wherever that order puts an unguarded
+member first (`conformance/cli-surface.md`, "P1"). A guarded member stands in
+both. The guard runs per prefix, so `refs --delete deep test` removes what `deep`
+matched and then reports the refusal for `test`. An alias names its target by the
+link body with the leading `../` components removed, read from the `refs/heads`
+root: an alias at `refs/heads/test/al2` whose body is `other` names the ref
+`other`, where the link itself resolves to `refs/heads/test/other`, so
+`refs --delete other` is refused and `refs --delete test/other` removes the ref.
+A matched ref that is an alias itself is guarded the same way, so
+`refs --delete test/al` is refused where `refs/heads/alal` links to `test/al`.
+Removing an alias that no alias names succeeds, and each prefix reads the aliases
+as the prefixes ahead of it left them, so `refs --delete alal test/al` removes
+both.
+
+Outside `refs/heads` the removal proceeds: a ref under `refs/remotes` is removed
+with an alias naming it, in the port's body form (`ral ->
+../remotes/origin/rr/x`) and in the tool's refspec form (`ral -> origin:rr/x`)
+alike, and an alias under `refs/remotes` or `refs/mirrors` names nothing for the
+guard. With `-c` the guard does not apply, so `refs -c --delete <collection-id>`
+removes the refs of that collection with the aliases among them. Where a prefix
+matches more than one guarded ref, or more than one alias names one matched ref,
+each implementation names the pair its own enumeration reaches first
+(`conformance/cli-surface.md`, "P1").
+
+Five tool behaviors here are not reproduced. A NEWREF ending in `^` whose base
+names no ref kills the tool with a signal before it writes anything (recovered
+with `--create='nosuch^'` against a repository holding no `nosuch`, with and
+without `--force`, and with and without `-A`, and with `-c` as
+`--create='<id>:<ref>^'`); the port reports `error: Invalid refspec <NEWREF>`,
+the words the tool gives that name at its third step, and writes nothing. A
+dangling alias -- a symlink under `refs/` whose target ref does not exist --
+makes the tool fail every invocation whose enumeration reaches it, with `error:
+Listing refs: openat(<path>): No such file or directory` and exit 1, where
+`<path>` is the link's path below `refs/heads` or below `refs/remotes/<remote>`:
+the default listing, `--list`, and `-r`; a `PREFIX` naming a directory that
+holds the link, in a listing and in a `--delete`, which then removes nothing;
+and `--create`, `--create --force`, and `-A --create`, each of which writes no
+ref. A link under `refs/mirrors` reaches the `-c` listing alone, leaving the
+default listing and `--create` unaffected, and `-c --create=<id>:<ref>`
+completes over a link under `refs/heads`. `-A` lists the dangling alias, and
+`-A` with a `PREFIX` naming it exactly prints nothing. `--delete` naming the
+link itself exits 0 and leaves the link in place. The port skips the dangling
+entry everywhere else: it lists the rest, writes every `--create` form, and
+removes what a prefix matched.
+
+A symlink under `refs/` that names a directory makes the tool report `error:
+Listing refs: Is a directory` and exit 1 from the default listing, `--list`,
+`-r`, `fsck`, `summary -u`, and `prune --refs-only`. The tool's prefix-scoped
+forms complete over the same link: a `PREFIX` naming the link enumerates the
+directory it points at, so `refs lnk` prints `nest/ing` where `refs/heads/lnk`
+links to `deep` and `deep/nest/ing` is a ref; a `--delete PREFIX` matching other
+refs removes them and exits 0; a `--delete` naming the link reports `error:
+Listing refs: opendir(lnk): Not a directory` and exits 1; and the default
+`prune`, which reads no ref, exits 0. The port reads every symlink under `refs/`
+as an alias and descends into a real directory alone, so reading the link fails
+with `EISDIR` wherever an enumeration reaches it: `error: i/o error: Is a
+directory (os error 21)` and exit 1 from every listing form, from `--delete`
+whatever the prefix matches, and from `fsck`, `prune`, and `summary -u`. `-A`
+lists the link on both sides, as `lnk -> deep`. A link naming its own directory
+(`refs/heads/selfdir -> .`) takes the same path on both sides. Such a link
+arrives by out-of-band mutation alone, since `refs -A --create` validates its
+target as a ref in both implementations.
+
+A collection directory under `refs/mirrors` whose
+name is not a valid collection
+id aborts the tool on a GLib assertion (`ostree_collection_ref_new: assertion
+'collection_id == NULL || ostree_validate_collection_id (collection_id, NULL)'
+failed`, killed by a signal), and a collection id given as a positional
+argument is validated (`error: Listing refs: Invalid collection ID <id>`, exit
+1); the port validates a collection id where `-c --create` writes one and lists
+what the path holds. On the missing ref name of `-c --create=<id>` the tool
+prints a GLib assertion line (`g_regex_match_full: assertion 'string != NULL'
+failed`) before its own `error: Invalid ref name (null)`; the port prints the
+error line alone.
+
+### `rev-parse`
+
+Prints the resolved 64-character commit checksum and a newline, one line per
+`REV` argument, in the order given. The first argument that does not resolve
+reports `error: Refspec '<rev>' not found` and exits 1, after the checksums
+before it were already printed. With no argument the command prints its usage
+text to standard error, then `error: REV must be specified`, and exits 1. A
+`REV` whose path under `refs/` runs through a ref file, or names a directory,
+is refused in the words "Ref name validation" above records.
+
+`-S`/`--single` takes no argument and prints the repository's one commit
+checksum. An empty repository reports `error: No commit objects found`, a
+repository holding more than one commit reports `error: Multiple commit objects
+found`, and an argument alongside `-S` reports the usage text and `error: Cannot
+specify arguments with --single`; each exits 1. The count is over the commit
+objects present in `objects/`, not over the refs.
+
+### `cat`
+
+Writes each named file's content to standard output in the order the paths were
+given, with nothing between them and nothing added. A leading `/` on a path is
+optional.
+
+Path resolution splits the path on `/` and looks up each component in the
+commit's tree literally: `.`, `..`, and an empty component each name nothing, so
+`cat REV /./a.txt` reports `error: No such file or directory: /.` and
+`cat REV //a.txt` reports `error: No such file or directory: /`. The reported
+path is absolute whether or not the argument was, and names the prefix that
+failed rather than the whole argument.
+
+An empty argument reaches no component and reports the commit root as absent:
+`cat REV ''` reports `error: No such file or directory: /`. The argument `/`
+reaches the root and gets the directory refusal instead.
+
+A symlink in the final position is followed, its target resolved against the
+link's own directory, or against the commit root when the target is absolute.
+The target's components are looked up literally too, so a target holding `..`
+fails: a symlink at `/sub/rel` pointing at `../a.txt` reports `error: No such
+file or directory: /sub/..`. A symlink in any other position is not followed:
+`cat REV /dlink/b.txt`, where `dlink` links to the directory `sub`, reports
+`error: Not a directory`. A chain of symlinks is followed to its end. The tool
+bounds the depth nowhere: a chain 20000 links deep resolves, and one 100000
+links deep kills it with a signal (exit 139). The port follows 256 links, above
+the depth any real tree holds, and refuses a chain deeper than that.
+
+The errors, each exit 1: a path naming a directory, or the commit root, reports
+`error: Can't open directory`; a missing path reports `error: No such file or
+directory: <absolute path>`; a non-final component that is a file reports
+`error: Not a directory`; an unresolvable `COMMIT` reports `error: Refspec
+'<rev>' not found`; a `COMMIT` that resolves to a commit the store does not hold
+is refused in each implementation's own words, `error: No such metadata object
+<checksum>.commit` from the tool and `error: object not found: Commit
+<checksum>` from the port, in the words "Revision syntax" above records; a
+`COMMIT` whose path under `refs/` runs through a ref file,
+or names a directory, is refused before the tree is read, in the words "Ref name
+validation" above records; a missing `COMMIT` or an empty path list prints the
+usage text and `error: A COMMIT and at least one PATH argument are required`. A
+self-referencing symlink kills the tool with a signal (recovered with a link
+whose target is its own name); the port reaches its 256-link bound and reports
+`error: Too many levels of symbolic links`, which is also the message a chain of
+257 distinct links gets.

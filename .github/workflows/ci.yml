@@ -32,3 +32,9 @@ jobs:
         run: cargo test --workspace --all-features
         env:
           OSTRYA_REQUIRE_MULTIGROUP: "1"
+
+      # A record carrying `evidence:` cites a library test by name, so a rename
+      # would void its cells with no signal. This resolves every citation
+      # against `cargo test -- --list`, which the step above already built.
+      - name: Conformance evidence check
+        run: cargo run -p ostrya-conformance -- check --verify-evidence

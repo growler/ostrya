@@ -40,6 +40,21 @@ impl Checksum {
         &self.0
     }
 
+    /// Parse 64 hex chars in the lowercase rendering [`to_hex`](Checksum::to_hex)
+    /// emits, refusing an uppercase character.
+    ///
+    /// This is the rule a revision is read by: a 64-character name is a
+    /// checksum in lowercase hex alone, and an uppercase or mixed-case name of
+    /// that length is a ref name (`docs/format-reference.md`, "Revision
+    /// syntax"). The lenient [`from_hex`](Checksum::from_hex) stays where a
+    /// checksum arrives as stored bytes rather than as a name.
+    pub fn from_hex_lower(s: &str) -> Result<Checksum> {
+        if s.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(Error::InvalidChecksum("hex checksum is not lowercase"));
+        }
+        Checksum::from_hex(s)
+    }
+
     /// Parse 64 hex chars. Accepts either case; emits lowercase.
     pub fn from_hex(s: &str) -> Result<Checksum> {
         let bytes = s.as_bytes();
@@ -252,6 +267,17 @@ mod tests {
     fn hex_rejects_bad_length_and_characters() {
         assert!(Checksum::from_hex("abcd").is_err());
         assert!(Checksum::from_hex(&"g".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn lowercase_hex_refuses_an_uppercase_character() {
+        let c = Checksum::from_hex_lower(FIXTURE_COMMIT).unwrap();
+        assert_eq!(c.to_hex(), FIXTURE_COMMIT);
+        assert!(Checksum::from_hex_lower(&FIXTURE_COMMIT.to_uppercase()).is_err());
+        // One uppercase character is enough, and the length rule still holds.
+        let mixed = format!("B{}", &FIXTURE_COMMIT[1..]);
+        assert!(Checksum::from_hex_lower(&mixed).is_err());
+        assert!(Checksum::from_hex_lower("abcd").is_err());
     }
 
     #[test]

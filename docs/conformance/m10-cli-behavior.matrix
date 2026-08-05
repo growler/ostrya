@@ -11,9 +11,26 @@
 # control the working directory and the environment of the invocation, which a
 # `run:` line does not state; each names a probe.
 #
-# This file carries Phase 17a's own cases: `init` and the global `--repo`
-# conventions (`../port-plan.md`, "Phase 17a"). Later sub-phases add records
-# here as their own subcommands and options land.
+# This file carries Phase 17a's cases -- `init` and the global `--repo`
+# conventions -- and Phase 17b's -- `refs`, `rev-parse`, and `cat`
+# (`../port-plan.md`). Later sub-phases add records here as their own
+# subcommands and options land.
+#
+# The `repo-with-commit` setup binds one branch, `conformance`, holding one
+# commit of corpus `C0`, so a cell needing a second ref, a nested ref name, an
+# alias, a collection id, or a parent commit cannot state itself with a `run:`
+# line against it. Those cells cite `evidence:` instead, naming the
+# `crates/ostrya-cli/tests/cli.rs` test that compares the port against the tool
+# over a repository built for the case. Growing the setup vocabulary would let
+# them become `run:` cells; that is a harness change, not a Phase 17b one.
+#
+# No Phase 17b cell names the `checksum-agreement` oracle. Each side's setup
+# commits with its own binary and neither passes a timestamp, so the two commit
+# checksums differ by wall-clock time until `commit --timestamp` lands in Phase
+# 17c. A cell that states a checksum instead names `stdout-text`, whose
+# normalizer turns the bound `$REV` into the placeholder, so
+# `rev-parse conformance` printing `$REV` on both sides states that each
+# implementation resolved the branch to the commit its own setup made.
 
 # ---------------------------------------------------------------------------
 # init -- mode acceptance.
@@ -225,3 +242,1467 @@ note: the cell runs in its own scratch root, which is not a repository, with
  The port's usage text is clap's own rendering and the tool's is GOption's, so
  the shared claim is the shape -- usage, then the error line, then exit 1 --
  which is why `stderr-text` is not an oracle here.
+
+# ---------------------------------------------------------------------------
+# refs -- listing.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: refs
+cell: refs/list
+setup: repo-with-commit
+run: refs --repo=$REPO
+expect-exit: 0
+expect-stdout: equals "$BRANCH"
+ref-expect-stdout: equals "$BRANCH"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: the default listing prints one refspec per line, with no prefix given and
+ nothing stripped. The setup binds one branch, so the whole listing is that one
+ name, which both implementations print alone.
+
+family: M10
+subcommand: refs
+cell: refs/list-revision
+setup: repo-with-commit
+run: refs --repo=$REPO -r
+expect-exit: 0
+expect-stdout: contains "$BRANCH"
+ref-expect-stdout: contains "$BRANCH"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: `-r` appends a tab and the commit checksum. The `stdout-text` oracle
+ carries the exact comparison, the normalizer having turned each side's own
+ commit checksum into `$REV`, so the cell states both the separator and the
+ value each side resolved. The `contains` claims state the name alone, a tab
+ being awkward to write in a record. Each claim reads `$BRANCH`, which is what
+ the ref name normalizes to, the branch name being a bound placeholder value.
+
+family: M10
+subcommand: refs
+cell: refs/prefix-exact-match
+setup: repo-with-commit
+run: refs --repo=$REPO $BRANCH
+expect-exit: 0
+expect-stdout: equals "$BRANCH"
+ref-expect-stdout: equals "$BRANCH"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: a PREFIX equal to the ref prints the whole refspec and strips nothing,
+ which is the boundary case of the stripping rule. A prefix the ref is nested
+ under, and `--list` suppressing the stripping, need a nested ref name the
+ setup does not bind; `refs/nested-prefix-stripping` below cites those.
+
+family: M10
+subcommand: refs
+cell: refs/prefix-no-match
+setup: repo-with-commit
+run: refs --repo=$REPO nosuch
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: a prefix matching nothing is not an error in either implementation.
+
+family: M10
+subcommand: refs
+cell: refs/prefix-invalid
+setup: repo-with-commit
+run: refs --repo=$REPO test/
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid refspec test/"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Listing refs: Invalid refspec test/"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: a PREFIX no ref name can hold is refused before it matches anything, so a
+ trailing `/` ends the listing rather than selecting the empty set. Both refuse
+ it and exit 1, in different words: the tool prefixes the line with `Listing
+ refs: ` and the port reports the refspec rule's one message, so `stderr-text`
+ is not an oracle here (`cli-surface.md`, "P1"). The remaining refused forms and
+ the ordering the check keeps are `refs/prefix-invalid-forms` below.
+
+family: M10
+subcommand: refs
+cell: refs/prefix-invalid-forms
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::refs_refuses_an_invalid_prefix
+spec: format-reference.md#refs
+note: the prefix-validation cases a setup binding one flat branch does not bind:
+ the refused forms `/test`, `a//b`, `.`, `..`, `test/../main`, an empty
+ argument, `:`, `:rr`, `origin:rr/`, `origin:..`, and a remote half holding a
+ `/`, each in the default listing, `--list`, `-r`, `-A`, and `--delete`; and the
+ check running where each prefix is taken, so a valid prefix ahead of a refused
+ one keeps the rows it printed and the refs it deleted. Needs the nested ref
+ name, the alias, and the two remote refs the cited test builds. The two
+ whole-remote forms this check accepts are `refs/prefix-whole-remote` below.
+
+family: M10
+subcommand: refs
+cell: refs/prefix-through-a-ref-file
+setup: repo-with-commit
+run: refs --repo=$REPO $BRANCH/x
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: i/o error: Not a directory (os error 20)"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Listing refs: fstatat(refs/heads/$BRANCH/x): Not a directory"
+oracle: exit-status stdout-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: a PREFIX whose path under `refs/` runs through a ref file is refused before
+ it matches anything, so `$BRANCH/x` over the ref `$BRANCH` ends the listing
+ rather than selecting the empty set. Both refuse it and exit 1, in different
+ words: the tool names the path and the syscall and the port reports the one
+ message it gives that condition, so `stderr-text` is not an oracle here
+ (`cli-surface.md`, "P1"). `refs-bytes` states that neither side touched a ref.
+ The remaining forms and paths are `refs/prefix-through-a-ref-file-forms` below.
+
+family: M10
+subcommand: refs
+cell: refs/prefix-through-a-ref-file-forms
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::refs_refuses_a_prefix_through_a_ref_file
+spec: format-reference.md#refs
+note: the paths a setup binding one flat branch does not bind: a prefix reaching
+ a ref file through an alias symlink and one reaching a ref file under
+ `refs/remotes/<remote>`, each in the default listing, `--list`, `-r`, `-A`, and
+ `--delete`; and the ordering the check keeps under `--delete`, where the refs a
+ valid prefix ahead of the refused one removed stand and the prefix behind it
+ never runs, so both leave the same refs tree. Needs the nested ref name, the
+ alias, and the two remote refs the cited test builds.
+
+family: M10
+subcommand: refs
+cell: refs/prefix-whole-remote
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::refs_whole_remote_prefix_matches_the_tool
+spec: format-reference.md#refs
+note: a whole-remote PREFIX -- `<remote>:` or `<remote>:.` -- selects every ref
+ of the remote it names, and one matching no ref exits 0. The default listing and
+ `-r` agree verbatim over the selected refs, compared form by form in
+ `refs_listing_matches_the_tool`, which `refs/nested-prefix-stripping` below
+ cites for the stripping a non-empty ref half carries. `--list` and `-A` select
+ the same refs and name them differently:
+ the tool joins the prefix's ref half with the name below it, keeping the `.` of
+ that join, so `stdout-text` is not an oracle for those two forms
+ (`cli-surface.md`, "P1"). Needs the two remote refs and the remote alias the
+ cited test builds.
+
+family: M10
+subcommand: refs
+cell: refs/alias-listing-empty
+setup: repo-with-commit
+run: refs --repo=$REPO -A
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: `-A` lists the aliases alone, so a repository holding none prints
+ nothing. The alias round trip -- creating one and listing it -- is
+ `refs/alias-round-trip` below.
+
+family: M10
+subcommand: refs
+cell: refs/collections-none
+setup: repo-with-commit
+run: refs --repo=$REPO -c
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: the setup creates the repository with no `collection-id` and writes no
+ mirror ref, so neither source of a collection ref is present and both
+ implementations print nothing. That a local ref is listed once the repository
+ carries a `collection-id` is `refs/collections-listing` below.
+
+family: M10
+subcommand: refs
+cell: refs/nested-prefix-stripping
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::refs_listing_matches_the_tool
+spec: format-reference.md#refs
+note: the nested-name cases a `run:` line cannot reach against a setup binding
+ one flat branch: a PREFIX the ref is nested under printing the name below it,
+ `--list` suppressing that, more than one PREFIX grouping the output in
+ argument order, a remote ref printed as `remote:name` and keeping its
+ `remote:` part when stripped, and the sort order over the whole set. The cited
+ test builds the repository the cases need and compares the port's output to
+ the tool's for each form.
+
+family: M10
+subcommand: refs
+cell: refs/alias-round-trip
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::refs_alias_matches_the_tool
+spec: format-reference.md#refs
+note: `-A --create` writing a relative symlink, `-A` listing it as
+ `name -> target` with the leading `../` removed -- or as the target ref's
+ refspec, where the link leaves the alias's own ref root -- a PREFIX naming a ref
+ exactly printing that ref with its commit checksum in the target position, the
+ default listing resolving the alias, and `-A --create` refusing a target that
+ names a commit rather than a ref. An interleaved create-then-list sequence,
+ which one `run:` line does not state. Also the step the remote-NEWREF refusal
+ `refs/create-alias-remote-newref` below states occupies: it is reported over an
+ unresolvable positional and over an existence check `--force` suppressed, and a
+ NEWREF the ref rule refuses stops one step earlier, which needs the remote ref
+ and the second branch the setup does not bind. The cited test also records two
+ divergences (`cli-surface.md`, "P1"): the tool names an alias under
+ `refs/remotes/<remote>/` by its path below the remote and the port names it by
+ its `remote:name` refspec; and `-A --create` naming a target under
+ `refs/remotes` makes the tool write a link body naming no file under
+ `refs/heads`, where the port writes the path to the target ref's file.
+
+family: M10
+subcommand: refs
+cell: refs/collections-listing
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::refs_collections_match_the_tool
+spec: format-reference.md#refs
+note: `-c` listing `(collection-id, ref)` pairs over a repository carrying a
+ `collection-id` and a mirror ref, `-c -r` appending the checksum, a positional
+ read as a collection id, `-c` winning over `-A`, and `-c --delete` removing a
+ whole collection. The setup binds no `collection-id`, so the cited test builds
+ the repository.
+
+# ---------------------------------------------------------------------------
+# refs -- creating and deleting.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: refs
+cell: refs/create
+setup: repo-with-commit
+run: refs --repo=$REPO --create=fresh $BRANCH
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: `refs-bytes` states that both implementations left the same set of ref
+ files, each holding the checksum its own side committed.
+
+family: M10
+subcommand: refs
+cell: refs/create-nested-newref
+setup: repo-with-commit
+run: refs --repo=$REPO --create=a/b/c $BRANCH
+expect-exit: 0
+oracle: exit-status refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: a NEWREF holding `/` has its parent directories created by both.
+
+family: M10
+subcommand: refs
+cell: refs/create-remote-newref
+setup: repo-with-commit
+run: refs --repo=$REPO --create=origin:fresh $BRANCH
+expect-exit: 0
+oracle: exit-status refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: a `remote:name` NEWREF is written under `refs/remotes/<remote>/`, which
+ `refs-bytes` reads as a path rather than as a name.
+
+family: M10
+subcommand: refs
+cell: refs/create-alias-remote-newref
+setup: repo-with-commit
+run: refs --repo=$REPO -A --create=origin:al $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: Cannot create alias to remote ref: origin"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Cannot create alias to remote ref: origin"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: an alias lives under `refs/heads`, so the `remote:name` NEWREF the cell
+ above writes as a ref is refused under `-A` by both, in the same words, which
+ name the remote half alone. The setup binds no remote and the message carries
+ the name as given, so the refusal needs none. `refs-bytes` states that neither
+ wrote a link. The remaining cases of the step -- the message naming the remote
+ half of a nested name, the two steps ahead of it, and the positional it
+ precedes -- are in `refs/alias-round-trip` above.
+
+family: M10
+subcommand: refs
+cell: refs/create-alias-refused-target
+setup: repo-with-commit
+run: refs --repo=$REPO -A --create=al a/../b
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Cannot create alias to non-existent ref: a/../b"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Cannot create alias to non-existent ref: a/../b"
+oracle: exit-status stdout-text stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: the target of `-A --create` is answered by an existence check that stands
+ ahead of ref-name validation, so a name the ref rule refuses is reported as a
+ name no ref holds and no `Invalid refspec` line reaches this site. The name is
+ read as given and names no ref in any repository, so the setup binds everything
+ the invocation reads. `refs-bytes` states that neither wrote a link. The other
+ refused shapes, and the target the tool's own character class refuses, are in
+ `refs/invalid-refspec-forms` below.
+
+family: M10
+subcommand: refs
+cell: refs/create-alias-target-through-a-ref-file
+setup: repo-with-commit
+run: refs --repo=$REPO -A --create=al $BRANCH/x
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: i/o error: Not a directory (os error 20)"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Cannot create alias to non-existent ref: $BRANCH/x"
+oracle: exit-status stdout-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: a target whose path under `refs/` runs through a ref file is refused by
+ both and in different words: the tool's existence check reports the target as a
+ name no ref holds, where every other site names the path and the syscall, and
+ the port reports the one message it gives that condition, so `stderr-text` is
+ not an oracle here (`cli-surface.md`, "P1"). A target naming a directory takes
+ the same split and needs a ref directory the setup does not bind, so it sits in
+ `refs/invalid-refspec-forms` below. `refs-bytes` states that neither wrote a
+ link.
+
+family: M10
+subcommand: refs
+cell: refs/create-collection
+setup: repo-with-commit
+run: refs --repo=$REPO -c --create=org.example.Fresh:new $BRANCH
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: with `-c` the NEWREF is a `<collection-id>:<ref>` pair and the write lands
+ under `refs/mirrors/<collection-id>/`, which `refs-bytes` reads as a path.
+
+family: M10
+subcommand: refs
+cell: refs/create-collection-invalid-id
+setup: repo-with-commit
+run: refs --repo=$REPO -c --create=fresh $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: Invalid collection ID fresh"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid collection ID fresh"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: a NEWREF holding no `:` is read as the collection id alone, and `fresh` is
+ one element where a collection id takes two or more. `refs-bytes` states that
+ neither side wrote a ref of that name.
+
+family: M10
+subcommand: refs
+cell: refs/create-collection-bad-pair
+setup: repo-with-commit
+run: refs --repo=$REPO -c --create=org.example.Fresh:a:b $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: Invalid refspec org.example.Fresh:a:b"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid refspec org.example.Fresh:a:b"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: the pair holds one `:`, so a second one is refused, and the refusal
+ precedes the resolution of the positional.
+
+family: M10
+subcommand: refs
+cell: refs/create-collection-no-ref-name
+setup: repo-with-commit
+run: refs --repo=$REPO -c --create=org.example.Fresh $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: Invalid ref name (null)"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid ref name (null)"
+oracle: exit-status refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: the NEWREF is a collection id and names no ref, and both refuse it in the
+ same words. `stderr-text` is left out because the tool prints a GLib assertion
+ line ahead of its own message and the port prints the message alone
+ (`cli-surface.md`, "P1"), so the two texts compare only as the substring both
+ `expect-stderr` fields state.
+
+family: M10
+subcommand: refs
+cell: refs/create-collection-ancestry-suffix
+setup: repo-with-commit
+run: refs --repo=$REPO -c --create='org.example.Fresh:new^' $BRANCH
+ref-run: n-a
+expect-exit: 1
+expect-stderr: contains "error: Invalid refspec org.example.Fresh:new^"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-clean
+severity: interop
+spec: format-reference.md#refs
+note: a `^` in either half of the pair is refused, and the port leaves `refs/`
+ untouched, which `refs-bytes` records for the port alone. `ref-run: n-a`
+ states that the tool has no comparable invocation: the ref half ends in `^`
+ and its base names no ref, so the tool dies on a signal the way it does
+ without `-c` (`cli-surface.md`, "P1"). `refs/create-collection-forms` below
+ cites the test that pins the crash.
+
+family: M10
+subcommand: refs
+cell: refs/create-collection-forms
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::refs_create_collection_matches_the_tool
+spec: format-reference.md#refs
+note: the `-c --create` cases the setup's single branch does not bind: a ref
+ name holding `/`, `-c` winning over `-A` so the write is a ref file and not a
+ symlink, `--force` retargeting a collection ref at a second commit, and the
+ step order the refusals follow, which needs a NEWREF the existence check
+ resolves. The cited test builds a repository holding four branches and two
+ remote refs, compares the port to the tool invocation by invocation, and pins
+ both divergences the cells above state.
+
+family: M10
+subcommand: refs
+cell: refs/create-existing-ref
+setup: repo-with-commit
+run: refs --repo=$REPO --create=$BRANCH $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: --create specified but ref conformance already exists"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: --create specified but ref conformance already exists"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: both refuse without `--force`, in the same words, and `refs-bytes` states
+ that neither wrote anything.
+
+family: M10
+subcommand: refs
+cell: refs/create-checksum-newref
+setup: repo-with-commit
+run: refs --repo=$REPO --create=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: --create specified but ref aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa already exists"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: --create specified but ref aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa already exists"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: the existence check resolves NEWREF, and 64 lowercase hex characters are a
+ checksum, which resolves to itself whether or not the store holds that commit.
+ Both therefore report the name as an existing ref, in the same words, and
+ `refs-bytes` states that neither wrote a ref file.
+
+family: M10
+subcommand: refs
+cell: refs/create-checksum-newref-upper-case
+setup: repo-with-commit
+run: refs --repo=$REPO --create=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA $BRANCH
+expect-exit: 0
+expect-stdout: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: the same name in uppercase is a ref name to that check, so it is free and
+ both implementations write `refs/heads/<NEWREF>` holding the branch's commit.
+ `refs-bytes` states the two trees agree on the path and the content.
+
+family: M10
+subcommand: refs
+cell: refs/create-existing-ref-forced
+setup: repo-with-commit
+run: refs --repo=$REPO --create=$BRANCH --force $BRANCH
+expect-exit: 0
+oracle: exit-status refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: `--force` replaces the existing ref, and the replacement holds the same
+ checksum it did, so `refs-bytes` states the write succeeded and stayed
+ consistent.
+
+family: M10
+subcommand: refs
+cell: refs/create-no-revision
+setup: repo-with-commit
+run: refs --repo=$REPO --create=fresh
+expect-exit: 1
+expect-stderr: contains "error: You must specify a revision when creating a new ref"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: You must specify a revision when creating a new ref"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+
+family: M10
+subcommand: refs
+cell: refs/create-two-revisions
+setup: repo-with-commit
+run: refs --repo=$REPO --create=fresh $BRANCH $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: You must specify only 1 existing ref when creating a new ref"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: You must specify only 1 existing ref when creating a new ref"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: the same PREFIX twice is two arguments, which is what the count rejects.
+
+family: M10
+subcommand: refs
+cell: refs/create-unresolvable-revision
+setup: repo-with-commit
+run: refs --repo=$REPO --create=fresh nosuch
+expect-exit: 1
+expect-stderr: contains "error: Refspec 'nosuch' not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Refspec 'nosuch' not found"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#revision-syntax
+
+family: M10
+subcommand: refs
+cell: refs/create-ancestry-suffix
+setup: repo-with-commit
+run: refs --repo=$REPO --create='nosuch^' $BRANCH
+ref-run: n-a
+expect-exit: 1
+expect-stderr: contains "error: Invalid refspec nosuch^"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-clean
+severity: interop
+spec: format-reference.md#refs
+note: a ref name holds no ancestry suffix, so the port refuses a NEWREF ending
+ in `^` and leaves `refs/` untouched, which `refs-bytes` records for the port
+ alone. `ref-run: n-a` states that the tool has no comparable invocation here:
+ the base `nosuch` names no ref, and the tool dies on a signal before it writes
+ anything, which the harness counts as a failure for any side it runs
+ (`cli-surface.md`, "P1"). The cases where the tool words a refusal itself need
+ a parent chain; `refs/create-ancestry-suffix-resolvable` below cites them.
+
+family: M10
+subcommand: refs
+cell: refs/create-ancestry-suffix-resolvable
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::refs_create_ancestry_suffix_matches_the_tool
+spec: format-reference.md#refs
+note: the four refusals both implementations word identically for a NEWREF
+ ending in `^` whose base resolves: `--create specified but ref NAME^ already
+ exists` where the base holds a parent, `Commit <checksum> has no parent` where
+ the base is a root commit, `Invalid refspec NAME^` under `--force` where the
+ ancestry resolves, and that same `has no parent` line under `--force` where the
+ base is a root commit, since the existence check resolves NEWREF whatever
+ `--force` says. Needs a branch whose tip holds a parent and a
+ second branch holding one root commit, which the setup's single commit does not
+ bind. The cited test also covers `-A` taking the same steps, and pins the
+ tool's crash on the base the cell above states.
+
+family: M10
+subcommand: refs
+cell: refs/create-invalid-refspec
+setup: repo-with-commit
+run: refs --repo=$REPO --create=a/../b $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: Invalid refspec a/../b"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid refspec a/../b"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ref-name-validation
+note: a NEWREF holding a traversal component would leave the `refs/` tree, and
+ both implementations refuse it in the same words, naming the refspec as it was
+ given. `refs-bytes` states that neither wrote a ref.
+
+family: M10
+subcommand: refs
+cell: refs/create-invalid-refspec-forced
+setup: repo-with-commit
+run: refs --repo=$REPO --create=a/../b --force nosuch
+expect-exit: 1
+expect-stderr: contains "error: Invalid refspec a/../b"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid refspec a/../b"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: under `--force` the name is still refused before the positional resolves.
+ The unresolvable `nosuch` states the order: the name is reported and `Refspec
+ 'nosuch' not found` is not.
+
+family: M10
+subcommand: refs
+cell: refs/create-empty-refspec
+setup: repo-with-commit
+run: refs --repo=$REPO --create= $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: Invalid refspec "
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: --create specified but ref  already exists"
+oracle: exit-status refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ref-name-validation
+note: an empty NEWREF is refused by both and written by neither, in different
+ words. The empty refspec is a search of the ref store in the tool, and this
+ setup binds exactly one ref, so the search finds it and the existence check
+ reports it as already present; the port refuses the empty name itself.
+ `stderr-text` is therefore not an oracle here (`cli-surface.md`, "P1").
+
+family: M10
+subcommand: refs
+cell: refs/create-collection-invalid-refspec
+setup: repo-with-commit
+run: refs --repo=$REPO -c --create=org.example.Fresh:a/../b $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: Invalid refspec org.example.Fresh:a/../b"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid refspec org.example.Fresh:a/../b"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: under `-c` the whole `<collection-id>:<ref>` pair is the name the message
+ carries, and a ref half that fails ref-name validation is refused at the same
+ step an empty half is.
+
+family: M10
+subcommand: refs
+cell: refs/invalid-refspec-forms
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::invalid_refspec_matches_the_tool
+spec: format-reference.md#ref-name-validation
+note: the refused-name cases the single-branch setup does not bind: every shape
+ an alias target takes, which both report as `Cannot create alias to non-existent
+ ref: <target>` -- the existence check standing ahead of the name rule there --
+ with the tool answering a target naming a directory the same way where the port
+ reports its `Is a directory` line, and a target the tool's own character class
+ refuses parting the two over a ref `ostrya commit -b` wrote; and a remote half
+ holding a `/`, which is one
+ component in both. The cited test also pins the two divergences
+ `cli-surface.md`, "P1" records -- the empty refspec as a search of a ref store
+ holding several refs, and what a ref name that names a directory draws: the
+ tool's three refusals, and its `--create` scan for a ref below the name, which
+ runs under `refs/heads` alone and leaves the write to replace an empty directory
+ and any directory under `refs/remotes`, where the port refuses both -- against a
+ repository holding four branches, a nested ref directory, and two remote refs.
+
+family: M10
+subcommand: refs
+cell: refs/delete
+setup: repo-with-commit
+run: refs --repo=$REPO --delete $BRANCH
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: a delete prints nothing, and `refs-bytes` states that both left the same
+ refs tree behind -- including the directories the removal emptied, which
+ neither implementation removes.
+
+family: M10
+subcommand: refs
+cell: refs/delete-no-match
+setup: repo-with-commit
+run: refs --repo=$REPO --delete nosuch
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: a prefix matching nothing exits 0 and leaves every ref in place.
+
+family: M10
+subcommand: refs
+cell: refs/delete-invalid-prefix
+setup: repo-with-commit
+run: refs --repo=$REPO --delete test/
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid refspec test/"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Listing refs: Invalid refspec test/"
+oracle: exit-status stdout-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: a delete validates its PREFIX the way a listing does, and `refs-bytes`
+ states that neither implementation removed anything. The two words differ by
+ the tool's `Listing refs: ` prefix, so `stderr-text` is not an oracle
+ (`cli-surface.md`, "P1"). That the refs an earlier valid prefix removed stand
+ when a later one is refused is `refs/prefix-invalid-forms` above.
+
+family: M10
+subcommand: refs
+cell: refs/delete-whole-remote
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::refs_whole_remote_prefix_matches_the_tool
+spec: format-reference.md#refs
+note: a whole-remote PREFIX matching a ref ends a delete with exit 1 and removes
+ nothing in both implementations, and the prefixes ahead of it keep their effect.
+ The tool refuses the refspec it built by joining the prefix's ref half with a
+ matched ref's name, and the port names the prefix as given, so `stderr-text` is
+ not an oracle (`cli-surface.md`, "P1"). One matching no ref exits 0 and removes
+ nothing. Needs the two remote refs the cited test builds.
+
+family: M10
+subcommand: refs
+cell: refs/delete-active-alias
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::refs_delete_alias_guard_matches_the_tool
+spec: format-reference.md#refs
+note: a prefix matching a ref under `refs/heads` that an alias names ends a
+ delete with exit 1 in both implementations, while the prefixes ahead of it keep
+ their effect. The port removes none of what that prefix matched, and the tool
+ removes the members of the selected set its own removal order reached ahead of
+ the guarded one, which the cited test pins over one guarded member among sixteen
+ in the plain form and in the `-A` form. The cited test also
+ compares the cases the guard leaves alone: the ref an alias's link resolves to
+ where its body names another, a remote ref an alias names in either body form,
+ an alias no alias names, an alias the prefix ahead of it freed, and `-c`, which
+ removes a collection's refs with the aliases among them. Where one prefix
+ matches more than one guarded ref the two name different pairs, so
+ `stderr-text` is not an oracle there, and neither is the refs tree
+ (`cli-surface.md`, "P1"). The setup binds
+ no alias, no nested ref name, and no collection id, so the cited test builds
+ the repositories.
+
+family: M10
+subcommand: refs
+cell: refs/delete-aliases
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::refs_delete_aliases_matches_the_tool
+spec: format-reference.md#refs
+note: `-A --delete` removes, for each prefix, the set a `-A` listing prints for
+ it -- the ref the prefix names exactly, or the aliases nested under it -- where
+ the plain form removes every ref the prefix matches. The cited test compares the
+ two selections over one prefix, the exact-match forms over an alias, a plain ref,
+ a remote ref, and a remote alias, a prefix holding no alias, the per-prefix and
+ live-set order, the guard over the selected set, the shared no-prefix message,
+ the whole-remote refusal, and `-c` winning over `-A` in either flag order. It
+ also pins the divergence `cli-surface.md`, "P1" records: the tool removes each
+ nested alias by the name it prints for it, so a prefix under `refs/remotes`
+ removes no alias of that remote and removes a local ref carrying the name
+ instead. The setup binds no alias and no collection id, so the cited test builds
+ the repositories.
+
+family: M10
+subcommand: refs
+cell: refs/delete-collection-own-id
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::refs_delete_collection_own_id_matches_the_tool
+spec: format-reference.md#refs
+note: `-c --delete` of the id equal to the repository's own `collection-id`
+ removes the refs under `refs/heads`, the aliases among them, and keeps the mirror
+ refs carrying that id, where a foreign id removes the mirror refs it names. The
+ cited test compares the own id, the foreign id, both together, the own id twice,
+ and an id no ref carries, over a repository holding both sources of a collection
+ ref under its own id; it also compares the `-c` listing that reads them, which
+ prints the same rows on both sides, and the three narrower repositories -- the
+ own id with no local ref, a local ref carrying a mirror ref's name, and no
+ `collection-id` at all. The setup binds no collection id and writes no mirror
+ ref, so the cited test builds the repositories.
+
+family: M10
+subcommand: refs
+cell: refs/delete-no-prefix
+setup: repo-with-commit
+run: refs --repo=$REPO --delete
+expect-exit: 1
+expect-stderr: contains "error: At least one PREFIX is required when deleting refs"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: At least one PREFIX is required when deleting refs"
+oracle: exit-status stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#refs
+note: a delete with no prefix would name every ref, and both refuse it rather
+ than emptying the repository.
+
+family: M10
+subcommand: refs
+cell: refs/create-wins-over-delete
+setup: repo-with-commit
+run: refs --repo=$REPO --delete --create=both $BRANCH
+expect-exit: 0
+oracle: exit-status refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#refs
+note: given both, each implementation creates and deletes nothing, so the
+ branch the PREFIX names survives alongside the new ref. `refs-bytes` states
+ that outcome rather than the precedence directly, which is the observable a
+ single invocation leaves.
+
+# ---------------------------------------------------------------------------
+# rev-parse.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/refspec
+setup: repo-with-commit
+run: rev-parse --repo=$REPO $BRANCH
+expect-exit: 0
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#rev-parse
+note: the normalizer turns each side's own commit checksum into `$REV`, so
+ equal `stdout-text` states that both implementations resolved the branch to
+ the commit their own setup committed, and printed it as the sole line.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/checksum
+setup: repo-with-commit
+run: rev-parse --repo=$REPO $REV
+expect-exit: 0
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#revision-syntax
+note: a bare 64-character checksum resolves to itself in both.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/checksum-upper-case
+setup: repo-with-commit
+run: rev-parse --repo=$REPO AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Refspec 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' not found"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Refspec 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' not found"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#revision-syntax
+note: a 64-character name is a checksum in lowercase hex alone, so an uppercase
+ one is a ref name and no ref carries it. Both report the line they give a name
+ that resolves to nothing, in the same words, where the cell above resolves the
+ lowercase form. The name needs no commit behind it, so the setup binds
+ everything the invocation reads.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/checksum-case-forms
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checksum_case_matches_the_tool
+spec: format-reference.md#revision-syntax
+note: the rest of the case rule, which needs the repository's own commit
+ checksum raised and a ref written under it, neither of which the setup binds.
+ The cited test compares the uppercase and mixed-case forms of a resolvable
+ checksum at `rev-parse`, `cat`, `checkout`, and a `^` suffix; the ref an
+ uppercase NEWREF writes and the revision, the alias, and the delete guard that
+ read it; and the ref file content case, where the tool refuses a non-lowercase
+ rendering and the port resolves it (`cli-surface.md`, "P1").
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/several-revisions
+setup: repo-with-commit
+run: rev-parse --repo=$REPO $BRANCH $REV
+expect-exit: 0
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#rev-parse
+note: more than one REV prints one line each, in the order given; here the two
+ forms name the same commit, so both implementations print the same line twice.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/unresolvable
+setup: repo-with-commit
+run: rev-parse --repo=$REPO nosuch
+expect-exit: 1
+expect-stderr: contains "error: Refspec 'nosuch' not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Refspec 'nosuch' not found"
+oracle: exit-status stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#revision-syntax
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/no-revision
+setup: repo-with-commit
+run: rev-parse --repo=$REPO
+expect-exit: 1
+expect-stderr: contains "error: REV must be specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: REV must be specified"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#rev-parse
+note: each prints the subcommand's usage text before the error line, so
+ `stderr-text` is not an oracle here, for the reason
+ `prune/no-repo-resolvable` states.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/single
+setup: repo-with-commit
+run: rev-parse --repo=$REPO -S
+expect-exit: 0
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#rev-parse
+note: the setup commits once, so the repository holds exactly one commit object
+ and `-S` prints it. Equal `stdout-text` states that both found the same one
+ commit, the normalizer having turned it into `$REV`.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/single-empty-repository
+setup: repo
+run: rev-parse --repo=$REPO -S
+expect-exit: 1
+expect-stderr: contains "error: No commit objects found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: No commit objects found"
+oracle: exit-status stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#rev-parse
+note: the `repo` setup creates the repository and commits nothing, which is the
+ zero-commit case `-S` reports on. The more-than-one case needs a second
+ commit; `rev-parse/ancestry-suffix` below cites it.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/single-with-argument
+setup: repo-with-commit
+run: rev-parse --repo=$REPO -S $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: Cannot specify arguments with --single"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Cannot specify arguments with --single"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#rev-parse
+note: `-S` names the repository's one commit, so an argument alongside it is a
+ contradiction both refuse. Usage text precedes the error line, so
+ `stderr-text` is not an oracle.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/ancestry-suffix
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::rev_parse_ancestry_matches_the_tool
+spec: format-reference.md#revision-syntax
+note: `REV^` walking one generation, `REV^^` walking two, and the root
+ commit's parent reported as `error: Commit <checksum> has no parent`. Needs a
+ parent chain, which the setup's single commit does not hold, and which the
+ port does not build from `commit -b` alone (`cli-surface.md`, "P2"). The cited
+ test also covers `-S` reporting more than one commit, and the `~N` and `^N`
+ non-syntaxes, where the tool reports `error: Invalid refspec <rev>` and the
+ port reports `error: Refspec '<rev>' not found` (`cli-surface.md`, "P1"); the
+ same repository serves all three.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/invalid-refspec
+setup: repo-with-commit
+run: rev-parse --repo=$REPO 'a/../b^'
+expect-exit: 1
+expect-stderr: contains "error: Invalid refspec a/../b"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid refspec a/../b"
+oracle: exit-status stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ref-name-validation
+note: the refused name is reported without the ancestry suffix, so the same line
+ states `a/../b^` and `a/../b`, and the suffix is stripped before the base is
+ read as a name in both.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/absent-checksum
+setup: repo-with-commit
+run: rev-parse --repo=$REPO 0000000000000000000000000000000000000000000000000000000000000000
+expect-exit: 0
+expect-stdout: equals "0000000000000000000000000000000000000000000000000000000000000000"
+ref-expect-exit: 0
+ref-expect-stdout: equals "0000000000000000000000000000000000000000000000000000000000000000"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#revision-syntax
+note: a checksum resolves to itself and reaches no object, so a checksum the
+ store carries no commit for prints at exit 0 in both.
+ `rev-parse/absent-commit-object` below is the same checksum where a `^` suffix
+ makes the walk read the commit.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/absent-commit-object
+setup: repo-with-commit
+run: rev-parse --repo=$REPO 0000000000000000000000000000000000000000000000000000000000000000^
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: object not found: Commit"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: No such metadata object"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#revision-syntax
+note: the `^` walk loads the base commit, so an absent one is refused here where
+ the bare checksum above resolves. Both exit 1 and write nothing, in different
+ words -- the tool names the loose object file and the port names the object type
+ -- so `stderr-text` is not an oracle here (`cli-surface.md`, "P1"). The whole
+ line, checksum included, is held by the test
+ `cat/absent-commit-through-a-ref` cites.
+
+# ---------------------------------------------------------------------------
+# cat.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: cat
+cell: cat/one-file
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH /file.txt
+expect-exit: 0
+expect-stdout: equals "corpus C0 regular file"
+ref-expect-stdout: equals "corpus C0 regular file"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#cat
+note: corpus `C0` holds `file.txt` with that one line, so the cell states the
+ content byte for byte as well as the equality of the two streams.
+
+family: M10
+subcommand: cat
+cell: cat/no-leading-slash
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH file.txt
+expect-exit: 0
+expect-stdout: equals "corpus C0 regular file"
+ref-expect-stdout: equals "corpus C0 regular file"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#cat
+note: the leading `/` is optional in both.
+
+family: M10
+subcommand: cat
+cell: cat/several-paths
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH /file.txt /dir/nested.txt
+expect-exit: 0
+expect-stdout: contains "corpus C0 nested file"
+ref-expect-stdout: contains "corpus C0 nested file"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#cat
+note: the contents follow one another in argument order with nothing between
+ them, which equal `stdout-text` states over both files at once.
+
+family: M10
+subcommand: cat
+cell: cat/empty-file
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH /empty
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#cat
+note: corpus `C0`'s zero-length file writes nothing and succeeds in both.
+
+family: M10
+subcommand: cat
+cell: cat/symlink-followed
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH /link
+expect-exit: 0
+expect-stdout: equals "corpus C0 regular file"
+ref-expect-stdout: equals "corpus C0 regular file"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#cat
+note: corpus `C0`'s `link` points at `file.txt`, and both implementations
+ follow a symlink in the final position and write the target's content.
+
+family: M10
+subcommand: cat
+cell: cat/directory
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH /dir
+expect-exit: 1
+expect-stderr: contains "error: Can't open directory"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Can't open directory"
+oracle: exit-status stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#cat
+
+family: M10
+subcommand: cat
+cell: cat/empty-path
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH ''
+expect-exit: 1
+expect-stderr: contains "error: No such file or directory: /"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: No such file or directory: /"
+oracle: exit-status stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#cat
+note: an empty argument reaches no component and reports the commit root as
+ absent, where `/` reaches the root and gets the directory refusal `cat/directory`
+ states.
+
+family: M10
+subcommand: cat
+cell: cat/missing-path
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH /nope
+expect-exit: 1
+expect-stderr: contains "error: No such file or directory: /nope"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: No such file or directory: /nope"
+oracle: exit-status stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#cat
+note: the reported path is the prefix that failed, made absolute.
+
+family: M10
+subcommand: cat
+cell: cat/unresolvable-commit
+setup: repo-with-commit
+run: cat --repo=$REPO nosuch /file.txt
+expect-exit: 1
+expect-stderr: contains "error: Refspec 'nosuch' not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Refspec 'nosuch' not found"
+oracle: exit-status stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#revision-syntax
+
+family: M10
+subcommand: cat
+cell: cat/invalid-refspec
+setup: repo-with-commit
+run: cat --repo=$REPO a/../b /file.txt
+expect-exit: 1
+expect-stderr: contains "error: Invalid refspec a/../b"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid refspec a/../b"
+oracle: exit-status stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ref-name-validation
+note: the COMMIT argument is a revision, so a name the ref rule refuses is
+ reported here in the words `refs` and `rev-parse` report it in, before any path
+ is looked up.
+
+family: M10
+subcommand: cat
+cell: cat/checksum-upper-case
+setup: repo-with-commit
+run: cat --repo=$REPO AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA /file.txt
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Refspec 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' not found"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Refspec 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' not found"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#revision-syntax
+note: the case rule of a 64-character name reaches this site too, so an uppercase
+ name is looked up as a ref and reported as resolving to nothing, in the same
+ words in both, before any path is read. `rev-parse/checksum-upper-case` is the
+ same name at the resolution site.
+
+family: M10
+subcommand: cat
+cell: cat/no-path
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH
+expect-exit: 1
+expect-stderr: contains "error: A COMMIT and at least one PATH argument are required"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: A COMMIT and at least one PATH argument are required"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#cat
+note: one message covers both missing operands, and each implementation prints
+ its own usage text before it, so `stderr-text` is not an oracle here.
+
+family: M10
+subcommand: cat
+cell: cat/path-resolution-edges
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::cat_path_resolution_matches_the_tool
+spec: format-reference.md#cat
+note: the literal-component cases -- `.`, `..`, and an empty component naming
+ nothing -- a symlink in a non-final position reporting `Not a directory`
+ rather than being followed, a relative symlink target resolved against the
+ link's own directory, an absolute one resolved against the commit root, and a
+ chain 64 links deep followed to its end. Corpus `C0` holds no symlink to a
+ directory, none whose target escapes the tree, and no chain, so the cited test
+ builds the tree these need. The same test runs the port alone over a link
+ naming itself, which reaches the port's 256-link bound and reports `error: Too
+ many levels of symbolic links` where the tool dies on a signal.
+
+family: M10
+subcommand: cat
+cell: cat/absent-commit-object
+setup: repo-with-commit
+run: cat --repo=$REPO 0000000000000000000000000000000000000000000000000000000000000000 /file.txt
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: object not found: Commit"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: No such metadata object"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#cat
+note: a COMMIT resolving to a commit the store does not hold is refused where the
+ commit is read, before any path is looked up, in different words: the tool names
+ the loose object file `<checksum>.commit` and the port names the object type
+ `Commit <checksum>`, so `stderr-text` is not an oracle here (`cli-surface.md`,
+ "P1").
+
+family: M10
+subcommand: cat
+cell: cat/absent-commit-through-a-ref
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::absent_commit_object_matches_the_tool
+spec: format-reference.md#revision-syntax
+note: the same pair where the revision is a ref pointing at an absent commit,
+ which takes two invocations -- `refs --create=dangling <checksum>` and then the
+ read -- so the setup cannot bind it in one `run:` line. The cited test holds the
+ whole message on each side, checksum included, over `cat`, `cat <checksum>^`,
+ and `rev-parse <checksum>^`, and pins the sites that take the checksum without
+ reading it: `rev-parse` printing it at exit 0 and `--create` writing a ref file
+ holding it, both implementations leaving the same refs tree.
+
+# ---------------------------------------------------------------------------
+# commit -- the branch-name guard the case rule of a 64-character name carries.
+# The rest of `commit`'s surface belongs to Phase 17b1 and 17c
+# (`../port-plan.md`).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: commit
+cell: commit/checksum-branch-name
+setup: repo tree
+run: commit --repo=$REPO -b bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Rev name 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' looks like a checksum"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Rev name 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' looks like a checksum"
+oracle: exit-status stdout-text stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#revision-syntax
+note: a branch name of 64 lowercase hex characters is the shape resolution reads
+ as a checksum, so a ref carrying it is reachable by no revision. Both refuse it
+ in the same words at the same step, and `refs-bytes` states that neither wrote
+ the ref. `inventory` is no oracle here: the tool writes the tree and the commit
+ object before it reads the branch name, so the refusal leaves them in
+ `objects/`, where the port publishes a transaction's objects at commit and
+ publishes none (`cli-surface.md`, "P2").
+
+family: M10
+subcommand: commit
+cell: commit/checksum-branch-name-upper-case
+setup: repo tree
+run: commit --repo=$REPO -b BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#revision-syntax
+note: the same 64 characters in uppercase are a branch name to both, so each
+ writes `refs/heads/<BRANCH>` and prints the commit it made. The normalizer
+ masks each side's own checksum, so `stdout-text` states that both printed one
+ and `refs-bytes` that both wrote the ref file holding it.
+
+family: M10
+subcommand: commit
+cell: commit/ancestry-branch-name
+setup: repo tree
+run: commit --repo=$REPO -b main^ $TREE
+ref-run: n-a
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid refspec main^"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-clean
+severity: interop
+spec: format-reference.md#revision-syntax
+note: a branch name ending in `^` is the second shape resolution shadows, read
+ as ancestry, so a ref carrying it is reachable by no revision. The port refuses
+ it at the ref write in the words it gives that shape at `refs --create`, and
+ leaves `refs/` and `objects/` untouched, which `refs-bytes` and `inventory`
+ record for the port alone. `ref-run: n-a` states that the tool has no
+ comparable invocation: the base `main` names no ref in this setup and the tool
+ dies on a signal, a second crash site beside the `refs --create=NEWREF` one
+ (`cli-surface.md`, "P2"). `commit/ancestry-branch-name-resolving-base` below
+ cites the test that pins the crash and the two bases the tool does report on.
+
+family: M10
+subcommand: commit
+cell: commit/ancestry-branch-name-empty-base
+setup: repo tree
+run: commit --repo=$REPO -b ^ $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid refspec ^"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Invalid refspec "
+oracle: exit-status stdout-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#revision-syntax
+note: the suffix alone, whose base is empty. Both refuse at exit 1 and write
+ nothing, and each names what it read: the port the branch as given and the tool
+ the empty base it split off, the tool's empty refspec being a name it searches
+ its ref store for and this repository holding no ref. The two texts part, so
+ `stderr-text` is no oracle and the two `expect-stderr` fields state each side's
+ own substring. `inventory` holds here where the 64-character guard leaves it
+ out: the tool reads an ancestry name before it commits the tree, so neither
+ side published an object (`cli-surface.md`, "P2").
+
+family: M10
+subcommand: commit
+cell: commit/ancestry-branch-name-resolving-base
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_ancestry_branch_name_matches_the_tool
+spec: format-reference.md#revision-syntax
+note: the bases the `repo tree` setup cannot bind, which need a repository
+ holding a commit and a tree the commit can read, and the consequence the guard
+ stands for. The cited test holds the port's one message against each of the
+ tool's three outcomes -- the walk's `Commit <checksum> has no parent` over a
+ root commit, the agreeing `Invalid refspec main^` over a commit holding a
+ parent, and the signal over an absent base -- pins the fault order ahead of the
+ guard, states the interior `^` the guard does not cross, and shows that over a
+ ref of the refused shape the tool's `refs` prints nothing and its `prune
+ --refs-only` deletes the commit that ref holds.

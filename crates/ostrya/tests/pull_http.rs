@@ -1463,9 +1463,8 @@ fn a_mirror_pull_rejects_a_malformed_summary_ref_name_before_fetching() {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
         assert!(
-            err.to_string().contains("invalid refspec component"),
+            matches!(&err, Error::InvalidRefspec(name) if name.as_bytes() == TRAVERSAL),
             "{err}"
         );
         assert_nothing_published(&dest).await;

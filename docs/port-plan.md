@@ -222,8 +222,8 @@ Reproduce the commit ordering the tool exhibits (observable by tracing its
 syscalls): `syncfs(repo)` then rename staged objects into `objects/xx/` then
 fsync each `objects/xx/` and `objects/` then write refs. Objects are durable
 before any ref points at them. Ref writes are individually atomic (tmpfile +
-fdatasync + rename) but not atomic as a set. Honor `fsync=false` (all fsync
-becomes no-op) and `per-object-fsync`.
+fdatasync + rename + fsync of the directory holding the ref) but not atomic as a
+set. Honor `fsync=false` (all fsync becomes no-op) and `per-object-fsync`.
 
 ## New repository mode: bare-user-shared
 
@@ -784,8 +784,9 @@ Definition:
   refspec-to-checksum entries applied at commit;
   `Repo::set_ref_immediate` writes outside a transaction. A ref file is
   64 hex chars plus `\n` (65 bytes), written tmpfile + fdatasync +
-  rename, parent directories created for `/`-bearing names; a `None`
-  checksum removes the ref file.
+  rename + fsync of the directory holding the ref, parent directories
+  created for `/`-bearing names; a `None` checksum removes the ref file
+  and syncs that directory too.
 - The completed `Transaction::commit()`: 7a's object publication
   followed by the ref queue, per the durability contract -- objects are
   durable before any ref points at them; ref writes are individually
@@ -3134,7 +3135,10 @@ interoperability harness outright.
 The phase is split into sub-phases so each is independently reviewable; the
 split follows `cli-surface.md`'s own ordering, with the matrix and its runner
 moved to the front (17a) so every later sub-phase has a Verify gate to grow
-against, matching this phase's "incremental" framing.
+against, matching this phase's "incremental" framing. A sub-phase whose scope a
+completed one uncovered is numbered after it rather than renumbering what
+follows: 17b1 holds the `commit` parenting divergence Phase 17b's own fixtures
+exposed.
 
 #### Phase 17a -- `init`, global `--repo` conventions, and the matrix harness (DONE)
 
@@ -3248,26 +3252,370 @@ directory gets the usage-text-plus-error form from both; and `init`'s
 cwd/`OSTREE_REPO` reuse succeeds idempotently for both on a repository
 carrying a `collection-id`, with the config untouched.
 
-#### Phase 17b -- `refs`, `rev-parse`, `cat`
+#### Phase 17b -- `refs`, `rev-parse`, `cat` (DONE)
 
-Wiring the already existing `Repo::list_refs`, `Repo::list_mirror_refs`, and
-`Repo::resolve_rev`, plus recovering their exact output text.
+The three subcommands, over `Repo::list_refs`, `Repo::list_mirror_refs`, and
+`Repo::resolve_rev`, with their exact output text recovered by observation and
+recorded in `format-reference.md`, "CLI output formats".
 
-- `refs`: `--list` (the default), `--delete`, `--create=NEWREF`,
+- `refs`: the default listing, `--list`, `--delete`, `--create=NEWREF`,
   `-r/--revision`, `-A/--alias`, `-c/--collections`, `--force`, and the
-  optional `PREFIX` positional.
-- `rev-parse`: `-S/--single`.
-- `cat`: no options beyond the common set; streams a file object's content
-  to stdout over the existing read path.
+  `PREFIX` positional, which the tool takes one or more of. The default
+  listing covers `refs/heads` and `refs/remotes`, the latter named
+  `remote:name`, sorted together by refspec. A `PREFIX` keeps the refs equal
+  to it or nested under it and strips it from the printed name, an exact match
+  printing the whole refspec; `--list` suppresses the stripping. More than one
+  prefix groups the output in argument order. Each prefix is validated as a
+  refspec where it is taken, in every listing form and in `--delete`, so a name
+  the ref rule refuses ends the invocation and a valid prefix ahead of it keeps
+  the rows it printed and the refs it deleted. A prefix passing that rule names
+  the path a listing enumerates, and a path running through a ref file ends the
+  invocation the same way, which is the tool's own `ENOTDIR` refusal. A
+  whole-remote prefix -- a
+  `<remote>:` prefix whose ref half is empty or `.` -- selects every ref of that
+  remote, and where it matches one a `--delete` is refused and removes nothing,
+  which is the tool's outcome for the name its own join builds. An alias holds
+  the ref it names in place: a `--delete` prefix matching a ref under
+  `refs/heads` that an alias names reports the tool's own `Ref '<refspec>' has an
+  active alias: '<alias>'` and removes none of what that prefix matched, per
+  prefix, reading the link body as a name from the `refs/heads` root and taking
+  no part under `-c`. With `-A` a `--delete` is an alias-only delete: each
+  prefix removes the set a `-A` listing prints for it, the ref the prefix names
+  exactly or the aliases nested under it, and the prefix rules, the whole-remote
+  refusal, and the alias guard all read that set. Under `-c` a `--delete` prefix
+  is a collection id, and the id equal to the repository's own `collection-id`
+  removes the refs under `refs/heads` alone, keeping the mirror refs that carry
+  that id.
+  `--create` wins over `--delete`
+  and `-c` wins over `-A`, matching the tool. With `-A`, `--create` writes an
+  alias under `refs/heads` and refuses a NEWREF naming a remote with the tool's
+  own `Cannot create alias to remote ref: <remote>`, at the tool's own step:
+  after the three checks every NEWREF takes and before the positional resolves.
+  The target is then checked for being an existing ref, the tool's fifth step,
+  which reports `Cannot create alias to non-existent ref: <rev>` and stands ahead
+  of ref-name validation, so a refused target draws that line and no
+  `Invalid refspec` one.
+  Under `-c`, `--create` takes a
+  `<collection-id>:<ref>` NEWREF and writes
+  `refs/mirrors/<collection-id>/<ref>`, validating the pair shape and the
+  collection id in the tool's own words and at the tool's own steps.
+- `rev-parse`: the `REV` positional, which the tool takes one or more of, and
+  `-S/--single`, whose count is over the commit objects in `objects/`.
+- `cat`: `COMMIT` and one or more `PATH`, streaming each file's content
+  through `FileObject::write_to` so no payload is buffered whole, and settling
+  the async writer over the duplicated stdout descriptor before returning, so
+  no tail stays in the backend's hands at process exit.
 
-Deliverables: the three subcommands, their output-format recovery folded
-into `format-reference.md`, and `m10` records for each.
+The library gained what the three needed and no more: `Repo::resolve_rev` now
+takes a trailing run of `^` characters, each stepping one generation back
+along `parent` (`Error::NoParentCommit` names the root commit it stops at), and
+reads a 64-character name as a checksum in lowercase hex alone, through
+`Checksum::from_hex_lower`, so an uppercase or mixed-case name of that length is
+a refspec, which is the tool's own split at every site a revision or a NEWREF is
+taken; the lenient `Checksum::from_hex` stays where a checksum arrives as stored
+bytes, which is ref file content and delta metadata
+(`format-reference.md`, "Revision syntax");
+`Repo::list_remote_refs` and `Repo::list_ref_aliases` list what `list_refs`
+does not reach; `Repo::check_refs_path` probes the path a listing prefix names
+below `refs/`, one fd-relative `statat` reporting the `ENOTDIR` the CLI renders;
+`Repo::set_ref_alias_immediate` writes an alias symlink whose
+body is the relative path from the alias's own directory to its target;
+`Repo::set_collection_ref_immediate` mirrors `set_ref_immediate` for a
+collection ref; and `FileObject::write_to` streams a payload into a writer,
+leaving the writer unflushed, since a sink takes as many payloads as its owner
+sends it and a framing or compressing sink emits on a flush, so the flush
+belongs to the caller. Every ref mutation settles its name as
+well as its content: under `[core] fsync` the directory holding the ref is
+`fsync`-ed after a write's rename, after an alias rename, and after a removal's
+unlink, where the tool syncs the ref file alone
+(`format-reference.md`, "Object store layout").
+The CLI's shared `resolve` helper now reports a resolution failure in the
+tool's own words (`Refspec '<rev>' not found`, `Commit <checksum> has no
+parent`), which every subcommand taking a revision inherits. A revision that
+resolves and names a commit the store does not hold is neither of those two: it
+reaches the object read and carries the library's own `object not found: Commit
+<checksum>`, where the tool names the loose object file
+(`cli-surface.md`, "P1"). `refs --create`
+resolves NEWREF through the same wording, and refuses a NEWREF ending in `^`
+with `Invalid refspec <NEWREF>`: a ref name carries no ancestry suffix, and
+that is the message the tool gives the same name at its own write path. A name
+the ref rule refuses carries the tool's words too: the library reports it as
+`Error::InvalidRefspec`, holding the refspec as given, and the CLI renders that
+one variant as `Invalid refspec <refspec>` wherever a revision, a NEWREF, an
+alias target, or a `commit -b` branch reaches the library. `refs --create`
+validates NEWREF at the tool's own step, after the existence check and before
+the positional resolves, so `--create=a/../b --force nosuch` reports the name
+and not the unresolvable revision. The existence check resolves NEWREF as a
+revision whatever `--force` says, and `--force` suppresses the refusal a
+resolved NEWREF draws, so `--create=NAME^ --force` reports `Commit <checksum>
+has no parent` where NAME's base is a root commit. `commit -b` carries a
+write-side guard for each of the two shapes the revision syntax shadows: a
+branch name of 64 lowercase hex characters is refused with the tool's own `Rev
+name '<name>' looks like a checksum`, and one ending in `^` with `Invalid
+refspec <name>`, the words `refs --create` gives that same shape, since
+resolution reads the first as a checksum and the second as ancestry, and no
+revision would reach the commit either ref holds (`format-reference.md`,
+"Revision syntax"). Both run at the ref write, after `--parent` resolves and
+after the tree is read, and abort the transaction, so the port publishes
+nothing. The tool refuses the checksum shape at that same step and the ancestry
+shape a step earlier, reading the branch name as a revision ahead of the tree
+and parting three ways over the base it names, one of the three a signal
+(`cli-surface.md`, "P2").
 
-Verify: `refs --list`/`-r`/`--create`/`--delete` against a fixture repository
-match the tool's own text and leave the same ref files; `rev-parse` resolves
-a bare checksum, a refspec, and (if the tool supports it, to confirm by
-observation) an ancestry suffix identically to the tool; `cat` reproduces a
-fixture file's content byte for byte.
+Two harness changes came with the phase. The `checksum-agreement` oracle
+resolves through `rev-parse` when the invocation printed no checksum, which is
+what `harness.md` said Phase 17b would complete. The `refs-bytes` oracle now
+rewrites the checksum a ref file holds the way the text oracles do -- the
+bound `$REV` becomes the placeholder and any other checksum is masked --
+because each side's setup commits with its own binary and neither passes a
+timestamp, so two raw checksums never compare until `commit --timestamp`
+lands in 17c.
+
+Eighteen tool behaviors are recorded and deliberately not reproduced, listed in
+`cli-surface.md`, "P1": the tool names an `-A` alias under
+`refs/remotes/<remote>/` by its path below the remote, dropping the remote, and
+removes each alias a `-A --delete` prefix reached by that same name, so a prefix
+under `refs/remotes` removes no alias of that remote and removes a local ref
+carrying the name instead where one exists, where the port removes the alias the
+prefix named; it writes the `remote:name` refspec as the link body where an
+`-A --create` target lives under `refs/remotes`, so its own `rev-parse` and its
+own default listing stop on an alias it wrote itself, where the port writes the
+path to the target ref's file and both implementations resolve it; it
+names each ref a whole-remote `PREFIX` selects by joining that prefix's ref half
+with the name below it, so the `.` of the join stays in what `--list` and `-A`
+print and in the refspec a `--delete` is then refused on, where the port prints
+the refspec and names the prefix as given; where one `--delete` prefix matches
+more than one ref an alias names, it reports the pair its own enumeration reaches
+first, which is neither refspec nor directory order throughout, where the port
+reports the first in refspec order, and it removes the members of a refused
+prefix's selected set that same order reached ahead of the guarded one, where the
+port removes none of what that prefix matched; a
+single dangling alias fails every invocation whose enumeration reaches it, its
+listings and its `--create` writes alike; an invalid
+collection id aborts it on a GLib assertion or is rejected outright; a GLib
+assertion line precedes its `Invalid ref name (null)` where a `-c --create`
+NEWREF holds no ref name; a self-referencing symlink makes `cat` die on a
+signal; `refs --create=NEWREF`
+dies on a signal where NEWREF ends in `^` and its base names no ref; an empty
+refspec searches the ref store, so it resolves against a one-ref repository and
+reports `Refspec  not unique` against a larger one where the port refuses the
+name; a ref name that names a directory under `refs/` draws three messages from
+the tool, two of them naming a ref read in directory order or its own temporary
+file, where the port reports one, and the tool's `--create` scans for a ref below
+the name under `refs/heads` alone, so it replaces an empty directory, a directory
+holding directories alone, and any directory under `refs/remotes` or
+`refs/mirrors` with the ref file and removes the refs below it, where the port
+refuses every one; a ref name whose path under
+`refs/` runs through a ref file draws the path and the syscall from the tool
+(`openat(refs/heads/plain/x): Not a directory`) wherever the name is resolved or
+written, and `open(O_TMPFILE): Not a directory` under `-c --create`, where the
+port reports the one message it gives that condition, and as an `-A --create`
+target either shape draws the tool's own `Cannot create alias to non-existent
+ref: <target>`, its existence check standing ahead of the name at that one site;
+a refused `PREFIX`
+carries the
+tool's `Listing refs: ` context prefix, where the port reports the refspec
+rule's one message and agrees on everything else; a `PREFIX` whose path under
+`refs/` runs through a ref file draws the path and the syscall from the tool
+(`fstatat(refs/heads/plain/x): Not a directory`), where the port reports the one
+message it gives that condition and agrees on the exit status, the standard
+output, and the refs tree; a revision resolving to a commit the store does not
+hold draws `No such metadata object <checksum>.commit` from the tool, naming the
+loose object file, where the port reports `object not found: Commit <checksum>`,
+the one message the library gives any absent object, so the wording for the other
+object types belongs with the phase that lands the commands reading them; a ref
+file holding a checksum in any rendering other than the 64 lowercase hex
+characters is refused by the tool wherever that ref is resolved, with `Invalid
+character '<byte>' in rev '<content>'`, where the port's reader takes either case
+and resolves it, and only an out-of-band write puts such content there, both
+implementations writing the lowercase form; an
+abbreviated commit checksum resolves anywhere a revision is taken; and a ref
+name is validated against a character class narrower than the port's, so a name
+of that shape draws `Invalid refspec <name>` from the tool wherever it is taken
+as a revision or a NEWREF and `Refspec '<name>' not found` from the port at a
+resolution site, which is
+what `rev-parse <name>~1` and `rev-parse <name>^2` report, the tool's ref
+enumeration skips such a name without a word, so its `prune --refs-only` deletes
+the commit that ref holds, and the tool holds such a name to name no ref as an
+`-A --create` target, where the port writes the alias. The last two are
+resolution behaviors that would change every subcommand at once, so they
+belong with a phase that reviews those paths. Building the fixtures also found
+three `commit` divergences recorded under "P2": `ostree commit -b BRANCH` parents
+the new commit on the branch tip and `ostrya commit -b BRANCH` writes a root
+commit every time; the checksum arm of the branch-name guard leaves the tool's
+tree and commit objects in `objects/` where the port publishes none, the tool
+having written them before it reads the name; and the ancestry arm draws one
+message from the port and three outcomes from the tool -- `Commit <checksum> has
+no parent` over a root commit, the port's own `Invalid refspec <name>` over a
+commit holding a parent, and a signal over a base naming no ref -- with a tree
+path that does not open reported by the port and never reached by the tool.
+
+Verify: `cargo test --workspace --all-features` is green, `cargo fmt --all
+--check` and `cargo clippy --workspace --all-features --all-targets` are
+clean. `crates/ostrya-conformance/tests/check.rs` validates 146 records and
+383 cells. The T0 selection through `crates/ostrya-cli/tests/conformance.rs`
+passes 77 cells where Phase 17a passed 12: 65 new M10 cells covering the
+listing forms, the PREFIX validation a listing and a `--delete` share, the
+create and delete paths and their nineteen refusals, the
+`rev-parse` forms and their seven refusals, the `cat` forms and their eight
+refusals, the two shapes `commit -b` parts a 64-character branch name into, and
+the two bases a `commit -b` ancestry name the tool reaches no crash on carries.
+Eighteen cells state a case the `repo-with-commit` setup cannot bind --
+a nested ref name, an alias, a collection id, a parent chain, a NEWREF holding
+an ancestry suffix, the collection-ref create forms, the symlink path edges,
+the refused-name forms, the refused PREFIX forms, the PREFIX paths that run
+through a ref file, the whole-remote PREFIX in
+a listing and in a `--delete`, the `--delete` alias guard, the alias-only
+`-A --delete`, the own-collection-id `-c --delete`, an absent commit read
+through a ref, the case rule of a 64-character name over the repository's
+own commit, and the bases a `commit -b` ancestry name needs a commit and a tree
+to reach -- and cite the
+`crates/ostrya-cli/tests/cli.rs` test that builds the repository and compares
+the port to `ostree` 2026.1 over it, invocation by invocation:
+`refs_listing_matches_the_tool` (30 invocations),
+`refs_refuses_an_invalid_prefix`,
+`refs_refuses_a_prefix_through_a_ref_file`,
+`refs_whole_remote_prefix_matches_the_tool`,
+`refs_alias_matches_the_tool`, `refs_delete_alias_guard_matches_the_tool`,
+`refs_delete_aliases_matches_the_tool`,
+`refs_delete_collection_own_id_matches_the_tool`,
+`refs_collections_match_the_tool`,
+`refs_create_ancestry_suffix_matches_the_tool`,
+`refs_create_collection_matches_the_tool`,
+`rev_parse_ancestry_matches_the_tool`, `absent_commit_object_matches_the_tool`,
+`checksum_case_matches_the_tool`, `cat_path_resolution_matches_the_tool`,
+`invalid_refspec_matches_the_tool`, and
+`commit_ancestry_branch_name_matches_the_tool`, with
+`commit_checksum_branch_name_matches_the_tool` beside them for the branch-name
+guard's other arm, which two cells state and no cell cites. Each compares the exit status,
+standard output, and standard error verbatim, both implementations reading one
+repository where the invocation mutates nothing and a byte-identical copy each
+where it does; the alias test also pins the remote-alias divergence in both
+directions, and the whole-remote test pins the tool's joined names and the
+refusal each side reports for a `--delete`. The alias-guard test holds the whole
+message where one alias names one matched ref and stops at the guard's words
+where a prefix matches more than one, the pair named following each
+implementation's own enumeration order. The alias-only delete test compares the
+two selections over one prefix and pins the remote-prefix divergence, including
+the local ref the tool's own name reaches. The own-collection-id test compares
+the own id, a foreign id, both together, and an id no ref carries over a
+repository holding both sources of a collection ref under its own id, with the
+`-c` listing that reads them and the three narrower repositories the rule's
+edges need: the own id with no local ref, a local ref carrying a mirror ref's
+name, and no `collection-id` at all. The absent-commit test holds each side's own
+message over `cat`, an ancestry suffix on the absent checksum, and the same
+revision read through a ref `--create` wrote, and compares the three sites that
+take a checksum without reading it. The checksum-case test compares the uppercase
+and mixed-case forms of the repository's own commit at every site a revision is
+taken, the ref an uppercase NEWREF writes and the revision, the alias, and the
+delete guard that then read it, the lowercase NEWREF the existence check reports
+as existing, and the two divergences the rule leaves: the tool's `--parent`
+reading its value with the parser that refuses a non-lowercase rendering, and
+that same parser refusing ref file content the port's reader resolves. The
+branch-name test holds the guard's whole message and the untouched refs tree,
+pins the object residue that parts the two, states the two faults that stand
+ahead of the guard in each implementation's own words, and commits the four other
+64-character shapes -- one character short, one long, one outside the hex class,
+and an uppercase and a mixed rendering -- reading each side's own checksum out of
+its own ref file, since neither passes a timestamp. The ancestry test holds the
+port's one message against each of the tool's four readings of the base -- the
+signal over a base naming no ref, `Invalid refspec ` over an empty base, `Commit
+<checksum> has no parent` over a root commit, and the agreeing `Invalid refspec
+main^` over a commit holding a parent -- states the fault order ahead of the
+guard, holds the interior `^` the guard does not cross, and pins the destructive
+class the guard stands for: over a ref of the refused shape, which an
+out-of-band write now places, the tool's `refs` prints nothing and its `prune
+--refs-only` removes the commit that ref holds. The refused-name test also holds the alias
+target: ten shapes the ref rule refuses draw the tool's own non-existence line in
+both implementations, a target whose path runs through a ref file and one naming
+a directory draw that line from the tool and the port's i/o message, and a target
+the tool's character class refuses leaves the port writing the alias where the
+tool refuses. The two prefix-refusal tests assert
+each side's own message, the two wording them differently, and compare the exit
+status, the standard output, and the refs tree.
+`cat_streams_a_large_payload_in_every_mode` commits a 5 MB
+pseudo-random payload into `archive`, `bare-user`, and `bare-user-only` and
+holds what `cat` writes to the source bytes, with the tool reading the port's
+own repository where it is available, so the streaming claim carries a guard
+that runs with no reference tool present.
+`crates/ostrya/tests/commit.rs`, `ref_writes_run_under_both_fsync_settings`,
+runs the ref write, the alias write, the removal, and a transaction's ref write
+under `fsync=true` and `fsync=false`, which pins the directory each sync opens,
+and `resolve_rev_reads_a_checksum_in_lowercase_hex_alone` pins the case rule at
+the library boundary: the lowercase form resolving to itself, the uppercase and
+mixed forms reported as missing refs, a ref carrying such a name resolving
+through its file, and ref file content still read in either case.
+A renamed library test cannot void
+the cells that cite it silently either: the workflow runs
+`ostrya-conformance check --verify-evidence` as a step of its own
+(`conformance/harness.md`, "Cargo and CI wiring").
+
+#### Phase 17b1 -- `commit` parenting
+
+A behavior fix rather than an option gap, found while building the Phase 17b
+fixtures and recorded in `cli-surface.md`, "P2". `ostree commit -b BRANCH`
+parents the new commit on that branch's current tip; `ostrya commit -b BRANCH`
+writes a root commit every time. Two commits onto one branch therefore leave
+the port with no ancestry at all, which `rev-parse REV^` reads today and `log`
+(17d) reads next. The fixtures for `rev_parse_ancestry_matches_the_tool` carry
+an explicit `--parent` for exactly this reason.
+
+Observed with `ostree` 2026.1, and the behavior this sub-phase reproduces:
+
+- `-b BRANCH` with no `--parent` takes that branch's current tip as the
+  parent. A branch that does not exist yet gives a root commit, so the first
+  commit onto a fresh branch is unchanged.
+- `--parent=none` asks for a root commit on a branch that has a tip. The ref
+  still moves to the new commit.
+- `--orphan` gives a root commit the same way, and additionally permits a
+  commit with no `-b`. Its `--help` line reads "Create a commit without writing
+  a ref", which describes the no-`-b` case: with `-b` given, the ref moves to
+  the new commit and the suppressed parent is the whole observable effect, and
+  the branch-name guard 17b landed still refuses a name of 64 lowercase hex
+  characters under it.
+- `--parent` takes a 64-character lowercase checksum or the literal `none`. An
+  abbreviated checksum and a refspec are both rejected with `error: Invalid rev
+  <value>`, an uppercase rendering with `error: Invalid character '<byte>' in rev
+  '<value>'`, and the checksum's existence is not checked -- a `--parent` naming
+  no object commits successfully. The port resolves a refspec here too, which
+  stays a superset of the tool's syntax the way the leading `--repo` form is
+  (17a), so this sub-phase adds `none` and narrows nothing. A 64-character
+  uppercase value is a refspec to the port, by the case rule 17b landed, so both
+  refuse it and word the refusal differently (`cli-surface.md`, "P2").
+- A commit with neither `-b` nor `--orphan` is refused: `error: A branch must
+  be specified with --branch, or use --orphan`. The port accepts that form
+  today and prints the checksum without writing a ref, so adopting the refusal
+  is the one thing this sub-phase takes away; it is what makes `--orphan` mean
+  something rather than being a synonym for the default.
+
+The parent is read before the transaction publishes, so the tip a commit
+inherits is the one its own ref write then replaces.
+
+Deliverables: the implicit parent in `ostrya commit`, `--parent=none`,
+`--orphan`, the `-b`-or-`--orphan` requirement, the observations folded into
+`format-reference.md`, "CLI output formats", and `m10` records for each.
+
+Three of the tool's options read the parent as well and stay with the phases
+that own them:
+
+- `--keep-metadata=KEY`, which copies one metadata key from the parent, and
+  `--skip-if-unchanged`, which compares the tree against the parent's: both
+  17f.
+- `--bind-ref=BRANCH` and `--no-bindings`, which write the ref bindings and
+  leave the parent alone: 17f. The branch-name guard does not reach the binding:
+  `commit --bind-ref=<64 lowercase hex>` writes that name into `ostree.ref-binding`
+  at exit 0, so the tool guards the ref it writes and not the name it records
+  (`cli-surface.md`, "P2").
+
+Verify: two `commit -b BRANCH` invocations onto one branch leave a chain both
+implementations resolve identically through `rev-parse BRANCH^`, and a first
+commit onto a fresh branch stays a root commit in both; `--parent=none` and
+`--orphan` each give a root commit on a branch that has a tip, with the ref
+moved, in both; a commit with neither `-b` nor `--orphan` is refused with the
+tool's own text in both. `rev_parse_ancestry_matches_the_tool` drops its
+explicit `--parent` and keeps passing, which is the regression this sub-phase
+exists to prevent, and `m10` gains cells for the implicit parent, the two
+root-commit forms, and the refusal.
 
 #### Phase 17c -- `commit`/`checkout`: the corpus-priority option gaps
 
@@ -3357,7 +3705,7 @@ of the same keyring.
 
 #### Phase 17f -- the remaining P2 option gaps
 
-Everything `cli-surface.md`'s P2 section lists that 17c/17d/17e do not
+Everything `cli-surface.md`'s P2 section lists that 17b1/17c/17d/17e do not
 already cover: the rest of `commit`'s and `checkout`'s missing options,
 `export --no-xattrs/--subpath/--prefix/-o`, the remaining `prune`, `fsck`,
 `diff`, and `summary` flags, and `static-delta show/delete/indexes`. The

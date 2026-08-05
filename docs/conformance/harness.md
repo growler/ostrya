@@ -182,7 +182,13 @@ artifact. The set is closed and matches the vocabulary in `README.md`.
 - `stdout-text` -- the captured standard output, normalized.
 - `stderr-text` -- the captured standard error, normalized.
 - `config-bytes` -- the bytes of the repository's `config` file.
-- `refs-bytes` -- every path under `refs/`, sorted, with its contents.
+- `refs-bytes` -- every path under `refs/`, sorted, with its contents. The
+  contents go through the placeholder substitution and the checksum masking
+  under "Normalization" below, so a ref holding the commit a setup made reads
+  `$REV` and any other checksum reads `<checksum>`. Without that, two
+  repositories each side committed for itself would never compare: neither
+  passes a timestamp, so the two commit checksums differ by wall-clock time
+  until `commit --timestamp` lands in Phase 17c.
 - `inventory` -- every loose object: relative path, extension, and size,
   sorted by path.
 - `manifest` -- a checkout walked by the harness and reduced to one line per
@@ -191,7 +197,15 @@ artifact. The set is closed and matches the vocabulary in `README.md`.
 - `checksum-agreement` -- the commit checksum the operation produced. Both
   implementations print it as the sole line of `commit`'s standard output, so
   a commit cell reads it there. A cell whose operation is another command
-  resolves the checksum through `rev-parse`.
+  resolves the checksum through `rev-parse`, against `$BRANCH` when a setup
+  bound one and `$REV` otherwise; a cell binding neither reports the oracle as
+  unavailable. The artifact is the raw checksum, with none of the masking
+  `refs-bytes` applies, so a cell naming this oracle needs a setup whose commit
+  is reproducible: each side commits with its own binary and neither passes a
+  timestamp, so the two checksums differ by wall-clock time. `commit
+  --timestamp` supplies the fixed timestamp in Phase 17c, and no cell names the
+  oracle before it. The unit tests in `crates/ostrya-conformance/src/oracle.rs`
+  guard the resolution path meanwhile.
 - `fsck` -- the exit status of each implementation's own `fsck` run against
   its own repository. The two word their progress and summary lines
   differently, and the claim is that both find the repository sound, so the
@@ -212,13 +226,16 @@ Every invocation runs with `OSTREE_REPO` removed from the environment and
 `LC_ALL` set to `C`, so a cell that exercises the environment fallback states
 that itself, and the two implementations' messages compare in one language.
 
-Captured text holds scratch paths, wall-clock values, and checksums, so text
-oracles normalize before comparison:
+Captured text holds scratch paths, wall-clock values, and checksums, so the text
+oracles and `refs-bytes` normalize before comparison:
 
-- a bound placeholder's path becomes the placeholder name;
+- a bound placeholder's value becomes the placeholder name, longest value first
+  so a value holding another one is rewritten whole. Every placeholder is a
+  path but `$BRANCH` and `$REV`, which are a ref name and a checksum;
 - a 64-character lowercase hex run becomes `<checksum>`, unless the cell names
   the `checksum-agreement` oracle;
-- progress lines carrying a rate or an elapsed time are dropped.
+- progress lines carrying a rate or an elapsed time are dropped. This step
+  applies to the text oracles alone, a ref name not being a progress line.
 
 The raw bytes go to the artifact directory in every case, so a comparison
 failure is diagnosed against what the process actually wrote.
@@ -318,6 +335,14 @@ This is how a machine that holds the reference tool, or the privilege, enforces
 what a machine without it cannot. A promoted cell is counted with the failures
 and leaves the `skip tier` breakdown.
 
+A `proved-elsewhere` skip is as strong as the cited test's own gating. The
+tool-comparison tests return without an assertion where `ostree` is absent, so
+the citation stands on a harness that carries the tool and states nothing on one
+that does not. `OSTRYA_REQUIRE_OSTREE` turns that skip into a failure, the way
+`--require tool=ostree` does for a `run:` cell. The host that runs the interop
+gate sets it; the CI job installs no reference tool and leaves it unset, so its
+`check --verify-evidence` step resolves the citation's test name alone.
+
 ## Severity and exit status
 
 A record's `severity:` is `interop` or `identity`. An `interop` failure fails
@@ -384,7 +409,13 @@ cell's scratch tree.
 
 - `crates/ostrya-conformance/tests/check.rs` holds one `#[test]` that runs
   `check`. It needs no built binaries and gates every record on every run of
-  `cargo test --workspace`.
+  `cargo test --workspace`. Evidence verification stays outside it, because it
+  runs `cargo` itself.
+- `.github/workflows/ci.yml` runs
+  `cargo run -p ostrya-conformance -- check --verify-evidence` as a step of its
+  own, after the test step has built the test targets it lists. A citation
+  naming no test fails the workflow, so a renamed library test cannot void the
+  cells that cite it silently.
 - `crates/ostrya-cli/tests/conformance.rs` holds one `#[test]` that calls the
   library with `env!("CARGO_BIN_EXE_ostrya")` as the port handle, runs the T0
   selection, fails on any `interop` failure, and prints the skip summary. This
@@ -409,16 +440,24 @@ that count.
 
 Oracle and setup availability follows the CLI surface `cli-surface.md` orders.
 
-- Available now: `exit-status`, `stdout-text`, `stderr-text`, `config-bytes`,
-  `refs-bytes`, `inventory`, `manifest` (walked by the harness from a
-  `checkout`), `fsck`, and `checksum-agreement` for cells whose operation is a
-  commit.
-- Phase 17b adds `rev-parse`, which completes `checksum-agreement`, and
-  `refs`, which lets `refs-bytes` compare each implementation's own listing
-  alongside the files on disk.
+- Available to a cell now: `exit-status`, `stdout-text`, `stderr-text`,
+  `config-bytes`, `refs-bytes`, `inventory`, `manifest` (walked by the harness
+  from a `checkout`), and `fsck`, each since Phase 17a.
+- Phase 17b completed the `checksum-agreement` resolution path with `rev-parse`:
+  a cell whose operation is not a commit resolves the checksum instead of
+  reporting the oracle unavailable. No cell names the oracle yet, because it
+  compares raw checksums and a reproducible commit waits on `commit
+  --timestamp` in Phase 17c. Phase 17b also added `refs` and `cat`, so a cell
+  can state a ref listing or a file's content as `stdout-text` alongside the
+  `refs-bytes` files on disk.
+- Phase 17b1 makes a setup able to build a parent chain: it gives `ostrya
+  commit -b BRANCH` the tool's implicit parent, so two commits onto one branch
+  leave an ancestry both implementations resolve. Until then a cell needing a
+  chain states `--parent` itself.
 - Phase 17c adds `--owner-uid`, `--owner-gid`, `--timestamp`, and
   `--no-xattrs` on `commit`, which corpora `C3` and `C13` need, and
-  `checkout -U` and `--subpath`.
+  `checkout -U` and `--subpath`. `--timestamp` is what the first
+  `checksum-agreement` cell waits on.
 - Phase 17d adds the GVariant text-form printer, which `show --raw` and the
   `--print-*` forms need.
 

@@ -99,6 +99,13 @@ fn config_bytes(side: &Side<'_>) -> Value {
     }
 }
 
+/// Every path under `refs/`, sorted, with the checksum each ref file holds.
+///
+/// The content goes through the same rewriting the text oracles apply: a bound
+/// placeholder's value becomes its name, so the branch ref reads `$REV`, and
+/// any other 64-character checksum is masked. Without that, two repositories
+/// each side committed for itself never compare -- neither passes a timestamp,
+/// so the two commit checksums differ by wall-clock time.
 fn refs_bytes(side: &Side<'_>) -> Value {
     let repo = match side.repo() {
         Ok(repo) => repo,
@@ -116,7 +123,15 @@ fn refs_bytes(side: &Side<'_>) -> Value {
             .display()
             .to_string();
         let content = std::fs::read_to_string(&path).unwrap_or_default();
-        lines.push(format!("{relative} {}", content.trim()));
+        let content = substitute(content.trim(), side.bindings);
+        lines.push(format!(
+            "{relative} {}",
+            if side.keep_checksums {
+                content
+            } else {
+                mask_checksums(&content)
+            }
+        ));
     }
     lines.sort();
     Value::Text(joined(lines))
@@ -236,19 +251,55 @@ fn manifest(side: &Side<'_>) -> Value {
 }
 
 /// The commit checksum the operation produced.
+///
+/// A commit prints it as the last line of its standard output, so a commit
+/// cell reads it there. Any other operation resolves it through `rev-parse`
+/// against the revision the cell's setups bound.
 fn checksum_agreement(side: &Side<'_>) -> Value {
-    let text = String::from_utf8_lossy(&side.outcome.stdout);
-    if let Some(line) = text.lines().map(str::trim).next_back()
-        && line.len() == 64
-        && line.chars().all(|c| c.is_ascii_hexdigit())
-    {
-        return Value::Text(format!("{line}\n"));
+    if let Some(checksum) = checksum_line(&side.outcome.stdout) {
+        return Value::Text(checksum);
     }
-    Value::Unavailable(
-        "the invocation printed no checksum, and resolving one needs `rev-parse`, \
-         which the port does not yet expose (cli-surface.md, P1)"
-            .to_owned(),
-    )
+    let repo = match side.repo() {
+        Ok(repo) => repo,
+        Err(value) => return value,
+    };
+    let Some(revision) = side
+        .bindings
+        .get("BRANCH")
+        .or_else(|| side.bindings.get("REV"))
+    else {
+        return Value::Unavailable(
+            "the invocation printed no checksum, and the cell's setups bound neither \
+             `$BRANCH` nor `$REV` for `rev-parse` to resolve"
+                .to_owned(),
+        );
+    };
+    let args = vec![
+        format!("--repo={}", repo.display()),
+        "rev-parse".to_owned(),
+        revision.clone(),
+    ];
+    match exec::run(side.tool, side.root, &args, &[]) {
+        Err(err) => Value::Unavailable(err),
+        Ok(outcome) if outcome.status != Some(0) => Value::Unavailable(format!(
+            "`{}` exited {}: {}",
+            outcome.command_text(),
+            outcome.status_text(),
+            String::from_utf8_lossy(&outcome.stderr).trim()
+        )),
+        Ok(outcome) => match checksum_line(&outcome.stdout) {
+            Some(checksum) => Value::Text(checksum),
+            None => Value::Unavailable(format!("`{}` printed no checksum", outcome.command_text())),
+        },
+    }
+}
+
+/// The last line of `stdout` when it is a bare 64-character hex checksum, with
+/// a trailing newline so the artifact compares as one line.
+fn checksum_line(stdout: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(stdout);
+    let line = text.lines().map(str::trim).next_back()?;
+    (line.len() == 64 && line.chars().all(|c| c.is_ascii_hexdigit())).then(|| format!("{line}\n"))
 }
 
 /// Each implementation's own `fsck` run against its own repository.
@@ -367,15 +418,7 @@ pub fn normalize(
     let text = String::from_utf8_lossy(bytes)
         .replace("\r\n", "\n")
         .replace('\r', "\n");
-
-    let mut ordered: Vec<(&String, &String)> = bindings.iter().collect();
-    ordered.sort_by_key(|(_, value)| std::cmp::Reverse(value.len()));
-    let mut text = text;
-    for (name, value) in ordered {
-        if !value.is_empty() {
-            text = text.replace(value.as_str(), &format!("${name}"));
-        }
-    }
+    let text = substitute(&text, bindings);
 
     let mut out = String::new();
     for line in text.lines() {
@@ -391,6 +434,20 @@ pub fn normalize(
         out.push('\n');
     }
     out
+}
+
+/// Replace every bound placeholder's value with its name, longest value first
+/// so a value holding another one is rewritten whole.
+fn substitute(text: &str, bindings: &BTreeMap<String, String>) -> String {
+    let mut ordered: Vec<(&String, &String)> = bindings.iter().collect();
+    ordered.sort_by_key(|(_, value)| std::cmp::Reverse(value.len()));
+    let mut text = text.to_owned();
+    for (name, value) in ordered {
+        if !value.is_empty() {
+            text = text.replace(value.as_str(), &format!("${name}"));
+        }
+    }
+    text
 }
 
 fn is_progress(line: &str) -> bool {
@@ -471,5 +528,138 @@ mod tests {
             false,
         );
         assert_eq!(text, "done\n");
+    }
+
+    // --- `checksum-agreement` ------------------------------------------------
+    //
+    // No cell names this oracle before `commit --timestamp` makes a commit
+    // reproducible (`docs/conformance/harness.md`, "Availability by
+    // sub-phase"), so these three tests are the resolution path's only guard.
+    // They stand in for the implementation with a script that answers the way
+    // `rev-parse` does, which keeps the harness's own no-linkage rule.
+
+    /// A directory of this test's own, empty at the start of each run.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-conformance-oracle-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        dir
+    }
+
+    /// A handle to a script that records the arguments it received in
+    /// `<dir>/argv` and prints `checksum` the way `rev-parse` does.
+    fn rev_parse_stub(dir: &Path, checksum: &str) -> Tool {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("stub");
+        let argv = dir.join("argv");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\necho {checksum}\n",
+                argv.display()
+            ),
+        )
+        .expect("write the stub");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("mark the stub executable");
+        Tool { role: "port", path }
+    }
+
+    /// An outcome carrying `stdout` and nothing else.
+    fn outcome(stdout: &[u8]) -> Outcome {
+        Outcome {
+            argv: vec!["stub".to_owned()],
+            cwd: PathBuf::from("/"),
+            status: Some(0),
+            signal: None,
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+            elapsed_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_printed_checksum_is_the_agreement_artifact() {
+        let checksum = "b".repeat(64);
+        let printed = outcome(format!("{checksum}\n").as_bytes());
+        let bindings = BTreeMap::new();
+        // The handle names no file, so reaching the fallback would report the
+        // oracle unavailable instead.
+        let tool = Tool {
+            role: "port",
+            path: PathBuf::from("/nonexistent-by-design"),
+        };
+        let value = checksum_agreement(&Side {
+            tool: &tool,
+            root: Path::new("/"),
+            repo: None,
+            bindings: &bindings,
+            outcome: &printed,
+            work: Path::new("/"),
+            keep_checksums: true,
+        });
+        assert_eq!(value, Value::Text(format!("{checksum}\n")));
+    }
+
+    #[test]
+    fn an_operation_printing_no_checksum_resolves_through_rev_parse() {
+        let dir = scratch("fallback");
+        let checksum = "c".repeat(64);
+        let tool = rev_parse_stub(&dir, &checksum);
+        let repo = dir.join("repo");
+        let quiet = outcome(b"Deleting refs\n");
+
+        // `$BRANCH` is resolved where a setup bound one, and `$REV` otherwise.
+        for (name, revision) in [("BRANCH", "conformance"), ("REV", &checksum)] {
+            let mut bindings = BTreeMap::new();
+            bindings.insert(name.to_owned(), revision.to_string());
+            let value = checksum_agreement(&Side {
+                tool: &tool,
+                root: &dir,
+                repo: Some(repo.clone()),
+                bindings: &bindings,
+                outcome: &quiet,
+                work: &dir,
+                keep_checksums: true,
+            });
+            assert_eq!(value, Value::Text(format!("{checksum}\n")));
+            assert_eq!(
+                std::fs::read_to_string(dir.join("argv"))
+                    .expect("the stub recorded its arguments")
+                    .trim(),
+                format!("--repo={} rev-parse {revision}", repo.display()),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cell_binding_no_revision_leaves_the_oracle_unavailable() {
+        let dir = scratch("unbound");
+        let tool = rev_parse_stub(&dir, &"d".repeat(64));
+        let quiet = outcome(b"");
+        let bindings = BTreeMap::new();
+        let value = checksum_agreement(&Side {
+            tool: &tool,
+            root: &dir,
+            repo: Some(dir.join("repo")),
+            bindings: &bindings,
+            outcome: &quiet,
+            work: &dir,
+            keep_checksums: true,
+        });
+        assert!(
+            matches!(value, Value::Unavailable(_)),
+            "an unbound revision produced {value:?}"
+        );
+        assert!(
+            !dir.join("argv").exists(),
+            "the oracle ran the tool with no revision to resolve"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

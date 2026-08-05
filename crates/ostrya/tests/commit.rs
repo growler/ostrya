@@ -19,8 +19,9 @@ use common::{
     ostree_available,
 };
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DirMeta, FileMeta,
-    MutableTree, ObjectType, Repo, RepoMode, RepoTree, Transaction, TreeEntry, Type, Value,
+    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
+    DirMeta, FileMeta, MutableTree, ObjectType, Repo, RepoMode, RepoTree, Transaction, TreeEntry,
+    Type, Value,
 };
 use ostrya_core::{Xattrs, loose_path};
 use ostrya_rt::block_on;
@@ -330,6 +331,87 @@ fn set_ref_immediate_writes_and_removes() {
 }
 
 #[test]
+fn ref_writes_run_under_both_fsync_settings() {
+    // Every ref mutation syncs the directory holding the ref when `[core] fsync`
+    // is set: the write after its rename, the alias write after its rename, and
+    // the removal after its unlink. The sync is not observable from outside the
+    // process, so this pins the paths it opens -- a parent named wrong fails the
+    // open -- and that both settings reach every form.
+    for fsync in [true, false] {
+        let tag = if fsync {
+            "commit-fsync"
+        } else {
+            "commit-nofsync"
+        };
+        let tmp = TmpDir::new(tag);
+        let root_dir = tmp.path().join("repo");
+        let a = csum(COMMIT);
+        let b = csum(CONTENT);
+        block_on(async {
+            Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            let config = root_dir.join("config");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!("fsync={fsync}\n"));
+            std::fs::write(&config, text).unwrap();
+            let repo = Repo::open(&root_dir).await.unwrap();
+
+            // A nested local ref, a remote ref, and a collection ref, whose
+            // parents sit one, two, and two levels below `refs/`.
+            repo.set_ref_immediate("branch/one", Some(&a))
+                .await
+                .unwrap();
+            repo.set_ref_immediate("origin:branch/two", Some(&b))
+                .await
+                .unwrap();
+            let cref = CollectionRef::new("org.example.Coll", "three");
+            repo.set_collection_ref_immediate(&cref, Some(&a))
+                .await
+                .unwrap();
+            assert_eq!(
+                repo.resolve_rev("branch/one", false).await.unwrap(),
+                Some(a)
+            );
+            assert_eq!(
+                repo.resolve_rev("origin:branch/two", false).await.unwrap(),
+                Some(b)
+            );
+
+            // An alias beside the nested ref, then the removal of both refs.
+            repo.set_ref_alias_immediate("branch/alias", "branch/one")
+                .await
+                .unwrap();
+            let alias = root_dir.join("refs/heads/branch/alias");
+            assert!(std::fs::symlink_metadata(&alias).unwrap().is_symlink());
+            assert_eq!(
+                repo.resolve_rev("branch/alias", false).await.unwrap(),
+                Some(a)
+            );
+
+            repo.set_ref_immediate("branch/alias", None).await.unwrap();
+            repo.set_ref_immediate("origin:branch/two", None)
+                .await
+                .unwrap();
+            assert!(!alias.exists());
+            assert_eq!(
+                repo.resolve_rev("origin:branch/two", true).await.unwrap(),
+                None
+            );
+
+            // A transaction's ref write takes the same path.
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref("branch/four", Some(&b));
+            txn.commit().await.unwrap();
+            assert_eq!(
+                repo.resolve_rev("branch/four", false).await.unwrap(),
+                Some(b)
+            );
+        });
+    }
+}
+
+#[test]
 fn set_ref_over_alias_replaces_symlink() {
     // Observed with the tool (2026.1): writing a ref whose file is a relative
     // symlink alias replaces the symlink with a regular ref file and leaves the
@@ -365,6 +447,155 @@ fn set_ref_over_alias_replaces_symlink() {
         let bar_meta = std::fs::symlink_metadata(heads.join("bar")).unwrap();
         assert!(bar_meta.file_type().is_file());
         assert_eq!(repo.resolve_rev("test/bar", false).await.unwrap(), Some(a));
+    });
+}
+
+#[test]
+fn check_refs_path_reports_a_path_through_a_ref_file() {
+    // The probe a listing runs over the path its PREFIX names: `ENOTDIR` where a
+    // component above the last is not a directory, and `Ok` for a ref file, a
+    // directory, and a path naming nothing, since a prefix matching no ref
+    // enumerates nothing. See docs/format-reference.md, "refs".
+    let tmp = TmpDir::new("commit-refs-path");
+    let root_dir = tmp.path().join("repo");
+    let a = csum(COMMIT);
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        repo.set_ref_immediate("plain", Some(&a)).await.unwrap();
+        repo.set_ref_immediate("deep/nest/ing", Some(&a))
+            .await
+            .unwrap();
+        repo.set_ref_immediate("origin:rr/x", Some(&a))
+            .await
+            .unwrap();
+        repo.set_ref_alias_immediate("al", "plain").await.unwrap();
+
+        for path in [
+            "heads/plain",
+            "heads/deep",
+            "heads/deep/nest",
+            "heads/al",
+            "remotes/origin",
+            "remotes/origin/rr/x",
+            // Naming nothing, at one level and at two.
+            "heads/nosuch",
+            "heads/nosuch/deeper",
+        ] {
+            repo.check_refs_path(path)
+                .await
+                .unwrap_or_else(|err| panic!("`{path}` was refused: {err}"));
+        }
+
+        // Through a ref file: the last component under one, an inner component
+        // under one, through an alias symlink naming one, and the remote form.
+        for path in [
+            "heads/plain/x",
+            "heads/plain/x/y",
+            "heads/al/x",
+            "remotes/origin/rr/x/y",
+        ] {
+            let err = repo.check_refs_path(path).await.unwrap_err();
+            assert!(
+                err.to_string().contains("Not a directory"),
+                "`{path}` was not refused with ENOTDIR, got {err}"
+            );
+        }
+    });
+}
+
+#[test]
+fn resolve_rev_reads_a_checksum_in_lowercase_hex_alone() {
+    // A 64-character revision is a checksum in lowercase hex alone; an uppercase
+    // or mixed-case name of that length is a refspec. Ref file content keeps the
+    // lenient reader, so a file holding an uppercase checksum resolves.
+    // See docs/format-reference.md, "Revision syntax".
+    let tmp = TmpDir::new("commit-rev-case");
+    let root_dir = tmp.path().join("repo");
+    let a = csum(COMMIT);
+    let upper = COMMIT.to_uppercase();
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        repo.set_ref_immediate("plain", Some(&a)).await.unwrap();
+
+        // The lowercase form resolves to itself, whether or not the store holds
+        // the commit.
+        assert_eq!(repo.resolve_rev(COMMIT, false).await.unwrap(), Some(a));
+        // The uppercase and mixed forms are ref names, and no ref carries them.
+        let mixed = format!("{}{}", &upper[..1], &COMMIT[1..]);
+        for rev in [upper.as_str(), mixed.as_str()] {
+            assert_eq!(repo.resolve_rev(rev, true).await.unwrap(), None);
+            let err = repo.resolve_rev(rev, false).await.unwrap_err();
+            assert!(
+                matches!(&err, ostrya::Error::RefNotFound(name) if name == rev),
+                "`{rev}` was not reported as a missing ref, got {err}"
+            );
+        }
+
+        // A ref carrying such a name resolves through the ref file.
+        repo.set_ref_immediate(&upper, Some(&a)).await.unwrap();
+        assert_eq!(repo.resolve_rev(&upper, false).await.unwrap(), Some(a));
+
+        // Ref file content is read by the lenient parser, the one case an
+        // uppercase checksum still resolves.
+        std::fs::write(
+            root_dir.join("refs/heads/uc"),
+            format!("{upper}\n").as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(repo.resolve_rev("uc", false).await.unwrap(), Some(a));
+    });
+}
+
+#[test]
+fn list_refs_refuses_a_symlink_naming_a_directory() {
+    // A symlink under refs/ is an alias, whatever it points at, so the listing
+    // reads it as a ref rather than descending into it. A link naming a
+    // directory therefore fails the read with EISDIR, which is the tool's own
+    // `Listing refs: Is a directory` refusal. A self-link is the case that
+    // would otherwise recurse without end. Both links are reachable only by
+    // out-of-band mutation; see docs/format-reference.md, "refs".
+    let tmp = TmpDir::new("commit-refs-dirlink");
+    let root_dir = tmp.path().join("repo");
+    let a = csum(COMMIT);
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        repo.set_ref_immediate("deep/nest/ing", Some(&a))
+            .await
+            .unwrap();
+        assert_eq!(repo.list_refs(None).await.unwrap().len(), 1);
+
+        let heads = root_dir.join("refs/heads");
+        // A link to the directory holding it: following it has no end.
+        std::os::unix::fs::symlink(".", heads.join("selfdir")).unwrap();
+        let err = repo.list_refs(None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Is a directory"),
+            "a self-link is refused, got {err}"
+        );
+
+        // A link to another directory, which resolves but names no ref.
+        std::fs::remove_file(heads.join("selfdir")).unwrap();
+        std::os::unix::fs::symlink("deep", heads.join("dal")).unwrap();
+        let err = repo.list_refs(None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Is a directory"),
+            "a link naming a directory is refused, got {err}"
+        );
+
+        // An alias naming a ref file is still read through the link.
+        std::fs::remove_file(heads.join("dal")).unwrap();
+        std::os::unix::fs::symlink("deep/nest/ing", heads.join("al")).unwrap();
+        let refs = repo.list_refs(None).await.unwrap();
+        assert_eq!(
+            refs,
+            vec![("al".to_owned(), a), ("deep/nest/ing".to_owned(), a)]
+        );
     });
 }
 

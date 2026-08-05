@@ -33,6 +33,15 @@ pub enum Error {
     /// A refspec did not resolve to a commit.
     #[error("ref not found: {0}")]
     RefNotFound(String),
+    /// A refspec does not name a path inside the `refs/` tree: an empty name,
+    /// an empty, `.`, or `..` component, a remote or collection element holding
+    /// a `/`, or an interior NUL. The payload is the refspec as given, spelled
+    /// `<remote>:<name>` or `<collection-id>:<name>` where one is present.
+    #[error("invalid refspec: {0}")]
+    InvalidRefspec(String),
+    /// A revision's `^` ancestry suffix asked for the parent of a root commit.
+    #[error("commit {0} has no parent")]
+    NoParentCommit(Checksum),
     /// On-disk data did not match the expected format.
     #[error("invalid format: {0}")]
     InvalidFormat(String),

@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use common::fixture_repo;
+use common::{fixture_repo, ostree_available};
 use ostrya::{CreateOptions, Repo, RepoMode};
 use ostrya_rt::block_on;
 
@@ -39,15 +39,6 @@ impl Drop for TmpDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-/// Whether the `ostree` tool is available for the cross-check tests.
-fn ostree_available() -> bool {
-    Command::new("ostree")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
 }
 
 #[test]

@@ -678,6 +678,7 @@ expect-exit: 1
 expect-stderr: contains "error: Invalid ref name (null)"
 ref-expect-exit: 1
 ref-expect-stderr: contains "error: Invalid ref name (null)"
+ref-may-abort: 6
 oracle: exit-status refs-bytes
 outcome: refused-both
 severity: interop
@@ -686,7 +687,12 @@ note: the NEWREF is a collection id and names no ref, and both refuse it in the
  same words. `stderr-text` is left out because the tool prints a GLib assertion
  line ahead of its own message and the port prints the message alone
  (`cli-surface.md`, "P1"), so the two texts compare only as the substring both
- `expect-stderr` fields state.
+ `expect-stderr` fields state. `ref-may-abort: 6` records a reference build that
+ leaves the error unset on this path: 2026.2 prints
+ `ostree_validate_rev: assertion 'rev != NULL' failed` and then aborts in
+ `ostree_run` on `assertion failed: (success || error)`, where 2026.1 prints the
+ same critical line and still exits 1. The port exits 1 with the message alone
+ on both.
 
 family: M10
 subcommand: refs

@@ -219,8 +219,27 @@ fn executable(record: &Record, errors: &mut Vec<String>) {
         }
     }
 
+    if let Some(text) = record.get("ref-may-abort") {
+        if text.trim().parse::<i32>().is_err() {
+            errors.push(format!(
+                "{origin}: `ref-may-abort: {text}` is not a signal number"
+            ));
+        }
+        if record.get("note").is_none() {
+            errors.push(format!(
+                "{origin}: `ref-may-abort` needs a `note:` recording the crash \
+                 that was observed"
+            ));
+        }
+    }
+
     if record.get("ref-run") == Some("n-a") {
-        for field in ["ref-expect-exit", "ref-expect-stdout", "ref-expect-stderr"] {
+        for field in [
+            "ref-expect-exit",
+            "ref-expect-stdout",
+            "ref-expect-stderr",
+            "ref-may-abort",
+        ] {
             if record.get(field).is_some() {
                 errors.push(format!(
                     "{origin}: `ref-run: n-a` leaves `{field}` with nothing to assert against"
@@ -499,6 +518,39 @@ mod tests {
             errors,
             vec![format!(
                 "{}: `run` names `$NOPE`, which no setup binds",
+                record.origin()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_crash_tolerance_without_a_note_is_reported() {
+        let record = record(&[("run", "ostrya refs"), ("ref-may-abort", "6")]);
+        let mut errors = Vec::new();
+        executable(&record, &mut errors);
+        assert_eq!(
+            errors,
+            vec![format!(
+                "{}: `ref-may-abort` needs a `note:` recording the crash that \
+                 was observed",
+                record.origin()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_crash_tolerance_naming_no_signal_is_reported() {
+        let record = record(&[
+            ("run", "ostrya refs"),
+            ("ref-may-abort", "sigabrt"),
+            ("note", "observed"),
+        ]);
+        let mut errors = Vec::new();
+        executable(&record, &mut errors);
+        assert_eq!(
+            errors,
+            vec![format!(
+                "{}: `ref-may-abort: sigabrt` is not a signal number",
                 record.origin()
             )]
         );

@@ -12,7 +12,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -261,6 +261,37 @@ fn ostree_available() -> bool {
     found
 }
 
+/// The environment variable that turns the ed25519-unsupported skip into a
+/// failure. A harness setting it declares that the installed `ostree` carries
+/// the engine, so a run where it does not is a broken harness rather than a
+/// test to pass over.
+const REQUIRE_OSTREE_ED25519: &str = "OSTRYA_REQUIRE_OSTREE_ED25519";
+
+/// Whether the `ostree` tool carries its ed25519 signing engine, which
+/// `ostree --version` reports as the `sign-ed25519` feature. The engine is a
+/// build option: a tool built without it refuses every ed25519 invocation with
+/// `Requested signature type is not implemented`, which describes the tool's
+/// build and states nothing about the port. With [`REQUIRE_OSTREE_ED25519`] set
+/// the absence fails; without it the test skips and says so.
+fn ostree_supports_ed25519() -> bool {
+    let supported = ostree_available()
+        && Command::new("ostree")
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("sign-ed25519"))
+            .unwrap_or(false);
+    assert!(
+        supported || std::env::var_os(REQUIRE_OSTREE_ED25519).is_none(),
+        "{REQUIRE_OSTREE_ED25519} is set and the installed `ostree` carries no \
+         ed25519 engine, so the ed25519 cross-check tests cannot run"
+    );
+    if supported {
+        return true;
+    }
+    eprintln!("skipped: `ostree` carries no ed25519 engine");
+    false
+}
+
 /// The commit a ref resolves to, read through the library.
 fn resolve(repo: &Path, refspec: &str) -> Option<String> {
     block_on(async {
@@ -378,7 +409,7 @@ fn commit_from_disk_reproduces_fixture_id_and_ref() {
 /// golden fixture commit without `--canonical-permissions` standing in for
 /// them. The ISO form of the same instant, the hexadecimal and octal renderings
 /// of the same ids, and a negative id (which declares nothing, so the tree keeps
-/// the invoking user's ownership and the commit differs) are held beside it.
+/// the ownership its source carries) are held beside it.
 #[test]
 fn commit_flags_reproduce_the_fixture_id() {
     let tmp = TmpDir::new("commit-flags");
@@ -428,11 +459,26 @@ fn commit_flags_reproduce_the_fixture_id() {
         COMMIT,
         "an offset-bearing wall clock and hexadecimal and octal ids agree",
     );
-    assert_ne!(
+    // A negative id declares nothing, so the source's ownership stands. Stating
+    // that as equality against the source's own ids holds whoever runs the test;
+    // comparing against the fixture instead would collapse under a root run,
+    // whose source tree already carries the fixture's `0:0`.
+    let source = std::fs::metadata(src.join("hello.txt")).unwrap();
+    let (uid, gid) = (source.uid(), source.gid());
+    assert_eq!(
         commit("@1700000000", "-1", "-1").ok().stdout_trimmed(),
-        COMMIT,
+        commit("@1700000000", &uid.to_string(), &gid.to_string())
+            .ok()
+            .stdout_trimmed(),
         "a negative id declares nothing, so the source's ownership stands",
     );
+    if (uid, gid) != (0, 0) {
+        assert_ne!(
+            commit("@1700000000", "-1", "-1").ok().stdout_trimmed(),
+            COMMIT,
+            "the source's ownership differs from the fixture's, so the commit does",
+        );
+    }
 
     // `SOURCE_DATE_EPOCH` names the same instant the fixture uses, and
     // `--timestamp` overrides whatever it holds.
@@ -1232,7 +1278,7 @@ fn sign_verify_delete_ed25519() {
     assert!(!bad.status.success(), "a wrong key must not verify");
 
     // The tool verifies the port-written signature.
-    if ostree_available() {
+    if ostree_supports_ed25519() {
         let out = Command::new("ostree")
             .arg(format!("--repo={}", repo.display()))
             .args([
@@ -1576,8 +1622,8 @@ fn static_delta_list_and_apply_offline() {
 
 #[test]
 fn static_delta_generate_signs_and_indexes() {
-    if !ostree_available() {
-        eprintln!("skipping: ostree tool not available");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree tool has no ed25519 engine");
         return;
     }
     let tmp = TmpDir::new("static-delta-generate");
@@ -4533,11 +4579,6 @@ fn refs_create_collection_matches_the_tool() {
             vec!["refs", "-c", "--create=nocollection", "plain"],
             "error: Invalid collection ID nocollection".to_owned(),
         ),
-        // A NEWREF with no `:` that is a collection id carries no ref name.
-        (
-            vec!["refs", "-c", "--create=org.example.Fresh", "plain"],
-            "error: Invalid ref name (null)".to_owned(),
-        ),
         // --force suppresses the already-exists refusal, so a name the existence
         // check resolves reaches the collection-id validation.
         (
@@ -4548,9 +4589,15 @@ fn refs_create_collection_matches_the_tool() {
         assert_agrees_on_error(&port, &tool, &args, &message);
     }
 
-    // The one divergence: on the missing ref name the tool prints a GLib
-    // assertion line before its own message, and the port prints the message
-    // alone (`docs/conformance/cli-surface.md`, "P1").
+    // A NEWREF with no `:` that is a collection id carries no ref name. This is
+    // the one divergence: the tool prints a GLib assertion line before its own
+    // message, and the port prints the message alone
+    // (`docs/conformance/cli-surface.md`, "P1"). The two are compared here
+    // rather than through `assert_agrees_on_error` because the tool's outcome
+    // depends on its build: 2026.1 prints the critical line and exits 1, and
+    // 2026.2 leaves the error unset and aborts in `ostree_run` on
+    // `assertion failed: (success || error)`. The port's refusal is the same
+    // either way, so it is what this states.
     let refused = ostrya(
         &[
             "refs",
@@ -4563,10 +4610,28 @@ fn refs_create_collection_matches_the_tool() {
         None,
         &[],
     );
+    assert_eq!(refused.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&refused.stderr),
         "error: Invalid ref name (null)\n"
     );
+    let tool_refused = ostree(&[
+        &format!("--repo={}", tool.display()),
+        "refs",
+        "-c",
+        "--create=org.example.Fresh",
+        "plain",
+    ]);
+    match tool_refused.status.code() {
+        Some(1) => assert!(
+            String::from_utf8_lossy(&tool_refused.stderr)
+                .contains("error: Invalid ref name (null)"),
+            "the tool exited 1 without its own refusal:\n{}",
+            String::from_utf8_lossy(&tool_refused.stderr)
+        ),
+        None => {}
+        other => panic!("the tool neither refused nor died on a signal: {other:?}"),
+    }
 
     // A ref name ending in `^` kills the tool the way it does without `-c`, so
     // the port's refusal stands on its own (`cli-surface.md`, "P1").

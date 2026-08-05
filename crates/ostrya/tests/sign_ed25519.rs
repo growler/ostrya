@@ -12,6 +12,9 @@
 //! ed25519` and validated round-trip against the tool. `SECRET_B64` is the
 //! base64 of the 64-byte secret (32-byte seed followed by the 32-byte public
 //! key); `PUBLIC_B64` is the base64 of the 32-byte public key.
+//!
+//! Each test that drives the tool is skipped where the tool's build carries no
+//! ed25519 engine, since such a build refuses every ed25519 invocation.
 
 mod common;
 
@@ -19,7 +22,7 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::Command;
 
-use common::{TmpDir, ostree_available};
+use common::{TmpDir, ostree_supports_ed25519};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Ed25519Signer,
     Ed25519Verifier, Error, MutableTree, ObjectType, Repo, RepoMode, Signer, base64,
@@ -99,8 +102,8 @@ fn public_key() -> Vec<u8> {
 
 #[test]
 fn port_ed25519_signature_is_verified_by_the_tool() {
-    if !ostree_available() {
-        eprintln!("skipping: ostree tool not available");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree tool has no ed25519 engine");
         return;
     }
     let tmp = TmpDir::new("ed25519-port-tool");
@@ -153,8 +156,8 @@ fn port_ed25519_signature_is_verified_by_the_tool() {
 
 #[test]
 fn port_verifies_an_ed25519_signature_the_tool_wrote() {
-    if !ostree_available() {
-        eprintln!("skipping: ostree tool not available");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree tool has no ed25519 engine");
         return;
     }
     let tmp = TmpDir::new("ed25519-tool-port");
@@ -249,8 +252,10 @@ fn delete_by_key_removes_the_ed25519_signature() {
         commit
     });
 
-    // The tool no longer verifies the deleted signature.
-    if ostree_available() {
+    // The tool no longer verifies the deleted signature. A tool with no
+    // ed25519 engine refuses the invocation whatever the commit holds, which
+    // would satisfy the assertion below without exercising the deletion.
+    if ostree_supports_ed25519() {
         let out = Command::new("ostree")
             .args([
                 &repo_arg,
@@ -271,8 +276,8 @@ fn delete_by_key_removes_the_ed25519_signature() {
 
 #[test]
 fn ed25519_commitmeta_is_byte_identical_to_the_tool() {
-    if !ostree_available() {
-        eprintln!("skipping: ostree tool not available");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree tool has no ed25519 engine");
         return;
     }
     // Two repositories hold the identical commit; one is signed by the port and
@@ -315,8 +320,8 @@ fn ed25519_commitmeta_is_byte_identical_to_the_tool() {
 
 #[test]
 fn ed25519_trusted_revoked_directory_convention() {
-    if !ostree_available() {
-        eprintln!("skipping: ostree tool not available");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree tool has no ed25519 engine");
         return;
     }
     let tmp = TmpDir::new("ed25519-keydir");

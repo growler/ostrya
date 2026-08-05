@@ -10,7 +10,8 @@
 //! cache are checked the same way, through the tool.
 //!
 //! Tests needing the tool are skipped when it is absent, matching the other
-//! interop tests.
+//! interop tests. The tests that sign also need the tool's ed25519 engine and
+//! are skipped where the build carries none.
 
 mod common;
 
@@ -19,7 +20,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{TmpDir, ostree_available};
+use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
@@ -1177,8 +1178,8 @@ fn a_signed_delta_verifies_and_indexes() {
         "the superblock is not wrapped in the signed envelope"
     );
 
-    if !ostree_available() {
-        eprintln!("skipping: ostree not available");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree has no ed25519 engine");
         return;
     }
     let src_arg = format!("--repo={}", src.display());
@@ -1292,8 +1293,8 @@ fn a_delta_carries_the_target_commits_detached_metadata() {
         "a commit with no detached metadata got a commitmeta entry"
     );
 
-    if !ostree_available() {
-        eprintln!("skipping: ostree not available");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree has no ed25519 engine");
         return;
     }
     // A delta destination has to be bare-user: the tool refuses static deltas in

@@ -122,6 +122,13 @@ pub fn t0_gate(port: &Path, artifact_dir: &Path) -> Result<Gate, String> {
     let port = exec::resolve("port", Some(port), "OSTRYA_BIN", "ostrya")
         .ok_or_else(|| format!("{} is not an executable file", port.display()))?;
     let reference = exec::resolve("reference", None, "OSTREE_BIN", "ostree");
+    // Only the reference converts its messages through the locale, so a run
+    // without one is unaffected.
+    if reference.is_some()
+        && let Some(defect) = exec::locale_codeset_defect()
+    {
+        return Err(defect);
+    }
 
     let options = runner::Options {
         port: port.clone(),

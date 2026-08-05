@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 
-use common::{TmpDir, ostree_available};
+use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_io::{AsyncRead, AsyncWrite};
 use hyper::body::{Bytes, Frame, SizeHint};
 use hyper::service::service_fn;
@@ -3829,8 +3829,8 @@ fn a_delta_is_held_to_the_pulls_signature_policy() {
 /// remote under another key.
 #[test]
 fn a_pull_verifies_what_the_tool_signed() {
-    if !ostree_available() {
-        eprintln!("skipping: the ostree tool is not installed");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: the ostree tool has no ed25519 engine");
         return;
     }
     block_on(async {

@@ -524,7 +524,7 @@ fn declared_cell(
     let keep_checksums = oracles.contains(&"checksum-agreement");
 
     let mut failures: Vec<String> = Vec::new();
-    let mut outcomes: Vec<(usize, Outcome)> = Vec::new();
+    let mut outcomes: Vec<(usize, Outcome, Option<String>)> = Vec::new();
 
     for (index, side) in sides.iter().enumerate() {
         let is_port = side.tool.role == "port";
@@ -545,32 +545,40 @@ fn declared_cell(
         write_artifact(directory, &format!("{label}.stdout"), &outcome.stdout)?;
         write_artifact(directory, &format!("{label}.stderr"), &outcome.stderr)?;
 
-        failures.extend(assertions(record, side, &outcome, is_port));
-        outcomes.push((index, outcome));
+        // A tolerated reference crash carries no claims to check: the process
+        // never reached its own exit or messages.
+        let tolerated = tolerated_abort(record, &outcome, is_port);
+        if tolerated.is_none() {
+            failures.extend(assertions(record, side, &outcome, is_port));
+        }
+        outcomes.push((index, outcome, tolerated));
     }
 
     let mut results: Vec<(String, OracleStatus)> = Vec::new();
     for name in &oracles {
         let mut values: Vec<(&'static str, Value)> = Vec::new();
-        for (index, outcome) in &outcomes {
+        for (index, outcome, tolerated) in &outcomes {
             let side = &sides[*index];
             let label = if side.tool.role == "port" {
                 "port"
             } else {
                 "ref"
             };
-            let value = oracle::apply(
-                name,
-                &Side {
-                    tool: side.tool,
-                    root: &side.root,
-                    repo: setup::primary_repo(&side.bindings),
-                    bindings: &side.bindings,
-                    outcome,
-                    work: &side.work,
-                    keep_checksums,
-                },
-            );
+            let value = match tolerated {
+                Some(reason) => Value::Unavailable(reason.clone()),
+                None => oracle::apply(
+                    name,
+                    &Side {
+                        tool: side.tool,
+                        root: &side.root,
+                        repo: setup::primary_repo(&side.bindings),
+                        bindings: &side.bindings,
+                        outcome,
+                        work: &side.work,
+                        keep_checksums,
+                    },
+                ),
+            };
             if let Value::Text(text) = &value {
                 write_artifact(
                     directory,
@@ -627,9 +635,16 @@ fn declared_cell(
     let (verdict, reason, detail) = if !failures.is_empty() {
         (Verdict::Fail, None, Some(failures.join("\n")))
     } else if !unavailable.is_empty() {
+        // A tolerated reference crash is its own category, so the summary names
+        // the reference build's defect rather than a missing port command.
+        let aborted = outcomes
+            .iter()
+            .any(|(_, _, tolerated)| tolerated.is_some())
+            .then_some("reference-abort")
+            .unwrap_or("unimplemented-cli");
         (
             Verdict::Skip,
-            Some("unimplemented-cli".to_owned()),
+            Some(aborted.to_owned()),
             Some(unavailable.join("; ")),
         )
     } else {
@@ -652,6 +667,25 @@ fn declared_cell(
         notes: Vec::new(),
         elapsed_ms: 0,
         promoted: false,
+    })
+}
+
+/// The reason a record tolerates the reference's abnormal termination, and
+/// `None` where it does not.
+///
+/// A reference build that crashes on a cell's invocation states nothing about
+/// the port, so `ref-may-abort:` names the one signal the record tolerates and
+/// the cell reports as skipped. The record names a single signal, so a crash
+/// other than the observed one still fails the cell, and the port's own
+/// `expect-*` claims are asserted either way.
+fn tolerated_abort(record: &Record, outcome: &Outcome, is_port: bool) -> Option<String> {
+    if is_port {
+        return None;
+    }
+    let tolerated: i32 = record.get("ref-may-abort")?.trim().parse().ok()?;
+    let signal = outcome.signal?;
+    (signal == tolerated).then(|| {
+        format!("the reference aborted on signal {signal}, which `ref-may-abort` tolerates")
     })
 }
 
@@ -858,5 +892,47 @@ mod tests {
             ..low_corpus
         };
         assert_eq!(required_tier(&high_corpus, &record), Tier::T3);
+    }
+
+    /// An outcome that ended on `signal`, or exited with `status`.
+    fn ended(signal: Option<i32>, status: Option<i32>) -> Outcome {
+        Outcome {
+            argv: Vec::new(),
+            cwd: PathBuf::from("t"),
+            status,
+            signal,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            elapsed_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_record_tolerates_the_reference_signal_it_names() {
+        let record = record(&[("ref-may-abort", "6")]);
+        assert!(tolerated_abort(&record, &ended(Some(6), None), false).is_some());
+    }
+
+    #[test]
+    fn a_tolerance_covers_no_other_signal() {
+        let record = record(&[("ref-may-abort", "6")]);
+        assert!(tolerated_abort(&record, &ended(Some(11), None), false).is_none());
+    }
+
+    #[test]
+    fn a_tolerance_never_covers_the_port() {
+        let record = record(&[("ref-may-abort", "6")]);
+        assert!(tolerated_abort(&record, &ended(Some(6), None), true).is_none());
+    }
+
+    #[test]
+    fn a_reference_that_exits_is_not_a_tolerated_abort() {
+        let record = record(&[("ref-may-abort", "6")]);
+        assert!(tolerated_abort(&record, &ended(None, Some(1)), false).is_none());
+    }
+
+    #[test]
+    fn a_record_without_the_field_tolerates_no_abort() {
+        assert!(tolerated_abort(&record(&[]), &ended(Some(6), None), false).is_none());
     }
 }

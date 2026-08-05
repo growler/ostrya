@@ -120,6 +120,36 @@ pub fn ostree_available() -> bool {
     found
 }
 
+/// The environment variable that turns the ed25519-unsupported skip into a
+/// failure. A harness setting it declares that the installed `ostree` carries
+/// the engine, so a run where it does not is a broken harness rather than a
+/// test to pass over.
+pub const REQUIRE_OSTREE_ED25519: &str = "OSTRYA_REQUIRE_OSTREE_ED25519";
+
+/// Whether the `ostree` tool carries its ed25519 signing engine, which
+/// `ostree --version` reports as the `sign-ed25519` feature. The engine is a
+/// build option: a tool built without it refuses every ed25519 invocation with
+/// `Requested signature type is not implemented`.
+///
+/// Tests that ask the tool to sign or verify with ed25519 skip when the engine
+/// is absent. Such a refusal describes the tool's build and states nothing
+/// about the port, and it would otherwise satisfy a test that asserts the tool
+/// rejects a signature. With [`REQUIRE_OSTREE_ED25519`] set the absence fails.
+pub fn ostree_supports_ed25519() -> bool {
+    let supported = ostree_available()
+        && Command::new("ostree")
+            .arg("--version")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("sign-ed25519"))
+            .unwrap_or(false);
+    assert!(
+        supported || std::env::var_os(REQUIRE_OSTREE_ED25519).is_none(),
+        "{REQUIRE_OSTREE_ED25519} is set and the installed `ostree` carries no \
+         ed25519 engine, so the ed25519 cross-check tests cannot run"
+    );
+    supported
+}
+
 /// Whether the `openssl` tool is available for cross-check tests.
 pub fn openssl_available() -> bool {
     Command::new("openssl")

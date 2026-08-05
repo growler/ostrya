@@ -237,6 +237,14 @@ fn command_run(args: &Args, format: Format) -> Result<ExitCode, String> {
             PathBuf::from("target/conformance").join(ostrya_conformance::run_id())
         }));
 
+    // Only the reference converts its messages through the locale, so a run
+    // without one is unaffected.
+    if reference.is_some()
+        && let Some(defect) = exec::locale_codeset_defect()
+    {
+        return Err(defect);
+    }
+
     let options = runner::Options {
         port: port.clone(),
         reference: reference.clone(),

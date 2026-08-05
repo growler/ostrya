@@ -47,7 +47,7 @@ pub const DESCRIPTIVE_FIELDS: [&str; 21] = [
 ];
 
 /// Fields the runner executes.
-pub const EXECUTABLE_FIELDS: [&str; 11] = [
+pub const EXECUTABLE_FIELDS: [&str; 12] = [
     "cell",
     "setup",
     "run",
@@ -59,6 +59,7 @@ pub const EXECUTABLE_FIELDS: [&str; 11] = [
     "ref-expect-exit",
     "ref-expect-stdout",
     "ref-expect-stderr",
+    "ref-may-abort",
 ];
 
 /// The outcome vocabulary, which is also the reason a declaration reports.

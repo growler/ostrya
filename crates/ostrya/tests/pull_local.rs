@@ -82,11 +82,14 @@ async fn commit_tree(
         branch,
         parent,
         CommitModifierFlags::SKIP_XATTRS,
+        None,
     )
     .await
 }
 
-/// Commit subtree `sub` as [`commit_tree`] does, under the given modifier flags.
+/// Commit subtree `sub` as [`commit_tree`] does, under the given modifier flags
+/// and, where `owner` names one, a declared uid and gid in place of the ones the
+/// source carries.
 async fn commit_tree_with(
     repo: &Repo,
     base: &Path,
@@ -94,10 +97,15 @@ async fn commit_tree_with(
     branch: &str,
     parent: Option<Checksum>,
     flags: CommitModifierFlags,
+    owner: Option<(u32, u32)>,
 ) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
     let mut modifier = CommitModifier::new(flags);
+    if let Some((uid, gid)) = owner {
+        modifier.owner_uid = Some(uid);
+        modifier.owner_gid = Some(gid);
+    }
     let dfd = std::fs::File::open(base).unwrap();
     txn.write_dfd_to_mtree(dfd.as_fd(), Path::new(sub), &mut mtree, Some(&mut modifier))
         .await
@@ -161,8 +169,23 @@ async fn canonical_source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, C
     build_tree(&base.join("v2"), b"hello two\n");
     let (path, repo) = make_repo(base, "src", mode).await;
     let flags = CommitModifierFlags::SKIP_XATTRS | CommitModifierFlags::CANONICAL_PERMISSIONS;
-    let c1 = commit_tree_with(&repo, base, "v1", "main", None, flags).await;
-    let c2 = commit_tree_with(&repo, base, "v2", "main", Some(c1), flags).await;
+    let c1 = commit_tree_with(&repo, base, "v1", "main", None, flags, None).await;
+    let c2 = commit_tree_with(&repo, base, "v2", "main", Some(c1), flags, None).await;
+    (path, repo, c1, c2)
+}
+
+/// A source repository as [`source_repo`], committed with a declared non-root
+/// owner so every object it holds carries a uid and gid a bare-user-only
+/// destination discards. The ownership is declared rather than inherited from the
+/// committing process, so the objects are the same whoever runs the test.
+async fn owned_source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, Checksum, Checksum) {
+    build_tree(&base.join("v1"), b"hello one\n");
+    build_tree(&base.join("v2"), b"hello two\n");
+    let (path, repo) = make_repo(base, "src", mode).await;
+    let flags = CommitModifierFlags::SKIP_XATTRS;
+    let owner = Some((1000, 1000));
+    let c1 = commit_tree_with(&repo, base, "v1", "main", None, flags, owner).await;
+    let c2 = commit_tree_with(&repo, base, "v2", "main", Some(c1), flags, owner).await;
     (path, repo, c1, c2)
 }
 
@@ -1161,9 +1184,11 @@ fn a_bare_user_only_destination_refuses_a_header_it_cannot_store() {
     let tmp = TmpDir::new("pull-buo-header");
     block_on(async {
         let base = tmp.path();
-        // Committed without canonical permissions, so every object carries the
-        // committing process's uid and gid, which this mode discards.
-        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::BareUser).await;
+        // Committed under a declared non-root owner, so every object carries a
+        // uid and gid this mode discards. A commit inheriting the running
+        // process's ids would carry 0:0 under a root test run, which is what
+        // this mode stores, and the refusal under test would not arise.
+        let (_src_dir, src, _c1, _c2) = owned_source_repo(base, RepoMode::BareUser).await;
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUserOnly).await;
 
         let err = dst

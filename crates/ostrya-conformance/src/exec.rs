@@ -175,14 +175,57 @@ fn opens_as_repository(directory: &Path) -> bool {
     false
 }
 
+/// The locale every invocation runs under.
+///
+/// The encoding is part of the comparison, not only the language. GLib holds its
+/// option-parser messages with U+201C and U+201D around the offending value and
+/// converts them to the locale's charset on the way to stderr. Under `C` the
+/// charset is ASCII, which cannot hold those characters, so a reference on a host
+/// carrying locale data prints `?` where one on a host carrying none prints the
+/// characters themselves. Pinning a UTF-8 locale keeps that conversion lossless,
+/// so the reference renders the same bytes on either host and the port, which
+/// writes UTF-8 throughout, matches it.
+pub const LOCALE: &str = "C.UTF-8";
+
+/// The reason the host resolves [`LOCALE`] to something other than UTF-8, and
+/// `None` where it resolves it to UTF-8.
+///
+/// A host missing the locale falls back to ASCII, where GLib prints `?` for the
+/// characters it cannot hold. That would read as a difference in the message
+/// text rather than as the missing locale it is, so the caller reports it once
+/// ahead of the cells instead of leaving it to surface in every cell that quotes
+/// a value.
+///
+/// `locale charmap` names the codeset the locale resolves to, which is what GLib
+/// converts its messages into. A host where `locale` cannot be run states
+/// nothing either way and is left alone.
+pub fn locale_codeset_defect() -> Option<String> {
+    let output = Command::new("locale")
+        .arg("charmap")
+        .env("LC_ALL", LOCALE)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    let codeset = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.success() && codeset != "UTF-8").then(|| {
+        format!(
+            "`LC_ALL={LOCALE}` resolves to the {codeset} codeset on this host, \
+             so the reference renders the characters it cannot hold as `?` and a \
+             message quoting a value compares as a text difference"
+        )
+    })
+}
+
 /// Run `tool` with `args` in `cwd`.
 ///
 /// `OSTREE_REPO` is removed unless `env` sets it, so the current-directory and
 /// environment fallbacks a cell exercises are the cell's own doing. `G_DEBUG`
 /// is removed, so a `fatal-criticals` or `fatal-warnings` setting on the
 /// operator's host cannot turn a GLib critical in the reference into an abort.
-/// `LC_ALL` is set to `C` so the two implementations' messages compare in one
-/// language.
+/// `LC_ALL` is set to [`LOCALE`] so the two implementations' messages compare in
+/// one language and one encoding.
 ///
 /// The run is refused, before the process starts, when `system_repo_refusal`
 /// reads the invocation as one that resolves the host's system repository.
@@ -204,7 +247,7 @@ pub fn run(
         .args(args.iter().map(OsStr::new))
         .env_remove("OSTREE_REPO")
         .env_remove("G_DEBUG")
-        .env("LC_ALL", "C")
+        .env("LC_ALL", LOCALE)
         .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

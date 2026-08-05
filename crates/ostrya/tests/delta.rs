@@ -11,14 +11,15 @@
 //! file edited in place; and a signed delta is verified with the ed25519 engine.
 //!
 //! Every test is skipped when the tool is absent, matching the other
-//! interop tests.
+//! interop tests. The signed-delta test also needs the tool's ed25519 engine
+//! and is skipped where the build carries none.
 
 mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{TmpDir, ostree_available};
+use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
 use ostrya::{
     CommitState, CreateOptions, Ed25519Verifier, FileKind, Repo, RepoMode, TreeEntry, base64,
@@ -304,8 +305,8 @@ fn applies_from_to_delta_with_bspatch() {
 
 #[test]
 fn verifies_signed_delta() {
-    if !ostree_available() {
-        eprintln!("skipping: ostree tool not available");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree tool has no ed25519 engine");
         return;
     }
     let tmp = TmpDir::new("delta-signed");

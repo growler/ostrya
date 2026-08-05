@@ -229,10 +229,27 @@ compared.
 ### Normalization
 
 Every invocation runs with `OSTREE_REPO` and `G_DEBUG` removed from the
-environment and `LC_ALL` set to `C`, so a cell that exercises the environment
-fallback states that itself, a `fatal-criticals` or `fatal-warnings` setting on
-the operator's host cannot turn a GLib critical in the reference into an abort,
-and the two implementations' messages compare in one language.
+environment and `LC_ALL` set to `C.UTF-8`, so a cell that exercises the
+environment fallback states that itself, a `fatal-criticals` or
+`fatal-warnings` setting on the operator's host cannot turn a GLib critical in
+the reference into an abort, and the two implementations' messages compare in
+one language and one encoding.
+
+The encoding is part of the comparison. GLib holds its option-parser messages
+with U+201C and U+201D around the offending value and converts them to the
+locale's codeset on the way to stderr. Under `C` that codeset is ASCII, which
+cannot hold those characters, so the reference prints `?` on a host carrying
+locale data and prints the characters themselves on a host carrying none -- the
+same tool, two renderings, decided by the host rather than by the tool. A UTF-8
+locale keeps the conversion lossless, so the reference renders the same bytes on
+either host and the port, which writes UTF-8 throughout, matches it. A record
+quoting a value in a message therefore states the typographic characters.
+
+Startup reads the codeset `LC_ALL=C.UTF-8` resolves to and refuses the run where
+it is not UTF-8, naming the locale as the cause. A host missing the locale would
+otherwise report a text difference in every cell that quotes a value. The check
+applies where a reference is present, since only the reference converts its
+messages through the locale.
 
 The reference tool resolves a repository from the current directory, then
 `OSTREE_REPO`, then the compiled-in `/sysroot/ostree/repo`, and the third
@@ -289,6 +306,29 @@ asserts that each side it ran terminated normally, so a signal is always a
 failure. A record that omits `expect-exit` claims exit status 0 for the port,
 and a record that omits `ref-expect-exit` claims the same for the reference; a
 record expecting a refusal states the status it expects.
+
+### Tolerating a reference crash
+
+`ref-may-abort: N` names one signal the reference build is known to die on. A
+reference that crashes states nothing about the port, so where the reference
+ends on that signal the cell reports `skip reference-abort` and every oracle
+reads `unavailable` for that side. The port's own `expect-*` claims are asserted
+either way, so a port regression on such a cell still fails.
+
+The tolerance is narrow by construction:
+
+- It names a single signal. The reference ending on any other signal fails the
+  cell as before.
+- It applies to the reference alone. The port aborting is always a failure.
+- It costs nothing where the reference works. A build that exits normally is
+  held to `ref-expect-exit` and the `ref-expect-*` claims, and the oracles
+  compare both sides, so the cell keeps its full strength there.
+- `check` refuses the field without a `note:` recording the observed crash, and
+  refuses it alongside `ref-run: n-a`.
+
+A cell carrying this field is evidence of a reference defect. The `note:` states
+what the crashing build printed, so a later build that stops crashing can be
+told apart from one that never did.
 
 ## Probes
 
@@ -375,6 +415,14 @@ that does not. `OSTRYA_REQUIRE_OSTREE` turns that skip into a failure, the way
 `--require tool=ostree` does for a `run:` cell. The host that runs the interop
 gate sets it; the CI job installs no reference tool and leaves it unset, so its
 `check --verify-evidence` step resolves the citation's test name alone.
+
+An optional engine in the tool gates the same way. The ed25519 tests return
+without an assertion where `ostree --version` lists no `sign-ed25519` feature,
+which the Debian build omits, because such a tool answers every ed25519
+invocation with `Requested signature type is not implemented`. That answer
+describes the tool's build and states nothing about the port, and it would
+otherwise satisfy a test asserting the tool rejects a signature.
+`OSTRYA_REQUIRE_OSTREE_ED25519` turns the skip into a failure.
 
 ## Severity and exit status
 

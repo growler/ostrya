@@ -14,7 +14,7 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::{TmpDir, fixture_root, ostree_available};
+use common::{TmpDir, fixture_root, ostree_available, ostree_supports_ed25519};
 use ostrya::base64;
 use ostrya::{
     Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, Repo, Summary, SummaryOptions, Value,
@@ -174,8 +174,8 @@ fn sign_and_verify_round_trip() {
 /// verify under a different key unreliable, so it is not asserted here.
 #[test]
 fn tool_verifies_a_port_signed_summary() {
-    if !ostree_available() {
-        eprintln!("skipping: ostree tool not available");
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree tool has no ed25519 engine");
         return;
     }
     let (_tmp, repo_dir) = writable_fixture("summary", "summary-tool-verify");

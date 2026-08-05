@@ -9,8 +9,11 @@
 //! [`DevInoCache`] to populate, and an optional filter.
 //!
 //! For each regular file the checkout hardlinks the loose object into place when
-//! the object's stored inode is already byte-identical to what the checkout
-//! would otherwise write, and copies otherwise. The copy path streams the
+//! the object's stored inode carries the metadata the destination needs, and
+//! copies otherwise. A hardlink adopts the object inode's mode as it stands, so
+//! a `bare-user` object under [`User`](CheckoutMode::User) arrives without the
+//! sticky bit a copy would keep; that is the tool's own outcome for the same
+//! commit. The copy path streams the
 //! payload through [`FileObject::reader`], attempting a `FICLONE` reflink on a
 //! non-archive object before falling back to a byte copy. Directories are always
 //! created fresh and receive their full logical mode after their children are
@@ -46,9 +49,12 @@ use crate::write::{FileMeta, TempKind};
 /// The permission-and-special-bit mask of an `st_mode` (`perm & 0o7777`).
 const PERM_MASK: u32 = 0o7777;
 /// The permission mask a [`User`](CheckoutMode::User) checkout applies to a
-/// regular file (`perm & 0o777`): the setuid, setgid, and sticky bits are
-/// dropped, the rwx bits including group- and other-write are kept.
-const USER_PERM_MASK: u32 = 0o777;
+/// regular file it writes (`perm & 0o1777`): the setuid and setgid bits are
+/// dropped, the sticky bit and the rwx bits including group- and other-write
+/// are kept. Recovered by checking a tree of assorted special-bit modes out
+/// with `ostree checkout -U --force-copy` in each mode
+/// (`format-reference.md`, "Checkout").
+const USER_PERM_MASK: u32 = 0o1777;
 /// The transient mode a directory is created with so its children can be
 /// written; the final logical mode is applied after they are materialized.
 const TRANSIENT_DIR_MODE: u32 = 0o700;
@@ -68,8 +74,10 @@ pub enum CheckoutMode {
     #[default]
     None,
     /// The unprivileged checkout (`ostree checkout -U`): no chown, no xattrs; a
-    /// regular file's mode drops the setuid/setgid/sticky bits, a directory's
-    /// mode keeps them.
+    /// regular file the checkout writes drops the setuid and setgid bits and
+    /// keeps the sticky bit, and a directory's mode keeps all three. A regular
+    /// file the checkout hardlinks instead carries the object inode's own mode,
+    /// which in `bare-user` holds no special bit at all.
     User,
 }
 

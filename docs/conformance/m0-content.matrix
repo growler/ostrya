@@ -128,17 +128,38 @@ question: This mode limits regular-file bits to 0775, so the setuid, setgid, and
 
 family: M0
 corpus: C3
-modes: archive bare-user bare-user-shared
+modes: archive bare-user
 tier: T0
-outcome: unobserved
+outcome: full
 severity: interop
-identity: unobserved
+identity: full
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --owner-uid=42 --owner-gid=43 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+spec: format-reference.md#commit
+note: the declared ids reach every entry -- the tree root's own metadata, the
+ nested directory, the regular files, and the symlink -- and both implementations
+ reach one commit checksum for them. An unprivileged writer can record any ids in
+ these two modes, since the ownership lives in the object header rather than on
+ the object inode; the `bare` row below is the mode where it does not.
+
+family: M0
+corpus: C3
+modes: bare-user-shared
+tier: T0
+outcome: full
+severity: interop
+identity: full
 oracle: checksum-agreement
-evidence: tests/fixtures/generated/MANIFEST (the archive and bare-user fixtures
- are generated with owner 0:0)
-question: The fixture generator already commits owner 0:0 into archive and
- bare-user unprivileged, so this should hold. Confirm it, and extend to
- bare-user-shared.
+evidence: ostrya_cli::cli::declared_ownership_is_one_commit_across_modes
+spec: format-reference.md#port-extension-bare-user-shared-mode
+note: the tool cannot open this mode, so the oracle is the cross-mode identity
+ invariant rather than a direct comparison, as it is for C0: the cited test
+ commits the declared ownership into archive, bare-user, and bare-user-shared and
+ holds the three checksums to each other, and the archive and bare-user rows
+ above compare theirs against the tool.
 
 family: M0
 corpus: C3
@@ -146,15 +167,22 @@ modes: bare-user-only
 tier: T0
 outcome: lossy
 severity: interop
-identity: not-required
-oracle: manifest
+identity: full
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --owner-uid=42 --owner-gid=43 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
 loss: The uid and gid are discarded and read back as 0. The mode stores no
  user.ostreemeta.
-evidence: -
 spec: format-reference.md#repository-modes-and-on-disk-storage
-question: Confirm the read-back value is 0 for both ids, and confirm the commit
- checksum still records the declared ids so that a pull into a
- checksum-preserving mode recovers them.
+note: both halves observed. The commit checksum records the declared ids: it
+ differs from the same tree committed without them, and the two implementations
+ agree on it, so a pull into a checksum-preserving mode recovers what this mode
+ does not store. The stored objects carry no ownership, so `ostree ls` reads 0 for
+ both ids out of either implementation's repository. The identity this mode's
+ reduction gives is its own: the checksum differs from the archive and bare-user
+ rows above, which record the mode as well as the ids.
 
 family: M0
 corpus: C3
@@ -166,10 +194,12 @@ identity: unobserved
 oracle: checksum-agreement exit-status
 evidence: -
 spec: format-reference.md#repository-modes-and-on-disk-storage
-question: Record what each implementation does when a non-root writer commits
- declared ids it does not own. The ids go on the object inode, so the chown
- fails. Capture both refusal texts and exit statuses, then confirm agreement at
- real root.
+question: Confirm the two implementations agree on the commit checksum at real
+ root, where the chown the ids need succeeds. The unprivileged half is observed:
+ a non-root writer is refused by both at exit 1, leaving no ref and no object,
+ the tool reporting `Writing content object: fchown: Operation not permitted` and
+ the port `i/o error: Operation not permitted (os error 1)`. The refusal cannot be
+ this cell's claim, since the same cell run at the tier it names must succeed.
 
 family: M0
 corpus: C4
@@ -194,8 +224,17 @@ oracle: checksum-agreement manifest
 evidence: -
 spec: format-reference.md#extended-attributes
 question: Confirm the stored xattr set is byte-wise name-sorted in each mode, and
- that the empty value and the 1024-byte value survive. In bare mode the set
- lives on the object inode rather than in a header.
+ that the 1024-byte value survives. In bare mode the set lives on the object inode
+ rather than in a header.
+note: one value of this corpus parts the two implementations, observed in archive,
+ bare, and bare-user while Phase 17c built its `commit --no-xattrs` cells: an
+ xattr whose value is zero bytes long is recorded by the port and dropped by the
+ tool, on a regular file and on a directory alike, so the object checksums differ
+ for any tree carrying one. The loss is at ingest only -- the tool's checkout
+ writes such an xattr back out of an object that carries one -- and bare-user-only
+ is unaffected, discarding every xattr. Deciding what the port records is its own
+ change, outside the phase that found it; until then no cell here states this
+ corpus in these modes.
 
 family: M0
 corpus: C4

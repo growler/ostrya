@@ -4,8 +4,9 @@
 //! path relative to a directory fd, ingesting its contents through the object
 //! writers (in [`crate::write`]) and recording them in a
 //! [`MutableTree`](crate::MutableTree). A [`CommitModifier`] shapes the walk:
-//! canonical permissions, an include/prune filter, an xattr-replacing callback,
-//! an SELinux label hook, a devino cache, and source consumption.
+//! canonical permissions, declared ownership, an include/prune filter, an
+//! xattr-replacing callback, an SELinux label hook, a devino cache, and source
+//! consumption.
 //!
 //! The walk reads each directory in one offloaded blocking pass (fd-relative
 //! `Dir` iteration, `statat` per entry, xattr reads, `readlinkat`), then
@@ -27,7 +28,7 @@ use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::modifier::{
-    CommitModifier, CommitModifierFlags, FilterResult, with_selinux, without_selinux,
+    CommitModifier, CommitModifierFlags, FilterResult, Owner, with_selinux, without_selinux,
 };
 use crate::mtree::MutableTree;
 use crate::transaction::Transaction;
@@ -129,6 +130,7 @@ fn walk_dir<'a>(
         let flags = modifier
             .as_deref()
             .map_or(CommitModifierFlags::empty(), |m| m.flags);
+        let owner = Owner::of(modifier.as_deref());
         let skip_xattrs = flags.contains(CommitModifierFlags::SKIP_XATTRS);
 
         // The heavy per-directory work runs on the blocking pool in one pass.
@@ -148,8 +150,8 @@ fn walk_dir<'a>(
                     mode: snap.mode,
                     xattrs: snap.xattrs,
                 };
-                let canon = apply_canonical(flags, base, false);
-                finalize_meta(modifier.as_deref_mut(), Path::new(&path), canon)?
+                let adjusted = adjust_meta(flags, owner, base, false);
+                finalize_meta(modifier.as_deref_mut(), Path::new(&path), adjusted)?
             }
         };
         let dirmeta = txn.write_dirmeta(&to_dirmeta(&dir_meta)).await?;
@@ -170,7 +172,7 @@ fn walk_dir<'a>(
                 mode: entry.mode,
                 xattrs: entry.xattrs,
             };
-            let filter_meta = apply_canonical(flags, base, is_symlink);
+            let filter_meta = adjust_meta(flags, owner, base, is_symlink);
 
             if let Some(m) = modifier.as_deref_mut()
                 && let Some(filter) = &mut m.filter
@@ -275,18 +277,25 @@ fn devino_hit(
     Some(checksum)
 }
 
-/// Force owner 0:0, canonicalize the permission bits, and empty the xattr set
-/// under [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS).
-/// Cheap and deterministic; runs no user callbacks. A walk without a modifier
-/// carries the empty flag set, making this a no-op. A symlink's mode is fixed
-/// by the object model, so only regular-file and directory permission bits are
-/// canonicalized.
+/// Apply the cheap, deterministic metadata adjustments a modifier states: the
+/// [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS)
+/// reduction, then the declared ownership. Runs no user callbacks. A walk
+/// without a modifier carries the empty flag set and no declared ownership,
+/// making this a no-op.
 ///
-/// The xattr set is emptied here, ahead of the callbacks, so a callback that
-/// supplies xattrs or an SELinux label still lands them, as it does under
+/// Under `CANONICAL_PERMISSIONS` the owner becomes 0:0, the xattr set is
+/// emptied, and a regular file's or directory's permission bits become
+/// `perm & 0o755`; a symlink's mode is fixed by the object model, so only
+/// regular-file and directory bits are canonicalized. The xattr set is emptied
+/// here, ahead of the callbacks, so a callback that supplies xattrs or an
+/// SELinux label still lands them, as it does under
 /// [`SKIP_XATTRS`](CommitModifierFlags::SKIP_XATTRS).
-pub(crate) fn apply_canonical(
+///
+/// The declared ownership is applied last, so a modifier that states both an
+/// id and the canonical flag records the id.
+pub(crate) fn adjust_meta(
     flags: CommitModifierFlags,
+    owner: Owner,
     mut meta: FileMeta,
     is_symlink: bool,
 ) -> FileMeta {
@@ -298,6 +307,7 @@ pub(crate) fn apply_canonical(
             meta.mode = (meta.mode & S_IFMT) | (meta.mode & CANONICAL_PERM_MASK);
         }
     }
+    owner.apply(&mut meta);
     meta
 }
 

@@ -195,6 +195,19 @@ struct CommitArgs {
     /// for an owner- and host-independent commit.
     #[arg(long)]
     canonical_permissions: bool,
+    /// Set file ownership user id.
+    #[arg(long, value_name = "UID", allow_hyphen_values = true)]
+    owner_uid: Option<String>,
+    /// Set file ownership group id.
+    #[arg(long, value_name = "GID", allow_hyphen_values = true)]
+    owner_gid: Option<String>,
+    /// Do not import extended attributes.
+    #[arg(long)]
+    no_xattrs: bool,
+    /// Override the timestamp of the commit: `@SECONDS` since the Unix epoch,
+    /// or a date and time carrying a UTC offset (`2020-01-02T03:04:05Z`).
+    #[arg(long, value_name = "TIMESTAMP")]
+    timestamp: Option<String>,
     /// The tree to commit; with none, read a tar stream from stdin.
     path: Option<PathBuf>,
 }
@@ -207,6 +220,12 @@ struct CheckoutArgs {
     /// Copy every object instead of hardlinking (the copy path still reflinks).
     #[arg(short = 'C', long, conflicts_with = "require_hardlinks")]
     force_copy: bool,
+    /// Do not change file ownership or initialize extended attributes.
+    #[arg(short = 'U', long)]
+    user_mode: bool,
+    /// Check out this path within the commit instead of the whole tree.
+    #[arg(long, value_name = "PATH")]
+    subpath: Option<PathBuf>,
     /// Write the commit's composefs EROFS image to the destination instead of a
     /// tree (requires a bare-user or bare-user-shared repository).
     #[arg(long)]
@@ -660,8 +679,12 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
     match command {
         Command::Init(args) => init(repo, verbose, name, args).await,
         Command::Commit(args) => {
+            // The tool reads `--owner-uid` and `--owner-gid` while it parses its
+            // options, so a value it cannot read is reported ahead of the
+            // repository (`docs/format-reference.md`, "CLI output formats").
+            let owner = commit_owner(&args);
             let (repo, _) = resolve_repo(repo, verbose, name).await;
-            commit(repo, args).await
+            commit(repo, args, owner).await
         }
         Command::Checkout(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
@@ -1126,13 +1149,26 @@ fn delta_secret_keys(args: &DeltaGenerateArgs) -> Result<Vec<String>> {
 /// lowercase alone: it asks for a root commit.
 const NO_PARENT: &str = "none";
 
-async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
+async fn commit(repo: Repo, args: CommitArgs, owner: Owner) -> Result<()> {
     // A commit either names the branch it moves or states that it writes no ref.
     // The check stands ahead of `--parent`, ahead of the tree, and ahead of any
     // object publication, which is the order the tool reports it in
     // (`docs/format-reference.md`, "CLI output formats").
     if args.branch.is_none() && !args.orphan {
         exit_error("A branch must be specified with --branch, or use --orphan");
+    }
+
+    // Canonical ingest owns every object 0:0, so a declared non-zero id would
+    // contradict it. The tool refuses the pair after the branch check and ahead
+    // of the tree, and names the flag whose id it read, uid first.
+    if args.canonical_permissions {
+        for (id, flag) in [(owner.uid, "--owner-uid"), (owner.gid, "--owner-gid")] {
+            if id.is_some_and(|id| id != 0) {
+                exit_error(&format!(
+                    "Cannot specify both --canonical-permissions and non-zero {flag}"
+                ));
+            }
+        }
     }
 
     let txn = repo.transaction().await?;
@@ -1173,14 +1209,26 @@ async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
         },
     };
 
-    let root = match args.path.as_deref() {
-        Some(path) => {
-            let dfd = std::fs::File::open(path).map_err(Error::Io)?;
-            let mut modifier = args.canonical_permissions.then(|| {
-                CommitModifier::new(
-                    CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS,
-                )
-            });
+    // The tool opens the tree ahead of reading `--timestamp`, so a tree path that
+    // does not open is reported and a timestamp the reader refuses is not.
+    let dfd = match args.path.as_deref() {
+        Some(path) => Some(std::fs::File::open(path).map_err(Error::Io)?),
+        None => None,
+    };
+    let timestamp = match args.timestamp.as_deref() {
+        Some(text) => match parse_timestamp(text) {
+            Some(seconds) => Some(seconds),
+            None => {
+                txn.abort().await?;
+                exit_error(&format!("Could not parse '{text}'"));
+            }
+        },
+        None => None,
+    };
+
+    let root = match dfd {
+        Some(dfd) => {
+            let mut modifier = commit_modifier(&args, owner);
             let mut mtree = MutableTree::new();
             txn.write_dfd_to_mtree(
                 dfd.as_fd(),
@@ -1193,9 +1241,11 @@ async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
         }
         None => {
             let stdin = stdin_file()?;
-            let mut mtree = repo
-                .import_tar(&txn, TarImportOptions::new(), stdin)
-                .await?;
+            let mut opts = TarImportOptions::new();
+            opts.owner_uid = owner.uid;
+            opts.owner_gid = owner.gid;
+            opts.skip_xattrs = args.no_xattrs;
+            let mut mtree = repo.import_tar(&txn, opts, stdin).await?;
             txn.write_mtree(&mut mtree).await?
         }
     };
@@ -1204,7 +1254,7 @@ async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
         parent,
         subject: args.subject,
         body: None,
-        timestamp: None,
+        timestamp,
         metadata: Some(ref_binding(args.branch.as_deref())),
     };
     let checksum = txn.write_commit(opts, &root).await?;
@@ -1224,6 +1274,265 @@ async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
     Ok(())
 }
 
+/// The ownership a `commit` invocation declares, read from `--owner-uid` and
+/// `--owner-gid`. A field is `None` where the option was absent or carried a
+/// negative id, which declares nothing: the tool's own default for both is
+/// `-1`, so every negative value leaves the source's ownership in place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Owner {
+    uid: Option<u32>,
+    gid: Option<u32>,
+}
+
+/// Read `--owner-uid` and `--owner-gid`, reporting a value neither can hold in
+/// the tool's own words and at the tool's own step: while the options are read,
+/// ahead of the repository and ahead of every check `commit` itself makes.
+fn commit_owner(args: &CommitArgs) -> Owner {
+    Owner {
+        uid: owner_id(args.owner_uid.as_deref(), "--owner-uid"),
+        gid: owner_id(args.owner_gid.as_deref(), "--owner-gid"),
+    }
+}
+
+/// One `--owner-*` id, or `None` where the option is absent or its value is
+/// negative. The value is read as a C `int` the way the tool's option parser
+/// reads one, so the two accept and refuse the same text
+/// (`docs/format-reference.md`, "CLI output formats").
+fn owner_id(value: Option<&str>, flag: &str) -> Option<u32> {
+    let text = value?;
+    match parse_c_int(text) {
+        Ok(id) if id >= 0 => Some(id as u32),
+        Ok(_) => None,
+        Err(IntError::Syntax) => exit_error(&format!(
+            "Cannot parse integer value \u{201c}{text}\u{201d} for {flag}"
+        )),
+        Err(IntError::Range) => exit_error(&format!(
+            "Integer value \u{201c}{text}\u{201d} for {flag} out of range"
+        )),
+    }
+}
+
+/// Why a C `int` value was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntError {
+    /// The text is not an integer in any accepted base.
+    Syntax,
+    /// The text is an integer outside the range of a C `int`.
+    Range,
+}
+
+/// Read `text` as a C `int` the way `strtol` with base 0 does: optional leading
+/// whitespace, an optional sign, then a `0x`-prefixed hexadecimal, a
+/// `0`-prefixed octal, or a decimal run. The whole text must be consumed, so a
+/// trailing space or letter is refused, and the value must fit an `i32`.
+fn parse_c_int(text: &str) -> std::result::Result<i32, IntError> {
+    let body = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, body) = match body.as_bytes().first() {
+        Some(b'-') => (true, &body[1..]),
+        Some(b'+') => (false, &body[1..]),
+        _ => (false, body),
+    };
+    let (radix, digits) = match body.as_bytes() {
+        [b'0', b'x' | b'X', ..] => (16, &body[2..]),
+        [b'0', ..] => (8, &body[1..]),
+        _ => (10, body),
+    };
+    // A lone `0` reaches here as an empty octal tail and is the value zero.
+    if digits.is_empty() {
+        return if radix == 8 {
+            Ok(0)
+        } else {
+            Err(IntError::Syntax)
+        };
+    }
+    let mut value: i64 = 0;
+    for byte in digits.bytes() {
+        let digit = (byte as char).to_digit(radix).ok_or(IntError::Syntax)?;
+        value = value
+            .checked_mul(i64::from(radix))
+            .and_then(|v| v.checked_add(i64::from(digit)))
+            .ok_or(IntError::Range)?;
+        if value > i64::from(u32::MAX) {
+            return Err(IntError::Range);
+        }
+    }
+    let value = if negative { -value } else { value };
+    i32::try_from(value).map_err(|_| IntError::Range)
+}
+
+/// The commit modifier the tree-shaping options ask for, or `None` where they
+/// ask for nothing. `--canonical-permissions` implies the xattr skip, since
+/// canonical ingest records no extended attributes.
+fn commit_modifier(args: &CommitArgs, owner: Owner) -> Option<CommitModifier> {
+    let mut flags = CommitModifierFlags::empty();
+    if args.canonical_permissions {
+        flags |= CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS;
+    }
+    if args.no_xattrs {
+        flags |= CommitModifierFlags::SKIP_XATTRS;
+    }
+    if flags == CommitModifierFlags::empty() && owner == Owner::default() {
+        return None;
+    }
+    let mut modifier = CommitModifier::new(flags);
+    modifier.owner_uid = owner.uid;
+    modifier.owner_gid = owner.gid;
+    Some(modifier)
+}
+
+/// Read a `--timestamp` value: `@SECONDS` since the Unix epoch, or a date and
+/// time carrying an explicit UTC offset. `None` for a value this reader does not
+/// hold, which `commit` reports as the tool words it.
+///
+/// The tool reads a superset: a wall-clock time with no offset (its own local
+/// time), a relative expression such as `now` or `yesterday`, and an empty value
+/// (today's midnight). Those need a time-zone database or a natural-language
+/// date reader, so the port refuses them and the difference is recorded in
+/// `docs/conformance/cli-surface.md`, "P2".
+fn parse_timestamp(text: &str) -> Option<u64> {
+    let text = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    match text.strip_prefix('@') {
+        Some(seconds) => parse_epoch(seconds),
+        None => parse_datetime(text),
+    }
+}
+
+/// The `@SECONDS` form: an optional sign, a decimal run, and an optional
+/// fractional part, which names a sub-second the commit timestamp cannot hold
+/// and is dropped. A pre-epoch value is recorded as the unsigned field's
+/// two's-complement form, matching the tool.
+fn parse_epoch(text: &str) -> Option<u64> {
+    let text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, body) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (whole, fraction) = match body.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (body, None),
+    };
+    if whole.is_empty() || !whole.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(fraction) = fraction
+        && (fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let seconds: i64 = whole.parse().ok()?;
+    Some(if negative {
+        seconds.checked_neg()? as u64
+    } else {
+        seconds as u64
+    })
+}
+
+/// The absolute form: `YYYY-MM-DD`, a `T` or a space, `HH:MM[:SS]`, an optional
+/// fractional second, and a UTC offset (`Z`, or `+HH`, `+HH:MM`, `+HHMM`, and
+/// their negatives). The offset is required: without one the value names a
+/// wall-clock time in a zone this reader does not resolve.
+fn parse_datetime(text: &str) -> Option<u64> {
+    let (year, rest) = take_digits(text, 4)?;
+    let (month, rest) = take_digits(rest.strip_prefix('-')?, 2)?;
+    let (day, rest) = take_digits(rest.strip_prefix('-')?, 2)?;
+    let rest = rest
+        .strip_prefix('T')
+        .or_else(|| rest.strip_prefix('t'))
+        .or_else(|| rest.strip_prefix(' '))?
+        .trim_start_matches(' ');
+    let (hour, rest) = take_digits(rest, 2)?;
+    let (minute, rest) = take_digits(rest.strip_prefix(':')?, 2)?;
+    let (second, rest) = match rest.strip_prefix(':') {
+        Some(rest) => take_digits(rest, 2)?,
+        None => (0, rest),
+    };
+    let rest = match rest.strip_prefix('.').or_else(|| rest.strip_prefix(',')) {
+        Some(rest) => {
+            let after = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            if after.len() == rest.len() {
+                return None;
+            }
+            after
+        }
+        None => rest,
+    };
+    let offset = parse_offset(rest.trim_start_matches(' '))?;
+
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    // A leap second is stated as :60 and lands on the following second, which is
+    // what an unsigned epoch count can hold.
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let seconds =
+        days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second - offset;
+    Some(seconds as u64)
+}
+
+/// A UTC offset in seconds, to subtract from the stated wall clock.
+fn parse_offset(text: &str) -> Option<i64> {
+    if text == "Z" || text == "z" {
+        return Some(0);
+    }
+    let (negative, body) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => return None,
+    };
+    let (hours, rest) = take_digits(body, 2)?;
+    let minutes = match rest {
+        "" => 0,
+        rest => {
+            let rest = rest.strip_prefix(':').unwrap_or(rest);
+            let (minutes, tail) = take_digits(rest, 2)?;
+            if !tail.is_empty() {
+                return None;
+            }
+            minutes
+        }
+    };
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let offset = hours * 3_600 + minutes * 60;
+    Some(if negative { -offset } else { offset })
+}
+
+/// Exactly `count` decimal digits from the front of `text`, with the rest.
+fn take_digits(text: &str, count: usize) -> Option<(i64, &str)> {
+    let (head, rest) = text.split_at_checked(count)?;
+    if !head.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((head.parse().ok()?, rest))
+}
+
+/// The number of days in `month` of `year`, under the proleptic Gregorian
+/// calendar the epoch count follows.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// The days from `1970-01-01` to the given proleptic Gregorian date, negative
+/// before the epoch. The era arithmetic counts 400-year cycles, whose length in
+/// days is fixed at 146097, so no table and no iteration is needed.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
 async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     let commit = resolve(&repo, &args.commit).await?;
 
@@ -1233,7 +1542,17 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mut opts = CheckoutOptions::new(CheckoutMode::None);
+    // `-U` applies no ownership and no xattrs and reduces a regular file's mode
+    // to `perm & 0777`; a `--subpath` directory's own metadata becomes the
+    // destination root's, and a `--subpath` file or symlink is placed inside a
+    // fresh destination directory (`docs/format-reference.md`, "Checkout").
+    let mode = if args.user_mode {
+        CheckoutMode::User
+    } else {
+        CheckoutMode::None
+    };
+    let mut opts = CheckoutOptions::new(mode);
+    opts.subpath = args.subpath;
     opts.force_copy = args.force_copy;
     // -H and -C are mutually exclusive (enforced by clap); -C forces copies and
     // -H requests hardlinks, which is the default path when copies are not
@@ -2825,6 +3144,114 @@ mod tests {
             );
         }
         assert_eq!(registered.len(), Command::NAMES.len());
+    }
+
+    /// An `--owner-uid`/`--owner-gid` value reads as a C `int` with the base
+    /// taken from the text: `0x` hexadecimal, a leading `0` octal, decimal
+    /// otherwise. Leading whitespace and a sign are accepted, a trailing byte is
+    /// not, and the range is a C `int`'s. Each value here was checked against
+    /// `ostree commit` (`docs/format-reference.md`, "CLI output formats").
+    #[test]
+    fn an_owner_id_reads_as_a_c_int() {
+        for (text, value) in [
+            ("0", 0),
+            ("42", 42),
+            ("+5", 5),
+            ("-0", 0),
+            (" 5", 5),
+            ("\t7", 7),
+            ("0x10", 16),
+            ("0X10", 16),
+            ("010", 8),
+            ("07", 7),
+            ("2147483647", 2147483647),
+            ("-1", -1),
+            ("-2147483648", -2147483648),
+        ] {
+            assert_eq!(parse_c_int(text), Ok(value), "`{text}`");
+        }
+        for text in ["abc", "", "5x", "5 ", "0x", "-", "--5", "5-", "0b1", "x5"] {
+            assert_eq!(parse_c_int(text), Err(IntError::Syntax), "`{text}`");
+        }
+        for text in [
+            "2147483648",
+            "4294967295",
+            "99999999999999999999",
+            "-2147483649",
+        ] {
+            assert_eq!(parse_c_int(text), Err(IntError::Range), "`{text}`");
+        }
+
+        // A negative id declares nothing, so the source's ownership stands.
+        let declared = |text: &str| owner_id(Some(text), "--owner-uid");
+        assert_eq!(declared("0"), Some(0));
+        assert_eq!(declared("42"), Some(42));
+        assert_eq!(declared("-1"), None);
+        assert_eq!(declared("-2"), None);
+        assert_eq!(owner_id(None, "--owner-uid"), None);
+    }
+
+    /// A `--timestamp` value reads as `@SECONDS` or as a date and time carrying
+    /// a UTC offset. The wall-clock forms without an offset and the relative
+    /// forms the tool also takes are refused
+    /// (`docs/conformance/cli-surface.md`, "P2").
+    #[test]
+    fn a_timestamp_reads_the_epoch_and_offset_forms() {
+        for (text, seconds) in [
+            ("@0", 0),
+            ("@1234567890", 1234567890),
+            ("@+5", 5),
+            ("@ 7", 7),
+            ("@0.5", 0),
+            ("@1234567890.999", 1234567890),
+            ("2009-02-13T23:31:30Z", 1234567890),
+            ("2009-02-13t23:31:30z", 1234567890),
+            ("2009-02-13 23:31:30+00", 1234567890),
+            ("2009-02-13 23:31:30+00:00", 1234567890),
+            ("2009-02-14 00:31:30+01:00", 1234567890),
+            ("2009-02-13 22:31:30-0100", 1234567890),
+            ("  2009-02-13T23:31:30Z  ", 1234567890),
+            ("2009-02-13T23:31:30.250Z", 1234567890),
+            ("2009-02-13T23:31Z", 1234567890 - 30),
+            ("1970-01-01T00:00:00Z", 0),
+            ("2000-02-29T00:00:00Z", 951782400),
+            ("2038-01-19T03:14:08Z", 2147483648),
+        ] {
+            assert_eq!(parse_timestamp(text), Some(seconds), "`{text}`");
+        }
+        // A pre-epoch instant records the unsigned field's two's-complement
+        // form, which is what the tool records for the same value.
+        assert_eq!(parse_timestamp("@-1"), Some(u64::MAX));
+        assert_eq!(
+            parse_timestamp("1969-12-31T23:59:59Z"),
+            Some(u64::MAX),
+            "the same instant in the absolute form"
+        );
+
+        for text in [
+            "",
+            "@",
+            "@1e3",
+            "@abc",
+            "1234567890",
+            "now",
+            "yesterday",
+            "2009-02-13",
+            // No offset: the value names a wall clock in a zone this reader does
+            // not resolve.
+            "2009-02-13T23:31:30",
+            "2009-02-13 23:31:30",
+            // Out of range for the field it names.
+            "2009-13-01T00:00:00Z",
+            "2009-02-30T00:00:00Z",
+            "2009-02-13T24:00:00Z",
+            "2009-02-13T23:60:00Z",
+            "2009-02-13T23:31:30+24:00",
+            "2009-02-13T23:31:30.Z",
+            "2009-02-13T23:31:30ZZ",
+        ] {
+            assert_eq!(parse_timestamp(text), None, "`{text}`");
+        }
     }
 
     /// The two prefix filters differ on the exact match alone: a listing keeps

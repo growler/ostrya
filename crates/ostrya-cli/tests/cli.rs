@@ -373,6 +373,432 @@ fn commit_from_disk_reproduces_fixture_id_and_ref() {
     }
 }
 
+/// The generator's own command line, now that the port accepts every option it
+/// uses: declared ownership, no xattrs, and a fixed timestamp reproduce the
+/// golden fixture commit without `--canonical-permissions` standing in for
+/// them. The ISO form of the same instant, the hexadecimal and octal renderings
+/// of the same ids, and a negative id (which declares nothing, so the tree keeps
+/// the invoking user's ownership and the commit differs) are held beside it.
+#[test]
+fn commit_flags_reproduce_the_fixture_id() {
+    let tmp = TmpDir::new("commit-flags");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let src = base.join("src");
+
+    let commit = |timestamp: &str, uid: &str, gid: &str| {
+        ostrya(
+            &[
+                "commit",
+                "--repo",
+                repo.to_str().unwrap(),
+                "-b",
+                BRANCH,
+                "-s",
+                SUBJECT,
+                "--parent=none",
+                &format!("--owner-uid={uid}"),
+                &format!("--owner-gid={gid}"),
+                "--no-xattrs",
+                &format!("--timestamp={timestamp}"),
+                src.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        )
+    };
+
+    assert_eq!(
+        commit("@1700000000", "0", "0").ok().stdout_trimmed(),
+        COMMIT,
+        "the generator's own flags reproduce the fixture commit id",
+    );
+    assert_eq!(
+        commit("2023-11-14T22:13:20Z", "0", "0")
+            .ok()
+            .stdout_trimmed(),
+        COMMIT,
+        "the ISO form of the fixture instant is the same timestamp",
+    );
+    assert_eq!(
+        commit("2023-11-14 23:13:20+01:00", "0x0", "00")
+            .ok()
+            .stdout_trimmed(),
+        COMMIT,
+        "an offset-bearing wall clock and hexadecimal and octal ids agree",
+    );
+    assert_ne!(
+        commit("@1700000000", "-1", "-1").ok().stdout_trimmed(),
+        COMMIT,
+        "a negative id declares nothing, so the source's ownership stands",
+    );
+
+    // `SOURCE_DATE_EPOCH` names the same instant the fixture uses, and
+    // `--timestamp` overrides whatever it holds.
+    let over_epoch = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--parent=none",
+            "--owner-uid=0",
+            "--owner-gid=0",
+            "--no-xattrs",
+            "--timestamp=@1700000000",
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[("SOURCE_DATE_EPOCH", "1")],
+    );
+    assert_eq!(
+        over_epoch.ok().stdout_trimmed(),
+        COMMIT,
+        "--timestamp wins over SOURCE_DATE_EPOCH",
+    );
+}
+
+/// The four `commit` tree-and-time options against the tool, over a tree
+/// carrying xattrs, a symlink, and a nested directory: each side commits the
+/// same tree with the same options and the printed checksums must agree, which
+/// states that the recorded ownership, mode, xattr set, and timestamp are
+/// byte-identical.
+#[test]
+fn commit_ownership_and_timestamp_flags_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-owner");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    ostrya_conformance::corpus::materialize("C4", &tree.join("attrs")).unwrap();
+    // The tool records no xattr whose value is zero bytes long, where the port
+    // records one, so a tree carrying such an entry compares two different
+    // objects whatever the options under test say. The case is corpus `C4`'s own
+    // (`docs/conformance/m0-content.matrix`) and is held out here.
+    std::fs::remove_file(tree.join("attrs/empty-value")).unwrap();
+
+    let port_repo = base.join("port");
+    let tool_repo = base.join("tool");
+    for repo in [&port_repo, &tool_repo] {
+        block_on(async {
+            Repo::create(repo, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+        });
+    }
+
+    // A case names the branch its commit binds, and two cases that must produce
+    // one commit share it: `ostree.ref-binding` carries the branch name, so a
+    // commit's checksum states the name too. Every commit is a root commit
+    // whatever the branch already holds.
+    let cases: [(&str, &str, Vec<&str>); 7] = [
+        ("plain", "plain", vec!["--timestamp=@1234567890"]),
+        (
+            "owner",
+            "owner",
+            vec![
+                "--timestamp=@1234567890",
+                "--owner-uid=42",
+                "--owner-gid=43",
+            ],
+        ),
+        (
+            "owner-radix",
+            "owner",
+            vec![
+                "--timestamp=@1234567890",
+                "--owner-uid=0x2a",
+                "--owner-gid=053",
+            ],
+        ),
+        (
+            "uid-only",
+            "uid-only",
+            vec!["--timestamp=@1234567890", "--owner-uid=42"],
+        ),
+        (
+            "no-xattrs",
+            "no-xattrs",
+            vec!["--timestamp=@1234567890", "--no-xattrs", "--owner-uid=42"],
+        ),
+        ("iso", "plain", vec!["--timestamp=2009-02-13T23:31:30Z"]),
+        ("pre-epoch", "pre-epoch", vec!["--timestamp=@-1"]),
+    ];
+
+    let mut checksums = std::collections::BTreeMap::new();
+    for (case, branch, options) in &cases {
+        let mut args = vec![
+            "commit".to_owned(),
+            "-b".to_owned(),
+            (*branch).to_owned(),
+            "-s".to_owned(),
+            "x".to_owned(),
+            "--parent=none".to_owned(),
+        ];
+        args.extend(options.iter().map(|option| (*option).to_owned()));
+        args.push(tree.to_str().unwrap().to_owned());
+
+        let port = {
+            let mut argv = vec!["--repo".to_owned(), port_repo.display().to_string()];
+            argv.extend(args.clone());
+            let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+            ostrya(&borrowed, None, &[]).ok().stdout_trimmed()
+        };
+        let tool = {
+            let out = Command::new("ostree")
+                .arg(format!("--repo={}", tool_repo.display()))
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "ostree commit {case} failed:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        assert_eq!(port, tool, "case `{case}`: the two commits differ");
+        checksums.insert(*case, port);
+    }
+
+    assert_eq!(
+        checksums["owner"], checksums["owner-radix"],
+        "`0x2a` and `053` are the ids 42 and 43",
+    );
+    assert_eq!(
+        checksums["plain"], checksums["iso"],
+        "`@1234567890` and its ISO form are one instant",
+    );
+    assert_ne!(
+        checksums["plain"], checksums["no-xattrs"],
+        "the corpus carries xattrs, so dropping them changes the commit",
+    );
+}
+
+/// A declared-ownership commit keeps object identity across the modes that
+/// store ownership: one checksum in `archive`, `bare-user`, and the port
+/// extension `bare-user-shared`. The tool cannot open the third mode, so this is
+/// what corpus `C3`'s `bare-user-shared` cell rests on
+/// (`docs/conformance/m0-content.matrix`); the other two modes are compared
+/// against the tool directly by the cells and the test above.
+#[test]
+fn declared_ownership_is_one_commit_across_modes() {
+    let tmp = TmpDir::new("commit-owner-modes");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+
+    let mut checksums = Vec::new();
+    for (name, mode) in [
+        ("archive", RepoMode::Archive),
+        ("bare-user", RepoMode::BareUser),
+        ("bare-user-shared", RepoMode::BareUserShared),
+    ] {
+        let repo = base.join(format!("repo-{name}"));
+        block_on(async {
+            Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+        });
+        let commit = ostrya(
+            &[
+                "commit",
+                "--repo",
+                repo.to_str().unwrap(),
+                "-b",
+                BRANCH,
+                "-s",
+                SUBJECT,
+                "--timestamp=@1700000000",
+                "--owner-uid=42",
+                "--owner-gid=43",
+                src.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        );
+        checksums.push((name, commit.ok().stdout_trimmed()));
+    }
+
+    let (first_name, first) = &checksums[0];
+    for (name, checksum) in &checksums[1..] {
+        assert_eq!(
+            checksum, first,
+            "{name} and {first_name} disagree on a declared-ownership commit",
+        );
+    }
+}
+
+/// The values `commit` refuses, in the tool's own words and at the tool's own
+/// step: an id no C `int` holds, an id beside `--canonical-permissions`, and a
+/// timestamp neither reader accepts. Every case leaves the repository empty.
+#[test]
+fn commit_refuses_the_values_the_tool_refuses() {
+    let tmp = TmpDir::new("commit-refuse");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let src = base.join("src");
+    let tool = ostree_available();
+
+    let cases: [(Vec<&str>, &str); 9] = [
+        (
+            vec!["--owner-uid=abc"],
+            "error: Cannot parse integer value \u{201c}abc\u{201d} for --owner-uid",
+        ),
+        (
+            vec!["--owner-uid="],
+            "error: Cannot parse integer value \u{201c}\u{201d} for --owner-uid",
+        ),
+        (
+            vec!["--owner-uid=5x"],
+            "error: Cannot parse integer value \u{201c}5x\u{201d} for --owner-uid",
+        ),
+        (
+            vec!["--owner-gid=zz"],
+            "error: Cannot parse integer value \u{201c}zz\u{201d} for --owner-gid",
+        ),
+        (
+            vec!["--owner-uid=2147483648"],
+            "error: Integer value \u{201c}2147483648\u{201d} for --owner-uid out of range",
+        ),
+        (
+            vec!["--canonical-permissions", "--owner-uid=1"],
+            "error: Cannot specify both --canonical-permissions and non-zero --owner-uid",
+        ),
+        (
+            vec!["--canonical-permissions", "--owner-gid=7", "--owner-uid=0"],
+            "error: Cannot specify both --canonical-permissions and non-zero --owner-gid",
+        ),
+        (
+            vec!["--timestamp=nonsense"],
+            "error: Could not parse 'nonsense'",
+        ),
+        // The tool's reader takes no bare epoch count, and neither does the
+        // port's; the `@` form is what states one.
+        (
+            vec!["--timestamp=1234567890"],
+            "error: Could not parse '1234567890'",
+        ),
+    ];
+
+    for (options, message) in &cases {
+        // The invocation both implementations receive, `--repo` apart: the port
+        // takes it as an option in either position, the tool only ahead of the
+        // subcommand name (`docs/conformance/cli-surface.md`, "Global
+        // conventions").
+        let mut shared = vec!["commit", "-b", "refused", "-s", "x"];
+        shared.extend(options.iter().copied());
+        shared.push(src.to_str().unwrap());
+        let mut args = vec!["--repo", repo.to_str().unwrap()];
+        args.extend(shared.iter().copied());
+
+        let run = ostrya(&args, None, &[]);
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "`{options:?}` was not refused:\n{}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+        assert!(run.stdout.is_empty(), "`{options:?}` printed a checksum");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr).trim(),
+            *message,
+            "`{options:?}` was refused in other words",
+        );
+        assert_eq!(
+            resolve(&repo, "refused"),
+            None,
+            "`{options:?}` left a ref behind",
+        );
+
+        if tool {
+            let out = Command::new("ostree")
+                .arg(format!("--repo={}", repo.display()))
+                .args(&shared)
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "the tool accepted `{options:?}`",
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr).trim(),
+                *message,
+                "the tool refuses `{options:?}` in other words",
+            );
+        }
+    }
+}
+
+/// The three tree-shaping options reach the tar stream `commit` reads from
+/// standard input, so a tar of a tree and the tree itself commit alike under
+/// them. The tool takes its tar through `--tree=tar=PATH`, a form the port does
+/// not yet accept (`docs/conformance/cli-surface.md`, "P2"), so this states the
+/// port's own two paths against each other.
+#[test]
+fn commit_tar_stream_honours_the_tree_options() {
+    let tmp = TmpDir::new("commit-tar-flags");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let src = base.join("src");
+
+    let plain = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            "plain",
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    let plain = plain.ok().stdout_trimmed();
+    let tar = ostrya(
+        &["export", "--repo", repo.to_str().unwrap(), &plain],
+        None,
+        &[],
+    );
+    let tar = tar.ok().stdout.clone();
+
+    let options = [
+        "--owner-uid=42",
+        "--owner-gid=43",
+        "--no-xattrs",
+        "--timestamp=@1700000000",
+    ];
+    let mut from_dir = vec![
+        "commit",
+        "--repo",
+        repo.to_str().unwrap(),
+        "-b",
+        "declared",
+        "-s",
+        SUBJECT,
+        "--parent=none",
+    ];
+    from_dir.extend(options);
+    let from_tar = from_dir.clone();
+    from_dir.push(src.to_str().unwrap());
+
+    assert_eq!(
+        ostrya(&from_tar, Some(&tar), &[]).ok().stdout_trimmed(),
+        ostrya(&from_dir, None, &[]).ok().stdout_trimmed(),
+        "the tar stream and the tree it came from commit alike under the options",
+    );
+}
+
 #[test]
 fn tar_roundtrip_via_stdin_reproduces_tree() {
     let tmp = TmpDir::new("tar");
@@ -526,6 +952,166 @@ fn checkout_roundtrips_and_matches_tool() {
             describe_tree(&dest_tool),
             "port and tool checkouts agree",
         );
+    }
+}
+
+/// `checkout -U` and `checkout --subpath=PATH` against the tool's checkout of
+/// the same commit, over a tree carrying a setuid file, a setgid directory, a
+/// nested directory, and a symlink, in the modes whose checkout path differs:
+/// `archive` copies, `bare-user` hardlinks under `-U`, and `bare` copies under
+/// `-U` while it hardlinks without it.
+#[test]
+fn checkout_user_mode_and_subpath_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-user");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    ostrya_conformance::corpus::materialize("C2", &tree.join("bits")).unwrap();
+
+    let cases: [(&str, Vec<&str>); 6] = [
+        ("user-mode", vec!["-U"]),
+        ("subpath-dir", vec!["-U", "--subpath=/dir"]),
+        ("subpath-relative", vec!["-U", "--subpath=dir"]),
+        ("subpath-file", vec!["-U", "--subpath=/file.txt"]),
+        ("subpath-symlink", vec!["-U", "--subpath=/link"]),
+        ("subpath-root", vec!["-U", "--subpath=/"]),
+    ];
+
+    for (mode_name, mode) in [
+        ("archive", RepoMode::Archive),
+        ("bare-user", RepoMode::BareUser),
+        ("bare", RepoMode::Bare),
+    ] {
+        let repo = base.join(format!("repo-{mode_name}"));
+        block_on(async {
+            Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+        });
+        let commit = ostrya(
+            &[
+                "commit",
+                "--repo",
+                repo.to_str().unwrap(),
+                "-b",
+                BRANCH,
+                "-s",
+                SUBJECT,
+                "--timestamp=@1700000000",
+                tree.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        );
+        let commit = commit.ok().stdout_trimmed();
+
+        for (case, options) in &cases {
+            let dest_port = base.join(format!("port-{mode_name}-{case}"));
+            let mut args = vec!["checkout", "--repo", repo.to_str().unwrap()];
+            args.extend(options.iter().copied());
+            args.push(&commit);
+            args.push(dest_port.to_str().unwrap());
+            ostrya(&args, None, &[]).ok();
+
+            let dest_tool = base.join(format!("tool-{mode_name}-{case}"));
+            let out = Command::new("ostree")
+                .arg(format!("--repo={}", repo.display()))
+                .arg("checkout")
+                .args(options)
+                .args([&commit, &dest_tool.display().to_string()])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "ostree checkout {case} in {mode_name} failed:\n{}",
+                String::from_utf8_lossy(&out.stderr),
+            );
+            assert_eq!(
+                describe_tree(&dest_port),
+                describe_tree(&dest_tool),
+                "case `{case}` in {mode_name}: the two checkouts differ",
+            );
+        }
+
+        // A file or symlink subpath is placed inside a destination directory the
+        // checkout creates, rather than becoming the destination itself.
+        let inside = base.join(format!("port-{mode_name}-subpath-file"));
+        assert!(
+            inside.join("file.txt").is_file(),
+            "a file subpath lands inside the destination directory",
+        );
+    }
+}
+
+/// The subpaths `checkout` refuses. Both implementations exit 1 and leave no
+/// destination behind; the words differ, which
+/// `docs/conformance/cli-surface.md`, "P2" records.
+#[test]
+fn checkout_refuses_a_subpath_that_names_nothing() {
+    let tmp = TmpDir::new("checkout-subpath-refuse");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let src = base.join("src");
+    let commit = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    let commit = commit.ok().stdout_trimmed();
+    let tool = ostree_available();
+
+    for subpath in ["/nope", "/subdir/nope", "/hello.txt/deeper"] {
+        let dest = base.join(format!("dest{}", subpath.replace('/', "-")));
+        let run = ostrya(
+            &[
+                "checkout",
+                "--repo",
+                repo.to_str().unwrap(),
+                &format!("--subpath={subpath}"),
+                &commit,
+                dest.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        );
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "`{subpath}` was not refused:\n{}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+        assert!(!dest.exists(), "`{subpath}` left a destination behind",);
+
+        if tool {
+            let dest_tool = base.join(format!("tool{}", subpath.replace('/', "-")));
+            let out = Command::new("ostree")
+                .arg(format!("--repo={}", repo.display()))
+                .args([
+                    "checkout",
+                    &format!("--subpath={subpath}"),
+                    &commit,
+                    &dest_tool.display().to_string(),
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(1), "the tool accepted `{subpath}`",);
+            assert!(
+                !dest_tool.exists(),
+                "the tool left a destination behind for `{subpath}`",
+            );
+        }
     }
 }
 

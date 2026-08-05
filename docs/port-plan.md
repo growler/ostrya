@@ -3653,7 +3653,7 @@ invocations that state its order. `rev_parse_ancestry_matches_the_tool` drops it
 prevent, and `checkout_roundtrips_and_matches_tool` states its round-trip with
 `--parent=none`, the branch it commits onto twice now holding a tip.
 
-#### Phase 17c -- `commit`/`checkout`: the corpus-priority option gaps
+#### Phase 17c -- `commit`/`checkout`: the corpus-priority option gaps (DONE)
 
 Exactly the flags `cli-surface.md` orders first because the interop corpora
 need them: on `commit`, `--owner-uid`, `--owner-gid`, `--timestamp`,
@@ -3664,11 +3664,90 @@ already has (ownership override, `CommitOptions` timestamp, the
 `SKIP_XATTRS` modifier flag, bare-user checkout, a tree-lookup-scoped
 checkout).
 
-Verify: corpus `C3` (declared ownership) and every reproducible-timestamp
-`m0`/`m1` cell stop depending on the interop harness's own out-of-band setup
-and go through the CLI directly; `checkout -U` and `--subpath` against a
-fixture commit match the tool's own checkout of the same commit, file for
-file.
+Two of those five library pieces were not in fact there. The commit modifier
+carried no ownership override, so `CommitModifier` gains `owner_uid` and
+`owner_gid`, applied after the canonical-permissions reduction and ahead of the
+callbacks, in both ingest walks (the filesystem walk and the overlay merge). And
+the tar import took no modifier at all, so `TarImportOptions` gains
+`owner_uid`, `owner_gid`, and `skip_xattrs`, which is what lets the three
+tree-shaping options reach the tar stream `commit` reads from standard input;
+`--canonical-permissions` still reaches the filesystem walk alone, and converging
+the port's stdin form with the tool's `--tree=tar=PATH` stays Phase 17f's.
+
+Each option's accepted values and refusals are the tool's, recovered by
+observation and recorded in `format-reference.md`, "CLI output formats":
+
+- the declared ids read as a C `int` with the base taken from the text, so
+  `0x2a`, `053`, and `42` are ids and `abc`, `5x`, and a trailing space are not;
+  the default is `-1`, so any negative value declares nothing. The two refusal
+  texts are GLib's, typographic quotes included, and they are reported while the
+  options are read -- ahead of the repository, which the port reproduces by
+  reading the ids in the dispatch arm before `resolve_repo`;
+- a non-zero declared id beside `--canonical-permissions` is refused, naming the
+  option whose id it read, after the missing-branch check and ahead of the tree;
+- `--timestamp` wins over `SOURCE_DATE_EPOCH` and is read after the tree opens,
+  so a tree path that does not open is reported and the timestamp is not. The
+  port's reader takes `@SECONDS` and an absolute date and time carrying a UTC
+  offset, which is a subset of the tool's natural-language reader: the local-time,
+  relative, and empty forms would need a time-zone database or a date-phrase
+  reader, and are refused with the tool's own `Could not parse '<value>'`. The
+  divergence is recorded in `cli-surface.md`, "P2". A pre-epoch instant is
+  recorded as the unsigned field's two's-complement form, matching the tool for
+  `@-1` and for `1969-12-31T23:59:59Z`.
+
+`checkout -U` exposed a library defect the phase fixes: the unprivileged mask was
+`perm & 0o777`, where the tool drops the setuid and setgid bits and keeps the
+sticky bit on a regular file it writes (`perm & 0o1777`). Recovered by checking a
+tree of seven special-bit modes, on files and on directories, out of four
+repository modes with `checkout`, `checkout -U`, and `checkout -U -C`. A regular
+file the checkout hardlinks instead adopts the object inode's mode, so a
+`bare-user` object's sticky bit is absent from a hardlinking unprivileged checkout
+and present in the same checkout forced to copy -- the tool's own outcome, which
+the port now shares.
+
+Verify: `cargo test --workspace --all-features` passes, with eight new tests.
+`ostrya::checkout::a_user_mode_checkout_keeps_the_sticky_bit_of_a_written_file`
+holds the corrected mask in `archive`, `bare`, and `bare-user` without needing
+the tool, and fails against the old one.
+`ostrya_cli::cli` gains `commit_flags_reproduce_the_fixture_id` (the fixture
+generator's own command line -- declared ownership, no xattrs, and a fixed
+timestamp -- reproduces the golden commit id, where `--canonical-permissions`
+stood in for it before),
+`commit_ownership_and_timestamp_flags_match_the_tool` (seven option sets over a
+tree carrying xattrs, a symlink, and a nested directory, each side's checksum
+compared),
+`declared_ownership_is_one_commit_across_modes`,
+`commit_refuses_the_values_the_tool_refuses` (nine refusals, text and exit status
+compared against the tool),
+`commit_tar_stream_honours_the_tree_options`,
+`checkout_user_mode_and_subpath_match_the_tool` (six forms across `archive`,
+`bare-user`, and `bare`, destination trees walked file for file), and
+`checkout_refuses_a_subpath_that_names_nothing`; `main.rs` gains unit tests for
+the two readers.
+
+In the matrix, `commit --timestamp` is what opened the `checksum-agreement`
+oracle: every setup that commits now states `--timestamp=@1700000000`, so the two
+sides reach one checksum, and thirteen new `m10` cells state the options
+directly. Corpus `C3` stops being a declaration -- `archive` and `bare-user`
+compare checksums against the tool through a `commit --owner-uid --owner-gid`
+run line, `bare-user-only` does the same and keeps its `lossy` read-back, and
+`bare-user-shared` cites the cross-mode identity test, the tool having no way to
+open that mode. `C3`'s `bare` cell stays a `needs-priv` declaration, its
+unprivileged half now recorded: both implementations refuse the chown at exit 1
+and leave nothing behind. `checkout -U` and `--subpath` cite the test that walks
+both destinations, no oracle reading a cell's own checkout destination, and the
+subpath refusal runs as a cell. An M10 record may now name the one repository
+mode its invocation needs, which the declared-ownership cells use to ask for
+`archive`, ownership on a `bare` object inode needing root. The run reports 413
+cells, 100 pass, 0 fail, where it reported 83 passes before the phase.
+
+One finding outside the phase's scope came out of building its tests, recorded in
+`m0-content.matrix`'s `C4` row and left undecided: an xattr whose value is zero
+bytes long is recorded by the port and dropped by the tool, so the object
+checksums part for any tree carrying one. The loss is at ingest alone -- the
+tool's checkout writes such an xattr back out of an object that holds one -- and
+it reaches `archive`, `bare`, and `bare-user` alike. Deciding what the port
+records touches the ingest path, so it wants a phase of its own.
 
 #### Phase 17d -- `show`, `log`, `ls`, `config get`, and the GVariant text-form printer
 

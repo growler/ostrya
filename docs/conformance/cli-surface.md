@@ -265,7 +265,13 @@ Two resolution behaviors the tool has and the port does not, each recorded in
 - an abbreviated commit checksum resolves in the tool, from a hex prefix as
   short as one character, wherever a revision is taken. Reproducing it needs a
   scan of `objects/` inside `Repo::resolve_rev`, which is library work outside
-  Phase 17b's CLI wiring, and it changes resolution for every subcommand;
+  Phase 17b's CLI wiring, and it changes resolution for every subcommand. One
+  consequence reaches `commit`'s implicit parent, observed while Phase 17c
+  compared its options: a branch name that is a hex prefix of an object the
+  repository already holds resolves for the tool, so `commit -b <prefix>` on a
+  fresh branch parents its commit on that object, where the port writes a root
+  commit. Against a repository holding one commit, `commit -b <the commit's first
+  two characters>` reproduces it;
 - the tool validates a ref name against a character class the port's own check
   does not, so `ostrya refs --create` writes some names the tool then refuses
   to resolve. Adopting the rule tightens `Repo::resolve_rev`, `commit -b`, and
@@ -311,23 +317,40 @@ Absent:
 The command exists and the matrix exercises an option it does not accept.
 
 `commit` accepts `--repo`, `--parent`, `-b/--branch`, `--orphan`, `-s/--subject`,
-and `--canonical-permissions`. Missing: `-m/--body`, `-F/--body-file`,
+`--canonical-permissions`, and, since Phase 17c, `--owner-uid=UID`,
+`--owner-gid=GID`, `--no-xattrs`, and `--timestamp=TIMESTAMP`. Missing:
+`-m/--body`, `-F/--body-file`,
 `-e/--editor`, `--no-bindings`, `--bind-ref=BRANCH`, `--base=REV`,
 `--tree`, `--add-metadata-string=KEY`, `--add-metadata=KEY`,
-`--keep-metadata=KEY`, `--add-detached-metadata-string=KEY`, `--owner-uid=UID`,
-`--owner-gid=GID`, `--bootable`, `--mode-ro-executables`, `--no-xattrs`,
+`--keep-metadata=KEY`, `--add-detached-metadata-string=KEY`,
+`--bootable`, `--mode-ro-executables`,
 `--selinux-policy=PATH`, `-P/--selinux-policy-from-base`,
 `--selinux-labeling-epoch`, `--link-checkout-speedup`, `-I/--devino-canonical`,
 `--tar-autocreate-parents`, `--tar-pathname-filter=REGEX`,
 `--skip-if-unchanged`, `--statoverride=PATH`, `--skip-list=PATH`, `--consume`,
 `--table-output`, `--gpg-sign=KEY-ID`, `--gpg-homedir=HOMEDIR`, `--sign=KEY`,
 `--sign-from-file=PATH`, `--sign-type=NAME`, `--generate-sizes`,
-`--generate-composefs-metadata`, `--fsync=POLICY`, `--timestamp=TIMESTAMP`.
+`--generate-composefs-metadata`, `--fsync=POLICY`.
 
-`--owner-uid` and `--owner-gid` are needed by corpus C3. `--timestamp` is needed
-by every reproducible cell. `--tree` is needed because the port reads a tar
-stream from standard input where the tool takes `--tree=tar=PATH`; the two forms
-must converge.
+`--tree` is needed because the port reads a tar stream from standard input where
+the tool takes `--tree=tar=PATH`; the two forms must converge. The port's stdin
+form honors `--owner-uid`, `--owner-gid`, and `--no-xattrs`; it ignores
+`--canonical-permissions`, which reaches the filesystem walk alone, so that
+option and the stdin form are not combined until `--tree` lands.
+
+The one divergence the four Phase 17c options carry sits at the values
+`--timestamp` takes. The tool reads a date with a full natural-language reader:
+`@SECONDS` since the epoch, an absolute date and time with or without a UTC
+offset (a value without one naming the tool's own local time), a ctime-style
+rendering, a relative expression such as `now` or `yesterday`, and an empty value
+(today's midnight). The port reads two of those forms -- `@SECONDS`, and an
+absolute date and time carrying `Z` or `±HH[:MM]` -- because the rest need a
+time-zone database or a natural-language date reader. A value the port does not
+hold reports `error: Could not parse '<value>'` and exit 1, which is the tool's
+own text for a value neither holds, so the two part on acceptance and not on
+wording. Both refuse a bare count of seconds (`--timestamp=1234567890`), the `@`
+being what states one. Each accepted form was checked against the tool by commit
+checksum, the pre-epoch `@-1` and the leap day among them.
 
 One `commit` divergence sits at the values `--parent` takes, the parenting
 behavior itself being shared (`../format-reference.md`, "CLI output formats").
@@ -400,13 +423,37 @@ an out-of-band write is the only arrival for either name. The character class
 itself stays deferred, so a `^` inside the name parts the two -- the port writes
 `a^b` and the tool refuses it with `Invalid refspec a^b`.
 
-`checkout` accepts `--repo`, `-H/--require-hardlinks`, `-C/--force-copy`, and
-`--composefs`. Missing: `-U/--user-mode`, `--disable-cache`, `--subpath=PATH`,
+`checkout` accepts `--repo`, `-H/--require-hardlinks`, `-C/--force-copy`,
+`--composefs`, and, since Phase 17c, `-U/--user-mode` and `--subpath=PATH`.
+Missing: `--disable-cache`,
 `--union`, `--union-add`, `--union-identical`, `--whiteouts`,
 `--process-passthrough-whiteouts`, `--allow-noent`, `--from-stdin`,
 `--from-file=FILE`, `--fsync=POLICY`, `-M/--bareuseronly-dirs`,
 `--skip-list=FILE`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`,
 `--composefs-noverity`.
+
+The destination trees `-U` and `--subpath` produce agree with the tool's file for
+file, in `archive`, `bare-user`, and `bare` (`../format-reference.md`,
+"Checkout"). Three divergences stand at the values `--subpath` takes and one at a
+flag pair:
+
+- a subpath naming nothing ends the checkout at exit 1 in both, leaving no
+  destination, and the words part: the tool reports `error: No such file or
+  directory: <path>`, naming the path with a leading slash it adds, and a path
+  running through a regular file reports `error: Not a directory`. The port
+  reports its own `error: checkout: subpath not found: <path>` for both;
+- `--subpath=.` and a trailing-slash form such as `--subpath=/sub/` are refused
+  by the tool, which reads the whole value as a name to look up (`No such file or
+  directory: /.`). The port reads a path, so `.` names the tree root and the
+  trailing slash names the same directory as the form without it. Both accept a
+  leading-slash and a relative spelling of a name that exists, and `/` names the
+  whole tree in both;
+- `-U -H` together are refused by the tool in a repository whose mode cannot
+  hardlink under a user-mode checkout (`error: Bare repository mode cannot
+  hardlink in user checkout mode`, observed for `bare`, and accepted for
+  `archive`, `bare-user`, and `bare-user-only`). The port's `-H` is a no-op, so
+  it accepts the pair everywhere and copies. Giving `-H` its refusal is `-H`
+  semantics, which belongs with the remaining `checkout` options.
 
 `export` accepts `--repo`. Missing: `--no-xattrs`, `--subpath=PATH`,
 `--prefix=PATH`, `-o/--output=PATH`.
@@ -601,6 +648,7 @@ black-box observation pass, and the results belong in that same section.
    step 3 exposed. Done, Phase 17b1.
 5. The P2 option gaps on `commit` and `checkout`, which the corpora need:
    `--owner-uid`, `--owner-gid`, `--timestamp`, `--no-xattrs`, `-U`, `--subpath`.
+   Done, Phase 17c.
 6. `show`, `log`, `ls`, `config`, together with the variant printer.
 7. The remaining P2 gaps.
 8. P3.

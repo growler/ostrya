@@ -251,9 +251,12 @@ spec: cli-surface.md#p0-blocks-the-harness
 
 The harness substitutes `$REPO` with the cell's own scratch repository path,
 runs the line under both implementations, and compares the artifacts the
-`oracle` field names. `ref-run` overrides the line for the reference tool, and
-`ref-run: n-a` states that the tool has no equivalent invocation, which leaves
-the record's absolute `expect-*` claims as the cell's only assertions.
+`oracle` field names. A `modes:` field states the repository mode the invocation
+needs, holding one value, since a cell is one invocation; a record naming none
+gets `bare`, and one naming two is a static error. `ref-run` overrides the line
+for the reference tool, and `ref-run: n-a` states that the tool has no
+equivalent invocation, which leaves the record's absolute `expect-*` claims as
+the cell's only assertions.
 `harness.md` holds the setup and placeholder vocabulary, the assertion forms,
 and the verdict rules.
 

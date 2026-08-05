@@ -3,6 +3,7 @@
 //! [`Transaction::write_dfd_to_mtree`](crate::Transaction::write_dfd_to_mtree)
 //! ingests an on-disk tree into a [`MutableTree`](crate::MutableTree). A
 //! [`CommitModifier`] shapes that ingest: a set of [`CommitModifierFlags`], a
+//! declared owner uid and gid that replace what the source carries, a
 //! synchronous filter that includes or prunes each entry, a synchronous xattr
 //! callback that replaces an entry's stored xattr set, an optional SELinux
 //! label callback, and an optional [`DevInoCache`] that skips re-hashing a file
@@ -154,6 +155,15 @@ const SELINUX_XATTR: &[u8] = b"security.selinux\0";
 pub struct CommitModifier {
     /// Flags controlling the ingest.
     pub flags: CommitModifierFlags,
+    /// The owner uid every ingested entry records, in place of the uid its
+    /// source carries. Applied after the
+    /// [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS)
+    /// reduction and before the callbacks, so a declared id wins over that
+    /// flag's `0`.
+    pub owner_uid: Option<u32>,
+    /// The owner gid every ingested entry records, on the same terms as
+    /// [`owner_uid`](CommitModifier::owner_uid).
+    pub owner_gid: Option<u32>,
     /// A filter called per path to include or prune entries.
     pub filter: Option<FilterFn>,
     /// A callback whose return value replaces an entry's stored xattr set.
@@ -168,14 +178,45 @@ pub struct CommitModifier {
 }
 
 impl CommitModifier {
-    /// A modifier with the given flags and no callbacks.
+    /// A modifier with the given flags, no declared ownership, and no
+    /// callbacks.
     pub fn new(flags: CommitModifierFlags) -> CommitModifier {
         CommitModifier {
             flags,
+            owner_uid: None,
+            owner_gid: None,
             filter: None,
             xattr_callback: None,
             label_callback: None,
             devino_cache: None,
+        }
+    }
+}
+
+/// The declared ownership a walk applies to every entry, read out of the
+/// modifier once so the per-entry adjustment holds no borrow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Owner {
+    pub(crate) uid: Option<u32>,
+    pub(crate) gid: Option<u32>,
+}
+
+impl Owner {
+    /// The ownership `modifier` declares; nothing declared for `None`.
+    pub(crate) fn of(modifier: Option<&CommitModifier>) -> Owner {
+        modifier.map_or(Owner::default(), |m| Owner {
+            uid: m.owner_uid,
+            gid: m.owner_gid,
+        })
+    }
+
+    /// Replace the ids `meta` carries with the declared ones.
+    pub(crate) fn apply(self, meta: &mut FileMeta) {
+        if let Some(uid) = self.uid {
+            meta.uid = uid;
+        }
+        if let Some(gid) = self.gid {
+            meta.gid = gid;
         }
     }
 }

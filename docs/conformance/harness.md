@@ -156,7 +156,11 @@ setup already committed, which is what a cell committing a second time onto the
 setup's branch wants.
 
 A cell that names no mode gets `bare`, and a cell that names no corpus gets
-`C0`. The branch a setup commits to is `conformance`.
+`C0`. The branch a setup commits to is `conformance`, and the timestamp it
+commits with is `@1700000000`, so a setup commit is reproducible: the two sides
+commit the same corpus and reach the same checksum. An M10 record states the
+mode its invocation needs with a `modes:` field holding one value, a cell being
+one invocation; naming two is a static error.
 
 The `setup:` field takes one or more names, and their bindings combine. A setup
 that binds a placeholder another setup in the same record already bound is a
@@ -190,10 +194,9 @@ artifact. The set is closed and matches the vocabulary in `README.md`.
 - `refs-bytes` -- every path under `refs/`, sorted, with its contents. The
   contents go through the placeholder substitution and the checksum masking
   under "Normalization" below, so a ref holding the commit a setup made reads
-  `$REV` and any other checksum reads `<checksum>`. Without that, two
-  repositories each side committed for itself would never compare: neither
-  passes a timestamp, so the two commit checksums differ by wall-clock time
-  until `commit --timestamp` lands in Phase 17c.
+  `$REV` and any other checksum reads `<checksum>`. The masking keeps a cell
+  comparable when its own invocation commits without a timestamp, which every
+  cell that does not state a checksum as its claim is free to do.
 - `inventory` -- every loose object: relative path, extension, and size,
   sorted by path.
 - `manifest` -- a checkout walked by the harness and reduced to one line per
@@ -205,12 +208,10 @@ artifact. The set is closed and matches the vocabulary in `README.md`.
   resolves the checksum through `rev-parse`, against `$BRANCH` when a setup
   bound one and `$REV` otherwise; a cell binding neither reports the oracle as
   unavailable. The artifact is the raw checksum, with none of the masking
-  `refs-bytes` applies, so a cell naming this oracle needs a setup whose commit
-  is reproducible: each side commits with its own binary and neither passes a
-  timestamp, so the two checksums differ by wall-clock time. `commit
-  --timestamp` supplies the fixed timestamp in Phase 17c, and no cell names the
-  oracle before it. The unit tests in `crates/ostrya-conformance/src/oracle.rs`
-  guard the resolution path meanwhile.
+  `refs-bytes` applies, so a cell naming this oracle states a timestamp: either
+  its own `run:` line passes `commit --timestamp`, or its claim rests on the
+  setup commit, which passes one. Without a fixed timestamp two checksums differ
+  by wall-clock time and the oracle would fail on every cell.
 - `fsck` -- the exit status of each implementation's own `fsck` run against
   its own repository. The two word their progress and summary lines
   differently, and the claim is that both find the repository sound, so the
@@ -450,19 +451,21 @@ Oracle and setup availability follows the CLI surface `cli-surface.md` orders.
   from a `checkout`), and `fsck`, each since Phase 17a.
 - Phase 17b completed the `checksum-agreement` resolution path with `rev-parse`:
   a cell whose operation is not a commit resolves the checksum instead of
-  reporting the oracle unavailable. No cell names the oracle yet, because it
-  compares raw checksums and a reproducible commit waits on `commit
-  --timestamp` in Phase 17c. Phase 17b also added `refs` and `cat`, so a cell
-  can state a ref listing or a file's content as `stdout-text` alongside the
+  reporting the oracle unavailable. Phase 17b also added `refs` and `cat`, so a
+  cell can state a ref listing or a file's content as `stdout-text` alongside the
   `refs-bytes` files on disk.
 - Phase 17b1 made a setup able to build a parent chain: `ostrya commit -b BRANCH`
   carries the tool's implicit parent, so two commits onto one branch leave an
   ancestry both implementations resolve. A cell that reads a parent still needs a
   second invocation, so those cells cite `evidence:`.
-- Phase 17c adds `--owner-uid`, `--owner-gid`, `--timestamp`, and
-  `--no-xattrs` on `commit`, which corpora `C3` and `C13` need, and
-  `checkout -U` and `--subpath`. `--timestamp` is what the first
-  `checksum-agreement` cell waits on.
+- Phase 17c opened `checksum-agreement` to cells: `commit --timestamp` makes a
+  commit reproducible, so every setup that commits states a timestamp and a cell
+  may compare raw checksums. It also added `--owner-uid`, `--owner-gid`, and
+  `--no-xattrs` on `commit`, which corpus `C3` states through the CLI and corpus
+  `C13` will, and `checkout -U` and `--subpath`. No oracle reads a cell's own
+  checkout destination -- `manifest` checks the setup's revision out itself --
+  so the two checkout options state their destination trees through
+  `evidence:`.
 - Phase 17d adds the GVariant text-form printer, which `show --raw` and the
   `--print-*` forms need.
 

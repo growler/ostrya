@@ -49,8 +49,8 @@ use ostrya_rt::File as RtFile;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 
 use crate::error::{Error, Result};
-use crate::ingest::{apply_canonical, finalize_meta, join_path, to_dirmeta};
-use crate::modifier::{CommitModifier, CommitModifierFlags, FilterResult};
+use crate::ingest::{adjust_meta, finalize_meta, join_path, to_dirmeta};
+use crate::modifier::{CommitModifier, CommitModifierFlags, FilterResult, Owner};
 use crate::mtree::MutableTree;
 use crate::transaction::Transaction;
 use crate::write::FileMeta;
@@ -107,8 +107,8 @@ impl Transaction {
             mode: dmode,
             xattrs: content_xattrs(skip_xattrs, &root_xattrs)?,
         };
-        let canon = apply_canonical(flags, base, false);
-        let root_meta = finalize_meta(modifier.as_deref_mut(), Path::new("/"), canon)?;
+        let adjusted = adjust_meta(flags, Owner::of(modifier.as_deref()), base, false);
+        let root_meta = finalize_meta(modifier.as_deref_mut(), Path::new("/"), adjusted)?;
         merge_dir(self, root_fd, mtree, modifier, "/".to_owned(), root_meta).await
     }
 }
@@ -160,6 +160,7 @@ fn merge_dir<'a>(
         let flags = modifier
             .as_deref()
             .map_or(CommitModifierFlags::empty(), |m| m.flags);
+        let owner = Owner::of(modifier.as_deref());
         let skip_xattrs = flags.contains(CommitModifierFlags::SKIP_XATTRS);
 
         // This directory's dirmeta comes from the upper inode.
@@ -203,7 +204,7 @@ fn merge_dir<'a>(
                 mode: entry.mode,
                 xattrs: content_xattrs(skip_xattrs, &entry.xattrs)?,
             };
-            let filter_meta = apply_canonical(flags, base, is_symlink);
+            let filter_meta = adjust_meta(flags, owner, base, is_symlink);
 
             // A filter Skip leaves the base version in place: the upper change is
             // not applied, and the base entry (if any) is untouched.

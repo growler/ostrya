@@ -1165,14 +1165,26 @@ xattrs.
   symlink is a real symlink lchowned to the logical uid/gid with the logical link
   xattrs. A directory is chowned to the logical uid/gid, chmodded to the full
   logical mode (`mode & 0o7777`), and given the logical xattrs.
-- Unprivileged: no chown and no xattrs. A regular file's mode is `mode & 0o777`,
-  so the setuid, setgid, and sticky bits are dropped and the rwx bits including
-  group- and other-write are kept (`4755` becomes `0755`, `0666` stays `0666`). A
-  directory's mode is the full `mode & 0o7777`, so its special bits are kept
-  (`2755` stays `2755`). A symlink is a real symlink with no chown and no xattrs.
+- Unprivileged: no chown and no xattrs. A regular file the checkout writes takes
+  `mode & 0o1777`, so the setuid and setgid bits are dropped, and the sticky bit
+  and the rwx bits including group- and other-write are kept (`4755` and `6755`
+  become `0755`, `1755` and `7755` become `1755`, `1644` stays `1644`, `0666`
+  stays `0666`). A directory's mode is the full `mode & 0o7777`, so all three
+  special bits are kept (`2755` stays `2755`, `1644` stays `1644`). A symlink is a
+  real symlink with no chown and no xattrs.
 
-Observed on a `bare` repository holding a tree of assorted modes: `f0666` checks
-out `0666` under both modes; `f4755` checks out `4755` faithful and `0755`
+The mask applies to a regular file the checkout writes. A regular file it
+hardlinks instead adopts the object inode's mode as it stands, which in
+`bare-user` carries no special bit, so the sticky bit of a `bare-user` object is
+absent from an unprivileged checkout that hardlinks and present in the same
+checkout forced to copy. Recovered by checking a tree of the modes `1644`, `1755`,
+`2755`, `4755`, `6755`, `7755`, and `3755` -- on files and on directories --
+out of `archive`, `bare`, `bare-user`, and `bare-user-only` repositories, with
+`ostree checkout`, `ostree checkout -U`, and `ostree checkout -U -C`, and reading
+the destination modes back. The `-U -C` result is the mask above in every mode.
+
+Observed further on a `bare` repository holding a tree of assorted modes: `f0666`
+checks out `0666` under both modes; `f4755` checks out `4755` faithful and `0755`
 unprivileged; `d2755` checks out `2755` under both; a `user.demo` xattr on a file
 is present after a faithful checkout and absent after an unprivileged one.
 
@@ -1276,6 +1288,17 @@ out as the destination root. A subpath to a directory makes its dirmeta the
 destination root's metadata and materializes its children. A subpath to a regular
 file or symlink creates the destination directory (a default `0700` observed) and
 places the single object inside it under its name. A missing subpath is an error.
+
+The spellings the tool accepts and refuses, recovered with
+`ostree checkout --subpath` against a commit holding `file.txt`, `dir/`, and
+`dir/link`: the leading slash is optional (`/dir` and `dir` name the same node),
+`/` names the whole tree, and a nested path resolves through its directories. A
+value the tool cannot resolve ends the checkout at exit 1 with no destination
+created: `error: No such file or directory: <path>`, naming the path with a
+leading slash the tool adds, and `error: Not a directory` where the path runs
+through a regular file. The tool looks the value up as given, so `.` is refused
+(`No such file or directory: /.`) and a trailing slash is refused
+(`No such file or directory: /sub/`).
 
 ## Extended attributes
 
@@ -2033,6 +2056,57 @@ The parent:
 `ostree.ref-binding` carries one `as` entry per branch the commit names, so a
 `-b BRANCH` commit carries `[BRANCH]` and a commit that names no branch carries
 the empty array. The key is present in both cases.
+
+The declared ownership. `--owner-uid=UID` and `--owner-gid=GID` replace the
+ownership every ingested entry records, independently of each other: the tree
+root's own metadata, every nested directory, every regular file, and every
+symlink. The permission bits and the xattr set are untouched. Each value is read
+as a C `int` with the base taken from its text -- a `0x` prefix hexadecimal, a
+leading `0` octal, decimal otherwise -- after optional leading whitespace and an
+optional sign, and the whole text must be consumed. The default for both is `-1`,
+so a negative value declares nothing and the source's own ownership stands
+(`--owner-uid=-1` and `--owner-uid=-2` alike; `-0` is the id zero). Recovered by
+committing one tree under each form and comparing commit checksums: `0x2a` and
+`053` are the ids `42` and `43`, `010` is `8`, and a declared id reaches the
+checksum in every repository mode, `bare-user-only` included, which stores no
+ownership yet hashes what was declared.
+
+A value no C `int` holds is refused while the options are read, ahead of the
+repository and ahead of every check the subcommand makes, at exit 1: `error:
+Cannot parse integer value “<value>” for --owner-uid` for a syntax the reader
+cannot hold (`abc`, an empty value, `5x`, a trailing space, `0x`, `--5`), and
+`error: Integer value “<value>” for --owner-gid out of range` above `2147483647`
+or below `-2147483648`. Both messages quote the value in typographic quotes
+(U+201C and U+201D).
+
+`--no-xattrs` records the empty xattr set for every entry, the tree root
+included, whatever the source carries.
+
+`--timestamp=TIMESTAMP` sets the commit timestamp, and wins over
+`SOURCE_DATE_EPOCH`, which the tool otherwise honors. The tool reads the value
+with a full natural-language date reader; the forms recovered by commit-checksum
+comparison are `@SECONDS` since the epoch (an optional sign and an optional
+fractional part, which is dropped: `@1234567890`, `@-1`, `@0.5`, `@ 0`, `@+5`),
+an absolute date and time in ISO 8601 or a space-separated rendering with or
+without a UTC offset (a value without one naming the tool's own local time), a
+ctime-style rendering, a relative expression (`now`, `yesterday`), and an empty
+value, which is today's midnight. A bare count of seconds is refused
+(`--timestamp=1234567890`), as is `@` alone and `@1e3`. A refused value reports
+`error: Could not parse '<value>'` at exit 1, in single quotes rather than the
+typographic pair the integer messages use. A pre-epoch instant is recorded as the
+unsigned timestamp field's two's-complement form, so `@-1` and
+`1969-12-31T23:59:59Z` are one commit.
+
+The fault order among these options, each fault observed alone and in pairs: the
+declared ids are read first, ahead of the repository and ahead of the
+missing-branch check; then the missing-branch check; then the refusal of a
+non-zero declared id beside `--canonical-permissions` (`error: Cannot specify
+both --canonical-permissions and non-zero --owner-uid`, naming `--owner-uid`
+where both are non-zero, and accepting a declared zero); then `--parent`
+resolution; then the tree, whose failure to open is reported ahead of the
+timestamp; then the timestamp. A refused timestamp publishes no object, so the
+object store is empty afterwards, unlike the branch-name guard, which stands
+after the tree is written.
 
 ### `refs`
 

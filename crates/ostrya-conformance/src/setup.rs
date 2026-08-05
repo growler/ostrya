@@ -15,6 +15,12 @@ use crate::record::Actor;
 /// The branch every setup that commits writes to.
 pub const BRANCH: &str = "conformance";
 
+/// The commit timestamp every setup that commits states. Both implementations
+/// read the `@SECONDS` form, so a setup commit is reproducible: the two sides
+/// commit the same corpus and reach the same checksum, which is what lets a cell
+/// name the `checksum-agreement` oracle.
+pub const TIMESTAMP: &str = "@1700000000";
+
 /// The corpus a setup commits when the record names none.
 pub const DEFAULT_CORPUS: &str = "C0";
 
@@ -168,6 +174,7 @@ fn commit(context: &Context<'_>, repo: &Path, branch: &str, tree: &Path) -> Resu
         "commit".to_owned(),
         "-b".to_owned(),
         branch.to_owned(),
+        format!("--timestamp={TIMESTAMP}"),
         path_text(tree)?,
     ];
     let outcome = expect_output(tool, context.root, &args)?;

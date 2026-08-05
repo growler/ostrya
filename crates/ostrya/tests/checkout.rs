@@ -659,6 +659,72 @@ fn checkout_applies_xattrs_to_read_only_entries() {
     });
 }
 
+/// A [`User`](CheckoutMode::User) checkout writes a regular file at
+/// `mode & 0o1777`: the setuid and setgid bits go, the sticky bit stays. A
+/// directory keeps all three. This is the tool's own rule for the file it writes
+/// (`docs/format-reference.md`, "Checkout"), and `force_copy` is what makes the
+/// checkout write every file rather than hardlink some of them.
+#[test]
+fn a_user_mode_checkout_keeps_the_sticky_bit_of_a_written_file() {
+    let tmp = TmpDir::new("co-user-bits");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let files = [0o1644u32, 0o1755, 0o2755, 0o4755, 0o6755, 0o7755];
+    // A source directory the walk must descend into keeps its owner execute bit,
+    // so the directory cases are the searchable renderings of the same bits.
+    let dirs = [0o1755u32, 0o2755, 0o4755, 0o6755, 0o7755, 0o1777];
+    for mode in files {
+        let file = src.join(format!("f{mode:04o}"));
+        std::fs::write(&file, b"x\n").unwrap();
+        set_mode(&file, mode);
+    }
+    for mode in dirs {
+        let dir = src.join(format!("d{mode:04o}"));
+        std::fs::create_dir(&dir).unwrap();
+        set_mode(&dir, mode);
+    }
+
+    // Every mode this rule reduces, in the mode the reduction keeps: the sticky
+    // bit and the permission bits survive, setuid and setgid do not.
+    let expected = |mode: u32| mode & 0o1777;
+
+    for repo_mode in [RepoMode::Archive, RepoMode::Bare, RepoMode::BareUser] {
+        let repo_dir = base.join(format!("repo-{repo_mode:?}"));
+        let destination = format!("co-{repo_mode:?}");
+        block_on(async {
+            let repo = Repo::create(&repo_dir, CreateOptions::new(repo_mode))
+                .await
+                .unwrap();
+            let commit = commit_tree(&repo, base, "src").await;
+
+            let mut opts = CheckoutOptions::new(CheckoutMode::User);
+            opts.force_copy = true;
+            let base_fd = std::fs::File::open(base).unwrap();
+            repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new(&destination), &commit)
+                .await
+                .unwrap();
+
+            let out = base.join(&destination);
+            for mode in files {
+                assert_eq!(
+                    mode_of(&out.join(format!("f{mode:04o}"))),
+                    expected(mode),
+                    "{repo_mode:?}: regular file {mode:04o}",
+                );
+            }
+            for mode in dirs {
+                assert_eq!(
+                    mode_of(&out.join(format!("d{mode:04o}"))),
+                    mode,
+                    "{repo_mode:?}: directory {mode:04o}",
+                );
+            }
+        });
+    }
+}
+
 /// The permission bits of a checked-out path.
 fn mode_of(path: &Path) -> u32 {
     std::fs::symlink_metadata(path).unwrap().mode() & 0o7777

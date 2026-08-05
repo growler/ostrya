@@ -22,7 +22,11 @@
 //! that the archive never names explicitly is given a default `0755` root-owned
 //! metadata object so the tree can serialize. With
 //! [`TarImportOptions::etc_to_usr_etc`], a top-level `etc` component is rewritten
-//! to `usr/etc`. Device and FIFO members are rejected, since an ostree tree
+//! to `usr/etc`. [`TarImportOptions::owner_uid`] and
+//! [`TarImportOptions::owner_gid`] replace the ownership every member records,
+//! the default directory metadata included, and
+//! [`TarImportOptions::skip_xattrs`] records no extended attributes at all.
+//! Device and FIFO members are rejected, since an ostree tree
 //! stores only regular files, symlinks, and directories. The returned tree is
 //! serialized and committed by the caller through
 //! [`Transaction::write_mtree`](crate::Transaction::write_mtree) and
@@ -79,6 +83,16 @@ pub struct TarImportOptions {
     /// Rewrite a top-level `etc` component to `usr/etc`, matching the ostree
     /// convention that composes configuration into `/usr`. Off by default.
     pub etc_to_usr_etc: bool,
+    /// The owner uid every imported entry records, in place of the uid its tar
+    /// header carries. Applies to the default metadata of a directory the
+    /// archive never names as well.
+    pub owner_uid: Option<u32>,
+    /// The owner gid every imported entry records, on the same terms as
+    /// [`owner_uid`](TarImportOptions::owner_uid).
+    pub owner_gid: Option<u32>,
+    /// Record no extended attributes, whatever `SCHILY.xattr.*` records the
+    /// archive carries.
+    pub skip_xattrs: bool,
 }
 
 impl TarImportOptions {
@@ -91,6 +105,16 @@ impl TarImportOptions {
     pub fn with_etc_migration(mut self, on: bool) -> TarImportOptions {
         self.etc_to_usr_etc = on;
         self
+    }
+
+    /// The uid an entry records: the declared one, else the one given.
+    fn uid(&self, from_header: u32) -> u32 {
+        self.owner_uid.unwrap_or(from_header)
+    }
+
+    /// The gid an entry records: the declared one, else the one given.
+    fn gid(&self, from_header: u32) -> u32 {
+        self.owner_gid.unwrap_or(from_header)
     }
 }
 
@@ -216,10 +240,10 @@ impl Repo {
                 TarEntry::Directory(dir) => {
                     let comps = normalize(dir.path(), &opts)?;
                     let meta = DirMeta {
-                        uid: dir.uid(),
-                        gid: dir.gid(),
+                        uid: opts.uid(dir.uid()),
+                        gid: opts.gid(dir.gid()),
                         mode: S_IFDIR | (dir.mode() & PERM_MASK),
-                        xattrs: attrs_to_xattrs(dir.attrs())?,
+                        xattrs: attrs_to_xattrs(dir.attrs(), &opts)?,
                     };
                     let checksum = self.stage_dirmeta(txn, &meta).await?;
                     register_ancestors(&comps, &mut all_dirs);
@@ -229,9 +253,12 @@ impl Repo {
                 TarEntry::File(file) => {
                     let comps = normalize(file.path(), &opts)?;
                     require_leaf(&comps, "regular file")?;
-                    let mut meta =
-                        FileMeta::regular(file.uid(), file.gid(), file.mode() & PERM_MASK);
-                    meta.xattrs = attrs_to_xattrs(file.attrs())?;
+                    let mut meta = FileMeta::regular(
+                        opts.uid(file.uid()),
+                        opts.gid(file.gid()),
+                        file.mode() & PERM_MASK,
+                    );
+                    meta.xattrs = attrs_to_xattrs(file.attrs(), &opts)?;
                     let checksum = txn.write_content(None, &meta, file).await?;
                     register_ancestors(&comps, &mut all_dirs);
                     file_index.insert(comps.clone(), checksum);
@@ -240,8 +267,9 @@ impl Repo {
                 TarEntry::Symlink(link) => {
                     let comps = normalize(link.path(), &opts)?;
                     require_leaf(&comps, "symlink")?;
-                    let mut meta = FileMeta::regular(link.uid(), link.gid(), 0o777);
-                    meta.xattrs = attrs_to_xattrs(link.attrs())?;
+                    let mut meta =
+                        FileMeta::regular(opts.uid(link.uid()), opts.gid(link.gid()), 0o777);
+                    meta.xattrs = attrs_to_xattrs(link.attrs(), &opts)?;
                     let checksum = txn.write_symlink(link.link(), &meta, None).await?;
                     register_ancestors(&comps, &mut all_dirs);
                     file_index.insert(comps.clone(), checksum);
@@ -312,8 +340,8 @@ impl Repo {
                     Some(checksum) => checksum,
                     None => {
                         let meta = DirMeta {
-                            uid: 0,
-                            gid: 0,
+                            uid: opts.uid(0),
+                            gid: opts.gid(0),
                             mode: S_IFDIR | 0o755,
                             xattrs: Xattrs::empty(),
                         };
@@ -462,8 +490,8 @@ fn xattrs_to_attrs(xattrs: &Xattrs) -> Result<AttrList> {
 
 /// Convert tar PAX attributes to a canonical ostrya xattr set, appending the
 /// terminating NUL each stored name carries. [`Xattrs::new`] sorts and validates.
-fn attrs_to_xattrs(attrs: &AttrList) -> Result<Xattrs> {
-    if attrs.is_empty() {
+fn attrs_to_xattrs(attrs: &AttrList, opts: &TarImportOptions) -> Result<Xattrs> {
+    if opts.skip_xattrs || attrs.is_empty() {
         return Ok(Xattrs::empty());
     }
     let mut pairs = Vec::with_capacity(attrs.len());

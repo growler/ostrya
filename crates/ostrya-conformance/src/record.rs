@@ -331,11 +331,21 @@ fn expand(record: &Record, index: usize) -> Result<Vec<Cell>, String> {
             let tail = record
                 .get("cell")
                 .ok_or_else(|| format!("{}: M10 needs a `cell` field", record.origin()))?;
+            // A cell is one invocation, so it holds one repository mode: the one
+            // the record names, else the default. Naming two would state two
+            // cells under one identifier.
+            if modes.len() > 1 {
+                return Err(format!(
+                    "{}: an M10 record names at most one mode, and this one names {}",
+                    record.origin(),
+                    modes.len()
+                ));
+            }
             cells.push(Cell {
                 id: format!("m10/{tail}"),
                 family: family.clone(),
                 row: record.get("subcommand").unwrap_or(tail).to_owned(),
-                mode: None,
+                mode: modes.first().map(|mode| (*mode).to_owned()),
                 corpus: corpora.first().map(|corpus| (*corpus).to_owned()),
                 op: None,
                 record: index,

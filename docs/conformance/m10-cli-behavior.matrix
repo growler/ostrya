@@ -12,9 +12,10 @@
 # `run:` line does not state; each names a probe.
 #
 # This file carries Phase 17a's cases -- `init` and the global `--repo`
-# conventions -- Phase 17b's -- `refs`, `rev-parse`, and `cat` -- and Phase
-# 17b1's -- `commit` parenting (`../port-plan.md`). Later sub-phases add records
-# here as their own subcommands and options land.
+# conventions -- Phase 17b's -- `refs`, `rev-parse`, and `cat` -- Phase 17b1's
+# -- `commit` parenting -- and Phase 17c's -- `commit --owner-uid/--owner-gid/
+# --timestamp/--no-xattrs` and `checkout -U/--subpath` (`../port-plan.md`).
+# Later sub-phases add records here as their own subcommands and options land.
 #
 # The `repo-with-commit` setup binds one branch, `conformance`, holding one
 # commit of corpus `C0`, so a cell needing a second ref, a nested ref name, an
@@ -26,11 +27,11 @@
 # setup vocabulary would let them become `run:` cells; that is a harness
 # change, not a Phase 17b one.
 #
-# No Phase 17b cell names the `checksum-agreement` oracle. Each side's setup
-# commits with its own binary and neither passes a timestamp, so the two commit
-# checksums differ by wall-clock time until `commit --timestamp` lands in Phase
-# 17c. A cell that states a checksum instead names `stdout-text`, whose
-# normalizer turns the bound `$REV` into the placeholder, so
+# `commit --timestamp` is what makes a commit reproducible, so the cells that
+# name the `checksum-agreement` oracle state a timestamp themselves, and every
+# setup that commits states one too (harness.md, "Setups and placeholders"). A
+# cell that reads a checksum rather than comparing one names `stdout-text`,
+# whose normalizer turns the bound `$REV` into the placeholder, so
 # `rev-parse conformance` printing `$REV` on both sides states that each
 # implementation resolved the branch to the commit its own setup made.
 
@@ -1601,8 +1602,9 @@ note: the same pair where the revision is a ref pointing at an absent commit,
  holding it, both implementations leaving the same refs tree.
 
 # ---------------------------------------------------------------------------
-# commit -- the branch-name guard the case rule of a 64-character name carries.
-# The option gaps the corpora need belong to Phase 17c (`../port-plan.md`).
+# commit -- the branch-name guard the case rule of a 64-character name carries,
+# the parenting Phase 17b1 landed, and the tree-and-time options Phase 17c
+# landed (`../port-plan.md`).
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -1913,3 +1915,313 @@ note: a commit that names no branch carries `ostree.ref-binding` as an empty `as
  text-form printer Phase 17d lands, so the cited test has the tool print the key
  out of the port's own commit, which is one custody direction of the claim; the
  other is the equal checksums that test's `SOURCE_DATE_EPOCH` commits produce.
+
+family: M10
+subcommand: commit
+cell: commit/timestamp-epoch
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the first cell to name `checksum-agreement`, which is what a fixed
+ timestamp makes possible: each side commits corpus C0 with its own binary and
+ the two print one checksum, so the whole commit object agrees -- tree, ownership,
+ metadata, and the timestamp itself. `inventory` states that the two object
+ stores hold the same loose objects at the same sizes.
+
+family: M10
+subcommand: commit
+cell: commit/timestamp-iso
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=2009-02-13T23:31:30Z $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_ownership_and_timestamp_flags_match_the_tool
+spec: format-reference.md#commit
+note: an absolute date and time carrying a UTC offset names the same instant
+ `commit/timestamp-epoch` states as `@1234567890`, and both implementations reach
+ the same commit from it. That the two forms are one instant is the cited test's
+ own assertion, one cell being able to compare only the two implementations.
+
+family: M10
+subcommand: commit
+cell: commit/timestamp-bare-epoch-refused
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=1234567890 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Could not parse '1234567890'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Could not parse '1234567890'"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: a bare count of seconds is not a timestamp to either reader; the `@` form
+ is what states one. Both refuse it in the same words and neither writes a ref or
+ publishes an object.
+
+family: M10
+subcommand: commit
+cell: commit/timestamp-unparsable
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=nonsense $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Could not parse 'nonsense'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Could not parse 'nonsense'"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: the value neither reader holds. The port's reader takes a subset of the
+ tool's -- the `@SECONDS` form and an absolute date and time carrying a UTC
+ offset -- so a wall clock with no offset and a relative expression part the two
+ (cli-surface.md, "P2"); this text parts neither.
+
+family: M10
+subcommand: commit
+cell: commit/owner-declared
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --owner-uid=42 --owner-gid=43 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: corpus C3 is corpus C0 committed with declared ownership, which this states
+ for the CLI: the ids reach every entry -- the tree root's own metadata, the
+ nested directory, the regular files, and the symlink -- so one commit checksum
+ covers them all. m0-content.matrix carries the same claim per repository mode.
+
+family: M10
+subcommand: commit
+cell: commit/owner-uid-only
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --owner-uid=42 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the two options are independent, so a declared uid beside no declared gid
+ records the invoking user's gid. Both implementations run as the same user here,
+ which is what makes that half of the pair comparable.
+
+family: M10
+subcommand: commit
+cell: commit/owner-radix
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --owner-uid=0x2a --owner-gid=053 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_ownership_and_timestamp_flags_match_the_tool
+spec: format-reference.md#commit
+note: an id's base comes from its text: `0x` hexadecimal, a leading `0` octal,
+ decimal otherwise. `0x2a` and `053` are 42 and 43, so this commit is
+ `commit/owner-declared`'s; the cited test holds the two checksums to each other,
+ one cell comparing only the two implementations.
+
+family: M10
+subcommand: commit
+cell: commit/owner-negative
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --owner-uid=-1 --owner-gid=-1 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the tool's default for both options is -1, so a negative id declares
+ nothing and the source's own ownership stands. Both implementations record the
+ invoking user's ids and reach one checksum.
+
+family: M10
+subcommand: commit
+cell: commit/owner-unparsable
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --owner-uid=abc $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Cannot parse integer value “abc” for --owner-uid"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Cannot parse integer value “abc” for --owner-uid"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: an id is read while the options are, ahead of the repository and ahead of
+ every check the subcommand makes, and the refusal names the option and quotes
+ the value in the tool's typographic quotes. This cell states the text; the
+ order is `commit/owner-fault-order` below.
+
+family: M10
+subcommand: commit
+cell: commit/owner-out-of-range
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --owner-gid=4294967295 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Integer value “4294967295” for --owner-gid out of range"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Integer value “4294967295” for --owner-gid out of range"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: the id is a C `int`, so a value above 2147483647 is refused by range rather
+ than by syntax, in words of its own. An id above that ceiling therefore reaches
+ no repository, whatever the uid space allows.
+
+family: M10
+subcommand: commit
+cell: commit/owner-fault-order
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_refuses_the_values_the_tool_refuses
+spec: format-reference.md#commit
+note: the order the three refusals hold: an unreadable id is reported ahead of
+ the repository and ahead of the missing-branch check, the
+ `--canonical-permissions` conflict after that check and ahead of the tree, and
+ an unreadable timestamp after the tree opens. Each is its own invocation, so the
+ order stands in the cited test rather than in one `run:` line.
+
+family: M10
+subcommand: commit
+cell: commit/canonical-owner-conflict
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --canonical-permissions --owner-uid=1 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Cannot specify both --canonical-permissions and non-zero --owner-uid"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Cannot specify both --canonical-permissions and non-zero --owner-uid"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit-modifier-canonical-permissions-consume-and-devino
+note: canonical ingest owns every object 0:0, so a declared non-zero id
+ contradicts it and both refuse the pair, naming the option whose id they read.
+ A declared zero is no contradiction and is accepted, which
+ `commit/canonical-owner-zero` states.
+
+family: M10
+subcommand: commit
+cell: commit/canonical-owner-zero
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --canonical-permissions --owner-uid=0 --owner-gid=0 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit-modifier-canonical-permissions-consume-and-devino
+note: the ids canonical ingest itself records, stated explicitly, which is the
+ form the fixture generator uses. Both implementations accept the pair and reach
+ one checksum.
+
+family: M10
+subcommand: commit
+corpus: C4
+cell: commit/no-xattrs
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --no-xattrs $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: corpus C4 carries the xattrs, so the option has something to drop: every
+ entry records the empty set and the two implementations reach one checksum. What
+ each records with the xattrs kept is m0-content.matrix's C4 row, where one value
+ of that corpus parts them.
+
+# ---------------------------------------------------------------------------
+# checkout -- the unprivileged mode and the subpath, Phase 17c
+# (`../port-plan.md`). No oracle reads a cell's own checkout destination: the
+# `manifest` oracle checks the setup's revision out itself, faithfully, into
+# work space of its own. The cells that state a destination tree therefore cite
+# the test that walks both implementations' destinations, and the cells here run
+# the refusals, which an exit status and a message state.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: checkout
+cell: checkout/user-mode
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_user_mode_and_subpath_match_the_tool
+spec: format-reference.md#checkout
+note: `-U` applies no ownership and no extended attributes, and a regular file it
+ writes keeps the sticky bit while it drops setuid and setgid; a directory keeps
+ all three. The cited test states the destination trees of both implementations
+ file for file, in the three modes whose checkout path differs.
+
+family: M10
+subcommand: checkout
+cell: checkout/subpath
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_user_mode_and_subpath_match_the_tool
+spec: format-reference.md#checkout
+note: a `--subpath` directory's own metadata becomes the destination root's, and
+ a `--subpath` file or symlink is placed inside a destination directory the
+ checkout creates at mode 0700. The leading slash is optional, and `/` names the
+ whole tree. The cited test states each form against the tool's own checkout.
+
+family: M10
+subcommand: checkout
+cell: checkout/subpath-absent
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --subpath=/nope $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "/nope"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No such file or directory: /nope"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: a subpath naming nothing ends the checkout at exit 1 with no destination
+ left behind, in both. The words part: the tool reports `No such file or
+ directory: <path>` and the port its own `checkout: subpath not found: <path>`,
+ which cli-surface.md, "P2" records, so each side states its own text and
+ `stderr-text` is no oracle here.

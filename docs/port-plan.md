@@ -3760,18 +3760,53 @@ tool's checkout writes such an xattr back out of an object that holds one -- and
 it reaches `archive`, `bare`, and `bare-user` alike. Deciding what the port
 records touches the ingest path, so it wants a phase of its own.
 
-#### Phase 17d -- `show`, `log`, `ls`, `config get`, and the GVariant text-form printer
+#### Phase 17d -- `show`, `log`, `ls`, `config get`, and the GVariant text-form printer (DONE)
 
 The GVariant text-form printer is its own distinct deliverable inside this
 sub-phase, flagged separately in `cli-surface.md` as easy to overlook: it
 reproduces the tool's GLib "print" convention (type annotations, the byte
-array literal form, floating point, nested containers) for `show --raw`,
+array literal form, nested containers) for `show --raw`,
 every `show --print-*` form, and `summary --raw`. It belongs in
 `ostrya-gvariant`, next to the `Value` type it prints, since the convention
 is GVariant's own rather than ostree-specific, matching that crate's
 "no ostree knowledge" charter. Recovered fact by fact against the tool's
 output across every metadata object type in the fixture set, with the
 recovered rules landing in `format-reference.md`.
+
+`show --print-variant-type=TYPE` reads any file as a value of a named type, which
+made the tool a byte-exact oracle for the printer: one hand-written serialized
+value per rule of the form, rather than only the metadata objects a repository
+holds. The recovered rules are in `format-reference.md`, "The GVariant text
+form". Two of them were not in the plan's picture. A byte array whose last byte
+is the only NUL it holds prints as a bytestring literal, `b'user.foo'`, with C
+escaping and octal for every byte outside printable ASCII, where every other byte
+array prints as `[byte 0x01, 0x02]`; the rule reaches real metadata, since an
+xattr name is stored NUL-terminated and a 64-byte ed25519 signature whose last
+byte happens to be zero prints as a bytestring too. And the string form escapes
+differently from the bytestring form -- one string holding the same bytes is
+`'a"b'` and `b'a\"b'` -- so the two literals needed separate escapers.
+
+Floating point is not part of the deliverable after all: `ostrya-gvariant`'s
+`Type` models the type set the on-disk format uses -- booleans, bytes, `u`, `t`,
+strings, variants, arrays, tuples, and dict entries -- and `d` is outside it, as
+are `i`, `n`, `q`, `x`, `o`, `g`, and the maybe types. Nothing the format stores
+needs them, so the printer covers the set the crate models and
+`show --print-variant-type` refuses a type outside it, which
+`cli-surface.md`, "P1", records.
+
+The byte order turned out to be part of the printer's contract. The on-disk
+format places its numeric fields in the variant already big-endian while the
+framing stays little-endian, so a parsed value holds each numeric field
+byte-reversed and one byteswap of the whole tree recovers the numbers the fields
+state. That swap is what `-B/--no-byteswap` suppresses, so `Value::byteswapped`
+landed beside the printer. `-B` also proved to mean more than its name: it turns
+the raw report on by itself, and unlike `--raw` it leaves a commit's own report
+in place after the variant line.
+
+One library addition came with the phase: `Repo::commit_sizes`, which totals a
+commit's `ostree.sizes` metadata and counts the recorded objects absent locally,
+since `--print-sizes` reports both figures and the CLI holds no `ostree-core`
+dependency to unpack the entries itself.
 
 - `show`: `--raw`, `--print-related`, `--print-variant-type=TYPE`,
   `--list-metadata-keys`, `--print-metadata-key=KEY`, `--print-hex`,
@@ -3786,14 +3821,54 @@ recovered rules landing in `format-reference.md`.
   `config set`/`unset` need a config-write path the library does not have
   yet and are deferred to 17e.
 
-Deliverables: the GVariant printer (`ostrya-gvariant`), `show`, `log`, `ls`,
-`config get`, and their output-format recovery folded into
-`format-reference.md`.
+Deliverables: the GVariant printer and `Value::byteswapped`
+(`ostrya-gvariant`), `Repo::commit_sizes`, `show`, `log`, `ls`, `config get`,
+and their output-format recovery folded into `format-reference.md`.
 
-Verify: the printer's output matches the tool's byte for byte across the
-golden fixture set for every metadata object type; each `show`/`log`/`ls`
-form's stdout matches the tool's for the same commit or tree; `config get`
-matches the tool's for every key class `format-reference.md` documents.
+Three tool behaviors are observed and deliberately not reproduced, each recorded
+in `cli-surface.md`, "P1": a variant type outside the codec's set, a second
+`OBJECT` operand, which the tool reads the first of and ignores the rest, and the
+instant a GPG signature was made, which the tool renders through gpgme in the
+host's locale and time zone and the port renders in UTC. Everything else in the
+signature report -- the algorithm, the short key id, the user id, and the three
+verdict lines -- agrees. Two more facts came out of the comparison: `show`'s
+absent-object line carries an `Opening content object <checksum>: ` prefix in
+every mode but `archive`, and `config`'s operand-count check stands ahead of the
+operation name with a one-operand allowance for everything except `set`.
+
+Verify: `cargo test --workspace --all-features` is green, `cargo fmt --all
+--check` and `cargo clippy --workspace --all-features --all-targets` are clean.
+`crates/ostrya-gvariant` gains five printer tests holding each recovered rule of
+the text form -- the annotation placement, the two empty-container forms, the
+bytestring rule with its octal escapes, the string escapes, the lone dict entry's
+comma, the dirmeta and xattr forms whole, and the byteswap over every numeric
+field -- and they fail against the rules the phase started from.
+`crates/ostrya-cli/tests/cli.rs` gains seven tests. `show_and_ls_report_the_fixture`
+holds the recursive listing, the commit report, and a symlink object's report to
+their text without the tool present. `variant_text_matches_the_tool` runs fifty
+hand-written serialized values, and one path that does not open, through
+`show --print-variant-type`, comparing the port against the tool for each, which
+is the printer's oracle. `show_forms_match_the_tool` compares twenty-eight
+invocations, thirty-six metadata-key forms over twelve keys, and the seven
+observed precedence pairs, over a repository the tool builds with the options the
+port's own `commit` does not carry yet -- a body, an empty subject, a `version`
+key, metadata of every type, and recorded sizes. `log_forms_match_the_tool`
+compares seven invocations: the walk, the raw form, an ancestry suffix, and the
+note a parent whose commit object was removed draws.
+`ls_forms_match_the_tool` compares twenty-two invocations, adding three more where
+the host lets an xattr be set, and `config_get_matches_the_tool` twenty over the
+value forms GKeyFile escapes and every refusal.
+`show_print_related_lists_each_pair`
+assembles a commit carrying two related entries through the library, which no
+`commit` option writes, and reads it back with both.
+`show_refuses_a_variant_type_the_codec_does_not_hold` states the one divergence
+without the tool.
+
+In the matrix, `m10-cli-behavior.matrix` gains forty-eight records: eighteen for
+`show`, four for `log`, twelve for `ls`, and fourteen for `config`. The
+T0 selection through `crates/ostrya-cli/tests/conformance.rs` reports 461 cells,
+148 pass, 0 fail, where it reported 413 cells and 100 passes before the phase.
+`crates/ostrya-conformance/tests/check.rs` validates 225 records and 461 cells.
 
 #### Phase 17e -- `config set`/`unset`, `remote` (excluding cookies), `gpg-import`/`gpg-list-keys`
 

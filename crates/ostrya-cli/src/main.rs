@@ -24,6 +24,10 @@
 //! - `refs` -- list, create, or delete refs, aliases, and collection refs.
 //! - `rev-parse` -- print the commit a revision names.
 //! - `cat` -- write a commit's files to stdout.
+//! - `show` -- report a metadata object, a file object, or one metadata key.
+//! - `log` -- walk a commit's parent chain.
+//! - `ls` -- list a commit's file paths.
+//! - `config` -- read a repository configuration value.
 //! - `prune` -- delete unreachable objects.
 //! - `fsck` -- verify object integrity and completeness.
 //! - `diff` -- report the paths that changed between two commits.
@@ -49,9 +53,10 @@ use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CollectionRef, CommitModifier, CommitModifierFlags,
     CommitOptions, CreateOptions, DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error,
     FileKind, FileObject, FsckOptions, MutableTree, ObjectType, PruneOptions, PullFlags,
-    PullOptions, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, SummaryOptions,
-    TarExportOptions, TarImportOptions, TimestampCheck, TreeEntry, Type, Value, Verifier,
-    VerifyOutcome, base64, load_sign_keys, load_sign_keys_from, validate_refspec,
+    PullOptions, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, SignatureInfo,
+    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, TreeEntry, Type, Value,
+    Verifier, VerifyOutcome, Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from,
+    to_text, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -97,6 +102,14 @@ enum Command {
     RevParse(RevParseArgs),
     /// Write the contents of a commit's files to stdout.
     Cat(CatArgs),
+    /// Output a metadata object.
+    Show(ShowArgs),
+    /// Show the log starting at a commit or ref.
+    Log(LogArgs),
+    /// List a commit's file paths.
+    Ls(LsArgs),
+    /// Read a repository configuration value.
+    Config(ConfigArgs),
     /// Delete objects unreachable from the repository's refs and commits.
     Prune(PruneArgs),
     /// Verify object integrity and completeness across every commit.
@@ -131,6 +144,10 @@ impl Command {
         "refs",
         "rev-parse",
         "cat",
+        "show",
+        "log",
+        "ls",
+        "config",
         "prune",
         "fsck",
         "diff",
@@ -152,6 +169,10 @@ impl Command {
             Command::Refs(_) => "refs",
             Command::RevParse(_) => "rev-parse",
             Command::Cat(_) => "cat",
+            Command::Show(_) => "show",
+            Command::Log(_) => "log",
+            Command::Ls(_) => "ls",
+            Command::Config(_) => "config",
             Command::Prune(_) => "prune",
             Command::Fsck(_) => "fsck",
             Command::Diff(_) => "diff",
@@ -298,6 +319,103 @@ struct CatArgs {
     commit: Option<String>,
     /// The paths to write, in order. A leading `/` is optional.
     path: Vec<String>,
+}
+
+#[derive(Args, Default)]
+struct ShowArgs {
+    /// Show the "related" commits.
+    #[arg(long)]
+    print_related: bool,
+    /// Read OBJECT as a file holding a value of this GVariant type.
+    #[arg(long, value_name = "TYPE")]
+    print_variant_type: Option<String>,
+    /// List the available metadata keys.
+    #[arg(long)]
+    list_metadata_keys: bool,
+    /// Print the value of one metadata key.
+    #[arg(long, value_name = "KEY")]
+    print_metadata_key: Option<String>,
+    /// For a byte-array valued key, print an unquoted hexadecimal string.
+    #[arg(long)]
+    print_hex: bool,
+    /// List the available detached metadata keys.
+    #[arg(long)]
+    list_detached_metadata_keys: bool,
+    /// Print the value of one detached metadata key.
+    #[arg(long, value_name = "KEY")]
+    print_detached_metadata_key: Option<String>,
+    /// Show the commit size metadata.
+    #[arg(long)]
+    print_sizes: bool,
+    /// Show the raw variant data.
+    #[arg(long)]
+    raw: bool,
+    /// Do not convert the variant data from big endian. The raw variant is
+    /// reported as stored, and a commit's own report follows it.
+    #[arg(short = 'B', long)]
+    no_byteswap: bool,
+    /// GPG homedir to use when looking for keyrings.
+    #[arg(long, value_name = "HOMEDIR")]
+    gpg_homedir: Option<PathBuf>,
+    /// Use this remote's GPG configuration when verifying signatures.
+    #[arg(long, value_name = "REMOTE")]
+    gpg_verify_remote: Option<String>,
+    /// The object to report: a revision, a metadata or file object checksum,
+    /// or, under --print-variant-type, a filename. Required; checked after the
+    /// repository resolves, matching the tool's error-ordering
+    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    object: Option<String>,
+}
+
+#[derive(Args)]
+struct LogArgs {
+    /// Show the raw variant data.
+    #[arg(long)]
+    raw: bool,
+    /// The revision to start at. Required; checked after the repository
+    /// resolves, matching the tool's error-ordering
+    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    rev: Option<String>,
+}
+
+#[derive(Args)]
+struct LsArgs {
+    /// Do not recurse into directory arguments.
+    #[arg(short = 'd', long)]
+    dironly: bool,
+    /// Print directories recursively.
+    #[arg(short = 'R', long)]
+    recursive: bool,
+    /// Print each entry's checksum: the content checksum of a file, the dirtree
+    /// and dirmeta checksums of a directory.
+    #[arg(short = 'C', long)]
+    checksum: bool,
+    /// Print each entry's extended attributes.
+    #[arg(short = 'X', long)]
+    xattrs: bool,
+    /// Print only the paths, NUL separated.
+    #[arg(long)]
+    nul_filenames_only: bool,
+    /// The commit to list (a checksum or a ref). Required; checked after the
+    /// repository resolves, matching the tool's error-ordering
+    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    commit: Option<String>,
+    /// The paths within the commit to list, in order. With none, the tree root
+    /// is listed.
+    path: Vec<String>,
+}
+
+#[derive(Args)]
+struct ConfigArgs {
+    /// The group the KEY belongs to. With this, KEY is read as a bare key name
+    /// rather than `section.key`.
+    #[arg(long, value_name = "GROUP")]
+    group: Option<String>,
+    /// The operation: `get`. `set` and `unset` need a config write path the
+    /// library does not have yet (`docs/port-plan.md`, Phase 17e).
+    operation: Option<String>,
+    /// The key to read: `section.key`, or a bare key name under --group.
+    args: Vec<String>,
 }
 
 #[derive(Args)]
@@ -705,6 +823,22 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         Command::Cat(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             cat(repo, name, args).await
+        }
+        Command::Show(args) => {
+            let (repo, path) = resolve_repo(repo, verbose, name).await;
+            show(repo, path, name, args).await
+        }
+        Command::Log(args) => {
+            let (repo, path) = resolve_repo(repo, verbose, name).await;
+            log(repo, path, name, args).await
+        }
+        Command::Ls(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            ls(repo, name, args).await
+        }
+        Command::Config(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            config(repo, name, args).await
         }
         Command::Prune(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
@@ -2387,6 +2521,829 @@ fn follow_link(components: &[String], target: &str) -> Vec<String> {
     };
     out.extend(split_cat_path(target));
     out
+}
+
+// --- show, log, ls, config ---------------------------------------------------
+
+/// The commit object's GVariant signature, which the raw report parses against.
+const COMMIT_SIGNATURE: &str = "(a{sv}aya(say)sstayay)";
+
+/// Parse a GVariant type signature, carrying the codec's refusal as a format
+/// error, so a signature the user typed is reported rather than panicking.
+fn parse_type(signature: &str) -> Result<Type> {
+    Type::parse(signature).map_err(|err| Error::InvalidFormat(err.to_string()))
+}
+
+/// Render a value in the GVariant text form, carrying a type mismatch as a
+/// format error.
+fn variant_text(ty: &Type, value: &Value) -> Result<String> {
+    to_text(ty, value).map_err(|err| Error::InvalidFormat(err.to_string()))
+}
+
+/// Report one object.
+///
+/// The reporting modes are mutually exclusive and take a fixed precedence,
+/// recovered by giving the tool each pair (`docs/format-reference.md`, "CLI
+/// output formats", under `show`): the detached metadata key, the metadata key,
+/// the detached key listing, the key listing, the related commits, the variant
+/// file, the sizes, and last the object's own report.
+async fn show(repo: Repo, repo_path: PathBuf, name: &str, args: ShowArgs) -> Result<()> {
+    let Some(object) = args.object.as_deref() else {
+        exit_with_error(name, "An object argument is required");
+    };
+    if let Some(key) = args.print_detached_metadata_key.as_deref() {
+        return show_detached_key(&repo, object, key, &args).await;
+    }
+    if let Some(key) = args.print_metadata_key.as_deref() {
+        return show_metadata_key(&repo, object, key, &args).await;
+    }
+    if args.list_detached_metadata_keys {
+        return show_detached_keys(&repo, object).await;
+    }
+    if args.list_metadata_keys {
+        return show_metadata_keys(&repo, object).await;
+    }
+    if args.print_related {
+        return show_related(&repo, object).await;
+    }
+    if let Some(signature) = args.print_variant_type.as_deref() {
+        return show_variant_file(signature, Path::new(object)).await;
+    }
+    if args.print_sizes {
+        return show_sizes(&repo, object).await;
+    }
+    show_object(&repo, &repo_path, object, &args).await
+}
+
+/// The commit metadata dict of the revision `object` names, byte-order
+/// converted unless `-B` was given. The dict is the commit's first member.
+async fn commit_metadata(repo: &Repo, object: &str, args: &ShowArgs) -> Result<Value> {
+    let checksum = resolve(repo, object).await?;
+    let commit = repo.load_variant(ObjectType::Commit, &checksum).await?;
+    let commit = maybe_byteswap(commit, args);
+    commit
+        .as_tuple()
+        .and_then(|members| members.first())
+        .cloned()
+        .ok_or_else(|| Error::InvalidFormat("commit object is not a tuple".into()))
+}
+
+/// A loaded variant with the on-disk big-endian fields converted, which `-B`
+/// suppresses so the numbers report as they are stored.
+fn maybe_byteswap(value: Value, args: &ShowArgs) -> Value {
+    if args.no_byteswap {
+        value
+    } else {
+        value.byteswapped()
+    }
+}
+
+/// Print one commit metadata key's value.
+async fn show_metadata_key(repo: &Repo, object: &str, key: &str, args: &ShowArgs) -> Result<()> {
+    let metadata = commit_metadata(repo, object, args).await?;
+    let Some(value) = metadata.dict_get(key) else {
+        exit_error(&format!("No such metadata key '{key}'"));
+    };
+    print_metadata_value(value, args.print_hex)
+}
+
+/// Print one detached metadata key's value.
+async fn show_detached_key(repo: &Repo, object: &str, key: &str, args: &ShowArgs) -> Result<()> {
+    let dict = detached_metadata(repo, object, args).await?;
+    let Some(value) = dict.dict_get(key) else {
+        exit_error(&format!("No such metadata key '{key}'"));
+    };
+    print_metadata_value(value, args.print_hex)
+}
+
+/// The commit's detached metadata dict, byte-order converted unless `-B` was
+/// given. A commit with no `.commitmeta` is reported in the tool's own words.
+async fn detached_metadata(repo: &Repo, object: &str, args: &ShowArgs) -> Result<Value> {
+    let checksum = resolve(repo, object).await?;
+    let Some(dict) = repo.read_commit_detached_metadata(&checksum).await? else {
+        exit_error(&format!(
+            "No detached metadata for commit {}",
+            checksum.to_hex()
+        ));
+    };
+    Ok(maybe_byteswap(dict, args))
+}
+
+/// Print a metadata value, which is a `v` holding the value proper. With
+/// `--print-hex` a byte-array value prints as unquoted lowercase hex, and every
+/// other type ignores the switch.
+fn print_metadata_value(value: &Value, hex: bool) -> Result<()> {
+    let (ty, inner) = match value.as_variant() {
+        Some((ty, inner)) => (ty.clone(), inner),
+        None => (Type::Str, value),
+    };
+    if hex && ty == Type::Array(Box::new(Type::Byte)) {
+        let bytes = inner.as_bytes().unwrap_or_default();
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            text.push_str(&format!("{byte:02x}"));
+        }
+        println!("{text}");
+        return Ok(());
+    }
+    println!("{}", variant_text(&ty, inner)?);
+    Ok(())
+}
+
+/// Print the commit metadata keys, sorted.
+async fn show_metadata_keys(repo: &Repo, object: &str) -> Result<()> {
+    let checksum = resolve(repo, object).await?;
+    let (commit, _) = repo.load_commit(&checksum).await?;
+    print_sorted_keys(&commit.metadata);
+    Ok(())
+}
+
+/// Print the detached metadata keys, sorted.
+async fn show_detached_keys(repo: &Repo, object: &str) -> Result<()> {
+    let checksum = resolve(repo, object).await?;
+    let Some(dict) = repo.read_commit_detached_metadata(&checksum).await? else {
+        exit_error(&format!(
+            "No detached metadata for commit {}",
+            checksum.to_hex()
+        ));
+    };
+    print_sorted_keys(&dict);
+    Ok(())
+}
+
+/// Print an `a{sv}` dict's keys, one per line, in sort order rather than the
+/// order the dict stores them in.
+fn print_sorted_keys(dict: &Value) {
+    let mut keys: Vec<&str> = dict
+        .as_array()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| entry.as_tuple()?.first()?.as_str())
+        .collect();
+    keys.sort_unstable();
+    for key in keys {
+        println!("{key}");
+    }
+}
+
+/// Print the commit's related-objects array, one `ref checksum` pair per line.
+/// The array is empty on every commit the tool writes, so a commit that carries
+/// none prints nothing at exit 0.
+async fn show_related(repo: &Repo, object: &str) -> Result<()> {
+    let checksum = resolve(repo, object).await?;
+    let (commit, _) = repo.load_commit(&checksum).await?;
+    for (refspec, target) in &commit.related {
+        let target = Checksum::from_ay(target)?;
+        println!("{refspec} {}", target.to_hex());
+    }
+    Ok(())
+}
+
+/// The ceiling on a file read as a GVariant value by `--print-variant-type`.
+/// A metadata object the format defines stays far below it, and the whole file
+/// is parsed in memory, so a larger one is refused by name rather than read.
+const MAX_VARIANT_FILE: u64 = 16 * 1024 * 1024;
+
+/// Read `path` as a serialized value of the named type and print it. The
+/// numeric fields are byte-order converted, which is what the tool does on this
+/// path whether or not `-B` is given.
+async fn show_variant_file(signature: &str, path: &Path) -> Result<()> {
+    let ty = parse_type(signature)?;
+    let owned = path.to_owned();
+    let bytes = match ostrya_rt::unblock(move || read_bounded(&owned, MAX_VARIANT_FILE)).await {
+        Ok(bytes) => bytes,
+        Err(message) => exit_error(&message),
+    };
+    let value = from_bytes(&ty, &bytes).map_err(|err| Error::InvalidFormat(err.to_string()))?;
+    println!("{}", variant_text(&ty, &value.byteswapped())?);
+    Ok(())
+}
+
+/// Read a whole file, refusing one longer than `limit`. A refusal comes back as
+/// the line it is reported on, in the tool's own `openat(<path>): <reason>`
+/// shape for a path that does not open.
+fn read_bounded(path: &Path, limit: u64) -> std::result::Result<Vec<u8>, String> {
+    let opened = |err: &std::io::Error| format!("openat({}): {}", path.display(), io_reason(err));
+    let meta = std::fs::metadata(path).map_err(|err| opened(&err))?;
+    if meta.len() > limit {
+        return Err(format!(
+            "{} is {} bytes, over the {limit}-byte ceiling for a variant file",
+            path.display(),
+            meta.len()
+        ));
+    }
+    std::fs::read(path).map_err(|err| opened(&err))
+}
+
+/// The system's own reason text for an I/O error, without the `(os error N)`
+/// tail Rust appends, which is the form the tool's messages carry.
+fn io_reason(err: &std::io::Error) -> String {
+    let text = err.to_string();
+    match text.find(" (os error ") {
+        Some(cut) => text[..cut].to_owned(),
+        None => text,
+    }
+}
+
+/// Print the commit's recorded sizes and how much of them is absent locally.
+async fn show_sizes(repo: &Repo, object: &str) -> Result<()> {
+    let checksum = resolve(repo, object).await?;
+    let Some(sizes) = repo.commit_sizes(&checksum).await? else {
+        exit_error("No metadata key ostree.sizes in commit");
+    };
+    println!(
+        "Compressed size (needed/total): {} bytes/{} bytes",
+        sizes.compressed_needed, sizes.compressed_total
+    );
+    println!(
+        "Unpacked size (needed/total): {} bytes/{} bytes",
+        sizes.unpacked_needed, sizes.unpacked_total
+    );
+    println!(
+        "Number of objects (needed/total): {}/{}",
+        sizes.objects_needed, sizes.objects_total
+    );
+    Ok(())
+}
+
+/// Report the object `object` names: a metadata object by type and checksum, a
+/// commit additionally by its own report, and a file object by its header.
+///
+/// The object type is recovered by probing the store, since a bare checksum
+/// names no type: commit, then dirtree, then dirmeta, then a file object, whose
+/// absence is the failure reported when nothing of that checksum is present.
+async fn show_object(repo: &Repo, repo_path: &Path, object: &str, args: &ShowArgs) -> Result<()> {
+    let checksum = resolve(repo, object).await?;
+    for ty in [ObjectType::Commit, ObjectType::DirTree, ObjectType::DirMeta] {
+        if !repo.has_object(ty, &checksum).await? {
+            continue;
+        }
+        println!("{} {}", object_type_name(ty), checksum.to_hex());
+        if args.raw || args.no_byteswap {
+            let value = repo.load_variant(ty, &checksum).await?;
+            let value = maybe_byteswap(value, args);
+            let signature = parse_type(metadata_signature(ty))?;
+            println!("{}", variant_text(&signature, &value)?);
+        }
+        // `--raw` alone reports the variant and stops; `-B` reports it and goes
+        // on to the commit's own report.
+        if ty == ObjectType::Commit && (!args.raw || args.no_byteswap) {
+            report_commit(repo, repo_path, &checksum, args).await?;
+        }
+        return Ok(());
+    }
+    match repo.load_file(&checksum).await {
+        Ok(file) => report_file(&checksum, &file),
+        Err(Error::ObjectNotFound { .. }) => {
+            // The absent-object line carries a prefix naming the open in every
+            // mode that stores the payload in the object file itself, and not in
+            // `archive`, whose header is read on its own
+            // (`docs/format-reference.md`, "CLI output formats", under `show`).
+            let hex = checksum.to_hex();
+            let refusal = format!("Couldn't find file object '{hex}'");
+            if repo.mode() == RepoMode::Archive {
+                exit_error(&refusal);
+            }
+            exit_error(&format!("Opening content object {hex}: {refusal}"));
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The name the tool prints for an object type.
+fn object_type_name(ty: ObjectType) -> &'static str {
+    match ty {
+        ObjectType::Commit => "commit",
+        ObjectType::DirTree => "dirtree",
+        ObjectType::DirMeta => "dirmeta",
+        ObjectType::File => "file",
+        ObjectType::CommitMeta => "commitmeta",
+        ObjectType::FileXattrs => "file-xattrs",
+        ObjectType::FileXattrsLink => "file-xattrs-link",
+        ObjectType::PayloadLink => "payload-link",
+        ObjectType::TombstoneCommit => "tombstone-commit",
+    }
+}
+
+/// The GVariant signature of a metadata object type, for the raw report.
+fn metadata_signature(ty: ObjectType) -> &'static str {
+    match ty {
+        ObjectType::DirTree => "(a(say)a(sayay))",
+        ObjectType::DirMeta => "(uuua(ayay))",
+        _ => COMMIT_SIGNATURE,
+    }
+}
+
+/// Print a commit's own report: its parent, content checksum, date, the
+/// `version` metadata key when it carries one, the subject and body, and the
+/// signature report when it carries GPG signatures.
+async fn report_commit(
+    repo: &Repo,
+    repo_path: &Path,
+    checksum: &Checksum,
+    args: &ShowArgs,
+) -> Result<()> {
+    let (commit, _) = repo.load_commit(checksum).await?;
+    if let Some(parent) = &commit.parent {
+        println!("Parent:  {}", parent.to_hex());
+    }
+    println!("ContentChecksum:  {}", commit.content_checksum().to_hex());
+    println!("Date:  {}", format_utc(commit.timestamp));
+    if let Some(version) =
+        commit
+            .metadata
+            .dict_get("version")
+            .and_then(|value| match value.as_variant() {
+                Some((_, inner)) => inner.as_str(),
+                None => value.as_str(),
+            })
+    {
+        println!("Version: {version}");
+    }
+    if commit.subject.is_empty() {
+        println!("(no subject)");
+    } else {
+        println!();
+        print_indented(&commit.subject);
+    }
+    if !commit.body.is_empty() {
+        println!();
+        print_indented(&commit.body);
+    }
+    println!();
+    report_commit_signatures(repo, repo_path, checksum, args).await
+}
+
+/// Print each line of `text` indented four spaces, the shape the commit report
+/// gives a subject and a body.
+fn print_indented(text: &str) {
+    for line in text.split('\n') {
+        println!("    {line}");
+    }
+}
+
+/// Print the GPG signature report a commit's `ostree.gpgsigs` draws, or nothing
+/// when it carries none.
+#[cfg(feature = "gpg")]
+async fn report_commit_signatures(
+    repo: &Repo,
+    repo_path: &Path,
+    checksum: &Checksum,
+    args: &ShowArgs,
+) -> Result<()> {
+    if stored_signatures(repo, checksum, "ostree.gpgsigs")
+        .await?
+        .is_empty()
+    {
+        return Ok(());
+    }
+    let verifier = show_gpg_verifier(repo_path, args)?;
+    let outcome = repo
+        .verify_commit(checksum, &[&verifier as &dyn Verifier])
+        .await?;
+    println!();
+    let plural = if outcome.signatures.len() == 1 {
+        ""
+    } else {
+        "s"
+    };
+    println!("Found {} signature{plural}:", outcome.signatures.len());
+    for sig in &outcome.signatures {
+        println!();
+        let made = sig.created.map(format_utc).unwrap_or_default();
+        let algorithm = sig.pubkey_algorithm.as_deref().unwrap_or("unknown");
+        let key_id = sig
+            .fingerprint
+            .as_deref()
+            .map(short_key_id)
+            .unwrap_or_default();
+        println!("  Signature made {made} using {algorithm} key ID {key_id}");
+        if sig.key_missing {
+            println!("  Can't check signature: public key not found");
+        } else if sig.valid {
+            println!("  Good signature from \"{}\"", signer_uid(sig));
+        } else {
+            println!("  BAD signature from \"{}\"", signer_uid(sig));
+        }
+    }
+    Ok(())
+}
+
+/// Without the gpg engine compiled in there are no signatures to report, and
+/// the two GPG options are accepted and unused.
+#[cfg(not(feature = "gpg"))]
+async fn report_commit_signatures(_: &Repo, _: &Path, _: &Checksum, _: &ShowArgs) -> Result<()> {
+    Ok(())
+}
+
+/// The keyrings `show` verifies a commit's GPG signatures against: the
+/// repository's own `gpgkeys.gpg`, every `*.gpg` file in a `--gpg-homedir`, or,
+/// under `--gpg-verify-remote`, that remote's whole trusted set.
+#[cfg(feature = "gpg")]
+fn show_gpg_verifier(repo_path: &Path, args: &ShowArgs) -> Result<GpgVerifier> {
+    if let Some(remote) = args.gpg_verify_remote.as_deref() {
+        return GpgVerifier::for_remote(repo_path, remote);
+    }
+    let mut paths = vec![repo_path.join("gpgkeys.gpg")];
+    if let Some(homedir) = args.gpg_homedir.as_deref() {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(homedir)
+            .map_err(Error::Io)?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension()? == "gpg").then_some(path)
+            })
+            .collect();
+        found.sort();
+        paths.extend(found);
+    }
+    GpgVerifier::from_keyring_files(paths)
+}
+
+/// The trailing sixteen hex digits of a fingerprint, the form the signature
+/// report names a key by.
+#[cfg(feature = "gpg")]
+fn short_key_id(fingerprint: &str) -> &str {
+    let start = fingerprint.len().saturating_sub(16);
+    &fingerprint[start..]
+}
+
+/// The signer's user id as one string, `Name <email>`, from the parts the
+/// engine reported.
+#[cfg(feature = "gpg")]
+fn signer_uid(sig: &SignatureInfo) -> String {
+    match (&sig.user_name, &sig.user_email) {
+        (Some(name), Some(email)) => format!("{name} <{email}>"),
+        (Some(name), None) => name.clone(),
+        (None, Some(email)) => format!("<{email}>"),
+        (None, None) => String::new(),
+    }
+}
+
+/// Print a file object's header report.
+fn report_file(checksum: &Checksum, file: &FileObject) -> Result<()> {
+    println!("Object: {}", checksum.to_hex());
+    println!("Type: file");
+    match &file.kind {
+        FileKind::Regular { size } => {
+            println!("File Type: regular");
+            println!("Size: {size}");
+        }
+        FileKind::Symlink { target } => {
+            println!("File Type: symlink");
+            println!("Target: {target}");
+        }
+    }
+    println!("Mode: 0{:o}", file.mode);
+    println!("Uid: {}", file.uid);
+    println!("Gid: {}", file.gid);
+    println!("Extended Attributes: {}", xattrs_text(&file.xattrs)?);
+    Ok(())
+}
+
+/// The xattr set in the `{ <a(ayay) text> }` form the file report and `ls -X`
+/// both print.
+fn xattrs_text(xattrs: &Xattrs) -> Result<String> {
+    let ty = parse_type("a(ayay)")?;
+    let entries: Vec<Value> = xattrs
+        .iter()
+        .map(|(name, value)| {
+            Value::Tuple(vec![
+                Value::Bytes(name.to_vec()),
+                Value::Bytes(value.to_vec()),
+            ])
+        })
+        .collect();
+    Ok(format!(
+        "{{ {} }}",
+        variant_text(&ty, &Value::Array(entries))?
+    ))
+}
+
+/// Walk a commit's parent chain, newest first, reporting each commit.
+///
+/// A parent whose commit object is absent ends the walk with the tool's own
+/// note, at exit 0, so a partial history reports what it holds. The starting
+/// revision itself is held to the stricter rule every other reading command
+/// uses: a checksum naming no commit is refused rather than read as an empty
+/// history.
+async fn log(repo: Repo, repo_path: PathBuf, name: &str, args: LogArgs) -> Result<()> {
+    let Some(rev) = args.rev.as_deref() else {
+        exit_with_error(name, "A rev argument is required");
+    };
+    let show = ShowArgs {
+        raw: args.raw,
+        ..ShowArgs::default()
+    };
+    let start = resolve(&repo, rev).await?;
+    if !repo.has_object(ObjectType::Commit, &start).await? {
+        return Err(Error::ObjectNotFound {
+            checksum: start,
+            ty: ObjectType::Commit,
+        });
+    }
+    let mut current = Some(start);
+    while let Some(checksum) = current {
+        if !repo.has_object(ObjectType::Commit, &checksum).await? {
+            println!("<< History beyond this commit not fetched >>");
+            return Ok(());
+        }
+        println!("commit {}", checksum.to_hex());
+        if args.raw {
+            let value = repo.load_variant(ObjectType::Commit, &checksum).await?;
+            let ty = parse_type(COMMIT_SIGNATURE)?;
+            println!("{}", variant_text(&ty, &value.byteswapped())?);
+        } else {
+            report_commit(&repo, &repo_path, &checksum, &show).await?;
+        }
+        let (commit, _) = repo.load_commit(&checksum).await?;
+        current = commit.parent;
+    }
+    Ok(())
+}
+
+/// One `ls` line's worth of entry facts, gathered before the line is written so
+/// every column has a single source.
+struct LsEntry {
+    kind: char,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    checksums: Vec<Checksum>,
+    xattrs: Xattrs,
+    path: String,
+    target: Option<String>,
+}
+
+/// List the paths a commit holds.
+async fn ls(repo: Repo, name: &str, args: LsArgs) -> Result<()> {
+    let Some(rev) = args.commit.as_deref() else {
+        exit_with_error(name, "An COMMIT argument is required");
+    };
+    // The revision resolves through the shared reader, so a name no ref holds
+    // is reported in the tool's own words here as it is at every other command.
+    let checksum = resolve(&repo, rev).await?;
+    let (root, _) = repo.read_commit(&checksum.to_hex()).await?;
+    if args.path.is_empty() {
+        return ls_directory(&repo, &root, "/", &args).await;
+    }
+    for given in &args.path {
+        let path = normalize_ls_path(given);
+        // An empty argument names the root and is still refused, which is what
+        // the tool does with it.
+        if path == "/" && !given.is_empty() {
+            ls_directory(&repo, &root, "/", &args).await?;
+            continue;
+        }
+        match root.lookup(Path::new(&path)).await? {
+            Some(TreeEntry::Dir { tree, .. }) => {
+                ls_directory(&repo, &tree, &path, &args).await?;
+            }
+            Some(TreeEntry::File { checksum, .. }) => {
+                let entry = ls_file_entry(&repo, &checksum, &path).await?;
+                print_ls_entry(&entry, &args);
+            }
+            None => exit_error(&format!(
+                "Inspecting path '{given}': No such file or directory: {path}"
+            )),
+        }
+    }
+    Ok(())
+}
+
+/// The path an `ls` argument names, with one optional leading `/` supplied.
+fn normalize_ls_path(given: &str) -> String {
+    let trimmed = given.trim_start_matches('/');
+    if trimmed.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+/// Print a directory and, unless `-d` was given, its children; with `-R`, every
+/// child directory's own contents follow it.
+async fn ls_directory(repo: &Repo, tree: &RepoTree, path: &str, args: &LsArgs) -> Result<()> {
+    let entry = ls_dir_entry(repo, tree, path).await?;
+    print_ls_entry(&entry, args);
+    if args.dironly {
+        return Ok(());
+    }
+    ls_children(repo, tree, path, args).await
+}
+
+/// Print a directory's children, recursing where `-R` asks for it.
+///
+/// The stack holds individual entries rather than whole directories, so
+/// printing a directory's line queues its own children right away, ahead of
+/// whatever siblings are still pending: the next line popped is always that
+/// directory's first child, which is what puts its contents immediately after
+/// its own line rather than after every sibling's line at the same level.
+async fn ls_children(repo: &Repo, tree: &RepoTree, path: &str, args: &LsArgs) -> Result<()> {
+    // The recursion is a work list rather than recursive calls, so a deep tree
+    // cannot grow the future's size with its depth.
+    let mut pending: Vec<(TreeEntry, String)> = Vec::new();
+    queue_children(&mut pending, tree, path).await?;
+    while let Some((child, base)) = pending.pop() {
+        match child {
+            TreeEntry::File { name, checksum } => {
+                let child_path = join_ls_path(&base, &name);
+                let entry = ls_file_entry(repo, &checksum, &child_path).await?;
+                print_ls_entry(&entry, args);
+            }
+            TreeEntry::Dir { name, tree } => {
+                let child_path = join_ls_path(&base, &name);
+                let entry = ls_dir_entry(repo, &tree, &child_path).await?;
+                print_ls_entry(&entry, args);
+                if args.recursive {
+                    queue_children(&mut pending, &tree, &child_path).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Push `tree`'s entries onto `pending`, in reverse so the stack pops them
+/// back in `read_dir`'s own order: files, then subdirectories, each in name
+/// order.
+async fn queue_children(
+    pending: &mut Vec<(TreeEntry, String)>,
+    tree: &RepoTree,
+    base: &str,
+) -> Result<()> {
+    let mut children = tree.read_dir().await?;
+    children.reverse();
+    pending.extend(children.into_iter().map(|child| (child, base.to_owned())));
+    Ok(())
+}
+
+/// The path of `name` inside the directory at `base`.
+fn join_ls_path(base: &str, name: &str) -> String {
+    if base == "/" {
+        format!("/{name}")
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
+/// Gather a directory's `ls` facts from its dirmeta.
+async fn ls_dir_entry(repo: &Repo, tree: &RepoTree, path: &str) -> Result<LsEntry> {
+    let meta = repo.load_dirmeta(tree.dirmeta_checksum()).await?;
+    Ok(LsEntry {
+        kind: 'd',
+        mode: meta.mode,
+        uid: meta.uid,
+        gid: meta.gid,
+        size: 0,
+        checksums: vec![*tree.dirtree_checksum(), *tree.dirmeta_checksum()],
+        xattrs: meta.xattrs,
+        path: path.to_owned(),
+        target: None,
+    })
+}
+
+/// Gather a file's `ls` facts from its object header.
+async fn ls_file_entry(repo: &Repo, checksum: &Checksum, path: &str) -> Result<LsEntry> {
+    let file = repo.load_file(checksum).await?;
+    let (kind, size, target) = match &file.kind {
+        FileKind::Regular { size } => ('-', *size, None),
+        FileKind::Symlink { target } => ('l', 0, Some(target.clone())),
+    };
+    Ok(LsEntry {
+        kind,
+        mode: file.mode,
+        uid: file.uid,
+        gid: file.gid,
+        size,
+        checksums: vec![*checksum],
+        xattrs: file.xattrs,
+        path: path.to_owned(),
+        target,
+    })
+}
+
+/// Write one `ls` line, or the path alone under `--nul-filenames-only`.
+fn print_ls_entry(entry: &LsEntry, args: &LsArgs) {
+    use std::io::Write;
+    if args.nul_filenames_only {
+        let mut out = std::io::stdout().lock();
+        let _ = out.write_all(entry.path.as_bytes());
+        let _ = out.write_all(b"\0");
+        return;
+    }
+    let mut line = format!(
+        "{}{:05o} {} {} {:>6}",
+        entry.kind,
+        entry.mode & 0o7777,
+        entry.uid,
+        entry.gid,
+        entry.size
+    );
+    if args.checksum {
+        for checksum in &entry.checksums {
+            line.push(' ');
+            line.push_str(&checksum.to_hex());
+        }
+    }
+    if args.xattrs {
+        // The xattr set came out of a parsed object, so it renders; a printer
+        // failure here would be a codec bug rather than input the user gave.
+        let text = xattrs_text(&entry.xattrs).unwrap_or_else(|_| "{ }".to_owned());
+        line.push(' ');
+        line.push_str(&text);
+    }
+    line.push(' ');
+    line.push_str(&entry.path);
+    if let Some(target) = &entry.target {
+        line.push_str(" -> ");
+        line.push_str(target);
+    }
+    println!("{line}");
+}
+
+/// Read a repository configuration value.
+async fn config(repo: Repo, name: &str, args: ConfigArgs) -> Result<()> {
+    let Some(operation) = args.operation.as_deref() else {
+        exit_with_error(name, "OPERATION must be specified");
+    };
+    // The operand count is checked ahead of the operation name: `set` takes a
+    // key and a value, and every other operation, a name the tool does not know
+    // included, takes a key alone (`docs/format-reference.md`, "CLI output
+    // formats", under `config get`).
+    let allowed = if operation == "set" { 2 } else { 1 };
+    if args.args.len() > allowed {
+        exit_with_error(name, "Too many arguments given");
+    }
+    match operation {
+        "get" => config_get(&repo, &args),
+        "set" | "unset" => exit_error(&format!("The {operation} operation is not implemented yet")),
+        other => exit_error(&format!("Unknown operation {other}")),
+    }
+}
+
+/// Print one configuration value. The key is `section.key`, split on its first
+/// `.`, or a bare key name when `--group` names the section.
+fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
+    let Some(key) = args.args.first() else {
+        if args.group.is_some() {
+            exit_error("Group name and key must be specified");
+        }
+        exit_error("KEY must be specified");
+    };
+    let (group, key) = match args.group.as_deref() {
+        Some(group) => (group, key.as_str()),
+        None => match key.split_once('.') {
+            Some((group, key)) => (group, key),
+            None => exit_error("Key must be of the form \"sectionname.keyname\""),
+        },
+    };
+    let keyfile = repo.config().keyfile();
+    if !keyfile.has_group(group) {
+        exit_error(&format!(
+            "Key file does not have group \u{201c}{group}\u{201d}"
+        ));
+    }
+    match keyfile.get_string(group, key)? {
+        Some(value) => println!("{value}"),
+        None => exit_error(&format!(
+            "Key file does not have key \u{201c}{key}\u{201d} in group \u{201c}{group}\u{201d}"
+        )),
+    }
+    Ok(())
+}
+
+/// Render a timestamp as the commit report's `Date:` line does: UTC, in
+/// `YYYY-MM-DD HH:MM:SS +0000`. The stored field is unsigned and a pre-epoch
+/// instant is its two's-complement form, so it is read as a signed count of
+/// seconds, matching the tool.
+fn format_utc(timestamp: u64) -> String {
+    let seconds = timestamp as i64;
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let (hour, minute, second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} +0000")
+}
+
+/// The civil date `days` days after 1970-01-01, the inverse of
+/// [`days_from_civil`].
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {

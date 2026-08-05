@@ -13,8 +13,10 @@
 #
 # This file carries Phase 17a's cases -- `init` and the global `--repo`
 # conventions -- Phase 17b's -- `refs`, `rev-parse`, and `cat` -- Phase 17b1's
-# -- `commit` parenting -- and Phase 17c's -- `commit --owner-uid/--owner-gid/
-# --timestamp/--no-xattrs` and `checkout -U/--subpath` (`../port-plan.md`).
+# -- `commit` parenting -- Phase 17c's -- `commit --owner-uid/--owner-gid/
+# --timestamp/--no-xattrs` and `checkout -U/--subpath` -- and Phase 17d's --
+# `show`, `log`, `ls`, and `config get`, together with the GVariant text form
+# they share (`../port-plan.md`).
 # Later sub-phases add records here as their own subcommands and options land.
 #
 # The `repo-with-commit` setup binds one branch, `conformance`, holding one
@@ -2234,3 +2236,803 @@ note: a subpath naming nothing ends the checkout at exit 1 with no destination
  directory: <path>` and the port its own `checkout: subpath not found: <path>`,
  which cli-surface.md, "P2" records, so each side states its own text and
  `stderr-text` is no oracle here.
+
+# ---------------------------------------------------------------------------
+# show -- the commit report, the raw variant, the metadata modes, and the
+# refusals (Phase 17d).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: show
+cell: show/commit-report
+setup: repo-with-commit
+run: show --repo=$REPO $BRANCH
+expect-exit: 0
+expect-stdout: contains "ContentChecksum:  "
+ref-expect-exit: 0
+ref-expect-stdout: contains "Date:  2023-11-14 22:13:20 +0000"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#show
+note: the setup commits corpus `C0` at `@1700000000`, so the report's parent-less
+ shape, its content checksum, and its date are the same on both sides, and equal
+ `stdout-text` states the whole report line for line.
+
+family: M10
+subcommand: show
+cell: show/commit-report-by-checksum
+setup: repo-with-commit
+run: show --repo=$REPO $REV
+expect-exit: 0
+expect-stdout: contains "commit "
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#show
+note: a 64-character checksum is probed against the object store rather than
+ resolved as a revision, and reaches the same report the branch does.
+
+family: M10
+subcommand: show
+cell: show/raw
+setup: repo-with-commit
+run: show --repo=$REPO --raw $BRANCH
+expect-exit: 0
+expect-stdout: contains "uint64 1700000000"
+ref-expect-stdout: contains "@a(say) []"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#the-gvariant-text-form
+note: the raw report is the commit variant in the GVariant text form, and the
+ commit's own report is suppressed. The timestamp reads as the number the stored
+ big-endian field names, which is the byteswap the default report applies, and
+ the empty related array carries its own signature.
+
+family: M10
+subcommand: show
+cell: show/raw-no-byteswap
+setup: repo-with-commit
+run: show --repo=$REPO -B $BRANCH
+expect-exit: 0
+expect-stdout: contains "uint64 67927162644070400"
+ref-expect-stdout: contains "ContentChecksum:  "
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#the-gvariant-text-form
+note: `-B` reports the stored form of the timestamp field, the byte-reversal of
+ `1700000000`, and unlike `--raw` it leaves the commit's own report in place.
+
+family: M10
+subcommand: show
+cell: show/list-metadata-keys
+setup: repo-with-commit
+run: show --repo=$REPO --list-metadata-keys $BRANCH
+expect-exit: 0
+expect-stdout: equals "ostree.ref-binding"
+ref-expect-stdout: equals "ostree.ref-binding"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#show
+note: a `-b` commit carries the one key, and the listing is sorted rather than in
+ stored order, which a commit carrying one key cannot distinguish; the cited
+ test states the sort over a commit carrying thirteen.
+
+family: M10
+subcommand: show
+cell: show/print-metadata-key
+setup: repo-with-commit
+run: show --repo=$REPO --print-metadata-key=ostree.ref-binding $BRANCH
+expect-exit: 0
+expect-stdout: equals "['$BRANCH']"
+ref-expect-stdout: equals "['$BRANCH']"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#the-gvariant-text-form
+note: the value prints unwrapped from its `v` and in the text form, so the `as`
+ array states the branch the commit binds.
+
+family: M10
+subcommand: show
+cell: show/print-metadata-key-absent
+setup: repo-with-commit
+run: show --repo=$REPO --print-metadata-key=nosuch $BRANCH
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: No such metadata key 'nosuch'"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: No such metadata key 'nosuch'"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#show
+
+family: M10
+subcommand: show
+cell: show/print-hex-non-byte-array
+setup: repo-with-commit
+run: show --repo=$REPO --print-hex --print-metadata-key=ostree.ref-binding $BRANCH
+expect-exit: 0
+expect-stdout: equals "['$BRANCH']"
+ref-expect-stdout: equals "['$BRANCH']"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#show
+note: `--print-hex` reaches a value whose type is exactly `ay`, and an `as` value
+ ignores it in both.
+
+family: M10
+subcommand: show
+cell: show/list-detached-metadata-keys-absent
+setup: repo-with-commit
+run: show --repo=$REPO --list-detached-metadata-keys $BRANCH
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: No detached metadata for commit "
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: No detached metadata for commit "
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#show
+note: an unsigned commit has no `.commitmeta`, and both detached modes report the
+ same line at exit 1.
+
+family: M10
+subcommand: show
+cell: show/print-related-empty
+setup: repo-with-commit
+run: show --repo=$REPO --print-related $BRANCH
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#show
+note: no `commit` option writes a related entry, so the array is empty on every
+ commit either implementation produces and the mode prints nothing at exit 0.
+ The line shape a non-empty array draws is stated by
+ `ostrya_cli::cli::show_print_related_lists_each_pair`, which assembles such a
+ commit through the library and reads it back with both.
+
+family: M10
+subcommand: show
+cell: show/print-sizes-absent
+setup: repo-with-commit
+run: show --repo=$REPO --print-sizes $BRANCH
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: No metadata key ostree.sizes in commit"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: No metadata key ostree.sizes in commit"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#show
+note: the setup commits without `--generate-sizes`, which Phase 17f lands, so the
+ key is absent and both refuse. The three totalling lines are stated by
+ `ostrya_cli::cli::show_forms_match_the_tool` over a commit the tool records
+ sizes on.
+
+family: M10
+subcommand: show
+cell: show/unresolvable
+setup: repo-with-commit
+run: show --repo=$REPO nosuch
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Refspec 'nosuch' not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Refspec 'nosuch' not found"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#show
+
+family: M10
+subcommand: show
+cell: show/checksum-naming-nothing
+setup: repo-with-commit
+run: show --repo=$REPO 0000000000000000000000000000000000000000000000000000000000000000
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Opening content object 0000000000000000000000000000000000000000000000000000000000000000: Couldn't find file object '0000000000000000000000000000000000000000000000000000000000000000'"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Opening content object 0000000000000000000000000000000000000000000000000000000000000000: Couldn't find file object '0000000000000000000000000000000000000000000000000000000000000000'"
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#show
+note: the object type is probed in the order commit, dirtree, dirmeta, file, so a
+ checksum naming nothing reports the last probe's failure. In `bare` the line
+ carries the `Opening content object` prefix every mode but `archive` adds, which
+ the next cell states without it. This is the one reading command where the
+ absent-object wording agrees: `log` and `ls` resolve a commit and draw the pair
+ cli-surface.md, "P1" records.
+
+family: M10
+subcommand: show
+cell: show/checksum-naming-nothing-archive
+setup: repo-with-commit
+modes: archive
+run: show --repo=$REPO 0000000000000000000000000000000000000000000000000000000000000000
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Couldn't find file object '0000000000000000000000000000000000000000000000000000000000000000'"
+ref-expect-exit: 1
+ref-expect-stderr: equals "error: Couldn't find file object '0000000000000000000000000000000000000000000000000000000000000000'"
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#show
+note: `archive` reads the object's own header, so the refusal is the bare line
+ with no prefix, which equal `stderr-text` states against the `bare` cell above.
+
+family: M10
+subcommand: show
+cell: show/no-object
+setup: repo-with-commit
+run: show --repo=$REPO
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: An object argument is required"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: An object argument is required"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#show
+note: each prints the subcommand's usage text before the error line, so
+ `stderr-text` is not an oracle here, for the reason
+ `refs/no-repo-resolvable` states.
+
+family: M10
+subcommand: show
+cell: show/mode-precedence-metadata-key-over-listing
+setup: repo-with-commit
+run: show --repo=$REPO --list-metadata-keys --print-metadata-key=ostree.ref-binding $BRANCH
+expect-exit: 0
+expect-stdout: equals "['$BRANCH']"
+ref-expect-stdout: equals "['$BRANCH']"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#show
+note: one of the eight-way precedence order's observed pairs; the key wins over
+ the listing, and the cited test states the rest.
+
+family: M10
+subcommand: show
+cell: show/mode-precedence-sizes-over-raw
+setup: repo-with-commit
+run: show --repo=$REPO --print-sizes --raw $BRANCH
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: No metadata key ostree.sizes in commit"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: No metadata key ostree.sizes in commit"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#show
+note: the sizes mode wins over `--raw`, which its refusal states: the raw variant
+ is not reported.
+
+family: M10
+subcommand: show
+cell: show/print-variant-type
+setup: repo-with-commit
+run: show --repo=$REPO --print-variant-type=ay $REPO/config
+expect-exit: 0
+expect-stdout: contains "[byte 0x5b"
+ref-expect-stdout: contains "[byte 0x5b"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#the-gvariant-text-form
+note: the object argument is a filename here, and the repository's own `config`
+ is a file both sides hold identical bytes of, so the byte-array text form
+ compares over it. It opens with `[`, byte `0x5b`, the config's first character.
+ The type set the port takes is narrower than the tool's, which cli-surface.md,
+ "P1" records; every type the on-disk format uses is inside it.
+
+# ---------------------------------------------------------------------------
+# log -- the parent-chain walk (Phase 17d).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: log
+cell: log/single-commit
+setup: repo-with-commit
+run: log --repo=$REPO $BRANCH
+expect-exit: 0
+expect-stdout: contains "ContentChecksum:  "
+ref-expect-exit: 0
+ref-expect-stdout: contains "Date:  2023-11-14 22:13:20 +0000"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#log
+note: the setup's commit is a root commit, so the walk reports it and ends. Each
+ commit's report is the one `show` gives it, which equal `stdout-text` states.
+
+family: M10
+subcommand: log
+cell: log/raw
+setup: repo-with-commit
+run: log --repo=$REPO --raw $BRANCH
+expect-exit: 0
+expect-stdout: contains "uint64 1700000000"
+ref-expect-stdout: contains "'conformance'"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#log
+note: `--raw` reports the checksum line and the variant for each commit and
+ nothing else, the same suppression `show --raw` makes.
+
+family: M10
+subcommand: log
+cell: log/unresolvable
+setup: repo-with-commit
+run: log --repo=$REPO nosuch
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Refspec 'nosuch' not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Refspec 'nosuch' not found"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#log
+
+family: M10
+subcommand: log
+cell: log/no-revision
+setup: repo-with-commit
+run: log --repo=$REPO
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: A rev argument is required"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: A rev argument is required"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#log
+note: each prints the subcommand's usage text before the error line, so
+ `stderr-text` is not an oracle here.
+
+# ---------------------------------------------------------------------------
+# ls -- the tree listing (Phase 17d).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: ls
+cell: ls/root
+setup: repo-with-commit
+run: ls --repo=$REPO $BRANCH
+expect-exit: 0
+expect-stdout: contains "l00777"
+ref-expect-exit: 0
+ref-expect-stdout: contains "/link -> file.txt"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#ls
+note: corpus `C0`'s root reports itself and its five entries, files in name order
+ and then the one directory. The ownership columns carry the running user's ids,
+ so the cell states the type, mode, and target columns absolutely and leaves the
+ rest to equal `stdout-text`.
+
+family: M10
+subcommand: ls
+cell: ls/dironly
+setup: repo-with-commit
+run: ls --repo=$REPO -d $BRANCH
+expect-exit: 0
+expect-stdout: contains "d00755"
+ref-expect-stdout: contains " /"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#ls
+note: `-d` reports the directory alone, so one line.
+
+family: M10
+subcommand: ls
+cell: ls/recursive
+setup: repo-with-commit
+run: ls --repo=$REPO -R $BRANCH
+expect-exit: 0
+expect-stdout: contains "/dir/nested.txt"
+ref-expect-stdout: contains "/dir/nested.txt"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#ls
+note: each subdirectory's contents follow the line naming it, so `dir`'s nested
+ file comes straight after `dir`.
+
+family: M10
+subcommand: ls
+cell: ls/checksum
+setup: repo-with-commit
+run: ls --repo=$REPO -C $BRANCH
+expect-exit: 0
+expect-stdout: contains "/link -> file.txt"
+ref-expect-stdout: contains "/link -> file.txt"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#ls
+note: `-C` inserts one checksum for a file and two for a directory, its dirtree
+ and then its dirmeta. Both sides commit the same corpus at the same timestamp,
+ so every checksum in the listing matches and equal `stdout-text` states them.
+
+family: M10
+subcommand: ls
+cell: ls/xattrs
+setup: repo-with-commit
+run: ls --repo=$REPO -X $BRANCH
+expect-exit: 0
+expect-stdout: contains "{ @a(ayay) [] }"
+ref-expect-stdout: contains "{ @a(ayay) [] }"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#ls
+note: corpus `C0` carries no xattr, so every entry reports the empty set, which
+ states the annotated empty-array form the text form gives it. A set with an
+ entry in it is stated by `ostrya_cli::cli::ls_forms_match_the_tool`, which
+ commits a tree carrying one where the host allows it.
+
+family: M10
+subcommand: ls
+cell: ls/nul-filenames-only
+setup: repo-with-commit
+run: ls --repo=$REPO --nul-filenames-only $BRANCH
+expect-exit: 0
+expect-stdout: contains "/link"
+ref-expect-stdout: contains "/link"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#ls
+note: the paths alone, each followed by a NUL, with no columns and no symlink
+ target, so the stream ends in a NUL rather than a newline.
+
+family: M10
+subcommand: ls
+cell: ls/path-directory
+setup: repo-with-commit
+run: ls --repo=$REPO $BRANCH /dir
+expect-exit: 0
+expect-stdout: contains "/dir/nested.txt"
+ref-expect-stdout: contains "/dir/nested.txt"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#ls
+note: a `PATH` naming a directory becomes the directory listed, and its entries
+ follow it.
+
+family: M10
+subcommand: ls
+cell: ls/path-file
+setup: repo-with-commit
+run: ls --repo=$REPO $BRANCH /file.txt
+expect-exit: 0
+expect-stdout: contains "-00644"
+ref-expect-stdout: contains " /file.txt"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#ls
+note: a `PATH` naming a file reports that one line, with the payload size in the
+ size column.
+
+family: M10
+subcommand: ls
+cell: ls/path-relative
+setup: repo-with-commit
+run: ls --repo=$REPO $BRANCH file.txt
+expect-exit: 0
+expect-stdout: contains " /file.txt"
+ref-expect-stdout: contains " /file.txt"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#ls
+note: the leading `/` is optional, and the reported path is absolute either way.
+
+family: M10
+subcommand: ls
+cell: ls/path-absent
+setup: repo-with-commit
+run: ls --repo=$REPO $BRANCH /nosuch
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Inspecting path '/nosuch': No such file or directory: /nosuch"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Inspecting path '/nosuch': No such file or directory: /nosuch"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ls
+note: the argument is quoted as given and the absolute path it resolved to
+ follows, which for a leading-slash argument are the same text.
+
+family: M10
+subcommand: ls
+cell: ls/path-empty
+setup: repo-with-commit
+run: ls --repo=$REPO $BRANCH ''
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Inspecting path '': No such file or directory: /"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Inspecting path '': No such file or directory: /"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ls
+note: an empty argument resolves to the root and is refused all the same, so the
+ message names `/` as the path while quoting the empty argument.
+
+family: M10
+subcommand: ls
+cell: ls/no-commit
+setup: repo-with-commit
+run: ls --repo=$REPO
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: An COMMIT argument is required"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: An COMMIT argument is required"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ls
+note: the tool's own wording, article included. Each prints the subcommand's
+ usage text before the error line, so `stderr-text` is not an oracle here.
+
+# ---------------------------------------------------------------------------
+# config get -- reading one configuration value (Phase 17d).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: config
+cell: config/get-mode
+setup: repo
+run: config --repo=$REPO get core.mode
+expect-exit: 0
+expect-stdout: equals "bare"
+ref-expect-exit: 0
+ref-expect-stdout: equals "bare"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#config-get
+
+family: M10
+subcommand: config
+cell: config/get-mode-archive
+setup: repo
+modes: archive
+run: config --repo=$REPO get core.mode
+expect-exit: 0
+expect-stdout: equals "archive-z2"
+ref-expect-exit: 0
+ref-expect-stdout: equals "archive-z2"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#config-get
+note: `archive` and `archive-z2` name one mode and the config always serializes
+ as `archive-z2`, which the value read back states.
+
+family: M10
+subcommand: config
+cell: config/get-repo-version
+setup: repo
+run: config --repo=$REPO get core.repo_version
+expect-exit: 0
+expect-stdout: equals "1"
+ref-expect-exit: 0
+ref-expect-stdout: equals "1"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#config-get
+
+family: M10
+subcommand: config
+cell: config/get-group-option
+setup: repo
+run: config --repo=$REPO get --group=core mode
+expect-exit: 0
+expect-stdout: equals "bare"
+ref-expect-exit: 0
+ref-expect-stdout: equals "bare"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#config-get
+note: `--group` names the section and the argument is then a whole key name.
+
+family: M10
+subcommand: config
+cell: config/get-key-absent
+setup: repo
+run: config --repo=$REPO get core.nosuch
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Key file does not have key “nosuch” in group “core”"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Key file does not have key “nosuch” in group “core”"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-get
+note: GLib quotes the group and the key in U+201C and U+201D, which the run's
+ UTF-8 locale keeps lossless in both.
+
+family: M10
+subcommand: config
+cell: config/get-group-absent
+setup: repo
+run: config --repo=$REPO get nosuch.mode
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Key file does not have group “nosuch”"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Key file does not have group “nosuch”"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-get
+
+family: M10
+subcommand: config
+cell: config/get-key-without-group
+setup: repo
+run: config --repo=$REPO get mode
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Key must be of the form \"sectionname.keyname\""
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Key must be of the form \"sectionname.keyname\""
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-get
+note: this one message quotes in ASCII double quotes rather than the typographic
+ pair the group and key messages use.
+
+family: M10
+subcommand: config
+cell: config/get-no-key
+setup: repo
+run: config --repo=$REPO get
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: KEY must be specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: KEY must be specified"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-get
+note: no usage text precedes this line in either, so `stderr-text` is an oracle
+ here where it is not for the missing-operation cell below.
+
+family: M10
+subcommand: config
+cell: config/get-group-without-key
+setup: repo
+run: config --repo=$REPO get --group=core
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Group name and key must be specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Group name and key must be specified"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-get
+
+family: M10
+subcommand: config
+cell: config/unknown-operation
+setup: repo
+run: config --repo=$REPO nosuchop core.mode
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Unknown operation nosuchop"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Unknown operation nosuchop"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-get
+
+family: M10
+subcommand: config
+cell: config/no-operation
+setup: repo
+run: config --repo=$REPO
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: OPERATION must be specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: OPERATION must be specified"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-get
+note: each prints the subcommand's usage text before the error line, so
+ `stderr-text` is not an oracle here.
+
+family: M10
+subcommand: config
+cell: config/too-many-arguments
+setup: repo
+run: config --repo=$REPO get core.mode extra
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Too many arguments given"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Too many arguments given"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-get
+note: the usage text precedes this line too, and the check stands after the
+ repository resolves in both.
+
+family: M10
+subcommand: config
+cell: config/too-many-arguments-set
+setup: repo
+run: config --repo=$REPO set core.mode bare extra
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Too many arguments given"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Too many arguments given"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-get
+note: the operand count is checked ahead of the operation name, and `set` is the
+ one operation taking two operands, so a third is refused where `get` refuses a
+ second. Each prints the subcommand's usage text before the error line, so
+ `stderr-text` is not an oracle here.
+
+family: M10
+subcommand: config
+cell: config/set-unimplemented
+setup: repo
+run: config --repo=$REPO set core.mode bare
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: The set operation is not implemented yet"
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: stdout-text
+outcome: unimplemented-cli
+cli-gap: config set
+severity: interop
+spec: cli-surface.md#p1-reading-and-resolution
+note: the config write path lands in Phase 17e, so the reference writes the value
+ and exits 0 where the port names the gap and exits 1. Neither writes to standard
+ output, which is the one artifact the two can be held to; `exit-status` and
+ `config-bytes` are left out because the claim is the gap itself.

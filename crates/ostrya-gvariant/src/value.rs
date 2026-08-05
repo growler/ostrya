@@ -104,6 +104,28 @@ impl Value {
         }
     }
 
+    /// The same value with every multi-byte scalar byte-swapped, recursively,
+    /// through arrays, tuples, dict entries, and the child of a variant.
+    ///
+    /// This is GVariant's own byte-order conversion. The on-disk format places
+    /// its numeric fields in the variant already big-endian while the framing
+    /// stays little-endian, so a value parsed from those bytes holds each
+    /// numeric field byte-reversed, and one swap of the whole tree recovers the
+    /// numbers the fields state. Booleans, bytes, and strings are unchanged.
+    pub fn byteswapped(&self) -> Value {
+        match self {
+            Value::U32(x) => Value::U32(x.swap_bytes()),
+            Value::U64(x) => Value::U64(x.swap_bytes()),
+            Value::Array(items) => Value::Array(items.iter().map(Value::byteswapped).collect()),
+            Value::Tuple(items) => Value::Tuple(items.iter().map(Value::byteswapped).collect()),
+            Value::Variant(inner) => {
+                let (ty, child) = &**inner;
+                Value::variant(ty.clone(), child.byteswapped())
+            }
+            Value::Bool(_) | Value::Byte(_) | Value::Str(_) | Value::Bytes(_) => self.clone(),
+        }
+    }
+
     /// Look up a key in a dictionary value (`a{s?}`): an array of two-element
     /// tuples whose first member is the key string. Returns the value member of
     /// the first entry whose key matches. Entries that are not `{s?}`-shaped are

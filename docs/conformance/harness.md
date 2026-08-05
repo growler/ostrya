@@ -541,8 +541,14 @@ Oracle and setup availability follows the CLI surface `cli-surface.md` orders.
   checkout destination -- `manifest` checks the setup's revision out itself --
   so the two checkout options state their destination trees through
   `evidence:`.
-- Phase 17d adds the GVariant text-form printer, which `show --raw` and the
-  `--print-*` forms need.
+- Phase 17d added the GVariant text-form printer, which `show --raw` and the
+  `--print-*` forms need, and the four reading commands over it: `show`, `log`,
+  `ls`, and `config get`. A cell can now state a metadata object, a commit
+  report, a parent-chain walk, a tree listing, or a configuration value as
+  `stdout-text`, so the harness's own readers -- decoding a commit's GVariant and
+  reading `config` by hand -- have a CLI equivalent to be held against. The
+  `repo-with-commit` setup binds one root commit, so a walk over a parent chain
+  and a listing carrying an xattr are stated through `evidence:` instead.
 
 A cell whose oracle or option is not yet available reports
 `skip: unimplemented-cli` and names what is missing, so the matrix reports the

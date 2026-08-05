@@ -637,11 +637,11 @@ fn declared_cell(
     } else if !unavailable.is_empty() {
         // A tolerated reference crash is its own category, so the summary names
         // the reference build's defect rather than a missing port command.
-        let aborted = outcomes
-            .iter()
-            .any(|(_, _, tolerated)| tolerated.is_some())
-            .then_some("reference-abort")
-            .unwrap_or("unimplemented-cli");
+        let aborted = if outcomes.iter().any(|(_, _, tolerated)| tolerated.is_some()) {
+            "reference-abort"
+        } else {
+            "unimplemented-cli"
+        };
         (
             Verdict::Skip,
             Some(aborted.to_owned()),

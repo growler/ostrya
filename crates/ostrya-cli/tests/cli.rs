@@ -5089,6 +5089,10 @@ fn absent_commit_object_matches_the_tool() {
     refused(&repo, &repo, &["cat", &absent, "/hello.txt"]);
     refused(&repo, &repo, &["cat", &ancestor, "/hello.txt"]);
     refused(&repo, &repo, &["rev-parse", &ancestor]);
+    // `log` and `ls` resolve a commit too, so the starting revision draws the
+    // same pair rather than `log` reading an absent commit as an empty history.
+    refused(&repo, &repo, &["log", &absent]);
+    refused(&repo, &repo, &["ls", &absent]);
 
     // A bare checksum reaches no object, so `rev-parse` prints it and exits 0.
     assert_agrees(&repo, &repo, &["rev-parse", &absent]);
@@ -6144,5 +6148,741 @@ fn cat_keeps_the_payload_written_before_a_refusal() {
             tool.stdout == payload,
             "the tool wrote different bytes before its own refusal"
         );
+    }
+}
+
+// --- show, log, ls, config (Phase 17d) ----------------------------------------
+
+/// The fixture repository read through `show` and `ls`, without the reference
+/// tool: the reports the port produces for the commit, its tree, and one file
+/// object, held to the text the tool was observed to write for them
+/// (`docs/format-reference.md`, "CLI output formats").
+#[test]
+fn show_and_ls_report_the_fixture() {
+    let tmp = TmpDir::new("show-fixture");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = format!("--repo={}", repo.display());
+
+    let ls = ostrya(&[&repo_arg, "ls", "-R", BRANCH], None, &[]);
+    assert_eq!(
+        ls.ok().stdout_trimmed(),
+        "d00755 0 0      0 /\n\
+         -00644 0 0      0 /empty.txt\n\
+         -00644 0 0     13 /hello.txt\n\
+         l00777 0 0      0 /link -> hello.txt\n\
+         d00755 0 0      0 /subdir\n\
+         -00644 0 0      7 /subdir/nested.txt",
+        "the recursive listing"
+    );
+
+    let show = ostrya(&[&repo_arg, "show", BRANCH], None, &[]);
+    assert_eq!(
+        String::from_utf8(show.ok().stdout.clone()).unwrap(),
+        format!(
+            "commit {COMMIT}\n\
+             ContentChecksum:  \
+             d79e5560a90877b47660b639e3d7c88c20ca5a7604f867960e155c552025e104\n\
+             Date:  2023-11-14 22:13:20 +0000\n\
+             \n    {SUBJECT}\n\n"
+        ),
+        "the commit report"
+    );
+
+    // The symlink object's own report, reached by the checksum `ls -C` names.
+    let listing = ostrya(&[&repo_arg, "ls", "-C", BRANCH], None, &[]);
+    let link_checksum = String::from_utf8(listing.ok().stdout.clone())
+        .unwrap()
+        .lines()
+        .find(|line| line.contains("/link"))
+        .and_then(|line| line.split_whitespace().nth(4).map(str::to_owned))
+        .expect("a checksum column on the symlink's line");
+    let object = ostrya(&[&repo_arg, "show", &link_checksum], None, &[]);
+    assert_eq!(
+        String::from_utf8(object.ok().stdout.clone()).unwrap(),
+        format!(
+            "Object: {link_checksum}\n\
+             Type: file\n\
+             File Type: symlink\n\
+             Target: hello.txt\n\
+             Mode: 0120777\n\
+             Uid: 0\n\
+             Gid: 0\n\
+             Extended Attributes: {{ @a(ayay) [] }}\n"
+        ),
+        "the symlink object's report"
+    );
+}
+
+/// A repository the reference tool builds, holding what the port's own `commit`
+/// cannot yet state: a body, an empty subject, a `version` key, metadata of
+/// every type the format uses, and recorded sizes. The reading commands are then
+/// compared over it, which is also the interop direction that matters -- the
+/// port reads what the tool wrote.
+#[cfg(unix)]
+fn tool_read_fixture(base: &Path) -> PathBuf {
+    let repo = base.join("toolrepo");
+    let src = base.join("readsrc");
+    std::fs::create_dir_all(src.join("nested/deep")).unwrap();
+    std::fs::write(src.join("file.txt"), b"hello\n").unwrap();
+    std::fs::write(src.join("empty"), b"").unwrap();
+    std::fs::write(src.join("exec.sh"), b"#!/bin/sh\necho x\n").unwrap();
+    std::os::unix::fs::symlink("file.txt", src.join("link")).unwrap();
+    std::fs::write(src.join("nested/a.txt"), b"n\n").unwrap();
+    std::fs::write(src.join("nested/deep/inner.bin"), b"deep\n").unwrap();
+    std::fs::set_permissions(src.join("exec.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let repo_arg = format!("--repo={}", repo.display());
+    ostree(&[&repo_arg, "init", "--mode=archive"]).ok();
+    let src_arg = src.display().to_string();
+    // A subject and a two-line body, then a second commit onto the same branch
+    // so the walk has a parent to follow, with sizes recorded.
+    ostree(&[
+        &repo_arg,
+        "commit",
+        "-b",
+        BRANCH,
+        "-s",
+        "first subject",
+        "--timestamp=@1700000000",
+        &src_arg,
+    ])
+    .ok();
+    std::fs::write(src.join("file.txt"), b"hello\nsecond\n").unwrap();
+    ostree(&[
+        &repo_arg,
+        "commit",
+        "-b",
+        BRANCH,
+        "-s",
+        "second subject",
+        "-m",
+        "a body\nwith two lines",
+        "--timestamp=@1700000100",
+        "--generate-sizes",
+        &src_arg,
+    ])
+    .ok();
+    // A commit with no subject and a body alone, one with a `version` key, one
+    // with a multi-line subject, and one carrying metadata of every type.
+    ostree(&[
+        &repo_arg,
+        "commit",
+        "-b",
+        "nobody",
+        "-m",
+        "body only line1\nline2",
+        "--timestamp=@1700000000",
+        &src_arg,
+    ])
+    .ok();
+    ostree(&[
+        &repo_arg,
+        "commit",
+        "-b",
+        "versioned",
+        "-s",
+        "subj",
+        "--add-metadata-string=version=1.2.3",
+        "--timestamp=@1700000000",
+        &src_arg,
+    ])
+    .ok();
+    ostree(&[
+        &repo_arg,
+        "commit",
+        "-b",
+        "multiline",
+        "-s",
+        "line one\nline two",
+        "--timestamp=@1700000000",
+        &src_arg,
+    ])
+    .ok();
+    ostree(&[
+        &repo_arg,
+        "commit",
+        "-b",
+        "typed",
+        "--timestamp=@1700000000",
+        "--add-metadata=ts=uint64 1234",
+        "--add-metadata=n=uint32 7",
+        "--add-metadata=by=byte 0x09",
+        "--add-metadata=s='hi'",
+        "--add-metadata=flag=true",
+        "--add-metadata=raw=[byte 0x01, 0x02]",
+        "--add-metadata=nulterm=b\"ab\"",
+        "--add-metadata=emptyay=@ay []",
+        "--add-metadata=nested=[[byte 0x01], @ay []]",
+        "--add-metadata=strs=['x','y']",
+        "--add-metadata=dict=@a{sv} {}",
+        "--add-metadata=zzz='last'",
+        "--add-metadata=aaa='first'",
+        &src_arg,
+    ])
+    .ok();
+    // A pre-epoch timestamp, whose stored field is the two's-complement form.
+    ostree(&[
+        &repo_arg,
+        "commit",
+        "-b",
+        "preepoch",
+        "-s",
+        "pre",
+        "--timestamp=@-1",
+        &src_arg,
+    ])
+    .ok();
+    repo
+}
+
+/// Every `show` form over the tool-built repository, both implementations
+/// reading the same objects: the commit report, the raw variant with and without
+/// the byte-order conversion, the metadata and detached-metadata modes, the
+/// sizes, and the refusals.
+#[test]
+fn show_forms_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("show-tool");
+    let base = tmp.path();
+    let repo = tool_read_fixture(base);
+    let tip = resolve(&repo, BRANCH).expect("the fixture branch resolves");
+    let typed = resolve(&repo, "typed").expect("the typed branch resolves");
+
+    // The tree's own object checksums, read out of the port's `ls -C`.
+    let listing = ostrya(
+        &[
+            &format!("--repo={}", repo.display()),
+            "ls",
+            "-C",
+            "-R",
+            BRANCH,
+        ],
+        None,
+        &[],
+    );
+    let lines: Vec<String> = String::from_utf8(listing.ok().stdout.clone())
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // The path is its own whitespace-delimited column, so a line is found by
+    // that column and the checksums read by index: one for a file, the dirtree
+    // and then the dirmeta for a directory.
+    let column = |path: &str, index: usize| {
+        lines
+            .iter()
+            .find(|line| line.split_whitespace().any(|field| field == path))
+            .and_then(|line| line.split_whitespace().nth(index).map(str::to_owned))
+            .unwrap_or_else(|| panic!("no listing line for {path}"))
+    };
+    let root_dirtree = column("/", 4);
+    let root_dirmeta = column("/", 5);
+    let file_object = column("/file.txt", 4);
+    let link_object = column("/link", 4);
+
+    for args in [
+        vec!["show", &tip],
+        vec!["show", "--raw", &tip],
+        vec!["show", "-B", &tip],
+        vec!["show", "--raw", "-B", &tip],
+        vec!["show", BRANCH],
+        vec!["show", "test/main^"],
+        vec!["show", "nobody"],
+        vec!["show", "versioned"],
+        vec!["show", "multiline"],
+        vec!["show", "preepoch"],
+        vec!["show", "--raw", "preepoch"],
+        vec!["show", &root_dirtree],
+        vec!["show", "--raw", &root_dirtree],
+        vec!["show", &root_dirmeta],
+        vec!["show", "--raw", &root_dirmeta],
+        vec!["show", "-B", &root_dirmeta],
+        vec!["show", &file_object],
+        vec!["show", "--raw", &file_object],
+        vec!["show", &link_object],
+        vec!["show", "--print-sizes", &tip],
+        vec!["show", "--print-related", &tip],
+        vec!["show", "--list-metadata-keys", &typed],
+        vec!["show", "--list-detached-metadata-keys", &tip],
+        vec!["show", "--print-detached-metadata-key=any", &tip],
+        vec!["show", "--print-metadata-key=nope", &typed],
+        vec!["show", "--print-sizes", "nobody"],
+        vec!["show", "nosuchref"],
+        vec![
+            "show",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        ],
+    ] {
+        assert_agrees(&repo, &repo, &args);
+    }
+
+    // Every metadata value type, each with and without `--print-hex` and the
+    // byte-order conversion.
+    for key in [
+        "ts",
+        "n",
+        "by",
+        "s",
+        "flag",
+        "raw",
+        "nulterm",
+        "emptyay",
+        "nested",
+        "strs",
+        "dict",
+        "ostree.ref-binding",
+    ] {
+        let arg = format!("--print-metadata-key={key}");
+        assert_agrees(&repo, &repo, &["show", &arg, &typed]);
+        assert_agrees(&repo, &repo, &["show", "-B", &arg, &typed]);
+        assert_agrees(&repo, &repo, &["show", "--print-hex", &arg, &typed]);
+    }
+
+    // The precedence among the reporting modes, one pair per observed rule.
+    let tip_ref: &str = &tip;
+    for args in [
+        vec![
+            "show",
+            "--list-metadata-keys",
+            "--print-metadata-key=ostree.ref-binding",
+            tip_ref,
+        ],
+        vec!["show", "--print-sizes", "--raw", tip_ref],
+        vec!["show", "--print-sizes", "--list-metadata-keys", tip_ref],
+        vec!["show", "--print-related", "--raw", tip_ref],
+        vec!["show", "--print-related", "--list-metadata-keys", tip_ref],
+        vec!["show", "--print-sizes", "--print-related", tip_ref],
+        vec![
+            "show",
+            "--list-detached-metadata-keys",
+            "--print-metadata-key=ostree.ref-binding",
+            tip_ref,
+        ],
+    ] {
+        assert_agrees(&repo, &repo, &args);
+    }
+}
+
+/// `show --print-related` over a commit that carries a non-empty related array.
+/// No `commit` option writes one, so the commit is assembled through the library
+/// and written into the object store, and both implementations read it back.
+#[test]
+fn show_print_related_lists_each_pair() {
+    let tmp = TmpDir::new("show-related");
+    let base = tmp.path();
+    let repo_path = commit_fixture(base);
+    let source: ostrya::Checksum = COMMIT.parse().unwrap();
+    let crafted = block_on(async {
+        let repo = Repo::open(&repo_path).await.unwrap();
+        let (mut commit, _) = repo.load_commit(&source).await.unwrap();
+        commit.related = vec![
+            ("other/ref".to_owned(), source.as_bytes().to_vec()),
+            ("second/ref".to_owned(), source.as_bytes().to_vec()),
+        ];
+        let bytes = commit.serialize().unwrap();
+        let checksum = ostrya::Checksum::sha256(&bytes);
+        let hex = checksum.to_hex();
+        let dir = repo_path.join("objects").join(&hex[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{}.commit", &hex[2..])), &bytes).unwrap();
+        hex
+    });
+    let expected = format!("other/ref {COMMIT}\nsecond/ref {COMMIT}\n");
+    let run = ostrya(
+        &[
+            &format!("--repo={}", repo_path.display()),
+            "show",
+            "--print-related",
+            &crafted,
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(
+        String::from_utf8(run.ok().stdout.clone()).unwrap(),
+        expected,
+        "the related pairs"
+    );
+    if ostree_available() {
+        assert_agrees(
+            &repo_path,
+            &repo_path,
+            &["show", "--print-related", &crafted],
+        );
+    }
+}
+
+/// `log` over the tool-built repository: the walk, the raw form, an ancestry
+/// suffix, and the note a parent whose commit object is absent draws.
+#[test]
+fn log_forms_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("log-tool");
+    let base = tmp.path();
+    let repo = tool_read_fixture(base);
+    let tip = resolve(&repo, BRANCH).expect("the fixture branch resolves");
+    let parent = resolve(&repo, "test/main^").expect("the parent resolves");
+    for args in [
+        vec!["log", BRANCH],
+        vec!["log", "--raw", BRANCH],
+        vec!["log", "test/main^"],
+        vec!["log", &tip],
+        vec!["log", "nobody"],
+        vec!["log", "preepoch"],
+        vec!["log", "nosuchref"],
+    ] {
+        assert_agrees(&repo, &repo, &args);
+    }
+
+    // With the parent's commit object removed, the walk reports what it holds
+    // and stops.
+    std::fs::remove_file(
+        repo.join("objects")
+            .join(&parent[..2])
+            .join(format!("{}.commit", &parent[2..])),
+    )
+    .unwrap();
+    assert_agrees(&repo, &repo, &["log", BRANCH]);
+    assert_agrees(&repo, &repo, &["log", "--raw", BRANCH]);
+}
+
+/// `log`'s per-commit report verifies GPG signatures against the repository's
+/// own `gpgkeys.gpg`, not the process's working directory. Run with no `cwd`
+/// override, so the two differ, the case `log` once broke by passing `.` as
+/// the repository path instead of the one `show` receives from `resolve_repo`.
+#[cfg(feature = "gpg")]
+#[test]
+fn log_verifies_signatures_against_the_repo_not_the_cwd() {
+    if !gpg_available() {
+        eprintln!("skipping: gpg/gpgv not available");
+        return;
+    }
+    let tmp = TmpDir::new("log-gpg-repo-path");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let home = GpgHome::create(base, "Ostrya Log Test <log-gpg@ostrya.example>");
+    let fpr = home.fingerprint();
+    let home_s = home.dir.to_str().unwrap().to_owned();
+
+    ostrya(
+        &[
+            "sign",
+            "--repo",
+            repo_s,
+            "-s",
+            "gpg",
+            "--gpg-homedir",
+            &home_s,
+            COMMIT,
+            &fpr,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    home.export_to(&repo.join("gpgkeys.gpg"));
+
+    let log = ostrya(&["log", "--repo", repo_s, COMMIT], None, &[]);
+    let stdout = String::from_utf8_lossy(&log.ok().stdout).into_owned();
+    assert!(
+        stdout.contains("Good signature from"),
+        "log did not verify against the repository's own keyring:\n{stdout}"
+    );
+}
+
+/// `ls` over the tool-built repository, in every option combination and over
+/// each path form: the tree root, a nested directory, a file, a symlink, a
+/// relative path, and a path naming nothing.
+#[test]
+fn ls_forms_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("ls-tool");
+    let base = tmp.path();
+    let repo = tool_read_fixture(base);
+    // Two xattrs on one file, so the `-X` column has more than one entry to
+    // report and the `a(ayay)` printer's annotation cascade past the first
+    // entry runs against the tool rather than only a hand-written value.
+    let src = base.join("readsrc");
+    let set = std::process::Command::new("setfattr")
+        .args(["-n", "user.foo", "-v", "bar"])
+        .arg(src.join("file.txt"))
+        .status();
+    let set2 = std::process::Command::new("setfattr")
+        .args(["-n", "user.bar", "-v", "baz"])
+        .arg(src.join("file.txt"))
+        .status();
+    if set.is_ok_and(|status| status.success()) && set2.is_ok_and(|status| status.success()) {
+        ostree(&[
+            &format!("--repo={}", repo.display()),
+            "commit",
+            "-b",
+            "withxattr",
+            "-s",
+            "xattr",
+            "--timestamp=@1700000000",
+            src.to_str().unwrap(),
+        ])
+        .ok();
+        for args in [
+            vec!["ls", "-X", "withxattr"],
+            vec!["ls", "-C", "-X", "withxattr"],
+            vec!["ls", "-X", "-R", "withxattr"],
+        ] {
+            assert_agrees(&repo, &repo, &args);
+        }
+    }
+    for args in [
+        vec!["ls", BRANCH],
+        vec!["ls", "-d", BRANCH],
+        vec!["ls", "-R", BRANCH],
+        vec!["ls", "-C", BRANCH],
+        vec!["ls", "-C", "-R", BRANCH],
+        vec!["ls", "--nul-filenames-only", BRANCH],
+        vec!["ls", "--nul-filenames-only", "-d", BRANCH],
+        vec!["ls", "--nul-filenames-only", "-C", BRANCH],
+        vec!["ls", "--nul-filenames-only", "-R", BRANCH],
+        vec!["ls", BRANCH, "/nested"],
+        vec!["ls", BRANCH, "nested"],
+        vec!["ls", BRANCH, "/nested/deep"],
+        vec!["ls", "-R", BRANCH, "/nested"],
+        vec!["ls", "-d", BRANCH, "/nested"],
+        vec!["ls", BRANCH, "/file.txt"],
+        vec!["ls", BRANCH, "/link"],
+        vec!["ls", BRANCH, "/"],
+        vec!["ls", BRANCH, ""],
+        vec!["ls", BRANCH, "/nope"],
+        vec!["ls", BRANCH, "nope"],
+        vec!["ls", BRANCH, "/nested", "/file.txt"],
+        vec!["ls", "nosuchref"],
+    ] {
+        assert_agrees(&repo, &repo, &args);
+    }
+}
+
+/// `ls -R` follows each subdirectory's contents immediately after its own
+/// line, even past a sibling directory (`docs/format-reference.md`, "ls",
+/// "Order and recursion"). Every fixture elsewhere in this file has at most
+/// one subdirectory per level, which cannot tell a level-order listing apart
+/// from the tool's pre-order one, so this builds a tree with two.
+#[test]
+fn ls_recursive_visits_each_subtree_before_its_next_sibling() {
+    let tmp = TmpDir::new("ls-siblings");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("da")).unwrap();
+    std::fs::create_dir_all(src.join("db")).unwrap();
+    std::fs::write(src.join("da/f1.txt"), b"one\n").unwrap();
+    std::fs::write(src.join("db/f2.txt"), b"two\n").unwrap();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_s = repo.to_str().unwrap();
+    ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo_s,
+            "-b",
+            "siblings",
+            "-s",
+            "siblings",
+            "--canonical-permissions",
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let ls = ostrya(&["--repo", repo_s, "ls", "-R", "siblings"], None, &[]);
+    assert_eq!(
+        ls.ok().stdout_trimmed(),
+        "d00755 0 0      0 /\n\
+         d00755 0 0      0 /da\n\
+         -00644 0 0      4 /da/f1.txt\n\
+         d00755 0 0      0 /db\n\
+         -00644 0 0      4 /db/f2.txt",
+        "/da's contents must come before /db's own line"
+    );
+    if ostree_available() {
+        assert_agrees(&repo, &repo, &["ls", "-R", "siblings"]);
+    }
+}
+
+/// `config get` over each key class the repository config holds, and over the
+/// value forms GKeyFile escapes, plus every refusal both implementations word
+/// the same way.
+#[test]
+fn config_get_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("config-tool");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let mut config = std::fs::read_to_string(repo.join("config")).unwrap();
+    config.push_str(
+        "[test]\nplain=value\nescaped=a\\nb\\tc\nspaces= leading and trailing \n\
+         semi=a;b;c\nempty=\nquoted=\"quoted\"\nutf8=héllo\nbackslash=a\\\\b\n\
+         [a]\nb.c=2\n",
+    );
+    std::fs::write(repo.join("config"), config).unwrap();
+    for args in [
+        vec!["config", "get", "core.mode"],
+        vec!["config", "get", "core.repo_version"],
+        vec!["config", "get", "--group=core", "mode"],
+        vec!["config", "get", "test.plain"],
+        vec!["config", "get", "test.escaped"],
+        vec!["config", "get", "test.spaces"],
+        vec!["config", "get", "test.semi"],
+        vec!["config", "get", "test.empty"],
+        vec!["config", "get", "test.quoted"],
+        vec!["config", "get", "test.utf8"],
+        vec!["config", "get", "test.backslash"],
+        vec!["config", "get", "a.b.c"],
+        vec!["config", "get", "--group=test", "plain"],
+        vec!["config", "get", "core.nope"],
+        vec!["config", "get", "nope.mode"],
+        vec!["config", "get", "mode"],
+        vec!["config", "get"],
+        vec!["config", "get", "--group=core"],
+        vec!["config", "get", "--group=core", "core.mode"],
+        vec!["config", "badop", "core.mode"],
+    ] {
+        assert_agrees(&repo, &repo, &args);
+    }
+}
+
+/// `show --print-variant-type` reads a file as a value of a named type, which
+/// makes the tool a byte-exact oracle for the GVariant text form. Each case is
+/// a hand-written serialized value covering one rule of the form.
+#[test]
+fn variant_text_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("variant-text");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let cases: &[(&str, &str, &[u8])] = &[
+        // Byte arrays: the bytestring form, its escapes, and the list form.
+        ("nul", "ay", &[0x00]),
+        ("bytestring", "ay", b"b\0"),
+        ("unterminated", "ay", &[0x62]),
+        ("interior_nul", "ay", &[0x62, 0x00, 0x63, 0x00]),
+        ("hi", "ay", b"hi\0"),
+        ("high_byte", "ay", &[0xff, 0x00]),
+        ("tab", "ay", b"a\tb\0"),
+        ("single_quote", "ay", b"a'b\0"),
+        ("double_quote", "ay", b"a\"b\0"),
+        ("both_quotes", "ay", b"a'\"b\0"),
+        ("utf8", "ay", "hé\0".as_bytes()),
+        ("del", "ay", &[0x7f, 0x00]),
+        ("escape", "ay", &[0x1b, 0x00]),
+        ("empty", "ay", b""),
+        ("bytes", "ay", &[0x01, 0x02, 0xff]),
+        // Strings and their escapes.
+        ("s_plain", "s", b"abc\0"),
+        ("s_empty", "s", b"\0"),
+        ("s_squote", "s", b"a'b\0"),
+        ("s_dquote", "s", b"a\"b\0"),
+        ("s_both", "s", b"a'\"b\0"),
+        ("s_tab", "s", b"a\tb\0"),
+        ("s_newline", "s", b"a\nb\0"),
+        ("s_return", "s", b"a\rb\0"),
+        ("s_bell", "s", b"a\x07b\0"),
+        ("s_backspace", "s", b"a\x08b\0"),
+        ("s_vtab", "s", b"a\x0bb\0"),
+        ("s_formfeed", "s", b"a\x0cb\0"),
+        ("s_escape", "s", b"a\x1bb\0"),
+        ("s_del", "s", b"a\x7fb\0"),
+        ("s_backslash", "s", b"a\\b\0"),
+        ("s_utf8", "s", "héllo\0".as_bytes()),
+        // Scalars, which the numeric conversion reaches.
+        ("u32", "u", &[0x01, 0x02, 0x03, 0x04]),
+        ("u64", "t", &[1, 2, 3, 4, 5, 6, 7, 8]),
+        ("bool_false", "b", &[0x00]),
+        ("bool_true", "b", &[0x01]),
+        ("byte", "y", &[0x2a]),
+        // Containers: where the annotation lands, and the empty forms.
+        ("as", "as", b"a\0bb\0\x02\x05"),
+        (
+            "aay_first_bytestring",
+            "aay",
+            &[0x62, 0x00, 0x63, 0x02, 0x03],
+        ),
+        (
+            "aay_second_bytestring",
+            "aay",
+            &[0x63, 0x62, 0x00, 0x01, 0x03],
+        ),
+        ("aay_first_empty", "aay", &[0x63, 0x00, 0x01]),
+        ("aay_second_empty", "aay", &[0x63, 0x01, 0x01]),
+        ("aay_empty", "aay", b""),
+        (
+            "dict",
+            "a{sy}",
+            &[0x61, 0x00, 0x01, 0x02, 0x62, 0x00, 0x02, 0x02, 0x04, 0x08],
+        ),
+        ("dict_empty", "a{sy}", b""),
+        ("dict_entry", "{sy}", &[0x61, 0x00, 0x01, 0x02]),
+        ("tuple_one", "(y)", &[0x01]),
+        ("tuple_empty", "()", &[0x00]),
+        ("tuple_two", "(yy)", &[0x01, 0x02]),
+        ("tuple_strings", "(ss)", b"a\0b\0\x02"),
+        ("variant_byte", "v", &[0x2a, 0x00, 0x79]),
+        ("variant_bytestring", "v", &[0x62, 0x00, 0x00, 0x61, 0x79]),
+        ("aab", "aab", &[0x01, 0x00, 0x01, 0x02]),
+    ];
+    for (name, signature, bytes) in cases {
+        let path = base.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let arg = format!("--print-variant-type={signature}");
+        assert_agrees(&repo, &repo, &["show", &arg, path.to_str().unwrap()]);
+    }
+    // A path that does not open is refused in the tool's own words.
+    let missing = base.join("nosuchfile");
+    assert_agrees(
+        &repo,
+        &repo,
+        &["show", "--print-variant-type=u", missing.to_str().unwrap()],
+    );
+}
+
+/// The types outside the codec's set are refused rather than printed, the one
+/// divergence `--print-variant-type` carries
+/// (`docs/conformance/cli-surface.md`, "P2").
+#[test]
+fn show_refuses_a_variant_type_the_codec_does_not_hold() {
+    let tmp = TmpDir::new("variant-type-refused");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let path = base.join("value");
+    std::fs::write(&path, [0x01, 0x02]).unwrap();
+    for signature in ["d", "q", "n", "i", "x", "o", "g", "ms", "(s"] {
+        let run = ostrya(
+            &[
+                &format!("--repo={}", repo.display()),
+                "show",
+                &format!("--print-variant-type={signature}"),
+                path.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        );
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "the port accepted the type {signature:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("invalid type signature"),
+            "the refusal of {signature:?} does not name the signature"
+        );
+        assert!(run.stdout.is_empty(), "{signature:?} wrote to stdout");
     }
 }

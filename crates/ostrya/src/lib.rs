@@ -217,11 +217,12 @@ pub use mtree::MutableTree;
 pub use ostrya_composefs::Image;
 pub use ostrya_core::base64;
 pub use ostrya_core::{
-    Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Type, Value,
+    Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Type, Value, Xattrs,
+    from_bytes, to_text,
 };
 pub use prune::{PruneOptions, PruneStats};
 pub use pull::{PullFlags, PullOptions, PullStats, PullVerify, TimestampCheck};
-pub use read::CommitState;
+pub use read::{CommitSizes, CommitState};
 pub use refs::{CollectionRef, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};
 pub use sign::{

@@ -232,6 +232,9 @@ reproduced:
   the same absent checksum reports `error: Couldn't find file object
   '<checksum>'` from `ostree show` -- so the wording for a dirtree, a dirmeta, or
   a file object belongs with the phase that lands the commands reading them.
+  Phase 17d settled it: `show` reaches a bare checksum with no object type and
+  reports the tool's own `Couldn't find file object` line, which the port
+  reproduces, while `log` and `ls` resolve a commit and so draw the pair above.
   The checksum is
   refused nowhere else: `rev-parse <checksum>` prints it at exit 0, `refs
   --create=NEWREF <checksum>` writes the ref file, and `commit
@@ -300,17 +303,62 @@ Two resolution behaviors the tool has and the port does not, each recorded in
   tool reports `error: Cannot create alias to non-existent ref: tes~t` at exit 1,
   the one case at that site where the two leave different refs trees.
 
-Absent:
+Done, Phase 17d:
 
 - `show` -- `--raw`, `--print-related`, `--print-variant-type=TYPE`,
   `--list-metadata-keys`, `--print-metadata-key=KEY`, `--print-hex`,
   `--list-detached-metadata-keys`, `--print-detached-metadata-key=KEY`,
   `--print-sizes`, `-B/--no-byteswap`, `--gpg-homedir=HOMEDIR`,
   `--gpg-verify-remote=REMOTE`.
-- `log` -- `--raw`.
+- `log` -- the default form and `--raw`.
 - `ls` -- `-d/--dironly`, `-R/--recursive`, `-C/--checksum`, `-X/--xattrs`,
-  `--nul-filenames-only`.
-- `config` -- the `get`, `set`, and `unset` operations, and `--group`.
+  `--nul-filenames-only`, `COMMIT`, and zero or more `PATH`.
+- `config get` -- the dotted key and `--group=GROUP`.
+
+Their output formats, and the GVariant text form they share, are recorded in
+`../format-reference.md`, "The GVariant text form", "`show`", "`log`", "`ls`",
+and "`config get`". Five tool behaviors around them are observed and
+deliberately not reproduced:
+
+- `show --print-variant-type=TYPE` takes any GVariant type string in the tool,
+  and the port takes the set its codec models -- booleans, bytes, `u`, `t`,
+  strings, variants, arrays, tuples, and dict entries
+  (`ostrya-gvariant`, `Type::parse`). A type outside it, `d` and `q` among them,
+  reports `error: invalid format: invalid type signature "<type>" at offset 0:
+  unsupported type character` and exits 1 where the tool prints the value. The
+  port's set covers every type the on-disk format uses, so no metadata object
+  is out of reach; a wider set would need value kinds nothing in the format
+  stores. A signature that is not a type at all kills the tool with a signal
+  (`--print-variant-type=zz` exits 139 after two GLib assertions), and the port
+  refuses it with the same line;
+- `show --print-variant-type` memory-maps the file in the tool and the port reads
+  it whole, up to sixteen mebibytes, refusing a larger one by name. A metadata
+  object the format defines stays far below that;
+- the tool takes more than one `OBJECT` and reads the first, ignoring the rest;
+  the port refuses the second with clap's `error: unexpected argument '<value>'
+  found`. Both exit 1 only in the port's case, so an invocation naming two
+  objects reports in one and reads in the other;
+- a revision resolving to a commit the store does not hold is refused in the
+  words "P1 -- reading and resolution" above records, now at `log` and `ls` as
+  well: the tool names the loose object file and the port names the object type.
+  `show` is the one command of the three where the two agree, the tool's own
+  wording there being `error: Couldn't find file object '<checksum>'`, which the
+  port reproduces because a bare checksum reaches `show` with no type;
+- the GPG signature report a signed commit draws agrees line for line except the
+  instant the signature was made: the tool renders it through gpgme in the host's
+  locale and time zone (`Wed 05 Aug 2026 17:11:19 CEST`) and the port renders it
+  in UTC in the shape its own `Date:` line carries (`2026-08-05 15:11:19 +0000`).
+  Matching the tool would need a locale database and the host time zone, neither
+  of which the port carries, and the rendering states no repository fact. The
+  algorithm name, the short key id, the user id, and the three verdict lines are
+  the same in both.
+
+Absent:
+
+- `config set` and `config unset`, which need the config write path Phase 17e
+  lands. The port accepts the operation names and reports `error: The <operation>
+  operation is not implemented yet` at exit 1, rather than the unknown-operation
+  line, so the gap is stated rather than misreported.
 
 ## P2 -- options missing from commands that exist
 
@@ -629,24 +677,18 @@ Observed by running the tool (2026.1).
 ## Output formats still to recover
 
 A script reads standard output, so the format is part of the surface. The
-formats of `refs`, `rev-parse`, and `cat` are recovered and recorded in
-`../format-reference.md`, "CLI output formats". Each format below still needs a
-black-box observation pass, and the results belong in that same section.
+formats of `commit`, `refs`, `rev-parse`, `cat`, `show`, `log`, `ls`, and
+`config get`, together with the GVariant text form the reading commands share,
+are recovered and recorded in `../format-reference.md`, "CLI output formats" and
+"The GVariant text form". Each format below still needs a black-box observation
+pass, and the results belong in that same section.
 
-- `ls` in each of its five option combinations, including the NUL-separated
-  form.
-- `show`, `show --raw`, and each `--print-*` form. The `--raw` and metadata-key
-  forms print GVariant in the GLib text form, so the port needs a variant
-  printer that matches it. This is a distinct piece of work inside Phase 17 and
-  is easy to overlook.
-- `log` and `log --raw`.
-- `config get`.
 - `diff`, including the per-path change prefixes and `--stats`.
 - `fsck` progress output and its `-q` form.
 - `prune` totals.
 - `summary -v`, `--raw`, and `--list-metadata-keys`.
 - `static-delta list`, `show`, and `indexes`.
-- `commit`, including the checksum line and `--table-output`.
+- `commit --table-output`.
 - `pull` progress output.
 - `remote list`, `show-url`, `refs`, and `summary`.
 
@@ -665,6 +707,8 @@ black-box observation pass, and the results belong in that same section.
 5. The P2 option gaps on `commit` and `checkout`, which the corpora need:
    `--owner-uid`, `--owner-gid`, `--timestamp`, `--no-xattrs`, `-U`, `--subpath`.
    Done, Phase 17c.
-6. `show`, `log`, `ls`, `config`, together with the variant printer.
+6. `show`, `log`, `ls`, and `config get`, together with the variant printer.
+   Done, Phase 17d. `config set` and `unset` moved to step 7's phase, needing the
+   config write path Phase 17e lands.
 7. The remaining P2 gaps.
 8. P3.

@@ -2545,3 +2545,250 @@ self-referencing symlink kills the tool with a signal (recovered with a link
 whose target is its own name); the port reaches its 256-link bound and reports
 `error: Too many levels of symbolic links`, which is also the message a chain of
 257 distinct links gets.
+
+### The GVariant text form
+
+The reading commands render a metadata value as text with GLib's own printer, so
+the convention belongs to GVariant rather than to ostree and lives in
+`ostrya-gvariant` beside the value type. It is the form `show --raw`,
+`show --print-metadata-key`, `show --print-detached-metadata-key`,
+`show --print-variant-type`, `ls -X`, and `summary --raw` all write. Recovered
+by giving the tool one hand-written serialized value per rule through
+`show --print-variant-type=TYPE`, which reads any file as a value of a named
+type:
+
+- A value whose literal does not state its own type carries a type annotation:
+  `byte 0x2a`, `uint32 42`, `uint64 42`. A byte is two lowercase hex digits
+  behind `0x`. A boolean prints `true` or `false` and a string prints quoted, and
+  neither carries an annotation.
+- A container holding at least one element delegates its annotation to its first
+  element, and the elements after it print unannotated: `aay` holding two byte
+  arrays prints `[[byte 0x63], [0x62]]`. A tuple annotates every member, whose
+  types do not follow one another: `(byte 0x01, byte 0x02)`. A one-member tuple
+  keeps a trailing comma, `(byte 0x01,)`, and the empty tuple prints `()`.
+- A container holding no element has nowhere to delegate to, so it carries its
+  own signature: `@ay []`, `@a(say) []`, `@a{sv} {}`. An empty container in an
+  unannotated position prints the bare literal, so `aay` holding a byte array and
+  then an empty one prints `[[byte 0x63], []]`.
+- An array of dict entries prints as one brace-enclosed list of `key: value`
+  pairs rather than a list of entries: `{'a': byte 0x01, 'b': 0x02}`. A dict
+  entry outside an array prints `{key, value}`, with a comma.
+- A variant prints `<child>`, and the child is always annotated, since a variant
+  states no child type of its own: `<byte 0x2a>`.
+- A byte array whose last byte is the only NUL it holds prints as a bytestring
+  literal, `b'user.foo'`, which states its own type and carries no annotation.
+  Every other byte array prints as the element list, `[byte 0x01, 0x02, 0xff]`;
+  the empty one has no trailing NUL and so prints `@ay []`. The rule reaches real
+  metadata: an xattr name is stored NUL-terminated and prints as a bytestring
+  while its value does not, and a 64-byte ed25519 signature whose last byte
+  happens to be zero prints as one too.
+
+The two literal forms escape differently, which one string holding the same
+bytes shows: as a string it is `'a"b'` and as a bytestring `b'a\"b'`.
+
+- A string is written in single quotes, or in double quotes when it holds a
+  single quote, so the quote it holds needs no escape. Only the quote in use is
+  escaped, so `"` stays literal inside single quotes. `\a`, `\b`, `\f`, `\n`,
+  `\r`, `\t`, `\v`, and `\\` take their short escape; every other C0 control and
+  DEL takes `\uXXXX` in four lowercase hex digits; and every other character,
+  ASCII or not, is written through, so UTF-8 stays readable.
+- A bytestring is written in single quotes, or in double quotes when its content
+  holds a single quote. A backslash and a double quote are always escaped, even
+  inside single quotes. `\b`, `\f`, `\n`, `\r`, `\t`, and `\v` take their short
+  escape, and every byte outside printable ASCII takes a three-digit octal
+  escape: `b'\377'`, `b'h\303\251'`.
+
+Byte order. The on-disk format places its numeric fields in the variant already
+big-endian while the framing stays little-endian, so a value parsed from those
+bytes holds each numeric field byte-reversed. One byteswap of the whole value
+tree recovers the numbers the fields state, and that is what the default report
+does: the commit whose stored timestamp field is `1700000000` big-endian reports
+`uint64 1700000000`, and `-B` reports the stored form, `uint64
+67927162644070400`. The swap reaches a numeric field inside a variant, so a
+`t`-valued metadata key written natively reports byteswapped. It reaches
+`--print-metadata-key` and `--print-detached-metadata-key` as well, and not
+`--print-variant-type`, whose report is byteswapped whether or not `-B` is given.
+
+### `show`
+
+The reporting modes are mutually exclusive, and where more than one is given the
+highest of this order wins, each printing and exiting 0. The order was recovered
+by giving the tool each pair:
+
+1. `--print-detached-metadata-key=KEY`
+2. `--print-metadata-key=KEY`
+3. `--list-detached-metadata-keys`
+4. `--list-metadata-keys`
+5. `--print-related`
+6. `--print-variant-type=TYPE`
+7. `--print-sizes`
+8. the object's own report, which `--raw` and `-B` extend
+
+The object argument. A 64-character lowercase checksum names an object whose type
+is recovered by probing the store in the order commit, dirtree, dirmeta, file, so
+the argument carries no type; anything else is a revision, resolved to a commit.
+A checksum naming nothing reports the last probe's failure, `error: Couldn't find
+file object '<checksum>'`, at exit 1. A revision that resolves to nothing reports
+`error: Refspec '<rev>' not found`. With no argument the usage text and `error: An
+object argument is required` go to standard error at exit 1.
+
+A metadata object reports its type and checksum on one line, `commit
+<checksum>`, `dirtree <checksum>`, or `dirmeta <checksum>`. `--raw` adds the
+value in the text form on the line below it and reports nothing more, so a
+commit's own report is suppressed. `-B` adds the same line with the numeric
+fields as stored, and a commit's own report still follows it, whether or not
+`--raw` was given as well.
+
+A commit's own report, in order, one line each: `Parent:  <checksum>` when the
+commit has a parent; `ContentChecksum:  <checksum>`, the SHA-256 over the two
+root checksums "Checksum computation" above defines; `Date:  <YYYY-MM-DD
+HH:MM:SS +0000>`, the timestamp in UTC, read as a signed count of seconds so a
+pre-epoch instant stored as the unsigned field's two's-complement form reports
+`1969-12-31 23:59:59 +0000`; and `Version: <value>` when the commit metadata
+carries a `version` key, with one space after the colon where the three lines
+above it carry two. Then the subject: a blank line, then each of its lines
+indented four spaces; an empty subject reports `(no subject)` with no blank line
+before it. Then the body, when it is not empty: a blank line, then each of its
+lines indented four spaces. Then one blank line, which closes the report.
+
+A file object reports its header instead, one field per line: `Object:
+<checksum>`, `Type: file`, `File Type: regular` with `Size: <bytes>` or `File
+Type: symlink` with `Target: <target>`, `Mode: 0<octal st_mode>` (the full mode
+including the file-type bits, behind a literal `0`), `Uid: <id>`, `Gid: <id>`,
+and `Extended Attributes: { <a(ayay) in the text form> }`. `--raw` and `-B`
+change nothing here.
+
+`--print-related` prints one line per entry of the commit's related-objects
+array, `<ref> <checksum>`. No `commit` option writes such an entry, so the array
+is empty on every commit either implementation produces and the mode prints
+nothing at exit 0; the line shape was recovered by assembling a commit that
+carries two entries and reading it back.
+
+`--list-metadata-keys` and `--list-detached-metadata-keys` print one key per
+line, sorted, rather than in the order the dict stores them. A commit with no
+`.commitmeta` reports `error: No detached metadata for commit <checksum>` at exit
+1 under either detached mode.
+
+`--print-metadata-key=KEY` and `--print-detached-metadata-key=KEY` print the
+value the key holds, unwrapped from its `v` and annotated as a value of its own
+type. A key the dict does not hold reports `error: No such metadata key '<key>'`
+at exit 1. Where the same option is given more than once the last wins.
+
+A checksum naming no object at all reports the file probe's failure, and the line
+carries a prefix naming the open in every mode that stores the payload in the
+object file itself: `error: Opening content object <checksum>: Couldn't find file
+object '<checksum>'` in `bare` and `bare-user`, and the bare refusal alone in
+`archive`, whose object carries its own header.
+
+`--print-hex` applies to a key whose value type is exactly `ay`: the bytes print
+as unquoted lowercase hex with no separator, and an empty array prints an empty
+line. A value of any other type, `aay` included, ignores the switch.
+
+`--print-sizes` totals the commit's `ostree.sizes` metadata over three lines:
+
+```text
+Compressed size (needed/total): <n> bytes/<n> bytes
+Unpacked size (needed/total): <n> bytes/<n> bytes
+Number of objects (needed/total): <n>/<n>
+```
+
+The "needed" figures cover the recorded objects absent from the local store, so
+they are zero in a complete repository and count the missing objects otherwise. A
+commit that carries no such key reports `error: No metadata key ostree.sizes in
+commit` at exit 1.
+
+`--print-variant-type=TYPE` reads the object argument as a filename rather than a
+revision and reports the file's bytes as a value of that type. A path that does
+not open reports `error: openat(<path>): <reason>` at exit 1.
+
+A commit carrying GPG signatures reports them after its own report: a blank
+line, `Found <n> signature:` (or `signatures:` for more than one), then per
+signature a blank line and two indented lines, `  Signature made <date> using
+<algorithm> key ID <the fingerprint's last sixteen hex digits>` and one of
+`  Good signature from "<user id>"`, `  BAD signature from "<user id>"`, or
+`  Can't check signature: public key not found`. The exit status stays 0 whatever
+the verdict. The keyring is the repository's own `gpgkeys.gpg`;
+`--gpg-verify-remote=REMOTE` reads that remote's trusted set instead, and
+`--gpg-homedir=HOMEDIR` adds the keyrings in the named directory.
+
+### `log`
+
+Walks the parent chain from the given revision, newest first, and reports each
+commit exactly as `show` does: `commit <checksum>` and then the commit's own
+report. `--raw` reports `commit <checksum>` and the value in the text form for
+each commit and nothing else, the same suppression `show --raw` makes. A parent
+whose commit object is absent ends the walk with `<< History beyond this commit
+not fetched >>` on its own line, at exit 0, so a partial history reports what it
+holds; a `.commitpartial` marker changes nothing. A revision that resolves to
+nothing reports `error: Refspec '<rev>' not found` at exit 1, and with no
+argument the usage text and `error: A rev argument is required` go to standard
+error at exit 1.
+
+### `ls`
+
+Prints one line per entry:
+
+```text
+<type><mode> <uid> <gid> <size>[ <checksum>...][ { <xattrs> }] <path>[ -> <target>]
+```
+
+The type is `d` for a directory, `-` for a regular file, and `l` for a symlink.
+The mode is the permission bits alone (`mode & 07777`) in five octal digits, so
+`00755`, `00644`, and a symlink's `00777`. The uid and gid are decimal with no
+padding. The size is right-aligned in six columns: the payload size of a regular
+file, and zero for a directory and for a symlink. The path is absolute, and a
+symlink adds ` -> ` and its target.
+
+`-C`/`--checksum` inserts the checksums after the size: one for a file, its
+content checksum, and two for a directory, its dirtree and then its dirmeta.
+`-X`/`--xattrs` inserts the entry's `a(ayay)` xattr set after them, wrapped in
+`{ ` and ` }`, so an entry with none reports `{ @a(ayay) [] }`.
+`--nul-filenames-only` prints the paths alone, each followed by a NUL, with no
+columns, no target, and no newline; it overrides `-C` and `-X`.
+
+Order and recursion. A directory reports itself and then its entries: its files
+in name order, then its subdirectories in name order, which is the order the
+dirtree stores them in rather than one merged sort, so a directory `aaa` follows a
+file `zzz`. `-R`/`--recursive` follows each subdirectory's contents immediately
+after the line naming it. `-d`/`--dironly` reports the directory alone.
+
+With no `PATH` the tree root is the directory listed. Each `PATH` is listed in
+turn, a leading `/` optional, and a `PATH` naming a file reports that one line. A
+`PATH` naming nothing reports `error: Inspecting path '<argument>': No such file
+or directory: <absolute path>` at exit 1, quoting the argument as given and
+naming the absolute path it resolved to. An empty `PATH` resolves to the root and
+is refused all the same, `error: Inspecting path '': No such file or directory:
+/`. With no `COMMIT` the usage text and `error: An COMMIT argument is required`
+go to standard error at exit 1, the tool's own wording.
+
+### `config get`
+
+Prints the value and a newline at exit 0. The key is `sectionname.keyname`, split
+on its first `.`, so `config get a.b.c` reads the key `b.c` in the group `a`.
+`--group=GROUP` names the section instead and the argument is then a whole key
+name, dots included.
+
+The value is unescaped as GKeyFile defines: `\n`, `\t`, and `\\` become the
+characters they name. Whitespace after the `=` is dropped and trailing whitespace
+is kept. A `;` is an ordinary character, a `"` is not a quote, and a value with
+nothing after the `=` prints an empty line.
+
+The refusals, each exit 1 with no usage text: a key holding no `.` with no
+`--group` reports `error: Key must be of the form "sectionname.keyname"`, in
+ASCII double quotes; a group the file does not hold reports `error: Key file does
+not have group “<group>”`; a key the group does not hold reports `error: Key file
+does not have key “<key>” in group “<group>”`; no key at all reports `error: KEY
+must be specified`, or `error: Group name and key must be specified` when
+`--group` was given; and an operation that is not `get`, `set`, or `unset`
+reports `error: Unknown operation <operation>`. The two messages naming a group
+or a key quote it in typographic quotes (U+201C and U+201D), the pair GLib uses.
+
+Two checks stand ahead of the operation name, each printing the usage text and
+then its error line at exit 1, and both after the repository resolves. With no
+operation at all: `error: OPERATION must be specified`. With more operands than
+the operation takes: `error: Too many arguments given`. The allowance is one
+operand beside the operation, and two for `set`, which takes a key and a value, so
+`get KEY EXTRA`, `unset KEY EXTRA`, and `set KEY VALUE EXTRA` are each refused
+while `set KEY VALUE` is not. An operation the tool does not know gets the
+one-operand allowance, so `<unknown> KEY EXTRA` reports the count and
+`<unknown> KEY` reports the unknown operation.

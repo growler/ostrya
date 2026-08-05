@@ -16,6 +16,28 @@ use crate::error::{Error, Result};
 use crate::object::{self, MAX_METADATA_SIZE};
 use crate::repo::Repo;
 
+/// The totals a commit's `ostree.sizes` metadata states, together with the part
+/// of them whose objects are absent from the local store.
+///
+/// The metadata key is written by a commit that asked for it, so a commit
+/// without the key has no sizes to report and
+/// [`commit_sizes`](Repo::commit_sizes) yields `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommitSizes {
+    /// On-disk (compressed) bytes over every recorded object.
+    pub compressed_total: u64,
+    /// On-disk bytes over the recorded objects absent locally.
+    pub compressed_needed: u64,
+    /// Uncompressed bytes over every recorded object.
+    pub unpacked_total: u64,
+    /// Uncompressed bytes over the recorded objects absent locally.
+    pub unpacked_needed: u64,
+    /// How many objects the metadata records.
+    pub objects_total: u64,
+    /// How many of the recorded objects are absent locally.
+    pub objects_needed: u64,
+}
+
 /// The completeness state of a commit in the local store.
 ///
 /// A commit is [`Partial`](CommitState::Partial) while a
@@ -93,6 +115,43 @@ impl Repo {
             .load_object_bytes(ObjectType::DirMeta, checksum)
             .await?;
         Ok(DirMeta::parse(&bytes)?)
+    }
+
+    /// Total the `ostree.sizes` metadata of a commit, or `None` when the commit
+    /// carries no such key.
+    ///
+    /// An entry whose object is absent from the local store counts toward the
+    /// "needed" totals. An entry that records no object type is read as a file
+    /// object, the only type the key covers on the commits that omit it.
+    pub async fn commit_sizes(&self, checksum: &Checksum) -> Result<Option<CommitSizes>> {
+        let (commit, _) = self.load_commit(checksum).await?;
+        let Some(value) = commit.metadata.dict_get("ostree.sizes") else {
+            return Ok(None);
+        };
+        let packed = match value.as_variant() {
+            Some((_, inner)) => inner,
+            None => value,
+        };
+        let entries = packed.as_array().ok_or_else(|| {
+            Error::InvalidFormat("ostree.sizes is not an array of packed entries".into())
+        })?;
+        let mut sizes = CommitSizes::default();
+        for packed in entries {
+            let buf = packed.as_bytes().ok_or_else(|| {
+                Error::InvalidFormat("an ostree.sizes entry is not a byte array".into())
+            })?;
+            let entry = ostrya_core::sizes::unpack_entry(buf)?;
+            sizes.compressed_total += entry.compressed;
+            sizes.unpacked_total += entry.unpacked;
+            sizes.objects_total += 1;
+            let ty = entry.objtype.unwrap_or(ObjectType::File);
+            if !self.has_object(ty, &entry.checksum).await? {
+                sizes.compressed_needed += entry.compressed;
+                sizes.unpacked_needed += entry.unpacked;
+                sizes.objects_needed += 1;
+            }
+        }
+        Ok(Some(sizes))
     }
 
     /// The on-disk (compressed) size of a loose object, used to recover an

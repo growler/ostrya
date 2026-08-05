@@ -242,9 +242,20 @@ reproduced:
   characters is refused by the tool wherever that ref is resolved, with `error:
   Invalid character '<byte>' in rev '<content>'`, naming the first character it
   refuses by byte value, and the port's reader takes either case and resolves it.
-  Both implementations write the lowercase form, so only an out-of-band write
-  puts such content in a ref file, and the port keeps the tolerant reader because
-  the same parser reads a checksum out of delta metadata. The rule for a
+  `commit -b BRANCH` is one of those sites, reached through the implicit parent,
+  and the one site where the divergence changes what a write produces: over a ref
+  file holding the uppercase rendering of a commit checksum the tool reports that
+  line and exits 1, and the port exits 0 and writes a commit carrying the
+  lowercased checksum as its parent. Content that is no checksum at all is
+  refused by both in different words, each exiting 1 and leaving the ref file in
+  place: the tool names the content, `error: Invalid rev <content>`, and the port
+  gives the library's own rendering, `error: invalid checksum: hex checksum is
+  not 64 characters`, rather than the capitalized resolution wording this site
+  otherwise carries, because `report_resolution_failure`
+  (`crates/ostrya-cli/src/main.rs`) maps `RefNotFound` and `NoParentCommit`
+  alone. Both implementations write the lowercase form, so only an out-of-band
+  write puts such content in a ref file, and the port keeps the tolerant reader
+  because the same parser reads a checksum out of delta metadata. The rule for a
   64-character name agrees in both, and is in `../format-reference.md`,
   "Revision syntax".
 
@@ -299,9 +310,9 @@ Absent:
 
 The command exists and the matrix exercises an option it does not accept.
 
-`commit` accepts `--repo`, `--parent`, `-b/--branch`, `-s/--subject`, and
-`--canonical-permissions`. Missing: `-m/--body`, `-F/--body-file`,
-`-e/--editor`, `--orphan`, `--no-bindings`, `--bind-ref=BRANCH`, `--base=REV`,
+`commit` accepts `--repo`, `--parent`, `-b/--branch`, `--orphan`, `-s/--subject`,
+and `--canonical-permissions`. Missing: `-m/--body`, `-F/--body-file`,
+`-e/--editor`, `--no-bindings`, `--bind-ref=BRANCH`, `--base=REV`,
 `--tree`, `--add-metadata-string=KEY`, `--add-metadata=KEY`,
 `--keep-metadata=KEY`, `--add-detached-metadata-string=KEY`, `--owner-uid=UID`,
 `--owner-gid=GID`, `--bootable`, `--mode-ro-executables`, `--no-xattrs`,
@@ -318,35 +329,28 @@ by every reproducible cell. `--tree` is needed because the port reads a tar
 stream from standard input where the tool takes `--tree=tar=PATH`; the two forms
 must converge.
 
-One `commit` divergence is a behavior rather than a missing option, found while
-building the Phase 17b fixtures, and it has a sub-phase of its own: Phase 17b1
-of `../port-plan.md`. `ostree commit -b BRANCH` with no `--parent` parents the
-new commit on that branch's current tip; `ostrya commit -b BRANCH` writes a root
-commit every time, so committing twice onto one branch produces two commits with
-no `parent` field and no ancestry for `rev-parse REV^` to walk. Four further
-facts recovered while scoping that fix:
+One `commit` divergence sits at the values `--parent` takes, the parenting
+behavior itself being shared (`../format-reference.md`, "CLI output formats").
+The tool reads the value with a reader that takes a 64-character lowercase
+checksum or the literal `none`, and the port resolves any revision there, which is
+a superset of that syntax like the leading `--repo` form above. Each side refuses
+what it cannot read, at exit 1, writing nothing:
 
-- `--parent=none` asks for a root commit on a branch that has a tip, and
-  `--orphan` does the same. With `-b` given the ref still moves to the new
-  commit in both cases, so what `--orphan` suppresses there is the parent and
-  not the ref write.
-- `--parent` takes a 64-character lowercase checksum or the literal `none`. Both
-  an abbreviated checksum and a refspec are rejected with `error: Invalid rev
-  <value>`, where the port resolves either; the port's leniency here is a
-  superset of the tool's syntax, like the leading `--repo` form above, and
-  Phase 17b1 keeps it. The tool reads the value with the parser that refuses a
-  non-lowercase rendering, so `--parent=<UPPER>` reports `error: Invalid
-  character '<byte>' in rev '<value>'`, where the port reads a 64-character
-  uppercase name as a refspec and reports `error: Refspec '<value>' not found`.
-  Both exit 1 and write nothing. The port's `--parent` carries the resolution
-  wording every subcommand taking a revision gives, so an ancestry suffix over a
-  root commit reports `error: Commit <checksum> has no parent` where the tool
-  refuses the syntax with `error: Invalid rev <value>`.
-- The `--parent` checksum's existence is not checked: a parent naming no object
-  commits successfully.
-- A commit with neither `-b` nor `--orphan` is refused with `error: A branch
-  must be specified with --branch, or use --orphan`. The port accepts that form
-  and prints the checksum without writing a ref.
+- an abbreviated checksum and a refspec report `error: Invalid rev <value>` from
+  the tool, where the port resolves a refspec naming a ref and reports `error:
+  Refspec '<value>' not found` for one naming none;
+- an empty value reports `error: Invalid rev ` from the tool and `error:
+  Invalid refspec ` from the port, the one refusal at this site the port words
+  with its refspec validator;
+- a non-lowercase rendering reports `error: Invalid character '<byte>' in rev
+  '<value>'` from the tool, naming the first byte it refuses by decimal value,
+  where the port reads a 64-character uppercase name as a refspec and reports
+  `error: Refspec '<value>' not found`. `--parent=NONE` parts the two the same
+  way, the literal being lowercase in both;
+- an ancestry suffix reports the base alone, `--parent=<checksum>^` giving `error:
+  Invalid rev <checksum>` from the tool, where the port walks it and carries the
+  resolution wording every subcommand taking a revision gives, so the ancestry of
+  a root commit reports `error: Commit <checksum> has no parent`.
 
 A second `commit` divergence sits beside the branch-name guard both
 implementations now carry: `commit -b <64 lowercase hex>` is refused in the same
@@ -594,7 +598,7 @@ black-box observation pass, and the results belong in that same section.
    variant printer, and it reads a file object over the same path `refs` and
    `rev-parse` opened.
 4. `commit` parenting, which `rev-parse REV^` and `log` both read and which
-   step 3 exposed. Phase 17b1.
+   step 3 exposed. Done, Phase 17b1.
 5. The P2 option gaps on `commit` and `checkout`, which the corpora need:
    `--owner-uid`, `--owner-gid`, `--timestamp`, `--no-xattrs`, `-U`, `--subpath`.
 6. `show`, `log`, `ls`, `config`, together with the variant printer.

@@ -87,6 +87,7 @@ impl Context<'_> {
 pub fn apply(names: &[&str], context: &Context<'_>) -> Result<BTreeMap<String, String>, String> {
     let mut bindings = BTreeMap::new();
     bindings.insert(IMPLICIT.to_owned(), path_text(context.root)?);
+    let mut corpus_tree = CorpusTree::default();
 
     for name in names {
         match *name {
@@ -101,8 +102,7 @@ pub fn apply(names: &[&str], context: &Context<'_>) -> Result<BTreeMap<String, S
             "repo-with-commit" => {
                 let repo = context.root.join("repo");
                 create(context, &repo, context.mode)?;
-                let tree = corpus::tree_path(context.root, context.corpus);
-                corpus::materialize(context.corpus, &tree)?;
+                let tree = corpus_tree.get(context)?;
                 let revision = commit(context, &repo, BRANCH, &tree)?;
                 bind(&mut bindings, "REPO", &repo)?;
                 insert(&mut bindings, "BRANCH", BRANCH.to_owned())?;
@@ -129,8 +129,7 @@ pub fn apply(names: &[&str], context: &Context<'_>) -> Result<BTreeMap<String, S
             "src-dst" => {
                 let source = context.root.join("src");
                 create(context, &source, context.src_mode)?;
-                let tree = corpus::tree_path(context.root, context.corpus);
-                corpus::materialize(context.corpus, &tree)?;
+                let tree = corpus_tree.get(context)?;
                 commit(context, &source, BRANCH, &tree)?;
                 let destination = context.root.join("dst");
                 create(context, &destination, context.dst_mode)?;
@@ -138,8 +137,7 @@ pub fn apply(names: &[&str], context: &Context<'_>) -> Result<BTreeMap<String, S
                 bind(&mut bindings, "DST", &destination)?;
             }
             "tree" => {
-                let tree = corpus::tree_path(context.root, context.corpus);
-                corpus::materialize(context.corpus, &tree)?;
+                let tree = corpus_tree.get(context)?;
                 bind(&mut bindings, "TREE", &tree)?;
             }
             "out-dir" => {
@@ -203,6 +201,28 @@ fn expect_output(tool: &Tool, cwd: &Path, args: &[String]) -> Result<exec::Outco
 
 fn bind(bindings: &mut BTreeMap<String, String>, name: &str, path: &Path) -> Result<(), String> {
     insert(bindings, name, path_text(path)?)
+}
+
+/// The corpus tree of one side, materialized on first use. Every setup that
+/// needs the corpus names one path for it, so two setups in the same record
+/// share the tree the first of them wrote. A second materialization over one
+/// path fails: `C0` and `C3` end at a symlink and `C8` at a hard link, and
+/// each reports `EEXIST` once the entry stands.
+#[derive(Default)]
+struct CorpusTree {
+    path: Option<PathBuf>,
+}
+
+impl CorpusTree {
+    fn get(&mut self, context: &Context<'_>) -> Result<PathBuf, String> {
+        if let Some(path) = &self.path {
+            return Ok(path.clone());
+        }
+        let path = corpus::tree_path(context.root, context.corpus);
+        corpus::materialize(context.corpus, &path)?;
+        self.path = Some(path.clone());
+        Ok(path)
+    }
 }
 
 fn insert(

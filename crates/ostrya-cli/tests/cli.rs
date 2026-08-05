@@ -484,7 +484,8 @@ fn checkout_roundtrips_and_matches_tool() {
     .ok();
 
     // Re-committing the checkout with the same options reproduces the commit:
-    // checkout is stable.
+    // checkout is stable. `--parent=none` keeps the second commit a root commit,
+    // the branch it names already holding a tip the implicit parent would take.
     let recommit = ostrya(
         &[
             "commit",
@@ -494,6 +495,7 @@ fn checkout_roundtrips_and_matches_tool() {
             BRANCH,
             "-s",
             SUBJECT,
+            "--parent=none",
             "--canonical-permissions",
             dest_port.to_str().unwrap(),
         ],
@@ -1944,11 +1946,18 @@ fn pull_sign_verify_switch_overrides_the_configuration() {
 
 /// Run the `ostree` tool with `args`.
 fn ostree(args: &[&str]) -> Run {
-    let out = Command::new("ostree")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .expect("spawn ostree");
+    ostree_env(args, &[])
+}
+
+/// The same with `env` added to the tool's environment, which the commits both
+/// implementations must reproduce need for `SOURCE_DATE_EPOCH`.
+fn ostree_env(args: &[&str], env: &[(&str, &str)]) -> Run {
+    let mut command = Command::new("ostree");
+    command.args(args).stdin(Stdio::null());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = command.output().expect("spawn ostree");
     Run {
         status: out.status,
         stdout: out.stdout,
@@ -1959,6 +1968,16 @@ fn ostree(args: &[&str]) -> Run {
 /// Run `args` against each implementation's own repository, passing the path as
 /// a trailing `--repo`, the position both accept in either form.
 fn run_both(port_repo: &Path, tool_repo: &Path, args: &[&str]) -> (Run, Run) {
+    run_both_env(port_repo, tool_repo, args, &[])
+}
+
+/// The same with `env` given to both implementations.
+fn run_both_env(
+    port_repo: &Path,
+    tool_repo: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Run, Run) {
     let with_repo = |repo: &Path| {
         let mut all = vec![args[0].to_owned(), "--repo".to_owned()];
         all.push(repo.display().to_string());
@@ -1970,16 +1989,24 @@ fn run_both(port_repo: &Path, tool_repo: &Path, args: &[&str]) -> (Run, Run) {
     let port = ostrya(
         &port_args.iter().map(String::as_str).collect::<Vec<_>>(),
         None,
-        &[],
+        env,
     );
-    let tool = ostree(&tool_args.iter().map(String::as_str).collect::<Vec<_>>());
+    let tool = ostree_env(
+        &tool_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        env,
+    );
     (port, tool)
 }
 
 /// Run `args` against `repo` under both implementations and assert that the
 /// exit status and both streams agree.
 fn assert_agrees(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
-    let (port, tool) = run_both(port_repo, tool_repo, args);
+    assert_agrees_env(port_repo, tool_repo, args, &[]);
+}
+
+/// The same with `env` given to both implementations.
+fn assert_agrees_env(port_repo: &Path, tool_repo: &Path, args: &[&str], env: &[(&str, &str)]) {
+    let (port, tool) = run_both_env(port_repo, tool_repo, args, env);
     let render = |run: &Run| {
         format!(
             "exit {:?}\nstdout: {:?}\nstderr: {:?}",
@@ -4304,14 +4331,14 @@ fn rev_parse_ancestry_matches_the_tool() {
     build_fixture_source(base);
     let repo = create_repo(base, RepoMode::Archive);
     let src = base.join("src");
-    // The chain is built with an explicit --parent, and with a checksum: the
-    // port does not default the parent to the branch tip and the tool's own
-    // --parent takes no refspec (`docs/conformance/cli-surface.md`, "P2").
+    // The chain is built by committing three times onto one branch, each commit
+    // taking the branch's tip as its parent with no `--parent` of its own, which
+    // is the parenting Phase 17b1 landed (`docs/port-plan.md`).
     let root = commit_tree(&repo, "chain", &src, None);
     std::fs::write(src.join("hello.txt"), b"second revision\n").unwrap();
-    let middle = commit_tree(&repo, "chain", &src, Some(&root));
+    commit_tree(&repo, "chain", &src, None);
     std::fs::write(src.join("hello.txt"), b"third revision\n").unwrap();
-    let tip = commit_tree(&repo, "chain", &src, Some(&middle));
+    let tip = commit_tree(&repo, "chain", &src, None);
 
     let tip_parent = format!("{tip}^");
     for args in [
@@ -4642,6 +4669,252 @@ fn checksum_case_matches_the_tool() {
         String::from_utf8_lossy(&tool.stderr),
         format!("error: Invalid character '65' in rev '{absent_upper}'\n"),
     );
+}
+
+/// `commit` parenting: a branch's current tip is the parent a commit naming that
+/// branch inherits, a tip standing over an absent commit object included,
+/// `--parent=none` and `--orphan` each ask for a root commit while the ref still
+/// moves, `--orphan` alone permits a commit that names no branch, and a commit
+/// naming neither is refused (`docs/format-reference.md`, "CLI output formats").
+///
+/// Both sides commit under one `SOURCE_DATE_EPOCH`, so each printed checksum
+/// states the whole commit object, the `parent` field included, rather than
+/// stating that a commit happened.
+#[test]
+fn commit_parenting_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-parenting");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let tree = base.join("src");
+    let src = tree.to_str().unwrap();
+    let empty = create_repo(base, RepoMode::Archive);
+    let untouched = describe_refs(&empty);
+    let objects = |repo: &Path| {
+        std::fs::read_dir(repo.join("objects"))
+            .unwrap()
+            .filter_map(|fanout| std::fs::read_dir(fanout.unwrap().path()).ok())
+            .map(|entries| entries.count())
+            .sum::<usize>()
+    };
+    let epoch = [("SOURCE_DATE_EPOCH", SOURCE_DATE_EPOCH)];
+    /// A commit onto the branch `chain`, with `extra` between the subject and the
+    /// tree the commit reads.
+    fn commit_args<'a>(subject: &'a str, extra: &[&'a str], src: &'a str) -> Vec<&'a str> {
+        let mut args = vec!["commit", "-b", "chain", "-s", subject];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--canonical-permissions", src]);
+        args
+    }
+
+    // The first commit onto a fresh branch has no tip to take, so it is a root
+    // commit; the second takes the tip the first left.
+    let port_repo = clone_repo(base, &empty, "chain-port");
+    let tool_repo = clone_repo(base, &empty, "chain-tool");
+    assert_agrees_env(
+        &port_repo,
+        &tool_repo,
+        &commit_args("one", &[], src),
+        &epoch,
+    );
+    let root = resolve(&port_repo, "chain").expect("the first commit moved the ref");
+    assert_agrees_on_error(
+        &port_repo,
+        &tool_repo,
+        &["rev-parse", "chain^"],
+        &format!("error: Commit {root} has no parent"),
+    );
+    std::fs::write(tree.join("hello.txt"), b"second revision\n").unwrap();
+    assert_agrees_env(
+        &port_repo,
+        &tool_repo,
+        &commit_args("two", &[], src),
+        &epoch,
+    );
+    assert_agrees(&port_repo, &tool_repo, &["rev-parse", "chain^"]);
+    assert_eq!(
+        resolve(&port_repo, "chain^").as_deref(),
+        Some(root.as_str()),
+        "the second commit did not inherit the tip the first left",
+    );
+    assert_eq!(
+        describe_refs(&port_repo),
+        describe_refs(&tool_repo),
+        "the two refs trees differ after two commits onto one branch",
+    );
+    let chained = clone_repo(base, &port_repo, "chained");
+    let tip = resolve(&chained, "chain").expect("the second commit moved the ref");
+
+    // The tip is read from the ref file and not loaded, so a ref standing over an
+    // absent commit object is inherited unread. Only an out-of-band write puts
+    // such a ref in place, so the ref file is written here.
+    let port_repo = clone_repo(base, &empty, "unread-port");
+    let tool_repo = clone_repo(base, &empty, "unread-tool");
+    let unread = "a".repeat(64);
+    for repo in [&port_repo, &tool_repo] {
+        std::fs::write(
+            repo.join("refs/heads/dangling"),
+            format!("{unread}\n").as_bytes(),
+        )
+        .unwrap();
+    }
+    assert_agrees_env(
+        &port_repo,
+        &tool_repo,
+        &[
+            "commit",
+            "-b",
+            "dangling",
+            "-s",
+            "unread",
+            "--canonical-permissions",
+            src,
+        ],
+        &epoch,
+    );
+    let (port_parent, tool_parent) = run_both(&port_repo, &tool_repo, &["rev-parse", "dangling^"]);
+    let inherited = port_parent.ok().stdout_trimmed();
+    assert_eq!(
+        inherited,
+        tool_parent.ok().stdout_trimmed(),
+        "the two parents read back over an absent tip differ",
+    );
+    assert_eq!(
+        inherited, unread,
+        "the absent tip the ref held is not the parent",
+    );
+    assert_eq!(
+        describe_refs(&port_repo),
+        describe_refs(&tool_repo),
+        "the two refs trees differ after a commit over an absent tip",
+    );
+
+    // Each form that asks for a root commit over a branch that has a tip. The ref
+    // moves to the new commit in both cases, so the suppressed parent is the whole
+    // observable effect of `--orphan` where a branch is named.
+    for (case, extra) in [("none", "--parent=none"), ("orphan", "--orphan")] {
+        let port_repo = clone_repo(base, &chained, &format!("{case}-port"));
+        let tool_repo = clone_repo(base, &chained, &format!("{case}-tool"));
+        assert_agrees_env(
+            &port_repo,
+            &tool_repo,
+            &commit_args("root", &[extra], src),
+            &epoch,
+        );
+        let written = resolve(&port_repo, "chain").expect("the ref holds a commit");
+        assert_ne!(written, tip, "`{extra}` left the ref where it was");
+        assert_agrees_on_error(
+            &port_repo,
+            &tool_repo,
+            &["rev-parse", "chain^"],
+            &format!("error: Commit {written} has no parent"),
+        );
+        assert_eq!(
+            describe_refs(&port_repo),
+            describe_refs(&tool_repo),
+            "the two refs trees differ after `{extra}`",
+        );
+    }
+
+    // An explicit `--parent` beside `--orphan` still parents the commit, so what
+    // `--orphan` suppresses is the implicit parent alone.
+    let port_repo = clone_repo(base, &chained, "orphan-parent-port");
+    let tool_repo = clone_repo(base, &chained, "orphan-parent-tool");
+    let parent = format!("--parent={root}");
+    assert_agrees_env(
+        &port_repo,
+        &tool_repo,
+        &commit_args("both", &["--orphan", &parent], src),
+        &epoch,
+    );
+    assert_eq!(
+        resolve(&port_repo, "chain^").as_deref(),
+        Some(root.as_str()),
+        "`--orphan --parent` did not take the parent it was given",
+    );
+
+    // `--orphan` with no branch: both print a checksum and write no ref, and the
+    // commit carries an empty `ostree.ref-binding`, which the tool reads back out
+    // of the port's own commit.
+    let port_repo = clone_repo(base, &empty, "no-branch-port");
+    let tool_repo = clone_repo(base, &empty, "no-branch-tool");
+    let orphan = [
+        "commit",
+        "-s",
+        "lone",
+        "--orphan",
+        "--canonical-permissions",
+        src,
+    ];
+    let (port_run, tool_run) = run_both_env(&port_repo, &tool_repo, &orphan, &epoch);
+    let lone = port_run.ok().stdout_trimmed();
+    assert_eq!(
+        lone,
+        tool_run.ok().stdout_trimmed(),
+        "the two commits that named no branch differ",
+    );
+    for (who, repo) in [("port", &port_repo), ("tool", &tool_repo)] {
+        assert_eq!(
+            describe_refs(repo),
+            untouched,
+            "the {who} wrote a ref for a commit that named no branch",
+        );
+    }
+    let binding = ostree(&[
+        &format!("--repo={}", port_repo.display()),
+        "show",
+        "--print-metadata-key=ostree.ref-binding",
+        &lone,
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&binding.ok().stdout),
+        "@as []\n",
+        "the tool read another binding out of the port's orphan commit",
+    );
+
+    // A commit naming neither a branch nor `--orphan` is refused before the parent
+    // is read, before the tree is read, and before anything is published.
+    let port_repo = clone_repo(base, &empty, "neither-port");
+    let tool_repo = clone_repo(base, &empty, "neither-tool");
+    for args in [
+        vec!["commit", "-s", "x", "--canonical-permissions", src],
+        vec!["commit", "-s", "x", "--parent=nosuchref", src],
+        vec!["commit", "-s", "x", "nosuchdir"],
+    ] {
+        assert_agrees_on_error(
+            &port_repo,
+            &tool_repo,
+            &args,
+            "error: A branch must be specified with --branch, or use --orphan",
+        );
+    }
+    for (who, repo) in [("port", &port_repo), ("tool", &tool_repo)] {
+        assert_eq!(
+            describe_refs(repo),
+            untouched,
+            "the {who} wrote a ref for a commit naming no branch",
+        );
+        assert_eq!(objects(repo), 0, "the {who} published an object");
+    }
+
+    // The `--parent` literal is lowercase alone, so any other spelling is a
+    // revision, which parts the two implementations the way every `--parent`
+    // value that is no checksum does (`docs/conformance/cli-surface.md`, "P2").
+    let (port, tool) = run_both(
+        &port_repo,
+        &tool_repo,
+        &commit_args("upper", &["--parent=NONE"], src),
+    );
+    for (who, run, message) in [
+        ("port", &port, "error: Refspec 'NONE' not found\n"),
+        ("tool", &tool, "error: Invalid rev NONE\n"),
+    ] {
+        assert_eq!(run.status.code(), Some(1), "the {who} did not exit 1");
+        assert_eq!(String::from_utf8_lossy(&run.stderr), message);
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "");
+    }
 }
 
 /// `commit -b` refuses a branch name of 64 lowercase hex characters -- the shape

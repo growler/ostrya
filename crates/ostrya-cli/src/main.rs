@@ -178,12 +178,16 @@ struct InitArgs {
 
 #[derive(Args)]
 struct CommitArgs {
-    /// The parent commit (a checksum or a ref); none for a root commit.
+    /// The parent commit (a checksum or a ref), or `none` for a root commit.
+    /// Absent, the branch's current tip is the parent.
     #[arg(long)]
     parent: Option<String>,
     /// Point this branch at the new commit and bind it into the commit.
     #[arg(short, long)]
     branch: Option<String>,
+    /// Commit with no parent, and permit a commit that names no branch.
+    #[arg(long)]
+    orphan: bool,
     /// The commit subject.
     #[arg(short, long)]
     subject: Option<String>,
@@ -1118,7 +1122,19 @@ fn delta_secret_keys(args: &DeltaGenerateArgs) -> Result<Vec<String>> {
     Ok(keys)
 }
 
+/// The one `--parent` value that is a literal rather than a revision, in
+/// lowercase alone: it asks for a root commit.
+const NO_PARENT: &str = "none";
+
 async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
+    // A commit either names the branch it moves or states that it writes no ref.
+    // The check stands ahead of `--parent`, ahead of the tree, and ahead of any
+    // object publication, which is the order the tool reports it in
+    // (`docs/format-reference.md`, "CLI output formats").
+    if args.branch.is_none() && !args.orphan {
+        exit_error("A branch must be specified with --branch, or use --orphan");
+    }
+
     let txn = repo.transaction().await?;
 
     // `--parent` takes a revision, so it carries the resolution wording every
@@ -1127,6 +1143,7 @@ async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
     // destructor, so the staging directory is reaped ahead of it, the way the
     // branch-name guard below does it.
     let parent = match args.parent.as_deref() {
+        Some(NO_PARENT) => None,
         Some(rev) => match repo.resolve_rev(rev, false).await {
             Ok(found) => found,
             Err(err) => {
@@ -1134,7 +1151,26 @@ async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
                 return Err(report_resolution_failure(err));
             }
         },
-        None => None,
+        // `--orphan` suppresses the implicit parent alone, so an explicit
+        // `--parent` alongside it still parents the commit.
+        None if args.orphan => None,
+        // The branch's current tip is the implicit parent. The tip is read from
+        // the ref file and not loaded, so a branch that names no ref gives a
+        // root commit and a ref over an absent object is inherited unread. A
+        // name the guard below refuses is not read at all, which leaves that
+        // refusal the message and the position it already has.
+        None => match args.branch.as_deref() {
+            Some(branch) if shadowed_branch_name(branch).is_none() => {
+                match repo.resolve_rev(branch, true).await {
+                    Ok(found) => found,
+                    Err(err) => {
+                        txn.abort().await?;
+                        return Err(report_resolution_failure(err));
+                    }
+                }
+            }
+            _ => None,
+        },
     };
 
     let root = match args.path.as_deref() {
@@ -1169,27 +1205,16 @@ async fn commit(repo: Repo, args: CommitArgs) -> Result<()> {
         subject: args.subject,
         body: None,
         timestamp: None,
-        metadata: args.branch.as_deref().map(ref_binding),
+        metadata: Some(ref_binding(args.branch.as_deref())),
     };
     let checksum = txn.write_commit(opts, &root).await?;
     if let Some(branch) = args.branch.as_deref() {
-        // The two shapes the revision syntax shadows are refused at the ref
-        // write, after the commit is written: resolution reads a trailing run
-        // of `^` as ancestry and a name of 64 lowercase hex characters as a
-        // checksum, so a ref carrying either is reachable by no revision
-        // (`docs/format-reference.md`, "Revision syntax"). Each carries the
-        // wording the port already gives that shape -- the ancestry name at
-        // `refs --create`, the checksum name at the tool's own guard -- and the
-        // two are disjoint, a 64-character hex name holding no `^`.
-        // `exit_error` runs no destructor, so the staging directory is reaped
-        // ahead of it.
-        if branch.ends_with('^') {
+        // A branch name the revision syntax shadows is refused at the ref write,
+        // after the commit is written. `exit_error` runs no destructor, so the
+        // staging directory is reaped ahead of it.
+        if let Some(message) = shadowed_branch_name(branch) {
             txn.abort().await?;
-            exit_error(&format!("Invalid refspec {branch}"));
-        }
-        if Checksum::from_hex_lower(branch).is_ok() {
-            txn.abort().await?;
-            exit_error(&format!("Rev name '{branch}' looks like a checksum"));
+            exit_error(&message);
         }
         txn.set_ref(branch, Some(&checksum));
     }
@@ -2716,16 +2741,40 @@ fn report_resolution_failure(err: Error) -> Error {
     }
 }
 
-/// The `ostree.ref-binding` metadata dict binding a commit to `branch`: a single
-/// `as` entry, matching what the tool writes for a branch commit.
-fn ref_binding(branch: &str) -> Value {
+/// The `ostree.ref-binding` metadata dict a commit carries: the branch `-b`
+/// named, or an empty `as` array where the commit names none, which is the value
+/// the tool writes under `--orphan` alone
+/// (`docs/format-reference.md`, "CLI output formats").
+fn ref_binding(branch: Option<&str>) -> Value {
+    let names = branch
+        .map(|branch| Value::Str(branch.to_owned()))
+        .into_iter()
+        .collect();
     Value::Array(vec![Value::Tuple(vec![
         Value::Str("ostree.ref-binding".to_owned()),
         Value::variant(
             Type::parse("as").expect("\"as\" is a valid gvariant type"),
-            Value::Array(vec![Value::Str(branch.to_owned())]),
+            Value::Array(names),
         ),
     ])])
+}
+
+/// The message a branch name the revision syntax shadows is refused with, and
+/// `None` for a name a ref can carry. Resolution reads a trailing run of `^` as
+/// ancestry and a name of 64 lowercase hex characters as a checksum, so a ref
+/// carrying either is reachable by no revision
+/// (`docs/format-reference.md`, "Revision syntax"). Each message is the wording
+/// the port already gives that shape -- the ancestry name at `refs --create`, the
+/// checksum name at the tool's own guard -- and the two shapes are disjoint, a
+/// 64-character hex name holding no `^`.
+fn shadowed_branch_name(branch: &str) -> Option<String> {
+    if branch.ends_with('^') {
+        return Some(format!("Invalid refspec {branch}"));
+    }
+    if Checksum::from_hex_lower(branch).is_ok() {
+        return Some(format!("Rev name '{branch}' looks like a checksum"));
+    }
+    None
 }
 
 /// An async streaming reader over stdin, backed by a duplicated descriptor so

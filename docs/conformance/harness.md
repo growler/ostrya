@@ -150,6 +150,11 @@ every invocation, is bound for every cell whatever its setups. The setups:
 - `tree` binds `$TREE`, the materialized corpus, outside any repository.
 - `out-dir` binds `$OUT`, an empty directory.
 
+The corpus has one path per side, so two setups in one record share the tree the
+first of them materialized: `repo-with-commit tree` binds `$TREE` to the tree the
+setup already committed, which is what a cell committing a second time onto the
+setup's branch wants.
+
 A cell that names no mode gets `bare`, and a cell that names no corpus gets
 `C0`. The branch a setup commits to is `conformance`.
 
@@ -450,10 +455,10 @@ Oracle and setup availability follows the CLI surface `cli-surface.md` orders.
   --timestamp` in Phase 17c. Phase 17b also added `refs` and `cat`, so a cell
   can state a ref listing or a file's content as `stdout-text` alongside the
   `refs-bytes` files on disk.
-- Phase 17b1 makes a setup able to build a parent chain: it gives `ostrya
-  commit -b BRANCH` the tool's implicit parent, so two commits onto one branch
-  leave an ancestry both implementations resolve. Until then a cell needing a
-  chain states `--parent` itself.
+- Phase 17b1 made a setup able to build a parent chain: `ostrya commit -b BRANCH`
+  carries the tool's implicit parent, so two commits onto one branch leave an
+  ancestry both implementations resolve. A cell that reads a parent still needs a
+  second invocation, so those cells cite `evidence:`.
 - Phase 17c adds `--owner-uid`, `--owner-gid`, `--timestamp`, and
   `--no-xattrs` on `commit`, which corpora `C3` and `C13` need, and
   `checkout -U` and `--subpath`. `--timestamp` is what the first

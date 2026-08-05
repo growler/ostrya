@@ -504,9 +504,8 @@ wherever a 64-character name is taken:
   single raised character. The refusal runs at the ref write, so a fault ahead of
   it is reported instead: an unresolvable `--parent` and a tree path that does
   not open each end the invocation first, in each implementation's own words
-  (`conformance/cli-surface.md`, "P2"). The tool's `--orphan`, which the port
-  does not carry, leaves the refusal standing, since `-b` writes the ref under it
-  too.
+  (`conformance/cli-surface.md`, "P2"). `--orphan` leaves the refusal standing in
+  both implementations, since `-b` writes the ref under it too.
 
 The revision syntax shadows two branch-name shapes, and `commit -b` guards both.
 Beside the checksum shape above stands a name ending in `^`, which resolution
@@ -1984,11 +1983,56 @@ is correct even inside a rootless, non-root container.
 ## CLI output formats
 
 The reading commands write to standard output, so their format is part of the
-interoperability surface a script depends on. Each format below was recovered by
-running `ostree` 2026.1 as a black box against repositories built for the
-purpose, and `conformance/m10-cli-behavior.matrix` states the cells that hold
-the port's output to the tool's. `conformance/cli-surface.md` lists the commands
-whose formats are still to be recovered.
+interoperability surface a script depends on, and `commit` states the commit it
+made the same way. Each format below was recovered by running `ostree` 2026.1 as
+a black box against repositories built for the purpose, and
+`conformance/m10-cli-behavior.matrix` states the cells that hold the port's
+output to the tool's. `conformance/cli-surface.md` lists the commands whose
+formats are still to be recovered.
+
+### `commit`
+
+Prints the new commit's 64-character checksum and a newline, and writes nothing
+to standard error, at exit 0.
+
+A commit names a branch with `-b BRANCH` or carries `--orphan`, which permits a
+commit that names none. A commit carrying neither reports `error: A branch must
+be specified with --branch, or use --orphan` and exits 1. The check stands ahead
+of `--parent`, ahead of the tree, and ahead of any object publication, so the same
+line answers a commit whose `--parent` does not resolve and one whose tree path
+does not open. A commit that names a branch writes the ref that name resolves
+to: `refs/heads/BRANCH` for a bare name and `refs/remotes/REMOTE/NAME` for a
+`REMOTE:NAME` value. A commit that names none writes no ref.
+
+The parent:
+
+- `-b BRANCH` with no `--parent` takes that branch's current tip. A branch that
+  names no ref has no tip, so the first commit onto a fresh branch is a root
+  commit. The tip is read from the ref file and not loaded, so a ref standing over
+  an absent commit object is inherited unread.
+- The tip is read before the transaction publishes, so the tip a commit inherits
+  is the one its own ref write then replaces.
+- `--parent=none` asks for a root commit on a branch that has a tip. The ref still
+  moves to the new commit.
+- `--orphan` suppresses the implicit parent the same way. With `-b` given the ref
+  still moves, so the suppressed parent is the whole observable effect there. An
+  explicit `--parent` alongside `--orphan` parents the commit on the value given.
+- `--parent` takes a 64-character lowercase checksum or the literal `none`, and
+  the checksum's existence is not checked: a `--parent` naming no object commits
+  successfully. `none` is a literal in lowercase alone, so `NONE` is a revision.
+- The tool refuses every other `--parent` value with the reader that takes a
+  checksum: an abbreviated checksum, a refspec, and an empty value each report
+  `error: Invalid rev <value>`, a checksum carrying an ancestry suffix reports its
+  base (`--parent=<checksum>^` gives `error: Invalid rev <checksum>`), and a
+  non-lowercase rendering reports `error: Invalid character '<byte>' in rev
+  '<value>'`, naming the first byte it refuses by decimal value. The port resolves
+  any revision there, which is a superset of that syntax, so a value the tool
+  refuses is either resolved by the port or reported in the port's own resolution
+  words (`conformance/cli-surface.md`, "P2").
+
+`ostree.ref-binding` carries one `as` entry per branch the commit names, so a
+`-b BRANCH` commit carries `[BRANCH]` and a commit that names no branch carries
+the empty array. The key is present in both cases.
 
 ### `refs`
 

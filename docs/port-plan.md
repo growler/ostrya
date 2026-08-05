@@ -1122,11 +1122,13 @@ Phase 17. Subcommands:
 - `ostrya export [--repo <repo>] <commit>` -- write the commit to stdout as
   a tar stream (Phase 10 export).
 
-`<commit>` and `--parent` accept a checksum or a ref. Further subcommands
-arrive with the phases that provide their machinery. Argument and option
-parsing uses `clap` (derive), scoped to the `ostrya-cli` crate, which also
-depends on `ostrya-rt` for the runtime driver and streaming descriptor;
-anything further is settled at phase start per the dependency rule.
+`<commit>` and `--parent` accept a checksum or a ref. The current `commit`
+parenting surface, `--orphan` included, is recorded in `format-reference.md`,
+"CLI output formats", under `commit`. Further subcommands arrive with the
+phases that provide their machinery. Argument and option parsing uses `clap`
+(derive), scoped to the `ostrya-cli` crate, which also depends on `ostrya-rt`
+for the runtime driver and streaming descriptor; anything further is settled
+at phase start per the dependency rule.
 
 Verify: committing a fixture tree through the binary yields the fixture
 commit id, a repository the tool accepts, and, with `--branch`, a ref the
@@ -3440,9 +3442,9 @@ the commit that ref holds, and the tool holds such a name to name no ref as an
 `-A --create` target, where the port writes the alias. The last two are
 resolution behaviors that would change every subcommand at once, so they
 belong with a phase that reviews those paths. Building the fixtures also found
-three `commit` divergences recorded under "P2": `ostree commit -b BRANCH` parents
-the new commit on the branch tip and `ostrya commit -b BRANCH` writes a root
-commit every time; the checksum arm of the branch-name guard leaves the tool's
+three `commit` divergences recorded under "P2": the parent `ostree commit -b
+BRANCH` takes from the branch tip, which Phase 17b1 below reproduces; the
+checksum arm of the branch-name guard leaves the tool's
 tree and commit objects in `objects/` where the port publishes none, the tool
 having written them before it reads the name; and the ancestry arm draws one
 message from the port and three outcomes from the tool -- `Commit <checksum> has
@@ -3550,21 +3552,21 @@ the cells that cite it silently either: the workflow runs
 `ostrya-conformance check --verify-evidence` as a step of its own
 (`conformance/harness.md`, "Cargo and CI wiring").
 
-#### Phase 17b1 -- `commit` parenting
+#### Phase 17b1 -- `commit` parenting (DONE)
 
 A behavior fix rather than an option gap, found while building the Phase 17b
-fixtures and recorded in `cli-surface.md`, "P2". `ostree commit -b BRANCH`
-parents the new commit on that branch's current tip; `ostrya commit -b BRANCH`
-writes a root commit every time. Two commits onto one branch therefore leave
-the port with no ancestry at all, which `rev-parse REV^` reads today and `log`
-(17d) reads next. The fixtures for `rev_parse_ancestry_matches_the_tool` carry
-an explicit `--parent` for exactly this reason.
+fixtures. `ostree commit -b BRANCH` parents the new commit on that branch's
+current tip, which `rev-parse REV^` reads today and `log` (17d) reads next. The
+whole behavior is recorded in `format-reference.md`, "CLI output formats", under
+`commit`; the values `--parent` takes still part the two implementations and stay
+in `cli-surface.md`, "P2".
 
-Observed with `ostree` 2026.1, and the behavior this sub-phase reproduces:
+Observed with `ostree` 2026.1, and reproduced:
 
 - `-b BRANCH` with no `--parent` takes that branch's current tip as the
   parent. A branch that does not exist yet gives a root commit, so the first
-  commit onto a fresh branch is unchanged.
+  commit onto a fresh branch is unchanged. The tip is read from the ref file and
+  not loaded, so a ref standing over an absent commit object is inherited unread.
 - `--parent=none` asks for a root commit on a branch that has a tip. The ref
   still moves to the new commit.
 - `--orphan` gives a root commit the same way, and additionally permits a
@@ -3572,28 +3574,39 @@ Observed with `ostree` 2026.1, and the behavior this sub-phase reproduces:
   a ref", which describes the no-`-b` case: with `-b` given, the ref moves to
   the new commit and the suppressed parent is the whole observable effect, and
   the branch-name guard 17b landed still refuses a name of 64 lowercase hex
-  characters under it.
+  characters under it. An explicit `--parent` beside `--orphan` parents the commit
+  on the value given, so `--orphan` suppresses the implicit parent alone.
+- A commit that names no branch still carries `ostree.ref-binding`, as an empty
+  `as` array, so the key is present whether or not a branch was named. The port
+  writes the array the same way, which is what keeps the two commit checksums
+  equal for that form.
 - `--parent` takes a 64-character lowercase checksum or the literal `none`. An
   abbreviated checksum and a refspec are both rejected with `error: Invalid rev
   <value>`, an uppercase rendering with `error: Invalid character '<byte>' in rev
   '<value>'`, and the checksum's existence is not checked -- a `--parent` naming
   no object commits successfully. The port resolves a refspec here too, which
   stays a superset of the tool's syntax the way the leading `--repo` form is
-  (17a), so this sub-phase adds `none` and narrows nothing. A 64-character
-  uppercase value is a refspec to the port, by the case rule 17b landed, so both
-  refuse it and word the refusal differently (`cli-surface.md`, "P2").
+  (17a), so this sub-phase added `none` and narrowed nothing. A 64-character
+  uppercase value is a refspec to the port, by the case rule 17b landed, and
+  `NONE` is one for the same reason, so both refuse either value and word the
+  refusal differently (`cli-surface.md`, "P2").
 - A commit with neither `-b` nor `--orphan` is refused: `error: A branch must
-  be specified with --branch, or use --orphan`. The port accepts that form
-  today and prints the checksum without writing a ref, so adopting the refusal
-  is the one thing this sub-phase takes away; it is what makes `--orphan` mean
-  something rather than being a synonym for the default.
+  be specified with --branch, or use --orphan`. Adopting the refusal is the one
+  thing this sub-phase took away, and it is what makes `--orphan` mean something
+  rather than being a synonym for the default. The check stands ahead of
+  `--parent`, ahead of the tree, and ahead of any object publication, so the same
+  line answers a commit whose `--parent` does not resolve and one whose tree path
+  does not open.
 
 The parent is read before the transaction publishes, so the tip a commit
-inherits is the one its own ref write then replaces.
+inherits is the one its own ref write then replaces. A branch name the guard
+refuses is not read as a tip at all, which leaves that refusal the message and
+the position 17b gave it: the ref write, after the tree.
 
-Deliverables: the implicit parent in `ostrya commit`, `--parent=none`,
-`--orphan`, the `-b`-or-`--orphan` requirement, the observations folded into
-`format-reference.md`, "CLI output formats", and `m10` records for each.
+Deliverables: the implicit parent in `ostrya commit`, `--parent=none`, `--orphan`,
+the `-b`-or-`--orphan` requirement, the `ostree.ref-binding` array a commit that
+names no branch carries, the observations folded into `format-reference.md`, "CLI
+output formats", and `m10` records for each.
 
 Three of the tool's options read the parent as well and stay with the phases
 that own them:
@@ -3607,15 +3620,38 @@ that own them:
   at exit 0, so the tool guards the ref it writes and not the name it records
   (`cli-surface.md`, "P2").
 
-Verify: two `commit -b BRANCH` invocations onto one branch leave a chain both
-implementations resolve identically through `rev-parse BRANCH^`, and a first
-commit onto a fresh branch stays a root commit in both; `--parent=none` and
-`--orphan` each give a root commit on a branch that has a tip, with the ref
-moved, in both; a commit with neither `-b` nor `--orphan` is refused with the
-tool's own text in both. `rev_parse_ancestry_matches_the_tool` drops its
-explicit `--parent` and keeps passing, which is the regression this sub-phase
-exists to prevent, and `m10` gains cells for the implicit parent, the two
-root-commit forms, and the refusal.
+One harness change came with the records. A cell committing onto the setup's own
+branch needs both the repository the setup populated and the tree it committed,
+which is `setup: repo-with-commit tree`; the corpus has one path per side, so the
+two setups now share the tree the first of them materialized. A second
+materialization over one path fails at the corpus symlink, so the sharing is
+what lets one record name both setups (`conformance/harness.md`, "Setups and
+placeholders").
+
+Verify: `cargo test --workspace --all-features` is green, `cargo fmt --all
+--check` and `cargo clippy --workspace --all-features --all-targets` are clean.
+`crates/ostrya-conformance/tests/check.rs` validates 159 records and 396 cells.
+The T0 selection through `crates/ostrya-cli/tests/conformance.rs` passes 83 cells
+where Phase 17b passed 77: six new `run:` cells covering the refusal a commit that
+names no branch draws, the checksum `--orphan` prints with no ref beside it, the
+ref move each root-commit form leaves, the branch-name guard standing under
+`--orphan`, and a `--parent` naming no object. Six more cells state a parent,
+which a second invocation reads, and cite
+`ostrya_cli::cli::commit_parenting_matches_the_tool`: the implicit parent, the tip
+inherited unread over an absent commit object, the two root-commit forms, the
+explicit `--parent` beside `--orphan`, and the empty `ostree.ref-binding`. A
+seventh `evidence:` cell states the order the branch check holds, which three
+invocations of the cited test carry. That test commits under one
+`SOURCE_DATE_EPOCH` on both sides, which the tool honors, so each compared
+checksum states the whole commit object -- the `parent` field included -- and not
+that a commit happened; it walks the chain two commits onto one branch leave,
+inherits the tip a ref standing over an absent commit object holds, holds the root
+commit each suppressing form gives with the ref moved, reads the empty binding
+back out of the port's own commit with the tool, and holds the refusal over three
+invocations that state its order. `rev_parse_ancestry_matches_the_tool` drops its
+`--parent` and keeps passing, which is the regression this sub-phase exists to
+prevent, and `checkout_roundtrips_and_matches_tool` states its round-trip with
+`--parent=none`, the branch it commits onto twice now holding a tip.
 
 #### Phase 17c -- `commit`/`checkout`: the corpus-priority option gaps
 

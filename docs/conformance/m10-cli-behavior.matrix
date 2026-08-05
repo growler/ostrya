@@ -12,17 +12,19 @@
 # `run:` line does not state; each names a probe.
 #
 # This file carries Phase 17a's cases -- `init` and the global `--repo`
-# conventions -- and Phase 17b's -- `refs`, `rev-parse`, and `cat`
-# (`../port-plan.md`). Later sub-phases add records here as their own
-# subcommands and options land.
+# conventions -- Phase 17b's -- `refs`, `rev-parse`, and `cat` -- and Phase
+# 17b1's -- `commit` parenting (`../port-plan.md`). Later sub-phases add records
+# here as their own subcommands and options land.
 #
 # The `repo-with-commit` setup binds one branch, `conformance`, holding one
 # commit of corpus `C0`, so a cell needing a second ref, a nested ref name, an
-# alias, a collection id, or a parent commit cannot state itself with a `run:`
-# line against it. Those cells cite `evidence:` instead, naming the
-# `crates/ostrya-cli/tests/cli.rs` test that compares the port against the tool
-# over a repository built for the case. Growing the setup vocabulary would let
-# them become `run:` cells; that is a harness change, not a Phase 17b one.
+# alias, or a collection id cannot state itself with a `run:` line against it. A
+# cell reading a commit's own parent cannot either: the parent is a field of the
+# commit object, so a second invocation reads it. Those cells cite `evidence:`
+# instead, naming the `crates/ostrya-cli/tests/cli.rs` test that compares the
+# port against the tool over a repository built for the case. Growing the
+# setup vocabulary would let them become `run:` cells; that is a harness
+# change, not a Phase 17b one.
 #
 # No Phase 17b cell names the `checksum-agreement` oracle. Each side's setup
 # commits with its own binary and neither passes a timestamp, so the two commit
@@ -1287,8 +1289,9 @@ evidence: ostrya_cli::cli::rev_parse_ancestry_matches_the_tool
 spec: format-reference.md#revision-syntax
 note: `REV^` walking one generation, `REV^^` walking two, and the root
  commit's parent reported as `error: Commit <checksum> has no parent`. Needs a
- parent chain, which the setup's single commit does not hold, and which the
- port does not build from `commit -b` alone (`cli-surface.md`, "P2"). The cited
+ parent chain, which the setup's single commit does not hold; the cited test
+ builds one by committing three times onto one branch, each commit taking the
+ tip the one before it left (Phase 17b1 of `../port-plan.md`). The cited
  test also covers `-S` reporting more than one commit, and the `~N` and `^N`
  non-syntaxes, where the tool reports `error: Invalid refspec <rev>` and the
  port reports `error: Refspec '<rev>' not found` (`cli-surface.md`, "P1"); the
@@ -1599,8 +1602,7 @@ note: the same pair where the revision is a ref pointing at an absent commit,
 
 # ---------------------------------------------------------------------------
 # commit -- the branch-name guard the case rule of a 64-character name carries.
-# The rest of `commit`'s surface belongs to Phase 17b1 and 17c
-# (`../port-plan.md`).
+# The option gaps the corpora need belong to Phase 17c (`../port-plan.md`).
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -1641,6 +1643,25 @@ note: the same 64 characters in uppercase are a branch name to both, so each
  writes `refs/heads/<BRANCH>` and prints the commit it made. The normalizer
  masks each side's own checksum, so `stdout-text` states that both printed one
  and `refs-bytes` that both wrote the ref file holding it.
+
+family: M10
+subcommand: commit
+cell: commit/orphan-keeps-the-checksum-guard
+setup: repo tree
+run: commit --repo=$REPO -b bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --orphan $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Rev name 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' looks like a checksum"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Rev name 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' looks like a checksum"
+oracle: exit-status stdout-text stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#revision-syntax
+note: `--orphan` leaves the branch-name guard standing, since `-b` writes the
+ ref under it too. `inventory` is no oracle here, for the reason
+ `commit/checksum-branch-name` states.
 
 family: M10
 subcommand: commit
@@ -1706,3 +1727,189 @@ note: the bases the `repo tree` setup cannot bind, which need a repository
  guard, states the interior `^` the guard does not cross, and shows that over a
  ref of the refused shape the tool's `refs` prints nothing and its `prune
  --refs-only` deletes the commit that ref holds.
+
+# ---------------------------------------------------------------------------
+# commit -- parenting: the branch tip a commit inherits, the two forms that ask
+# for a root commit, and the ref a commit must name (Phase 17b1 of
+# `../port-plan.md`).
+#
+# A parent is a field of the commit object, so a cell that states one reads the
+# new commit with a second invocation. Those cells cite `evidence:`; the cells
+# below state what one invocation shows: the ref each form leaves, the checksum
+# each prints, and the refusal.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: commit
+cell: commit/no-branch-refused
+setup: repo tree
+run: commit --repo=$REPO -s x $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: A branch must be specified with --branch, or use --orphan"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: A branch must be specified with --branch, or use --orphan"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: a commit either names the branch it moves or states with `--orphan` that it
+ writes no ref. Both refuse the pair's absence in the same words, and neither
+ publishes an object, which `refs-bytes` and `inventory` state as an empty `refs/`
+ and an empty object store on both sides. `commit/no-branch-fault-order` below
+ cites the order the check holds.
+
+family: M10
+subcommand: commit
+cell: commit/no-branch-fault-order
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_parenting_matches_the_tool
+spec: format-reference.md#commit
+note: the missing branch is reported ahead of `--parent` and ahead of the tree, so
+ the same line answers a commit that also carries an unresolvable `--parent` and
+ one whose tree path does not open. Each is its own invocation, so the three
+ stand together in the cited test rather than in one `run:` line.
+
+family: M10
+subcommand: commit
+cell: commit/orphan-without-branch
+setup: repo tree
+run: commit --repo=$REPO -s lone --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: `--orphan` is what permits a commit that names no branch. Both print the
+ commit they made, which `stdout-text` states through the masked checksum, and
+ neither writes a ref, which `refs-bytes` states as an empty `refs/` on both
+ sides. `commit/orphan-ref-binding` below cites the metadata such a commit
+ carries.
+
+family: M10
+subcommand: commit
+cell: commit/parent-none-moves-the-ref
+setup: repo-with-commit tree
+run: commit --repo=$REPO -b $BRANCH -s root --parent=none $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: `--parent=none` asks for a root commit over a branch that has a tip, and the
+ ref still moves to the new commit. The normalizer masks each side's own
+ checksum, so `refs-bytes` states that both moved the ref off `$REV` and onto the
+ commit each printed. That the new commit is a root commit needs a second
+ invocation; `commit/parent-none-root` below cites it.
+
+family: M10
+subcommand: commit
+cell: commit/orphan-moves-the-ref
+setup: repo-with-commit tree
+run: commit --repo=$REPO -b $BRANCH -s root --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: `--orphan` beside a branch suppresses the parent and leaves the ref write
+ alone, so this cell states the same ref move `commit/parent-none-moves-the-ref`
+ states, for the other form. `commit/orphan-root` below cites the root commit
+ itself.
+
+family: M10
+subcommand: commit
+cell: commit/parent-with-no-object
+setup: repo tree
+run: commit --repo=$REPO -b lone -s x --parent=0000000000000000000000000000000000000000000000000000000000000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status stdout-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the `--parent` checksum's existence is not checked, so a parent naming no
+ object commits successfully in both, and the ref moves to the commit each
+ printed.
+
+family: M10
+subcommand: commit
+cell: commit/implicit-parent
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_parenting_matches_the_tool
+spec: format-reference.md#commit
+note: `-b BRANCH` with no `--parent` takes that branch's current tip as the
+ parent, and a branch that names no ref gives a root commit. Reading the parent
+ needs a second invocation, `rev-parse BRANCH^`. The cited test commits twice
+ onto one branch under one `SOURCE_DATE_EPOCH`, so the two implementations agree
+ on the whole commit object and not on the fact of a commit alone, and it walks
+ the chain in both.
+
+family: M10
+subcommand: commit
+cell: commit/implicit-parent-unread
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_parenting_matches_the_tool
+spec: format-reference.md#commit
+note: the tip is read from the ref file and not loaded, so a ref standing over
+ an absent commit object is inherited unread. Writing such a ref needs an
+ out-of-band write no setup performs, so the cited test writes the ref file
+ itself and reads the new commit's parent back in both.
+
+family: M10
+subcommand: commit
+cell: commit/parent-none-root
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_parenting_matches_the_tool
+spec: format-reference.md#commit
+note: the root commit `--parent=none` asks for, read back as `error: Commit
+ <checksum> has no parent` from both implementations over the branch the commit
+ moved.
+
+family: M10
+subcommand: commit
+cell: commit/orphan-root
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_parenting_matches_the_tool
+spec: format-reference.md#commit
+note: the same root commit under `--orphan`, over a branch that has a tip.
+
+family: M10
+subcommand: commit
+cell: commit/orphan-explicit-parent
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_parenting_matches_the_tool
+spec: format-reference.md#commit
+note: `--orphan --parent=<checksum>` parents the commit on the checksum given, so
+ what `--orphan` suppresses is the implicit parent alone. The cited test states
+ the parent through `rev-parse BRANCH^` in both implementations.
+
+family: M10
+subcommand: commit
+cell: commit/orphan-ref-binding
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_parenting_matches_the_tool
+spec: format-reference.md#commit
+note: a commit that names no branch carries `ostree.ref-binding` as an empty `as`
+ array rather than carrying no such key. Reading the key needs the GVariant
+ text-form printer Phase 17d lands, so the cited test has the tool print the key
+ out of the port's own commit, which is one custody direction of the claim; the
+ other is the equal checksums that test's `SOURCE_DATE_EPOCH` commits produce.

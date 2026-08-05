@@ -15,7 +15,9 @@
 //! mid-creation in another process. A process-global set of the staging
 //! directories this process currently owns keeps the reaper from touching them:
 //! the record locks are process-associated, so a second descriptor to a live
-//! sibling lock would neither conflict nor survive being closed.
+//! sibling lock would neither conflict nor survive being closed. A directory
+//! enters that set before it is created and leaves it after it is removed, so
+//! every directory a same-process reaper can list is already in the set.
 
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -83,12 +85,9 @@ impl StagingDir {
         reap_stale(tmp_fd.as_fd(), expiry_secs);
 
         let prefix = format!("staging-{}-", boot_id()?);
+        // `mkdtemp` claims the name in `active` before the directory exists, so
+        // a concurrent same-process reaper never sees it unclaimed.
         let (name, dir_fd) = mkdtemp(tmp_fd.as_fd(), &prefix)?;
-
-        // Claim ownership before the sibling lock exists, so a concurrent
-        // same-process reaper that sees the directory finds it already in
-        // `active` and leaves it alone.
-        active().lock().unwrap().insert(name.clone());
 
         let lock_name = format!("{name}-lock");
         let lock_fd = match acquire_staging_lock(tmp_fd.as_fd(), &lock_name) {
@@ -165,22 +164,45 @@ fn boot_id() -> io::Result<&'static str> {
 }
 
 /// Create a uniquely named directory `prefix + suffix` under `tmp_fd`, retrying
-/// on a name collision.
+/// on a name collision. The returned name is claimed in `active`, which the
+/// caller releases when the staging directory ends.
+///
+/// The claim precedes the `mkdirat` that publishes the name, so every directory
+/// a same-process reaper can list is already claimed. The claim is the only
+/// barrier that holds within one process: the record locks are
+/// process-associated, so a reaper reaching the sibling lock of a live directory
+/// takes it without conflict and removes the directory.
 fn mkdtemp(tmp_fd: BorrowedFd<'_>, prefix: &str) -> io::Result<(String, OwnedFd)> {
     for _ in 0..MKDTEMP_ATTEMPTS {
         let name = format!("{prefix}{}", random_suffix());
+        // A name another live transaction in this process owns is left to its
+        // owner: releasing that claim here would strip its protection.
+        if !active().lock().unwrap().insert(name.clone()) {
+            continue;
+        }
         match rustix::fs::mkdirat(tmp_fd, name.as_str(), Mode::from_raw_mode(STAGING_DIR_MODE)) {
             Ok(()) => {
-                let dir_fd = rustix::fs::openat(
+                match rustix::fs::openat(
                     tmp_fd,
                     name.as_str(),
                     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                     Mode::empty(),
-                )?;
-                return Ok((name, dir_fd));
+                ) {
+                    Ok(dir_fd) => return Ok((name, dir_fd)),
+                    Err(e) => {
+                        active().lock().unwrap().remove(&name);
+                        return Err(e.into());
+                    }
+                }
             }
-            Err(Errno::EXIST) => continue,
-            Err(e) => return Err(e.into()),
+            Err(Errno::EXIST) => {
+                active().lock().unwrap().remove(&name);
+                continue;
+            }
+            Err(e) => {
+                active().lock().unwrap().remove(&name);
+                return Err(e.into());
+            }
         }
     }
     Err(io::Error::new(

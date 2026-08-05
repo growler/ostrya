@@ -526,7 +526,8 @@ Observed by running the tool (2026.1).
   matrix cell exercises.
 - With no `--repo`, the precedence is: the current directory, when it is a
   repository the tool can open; otherwise `OSTREE_REPO`, when set and openable;
-  otherwise the tool prints the subcommand's usage text to standard error,
+  otherwise the compiled-in path `/sysroot/ostree/repo`, when the host carries
+  one; otherwise the tool prints the subcommand's usage text to standard error,
   followed by `error: Command requires a --repo argument`, and exits 1. A
   current directory that opens (has a `[core]` section with a recognized
   `mode` key) is preferred even when `OSTREE_REPO` names a different, valid
@@ -539,6 +540,21 @@ Observed by running the tool (2026.1).
   rather than falling through; the port does not reproduce this third case,
   since it is not exercised by any `cli-surface.md`-required option and adds a
   parse-depth distinction with no matrix weight.
+- The third source is a path the tool compiles in, and its help text states the
+  chain: `--repo=PATH   Path to OSTree repository (defaults to current
+  directory or /sysroot/ostree/repo)`, with `OSTREE_REPO` sitting between the
+  two paths that line names. An `OSTREE_REPO` value that does not open as a
+  repository leaves the chain running: with `OSTREE_REPO` set to an empty
+  directory and to an absent path, the tool reports `error: Command requires a
+  --repo argument` on a host with no system repository, so it passes over the
+  value and continues. No environment variable closes the third source. A
+  repo-less tool invocation on an ostree-managed host therefore resolves the
+  system repository, and a writing subcommand acts on it. The port's chain is
+  the current directory, then `OSTREE_REPO`, and it ends there. Resolving no
+  third source keeps `ostrya` from acting on a live system repository through
+  an omitted `--repo`, and it costs `ostrya prune` an explicit `--repo` where
+  `ostree prune` needs none on an ostree-managed host. The port holds this
+  divergence by intent.
 - `init` uses this same precedence, not a special case: with no explicit
   `--repo`, a current directory or an `OSTREE_REPO` target that already opens
   as a repository is reused (an idempotent re-init, same as passing that path

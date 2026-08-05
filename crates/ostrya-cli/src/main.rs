@@ -784,13 +784,16 @@ fn exit_requires_repo(subcommand: &str) -> ! {
 }
 
 /// Resolve the repository a subcommand operates on and the filesystem path
-/// used to reach it, applying the tool's precedence: an explicit `--repo`
+/// used to reach it, applying the port's precedence: an explicit `--repo`
 /// (either position) first; then the current directory, if it opens as a
-/// repository; then `OSTREE_REPO`. With none of those, print `subcommand`'s
-/// usage text and the tool's error line and exit. `init` shares this
-/// precedence too, through `resolve_init_path`, below, which resolves to a
-/// path rather than an opened `Repo` since its explicit-`--repo` tier need
-/// not already exist.
+/// repository; then `OSTREE_REPO`. The chain ends there. The tool carries one
+/// more source after `OSTREE_REPO`, the compiled-in `/sysroot/ostree/repo`;
+/// the port leaves that step out, which keeps `ostrya` from acting on a live
+/// system repository through an omitted `--repo`. With none of the three,
+/// print `subcommand`'s usage text and the tool's error line and exit. `init`
+/// shares this precedence too, through `resolve_init_path`, below, which
+/// resolves to a path rather than an opened `Repo` since its explicit-`--repo`
+/// tier need not already exist.
 async fn resolve_repo(repo: Option<&Path>, verbose: bool, subcommand: &str) -> (Repo, PathBuf) {
     if let Some(path) = repo {
         match Repo::open(path).await {

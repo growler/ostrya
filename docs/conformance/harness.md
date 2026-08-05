@@ -228,9 +228,26 @@ compared.
 
 ### Normalization
 
-Every invocation runs with `OSTREE_REPO` removed from the environment and
-`LC_ALL` set to `C`, so a cell that exercises the environment fallback states
-that itself, and the two implementations' messages compare in one language.
+Every invocation runs with `OSTREE_REPO` and `G_DEBUG` removed from the
+environment and `LC_ALL` set to `C`, so a cell that exercises the environment
+fallback states that itself, a `fatal-criticals` or `fatal-warnings` setting on
+the operator's host cannot turn a GLib critical in the reference into an abort,
+and the two implementations' messages compare in one language.
+
+The reference tool resolves a repository from the current directory, then
+`OSTREE_REPO`, then the compiled-in `/sysroot/ostree/repo`, and the third
+source stands outside the environment's reach. The harness reads it from the
+host: startup records whether `/sysroot/ostree/repo` is present, and the
+`host:` banner line ends with `system repo /sysroot/ostree/repo` or `no system
+repo` on every run. Where the host carries one, every invocation the harness
+makes binds a repository -- through `--repo`, through `OSTREE_REPO`, or through
+a working directory that opens as one -- and an invocation binding none is
+refused before the process starts. Declared cells, probes, setups, oracles, and
+`observe` all reach the one function that starts a process, which is where the
+refusal sits. The argv and the bound environment are read textually, and the
+check refuses where the reading is uncertain, as it is for an argv ending in a
+bare `--repo`. The working directory is read from disk, since it is the first
+source in the chain and an invocation resolving there never reaches the third.
 
 Captured text holds scratch paths, wall-clock values, and checksums, so the text
 oracles and `refs-bytes` normalize before comparison:
@@ -324,13 +341,21 @@ Three verdicts. A cell reports exactly one.
   values, and the artifact directory.
 - `skip` -- the cell was not observed, with one reason: `tier`,
   `reference-absent`, `unimplemented-cli`, `proved-elsewhere`, `declaration`,
-  or `filtered`.
+  `filtered`, or `system-repo`.
 
-The `tier` skip is the one an operator can lift, so the summary breaks it down
-by the tier each skipped cell needs and states what lifting it takes: a user
-namespace for T2, root for T3, and root on an SELinux-enforcing kernel for T4.
-An unprivileged run therefore reports how much of the matrix a privileged run
-would add, before that run happens.
+A `system-repo` skip states that the host carries `/sysroot/ostree/repo` and
+the cell holds an invocation binding no repository, which the reference tool
+resolves against that path, so the claim the cell states cannot be made here.
+The skip names the path and the invocation. It is decided for both
+implementation handles together, so a cell whose premise fails for either side
+skips whole. The host decides it, and `--require` carries no flag that promotes
+it, so the cell is observed on a host carrying no system repository.
+
+The `tier` skip is the one an operator lifts by re-running, so the summary
+breaks it down by the tier each skipped cell needs and states what lifting it
+takes: a user namespace for T2, root for T3, and root on an SELinux-enforcing
+kernel for T4. An unprivileged run therefore reports how much of the matrix a
+privileged run would add, before that run happens.
 
 `--require` promotes a class of skips to failures:
 
@@ -339,7 +364,9 @@ would add, before that run happens.
 
 This is how a machine that holds the reference tool, or the privilege, enforces
 what a machine without it cannot. A promoted cell is counted with the failures
-and leaves the `skip tier` breakdown.
+and leaves the `skip tier` breakdown. `system-repo` has no promotion, since the
+host that carries a system repository is the host on which the claim cannot be
+stated.
 
 A `proved-elsewhere` skip is as strong as the cited test's own gating. The
 tool-comparison tests return without an assertion where `ostree` is absent, so

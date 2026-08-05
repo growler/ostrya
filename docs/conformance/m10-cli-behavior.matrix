@@ -225,12 +225,16 @@ note: `static-delta` takes a nested subcommand, and leaving it unnamed is
  `error: opening repo` instead; both implementations report the missing
  subcommand. Each prints the subcommand's usage text before the error line,
  which `stderr-text` is not an oracle for here, for the same reason as
- `prune/no-repo-resolvable` below.
+ `refs/no-repo-resolvable` below.
+
+# ---------------------------------------------------------------------------
+# refs -- listing.
+# ---------------------------------------------------------------------------
 
 family: M10
-subcommand: prune
-cell: prune/no-repo-resolvable
-run: prune
+subcommand: refs
+cell: refs/no-repo-resolvable
+run: refs
 expect-exit: 1
 expect-stderr: contains "error: Command requires a --repo argument"
 ref-expect-exit: 1
@@ -244,11 +248,10 @@ note: the cell runs in its own scratch root, which is not a repository, with
  subcommand's usage text to standard error, then that error line, and exit 1.
  The port's usage text is clap's own rendering and the tool's is GOption's, so
  the shared claim is the shape -- usage, then the error line, then exit 1 --
- which is why `stderr-text` is not an oracle here.
-
-# ---------------------------------------------------------------------------
-# refs -- listing.
-# ---------------------------------------------------------------------------
+ which is why `stderr-text` is not an oracle here. The claim under test is the
+ global `--repo` convention, which every subcommand in that set states in the
+ same words, and the cell runs a subcommand that writes nothing, so a host
+ where a third `--repo` source resolves is never written to.
 
 family: M10
 subcommand: refs
@@ -1230,7 +1233,7 @@ severity: interop
 spec: format-reference.md#rev-parse
 note: each prints the subcommand's usage text before the error line, so
  `stderr-text` is not an oracle here, for the reason
- `prune/no-repo-resolvable` states.
+ `refs/no-repo-resolvable` states.
 
 family: M10
 subcommand: rev-parse

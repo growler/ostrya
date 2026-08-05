@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use crate::tier;
+
 /// One implementation handle.
 #[derive(Clone, Debug)]
 pub struct Tool {
@@ -86,11 +88,104 @@ impl Outcome {
     }
 }
 
+/// The refusal an invocation earns when it would let an implementation resolve
+/// the host's system repository, and `None` when it would not.
+///
+/// The reference tool resolves a repository from the current directory, then
+/// `OSTREE_REPO`, then the compiled-in `tier::SYSTEM_REPO`. An invocation that
+/// binds no repository therefore reaches the host's own system repository on a
+/// host that carries one, and a writing subcommand acts on live state. The
+/// check refuses that invocation.
+///
+/// The argv and the environment are read textually. The argv binds a
+/// repository when an argument begins with `--repo=` and carries a value, or
+/// when an argument equals `--repo` and another argument follows it. An argv
+/// ending in a bare `--repo` is an uncertain reading, and the check refuses
+/// where the reading is uncertain. The environment binds a repository when
+/// `env` carries `OSTREE_REPO` with a value; `run` removes that variable from
+/// the inherited environment, so the slice is the whole truth. `cwd` is read
+/// from disk, since it is the first source in the chain and an invocation that
+/// resolves there never reaches the third.
+pub fn system_repo_refusal(
+    cwd: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    system_repo: Option<&Path>,
+) -> Option<String> {
+    let system_repo = system_repo?;
+    if binds_repo_argument(args) || binds_repo_variable(env) || opens_as_repository(cwd) {
+        return None;
+    }
+    Some(format!(
+        "this invocation binds no repository, and the host carries {}, which \
+         the reference tool resolves as its third `--repo` source: the run \
+         would act on the host's own system repository",
+        system_repo.display()
+    ))
+}
+
+/// Whether the argv binds a repository. An argv ending in a bare `--repo`
+/// reads as no binding, so the caller refuses it.
+fn binds_repo_argument(args: &[String]) -> bool {
+    let mut rest = args.iter();
+    while let Some(argument) = rest.next() {
+        if let Some(value) = argument.strip_prefix("--repo=") {
+            if !value.is_empty() {
+                return true;
+            }
+        } else if argument == "--repo" && rest.next().is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `env` binds `OSTREE_REPO` to a value.
+fn binds_repo_variable(env: &[(String, String)]) -> bool {
+    env.iter()
+        .any(|(key, value)| key == "OSTREE_REPO" && !value.is_empty())
+}
+
+/// Whether `directory` opens as a repository, by the rule
+/// `docs/conformance/cli-surface.md` records for the tool's first `--repo`
+/// source: the directory holds an `objects` directory and a `config` file
+/// whose text carries a `[core]` section with a `mode` key. Anything less does
+/// not open, so a directory that is only repository-shaped still refuses.
+fn opens_as_repository(directory: &Path) -> bool {
+    if !directory.join("objects").is_dir() {
+        return false;
+    }
+    let Ok(config) = std::fs::read_to_string(directory.join("config")) else {
+        return false;
+    };
+    let mut in_core = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_core = line.trim_end_matches(|c: char| c == ';' || c.is_whitespace()) == "[core]";
+            continue;
+        }
+        if in_core
+            && let Some((key, _)) = line.split_once('=')
+            && key.trim() == "mode"
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Run `tool` with `args` in `cwd`.
 ///
 /// `OSTREE_REPO` is removed unless `env` sets it, so the current-directory and
-/// environment fallbacks a cell exercises are the cell's own doing. `LC_ALL`
-/// is set to `C` so the two implementations' messages compare in one language.
+/// environment fallbacks a cell exercises are the cell's own doing. `G_DEBUG`
+/// is removed, so a `fatal-criticals` or `fatal-warnings` setting on the
+/// operator's host cannot turn a GLib critical in the reference into an abort.
+/// `LC_ALL` is set to `C` so the two implementations' messages compare in one
+/// language.
+///
+/// The run is refused, before the process starts, when `system_repo_refusal`
+/// reads the invocation as one that resolves the host's system repository.
 pub fn run(
     tool: &Tool,
     cwd: &Path,
@@ -99,11 +194,16 @@ pub fn run(
 ) -> Result<Outcome, String> {
     use std::os::unix::process::ExitStatusExt;
 
+    if let Some(message) = system_repo_refusal(cwd, args, env, tier::system_repo()) {
+        return Err(message);
+    }
+
     let started = Instant::now();
     let output = Command::new(&tool.path)
         .current_dir(cwd)
         .args(args.iter().map(OsStr::new))
         .env_remove("OSTREE_REPO")
+        .env_remove("G_DEBUG")
         .env("LC_ALL", "C")
         .envs(env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
@@ -123,4 +223,124 @@ pub fn run(
         stderr: output.stderr,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The host fact is injected, so these run on a host with or without a
+    /// system repository.
+    fn present() -> Option<&'static Path> {
+        Some(Path::new(tier::SYSTEM_REPO))
+    }
+
+    /// A working directory that does not open as a repository, so the cases
+    /// below turn on the argv and the environment alone.
+    fn elsewhere() -> &'static Path {
+        Path::new("/ostrya-conformance-no-such-directory")
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    /// A directory of this test's own, empty at the start of each run.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-conformance-exec-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        dir
+    }
+
+    #[test]
+    fn a_repo_less_argv_is_refused_where_the_host_carries_a_system_repo() {
+        let message = system_repo_refusal(elsewhere(), &argv(&["prune"]), &[], present())
+            .expect("the invocation binds no repository");
+        assert!(message.contains(tier::SYSTEM_REPO), "{message}");
+    }
+
+    #[test]
+    fn an_argv_binding_the_repository_is_allowed() {
+        assert!(
+            system_repo_refusal(
+                elsewhere(),
+                &argv(&["--repo=/scratch/repo", "prune"]),
+                &[],
+                present()
+            )
+            .is_none()
+        );
+        assert!(
+            system_repo_refusal(
+                elsewhere(),
+                &argv(&["prune", "--repo", "/scratch/repo"]),
+                &[],
+                present()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_trailing_bare_repo_flag_is_refused_as_an_uncertain_reading() {
+        assert!(
+            system_repo_refusal(elsewhere(), &argv(&["prune", "--repo"]), &[], present()).is_some()
+        );
+        assert!(
+            system_repo_refusal(elsewhere(), &argv(&["--repo=", "prune"]), &[], present())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn an_environment_binding_the_repository_is_allowed() {
+        let env = [("OSTREE_REPO".to_owned(), "/scratch/repo".to_owned())];
+        assert!(system_repo_refusal(elsewhere(), &argv(&["prune"]), &env, present()).is_none());
+
+        let empty = [("OSTREE_REPO".to_owned(), String::new())];
+        assert!(system_repo_refusal(elsewhere(), &argv(&["prune"]), &empty, present()).is_some());
+    }
+
+    #[test]
+    fn a_repo_less_argv_is_allowed_where_the_host_carries_no_system_repo() {
+        assert!(system_repo_refusal(elsewhere(), &argv(&["prune"]), &[], None).is_none());
+    }
+
+    #[test]
+    fn a_repo_less_argv_whose_cwd_is_a_repository_is_allowed() {
+        let dir = scratch("cwd-repo");
+        std::fs::create_dir_all(dir.join("objects")).expect("create objects");
+        std::fs::write(
+            dir.join("config"),
+            "[core]\nrepo_version=1\nmode=bare-user\n",
+        )
+        .expect("write config");
+
+        assert!(system_repo_refusal(&dir, &argv(&["prune"]), &[], present()).is_none());
+        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+    }
+
+    #[test]
+    fn a_repo_less_argv_whose_cwd_does_not_open_is_refused() {
+        let dir = scratch("cwd-not-a-repo");
+        // Repository-shaped and no more: the `objects` directory is there, and
+        // the `config` states no `[core]` section with a `mode` key.
+        std::fs::create_dir_all(dir.join("objects")).expect("create objects");
+        std::fs::write(dir.join("config"), "[remote \"origin\"]\nurl=http://x/\n")
+            .expect("write config");
+
+        assert!(system_repo_refusal(&dir, &argv(&["prune"]), &[], present()).is_some());
+
+        // The same directory with no `objects` and a complete `config` also
+        // does not open.
+        std::fs::remove_dir_all(dir.join("objects")).expect("remove objects");
+        std::fs::write(dir.join("config"), "[core]\nmode=bare\n").expect("rewrite config");
+        assert!(system_repo_refusal(&dir, &argv(&["prune"]), &[], present()).is_some());
+
+        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+    }
 }

@@ -74,7 +74,7 @@ pub struct CellResult {
     /// tier each named corpus declares.
     pub required_tier: Tier,
     pub verdict: Verdict,
-    /// The skip reason, one of the six the design names.
+    /// The skip reason, one of the seven the design names.
     pub reason: Option<String>,
     /// The failure message, or the detail behind a skip.
     pub detail: Option<String>,
@@ -279,8 +279,30 @@ fn one(matrix: &Matrix, cell: &Cell, options: &Options) -> CellResult {
         return result;
     }
 
-    let started = std::time::Instant::now();
+    // The reference tool resolves the compiled-in `tier::SYSTEM_REPO` when an
+    // invocation binds no repository, so on a host carrying one the cell's
+    // premise fails and the run would act on live system state. A cell whose
+    // premise fails for either implementation handle is a cell to skip whole,
+    // so both invocations are read here. A declared cell runs in the side's
+    // scratch root, which no setup makes a repository -- the setups bind
+    // `$REPO` to a path under it -- so the current directory resolves nothing
+    // there and the run line is the whole reading.
+    //
+    // A `probe:` cell carries no textual `run:` line, so the guard inside
+    // `exec::run` is its gate, one invocation at a time. Of the two registered
+    // probes, `repo-position-precedence` binds `--repo` or `OSTREE_REPO` in
+    // all three of its invocations (`probe.rs:127`, `:134`, `:142`), and
+    // `init-reuse-via-cwd-and-env` exercises the current-directory source
+    // deliberately (`probe.rs:84`), which the guard's `cwd` term admits.
     let directory = options.artifact_dir.join(&cell.id);
+    if !is_probe
+        && let Some(detail) =
+            system_repo_premise(record, &directory, options.host.system_repo.as_deref())
+    {
+        return CellResult::skip(cell, record, required, "system-repo", detail);
+    }
+
+    let started = std::time::Instant::now();
     let mut result = match execute(cell, record, options, required, &directory, is_probe) {
         Ok(result) => result,
         Err(message) => CellResult {
@@ -308,6 +330,40 @@ fn one(matrix: &Matrix, cell: &Cell, options: &Options) -> CellResult {
         result.artifact = None;
     }
     result
+}
+
+/// The detail a `system-repo` skip carries, and `None` when the cell's two
+/// invocations both bind a repository or the host carries none.
+///
+/// The invocations are read as the record states them, before substitution: a
+/// placeholder such as `--repo=$REPO` still reads as a binding. `directory` is
+/// the cell's artifact directory, which holds the two scratch roots the
+/// invocations run in; no setup makes a scratch root a repository, so the
+/// current-directory source resolves nothing for a declared cell.
+fn system_repo_premise(
+    record: &Record,
+    directory: &Path,
+    system_repo: Option<&Path>,
+) -> Option<String> {
+    let system_repo = system_repo?;
+    for line in [record.get("run"), record.reference_run()]
+        .into_iter()
+        .flatten()
+    {
+        // A line the splitter rejects is left to the executor, which reports
+        // the syntax error itself.
+        let Ok(args) = syntax::split(line) else {
+            continue;
+        };
+        if exec::system_repo_refusal(directory, &args, &[], Some(system_repo)).is_some() {
+            return Some(format!(
+                "`{line}` binds no repository, and this host carries {}, which \
+                 the reference tool resolves; the claim cannot be made here",
+                system_repo.display()
+            ));
+        }
+    }
+    None
 }
 
 fn promote(result: &mut CellResult, flag: &str) {
@@ -759,6 +815,27 @@ mod tests {
     fn a_require_promoted_skip_gates_regardless_of_strict_identity() {
         let promoted = failure("identity", true);
         assert!(gating_failure(&[promoted], false));
+    }
+
+    #[test]
+    fn a_repo_less_invocation_on_either_side_fails_the_system_repo_premise() {
+        let present = Some(Path::new(crate::tier::SYSTEM_REPO));
+        // The scratch root a declared cell runs in, which is never a
+        // repository.
+        let directory = Path::new("/ostrya-conformance-no-such-directory");
+
+        let bound = record(&[("run", "--repo=$REPO refs")]);
+        assert!(system_repo_premise(&bound, directory, present).is_none());
+        // The host fact decides: the same record passes the premise where no
+        // system repository exists.
+        let unbound = record(&[("run", "prune")]);
+        assert!(system_repo_premise(&unbound, directory, None).is_none());
+        assert!(system_repo_premise(&unbound, directory, present).is_some());
+
+        // `ref-run` states the reference's own invocation, and a repo-less one
+        // there fails the premise for the whole cell.
+        let reference_only = record(&[("run", "--repo=$REPO refs"), ("ref-run", "refs")]);
+        assert!(system_repo_premise(&reference_only, directory, present).is_some());
     }
 
     #[test]

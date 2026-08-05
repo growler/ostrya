@@ -3161,6 +3161,17 @@ repository, else `OSTREE_REPO`; with neither, the failing subcommand's usage
 text and `error: Command requires a --repo argument` go to standard error and
 the process exits 1 -- the same shape the tool uses, though the port's usage
 text is `clap`'s own rendering, not byte-identical to the tool's GOption text.
+The tool's chain carries a third step, stated in its own `--repo` help text and
+quoted in `conformance/cli-surface.md`, "Global conventions": with no `--repo`,
+no current-directory repository, and no `OSTREE_REPO` that opens, it resolves
+the compiled-in `/sysroot/ostree/repo`, an `OSTREE_REPO` naming a path that
+does not open leaving that chain running. A repo-less tool invocation on an
+ostree-managed host therefore resolves the system repository, and a writing
+subcommand acts on it. The port's chain ends at `OSTREE_REPO` and resolves no
+third source, which keeps `ostrya` from acting on a live system repository
+through an omitted `--repo` and costs `ostrya prune` an explicit `--repo` where
+`ostree prune` needs none on an ostree-managed host. The port holds this
+divergence by intent.
 `init` shares this precedence rather than special-casing it: a cwd/
 `OSTREE_REPO` target that already opens as a repository is reused (an
 idempotent re-init, matching `Repo::create`); one that does not falls through

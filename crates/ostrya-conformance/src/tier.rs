@@ -5,9 +5,29 @@
 //! process provides, so a cell needing more reports as skipped rather than
 //! failing for a reason the host caused.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use crate::record::Tier;
+
+/// The path the reference tool compiles in as its third `--repo` source, after
+/// the current directory and `OSTREE_REPO`.
+pub const SYSTEM_REPO: &str = "/sysroot/ostree/repo";
+
+/// The system repository, when the host carries one.
+///
+/// The host carries one when `SYSTEM_REPO` exists and is a directory. Every
+/// invocation consults this fact, so it is detected once per process.
+pub fn system_repo() -> Option<&'static Path> {
+    static DETECTED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DETECTED
+        .get_or_init(|| {
+            let path = Path::new(SYSTEM_REPO);
+            path.is_dir().then(|| path.to_path_buf())
+        })
+        .as_deref()
+}
 
 /// What the host grants the running process.
 #[derive(Clone, Debug)]
@@ -21,13 +41,16 @@ pub struct Host {
     pub selinux_enforcing: bool,
     /// Whether `unshare -r true` succeeds, so T2 is reachable by re-running.
     pub namespaces_available: bool,
+    /// The repository the reference tool's third `--repo` source resolves,
+    /// when the host carries one.
+    pub system_repo: Option<PathBuf>,
 }
 
 impl Host {
     /// One line naming the tier and the reason it is that tier.
     pub fn describe(&self) -> String {
         format!(
-            "tier {} (euid {}, {} group(s), {} namespace, SELinux {})",
+            "tier {} (euid {}, {} group(s), {} namespace, SELinux {}, {})",
             self.tier,
             self.euid,
             self.groups,
@@ -40,6 +63,10 @@ impl Host {
                 "enforcing"
             } else {
                 "not enforcing"
+            },
+            match &self.system_repo {
+                Some(path) => format!("system repo {}", path.display()),
+                None => "no system repo".to_owned(),
             },
         )
     }
@@ -89,6 +116,7 @@ pub fn detect() -> Host {
         initial_namespace,
         selinux_enforcing,
         namespaces_available: namespaces_available(),
+        system_repo: system_repo().map(Path::to_path_buf),
     }
 }
 

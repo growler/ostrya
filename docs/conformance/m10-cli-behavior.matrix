@@ -3017,22 +3017,503 @@ note: the operand count is checked ahead of the operation name, and `set` is the
  second. Each prints the subcommand's usage text before the error line, so
  `stderr-text` is not an oracle here.
 
+# ---------------------------------------------------------------------------
+# config set/unset -- writing one configuration value (Phase 17e).
+# ---------------------------------------------------------------------------
+
 family: M10
 subcommand: config
-cell: config/set-unimplemented
+cell: config/set-new-key
 setup: repo
-run: config --repo=$REPO set core.mode bare
-expect-exit: 1
+run: config --repo=$REPO set core.newkey somevalue
+expect-exit: 0
 expect-stdout: empty
-expect-stderr: contains "error: The set operation is not implemented yet"
 ref-expect-exit: 0
 ref-expect-stdout: empty
-oracle: stdout-text
-outcome: unimplemented-cli
-cli-gap: config set
+oracle: exit-status stdout-text config-bytes
+outcome: full
 severity: interop
-spec: cli-surface.md#p1-reading-and-resolution
-note: the config write path lands in Phase 17e, so the reference writes the value
- and exits 0 where the port names the gap and exits 1. Neither writes to standard
- output, which is the one artifact the two can be held to; `exit-status` and
- `config-bytes` are left out because the claim is the gap itself.
+spec: format-reference.md#config-set-and-config-unset
+note: a new key joins its group at the end, and the rewritten document drops the
+ comment and blank lines the input carried, so `config-bytes` is an oracle.
+
+family: M10
+subcommand: config
+cell: config/set-new-group
+setup: repo
+run: config --repo=$REPO set newgroup.k v
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+note: a group the document does not hold is appended after a blank line.
+
+family: M10
+subcommand: config
+cell: config/set-group-option
+setup: repo
+run: config --repo=$REPO --group=core set k2 v2
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+note: `--group` names the section and the argument is then a whole key name.
+
+family: M10
+subcommand: config
+cell: config/set-escaped-value
+setup: repo
+run: config --repo=$REPO set core.lead '   ab'
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+note: the leading whitespace run is stored escaped, one `\s` per space, so the
+ value reads back whole.
+
+family: M10
+subcommand: config
+cell: config/unset-key
+setup: repo
+run: config --repo=$REPO unset core.repo_version
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+
+family: M10
+subcommand: config
+cell: config/unset-absent-key
+setup: repo
+run: config --repo=$REPO unset core.absent
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+note: a key the document does not hold is success and the file is left as it
+ stands, which `config-bytes` states.
+
+family: M10
+subcommand: config
+cell: config/unset-absent-group
+setup: repo
+run: config --repo=$REPO unset nogroup.k
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+
+family: M10
+subcommand: config
+cell: config/set-without-value
+setup: repo
+run: config --repo=$REPO set core.k
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: KEY and VALUE must be specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: KEY and VALUE must be specified"
+oracle: exit-status stdout-text stderr-text config-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+note: no usage text precedes this line in either, so `stderr-text` is an oracle
+ here.
+
+family: M10
+subcommand: config
+cell: config/set-group-without-value
+setup: repo
+run: config --repo=$REPO --group=core set k
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: GROUP name, KEY and VALUE must be specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: GROUP name, KEY and VALUE must be specified"
+oracle: exit-status stdout-text stderr-text config-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+note: `--group` changes the wording of the refusal, which names the group too.
+
+family: M10
+subcommand: config
+cell: config/unset-without-key
+setup: repo
+run: config --repo=$REPO unset
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: KEY must be specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: KEY must be specified"
+oracle: exit-status stdout-text stderr-text config-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+
+family: M10
+subcommand: config
+cell: config/unset-key-without-group
+setup: repo
+run: config --repo=$REPO unset nodot
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Key must be of the form \"sectionname.keyname\""
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Key must be of the form \"sectionname.keyname\""
+oracle: exit-status stdout-text stderr-text config-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#config-set-and-config-unset
+
+family: M10
+subcommand: config
+cell: config/set-and-get-round-trip
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::config_set_and_unset_match_the_tool
+spec: format-reference.md#config-set-and-config-unset
+note: the cases a one-invocation cell cannot state: a value read back through
+ `config get` after `set` wrote it, a key set twice keeping its position, the
+ group header an emptied group keeps, a quoted `remote "x"` group reached through
+ the `section.key` form, and the tool reading the document the port rewrote. The
+ test compares the two `config` files byte for byte at every step.
+
+# ---------------------------------------------------------------------------
+# remote -- the configured remotes and their trusted keys (Phase 17e).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: remote
+cell: remote/no-subcommand
+run: remote
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: No \"remote\" subcommand specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: No \"remote\" subcommand specified"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#remote
+note: the missing nested subcommand is reported before any repository is
+ resolved, so the cell names no setup. Each prints its own usage text before the
+ error line, so `stderr-text` is not an oracle here. A leading `--repo=PATH`
+ cannot be stated either: the tool's `remote` accepts no `--repo` of its own,
+ only its nested subcommands do (`cli-surface.md`, "P3").
+
+family: M10
+subcommand: remote
+cell: remote/add-url
+setup: repo
+run: --repo=$REPO remote add origin https://example.invalid/repo
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#remote
+note: the section is appended as `[remote "origin"]` with one `url` key.
+
+family: M10
+subcommand: remote
+cell: remote/add-branches
+setup: repo
+run: --repo=$REPO remote add origin https://example.invalid/repo main other/branch
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#remote
+note: each branch is written into `branches` followed by the separator, the
+ trailing one included.
+
+family: M10
+subcommand: remote
+cell: remote/add-no-gpg-verify
+setup: repo
+run: --repo=$REPO remote add origin https://example.invalid/repo --no-gpg-verify
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#remote
+
+family: M10
+subcommand: remote
+cell: remote/add-metalink
+setup: repo
+run: --repo=$REPO remote add origin metalink=https://example.invalid/m
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#remote
+note: the `metalink=` prefix names its own key; a `mirrorlist=` prefix stays in
+ the `url` value, which `remote/add-forms` covers.
+
+family: M10
+subcommand: remote
+cell: remote/add-invalid-name
+setup: repo
+run: --repo=$REPO remote add . https://example.invalid/repo
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid remote name ."
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid remote name ."
+oracle: exit-status stdout-text stderr-text config-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#remote
+note: the name rule takes an alphanumeric or `_` first, then alphanumerics and
+ `-`, `_`, `.`; `config-bytes` states that neither side wrote a section.
+
+family: M10
+subcommand: remote
+cell: remote/add-set-without-equals
+setup: repo
+run: --repo=$REPO remote add origin https://example.invalid/repo --set=novalue
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Missing '=' in KEY=VALUE for --set"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Missing '=' in KEY=VALUE for --set"
+oracle: exit-status stdout-text stderr-text config-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#remote
+
+family: M10
+subcommand: remote
+cell: remote/add-without-url
+setup: repo
+run: --repo=$REPO remote add origin
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: NAME and URL must be specified"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: NAME and URL must be specified"
+oracle: exit-status stdout-text config-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#remote
+note: each prints the nested subcommand's usage text before the error line, so
+ `stderr-text` is not an oracle here.
+
+family: M10
+subcommand: remote
+cell: remote/delete-absent
+setup: repo
+run: --repo=$REPO remote delete absent
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Remote \"absent\" not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Remote \"absent\" not found"
+oracle: exit-status stdout-text stderr-text config-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#remote
+
+family: M10
+subcommand: remote
+cell: remote/delete-absent-if-exists
+setup: repo
+run: --repo=$REPO remote delete absent --if-exists
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#remote
+
+family: M10
+subcommand: remote
+cell: remote/list-none
+setup: repo
+run: --repo=$REPO remote list
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text config-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#remote
+note: a repository configuring no remote lists nothing at exit 0, under `-u` as
+ well.
+
+family: M10
+subcommand: remote
+cell: remote/show-url-absent
+setup: repo
+run: --repo=$REPO remote show-url absent
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Remote \"absent\" not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Remote \"absent\" not found"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#remote
+note: a reading subcommand reaches no name rule: a name `add` would refuse simply
+ names no section.
+
+family: M10
+subcommand: remote
+cell: remote/refs-absent
+setup: repo
+run: --repo=$REPO remote refs absent
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Remote \"absent\" not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Remote \"absent\" not found"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#remote
+
+family: M10
+subcommand: remote
+cell: remote/summary-absent
+setup: repo
+run: --repo=$REPO remote summary absent
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Remote \"absent\" not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Remote \"absent\" not found"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#remote
+
+family: M10
+subcommand: remote
+cell: remote/gpg-list-keys-absent
+setup: repo
+run: --repo=$REPO remote gpg-list-keys absent
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Remote \"absent\" not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Remote \"absent\" not found"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#remote
+note: `gpg-import` words the same condition with a `GPG: ` prefix, which
+ `remote/gpg-forms` covers.
+
+family: M10
+subcommand: remote
+cell: remote/add-forms
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::remote_add_and_delete_match_the_tool
+spec: format-reference.md#remote
+note: the cases a one-invocation cell cannot state: the key order every option
+ writes in, `--contenturl`, `--collection-id`, `--custom-backend`, `--set`,
+ `--no-sign-verify` and the GPG switch it also writes, `--sign-verify` inline and
+ from a file, the `mirrorlist=` prefix, the existence rules
+ (`--if-not-exists`, `--force`, and the refusal naming both), `remote list` and
+ `list -u` over several remotes with the column the names are padded to, and
+ `show-url`. The test compares the two `config` files byte for byte at every
+ step.
+
+family: M10
+subcommand: remote
+cell: remote/delete-existing
+setup: repo
+outcome: lossy
+severity: interop
+loss: The tool's document keeps one trailing blank line where the last section
+ was, and the port's keeps none. Both reparse to the same configuration.
+evidence: ostrya_cli::cli::remote_add_and_delete_match_the_tool
+spec: format-reference.md#remote
+note: deleting a section needs one invocation to add it first. A section removed
+ from the middle of the document leaves both files identical; removing the last
+ one is the divergence the outcome names -- the tool keeps the blank line that
+ separated it and the port keeps none. Both documents reparse to the same
+ configuration, which the test states by having the tool list the remotes out of
+ the port's own file.
+
+family: M10
+subcommand: remote
+cell: remote/refs-and-summary
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::remote_refs_and_summary_match_the_tool
+spec: format-reference.md#remote
+note: reading a live remote needs a server, which no setup binds. The test serves
+ a repository over HTTP and compares `remote refs`, `refs -r`, the summary
+ report, `--raw`, `--list-metadata-keys`, three `--print-metadata-key` forms, and
+ the refusal a remote publishing no summary draws. The timestamps in the report
+ are the one divergence: the tool renders them in the host time zone and the port
+ in UTC, so the test fixes `TZ=UTC` (`cli-surface.md`, "P3").
+
+family: M10
+subcommand: remote
+cell: remote/gpg-forms
+setup: repo
+outcome: lossy
+severity: interop
+loss: `gpg-list-keys` omits the two Web Key Directory URL lines the tool prints
+ per user id, and renders the key's creation instant in UTC rather than the host
+ locale and time zone. The fingerprint, the creation instant, and the user ids
+ are the same in both.
+evidence: ostrya_cli::cli::remote_gpg_keyring_round_trips_with_the_tool
+spec: format-reference.md#remote
+note: importing keys needs a generated key and a remote, which no setup binds.
+ The test imports one keyring into each implementation's repository and states
+ that each reads the keyring the other wrote, that the count a repeated import
+ reports is the same, that a `KEY-ID` selection takes the key it names, that the
+ imported key verifies a commit the tool's own `gpg-sign` signed with it, and
+ that deleting the remote takes its keyring with it. `gpg-list-keys` is the
+ divergence the outcome names:
+ the port reports the fingerprint, the creation instant, and the user ids, and
+ leaves out the two Web Key Directory URL lines, rendering the instant in UTC
+ rather than the host locale (`cli-surface.md`, "P3").

@@ -353,12 +353,17 @@ deliberately not reproduced:
   algorithm name, the short key id, the user id, and the three verdict lines are
   the same in both.
 
-Absent:
+`config set` and `config unset` write the document through the config write path
+Phase 17e landed. Both accept what the tool accepts and word every refusal the
+same way, and the file each writes holds the same bytes
+(`../format-reference.md`, "`config set` and `config unset`"). One divergence
+stands, at a key naming an empty group or an empty key: `config set .k v` and
+`config set g. v` reach GLib's own key-file assertions in the tool, which prints
+a `GLib-CRITICAL` line, writes nothing, and exits 0, where the port refuses the
+name (`keyfile: group name is empty`, `keyfile: key is empty`), writes nothing,
+and exits 1. Both leave the file as it stands.
 
-- `config set` and `config unset`, which need the config write path Phase 17e
-  lands. The port accepts the operation names and reports `error: The <operation>
-  operation is not implemented yet` at exit 1, rather than the unknown-operation
-  line, so the gap is stated rather than misreported.
+Nothing in this section is absent.
 
 ## P2 -- options missing from commands that exist
 
@@ -547,9 +552,8 @@ extensions `--force-copy` and `-L/--localcache-repo`. Missing:
 No matrix cell needs these. The shell suite invokes them.
 
 - `reset` -- reset a ref to an earlier commit.
-- `remote` -- `add`, `delete`, `show-url`, `list`, `gpg-import`,
-  `gpg-list-keys`, `add-cookie`, `delete-cookie`, `list-cookies`, `refs`,
-  `summary`.
+- `remote add-cookie`, `delete-cookie`, and `list-cookies` -- see the cookie-jar
+  note at the end of this section.
 - `checksum` -- `--ignore-xattrs`.
 - `find-remotes` -- `--cache-dir`, `--disable-fsync`, `--finders=FINDERS`,
   `--pull`, `--mirror`.
@@ -558,6 +562,55 @@ No matrix cell needs these. The shell suite invokes them.
 - `gpg-sign` -- `-d/--delete`, `--gpg-homedir=HOMEDIR`. The port folds GPG
   signing into `sign --sign-type=gpg`, so this is an alias with its own option
   names.
+
+`remote` landed in Phase 17e: `add`, `delete`, `list`, `show-url`, `refs`,
+`summary`, `gpg-import`, and `gpg-list-keys`, with the option set the tool
+carries on each and the output formats `../format-reference.md`, "`remote`",
+records. Five divergences stand:
+
+- the tool's `remote` accepts no `--repo` of its own -- `ostree remote --repo=R
+  list` reports `error: Unknown option --repo=R`, where the leading position
+  (`ostree --repo=R remote list`) and the nested subcommand's own `--repo` both
+  work. The port accepts `--repo` in every position, the leniency "Global
+  conventions" already records;
+- a nested subcommand the tool does not know reports `error: Unknown "remote"
+  subcommand '<name>'` at exit 1, where the port reports clap's own
+  `unrecognized subcommand` text. A missing nested subcommand agrees in both;
+- `remote delete` removing the last `[remote "<name>"]` section of the document
+  leaves the tool's file with one trailing blank line, where the section's
+  separator was, and the port's with none. Removing a section any other section
+  follows leaves the two files identical, and both documents reparse to the same
+  configuration;
+- `--sign-verify=spki=...` reports `error: Requested signature type is not
+  implemented` from the tool, whose build carries the ed25519 engine alone, and
+  the port accepts it where it is built with the `spki` feature. Each refuses an
+  engine it does not carry in those same words;
+- `remote gpg-list-keys` reports the key fingerprint, the creation instant, and
+  the user ids in the tool's own shape, and leaves out the `Advanced update URL`
+  and `Direct update URL` lines the tool prints per user id: they name the key's
+  OpenPGP Web Key Directory location, derived from a hash of the address, and
+  state no repository fact. The creation instant parts the same way the GPG
+  signature report in "P1" does -- the tool renders it in the host locale and
+  time zone and the port in UTC. `remote summary` renders its `Timestamp` and
+  `Last-Modified` lines the same way, so a report compares byte for byte with
+  `TZ=UTC` set.
+
+Two messages the port words for itself, each reporting a condition the tool
+reports through gpgme: `remote gpg-import` with no `--keyring` and no `--stdin`
+(the tool's `GPG: Unable to export keys: GPGME: No data`), and a `KEY-ID` naming
+no key in the source (the tool's `GPG: Unable to find key "<id>": GPGME: End of
+file`).
+
+`--cache-dir`, which the tool's `remote refs` and `remote summary` accept, is not
+carried: the port fetches a summary without a cache directory of its own. The
+port's fetcher serves `http` and `https` alone, where the tool also reads a
+`file://` remote, so a `file://` URL reports `fetch url scheme file: only http
+and https are fetched` (`../port-plan.md`, Phase 16a).
+
+`remote add-cookie`, `remote delete-cookie`, and `remote list-cookies` stay out.
+`fetch.rs` refuses any `Cookie` header at construction whenever a mirror is
+cleartext `http`, a deliberate choice, and cookie-jar support needs its own design
+pass against that refusal.
 
 ## Global conventions
 
@@ -686,11 +739,14 @@ pass, and the results belong in that same section.
 - `diff`, including the per-path change prefixes and `--stats`.
 - `fsck` progress output and its `-q` form.
 - `prune` totals.
-- `summary -v`, `--raw`, and `--list-metadata-keys`.
+- `summary -v`, `--raw`, and `--list-metadata-keys`, whose formats are the ones
+  `remote summary` reports and whose flags the local command still lacks.
 - `static-delta list`, `show`, and `indexes`.
 - `commit --table-output`.
 - `pull` progress output.
-- `remote list`, `show-url`, `refs`, and `summary`.
+
+`remote list`, `show-url`, `refs`, and `summary` are recovered, in
+`../format-reference.md`, "`remote`".
 
 ## Ordering
 
@@ -708,7 +764,8 @@ pass, and the results belong in that same section.
    `--owner-uid`, `--owner-gid`, `--timestamp`, `--no-xattrs`, `-U`, `--subpath`.
    Done, Phase 17c.
 6. `show`, `log`, `ls`, and `config get`, together with the variant printer.
-   Done, Phase 17d. `config set` and `unset` moved to step 7's phase, needing the
-   config write path Phase 17e lands.
-7. The remaining P2 gaps.
-8. P3.
+   Done, Phase 17d.
+7. `config set`/`unset`, `remote`, and the two GPG keyring commands, which need
+   the config write path. Done, Phase 17e.
+8. The remaining P2 gaps.
+9. The rest of P3.

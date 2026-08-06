@@ -103,6 +103,15 @@ impl Repo {
     pub async fn reload_config(&self) -> Result<()>;
     pub fn is_writable(&self) -> bool;
 
+    /// Replace `config` with the document a caller edited through `KeyFile`'s
+    /// setters and removers: a temporary file at mode 0644, `fdatasync`ed when
+    /// `[core] fsync` is set, renamed over the target, with the repository
+    /// directory synced. This handle keeps the configuration it was opened with.
+    pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()>;
+    /// Remove a remote's trusted keyring, `<remote>.trustedkeys.gpg`. An
+    /// already-absent keyring is success.
+    pub async fn remove_remote_keyring(&self, remote: &str) -> Result<()>;
+
     // --- reading ---
     /// A refspec, a 64-char lowercase checksum, or either with a trailing run
     /// of `^`, each stepping one generation back along `parent`. A 64-char name
@@ -631,6 +640,23 @@ impl Repo {
     pub async fn verify_commit(&self, c: &Checksum, verifiers: &[&dyn Verifier])
         -> Result<VerifyOutcome>;
 }
+
+/// One key of a remote's trusted keyring, as a `gpg` key listing states it.
+pub struct GpgKey {
+    pub fingerprint: String,
+    pub created: Option<u64>,
+    pub user_ids: Vec<String>,
+}
+
+impl Repo {                                   // feature = "sign-gpg"
+    /// Add the certificates `keys` holds to `<remote>.trustedkeys.gpg`, and
+    /// report how many the keyring did not already hold. With `key_ids`
+    /// non-empty only the keys those selectors name are imported.
+    pub async fn gpg_import_keys(&self, remote: &str, keys: &[u8], key_ids: &[String])
+        -> Result<usize>;
+    /// The keys that keyring holds. An absent keyring holds none.
+    pub async fn gpg_list_keys(&self, remote: &str) -> Result<Vec<GpgKey>>;
+}
 ```
 
 Key loading helpers (ed25519 base64-per-line files and the
@@ -856,10 +882,22 @@ pub struct PullStats {
 
 /// The read side of a `summary` file: the ref list a pull resolves against, and
 /// the global metadata dict verbatim.
-pub struct Summary { pub refs: Vec<(String, Checksum)>, pub metadata: Value }
+pub struct Summary { pub refs: Vec<SummaryRef>, pub metadata: Value }
+/// One field-0 entry: a ref, the commit it names, and what the summary records
+/// about that commit. `commit_size` is stored in host order; the numbers in
+/// `metadata` are big-endian.
+pub struct SummaryRef {
+    pub name: String,
+    pub commit: Checksum,
+    pub commit_size: u64,
+    pub metadata: Value,
+}
 impl Summary {
     pub fn parse(bytes: &[u8]) -> Result<Summary>;
     pub fn lookup(&self, ref_name: &str) -> Option<Checksum>;
+    pub fn metadata_value(&self, key: &str) -> Option<&Value>;
+    /// The refs of each collection `ostree.summary.collection-map` lists.
+    pub fn collection_map(&self) -> Result<Vec<(String, Vec<SummaryRef>)>>;
 }
 
 impl Repo {

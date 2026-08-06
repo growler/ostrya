@@ -2792,3 +2792,170 @@ operand beside the operation, and two for `set`, which takes a key and a value, 
 while `set KEY VALUE` is not. An operation the tool does not know gets the
 one-operand allowance, so `<unknown> KEY EXTRA` reports the count and
 `<unknown> KEY` reports the unknown operation.
+
+### `config set` and `config unset`
+
+Both write the whole document back and print nothing at exit 0. The key is read
+the way `config get` reads it: `sectionname.keyname` split on its first `.`, or a
+whole key name under `--group=GROUP`.
+
+`set` takes a key and a value. A group the document does not hold is appended
+after a blank line; a key its group does not hold is appended at the end of that
+group; a key already there keeps its position and takes the new value. The value
+is escaped as GKeyFile defines on write: a backslash becomes `\\`, a newline
+`\n`, and a carriage return `\r` anywhere in the value, and within the leading
+whitespace run each space becomes `\s` and each tab `\t`. A space or tab
+elsewhere, and a `;`, are written literally.
+
+`unset` takes a key. Removing a group's last key leaves the group header in the
+file with no entries. A key the document does not hold, and a group it does not
+hold, are both success and leave the file untouched.
+
+The rewritten document keeps the groups and keys the operation did not touch, in
+the order it read them, and drops the comment and blank lines the input carried.
+The file is replaced atomically at mode `0644`.
+
+The refusals, each exit 1 with no usage text: `set` with fewer than two operands
+reports `error: KEY and VALUE must be specified`, or `error: GROUP name, KEY and
+VALUE must be specified` when `--group` was given; `unset` with no operand
+reports `error: KEY must be specified`, or `error: Group name and key must be
+specified` under `--group`; and a key holding no `.` with no `--group` reports
+`error: Key must be of the form "sectionname.keyname"`. The operand-count check
+and the missing-operation check of `config get` stand ahead of all of these.
+
+### `remote`
+
+`remote` takes a nested subcommand. A missing one reports the subcommand's usage
+text and `error: No "remote" subcommand specified` at exit 1, before any
+repository is resolved.
+
+`remote add NAME URL [BRANCH...]` writes the `[remote "NAME"]` section and prints
+nothing at exit 0. The keys are written in this order:
+
+- `url`, or `metalink` when the URL carries the `metalink=` prefix, which is
+  stripped. A `mirrorlist=` prefix is not stripped and stays in the `url` value.
+- `branches`, when branches were given: each followed by `;`, the last one
+  included.
+- `contenturl`, from `--contenturl=URL`.
+- `custom-backend`, from `--custom-backend=NAME`.
+- each `--set=KEY=VALUE` pair, in the order given.
+- `gpg-verify=false`, from `--no-gpg-verify` and from `--no-sign-verify`, which
+  turns both checks off.
+- `sign-verify=false`, from `--no-sign-verify`.
+- `verification-<engine>-key` or `verification-<engine>-file` per
+  `--sign-verify=KEYTYPE=inline:PUBKEY` or `--sign-verify=KEYTYPE=file:PATH`,
+  followed by `sign-verify` naming the engines, comma separated, in the order
+  given.
+- `collection-id`, from `--collection-id=ID`.
+
+A remote name is at least one character; every character is alphanumeric or one
+of `-`, `_`, `.`; and the first is alphanumeric or `_`. So `_`, `1o`, `a..b`, and
+a non-ASCII letter are names, and ``, `-`, `.`, `..`, `a b`, `a/b`, and `a+b` are
+not. A refused name reports `error: Invalid remote name <name>` at exit 1 and
+writes nothing. `add` and `delete` hold their operand to this rule; the reading
+subcommands do not, so a name of any shape simply names no section.
+
+A section already there reports `error: Remote configuration for "<name>" already
+exists: (in config)` at exit 1. `--if-not-exists` leaves it as it stands at exit
+0, `--force` replaces the section whole, and naming both reports the usage text
+and `error: Can only specify one of --if-not-exists and --force`. A `--set` value
+holding no `=` reports `error: Missing '=' in KEY=VALUE for --set`, and a
+`--sign-verify` value that is not `KEYTYPE=inline:DATA` or `KEYTYPE=file:DATA`
+reports `error: Failed to parse KEYTYPE=[inline|file]:DATA in <value>`, both at
+exit 1 with no usage text. A missing NAME or URL reports the usage text and
+`error: NAME and URL must be specified`.
+
+`remote delete NAME` removes the section and the remote's
+`<remote>.trustedkeys.gpg` keyring, and prints nothing at exit 0. A section the
+document does not hold reports `error: Remote "<name>" not found` at exit 1,
+which `--if-exists` turns into exit 0.
+
+`remote list` prints one name per line, sorted by name, whatever order the
+sections appear in. `-u`/`--show-urls` prints each name padded with spaces to the
+longest name of the whole list plus two, counted in bytes, followed by the
+remote's `url`. A section stating no `url` -- a metalink remote, for one --
+reports `error: No "url" option in remote "<name>"` at exit 1 where its turn
+comes, so the names before it are already printed.
+
+`remote show-url NAME` prints the `url` value and a newline, and reports the same
+two refusals: `error: Remote "<name>" not found` and `error: No "url" option in
+remote "<name>"`.
+
+`remote refs NAME` fetches the remote's summary and prints one `NAME:REF` line
+per ref the summary lists, in the order it lists them. `-r`/`--revision` adds a
+tab and the commit checksum to each line. A remote publishing no summary reports
+`error: Remote refs not available; server has no summary file` at exit 1.
+
+`remote summary NAME` fetches the same summary and reports it. `--raw` prints the
+whole document in the GVariant text form, with the big-endian fields converted;
+`--list-metadata-keys` prints the global metadata keys, sorted;
+`--print-metadata-key=KEY` prints one value in the annotated text form, with the
+same conversion, and reports `error: No such metadata key '<key>'` at exit 1 for
+a key the dict does not hold. A remote publishing no summary reports `error:
+Remote server has no summary file`.
+
+The default report prints each ref of field 0, then the refs of every collection
+`ostree.summary.collection-map` lists, then the global metadata. One ref reads:
+
+```
+* main
+    Latest Commit (150 bytes):
+      21386ebf0c349ce54f2196fb4ec77f5a4dc57d03d4a4d5a97c61a9542c9e5e23
+    Version (ostree.commit.version): 1.2.3
+    Timestamp (ostree.commit.timestamp): 2023-11-14T22:30:00+00
+```
+
+A blank line follows each ref. A summary stating `ostree.summary.collection-id`
+names every ref of field 0 as a pair, `* (org.example.C, main)`, and each
+collection-map ref is named as a pair with its own collection. The `Version` line
+appears only where the ref metadata carries the key, and its string prints
+unquoted. The `Timestamp` line converts the stored big-endian field and renders
+it as `YYYY-MM-DDTHH:MM:SS` and a UTC offset.
+
+The global metadata prints in the order the summary stores it, one line per
+entry, with a label for each key the format defines:
+
+```
+Repository Mode (ostree.summary.mode): archive-z2
+Last-Modified (ostree.summary.last-modified): 2026-08-05T19:40:49+00
+Has Tombstone Commits (ostree.summary.tombstone-commits): No
+Static Deltas (ostree.static-deltas): {'<from>-<to>': <[byte 0xeb, 0x57]>}
+Collection Map (ostree.summary.collection-map): (printed above)
+Collection ID (ostree.summary.collection-id): org.example.C
+ostree.summary.indexed-deltas: true
+```
+
+`Last-Modified` converts its big-endian field the way a `Timestamp` line does.
+`Has Tombstone Commits` prints `Yes` or `No`. `Collection Map` prints
+`(printed above)`, its refs having been reported with the others. A key the
+format does not define, `ostree.summary.indexed-deltas` among them, prints its
+own name and its value; a string value prints unquoted where the key carries a
+label and quoted where it does not. Every value outside the labeled set prints in
+the GVariant text form with no type annotation and no byte-order conversion, so a
+`t` value stored little-endian reads as the number it holds.
+
+`remote gpg-import NAME [KEY-ID...]` adds the keys of each `-k`/`--keyring=FILE`,
+or of standard input under `--stdin`, to the remote's `<remote>.trustedkeys.gpg`
+keyring, and prints `Imported <n> GPG key to remote "<name>"` -- `keys` for any
+count but one. The count is the keys the keyring did not already hold, so a
+repeated import reports `0`. A `KEY-ID` selects the keys it names out of the
+source, each resolved the way `gpg` resolves one. Naming both sources reports the
+usage text and `error: --keyring and --stdin are mutually exclusive`; a
+`--keyring` naming no file reports `error: Error opening file <path>: <reason>`,
+which is read before the remote is looked up; and a remote the configuration does
+not describe reports `error: GPG: Remote "<name>" not found`, the one message at
+this site carrying the prefix.
+
+`remote gpg-list-keys NAME` reports each key of the remote's keyring:
+
+```
+Key: FA2B2317C9966572B5D729EDCA965442280A3BB5
+  Created: 2026-08-05 20:04:00 +0000
+  UID: Ostrya Test <test@example.invalid>
+```
+
+A key with more than one user id carries one `UID` line per id, and a keyring
+that is absent or holds no key prints nothing at exit 0. The tool follows each
+`UID` line with an `Advanced update URL` and a `Direct update URL` line naming
+the key's Web Key Directory location, and renders `Created` in the host locale
+and time zone; `../conformance/cli-surface.md`, "P3", records both.

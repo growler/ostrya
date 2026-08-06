@@ -400,10 +400,14 @@ impl Repo {
             // A summary name becomes a ref this pull writes, so it is held to
             // the ref store's rule here, before the first object is requested,
             // rather than when the transaction resolves it at publication.
-            for (name, _) in &summary.refs {
-                crate::refs::check_ref_path(name)?;
+            for entry in &summary.refs {
+                crate::refs::check_ref_path(&entry.name)?;
             }
-            return Ok(summary.refs.clone());
+            return Ok(summary
+                .refs
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.commit))
+                .collect());
         } else {
             let branches = match self.config().remote(remote) {
                 Some(section) => section.branches()?.unwrap_or_default(),

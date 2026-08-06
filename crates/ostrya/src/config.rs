@@ -13,14 +13,21 @@
 //!
 //! The parsed [`KeyFile`] is retained so a caller can read keys this view does
 //! not model and so the document reserializes in the order it was written.
+//!
+//! The write side is [`Repo::write_config`]: it replaces `config` atomically
+//! with the document a caller edited through [`KeyFile`]'s own setters and
+//! removers.
 
 use ostrya_core::{KeyFile, RepoMode};
 
 use crate::error::{Error, Result};
+use crate::repo::Repo;
 
 const CORE: &str = "core";
 const ARCHIVE: &str = "archive";
 const EX_INTEGRITY: &str = "ex-integrity";
+/// The name of the repository file holding `config`.
+const CONFIG_FILE: &str = "config";
 
 /// A parsed repository configuration.
 #[derive(Debug, Clone)]
@@ -352,6 +359,43 @@ impl RepoConfig {
     pub fn keyfile(&self) -> &KeyFile {
         &self.keyfile
     }
+}
+
+impl Repo {
+    /// Replace the repository `config` with the document `keyfile` holds.
+    ///
+    /// The file is written the way the rest of the write path writes a
+    /// repository-root file: a fresh temporary file at mode `0644`,
+    /// `fdatasync`ed when `[core] fsync` is set, renamed over `config`, with the
+    /// repository directory synced after the rename. A reader therefore sees
+    /// either the old document or the new one.
+    ///
+    /// The document is written as given. A caller that removes `[core] mode` or
+    /// `[core] repo_version` writes a file [`Repo::open`] refuses, so read the
+    /// current document through [`RepoConfig::keyfile`], edit it, and write it
+    /// back.
+    ///
+    /// This handle keeps the configuration it was opened with; reopen the
+    /// repository to read the new values.
+    pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
+        let fsync = self.config().fsync()?;
+        self.write_root_file(CONFIG_FILE, keyfile.to_string().into_bytes(), fsync)
+            .await
+    }
+
+    /// Remove a remote's trusted GPG keyring, `<remote>.trustedkeys.gpg`, at the
+    /// repository root. An already-absent keyring is success.
+    ///
+    /// A remote's keyring belongs to its configuration section, so deleting the
+    /// section deletes this file with it.
+    pub async fn remove_remote_keyring(&self, remote: &str) -> Result<()> {
+        self.remove_root_file(&remote_keyring_name(remote)).await
+    }
+}
+
+/// The name of a remote's trusted keyring at the repository root.
+pub(crate) fn remote_keyring_name(remote: &str) -> String {
+    format!("{remote}.trustedkeys.gpg")
 }
 
 /// A typed accessor for one `[remote "<name>"]` section.

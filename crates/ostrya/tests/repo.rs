@@ -217,3 +217,61 @@ fn tool_operates_on_created_repo() {
         String::from_utf8_lossy(&commit.stderr)
     );
 }
+
+/// `Repo::write_config` replaces `config` with an edited document, keeping the
+/// file's mode, and a reopen reads the new values.
+#[test]
+fn write_config_replaces_the_document_and_keeps_the_mode() {
+    let tmp = TmpDir::new("write-config");
+    let repo_path = tmp.path().join("repo");
+    let repo = block_on(Repo::create(
+        &repo_path,
+        CreateOptions::new(RepoMode::Archive),
+    ))
+    .expect("create");
+
+    let mut keyfile = repo.config().keyfile().clone();
+    keyfile.set_string("core", "fsync", "false").expect("set");
+    keyfile
+        .set_string("remote \"origin\"", "url", "https://example.invalid/r")
+        .expect("set");
+    keyfile.set_string("core", "gone", "x").expect("set");
+    assert!(keyfile.remove_key("core", "gone"));
+    block_on(repo.write_config(&keyfile)).expect("write config");
+
+    let config = repo_path.join("config");
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("read config"),
+        "[core]\nrepo_version=1\nmode=archive-z2\nfsync=false\n\n\
+         [remote \"origin\"]\nurl=https://example.invalid/r\n"
+    );
+    assert_eq!(
+        std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "the rewritten config keeps mode 0644"
+    );
+
+    // The handle that wrote keeps the configuration it was opened with; a reopen
+    // reads the new one.
+    assert!(repo.config().fsync().expect("fsync"));
+    let reopened = block_on(Repo::open(&repo_path)).expect("reopen");
+    assert!(!reopened.config().fsync().expect("fsync"));
+    assert_eq!(
+        reopened
+            .config()
+            .remote("origin")
+            .expect("the remote section")
+            .url()
+            .expect("url")
+            .as_deref(),
+        Some("https://example.invalid/r")
+    );
+
+    // A remote's keyring is removed with its section.
+    let keyring = repo_path.join("origin.trustedkeys.gpg");
+    std::fs::write(&keyring, b"not a real keyring").unwrap();
+    block_on(reopened.remove_remote_keyring("origin")).expect("remove keyring");
+    assert!(!keyring.exists());
+    // An already-absent keyring is success.
+    block_on(reopened.remove_remote_keyring("origin")).expect("remove keyring again");
+}

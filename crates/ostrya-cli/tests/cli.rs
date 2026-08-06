@@ -2639,6 +2639,11 @@ fn assert_agrees(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
 /// The same with `env` given to both implementations.
 fn assert_agrees_env(port_repo: &Path, tool_repo: &Path, args: &[&str], env: &[(&str, &str)]) {
     let (port, tool) = run_both_env(port_repo, tool_repo, args, env);
+    assert_runs_agree(&port, &tool, &args.join(" "));
+}
+
+/// Assert that two finished runs agree on the exit status and both streams.
+fn assert_runs_agree(port: &Run, tool: &Run, label: &str) {
     let render = |run: &Run| {
         format!(
             "exit {:?}\nstdout: {:?}\nstderr: {:?}",
@@ -2648,11 +2653,9 @@ fn assert_agrees_env(port_repo: &Path, tool_repo: &Path, args: &[&str], env: &[(
         )
     };
     assert_eq!(
-        render(&port),
-        render(&tool),
-        "`ostrya {}` and `ostree {}` disagree",
-        args.join(" "),
-        args.join(" "),
+        render(port),
+        render(tool),
+        "`ostrya {label}` and `ostree {label}` disagree",
     );
 }
 
@@ -2661,25 +2664,27 @@ fn assert_agrees_env(port_repo: &Path, tool_repo: &Path, args: &[&str], env: &[(
 /// error, which is the `error: ` line the usage block precedes.
 fn assert_agrees_on_error(port_repo: &Path, tool_repo: &Path, args: &[&str], message: &str) {
     let (port, tool) = run_both(port_repo, tool_repo, args);
-    for (who, run) in [("port", &port), ("tool", &tool)] {
+    assert_runs_agree_on_error(&port, &tool, &args.join(" "), message);
+}
+
+/// Assert that two finished runs both failed and both carry `message`.
+fn assert_runs_agree_on_error(port: &Run, tool: &Run, label: &str, message: &str) {
+    for (who, run) in [("port", port), ("tool", tool)] {
         assert_eq!(
             run.status.code(),
             Some(1),
-            "the {who} did not exit 1 for `{}`",
-            args.join(" ")
+            "the {who} did not exit 1 for `{label}`"
         );
         let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
         assert!(
             stderr.contains(message),
-            "the {who}'s stderr for `{}` lacks {message:?}:\n{stderr}",
-            args.join(" ")
+            "the {who}'s stderr for `{label}` lacks {message:?}:\n{stderr}"
         );
     }
     assert_eq!(
         String::from_utf8_lossy(&port.stdout),
         String::from_utf8_lossy(&tool.stdout),
-        "`{}` wrote different standard output",
-        args.join(" ")
+        "`{label}` wrote different standard output"
     );
 }
 
@@ -6754,6 +6759,569 @@ fn config_get_matches_the_tool() {
         vec!["config", "badop", "core.mode"],
     ] {
         assert_agrees(&repo, &repo, &args);
+    }
+}
+
+/// Two repositories of one mode, one per implementation, for a cell whose
+/// invocation writes: each side acts on its own repository and the two `config`
+/// files are then compared.
+fn create_repo_pair(base: &Path, mode: RepoMode) -> (PathBuf, PathBuf) {
+    let port = base.join("port");
+    let tool = base.join("tool");
+    std::fs::create_dir_all(&port).unwrap();
+    std::fs::create_dir_all(&tool).unwrap();
+    (create_repo(&port, mode), create_repo(&tool, mode))
+}
+
+/// The `config` bytes of a repository, as text.
+fn config_text(repo: &Path) -> String {
+    std::fs::read_to_string(repo.join("config")).unwrap()
+}
+
+/// Run `args` against each side's own repository, assert the two agree on the
+/// exit status and both streams, and assert their `config` files hold the same
+/// bytes afterwards.
+fn assert_config_agrees(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
+    assert_agrees(port_repo, tool_repo, args);
+    assert_eq!(
+        config_text(port_repo),
+        config_text(tool_repo),
+        "`{}` left different config bytes",
+        args.join(" ")
+    );
+}
+
+/// Run one `remote` invocation against each side's own repository with a
+/// leading `--repo=PATH`.
+///
+/// `remote` itself takes no `--repo` in the tool -- its nested subcommands do,
+/// and the leading position reaches both -- so the shared trailing-`--repo`
+/// runner cannot serve this family.
+fn run_remote_both(
+    port_repo: &Path,
+    tool_repo: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Run, Run) {
+    let with_repo = |repo: &Path| {
+        let mut all = vec![format!("--repo={}", repo.display())];
+        all.extend(args.iter().map(|arg| (*arg).to_owned()));
+        all
+    };
+    let port_args = with_repo(port_repo);
+    let tool_args = with_repo(tool_repo);
+    let port = ostrya(
+        &port_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        None,
+        env,
+    );
+    let tool = ostree_env(
+        &tool_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        env,
+    );
+    (port, tool)
+}
+
+/// Run one `remote` invocation on both sides, assert the two agree, and assert
+/// the two `config` files still hold the same bytes.
+fn assert_remote_config_agrees(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
+    let (port, tool) = run_remote_both(port_repo, tool_repo, args, &[]);
+    assert_runs_agree(&port, &tool, &args.join(" "));
+    assert_eq!(
+        config_text(port_repo),
+        config_text(tool_repo),
+        "`{}` left different config bytes",
+        args.join(" ")
+    );
+}
+
+/// The same for a `remote` invocation each implementation precedes with its own
+/// usage text.
+fn assert_remote_config_agrees_on_error(
+    port_repo: &Path,
+    tool_repo: &Path,
+    args: &[&str],
+    message: &str,
+) {
+    let (port, tool) = run_remote_both(port_repo, tool_repo, args, &[]);
+    assert_runs_agree_on_error(&port, &tool, &args.join(" "), message);
+    assert_eq!(
+        config_text(port_repo),
+        config_text(tool_repo),
+        "`{}` left different config bytes",
+        args.join(" ")
+    );
+}
+
+/// The same for an invocation each implementation precedes with its own usage
+/// text: the exit status, standard output, and the `error: ` line are compared,
+/// and the two `config` files must still hold the same bytes.
+fn assert_config_agrees_on_error(port_repo: &Path, tool_repo: &Path, args: &[&str], message: &str) {
+    assert_agrees_on_error(port_repo, tool_repo, args, message);
+    assert_eq!(
+        config_text(port_repo),
+        config_text(tool_repo),
+        "`{}` left different config bytes",
+        args.join(" ")
+    );
+}
+
+/// `config set` and `config unset` write the document the way the tool writes
+/// it: the same bytes, the same refusals, and a value that reads back whole.
+#[test]
+fn config_set_and_unset_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("config-write");
+    let (port, tool) = create_repo_pair(tmp.path(), RepoMode::Archive);
+    for args in [
+        // A new key joins its group at the end; a new group follows a blank line.
+        vec!["config", "set", "core.newkey", "somevalue"],
+        vec!["config", "set", "newgroup.k", "v"],
+        vec!["config", "set", "--group=core", "k2", "v2"],
+        // An existing key keeps its position.
+        vec!["config", "set", "core.newkey", "second"],
+        // The escaping a value carries on write, and reading it back.
+        vec!["config", "set", "core.list", "a;b;c"],
+        vec!["config", "set", "core.lead", "   ab"],
+        vec!["config", "set", "core.nl", "a\nb"],
+        vec!["config", "get", "core.nl"],
+        vec!["config", "get", "core.lead"],
+        // A quoted group name reached through the `section.key` form.
+        vec![
+            "config",
+            "set",
+            "remote \"x\".url",
+            "https://example.invalid/r",
+        ],
+        vec!["config", "get", "remote \"x\".url"],
+        // Removing a key leaves its group's header behind.
+        vec!["config", "set", "g.k", "v"],
+        vec!["config", "unset", "g.k"],
+        // A key and a group the document does not hold are both success.
+        vec!["config", "unset", "core.absent"],
+        vec!["config", "unset", "nogroup.k"],
+        // The refusals, each worded the same way on both sides.
+        vec!["config", "set", "core.k"],
+        vec!["config", "set"],
+        vec!["config", "unset"],
+        vec!["config", "set", "--group=core"],
+        vec!["config", "unset", "--group=core"],
+        vec!["config", "set", "nodot", "v"],
+        vec!["config", "unset", "nodot"],
+    ] {
+        assert_config_agrees(&port, &tool, &args);
+    }
+    // The operand-count refusal comes with each implementation's own usage text.
+    for args in [
+        vec!["config", "set", "core.k", "v", "extra"],
+        vec!["config", "unset", "core.k", "extra"],
+    ] {
+        assert_config_agrees_on_error(&port, &tool, &args, "error: Too many arguments given");
+    }
+    // The document the port rewrote reparses in the tool.
+    let read_back = ostree(&[
+        "config",
+        "--repo",
+        port.to_str().unwrap(),
+        "get",
+        "core.newkey",
+    ]);
+    assert_eq!(read_back.ok().stdout_trimmed(), "second");
+}
+
+/// `remote add` and `remote delete` write the same configuration the tool
+/// writes, and the two agree on every refusal. The one divergence is the blank
+/// line a deleted group leaves behind in the tool's file.
+#[test]
+fn remote_add_and_delete_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("remote-write");
+    let base = tmp.path();
+    let (port, tool) = create_repo_pair(base, RepoMode::Archive);
+    for args in [
+        // The key order, one option at a time and all at once.
+        vec!["remote", "add", "origin", "https://example.invalid/repo"],
+        vec![
+            "remote",
+            "add",
+            "branched",
+            "https://example.invalid/repo",
+            "main",
+            "other/branch",
+        ],
+        vec![
+            "remote",
+            "add",
+            "opts",
+            "https://example.invalid/r",
+            "--no-gpg-verify",
+            "--contenturl=https://example.invalid/c",
+            "--collection-id=org.example.C",
+            "--custom-backend=flatpak",
+            "--set=tls-permissive=true",
+            "--set=zzz=1",
+        ],
+        // `--no-sign-verify` turns the GPG check off as well.
+        vec![
+            "remote",
+            "add",
+            "unsigned",
+            "https://example.invalid/r",
+            "--no-sign-verify",
+        ],
+        // A sign-api key, inline and from a file.
+        vec![
+            "remote",
+            "add",
+            "inline",
+            "https://example.invalid/r",
+            "--sign-verify=ed25519=inline:AAAA",
+        ],
+        vec![
+            "remote",
+            "add",
+            "fromfile",
+            "https://example.invalid/r",
+            "--sign-verify=ed25519=file:/etc/keys.ed25519",
+        ],
+        // A metalink URL becomes its own key; a mirrorlist one stays in `url`.
+        vec![
+            "remote",
+            "add",
+            "meta",
+            "metalink=https://example.invalid/m",
+        ],
+        vec![
+            "remote",
+            "add",
+            "mirrors",
+            "mirrorlist=https://example.invalid/ml",
+        ],
+        // The existence rules.
+        vec!["remote", "add", "origin", "https://other.invalid/r"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://other.invalid/r",
+            "--if-not-exists",
+        ],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://other.invalid/r",
+            "--force",
+        ],
+        // The name rule: `_` is a name, and `.`, a space, and a slash are not.
+        vec!["remote", "add", "_", "https://example.invalid/r"],
+        vec!["remote", "add", ".", "https://example.invalid/r"],
+        vec!["remote", "add", "we ird", "https://example.invalid/r"],
+        vec!["remote", "add", "a/b", "https://example.invalid/r"],
+        // The option refusals that carry no usage text.
+        vec![
+            "remote",
+            "add",
+            "bad",
+            "https://example.invalid/r",
+            "--set=novalue",
+        ],
+        vec![
+            "remote",
+            "add",
+            "bad",
+            "https://example.invalid/r",
+            "--sign-verify=bogus",
+        ],
+        // Listing, and the URL of one remote. `list -u` refuses the metalink
+        // remote, after the names before it are printed.
+        vec!["remote", "list"],
+        vec!["remote", "list", "-u"],
+        vec!["remote", "show-url", "origin"],
+        vec!["remote", "show-url", "absent"],
+        vec!["remote", "delete", "absent"],
+        vec!["remote", "delete", "absent", "--if-exists"],
+        vec!["remote", "delete", "a/b"],
+    ] {
+        assert_remote_config_agrees(&port, &tool, &args);
+    }
+    // The refusals each implementation precedes with its own usage text.
+    for (args, message) in [
+        (
+            vec!["remote", "add"],
+            "error: NAME and URL must be specified",
+        ),
+        (
+            vec!["remote", "add", "onlyname"],
+            "error: NAME and URL must be specified",
+        ),
+        (
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://other.invalid/r",
+                "--if-not-exists",
+                "--force",
+            ],
+            "error: Can only specify one of --if-not-exists and --force",
+        ),
+        (vec!["remote", "delete"], "error: NAME must be specified"),
+        (vec!["remote", "show-url"], "error: NAME must be specified"),
+    ] {
+        assert_remote_config_agrees_on_error(&port, &tool, &args, message);
+    }
+
+    // Either implementation lists the remotes out of the other's file.
+    let cross = |repo: &Path| {
+        let repo_arg = format!("--repo={}", repo.display());
+        let port = ostrya(&[&repo_arg, "remote", "list", "-u"], None, &[]);
+        let tool = ostree(&[&repo_arg, "remote", "list", "-u"]);
+        assert_runs_agree(&port, &tool, "remote list -u");
+    };
+    cross(&port);
+    cross(&tool);
+
+    // A section removed from the middle of the document leaves both files
+    // identical.
+    for args in [
+        vec!["remote", "delete", "meta"],
+        vec!["remote", "delete", "origin"],
+    ] {
+        assert_remote_config_agrees(&port, &tool, &args);
+    }
+    assert!(
+        !config_text(&port).contains("[remote \"origin\"]"),
+        "the port's config still holds the deleted section:\n{}",
+        config_text(&port)
+    );
+
+    // Removing the last section is where the two files part: the tool keeps the
+    // blank line that separated it and the port keeps none. Both documents
+    // reparse to the same configuration, which the tool reading the port's own
+    // file states.
+    for name in [
+        "branched", "opts", "unsigned", "inline", "fromfile", "mirrors", "_",
+    ] {
+        let args = vec!["remote", "delete", name];
+        let (port_run, tool_run) = run_remote_both(&port, &tool, &args, &[]);
+        assert_runs_agree(&port_run, &tool_run, &args.join(" "));
+    }
+    assert_eq!(
+        config_text(&tool),
+        format!("{}\n", config_text(&port)),
+        "the two files must differ only in the trailing blank line"
+    );
+    let listed = ostree(&[&format!("--repo={}", port.display()), "remote", "list"]);
+    let tool_listed = ostree(&[&format!("--repo={}", tool.display()), "remote", "list"]);
+    assert_eq!(
+        listed.ok().stdout_trimmed(),
+        tool_listed.ok().stdout_trimmed(),
+        "the tool must read the same remotes out of either file"
+    );
+}
+
+/// `remote refs` and `remote summary` read a live remote over HTTP: the ref
+/// listing, the report, the raw variant, and the metadata forms.
+#[test]
+fn remote_refs_and_summary_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("remote-live");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let server = FileServer::start(&remote);
+    let (port, tool) = create_repo_pair(base, RepoMode::Archive);
+    for repo in [&port, &tool] {
+        configure_remote(repo, &server.url(), "gpg-verify=false\n");
+    }
+    // The summary's `last-modified` is the remote's own, so both sides read one
+    // value; `TZ` fixes the zone the tool renders it in, which the port renders
+    // in UTC whatever the zone.
+    let env = &[("TZ", "UTC")];
+    for args in [
+        vec!["remote", "refs", "origin"],
+        vec!["remote", "refs", "origin", "-r"],
+        vec!["remote", "refs", "origin", "--revision"],
+        vec!["remote", "summary", "origin"],
+        vec!["remote", "summary", "origin", "--raw"],
+        vec!["remote", "summary", "origin", "--list-metadata-keys"],
+        vec![
+            "remote",
+            "summary",
+            "origin",
+            "--print-metadata-key=ostree.summary.mode",
+        ],
+        vec![
+            "remote",
+            "summary",
+            "origin",
+            "--print-metadata-key=ostree.summary.last-modified",
+        ],
+        vec![
+            "remote",
+            "summary",
+            "origin",
+            "--print-metadata-key=ostree.summary.tombstone-commits",
+        ],
+        vec!["remote", "summary", "origin", "--print-metadata-key=absent"],
+        vec!["remote", "refs", "absent"],
+        vec!["remote", "summary", "absent"],
+    ] {
+        let (port_run, tool_run) = run_remote_both(&port, &tool, &args, env);
+        assert_runs_agree(&port_run, &tool_run, &args.join(" "));
+    }
+    // The missing-operand refusal comes with each implementation's own usage.
+    for args in [vec!["remote", "refs"], vec!["remote", "summary"]] {
+        let (port_run, tool_run) = run_remote_both(&port, &tool, &args, env);
+        assert_runs_agree_on_error(
+            &port_run,
+            &tool_run,
+            &args.join(" "),
+            "error: NAME must be specified",
+        );
+    }
+
+    // A remote publishing no summary is refused in each subcommand's own words.
+    let bare = build_dest(base, "bare-remote");
+    let bare_server = FileServer::start(&bare);
+    for repo in [&port, &tool] {
+        let config = repo.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "\n[remote \"nosummary\"]\nurl={}\ngpg-verify=false\n",
+            bare_server.url()
+        ));
+        std::fs::write(&config, text).unwrap();
+    }
+    for args in [
+        vec!["remote", "refs", "nosummary"],
+        vec!["remote", "summary", "nosummary"],
+    ] {
+        let (port_run, tool_run) = run_remote_both(&port, &tool, &args, env);
+        assert_runs_agree(&port_run, &tool_run, &args.join(" "));
+    }
+}
+
+/// `remote gpg-import` writes a keyring the tool reads and reads one the tool
+/// wrote, counts what it added the way the tool counts it, and the key it
+/// imports verifies a commit signed with that key. `gpg-list-keys` reports the
+/// keys either implementation imported.
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_gpg_keyring_round_trips_with_the_tool() {
+    if !ostree_available() || !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("remote-gpg");
+    let base = tmp.path();
+    let home = GpgHome::create(base, "Ostrya Remote <remote-gpg@ostrya.example>");
+    let fpr = home.fingerprint();
+    let public = base.join("public.gpg");
+    home.export_to(&public);
+    let public_s = public.to_str().unwrap();
+    let keyring_arg = format!("--keyring={public_s}");
+
+    let (port, tool) = create_repo_pair(base, RepoMode::Archive);
+    for repo in [&port, &tool] {
+        configure_remote(repo, "https://example.invalid/r", "");
+    }
+    // The import reports the same count on both sides, a repeated import adds
+    // nothing, and a `KEY-ID` selection takes the one key it names.
+    for args in [
+        vec!["remote", "gpg-import", "origin", &keyring_arg],
+        vec!["remote", "gpg-import", "origin", &keyring_arg],
+        vec!["remote", "gpg-import", "origin", &keyring_arg, &fpr],
+        vec!["remote", "gpg-import", "absent", &keyring_arg],
+        vec!["remote", "gpg-import", "origin", "--keyring=/nonexistent"],
+    ] {
+        let (port_run, tool_run) = run_remote_both(&port, &tool, &args, &[]);
+        assert_runs_agree(&port_run, &tool_run, &args.join(" "));
+    }
+    // Naming both key sources is refused ahead of the usage text in both.
+    let both_sources = vec!["remote", "gpg-import", "origin", &keyring_arg, "--stdin"];
+    let (port_run, tool_run) = run_remote_both(&port, &tool, &both_sources, &[]);
+    assert_runs_agree_on_error(
+        &port_run,
+        &tool_run,
+        "remote gpg-import --keyring --stdin",
+        "error: --keyring and --stdin are mutually exclusive",
+    );
+
+    // Each implementation reads the keyring the other wrote. The listing itself
+    // parts on two lines the port does not produce (`cli-surface.md`, "P3"), so
+    // the claim is the fingerprint and the user id.
+    for repo in [&port, &tool] {
+        let repo_arg = format!("--repo={}", repo.display());
+        let listing = ostrya(&[&repo_arg, "remote", "gpg-list-keys", "origin"], None, &[]);
+        let text = listing.ok().stdout_trimmed();
+        assert!(
+            text.contains(&format!("Key: {fpr}")) && text.contains("  UID: Ostrya Remote"),
+            "the port's listing of {repo:?} lacks the imported key:\n{text}"
+        );
+        let tool_listing = ostree(&[&repo_arg, "remote", "gpg-list-keys", "origin"]);
+        let tool_text = tool_listing.ok().stdout_trimmed();
+        assert!(
+            tool_text.contains(&format!("Key: {fpr}")),
+            "the tool's listing of {repo:?} lacks the imported key:\n{tool_text}"
+        );
+    }
+
+    // The imported key verifies a commit the tool signed with it, through the
+    // remote the keyring belongs to.
+    let signed = commit_fixture(base);
+    let signed_s = signed.to_str().unwrap();
+    configure_remote(&signed, "https://example.invalid/r", "");
+    ostree(&[
+        "gpg-sign",
+        "--repo",
+        signed_s,
+        "--gpg-homedir",
+        home.dir.to_str().unwrap(),
+        COMMIT,
+        &fpr,
+    ])
+    .ok();
+    ostrya(
+        &[
+            &format!("--repo={signed_s}"),
+            "remote",
+            "gpg-import",
+            "origin",
+            &keyring_arg,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let verified = ostrya(
+        &[
+            "sign", "--verify", "--repo", signed_s, "-s", "gpg", "--remote", "origin", COMMIT,
+        ],
+        None,
+        &[],
+    );
+    assert!(
+        verified.ok().stdout_trimmed().contains("verification OK"),
+        "the imported keyring must verify the commit it signed"
+    );
+
+    // Deleting the remote takes its keyring with it, in both.
+    for repo in [&port, &tool] {
+        assert!(repo.join("origin.trustedkeys.gpg").exists());
+    }
+    let (port_run, tool_run) = run_remote_both(&port, &tool, &["remote", "delete", "origin"], &[]);
+    assert_runs_agree(&port_run, &tool_run, "remote delete origin");
+    for repo in [&port, &tool] {
+        assert!(
+            !repo.join("origin.trustedkeys.gpg").exists(),
+            "{repo:?} kept the deleted remote's keyring"
+        );
     }
 }
 

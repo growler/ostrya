@@ -40,6 +40,13 @@
 //! stored blob; `gpgv` performs public-key operations only and starts no
 //! agent.
 //!
+//! A remote's own trusted keyring is managed through the same subprocess
+//! plumbing: [`Repo::gpg_import_keys`] adds certificates to
+//! `<remote>.trustedkeys.gpg` and reports how many the keyring did not already
+//! hold, and [`Repo::gpg_list_keys`] reads back the keys it holds as
+//! [`GpgKey`] records. Both run `gpg` in a private scratch directory, so the
+//! invoking user's GnuPG home takes no part.
+//!
 //! A signature is valid only when `gpgv` reports `GOODSIG`. An expired key
 //! (`EXPKEYSIG`), a revoked key (`REVKEYSIG`), a bad signature (`BADSIG`),
 //! and an absent key (`ERRSIG`/`NO_PUBKEY`) are reported per signature in
@@ -52,7 +59,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ostrya_core::base64;
 
+use crate::config::remote_keyring_name;
 use crate::error::{Error, Result};
+use crate::repo::Repo;
 use crate::sign::{
     SignFuture, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, read_key_path,
     read_key_source,
@@ -72,6 +81,12 @@ const OSTREE_GPG_HOME_ENV: &str = "OSTREE_GPG_HOME";
 const SYSTEM_REMOTES_D: &str = "/etc/ostree/remotes.d";
 /// The prefix of a machine-readable status line on the status fd.
 const STATUS_PREFIX: &str = "[GNUPG:] ";
+/// The scratch-directory name of the keyring an import writes and a listing
+/// reads.
+const RING_FILE: &str = "ring.gpg";
+/// The scratch-directory name of the keyring holding the keys offered to an
+/// import, out of which a `KEY-ID` selection exports.
+const OFFERED_FILE: &str = "offered.gpg";
 /// The ceiling on one keyring file, whose whole content is read into memory.
 /// One exported ed25519 certificate is a few hundred bytes, so four mebibytes
 /// holds thousands of them, and a remote's trusted set is a handful.
@@ -283,6 +298,263 @@ impl Verifier for GpgVerifier {
             result.map(|()| outcome)
         })
     }
+}
+
+/// One key in a remote's trusted keyring, as `remote gpg-list-keys` reports it.
+///
+/// The fields are what `gpg`'s machine-readable key listing states about the
+/// primary key: its fingerprint, the instant it was created, and its user ids in
+/// listing order. Subkeys are not reported on their own; a subkey's parent
+/// carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpgKey {
+    /// The primary key fingerprint, uppercase hex.
+    pub fingerprint: String,
+    /// When the key was created, in seconds since the Unix epoch.
+    pub created: Option<u64>,
+    /// The user ids bound to the key, in listing order.
+    pub user_ids: Vec<String>,
+}
+
+impl Repo {
+    /// Import the OpenPGP certificates `keys` holds into `remote`'s trusted
+    /// keyring, `<remote>.trustedkeys.gpg`, and report how many the keyring did
+    /// not already hold.
+    ///
+    /// `keys` is a binary or ASCII-armored certificate stream, which is what an
+    /// exported public keyring is. With `key_ids` non-empty only the keys those
+    /// selectors name are imported, each selector resolved the way `gpg` resolves
+    /// one (a fingerprint, key id, or user id substring); a selector that names
+    /// nothing in `keys` fails the import and the keyring is left as it was.
+    ///
+    /// The work runs as `gpg` subprocesses in a private scratch directory, so
+    /// neither the invoking user's GnuPG home nor any agent takes part, and the
+    /// keyring is replaced atomically at the repository root.
+    pub async fn gpg_import_keys(
+        &self,
+        remote: &str,
+        keys: &[u8],
+        key_ids: &[String],
+    ) -> Result<usize> {
+        let name = remote_keyring_name(remote);
+        let existing = self.read_root_file(&name).await?.unwrap_or_default();
+        let dir = scratch_dir();
+
+        let result = self
+            .import_into_scratch(&dir, existing, keys, key_ids)
+            .await;
+        let cleanup = dir.clone();
+        let _ = ostrya_rt::unblock(move || std::fs::remove_dir_all(cleanup)).await;
+
+        let (imported, keyring) = result?;
+        let fsync = self.config().fsync()?;
+        self.write_root_file(&name, keyring, fsync).await?;
+        Ok(imported)
+    }
+
+    /// The keys `remote`'s trusted keyring holds. An absent keyring holds none.
+    ///
+    /// The keyring is read through a `gpg` key listing in a private scratch
+    /// directory, so the invoking user's own keyring plays no part.
+    pub async fn gpg_list_keys(&self, remote: &str) -> Result<Vec<GpgKey>> {
+        let Some(keyring) = self.read_root_file(&remote_keyring_name(remote)).await? else {
+            return Ok(Vec::new());
+        };
+        let dir = scratch_dir();
+        let result = list_keys_in_scratch(&dir, keyring).await;
+        let cleanup = dir.clone();
+        let _ = ostrya_rt::unblock(move || std::fs::remove_dir_all(cleanup)).await;
+        result
+    }
+
+    /// Stage the current keyring in `dir`, import into it, and return the number
+    /// of keys added and the resulting keyring bytes.
+    async fn import_into_scratch(
+        &self,
+        dir: &Path,
+        existing: Vec<u8>,
+        keys: &[u8],
+        key_ids: &[String],
+    ) -> Result<(usize, Vec<u8>)> {
+        let setup_dir = dir.to_owned();
+        let staged = existing;
+        ostrya_rt::unblock(move || -> std::io::Result<()> {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&setup_dir)?;
+            std::fs::write(setup_dir.join(RING_FILE), &staged)
+        })
+        .await?;
+
+        let selected = if key_ids.is_empty() {
+            keys.to_vec()
+        } else {
+            select_keys(dir, keys, key_ids).await?
+        };
+        let imported = import_keyring(dir, RING_FILE, &selected).await?;
+        let read_dir = dir.to_owned();
+        let keyring = ostrya_rt::unblock(move || std::fs::read(read_dir.join(RING_FILE))).await?;
+        Ok((imported, keyring))
+    }
+}
+
+/// Export the keys `key_ids` names out of `keys`, through a scratch keyring of
+/// its own so the selection reads only what was offered. A selector that names
+/// nothing is refused by name.
+async fn select_keys(dir: &Path, keys: &[u8], key_ids: &[String]) -> Result<Vec<u8>> {
+    import_keyring(dir, OFFERED_FILE, keys).await?;
+    let mut selected = Vec::new();
+    for id in key_ids {
+        let mut cmd = gpg_in(dir, OFFERED_FILE);
+        cmd.arg("--export").arg(id);
+        let output = cmd.output(&[]).await.map_err(|e| spawn_err("gpg", &e))?;
+        if !output.status.success() || output.stdout.is_empty() {
+            return Err(Error::Signature(format!(
+                "no key matching '{id}' among the keys to import"
+            )));
+        }
+        selected.extend_from_slice(&output.stdout);
+    }
+    Ok(selected)
+}
+
+/// Import `keys` into the scratch keyring `ring` and report how many keys the
+/// keyring did not already hold, read from the `IMPORT_RES` status line.
+async fn import_keyring(dir: &Path, ring: &str, keys: &[u8]) -> Result<usize> {
+    let mut cmd = gpg_in(dir, ring);
+    cmd.arg("--status-fd").arg("1").arg("--import");
+    let output = cmd.output(keys).await.map_err(|e| spawn_err("gpg", &e))?;
+    if !output.status.success() {
+        return Err(Error::Signature(format!(
+            "gpg --import failed: {}",
+            failure_text(&output)
+        )));
+    }
+    Ok(parse_import_count(&output.stdout))
+}
+
+/// List the keys of a keyring staged in `dir`.
+async fn list_keys_in_scratch(dir: &Path, keyring: Vec<u8>) -> Result<Vec<GpgKey>> {
+    let setup_dir = dir.to_owned();
+    ostrya_rt::unblock(move || -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&setup_dir)?;
+        std::fs::write(setup_dir.join(RING_FILE), &keyring)
+    })
+    .await?;
+
+    let mut cmd = gpg_in(dir, RING_FILE);
+    cmd.arg("--with-colons")
+        .arg("--fixed-list-mode")
+        .arg("--list-keys");
+    let output = cmd.output(&[]).await.map_err(|e| spawn_err("gpg", &e))?;
+    if !output.status.success() {
+        return Err(Error::Signature(format!(
+            "gpg --list-keys failed: {}",
+            failure_text(&output)
+        )));
+    }
+    Ok(parse_key_listing(&output.stdout))
+}
+
+/// A `gpg` command bound to the scratch directory as its GnuPG home and to
+/// `ring` as its one keyring, so no keyring of the invoking user is read or
+/// written.
+fn gpg_in(dir: &Path, ring: &str) -> ostrya_rt::Command {
+    let mut cmd = ostrya_rt::Command::new("gpg");
+    cmd.arg("--homedir")
+        .arg(dir)
+        .arg("--batch")
+        .arg("--no-default-keyring")
+        .arg("--keyring")
+        .arg(dir.join(ring));
+    cmd
+}
+
+/// The count of newly imported keys an import run reports: field 3 of
+/// `IMPORT_RES`, which counts the keys the keyring did not already hold. A run
+/// that imported nothing new reports `0` there.
+fn parse_import_count(stdout: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(stdout);
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(STATUS_PREFIX) else {
+            continue;
+        };
+        let mut fields = rest.split(' ');
+        if fields.next() != Some("IMPORT_RES") {
+            continue;
+        }
+        // IMPORT_RES <count> <no-user-id> <imported> <imported-rsa> <unchanged> ...
+        return fields
+            .nth(2)
+            .and_then(|field| field.parse::<usize>().ok())
+            .unwrap_or(0);
+    }
+    0
+}
+
+/// Parse a `--with-colons` key listing into one record per primary key. A `pub`
+/// record starts a key, the `fpr` record that follows it carries the
+/// fingerprint, and each `uid` record adds a user id; the records of a subkey
+/// (`sub` and what follows it) belong to the key they were listed under.
+fn parse_key_listing(stdout: &[u8]) -> Vec<GpgKey> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut keys: Vec<GpgKey> = Vec::new();
+    let mut in_subkey = false;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        match fields.first().copied() {
+            Some("pub") => {
+                in_subkey = false;
+                keys.push(GpgKey {
+                    fingerprint: String::new(),
+                    created: fields.get(5).and_then(|f| parse_epoch(f)),
+                    user_ids: Vec::new(),
+                });
+            }
+            Some("sub") => in_subkey = true,
+            Some("fpr") if !in_subkey => {
+                if let Some(key) = keys.last_mut()
+                    && key.fingerprint.is_empty()
+                    && let Some(fpr) = fields.get(9)
+                {
+                    key.fingerprint = (*fpr).to_owned();
+                }
+            }
+            Some("uid") => {
+                if let Some(key) = keys.last_mut()
+                    && let Some(uid) = fields.get(9)
+                    && !uid.is_empty()
+                {
+                    key.user_ids.push(unescape_colon_field(uid));
+                }
+            }
+            _ => {}
+        }
+    }
+    keys
+}
+
+/// Undo the escaping a `--with-colons` field carries: `\x3a` for a colon, and
+/// the same `\xNN` form for any other byte gpg escapes.
+fn unescape_colon_field(field: &str) -> String {
+    let mut out = String::with_capacity(field.len());
+    let mut rest = field;
+    while let Some(index) = rest.find("\\x") {
+        out.push_str(&rest[..index]);
+        let hex = rest.get(index + 2..index + 4);
+        match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+            Some(byte) => {
+                out.push(byte as char);
+                rest = &rest[index + 4..];
+            }
+            None => {
+                out.push_str("\\x");
+                rest = &rest[index + 2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Verify each staged signature blob with one `gpgv` run, accumulating the
@@ -556,11 +828,12 @@ pub(crate) fn read_keyring_fd(fd: OwnedFd, name: &str) -> Result<Vec<u8>> {
     read_key_source(fd, &format!("the keyring '{name}'"), MAX_KEYRING)
 }
 
-/// A process-unique scratch directory path for one verification run.
+/// A process-unique scratch directory path for one `gpg` or `gpgv` run: the
+/// GnuPG home directory a verification, an import, or a listing works in.
 fn scratch_dir() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
-        "ostrya-gpgv-{}-{}",
+        "ostrya-gpg-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
@@ -629,6 +902,69 @@ mod tests {
         assert_eq!(info.user_name.as_deref(), Some("Ostrya Obs"));
         assert_eq!(info.user_email.as_deref(), Some("obs@ostrya.example"));
         assert!(!info.expired && !info.revoked && !info.key_missing);
+    }
+
+    /// The two `IMPORT_RES` lines a first and a repeated import produce: field 3
+    /// counts the keys the keyring did not already hold.
+    #[test]
+    fn parses_the_import_count() {
+        let first = b"[GNUPG:] IMPORTED EA11F223F7A88090 T <t@e.invalid>\n\
+[GNUPG:] IMPORT_OK 1 A98EFC84DC1176AFDF076367EA11F223F7A88090\n\
+[GNUPG:] IMPORT_RES 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0\n";
+        assert_eq!(parse_import_count(first), 1);
+        let repeated = b"[GNUPG:] IMPORT_OK 0 A98EFC84DC1176AFDF076367EA11F223F7A88090\n\
+[GNUPG:] IMPORT_RES 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0\n";
+        assert_eq!(parse_import_count(repeated), 0);
+        let two = b"[GNUPG:] IMPORT_RES 2 0 2 0 0 0 0 0 0 0 0 0 0 0 0\n";
+        assert_eq!(parse_import_count(two), 2);
+        // A run whose status stream says nothing about the result counts none.
+        assert_eq!(parse_import_count(b""), 0);
+    }
+
+    /// A `--with-colons` listing of one ed25519 key and one RSA key with an
+    /// encryption subkey, as `gpg --list-keys` wrote it.
+    #[test]
+    fn parses_the_key_listing() {
+        let listing = b"tru::1:1785958949:0:3:1:5\n\
+pub:-:255:22:CA965442280A3BB5:1785958949:::-:::scSC:::::ed25519:::0:\n\
+fpr:::::::::FA2B2317C9966572B5D729EDCA965442280A3BB5:\n\
+uid:-::::1785958949::2002AD890A7DC86C5CE36C4EB351537E74CBC5E9::Ostrya Test <test@example.invalid>::::::::::0:\n\
+uid:-::::1785958949::AA02AD890A7DC86C5CE36C4EB351537E74CBC5E8::Second Id <second@example.invalid>::::::::::0:\n\
+pub:-:2048:1:56A674CB09BADB3E:1785958950:::-:::scSC::::::23::0:\n\
+fpr:::::::::8EB5022E57DB2BB28470F20A56A674CB09BADB3E:\n\
+uid:-::::1785958950::FA8A955FF9BB9C4540D030246F056A7DB9E282FA::No Email Person::::::::::0:\n\
+sub:-:2048:1:9A5C1E4D2F3B7A81:1785958950::::::e::::::23:\n\
+fpr:::::::::1111111111111111111111119A5C1E4D2F3B7A81:\n";
+        let keys = parse_key_listing(listing);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys[0].fingerprint,
+            "FA2B2317C9966572B5D729EDCA965442280A3BB5"
+        );
+        assert_eq!(keys[0].created, Some(1_785_958_949));
+        assert_eq!(
+            keys[0].user_ids,
+            [
+                "Ostrya Test <test@example.invalid>",
+                "Second Id <second@example.invalid>"
+            ]
+        );
+        // The subkey's own fingerprint record does not become a third key, and
+        // it does not replace its parent's.
+        assert_eq!(
+            keys[1].fingerprint,
+            "8EB5022E57DB2BB28470F20A56A674CB09BADB3E"
+        );
+        assert_eq!(keys[1].user_ids, ["No Email Person"]);
+    }
+
+    #[test]
+    fn unescapes_a_colon_field() {
+        assert_eq!(unescape_colon_field("plain"), "plain");
+        assert_eq!(unescape_colon_field("a\\x3ab"), "a:b");
+        assert_eq!(unescape_colon_field("a\\x5cb"), "a\\b");
+        // A `\x` that is not a byte escape stays as written.
+        assert_eq!(unescape_colon_field("a\\xzz"), "a\\xzz");
     }
 
     #[test]

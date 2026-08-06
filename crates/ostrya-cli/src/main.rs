@@ -27,7 +27,9 @@
 //! - `show` -- report a metadata object, a file object, or one metadata key.
 //! - `log` -- walk a commit's parent chain.
 //! - `ls` -- list a commit's file paths.
-//! - `config` -- read a repository configuration value.
+//! - `config` -- read a repository configuration value, or write one.
+//! - `remote` -- add, delete, and list the configured remotes, read a live
+//!   remote's refs and summary, and manage a remote's trusted GPG keys.
 //! - `prune` -- delete unreachable objects.
 //! - `fsck` -- verify object integrity and completeness.
 //! - `diff` -- report the paths that changed between two commits.
@@ -54,9 +56,9 @@ use ostrya::{
     CommitOptions, CreateOptions, DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error,
     FileKind, FileObject, FsckOptions, MutableTree, ObjectType, PruneOptions, PullFlags,
     PullOptions, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, SignatureInfo,
-    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, TreeEntry, Type, Value,
-    Verifier, VerifyOutcome, Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from,
-    to_text, validate_refspec,
+    Summary, SummaryOptions, SummaryRef, TarExportOptions, TarImportOptions, TimestampCheck,
+    TreeEntry, Type, Value, Verifier, VerifyOutcome, Xattrs, base64, from_bytes, load_sign_keys,
+    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -108,8 +110,10 @@ enum Command {
     Log(LogArgs),
     /// List a commit's file paths.
     Ls(LsArgs),
-    /// Read a repository configuration value.
+    /// Read or write a repository configuration value.
     Config(ConfigArgs),
+    /// Manage the configured remotes and their trusted GPG keys.
+    Remote(RemoteArgs),
     /// Delete objects unreachable from the repository's refs and commits.
     Prune(PruneArgs),
     /// Verify object integrity and completeness across every commit.
@@ -148,6 +152,7 @@ impl Command {
         "log",
         "ls",
         "config",
+        "remote",
         "prune",
         "fsck",
         "diff",
@@ -173,6 +178,7 @@ impl Command {
             Command::Log(_) => "log",
             Command::Ls(_) => "ls",
             Command::Config(_) => "config",
+            Command::Remote(_) => "remote",
             Command::Prune(_) => "prune",
             Command::Fsck(_) => "fsck",
             Command::Diff(_) => "diff",
@@ -411,11 +417,166 @@ struct ConfigArgs {
     /// rather than `section.key`.
     #[arg(long, value_name = "GROUP")]
     group: Option<String>,
-    /// The operation: `get`. `set` and `unset` need a config write path the
-    /// library does not have yet (`docs/port-plan.md`, Phase 17e).
+    /// The operation: `get`, `set`, or `unset`.
     operation: Option<String>,
-    /// The key to read: `section.key`, or a bare key name under --group.
+    /// The key to read or write -- `section.key`, or a bare key name under
+    /// --group -- and, for `set`, the value.
     args: Vec<String>,
+}
+
+#[derive(Args)]
+struct RemoteArgs {
+    #[command(subcommand)]
+    command: Option<RemoteCommand>,
+}
+
+#[derive(Subcommand)]
+enum RemoteCommand {
+    /// Add a remote repository.
+    Add(RemoteAddArgs),
+    /// Delete a remote repository, and its trusted GPG keyring with it.
+    Delete(RemoteDeleteArgs),
+    /// List the configured remote names, sorted.
+    List(RemoteListArgs),
+    /// Print a remote's URL.
+    #[command(name = "show-url")]
+    ShowUrl(RemoteNameArgs),
+    /// List the refs a remote publishes in its summary.
+    Refs(RemoteRefsArgs),
+    /// Report a remote's summary.
+    Summary(RemoteSummaryArgs),
+    /// Import GPG keys into a remote's trusted keyring.
+    #[command(name = "gpg-import")]
+    GpgImport(RemoteGpgImportArgs),
+    /// List the GPG keys a remote's trusted keyring holds.
+    #[command(name = "gpg-list-keys")]
+    GpgListKeys(RemoteNameArgs),
+}
+
+impl RemoteCommand {
+    /// The name `clap` registered this nested subcommand under, which the error
+    /// paths use to render its usage text.
+    fn name(&self) -> &'static str {
+        match self {
+            RemoteCommand::Add(_) => "add",
+            RemoteCommand::Delete(_) => "delete",
+            RemoteCommand::List(_) => "list",
+            RemoteCommand::ShowUrl(_) => "show-url",
+            RemoteCommand::Refs(_) => "refs",
+            RemoteCommand::Summary(_) => "summary",
+            RemoteCommand::GpgImport(_) => "gpg-import",
+            RemoteCommand::GpgListKeys(_) => "gpg-list-keys",
+        }
+    }
+}
+
+#[derive(Args)]
+struct RemoteAddArgs {
+    /// Set this configuration key in the remote's section; repeatable, and
+    /// applied before the options that write a fixed key.
+    #[arg(long = "set", value_name = "KEY=VALUE")]
+    set: Vec<String>,
+    /// Do not require a GPG signature on the commits pulled from this remote.
+    #[arg(long)]
+    no_gpg_verify: bool,
+    /// Do not require a sign-api signature, and do not require a GPG one
+    /// either, which is what the tool writes for this switch.
+    #[arg(long)]
+    no_sign_verify: bool,
+    /// Trust this key for one sign-api engine:
+    /// KEYTYPE=inline:PUBKEY or KEYTYPE=file:PATH.
+    #[arg(long, value_name = "KEYTYPE=[inline|file]:PUBKEY")]
+    sign_verify: Vec<String>,
+    /// Do nothing when the remote already exists.
+    #[arg(long)]
+    if_not_exists: bool,
+    /// Replace the remote's section when it already exists.
+    #[arg(long)]
+    force: bool,
+    /// Import the keys this keyring file holds into the remote's trusted
+    /// keyring, as `remote gpg-import` does.
+    #[arg(long, value_name = "FILE")]
+    gpg_import: Option<PathBuf>,
+    /// Record that this remote's content is fetched by something other than
+    /// this implementation.
+    #[arg(long, value_name = "NAME")]
+    custom_backend: Option<String>,
+    /// Fetch content objects from this URL instead of the remote's own.
+    #[arg(long, value_name = "URL")]
+    contenturl: Option<String>,
+    /// A globally unique id for the remote as a collection of refs.
+    #[arg(long, value_name = "COLLECTION-ID")]
+    collection_id: Option<String>,
+    /// The remote name. Required, with the URL; both are checked after the
+    /// repository resolves, matching the tool's error-ordering
+    /// (`docs/conformance/cli-surface.md`, "Global conventions").
+    name: Option<String>,
+    /// The remote's base URL, or `metalink=URL` for a metalink-described one.
+    url: Option<String>,
+    /// The refs a pull of this remote takes when it is asked for none.
+    branches: Vec<String>,
+}
+
+#[derive(Args)]
+struct RemoteDeleteArgs {
+    /// Do nothing when the remote does not exist.
+    #[arg(long)]
+    if_exists: bool,
+    /// The remote to delete. Required; checked after the repository resolves.
+    name: Option<String>,
+}
+
+#[derive(Args)]
+struct RemoteListArgs {
+    /// Print each remote's URL after its name.
+    #[arg(short = 'u', long)]
+    show_urls: bool,
+}
+
+#[derive(Args)]
+struct RemoteNameArgs {
+    /// The remote to report. Required; checked after the repository resolves.
+    name: Option<String>,
+}
+
+#[derive(Args)]
+struct RemoteRefsArgs {
+    /// Print each ref's commit checksum after a tab.
+    #[arg(short = 'r', long)]
+    revision: bool,
+    /// The remote to list. Required; checked after the repository resolves.
+    name: Option<String>,
+}
+
+#[derive(Args)]
+struct RemoteSummaryArgs {
+    /// List the available metadata keys.
+    #[arg(long)]
+    list_metadata_keys: bool,
+    /// Print the value of one metadata key.
+    #[arg(long, value_name = "KEY")]
+    print_metadata_key: Option<String>,
+    /// Show the raw variant data.
+    #[arg(long)]
+    raw: bool,
+    /// The remote to report. Required; checked after the repository resolves.
+    name: Option<String>,
+}
+
+#[derive(Args)]
+struct RemoteGpgImportArgs {
+    /// Import the keys this keyring file holds; repeatable.
+    #[arg(short = 'k', long = "keyring", value_name = "FILE")]
+    keyring: Vec<PathBuf>,
+    /// Import the keys standard input holds.
+    #[arg(long)]
+    stdin: bool,
+    /// The remote to import into. Required; checked after the repository
+    /// resolves.
+    name: Option<String>,
+    /// The keys to import, named the way `gpg` names one; with none, every key
+    /// the source holds.
+    key_ids: Vec<String>,
 }
 
 #[derive(Args)]
@@ -840,6 +1001,15 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             config(repo, name, args).await
         }
+        Command::Remote(args) => {
+            // The tool reports a missing nested subcommand before it resolves
+            // the repository, the same order `static-delta` takes.
+            let Some(sub) = args.command else {
+                exit_with_error(name, "No \"remote\" subcommand specified");
+            };
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            remote(repo, sub).await
+        }
         Command::Prune(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             prune(repo, args).await
@@ -898,6 +1068,20 @@ fn exit_with_error(subcommand: &str, message: &str) -> ! {
     let sub = top
         .find_subcommand_mut(subcommand)
         .expect("subcommand name matches a defined command");
+    eprint!("{}", sub.render_help());
+    eprintln!("error: {message}");
+    std::process::exit(1);
+}
+
+/// Print a nested subcommand's usage text and `error: {message}`, then exit 1,
+/// the shape the tool gives a `remote add` or `remote delete` missing an
+/// operand.
+fn exit_with_nested_error(subcommand: &str, nested: &str, message: &str) -> ! {
+    let mut top = <Cli as CommandFactory>::command();
+    let sub = top
+        .find_subcommand_mut(subcommand)
+        .and_then(|sub| sub.find_subcommand_mut(nested))
+        .expect("the nested subcommand name matches a defined command");
     eprint!("{}", sub.render_help());
     eprintln!("error: {message}");
     std::process::exit(1);
@@ -3277,27 +3461,35 @@ async fn config(repo: Repo, name: &str, args: ConfigArgs) -> Result<()> {
     }
     match operation {
         "get" => config_get(&repo, &args),
-        "set" | "unset" => exit_error(&format!("The {operation} operation is not implemented yet")),
+        "set" => config_set(&repo, &args).await,
+        "unset" => config_unset(&repo, &args).await,
         other => exit_error(&format!("Unknown operation {other}")),
     }
 }
 
-/// Print one configuration value. The key is `section.key`, split on its first
-/// `.`, or a bare key name when `--group` names the section.
-fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
+/// The group and key one `config` operand names: `section.key`, split on its
+/// first `.`, or a bare key name when `--group` names the section. A missing
+/// operand is reported in the tool's own words, which name the group when
+/// `--group` was given.
+fn config_target(args: &ConfigArgs) -> (&str, &str) {
     let Some(key) = args.args.first() else {
         if args.group.is_some() {
             exit_error("Group name and key must be specified");
         }
         exit_error("KEY must be specified");
     };
-    let (group, key) = match args.group.as_deref() {
+    match args.group.as_deref() {
         Some(group) => (group, key.as_str()),
         None => match key.split_once('.') {
             Some((group, key)) => (group, key),
             None => exit_error("Key must be of the form \"sectionname.keyname\""),
         },
-    };
+    }
+}
+
+/// Print one configuration value.
+fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
+    let (group, key) = config_target(args);
     let keyfile = repo.config().keyfile();
     if !keyfile.has_group(group) {
         exit_error(&format!(
@@ -3311,6 +3503,581 @@ fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
         )),
     }
     Ok(())
+}
+
+/// Set one configuration value, creating the group when it is new, and write the
+/// document back. The value is escaped the way the tool escapes one on write, so
+/// a value carrying a newline or leading whitespace is stored in a form that
+/// reads back whole.
+async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
+    if args.args.len() < 2 {
+        if args.group.is_some() {
+            exit_error("GROUP name, KEY and VALUE must be specified");
+        }
+        exit_error("KEY and VALUE must be specified");
+    }
+    let (group, key) = config_target(args);
+    let value = &args.args[1];
+    let mut keyfile = repo.config().keyfile().clone();
+    keyfile.set_string(group, key, value)?;
+    repo.write_config(&keyfile).await
+}
+
+/// Remove one configuration value and write the document back. A key the
+/// document does not hold, and a group it does not hold, are both success and
+/// leave the file untouched, matching the tool.
+async fn config_unset(repo: &Repo, args: &ConfigArgs) -> Result<()> {
+    let (group, key) = config_target(args);
+    let mut keyfile = repo.config().keyfile().clone();
+    if !keyfile.remove_key(group, key) {
+        return Ok(());
+    }
+    repo.write_config(&keyfile).await
+}
+
+// --- remote ------------------------------------------------------------------
+
+/// The summary's GVariant signature, which the raw report parses against.
+const SUMMARY_SIGNATURE: &str = "(a(s(taya{sv}))a{sv})";
+
+/// The summary metadata keys the report gives a label of their own
+/// (`docs/format-reference.md`, "CLI output formats", under `remote summary`).
+const SUMMARY_LABELS: &[(&str, &str)] = &[
+    ("ostree.summary.mode", "Repository Mode"),
+    ("ostree.summary.last-modified", "Last-Modified"),
+    ("ostree.summary.tombstone-commits", "Has Tombstone Commits"),
+    ("ostree.static-deltas", "Static Deltas"),
+    ("ostree.summary.collection-map", "Collection Map"),
+    ("ostree.summary.collection-id", "Collection ID"),
+];
+
+/// The per-ref metadata keys the report labels, with the same treatment.
+const REF_LABELS: &[(&str, &str)] = &[
+    ("ostree.commit.version", "Version"),
+    ("ostree.commit.timestamp", "Timestamp"),
+];
+
+/// Run one `remote` subcommand.
+async fn remote(repo: Repo, sub: RemoteCommand) -> Result<()> {
+    let nested = sub.name();
+    match sub {
+        RemoteCommand::Add(args) => remote_add(&repo, nested, args).await,
+        RemoteCommand::Delete(args) => remote_delete(&repo, nested, args).await,
+        RemoteCommand::List(args) => remote_list(&repo, &args),
+        RemoteCommand::ShowUrl(args) => remote_show_url(&repo, nested, &args),
+        RemoteCommand::Refs(args) => remote_refs(&repo, nested, &args).await,
+        RemoteCommand::Summary(args) => remote_summary(&repo, nested, &args).await,
+        RemoteCommand::GpgImport(args) => remote_gpg_import(&repo, nested, args).await,
+        RemoteCommand::GpgListKeys(args) => remote_gpg_list_keys(&repo, nested, &args).await,
+    }
+}
+
+/// The key-file group one remote's configuration lives in.
+fn remote_group(name: &str) -> String {
+    format!("remote \"{name}\"")
+}
+
+/// Whether `name` is a name the tool accepts for a remote: at least one
+/// character, every character alphanumeric or one of `-`, `_`, `.`, and the
+/// first one alphanumeric or `_`. Recovered by offering the tool a set of names
+/// (`docs/format-reference.md`, "CLI output formats", under `remote add`), which
+/// is why `_` is a name and `-`, `.`, and `..` are not.
+fn valid_remote_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_alphanumeric() || first == '_') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// The operand naming the remote, or the tool's own refusal for a missing one.
+fn remote_operand<'a>(nested: &str, name: Option<&'a str>) -> &'a str {
+    match name {
+        Some(name) => name,
+        None => exit_with_nested_error("remote", nested, "NAME must be specified"),
+    }
+}
+
+/// The configuration section of a remote a reading subcommand names, or the
+/// tool's own refusal. A read reaches no name rule: a name `add` would refuse
+/// simply names no section.
+fn remote_section<'a>(repo: &'a Repo, name: &str) -> ostrya::Remote<'a> {
+    match repo.config().remote(name) {
+        Some(section) => section,
+        None => exit_error(&format!("Remote \"{name}\" not found")),
+    }
+}
+
+/// Refuse a remote the configuration does not describe, for a subcommand that
+/// reads nothing out of the section itself.
+fn require_remote(repo: &Repo, name: &str) {
+    remote_section(repo, name);
+}
+
+/// The URL a remote publishes, or the tool's own refusal for a section that
+/// states none. A metalink-described remote states no `url`, so `show-url` and
+/// `list -u` refuse it.
+fn remote_url(section: &ostrya::Remote<'_>, name: &str) -> Result<String> {
+    match section.url()? {
+        Some(url) => Ok(url),
+        None => exit_error(&format!("No \"url\" option in remote \"{name}\"")),
+    }
+}
+
+/// Add a remote's configuration section, and import a keyring into its trusted
+/// keys when `--gpg-import` names one.
+///
+/// The keys are written in the order the tool writes them: the URL (or the
+/// metalink), the branch list, the content URL, the custom backend, the
+/// `--set` pairs in the order they were given, the GPG switch, the sign-api
+/// verification keys, and the collection id.
+async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()> {
+    let (Some(name), Some(url)) = (args.name.as_deref(), args.url.as_deref()) else {
+        exit_with_nested_error("remote", nested, "NAME and URL must be specified");
+    };
+    if args.if_not_exists && args.force {
+        exit_with_nested_error(
+            "remote",
+            nested,
+            "Can only specify one of --if-not-exists and --force",
+        );
+    }
+    if !args.sign_verify.is_empty() && args.no_sign_verify {
+        exit_error("Cannot specify both --sign-verify and --no-sign-verify");
+    }
+    if !valid_remote_name(name) {
+        exit_error(&format!("Invalid remote name {name}"));
+    }
+
+    let group = remote_group(name);
+    let mut keyfile = repo.config().keyfile().clone();
+    if keyfile.has_group(&group) {
+        if args.if_not_exists {
+            return Ok(());
+        }
+        if !args.force {
+            exit_error(&format!(
+                "Remote configuration for \"{name}\" already exists: (in config)"
+            ));
+        }
+        keyfile.remove_group(&group);
+    }
+
+    match url.strip_prefix("metalink=") {
+        Some(metalink) => keyfile.set_string(&group, "metalink", metalink)?,
+        None => keyfile.set_string(&group, "url", url)?,
+    }
+    if !args.branches.is_empty() {
+        // Each branch is followed by the separator, the trailing one included,
+        // which is the list form the tool writes.
+        let mut list = String::new();
+        for branch in &args.branches {
+            list.push_str(branch);
+            list.push(';');
+        }
+        keyfile.set_string(&group, "branches", &list)?;
+    }
+    if let Some(contenturl) = &args.contenturl {
+        keyfile.set_string(&group, "contenturl", contenturl)?;
+    }
+    if let Some(backend) = &args.custom_backend {
+        keyfile.set_string(&group, "custom-backend", backend)?;
+    }
+    for pair in &args.set {
+        let Some((key, value)) = pair.split_once('=') else {
+            exit_error("Missing '=' in KEY=VALUE for --set");
+        };
+        keyfile.set_string(&group, key, value)?;
+    }
+    // `--no-sign-verify` turns the GPG check off as well, which is what the tool
+    // writes for it.
+    if args.no_gpg_verify || args.no_sign_verify {
+        keyfile.set_string(&group, "gpg-verify", "false")?;
+    }
+    if args.no_sign_verify {
+        keyfile.set_string(&group, "sign-verify", "false")?;
+    }
+    if !args.sign_verify.is_empty() {
+        let mut engines: Vec<&str> = Vec::new();
+        for spec in &args.sign_verify {
+            let (engine, key, from_file) = parse_sign_verify_spec(spec);
+            let suffix = if from_file { "file" } else { "key" };
+            keyfile.set_string(&group, &format!("verification-{engine}-{suffix}"), key)?;
+            engines.push(engine);
+        }
+        keyfile.set_string(&group, "sign-verify", &engines.join(","))?;
+    }
+    if let Some(collection_id) = &args.collection_id {
+        keyfile.set_string(&group, "collection-id", collection_id)?;
+    }
+    repo.write_config(&keyfile).await?;
+
+    if let Some(path) = &args.gpg_import {
+        let keys = read_keyring_file(path)?;
+        report_gpg_import(gpg_import(repo, name, &keys, &[]).await?, name);
+    }
+    Ok(())
+}
+
+/// Read one `--sign-verify` or `--gpg-import` engine spec:
+/// `KEYTYPE=inline:PUBKEY` or `KEYTYPE=file:PATH`, refused in the tool's own
+/// words. The engine name is held to the ones this build carries, which is where
+/// the tool reports a type it does not implement.
+fn parse_sign_verify_spec(spec: &str) -> (&str, &str, bool) {
+    let malformed = || {
+        exit_error(&format!(
+            "Failed to parse KEYTYPE=[inline|file]:DATA in {spec}"
+        ))
+    };
+    let Some((engine, source)) = spec.split_once('=') else {
+        malformed()
+    };
+    if engine.is_empty() {
+        malformed()
+    }
+    let known = match engine {
+        "ed25519" => true,
+        #[cfg(feature = "spki")]
+        "spki" => true,
+        _ => false,
+    };
+    if !known {
+        exit_error("Requested signature type is not implemented");
+    }
+    if let Some(key) = source.strip_prefix("inline:") {
+        (engine, key, false)
+    } else if let Some(path) = source.strip_prefix("file:") {
+        (engine, path, true)
+    } else {
+        malformed()
+    }
+}
+
+/// Delete a remote's configuration section and its trusted keyring.
+async fn remote_delete(repo: &Repo, nested: &str, args: RemoteDeleteArgs) -> Result<()> {
+    let name = remote_operand(nested, args.name.as_deref());
+    if !valid_remote_name(name) {
+        exit_error(&format!("Invalid remote name {name}"));
+    }
+    let mut keyfile = repo.config().keyfile().clone();
+    if !keyfile.remove_group(&remote_group(name)) {
+        if args.if_exists {
+            return Ok(());
+        }
+        exit_error(&format!("Remote \"{name}\" not found"));
+    }
+    repo.write_config(&keyfile).await?;
+    repo.remove_remote_keyring(name).await
+}
+
+/// List the configured remote names, sorted by name, with each URL after its
+/// name under `-u`.
+///
+/// Under `-u` the names are padded to the longest name of the whole list plus
+/// two, counted in bytes, so the URLs line up; a remote that states no `url`
+/// stops the listing where its turn comes, the names before it already printed.
+fn remote_list(repo: &Repo, args: &RemoteListArgs) -> Result<()> {
+    let mut names: Vec<&str> = repo.config().remotes().collect();
+    names.sort_unstable();
+    let width = names.iter().map(|name| name.len()).max().unwrap_or(0) + 2;
+    for name in names {
+        if !args.show_urls {
+            println!("{name}");
+            continue;
+        }
+        let section = remote_section(repo, name);
+        let padding = " ".repeat(width - name.len());
+        println!("{name}{padding}{}", remote_url(&section, name)?);
+    }
+    Ok(())
+}
+
+/// Print one remote's URL.
+fn remote_show_url(repo: &Repo, nested: &str, args: &RemoteNameArgs) -> Result<()> {
+    let name = remote_operand(nested, args.name.as_deref());
+    let section = remote_section(repo, name);
+    println!("{}", remote_url(&section, name)?);
+    Ok(())
+}
+
+/// The summary a remote publishes, or the tool's own refusal when it publishes
+/// none. `absent` is the wording for the subcommand asking.
+async fn fetch_remote_summary(repo: &Repo, name: &str, absent: &str) -> Result<Summary> {
+    require_remote(repo, name);
+    let (bytes, _signature) = repo.remote_fetch_summary(name).await?;
+    let Some(bytes) = bytes else {
+        exit_error(absent);
+    };
+    Summary::parse(&bytes)
+}
+
+/// List the refs a remote's summary publishes, each under the remote's prefix.
+async fn remote_refs(repo: &Repo, nested: &str, args: &RemoteRefsArgs) -> Result<()> {
+    let name = remote_operand(nested, args.name.as_deref());
+    let summary = fetch_remote_summary(
+        repo,
+        name,
+        "Remote refs not available; server has no summary file",
+    )
+    .await?;
+    for entry in &summary.refs {
+        if args.revision {
+            println!("{name}:{}\t{}", entry.name, entry.commit.to_hex());
+        } else {
+            println!("{name}:{}", entry.name);
+        }
+    }
+    Ok(())
+}
+
+/// Report a remote's summary: the raw variant, the metadata keys, one metadata
+/// value, or the summary report itself.
+async fn remote_summary(repo: &Repo, nested: &str, args: &RemoteSummaryArgs) -> Result<()> {
+    let name = remote_operand(nested, args.name.as_deref());
+    if args.raw {
+        require_remote(repo, name);
+        let (bytes, _) = repo.remote_fetch_summary(name).await?;
+        let Some(bytes) = bytes else {
+            exit_error("Remote server has no summary file");
+        };
+        let ty = parse_type(SUMMARY_SIGNATURE)?;
+        let value = from_bytes(&ty, &bytes).map_err(|err| Error::InvalidFormat(err.to_string()))?;
+        println!("{}", variant_text(&ty, &value.byteswapped())?);
+        return Ok(());
+    }
+    let summary = fetch_remote_summary(repo, name, "Remote server has no summary file").await?;
+    if args.list_metadata_keys {
+        print_sorted_keys(&summary.metadata);
+        return Ok(());
+    }
+    if let Some(key) = args.print_metadata_key.as_deref() {
+        // The raw reports convert the stored big-endian fields, so a value read
+        // by name reads as the number the field states.
+        let metadata = summary.metadata.byteswapped();
+        let Some(value) = metadata.dict_get(key) else {
+            exit_error(&format!("No such metadata key '{key}'"));
+        };
+        return print_metadata_value(value, false);
+    }
+    print_summary_report(&summary)
+}
+
+/// Report a summary the way the tool reports one: each ref of field 0, then the
+/// refs of every collection the collection map lists, then the global metadata
+/// in the order the summary stores it.
+fn print_summary_report(summary: &Summary) -> Result<()> {
+    let collection_id = summary
+        .metadata_value("ostree.summary.collection-id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    for entry in &summary.refs {
+        print_summary_ref(collection_id.as_deref(), entry)?;
+    }
+    for (collection, refs) in summary.collection_map()? {
+        for entry in &refs {
+            print_summary_ref(Some(&collection), entry)?;
+        }
+    }
+    for entry in summary.metadata.as_array().unwrap_or_default() {
+        let Some((key, value)) = dict_entry(entry) else {
+            continue;
+        };
+        print_summary_metadata(key, value)?;
+    }
+    Ok(())
+}
+
+/// Report one ref of a summary: its name, the size and checksum of the commit it
+/// names, and the metadata the summary records for it. A repository that states
+/// a collection id names each of its refs as a `(collection, ref)` pair.
+fn print_summary_ref(collection_id: Option<&str>, entry: &SummaryRef) -> Result<()> {
+    match collection_id {
+        Some(collection) => println!("* ({collection}, {})", entry.name),
+        None => println!("* {}", entry.name),
+    }
+    println!("    Latest Commit ({} bytes):", entry.commit_size);
+    println!("      {}", entry.commit.to_hex());
+    for member in entry.metadata.as_array().unwrap_or_default() {
+        let Some((key, value)) = dict_entry(member) else {
+            continue;
+        };
+        let label = label_for(REF_LABELS, key);
+        match (key, value.as_variant()) {
+            ("ostree.commit.timestamp", Some((_, inner))) => {
+                let seconds = inner.as_u64().unwrap_or_default().swap_bytes();
+                println!("    {label}: {}", format_iso_utc(seconds));
+            }
+            (_, Some((_, Value::Str(text)))) => println!("    {label}: {text}"),
+            (_, Some((ty, inner))) => {
+                println!("    {label}: {}", unannotated_text(ty, inner)?);
+            }
+            (_, None) => {}
+        }
+    }
+    println!();
+    Ok(())
+}
+
+/// Report one global metadata entry. The keys the format defines carry a label
+/// and their own rendering; every other key prints its name and its value in the
+/// text form, with no type annotation.
+fn print_summary_metadata(key: &str, value: &Value) -> Result<()> {
+    let label = label_for(SUMMARY_LABELS, key);
+    let Some((ty, inner)) = value.as_variant() else {
+        return Ok(());
+    };
+    match key {
+        "ostree.summary.last-modified" => {
+            let seconds = inner.as_u64().unwrap_or_default().swap_bytes();
+            println!("{label}: {}", format_iso_utc(seconds));
+        }
+        "ostree.summary.tombstone-commits" => {
+            let yes = inner.as_bool().unwrap_or(false);
+            println!("{label}: {}", if yes { "Yes" } else { "No" });
+        }
+        // The map's refs are reported with the other refs, above.
+        "ostree.summary.collection-map" => println!("{label}: (printed above)"),
+        _ => match inner {
+            Value::Str(text) => println!("{label}: {text}"),
+            _ => println!("{label}: {}", unannotated_text(ty, inner)?),
+        },
+    }
+    Ok(())
+}
+
+/// The label a report gives `key`, which is the key itself when the format does
+/// not define one. A labeled key carries its name in parentheses.
+fn label_for(labels: &[(&str, &str)], key: &str) -> String {
+    match labels.iter().find(|(name, _)| *name == key) {
+        Some((_, label)) => format!("{label} ({key})"),
+        None => key.to_owned(),
+    }
+}
+
+/// One `a{sv}` entry read as a key and the variant it holds.
+fn dict_entry(entry: &Value) -> Option<(&str, &Value)> {
+    let fields = entry.as_tuple()?;
+    Some((fields.first()?.as_str()?, fields.get(1)?))
+}
+
+/// Render a value in the GVariant text form with no type annotation, the form a
+/// report that names the value itself uses.
+fn unannotated_text(ty: &Type, value: &Value) -> Result<String> {
+    to_text_unannotated(ty, value).map_err(|err| Error::InvalidFormat(err.to_string()))
+}
+
+/// Render a timestamp the way a summary report does: UTC, in
+/// `YYYY-MM-DDTHH:MM:SS+00`. The tool renders the same instant in the host's
+/// time zone (`docs/conformance/cli-surface.md`, "P3").
+fn format_iso_utc(timestamp: u64) -> String {
+    let seconds = timestamp as i64;
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let (hour, minute, second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}+00")
+}
+
+/// Read a keyring file whole, refusing what the tool refuses in its own words.
+fn read_keyring_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|err| {
+        exit_error(&format!(
+            "Error opening file {}: {}",
+            path.display(),
+            io_reason(&err)
+        ))
+    })
+}
+
+/// Import keys into a remote's trusted keyring.
+async fn remote_gpg_import(repo: &Repo, nested: &str, args: RemoteGpgImportArgs) -> Result<()> {
+    let name = remote_operand(nested, args.name.as_deref());
+    if !args.keyring.is_empty() && args.stdin {
+        exit_with_nested_error(
+            "remote",
+            nested,
+            "--keyring and --stdin are mutually exclusive",
+        );
+    }
+    // The key sources are read before the remote is looked up, the order the
+    // tool takes: a `--keyring` naming no file is reported even for a remote the
+    // configuration does not describe.
+    let mut keys = Vec::new();
+    if args.stdin {
+        use std::io::Read;
+        std::io::stdin().read_to_end(&mut keys)?;
+    } else {
+        for path in &args.keyring {
+            keys.extend_from_slice(&read_keyring_file(path)?);
+        }
+    }
+    // This one subcommand prefixes its refusal of an unknown remote, which the
+    // tool's own message does too.
+    if repo.config().remote(name).is_none() {
+        exit_error(&format!("GPG: Remote \"{name}\" not found"));
+    }
+    if keys.is_empty() {
+        exit_error("No keys to import; pass --keyring or --stdin");
+    }
+    let imported = gpg_import(repo, name, &keys, &args.key_ids).await?;
+    report_gpg_import(imported, name);
+    Ok(())
+}
+
+/// Print what an import added, in the tool's own words, which count the keys the
+/// keyring did not already hold.
+fn report_gpg_import(imported: usize, remote: &str) {
+    let keys = if imported == 1 { "key" } else { "keys" };
+    println!("Imported {imported} GPG {keys} to remote \"{remote}\"");
+}
+
+/// List the keys a remote's trusted keyring holds.
+async fn remote_gpg_list_keys(repo: &Repo, nested: &str, args: &RemoteNameArgs) -> Result<()> {
+    let name = remote_operand(nested, args.name.as_deref());
+    require_remote(repo, name);
+    for key in gpg_list_keys(repo, name).await? {
+        println!("Key: {}", key.fingerprint);
+        if let Some(created) = key.created {
+            println!("  Created: {}", format_utc(created));
+        }
+        for uid in &key.user_ids {
+            println!("  UID: {uid}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpg")]
+async fn gpg_import(repo: &Repo, remote: &str, keys: &[u8], key_ids: &[String]) -> Result<usize> {
+    repo.gpg_import_keys(remote, keys, key_ids).await
+}
+
+#[cfg(not(feature = "gpg"))]
+async fn gpg_import(_: &Repo, _: &str, _: &[u8], _: &[String]) -> Result<usize> {
+    Err(unsupported_type("gpg"))
+}
+
+#[cfg(feature = "gpg")]
+async fn gpg_list_keys(repo: &Repo, remote: &str) -> Result<Vec<ostrya::GpgKey>> {
+    repo.gpg_list_keys(remote).await
+}
+
+#[cfg(not(feature = "gpg"))]
+async fn gpg_list_keys(_: &Repo, _: &str) -> Result<Vec<GpgKeyStub>> {
+    Err(unsupported_type("gpg"))
+}
+
+/// Stands in for the GPG key record where the engine is not built, so the
+/// listing's own code compiles under either feature set.
+#[cfg(not(feature = "gpg"))]
+struct GpgKeyStub {
+    fingerprint: String,
+    created: Option<u64>,
+    user_ids: Vec<String>,
 }
 
 /// Render a timestamp as the commit report's `Date:` line does: UTC, in

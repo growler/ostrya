@@ -17,6 +17,10 @@
 //! [`KeyFile::set_value`] takes a raw value and rejects group names, keys, and
 //! values whose structural characters would not survive a re-parse;
 //! [`KeyFile::set_string`] escapes a value the way the tool does on write.
+//! [`KeyFile::remove_key`] and [`KeyFile::remove_group`] are the write side's
+//! other half: a rewritten document keeps the groups and keys the caller did
+//! not touch, in the order it read them, and drops the comment and blank lines
+//! the input carried, which is what the tool's own rewrite does.
 
 use crate::error::{Error, Result};
 
@@ -210,6 +214,38 @@ impl KeyFile {
     /// [`set_value`](KeyFile::set_value) to store an already-escaped raw value.
     pub fn set_string(&mut self, group: &str, key: &str, value: &str) -> Result<()> {
         self.set_value(group, key, &escape(value))
+    }
+
+    /// Remove one key, reporting whether it was there.
+    ///
+    /// The group stays, even when the removed key was its last: the tool leaves
+    /// the header of an emptied group in place, and
+    /// [`Display`](std::fmt::Display) writes it back with no entries.
+    pub fn remove_key(&mut self, group: &str, key: &str) -> bool {
+        let Some(entries) = self
+            .groups
+            .iter_mut()
+            .find(|g| g.name == group)
+            .map(|g| &mut g.entries)
+        else {
+            return false;
+        };
+        let Some(index) = entries.iter().position(|(k, _)| k == key) else {
+            return false;
+        };
+        entries.remove(index);
+        true
+    }
+
+    /// Remove a group and every key in it, reporting whether it was there.
+    ///
+    /// The remaining groups keep their order.
+    pub fn remove_group(&mut self, group: &str) -> bool {
+        let Some(index) = self.groups.iter().position(|g| g.name == group) else {
+            return false;
+        };
+        self.groups.remove(index);
+        true
     }
 }
 
@@ -690,6 +726,70 @@ mod tests {
             let reparsed = KeyFile::parse(&kf.to_string()).unwrap();
             assert_eq!(kf, reparsed);
         }
+    }
+
+    // ---- B6: removal (observed via `ostree config unset`) -------------------
+
+    #[test]
+    fn remove_key_keeps_the_group_header() {
+        // `ostree config set g.k v` followed by `ostree config unset g.k` leaves
+        // the emptied `[g]` header in the file, which this reproduces.
+        let mut kf = KeyFile::parse("[core]\nrepo_version=1\nmode=archive-z2\n\n[g]\nk=v\n")
+            .expect("the file parses");
+        assert!(kf.remove_key("g", "k"));
+        assert_eq!(
+            kf.to_string(),
+            "[core]\nrepo_version=1\nmode=archive-z2\n\n[g]\n"
+        );
+        assert!(kf.has_group("g"));
+        assert_eq!(kf.get_value("g", "k"), None);
+    }
+
+    #[test]
+    fn remove_key_reports_an_absent_key_and_group() {
+        let mut kf = KeyFile::parse(ARCHIVE_CONFIG).expect("the file parses");
+        assert!(!kf.remove_key("core", "absent"));
+        assert!(!kf.remove_key("nogroup", "mode"));
+        // Nothing moved.
+        assert_eq!(kf.to_string(), ARCHIVE_CONFIG);
+    }
+
+    #[test]
+    fn remove_key_leaves_the_other_keys_in_order() {
+        let mut kf =
+            KeyFile::parse("[core]\nrepo_version=1\nmode=bare\nfsync=false\n").expect("parses");
+        assert!(kf.remove_key("core", "mode"));
+        assert_eq!(kf.to_string(), "[core]\nrepo_version=1\nfsync=false\n");
+    }
+
+    #[test]
+    fn remove_group_drops_the_header_and_its_keys() {
+        let text = "[core]\nrepo_version=1\nmode=bare\n\n\
+                    [remote \"a\"]\nurl=https://a.invalid/r\n\n\
+                    [remote \"b\"]\nurl=https://b.invalid/r\n";
+        let mut kf = KeyFile::parse(text).expect("the file parses");
+        assert!(kf.remove_group("remote \"a\""));
+        assert!(!kf.remove_group("remote \"a\""));
+        assert_eq!(
+            kf.to_string(),
+            "[core]\nrepo_version=1\nmode=bare\n\n[remote \"b\"]\nurl=https://b.invalid/r\n"
+        );
+        assert_eq!(kf.groups().collect::<Vec<_>>(), ["core", "remote \"b\""]);
+    }
+
+    #[test]
+    fn a_rewrite_keeps_untouched_groups_and_drops_comments() {
+        // The tool's own rewrite: the groups and keys it did not touch keep
+        // their order and their bytes, and the comment and blank lines the
+        // input carried are gone.
+        let text = "# leading comment\n[core]\nrepo_version=1\nmode=archive-z2\n\
+                    # inner comment\nfoo=bar\n\n[other]\nx=1\n";
+        let mut kf = KeyFile::parse(text).expect("the file parses");
+        kf.set_value("core", "new", "v").expect("the key is valid");
+        assert_eq!(
+            kf.to_string(),
+            "[core]\nrepo_version=1\nmode=archive-z2\nfoo=bar\nnew=v\n\n[other]\nx=1\n"
+        );
     }
 
     #[test]

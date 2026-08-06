@@ -91,15 +91,30 @@ const REF_BINDING_KEY: &str = "ostree.ref-binding";
 ///
 /// Field 0 of the summary is the remote's ref list, which is what a pull
 /// resolves a requested ref against before falling back to `refs/heads/<ref>`,
-/// and what a mirror pull of every ref takes its targets from. The per-ref
-/// commit size and metadata the file also carries are not retained: a pull reads
-/// the commit object itself for both.
+/// and what a mirror pull of every ref takes its targets from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
     /// The refs the summary lists, in the order it lists them (byte-wise sorted
     /// by name, as the writer produced them).
-    pub refs: Vec<(String, Checksum)>,
+    pub refs: Vec<SummaryRef>,
     /// The global metadata dict, as the `a{sv}` [`Value`] the file holds.
+    pub metadata: Value,
+}
+
+/// One field-0 entry of a summary: a ref, the commit it names, and what the
+/// summary records about that commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryRef {
+    /// The ref name.
+    pub name: String,
+    /// The commit the ref names.
+    pub commit: Checksum,
+    /// The size of the commit object, in bytes. The field is stored in host
+    /// order, unlike the numbers in the metadata dicts.
+    pub commit_size: u64,
+    /// The per-ref metadata dict, as the `a{sv}` [`Value`] the file holds:
+    /// `ostree.commit.version` when the commit carries one, and a big-endian
+    /// `ostree.commit.timestamp`.
     pub metadata: Value,
 }
 
@@ -144,23 +159,53 @@ impl Summary {
             .map(|(_, value)| value)
     }
 
+    /// The refs of each collection `ostree.summary.collection-map` lists, in the
+    /// order the map lists them.
+    ///
+    /// The map is what a repository publishes about the refs it mirrors from
+    /// other collections; a summary without the key lists none. A map that does
+    /// not hold the shape the key's type promises fails with
+    /// [`Error::InvalidFormat`].
+    pub fn collection_map(&self) -> Result<Vec<(String, Vec<SummaryRef>)>> {
+        let Some(map) = self.metadata_value(COLLECTION_MAP_KEY) else {
+            return Ok(Vec::new());
+        };
+        let Some(entries) = map.as_array() else {
+            return Err(malformed("the collection map is not an array"));
+        };
+        let mut collections = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Some([Value::Str(collection), Value::Array(refs)]) = entry.as_tuple() else {
+                return Err(malformed("a collection-map entry is not (id, refs)"));
+            };
+            let mut parsed = Vec::with_capacity(refs.len());
+            for value in refs {
+                parsed.push(parse_ref_entry(value.clone())?);
+            }
+            collections.push((collection.clone(), parsed));
+        }
+        Ok(collections)
+    }
+
     /// The commit a ref names, or `None` when the summary does not list it.
     pub fn lookup(&self, ref_name: &str) -> Option<Checksum> {
         self.refs
             .iter()
-            .find(|(name, _)| name == ref_name)
-            .map(|(_, commit)| *commit)
+            .find(|entry| entry.name == ref_name)
+            .map(|entry| entry.commit)
     }
 }
 
-/// One field-0 entry `(s, (t, ay, a{sv}))`, reduced to the ref name and the
-/// commit it names.
-fn parse_ref_entry(entry: Value) -> Result<(String, Checksum)> {
+/// One field-0 entry `(s, (t, ay, a{sv}))`.
+fn parse_ref_entry(entry: Value) -> Result<SummaryRef> {
     let Value::Tuple(fields) = entry else {
         return Err(malformed("a summary ref entry is not a tuple"));
     };
     let [Value::Str(name), Value::Tuple(inner)] = &fields[..] else {
         return Err(malformed("a summary ref entry is not (name, details)"));
+    };
+    let Some(Value::U64(size)) = inner.first() else {
+        return Err(malformed("a summary ref entry holds no commit size"));
     };
     let Some(Value::Bytes(checksum)) = inner.get(1) else {
         return Err(malformed("a summary ref entry holds no commit checksum"));
@@ -171,7 +216,15 @@ fn parse_ref_entry(entry: Value) -> Result<(String, Checksum)> {
             checksum.len()
         ))
     })?;
-    Ok((name.clone(), Checksum::from_bytes(raw)))
+    let Some(metadata) = inner.get(2) else {
+        return Err(malformed("a summary ref entry holds no metadata dict"));
+    };
+    Ok(SummaryRef {
+        name: name.clone(),
+        commit: Checksum::from_bytes(raw),
+        commit_size: *size,
+        metadata: metadata.clone(),
+    })
 }
 
 /// A summary that does not hold the shape its type promises.
@@ -463,7 +516,7 @@ impl Repo {
     }
 
     /// Remove a file at the repository root; an already-absent file is success.
-    async fn remove_root_file(&self, name: &str) -> Result<()> {
+    pub(crate) async fn remove_root_file(&self, name: &str) -> Result<()> {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         let name = name.to_owned();
         ostrya_rt::unblock(move || {
@@ -648,7 +701,11 @@ mod tests {
         let bytes = encode(&[("test/main", checksum(1)), ("other", checksum(2))]);
         let summary = Summary::parse(&bytes).unwrap();
         assert_eq!(
-            summary.refs,
+            summary
+                .refs
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.commit))
+                .collect::<Vec<_>>(),
             vec![
                 ("test/main".to_owned(), checksum(1)),
                 ("other".to_owned(), checksum(2)),
@@ -656,6 +713,25 @@ mod tests {
         );
         assert_eq!(summary.lookup("test/main"), Some(checksum(1)));
         assert_eq!(summary.lookup("absent"), None);
+    }
+
+    /// The size and the per-ref metadata the file records, which
+    /// `remote summary` reports for each ref.
+    #[test]
+    fn retains_each_ref_size_and_metadata() {
+        let bytes = encode(&[("test/main", checksum(1))]);
+        let summary = Summary::parse(&bytes).unwrap();
+        let entry = &summary.refs[0];
+        assert_eq!(entry.commit_size, 100);
+        let timestamp = entry
+            .metadata
+            .dict_get(COMMIT_TIMESTAMP_KEY)
+            .and_then(Value::as_variant)
+            .and_then(|(_, value)| value.as_u64())
+            .expect("the entry carries a timestamp");
+        // The field is stored big-endian, so one byteswap recovers the number
+        // the writer put in.
+        assert_eq!(timestamp.swap_bytes(), 7);
     }
 
     #[test]

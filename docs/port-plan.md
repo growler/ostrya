@@ -3818,8 +3818,7 @@ dependency to unpack the entries itself.
 - `ls`: `-d/--dironly`, `-R/--recursive`, `-C/--checksum`, `-X/--xattrs`,
   `--nul-filenames-only`, over the existing `RepoTree::read_dir`/`lookup`.
 - `config get`, over the existing `RepoConfig`/`KeyFile` read accessors.
-  `config set`/`unset` need a config-write path the library does not have
-  yet and are deferred to 17e.
+  `config set`/`unset` landed in 17e, with the config-write path they need.
 
 Deliverables: the GVariant printer and `Value::byteswapped`
 (`ostrya-gvariant`), `Repo::commit_sizes`, `show`, `log`, `ls`, `config get`,
@@ -3870,7 +3869,7 @@ T0 selection through `crates/ostrya-cli/tests/conformance.rs` reports 461 cells,
 148 pass, 0 fail, where it reported 413 cells and 100 passes before the phase.
 `crates/ostrya-conformance/tests/check.rs` validates 225 records and 461 cells.
 
-#### Phase 17e -- `config set`/`unset`, `remote` (excluding cookies), `gpg-import`/`gpg-list-keys`
+#### Phase 17e -- `config set`/`unset`, `remote` (excluding cookies), `gpg-import`/`gpg-list-keys` (DONE)
 
 New library work, not just CLI wiring:
 
@@ -3898,11 +3897,93 @@ Deliverables: `KeyFile` unset and serialization, `Repo`'s config rewrite,
 `config set`/`unset`, `remote add/delete/list/show-url/refs/summary`,
 `gpg-import`/`gpg-list-keys`.
 
-Verify: `config set` followed by `config get` round-trips, and the tool
-reads the resulting file unchanged; `remote add` followed by the tool's own
-`remote list` agree, and the reverse; a key imported by `gpg-import` verifies
-a commit the tool signed with it; `gpg-list-keys` matches the tool's listing
-of the same keyring.
+`KeyFile`'s serializer already round-tripped a document it did not fully
+rewrite, so the phase added the two removers beside its setters:
+`remove_key`, which keeps an emptied group's header the way the tool keeps
+it, and `remove_group`. `Repo::write_config` writes the document through the
+same root-file writer `summary` uses (a temporary file at mode `0644`,
+`fdatasync` under `[core] fsync`, rename, directory sync). It writes what it
+is given and leaves the calling handle's parsed configuration alone: reading
+back needs a reopen. Validating the document instead would have refused
+`config unset core.mode`, which the tool accepts, and the port has no reason
+to guard a key the operator named.
+
+`remote refs` and `remote summary` read a live remote through the
+`Repo::remote_fetch_summary` the pull path already carried, which had no
+caller until now. Reporting a summary needed the per-ref detail the parser
+had been dropping: `Summary::refs` is a `SummaryRef` per entry, carrying the
+commit size and the per-ref metadata dict beside the name and the checksum,
+and `Summary::collection_map` reads the refs of every collection
+`ostree.summary.collection-map` lists. The report's byte order is per field,
+not per document: `Last-Modified` and each `Timestamp` are stored big-endian
+and are converted, and every other metadata value prints as stored, so a `t`
+a caller set through `--add-metadata` reads as the number it holds. `--raw`
+and `--print-metadata-key` take the blanket byteswap `show --raw` takes
+instead, which is why one summary reports `uint64 8502796096475496448` for a
+118-byte commit in `--raw` and `Latest Commit (118 bytes)` in the report.
+The report prints an unannotated value where `--print-metadata-key` prints an
+annotated one, so `ostrya-gvariant` gained `to_text_unannotated` beside
+`to_text`.
+
+`gpg-import` and `gpg-list-keys` run `gpg` in a private scratch directory:
+the import stages the remote's current keyring, imports the offered keys into
+it, and reads the count of new keys out of the `IMPORT_RES` status line,
+which is what the tool's own `Imported <n> GPG key(s)` reports; the listing
+parses a `--with-colons` key listing. A `KEY-ID` selection exports each named
+key out of a second scratch keyring, so a selector naming nothing is refused
+by name. `remote delete` removes `<remote>.trustedkeys.gpg` with the section,
+through `Repo::remove_remote_keyring`.
+
+Four facts the option help does not state came out of the comparison, and are
+recorded in `format-reference.md`, "CLI output formats": `--no-sign-verify`
+writes `gpg-verify=false` as well as `sign-verify=false`; a remote name takes
+an alphanumeric or `_` first and then alphanumerics and `-`, `_`, `.`, so `_`
+is a name and `-`, `.`, and `..` are not; `remote list` sorts by name whatever
+order the sections appear in, and `-u` pads each name to the longest name of
+the whole list plus two, counted in bytes; and the `metalink=` URL prefix
+names its own key while a `mirrorlist=` prefix stays in the `url` value.
+
+Five divergences are recorded in `cli-surface.md`, "P3", none of them a
+repository fact: the tool's `remote` container accepts no `--repo` of its own
+where the port accepts one in every position; an unknown nested subcommand
+draws clap's own text; `remote delete` removing the document's last section
+leaves the tool one trailing blank line and the port none, both reparsing
+equal; `--sign-verify=spki=...` is refused by the tool's build and accepted by
+the port's `spki` feature; and `gpg-list-keys` leaves out the two Web Key
+Directory URL lines and renders the creation instant in UTC, the same locale
+and time-zone divergence the GPG signature report in "P1" already carries.
+`remote refs`/`summary` also drop `--cache-dir`, and the port's fetcher reads
+`http` and `https` where the tool also reads `file://`.
+
+Verify: `cargo test --workspace --all-features` is green, `cargo fmt --all
+--check` and `cargo clippy --workspace --all-features --all-targets` are
+clean. `crates/ostrya-core` gains five `KeyFile` tests holding the removers
+and the rewrite rule; `crates/ostrya-gvariant` one printer test holding the
+unannotated form; `crates/ostrya` one summary test for the retained per-ref
+detail, three `gpg` tests for the import count, the key listing, and the
+colon-field unescaping, and one `repo` test holding the config rewrite -- the
+document, the file mode, the stale handle, and the keyring removal. `crates/ostrya-cli/tests/cli.rs` gains four tests.
+`config_set_and_unset_match_the_tool` runs twenty-four invocations, each side
+against its own repository, comparing both streams, the exit status, and the
+two `config` files byte for byte. `remote_add_and_delete_match_the_tool` runs
+twenty-nine the same way, the name rule and the existence rules among them,
+has each implementation list the remotes out of the other's file, and states
+the one delete divergence there. `remote_refs_and_summary_match_the_tool` serves a
+repository over HTTP and compares fifteen invocations under `TZ=UTC`.
+`remote_gpg_keyring_round_trips_with_the_tool` imports one keyring into each
+implementation's repository, states that each reads the keyring the other
+wrote, that a key imported by the port verifies a commit the tool's own
+`gpg-sign` signed with it, and that deleting the remote takes its keyring with
+it.
+
+In the matrix, `m10-cli-behavior.matrix` gains thirty records net: eleven for
+`config set`/`unset`, replacing the placeholder record 17d left for the
+not-yet-implemented operations, and nineteen for `remote`, four of them citing
+`evidence:` for the cases one invocation cannot state. The T0 selection
+through `crates/ostrya-cli/tests/conformance.rs` reports 491 cells, 173 pass,
+0 fail, where it reported 461 cells and 148 passes before the phase.
+`crates/ostrya-conformance/tests/check.rs` validates 255 records and 491
+cells.
 
 #### Phase 17f -- the remaining P2 option gaps
 

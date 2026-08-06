@@ -48,7 +48,7 @@ pub use xattr::{Xattrs, XattrsRef};
 // arbitrary metadata dicts without depending on `ostrya-gvariant` directly.
 pub use ostrya_gvariant::{
     ArrayIter, GvDecode, GvType, Type, Value, choose_offset_size, from_bytes, to_bytes, to_text,
-    write_offset,
+    to_text_unannotated, write_offset,
 };
 
 #[cfg(test)]

@@ -153,6 +153,14 @@
 //! `gpg-verify`, `gpg-verify-summary`, `sign-verify`, and `sign-verify-summary`
 //! keys state the policy, [`PullVerify`] overrides it, and the keys come from
 //! that remote's trusted keyrings and its `verification-<engine>-*` entries.
+//! It also covers the configuration write side (Phase 17e):
+//! [`Repo::write_config`] replaces `config` atomically with a document edited
+//! through [`KeyFile`](ostrya_core::KeyFile), which is how a remote's section is
+//! added or removed, and [`Repo::remove_remote_keyring`] deletes the keyring that
+//! section owns. Under the `sign-gpg` feature, `Repo::gpg_import_keys` and
+//! `Repo::gpg_list_keys` add certificates to a remote's
+//! `<remote>.trustedkeys.gpg` and read back the key records it holds (see the
+//! [`gpg`] module).
 
 mod bspatch;
 pub mod checkout;
@@ -207,7 +215,7 @@ pub use fetch::{
 pub use file::{ContentReader, FileKind, FileObject};
 pub use fsck::{FsckError, FsckErrorKind, FsckOptions, FsckReport};
 #[cfg(feature = "sign-gpg")]
-pub use gpg::{GpgSigner, GpgVerifier};
+pub use gpg::{GpgKey, GpgSigner, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter, VerifyingReader};
 pub use lock::LockKind;
 pub use modifier::{
@@ -218,7 +226,7 @@ pub use ostrya_composefs::Image;
 pub use ostrya_core::base64;
 pub use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Type, Value, Xattrs,
-    from_bytes, to_text,
+    from_bytes, to_text, to_text_unannotated,
 };
 pub use prune::{PruneOptions, PruneStats};
 pub use pull::{PullFlags, PullOptions, PullStats, PullVerify, TimestampCheck};
@@ -233,7 +241,7 @@ pub use sign::{
 #[cfg(feature = "sign-spki")]
 pub use spki::{SpkiSigner, SpkiVerifier};
 pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
-pub use summary::{Summary, SummaryOptions};
+pub use summary::{Summary, SummaryOptions, SummaryRef};
 pub use tar::{TarExportOptions, TarImportOptions};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};

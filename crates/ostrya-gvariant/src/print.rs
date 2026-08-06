@@ -33,6 +33,23 @@ pub fn to_text(ty: &Type, value: &Value) -> Result<String> {
     Ok(out)
 }
 
+/// Render `value` of type `ty` in the GVariant text form, with no type
+/// annotations.
+///
+/// The rules are [`to_text`]'s with every annotation left out: a byte and an
+/// unsigned integer print bare, an empty container prints `[]` or `{}` rather
+/// than its signature, and a tuple's members print bare. A variant child still
+/// carries an annotation, a variant stating no child type of its own.
+///
+/// This is the form a report that names the value itself uses, where the reader
+/// already knows what it is looking at (`docs/format-reference.md`, "The
+/// GVariant text form").
+pub fn to_text_unannotated(ty: &Type, value: &Value) -> Result<String> {
+    let mut out = String::new();
+    write_value(&mut out, ty, value, false)?;
+    Ok(out)
+}
+
 /// Write one value, annotating it when `annotate` is set and its literal does
 /// not state its type.
 fn write_value(out: &mut String, ty: &Type, value: &Value, annotate: bool) -> Result<()> {
@@ -445,6 +462,45 @@ mod tests {
             "(uint64 1700000000, uint32 1000, 'kept', [byte 0x01, 0x02], true, \
              byte 0x03, [uint32 7], <uint64 9>)"
         );
+    }
+
+    /// The unannotated form, observed against `ostree summary -v`, which reports
+    /// a metadata value the reader has already been told the name of.
+    #[test]
+    fn prints_the_unannotated_forms_recovered_from_the_tool() {
+        let bare = |signature: &str, value: Value| {
+            to_text_unannotated(&Type::parse(signature).unwrap(), &value).unwrap()
+        };
+        assert_eq!(bare("t", Value::U64(7)), "7");
+        assert_eq!(bare("y", Value::Byte(0x2a)), "0x2a");
+        assert_eq!(bare("b", Value::Bool(true)), "true");
+        assert_eq!(bare("s", Value::Str("str".into())), "'str'");
+        // An empty container prints its brackets alone, where the annotated form
+        // carries the signature.
+        assert_eq!(bare("ay", bytes(&[])), "[]");
+        assert_eq!(bare("a{sv}", Value::Array(Vec::new())), "{}");
+        assert_eq!(bare("ay", bytes(&[0x01, 0x02])), "[0x01, 0x02]");
+        assert_eq!(
+            bare(
+                "as",
+                Value::Array(vec![Value::Str("a".into()), Value::Str("b".into())])
+            ),
+            "['a', 'b']"
+        );
+        assert_eq!(
+            bare(
+                "(ts)",
+                Value::Tuple(vec![Value::U64(1), Value::Str("s".into())])
+            ),
+            "(1, 's')"
+        );
+        // A variant child states no type of its own, so it is annotated even
+        // inside an unannotated value.
+        let deltas = Value::Array(vec![Value::Tuple(vec![
+            Value::Str("from-to".into()),
+            Value::variant(Type::parse("ay").unwrap(), bytes(&[0xeb, 0x57])),
+        ])]);
+        assert_eq!(bare("a{sv}", deltas), "{'from-to': <[byte 0xeb, 0x57]>}");
     }
 
     #[test]

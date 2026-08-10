@@ -37,9 +37,13 @@ roadmap.
 
 ## Design
 
-- Pure Rust, with no C library linkage beyond what `std` links. `rustix`
-  provides the syscalls a portable async file API cannot express (fd-relative
-  opens and metadata, xattrs, statx, FICLONE reflink, `O_TMPFILE` + linkat,
+- Pure Rust, with two static C-linking exceptions, each requiring no C runtime
+  of its own beyond the libc `std` already links: `liblzma`, which the library
+  links for xz in static deltas, and PCRE2, which the `ostrya-cli` binary
+  links for the `commit --tar-pathname-filter` expression. PCRE2 belongs to
+  that binary alone, which sets `publish = false`. `rustix` provides the
+  syscalls a portable async file API cannot express (fd-relative opens and
+  metadata, xattrs, statx, FICLONE reflink, `O_TMPFILE` + linkat,
   OFD-compatible record locks). Streaming file I/O goes through the runtime's
   async file.
 - Async throughout. The runtime backend sits behind the internal `ostrya-rt`

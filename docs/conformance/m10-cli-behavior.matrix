@@ -5659,9 +5659,9 @@ spec: format-reference.md#tar
 note: the value splits at its first comma, the replacement is global, a member
  the expression does not match is unchanged, a directory member carries its
  trailing slash, the archive's own root member is the empty string, and a
- hardlink's target is a member name the filter reaches. The cited test states
- each by the commit checksum, over the expression subset the port reads
- (`cli-surface.md`, "P2").
+ hardlink's target is a member name the filter reaches. An empty match advances
+ the splice past one whole character, which leaves that character in the name.
+ The cited test states each by the commit checksum (`cli-surface.md`, "P2").
 
 family: M10
 subcommand: commit
@@ -5674,15 +5674,23 @@ identity: full
 evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: a value with no comma reports `error: Missing ',' in
- --tar-pathname-filter` from both, at exit 1. An expression neither dialect
- compiles is refused by both at exit 1, with no object and no ref written. The
- wording of that compile failure is the one difference: the tool reports
- `error: --tar-pathname-filter: Error while compiling regular expression
- '<expression>' at char N: <reason>`, and the port reports the same line
- without the character offset and with the `regex` crate's multi-line reason,
- so `stderr-text` is not an oracle there (`cli-surface.md`, "Scope of CLI
- compatibility"). The refusal, the exit status, and the absent commit are what
- is compared. Both need a `tar=` source, which no setup binds.
+ --tar-pathname-filter` from both, at exit 1. An expression neither engine
+ compiles is refused by both at exit 1, with no object and no ref written, and
+ both report `error: --tar-pathname-filter: Error while compiling regular
+ expression '<expression>' at char N: <reason>`. The reason string is one
+ difference: GLib passes some of PCRE2's own reasons through and rewords
+ others, so `[[:bogus:]]` and `f{65536}` agree character for character where
+ `dir1((`, `\q`, and `(*BOGUS)f` part on the reason alone. The unit `N` counts
+ is the other: the port reports the code-unit offset PCRE2 answers, the tool
+ reports a character offset. The two agree over an expression that holds ASCII
+ characters alone ahead of the error point, which is the five named above, and
+ the cited test states each of the five lines. A non-ASCII character ahead of
+ the error point parts the offsets by the code units that character occupies
+ beyond the first: `\q` behind one `é` reports char 3 from the port and char 2
+ from the tool, and behind one `U+1F600` char 5 and char 2. The cited test
+ states both offsets over eight such expressions, so an assertion holds the
+ divergence (`cli-surface.md`, "Scope of CLI compatibility"). Both need a
+ `tar=` source, which no setup binds.
 
 family: M10
 subcommand: commit
@@ -5709,27 +5717,30 @@ subcommand: commit
 cell: commit/tar-pathname-filter-dialect
 modes: archive
 setup: repo tree
-outcome: lossy
+outcome: full
 severity: interop
 identity: full
 evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
-note: the expression dialect, which needs a `tar=` source no setup binds. The
- tool compiles a PCRE through GLib; the port compiles the `regex` crate's
- dialect. Both carry the anchors `^`, `$`, `\A`, and `\z`, `\b` and `\B`, the
- POSIX class names in the plain and the negated form, the `\xHH` and `\x{...}`
- escapes, `\p{...}`, capturing, non-capturing, and named groups, alternation,
- the greedy and lazy quantifiers, `(?i)` at any position, and `(?i:...)`; each
- of those reaches the tool's commit checksum. Measured in both directions over
- the cited test, no expression both dialects compile is answered differently.
-loss: seven constructs PCRE carries and `regex` does not, so the port refuses
- where the tool compiles: the four lookarounds, the atomic group `(?>`, the
- comment group `(?#`, `\Q...\E`, the anchor `\Z`, the single-byte `\C`, and a
- backreference inside the expression. Two run the other way, the port compiling
- where the tool refuses: a repeat count above PCRE's 65535 limit, and
- `[[:bogus:]]`, which `regex` reads as a nested class and PCRE as an unknown
- POSIX name. A refusal is compared as a refusal; the wording is the port's own
- (`cli-surface.md`, "Scope of CLI compatibility").
+note: the expression dialect, which needs a `tar=` source no setup binds. Both
+ implementations compile the value with PCRE2: the tool through GLib's
+ `GRegex`, and the port through the `pcre2` crate's vendored 10.46. Both carry
+ the anchors, `\b` and `\B`, the POSIX class names, the character and Unicode
+ escapes, every group form, the greedy, lazy, and possessive quantifiers, the
+ inline options, the four lookarounds, the atomic and comment groups,
+ `\Q...\E`, `\C`, `\K`, backreferences, recursion, subroutine calls,
+ conditionals, `\h`, `\R`, `\N`, `\g{1}`, octal escapes, `(?J)`, `(?x)`, a
+ callout, the backtracking verbs, and the start-of-pattern options; each form
+ the cited test holds reaches the tool's commit checksum. `(?J)` is held on
+ both halves of the value: the expression puts one name on two groups, and the
+ replacement reads that name back with `\g<name>`, which resolves to the first
+ group of that name the match set. Measured in both directions, no expression
+ both compile is answered differently, and every expression one refuses the
+ other refuses too. The residue is the reason string in a compile-failure line,
+ the unit that same line's offset counts in, and the exit path a match-time
+ refusal takes, all three outside the oracle (`cli-surface.md`, "Scope of CLI
+ compatibility"), and the PCRE2 version, which the port vendors and the tool
+ takes from the host GLib.
 
 family: M10
 subcommand: commit
@@ -5755,12 +5766,70 @@ severity: interop
 identity: full
 evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
-note: `regex` compiles to a finite automaton, so one match costs time linear in
- the length of the pathname and the option carries no step budget. `^(a+)+b`
- and `^a+$` against a 250-character member name both reach the tool's commit
- checksum at exit 0, and the pair answers inside a bound a backtracking matcher
- over that name could not meet, which is what the cited test holds. Needs a
- `tar=` source no setup binds.
+note: PCRE2 finds the literal an expression requires and ends a match that
+ cannot reach it without backtracking, so `^(a+)+b` and `^a+$` against a
+ 250-character member name both reach the tool's commit checksum at exit 0,
+ inside a bound a matcher that did backtrack over that name could not meet,
+ which is what the cited test holds. An expression that requires no literal
+ spends the match budget instead, which
+ `commit/tar-pathname-filter-refused-at-match-time` states. Needs a `tar=`
+ source no setup binds.
+
+family: M10
+subcommand: commit
+cell: commit/tar-pathname-filter-unicode
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the expression is compiled with UTF and UCP on, which both
+ implementations state by the commit checksum over a member name that holds a
+ non-ASCII character. `\d` matches `U+0663`, `^\w` and `[[:alpha:]]` match `é`,
+ `\s` matches `U+00A0`, and `^.` consumes one character and not one byte. Needs
+ a `tar=` source no setup binds.
+
+family: M10
+subcommand: commit
+cell: commit/tar-pathname-filter-newlines
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the newline convention is `any` in both, so a carriage return, a line
+ feed, the pair, a vertical tab, a form feed, `U+0085`, `U+2028`, and `U+2029`
+ each end a line. `$` and `\Z` match before one final terminator where `\z`
+ does not, `(?m)^` matches after one inside a name, `.` consumes none of them,
+ and `\R` consumes any. A convention the value states itself, `(*LF)`,
+ `(*CRLF)`, or `(*ANYCRLF)`, wins over the default in both. The port states the
+ default with PCRE2's `(*ANY)` start-of-pattern option ahead of the value, the
+ crate stating no option for it, and a start-of-pattern option the value
+ carries follows it. The cited test states each case by the commit checksum,
+ one archive per terminator. Needs a `tar=` source no setup binds.
+
+family: M10
+subcommand: commit
+cell: commit/tar-pathname-filter-refused-at-match-time
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: an expression that requires no literal spends PCRE2's match budget over a
+ 250-character member name, and a `\C` rewrite over a multi-byte name splits a
+ character. Neither writes an object or a ref. The exit path is the difference:
+ the port reports the reason at exit 1, and the tool ends on a GLib assertion
+ at exit 134 whose message names `ot-builtin-commit.c` and
+ `handle_translate_pathname`, reading `match limit exceeded` for the budget and
+ `bad offset into UTF string` for the split character. `(a+)+\d`,
+ `(a+)+[0-9]`, and `(a|aa)+\d` each reach the budget. Needs a `tar=` source no
+ setup binds.
 
 family: M10
 subcommand: commit

@@ -2118,7 +2118,19 @@ wins, and the value is read as an archive is loaded, so a command line naming no
 comma reports `error: Missing ',' in --tar-pathname-filter` and an expression
 that does not compile reports
 `error: --tar-pathname-filter: Error while compiling regular expression
-'<expression>' at char N: <reason>`, both at exit 1.
+'<expression>' at char N: <reason>`, both at exit 1. The tool counts `N` in
+characters and the port in code units, which `conformance/cli-surface.md`,
+"P2", records.
+
+The expression is a PCRE2 pattern, compiled with UTF and UCP on and the newline
+convention set to `any`, and every other compile option at PCRE2's default. The
+replacement is GLib's syntax: `\0` to `\9`, `\g<name>`, `\g<number>`, `\\`, the
+seven control escapes `\n`, `\t`, `\r`, `\a`, `\b`, `\f`, and `\v`, and `$` as a
+literal. A group the expression does not declare contributes nothing, and any
+other replacement escape is refused. An empty match advances past one whole
+character, which leaves that character in the name.
+(`conformance/cli-surface.md`, "P2", states the dialect in full, together with
+the four places the two implementations part.)
 
 The commit modifiers reach an archive the way they reach a filesystem walk, with
 one difference: `--canonical-permissions` records owner `0:0` and

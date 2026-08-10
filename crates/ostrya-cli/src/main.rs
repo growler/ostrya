@@ -70,7 +70,7 @@ use ostrya::{GpgSigner, GpgVerifier};
 #[cfg(feature = "spki")]
 use ostrya::{SpkiSigner, SpkiVerifier};
 
-use regex::{Captures, Regex};
+use pcre2::bytes::{CaptureLocations, RegexBuilder};
 
 /// A pure-Rust front-end over the ostrya repository library.
 #[derive(Parser)]
@@ -2880,6 +2880,10 @@ async fn overlay_source(
     }
 }
 
+/// PCRE2's start-of-pattern option for the `any` newline convention, which is
+/// the convention GLib's `GRegex` compiles under.
+const NEWLINE_ANY: &str = "(*ANY)";
+
 /// The tar import options a `commit` invocation states. The pathname filter is
 /// read here, as a tar source is loaded, so a value the reader refuses is
 /// reported only where an archive is read: a command line naming no tar source
@@ -2895,12 +2899,42 @@ fn tar_import_options(args: &CommitArgs) -> std::result::Result<TarImportOptions
     let Some((pattern, replacement)) = value.split_once(',') else {
         return Err("Missing ',' in --tar-pathname-filter".to_owned());
     };
-    let regex = Regex::new(pattern).map_err(|err| {
-        format!(
-            "--tar-pathname-filter: Error while compiling regular expression \
-             \u{2018}{pattern}\u{2019}: {err}"
-        )
-    })?;
+    // The tool compiles this value as a PCRE2 pattern through GLib's `GRegex`,
+    // with UTF and UCP on and every other compile option at its default, which
+    // is what the probes in `docs/conformance/cli-surface.md`, "P2" state. The
+    // JIT stays off: the interpreter and the JIT part in how they account the
+    // match limits and not in what they match.
+    //
+    // `GRegex` also sets the newline convention to `any`, so a carriage return,
+    // a line feed, the pair, a vertical tab, a form feed, `U+0085`, `U+2028`,
+    // and `U+2029` each end a line. The convention decides where `$`, `\Z`, and
+    // `(?m)^` match and which characters `.` and `\N` exclude, so a name
+    // holding one of those characters is renamed under it. The crate states no
+    // option for the convention, so the compiled pattern carries PCRE2's own
+    // `(*ANY)` start-of-pattern option ahead of the value. A convention the
+    // value states itself follows `(*ANY)` and wins, in both implementations.
+    let regex = RegexBuilder::new()
+        .utf(true)
+        .ucp(true)
+        .build(&format!("{NEWLINE_ANY}{pattern}"))
+        .map_err(|err| {
+            // PCRE2 counts the offset from the compiled pattern, and the line
+            // the tool writes counts the value the caller wrote. Both counts
+            // are in code units, so the subtraction is a byte count; the tool
+            // writes a character offset here, which
+            // `docs/conformance/cli-surface.md`, "P2" records as a divergence.
+            let at = match err.offset() {
+                Some(offset) => {
+                    format!(" at char {}", offset.saturating_sub(NEWLINE_ANY.len()))
+                }
+                None => String::new(),
+            };
+            format!(
+                "--tar-pathname-filter: Error while compiling regular expression \
+                 \u{2018}{pattern}\u{2019}{at}: {}",
+                pcre2_reason(&err)
+            )
+        })?;
     let replacement = parse_replacement(replacement).map_err(|reason| {
         format!(
             "--tar-pathname-filter: Error while reading the replacement \
@@ -2912,14 +2946,94 @@ fn tar_import_options(args: &CommitArgs) -> std::result::Result<TarImportOptions
     // root's metadata, so `^dir1/(.*)$,\1` strips a prefix. A file member mapped
     // onto the empty string names the root as a file, which the tar importer
     // refuses (`docs/conformance/cli-surface.md`, "P2").
+    let pattern = pattern.to_owned();
+    let mut locs = regex.capture_locations();
     opts.rename = Some(Box::new(move |name: &str| {
-        Ok(regex
-            .replace_all(name, |caps: &Captures| {
-                expand_replacement(&replacement, caps)
-            })
-            .into_owned())
+        let subject = name.as_bytes();
+        let mut out = Vec::with_capacity(subject.len());
+        // The replacement is global, so the loop splices one match at a time.
+        // `held` is where the untouched tail starts and `search` is where the
+        // next attempt starts. The two part after an empty match, which
+        // advances the search past one whole character while that character
+        // stays in the tail. Advancing one byte instead would start an attempt
+        // inside a character, which PCRE2 states no meaning for.
+        let mut held = 0;
+        let mut search = 0;
+        while search <= subject.len() {
+            let found = regex
+                .captures_read_at(&mut locs, subject, search)
+                .map_err(|err| {
+                    Error::Tar(format!(
+                        "--tar-pathname-filter: Error while matching regular expression \
+                         \u{2018}{pattern}\u{2019}: {}",
+                        pcre2_reason(&err)
+                    ))
+                })?;
+            let Some(found) = found else { break };
+            out.extend_from_slice(&subject[held..found.start()]);
+            expand_replacement(
+                &replacement,
+                subject,
+                regex.capture_names(),
+                &locs,
+                &mut out,
+            );
+            held = found.end();
+            search = if found.end() > found.start() {
+                found.end()
+            } else {
+                next_character(name, found.end())
+            };
+        }
+        out.extend_from_slice(&subject[held..]);
+        // `\C` matches one byte, so a rewrite can split a character. The port
+        // stores a pathname as text and refuses such a result; the tool ends
+        // the run on a GLib assertion in the same case
+        // (`docs/conformance/cli-surface.md`, "P2").
+        String::from_utf8(out).map_err(|_| {
+            Error::Tar(format!(
+                "--tar-pathname-filter: the rewritten name of \u{2018}{name}\u{2019} is \
+                 not valid UTF-8"
+            ))
+        })
     }));
     Ok(opts)
+}
+
+/// The reason a PCRE2 error names, without the text the crate writes in front
+/// of it. Each refusal line names the operation and the character offset in the
+/// positions the tool's own line names them, so the crate's text is dropped.
+/// The kind of the error states the shape of that text: a compile error names
+/// the operation and an offset clause the crate states for some errors alone,
+/// and every other kind names the operation up to the first `": "`. Text of
+/// another shape is answered whole.
+fn pcre2_reason(err: &pcre2::Error) -> String {
+    let text = err.to_string();
+    let reason = match err.kind() {
+        pcre2::ErrorKind::Compile => text
+            .strip_prefix("PCRE2: error compiling pattern")
+            .map(|rest| match rest.strip_prefix(" at offset ") {
+                Some(after) => after.trim_start_matches(|c: char| c.is_ascii_digit()),
+                None => rest,
+            })
+            .and_then(|rest| rest.strip_prefix(": ")),
+        _ => text
+            .strip_prefix("PCRE2: error ")
+            .and_then(|rest| rest.split_once(": "))
+            .map(|(_, reason)| reason),
+    };
+    reason.unwrap_or(text.as_str()).to_owned()
+}
+
+/// The offset of the character that follows the one at `at`. An empty match
+/// advances the search this way, so no attempt starts inside a character. An
+/// offset at the end of the name answers one past it, which ends the loop.
+fn next_character(name: &str, at: usize) -> usize {
+    let mut next = at + 1;
+    while next < name.len() && !name.is_char_boundary(next) {
+        next += 1;
+    }
+    next
 }
 
 /// One piece of a parsed replacement template.
@@ -3027,25 +3141,41 @@ fn parse_replacement(replacement: &str) -> std::result::Result<Vec<ReplacementPi
     Ok(pieces)
 }
 
-/// Build one match's replacement text.
-fn expand_replacement(pieces: &[ReplacementPiece], caps: &Captures) -> String {
-    let mut out = String::new();
+/// Append one match's replacement text. `names` holds the expression's capture
+/// names by group number, which is how a `\g<name>` reference reaches a group.
+/// `(?J)` lets several groups carry one name, so the reference resolves to the
+/// first group, by number, that carries the name and that the match set. A
+/// reference that reaches no set group, and a name the expression does not
+/// declare, contribute nothing.
+fn expand_replacement(
+    pieces: &[ReplacementPiece],
+    subject: &[u8],
+    names: &[Option<String>],
+    locs: &CaptureLocations,
+    out: &mut Vec<u8>,
+) {
     for piece in pieces {
         match piece {
-            ReplacementPiece::Text(text) => out.push_str(text),
-            ReplacementPiece::Index(index) => {
-                if let Some(m) = caps.get(*index) {
-                    out.push_str(m.as_str());
-                }
-            }
+            ReplacementPiece::Text(text) => out.extend_from_slice(text.as_bytes()),
+            ReplacementPiece::Index(index) => push_group(subject, locs, *index, out),
             ReplacementPiece::Name(name) => {
-                if let Some(m) = caps.name(name) {
-                    out.push_str(m.as_str());
+                let group = names.iter().enumerate().find_map(|(group, held)| {
+                    (held.as_deref() == Some(name.as_str()) && locs.get(group).is_some())
+                        .then_some(group)
+                });
+                if let Some(group) = group {
+                    push_group(subject, locs, group, out);
                 }
             }
         }
     }
-    out
+}
+
+/// Append the text one capture group matched.
+fn push_group(subject: &[u8], locs: &CaptureLocations, group: usize, out: &mut Vec<u8>) {
+    if let Some((start, end)) = locs.get(group) {
+        out.extend_from_slice(&subject[start..end]);
+    }
 }
 
 /// The commit modifier the tree-shaping options ask for, or `None` where they

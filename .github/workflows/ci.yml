@@ -23,6 +23,35 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # PCRE2 is the second C library in the tree, and it belongs to the
+      # unpublished binary alone: `ostrya-cli` compiles the `commit
+      # --tar-pathname-filter` expression with it and sets `publish = false`, so
+      # no published crate links it (`CLAUDE.md`, goal 1). The rule covers the
+      # whole `pcre2` name family, because `pcre2-sys` reaches the same C
+      # library on its own. This fails when any other manifest names a `pcre2`
+      # crate.
+      - name: PCRE2 stays in ostrya-cli
+        run: |
+          cargo metadata --format-version 1 --all-features \
+            | jq -e '[.packages[]
+                      | select(.name | test("^pcre2") | not)
+                      | select(any(.dependencies[]?.name; test("^pcre2")))
+                      | .name] == ["ostrya-cli"]'
+
+      # `.cargo/config.toml` pins `pcre2-sys` to its vendored static build. A
+      # runner that carries `libpcre2-dev` links its own PCRE2 without the pin,
+      # and the dialect `commit --tar-pathname-filter` compiles follows that
+      # version. `pcre2-sys` also builds the vendored copy where `pkg-config`
+      # finds no `libpcre2-8`. This step installs `libpcre2-dev`, so the system
+      # library is present and the step holds the pin and not only the shipped
+      # binary's linkage.
+      - name: PCRE2 is linked statically
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcre2-dev
+          cargo build -p ostrya-cli
+          ! readelf -d target/debug/ostrya | grep -qi pcre2
+
       # The local-pull ownership-gate tests need the process to belong to more
       # than one group, and skip themselves where it does not. The runner user
       # belongs to several, so this job demands the coverage rather than

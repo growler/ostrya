@@ -13642,10 +13642,17 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     pack_tar(&hl, &hard);
     let source = format!("--tree=tar={}", full.display());
 
+    // The branch name holds a character that is not a hexadecimal digit, so it
+    // cannot read as an abbreviated commit checksum. The tool resolves the
+    // implicit parent of `commit -b NAME` through a revision parse that accepts
+    // one, so a hexadecimal name that prefixes a commit this repository already
+    // holds takes that commit as its parent where no such ref stands, and the
+    // port takes no parent. That divergence belongs to the parent lookup and
+    // not to this option, so the names here keep clear of it.
     let mut branch = 0;
     let mut agrees = |extra: &[&str]| {
         branch += 1;
-        let name = format!("f{branch}");
+        let name = format!("tar{branch}");
         let mut args = vec!["commit", "-b", &name, FIXED_TIMESTAMP];
         args.extend_from_slice(extra);
         assert_agrees(&port_repo, &tool_repo, &args);
@@ -13740,11 +13747,12 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     agrees(&[&nested_source, r"--tar-pathname-filter=^dir1/(.*),X/\1"]);
 
     // A quantified atom over a long member name is matched rather than refused,
-    // and so is an expression whose backtracking grows exponentially under a
-    // backtracking matcher. 250 characters is the longest name a filesystem
-    // holds. Both reach the tool's commit checksum at exit 0, which states that
-    // the option carries no step budget, and the pair answers inside a bound a
-    // backtracking matcher over that name could not meet.
+    // and so is an expression whose backtracking would grow exponentially
+    // without the required literal PCRE2 finds in it: `^(a+)+b` needs a `b` the
+    // name does not hold, so the match ends without backtracking. 250
+    // characters is the longest name a filesystem holds. Both reach the tool's
+    // commit checksum at exit 0, inside a bound a matcher that did backtrack
+    // over that name could not meet.
     let long = root.join("long");
     std::fs::create_dir_all(&long).unwrap();
     std::fs::write(long.join("a".repeat(250)), "x\n").unwrap();
@@ -13791,8 +13799,187 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         );
     }
 
-    // Values both refuse. The port words its refusals in the `regex` crate's
-    // terms, so the refusal is compared and the wording is not
+    // Constructs PCRE2 carries, each reaching the tool's commit checksum: the
+    // four lookarounds, the atomic group, the comment group, the literal span,
+    // `\N`, a backreference, the extended flag, and a callout. `\C` matches one
+    // byte, which rewrites an all-ASCII name without splitting a character. The
+    // two backtracking verbs and the start-of-pattern options close the set;
+    // the port injects a start-of-pattern option of its own for the newline
+    // convention, and a value that states one itself is placed after it.
+    for filter in [
+        r"--tar-pathname-filter=(?=f)x,Q",
+        r"--tar-pathname-filter=(?=f).,Q",
+        r"--tar-pathname-filter=(?!f).,Q",
+        r"--tar-pathname-filter=(?<=f)x,Q",
+        r"--tar-pathname-filter=(?<!f)t,Q",
+        r"--tar-pathname-filter=(?>f),Q",
+        r"--tar-pathname-filter=(?#c)f,Q",
+        r"--tar-pathname-filter=\Qf+t\E,Q",
+        r"--tar-pathname-filter=\Qf.\E,Q",
+        r"--tar-pathname-filter=\C,Q",
+        r"--tar-pathname-filter=\N,Q",
+        r"--tar-pathname-filter=(x)?\1f,Q",
+        "--tar-pathname-filter=(?x) f ,Q",
+        "--tar-pathname-filter=(?C1)f,Q",
+        "--tar-pathname-filter=(*SKIP)f,Q",
+        "--tar-pathname-filter=f(*ACCEPT),Q",
+        "--tar-pathname-filter=(*UTF)f,Q",
+        "--tar-pathname-filter=(*UCP)f,Q",
+        "--tar-pathname-filter=(*LIMIT_MATCH=10)f,Q",
+        "--tar-pathname-filter=(*NUL)f,Q",
+    ] {
+        agrees(&[&source, filter]);
+    }
+
+    // An archive whose member names hold a doubled letter, a space, and an
+    // upper-case letter, which is what a backreference, `\K`, a subroutine
+    // call, `\h`, and an octal escape need in order to match.
+    let doubled = root.join("doubled");
+    std::fs::create_dir_all(&doubled).unwrap();
+    for member in ["ff.txt", "f.txt", "a b.txt", "A.txt"] {
+        std::fs::write(doubled.join(member), "x\n").unwrap();
+    }
+    let doubled_tar = base.join("doubled.tar");
+    pack_tar(&doubled, &doubled_tar);
+    let doubled_source = format!("--tree=tar={}", doubled_tar.display());
+    for filter in [
+        r"--tar-pathname-filter=(?<=f)f,Q",
+        r"--tar-pathname-filter=(f)\1,Q",
+        r"--tar-pathname-filter=f\Kf,Q",
+        // A possessive quantifier gives nothing back where its greedy form
+        // does, so `^f*+f` and `^f*f` answer differently over `ff.txt`.
+        r"--tar-pathname-filter=^f*+f,Q",
+        r"--tar-pathname-filter=^f*f,Q",
+        r"--tar-pathname-filter=^(f(?R)?),Q",
+        r"--tar-pathname-filter=(f)(?1),Q",
+        r"--tar-pathname-filter=(f)?(?(1)f|x),Q",
+        r"--tar-pathname-filter=(f)\g{1},Q",
+        r"--tar-pathname-filter=\h,Q",
+        r"--tar-pathname-filter=\101,Q",
+        r"--tar-pathname-filter=(?J)(?<n>f)|(?<n>x),Q",
+        // A duplicate name in the expression, paired with a read of that name
+        // from the replacement. The match sets one group of the pair, and the
+        // name reaches the group the match set: `f.txt` sets the first group
+        // and `A.txt` the second.
+        r"--tar-pathname-filter=(?J)(?<n>f)|(?<n>A),[\g<n>]",
+        // An empty match advances the splice past one whole character, which
+        // leaves that character in the name. The lookbehind holds the
+        // expression off the archive's root member, whose name is empty.
+        r"--tar-pathname-filter=(?<=.)x*,Q",
+        // A lazy quantifier prefers its empty branch, so the splice advances
+        // past the character rather than retrying the offset for a non-empty
+        // match. The two loop shapes part here and nowhere else.
+        r"--tar-pathname-filter=(?<=.)f*?,Q",
+        // A greedy quantifier matches once and then matches empty where that
+        // match ended, which is where the splice loop's two positions part
+        // for a non-empty match. `ff.txt` holds the doubled letter that
+        // reaches it.
+        r"--tar-pathname-filter=(?<=.)f*,Q",
+    ] {
+        agrees(&[&doubled_source, filter]);
+    }
+
+    // One archive per member name that states a dialect semantic.
+    let pack_named = |name: &str, members: &[&str]| -> String {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for member in members {
+            std::fs::write(dir.join(member), "x\n").unwrap();
+        }
+        let path = base.join(format!("{name}.tar"));
+        pack_tar(&dir, &path);
+        format!("--tree=tar={}", path.display())
+    };
+    let digit = pack_named("digit", &["\u{663}.txt"]);
+    let letter = pack_named("letter", &["é.txt"]);
+    let multibyte = pack_named("multibyte", &["aébc"]);
+    let space = pack_named("space", &["\u{a0}.txt"]);
+    let trailing = pack_named("trailing", &["f.txt\n"]);
+    let embedded = pack_named("embedded", &["a\nb.txt"]);
+
+    // UCP is on, so `\d`, `\w`, `\s`, and the POSIX class names are
+    // Unicode-aware, and UTF is on, so `.` consumes one character and not one
+    // byte.
+    agrees(&[&digit, r"--tar-pathname-filter=\d,Q"]);
+    agrees(&[&letter, r"--tar-pathname-filter=^\w,Q"]);
+    agrees(&[&letter, "--tar-pathname-filter=[[:alpha:]],Q"]);
+    agrees(&[&letter, "--tar-pathname-filter=^.,Q"]);
+    agrees(&[&space, r"--tar-pathname-filter=\s,Q"]);
+    agrees(&[&multibyte, r"--tar-pathname-filter=(?<=.)x*,Q"]);
+
+    // `$` and `\Z` match before a final newline where `\z` does not.
+    for filter in [
+        r"--tar-pathname-filter=^f\.txt$,Q",
+        r"--tar-pathname-filter=^f\.txt\Z,Q",
+        r"--tar-pathname-filter=^f\.txt\z,Q",
+    ] {
+        agrees(&[&trailing, filter]);
+    }
+
+    // Multi-line is off, `(?m)` turns it on, and `.` consumes no line
+    // terminator.
+    for filter in [
+        "--tar-pathname-filter=^a$,Q",
+        "--tar-pathname-filter=(?m)^a$,Q",
+        "--tar-pathname-filter=a.b,Q",
+        r"--tar-pathname-filter=a\Rb,Q",
+    ] {
+        agrees(&[&embedded, filter]);
+    }
+
+    // The newline convention is `any`: a carriage return, the pair, a vertical
+    // tab, a form feed, `U+0085`, `U+2028`, and `U+2029` each end a line, so
+    // `$` and `\Z` match before one and `.` consumes none of them
+    // (`docs/conformance/cli-surface.md`, "P2").
+    for (name, member) in [
+        ("nl-cr", "c\r"),
+        ("nl-crlf", "c\r\n"),
+        ("nl-vt", "c\u{b}"),
+        ("nl-ff", "c\u{c}"),
+        ("nl-nel", "c\u{85}"),
+        ("nl-ls", "c\u{2028}"),
+        ("nl-ps", "c\u{2029}"),
+    ] {
+        let one = pack_named(name, &[member]);
+        for filter in [
+            "--tar-pathname-filter=^c$,Q",
+            r"--tar-pathname-filter=^c\Z,Q",
+            "--tar-pathname-filter=^c.,Q",
+        ] {
+            agrees(&[&one, filter]);
+        }
+    }
+    // A convention the value states itself wins over the injected one, in both.
+    for (name, member) in [("nl-cr", "c\r"), ("nl-crlf", "c\r\n")] {
+        let one = pack_named(name, &[member]);
+        for filter in [
+            "--tar-pathname-filter=(*LF)^c$,Q",
+            "--tar-pathname-filter=(*CRLF)^c$,Q",
+            "--tar-pathname-filter=(*ANYCRLF)^c$,Q",
+        ] {
+            agrees(&[&one, filter]);
+        }
+    }
+    // The same convention decides where `(?m)^` matches and what `\R` consumes,
+    // for a terminator inside a name.
+    for (name, member) in [
+        ("mid-cr", "a\rb"),
+        ("mid-vt", "a\u{b}b"),
+        ("mid-nel", "a\u{85}b"),
+    ] {
+        let one = pack_named(name, &[member]);
+        for filter in [
+            "--tar-pathname-filter=a.b,Q",
+            "--tar-pathname-filter=(?m)^a$,Q",
+            r"--tar-pathname-filter=a\Rb,Q",
+        ] {
+            agrees(&[&one, filter]);
+        }
+    }
+
+    // Values both refuse. The port words its refusals in PCRE2's own terms,
+    // which GLib rewords for some reasons, so the refusal is compared and the
+    // wording is compared only where it was measured to agree
     // (`docs/conformance/cli-surface.md`, "P2").
     let mut refused = 0;
     let mut both_refuse = |extra: &[&str]| {
@@ -13833,14 +14020,21 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         );
     };
     for filter in [
-        // A value with no comma, and an expression neither dialect compiles.
+        // A value with no comma, and an expression neither engine compiles: an
+        // unbalanced group, an unknown escape, an unknown verb, an unknown
+        // POSIX class name, and a repeat count above PCRE2's own limit.
         "--tar-pathname-filter=nocomma",
         "--tar-pathname-filter=dir1((,x",
         r"--tar-pathname-filter=\q,Q",
+        "--tar-pathname-filter=(*BOGUS)f,Q",
+        "--tar-pathname-filter=[[:bogus:]],Q",
+        "--tar-pathname-filter=f{65536},Q",
+        // An expression whose empty match at the start of every name rewrites
+        // the archive's own root member, which leaves each remaining member
+        // with no parent, and a group reference in the replacement that reaches
+        // a member collision.
         r"--tar-pathname-filter=\K,Q",
         "--tar-pathname-filter=f*+,Q",
-        // A quantified group whose inner atom matches the empty string, and a
-        // group reference in the replacement that reaches a member collision.
         "--tar-pathname-filter=(x*)+,Q",
         r"--tar-pathname-filter=^(only)(A.*)$,\2\1",
         // A replacement escape GLib does not know.
@@ -13857,64 +14051,270 @@ fn commit_tar_pathname_filter_matches_the_tool() {
         both_refuse(&[&source, filter]);
     }
 
-    // Two recorded divergences, measured rather than assumed. The port compiles
-    // the `regex` dialect, so a construct PCRE carries and `regex` does not is
-    // refused where the tool compiles it, and PCRE's own compile limits are not
-    // reproduced (`docs/conformance/cli-surface.md`, "P2").
-    let split = |filter: &str| {
-        let args = vec![
+    // Two compile limits whose refusal line agrees character for character, the
+    // character offset included, which is what the shared engine buys.
+    for (filter, line) in [
+        (
+            "--tar-pathname-filter=[[:bogus:]],Q",
+            "error: --tar-pathname-filter: Error while compiling regular expression \
+             \u{2018}[[:bogus:]]\u{2019} at char 10: unknown POSIX class name\n",
+        ),
+        (
+            "--tar-pathname-filter=f{65536},Q",
+            "error: --tar-pathname-filter: Error while compiling regular expression \
+             \u{2018}f{65536}\u{2019} at char 7: number too big in {} quantifier\n",
+        ),
+    ] {
+        let args = [
             "commit",
             "-b",
-            "split",
+            "shared",
             FIXED_TIMESTAMP,
             source.as_str(),
             filter,
         ];
-        run_both(&port_repo, &tool_repo, &args)
-    };
-    for filter in [
-        // A lookaround, an atomic group, a comment group, and `\Q...\E`.
-        r"--tar-pathname-filter=(?=f)x,Q",
-        r"--tar-pathname-filter=(?<=f)x,Q",
-        r"--tar-pathname-filter=(?>f),Q",
-        r"--tar-pathname-filter=(?#c)f,Q",
-        r"--tar-pathname-filter=\Qf+t\E,Q",
-        // `\C`, a single byte, which a UTF-8 engine does not express.
-        r"--tar-pathname-filter=\C,Q",
-        // `\Z` before a final newline, which `regex` does not carry.
-        r"--tar-pathname-filter=f\.txt\Z,Q",
-        // A backreference in the expression, which a finite-automaton engine
-        // cannot express.
-        r"--tar-pathname-filter=(x)?\1f,Q",
+        let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+        for (who, run) in [("port", &port), ("tool", &tool)] {
+            assert_eq!(run.status.code(), Some(1), "the {who} accepted `{filter}`");
+            assert_eq!(
+                String::from_utf8_lossy(&run.stderr),
+                line,
+                "the {who} worded the refusal of `{filter}` differently",
+            );
+        }
+    }
+
+    // The reason string is one of the two recorded divergences left in the
+    // compile-failure line: GLib passes some of PCRE2's reasons through and
+    // rewords others. The other is the unit the offset counts in, code units in
+    // the port and characters in the tool; every expression here is ASCII, so
+    // the offset agrees over each of them
+    // (`docs/conformance/cli-surface.md`, "P2").
+    for (filter, expression, at, port_reason, tool_reason) in [
+        (
+            "--tar-pathname-filter=dir1((,x",
+            "dir1((",
+            6,
+            "missing closing parenthesis",
+            "missing terminating )",
+        ),
+        (
+            r"--tar-pathname-filter=\q,Q",
+            r"\q",
+            1,
+            r"unrecognized character follows \",
+            r"unrecognised character following \",
+        ),
+        (
+            "--tar-pathname-filter=(*BOGUS)f,Q",
+            "(*BOGUS)f",
+            7,
+            "(*VERB) not recognized or malformed",
+            "(*VERB) not recognised",
+        ),
     ] {
-        let (port, tool) = split(filter);
+        let args = [
+            "commit",
+            "-b",
+            "wording",
+            FIXED_TIMESTAMP,
+            source.as_str(),
+            filter,
+        ];
+        let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+        let head = format!(
+            "error: --tar-pathname-filter: Error while compiling regular expression \
+             \u{2018}{expression}\u{2019} at char {at}: "
+        );
+        for (who, run, reason) in [("port", &port, port_reason), ("tool", &tool, tool_reason)] {
+            assert_eq!(run.status.code(), Some(1), "the {who} accepted `{filter}`");
+            assert_eq!(
+                String::from_utf8_lossy(&run.stderr),
+                format!("{head}{reason}\n"),
+                "the {who} worded the refusal of `{filter}` differently",
+            );
+        }
+    }
+
+    // The unit the offset counts in is the other one: the port reports the
+    // code-unit offset PCRE2 answers, which is a byte offset for the 8-bit
+    // library, and the tool reports a character offset. A non-ASCII character
+    // ahead of the error point moves the two apart by the extra bytes it
+    // occupies, so the two-byte `é` moves them apart by one and the four-byte
+    // `U+1F600` by three, which counts per character and not per two bytes.
+    // Each expression carries one error the loop above already words, so the
+    // count is stated apart from the error kind
+    // (`docs/conformance/cli-surface.md`, "P2").
+    for (filter, expression, port_at, tool_at, port_reason, tool_reason) in [
+        (
+            r"--tar-pathname-filter=é\q,Q",
+            r"é\q",
+            3,
+            2,
+            r"unrecognized character follows \",
+            r"unrecognised character following \",
+        ),
+        (
+            r"--tar-pathname-filter=éé\q,Q",
+            r"éé\q",
+            5,
+            3,
+            r"unrecognized character follows \",
+            r"unrecognised character following \",
+        ),
+        (
+            r"--tar-pathname-filter=😀\q,Q",
+            r"😀\q",
+            5,
+            2,
+            r"unrecognized character follows \",
+            r"unrecognised character following \",
+        ),
+        (
+            "--tar-pathname-filter=é[[:bogus:]],Q",
+            "é[[:bogus:]]",
+            12,
+            11,
+            "unknown POSIX class name",
+            "unknown POSIX class name",
+        ),
+        (
+            "--tar-pathname-filter=édir1((,x",
+            "édir1((",
+            8,
+            7,
+            "missing closing parenthesis",
+            "missing terminating )",
+        ),
+        (
+            "--tar-pathname-filter=ééédir1((,x",
+            "ééédir1((",
+            12,
+            9,
+            "missing closing parenthesis",
+            "missing terminating )",
+        ),
+        (
+            "--tar-pathname-filter=éf{65536},Q",
+            "éf{65536}",
+            9,
+            8,
+            "number too big in {} quantifier",
+            "number too big in {} quantifier",
+        ),
+        (
+            "--tar-pathname-filter=é(*BOGUS)f,Q",
+            "é(*BOGUS)f",
+            9,
+            8,
+            "(*VERB) not recognized or malformed",
+            "(*VERB) not recognised",
+        ),
+    ] {
+        let args = [
+            "commit",
+            "-b",
+            "offset",
+            FIXED_TIMESTAMP,
+            source.as_str(),
+            filter,
+        ];
+        let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+        let line = |at: usize, reason: &str| {
+            format!(
+                "error: --tar-pathname-filter: Error while compiling regular expression \
+                 \u{2018}{expression}\u{2019} at char {at}: {reason}\n"
+            )
+        };
+        for (who, run, at, reason) in [
+            ("port", &port, port_at, port_reason),
+            ("tool", &tool, tool_at, tool_reason),
+        ] {
+            assert_eq!(run.status.code(), Some(1), "the {who} accepted `{filter}`");
+            assert_eq!(
+                String::from_utf8_lossy(&run.stderr),
+                line(at, reason),
+                "the {who} reported another offset or reason for `{filter}`",
+            );
+        }
+    }
+
+    // A match-time limit refuses the commit. PCRE2 accounts a step budget, so an
+    // expression with no required literal ends the match rather than running on.
+    // The tool ends the run on a GLib assertion at exit 134 in the same case,
+    // which is the recorded exit-path divergence.
+    for (filter, expression) in [
+        (r"--tar-pathname-filter=(a+)+\d,Q", r"(a+)+\d"),
+        ("--tar-pathname-filter=(a+)+[0-9],Q", "(a+)+[0-9]"),
+        (r"--tar-pathname-filter=(a|aa)+\d,Q", r"(a|aa)+\d"),
+    ] {
+        let args = [
+            "commit",
+            "-b",
+            "budget",
+            FIXED_TIMESTAMP,
+            long_source.as_str(),
+            filter,
+        ];
+        let (port, tool) = run_both(&port_repo, &tool_repo, &args);
         assert_eq!(
             port.status.code(),
             Some(1),
-            "the port compiled `{filter}`, which the recorded divergence says it refuses"
+            "the port did not refuse `{filter}`:\n{}",
+            String::from_utf8_lossy(&port.stdout),
         );
         assert_eq!(
-            tool.status.code(),
-            Some(0),
-            "the tool refused `{filter}`, so the recorded divergence no longer holds"
+            String::from_utf8_lossy(&port.stderr),
+            format!(
+                "error: tar: --tar-pathname-filter: Error while matching regular \
+                 expression \u{2018}{expression}\u{2019}: match limit exceeded\n"
+            ),
+            "the port worded the match-limit refusal of `{filter}` differently",
+        );
+        assert!(
+            !tool.status.success(),
+            "the tool answered `{filter}`, so the recorded divergence no longer holds"
         );
     }
-    for filter in [
-        // A nested class the tool reads as a POSIX name it does not know.
-        "--tar-pathname-filter=[[:bogus:]],Q",
-        // PCRE's repeat-count limit, which `regex` does not share.
-        "--tar-pathname-filter=f{65536},Q",
-    ] {
-        let (port, tool) = split(filter);
+
+    // `\C` matches one byte, so a rewrite over a multi-byte name can split a
+    // character. The port refuses the member, and the tool ends the run on a
+    // GLib assertion whose message reads `bad offset into UTF string`. Neither
+    // writes a commit.
+    let args = [
+        "commit",
+        "-b",
+        "byte",
+        FIXED_TIMESTAMP,
+        letter.as_str(),
+        r"--tar-pathname-filter=\C,Q",
+    ];
+    let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+    assert_eq!(
+        port.status.code(),
+        Some(1),
+        "the port rewrote a name that splits a character"
+    );
+    assert!(
+        String::from_utf8_lossy(&port.stderr).contains("is not valid UTF-8"),
+        "the port did not name the invalid rewrite:\n{}",
+        String::from_utf8_lossy(&port.stderr),
+    );
+    assert!(
+        !tool.status.success(),
+        "the tool rewrote a name that splits a character"
+    );
+    for (who, repo) in [("port", &port_repo), ("tool", &tool_repo)] {
         assert_eq!(
-            port.status.code(),
-            Some(0),
-            "the port refused `{filter}`, so the recorded divergence no longer holds"
-        );
-        assert_eq!(
-            tool.status.code(),
+            ostrya(
+                &["rev-parse", "--repo", repo.to_str().unwrap(), "byte"],
+                None,
+                &[],
+            )
+            .status
+            .code(),
             Some(1),
-            "the tool compiled `{filter}`, which the recorded divergence says it refuses"
+            "the {who} wrote a commit for a name that splits a character"
         );
     }
 }

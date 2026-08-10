@@ -14,12 +14,16 @@ library is MIT-licensed.
 
 ## Goals and constraints
 
-1. Rust-native. `liblzma` is the one C library linked: statically built from
-   source for xz in static deltas, requiring no C runtime of its own beyond the
-   libc `std` already links. Nothing else links C. `rustix` handles the
-   syscalls a portable async file API cannot express (fd-relative opens and
-   metadata, xattrs, statx, FICLONE reflink, O_TMPFILE + linkat, OFD locks);
-   streaming file I/O goes through the runtime's async file.
+1. Rust-native. `liblzma` is the one C library the library links: statically
+   built from source for xz in static deltas, requiring no C runtime of its own
+   beyond the libc `std` already links. PCRE2 joins it on the same terms in the
+   `ostrya-cli` binary alone, where it compiles the `commit
+   --tar-pathname-filter` expression the tool also compiles with PCRE2; that
+   crate sets `publish = false`, so no published crate links it, and CI holds
+   the rule that no other manifest may name `pcre2`. Nothing else links C.
+   `rustix` handles the syscalls a portable async file API cannot express
+   (fd-relative opens and metadata, xattrs, statx, FICLONE reflink, O_TMPFILE +
+   linkat, OFD locks); streaming file I/O goes through the runtime's async file.
 2. Async, with a feature-gated runtime backend behind the internal
    `ostrya-rt` crate: `smol` by default, `tokio` optional.
 3. Multiple concurrent transactions within a single process.
@@ -44,8 +48,10 @@ redesigned to be idiomatic Rust (see `api-sketch.md`).
 ## Interpretation of "no dependencies except rust"
 
 Read as: the Rust crate ecosystem is in scope and C libraries are avoided. The
-one exception is `liblzma`, statically linked for xz (see the Decisions
-section); it requires no C runtime beyond the libc `std` already links. Every
+library links `liblzma` statically for xz, and the `ostrya-cli` binary links
+PCRE2 statically for the `commit --tar-pathname-filter` expression (see the
+Decisions section); each requires no C runtime beyond the libc `std` already
+links. PCRE2 belongs to that binary alone, which sets `publish = false`. Every
 crate is authorized by the operator before it enters a manifest. The foundation
 crates below are all pure Rust:
 
@@ -78,13 +84,18 @@ crates below are all pure Rust:
 - `smol-tar` -- async tar import/export in the smol ecosystem.
 - `clap` -- command-line argument parsing for the `ostrya` binary
   (`ostrya-cli` only).
+- `pcre2` (`ostrya-cli` only) -- compiles the `commit
+  --tar-pathname-filter` expression, which the tool compiles with PCRE2. The
+  crate vendors the PCRE2 C library and builds it statically; `ostrya-cli` sets
+  `publish = false`, so no published crate links it.
 - HTTP client, INI parsing, fs-verity, and EROFS: see the Decisions section;
   each has a pure-Rust path. LZMA/xz links `liblzma` statically (see the
   Decisions section).
 
 Anything else that would pull in C (openssl-sys, libgpg-error/gpgme, libcurl,
 libsoup, libarchive, libcomposefs, glib) is excluded by constraint 1;
-statically-linked `liblzma` is the sole authorized exception.
+statically-linked `liblzma` and statically-linked PCRE2 are the two authorized
+exceptions, and PCRE2 is authorized in the `ostrya-cli` binary alone.
 
 ## Architecture
 
@@ -1598,8 +1609,9 @@ identical bytes. One source object is held at a time.
 
 Dependency: `liblzma` (MIT/Apache-2.0), statically linked and built from source
 (bundled xz 5.8, no runtime liblzma), backing `async-compression`'s xz codec in
-both directions. It is the sole authorized C-linking exception (see the
-Interpretation section and decision #1).
+both directions. It is one of the two authorized C-linking exceptions, the
+other being PCRE2 in `ostrya-cli` (see the Interpretation section and decision
+#1).
 
 Verify: the port applies the tool's from-scratch, from->to bspatch, and from->to
 rollsum deltas and reproduces the target commit's objects, the tool's `fsck` and
@@ -1977,8 +1989,8 @@ consumer that stops early never observes EOF and so never verifies, and a read
 into an empty buffer touches neither the stream nor the check.
 
 Dependency set for the phase, all pure Rust with no C in the graph (verified
-with `cargo tree -e normal,build`: the only `cc` in the workspace remains
-liblzma's): `hyper` 1.11 (`client`, `http1`, `http2`) as the HTTP engine, with
+with `cargo tree -e normal,build`: the workspace's `cc` sources are liblzma's
+and PCRE2's): `hyper` 1.11 (`client`, `http1`, `http2`) as the HTTP engine, with
 the `http` and `bytes` types taken from its re-exports; `rustls` 0.23 with
 `rustls-graviola` 0.4 as the crypto provider -- Rust plus formally-verified
 assembly from s2n-bignum, so no C compiler and no `cc` build dependency, at the
@@ -4156,18 +4168,23 @@ and `Transaction::begin_tree_source` scopes `ostree.sizes` to one source, which
 is what makes a multi-source `--generate-sizes` commit reach the tool's
 checksum.
 
-The filter takes an expression. The tool compiles a PCRE through GLib's
-`GRegex`; the CLI compiles the `regex` crate's dialect, which is the one
-dependency this item adds. The two carry the constructs a pathname filter uses
-and part at the edges, measured in both directions and recorded in
-`conformance/cli-surface.md`, "P2": seven constructs the port refuses and the
-tool compiles, and two the port compiles and the tool refuses. No expression
-was found that both compile and answer differently, which is the property that
-matters, the commit checksum being the oracle. Refusing is the safe direction:
-a construct the port does not compile never rewrites a pathname under a meaning
-of the port's own. `regex` compiles to a finite automaton, so one match costs
-time linear in the length of the pathname and the option carries no step
-budget.
+The filter takes an expression. Both implementations compile it with PCRE2: the
+tool through GLib's `GRegex`, and the CLI through the `pcre2` crate, which is
+the one dependency this item adds and the only crate in the workspace that may
+name it, a rule CI holds. The crate vendors PCRE2 10.46 and links it
+statically, pinned to the vendored build by `.cargo/config.toml` so a host that
+carries `libpcre2-dev` cannot supply another version, and `ostrya-cli` sets
+`publish = false`, so no published crate links it. The compile options the tool
+uses are recovered by observation, one probe per option: UTF and UCP on, the
+newline convention `any`, and every other option at PCRE2's default. The crate
+states no option for the convention, so the compiled pattern carries PCRE2's
+own `(*ANY)` start-of-pattern option ahead of the value, and a convention the
+value states itself follows it and wins in both. Measured in both directions
+and recorded in `conformance/cli-surface.md`, "P2": every expression one
+implementation compiles the other compiles too, and no expression both compile
+is answered differently, the commit checksum being the oracle. PCRE2 accounts a
+match budget, so an expression that requires no literal is refused at the limit
+instead of running long.
 
 The replacement half stays the port's own reader, GLib's replacement syntax
 being what an operator writes: `\0` to `\9`, `\g<name>`, `\g<number>`, `\\`,
@@ -4178,7 +4195,10 @@ This is the worked example of `CLAUDE.md`, "CLI compatibility is functional,
 not literal", rule 2. The item first shipped a from-scratch backtracking
 matcher over a PCRE subset, to add no dependency. A review measured three
 constructs it read differently from PCRE and three unbounded-work paths in it,
-so the engine was removed in favour of the crate.
+so the engine was removed in favour of a crate. The `regex` crate that replaced
+it read the POSIX class names as ASCII and `$` as end-of-text, so one command
+line wrote two different commits, and the engine moved again to the library the
+tool itself links. Reading somebody else's dialect means running their engine.
 
 This item closes the standing `--tree` divergence. `--tree=tar=PATH` joins the
 port's stdin form, and `--tree=tar=-` and `--tree=tar=/dev/stdin` name standard
@@ -4193,16 +4213,19 @@ walk's, and the port does the same.
 
 Six divergences stand, all in `cli-surface.md`, "P2": the source a command
 line naming none states, the wording of an archive that opens and does not parse,
-the expression subset the filter compiles, the reference defect a file member
-filtered to an empty name reaches -- the tool aborts on a GLib assertion or
-writes a dirtree entry with an empty name, and the port refuses the member -- the
-wording of a tar entry the reader refuses, and the `--table-output` counters over
-a `ref` source that does not open the source list.
+the four places the filter's expression parts (the reason string a compile
+failure names, the unit that same line's offset counts in, the exit path a
+match-time refusal takes, and the PCRE2 version each side links), the reference
+defect a file member filtered to an empty name reaches -- the tool aborts on a
+GLib assertion or writes a dirtree entry with an empty name, and the port
+refuses the member -- the wording of a tar entry the reader refuses, and the
+`--table-output` counters over a `ref` source that does not open the source
+list.
 Four wordings the port reproduces are the tool's own: `opendir(<path>):
 <reason>` for a source that does not open, the positional `PATH` included,
 `archive_read_open_filename: Failed to open '<path>'`,
 `unlinkat(<name>): <reason>` for an entry a consuming walk cannot remove, and
-`Archive entry pathname is not valid UTF-8`. The conformance run reported 615
+`Archive entry pathname is not valid UTF-8`. The conformance run reported 618
 cells and 248 passes after the item.
 
 `F8` gives `commit` its five signing options: `--gpg-sign`, `--gpg-homedir`,
@@ -4256,7 +4279,7 @@ port applies to a 64-byte `--sign` value, which the tool signs with; the
 the port names the path as the command line spelled it; the branch-name
 term of the signing step's fault order, observable only over a name both ref-name
 grammars refuse; and the name-dependent order the tool stores some
-detached-metadata key sets in. The conformance run reports 643 cells and 256
+detached-metadata key sets in. The conformance run reports 646 cells and 256
 passes.
 
 `commit -e` settles the message before it takes any repository lock. The
@@ -4369,10 +4392,15 @@ admin tests. Recommend deferring or descoping unless explicitly required.
 Resolved:
 
 1. Dependency policy: every crate is authorized by the operator before it
-   enters a manifest. C libraries are avoided; the sole exception is `liblzma`,
-   statically linked for xz (bundled and built from source, needing no C
-   runtime beyond the libc `std` links). The Rust crate ecosystem is in scope
-   (rustix, smol, sha2, ed25519-dalek, rustls, miniz_oxide, and so on).
+   enters a manifest. C libraries are avoided; the two authorized exceptions
+   are `liblzma`, statically linked for xz, and PCRE2, statically linked in the
+   `ostrya-cli` binary for the `commit --tar-pathname-filter` expression (both
+   bundled and built from source, needing no C runtime beyond the libc `std`
+   links). `ostrya-cli` sets `publish = false`, so no published crate links
+   PCRE2, and CI holds the rule that no other manifest may name `pcre2`
+   (`.github/workflows/ci.yml`, "PCRE2 stays in ostrya-cli"). The Rust crate
+   ecosystem is in scope (rustix, smol, sha2, ed25519-dalek, rustls,
+   miniz_oxide, and so on).
 2. GVariant: hand-roll a minimal codec (`ostrya-gvariant`) tailored to
    ostree's fixed type set, fuzzed against golden bytes from the tool.
 3. Test-suite scope: phased. Target the library-format-testable subset plus

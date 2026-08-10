@@ -1,0 +1,9 @@
+# `pcre2-sys` prefers a system `libpcre2-8` through `pkg-config` and builds its
+# vendored copy only where `pkg-config` finds nothing or where
+# `PCRE2_SYS_STATIC` is set. A host that carries `libpcre2-dev` would otherwise
+# link that host's PCRE2 version, and the dialect
+# `commit --tar-pathname-filter` compiles would follow it. This pins the
+# vendored static build everywhere, `force` so a host environment cannot
+# unset it.
+[env]
+PCRE2_SYS_STATIC = { value = "1", force = true }

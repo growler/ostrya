@@ -2,7 +2,8 @@
 //!
 //! One rustls [`ClientConfig`] is built per [`Fetcher`](crate::Fetcher) and
 //! shared by every connection it opens. The crypto provider is `graviola`:
-//! Rust plus formally-verified assembly, so the build needs no C compiler.
+//! Rust plus formally-verified assembly, so the provider adds no C to the
+//! build and carries no `cc` build dependency.
 //!
 //! ALPN advertises `h2` before `http/1.1` unless HTTP/2 is switched off, which
 //! is what selects the protocol version -- the server picks from the offer

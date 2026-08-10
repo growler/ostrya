@@ -22,11 +22,13 @@ gpg = ["ostrya/sign-gpg"]
 ostrya = { path = "../ostrya", default-features = false }
 ostrya-rt = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-# `commit --tar-pathname-filter` compiles an expression. The tool compiles a
-# PCRE through GLib; the port compiles the `regex` dialect, which is a
-# functional equivalent and not a character-for-character one
-# (`docs/conformance/cli-surface.md`, "P2").
-regex = "1"
+# `commit --tar-pathname-filter` compiles an expression. The tool compiles it as
+# a PCRE2 pattern through GLib's `GRegex`, so the port compiles it with PCRE2
+# too (`docs/conformance/cli-surface.md`, "P2"). This is the one crate in the
+# workspace that may name `pcre2`: the C library it vendors is built statically
+# and this crate sets `publish = false`, so no published crate carries it. CI
+# holds the rule (`.github/workflows/ci.yml`, "PCRE2 stays in ostrya-cli").
+pcre2 = "0.2.11"
 
 # `tests/conformance.rs` runs the conformance matrix against the binary this
 # crate builds (`docs/conformance/harness.md`, "Cargo and CI wiring"). The

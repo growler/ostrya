@@ -454,56 +454,129 @@ format` for anything else and `error: archive_read_open_filename: Error reading
 reports the reader's own line under `error: i/o error:` for everything else.
 Both exit 1 and write no commit.
 
-The third is the expression `--tar-pathname-filter` compiles. The tool compiles
-a PCRE through GLib's `GRegex`. The port compiles the `regex` crate's dialect.
-The two carry the constructs a pathname filter uses and part at the edges, so
-this option is a functional equivalent and not a character-for-character one
-("Scope of CLI compatibility").
+The third is the expression `--tar-pathname-filter` compiles. Both
+implementations compile it with PCRE2: the tool through GLib's `GRegex`, which
+links the host's `libpcre2-8`, and the port through the `pcre2` crate, which
+vendors PCRE2 10.46 and links it statically. One pattern reaches one engine
+family, and the option parts from the tool in four places: the reason string in
+a compile failure, the unit that same line's offset counts in, the exit path a
+match-time refusal takes, and the PCRE2 version each side carries ("Scope of CLI
+compatibility"). The cited test for this option is
+`ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool` in
+`crates/ostrya-cli/tests/cli.rs`.
 
-Both dialects carry, each form reaching the tool's commit checksum: literal
-characters, `.`, the anchors `^`, `$`, `\A`, and `\z`, the word boundary `\b`
-and its negation `\B`, `[...]` classes with ranges and negation, the fourteen
-POSIX class names in the plain and the `[[:^alpha:]]` form, the `\d`, `\w`, and
-`\s` shorthands and their negations, the character escapes `\n`, `\t`, `\r`,
-`\f`, `\a`, `\0`, `\xHH`, and `\x{...}`, the Unicode property `\p{...}`,
-capturing and non-capturing groups, the named group `(?<name>...)`, alternation,
-the quantifiers `*`, `+`, `?`, and `{n}` in greedy and lazy form, the
-case-insensitive flag `(?i)` at any position, and the inline-option group
-`(?i:...)`. The value splits at its first comma, so an expression this option
-carries holds no `{n,}`, `{n,m}`, or `{,m}` bound.
+Every construct the cited test states reaches the tool's commit checksum:
+literal characters, `.`, the anchors `^`, `$`, `\A`, `\Z`, and `\z`, `\b` and
+`\B`, `[...]` classes with ranges and negation, the POSIX class names in the
+plain and the `[[:^alpha:]]` form, the `\d`, `\w`, `\s`, `\h`, `\R`, and `\N`
+classes and their negations, the character escapes `\n`, `\t`, `\r`, `\f`, `\a`,
+`\0`, `\101`, `\xHH`, and `\x{...}`, the Unicode property `\p{...}`, the
+single-code-unit `\C`, capturing, non-capturing, named, atomic, and comment
+groups, the duplicate-name flag `(?J)`, the literal span `\Q...\E`, the four
+lookarounds, the match reset `\K`, alternation, the quantifiers `*`, `+`, `?`,
+and `{n}` in greedy, lazy, and possessive form, the backreferences `\1` to `\9`
+and `\g{1}`, recursion `(?R)`, a subroutine call `(?1)`, a conditional
+`(?(1)a|b)`, a callout `(?C1)`, the backtracking verbs `(*SKIP)` and
+`(*ACCEPT)`, the inline options `(?i)`, `(?s)`, `(?m)`, and `(?x)` at any
+position, the inline-option group `(?i:...)`, and the start-of-pattern options
+`(*UTF)`, `(*UCP)`, `(*NUL)`, `(*LIMIT_MATCH=N)`, `(*LF)`, `(*CRLF)`, and
+`(*ANYCRLF)`. The value splits at its first comma, so an expression this option
+carries holds no `{n,}`, `{n,m}`, or `{,m}` bound. `(?J)` is measured on both
+halves of the value: the expression declares one name on two groups, and the
+replacement reads that name back with `\g<name>`.
 
-PCRE carries and `regex` does not, so the port refuses where the tool compiles:
-the lookarounds `(?=`, `(?!`, `(?<=`, and `(?<!`, the atomic group `(?>`, the
-comment group `(?#`, the literal span `\Q...\E`, the anchor `\Z`, the
-single-byte `\C`, and the backreferences `\1` to `\9` inside the expression,
-which a finite-automaton engine does not express. Refusing is the safe
-direction: a construct the port does not compile never rewrites a pathname under
-a meaning the tool does not share.
+The compile options are recovered by observation, one probe per option: a
+one-member archive committed under one expression, the committed member name
+stating whether the expression matched.
 
-`regex` carries and PCRE does not, so the port compiles where the tool refuses:
-a repeat count above 65535, which is PCRE's own compile limit and not the
-port's, and a nested character class, so `[[:bogus:]]` is a class holding the
-characters of `[:bogus:]` for the port and an unknown POSIX name for the tool.
+- UTF is on. `^.` over the member `é.txt` consumes one character, and `\C`
+  consumes one code unit, so it can split that character.
+- UCP is on. `\d` matches `U+0663`, `^\w` and `[[:alpha:]]` match `é`, and `\s`
+  matches `U+00A0`.
+- The newline convention is `any`. A carriage return, a line feed, the pair, a
+  vertical tab, a form feed, `U+0085`, `U+2028`, and `U+2029` each end a line,
+  so `$` and `\Z` match before one final terminator, `(?m)^` matches after one
+  inside a name, and `.` consumes none of them. `\z` matches at the end of the
+  name alone.
+- Caseless, dotall, extended, and multi-line matching are off, and each is
+  reachable inline.
+
+The port states UTF and UCP through the crate's builder. The crate states no
+option for the newline convention, so the compiled pattern carries PCRE2's own
+`(*ANY)` start-of-pattern option ahead of the value; a convention the value
+states itself follows it and wins, in both implementations. The JIT is off in
+the port: the interpreter and the JIT part in how they account the match limits
+and not in what they match, and the tool's own use of it is not observable.
+
+An empty match advances the splice past one whole character, which leaves that
+character in the name, so `(?<=.)x*,Q` over the member `aébc` writes `aQéQbQcQ`
+in both.
 
 The replacement syntax is GLib's, which the port reads itself: `\0` to `\9`,
 `\g<name>` and `\g<number>`, `\\`, the seven control escapes, and `$` as a
-literal; a group the expression does not declare contributes nothing, and any
-other replacement escape is refused. A malformed replacement ends the tool at
-exit 134 on an assertion whose printed message names `ot-builtin-commit.c` and
-`handle_translate_pathname`; `--tar-pathname-filter='.*,\q'` over any archive
-reaches it. The port reports its own line at exit 1.
+literal; a group the expression does not declare contributes nothing, a name
+that `(?J)` puts on several groups resolves to the first of them, by number,
+that the match set, and any other replacement escape is refused. A malformed
+replacement ends the tool at exit 134 on an assertion whose printed message
+names `ot-builtin-commit.c` and `handle_translate_pathname`;
+`--tar-pathname-filter='.*,\q'` over any archive reaches it. The port reports
+its own line at exit 1.
 
-An expression neither dialect compiles is refused by both at exit 1 with no
-commit written, each in its own words: the tool reports `error:
---tar-pathname-filter: Error while compiling regular expression '<expression>'
-at char N: <reason>`, and the port reports the same line without the offset and
-with the `regex` crate's reason. The cited test compares the refusal and the
-absent commit rather than the wording.
+An expression neither engine compiles is refused by both at exit 1 with no
+commit written, and both report `error: --tar-pathname-filter: Error while
+compiling regular expression '<expression>' at char N: <reason>`. The line
+parts in two places.
 
-One match costs time linear in the length of the pathname, `regex` compiling to
-a finite automaton, so the option carries no step budget and no expression makes
-it run long. `^(a+)+b` against a member name of 250 `a` characters is answered
-by both.
+The reason string is the first. GLib passes some of PCRE2's own reasons through
+and rewords others. The reword set is wider than the five the cited test
+compares:
+
+- `[[:bogus:]]` at char 10 reads `unknown POSIX class name` from both, character
+  for character.
+- `f{65536}` at char 7 reads `number too big in {} quantifier` from both.
+- `dir1((` at char 6 reads `missing closing parenthesis` from the port and
+  `missing terminating )` from the tool.
+- `\q` at char 1 reads `unrecognized character follows \` from the port and
+  `unrecognised character following \` from the tool.
+- `(*BOGUS)f` at char 7 reads `(*VERB) not recognized or malformed` from the
+  port and `(*VERB) not recognised` from the tool.
+
+The unit `N` counts is the second. The port reports the code-unit offset PCRE2
+answers, which is a byte offset for the 8-bit library, and the tool reports a
+character offset. The two answer the same offset for an expression that holds
+ASCII characters alone ahead of the error point, which is every expression
+above. Past that the port's offset runs ahead by the extra bytes the characters
+before the error point occupy. Each probe below carries one error the list above
+already states, so the count rule is measured apart from the error kind. The
+port's offset stands first.
+
+- `é\q` reads 3 and 2, and `éé\q` reads 5 and 3.
+- The four-byte `U+1F600` ahead of `\q` reads 5 and 2.
+- `é[[:bogus:]]` reads 12 and 11, `édir1((` reads 8 and 7, `éf{65536}` reads 9
+  and 8, and `é(*BOGUS)f` reads 9 and 8.
+- `ééédir1((` reads 12 and 9.
+
+A match spends a step budget PCRE2 accounts. An expression that requires a
+literal ends without spending it: `^(a+)+b` against a member name of 250 `a`
+characters needs a `b` the name does not hold, so both answer at exit 0 and
+write one commit. `(a+)+\d`, `(a+)+[0-9]`, and `(a|aa)+\d` require no literal
+and reach the limit over that name. Both refuse, writing no object and no ref,
+and the exit path is the difference: the port reports `error: tar:
+--tar-pathname-filter: Error while matching regular expression '<expression>':
+match limit exceeded` at exit 1, and the tool ends on a GLib assertion at exit
+134 whose printed message names `ot-builtin-commit.c` and
+`handle_translate_pathname` and reads `Error while matching regular expression
+<expression>: match limit exceeded (g-regex-error-quark, 3)`. A `\C` rewrite
+that splits a character reaches the same pair of exit paths: the port stores a
+pathname as text and reports `error: tar: --tar-pathname-filter: the rewritten
+name of '<name>' is not valid UTF-8` at exit 1, and the tool's assertion reads
+`bad offset into UTF string`.
+
+The PCRE2 version is the last difference. The port carries the 10.46 the
+`pcre2-sys` crate vendors, pinned to the vendored static build in
+`.cargo/config.toml` so a host that installs `libpcre2-dev` cannot supply
+another, and the tool carries whatever the host GLib links, which is 10.46 on
+the host these probes ran on.
 
 The fourth is a reference defect over a member the filter maps to the empty
 string. A directory member mapped onto the empty string names the tree root in

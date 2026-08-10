@@ -245,18 +245,20 @@ fn rejects_invalid_names_and_collisions() {
             );
         }
 
-        // A name cannot be both a file and a directory.
+        // A name cannot be both a file and a directory. The two refusals name
+        // the entry, which is what a command overlaying one tree source on
+        // another reports.
         let mut mtree = MutableTree::new();
         mtree.replace_file("x", some).unwrap();
         assert!(
-            matches!(mtree.ensure_dir("x").await, Err(Error::MutableTree(_))),
+            matches!(mtree.ensure_dir("x").await, Err(Error::ReplaceFileWithDir(name)) if name == "x"),
             "ensure_dir over an existing file"
         );
 
         let mut mtree = MutableTree::new();
         mtree.ensure_dir("d").await.unwrap();
         assert!(
-            matches!(mtree.replace_file("d", some), Err(Error::MutableTree(_))),
+            matches!(mtree.replace_file("d", some), Err(Error::ReplaceDirWithFile(name)) if name == "d"),
             "replace_file over an existing directory"
         );
 

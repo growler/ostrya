@@ -406,6 +406,45 @@ fn free_space_guard_trips_on_an_exhausted_budget() {
     });
 }
 
+/// A `[core] fsync` value the reader does not hold reaches every write path,
+/// with a [`Transaction::set_fsync`] override of either polarity and with none.
+/// The override replaces the configured policy and never the reading of it.
+#[test]
+fn a_bad_configured_fsync_is_refused_under_every_override() {
+    let tmp = TmpDir::new("write-fsync-bad-config");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let config = root.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("fsync=bogus\n");
+        std::fs::write(&config, text).unwrap();
+        let repo = Repo::open(&root).await.unwrap();
+
+        for override_value in [None, Some(true), Some(false)] {
+            let mut txn = repo.transaction().await.unwrap();
+            if let Some(enabled) = override_value {
+                txn.set_fsync(enabled);
+            }
+            let err = txn
+                .write_regfile_inline(None, &reg(), HELLO)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::Core(ostrya_core::Error::KeyFile(text))
+                        if text.contains("core.fsync")
+                ),
+                "override {override_value:?} gave {err:?} in place of the config refusal",
+            );
+            txn.abort().await.unwrap();
+        }
+    });
+}
+
 #[test]
 fn concurrent_writers_share_one_transaction() {
     let tmp = TmpDir::new("write-concurrent");

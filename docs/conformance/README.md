@@ -63,6 +63,15 @@ possible" precise.
 - `unimplemented-cli` -- the library supports the operation and the CLI does not
   expose it. The record names the missing command in a `cli-gap:` field.
 
+Three outcomes take a field that states what the outcome leaves open:
+`unobserved` takes `question:`, `lossy` takes `loss:`, and `unimplemented-cli`
+takes `cli-gap:`. `check` reports a record that states one of the three and
+omits its field. The `cli-gap:` pairing holds in both directions, so `check`
+also reports a `cli-gap:` field on a record stating another outcome: the
+command it names has landed, and the field is stale. A `question:` field is
+free of that rule, since a record of any outcome can state what is still to
+observe.
+
 ## Severity
 
 Each cell is judged at two levels.
@@ -217,6 +226,18 @@ Recognized descriptive fields: `family`, `corpus`, `op`, `modes`, `src-mode`,
 `dst-mode`, `created-by`, `populated-by`, `operated-by`, `tier`, `outcome`,
 `severity`, `identity`, `oracle`, `evidence`, `spec`, `loss`, `question`,
 `cli-gap`, `subcommand`, `note`.
+
+The `spec:` field holds one or more `<document>#<anchor>` values. The document
+name resolves in this directory, which holds `cli-surface.md` and
+`harness.md`, and then in `../`, which holds `format-reference.md` and
+`port-plan.md`. The anchor is the fragment GitHub derives from the heading
+text: the text lowercased, with every character outside letters, digits,
+hyphens, and underscores dropped, and every space turned into a hyphen. A
+heading of the form `P2 -- options missing from commands that exist` therefore
+carries the anchor `p2----options-missing-from-commands-that-exist`. `check`
+reports a value that names no document and a value that names no heading of
+its document. A run whose record directory sits apart from the design
+documents leaves the field unchecked.
 
 A record carries executable fields as well once its claim is observed:
 `cell`, `setup`, `run`, `ref-run`, `probe`, `expect-exit`, `expect-stdout`,

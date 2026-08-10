@@ -4,7 +4,8 @@
 //! ingests an on-disk tree into a [`MutableTree`](crate::MutableTree). A
 //! [`CommitModifier`] shapes that ingest: a set of [`CommitModifierFlags`], a
 //! declared owner uid and gid that replace what the source carries, a
-//! synchronous filter that includes or prunes each entry, a synchronous xattr
+//! synchronous filter that includes or prunes each entry, a synchronous mode
+//! callback that replaces an entry's recorded `st_mode`, a synchronous xattr
 //! callback that replaces an entry's stored xattr set, an optional SELinux
 //! label callback, and an optional [`DevInoCache`] that skips re-hashing a file
 //! already known by its `(device, inode)`.
@@ -16,11 +17,24 @@
 //! `Send`, which keeps the modifier and the walk future `Send`.
 
 use std::collections::HashMap;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;
 
 use ostrya_core::{Checksum, Xattrs};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::io::Errno;
 
+use crate::error::Result;
+use crate::repo::Repo;
+use crate::traverse::read_dir_names;
 use crate::write::FileMeta;
+
+/// The loose-object file-name suffix of an uncompressed content object. A
+/// compressed one (`.filez`) is never a hardlink target, so only this form
+/// enters a devino cache.
+const CONTENT_SUFFIX: &str = ".file";
+/// The hex-character count of a loose object's name below its fanout directory.
+const LOOSE_NAME_HEX: usize = 62;
 
 /// Flags controlling how a filesystem tree is ingested.
 ///
@@ -99,10 +113,17 @@ pub enum FilterResult {
 /// A `(device, inode)` to content-checksum map.
 ///
 /// Populated by checkout (Phase 8), which records the inode of each object it
-/// writes, and consulted at ingest under
-/// [`DEVINO_CANONICAL`](CommitModifierFlags::DEVINO_CANONICAL): a source file
-/// whose `(device, inode)` is present is taken to be that object and is not
-/// re-read.
+/// writes, and by [`Repo::devino_cache`](crate::Repo::devino_cache), which
+/// reads the same mapping out of a repository's own loose objects. A source
+/// file whose `(device, inode)` is present is taken to be that object and its
+/// content is never read.
+///
+/// The cache is consulted whenever it is attached to a modifier. Without
+/// [`DEVINO_CANONICAL`](CommitModifierFlags::DEVINO_CANONICAL) a hit supplies
+/// the stored object's own metadata, the modifier is applied over that
+/// metadata, and the object is rewritten from the stored content where the
+/// result differs. With the flag the hit is taken verbatim and the filter and
+/// every callback are skipped for that entry.
 #[derive(Debug, Default, Clone)]
 pub struct DevInoCache {
     map: HashMap<(u64, u64), Checksum>,
@@ -137,8 +158,85 @@ impl DevInoCache {
     }
 }
 
+impl Repo {
+    /// Build a [`DevInoCache`] from this repository's own uncompressed loose
+    /// content objects.
+    ///
+    /// Each `objects/<xx>/<62hex>.file` entry that is a regular file
+    /// contributes its `(st_dev, st_ino)` and the checksum its name spells. A
+    /// checkout that hardlinks those objects into a destination tree therefore
+    /// produces files this cache resolves, whichever process made the
+    /// checkout.
+    ///
+    /// An `archive` repository stores every content object compressed
+    /// (`.filez`), so it contributes nothing and the cache comes back empty.
+    pub async fn devino_cache(&self) -> Result<DevInoCache> {
+        let repo = self.clone();
+        ostrya_rt::unblock(move || devino_cache_blocking(repo.objects_fd())).await
+    }
+}
+
+/// Scan an `objects/` directory fd for uncompressed loose content objects.
+fn devino_cache_blocking(objects_fd: BorrowedFd<'_>) -> Result<DevInoCache> {
+    let mut cache = DevInoCache::new();
+    // The reader accepts only the lower-case namespace both implementations
+    // write. A name holding upper-case hex folds to a checksum no writer here
+    // produced, and the entry it adds is what `-I` then commits for a source
+    // file hardlinked to that object. Such a name exists only if something
+    // outside either implementation wrote it, so no test produces one.
+    for fanout in read_dir_names(objects_fd)? {
+        if fanout.len() != 2
+            || !fanout
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            continue;
+        }
+        let dir = match rustix::fs::openat(
+            objects_fd,
+            fanout.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        for entry in read_dir_names(dir.as_fd())? {
+            let Some(rest) = entry.strip_suffix(CONTENT_SUFFIX) else {
+                continue;
+            };
+            if rest.len() != LOOSE_NAME_HEX {
+                continue;
+            }
+            let Ok(checksum) = Checksum::from_hex_lower(&format!("{fanout}{rest}")) else {
+                continue;
+            };
+            let Ok(st) = rustix::fs::statat(dir.as_fd(), entry.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            else {
+                continue;
+            };
+            // A `bare` repository stores a symlink object as a symlink, and a
+            // hardlinking checkout links that inode into the destination, so
+            // both file types can be one end of a hardlink pair with a source
+            // entry. Nothing else under `objects/` can.
+            if !matches!(
+                FileType::from_raw_mode(st.st_mode),
+                FileType::RegularFile | FileType::Symlink
+            ) {
+                continue;
+            }
+            cache.insert(st.st_dev, st.st_ino, checksum);
+        }
+    }
+    Ok(cache)
+}
+
 /// A synchronous filter over ingested paths.
 pub type FilterFn = Box<dyn FnMut(&Path, &FileMeta) -> FilterResult + Send>;
+/// A synchronous callback that replaces an entry's recorded `st_mode`. The
+/// returned value carries the file-type bits as well as the permission bits.
+pub type ModeFn = Box<dyn FnMut(&Path, &FileMeta) -> u32 + Send>;
 /// A synchronous callback that replaces an entry's stored xattr set.
 pub type XattrFn = Box<dyn FnMut(&Path, &FileMeta) -> Xattrs + Send>;
 /// A synchronous callback that returns the SELinux label for an entry.
@@ -166,6 +264,12 @@ pub struct CommitModifier {
     pub owner_gid: Option<u32>,
     /// A filter called per path to include or prune entries.
     pub filter: Option<FilterFn>,
+    /// A callback whose return value replaces an entry's recorded `st_mode`.
+    /// Runs after the
+    /// [`CANONICAL_PERMISSIONS`](CommitModifierFlags::CANONICAL_PERMISSIONS)
+    /// reduction and the declared ownership, and ahead of the xattr callback
+    /// and the SELinux label hook.
+    pub mode_callback: Option<ModeFn>,
     /// A callback whose return value replaces an entry's stored xattr set.
     pub xattr_callback: Option<XattrFn>,
     /// A callback returning an entry's SELinux label. A pre-existing
@@ -186,6 +290,7 @@ impl CommitModifier {
             owner_uid: None,
             owner_gid: None,
             filter: None,
+            mode_callback: None,
             xattr_callback: None,
             label_callback: None,
             devino_cache: None,

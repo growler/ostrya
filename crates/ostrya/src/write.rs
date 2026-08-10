@@ -69,9 +69,10 @@ const SEAL_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 /// The logical metadata a content writer applies to an object.
 ///
 /// This is the uid, gid, `st_mode`, and xattr set the object header records.
-/// For a regular file the mode carries the `S_IFREG` bits; a symlink's mode is
-/// fixed by the object model, so [`Transaction::write_symlink`] ignores
-/// `mode` here.
+/// For a regular file the mode carries the `S_IFREG` bits. For a symlink the
+/// mode carries the `S_IFLNK` bits, and [`Transaction::write_symlink`] records
+/// the permission bits beside them; a `mode` naming any other type takes the
+/// model's own `S_IFLNK | 0o777` there.
 #[derive(Debug, Clone)]
 pub struct FileMeta {
     /// The logical owning user id.
@@ -112,13 +113,26 @@ impl FileMeta {
         }
     }
 
-    /// The header for a symlink content object with the given target. The mode
-    /// is fixed to `S_IFLNK | 0o777` by the object model.
+    /// The header for a symlink content object with the given target. A mode
+    /// already naming a symlink is recorded as it stands, permission bits
+    /// included, which is what a `--statoverride` entry over a symlink and a
+    /// symlink object copied from another repository both need. A mode naming a
+    /// regular file, and one carrying no file-type bits at all, take the
+    /// model's own `S_IFLNK | 0o777`: those are the forms a caller that states
+    /// permission bits alone builds.
+    ///
+    /// Any other file type is recorded as it stands and refused by the header's
+    /// own validation, so a `--statoverride` value that renames a
+    /// symlink to a type the object model does not hold fails the write rather
+    /// than committing a mode the entry never asked for.
     fn symlink_header(&self, target: &str) -> FileHeader {
         FileHeader {
             uid: self.uid,
             gid: self.gid,
-            mode: SYMLINK_MODE,
+            mode: match self.mode & S_IFMT {
+                0 | S_IFREG => SYMLINK_MODE,
+                _ => self.mode,
+            },
             symlink_target: target.to_owned(),
             xattrs: self.xattrs.clone(),
         }

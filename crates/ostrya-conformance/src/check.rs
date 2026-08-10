@@ -4,7 +4,8 @@
 //! that the completeness rule in `docs/conformance/README.md` holds for each
 //! family, that every placeholder in a `run:` line is bound by the record's
 //! setups, that every named corpus, setup, oracle, and probe is registered,
-//! and that every registered probe is named by some record.
+//! that every registered probe is named by some record, and that every
+//! `spec:` value names a heading a design document holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -17,12 +18,16 @@ use crate::syntax;
 
 /// What `check` found.
 pub struct Report {
+    /// How many records the matrix files hold.
     pub records: usize,
+    /// How many cells those records expand into.
     pub cells: usize,
+    /// Every rule violation found, one message each.
     pub errors: Vec<String>,
 }
 
 impl Report {
+    /// Whether the check found no violation.
     pub fn ok(&self) -> bool {
         self.errors.is_empty()
     }
@@ -41,6 +46,7 @@ pub fn check(matrix: &Matrix) -> Report {
     duplicates(matrix, &mut errors);
     completeness(matrix, &mut errors);
     unused_probes(matrix, &mut errors);
+    spec_anchors(matrix, &mut errors);
 
     Report {
         records: matrix.records.len(),
@@ -125,6 +131,12 @@ fn vocabulary(record: &Record, errors: &mut Vec<String>) {
 /// The outcome vocabulary in `docs/conformance/README.md` ties three outcomes
 /// to a field that must accompany them: `unobserved` to `question`, `lossy`
 /// to `loss`, and `unimplemented-cli` to `cli-gap`.
+///
+/// The `cli-gap` tie holds in both directions. The shared verification gate of
+/// `phase-17-cli-conformance-plan.md` moves a cell off `unimplemented-cli` as
+/// the command it names lands, and a `cli-gap:` left on the record then names
+/// a gap that is closed. The other two fields carry no converse rule:
+/// `question:` records what is still to observe under any outcome.
 fn outcome_fields(record: &Record, errors: &mut Vec<String>) {
     let origin = record.origin();
     let required = match record.get("outcome") {
@@ -138,6 +150,13 @@ fn outcome_fields(record: &Record, errors: &mut Vec<String>) {
     {
         errors.push(format!(
             "{origin}: `outcome: {}` needs a `{field}` field",
+            record.outcome()
+        ));
+    }
+    if record.get("cli-gap").is_some() && record.get("outcome") != Some("unimplemented-cli") {
+        errors.push(format!(
+            "{origin}: `cli-gap` belongs to `outcome: unimplemented-cli`, and \
+             this record states `outcome: {}`",
             record.outcome()
         ));
     }
@@ -308,6 +327,124 @@ fn unused_probes(matrix: &Matrix, errors: &mut Vec<String>) {
             ));
         }
     }
+}
+
+/// Confirm every `spec:` value names a heading its document holds.
+///
+/// A `spec:` value is `<document>#<anchor>`. The document name resolves in
+/// the matrix directory, which holds `cli-surface.md` and `harness.md`, and
+/// then in the parent directory, which holds `format-reference.md`,
+/// `port-plan.md`, and `api-sketch.md`. The anchor is the fragment GitHub
+/// derives from the heading text, so a value that resolves here is a link
+/// that lands on the section in the rendered document.
+///
+/// The presence of `format-reference.md` in the parent directory states that
+/// the design documents sit beside the records. Where it is absent the run
+/// holds the record files on their own, a privileged run from a copied
+/// directory does so, and the whole check reports nothing.
+fn spec_anchors(matrix: &Matrix, errors: &mut Vec<String>) {
+    if !matrix.dir.join("../format-reference.md").is_file() {
+        return;
+    }
+    let mut cache: BTreeMap<std::path::PathBuf, BTreeSet<String>> = BTreeMap::new();
+
+    for record in &matrix.records {
+        for field in &record.paragraph.fields {
+            if field.name != "spec" {
+                continue;
+            }
+            for value in field.value.split_whitespace() {
+                let Some((document, anchor)) = value.split_once('#') else {
+                    errors.push(format!(
+                        "{}:{}: `spec: {value}` names no heading",
+                        record.paragraph.file.display(),
+                        field.line
+                    ));
+                    continue;
+                };
+                let candidates = [
+                    matrix.dir.join(document),
+                    matrix.dir.join("..").join(document),
+                ];
+                let Some(path) = candidates.iter().find(|path| path.is_file()) else {
+                    errors.push(format!(
+                        "{}:{}: `spec: {value}` names no document `{document}`",
+                        record.paragraph.file.display(),
+                        field.line
+                    ));
+                    continue;
+                };
+                let headings = cache.entry(path.clone()).or_insert_with(|| {
+                    match std::fs::read_to_string(path) {
+                        Ok(text) => heading_anchors(&text),
+                        Err(_) => BTreeSet::new(),
+                    }
+                });
+                if !headings.contains(anchor) {
+                    errors.push(format!(
+                        "{}:{}: `spec: {value}` names no heading of `{document}`",
+                        record.paragraph.file.display(),
+                        field.line
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Every anchor the headings of a Markdown document generate.
+///
+/// A heading inside a fenced code block is text, so the fences are tracked
+/// and their contents skipped.
+fn heading_anchors(text: &str) -> BTreeSet<String> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut anchors = BTreeSet::new();
+    let mut fenced = false;
+
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let hashes = line.len() - line.trim_start_matches('#').len();
+        if !(1..=6).contains(&hashes) {
+            continue;
+        }
+        let Some(title) = line[hashes..].strip_prefix(' ') else {
+            continue;
+        };
+        let base = anchor_of(title.trim());
+        let seen = counts.entry(base.clone()).or_insert(0);
+        anchors.insert(if *seen == 0 {
+            base
+        } else {
+            format!("{base}-{seen}")
+        });
+        *seen += 1;
+    }
+    anchors
+}
+
+/// The anchor GitHub derives from one heading's text.
+///
+/// The text is lowercased, every character outside letters, digits, hyphens,
+/// and underscores is dropped, and every space becomes a hyphen. A heading
+/// ending in `-- words` therefore yields four consecutive hyphens: one for
+/// the space, two for the dashes, and one for the space after them.
+fn anchor_of(title: &str) -> String {
+    title
+        .to_lowercase()
+        .chars()
+        .filter_map(|ch| match ch {
+            ' ' => Some('-'),
+            '-' | '_' => Some(ch),
+            _ if ch.is_alphanumeric() => Some(ch),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Confirm every `evidence:` value that looks like a test path names a test
@@ -597,6 +734,155 @@ mod tests {
             &mut errors,
         );
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn a_cli_gap_left_behind_by_a_landed_command_is_reported() {
+        let mut errors = Vec::new();
+        outcome_fields(
+            &record(&[("outcome", "full"), ("cli-gap", "config set")]),
+            &mut errors,
+        );
+        assert_eq!(
+            errors,
+            vec![
+                "t:1: `cli-gap` belongs to `outcome: unimplemented-cli`, and \
+                 this record states `outcome: full`"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cli_gap_under_its_own_outcome_passes() {
+        let mut errors = Vec::new();
+        outcome_fields(
+            &record(&[("outcome", "unimplemented-cli"), ("cli-gap", "config set")]),
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn a_question_under_another_outcome_passes() {
+        let mut errors = Vec::new();
+        outcome_fields(
+            &record(&[("outcome", "refused-both"), ("question", "record the text")]),
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn an_anchor_lowercases_and_drops_punctuation() {
+        assert_eq!(
+            anchor_of("Commit modifier: canonical permissions, consume, and devino"),
+            "commit-modifier-canonical-permissions-consume-and-devino"
+        );
+        assert_eq!(
+            anchor_of("`config set` and `config unset`"),
+            "config-set-and-config-unset"
+        );
+        assert_eq!(
+            anchor_of("Port extension: bare-user-shared mode"),
+            "port-extension-bare-user-shared-mode"
+        );
+    }
+
+    #[test]
+    fn a_dashed_heading_yields_four_hyphens() {
+        assert_eq!(
+            anchor_of("P2 -- options missing from commands that exist"),
+            "p2----options-missing-from-commands-that-exist"
+        );
+    }
+
+    #[test]
+    fn heading_anchors_skips_a_fenced_block_and_numbers_a_repeat() {
+        let anchors = heading_anchors(
+            "# Title\n```\n# not a heading\n```\n## Refs\ntext\n## Refs\n### Trailing #\n",
+        );
+        assert!(anchors.contains("title"));
+        assert!(!anchors.contains("not-a-heading"));
+        assert!(anchors.contains("refs"));
+        assert!(anchors.contains("refs-1"));
+        assert!(anchors.contains("trailing-"));
+    }
+
+    /// A directory pair shaped like `docs/` and `docs/conformance/`, holding
+    /// `format-reference.md` beside the records and one `doc.md` among them.
+    fn scratch_docs(tag: u32) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "ostrya-conformance-spec-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("conformance");
+        std::fs::create_dir_all(&dir).expect("the scratch directories are created");
+        std::fs::write(root.join("format-reference.md"), "## Object store layout\n")
+            .expect("the parent document is written");
+        std::fs::write(dir.join("doc.md"), "## P2 -- options that exist\n")
+            .expect("the sibling document is written");
+        dir
+    }
+
+    #[test]
+    fn a_spec_anchor_that_names_no_heading_is_reported() {
+        let dir = scratch_docs(line!());
+        let matrix = Matrix {
+            dir: dir.clone(),
+            records: vec![
+                record(&[("spec", "doc.md#p2")]),
+                record(&[("spec", "doc.md#p2----options-that-exist")]),
+                record(&[("spec", "format-reference.md#object-store-layout")]),
+                record(&[("spec", "absent.md#anything")]),
+                record(&[("spec", "doc.md")]),
+            ],
+            cells: Vec::new(),
+        };
+        let mut errors = Vec::new();
+        spec_anchors(&matrix, &mut errors);
+        std::fs::remove_dir_all(dir.parent().expect("the scratch root")).ok();
+
+        assert_eq!(
+            errors,
+            vec![
+                "t:1: `spec: doc.md#p2` names no heading of `doc.md`".to_owned(),
+                "t:1: `spec: absent.md#anything` names no document `absent.md`".to_owned(),
+                "t:1: `spec: doc.md` names no heading".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn records_apart_from_the_design_documents_are_left_unchecked() {
+        let dir = scratch_docs(line!());
+        std::fs::remove_file(
+            dir.parent()
+                .expect("the scratch root")
+                .join("format-reference.md"),
+        )
+        .expect("the parent document is removed");
+
+        let matrix = Matrix {
+            dir: dir.clone(),
+            records: vec![record(&[("spec", "doc.md#p2")])],
+            cells: Vec::new(),
+        };
+        let mut errors = Vec::new();
+        spec_anchors(&matrix, &mut errors);
+        std::fs::remove_dir_all(dir.parent().expect("the scratch root")).ok();
+
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
+    }
+
+    #[test]
+    fn every_spec_anchor_of_the_shipped_matrix_resolves() {
+        let matrix = crate::record::load(&crate::default_matrix_dir())
+            .expect("the shipped record files load");
+        let mut errors = Vec::new();
+        spec_anchors(&matrix, &mut errors);
+        assert!(errors.is_empty(), "{}", errors.join("\n"));
     }
 
     #[test]

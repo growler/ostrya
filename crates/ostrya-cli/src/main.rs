@@ -47,23 +47,30 @@
 //! [`ostrya_rt::File`] over a duplicated descriptor, so no unbounded stream is
 //! buffered in memory.
 
+use std::collections::{HashMap, HashSet};
 use std::os::fd::AsFd;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CollectionRef, CommitModifier, CommitModifierFlags,
-    CommitOptions, CreateOptions, DeltaOptions, DiffChange, Ed25519Signer, Ed25519Verifier, Error,
-    FileKind, FileObject, FsckOptions, MutableTree, ObjectType, PruneOptions, PullFlags,
-    PullOptions, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, SignatureInfo,
-    Summary, SummaryOptions, SummaryRef, TarExportOptions, TarImportOptions, TimestampCheck,
-    TreeEntry, Type, Value, Verifier, VerifyOutcome, Xattrs, base64, from_bytes, load_sign_keys,
+    CommitOptions, CreateOptions, DeltaOptions, DevInoCache, DiffChange, Ed25519Signer,
+    Ed25519Verifier, Error, FileKind, FileObject, FilterResult, FsckOptions, MutableTree,
+    ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias, Repo,
+    RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef,
+    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
+    Type, Value, Verifier, VerifyOutcome, Xattrs, base64, from_bytes, load_sign_keys,
     load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
 #[cfg(feature = "spki")]
 use ostrya::{SpkiSigner, SpkiVerifier};
+
+use regex::{Captures, Regex};
 
 /// A pure-Rust front-end over the ostrya repository library.
 #[derive(Parser)]
@@ -88,6 +95,11 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// `commit` carries the largest option set of any subcommand, so its variant is
+// the largest here. `clap`'s `Subcommand` derive reads the field type as the
+// argument group itself, which a `Box` is not, so the indirection the lint asks
+// for cannot be applied. One `Cli` value is parsed per process.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Initialize a new empty repository.
     Init(InitArgs),
@@ -218,6 +230,33 @@ struct CommitArgs {
     /// The commit subject.
     #[arg(short, long)]
     subject: Option<String>,
+    /// The commit body. Given more than once, the last value wins.
+    #[arg(short = 'm', long, value_name = "BODY", overrides_with = "body")]
+    body: Option<String>,
+    /// Read the commit body from this file, which wins over --body.
+    #[arg(short = 'F', long, value_name = "FILE", overrides_with = "body_file")]
+    body_file: Option<PathBuf>,
+    /// Write the subject and the body in an editor, which replaces both.
+    #[arg(short = 'e', long)]
+    editor: bool,
+    /// Do not write any ref bindings.
+    #[arg(long)]
+    no_bindings: bool,
+    /// Bind this ref name into the commit beside the branch.
+    #[arg(long = "bind-ref", value_name = "BRANCH")]
+    bind_ref: Vec<String>,
+    /// Add a string-valued key to the commit metadata.
+    #[arg(long, value_name = "KEY=VALUE")]
+    add_metadata_string: Vec<String>,
+    /// Add a key to the commit metadata, its value in the GVariant text form.
+    #[arg(long, value_name = "KEY=VALUE")]
+    add_metadata: Vec<String>,
+    /// Carry this metadata key over from the parent commit.
+    #[arg(long, value_name = "KEY")]
+    keep_metadata: Vec<String>,
+    /// Add a string-valued key to the detached commit metadata.
+    #[arg(long, value_name = "KEY=VALUE")]
+    add_detached_metadata_string: Vec<String>,
     /// Force owner 0:0, canonicalize modes to `perm & 0755`, and drop xattrs,
     /// for an owner- and host-independent commit.
     #[arg(long)]
@@ -231,12 +270,100 @@ struct CommitArgs {
     /// Do not import extended attributes.
     #[arg(long)]
     no_xattrs: bool,
+    /// File holding the mode changes to make, one
+    /// `[=]<decimal mode> <absolute in-tree path>` per line.
+    #[arg(long, value_name = "PATH", overrides_with = "statoverride")]
+    statoverride: Option<PathBuf>,
+    /// File holding the paths to leave out, one absolute in-tree path per
+    /// line. A listed directory prunes its whole subtree.
+    #[arg(long, value_name = "PATH", overrides_with = "skip_list")]
+    skip_list: Option<PathBuf>,
+    /// Clear the write bits of every regular file that carries an execute bit.
+    #[arg(long)]
+    mode_ro_executables: bool,
+    /// Print the parent's checksum and write nothing where the tree matches
+    /// the parent commit.
+    #[arg(long)]
+    skip_if_unchanged: bool,
+    /// Resolve a source file that is a hardlink to one of the repository's own
+    /// content objects by its inode, instead of reading it.
+    #[arg(long)]
+    link_checkout_speedup: bool,
+    /// Take an inode match as the file's whole identity, which skips the
+    /// commit modifiers for it. Implies --link-checkout-speedup.
+    #[arg(short = 'I', long)]
+    devino_canonical: bool,
     /// Override the timestamp of the commit: `@SECONDS` since the Unix epoch,
     /// or a date and time carrying a UTC offset (`2020-01-02T03:04:05Z`).
     #[arg(long, value_name = "TIMESTAMP")]
     timestamp: Option<String>,
-    /// The tree to commit; with none, read a tar stream from stdin.
-    path: Option<PathBuf>,
+    /// Specify how to invoke fsync(): a boolean word from `true`, `yes`, `1`,
+    /// `false`, `no`, or `0`, read without regard to case.
+    #[arg(long, value_name = "POLICY", allow_hyphen_values = true)]
+    fsync: Option<String>,
+    /// Report the commit and the object counts in a `KEY: VALUE` block instead
+    /// of the checksum alone.
+    #[arg(long)]
+    table_output: bool,
+    /// Store the size of every object the commit reaches in `ostree.sizes`. An
+    /// archive repository alone writes the key.
+    #[arg(long)]
+    generate_sizes: bool,
+    /// Store `ostree.linux` and `ostree.bootable`, read from the one kernel
+    /// directory under `/usr/lib/modules` in the committed tree.
+    #[arg(long)]
+    bootable: bool,
+    /// Store the fs-verity digest of the tree's composefs image in
+    /// `ostree.composefs.digest.v0`.
+    #[arg(long)]
+    generate_composefs_metadata: bool,
+    /// Overlay the given argument as a tree, in command-line order. Repeatable.
+    #[arg(long, value_name = "dir=PATH or tar=TARFILE or ref=COMMIT")]
+    tree: Vec<String>,
+    /// Start from the given commit as a base (no modifiers apply). Given more
+    /// than once, the last value wins.
+    #[arg(long, value_name = "REV", overrides_with = "base")]
+    base: Option<String>,
+    /// Consume (delete) content after commit (for local directories).
+    #[arg(long)]
+    consume: bool,
+    /// When loading tar archives, automatically create parent directories as
+    /// needed.
+    #[arg(long)]
+    tar_autocreate_parents: bool,
+    /// When loading tar archives, use REGEX,REPLACEMENT against path names.
+    /// Given more than once, the last value wins.
+    #[arg(
+        long,
+        value_name = "REGEX,REPLACEMENT",
+        overrides_with = "tar_pathname_filter"
+    )]
+    tar_pathname_filter: Option<String>,
+    /// GPG Key ID to sign the commit with. Repeatable, and each occurrence adds
+    /// one signature under `ostree.gpgsigs`, in command-line order.
+    #[arg(long, value_name = "KEY-ID")]
+    gpg_sign: Vec<String>,
+    /// GPG Homedir to use when looking for keyrings. Read by --gpg-sign and,
+    /// under --sign-type=gpg, by --sign and --sign-from-file. It wins over
+    /// GNUPGHOME.
+    #[arg(long, value_name = "HOMEDIR")]
+    gpg_homedir: Option<PathBuf>,
+    /// Sign the commit with this key: for ed25519 and spki, the base64 of the
+    /// secret key. Repeatable, and each occurrence adds one signature.
+    #[arg(long, value_name = "KEY_ID")]
+    sign: Vec<String>,
+    /// Sign the commit with the key on the first line of this file.
+    /// Repeatable, and each occurrence adds one signature. An empty path
+    /// carries its own refusal.
+    #[arg(long, value_name = "PATH")]
+    sign_from_file: Vec<std::ffi::OsString>,
+    /// Signature type to use (defaults to 'ed25519'). Given more than once,
+    /// the last value wins.
+    #[arg(long, value_name = "NAME", overrides_with = "sign_type")]
+    sign_type: Option<String>,
+    /// The tree to commit. Ignored where any --tree is given, as is every
+    /// argument after the first; with neither, read a tar stream from stdin.
+    path: Vec<PathBuf>,
 }
 
 #[derive(Args)]
@@ -962,8 +1089,9 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             // options, so a value it cannot read is reported ahead of the
             // repository (`docs/format-reference.md`, "CLI output formats").
             let owner = commit_owner(&args);
+            let fsync = fsync_policy(args.fsync.as_deref());
             let (repo, _) = resolve_repo(repo, verbose, name).await;
-            commit(repo, args, owner).await
+            commit(repo, args, owner, fsync).await
         }
         Command::Checkout(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
@@ -1050,12 +1178,25 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
     }
 }
 
+/// End the process with `code`, the one exit the CLI takes that does not return
+/// through `main`.
+///
+/// `std::process::exit` runs no destructor, so a subcommand that exits while a
+/// transaction is live would leave its staging directory under `tmp/`. The reap
+/// runs first, which holds the rule for every subcommand and every exit site:
+/// a refusal writes no object, moves no ref, and leaves `tmp/` as it found it
+/// (`docs/conformance/cli-surface.md`, "Global conventions").
+fn exit_process(code: i32) -> ! {
+    ostrya::reap_process_staging();
+    std::process::exit(code);
+}
+
 /// Print the top-level usage text and the tool's own error line for a bare
 /// invocation, and exit like the tool does.
 fn exit_no_command() -> ! {
     eprint!("{}", <Cli as CommandFactory>::command().render_help());
     eprintln!("error: No command specified");
-    std::process::exit(1);
+    exit_process(1);
 }
 
 /// Print `subcommand`'s usage text and `error: {message}`, then exit 1,
@@ -1070,7 +1211,7 @@ fn exit_with_error(subcommand: &str, message: &str) -> ! {
         .expect("subcommand name matches a defined command");
     eprint!("{}", sub.render_help());
     eprintln!("error: {message}");
-    std::process::exit(1);
+    exit_process(1);
 }
 
 /// Print a nested subcommand's usage text and `error: {message}`, then exit 1,
@@ -1084,14 +1225,14 @@ fn exit_with_nested_error(subcommand: &str, nested: &str, message: &str) -> ! {
         .expect("the nested subcommand name matches a defined command");
     eprint!("{}", sub.render_help());
     eprintln!("error: {message}");
-    std::process::exit(1);
+    exit_process(1);
 }
 
 /// Print `error: {message}` with no usage text and exit 1, the shape the tool
 /// uses once a subcommand is running and its arguments are in hand.
 fn exit_error(message: &str) -> ! {
     eprintln!("error: {message}");
-    std::process::exit(1);
+    exit_process(1);
 }
 
 /// Print `subcommand`'s usage text and the tool's own "no repo" error line,
@@ -1123,7 +1264,7 @@ async fn resolve_repo(repo: Option<&Path>, verbose: bool, subcommand: &str) -> (
             }
             Err(err) => {
                 eprintln!("error: opening repo: {err}");
-                std::process::exit(1);
+                exit_process(1);
             }
         }
     }
@@ -1203,7 +1344,7 @@ fn parse_init_mode(mode: &str) -> RepoMode {
         "bare-user-shared" => RepoMode::BareUserShared,
         _ => {
             eprintln!("error: Invalid mode '{mode}' in repository configuration");
-            std::process::exit(1);
+            exit_process(1);
         }
     }
 }
@@ -1470,7 +1611,17 @@ fn delta_secret_keys(args: &DeltaGenerateArgs) -> Result<Vec<String>> {
 /// lowercase alone: it asks for a root commit.
 const NO_PARENT: &str = "none";
 
-async fn commit(repo: Repo, args: CommitArgs, owner: Owner) -> Result<()> {
+async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>) -> Result<()> {
+    // The two walk-control files are read first: ahead of the missing-branch
+    // check, ahead of `--parent`, ahead of the metadata options, ahead of the
+    // tree, and ahead of the timestamp, which is where the tool reports a file
+    // it cannot open or read (`docs/format-reference.md`, "CLI output
+    // formats").
+    let walk = match WalkOptions::read(&args) {
+        Ok(walk) => walk,
+        Err(message) => exit_error(&message),
+    };
+
     // A commit either names the branch it moves or states that it writes no ref.
     // The check stands ahead of `--parent`, ahead of the tree, and ahead of any
     // object publication, which is the order the tool reports it in
@@ -1492,21 +1643,42 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner) -> Result<()> {
         }
     }
 
-    let txn = repo.transaction().await?;
+    // Every refusal from here to the transaction below stands ahead of the
+    // repository lock, so there is no transaction to abort and no staging
+    // directory to reap: the process exits having written no object and no ref.
+    macro_rules! refuse_unlocked {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(message) => exit_error(&message),
+            }
+        };
+    }
+
+    // The `[core]` keys the transaction reads are parsed here, ahead of the
+    // edit, because the transaction opens once the editor has returned. The
+    // tool reads them when it opens the repository, so a value their reader
+    // refuses stands ahead of `--parent`, ahead of the metadata options, and
+    // ahead of the editor on both sides (`docs/port-plan.md`, Phase 17f). The
+    // first four are the set the transaction open reads; the fsync pair is the
+    // set its write paths read, and it is parsed here too so that `--fsync`
+    // does not move where a refusal lands (`docs/format-reference.md`, "The
+    // fsync vocabulary").
+    let config = repo.config();
+    config.locking()?;
+    config.lock_timeout_secs()?;
+    config.tmp_expiry_secs()?;
+    config.min_free_space()?;
+    config.fsync()?;
+    config.per_object_fsync()?;
 
     // `--parent` takes a revision, so it carries the resolution wording every
     // subcommand taking one gives (`docs/port-plan.md`, Phase 17b).
-    // `report_resolution_failure` reports through `exit_error`, which runs no
-    // destructor, so the staging directory is reaped ahead of it, the way the
-    // branch-name guard below does it.
     let parent = match args.parent.as_deref() {
         Some(NO_PARENT) => None,
         Some(rev) => match repo.resolve_rev(rev, false).await {
             Ok(found) => found,
-            Err(err) => {
-                txn.abort().await?;
-                return Err(report_resolution_failure(err));
-            }
+            Err(err) => return Err(report_resolution_failure(err)),
         },
         // `--orphan` suppresses the implicit parent alone, so an explicit
         // `--parent` alongside it still parents the commit.
@@ -1520,22 +1692,168 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner) -> Result<()> {
             Some(branch) if shadowed_branch_name(branch).is_none() => {
                 match repo.resolve_rev(branch, true).await {
                     Ok(found) => found,
-                    Err(err) => {
-                        txn.abort().await?;
-                        return Err(report_resolution_failure(err));
-                    }
+                    Err(err) => return Err(report_resolution_failure(err)),
                 }
             }
             _ => None,
         },
     };
 
-    // The tool opens the tree ahead of reading `--timestamp`, so a tree path that
-    // does not open is reported and a timestamp the reader refuses is not.
-    let dfd = match args.path.as_deref() {
-        Some(path) => Some(std::fs::File::open(path).map_err(Error::Io)?),
+    // The metadata options are read next, each group in the order below, and a
+    // group's refusal stands ahead of the body file, ahead of the editor, ahead
+    // of the tree, and ahead of the timestamp (`docs/format-reference.md`,
+    // "CLI output formats"). An empty key is refused where the dict is
+    // assembled instead, so it stands after all four.
+    if !args.keep_metadata.is_empty() && parent.is_none() {
+        refuse_unlocked!(Err(
+            "Either --branch or --parent must be specified when using --keep-metadata".to_owned()
+        ));
+    }
+    let added_strings = refuse_unlocked!(metadata_pairs(&args.add_metadata_string));
+    let added_variants = refuse_unlocked!(parse_added_metadata(&args.add_metadata));
+    let detached_pairs = refuse_unlocked!(metadata_pairs(&args.add_detached_metadata_string));
+    let kept = match parent.as_ref() {
+        Some(parent) => refuse_unlocked!(kept_metadata(&repo, parent, &args.keep_metadata).await?),
+        None => Vec::new(),
+    };
+
+    // `-e` replaces the subject and the body outright, so neither `-m` nor
+    // `-F` is read when it is given; `-F` wins over `-m` in either order.
+    let body = match (args.editor, args.body_file.as_deref()) {
+        (true, _) => None,
+        (false, Some(path)) => Some(refuse_unlocked!(read_body_file(path))),
+        (false, None) => args.body.clone(),
+    };
+
+    // The editor runs after the metadata options are read and before the tree
+    // opens, so a tree path that does not open and a timestamp the reader
+    // refuses are both reported after the edit. Its result replaces both the
+    // subject and the body.
+    let (subject, body) = if args.editor {
+        let edited = refuse_unlocked!(
+            run_commit_editor(
+                args.branch.as_deref().filter(|_| !args.orphan),
+                args.subject.as_deref(),
+            )
+            .await
+        );
+        (Some(edited.0), Some(edited.1))
+    } else {
+        (args.subject.clone(), body)
+    };
+
+    // The message is settled, so the repository lock is taken now: an editing
+    // session holds no lock, and an exclusive operation on the same repository
+    // runs while the message is being written. The tool takes its lock at this
+    // same point (`docs/port-plan.md`, Phase 17f).
+    let mut txn = repo.transaction().await?;
+    // The option narrows the configured policy and never widens it: a repository
+    // holding `[core] fsync=false` syncs nothing under `--fsync=true`, so only
+    // `false` reaches the transaction and `true` leaves the config in charge
+    // (`docs/format-reference.md`, "CLI output formats", "The fsync
+    // vocabulary").
+    if fsync == Some(false) {
+        txn.set_fsync(false);
+    }
+    // `--generate-sizes` covers both ingest paths, the tar stream included, so
+    // the request goes to the transaction rather than to the walk's commit
+    // modifier. Outside archive mode it changes nothing. A skip list naming the
+    // walk root leaves every source unread, so no object is accounted and the
+    // key is left out of the commit altogether
+    // (`docs/format-reference.md`, "Metadata object formats").
+    txn.set_generate_sizes(args.generate_sizes && !walk.root_pruned);
+
+    // A refusal from here on has a transaction to abort first: `exit_error`
+    // runs no destructor, so the staging directory is reaped ahead of it.
+    macro_rules! refuse {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(message) => {
+                    txn.abort().await?;
+                    exit_error(&message);
+                }
+            }
+        };
+    }
+
+    // `--base` is the bottom layer of the source list whatever its position on
+    // the command line, and it resolves ahead of the tree specifications, so an
+    // unresolvable base is reported before a source that does not open and
+    // before `--consume` removes anything
+    // (`docs/format-reference.md`, "CLI output formats", `commit`).
+    let base = match args.base.as_deref() {
+        Some(rev) => match repo.resolve_rev(rev, false).await {
+            Ok(found) => found,
+            Err(err) => {
+                txn.abort().await?;
+                return Err(report_resolution_failure(err));
+            }
+        },
         None => None,
     };
+
+    // The cache is built from this repository's own loose objects, so a source
+    // tree checked out by any earlier process resolves through it. `-I` implies
+    // `--link-checkout-speedup`.
+    let devino = if args.link_checkout_speedup || args.devino_canonical {
+        Some(repo.devino_cache().await?)
+    } else {
+        None
+    };
+    let mut modifier = commit_modifier(&args, owner, &walk, devino);
+    let mut mtree = MutableTree::new();
+    // The sources are read ahead of `--timestamp`, one at a time and in order,
+    // so a source that does not open is reported where the tool reports it and
+    // a source `--consume` already emptied stays gone when a later one fails
+    // (`docs/format-reference.md`, "CLI output formats", `commit`).
+    let specs = refuse!(tree_specs(&args));
+    // The base is the bottom layer and no modifier reaches it, so every
+    // entry a later source leaves alone keeps the mode, the ownership, and
+    // the extended attributes the base recorded. A pruned walk root
+    // contributes nothing over it, so the base alone is what the commit holds.
+    if let Some(base) = base {
+        let (commit, _) = repo.load_commit(&base).await?;
+        txn.overlay_tree_to_mtree(&commit.root_dirtree, &commit.root_dirmeta, &mut mtree, None)
+            .await?;
+    }
+    for spec in specs {
+        let source = refuse!(open_tree_source(&repo, spec).await?);
+        // A skip list naming the walk root prunes the walk itself: the source
+        // is opened, so one that does not open is reported here, and no entry
+        // below the root is offered to the filter, so every other entry of
+        // either control file goes unmatched.
+        if walk.root_pruned {
+            continue;
+        }
+        // An OR-form `--statoverride` entry over a directory below the walk
+        // root reaches an archive's member alone, and one modifier is shared by
+        // every source, so the source kind is stated before the overlay reads
+        // it (`docs/format-reference.md`, "CLI output formats", `commit`).
+        walk.source_is_tar
+            .store(matches!(source, OpenSource::Tar(_)), Ordering::Relaxed);
+        // `ostree.sizes` covers the objects the last source contributed
+        // together with the directory objects the serialization writes, so
+        // each source opens its own accounting scope.
+        txn.begin_tree_source();
+        refuse!(overlay_source(&repo, &txn, &args, source, &mut mtree, modifier.as_mut()).await?);
+    }
+    // Both control files are checked once the sources have been read, the
+    // statoverride file first. An entry inside a pruned directory is unmatched,
+    // the walk never having reached it.
+    refuse!(report_unmatched(
+        "statoverride",
+        &walk.unmatched_statoverride()
+    ));
+    refuse!(report_unmatched("skip-list", &walk.unmatched_skip_list()));
+    // A source list that supplied no root directory -- an empty archive, one
+    // naming no root member, or a walk the skip list pruned at the root --
+    // leaves the tree with no metadata to write, `--base` having supplied none.
+    if mtree.metadata_checksum().is_none() {
+        refuse!(Err("Can't commit an empty tree".to_owned()));
+    }
+    let root = txn.write_mtree(&mut mtree).await?;
+
     let timestamp = match args.timestamp.as_deref() {
         Some(text) => match parse_timestamp(text) {
             Some(seconds) => Some(seconds),
@@ -1547,52 +1865,484 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner) -> Result<()> {
         None => None,
     };
 
-    let root = match dfd {
-        Some(dfd) => {
-            let mut modifier = commit_modifier(&args, owner);
-            let mut mtree = MutableTree::new();
-            txn.write_dfd_to_mtree(
-                dfd.as_fd(),
-                std::path::Path::new("."),
-                &mut mtree,
-                modifier.as_mut(),
-            )
-            .await?;
-            txn.write_mtree(&mut mtree).await?
+    let metadata = refuse!(commit_metadata_dict(
+        &repo,
+        &args,
+        &added_strings,
+        &added_variants,
+        &kept,
+    ));
+    let detached = detached_metadata_dict(&detached_pairs);
+
+    // `--skip-if-unchanged` compares the walked tree against the resolved
+    // parent, root contents and root metadata both. The commit's own metadata
+    // takes no part, so a new subject or a new metadata key over an unchanged
+    // tree is still skipped. With no parent there is nothing to compare and the
+    // commit is written.
+    if args.skip_if_unchanged
+        && let Some(parent) = parent
+    {
+        let (previous, _) = repo.load_commit(&parent).await?;
+        if previous.root_dirtree == *root.dirtree_checksum()
+            && previous.root_dirmeta == *root.dirmeta_checksum()
+        {
+            txn.abort().await?;
+            if args.table_output {
+                print_skipped_commit_table(&parent);
+            } else {
+                println!("{}", parent.to_hex());
+            }
+            return Ok(());
         }
-        None => {
-            let stdin = stdin_file()?;
-            let mut opts = TarImportOptions::new();
-            opts.owner_uid = owner.uid;
-            opts.owner_gid = owner.gid;
-            opts.skip_xattrs = args.no_xattrs;
-            let mut mtree = repo.import_tar(&txn, opts, stdin).await?;
-            txn.write_mtree(&mut mtree).await?
-        }
-    };
+    }
+
+    // The two derived keys are read from the committed tree, so they stand
+    // after the walk, after the control-file reports, after the empty-tree
+    // refusal, and after `--skip-if-unchanged` has had its say
+    // (`docs/format-reference.md`, "CLI output formats", `commit`).
+    let mut metadata = metadata;
+    if args.bootable {
+        let version = refuse!(kernel_version(&txn, &root).await?);
+        // The derived pair replaces a value supplied for either key: a commit
+        // carrying `--add-metadata-string=ostree.linux=...` beside `--bootable`
+        // reaches the same object as one carrying `--bootable` alone.
+        drop_metadata_keys(&mut metadata, &[LINUX_KEY, BOOTABLE_KEY])?;
+        prepend_metadata_entries(
+            &mut metadata,
+            vec![
+                string_entry(LINUX_KEY, &version),
+                Value::Tuple(vec![
+                    Value::Str(BOOTABLE_KEY.to_owned()),
+                    Value::variant(Type::Bool, Value::Bool(true)),
+                ]),
+            ],
+        )?;
+    }
+    // The composefs digest stands after the binding keys, and the library
+    // appends `ostree.sizes` after it. A value the command line supplied under
+    // the same key -- through `--add-metadata-string`, `--add-metadata`, or
+    // `--keep-metadata` -- takes the derived digest in the slot it already
+    // holds, and a repeated key collapses to that one entry.
+    if args.generate_composefs_metadata {
+        let digest = txn.composefs_digest(&root).await?;
+        let entry = Value::Tuple(vec![
+            Value::Str(COMPOSEFS_DIGEST_KEY.to_owned()),
+            Value::variant(
+                Type::Array(Box::new(Type::Byte)),
+                Value::Bytes(digest.to_vec()),
+            ),
+        ]);
+        set_metadata_entry(&mut metadata, COMPOSEFS_DIGEST_KEY, entry)?;
+    }
 
     let opts = CommitOptions {
         parent,
-        subject: args.subject,
-        body: None,
+        subject,
+        body,
         timestamp,
-        metadata: Some(ref_binding(args.branch.as_deref())),
+        metadata: Some(metadata),
     };
     let checksum = txn.write_commit(opts, &root).await?;
+    // A branch name the revision syntax shadows, and one the refspec grammar
+    // refuses, are both reported after the commit is written and ahead of the
+    // signing step, which is the order the tool reports each of them against a
+    // key it cannot use. The order is observable only over a name both
+    // grammars refuse: `validate_refspec` covers path safety alone, so a name
+    // the tool's wider ref-name grammar refuses and this one accepts -- one
+    // holding a space or a caret -- reaches the signing step here and the
+    // refspec refusal there (`docs/conformance/cli-surface.md`, "P2").
+    // `exit_error` runs no destructor, so the staging directory is reaped ahead
+    // of it.
     if let Some(branch) = args.branch.as_deref() {
-        // A branch name the revision syntax shadows is refused at the ref write,
-        // after the commit is written. `exit_error` runs no destructor, so the
-        // staging directory is reaped ahead of it.
         if let Some(message) = shadowed_branch_name(branch) {
             txn.abort().await?;
             exit_error(&message);
         }
+        if validate_refspec(branch).is_err() {
+            txn.abort().await?;
+            exit_error(&format!("Invalid refspec {branch}"));
+        }
+    }
+    // `--add-detached-metadata-string` replaces the whole stored detached
+    // metadata and the signing engines append to what stands, so the dict is
+    // queued ahead of the signatures: a run naming both writes the user keys
+    // first and the signature keys after them, and it drops any signature an
+    // earlier run left on the same checksum
+    // (`docs/format-reference.md`, "CLI output formats", `commit`).
+    if let Some(detached) = detached {
+        txn.set_commit_detached_metadata(&checksum, detached);
+    }
+    // The signatures are produced before the ref is written and before the
+    // transaction publishes, so a key that cannot sign leaves no object in
+    // `objects/` and the ref where it stood.
+    refuse!(sign_staged_commit(&txn, &checksum, &args).await?);
+    if let Some(branch) = args.branch.as_deref() {
         txn.set_ref(branch, Some(&checksum));
     }
-    txn.commit().await?;
+    let stats = txn.commit().await?;
 
-    println!("{}", checksum.to_hex());
+    if args.table_output {
+        print_commit_table(&checksum, &stats);
+    } else {
+        println!("{}", checksum.to_hex());
+    }
     Ok(())
+}
+
+/// The `--sign-type` name in force when the option is absent, and the one name
+/// the tool's own build carries.
+const DEFAULT_SIGN_TYPE: &str = "ed25519";
+
+/// The length of an ed25519 secret key: the 32-byte seed followed by the
+/// 32-byte public key.
+const ED25519_SECRET_LEN: usize = 64;
+
+/// The largest first line `--sign-from-file` accepts. A base64 ed25519 secret
+/// is 88 characters and a GPG key id shorter still, so this bounds the read well
+/// above any key while barring an unbounded one (`CLAUDE.md`, "Working
+/// conventions"). A longer first line is refused rather than cut.
+const SIGN_KEY_FILE_LIMIT: u64 = 64 * 1024;
+
+/// Sign the staged commit with every key the signing options name.
+///
+/// The step runs after the commit object is staged and before the ref write and
+/// the publication, so a refusal here leaves no object in `objects/` and the ref
+/// where it stood, and a run naming several keys is all or nothing
+/// (`docs/format-reference.md`, "Signing details").
+///
+/// The order the signatures take is fixed and does not follow the command line:
+/// every `--sign` key first, then every `--sign-from-file` key, then every
+/// `--gpg-sign` key. `--sign-type` selects the engine of the first two groups
+/// alone and is read only when one of them names a key, so a name no engine
+/// carries passes unremarked through a run that signs nothing.
+async fn sign_staged_commit(
+    txn: &Transaction,
+    checksum: &Checksum,
+    args: &CommitArgs,
+) -> Result<std::result::Result<(), String>> {
+    macro_rules! refuse {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(message) => return Ok(Err(message)),
+            }
+        };
+    }
+    if !args.sign.is_empty() || !args.sign_from_file.is_empty() {
+        let engine = refuse!(commit_sign_type(
+            args.sign_type.as_deref().unwrap_or(DEFAULT_SIGN_TYPE)
+        ));
+        for key in &args.sign {
+            let signer = refuse!(commit_signer(engine, key.as_bytes(), args));
+            txn.sign_commit(checksum, signer.as_ref()).await?;
+        }
+        for path in &args.sign_from_file {
+            let key = refuse!(read_sign_key_file(Path::new(path)));
+            let signer = refuse!(commit_signer(engine, &key, args));
+            txn.sign_commit(checksum, signer.as_ref()).await?;
+        }
+    }
+    refuse!(sign_staged_commit_gpg(txn, checksum, args).await?);
+    Ok(Ok(()))
+}
+
+/// The shortest `--gpg-sign` selector the key lookup accepts, in bytes. A
+/// shorter one is refused without a lookup
+/// (`docs/format-reference.md`, "Signing details").
+#[cfg(feature = "gpg")]
+const GPG_SIGN_SELECTOR_MIN: usize = 8;
+
+/// Add the `--gpg-sign` signatures, one per occurrence and in command-line
+/// order.
+///
+/// Each selector is resolved in the GnuPG home directory `--gpg-homedir` names,
+/// or the one gpg resolves for itself, and it must name exactly one secret key.
+/// A selector under [`GPG_SIGN_SELECTOR_MIN`] bytes is refused without a lookup,
+/// one that names no key and one that names several each carry their own
+/// refusal, and the refusal comes before any signature is produced. The
+/// signature is then made against the fingerprint the lookup returned, so the
+/// key that signs is the key the lookup named.
+#[cfg(feature = "gpg")]
+async fn sign_staged_commit_gpg(
+    txn: &Transaction,
+    checksum: &Checksum,
+    args: &CommitArgs,
+) -> Result<std::result::Result<(), String>> {
+    for key in &args.gpg_sign {
+        if key.len() < GPG_SIGN_SELECTOR_MIN {
+            return Ok(Err(format!(
+                "Unable to lookup key ID {key}: GPGME: Invalid value"
+            )));
+        }
+        let lookup = commit_gpg_signer(key, args);
+        let homedir = gpg_homedir_text(&lookup);
+        let found = lookup.secret_key_fingerprints().await?;
+        let [fingerprint] = found.as_slice() else {
+            return Ok(Err(if found.is_empty() {
+                format!("No gpg key found with ID {key} (homedir: {homedir})")
+            } else {
+                format!(
+                    "gpg key id {key} ambiguous (homedir: {homedir}). Try the fingerprint instead"
+                )
+            }));
+        };
+        let signer = commit_gpg_signer(fingerprint, args);
+        txn.sign_commit(checksum, &signer).await?;
+    }
+    Ok(Ok(()))
+}
+
+#[cfg(not(feature = "gpg"))]
+async fn sign_staged_commit_gpg(
+    _: &Transaction,
+    _: &Checksum,
+    args: &CommitArgs,
+) -> Result<std::result::Result<(), String>> {
+    if args.gpg_sign.is_empty() {
+        return Ok(Ok(()));
+    }
+    // A build without the engine refuses through the same channel as every
+    // other signing refusal, so the line reads the same wherever it comes from.
+    Ok(Err("Requested signature type is not implemented".to_owned()))
+}
+
+/// The `--gpg-sign` signer for one key selector.
+#[cfg(feature = "gpg")]
+fn commit_gpg_signer(key: &str, args: &CommitArgs) -> GpgSigner {
+    let signer = GpgSigner::new(key);
+    match &args.gpg_homedir {
+        Some(dir) => signer.with_homedir(dir),
+        None => signer,
+    }
+}
+
+/// The GnuPG home directory a key-lookup refusal names: the signer's home
+/// directory, or the literal `<default>` where the signer carries none and gpg
+/// resolves the directory for itself.
+#[cfg(feature = "gpg")]
+fn gpg_homedir_text(signer: &GpgSigner) -> String {
+    match signer.homedir() {
+        Some(dir) => dir.display().to_string(),
+        None => "<default>".to_owned(),
+    }
+}
+
+/// Read `--sign-type` into the engine it names, refusing a name no engine
+/// carries in the tool's own words. The match is exact and case sensitive with
+/// no trimming, so `ED25519` and a whitespace-padded name each name no engine.
+/// `dummy` is a registered engine the command line does not reach, and it
+/// carries its own refusal.
+fn commit_sign_type(name: &str) -> std::result::Result<SignType, String> {
+    match name {
+        "ed25519" => Ok(SignType::Ed25519),
+        #[cfg(feature = "spki")]
+        "spki" => Ok(SignType::Spki),
+        #[cfg(feature = "gpg")]
+        "gpg" => Ok(SignType::Gpg),
+        "dummy" => Err("dummy signature type is only for ostree testing".to_owned()),
+        _ => Err("Requested signature type is not implemented".to_owned()),
+    }
+}
+
+/// The signer one `--sign` or `--sign-from-file` key names under `engine`.
+///
+/// The key arrives as bytes, since `--sign-from-file` reads a line of a file
+/// and the tool places no encoding requirement on it. The ed25519 engine reads
+/// the bytes directly; the engines whose key is a text selector read the same
+/// bytes with every invalid UTF-8 sequence replaced.
+fn commit_signer(
+    engine: SignType,
+    key: &[u8],
+    args: &CommitArgs,
+) -> std::result::Result<Box<dyn Signer>, String> {
+    match engine {
+        SignType::Ed25519 => {
+            let secret = ed25519_secret_key(key)?;
+            Ed25519Signer::from_secret_key(&secret)
+                .map(|signer| Box::new(signer) as Box<dyn Signer>)
+                .map_err(|err| err.to_string())
+        }
+        SignType::Spki => commit_signer_spki(&String::from_utf8_lossy(key)),
+        SignType::Gpg => commit_signer_gpg(&String::from_utf8_lossy(key), args),
+    }
+}
+
+#[cfg(feature = "spki")]
+fn commit_signer_spki(key: &str) -> std::result::Result<Box<dyn Signer>, String> {
+    SpkiSigner::from_base64(key)
+        .map(|signer| Box::new(signer) as Box<dyn Signer>)
+        .map_err(|err| err.to_string())
+}
+
+#[cfg(not(feature = "spki"))]
+fn commit_signer_spki(_: &str) -> std::result::Result<Box<dyn Signer>, String> {
+    Err("Requested signature type is not implemented".to_owned())
+}
+
+#[cfg(feature = "gpg")]
+fn commit_signer_gpg(key: &str, args: &CommitArgs) -> std::result::Result<Box<dyn Signer>, String> {
+    Ok(Box::new(commit_gpg_signer(key, args)))
+}
+
+#[cfg(not(feature = "gpg"))]
+fn commit_signer_gpg(_: &str, _: &CommitArgs) -> std::result::Result<Box<dyn Signer>, String> {
+    Err("Requested signature type is not implemented".to_owned())
+}
+
+/// Read an ed25519 secret key from its base64 text, refusing a value of any
+/// other length in the tool's own words.
+///
+/// The decode is lenient: every byte outside the base64 alphabet is skipped, so
+/// surrounding whitespace, an interior newline, and a line of prose all decode
+/// to some byte count and the length check states the refusal. This is what
+/// makes `--sign=not-base64!!!` report six bytes rather than a decoder error.
+fn ed25519_secret_key(key: &[u8]) -> std::result::Result<Vec<u8>, String> {
+    let secret = lenient_base64(key);
+    if secret.len() != ED25519_SECRET_LEN {
+        return Err(format!(
+            "Invalid ed25519 secret key: Ill-formed input: expected {ED25519_SECRET_LEN} bytes, \
+             got {} bytes",
+            secret.len()
+        ));
+    }
+    Ok(secret)
+}
+
+/// Decode base64 text the way the tool's decoder does.
+///
+/// Every byte outside the alphabet is skipped, so whitespace and prose
+/// characters contribute nothing. A padding character carries the value zero and
+/// counts toward its group. Three bytes come out of every complete
+/// four-character group, and each of that group's last two characters that is a
+/// padding character removes one of them again. A trailing group short of four
+/// characters contributes nothing at all.
+///
+/// Padding therefore acts per group and per position. `AAAA=` decodes to three
+/// bytes, since the padding character opens an incomplete group; `AA=A` decodes
+/// to two, since the padding character sits third in a complete group; and
+/// `AA==AA==` decodes to two, one byte from each of its two groups. A
+/// three-character argument decodes to zero bytes and a nine-character one to
+/// six.
+fn lenient_base64(text: &[u8]) -> Vec<u8> {
+    let value = |c: u8| -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0),
+            _ => None,
+        }
+    };
+    let mut out = Vec::new();
+    let mut group: u32 = 0;
+    let mut held = 0usize;
+    let mut dropped = 0usize;
+    for &byte in text {
+        let Some(six) = value(byte) else { continue };
+        if held >= 2 && byte == b'=' {
+            dropped += 1;
+        }
+        group = (group << 6) | u32::from(six);
+        held += 1;
+        if held == 4 {
+            out.push((group >> 16) as u8);
+            out.push((group >> 8) as u8);
+            out.push(group as u8);
+            out.truncate(out.len() - dropped);
+            group = 0;
+            held = 0;
+            dropped = 0;
+        }
+    }
+    out
+}
+
+/// Read the key one `--sign-from-file` occurrence names: the first line of the
+/// file alone, with the rest of the file ignored.
+///
+/// The line is read as bytes and carries no encoding requirement, so a file
+/// holding a byte sequence that is not UTF-8 reaches the engine and its own
+/// length check states the outcome. A NUL byte ends the line ahead of the
+/// newline, so `AAAA\0BBBB` is the key `AAAA`.
+///
+/// A path that does not open is reported naming the path as the command line
+/// spelled it, where the tool names the absolute path
+/// (`docs/conformance/cli-surface.md`, "P2"). An empty path carries its own
+/// refusal. A file whose first line is empty, and an empty file, both yield an
+/// empty key, which the engine's own length check refuses; the tool dies on a
+/// signal for each of the two (`docs/conformance/cli-surface.md`, "P2"). A
+/// first line longer than [`SIGN_KEY_FILE_LIMIT`] is refused rather than cut,
+/// so the length the engine reports is always the length the file holds; the
+/// tool reads a line of any length (`docs/conformance/cli-surface.md`, "P2").
+fn read_sign_key_file(path: &Path) -> std::result::Result<Vec<u8>, String> {
+    if path.as_os_str().is_empty() {
+        return Err("Operation not supported".to_owned());
+    }
+    let fail =
+        |err: &std::io::Error| format!("Error opening file {}: {}", path.display(), io_reason(err));
+    let file = std::fs::File::open(path).map_err(|err| fail(&err))?;
+    // One byte over the cap distinguishes a line that fills it from one that
+    // exceeds it.
+    let mut reader = std::io::BufReader::new(std::io::Read::take(file, SIGN_KEY_FILE_LIMIT + 1));
+    let mut line = Vec::new();
+    std::io::BufRead::read_until(&mut reader, b'\n', &mut line).map_err(|err| fail(&err))?;
+    let end = line
+        .iter()
+        .position(|&byte| byte == 0 || byte == b'\n')
+        .unwrap_or(line.len());
+    line.truncate(end);
+    if line.len() as u64 > SIGN_KEY_FILE_LIMIT {
+        return Err(format!(
+            "Error reading file {}: the first line is longer than {SIGN_KEY_FILE_LIMIT} bytes",
+            path.display()
+        ));
+    }
+    Ok(line)
+}
+
+/// Print the `--table-output` block for a `--skip-if-unchanged` run that wrote
+/// nothing: the parent's checksum, and zero for each of the six counters.
+///
+/// The tool prints uninitialized counter values here, which differ between two
+/// identical runs, so the port states the counts of the work it did rather than
+/// reproducing them (`docs/conformance/cli-surface.md`, "P2").
+fn print_skipped_commit_table(parent: &Checksum) {
+    print_commit_table(parent, &TransactionStats::default());
+}
+
+/// Print the `--table-output` block: seven `KEY: VALUE` lines in a fixed order,
+/// one space after each colon and no padding
+/// (`docs/format-reference.md`, "CLI output formats").
+///
+/// `Content Bytes Written` reports `content_bytes_unpacked`, the content byte
+/// count of the regular files written, which is the number the tool prints.
+/// `TransactionStats::content_bytes_written` in the same struct holds the size
+/// the objects take in the repository, which for an `archive` repository is the
+/// compressed size and is what `PullStats` reports; the two differ for every
+/// compressed object.
+fn print_commit_table(checksum: &Checksum, stats: &TransactionStats) {
+    println!("Commit: {}", checksum.to_hex());
+    println!("Metadata Total: {}", stats.metadata_total);
+    println!("Metadata Written: {}", stats.metadata_written);
+    println!("Content Total: {}", stats.content_total);
+    println!("Content Written: {}", stats.content_written);
+    println!("Content Cache Hits: {}", stats.devino_cache_hits);
+    println!("Content Bytes Written: {}", stats.content_bytes_unpacked);
+}
+
+/// Read a `--fsync=POLICY` value into the policy it names, refusing anything
+/// else in the tool's own words and at the tool's own step: while the options
+/// are read, ahead of the repository and ahead of every check the subcommand
+/// makes (`docs/format-reference.md`, "CLI output formats").
+fn fsync_policy(value: Option<&str>) -> Option<bool> {
+    let text = value?;
+    match text.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" => Some(true),
+        "false" | "no" | "0" => Some(false),
+        _ => exit_error(&format!("Invalid boolean argument '{text}'")),
+    }
 }
 
 /// The ownership a `commit` invocation declares, read from `--owner-uid` and
@@ -1681,10 +2431,632 @@ fn parse_c_int(text: &str) -> std::result::Result<i32, IntError> {
     i32::try_from(value).map_err(|_| IntError::Range)
 }
 
+/// The file-type mask of an `st_mode`, and the regular-file value in it.
+const S_IFMT: u32 = 0o170000;
+/// The regular-file type value of an `st_mode`.
+const S_IFREG: u32 = 0o100000;
+/// The directory type value of an `st_mode`.
+const S_IFDIR: u32 = 0o040000;
+/// The three execute bits, which `--mode-ro-executables` tests.
+const EXEC_BITS: u32 = 0o111;
+/// The three write bits, which `--mode-ro-executables` clears.
+const WRITE_BITS: u32 = 0o222;
+
+/// One `--statoverride` entry.
+#[derive(Debug, Clone)]
+struct StatOverride {
+    /// Whether the value replaces the entry's permission bits (an `=` prefix)
+    /// rather than being ORed into its mode.
+    assign: bool,
+    /// The mode value, read in base 10.
+    value: u32,
+    /// The text after the first space, which is the in-tree path the entry
+    /// matches and the text an unmatched report names.
+    path: String,
+}
+
+/// The `commit` options that reach the filesystem walk, read from the two
+/// control files before anything else the subcommand does.
+///
+/// Each control file holds at most one entry per path, and the statoverride
+/// file at most one per path per form: a path named more than once by one form
+/// takes the value of the last line naming it, at the position the file first
+/// names it.
+#[derive(Debug, Default)]
+struct WalkOptions {
+    /// The OR-form `--statoverride` entries, one per path.
+    statoverride_or: Vec<(String, u32)>,
+    /// The `=`-form `--statoverride` entries, one per path.
+    statoverride_assign: Vec<(String, u32)>,
+    /// The `--skip-list` paths, one per path.
+    skip_list: Vec<String>,
+    /// Whether the skip list names the walk root, which prunes everything.
+    root_pruned: bool,
+    /// Which OR-form `--statoverride` path the walk reached, one flag per path.
+    /// A path the skip list prunes is reached, the walk having offered the
+    /// entry before the prune; a path below a pruned directory is not.
+    statoverride_matched: Arc<Mutex<Vec<bool>>>,
+    /// Which `--skip-list` path the walk reached, one flag per path.
+    skip_list_matched: Arc<Mutex<Vec<bool>>>,
+    /// Which OR-form `--statoverride` entry a source has already taken the
+    /// value of, one flag per path. An entry reaches one entry of the tree per
+    /// run, so the mode callback reads this and not
+    /// [`statoverride_matched`](WalkOptions::statoverride_matched): a path the
+    /// skip list prunes counts as reached without any source taking the value.
+    statoverride_spent: Arc<Mutex<Vec<bool>>>,
+    /// Whether the source being overlaid is an archive. One modifier is shared
+    /// by every source of a run, and an OR-form `--statoverride` entry over a
+    /// directory below the walk root reaches an archive's member where it
+    /// leaves a filesystem walk and a `ref` source alone, so the caller states
+    /// the source kind here before each source is read.
+    source_is_tar: Arc<AtomicBool>,
+}
+
+/// The in-tree path of the walk root, which both control files spell `/`.
+const WALK_ROOT: &str = "/";
+
+impl WalkOptions {
+    /// Read both control files, in the order the tool reads them.
+    fn read(args: &CommitArgs) -> std::result::Result<WalkOptions, String> {
+        let statoverride = match args.statoverride.as_deref() {
+            Some(path) => read_statoverride(path)?,
+            None => Vec::new(),
+        };
+        let skip_list = match args.skip_list.as_deref() {
+            Some(path) => fold_paths(read_skip_list(path)?),
+            None => Vec::new(),
+        };
+        // The walk root is never offered to the filter, so a skip list naming
+        // it is answered here: the whole tree is pruned, every other entry of
+        // either file goes unmatched, and the commit has nothing to write.
+        let root_pruned = skip_list.iter().any(|path| path == WALK_ROOT);
+        // One flag per path, with a root entry marked here since the filter
+        // never sees it.
+        let skip_seen: Vec<bool> = skip_list.iter().map(|path| path == WALK_ROOT).collect();
+        let statoverride_or = fold_overrides(&statoverride, false);
+        // The walk root counts as reached whether or not the skip list prunes
+        // it, so an OR entry naming it is marked here too: with the root pruned
+        // the walk runs over nothing and the mode callback never sees it.
+        let override_seen: Vec<bool> = statoverride_or
+            .iter()
+            .map(|(path, _)| root_pruned && path == WALK_ROOT)
+            .collect();
+        let spent = vec![false; statoverride_or.len()];
+        Ok(WalkOptions {
+            statoverride_matched: Arc::new(Mutex::new(override_seen)),
+            skip_list_matched: Arc::new(Mutex::new(skip_seen)),
+            statoverride_spent: Arc::new(Mutex::new(spent)),
+            statoverride_assign: fold_overrides(&statoverride, true),
+            statoverride_or,
+            skip_list,
+            root_pruned,
+            source_is_tar: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Whether any option here shapes a mode.
+    fn shapes_modes(&self) -> bool {
+        !self.statoverride_or.is_empty() || !self.statoverride_assign.is_empty()
+    }
+
+    /// The `--statoverride` paths the walk never reached, one entry per path.
+    /// An `=` entry is not checked, so one matching nothing is ignored, and a
+    /// path both forms name is checked once, through its OR-form entry. A path
+    /// the skip list prunes is reached; a path below a pruned directory is not.
+    fn unmatched_statoverride(&self) -> Vec<String> {
+        let matched = self.statoverride_matched.lock().unwrap();
+        self.statoverride_or
+            .iter()
+            .zip(matched.iter())
+            .filter(|(_, hit)| !**hit)
+            .map(|((path, _), _)| path.clone())
+            .collect()
+    }
+
+    /// The `--skip-list` paths the walk never reached, one entry per path.
+    /// Every path is checked.
+    fn unmatched_skip_list(&self) -> Vec<String> {
+        let matched = self.skip_list_matched.lock().unwrap();
+        self.skip_list
+            .iter()
+            .zip(matched.iter())
+            .filter(|(_, hit)| !**hit)
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+}
+
+/// Print one `Unmatched <kind> path:` line per path of one control file the
+/// walk never reached. The error is the summary line that follows them, which
+/// the caller reports and exits 1 on; an empty list is `Ok`.
+fn report_unmatched(kind: &str, unmatched: &[String]) -> std::result::Result<(), String> {
+    if unmatched.is_empty() {
+        return Ok(());
+    }
+    for path in unmatched {
+        eprintln!("Unmatched {kind} path: {path}");
+    }
+    Err(format!("Unmatched {kind} paths"))
+}
+
+/// The largest control file `--statoverride` and `--skip-list` read, matching
+/// the cap `-F/--body-file` takes (`CLAUDE.md`, "Working conventions", which
+/// bars an unbounded read).
+const CONTROL_FILE_LIMIT: u64 = 128 * 1024 * 1024;
+
+/// Read a control file as text. A path that does not open is reported the way
+/// the tool reports it, naming the path as the command line spelled it; a
+/// directory is reported without one.
+///
+/// The bytes must be UTF-8 whole, and a NUL byte counts as invalid. A single
+/// invalid byte anywhere in the file refuses the command with `Invalid UTF-8`,
+/// which is what the tool does. An accepted file therefore holds text alone,
+/// and the walk compares each entry's own bytes against the walk path's bytes,
+/// so a spelled replacement character names that character and nothing else.
+/// The read stops at [`CONTROL_FILE_LIMIT`].
+fn read_control_file(path: &Path) -> std::result::Result<String, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|err| format!("openat({}): {}", path.display(), io_reason(&err)))?;
+    let mut bytes = Vec::new();
+    let mut bounded = std::io::Read::take(file, CONTROL_FILE_LIMIT + 1);
+    std::io::Read::read_to_end(&mut bounded, &mut bytes).map_err(|err| match err.kind() {
+        std::io::ErrorKind::IsADirectory => "Is a directory".to_owned(),
+        _ => io_reason(&err),
+    })?;
+    if bytes.len() as u64 > CONTROL_FILE_LIMIT {
+        return Err(format!(
+            "Control file larger than {CONTROL_FILE_LIMIT} bytes"
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err("Invalid UTF-8".to_owned());
+    }
+    String::from_utf8(bytes).map_err(|_| "Invalid UTF-8".to_owned())
+}
+
+/// Read a `--statoverride` file: one `[=]<decimal mode> <path>` per line, with
+/// blank lines ignored and everything after the first space taken as the path.
+fn read_statoverride(path: &Path) -> std::result::Result<Vec<StatOverride>, String> {
+    let text = read_control_file(path)?;
+    let mut entries = Vec::new();
+    for line in text.split('\n').filter(|line| !line.is_empty()) {
+        let Some((mode, rest)) = line.split_once(' ') else {
+            return Err("Malformed statoverride file (no space found)".to_owned());
+        };
+        let (assign, digits) = match mode.strip_prefix('=') {
+            Some(digits) => (true, digits),
+            None => (false, mode),
+        };
+        entries.push(StatOverride {
+            assign,
+            value: leading_u32(digits),
+            path: rest.to_owned(),
+        });
+    }
+    Ok(entries)
+}
+
+/// Read a `--skip-list` file: one path per line, blank lines ignored.
+fn read_skip_list(path: &Path) -> std::result::Result<Vec<String>, String> {
+    Ok(read_control_file(path)?
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Reduce the `--statoverride` entries of one form to one entry per path: the
+/// value of the last line naming a path, at the position the file first names
+/// it. The two forms are folded apart, so a path named by both keeps a value
+/// under each.
+fn fold_overrides(entries: &[StatOverride], assign: bool) -> Vec<(String, u32)> {
+    let mut at: HashMap<&str, usize> = HashMap::new();
+    let mut folded: Vec<(String, u32)> = Vec::new();
+    for entry in entries.iter().filter(|entry| entry.assign == assign) {
+        match at.get(entry.path.as_str()) {
+            Some(&index) => folded[index].1 = entry.value,
+            None => {
+                at.insert(entry.path.as_str(), folded.len());
+                folded.push((entry.path.clone(), entry.value));
+            }
+        }
+    }
+    folded
+}
+
+/// Reduce the `--skip-list` paths to one entry per path, at the position the
+/// file first names it.
+fn fold_paths(paths: Vec<String>) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.clone()))
+        .collect()
+}
+
+/// Read the leading decimal run of a `--statoverride` mode field: an optional
+/// sign, then digits, with the value truncated to 32 bits. Text holding no
+/// digit is the value zero, so an entry with an unreadable mode changes nothing
+/// under the OR form.
+///
+/// The tool reads the field as a C `double` and converts it, so it also takes a
+/// hexadecimal literal, a decimal point, and an exponent, and turns a value
+/// past the 32-bit range into `0x80000000`. Those forms are outside the
+/// documented format, which is a mode in decimal, and their out-of-range
+/// conversion is platform-defined; the port reads decimal alone and the
+/// difference is recorded in `docs/conformance/cli-surface.md`, "P2".
+fn leading_u32(text: &str) -> u32 {
+    let (negative, body) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let digits: String = body.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return 0;
+    }
+    let value: u64 = digits.parse().unwrap_or(u64::MAX);
+    (if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }) as u32
+}
+
+/// One tree source a `commit` invocation names.
+enum TreeSpec {
+    /// `--tree=dir=PATH`, and the positional `PATH`. The path is kept as it was
+    /// spelled, which is what `--consume` reads.
+    Dir(PathBuf),
+    /// `--tree=tar=PATH`. The tool spells standard input `-`, and reaches it
+    /// through `/dev/stdin` as well.
+    Tar(PathBuf),
+    /// `--tree=ref=REV`.
+    Ref(String),
+    /// The port's own default source: a tar stream on standard input, where
+    /// the tool walks the current working directory
+    /// (`docs/conformance/cli-surface.md`, "P2").
+    Stdin,
+}
+
+/// One tree source, opened or resolved.
+enum OpenSource {
+    /// A directory, and the path it was named by.
+    Dir(std::fs::File, PathBuf),
+    /// A tar stream.
+    Tar(ostrya_rt::File),
+    /// A committed tree, by its root dirtree and dirmeta checksums.
+    Ref(Checksum, Checksum),
+}
+
+/// The `ENOTDIR` a source that is not a directory is refused with. The port
+/// reads the source's metadata no-follow and refuses what that read does not
+/// state a directory, so a symlink naming a directory is refused too, as the
+/// tool's own `opendir` refuses it.
+const ENOTDIR: i32 = 20;
+
+/// The source list a `commit` invocation states, in the order the sources are
+/// overlaid. `--tree` values come in command-line order; with none, the
+/// positional `PATH` is the one source, and with neither the port reads a tar
+/// stream from standard input. A positional `PATH` beside any `--tree` is
+/// ignored, at exit 0 and unread.
+fn tree_specs(args: &CommitArgs) -> std::result::Result<Vec<TreeSpec>, String> {
+    if args.tree.is_empty() {
+        return Ok(vec![match args.path.first() {
+            Some(path) => TreeSpec::Dir(path.clone()),
+            None => TreeSpec::Stdin,
+        }]);
+    }
+    args.tree
+        .iter()
+        .map(|value| match value.split_once('=') {
+            Some(("dir", path)) => Ok(TreeSpec::Dir(PathBuf::from(path))),
+            Some(("tar", path)) => Ok(TreeSpec::Tar(PathBuf::from(path))),
+            Some(("ref", rev)) => Ok(TreeSpec::Ref(rev.to_owned())),
+            Some((kind, _)) => Err(format!("Invalid tree type specification '{kind}'")),
+            None => Err(format!("Missing type in tree specification '{value}'")),
+        })
+        .collect()
+}
+
+/// Open or resolve one source. The caller opens and overlays the sources one
+/// at a time and in order, so a source that does not open is reported once
+/// every earlier source is read and `--consume` has removed what those sources
+/// named. The timestamp is read once the last source is overlaid, so a source
+/// that does not open is reported ahead of a timestamp the reader refuses.
+///
+/// A `dir=` or a `tar=` source that does not open comes back as the message
+/// rather than as an exit, because the caller holds an open transaction whose
+/// staging directory has to be reaped first.
+///
+/// A `dir=` source is stated a directory by a no-follow metadata read and is
+/// opened after that read, so the path can change between the two calls. The
+/// walk reopens the descriptor with `OFlags::DIRECTORY | OFlags::NOFOLLOW`
+/// (`ostrya::ingest::open_walk_root`), so a raced replacement that is not a
+/// directory is refused there.
+async fn open_tree_source(
+    repo: &Repo,
+    spec: TreeSpec,
+) -> Result<std::result::Result<OpenSource, String>> {
+    Ok(Ok(match spec {
+        TreeSpec::Dir(path) => {
+            let opened = std::fs::symlink_metadata(&path).and_then(|meta| {
+                if meta.is_dir() {
+                    std::fs::File::open(&path)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(ENOTDIR))
+                }
+            });
+            match opened {
+                Ok(dfd) => OpenSource::Dir(dfd, path),
+                Err(err) => {
+                    return Ok(Err(format!(
+                        "opendir({}): {}",
+                        path.display(),
+                        io_reason(&err)
+                    )));
+                }
+            }
+        }
+        TreeSpec::Stdin => OpenSource::Tar(stdin_file()?),
+        TreeSpec::Tar(path) if path == Path::new("-") || path == Path::new("/dev/stdin") => {
+            OpenSource::Tar(stdin_file()?)
+        }
+        TreeSpec::Tar(path) => {
+            let Ok(file) = std::fs::File::open(&path) else {
+                return Ok(Err(format!(
+                    "archive_read_open_filename: Failed to open '{}'",
+                    path.display()
+                )));
+            };
+            OpenSource::Tar(ostrya_rt::File::from(std::os::fd::OwnedFd::from(file)))
+        }
+        TreeSpec::Ref(rev) => {
+            let checksum = match repo.resolve_rev(&rev, false).await {
+                Ok(Some(checksum)) => checksum,
+                Ok(None) => return Err(report_resolution_failure(Error::RefNotFound(rev))),
+                Err(err) => return Err(report_resolution_failure(err)),
+            };
+            let (commit, _) = repo.load_commit(&checksum).await?;
+            OpenSource::Ref(commit.root_dirtree, commit.root_dirmeta)
+        }
+    }))
+}
+
+/// Overlay one source onto `mtree`. A later source's directory metadata
+/// replaces what an earlier one recorded, its files replace files of the same
+/// name, and a name that is a directory on one side and a file on the other is
+/// refused (`docs/format-reference.md`, "CLI output formats", `commit`).
+///
+/// A refusal comes back as the message rather than as an exit, because the
+/// caller holds an open transaction whose staging directory has to be reaped
+/// first.
+async fn overlay_source(
+    repo: &Repo,
+    txn: &Transaction,
+    args: &CommitArgs,
+    source: OpenSource,
+    mtree: &mut MutableTree,
+    modifier: Option<&mut CommitModifier>,
+) -> Result<std::result::Result<(), String>> {
+    match source {
+        OpenSource::Dir(dfd, path) => {
+            txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), mtree, modifier)
+                .await?;
+            // `--consume` removes the source directory itself once its contents
+            // are ingested, unless the path is spelled `.`. The test is on the
+            // text, so an absolute path naming the working directory is removed
+            // and `./` is not spared. A removal that fails aborts the commit and
+            // names the path, which is what the tool does.
+            // The test is on the text the value carries, which `Path` equality
+            // would normalize away: `./` and `.` name one directory and only
+            // the second is spared.
+            if args.consume
+                && path.as_os_str() != "."
+                && let Err(err) = std::fs::remove_dir(&path)
+            {
+                return Ok(Err(format!(
+                    "unlinkat({}): {}",
+                    path.display(),
+                    io_reason(&err)
+                )));
+            }
+            Ok(Ok(()))
+        }
+        OpenSource::Ref(dirtree, dirmeta) => {
+            txn.overlay_tree_to_mtree(&dirtree, &dirmeta, mtree, modifier)
+                .await?;
+            Ok(Ok(()))
+        }
+        OpenSource::Tar(input) => {
+            let opts = match tar_import_options(args) {
+                Ok(opts) => opts,
+                Err(message) => return Ok(Err(message)),
+            };
+            repo.import_tar_into(txn, opts, input, mtree, modifier)
+                .await?;
+            Ok(Ok(()))
+        }
+    }
+}
+
+/// The tar import options a `commit` invocation states. The pathname filter is
+/// read here, as a tar source is loaded, so a value the reader refuses is
+/// reported only where an archive is read: a command line naming no tar source
+/// carries a malformed filter at exit 0, which is what the tool does.
+fn tar_import_options(args: &CommitArgs) -> std::result::Result<TarImportOptions, String> {
+    let mut opts = TarImportOptions::new();
+    opts.skip_xattrs = args.no_xattrs;
+    opts.autocreate_parents = args.tar_autocreate_parents;
+
+    let Some(value) = args.tar_pathname_filter.as_deref() else {
+        return Ok(opts);
+    };
+    let Some((pattern, replacement)) = value.split_once(',') else {
+        return Err("Missing ',' in --tar-pathname-filter".to_owned());
+    };
+    let regex = Regex::new(pattern).map_err(|err| {
+        format!(
+            "--tar-pathname-filter: Error while compiling regular expression \
+             \u{2018}{pattern}\u{2019}: {err}"
+        )
+    })?;
+    let replacement = parse_replacement(replacement).map_err(|reason| {
+        format!(
+            "--tar-pathname-filter: Error while reading the replacement \
+             \u{2018}{replacement}\u{2019}: {reason}"
+        )
+    })?;
+    // A member the filter empties names the tree root, which is what the tool
+    // makes of it: a directory member mapped onto the empty string supplies the
+    // root's metadata, so `^dir1/(.*)$,\1` strips a prefix. A file member mapped
+    // onto the empty string names the root as a file, which the tar importer
+    // refuses (`docs/conformance/cli-surface.md`, "P2").
+    opts.rename = Some(Box::new(move |name: &str| {
+        Ok(regex
+            .replace_all(name, |caps: &Captures| {
+                expand_replacement(&replacement, caps)
+            })
+            .into_owned())
+    }));
+    Ok(opts)
+}
+
+/// One piece of a parsed replacement template.
+enum ReplacementPiece {
+    /// Literal text.
+    Text(String),
+    /// The text a group matched, by number.
+    Index(usize),
+    /// The text a group matched, by name.
+    Name(String),
+}
+
+/// Read the replacement half of `--tar-pathname-filter`.
+///
+/// The syntax is the one `g_regex_replace` states, which the port keeps because
+/// it is the syntax an operator writes: `\0` to `\9` and `\g<name>` or
+/// `\g<number>` name a group, `\\` is a backslash, `\n`, `\t`, `\r`, `\a`,
+/// `\b`, `\f`, and `\v` are the control characters, any other escape is
+/// refused, and `$` carries no meaning. A group that is unset, or that the
+/// expression does not declare, contributes nothing.
+fn parse_replacement(replacement: &str) -> std::result::Result<Vec<ReplacementPiece>, String> {
+    let text: Vec<char> = replacement.chars().collect();
+    let mut pieces = Vec::new();
+    let mut literal = String::new();
+    let mut at = 0;
+    while at < text.len() {
+        if text[at] != '\\' {
+            literal.push(text[at]);
+            at += 1;
+            continue;
+        }
+        at += 1;
+        let Some(c) = text.get(at).copied() else {
+            return Err("trailing backslash".to_owned());
+        };
+        at += 1;
+        let piece = match c {
+            '0'..='9' => ReplacementPiece::Index(c as usize - '0' as usize),
+            'g' => {
+                if text.get(at) != Some(&'<') {
+                    return Err("expected < after \\g".to_owned());
+                }
+                at += 1;
+                let mut name = String::new();
+                loop {
+                    match text.get(at) {
+                        Some('>') => {
+                            at += 1;
+                            break;
+                        }
+                        Some(c) => {
+                            name.push(*c);
+                            at += 1;
+                        }
+                        None => return Err("unterminated \\g<...>".to_owned()),
+                    }
+                }
+                match name.parse::<usize>() {
+                    Ok(index) => ReplacementPiece::Index(index),
+                    Err(_) => ReplacementPiece::Name(name),
+                }
+            }
+            '\\' => {
+                literal.push('\\');
+                continue;
+            }
+            'n' => {
+                literal.push('\n');
+                continue;
+            }
+            't' => {
+                literal.push('\t');
+                continue;
+            }
+            'r' => {
+                literal.push('\r');
+                continue;
+            }
+            'a' => {
+                literal.push('\u{7}');
+                continue;
+            }
+            'b' => {
+                literal.push('\u{8}');
+                continue;
+            }
+            'f' => {
+                literal.push('\u{c}');
+                continue;
+            }
+            'v' => {
+                literal.push('\u{b}');
+                continue;
+            }
+            other => return Err(format!("unknown replacement escape \\{other}")),
+        };
+        if !literal.is_empty() {
+            pieces.push(ReplacementPiece::Text(std::mem::take(&mut literal)));
+        }
+        pieces.push(piece);
+    }
+    if !literal.is_empty() {
+        pieces.push(ReplacementPiece::Text(literal));
+    }
+    Ok(pieces)
+}
+
+/// Build one match's replacement text.
+fn expand_replacement(pieces: &[ReplacementPiece], caps: &Captures) -> String {
+    let mut out = String::new();
+    for piece in pieces {
+        match piece {
+            ReplacementPiece::Text(text) => out.push_str(text),
+            ReplacementPiece::Index(index) => {
+                if let Some(m) = caps.get(*index) {
+                    out.push_str(m.as_str());
+                }
+            }
+            ReplacementPiece::Name(name) => {
+                if let Some(m) = caps.name(name) {
+                    out.push_str(m.as_str());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The commit modifier the tree-shaping options ask for, or `None` where they
 /// ask for nothing. `--canonical-permissions` implies the xattr skip, since
 /// canonical ingest records no extended attributes.
-fn commit_modifier(args: &CommitArgs, owner: Owner) -> Option<CommitModifier> {
+fn commit_modifier(
+    args: &CommitArgs,
+    owner: Owner,
+    walk: &WalkOptions,
+    devino: Option<DevInoCache>,
+) -> Option<CommitModifier> {
     let mut flags = CommitModifierFlags::empty();
     if args.canonical_permissions {
         flags |= CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS;
@@ -1692,12 +3064,107 @@ fn commit_modifier(args: &CommitArgs, owner: Owner) -> Option<CommitModifier> {
     if args.no_xattrs {
         flags |= CommitModifierFlags::SKIP_XATTRS;
     }
-    if flags == CommitModifierFlags::empty() && owner == Owner::default() {
+    if args.devino_canonical {
+        flags |= CommitModifierFlags::DEVINO_CANONICAL;
+    }
+    // `--consume` empties each filesystem source as it is walked. The flag is
+    // read by that walk alone, so a `tar` or a `ref` source ignores it.
+    if args.consume {
+        flags |= CommitModifierFlags::CONSUME;
+    }
+    let shapes_modes = args.mode_ro_executables || walk.shapes_modes();
+    // A cache that came back empty resolves nothing, so it asks for no modifier
+    // of its own. An `archive` repository stores every content object
+    // compressed and contributes no entry, and a modifier attached over that
+    // empty cache costs a `ref` source the checksum-copy overlay path for no
+    // result (`docs/format-reference.md`, "Commit modifier: canonical
+    // permissions, consume, and devino").
+    if flags == CommitModifierFlags::empty()
+        && owner == Owner::default()
+        && !shapes_modes
+        && walk.skip_list.is_empty()
+        && devino.as_ref().is_none_or(DevInoCache::is_empty)
+    {
         return None;
     }
     let mut modifier = CommitModifier::new(flags);
     modifier.owner_uid = owner.uid;
     modifier.owner_gid = owner.gid;
+    modifier.devino_cache = devino;
+
+    if !walk.skip_list.is_empty() {
+        let entries = walk.skip_list.clone();
+        let matched = walk.skip_list_matched.clone();
+        // A pruned entry never reaches the mode callback, so the OR-form
+        // `--statoverride` entry naming the same path is marked here: the walk
+        // reached the path and pruned it there, which counts as reached. A path
+        // below a pruned directory is never offered and stays unmatched.
+        let or_entries: Vec<String> = walk
+            .statoverride_or
+            .iter()
+            .map(|(entry, _)| entry.clone())
+            .collect();
+        let or_matched = walk.statoverride_matched.clone();
+        modifier.filter = Some(Box::new(move |path, _meta| {
+            let name = path.as_os_str().as_bytes();
+            match entries.iter().position(|entry| entry.as_bytes() == name) {
+                Some(index) => {
+                    matched.lock().unwrap()[index] = true;
+                    if let Some(index) = or_entries.iter().position(|e| e.as_bytes() == name) {
+                        or_matched.lock().unwrap()[index] = true;
+                    }
+                    FilterResult::Skip
+                }
+                None => FilterResult::Allow,
+            }
+        }));
+    }
+
+    if shapes_modes {
+        let or_entries = walk.statoverride_or.clone();
+        let assign_entries = walk.statoverride_assign.clone();
+        let matched = walk.statoverride_matched.clone();
+        let spent_entries = walk.statoverride_spent.clone();
+        let source_is_tar = walk.source_is_tar.clone();
+        let ro_executables = args.mode_ro_executables;
+        modifier.mode_callback = Some(Box::new(move |path, meta| {
+            let mut mode = meta.mode;
+            // `--mode-ro-executables` runs first, so a `--statoverride` entry
+            // over the same path states the mode the entry ends with.
+            if ro_executables && mode & S_IFMT == S_IFREG && mode & EXEC_BITS != 0 {
+                mode &= !WRITE_BITS;
+            }
+            let name = path.as_os_str().as_bytes();
+            // The OR form stands ahead of the `=` form: where a path carries an
+            // entry of each, the OR value alone reaches the mode, whichever
+            // order the file states the two lines in.
+            if let Some(index) = or_entries.iter().position(|(e, _)| e.as_bytes() == name) {
+                matched.lock().unwrap()[index] = true;
+                // An OR entry reaches one tree entry per run: the first any
+                // source offers under its path spends it, and a later source
+                // under that path keeps the mode it brought.
+                let spent = std::mem::replace(&mut spent_entries.lock().unwrap()[index], true);
+                // A directory below the walk root spends the entry and takes no
+                // value from it, leaving the mode to the `=` form or to the walk
+                // where there is none. An archive's member is the exception: the
+                // OR value reaches a directory there.
+                if !spent
+                    && (name == WALK_ROOT.as_bytes()
+                        || mode & S_IFMT != S_IFDIR
+                        || source_is_tar.load(Ordering::Relaxed))
+                {
+                    return mode | or_entries[index].1;
+                }
+            }
+            // An `=` entry states the permission bits alone; the entry's own
+            // file-type bits stay, so a value carrying type bits of its own
+            // renames the type the mode holds.
+            match assign_entries.iter().find(|(e, _)| e.as_bytes() == name) {
+                Some((_, value)) => (mode & S_IFMT) | value,
+                None => mode,
+            }
+        }));
+    }
     Some(modifier)
 }
 
@@ -4160,7 +5627,7 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     // Match the tool's convention: a repository with faults exits nonzero.
     std::io::stdout().flush().ok();
     if !report.is_ok() {
-        std::process::exit(1);
+        exit_process(1);
     }
     Ok(())
 }
@@ -4230,7 +5697,7 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
         let outcome = repo.verify_summary(&[verifier.as_ref()]).await?;
         report_verify(&outcome);
         if !outcome.valid {
-            std::process::exit(1);
+            exit_process(1);
         }
         return Ok(());
     }
@@ -4448,7 +5915,7 @@ async fn verify_signatures(
     let outcome = repo.verify_commit(commit, &[verifier.as_ref()]).await?;
     report_verify(&outcome);
     if !outcome.valid {
-        std::process::exit(1);
+        exit_process(1);
     }
     Ok(())
 }
@@ -4485,7 +5952,7 @@ async fn delete_signatures(
                     doomed.push(blob);
                 }
             }
-            repo.delete_signatures(commit, key, |_, blob| doomed.iter().any(|d| d == blob))
+            repo.delete_signatures(commit, key, move |_, blob| doomed.iter().any(|d| d == blob))
                 .await?
         }
     };
@@ -4550,7 +6017,7 @@ async fn gpg_delete(
             doomed.push(blob);
         }
     }
-    repo.delete_signatures(commit, "ostree.gpgsigs", |_, blob| {
+    repo.delete_signatures(commit, "ostree.gpgsigs", move |_, blob| {
         doomed.iter().any(|d| d == blob)
     })
     .await
@@ -4787,22 +6254,535 @@ fn report_resolution_failure(err: Error) -> Error {
     }
 }
 
-/// The `ostree.ref-binding` metadata dict a commit carries: the branch `-b`
-/// named, or an empty `as` array where the commit names none, which is the value
-/// the tool writes under `--orphan` alone
+/// The metadata key holding the ref names a commit is bound to.
+const REF_BINDING_KEY: &str = "ostree.ref-binding";
+/// The metadata key holding the collection id a commit is bound to.
+const COLLECTION_BINDING_KEY: &str = "ostree.collection-binding";
+/// The metadata key `--bootable` fills with the kernel directory's name.
+const LINUX_KEY: &str = "ostree.linux";
+/// The metadata key `--bootable` sets to true.
+const BOOTABLE_KEY: &str = "ostree.bootable";
+/// The metadata key `--generate-composefs-metadata` fills with the tree's
+/// composefs image digest.
+const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
+/// The directory `--bootable` searches, one level deep, for the kernel.
+const MODULES_DIR: &str = "/usr/lib/modules";
+/// The entry name a kernel directory must hold. Its type is not read: a
+/// regular file, a symlink, and a directory of that name all count.
+const KERNEL_ENTRY: &str = "vmlinuz";
+
+/// The kernel version `--bootable` stores in `ostree.linux`: the name of the
+/// single directory under `/usr/lib/modules` in the committed tree that holds an
+/// entry named `vmlinuz`. The search is one level deep, and an entry under
+/// `/usr/lib/modules` that is not a directory takes no part
+/// (`docs/format-reference.md`, "CLI output formats", `commit`).
+///
+/// The refusals carry the tool's own wording: the first component of the path
+/// the tree does not hold, a component that is not a directory, and the two
+/// counts that are not one.
+async fn kernel_version(
+    txn: &Transaction,
+    root: &RepoTree,
+) -> Result<std::result::Result<String, String>> {
+    let mut dir = root.clone();
+    let mut walked = String::new();
+    for component in MODULES_DIR.split('/').filter(|part| !part.is_empty()) {
+        walked.push('/');
+        walked.push_str(component);
+        let entry = txn
+            .read_dir(&dir)
+            .await?
+            .into_iter()
+            .find(|entry| entry_name(entry) == component);
+        match entry {
+            None => {
+                return Ok(Err(format!("No such file or directory: {walked}")));
+            }
+            Some(TreeEntry::File { .. }) => return Ok(Err("Not a directory".to_owned())),
+            Some(TreeEntry::Dir { tree, .. }) => dir = tree,
+        }
+    }
+    let mut found = Vec::new();
+    for entry in txn.read_dir(&dir).await? {
+        if let TreeEntry::Dir { name, tree } = entry
+            && txn
+                .read_dir(&tree)
+                .await?
+                .iter()
+                .any(|entry| entry_name(entry) == KERNEL_ENTRY)
+        {
+            found.push(name);
+        }
+    }
+    match found.len() {
+        0 => Ok(Err(format!("No kernel found in {MODULES_DIR}"))),
+        1 => Ok(Ok(found.remove(0))),
+        _ => Ok(Err(format!("Multiple kernels found in {MODULES_DIR}"))),
+    }
+}
+
+/// The name of a directory entry, whichever kind it is.
+fn entry_name(entry: &TreeEntry) -> &str {
+    match entry {
+        TreeEntry::File { name, .. } | TreeEntry::Dir { name, .. } => name,
+    }
+}
+
+/// Insert entries at the head of an `a{sv}` metadata dict, the slot the keys a
+/// tree walk derives take (`docs/format-reference.md`, "CLI output formats",
+/// `commit`).
+fn prepend_metadata_entries(metadata: &mut Value, entries: Vec<Value>) -> Result<()> {
+    let Value::Array(existing) = metadata else {
+        return Err(Error::InvalidFormat(
+            "commit metadata must be an a{sv} dict".into(),
+        ));
+    };
+    existing.splice(0..0, entries);
+    Ok(())
+}
+
+/// Remove every entry of an `a{sv}` metadata dict holding one of these keys,
+/// which is what a derived key does to a value the command line supplied for the
+/// same name.
+fn drop_metadata_keys(metadata: &mut Value, keys: &[&str]) -> Result<()> {
+    let Value::Array(existing) = metadata else {
+        return Err(Error::InvalidFormat(
+            "commit metadata must be an a{sv} dict".into(),
+        ));
+    };
+    existing.retain(|entry| match entry {
+        Value::Tuple(fields) => match fields.first() {
+            Some(Value::Str(key)) => !keys.contains(&key.as_str()),
+            _ => true,
+        },
+        _ => true,
+    });
+    Ok(())
+}
+
+/// Store one entry in an `a{sv}` metadata dict under `key`. An entry the dict
+/// already holds under that name takes the new value in the slot it stands in,
+/// and every later entry under the same name is removed. A name the dict does
+/// not hold is appended.
+fn set_metadata_entry(metadata: &mut Value, key: &str, entry: Value) -> Result<()> {
+    let Value::Array(existing) = metadata else {
+        return Err(Error::InvalidFormat(
+            "commit metadata must be an a{sv} dict".into(),
+        ));
+    };
+    let holds_key = |value: &Value| match value {
+        Value::Tuple(fields) => matches!(fields.first(), Some(Value::Str(name)) if name == key),
+        _ => false,
+    };
+    let mut slot = None;
+    let mut kept = 0;
+    existing.retain(|value| {
+        if holds_key(value) {
+            if slot.is_none() {
+                slot = Some(kept);
+            }
+            return false;
+        }
+        kept += 1;
+        true
+    });
+    match slot {
+        Some(at) => existing.insert(at, entry),
+        None => existing.push(entry),
+    }
+    Ok(())
+}
+
+/// The `ostree.ref-binding` value: the branch `-b` named together with every
+/// `--bind-ref` value, sorted byte-wise ascending with duplicates kept. A commit
+/// that names neither carries the empty `as` array, which is the value the tool
+/// writes under `--orphan` alone
 /// (`docs/format-reference.md`, "CLI output formats").
-fn ref_binding(branch: Option<&str>) -> Value {
-    let names = branch
-        .map(|branch| Value::Str(branch.to_owned()))
+fn ref_binding(branch: Option<&str>, bind_refs: &[String]) -> Value {
+    let mut names: Vec<&str> = branch
         .into_iter()
+        .chain(bind_refs.iter().map(String::as_str))
         .collect();
-    Value::Array(vec![Value::Tuple(vec![
-        Value::Str("ostree.ref-binding".to_owned()),
-        Value::variant(
-            Type::parse("as").expect("\"as\" is a valid gvariant type"),
-            Value::Array(names),
+    names.sort_unstable();
+    Value::variant(
+        Type::parse("as").expect("\"as\" is a valid gvariant type"),
+        Value::Array(
+            names
+                .into_iter()
+                .map(|name| Value::Str(name.to_owned()))
+                .collect(),
         ),
-    ])])
+    )
+}
+
+/// A string-valued metadata entry, the form `--add-metadata-string` and
+/// `--add-detached-metadata-string` write.
+fn string_entry(key: &str, value: &str) -> Value {
+    Value::Tuple(vec![
+        Value::Str(key.to_owned()),
+        Value::variant(Type::Str, Value::Str(value.to_owned())),
+    ])
+}
+
+/// Split every `KEY=VALUE` metadata argument at its first `=`, so a value may
+/// hold further ones. An empty key passes here and is refused where the dict is
+/// assembled; a missing `=` is refused at once, in the tool's own words.
+fn metadata_pairs(arguments: &[String]) -> std::result::Result<Vec<(&str, &str)>, String> {
+    arguments
+        .iter()
+        .map(|argument| {
+            argument
+                .split_once('=')
+                .ok_or_else(|| format!("Missing '=' in KEY=VALUE metadata '{argument}'"))
+        })
+        .collect()
+}
+
+/// Read every `--add-metadata` argument into the key it names and the variant
+/// its value states. The value goes through the GVariant text form, and a
+/// refusal names the whole argument and the reader's own offsets.
+fn parse_added_metadata(arguments: &[String]) -> std::result::Result<Vec<(&str, Value)>, String> {
+    let mut entries = Vec::with_capacity(arguments.len());
+    for (key, text) in metadata_pairs(arguments)? {
+        let argument = format!("{key}={text}");
+        let (ty, value) =
+            ostrya::from_text(text).map_err(|error| format!("Parsing {argument}: {error}"))?;
+        entries.push((key, Value::variant(ty, value)));
+    }
+    Ok(entries)
+}
+
+/// Read every `--keep-metadata` key out of the resolved parent commit, keeping
+/// each value's bytes as they stand. A key the parent does not hold is refused
+/// naming the commit it was looked for in.
+async fn kept_metadata(
+    repo: &Repo,
+    parent: &Checksum,
+    keys: &[String],
+) -> Result<std::result::Result<Vec<(String, Value)>, String>> {
+    if keys.is_empty() {
+        return Ok(Ok(Vec::new()));
+    }
+    let commit = repo.load_variant(ObjectType::Commit, parent).await?;
+    let metadata = commit
+        .as_tuple()
+        .and_then(|members| members.first())
+        .cloned()
+        .ok_or_else(|| Error::InvalidFormat("commit object is not a tuple".into()))?;
+    let mut entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(value) = metadata.dict_get(key) else {
+            return Ok(Err(format!(
+                "Missing metadata key '{key}' from commit '{}'",
+                parent.to_hex()
+            )));
+        };
+        entries.push((key.clone(), value.clone()));
+    }
+    Ok(Ok(entries))
+}
+
+/// Assemble the commit metadata dict, whose entry order is part of the commit
+/// checksum (`docs/format-reference.md`, "CLI output formats"): every
+/// `--add-metadata-string` in command-line order, then every `--add-metadata`,
+/// then every `--keep-metadata`, then the binding keys. Duplicate keys are kept
+/// as duplicates. An empty key is refused here, after the tree and the
+/// timestamp.
+fn commit_metadata_dict(
+    repo: &Repo,
+    args: &CommitArgs,
+    added_strings: &[(&str, &str)],
+    added_variants: &[(&str, Value)],
+    kept: &[(String, Value)],
+) -> std::result::Result<Value, String> {
+    let mut entries = Vec::new();
+    for (key, value) in added_strings {
+        if key.is_empty() {
+            return Err("Empty metadata key".to_owned());
+        }
+        entries.push(string_entry(key, value));
+    }
+    for (key, value) in added_variants {
+        if key.is_empty() {
+            return Err("Empty metadata key".to_owned());
+        }
+        entries.push(Value::Tuple(vec![
+            Value::Str((*key).to_owned()),
+            value.clone(),
+        ]));
+    }
+    for (key, value) in kept {
+        entries.push(Value::Tuple(vec![Value::Str(key.clone()), value.clone()]));
+    }
+    // `--no-bindings` writes neither binding key, so the dict of a commit that
+    // adds nothing of its own comes out empty.
+    if !args.no_bindings {
+        entries.push(Value::Tuple(vec![
+            Value::Str(REF_BINDING_KEY.to_owned()),
+            ref_binding(args.branch.as_deref(), &args.bind_ref),
+        ]));
+        if let Some(collection) = repo.config().collection_id() {
+            entries.push(string_entry(COLLECTION_BINDING_KEY, collection));
+        }
+    }
+    Ok(Value::Array(entries))
+}
+
+/// The detached metadata dict `--add-detached-metadata-string` writes, or `None`
+/// where the option was not given. The entries keep command-line order, an empty
+/// key is accepted here, and duplicates are kept as duplicates.
+fn detached_metadata_dict(pairs: &[(&str, &str)]) -> Option<Value> {
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        pairs
+            .iter()
+            .map(|(key, value)| string_entry(key, value))
+            .collect(),
+    ))
+}
+
+/// The most `-F/--body-file` reads, and the most the `-e/--editor` file reads
+/// back. The body is a field of the commit object, and the port loads no
+/// metadata object above this size, so a body past it names a commit the port
+/// could never read back. The bound keeps the read off the file's own size
+/// (`CLAUDE.md`, "Working conventions").
+const MAX_BODY_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Read `-F/--body-file`: the whole file becomes the body, byte for byte.
+fn read_body_file(path: &Path) -> std::result::Result<String, String> {
+    read_message_file(path, "Commit body")
+}
+
+/// Read a file that carries commit message text. The file must be valid UTF-8,
+/// hold no NUL, and stay within [`MAX_BODY_BYTES`]; `kind` names it in the
+/// over-limit line.
+///
+/// The refusals carry the tool's own wording -- `openat(<path>): <reason>` for
+/// a path that does not open, the reason alone for a read that fails, and
+/// `Invalid UTF-8` for content neither implementation can hold.
+fn read_message_file(path: &Path, kind: &str) -> std::result::Result<String, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|err| format!("openat({}): {}", path.display(), io_reason(&err)))?;
+    let mut bytes = Vec::new();
+    let mut bounded = std::io::Read::take(file, MAX_BODY_BYTES + 1);
+    std::io::Read::read_to_end(&mut bounded, &mut bytes).map_err(|err| io_reason(&err))?;
+    if bytes.len() as u64 > MAX_BODY_BYTES {
+        return Err(format!("{kind} larger than {MAX_BODY_BYTES} bytes"));
+    }
+    if bytes.contains(&0) {
+        return Err("Invalid UTF-8".to_owned());
+    }
+    String::from_utf8(bytes).map_err(|_| "Invalid UTF-8".to_owned())
+}
+
+/// The environment variables that name the editor, in the order they are
+/// consulted. The first one that is set wins, an empty value included; with
+/// none set the built-in default below is used. `GIT_EDITOR` is not among them.
+const EDITOR_VARIABLES: [&str; 3] = ["OSTREE_EDITOR", "VISUAL", "EDITOR"];
+/// The editor used when no environment variable names one.
+const DEFAULT_EDITOR: &str = "vi";
+
+/// The commit-message template written into the editor's temporary file. The
+/// branch block is appended for a commit that names one
+/// (`docs/format-reference.md`, "CLI output formats").
+const MESSAGE_TEMPLATE: &str = "\n\
+     # Please enter the commit message for your changes. The first line will\n\
+     # become the subject, and the remainder the body. Lines starting\n\
+     # with '#' will be ignored, and an empty message aborts the commit.\n";
+
+/// Run the editor over the commit-message template and read the subject and the
+/// body back out of what it wrote.
+///
+/// The template carries the branch block when `branch` names one, and `subject`
+/// is appended after the block as a prefill. The editor value is a shell command
+/// line, the temporary file's path is appended to it shell-quoted, and a
+/// non-zero exit discards the whole edit.
+///
+/// The wait for the editor leaves the executor free; see [`wait_for_editor`].
+async fn run_commit_editor(
+    branch: Option<&str>,
+    subject: Option<&str>,
+) -> std::result::Result<(String, String), String> {
+    let mut template = MESSAGE_TEMPLATE.to_owned();
+    if let Some(branch) = branch {
+        template.push_str("#\n# Branch: ");
+        template.push_str(branch);
+        template.push('\n');
+    }
+    if let Some(subject) = subject {
+        template.push_str(subject);
+        template.push('\n');
+    }
+
+    let path = write_editor_file(template.as_bytes())?;
+    let editor = editor_command();
+    // The command line carries the editor value and the path as bytes, so an
+    // editor variable that is not UTF-8, and a `TMPDIR` that is not UTF-8,
+    // still name the editor to run and the file the port wrote.
+    let mut command = editor.as_bytes().to_vec();
+    command.push(b' ');
+    command.extend_from_slice(&shell_quote(&path));
+    let status = wait_for_editor(command).await;
+    // The editor writes the file, so the read is bounded the way `-F` is and
+    // refuses the same content: an editor is free to leave any bytes behind
+    // (`CLAUDE.md`, "Working conventions", which bars an unbounded read).
+    let edited = read_message_file(&path, "Commit message");
+    let _ = std::fs::remove_file(&path);
+
+    let status = status.map_err(|err| {
+        format!(
+            "There was a problem with the editor '{}'{}",
+            Path::new(&editor).display(),
+            io_reason(&err)
+        )
+    })?;
+    if !status.success() {
+        let reason = match status.code() {
+            Some(code) => format!("Child process exited with code {code}"),
+            None => format!(
+                "Child process killed by signal {}",
+                std::os::unix::process::ExitStatusExt::signal(&status).unwrap_or(0)
+            ),
+        };
+        return Err(format!(
+            "There was a problem with the editor '{}'{reason}",
+            Path::new(&editor).display()
+        ));
+    }
+    let edited = edited?;
+    let (subject, body) = parse_commit_message(&edited);
+    if subject.is_empty() {
+        return Err("Aborting commit due to empty commit subject.".to_owned());
+    }
+    Ok((subject, body))
+}
+
+/// Run `command` under `/bin/sh -c` and wait for it to exit.
+///
+/// The editor takes over the terminal, so it inherits this process's three
+/// standard streams, which [`std::process::Command`] gives it and
+/// [`ostrya_rt::Command`] pipes. The wait itself runs on the blocking pool
+/// through [`ostrya_rt::unblock`], so the executor thread stays free for the
+/// length of the editing session.
+async fn wait_for_editor(command: Vec<u8>) -> std::io::Result<std::process::ExitStatus> {
+    ostrya_rt::unblock(move || {
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(std::ffi::OsString::from_vec(command))
+            .status()
+    })
+    .await
+}
+
+/// The editor command line: the first of [`EDITOR_VARIABLES`] that is set, else
+/// [`DEFAULT_EDITOR`]. The value is read as bytes, so a variable holding a value
+/// that is not UTF-8 counts as set and names the editor to run.
+fn editor_command() -> std::ffi::OsString {
+    EDITOR_VARIABLES
+        .iter()
+        .find_map(std::env::var_os)
+        .unwrap_or_else(|| std::ffi::OsString::from(DEFAULT_EDITOR))
+}
+
+/// Wrap a path so a shell reads it as one word: single quotes around it, with
+/// each single quote it holds closed, escaped, and reopened. The bytes pass
+/// through unchanged, so a path that is not UTF-8 survives.
+fn shell_quote(path: &Path) -> Vec<u8> {
+    let mut out = vec![b'\''];
+    for &byte in path.as_os_str().as_bytes() {
+        if byte == b'\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            out.push(byte);
+        }
+    }
+    out.push(b'\'');
+    out
+}
+
+/// Write the template to a fresh file under `TMPDIR`, named `.` and six
+/// characters, and return its path. The file is created readable and writable
+/// by its owner alone, which is the mode the tool creates it with, so the
+/// message cannot be read while it is being edited. It is removed once the
+/// editor has run.
+fn write_editor_file(contents: &[u8]) -> std::result::Result<PathBuf, String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let dir = std::env::var_os("TMPDIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    let mut seed = std::process::id() as u64;
+    for _ in 0..64 {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(nanos());
+        let name: String = (0..6)
+            .map(|i| {
+                let digit = (seed >> (i * 6)) % 36;
+                char::from_digit(digit as u32, 36)
+                    .expect("a base-36 digit")
+                    .to_ascii_uppercase()
+            })
+            .collect();
+        let path = dir.join(format!(".{name}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(contents).map_err(|err| io_reason(&err))?;
+                return Ok(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!("openat({}): {}", path.display(), io_reason(&err)));
+            }
+        }
+    }
+    Err(format!(
+        "openat({}): could not name an unused temporary file",
+        dir.display()
+    ))
+}
+
+/// The nanosecond part of the current time, which seeds the temporary name.
+fn nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| u64::from(since.subsec_nanos()))
+}
+
+/// Read the subject and the body out of an edited commit message.
+///
+/// Every line loses its trailing whitespace, a line whose first character is
+/// `#` is dropped, and the leading blank lines go. The first line left is the
+/// subject; the lines after it, less their own leading and trailing blank
+/// lines, are the body, joined by newlines
+/// (`docs/format-reference.md`, "CLI output formats").
+fn parse_commit_message(text: &str) -> (String, String) {
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(str::trim_end)
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    let mut head = &lines[..];
+    while head.first().is_some_and(|line| line.is_empty()) {
+        head = &head[1..];
+    }
+    let Some(subject) = head.first().map(|line| (*line).to_owned()) else {
+        return (String::new(), String::new());
+    };
+    let mut body = &head[1..];
+    while body.first().is_some_and(|line| line.is_empty()) {
+        body = &body[1..];
+    }
+    while body.last().is_some_and(|line| line.is_empty()) {
+        body = &body[..body.len() - 1];
+    }
+    (subject, body.join("\n"))
 }
 
 /// The message a branch name the revision syntax shadows is refused with, and
@@ -5115,5 +7095,98 @@ mod tests {
                 "`{refspec} -> {body}` printed the wrong target",
             );
         }
+    }
+
+    /// The editing session runs off the executor: the first poll of
+    /// [`wait_for_editor`] over a command that is still running yields
+    /// [`Poll::Pending`] at once, so the thread that drives the commit future is
+    /// free while the editor holds the terminal. A wait performed on the
+    /// executor thread would instead return [`Poll::Ready`] after the command
+    /// exits.
+    #[test]
+    fn the_editor_wait_leaves_the_executor() {
+        use std::future::Future as _;
+        use std::task::Poll;
+        use std::time::{Duration, Instant};
+
+        // The command outlives the poll below and is reaped by the blocking
+        // pool. Two seconds is long enough that a wait taken on this thread
+        // cannot come back inside the window asserted below.
+        let (pending, held) = ostrya_rt::block_on(async {
+            let mut editor = std::pin::pin!(wait_for_editor(b"sleep 2".to_vec()));
+            let started = Instant::now();
+            let first = std::future::poll_fn(|cx| Poll::Ready(editor.as_mut().poll(cx))).await;
+            (first.is_pending(), started.elapsed())
+        });
+        assert!(pending, "the first poll of the editor wait was ready");
+        assert!(
+            held < Duration::from_secs(1),
+            "the poll held the thread for {held:?}"
+        );
+    }
+
+    /// A `--skip-list` path and a `--statoverride` path are matched against the
+    /// bytes of the walk path. A control file holds UTF-8 alone
+    /// ([`read_control_file`]), so an entry spelling `U+FFFD` names that
+    /// character and reaches no entry whose name holds a byte that is not
+    /// UTF-8.
+    ///
+    /// Both ingest sources refuse such a name ahead of the callbacks, the
+    /// filesystem walk while it reads the directory and the tar reader while it
+    /// reads the header, so the two callbacks are driven here directly.
+    #[test]
+    fn a_control_file_path_matches_the_walk_path_by_bytes() {
+        use ostrya::FileMeta;
+        use std::ffi::OsStr;
+
+        let cli = Cli::parse_from(["ostrya", "commit", "-b", "x", "/src"]);
+        let Some(Command::Commit(args)) = cli.command else {
+            panic!("`commit` parsed as another subcommand");
+        };
+        // One skip-list path and one statoverride path of each form, all four
+        // spelling the replacement character.
+        let spelled = "/bad\u{fffd}.txt";
+        let options = || WalkOptions {
+            statoverride_or: vec![(spelled.to_owned(), 0o4000)],
+            statoverride_assign: vec![(spelled.to_owned(), 0o707)],
+            skip_list: vec![spelled.to_owned()],
+            root_pruned: false,
+            statoverride_matched: Arc::new(Mutex::new(vec![false])),
+            skip_list_matched: Arc::new(Mutex::new(vec![false])),
+            statoverride_spent: Arc::new(Mutex::new(vec![false])),
+            source_is_tar: Arc::new(AtomicBool::new(false)),
+        };
+        let meta = FileMeta::regular(0, 0, 0o644);
+
+        // A walk path holding the raw byte `0xFF` is a different path.
+        let walk = options();
+        let mut modifier = commit_modifier(&args, Owner::default(), &walk, None)
+            .expect("the walk options ask for a modifier");
+        let raw = Path::new(OsStr::from_bytes(b"/bad\xff.txt"));
+        let filter = modifier.filter.as_mut().expect("the skip list sets one");
+        assert_eq!(filter(raw, &meta), FilterResult::Allow);
+        let mode = modifier
+            .mode_callback
+            .as_mut()
+            .expect("statoverride sets one");
+        assert_eq!(mode(raw, &meta), meta.mode);
+        assert_eq!(walk.unmatched_skip_list(), vec![spelled.to_owned()]);
+        assert_eq!(walk.unmatched_statoverride(), vec![spelled.to_owned()]);
+
+        // The path the entries do spell is matched, so the comparison is exact
+        // and not merely refusing.
+        let walk = options();
+        let mut modifier = commit_modifier(&args, Owner::default(), &walk, None)
+            .expect("the walk options ask for a modifier");
+        let named = Path::new(spelled);
+        let filter = modifier.filter.as_mut().expect("the skip list sets one");
+        assert_eq!(filter(named, &meta), FilterResult::Skip);
+        let mode = modifier
+            .mode_callback
+            .as_mut()
+            .expect("statoverride sets one");
+        assert_eq!(mode(named, &meta), meta.mode | 0o4000);
+        assert!(walk.unmatched_skip_list().is_empty());
+        assert!(walk.unmatched_statoverride().is_empty());
     }
 }

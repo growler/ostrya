@@ -29,7 +29,9 @@ pub const DEFAULT_MODE: &str = "bare";
 
 /// The file `two-repos` writes, and the content that tells the two apart.
 pub const MARKER_FILE: &str = "which.txt";
+/// The content that names the first repository.
 pub const MARKER_ONE: &str = "distinguish-repo-1";
+/// The content that names the second repository.
 pub const MARKER_TWO: &str = "distinguish-repo-2";
 
 /// Every setup name, with the placeholders it binds.
@@ -65,13 +67,21 @@ pub struct Context<'a> {
     pub root: &'a Path,
     /// The implementation whose subtree this is.
     pub own: &'a Tool,
+    /// The port, where the run has one.
     pub port: Option<&'a Tool>,
+    /// The reference implementation, where the run has one.
     pub reference: Option<&'a Tool>,
+    /// The repository mode the setup creates.
     pub mode: &'a str,
+    /// The source repository's mode, for a two-repository setup.
     pub src_mode: &'a str,
+    /// The destination repository's mode, for a two-repository setup.
     pub dst_mode: &'a str,
+    /// The corpus the setup populates from.
     pub corpus: &'a str,
+    /// Which implementation creates the repository.
     pub created_by: Actor,
+    /// Which implementation populates it.
     pub populated_by: Actor,
 }
 

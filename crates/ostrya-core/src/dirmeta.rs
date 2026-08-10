@@ -16,10 +16,13 @@ use crate::xattr::{Xattrs, XattrsRef};
 /// An owned dirmeta object. Scalar fields are host-order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirMeta {
+    /// The owner uid.
     pub uid: u32,
+    /// The owner gid.
     pub gid: u32,
     /// Full `st_mode` including the directory file-type bits.
     pub mode: u32,
+    /// The directory's extended attributes.
     pub xattrs: Xattrs,
 }
 
@@ -89,10 +92,12 @@ impl<'a> DirMetaRef<'a> {
         })
     }
 
+    /// The owner uid, host-order.
     pub fn uid(&self) -> u32 {
         self.uid
     }
 
+    /// The owner gid, host-order.
     pub fn gid(&self) -> u32 {
         self.gid
     }
@@ -102,6 +107,7 @@ impl<'a> DirMetaRef<'a> {
         self.mode
     }
 
+    /// A borrowed view of the directory's extended attributes.
     pub fn xattrs(&self) -> XattrsRef<'a> {
         self.xattrs
     }

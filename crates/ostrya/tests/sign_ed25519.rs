@@ -232,7 +232,9 @@ fn delete_by_key_removes_the_ed25519_signature() {
             .await
             .unwrap();
         let removed = repo
-            .delete_signatures(&commit, "ostree.sign.ed25519", |_, blob| blob == expected)
+            .delete_signatures(&commit, "ostree.sign.ed25519", move |_, blob| {
+                blob == expected
+            })
             .await
             .unwrap();
         assert_eq!(removed, 1);

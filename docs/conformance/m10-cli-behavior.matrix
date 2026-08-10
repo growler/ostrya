@@ -50,7 +50,7 @@ expect-exit: 0
 oracle: exit-status config-bytes
 outcome: full
 severity: interop
-spec: cli-surface.md#p0-blocks-the-harness
+spec: cli-surface.md#p0----blocks-the-harness
 
 family: M10
 subcommand: init
@@ -61,7 +61,7 @@ expect-exit: 0
 oracle: exit-status config-bytes
 outcome: full
 severity: interop
-spec: cli-surface.md#p0-blocks-the-harness
+spec: cli-surface.md#p0----blocks-the-harness
 
 family: M10
 subcommand: init
@@ -72,7 +72,7 @@ expect-exit: 0
 oracle: exit-status config-bytes
 outcome: full
 severity: interop
-spec: cli-surface.md#p0-blocks-the-harness
+spec: cli-surface.md#p0----blocks-the-harness
 
 family: M10
 subcommand: init
@@ -83,7 +83,7 @@ expect-exit: 0
 oracle: exit-status config-bytes
 outcome: full
 severity: interop
-spec: cli-surface.md#p0-blocks-the-harness
+spec: cli-surface.md#p0----blocks-the-harness
 note: `--mode=archive` and `--mode=archive-z2` name the same mode, which both
  implementations serialize as `archive-z2`. The `config-bytes` oracle states
  that the port's config equals the tool's for this spelling, and the
@@ -101,7 +101,7 @@ expect-exit: 0
 oracle: exit-status config-bytes
 outcome: full
 severity: interop
-spec: cli-surface.md#p0-blocks-the-harness
+spec: cli-surface.md#p0----blocks-the-harness
 note: the alias both implementations accept alongside `archive`. The cell
  pairs with `init/mode=archive` above: each states that the port's config
  equals the tool's for one spelling.
@@ -404,20 +404,20 @@ family: M10
 subcommand: refs
 cell: refs/prefix-whole-remote
 setup: repo-with-commit
-outcome: full
+outcome: lossy
 severity: interop
+loss: `--list` and `-A` select the same refs and name them differently: the tool
+ joins the prefix's ref half with the name below it, keeping the `.` of that
+ join, and the port prints the `remote:name` refspec. `stdout-text` is not an
+ oracle for those two forms (`cli-surface.md`, "P1").
 evidence: ostrya_cli::cli::refs_whole_remote_prefix_matches_the_tool
 spec: format-reference.md#refs
 note: a whole-remote PREFIX -- `<remote>:` or `<remote>:.` -- selects every ref
  of the remote it names, and one matching no ref exits 0. The default listing and
  `-r` agree verbatim over the selected refs, compared form by form in
  `refs_listing_matches_the_tool`, which `refs/nested-prefix-stripping` below
- cites for the stripping a non-empty ref half carries. `--list` and `-A` select
- the same refs and name them differently:
- the tool joins the prefix's ref half with the name below it, keeping the `.` of
- that join, so `stdout-text` is not an oracle for those two forms
- (`cli-surface.md`, "P1"). Needs the two remote refs and the remote alias the
- cited test builds.
+ cites for the stripping a non-empty ref half carries. Needs the two remote refs
+ and the remote alias the cited test builds.
 
 family: M10
 subcommand: refs
@@ -474,8 +474,14 @@ family: M10
 subcommand: refs
 cell: refs/alias-round-trip
 setup: repo-with-commit
-outcome: full
+outcome: lossy
 severity: interop
+loss: two names an alias takes (`cli-surface.md`, "P1"). The tool names an alias
+ under `refs/remotes/<remote>/` by its path below the remote and the port names
+ it by its `remote:name` refspec. `-A --create` naming a target under
+ `refs/remotes` makes the tool write a link body naming no file under
+ `refs/heads`, where the port writes the path to the target ref's file. The
+ cited test pins both.
 evidence: ostrya_cli::cli::refs_alias_matches_the_tool
 spec: format-reference.md#refs
 note: `-A --create` writing a relative symlink, `-A` listing it as
@@ -488,12 +494,7 @@ note: `-A --create` writing a relative symlink, `-A` listing it as
  `refs/create-alias-remote-newref` below states occupies: it is reported over an
  unresolvable positional and over an existence check `--force` suppressed, and a
  NEWREF the ref rule refuses stops one step earlier, which needs the remote ref
- and the second branch the setup does not bind. The cited test also records two
- divergences (`cli-surface.md`, "P1"): the tool names an alias under
- `refs/remotes/<remote>/` by its path below the remote and the port names it by
- its `remote:name` refspec; and `-A --create` naming a target under
- `refs/remotes` makes the tool write a link body naming no file under
- `refs/heads`, where the port writes the path to the target ref's file.
+ and the second branch the setup does not bind.
 
 family: M10
 subcommand: refs
@@ -835,7 +836,7 @@ ref-expect-stderr: contains "error: Refspec 'nosuch' not found"
 oracle: exit-status stderr-text refs-bytes
 outcome: refused-both
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 
 family: M10
 subcommand: refs
@@ -888,7 +889,7 @@ ref-expect-stderr: contains "error: Invalid refspec a/../b"
 oracle: exit-status stderr-text refs-bytes
 outcome: refused-both
 severity: interop
-spec: format-reference.md#ref-name-validation
+spec: format-reference.md#object-store-layout
 note: a NEWREF holding a traversal component would leave the `refs/` tree, and
  both implementations refuse it in the same words, naming the refspec as it was
  given. `refs-bytes` states that neither wrote a ref.
@@ -922,7 +923,7 @@ ref-expect-stderr: contains "error: --create specified but ref  already exists"
 oracle: exit-status refs-bytes
 outcome: refused-both
 severity: interop
-spec: format-reference.md#ref-name-validation
+spec: format-reference.md#object-store-layout
 note: an empty NEWREF is refused by both and written by neither, in different
  words. The empty refspec is a search of the ref store in the tool, and this
  setup binds exactly one ref, so the search finds it and the existence check
@@ -953,7 +954,7 @@ setup: repo-with-commit
 outcome: refused-both
 severity: interop
 evidence: ostrya_cli::cli::invalid_refspec_matches_the_tool
-spec: format-reference.md#ref-name-validation
+spec: format-reference.md#object-store-layout
 note: the refused-name cases the single-branch setup does not bind: every shape
  an alias target takes, which both report as `Cannot create alias to non-existent
  ref: <target>` -- the existence check standing ahead of the name rule there --
@@ -1065,8 +1066,13 @@ family: M10
 subcommand: refs
 cell: refs/delete-aliases
 setup: repo-with-commit
-outcome: full
+outcome: lossy
 severity: interop
+loss: the set a prefix under `refs/remotes` removes. The tool removes each
+ nested alias by the name it prints for it, so it removes no alias of that
+ remote and removes a local ref carrying the name instead, where the port
+ removes the alias the prefix named. Both exit 0 and print nothing, so the refs
+ tree is the only witness (`cli-surface.md`, "P1").
 evidence: ostrya_cli::cli::refs_delete_aliases_matches_the_tool
 spec: format-reference.md#refs
 note: `-A --delete` removes, for each prefix, the set a `-A` listing prints for
@@ -1076,11 +1082,8 @@ note: `-A --delete` removes, for each prefix, the set a `-A` listing prints for
  a remote ref, and a remote alias, a prefix holding no alias, the per-prefix and
  live-set order, the guard over the selected set, the shared no-prefix message,
  the whole-remote refusal, and `-c` winning over `-A` in either flag order. It
- also pins the divergence `cli-surface.md`, "P1" records: the tool removes each
- nested alias by the name it prints for it, so a prefix under `refs/remotes`
- removes no alias of that remote and removes a local ref carrying the name
- instead. The setup binds no alias and no collection id, so the cited test builds
- the repositories.
+ also pins the divergence the `loss` field states. The setup binds no alias and
+ no collection id, so the cited test builds the repositories.
 
 family: M10
 subcommand: refs
@@ -1159,7 +1162,7 @@ expect-exit: 0
 oracle: exit-status stdout-text
 outcome: full
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: a bare 64-character checksum resolves to itself in both.
 
 family: M10
@@ -1176,7 +1179,7 @@ ref-expect-stderr: contains "error: Refspec 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 oracle: exit-status stdout-text stderr-text
 outcome: refused-both
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: a 64-character name is a checksum in lowercase hex alone, so an uppercase
  one is a ref name and no ref carries it. Both report the line they give a name
  that resolves to nothing, in the same words, where the cell above resolves the
@@ -1187,17 +1190,19 @@ family: M10
 subcommand: rev-parse
 cell: rev-parse/checksum-case-forms
 setup: repo-with-commit
-outcome: full
+outcome: lossy
 severity: interop
+loss: the case a ref file's own content may take. The tool refuses a
+ non-lowercase rendering there and the port resolves it (`cli-surface.md`,
+ "P1").
 evidence: ostrya_cli::cli::checksum_case_matches_the_tool
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: the rest of the case rule, which needs the repository's own commit
  checksum raised and a ref written under it, neither of which the setup binds.
  The cited test compares the uppercase and mixed-case forms of a resolvable
- checksum at `rev-parse`, `cat`, `checkout`, and a `^` suffix; the ref an
- uppercase NEWREF writes and the revision, the alias, and the delete guard that
- read it; and the ref file content case, where the tool refuses a non-lowercase
- rendering and the port resolves it (`cli-surface.md`, "P1").
+ checksum at `rev-parse`, `cat`, `checkout`, and a `^` suffix, and the ref an
+ uppercase NEWREF writes together with the revision, the alias, and the delete
+ guard that read it. It also pins the divergence the `loss` field states.
 
 family: M10
 subcommand: rev-parse
@@ -1224,7 +1229,7 @@ ref-expect-stderr: contains "error: Refspec 'nosuch' not found"
 oracle: exit-status stderr-text
 outcome: refused-both
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 
 family: M10
 subcommand: rev-parse
@@ -1298,7 +1303,7 @@ setup: repo-with-commit
 outcome: full
 severity: interop
 evidence: ostrya_cli::cli::rev_parse_ancestry_matches_the_tool
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: `REV^` walking one generation, `REV^^` walking two, and the root
  commit's parent reported as `error: Commit <checksum> has no parent`. Needs a
  parent chain, which the setup's single commit does not hold; the cited test
@@ -1321,7 +1326,7 @@ ref-expect-stderr: contains "error: Invalid refspec a/../b"
 oracle: exit-status stderr-text
 outcome: refused-both
 severity: interop
-spec: format-reference.md#ref-name-validation
+spec: format-reference.md#object-store-layout
 note: the refused name is reported without the ancestry suffix, so the same line
  states `a/../b^` and `a/../b`, and the suffix is stripped before the base is
  read as a name in both.
@@ -1338,7 +1343,7 @@ ref-expect-stdout: equals "00000000000000000000000000000000000000000000000000000
 oracle: exit-status stdout-text
 outcome: full
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: a checksum resolves to itself and reaches no object, so a checksum the
  store carries no commit for prints at exit 0 in both.
  `rev-parse/absent-commit-object` below is the same checksum where a `^` suffix
@@ -1358,7 +1363,7 @@ ref-expect-stderr: contains "error: No such metadata object"
 oracle: exit-status stdout-text
 outcome: refused-both
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: the `^` walk loads the base commit, so an absent one is refused here where
  the bare checksum above resolves. Both exit 1 and write nothing, in different
  words -- the tool names the loose object file and the port names the object type
@@ -1502,7 +1507,7 @@ ref-expect-stderr: contains "error: Refspec 'nosuch' not found"
 oracle: exit-status stderr-text
 outcome: refused-both
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 
 family: M10
 subcommand: cat
@@ -1516,7 +1521,7 @@ ref-expect-stderr: contains "error: Invalid refspec a/../b"
 oracle: exit-status stderr-text
 outcome: refused-both
 severity: interop
-spec: format-reference.md#ref-name-validation
+spec: format-reference.md#object-store-layout
 note: the COMMIT argument is a revision, so a name the ref rule refuses is
  reported here in the words `refs` and `rev-parse` report it in, before any path
  is looked up.
@@ -1535,7 +1540,7 @@ ref-expect-stderr: contains "error: Refspec 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 oracle: exit-status stdout-text stderr-text
 outcome: refused-both
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: the case rule of a 64-character name reaches this site too, so an uppercase
  name is looked up as a ref and reported as resolving to nothing, in the same
  words in both, before any path is read. `rev-parse/checksum-upper-case` is the
@@ -1603,7 +1608,7 @@ setup: repo-with-commit
 outcome: refused-both
 severity: interop
 evidence: ostrya_cli::cli::absent_commit_object_matches_the_tool
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: the same pair where the revision is a ref pointing at an absent commit,
  which takes two invocations -- `refs --create=dangling <checksum>` and then the
  read -- so the setup cannot bind it in one `run:` line. The cited test holds the
@@ -1632,7 +1637,7 @@ ref-expect-stderr: contains "error: Rev name 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 oracle: exit-status stdout-text stderr-text refs-bytes
 outcome: refused-both
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: a branch name of 64 lowercase hex characters is the shape resolution reads
  as a checksum, so a ref carrying it is reachable by no revision. Both refuse it
  in the same words at the same step, and `refs-bytes` states that neither wrote
@@ -1651,7 +1656,7 @@ expect-stderr: empty
 oracle: exit-status stdout-text refs-bytes
 outcome: full
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: the same 64 characters in uppercase are a branch name to both, so each
  writes `refs/heads/<BRANCH>` and prints the commit it made. The normalizer
  masks each side's own checksum, so `stdout-text` states that both printed one
@@ -1671,7 +1676,7 @@ ref-expect-stderr: contains "error: Rev name 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 oracle: exit-status stdout-text stderr-text refs-bytes
 outcome: refused-both
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: `--orphan` leaves the branch-name guard standing, since `-b` writes the
  ref under it too. `inventory` is no oracle here, for the reason
  `commit/checksum-branch-name` states.
@@ -1688,7 +1693,7 @@ expect-stderr: contains "error: Invalid refspec main^"
 oracle: exit-status stdout-text stderr-text refs-bytes inventory
 outcome: refused-clean
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: a branch name ending in `^` is the second shape resolution shadows, read
  as ancestry, so a ref carrying it is reachable by no revision. The port refuses
  it at the ref write in the words it gives that shape at `refs --create`, and
@@ -1713,7 +1718,7 @@ ref-expect-stderr: contains "error: Invalid refspec "
 oracle: exit-status stdout-text refs-bytes inventory
 outcome: refused-both
 severity: interop
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: the suffix alone, whose base is empty. Both refuse at exit 1 and write
  nothing, and each names what it read: the port the branch as given and the tool
  the empty base it split off, the tool's empty refspec being a name it searches
@@ -1730,7 +1735,7 @@ setup: repo-with-commit
 outcome: refused-both
 severity: interop
 evidence: ostrya_cli::cli::commit_ancestry_branch_name_matches_the_tool
-spec: format-reference.md#revision-syntax
+spec: format-reference.md#object-store-layout
 note: the bases the `repo tree` setup cannot bind, which need a repository
  holding a commit and a tree the commit can read, and the consequence the guard
  stands for. The cited test holds the port's one message against each of the
@@ -2180,6 +2185,242 @@ note: corpus C4 carries the xattrs, so the option has something to drop: every
  entry records the empty set and the two implementations reach one checksum. What
  each records with the xattrs kept is m0-content.matrix's C4 row, where one value
  of that corpus parts them.
+
+# ---------------------------------------------------------------------------
+# commit -- durability and reporting, Phase 17f (`F10`).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: commit
+cell: commit/table-output
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --table-output $TREE
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: contains "Content Bytes Written: 45"
+oracle: exit-status stdout-text stderr-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the seven-line `KEY: VALUE` block, compared line for line after the
+ normalizer masks each side's own checksum on the `Commit:` line. The six
+ counter lines carry no checksum, so they compare verbatim, which is what makes
+ this cell a claim about the counts. Corpus C0 gives `Metadata Total: 5`,
+ `Metadata Written: 4`, `Content Total: 4`, `Content Written: 4`, `Content Cache
+ Hits: 0`, and the byte count the `expect-stdout` line states, that being 23 + 0
+ + 22 over the corpus's three regular files.
+
+family: M10
+subcommand: commit
+cell: commit/table-output-archive
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --table-output $TREE
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: contains "Content Bytes Written: 45"
+oracle: exit-status stdout-text stderr-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the same block in the mode that compresses its content objects. The byte
+ count is the payload length and not the stored `.filez` length, so it equals
+ the `bare` cell's above while `inventory` reports other object sizes.
+
+family: M10
+subcommand: commit
+cell: commit/table-output-bare-user
+modes: bare-user
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --table-output $TREE
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: contains "Content Bytes Written: 45"
+oracle: exit-status stdout-text stderr-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the third mode. The block's field set, its order, and its counts hold
+ across `archive`, `bare`, and `bare-user`.
+
+family: M10
+subcommand: commit
+cell: commit/table-output-second-commit
+setup: repo-with-commit tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --table-output $TREE
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: contains "Metadata Written: 1"
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the setup commits the corpus already, so this second commit of the same
+ tree writes the commit object alone. Both totals keep the values the first cell
+ states, `Content Written` and `Content Bytes Written` fall to zero, and
+ `Metadata Written` is the 1 the `expect-stdout` line states. This is what
+ states that the counters report the work done and not the tree's shape.
+
+family: M10
+subcommand: commit
+cell: commit/fsync-true
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --fsync=true $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#the-fsync-vocabulary
+note: the policy that is also the default. The two implementations print one
+ checksum and hold one object store, which is the claim `--fsync` carries: it
+ changes the durability of the writes and no recorded byte.
+
+family: M10
+subcommand: commit
+cell: commit/fsync-false
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --fsync=false $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#the-fsync-vocabulary
+note: the other policy over the same corpus, branch, and timestamp, so it
+ reaches the checksum `commit/fsync-true` reaches. The pair states that the
+ policy leaves the objects alone.
+
+family: M10
+subcommand: commit
+cell: commit/fsync-case-and-numeral
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --fsync=YeS $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#the-fsync-vocabulary
+note: the value words are matched without regard to case. The whole accepted set
+ -- `true`, `yes`, `1`, `false`, `no`, `0`, in every case -- is one invocation
+ per value, so the set stands in the cited test of
+ `commit/fsync-fault-order` below and this cell states one spelling of it.
+
+family: M10
+subcommand: commit
+cell: commit/fsync-invalid-value
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --fsync=on $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Invalid boolean argument 'on'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Invalid boolean argument 'on'"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#the-fsync-vocabulary
+note: `on` is a boolean word neither reader holds, the accepted set being
+ `true`, `yes`, `1`, `false`, `no`, and `0`. Both refuse in the same words at
+ exit 1, and neither writes a ref or publishes an object.
+
+family: M10
+subcommand: commit
+cell: commit/fsync-empty-value
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --fsync= $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Invalid boolean argument ''"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Invalid boolean argument ''"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#the-fsync-vocabulary
+note: the empty value reaches the same reader and is quoted verbatim by both.
+
+family: M10
+subcommand: commit
+cell: commit/fsync-refusal-stands-first
+setup: repo tree
+run: commit --repo=$REPO --fsync=on $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Invalid boolean argument 'on'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Invalid boolean argument 'on'"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: the invocation names no branch, so the missing-branch line would answer it
+ where the policy were read later. Both report the policy instead, which places
+ the read in the option step, ahead of the missing-branch check.
+
+family: M10
+subcommand: commit
+cell: commit/fsync-fault-order
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_fsync_policy_matches_the_tool
+spec: format-reference.md#commit
+note: the rest of the fault order and the one divergence inside it, each of them
+ its own invocation. The cited test holds the whole accepted value set against
+ the tool, states that the refusal stands ahead of the tree and ahead of the
+ timestamp as well, states that the valueless `--fsync` takes the next word as
+ its value and refuses that word, and states the divergence: with a refusable id
+ and a refusable policy on one command line the tool reports the leftmost and
+ the port reports the id whatever its position. The test runs both orders, which
+ is what "whatever its position" takes (cli-surface.md, "P2").
+
+family: M10
+subcommand: commit
+cell: commit/fsync-syscalls
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_fsync_policy_controls_the_syscalls
+spec: format-reference.md#the-fsync-vocabulary
+note: what the policy does, which no artifact this harness reads can show: the
+ policy changes the `fsync`, `fdatasync`, and `syncfs` calls alone, and leaves
+ standard output, standard error, the exit status, and the repository bytes
+ alike. The cited test counts those calls for both binaries with `strace` over
+ the four rows of the configured-value and option-value table
+ (format-reference.md, "The fsync vocabulary"): the option narrows the
+ configured value and never widens it, so a repository holding `[core]
+ fsync=false` syncs nothing under `--fsync=true`, and the resolved policy
+ reaches the ref write and not the object writes alone. The syncing row is held
+ to the target of every call -- each fanout under `objects/`, `objects/`
+ itself, the repository for the `syncfs`, the ref's temp file for the
+ `fdatasync`, and, for the port, the directory holding the ref -- and to the
+ total the table records, 11 for the tool and 12 for the port. The test asserts
+ on a host carrying `strace` and returns without an assertion on one that does
+ not, which is a gate beyond the tool's own presence.
+
+family: M10
+subcommand: commit
+cell: commit/table-output-counters
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_table_output_matches_the_tool
+spec: format-reference.md#commit
+note: the counters over a growing tree, which one `run:` line cannot state: the
+ cited test commits corpus C0, then the corpus plus one file, then the corpus
+ again, into `archive`, `bare`, and `bare-user`, and compares the block byte for
+ byte at every step, and requires the three blocks to differ from each other.
+ That sequence moves `Metadata Written`, `Content Total`, `Content Written`, and
+ `Content Bytes Written` apart, so the comparison reads the counts and not the
+ block's shape.
 
 # ---------------------------------------------------------------------------
 # checkout -- the unprivileged mode and the subpath, Phase 17c
@@ -3517,3 +3758,2548 @@ note: importing keys needs a generated key and a remote, which no setup binds.
  the port reports the fingerprint, the creation instant, and the user ids, and
  leaves out the two Web Key Directory URL lines, rendering the instant in UTC
  rather than the host locale (`cli-surface.md`, "P3").
+
+# ---------------------------------------------------------------------------
+# commit -- the message and the body, the metadata dict, and the ref bindings
+# (Phase 17f). Every cell here states a timestamp, so `checksum-agreement` is
+# the oracle: the subject, the body, the metadata dict, and the entry order of
+# that dict are all commit-object fields, and one checksum on both sides states
+# them together.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: commit
+cell: commit/body-inline
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s subj -m 'body text' --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: `-m` is stored verbatim in the commit's body field, so the agreeing
+ checksum states the stored bytes.
+
+family: M10
+subcommand: commit
+cell: commit/body-without-subject
+setup: repo tree
+run: commit --repo=$REPO -b conformance -m 'body alone' --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: a body with no subject is accepted; the subject field holds the empty
+ string.
+
+family: M10
+subcommand: commit
+cell: commit/body-file
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s subj -F $TREE/file.txt --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the whole file becomes the body, its trailing newline included. Corpus C0
+ holds `file.txt` with fixed content, so the checksum is reproducible.
+
+family: M10
+subcommand: commit
+cell: commit/body-file-wins-over-body
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s subj -m inline -F $TREE/file.txt --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: `-F` and `-m` together are accepted and `-F` wins. The reversed order is
+ its own invocation, which the cited test in `commit/body-forms` states.
+
+family: M10
+subcommand: commit
+cell: commit/body-file-absent
+setup: repo tree
+run: commit --repo=$REPO -b conformance -F $SCRATCH/nope.txt --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: openat($SCRATCH/nope.txt): No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: openat($SCRATCH/nope.txt): No such file or directory"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: the refusal names the path as it was given. It stands after `--parent`
+ resolution and ahead of the tree, so nothing is written.
+
+family: M10
+subcommand: commit
+cell: commit/body-file-is-a-directory
+setup: repo tree
+run: commit --repo=$REPO -b conformance -F $TREE --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Is a directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Is a directory"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: a directory opens and then fails to read, so the reason stands alone with
+ no `openat(<path>)` prefix.
+
+family: M10
+subcommand: commit
+cell: commit/body-forms
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_body_forms_match_the_tool
+spec: format-reference.md#commit
+note: the body forms one invocation cannot state together: a repeated `-m`,
+ whose last value wins; `-F` ahead of `-m`; an empty body file, one ending in
+ several newlines, one ending in none, and one carrying surrounding spaces; and
+ the two content refusals, a file that is not UTF-8 and one holding a NUL, both
+ reporting `error: Invalid UTF-8`. Each needs a file the corpus does not hold,
+ so the test writes them.
+
+family: M10
+subcommand: commit
+cell: commit/editor
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_editor_matches_the_tool
+spec: format-reference.md#commit
+note: `-e` runs the editor the environment names, which a `run:` line states
+ neither. The test writes the editor scripts and compares the template bytes
+ both implementations produce -- with a branch, under `--orphan`, and with a `-s`
+ prefill -- then the commit each edited message reaches, the empty-subject
+ refusal, the message a non-zero editor exit reports, twenty-three cases of the
+ reading rules `format-reference.md` states, the temporary file's 0600 mode,
+ the three refusals over what the editor left -- a byte that is not UTF-8, a
+ NUL, and a file the editor removed -- and the editor's place in the fault
+ order, behind the metadata options and ahead of the tree and the timestamp.
+ The port's own 128-mebibyte bound on that file is stated in
+ `cli-surface.md` and no cell reaches it.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-string
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata-string=foo=bar --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the key lands in the commit metadata dict ahead of `ostree.ref-binding`,
+ which the agreeing checksum states along with the value's own bytes.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-string-splits-at-first-equals
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata-string=foo=has=equals=in=value --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: everything after the first `=` is the value, further ones included.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-duplicate-key
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata-string=foo=bar --add-metadata-string=foo=second --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: a key given twice is written twice; the dict really carries two entries of
+ that name.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-group-order
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata-string=s1=A --add-metadata=m1="B" --add-metadata-string=s2=C --add-metadata=m2="D" --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the entries come out grouped by option and not in command-line order --
+ both `--add-metadata-string` keys, then both `--add-metadata` keys, then the
+ binding key. The order is part of the commit checksum, so the agreeing checksum
+ is what states it.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-variant-uint32
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata=k='uint32 42' --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the value is serialized in host byte order and is not converted, so the
+ agreeing checksum states the stored bytes rather than the printed number. The
+ same commit read back through `show --raw` reports 704643072 in both
+ implementations.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-variant-double
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata=k=1.5 --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: a literal carrying a fraction is a double, a type the on-disk format does
+ not use and `--add-metadata` reaches.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-variant-array
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata=k='["a","b"]' --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: a container with no declaration takes the common type of its elements,
+ `as` here.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-variant-maybe
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata=k='@ms nothing' --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: `nothing` states no type of its own, so the declaration is what gives it
+ one.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-variant-untypeable
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata=k=[] --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Parsing k=[]: 0-2:unable to infer type"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Parsing k=[]: 0-2:unable to infer type"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: the message names the whole `KEY=VALUE` argument and reports offsets into
+ the value alone.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-variant-out-of-range
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata=k=3000000000 --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Parsing k=3000000000: 0-10:number out of range for type 'i'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Parsing k=3000000000: 0-10:number out of range for type 'i'"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: an integer literal with no other context is an `i`, so one above that
+ range is refused naming the type rather than promoted.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-missing-equals
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata-string=noequals --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Missing '=' in KEY=VALUE metadata 'noequals'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Missing '=' in KEY=VALUE metadata 'noequals'"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: the same wording answers `--add-metadata` and
+ `--add-detached-metadata-string`, which the cited test in
+ `commit/metadata-forms` states.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-empty-key
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-metadata-string==emptykey --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Empty metadata key"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Empty metadata key"
+oracle: exit-status stdout-text stderr-text refs-bytes
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: the empty key is refused where the dict is assembled, which is after the
+ tree is written, so `inventory` is no oracle for this cell: the tool leaves the
+ tree's objects behind and the port publishes none.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-forms
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_metadata_matches_the_tool
+spec: format-reference.md#commit
+note: the 236 accepted GVariant value forms and the 170 refused ones, each its
+ own invocation, each held to the tool by commit checksum or by the refusal
+ text, and each held to its own side of the reader by an absolute exit status. The set covers the reader's edges: a bytestring ending at its first NUL,
+ the one-member tuple's comma, the lower-case exponent marker, the decimal
+ subnormal refusal, the hexadecimal subnormal a body states exactly, a
+ hexadecimal mantissa past 32 digits, the object-path and signature checks,
+ `nan` and the infinities, the binary literal, the reader the target type picks,
+ and the nesting cap at the level past the one both readers take. It covers the
+ escape tables as well: every short escape a string and a bytestring take, the
+ line continuation a backslash before a line feed makes, a unicode escape that
+ names a character, a character written through as itself, each radix prefix in
+ either case, a digit outside the radix, the range edge of each narrow integer
+ type, each remaining type keyword, the signature bodies the type scanner takes
+ and refuses, the characters a declaration ends at, an array whose element type
+ comes from a later element, and the character class an object-path element
+ takes. Several hold a single quote, which a `run:` line consumes, so the set
+ stands in the cited test.
+
+family: M10
+subcommand: commit
+cell: commit/keep-metadata
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_keep_metadata_matches_the_tool
+spec: format-reference.md#commit
+note: `--keep-metadata` reads a key out of the resolved parent, which no setup
+ binds with user metadata on it. The test commits a parent holding three keys,
+ one of them numeric so the carried bytes are checked as bytes, then states the
+ carry order, the duplicate, the override, the survival under `--no-bindings`,
+ the implicit parent, `--orphan` beside an explicit `--parent`, and the two
+ refusals.
+
+family: M10
+subcommand: commit
+cell: commit/detached-metadata
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --add-detached-metadata-string=dk=dv --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the detached dict goes to the commit's `.commitmeta` file and leaves the
+ commit checksum alone, so a cell naming `checksum-agreement` states the second
+ half of that claim and `inventory` states that both wrote the file at the same
+ size. The bytes themselves and the key listing over them stand in
+ `commit/detached-metadata-forms`.
+
+family: M10
+subcommand: commit
+cell: commit/detached-metadata-forms
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_detached_metadata_matches_the_tool,
+ ostrya_cli::cli::commit_metadata_matches_the_tool
+spec: format-reference.md#commit
+note: reading the detached dict back needs a second invocation, and comparing
+ its bytes needs the loose path the commit checksum names. The first cited test
+ states both for six forms, the duplicate key and the empty key among them, and
+ requires the stored file to hold bytes rather than to be absent on both sides.
+ The empty key is accepted here where the two commit-metadata options refuse
+ it, which the second cited test states.
+
+family: M10
+subcommand: commit
+cell: commit/bind-ref
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --bind-ref=extra --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the bound name joins the branch in `ostree.ref-binding` rather than
+ replacing it.
+
+family: M10
+subcommand: commit
+cell: commit/bind-ref-sorted
+setup: repo tree
+run: commit --repo=$REPO -b zzz -s x --bind-ref=B --bind-ref=a --bind-ref=C --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the array is sorted byte-wise ascending with the branch sorted in, so
+ `B`, `C`, `a`, `zzz`. The order is uppercase before lowercase, which states
+ that the sort is over bytes and not a locale collation.
+
+family: M10
+subcommand: commit
+cell: commit/bind-ref-duplicates-kept
+setup: repo tree
+run: commit --repo=$REPO -b s3 -s x --bind-ref=zzz --bind-ref=aaa --bind-ref=aaa --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: no dedup: the array holds `aaa` twice.
+
+family: M10
+subcommand: commit
+cell: commit/bind-ref-checksum-name
+setup: repo tree
+run: commit --repo=$REPO -b okbr -s x --bind-ref=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement refs-bytes
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the 64-lowercase-hex name `-b` refuses is a name `--bind-ref` accepts, so
+ the branch-name guard covers the ref the command writes and not the name it
+ records (`cli-surface.md`, "P2").
+
+family: M10
+subcommand: commit
+cell: commit/bind-ref-no-name-rule
+setup: repo tree
+run: commit --repo=$REPO -b vb1 -s x --bind-ref=bad//name --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement refs-bytes
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: no character-class check reaches a bound name, so a name `-b` reports
+ `Invalid refspec` for is recorded as it stands. The empty name and a name
+ holding a space are the same case and stand in
+ `ostrya_cli::cli::commit_ref_bindings_match_the_tool`.
+
+family: M10
+subcommand: commit
+cell: commit/bind-ref-without-branch
+setup: repo tree
+run: commit --repo=$REPO -s x --bind-ref=noBranch --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: A branch must be specified with --branch, or use --orphan"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: A branch must be specified with --branch, or use --orphan"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: `--bind-ref` names no branch, so the ordinary branch check answers a
+ commit carrying it alone.
+
+family: M10
+subcommand: commit
+cell: commit/no-bindings
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --no-bindings --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement refs-bytes
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: no `ostree.ref-binding` key at all, so a commit adding nothing else comes
+ out with an empty metadata dict. The ref still moves, which `refs-bytes`
+ states.
+
+family: M10
+subcommand: commit
+cell: commit/no-bindings-overrides-bind-ref
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --no-bindings --bind-ref=x --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: `--no-bindings` wins, so this commit and `commit/no-bindings` reach one
+ object. The cited test in `commit/bind-ref-forms` states the collapse across
+ `-b`, `--orphan`, and `--bind-ref`.
+
+family: M10
+subcommand: commit
+cell: commit/orphan-bind-ref
+setup: repo tree
+run: commit --repo=$REPO -s x --orphan --bind-ref=zz --bind-ref=aa --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement refs-bytes
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: `--bind-ref` is accepted beside `--orphan`, and the array then holds the
+ bound names alone, still sorted. No ref is written.
+
+family: M10
+subcommand: commit
+cell: commit/bind-ref-forms
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_ref_bindings_match_the_tool
+spec: format-reference.md#commit
+note: the binding cases one invocation cannot state: the collapse of
+ `-b X --no-bindings`, `--orphan --no-bindings`, and
+ `--no-bindings --bind-ref=x` onto one commit object; the names a `run:` line
+ cannot carry, the empty one and one holding a tab among them; and the
+ collection binding, which needs `init --collection-id` and so a repository no
+ setup builds. Each implementation's own `show --raw` reads the dict back over
+ that repository: `ostree.collection-binding` stands after `ostree.ref-binding`
+ under a branch, under `--bind-ref`, and under `--orphan`, `--bind-ref` leaves
+ the collection value as it stands, and `--no-bindings` removes both keys.
+
+# ---------------------------------------------------------------------------
+# commit -- the walk modifiers (Phase 17f, item F5) and the checkout speedup
+# (item F6). A cell whose claim needs a control file, a checkout, or a second
+# invocation reading what the first left cites `evidence:`: the `run:` grammar
+# writes no file and the setup vocabulary builds no checkout.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: commit
+cell: commit/mode-ro-executables
+setup: repo tree
+corpus: C2
+run: commit --repo=$REPO -b conformance --mode-ro-executables --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: corpus `C2` holds `04755`, `02755`, and `01755` as regular files and
+ `02775` and `01777` as directories, so the checksum states the rule and the
+ two limits on it at once: the write bits of an executable file go, setuid,
+ setgid, and sticky survive, and a directory is left alone whatever its mode.
+ Corpus `C1` would add the modes with no execute bit; it also holds a `0000`
+ file, which neither implementation can read as a non-root user, so the forms
+ cell below carries those instead.
+
+family: M10
+subcommand: commit
+cell: commit/mode-ro-executables-forms
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_mode_ro_executables_matches_the_tool
+spec: format-reference.md#commit
+note: the mode grid one corpus does not hold: a regular file carrying only the
+ group execute bit and one carrying only the other execute bit, both of which
+ trigger the rule, beside `0644`, `0640`, `0600`, and `0555`, which are left as
+ they are, and a symlink, which is left alone. The same test states the option
+ beside `--statoverride`, `--canonical-permissions`, `--owner-uid`, and
+ `--no-xattrs`.
+
+family: M10
+subcommand: commit
+cell: commit/mode-ro-executables-canonical
+setup: repo tree
+corpus: C2
+modes: archive
+run: commit --repo=$REPO -b conformance --mode-ro-executables --canonical-permissions --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: both modifiers are AND masks, so they commute and this pair states no
+ order: `04755` reaches `0555` and `01755` reaches `0555` whichever runs first.
+ What the pair states is that both reach every regular file of the corpus and
+ that the two masks compose, every one of them landing on one mode. The order
+ itself is stated by `commit/statoverride-canonical-order`, `--statoverride`
+ being the one mode modifier that assigns or ORs. The cell states `archive`,
+ canonical ingest owning every object 0:0 and a `bare` repository recording that
+ ownership on the inode, which needs root.
+
+family: M10
+subcommand: commit
+cell: commit/statoverride-absent
+setup: repo tree
+run: commit --repo=$REPO -b conformance --statoverride=$SCRATCH/nope.txt --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: openat($SCRATCH/nope.txt): No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: openat($SCRATCH/nope.txt): No such file or directory"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: the control file is read ahead of the missing-branch check, ahead of
+ `--parent`, ahead of the tree, and ahead of the timestamp, so nothing is
+ written and the refusal names the path as the command line spelled it.
+
+family: M10
+subcommand: commit
+cell: commit/statoverride-is-a-directory
+setup: repo tree
+run: commit --repo=$REPO -b conformance --statoverride=$TREE --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Is a directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Is a directory"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: a directory opens and then fails to read, so the reason stands alone with
+ no `openat(<path>)` prefix, the way a `-F` directory does.
+
+family: M10
+subcommand: commit
+cell: commit/skip-list-absent
+setup: repo tree
+run: commit --repo=$REPO -b conformance --skip-list=$SCRATCH/nope.txt --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: openat($SCRATCH/nope.txt): No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: openat($SCRATCH/nope.txt): No such file or directory"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: the same wording and the same step as the statoverride file, which is
+ read first when both are given.
+
+family: M10
+subcommand: commit
+cell: commit/skip-list-is-a-directory
+setup: repo tree
+run: commit --repo=$REPO -b conformance --skip-list=$TREE --timestamp=@1700000000 $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Is a directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Is a directory"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#commit
+note: as for the statoverride file.
+
+family: M10
+subcommand: commit
+cell: commit/statoverride-forms
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_statoverride_matches_the_tool
+spec: format-reference.md#commit
+note: every claim about the file's content needs a file, which the `run:`
+ grammar cannot write. The cited test compares eighty-nine invocations by
+ commit checksum and by refusal text: the OR form and the `=` form, the base-10
+ reading, a mode field carrying a sign or leading zeros, the entries over the root directory, a nested file, a symlink, and a
+ directory that is not descended into, the OR form over a directory below the
+ walk root of this record's filesystem source, which states no mode and leaves
+ the `=` entry to state one, an `=`
+ value whose file-type bits land inside a symlink's own, the rule for a path
+ named more than once -- one entry per path per form holding the value of the
+ last line naming it, with the OR form ahead of the `=` form whichever order
+ the two lines come in -- blank lines, an empty file, a missing final newline,
+ a mode field holding no digit, the `=` entry that matches nothing and is
+ ignored, the unmatched report for every other path, the malformed-line
+ refusal, a file that does not open or is a directory, a file holding a byte
+ that is not UTF-8 or is NUL, the ten `--canonical-permissions` pairs
+ `commit/statoverride-canonical-order` states, and fifteen pairs with a
+ `--skip-list`: a path the skip list prunes counts as reached and draws no
+ report, a path below a pruned directory does not, a path both files name that
+ the tree does not hold does not, the walk root counts as reached even where
+ the skip list prunes it, and the order of the two options changes none of it.
+
+family: M10
+subcommand: commit
+cell: commit/statoverride-or-spend
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_statoverride_spends_one_entry_per_run
+spec: format-reference.md#commit
+note: an OR-form entry reaches one entry of the tree per run. The first entry
+ any source offers under the path spends it, and a later source under that path
+ keeps the mode it brought. The claim needs more than one source and a
+ statoverride file, neither of which the `run:` grammar writes, so the cited
+ test states it: over `/f.txt` at 0644, `/link`, and the walk root, one source
+ reaches `-00664`, `l04777`, and `d00775`, and a second source of the same
+ corpus leaves `-00644`, `l00777`, and `d00755`, over a `dir=` pair, a `ref=`
+ and `dir=` pair, and a `tar=` pair alike. The `=` form is not spent: `=448
+ /f.txt` reaches `-00700` in both sources of a `dir=` pair and of a `tar=` pair.
+ The test reads each mode out of both repositories, so the rule is stated and
+ not inferred from the checksum. A spent entry counts as reached, so the last
+ invocation states that a run naming a spent path and an absent one reports the
+ absent path alone, at exit 1.
+
+family: M10
+subcommand: commit
+cell: commit/statoverride-or-tar-directory
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_statoverride_spends_one_entry_per_run,
+ ostrya_cli::cli::commit_tar_source_matches_the_tool
+spec: format-reference.md#commit
+note: a directory below the walk root spends the OR entry and takes no value
+ from it, except over an archive member, where the OR value reaches a directory
+ as well. Over `/common` at 0755, `16 /common` reaches `d00755` from a `dir=`
+ source and from a `ref=` source and `d00775` from a `tar=` source, and `=504
+ /common` reaches `d00770` from all three. The exception is the archive's only
+ where the archive spends the entry: with `--tree=dir=t1 --tree=tar=a1`, and
+ with `--tree=ref=seed --tree=tar=a1`, and with two archives of one corpus, the
+ directory ends at `d00755`, the earlier source having spent the entry, and with
+ `--tree=dir=t1 --tree=tar=a2` over `/onlyB`, which `t1` does not hold, it ends
+ at `d00775`. The second cited test holds the single-source pair over its own
+ corpus. Both need an archive and a statoverride file, which no setup binds.
+
+family: M10
+subcommand: commit
+cell: commit/statoverride-unmatched-order
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_statoverride_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two implementations agree on the set of `Unmatched statoverride
+ path:` lines and part on the sequence. The tool emits them in a hash order --
+ five entries written `/z1 /a2 /m3 /b4 /y5` come back `/z1 /a2 /b4 /m3 /y5` --
+ where the port emits them in the order the file first names each path. Both
+ emit one line per unmatched path, so a path named more than once, and a path
+ an `=` entry names beside its OR entry, get one line. The cited test sorts
+ both sides before comparing, which keeps the count of each line, and states
+ the two sequences themselves over the five-entry file, together with the one
+ line each path draws, the empty standard output, and the exit status.
+
+family: M10
+subcommand: commit
+cell: commit/skip-list-forms
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_skip_list_matches_the_tool
+spec: format-reference.md#commit
+note: twenty-seven invocations compared by commit checksum and by refusal text: a
+ file, a symlink, and a directory whose whole subtree goes with it; blank lines,
+ a path named more than once, and an empty file; every child of the root, which
+ leaves a tree of the root alone; the root itself, which reports `error: Can't
+ commit an empty tree` at exit 1 on both sides; three entries inside a pruned directory, which the walk
+ never reaches and which are therefore unmatched, in either file order and one
+ naming a directory of its own; a path named more than once that
+ matches nothing, which gets one report line; the three spellings that match
+ nothing (a trailing space, no leading slash, a trailing slash); and a file that
+ does not open or is a directory. The last two invocations state the order of
+ the two checks: the statoverride file's unmatched report ends the run and the
+ skip list's report is never reached, whichever order the command line gives
+ the two options.
+
+family: M10
+subcommand: commit
+cell: commit/statoverride-canonical-order
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_statoverride_matches_the_tool
+spec: format-reference.md#commit
+note: the three mode modifiers run in the order `--mode-ro-executables`, then
+ `--statoverride`, then the `--canonical-permissions` reduction. The first two
+ are AND masks and commute, so only the pair with `--statoverride`, which
+ assigns or ORs, states the order. The cited test compares eleven
+ `--canonical-permissions` invocations by commit checksum, and reads the mode
+ each entry ended at back out of both repositories: `=511 /plain.txt`
+ reaches `-00755` where the reverse order would give `-00777`, `=2048
+ /dir1/a.txt` reaches `-00000` where the reverse would give `-04000`, `146
+ /roexec` reaches `-00755` where the reverse would give `-00777`, and `=511 /`
+ and `=511 /dir1` reach `d00755` where the reverse would give `d00777`. Five
+ state that the reduction records the file type the walk found, so `=33261`,
+ `=4096`, `=16384`, `=40960`, and `=49152` leave a regular file a regular file
+ and a directory a directory. The eleventh puts all three modifiers on one
+ command line, where `=511 /roexec` reaches `-00755`.
+
+family: M10
+subcommand: commit
+cell: commit/control-file-encoding
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_statoverride_matches_the_tool
+spec: format-reference.md#commit
+note: a byte that is not UTF-8, and a NUL byte, refuse either control file with
+ `error: Invalid UTF-8` alone on standard error, at exit 1, standard output
+ empty and no ref written. The check covers the whole file and stands ahead of
+ the walk, ahead of the other control file's unmatched report, and ahead of a
+ tree path that does not open. The cited test states each of those over seven
+ `--statoverride` invocations, one file holding two paths that differ only in
+ the invalid byte among them, and `commit/skip-list-forms` states the encoding
+ rule for `--skip-list` over two.
+
+family: M10
+subcommand: commit
+cell: commit/statoverride-type-rename
+setup: repo tree
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::commit_statoverride_divergences_stand_as_recorded,
+ ostrya_cli::cli::commit_statoverride_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a `--statoverride` value carrying bits inside the file-type field renames
+ the type the mode holds, and the object model holds a regular file and a
+ symlink alone. The port refuses every renamed type it cannot hold, at exit 1,
+ writing nothing: `error: invalid file header: mode is not a regular file or
+ symlink` over a regular file and over a symlink, and `error: invalid dirmeta:
+ mode is not a directory mode` over a directory. Each of those refusals leaves
+ the branch it named absent. The tool refuses the directory arm too, in its own
+ words, and writes the other two at exit 0 as objects its own readers then
+ refuse: its checkout fails over the renamed symlink and its `fsck` reports an
+ invalid mode. Over a symlink the two agree where the renamed type is still
+ `S_IFLNK` (`=32768`, `=8192`, `=33261`) and part where it is not (`=4096`,
+ `=16384`, `=49152`); beside `--canonical-permissions` the regular-file and
+ directory arms agree, the reduction recording the file type the walk found.
+ The agreeing halves are the second cited test's.
+
+family: M10
+subcommand: commit
+cell: commit/statoverride-mode-reader
+setup: repo tree
+outcome: lossy
+severity: interop
+identity: not-required
+loss: the value dialect. The tool reads the field through a C `double`, so it
+ takes a hexadecimal literal, a decimal point, and an exponent as well, and
+ converts a value past the 32-bit range to `0x80000000`; the port reads the
+ documented format alone. The first cited test states ten such fields, each
+ landing on a different commit in the two implementations at exit 0 in both,
+ and holds the tool's `4294967296`, `1e100`, `inf`, `nan`, and `4294967295`
+ against the commit the literal `2147483648` gives, which is the value both
+ implementations read for `0x80000000`. `4294967295` and `-1` are the two
+ spellings of `0xFFFFFFFF`, so each renames the type and draws the refusal the
+ cell above states, where the tool commits at exit 0. The forms sit outside the
+ documented format and the out-of-range conversion is platform-defined, so the
+ port does not reproduce them (`cli-surface.md`, "Scope of CLI compatibility").
+evidence: ostrya_cli::cli::commit_statoverride_divergences_stand_as_recorded,
+ ostrya_cli::cli::commit_statoverride_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the mode field the two readers share. The port reads the form the
+ documented format states, a mode in decimal with an optional sign and leading
+ zeros, and a field holding no digit as the value zero. `+448`, `0000448`, and
+ `-0` reach the tool's own commit under either form, which the second cited
+ test states.
+
+family: M10
+subcommand: commit
+cell: commit/skip-if-unchanged
+setup: repo-with-commit tree
+run: commit --repo=$REPO -b $BRANCH --skip-if-unchanged --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stdout: equals "$REV"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: equals "$REV"
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the setup commits the corpus to `$BRANCH` with the same timestamp, so the
+ walked tree matches the tip and the run writes nothing: the parent's checksum
+ on standard output, standard error empty, exit 0, and the ref where it stood.
+ `inventory` states that no object was added.
+
+family: M10
+subcommand: commit
+cell: commit/skip-if-unchanged-fresh-branch
+setup: repo-with-commit tree
+run: commit --repo=$REPO -b other --skip-if-unchanged --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement refs-bytes
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: a branch that names no ref has no parent to compare with, so the commit
+ is written and the ref is created. The commit differs from the setup's own by
+ its `ostree.ref-binding` alone.
+
+family: M10
+subcommand: commit
+cell: commit/skip-if-unchanged-orphan
+setup: repo-with-commit tree
+run: commit --orphan --repo=$REPO --skip-if-unchanged --timestamp=@1700000000 $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement refs-bytes
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: `--orphan` suppresses the implicit parent, so there is nothing to compare
+ and the commit is written. No ref moves.
+
+family: M10
+subcommand: commit
+cell: commit/skip-if-unchanged-forms
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_skip_if_unchanged_matches_the_tool
+spec: format-reference.md#commit
+note: the cases that need a second invocation reading what the first left: the
+ run that commits followed by the run that skips; a different `-s` and an added
+ `--add-metadata-string`, both still skipped, which states that the commit's own
+ metadata takes no part in the comparison; `--owner-uid=0`, which changes every
+ object and is committed, and the repeat of it, which is skipped; a
+ `--statoverride` entry over the root directory alone, which changes the root
+ dirmeta and is committed; an unmatched entry, which still fails the command at
+ exit 1 because the walk runs either way; `--parent=none`, which commits; and
+ `--parent` naming a matching commit beside a `-b` that names no ref, which
+ prints the parent's own checksum at exit 0 and leaves the ref unresolvable.
+
+family: M10
+subcommand: commit
+cell: commit/link-checkout-speedup
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_checkout_speedup_matches_the_tool
+spec: format-reference.md#commit-modifier-canonical-permissions-consume-and-devino
+note: the option resolves a source file that is a hardlink to one of the
+ repository's own objects, so the cell needs a checkout no setup builds. The
+ cited test commits the walk tree and checks it out over four arms, each a
+ repository mode paired with a checkout form: `archive` with `-U`, `bare-user`
+ with `-U`, `bare` with `-U`, and `bare` with `-H`. `-U` is the one form every
+ mode accepts; the tool takes `-H` in `bare` alone
+ (`cli-surface.md#p2----options-missing-from-commands-that-exist`). Each arm
+ compares thirteen recommit invocations by commit checksum: the plain walk,
+ `--no-xattrs`, the option alone, and the option beside `--statoverride`,
+ `--mode-ro-executables`, `--owner-uid`, and `--skip-list`, each of which still
+ applies over the resolved object and so reaches its own commit. A hardlinked
+ copy of the checkout reaches the commit the checkout itself reaches, which
+ states that the cache keys on the inode. Each arm also reads
+ `Content Cache Hits` out of both sides' own `--table-output` block and holds
+ the two against the count that arm resolves: 0, 13, 0, and 14. The `bare` `-H`
+ arm is the one that hardlinks a symlink object, which a `bare` repository
+ stores as a symlink, so its count is one above the thirteen regular files.
+
+family: M10
+subcommand: commit
+cell: commit/devino-canonical
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_checkout_speedup_matches_the_tool
+spec: format-reference.md#commit-modifier-canonical-permissions-consume-and-devino
+note: `-I` takes a resolved object verbatim, so the commit modifiers are
+ skipped for every entry that resolves. The claim the cited test carries is
+ agreement with the tool: it compares `-I` beside `--statoverride`,
+ `--mode-ro-executables`, `--owner-uid`, and `--skip-list` over four arms --
+ `archive` with `-U`, `bare-user` with `-U`, `bare` with `-U`, and `bare` with
+ `-H` -- by exit status, by standard output, and by the reason on standard
+ error. It does not claim that `-I` reaches the option-free
+ checksum, which holds only where every entry the modifier would reach resolves.
+ An `archive` repository resolves nothing, so `-I` there is the plain walk,
+ which the test states by the two checksums meeting. Over a `bare-user` `-U`
+ checkout `-I --owner-uid=7` and `-I` alone reach different commits, the
+ directories and the symlink taking uid 7, which the test reads back out of the
+ committed tree. A `bare` `-H` checkout resolves the symlink as well, because
+ that mode stores a symlink object as a symlink and the checkout hardlinks that
+ inode.
+
+family: M10
+subcommand: commit
+cell: commit/devino-bare-user-user-mode-xattr
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_checkout_speedup_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: no cell claims that the two options leave the checksum alone, because
+ over a `bare-user` repository checked out with `-U` they do not. That checkout
+ hardlinks the stored objects. Each object carries the repository's own
+ `user.ostreemeta` xattr, and each object inode holds the permission bits with
+ the setuid, setgid, and sticky bits cleared. The plain walk reads the xattr as
+ a real xattr of the source file and commits it beside the cleared bits, so the
+ plain commit is the outlier. Either option resolves the object and reaches the
+ checksum of the source tree itself, which is the faithful result.
+ `--no-xattrs` on the plain walk drops the xattr and keeps the cleared bits, so
+ it reaches a third checksum. The cited test holds the four checksums against
+ each other over that mode: `--link-checkout-speedup` and `-I` reach one
+ commit, which equals the source tree committed with `--orphan` at the same
+ timestamp; the plain commit and the `--no-xattrs` commit each differ from it
+ and from one another. Both implementations reach the same checksum for every
+ one of those invocations, so the divergence this record carries stands between
+ the flagged and the unflagged commit.
+
+# ---------------------------------------------------------------------------
+# commit -- the derived metadata keys (Phase 17f, F9).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-archive
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --generate-sizes --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the mode that writes `ostree.sizes`. The key holds one packed record per
+ reachable object, and its bytes are part of the commit, so the agreeing
+ checksum states that both implementations packed the same records in the same
+ order. `inventory` states that the objects those records measure are the same
+ objects at the same sizes. Both claims hold for corpus `C0`, whose payloads the
+ two DEFLATE encoders compress to equal lengths. Most payloads reach two
+ lengths, so both claims are corpus-bound; `commit/generate-sizes-deflate` below
+ states the general case.
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-bare
+modes: bare
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --generate-sizes --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the option is accepted and writes no key here. That the commit is the one
+ the same invocation without the option makes is `commit/generate-sizes-no-op`
+ below, one cell being one invocation.
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-bare-user
+modes: bare-user
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --generate-sizes --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-bare-user-only
+modes: bare-user-only
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --generate-sizes --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-second-commit
+modes: archive
+setup: repo-with-commit tree
+run: commit --repo=$REPO -b $BRANCH -s x --timestamp=@1234567890 --generate-sizes $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the second commit onto a branch whose objects the setup already published,
+ so every object the tree reaches deduplicates. The key covers the whole tree
+ either way, so the records name objects neither side wrote in this invocation.
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-no-op
+modes: bare
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_generate_sizes_matches_the_tool
+spec: format-reference.md#commit
+note: outside archive mode the request writes no key at all: the commit the
+ option makes and the commit the same invocation without it makes are one
+ object. Two invocations state it, so the cited test compares the two checksums
+ in `bare`, `bare-user`, and `bare-user-only`, and states the opposite for
+ `archive`.
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-records
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_generate_sizes_matches_the_tool
+spec: format-reference.md#commit
+note: the packed records themselves, compared entry by entry rather than through
+ the commit checksum. The cited test has the tool print `ostree.sizes` out of
+ each implementation's own repository, over three trees, so the checksum, the
+ archived size, the unpacked size, and the object-type byte of every entry are
+ read on both sides.
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-tar
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_generate_sizes_matches_the_tool
+spec: format-reference.md#commit
+note: the option covers the tar form as well. One `run:` line cannot state it:
+ the port reads the stream on standard input where the tool takes
+ `--tree=tar=PATH`, so the cited test drives each implementation its own way,
+ compares the checksums, and reads the packed records back out of both
+ repositories.
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-deflate
+modes: archive
+corpus: C9
+setup: repo tree
+outcome: lossy
+severity: interop
+identity: not-required
+loss: the archived size is the stored size, so the value follows the writer's
+ DEFLATE encoder, and the two encoders reach two lengths for most payloads:
+ `large.bin` stores as 4424 for the tool and 4421 for the port, and a payload
+ of 50 `a` bytes as 40 and 50. The packed records carry those lengths, so the
+ two commit checksums part under `--generate-sizes` and meet without it. The
+ object checksums agree, so the repositories stay interoperable
+ (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::commit_generate_sizes_deflate_divergence_stands_as_recorded
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the general case `commit/generate-sizes-archive` above leaves open. Over
+ corpus `C9` plus a payload of 50 `a` bytes the cited test reads the stored
+ `.filez` size of each named payload out of both repositories and states the
+ two commit checksums with the option and without it. The numbers are pinned,
+ so a change in either encoder or in the archive compression level fails the
+ test.
+
+family: M10
+subcommand: commit
+cell: commit/bootable-no-usr
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --bootable --orphan $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: No such file or directory: /usr"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: No such file or directory: /usr"
+oracle: exit-status stdout-text stderr-text inventory
+outcome: refused-both
+severity: interop
+identity: n-a
+spec: format-reference.md#commit
+note: corpus C0 holds no `usr`, so the kernel search refuses at its first
+ component and names it. `inventory` states that neither implementation
+ published an object for the refused commit.
+
+family: M10
+subcommand: commit
+cell: commit/bootable-keys
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_bootable_matches_the_tool
+spec: format-reference.md#commit
+note: the derived pair, `ostree.linux` and `ostree.bootable`. No corpus holds
+ `usr/lib/modules/<version>/vmlinuz`, so the cited test builds the tree and
+ compares the commit checksum in `archive`, `bare`, `bare-user`, and
+ `bare-user-only`, beside `--no-bindings`, beside `--bind-ref`, and over the tar
+ form. It reads the pair back out of both repositories as well: the version the
+ one kernel directory names, the boolean beside it, one entry of each name, and
+ the slot the pair holds ahead of the bindings.
+
+family: M10
+subcommand: commit
+cell: commit/bootable-overrides-explicit
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_bootable_matches_the_tool
+spec: format-reference.md#commit
+note: the derived value replaces one the command line supplies for the same key,
+ and the entry keeps the derived slot, so `--bootable
+ --add-metadata-string=ostree.linux=9.9.9` and `--bootable` alone reach one
+ commit. The cited test states it over one branch name with `--parent=none`,
+ which holds the ref binding and the parent still, over four spellings: no
+ supplied value, a supplied `ostree.linux`, a supplied `ostree.bootable`, and
+ `ostree.linux` supplied twice. Needs the kernel tree the cited test builds.
+
+family: M10
+subcommand: commit
+cell: commit/bootable-tree-shapes
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+identity: n-a
+evidence: ostrya_cli::cli::commit_bootable_matches_the_tool
+spec: format-reference.md#commit
+note: the four refusals the search reaches beyond `commit/bootable-no-usr` --
+ no `/usr/lib`, no `/usr/lib/modules`, no kernel, and more than one kernel --
+ together with the shapes that are accepted: a `vmlinuz` symlink whose target is
+ absent, a stray file beside the kernel directory under `/usr/lib/modules`, and
+ a symlink naming that directory. A `/usr/lib` that is a file and a kernel one
+ level below the version directory are refused too. Each needs a tree no corpus
+ holds, and each side's exit status is held at the value the shape draws.
+
+family: M10
+subcommand: commit
+cell: commit/bootable-fault-order
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+identity: n-a
+evidence: ostrya_cli::cli::commit_bootable_matches_the_tool
+spec: format-reference.md#commit
+note: the kernel search stands after the walk: an unmatched `--skip-list` entry,
+ an empty tree, and a `--skip-if-unchanged` match are each reported ahead of it,
+ the last of them printing the parent's checksum at exit 0 over a tree holding
+ no kernel. Each pairing needs two faults in one invocation, which the cited
+ test states: the first two by the message each carries and by the absence of
+ the search's own, and the third by the parent's checksum at exit 0.
+
+family: M10
+subcommand: commit
+cell: commit/composefs-digest-archive
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --generate-composefs-metadata --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#composefs
+note: `ostree.composefs.digest.v0` holds the fs-verity digest of the tree's
+ composefs image, so the agreeing checksum states that both implementations
+ built the same image bytes out of the same tree.
+
+family: M10
+subcommand: commit
+cell: commit/composefs-digest-bare
+modes: bare
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --generate-composefs-metadata --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#composefs
+
+family: M10
+subcommand: commit
+cell: commit/composefs-digest-bare-user
+modes: bare-user
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --generate-composefs-metadata --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#composefs
+
+family: M10
+subcommand: commit
+cell: commit/composefs-digest-bare-user-only
+modes: bare-user-only
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1234567890 --generate-composefs-metadata --orphan $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#composefs
+note: this mode canonicalizes the tree, so its digest is not the one the other
+ three reach. Both implementations reach the same one here, which is the claim.
+
+family: M10
+subcommand: commit
+cell: commit/composefs-digest-tracks-the-tree
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_generate_composefs_metadata_matches_the_tool
+spec: format-reference.md#composefs
+note: the digest depends on the committed tree and not on the repository mode,
+ so `archive`, `bare`, and `bare-user` holding one tree reach one value and
+ `bare-user-only`, which canonicalizes the tree, reaches another. Four
+ repositories state it, so the cited test reads the stored key out of each.
+
+family: M10
+subcommand: commit
+cell: commit/composefs-digest-over-a-supplied-value
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_generate_composefs_metadata_over_a_supplied_value
+spec: format-reference.md#commit
+note: the derived digest replaces a value supplied under
+ `ostree.composefs.digest.v0`, and the entry keeps the slot that value stands
+ in, so the dict holds one entry of that name and it precedes
+ `ostree.ref-binding`. The cited test states the three routes that supply the
+ name -- `--add-metadata-string`, `--add-metadata`, and `--keep-metadata` -- the
+ name given twice, and the pairing with `--bootable` and `--generate-sizes`,
+ reads the slot back through the tool's own `show --raw`, and holds the stored
+ value against the digest the tree gives with nothing supplied. Needs the kernel tree
+ the cited test builds.
+
+family: M10
+subcommand: commit
+cell: commit/derived-metadata-key-order
+modes: archive
+setup: repo tree
+outcome: lossy
+severity: interop
+identity: not-required
+loss: the key order under a derived option. The tool holds the dict in a
+ hash-ordered container while `--bootable` or `--generate-composefs-metadata` is
+ given, so its order follows the key set and parts from the port's for some
+ sets. The order is part of the checksum, so the two commits differ wherever the
+ hash order does (`cli-surface.md`, "P2"). The claim this record carries is the
+ port's own order.
+evidence: ostrya_cli::cli::commit_derived_metadata_key_order
+spec: format-reference.md#commit
+note: the port writes the derived keys in the slots the key-order rule gives
+ them: the `--bootable` pair first, the user keys next, then the bindings, then
+ the composefs digest, and `ostree.sizes` last. The cited test reads the order
+ back through the port's own `show --raw`.
+
+# ---------------------------------------------------------------------------
+# commit -- the tree sources: `--tree`, `--base`, `--consume`, and the two tar
+# options (Phase 17f, item F4).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: commit
+cell: commit/tree-dir
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance --tree=dir=$TREE --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: one `dir=` source alone reaches the checksum the positional form reaches,
+ so the option adds a spelling and not a rule.
+
+family: M10
+subcommand: commit
+cell: commit/tree-dir-repeated
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance --tree=dir=$TREE --tree=dir=$TREE --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: overlaying one source on itself is the identity, which states that a
+ later source's files and directory metadata replace the earlier ones rather
+ than being refused as a collision.
+
+family: M10
+subcommand: commit
+cell: commit/tree-positional-ignored
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance --tree=dir=$TREE /nonexistent-xyz --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: a positional PATH beside any `--tree` is ignored and is not opened, so a
+ path that does not exist there still commits, at exit 0 and with the checksum
+ the `--tree` source alone reaches.
+
+family: M10
+subcommand: commit
+cell: commit/tree-ref
+modes: archive
+setup: repo-with-commit
+run: commit --repo=$REPO -b second --tree=ref=$REV --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: a `ref=` source takes any revision `rev-parse` reads. The two checksums
+ agree because each side's setup committed the same corpus at the same
+ timestamp, so `$REV` names the same commit in both repositories.
+
+family: M10
+subcommand: commit
+cell: commit/tree-ref-is-modified
+modes: archive
+setup: repo-with-commit
+run: commit --repo=$REPO -b second --tree=ref=$REV --owner-uid=99 --owner-gid=98 --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the commit modifiers reach a `ref=` source, so "no modifiers apply" is a
+ property of `--base` and not of content that came from the repository. The
+ pair with `commit/base-is-not-modified` states the difference.
+
+family: M10
+subcommand: commit
+cell: commit/tree-ref-no-xattrs
+modes: archive
+corpus: C4
+setup: repo-with-commit
+run: commit --repo=$REPO -b second --tree=ref=$REV --no-xattrs --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: corpus C4 puts the xattrs in the source commit, so the option has
+ something to drop over a `ref=` source: every entry records the empty set, the
+ tree root included, and the two implementations reach one checksum. The two
+ setup commits themselves part over C4's zero-length value
+ (`m0-content.matrix`, corpus C4), and this cell drops the whole set, so the
+ trees it writes meet. `commit/no-xattrs` states the same option over a
+ `dir=` source, and the pair states that a modifier is compared over each
+ source kind.
+
+family: M10
+subcommand: commit
+cell: commit/base
+modes: archive
+setup: repo-with-commit tree
+run: commit --repo=$REPO -b second --base=$REV --tree=dir=$TREE --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: `--base` is the bottom layer and the `--tree` source overlays it. Here the
+ two hold the same corpus, so the checksum states that the overlay of a tree on
+ the commit of that tree is that tree.
+
+family: M10
+subcommand: commit
+cell: commit/base-position-does-not-matter
+modes: archive
+setup: repo-with-commit tree
+run: commit --repo=$REPO -b second --tree=dir=$TREE --base=$REV --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the base is applied first whatever its position on the command line, so
+ this cell reaches the checksum `commit/base` reaches.
+
+family: M10
+subcommand: commit
+cell: commit/base-alone-with-a-ref-source
+modes: archive
+setup: repo-with-commit
+run: commit --repo=$REPO -b second --base=$REV --tree=ref=$REV --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the base and the one source name the same commit, so the result is that
+ commit's tree whichever layer supplied each entry.
+
+family: M10
+subcommand: commit
+cell: commit/base-absent-revision
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance --base=nosuchref --tree=dir=$TREE --timestamp=@1700000000
+expect-exit: 1
+expect-stderr: contains "error: Refspec 'nosuchref' not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Refspec 'nosuchref' not found"
+oracle: exit-status stderr-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the base resolves before any source is opened, so the refusal stands
+ ahead of a source that cannot be read and ahead of anything `--consume` would
+ remove.
+
+family: M10
+subcommand: commit
+cell: commit/tree-invalid-type
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance --tree=foo=$TREE --timestamp=@1700000000
+expect-exit: 1
+expect-stderr: contains "error: Invalid tree type specification 'foo'"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid tree type specification 'foo'"
+oracle: exit-status stderr-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the value splits at its first `=`, and the part before it must be `dir`,
+ `tar`, or `ref`.
+
+family: M10
+subcommand: commit
+cell: commit/tree-missing-type
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance --tree=plain --timestamp=@1700000000
+expect-exit: 1
+expect-stderr: contains "error: Missing type in tree specification 'plain'"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Missing type in tree specification 'plain'"
+oracle: exit-status stderr-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: a value carrying no `=` names no kind, and the refusal quotes the value
+ as it was given.
+
+family: M10
+subcommand: commit
+cell: commit/tree-dir-absent
+modes: archive
+setup: repo
+run: commit --repo=$REPO -b conformance --tree=dir=/nonexistent-zz --timestamp=@1700000000
+expect-exit: 1
+expect-stderr: contains "error: opendir(/nonexistent-zz): No such file or directory"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: opendir(/nonexistent-zz): No such file or directory"
+oracle: exit-status stderr-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the path is an absolute constant, so the two streams compare whole. A
+ source that is a regular file or a symlink naming a directory reports the same
+ line with `Not a directory`, which the cited test states.
+
+family: M10
+subcommand: commit
+cell: commit/tree-ref-absent
+modes: archive
+setup: repo
+run: commit --repo=$REPO -b conformance --tree=ref=nosuchref --timestamp=@1700000000
+expect-exit: 1
+expect-stderr: contains "error: Refspec 'nosuchref' not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Refspec 'nosuchref' not found"
+oracle: exit-status stderr-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: a `ref=` value resolves the way every revision does, so an absent one
+ carries the wording every subcommand taking a revision gives.
+
+family: M10
+subcommand: commit
+cell: commit/tree-tar-absent
+modes: archive
+setup: repo
+run: commit --repo=$REPO -b conformance --tree=tar=/nonexistent.tar --timestamp=@1700000000
+expect-exit: 1
+expect-stderr: contains "error: archive_read_open_filename: Failed to open '/nonexistent.tar'"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: archive_read_open_filename: Failed to open '/nonexistent.tar'"
+oracle: exit-status stderr-text refs-bytes
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: an archive that does not open carries the tool's own wording. An archive
+ that opens and does not parse does not: the two readers differ there, which
+ `cli-surface.md`, "P2" records.
+
+family: M10
+subcommand: commit
+cell: commit/tree-tar-pathname-not-utf8
+modes: archive
+setup: repo
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_tar_pathname_not_utf8_is_refused
+spec: format-reference.md#commit
+note: a member whose pathname holds a byte that is not valid UTF-8 is refused by
+ both at exit 1, in the same words, `error: Archive entry pathname is not valid
+ UTF-8`, and neither writes a commit. The `run:` grammar writes no archive and
+ no setup binds one holding such a byte, so the cited test packs the header
+ blocks itself: a `./` root member and one regular file whose name holds the
+ byte `0xFF`.
+
+family: M10
+subcommand: commit
+cell: commit/tree-dir-name-not-utf8
+modes: archive
+setup: repo
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_tree_name_not_utf8_is_refused
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a walked entry whose name holds a byte that is not valid UTF-8 is refused
+ by both at exit 1, with standard output empty and no ref written. The two word
+ the refusal differently, which `cli-surface.md`, "P2" records, so `stderr-text`
+ is not an oracle here. The refusal stands ahead of the walk callbacks in both,
+ so a `--skip-list` or a `--statoverride` path spelling the replacement
+ character reaches no such entry: each control file holds UTF-8 alone
+ (`commit/control-file-encoding`) and the walk compares a control-file path
+ against the walk path by bytes. The `run:` grammar writes no such name and no
+ setup binds one, so the cited test creates the entry itself, a regular file
+ whose name holds the byte `0xFF`, and runs the plain commit and one of each
+ control-file form over it.
+
+family: M10
+subcommand: commit
+cell: commit/consume
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance --consume --tree=dir=$TREE --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the commit reaches the checksum the same source reaches unconsumed, so
+ the option changes what is left on disk and not what is committed. What is
+ left is stated by the cited test, the harness having no oracle over a path
+ outside the repository.
+
+family: M10
+subcommand: commit
+cell: commit/tar-autocreate-parents-with-a-dir-source
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance --tar-autocreate-parents --tree=dir=$TREE --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the option is read by the archive importer alone, so a command line
+ naming no archive accepts it and commits the same tree.
+
+family: M10
+subcommand: commit
+cell: commit/tar-pathname-filter-unread-without-an-archive
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance --tar-pathname-filter=nocomma --tree=dir=$TREE --timestamp=@1700000000
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the value is read as an archive is loaded, so a value neither reader
+ accepts is carried at exit 0 where no archive is read. The same value beside a
+ `tar=` source is refused, which the cited test states.
+
+family: M10
+subcommand: commit
+cell: commit/tree-forms
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tree_sources_match_the_tool
+spec: format-reference.md#commit
+note: the composition grid one invocation cannot state: every ordered pair of
+ the three source kinds, a shared directory whose metadata the later source
+ replaces, a shared file the later source replaces, and the trailing-slash and
+ extra-positional spellings. Each accepted form is compared by the commit
+ checksum. The same test states the two type-change refusals, which name the
+ entry and not its path, and the source refusals a constant path cannot spell:
+ a `dir=` source that is a regular file or a symlink naming a directory, and a
+ `ref=` value asking for the parent of a root commit. Each of those exits 1 on
+ both sides.
+
+family: M10
+subcommand: commit
+cell: commit/base-is-not-modified
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_base_matches_the_tool
+spec: format-reference.md#commit
+note: an entry that survives from `--base` keeps the mode, the ownership, and
+ the extended attributes the base recorded, where an entry from any `--tree`
+ is shaped by the modifiers. Two commits over one repository state it, so the
+ cited test builds the pair; the `repo-with-commit` setup holds one commit of
+ the corpus the tree also holds, which no invocation can tell apart. The base
+ tree carries one `user.*` xattr and the later tree another, so the test reads
+ the `ls -X -R` row of each entry back out of both repositories: the row of the
+ entry the base contributed equals the row the base commit itself holds under
+ `--owner-uid`, `--owner-gid`, and `--no-xattrs`, and the row of the entry the
+ later source brought carries what the modifier did to it. The same test states
+ that the last `--base` wins, that the base resolves after the missing-branch
+ check, and that a skip list naming the walk root leaves the base as the whole
+ tree, so the commit is written and both sides state one checksum, with and
+ without `--generate-sizes`, whose key the pruned walk leaves out.
+
+family: M10
+subcommand: commit
+cell: commit/tar-source
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tar_source_matches_the_tool
+spec: format-reference.md#tar
+note: an archive is not a placeholder any setup binds, so every `tar=` claim is
+ stated here: an archive alone and beside a filesystem source, a hardlink
+ member, each modifier that reaches a filesystem source reaching an archive
+ too, an archive naming no root member, an empty archive, and a member whose
+ parent no member names. A `--statoverride` entry over a symlink member is
+ stated here too: the member carries the `S_IFLNK` file type, so the entry
+ reaches the permission bits the content object records as it does over a
+ filesystem symlink, which the two sources under one entry state by reaching
+ one commit. A `--skip-list` reaches an archive too. The symlink member's own
+ header mode is stated here as well: the low twelve bits of the octal field are recorded, the setuid, setgid,
+ and sticky bits included, and the bits above them are dropped. `tar` writes
+ `0777` for every symlink member it packs, so the cited test writes the header
+ field itself, in the old-GNU and the ustar forms, whose committed trees the
+ test compares against each other.
+
+family: M10
+subcommand: commit
+cell: commit/tar-autocreate-parents
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tar_source_matches_the_tool
+spec: format-reference.md#tar
+note: the flag supplies a missing root as mode `0755` owned `0:0`, and supplies
+ a missing intermediate parent as mode `0755` with the triggering member's
+ ownership, rewriting the root's metadata to match. The cited test states each
+ case by the commit checksum and reads the supplied metadata back out of both
+ repositories.
+
+family: M10
+subcommand: commit
+cell: commit/tar-pathname-filter
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
+spec: format-reference.md#tar
+note: the value splits at its first comma, the replacement is global, a member
+ the expression does not match is unchanged, a directory member carries its
+ trailing slash, the archive's own root member is the empty string, and a
+ hardlink's target is a member name the filter reaches. The cited test states
+ each by the commit checksum, over the expression subset the port reads
+ (`cli-surface.md`, "P2").
+
+family: M10
+subcommand: commit
+cell: commit/tar-pathname-filter-refusals
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a value with no comma reports `error: Missing ',' in
+ --tar-pathname-filter` from both, at exit 1. An expression neither dialect
+ compiles is refused by both at exit 1, with no object and no ref written. The
+ wording of that compile failure is the one difference: the tool reports
+ `error: --tar-pathname-filter: Error while compiling regular expression
+ '<expression>' at char N: <reason>`, and the port reports the same line
+ without the character offset and with the `regex` crate's multi-line reason,
+ so `stderr-text` is not an oracle there (`cli-surface.md`, "Scope of CLI
+ compatibility"). The refusal, the exit status, and the absent commit are what
+ is compared. Both need a `tar=` source, which no setup binds.
+
+family: M10
+subcommand: commit
+cell: commit/consume-forms
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_consume_matches_the_tool
+spec: format-reference.md#commit
+note: what `--consume` leaves on disk, which no oracle reads, each case held at
+ the state it leaves and at exit 0: the source directory itself goes for a
+ `--tree=dir=` value, a positional path, and a trailing-slash spelling, and stays, emptied, where the path is spelled `.`. A
+ `ref=` source that resolves and a `tar=` archive file both survive beside a
+ consumed `dir=` source, and the commit is written. A walk filter spares nothing:
+ a path `--skip-list` names is removed with the rest and the source directory
+ goes. Two sources are both consumed, and a second source that does not open
+ leaves the first gone with no commit written. A removal that fails reports the entry's own name as `unlinkat(<name>):
+ <reason>` at exit 1, from both.
+
+family: M10
+subcommand: commit
+cell: commit/tar-pathname-filter-dialect
+modes: archive
+setup: repo tree
+outcome: lossy
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the expression dialect, which needs a `tar=` source no setup binds. The
+ tool compiles a PCRE through GLib; the port compiles the `regex` crate's
+ dialect. Both carry the anchors `^`, `$`, `\A`, and `\z`, `\b` and `\B`, the
+ POSIX class names in the plain and the negated form, the `\xHH` and `\x{...}`
+ escapes, `\p{...}`, capturing, non-capturing, and named groups, alternation,
+ the greedy and lazy quantifiers, `(?i)` at any position, and `(?i:...)`; each
+ of those reaches the tool's commit checksum. Measured in both directions over
+ the cited test, no expression both dialects compile is answered differently.
+loss: seven constructs PCRE carries and `regex` does not, so the port refuses
+ where the tool compiles: the four lookarounds, the atomic group `(?>`, the
+ comment group `(?#`, `\Q...\E`, the anchor `\Z`, the single-byte `\C`, and a
+ backreference inside the expression. Two run the other way, the port compiling
+ where the tool refuses: a repeat count above PCRE's 65535 limit, and
+ `[[:bogus:]]`, which `regex` reads as a nested class and PCRE as an unknown
+ POSIX name. A refusal is compared as a refusal; the wording is the port's own
+ (`cli-surface.md`, "Scope of CLI compatibility").
+
+family: M10
+subcommand: commit
+cell: commit/tar-pathname-filter-prefix-strip
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
+spec: format-reference.md#tar
+note: `^dir1/(.*)$,\1` maps the directory member `dir1/` onto the empty string,
+ which names the tree root, and both implementations write the same commit for
+ the stripped tree. Needs a `tar=` source no setup binds.
+
+family: M10
+subcommand: commit
+cell: commit/tar-pathname-filter-linear-time
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `regex` compiles to a finite automaton, so one match costs time linear in
+ the length of the pathname and the option carries no step budget. `^(a+)+b`
+ and `^a+$` against a 250-character member name both reach the tool's commit
+ checksum at exit 0, and the pair answers inside a bound a backtracking matcher
+ over that name could not meet, which is what the cited test holds. Needs a
+ `tar=` source no setup binds.
+
+family: M10
+subcommand: commit
+cell: commit/tar-import-collision-wording
+modes: archive
+setup: repo tree
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `.*,Q` maps every member of an archive onto one name, which puts a file
+ member where an earlier member made a directory. Both refuse at exit 1 with no
+ commit written and with the same message body, `Can't replace directory with
+ file: QQ`. The tool prefixes the frames its importer unwound through, which
+ differ between a plain member and a deferred hardlink; the port holds no
+ deferred pass and reports the body alone. Needs a `tar=` source no setup binds.
+
+family: M10
+subcommand: commit
+cell: commit/table-output-with-a-ref-source
+modes: archive
+setup: repo tree
+outcome: lossy
+severity: interop
+loss: The tool counts a `ref=` source's content objects into `Content Total`
+ where that source does not open the list, and the port does not, so a `tar=`
+ source of three regular files followed by `--tree=ref=only1`, a ref whose tree
+ holds one file, reports 4 from the tool and 3 from the port. A `ref=` source
+ that stands alone reports 0 content objects from both, and `Metadata Total`
+ is the tool's 1 against the port's 2. Those two counts hold where the run
+ reads the root alone. `--generate-sizes` makes the tool read the whole tree,
+ so both totals then rise with that tree's object count and reach the counts a
+ fresh commit of it reports, where the port holds 2 and 0. The commit checksum,
+ `Content Written`, `Metadata Written`, `Content Cache Hits`, and
+ `Content Bytes Written` agree. The same two sources in the other order agree
+ on the whole block, and part under `--generate-sizes`, where `Metadata Total`
+ and `Content Total` are the tool's 4 and 4 against the port's 3 and 3.
+evidence: ostrya_cli::cli::commit_table_output_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: needs a `ref=` source beside another source, which no setup binds. The
+ counters are the whole difference; the commit both write is the same object.
+
+family: M10
+subcommand: commit
+cell: commit/generate-sizes-over-a-source-list
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_generate_sizes_matches_the_tool
+spec: format-reference.md#commit
+note: `ostree.sizes` over a source list is scoped to the content objects the last
+ `--tree` source contributed plus the directory objects the serialization wrote,
+ so the composition reaches the commit checksum. Nine source lists agree: one
+ source, dir over dir in both orders, dir under tar, a source contributing no
+ content, `--base` plus a tree, a `ref=` source on either side of a dir source,
+ and three sources, each compared by the commit checksum and by the packed
+ records read back out of both repositories. Needs several sources and an
+ archive, which no setup binds.
+
+# ---------------------------------------------------------------------------
+# commit -- signing (Phase 17f, item F8).
+#
+# A cell whose invocation needs the tool's ed25519 engine cites `evidence:`.
+# The engine is a build option the reference tool may omit, and such a build
+# answers every ed25519 invocation with `Requested signature type is not
+# implemented`, which describes the build and states nothing about the port
+# (harness.md, "Verdicts"). The cited tests gate on that feature and on
+# `OSTRYA_REQUIRE_OSTREE_ED25519`, so the claim holds exactly where the engine
+# is present. The `--sign-type` name-resolution cells below need no engine, so
+# they stand as `run:` cells on every build.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: commit
+cell: commit/sign-type-unknown
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --sign-type=nosuch --sign=zzz $TREE
+expect-exit: 1
+expect-stderr: contains "error: Requested signature type is not implemented"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Requested signature type is not implemented"
+oracle: exit-status stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the name is read before the key, so a run naming both a name no engine
+ carries and a key no engine could read reports the name.
+
+family: M10
+subcommand: commit
+cell: commit/sign-type-empty
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --sign-type= --sign=zzz $TREE
+expect-exit: 1
+expect-stderr: contains "error: Requested signature type is not implemented"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Requested signature type is not implemented"
+oracle: exit-status stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: an empty name names no engine, so it draws the same refusal as a name
+ no engine carries.
+
+family: M10
+subcommand: commit
+cell: commit/sign-type-uppercase
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --sign-type=ED25519 --sign=zzz $TREE
+expect-exit: 1
+expect-stderr: contains "error: Requested signature type is not implemented"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Requested signature type is not implemented"
+oracle: exit-status stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the match is case sensitive, so the engine's own name in upper case
+ names no engine.
+
+family: M10
+subcommand: commit
+cell: commit/sign-type-padded
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --sign-type=' ed25519' --sign=zzz $TREE
+expect-exit: 1
+expect-stderr: contains "error: Requested signature type is not implemented"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Requested signature type is not implemented"
+oracle: exit-status stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the name is not trimmed, so a leading space names no engine. A trailing
+ space parts the two the same way, which the cited refusal test states.
+
+family: M10
+subcommand: commit
+cell: commit/sign-type-dummy
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --sign-type=dummy --sign=zzz $TREE
+expect-exit: 1
+expect-stderr: contains "error: dummy signature type is only for ostree testing"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: dummy signature type is only for ostree testing"
+oracle: exit-status stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the name carries its own refusal in both, so `dummy` is the one name that
+ parts from the "not implemented" line without naming a usable engine. The
+ tool registers the engine and blocks the command line from it; the port
+ carries the refusal alone.
+
+family: M10
+subcommand: commit
+cell: commit/sign-type-last-occurrence-decides
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --sign-type=ed25519 --sign-type=nosuch --sign=zzz $TREE
+expect-exit: 1
+expect-stderr: contains "error: Requested signature type is not implemented"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Requested signature type is not implemented"
+oracle: exit-status stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#commit
+note: the last occurrence decides, so a good name ahead of a bad one is
+ overwritten. The reverse order commits, which needs the engine and so is
+ stated by the cited refusal test.
+
+family: M10
+subcommand: commit
+cell: commit/sign-type-unread-without-a-key
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --sign-type=nosuch $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: the name is read only where `--sign` or `--sign-from-file` names a key,
+ so a name no engine carries passes unremarked through a run that signs
+ nothing, and the commit carries no detached metadata.
+
+family: M10
+subcommand: commit
+cell: commit/gpg-homedir-alone
+modes: archive
+setup: repo tree
+run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --gpg-homedir=/nonexistent-zz-home $TREE
+expect-exit: 0
+expect-stderr: empty
+oracle: exit-status checksum-agreement inventory
+outcome: full
+severity: interop
+identity: full
+spec: format-reference.md#commit
+note: with no `--gpg-sign` the home directory is never opened, so a path that
+ does not exist changes nothing and the commit carries no detached metadata.
+
+family: M10
+subcommand: commit
+cell: commit/sign-ed25519
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_sign_ed25519_matches_the_tool
+spec: format-reference.md#signing-details
+note: one `--sign` key writes one 64-byte element under `ostree.sign.ed25519`,
+ which the cited test reads back out of both repositories, both implementations
+ reach one commit checksum, and the `.commitmeta` files hold the same bytes,
+ ed25519 being deterministic.
+
+family: M10
+subcommand: commit
+cell: commit/sign-ed25519-order-and-multiplicity
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_sign_ed25519_matches_the_tool
+spec: format-reference.md#signing-details
+note: `--sign` is repeatable with no deduplication and the elements follow the
+ command line, so two keys in each order and one key twice are three distinct
+ `.commitmeta` files, each of which the two implementations write alike. The
+ cited test runs the three over one orphan commit, each into a fresh repository
+ pair, so the three files are compared with each other, and it reads the
+ element count of the repeated key back as two.
+
+family: M10
+subcommand: commit
+cell: commit/sign-from-file
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_sign_ed25519_matches_the_tool
+spec: format-reference.md#commit
+note: each occurrence contributes the first line of its file and ignores the
+ rest, with a trailing newline optional and surrounding spaces skipped, so every
+ file form reaches the signature the key named on the command line makes. The
+ cited test states that over one orphan commit, each form into a fresh
+ repository pair. A `run:` line cannot state it: the harness has no setup that
+ writes a key file.
+
+family: M10
+subcommand: commit
+cell: commit/sign-lists-are-separate
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_sign_ed25519_matches_the_tool
+spec: format-reference.md#commit
+note: every `--sign` key signs before every `--sign-from-file` key whatever the
+ command line's order, so the two interleavings of one key from each list
+ reach the same `.commitmeta` bytes. The cited test runs both over one orphan
+ commit, each into a fresh repository pair, and compares the two files.
+
+family: M10
+subcommand: commit
+cell: commit/sign-orphan
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_sign_ed25519_matches_the_tool
+spec: format-reference.md#signing-details
+note: an orphan commit is signed the same way and writes no ref, which states
+ that the signature is detached and outside the commit's own hash. The cited
+ test compares the run, then the `.commitmeta` bytes at the orphan checksum,
+ then that no ref resolves to it, on both sides.
+
+family: M10
+subcommand: commit
+cell: commit/sign-key-length-refusals
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_sign_refusals_match_the_tool
+spec: format-reference.md#commit
+note: the decode skips every character outside the base64 alphabet and the
+ length check states the refusal, so a three-character value reports zero
+ bytes, `not-base64!!!` reports six, and a 32-byte public key reports 32, each
+ of the three held at exit 1 in the words it reports.
+ Padding acts per group and per position: three bytes come out of each complete
+ four-character group and each of that group's last two characters that is a
+ padding character removes one of them again. The cited test walks every string
+ over `A` and `=` up to length five, a padding character inserted into a valid
+ key at five offsets, and a stray character appended to a valid key, whose
+ stored signature the test reads back.
+
+family: M10
+subcommand: commit
+cell: commit/sign-from-file-refusals
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_sign_refusals_match_the_tool
+spec: format-reference.md#commit
+note: a path that does not open, a directory, and an empty path each carry
+ their own line, and the fault order inside the step puts `--sign-type` first,
+ then the `--sign` keys, then the `--sign-from-file` paths.
+
+family: M10
+subcommand: commit
+cell: commit/sign-from-file-empty-first-line
+modes: archive
+setup: repo tree
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::commit_sign_from_file_empty_line_is_refused_cleanly
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: reference build 2026.1 dies on SIGSEGV where the first line is empty and
+ on SIGABRT where the file holds no bytes, so no comparison is available. The
+ port reads a key of zero bytes and reports the length refusal at exit 1,
+ leaving the ref and the commit objects as they stand, which is what
+ `refused-clean` states. The cited test states the port alone.
+
+family: M10
+subcommand: commit
+cell: commit/sign-precedes-the-ref-write
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_sign_precedes_the_ref_write
+spec: format-reference.md#signing-details
+note: two forced faults state the order. A key that cannot sign leaves the ref
+ at the checksum it held, with no commit object published and no `.commitmeta`;
+ a `refs/heads` that cannot be written leaves the commit object beside its
+ `.commitmeta` and writes no ref. The two word the write failure differently, so
+ the claim is the state each leaves.
+
+family: M10
+subcommand: commit
+cell: commit/sign-replace-and-append
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_sign_replace_and_append_match_the_tool
+spec: format-reference.md#signing-details
+note: six runs onto one orphan checksum. `--add-detached-metadata-string`
+ replaces the whole stored dict and a signing option appends to what stands, so
+ a signature survives a later signing run and not a later replace, which the
+ cited test reads out of the key listing after each run. `--orphan` resolves no
+ parent, so `--skip-if-unchanged` beside it compares against nothing and the run
+ signs like any other: the stored dict grows by one element.
+
+family: M10
+subcommand: commit
+cell: commit/gpg-sign
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_gpg_sign_matches_the_tool
+spec: format-reference.md#signing-details
+note: `--gpg-sign` is repeatable with no deduplication and writes one
+ `ostree.gpgsigs` element per occurrence, which the cited test counts in both
+ repositories. The signature bytes carry a creation instant, so the claim is the
+ commit checksum, the element count, and the key set rather than the
+ `.commitmeta` bytes. A `run:` line cannot state it: the harness has no setup
+ that generates a GnuPG home directory.
+
+family: M10
+subcommand: commit
+cell: commit/gpg-sign-absent-key
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_gpg_sign_matches_the_tool
+spec: format-reference.md#commit
+note: a home directory that does not exist, one holding no matching key, and a
+ key id no home directory holds all draw `error: No gpg key found with ID
+ <KEY-ID> (homedir: <path>)` at exit 1 with no ref written, and the homedir term
+ is the literal `<default>` where `--gpg-homedir` is absent. The cited test
+ holds both terms of that line.
+
+family: M10
+subcommand: commit
+cell: commit/gpg-homedir-overrides-the-environment
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_gpg_sign_matches_the_tool
+spec: format-reference.md#commit
+note: with GNUPGHOME naming a populated home directory and `--gpg-homedir`
+ naming an empty one, the run fails at exit 1 with the "No gpg key found" line,
+ so the option wins over the environment.
+
+family: M10
+subcommand: commit
+cell: commit/gpg-sign-selector-length
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_gpg_sign_matches_the_tool
+spec: format-reference.md#commit
+note: a `--gpg-sign` selector under eight bytes draws `error: Unable to lookup
+ key ID <KEY-ID>: GPGME: Invalid value` without a key lookup, whatever it would
+ have named. The cited test walks the empty selector and five short ones, four
+ of which are user-id substrings that a lookup would resolve, so no key is
+ picked from a selector the tool refuses. Eight bytes and longer reach the
+ lookup: a user-id substring naming the key signs, which the stored
+ `ostree.gpgsigs` element states, and one naming nothing draws the "No gpg key
+ found" line. Each refusal is held at exit 1, with the line the record quotes
+ and with no ref written. A `run:` line cannot state it: the harness has no setup that
+ generates a GnuPG home directory.
+
+family: M10
+subcommand: commit
+cell: commit/gpg-sign-ambiguous
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::commit_gpg_sign_matches_the_tool
+spec: format-reference.md#commit
+note: a selector of eight bytes or more naming more than one secret key draws
+ `error: gpg key id <KEY-ID> ambiguous (homedir: <path>). Try the fingerprint
+ instead` at exit 1 with no ref written, so neither implementation signs with
+ one of the several. The cited test adds a second key whose user id shares an
+ eight-byte prefix with the first and names that prefix, with the home directory
+ taken from GNUPGHOME and from `--gpg-homedir`, and holds the refusal at exit 1
+ in the words it reports.
+
+family: M10
+subcommand: commit
+cell: commit/sign-from-file-bytes
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_sign_ed25519_matches_the_tool,
+ ostrya_cli::cli::commit_sign_refusals_match_the_tool
+spec: format-reference.md#commit
+note: the first line is read as bytes with no encoding requirement, and a NUL
+ byte ends it ahead of the newline. The first cited test states the two forms
+ that sign and the second the two byte counts. A valid key carrying one invalid UTF-8 byte
+ signs, and so does one followed by a NUL and further characters; a first line of
+ `AAAA\xffAAAA` reports six bytes and one of `AAAA\0BBBB` reports three. A `run:`
+ line cannot state it: the harness has no setup that writes a key file.
+
+family: M10
+subcommand: commit
+cell: commit/sign-from-file-over-long-line
+modes: archive
+setup: repo tree
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::commit_sign_from_file_empty_line_is_refused_cleanly
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port bounds the read at 65536 bytes and refuses a longer first line
+ with `error: Error reading file <path>: the first line is longer than 65536
+ bytes` at exit 1, that line alone, leaving the ref and the commit objects as
+ they stand. The tool reads a line of any length, so no comparison is
+ available. The cited test states the port alone, and holds the whole line.
+
+family: M10
+subcommand: commit
+cell: commit/sign-keypair-mismatch
+modes: archive
+setup: repo tree
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::commit_sign_keypair_mismatch_is_refused_cleanly
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a 64-byte `--sign` value whose trailing half is not the public key of its
+ leading 32-byte seed is refused by the port at exit 1 with the repository as it
+ stands, where the tool signs at exit 0 and stores one 64-byte element made with
+ a seed the stated public half does not match. One key's seed followed by another
+ key's public key reports `Mismatched Keypair detected` and a trailing half that
+ is not a curve point reports `Cannot decompress Edwards point`, so the refusal
+ itself has no counterpart. The cited test states the port's refusal and the
+ tool's stored element.
+
+family: M10
+subcommand: commit
+cell: commit/gpg-sign-round-trip
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_gpg_sign_matches_the_tool
+spec: format-reference.md#signing-details
+note: each implementation's `--gpg-sign` signature verifies through the other's
+ `show --gpg-verify-remote` over a remote holding the exported public keyring,
+ in all four pairings.
+
+family: M10
+subcommand: commit
+cell: commit/sign-key-insertion-order
+modes: archive
+setup: repo tree
+outcome: lossy
+severity: interop
+loss: the order the `.commitmeta` dict stores its keys in, over a set holding a
+ user key beside both engines. The port stores insertion order always, and the
+ tool stores a name-dependent order over 6 of 40 generated names
+ (`cli-surface.md`, "P2"). Every reader looks a key up by name and
+ `show --list-detached-metadata-keys` sorts, so the two listings agree, and the
+ commit object each writes is the same, which `commit/gpg-sign` above states.
+evidence: ostrya_cli::cli::commit_gpg_sign_matches_the_tool
+spec: format-reference.md#signing-details
+note: the port stores insertion order -- the caller's detached-metadata keys in
+ command-line order, then `ostree.sign.<type>`, then `ostree.gpgsigs` --
+ whatever order the signing options take on the command line, and `show
+ --list-detached-metadata-keys` sorts them instead, which the cited test states
+ by reading the listing and the stored order of one commit and finding them
+ different. The test reads the key order out of the raw `.commitmeta`, over both
+ option orders, three user-key names, and a run carrying two user keys. It holds
+ the two stored orders against each other over `zzz` and `zzy`, the names where
+ they meet, and over the rest requires them to differ, so the divergence the
+ `loss` field states cannot go stale.

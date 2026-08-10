@@ -10,16 +10,22 @@ use std::path::{Path, PathBuf};
 /// One `key: value` field, with the line it started on.
 #[derive(Clone, Debug)]
 pub struct Field {
+    /// The field name, as written.
     pub name: String,
+    /// The field value, with continuation lines joined.
     pub value: String,
+    /// The 1-based line the field started on.
     pub line: usize,
 }
 
 /// One paragraph: the fields in file order.
 #[derive(Clone, Debug)]
 pub struct Paragraph {
+    /// The file the paragraph was read from.
     pub file: PathBuf,
+    /// The 1-based line the paragraph started on.
     pub line: usize,
+    /// The fields, in file order.
     pub fields: Vec<Field>,
 }
 
@@ -57,8 +63,11 @@ impl Paragraph {
 /// A syntax error, carrying the position that produced it.
 #[derive(Debug)]
 pub struct ParseError {
+    /// The file the error was found in.
     pub file: PathBuf,
+    /// The 1-based line the error was found on.
     pub line: usize,
+    /// What was wrong.
     pub message: String,
 }
 

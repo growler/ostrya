@@ -120,6 +120,74 @@ impl GpgSigner {
         self.homedir = Some(dir.into());
         self
     }
+
+    /// The GnuPG home directory this signer resolves its key in, or `None` for
+    /// gpg's own default.
+    pub fn homedir(&self) -> Option<&Path> {
+        self.homedir.as_deref()
+    }
+
+    /// The fingerprints of the secret keys `gpg` resolves this signer's
+    /// selector to, in listing order.
+    ///
+    /// Runs `gpg --list-secret-keys` over the selector, which reports the keys
+    /// without touching the private material or starting a signing operation. A
+    /// home directory that does not exist, one that cannot be read, and one
+    /// holding no matching key all answer an empty list, so a caller reports one
+    /// "no such key" refusal for the three. More than one fingerprint means the
+    /// selector names more than one key and a caller that needs a single signing
+    /// key refuses it.
+    ///
+    /// The selector stands after `--`, so gpg reads it as a key name alone.
+    /// Without the terminator gpg reads an option-shaped selector as one of its
+    /// own options, and a selector such as `--homedir=<path>` moves the lookup
+    /// to another home directory and creates a keybox and a trust database
+    /// there.
+    pub async fn secret_key_fingerprints(&self) -> Result<Vec<String>> {
+        let mut cmd = ostrya_rt::Command::new("gpg");
+        if let Some(dir) = &self.homedir {
+            cmd.arg("--homedir").arg(dir);
+        }
+        cmd.arg("--batch")
+            .arg("--with-colons")
+            .arg("--list-secret-keys")
+            .arg("--")
+            .arg(&self.key);
+        let output = cmd.output(&[]).await.map_err(|e| spawn_err("gpg", &e))?;
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+        Ok(primary_fingerprints(&output.stdout))
+    }
+}
+
+/// The primary-key fingerprints in a `--with-colons` secret-key listing, in
+/// listing order.
+///
+/// Each `sec` record opens one key and the `fpr` record that follows it carries
+/// that key's fingerprint in field ten. A `ssb` record opens a subkey, whose own
+/// `fpr` record names the subkey and is skipped.
+fn primary_fingerprints(listing: &[u8]) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut wanted = false;
+    for line in listing.split(|&b| b == b'\n') {
+        let mut fields = line.split(|&b| b == b':');
+        match fields.next() {
+            Some(b"sec") => wanted = true,
+            Some(b"fpr") if wanted => {
+                wanted = false;
+                if let Some(fpr) = fields.nth(8)
+                    && let Ok(text) = std::str::from_utf8(fpr)
+                    && !text.is_empty()
+                {
+                    found.push(text.to_owned());
+                }
+            }
+            Some(b"ssb") => wanted = false,
+            _ => {}
+        }
+    }
+    found
 }
 
 impl Signer for GpgSigner {
@@ -399,13 +467,14 @@ impl Repo {
 
 /// Export the keys `key_ids` names out of `keys`, through a scratch keyring of
 /// its own so the selection reads only what was offered. A selector that names
-/// nothing is refused by name.
+/// nothing is refused by name. Each selector stands after `--`, so gpg reads it
+/// as a key name rather than as one of its own options.
 async fn select_keys(dir: &Path, keys: &[u8], key_ids: &[String]) -> Result<Vec<u8>> {
     import_keyring(dir, OFFERED_FILE, keys).await?;
     let mut selected = Vec::new();
     for id in key_ids {
         let mut cmd = gpg_in(dir, OFFERED_FILE);
-        cmd.arg("--export").arg(id);
+        cmd.arg("--export").arg("--").arg(id);
         let output = cmd.output(&[]).await.map_err(|e| spawn_err("gpg", &e))?;
         if !output.status.success() || output.stdout.is_empty() {
             return Err(Error::Signature(format!(

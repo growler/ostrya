@@ -142,22 +142,27 @@ impl Actor {
 /// One record from a family file.
 #[derive(Clone, Debug)]
 pub struct Record {
+    /// The paragraph the record was parsed from.
     pub paragraph: Paragraph,
 }
 
 impl Record {
+    /// The single value of `name`, or `None` where the record states none.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.paragraph.get(name)
     }
 
+    /// Every value of `name`, in file order.
     pub fn list(&self, name: &str) -> Vec<&str> {
         self.paragraph.list(name)
     }
 
+    /// The `<file>:<line>` position the record starts at.
     pub fn origin(&self) -> String {
         self.paragraph.origin()
     }
 
+    /// The `family` field, or the empty string.
     pub fn family(&self) -> &str {
         self.get("family").unwrap_or("")
     }
@@ -167,10 +172,12 @@ impl Record {
         self.get("tier").and_then(Tier::parse).unwrap_or(Tier::T0)
     }
 
+    /// The `severity` field, `interop` by default.
     pub fn severity(&self) -> &str {
         self.get("severity").unwrap_or("interop")
     }
 
+    /// The `outcome` field, `unobserved` by default.
     pub fn outcome(&self) -> &str {
         self.get("outcome").unwrap_or("unobserved")
     }
@@ -205,20 +212,29 @@ impl Record {
 /// fields describe.
 #[derive(Clone, Debug)]
 pub struct Cell {
+    /// The cell id, unique across the matrix.
     pub id: String,
+    /// The family the cell belongs to.
     pub family: String,
     /// The row key the completeness rule and the report grid use.
     pub row: String,
+    /// The repository mode the cell runs in, where it names one.
     pub mode: Option<String>,
+    /// The corpus the cell runs over, where it names one.
     pub corpus: Option<String>,
+    /// The operation the cell exercises, where it names one.
     pub op: Option<String>,
+    /// The index of the record this cell expanded from.
     pub record: usize,
 }
 
 /// Every record file in one directory, and the cells they expand into.
 pub struct Matrix {
+    /// The directory the record files were read from.
     pub dir: PathBuf,
+    /// Every record, in file order.
     pub records: Vec<Record>,
+    /// Every cell those records expand into.
     pub cells: Vec<Cell>,
 }
 

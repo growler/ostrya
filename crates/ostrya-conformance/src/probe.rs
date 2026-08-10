@@ -17,15 +17,18 @@ use crate::exec::{self, Outcome, Tool};
 
 /// One side, as a probe sees it.
 pub struct SideEnv<'a> {
+    /// The implementation this side runs.
     pub tool: &'a Tool,
     /// The side's subtree, and the working directory unless the probe changes
     /// it.
     pub root: &'a Path,
+    /// The setup bindings the cell resolved.
     pub bindings: &'a BTreeMap<String, String>,
 }
 
 /// What a probe receives.
 pub struct Env<'a> {
+    /// One entry per side, in cell order.
     pub sides: Vec<SideEnv<'a>>,
 }
 

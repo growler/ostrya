@@ -212,12 +212,12 @@ fn etc_migration_remaps_top_level_etc() {
         .unwrap();
         let commit = {
             let txn = repo.transaction().await.unwrap();
+            // The archive names neither a root member nor `usr/`, so the
+            // remapped member needs both of its parents synthesized.
+            let mut opts = TarImportOptions::new().with_etc_migration(true);
+            opts.autocreate_parents = true;
             let mut mtree = repo
-                .import_tar(
-                    &txn,
-                    TarImportOptions::new().with_etc_migration(true),
-                    Cursor::new(built),
-                )
+                .import_tar(&txn, opts, Cursor::new(built))
                 .await
                 .unwrap();
             let root = txn.write_mtree(&mut mtree).await.unwrap();
@@ -342,6 +342,72 @@ fn import_rejects_unsupported_nodes() {
             txn.abort().await.unwrap();
         }
     });
+}
+
+/// A member whose pathname holds a byte that is not valid UTF-8 is refused. The
+/// port stores pathnames as text, so the reader's decode failure comes back as
+/// [`ostrya::Error::TarPathname`], whose message is the line the CLI prints.
+#[test]
+fn import_rejects_a_pathname_that_is_not_utf8() {
+    let tmp = TmpDir::new("tar-pathname");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let err = repo
+            .import_tar(
+                &txn,
+                TarImportOptions::new(),
+                Cursor::new(invalid_pathname_tar()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ostrya::Error::TarPathname), "got {err:?}");
+        txn.abort().await.unwrap();
+    });
+}
+
+/// An archive holding a `./` root member and one regular file whose name holds
+/// the byte `0xFF`. [`TarWriter`] takes each pathname as text, so the two
+/// header blocks are written directly.
+fn invalid_pathname_tar() -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(&ustar_header(b"./", 0o755, b'5', 0));
+    let body = b"hello\n";
+    out.extend_from_slice(&ustar_header(b"./b\xFFd.txt", 0o644, b'0', body.len()));
+    out.extend_from_slice(body);
+    out.resize(out.len().next_multiple_of(512), 0);
+    // Two zero blocks end the stream, and the whole is padded to a tar record.
+    out.resize(out.len() + 1024, 0);
+    out.resize(out.len().next_multiple_of(10240), 0);
+    out
+}
+
+/// One 512-byte ustar header block. The name is taken as bytes, so a pathname
+/// that is not valid UTF-8 can be stated.
+fn ustar_header(name: &[u8], mode: u32, typeflag: u8, size: usize) -> [u8; 512] {
+    let mut h = [0u8; 512];
+    let put = |h: &mut [u8; 512], at: usize, bytes: &[u8]| {
+        h[at..at + bytes.len()].copy_from_slice(bytes);
+    };
+    put(&mut h, 0, name);
+    put(&mut h, 100, format!("{mode:07o}\0").as_bytes());
+    put(&mut h, 108, b"0000000\0");
+    put(&mut h, 116, b"0000000\0");
+    put(&mut h, 124, format!("{size:011o}\0").as_bytes());
+    put(&mut h, 136, b"00000000000\0");
+    // The checksum field is summed as eight spaces and written afterwards.
+    put(&mut h, 148, b"        ");
+    h[156] = typeflag;
+    put(&mut h, 257, b"ustar\0");
+    put(&mut h, 263, b"00");
+    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+    put(&mut h, 148, format!("{sum:06o}\0 ").as_bytes());
+    h
 }
 
 /// Build a one-member archive from a metadata-only entry.

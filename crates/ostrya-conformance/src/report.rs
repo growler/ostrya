@@ -13,12 +13,16 @@ use crate::tier::Host;
 /// Which format to write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
+    /// A human-readable grid.
     Human,
+    /// TAP version 14.
     Tap,
+    /// One JSON document.
     Json,
 }
 
 impl Format {
+    /// The format `text` names, or `None` for an unknown name.
     pub fn parse(text: &str) -> Option<Format> {
         match text {
             "human" => Some(Format::Human),
@@ -31,9 +35,13 @@ impl Format {
 
 /// What the run itself recorded, for the report header.
 pub struct RunInfo {
+    /// Where the run wrote its artifacts.
     pub artifact_dir: String,
+    /// The port executable the run used.
     pub port: String,
+    /// The reference executable, where the run found one.
     pub reference: Option<String>,
+    /// What the host offered the run.
     pub host: Host,
 }
 

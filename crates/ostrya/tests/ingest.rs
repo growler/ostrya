@@ -13,6 +13,7 @@ use std::os::fd::AsFd;
 use std::path::Path;
 
 use common::{ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, fixture_repo, ostree_available};
+use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CreateOptions, DevInoCache, FileKind, FileMeta,
     FilterResult, MutableTree, Repo, RepoMode, TreeEntry,
@@ -476,10 +477,104 @@ fn xattr_callback_lands_in_the_object_id() {
 }
 
 #[test]
+fn canonical_permissions_reduce_the_mode_callback_result() {
+    // The canonical reduction stands last of the mode modifiers, so a mode
+    // callback states the mode the reduction then masks. The file type stays
+    // the one the walk found, so a callback naming a type of its own leaves
+    // the entry the kind it is. Both the plain walk and the devino-cache path
+    // run the callback through the same step, so both are asserted here.
+    let tmp = TmpDir::new("ingest-canon-order");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    std::fs::write(src.join("hello.txt"), b"hello ostree\n").unwrap();
+    set_mode(&src.join("hello.txt"), 0o644);
+    set_mode(&src.join("sub"), 0o700);
+    set_mode(&src, 0o755);
+    let stat = rustix::fs::stat(src.join("hello.txt")).unwrap();
+
+    // What the CLI's `--statoverride` mode callback does for `=511 /hello.txt`,
+    // `=2048 /sub`, and a value renaming the file's type.
+    let assign = |value: u32| {
+        move |path: &Path, meta: &FileMeta| -> u32 {
+            match path.to_str().unwrap() {
+                "/hello.txt" | "/sub" => (meta.mode & 0o170000) | value,
+                _ => meta.mode,
+            }
+        }
+    };
+
+    block_on(async {
+        let root = base.join("repo");
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+
+        let walk = async |value: u32, cache: Option<DevInoCache>| {
+            let txn = repo.transaction().await.unwrap();
+            let dfd = std::fs::File::open(base).unwrap();
+            let mut modifier = CommitModifier::new(
+                CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS,
+            );
+            modifier.mode_callback = Some(Box::new(assign(value)));
+            modifier.devino_cache = cache;
+            let mut mtree = MutableTree::new();
+            txn.write_dfd_to_mtree(
+                dfd.as_fd(),
+                Path::new("src"),
+                &mut mtree,
+                Some(&mut modifier),
+            )
+            .await
+            .unwrap();
+            let rt = txn.write_mtree(&mut mtree).await.unwrap();
+            let dirtree = *rt.dirtree_checksum();
+            txn.commit().await.unwrap();
+            let tree = repo.load_dirtree(&dirtree).await.unwrap();
+            let hello = tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1;
+            let sub = tree.dirs.iter().find(|(n, _, _)| n == "sub").unwrap().2;
+            (
+                repo.load_file(&hello).await.unwrap().mode,
+                repo.load_dirmeta(&sub).await.unwrap().mode,
+            )
+        };
+
+        // 0o777 assigned, then reduced: 0o755. 0o4000 assigned, then reduced:
+        // nothing survives the mask. Running the reduction first would give
+        // 0o777 and 0o4000.
+        assert_eq!(walk(0o777, None).await, (0o100755, 0o40755));
+        assert_eq!(walk(0o4000, None).await, (0o100000, 0o40000));
+        // A value naming a directory's type over a regular file leaves a
+        // regular file, and the permission bits it carries are masked.
+        assert_eq!(walk(0o40755, None).await, (0o100755, 0o40755));
+
+        // The same over the devino-cache path: the stored object supplies the
+        // metadata, and the callback and the reduction shape it in that order.
+        let stored = {
+            let (mode, _) = walk(0o777, None).await;
+            assert_eq!(mode, 0o100755);
+            let txn = repo.transaction().await.unwrap();
+            let meta = FileMeta::regular(0, 0, 0o644);
+            let c = txn
+                .write_regfile_inline(None, &meta, b"hello ostree\n")
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            c
+        };
+        let mut cache = DevInoCache::new();
+        cache.insert(stat.st_dev, stat.st_ino, stored);
+        assert_eq!(walk(0o777, Some(cache)).await, (0o100755, 0o40755));
+    });
+}
+
+#[test]
 fn devino_cache_hit_skips_rehashing() {
     // With DEVINO_CANONICAL and a cache entry for the file's (dev, ino), the
     // file takes the cached checksum and no object is staged. Without the flag,
-    // the file is hashed normally.
+    // the cache is still consulted: the stored object supplies the metadata the
+    // modifier shapes, and the object is reused where the shaped metadata
+    // matches it and rewritten from the stored content where it does not.
     let tmp = TmpDir::new("ingest-devino");
     let base = tmp.path();
     let src = base.join("src");
@@ -523,16 +618,80 @@ fn devino_cache_hit_skips_rehashing() {
         let hello = tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1;
         assert_eq!(hello, sentinel, "the cached checksum is used verbatim");
 
-        // No flag: the same cache is ignored and the file is hashed.
-        let root = base.join("repo-miss");
+        // A repository holding the real object, for the two walks below.
+        let root = base.join("repo-plain");
         let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
             .await
             .unwrap();
+        let real = {
+            let txn = repo.transaction().await.unwrap();
+            let dfd = std::fs::File::open(base).unwrap();
+            let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+            let mut mtree = MutableTree::new();
+            txn.write_dfd_to_mtree(
+                dfd.as_fd(),
+                Path::new("src"),
+                &mut mtree,
+                Some(&mut modifier),
+            )
+            .await
+            .unwrap();
+            let rt = txn.write_mtree(&mut mtree).await.unwrap();
+            let root_dirtree = *rt.dirtree_checksum();
+            txn.commit().await.unwrap();
+            let tree = repo.load_dirtree(&root_dirtree).await.unwrap();
+            tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1
+        };
+
+        // The source file is rewritten in place, keeping its inode, so the
+        // stored object's payload and the source file's payload now differ.
+        // Either half below that read the source would produce an object
+        // holding `rewritten` rather than the stored bytes.
+        std::fs::write(
+            src.join("hello.txt"),
+            b"a payload the store does not hold\n",
+        )
+        .unwrap();
+        set_mode(&src.join("hello.txt"), 0o644);
+        let after = rustix::fs::stat(src.join("hello.txt")).unwrap();
+        assert_eq!(
+            (after.st_dev, after.st_ino),
+            (stat.st_dev, stat.st_ino),
+            "the rewrite kept the inode the cache is keyed on"
+        );
+
+        // No flag, and the shaped metadata equals the stored metadata: the
+        // object is reused and the hit is counted.
         let txn = repo.transaction().await.unwrap();
         let dfd = std::fs::File::open(base).unwrap();
         let mut cache = DevInoCache::new();
-        cache.insert(stat.st_dev, stat.st_ino, sentinel);
+        cache.insert(stat.st_dev, stat.st_ino, real);
         let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+        modifier.devino_cache = Some(cache.clone());
+        let mut mtree = MutableTree::new();
+        txn.write_dfd_to_mtree(
+            dfd.as_fd(),
+            Path::new("src"),
+            &mut mtree,
+            Some(&mut modifier),
+        )
+        .await
+        .unwrap();
+        let rt = txn.write_mtree(&mut mtree).await.unwrap();
+        let root_dirtree = *rt.dirtree_checksum();
+        let stats = txn.commit().await.unwrap();
+        assert_eq!(stats.devino_cache_hits, 1, "the cache is consulted");
+        assert_eq!(stats.content_written, 0, "no object is rewritten");
+        let tree = repo.load_dirtree(&root_dirtree).await.unwrap();
+        let hello = tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1;
+        assert_eq!(hello, real, "the stored object is reused");
+
+        // No flag, and the modifier changes the metadata: the object is
+        // rewritten from the stored content under the shaped metadata.
+        let txn = repo.transaction().await.unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+        modifier.owner_uid = Some(4242);
         modifier.devino_cache = Some(cache);
         let mut mtree = MutableTree::new();
         txn.write_dfd_to_mtree(
@@ -546,13 +705,25 @@ fn devino_cache_hit_skips_rehashing() {
         let rt = txn.write_mtree(&mut mtree).await.unwrap();
         let root_dirtree = *rt.dirtree_checksum();
         let stats = txn.commit().await.unwrap();
-        assert_eq!(stats.devino_cache_hits, 0, "the cache is not consulted");
-        assert_eq!(stats.content_written, 1, "the file is hashed");
-
-        let repo = Repo::open(&root).await.unwrap();
+        assert_eq!(stats.devino_cache_hits, 0, "the hit did not stand");
+        assert_eq!(stats.content_written, 1, "the object is rewritten");
         let tree = repo.load_dirtree(&root_dirtree).await.unwrap();
         let hello = tree.files.iter().find(|(n, _)| n == "hello.txt").unwrap().1;
-        assert_ne!(hello, sentinel, "the real content is hashed");
+        assert_ne!(hello, real, "the shaped metadata gives a new identity");
+        let object = repo.load_file(&hello).await.unwrap();
+        assert_eq!(object.uid, 4242);
+        let mut payload = Vec::new();
+        object
+            .reader()
+            .await
+            .unwrap()
+            .read_to_end(&mut payload)
+            .await
+            .unwrap();
+        assert_eq!(
+            payload, b"hello ostree\n",
+            "the rewritten object carries the stored payload, not the source file's"
+        );
     });
 }
 
@@ -588,6 +759,55 @@ fn consume_empties_the_source() {
         assert!(base.exists(), "the parent of the walk root remains");
         assert_eq!(stats.content_written, 4, "objects are still staged");
     });
+}
+
+#[test]
+fn consume_spares_a_walk_root_spelled_dot() {
+    // A consuming walk spares the walk root when the path is exactly `.`, and
+    // removes it under every other spelling, `./` among them. The test is on
+    // the text the path carries, which is the rule
+    // `docs/format-reference.md`, "CLI output formats", `commit` records for
+    // `--consume`. Both spellings here name the directory the walk-root
+    // descriptor is open on, and the kernel refuses to unlink a path whose
+    // last component is `.`, so each leaves the directory in place and empties
+    // it.
+    for spelling in [".", "./"] {
+        let tmp = TmpDir::new("ingest-consume-dot");
+        let base = tmp.path();
+        let src = build_fixture_source(base);
+        let root = base.join("repo");
+        block_on(async {
+            let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            let dfd = std::fs::File::open(&src).unwrap();
+            let mut modifier = CommitModifier::new(
+                CommitModifierFlags::CONSUME | CommitModifierFlags::SKIP_XATTRS,
+            );
+            let mut mtree = MutableTree::new();
+            txn.write_dfd_to_mtree(
+                dfd.as_fd(),
+                Path::new(spelling),
+                &mut mtree,
+                Some(&mut modifier),
+            )
+            .await
+            .unwrap();
+            txn.write_mtree(&mut mtree).await.unwrap();
+            txn.commit().await.unwrap();
+
+            assert!(
+                src.is_dir(),
+                "the walk root spelled {spelling} stands after the walk"
+            );
+            assert_eq!(
+                std::fs::read_dir(&src).unwrap().count(),
+                0,
+                "the walk root spelled {spelling} is emptied"
+            );
+        });
+    }
 }
 
 #[test]
@@ -890,10 +1110,11 @@ fn error_on_unlabeled_fails_when_the_hook_returns_no_label() {
 }
 
 #[test]
-fn consume_with_a_pruning_filter_leaves_the_pruned_source() {
-    // CONSUME deletes each ingested source, but a filter that prunes a file
-    // inside a subdirectory leaves that file -- and its now-non-empty parent --
-    // on disk without failing the walk, and the committed tree omits it.
+fn consume_with_a_pruning_filter_still_empties_the_source() {
+    // CONSUME empties each ingested source whatever the filter kept out of the
+    // commit: a pruned file and its parent are removed with the rest, and the
+    // committed tree omits the pruned file. Leaving them would strand the
+    // source half-deleted and fail the removal of the directory above.
     let tmp = TmpDir::new("ingest-consume-prune");
     let base = tmp.path();
     let src = base.join("src");
@@ -934,9 +1155,10 @@ fn consume_with_a_pruning_filter_leaves_the_pruned_source() {
         let root_dirtree = *rt.dirtree_checksum();
         txn.commit().await.unwrap();
 
-        assert!(src.join("subdir/skip.txt").exists(), "pruned file remains");
-        assert!(src.join("subdir").exists(), "its parent remains");
-        assert!(!src.join("subdir/keep.txt").exists(), "kept file consumed");
+        assert!(
+            !src.join("subdir").exists(),
+            "the pruned file and its parent are consumed with the rest"
+        );
 
         let repo = Repo::open(&root).await.unwrap();
         let tree = repo.load_dirtree(&root_dirtree).await.unwrap();
@@ -1118,4 +1340,128 @@ fn devino_hit_skips_the_xattr_callback() {
         0,
         "the xattr callback is not invoked for a cached file"
     );
+}
+
+/// Marks the re-executed child of
+/// [`deep_source_tree_ingests_under_a_low_descriptor_limit`], and names the
+/// file the child writes to record that the ingest ran.
+const DEEP_INGEST_CHILD: &str = "OSTRYA_DEEP_INGEST_CHILD";
+/// The soft descriptor limit the child runs under. It stands well above what
+/// the repository, the runtime, and the blocking pool open for themselves.
+const DEEP_INGEST_NOFILE: usize = 256;
+/// The depth of the source tree the child ingests. It stands well above
+/// [`DEEP_INGEST_NOFILE`], so a walk holding one descriptor per level runs out.
+const DEEP_INGEST_DEPTH: usize = 1024;
+/// The thread stack the child runs with. One level of the walk costs one
+/// future, and the tree is deep, so the child is given room for the whole
+/// descent and the descriptor limit is what the walk meets.
+const DEEP_INGEST_STACK: usize = 512 * 1024 * 1024;
+
+#[test]
+fn deep_source_tree_ingests_under_a_low_descriptor_limit() {
+    // The walk holds at most two directory descriptors, whatever the depth of
+    // the source, so a tree deeper than the process descriptor limit ingests.
+    //
+    // The limit is a property of the process and the tests of this binary run
+    // in parallel threads, so the lowered limit goes to a child: this test
+    // binary re-executed for this test alone, through `sh` with `ulimit -n`.
+    if let Some(marker) = std::env::var_os(DEEP_INGEST_CHILD) {
+        ingest_a_deep_tree();
+        std::fs::write(marker, b"ingested").expect("record that the deep ingest ran");
+        return;
+    }
+    let tmp = TmpDir::new("ingest-deep-marker");
+    let marker = tmp.path().join("ingested");
+    let exe = std::env::current_exe().expect("the path of the running test binary");
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"ulimit -n "$1" || exit 111; shift; exec "$@""#)
+        .arg("sh")
+        .arg(DEEP_INGEST_NOFILE.to_string())
+        .arg(&exe)
+        .arg("--exact")
+        .arg("deep_source_tree_ingests_under_a_low_descriptor_limit")
+        .arg("--nocapture")
+        .env(DEEP_INGEST_CHILD, &marker)
+        .env("RUST_MIN_STACK", DEEP_INGEST_STACK.to_string())
+        .status()
+        .expect("re-run the test binary under a lowered descriptor limit");
+    assert!(
+        status.success(),
+        "the deep ingest failed under a soft limit of {DEEP_INGEST_NOFILE} descriptors: {status}"
+    );
+    // A name the child's filter does not match runs nothing and still exits 0,
+    // so the marker is what proves the ingest ran.
+    assert!(
+        marker.exists(),
+        "the child ran no deep ingest: the test name the filter names is stale"
+    );
+}
+
+/// The soft `RLIMIT_NOFILE` of the running process, read from `/proc`.
+fn soft_nofile_limit() -> usize {
+    let limits = std::fs::read_to_string("/proc/self/limits").expect("read /proc/self/limits");
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max open files"))
+        .expect("the open-file limit line");
+    line.split_whitespace()
+        .nth(3)
+        .and_then(|soft| soft.parse().ok())
+        .expect("the soft open-file limit")
+}
+
+/// Ingest a source tree [`DEEP_INGEST_DEPTH`] directories deep, consuming it.
+/// Runs in the child process, under the lowered descriptor limit.
+fn ingest_a_deep_tree() {
+    assert_eq!(
+        soft_nofile_limit(),
+        DEEP_INGEST_NOFILE,
+        "the child runs under the lowered descriptor limit"
+    );
+    let tmp = TmpDir::new("ingest-deep");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir(&src).unwrap();
+    set_mode(&src, 0o755);
+    // The tree is built through a descending descriptor, so no path of its own
+    // grows past the kernel's limit. CONSUME then empties it as the walk
+    // ascends, which is also what removes it: a path-based removal of a tree
+    // this deep runs out of descriptors itself.
+    let mut dir: std::os::fd::OwnedFd = std::fs::File::open(&src).unwrap().into();
+    for _ in 0..DEEP_INGEST_DEPTH {
+        rustix::fs::mkdirat(dir.as_fd(), "d", rustix::fs::Mode::from_raw_mode(0o755)).unwrap();
+        dir = rustix::fs::openat(
+            dir.as_fd(),
+            "d",
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+    }
+    drop(dir);
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        let mut modifier =
+            CommitModifier::new(CommitModifierFlags::CONSUME | CommitModifierFlags::SKIP_XATTRS);
+        let mut mtree = MutableTree::new();
+        txn.write_dfd_to_mtree(
+            dfd.as_fd(),
+            Path::new("src"),
+            &mut mtree,
+            Some(&mut modifier),
+        )
+        .await
+        .unwrap();
+        txn.abort().await.unwrap();
+    });
+
+    assert!(!src.exists(), "the consuming walk emptied the deep source");
 }

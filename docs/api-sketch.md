@@ -73,16 +73,102 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 pub enum Error {
     Io(std::io::Error),
-    NotFound { object: ObjectName },
+    Core(ostrya_core::Error),          // the format-primitive layer
+    ObjectNotFound { checksum: Checksum, ty: ObjectType },
     RefNotFound(String),
-    CorruptObject { object: ObjectName, detail: String },
-    ChecksumMismatch { expected: Checksum, actual: Checksum },
+    InvalidRefspec(String),
+    NoParentCommit(Checksum),
     InvalidFormat(String),
-    Signature(SignatureError),
-    Lock(LockError),
-    // ...
+    Unsupported(String),
+    LockTimeout { secs: i64 },
+    ChecksumMismatch { expected: Checksum, actual: Checksum },
+    InsufficientFreeSpace { shortfall: u64 },
+    Signature(String),
+    // ... one variant per class of refusal the library reports
 }
 ```
+
+## GVariant types and values (`ostrya-gvariant`)
+
+`ostrya_gvariant::Variant<'a>` is the typed codec view over one serialized
+metadata object, borrowing the buffer it decodes.
+`ostrya-gvariant` also carries a dynamic pair, `Type` and `Value`, which
+serves `a{sv}` metadata a caller supplies and the reading commands print.
+`ostrya` re-exports `Type` and `Value` and takes them on its own surface;
+`Variant` stays inside the codec.
+
+`Type` names every character of the GVariant type alphabet. `Value` names
+every representation those characters take, with four canonicalizations: a
+byte array (`ay`) is `Bytes`, a dict entry is a two-element `Tuple`, an object
+path (`o`) and a signature (`g`) are `Str`, and a handle (`h`) is `I32`. The
+`Type` a value is paired with states which member of a folded pair the value
+carries.
+
+```rust
+pub enum Type {
+    Bool, Byte, I16, U16, I32, U32, I64, U64, Handle, Double,
+    Str, ObjectPath, Signature, Variant,
+    Maybe(Box<Type>), Array(Box<Type>), Tuple(Vec<Type>),
+    DictEntry(Box<Type>, Box<Type>),
+}
+impl Type {
+    pub fn parse(signature: &str) -> Result<Type>;
+    pub fn signature(&self) -> String;
+    /// Whether this is a basic type: a scalar or a string, the types a dict
+    /// entry accepts as its key.
+    pub fn is_basic(&self) -> bool;
+}
+
+pub enum Value {
+    Bool(bool), Byte(u8), I16(i16), U16(u16), I32(i32), U32(u32),
+    I64(i64), U64(u64),
+    /// The IEEE-754 bit pattern of a `d` value, so a value compares by the
+    /// bytes it serializes to. Build one with `Value::double`.
+    Double(u64),
+    Str(String), Bytes(Vec<u8>),
+    /// `m<T>`: the value it holds, or `None` for `nothing`.
+    Maybe(Option<Box<Value>>),
+    Array(Vec<Value>), Tuple(Vec<Value>), Variant(Box<(Type, Value)>),
+}
+impl Value {
+    pub fn variant(ty: Type, value: Value) -> Value;
+    pub fn double(value: f64) -> Value;
+}
+```
+
+Neither enum is `#[non_exhaustive]`. Both enumerate a closed external
+specification, so an exhaustive `match` stays valid and stays a compile-time
+gate; `port-plan.md`, decision 14, records the rule.
+
+### The GVariant text form
+
+The pair also converts to and from the GVariant text form, which is the form
+the reading commands print and the form `--add-metadata` reads. The rules are
+recorded in `format-reference.md`, "The GVariant text form".
+
+```rust
+/// Render `value` of type `ty`, annotating each literal that states no type of
+/// its own. `Error::TypeMismatch` where `value` does not match `ty`.
+pub fn to_text(ty: &Type, value: &Value) -> Result<String>;
+
+/// The same rendering with every annotation left out, for a report whose
+/// reader already knows the type.
+pub fn to_text_unannotated(ty: &Type, value: &Value) -> Result<String>;
+
+/// Read one text form, returning the type it states and the value.
+pub fn from_text(text: &str) -> std::result::Result<(Type, Value), TextError>;
+
+/// A half-open byte range of the input text, as a refusal reports it.
+pub struct Span { pub start: usize, pub end: usize }
+
+/// Why a text form was refused. `Display` renders `<spans>:<reason>`, with the
+/// spans separated by commas. Two spans appear where the reason names a pair
+/// that disagrees, such as the two elements a container cannot unify.
+pub struct TextError { pub spans: Vec<Span>, pub reason: String }
+```
+
+`ostrya` re-exports `to_text`, `to_text_unannotated`, `from_text`, `Span`, and
+`TextError` alongside `Type` and `Value`.
 
 ## Repo
 
@@ -90,7 +176,6 @@ pub enum Error {
 #[derive(Clone)]
 pub struct Repo { /* Arc<RepoInner> */ }
 
-pub struct OpenOptions { /* future-proofing: version checks, cache dir */ }
 pub struct CreateOptions { pub mode: RepoMode, pub collection_id: Option<String> }
 
 impl Repo {
@@ -99,9 +184,7 @@ impl Repo {
     pub async fn create_at(dir: BorrowedFd<'_>, path: &Path, opts: CreateOptions) -> Result<Repo>;
 
     pub fn mode(&self) -> RepoMode;
-    pub fn config(&self) -> &Config;                       // parsed, read-only view
-    pub async fn reload_config(&self) -> Result<()>;
-    pub fn is_writable(&self) -> bool;
+    pub fn config(&self) -> &RepoConfig;                   // parsed, read-only view
 
     /// Replace `config` with the document a caller edited through `KeyFile`'s
     /// setters and removers: a temporary file at mode 0644, `fdatasync`ed when
@@ -120,8 +203,6 @@ impl Repo {
         -> Result<Option<Checksum>>;
     pub async fn list_refs(&self, prefix: Option<&str>)            // refs/heads
         -> Result<Vec<(String, Checksum)>>;
-    pub async fn list_refs_ext(&self, prefix: Option<&str>, flags: ListRefsFlags)
-        -> Result<Vec<(String, Checksum)>>;
     /// refs/remotes, each named by its `remote:name` refspec.
     pub async fn list_remote_refs(&self) -> Result<Vec<(String, Checksum)>>;
     /// refs/mirrors, as (collection_id, ref_name, commit).
@@ -137,8 +218,8 @@ impl Repo {
     pub async fn load_commit(&self, c: &Checksum) -> Result<(Commit, CommitState)>;
     pub async fn load_dirtree(&self, c: &Checksum) -> Result<DirTree>;
     pub async fn load_dirmeta(&self, c: &Checksum) -> Result<DirMeta>;
-    pub async fn load_variant(&self, ty: ObjectType, c: &Checksum) -> Result<Variant>;
-    pub async fn has_object(&self, obj: &ObjectName) -> Result<bool>;
+    pub async fn load_variant(&self, ty: ObjectType, c: &Checksum) -> Result<Value>;
+    pub async fn has_object(&self, ty: ObjectType, c: &Checksum) -> Result<bool>;
 
     /// Open a committed file's metadata plus an async content reader.
     pub async fn load_file(&self, c: &Checksum) -> Result<FileObject>;
@@ -147,15 +228,17 @@ impl Repo {
     pub async fn read_commit(&self, rev: &str) -> Result<(RepoTree, Checksum)>;
 
     // --- detached metadata / signing (see Signing) ---
-    pub async fn read_commit_detached_metadata(&self, c: &Checksum) -> Result<Option<Variant>>;
-    pub async fn write_commit_detached_metadata(&self, c: &Checksum, meta: Option<&Variant>) -> Result<()>;
+    pub async fn read_commit_detached_metadata(&self, c: &Checksum) -> Result<Option<Value>>;
+    pub async fn write_commit_detached_metadata(&self, c: &Checksum, meta: Option<&Value>) -> Result<()>;
 
     // --- transactions ---
     pub async fn transaction(&self) -> Result<Transaction>;
     pub async fn transaction_with_lock(&self, lock: LockKind) -> Result<Transaction>;
 
     // --- checkout ---
-    pub async fn checkout(&self, opts: &CheckoutOptions,
+    // The options arrive by `&mut`: the filter callback runs through an
+    // exclusive borrow and the devino cache is populated in place.
+    pub async fn checkout_at(&self, opts: &mut CheckoutOptions,
         dest_dir: BorrowedFd<'_>, dest_path: &Path, commit: &Checksum) -> Result<()>;
 
     // --- immediate ref writes (outside a transaction) ---
@@ -172,7 +255,14 @@ impl Repo {
     pub async fn fsck(&self, opts: &FsckOptions) -> Result<FsckReport>;
     pub async fn traverse_commit(&self, c: &Checksum, depth: i32)
         -> Result<HashSet<ObjectName>>;
-    pub async fn regenerate_summary(&self, signers: &[&dyn Signer]) -> Result<()>;
+    pub async fn regenerate_summary(&self, opts: &SummaryOptions) -> Result<()>;
+}
+
+/// Knobs for [`Repo::regenerate_summary`]. Both timestamps default to the
+/// current time; setting them makes the output reproducible.
+pub struct SummaryOptions {
+    pub last_modified: Option<u64>,
+    pub metadata_commit_timestamp: Option<u64>,
 }
 ```
 
@@ -180,7 +270,7 @@ impl Repo {
 
 ```rust
 pub struct Commit {
-    pub metadata: Variant,                 // a{sv}
+    pub metadata: Value,                   // a{sv}, in on-disk order
     pub parent: Option<Checksum>,
     pub related: Vec<(String, Vec<u8>)>,   // written empty; retained on parse
                                            // for byte-exact reserialization
@@ -204,7 +294,8 @@ pub struct DirTree {
     pub dirs:  Vec<(String, Checksum, Checksum)>, // name-sorted (dirtree, dirmeta)
 }
 
-pub enum CommitState { Normal, Partial, FsckPartial }
+/// `Partial` states that a `.commitpartial` marker sits beside the commit.
+pub enum CommitState { Normal, Partial }
 
 pub struct FileObject {
     pub uid: u32, pub gid: u32, pub mode: u32,
@@ -248,7 +339,7 @@ The runtime backend is feature-gated behind the internal `ostrya-rt` crate
 model"). It is the only crate that knows which backend is compiled.
 
 ```rust
-// ostrya-rt -- the whole surface at this phase.
+// ostrya-rt -- the whole surface.
 pub async fn unblock<T: Send + 'static>(
     f: impl FnOnce() -> T + Send + 'static) -> T;   // the only pool entry
 
@@ -267,7 +358,11 @@ impl File {
     pub async fn into_std(self) -> std::fs::File;   // settles pipelined ops
 }
 
-pub struct Timer;   // lands with Phase 6 (lock retry); spawn/net with pull
+pub struct Timer;                       // Timer::after(Duration)
+pub struct Deadline;                    // a restartable inactivity window
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>;
+pub struct Command;                     // subprocess, for the gpg engines
+pub struct TcpListener;  pub struct TcpStream;
 ```
 
 The hashing streams live in `ostrya` and are generic over the inner stream,
@@ -387,17 +482,19 @@ impl Transaction {
     /// transaction's staging area, hashing (and, in archive mode,
     /// compressing) on the way down.
     pub async fn content_writer(&self, expected: Option<&Checksum>,
-        meta: &FileMeta) -> Result<ContentWriter>;
+        meta: &FileMeta) -> Result<ContentWriter<'_>>;
     /// Pull-style convenience over `content_writer`.
     pub async fn write_content(&self, expected: Option<&Checksum>,
-        meta: &FileMeta, reader: impl AsyncRead + Send) -> Result<Checksum>;
+        meta: &FileMeta, reader: impl AsyncRead + Unpin) -> Result<Checksum>;
     /// Small content the caller already holds; the general path is
     /// `write_content`, which streams.
     pub async fn write_regfile_inline(&self, expected: Option<&Checksum>,
         meta: &FileMeta, data: &[u8]) -> Result<Checksum>;
-    pub async fn write_symlink(&self, target: &str, meta: &FileMeta) -> Result<Checksum>;
+    pub async fn write_symlink(&self, target: &str, meta: &FileMeta,
+        expected: Option<&Checksum>) -> Result<Checksum>;
+    /// `bytes` is one already-serialized metadata object.
     pub async fn write_metadata(&self, ty: ObjectType, expected: Option<&Checksum>,
-        variant: &Variant) -> Result<Checksum>;
+        bytes: &[u8]) -> Result<Checksum>;
 
     // tree building
     pub async fn write_dfd_to_mtree(&self, dfd: BorrowedFd<'_>, path: &Path,
@@ -406,6 +503,10 @@ impl Transaction {
     /// holding the overlay's lower layer (see "Staging tree, tree merge,
     /// and overlay import").
     pub async fn merge_overlay_dfd_to_mtree(&self, dfd: BorrowedFd<'_>,
+        mtree: &mut MutableTree, modifier: Option<&mut CommitModifier>) -> Result<()>;
+    /// Overlay a committed tree onto an mtree under the same modifier the
+    /// filesystem walk takes, so the two source kinds compose.
+    pub async fn overlay_tree_to_mtree(&self, dirtree: &Checksum, dirmeta: &Checksum,
         mtree: &mut MutableTree, modifier: Option<&mut CommitModifier>) -> Result<()>;
     pub async fn write_mtree(&self, mtree: &mut MutableTree) -> Result<RepoTree>;
 
@@ -424,9 +525,56 @@ impl Transaction {
     pub fn set_ref(&self, refspec: &str, checksum: Option<&Checksum>);
     pub fn set_collection_ref(&self, r: &CollectionRef, checksum: Option<&Checksum>);
 
+    /// Replaces `[core] fsync` for this transaction alone, over the per-object
+    /// writes, the publication step, and the ref writes `commit` applies.
+    /// Changes durability and no stored byte.
+    pub fn set_fsync(&mut self, enabled: bool);
+
+    /// Settles whether every commit this transaction writes carries
+    /// `ostree.sizes`, for an ingest that runs no commit modifier. The answer
+    /// holds for the whole transaction and wins over the flag an ingest sets.
+    /// Archive mode alone writes the key.
+    pub fn set_generate_sizes(&mut self, enabled: bool);
+
+    /// Opens a new tree source for `ostree.sizes` accounting, scoping the key
+    /// to the objects the last source contributed plus the directory objects
+    /// the tree serialization writes. A caller that composes a commit from
+    /// several sources calls this before each of them; a caller that never
+    /// calls it leaves the key covering every object the commit reaches.
+    pub fn begin_tree_source(&self);
+
+    /// Lists one directory of a tree this transaction staged, reading its
+    /// staged objects before `objects/`, for metadata a commit derives from the
+    /// tree it is about to publish. Each `TreeEntry::Dir` it returns is read
+    /// back the same way; `RepoTree::read_dir` reads `objects/` alone.
+    pub async fn read_dir(&self, tree: &RepoTree) -> Result<Vec<TreeEntry>>;
+
+    // detached metadata and signatures, written at `commit` after the staged
+    // objects publish and before the queued refs, so a commit and its
+    // `.commitmeta` are both durable before a ref names them.
+
+    /// Queues the `a{sv}` dict a commit's `.commitmeta` holds, replacing what
+    /// the repository stores. The last dict queued for a checksum wins.
+    pub fn set_commit_detached_metadata(&self, c: &Checksum, meta: Value);
+
+    /// Signs a commit this transaction staged and appends the signature to its
+    /// queued dict, starting from the queued dict, else the stored one, else an
+    /// empty one. Nothing reaches the filesystem here, so a signature that
+    /// cannot be produced fails the transaction with no object published and no
+    /// ref moved.
+    pub async fn sign_commit(&self, c: &Checksum, signer: &dyn Signer) -> Result<()>;
+
     pub async fn commit(self) -> Result<TransactionStats>;
     pub async fn abort(self) -> Result<()>;
 }
+
+/// Removes the staging directory and the sibling lock file of every live
+/// transaction in this process. `commit`, `abort`, and `Drop` each remove
+/// their own, so an unwound return needs nothing more; a caller that ends the
+/// process without running destructors calls this immediately ahead of the
+/// exit. It is for that moment alone: a transaction that keeps running after it
+/// finds its staged objects gone.
+pub fn reap_process_staging();
 
 /// Streams one regular file's payload into a transaction. Implements
 /// `futures_io::AsyncWrite` unconditionally and `tokio::io::AsyncWrite`
@@ -434,8 +582,8 @@ impl Transaction {
 /// per-mode object metadata, and stages the object under its id (a dedup
 /// hit returns the existing id). Dropping without `finish` abandons the
 /// staged temporary, which the transaction reaps.
-pub struct ContentWriter { /* HashingWriter over a staging rt::File */ }
-impl ContentWriter {
+pub struct ContentWriter<'txn> { /* HashingWriter over a staging rt::File */ }
+impl ContentWriter<'_> {
     pub async fn finish(self) -> Result<Checksum>;
 }
 
@@ -444,12 +592,16 @@ pub struct CommitOptions {
     pub subject: Option<String>,
     pub body: Option<String>,
     pub timestamp: Option<u64>,      // else SOURCE_DATE_EPOCH or now
-    pub metadata: Option<Variant>,   // a{sv}; ostree.sizes auto-added
+    pub metadata: Option<Value>,     // a{sv}; ostree.sizes auto-added
 }
 
 pub enum LockKind { Shared, Exclusive }
-pub struct TransactionStats { pub metadata_written: u32, pub content_written: u32,
-    pub content_bytes_written: u64, pub devino_cache_hits: u32 /* ... */ }
+pub struct TransactionStats { pub metadata_total: u32, pub metadata_written: u32,
+    pub content_total: u32, pub content_written: u32,
+    pub content_bytes_written: u64,   // stored size
+    pub content_bytes_unpacked: u64,  // payload size, regular files only
+    pub devino_cache_hits: u32,
+    pub filtered: u32 }                // entries a modifier filter excluded
 ```
 
 ## Mutable tree and commit modifier
@@ -464,6 +616,10 @@ impl MutableTree {
     pub async fn ensure_dir(&mut self, name: &str) -> Result<&mut MutableTree>;
     pub fn replace_file(&mut self, name: &str, checksum: Checksum) -> Result<()>;
     pub fn set_metadata_checksum(&mut self, c: Checksum);
+    /// This directory's dirmeta checksum, if set. A root with none cannot be
+    /// written, which is how a source list that supplied no root directory is
+    /// recognized.
+    pub fn metadata_checksum(&self) -> Option<Checksum>;
     pub fn remove(&mut self, name: &str, allow_noent: bool) -> Result<()>;
 }
 
@@ -475,17 +631,43 @@ bitflags! { pub struct CommitModifierFlags: u32 {
 
 pub enum FilterResult { Allow, Skip }
 
-// The walk takes the modifier as `Option<&mut CommitModifier>`: the FnMut
-// callbacks run through the exclusive borrow, and the Send bound on each
-// box keeps the walk future Send.
+// Each hook is a named boxed-closure alias. The walk takes the modifier as
+// `Option<&mut CommitModifier>`: the FnMut callbacks run through the exclusive
+// borrow, and the Send bound on each box keeps the walk future Send.
+pub type FilterFn = Box<dyn FnMut(&Path, &FileMeta) -> FilterResult + Send>;
+/// Returns the st_mode the entry records, file-type bits included.
+pub type ModeFn   = Box<dyn FnMut(&Path, &FileMeta) -> u32 + Send>;
+pub type XattrFn  = Box<dyn FnMut(&Path, &FileMeta) -> Xattrs + Send>;
+pub type LabelFn  = Box<dyn FnMut(&Path, &FileMeta) -> Option<Vec<u8>> + Send>;
+
 pub struct CommitModifier {
     pub flags: CommitModifierFlags,
-    pub filter: Option<Box<dyn FnMut(&Path, &FileMeta) -> FilterResult + Send>>,
-    pub xattr_callback: Option<Box<dyn FnMut(&Path, &FileMeta) -> Xattrs + Send>>,
-    pub label_callback: Option<Box<dyn FnMut(&Path, &FileMeta) -> Option<Vec<u8>> + Send>>,
+    pub filter: Option<FilterFn>,
+    /// The owner ids every ingested entry records. Applied after the
+    /// CANONICAL_PERMISSIONS reduction and before the callbacks, so a declared
+    /// id wins over that flag's `0`.
+    pub owner_uid: Option<u32>,
+    pub owner_gid: Option<u32>,
+    // mode_callback runs ahead of the xattr callback and the label hook.
+    pub mode_callback: Option<ModeFn>,
+    pub xattr_callback: Option<XattrFn>,
+    pub label_callback: Option<LabelFn>,
     pub devino_cache: Option<DevInoCache>,
 }
+
+impl Repo {
+    // The (device, inode) map of this repository's own uncompressed loose
+    // content objects, which a hardlinking checkout puts on disk. Empty for
+    // an archive repository, which stores every content object compressed.
+    pub async fn devino_cache(&self) -> Result<DevInoCache>;
+}
 ```
+
+A cache attached to a modifier is consulted for every regular file and symlink
+the walk reaches. Without `DEVINO_CANONICAL` a hit supplies the stored object's
+metadata, the modifier is applied over it, and the object is rewritten from the
+stored payload only where the result differs. With the flag the hit is taken
+verbatim and the filter and every callback are skipped for that entry.
 
 ## Staging tree, tree merge, and overlay import (port extensions)
 
@@ -528,7 +710,7 @@ impl StagingTree<'_> {
     pub async fn merge(&self, other: &MutableTree, opts: MergeOptions) -> Result<()>;
 
     pub async fn write_file(&self, path: &Path, meta: &FileMeta)
-        -> Result<StagedFileWriter<'_>>;
+        -> Result<StagedFileWriter<'txn>>;
     pub async fn write_file_content(&self, path: &Path, meta: &FileMeta,
         content: &[u8]) -> Result<()>;
     pub async fn make_dir(&self, path: &Path, meta: &DirMeta) -> Result<()>;
@@ -548,7 +730,7 @@ impl StagingTree<'_> {
 }
 
 /// finish() completes the content object and records it at the path.
-pub struct StagedFileWriter<'a> { /* ContentWriter + path + tree handle */ }
+pub struct StagedFileWriter<'txn> { /* ContentWriter + path + tree handle */ }
 impl StagedFileWriter<'_> { pub async fn finish(self) -> Result<()>; }
 
 pub enum StagingEntry {
@@ -592,6 +774,9 @@ untouched.
 pub enum CheckoutMode { None, User }
 pub enum OverwriteMode { None, UnionFiles, AddFiles, UnionIdentical }
 
+/// A `Skip` on a directory prunes its whole subtree.
+pub type CheckoutFilterFn = Box<dyn FnMut(&Path, &FileMeta) -> FilterResult + Send>;
+
 pub struct CheckoutOptions {
     pub mode: CheckoutMode,
     pub overwrite: OverwriteMode,
@@ -600,21 +785,29 @@ pub struct CheckoutOptions {
     pub force_copy: bool,
     pub process_whiteouts: bool,
     pub devino_cache: Option<DevInoCache>,
-    pub filter: Option<Box<dyn FnMut(&Path, &FileMeta) -> FilterResult>>,
+    pub filter: Option<CheckoutFilterFn>,
 }
 ```
 
 ## Signing
 
+Both traits are object-safe and taken as `&dyn`, so the asynchronous method
+returns a boxed future rather than being an `async fn`.
+
 ```rust
-pub trait Signer {
+pub type SignFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+pub type VerifyFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<VerifyOutcome>> + Send + 'a>>;
+
+pub trait Signer: Send + Sync {
     fn name(&self) -> &str;                       // "ed25519", "spki", "gpg", "dummy"
     fn metadata_key(&self) -> &str;               // e.g. "ostree.sign.ed25519"
-    async fn sign(&self, data: &[u8]) -> Result<Vec<u8>>;
+    fn sign<'a>(&'a self, data: &'a [u8]) -> SignFuture<'a>;
 }
-pub trait Verifier {
+pub trait Verifier: Send + Sync {
     fn metadata_key(&self) -> &str;
-    async fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome>;
+    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>])
+        -> VerifyFuture<'a>;
 }
 
 pub struct Ed25519Signer { /* 64-byte secret */ }
@@ -639,6 +832,24 @@ impl Repo {
     pub async fn sign_commit(&self, c: &Checksum, signer: &dyn Signer) -> Result<()>;
     pub async fn verify_commit(&self, c: &Checksum, verifiers: &[&dyn Verifier])
         -> Result<VerifyOutcome>;
+    /// Append a signature over the repository's `summary` bytes to
+    /// `summary.sig`.
+    pub async fn sign_summary(&self, signer: &dyn Signer) -> Result<()>;
+    pub async fn verify_summary(&self, verifiers: &[&dyn Verifier])
+        -> Result<VerifyOutcome>;
+}
+
+impl GpgSigner {
+    /// The GnuPG home directory this signer resolves its key in, or `None` for
+    /// gpg's own default.
+    pub fn homedir(&self) -> Option<&Path>;
+
+    /// The fingerprints `gpg --list-secret-keys` resolves this signer's
+    /// selector to, in listing order. A home directory that does not exist, one
+    /// that cannot be read, and one holding no matching key all answer an empty
+    /// list. More than one fingerprint means the selector is ambiguous, and a
+    /// caller that needs a single signing key refuses it.
+    pub async fn secret_key_fingerprints(&self) -> Result<Vec<String>>;
 }
 
 /// One key of a remote's trusted keyring, as a `gpg` key listing states it.
@@ -913,57 +1124,120 @@ impl Repo {
 
 ## Static deltas
 
+The three size thresholds are in bytes, where the tool's options take decimal
+megabytes. Generation, signing, and index publication are three calls, so a
+caller signs a delta it has just written and publishes it once.
+
 ```rust
-pub struct DeltaGenerateOptions {
-    pub max_chunk_size_mb: u32,           // default 32
-    pub max_bsdiff_size_mb: u32,          // default 128
-    pub min_fallback_size_mb: u32,        // default 4
-    pub bsdiff_enabled: bool,
-    pub inline_parts: bool,
-    pub signers: Vec<Box<dyn Signer>>,
+pub struct DeltaOptions {
+    pub min_fallback_size: u64,           // default 4_000_000; 0 turns fallbacks off
+    pub max_bsdiff_size: u64,             // default 64_000_000
+    pub max_chunk_size: u64,              // default 32_000_000
+    pub bsdiff: bool,
+    /// The superblock timestamp. `None` uses the current time; setting it makes
+    /// the output reproducible.
+    pub timestamp: Option<u64>,
+    /// Write the superblock and the part files here instead of the
+    /// repository's `deltas/` tree.
+    pub output_dir: Option<PathBuf>,
 }
 impl Repo {
-    pub async fn static_delta_generate(&self, from: Option<&Checksum>, to: &Checksum,
-        opts: DeltaGenerateOptions) -> Result<()>;
-    pub async fn static_delta_execute_offline(&self, delta_dir: BorrowedFd<'_>,
-        skip_validation: bool) -> Result<()>;
-    pub async fn list_static_delta_names(&self) -> Result<Vec<String>>;
+    /// Returns the directory the delta was written to: relative to the
+    /// repository root for the default location, and `output_dir` verbatim
+    /// where that option is set.
+    pub async fn generate_static_delta(&self, from: Option<&Checksum>,
+        to: &Checksum, opts: &DeltaOptions) -> Result<PathBuf>;
+    /// Apply the delta in `dir` and return the commit it delivered.
+    pub async fn apply_static_delta_offline(&self, dir: &Path) -> Result<Checksum>;
+    pub async fn sign_static_delta(&self, dir: &Path, signer: &dyn Signer) -> Result<()>;
+    pub async fn verify_static_delta(&self, dir: &Path, verifiers: &[&dyn Verifier])
+        -> Result<VerifyOutcome>;
+    /// Rebuild the `delta-indexes/` cache that advertises the stored deltas to
+    /// a fetcher.
+    pub async fn reindex_static_deltas(&self) -> Result<()>;
+    /// The stored deltas, each named as the tool names it: the target commit
+    /// hex, or `<from-hex>-<to-hex>`.
+    pub async fn list_static_deltas(&self) -> Result<Vec<String>>;
 }
 ```
 
-## Tar (always compiled) and composefs (feature-gated)
+## Tar and composefs
+
+Both are always compiled. Tar is built on smol-tar; composefs is built on the
+workspace's own `ostrya-composefs` crate.
 
 ```rust
-// Tar is always compiled (built on smol-tar), not feature-gated.
 impl Repo {
     pub async fn export_tar(&self, commit: &Checksum, opts: TarExportOptions,
         out: impl AsyncWrite) -> Result<()>;
     pub async fn import_tar(&self, txn: &Transaction, opts: TarImportOptions,
         input: impl AsyncRead) -> Result<MutableTree>;
+    /// Read an archive into a tree an earlier source already filled, shaping
+    /// each member with the commit modifier. Every member is placed under a
+    /// directory the tree already holds unless
+    /// `TarImportOptions::autocreate_parents` permits synthesizing it, and
+    /// `TarImportOptions::rename` rewrites each member's pathname first.
+    pub async fn import_tar_into(&self, txn: &Transaction, opts: TarImportOptions,
+        input: impl AsyncRead, mtree: &mut MutableTree,
+        modifier: Option<&mut CommitModifier>) -> Result<()>;
 }
 
-#[cfg(feature = "composefs")]
+#[non_exhaustive]
+pub struct TarExportOptions {}
+
+/// A rename hook over member pathnames. It takes the normalized member name
+/// and returns the name the member is imported under.
+pub type TarRename = Box<dyn FnMut(&str) -> Result<String> + Send>;
+
+#[non_exhaustive]
+pub struct TarImportOptions {
+    pub etc_to_usr_etc: bool,
+    pub owner_uid: Option<u32>,
+    pub owner_gid: Option<u32>,
+    pub skip_xattrs: bool,
+    pub autocreate_parents: bool,
+    pub rename: Option<TarRename>,
+}
+
+/// The EROFS image bytes and the fs-verity digest over them.
+pub struct Image { pub bytes: Vec<u8>, pub fs_verity: [u8; 32] }
+
 impl Repo {
     /// Produce the EROFS/composefs image for a commit and its fs-verity digest.
     /// Inode metadata always comes from the real file attributes (no canonical
     /// mode); in bare-user-shared mode metadata comes from `user.ostreemeta`
     /// and each regular file redirects to its `.file` loose path. Ownership is
-    /// presented via composefs uid mapping at mount.
-    pub async fn export_composefs(&self, commit: &Checksum, out: BorrowedFd<'_>)
-        -> Result<[u8; 32]>;
+    /// presented via composefs uid mapping at mount. A repository outside the
+    /// composefs backing modes (`bare-user`, `bare-user-shared`) is
+    /// `Error::Unsupported`.
+    pub async fn export_composefs(&self, commit: &Checksum) -> Result<Image>;
     /// Compute and store `ostree.composefs.digest.v0` in the commit's metadata.
     pub async fn commit_add_composefs_metadata(&self, txn: &Transaction,
         commit: &Checksum) -> Result<Checksum>;
 }
+
+impl Transaction {
+    /// The fs-verity digest of the composefs image for a tree this transaction
+    /// has staged, for a commit that carries the key in its own metadata. The
+    /// image derives from the tree alone, so the value is the same in every
+    /// repository mode holding that tree.
+    pub async fn composefs_digest(&self, root: &RepoTree) -> Result<[u8; 32]>;
+}
 ```
+
+`TarExportOptions` is `Send + Sync`. `TarImportOptions` is `Send` alone: it
+holds the `rename` callback field, which the import calls through `&mut`, the
+way `CommitModifier` holds its filter and its three hooks. A holder that needs
+the options behind a shared reference across threads wraps them. Both
+assertions are pinned in `crates/ostrya/src/tar.rs`.
 
 ## Notes on divergence from the C API
 
 - No `GCancellable`: cancel by dropping the future or racing a cancel signal.
 - No out-parameters: results come back in `Result<T>`.
 - No `glib::Variant` options dicts on the public surface: builders and structs.
-  A `Variant` type still exists internally for on-disk metadata and is exposed
-  where commit metadata genuinely is an arbitrary `a{sv}`.
+  The dynamic `Value` is exposed where commit metadata genuinely is an
+  arbitrary `a{sv}`.
 - No raw `dfd: i32`: `BorrowedFd`/`OwnedFd`.
 - The large `Repo` god-object is split: `Repo` for lifecycle/read/checkout/
   maintenance, `Transaction` for all writes, and `Signer`/`Verifier`/`Progress`

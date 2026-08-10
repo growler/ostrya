@@ -42,12 +42,15 @@ pub enum Value {
 
 /// One side's post-execution state.
 pub struct Side<'a> {
+    /// The implementation this side ran.
     pub tool: &'a Tool,
     /// The side's subtree, the working directory of every extra invocation.
     pub root: &'a Path,
     /// The repository the oracles read, when the setups bound one.
     pub repo: Option<PathBuf>,
+    /// The setup bindings the cell resolved.
     pub bindings: &'a BTreeMap<String, String>,
+    /// What the cell's invocation produced.
     pub outcome: &'a Outcome,
     /// Where an oracle that needs scratch space of its own may write.
     pub work: &'a Path,

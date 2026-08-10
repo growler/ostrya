@@ -142,21 +142,23 @@ impl Repo {
     /// dict, which is created if absent; other engines' arrays are untouched.
     ///
     /// Appending is a read-modify-write: the dict is loaded, the signature is
-    /// added, and the `.commitmeta` file is replaced atomically. The
-    /// read-modify-write is not serialized across calls, so signing one commit
-    /// from more than one task at a time can drop a signature. Sign a given
-    /// commit from a single task at a time; signing different commits
-    /// concurrently is safe.
+    /// added, and the `.commitmeta` file is replaced atomically. The three
+    /// steps run under the guard the whole process shares, the one
+    /// [`Transaction::sign_commit`](crate::Transaction::sign_commit) writes
+    /// under, so signing one commit from several tasks at a time keeps every
+    /// signature. The guard reaches this process alone: two processes signing
+    /// one commit at the same time can drop a signature.
     pub async fn sign_commit(&self, checksum: &Checksum, signer: &dyn Signer) -> Result<()> {
         let data = self.load_object_bytes(ObjectType::Commit, checksum).await?;
         let signature = signer.sign(&data).await?;
-        let mut dict = self
-            .read_commit_detached_metadata(checksum)
-            .await?
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        append_signature(&mut dict, signer.metadata_key(), signature)?;
-        self.write_commit_detached_metadata(checksum, Some(&dict))
-            .await
+        let fsync = self.config().fsync()?;
+        self.merge_commit_detached_metadata(
+            checksum,
+            None,
+            vec![(signer.metadata_key().to_owned(), signature)],
+            fsync,
+        )
+        .await
     }
 
     /// Verify the commit `checksum` against `verifiers`.
@@ -202,28 +204,28 @@ impl Repo {
     /// nothing and leaves the file untouched. Returns the number of signatures
     /// removed.
     ///
-    /// Like [`sign_commit`](Self::sign_commit), this is a read-modify-write that
-    /// is not serialized across calls; edit a given commit's signatures from a
-    /// single task at a time.
+    /// Like [`sign_commit`](Self::sign_commit), this is a read-modify-write
+    /// under the guard the whole process shares: `remove` runs on the dict the
+    /// file holds at that moment, and a signer of the same commit in another
+    /// task reaches the file before or after the removal, never inside it. The
+    /// guard reaches this process alone. `remove` runs on the blocking pool, so
+    /// it must be `Send` and own what it matches against.
     pub async fn delete_signatures(
         &self,
         checksum: &Checksum,
         metadata_key: &str,
-        mut remove: impl FnMut(&[u8], &[u8]) -> bool,
+        remove: impl FnMut(&[u8], &[u8]) -> bool + Send + 'static,
     ) -> Result<usize> {
-        let mut dict = match self.read_commit_detached_metadata(checksum).await? {
-            Some(dict) => dict,
-            None => return Ok(0),
-        };
         let payload = self.load_object_bytes(ObjectType::Commit, checksum).await?;
-        let removed = remove_signatures(&mut dict, metadata_key, &payload, &mut remove)?;
-        if removed == 0 {
-            return Ok(0);
-        }
-        let empty = matches!(&dict, Value::Array(entries) if entries.is_empty());
-        self.write_commit_detached_metadata(checksum, (!empty).then_some(&dict))
-            .await?;
-        Ok(removed)
+        let fsync = self.config().fsync()?;
+        self.prune_commit_detached_signatures(
+            checksum,
+            metadata_key.to_owned(),
+            payload,
+            remove,
+            fsync,
+        )
+        .await
     }
 }
 

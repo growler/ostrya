@@ -1,25 +1,51 @@
 use crate::{Error, Result};
 
-/// Maximum container nesting depth accepted in a type signature.
-const MAX_TYPE_DEPTH: usize = 64;
+/// Maximum container nesting depth accepted in a type signature. It is the
+/// depth the value parser and the serializer carry, so a value either of them
+/// accepts names a type this parser accepts back.
+const MAX_TYPE_DEPTH: usize = crate::de::MAX_VALUE_DEPTH;
 
-/// A GVariant type, restricted to the signatures the ostree on-disk format
-/// uses: booleans, bytes, u32, u64, strings, variants, arrays, tuples, and
-/// dict entries. Any other type character is rejected by [`Type::parse`].
+/// A GVariant type.
+///
+/// The ostree on-disk format uses booleans, bytes, u32, u64, strings, variants,
+/// arrays, tuples, and dict entries. The remaining GVariant types -- the signed
+/// and the narrow integers, the handle, the double, the object path, the
+/// signature, and the maybe -- reach a repository through
+/// `commit --add-metadata`, which takes any value the GVariant text form states
+/// (`docs/format-reference.md`, "CLI output formats"). Any character outside the
+/// GVariant type alphabet is rejected by [`Type::parse`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     /// `b`
     Bool,
     /// `y`
     Byte,
+    /// `n`
+    I16,
+    /// `q`
+    U16,
+    /// `i`
+    I32,
     /// `u`
     U32,
+    /// `x`
+    I64,
     /// `t`
     U64,
+    /// `h`
+    Handle,
+    /// `d`
+    Double,
     /// `s`
     Str,
+    /// `o`
+    ObjectPath,
+    /// `g`
+    Signature,
     /// `v`
     Variant,
+    /// `m<T>`
+    Maybe(Box<Type>),
     /// `a<T>`
     Array(Box<Type>),
     /// `(<T>...)`
@@ -56,10 +82,22 @@ impl Type {
         match self {
             Type::Bool => out.push('b'),
             Type::Byte => out.push('y'),
+            Type::I16 => out.push('n'),
+            Type::U16 => out.push('q'),
+            Type::I32 => out.push('i'),
             Type::U32 => out.push('u'),
+            Type::I64 => out.push('x'),
             Type::U64 => out.push('t'),
+            Type::Handle => out.push('h'),
+            Type::Double => out.push('d'),
             Type::Str => out.push('s'),
+            Type::ObjectPath => out.push('o'),
+            Type::Signature => out.push('g'),
             Type::Variant => out.push('v'),
+            Type::Maybe(elem) => {
+                out.push('m');
+                elem.write_signature(out);
+            }
             Type::Array(elem) => {
                 out.push('a');
                 elem.write_signature(out);
@@ -83,10 +121,11 @@ impl Type {
     /// The alignment requirement of the serialized form, in bytes.
     pub fn alignment(&self) -> usize {
         match self {
-            Type::Bool | Type::Byte | Type::Str => 1,
-            Type::U32 => 4,
-            Type::U64 | Type::Variant => 8,
-            Type::Array(elem) => elem.alignment(),
+            Type::Bool | Type::Byte | Type::Str | Type::ObjectPath | Type::Signature => 1,
+            Type::I16 | Type::U16 => 2,
+            Type::I32 | Type::U32 | Type::Handle => 4,
+            Type::I64 | Type::U64 | Type::Double | Type::Variant => 8,
+            Type::Maybe(elem) | Type::Array(elem) => elem.alignment(),
             Type::Tuple(members) => members.iter().map(Type::alignment).max().unwrap_or(1),
             Type::DictEntry(key, value) => key.alignment().max(value.alignment()),
         }
@@ -96,9 +135,15 @@ impl Type {
     pub fn fixed_size(&self) -> Option<usize> {
         match self {
             Type::Bool | Type::Byte => Some(1),
-            Type::U32 => Some(4),
-            Type::U64 => Some(8),
-            Type::Str | Type::Variant | Type::Array(_) => None,
+            Type::I16 | Type::U16 => Some(2),
+            Type::I32 | Type::U32 | Type::Handle => Some(4),
+            Type::I64 | Type::U64 | Type::Double => Some(8),
+            Type::Str
+            | Type::ObjectPath
+            | Type::Signature
+            | Type::Variant
+            | Type::Maybe(_)
+            | Type::Array(_) => None,
             Type::Tuple(members) => fixed_size_of(members.iter(), self.alignment()),
             Type::DictEntry(key, value) => {
                 fixed_size_of([&**key, &**value].into_iter(), self.alignment())
@@ -106,10 +151,24 @@ impl Type {
         }
     }
 
-    fn is_basic(&self) -> bool {
+    /// Whether this is a basic type: a scalar or a string, the types a dict
+    /// entry accepts as its key.
+    pub fn is_basic(&self) -> bool {
         matches!(
             self,
-            Type::Bool | Type::Byte | Type::U32 | Type::U64 | Type::Str
+            Type::Bool
+                | Type::Byte
+                | Type::I16
+                | Type::U16
+                | Type::I32
+                | Type::U32
+                | Type::I64
+                | Type::U64
+                | Type::Handle
+                | Type::Double
+                | Type::Str
+                | Type::ObjectPath
+                | Type::Signature
         )
     }
 }
@@ -146,10 +205,19 @@ fn parse_one(sig: &[u8], pos: &mut usize, depth: usize) -> std::result::Result<T
     match c {
         b'b' => Ok(Type::Bool),
         b'y' => Ok(Type::Byte),
+        b'n' => Ok(Type::I16),
+        b'q' => Ok(Type::U16),
+        b'i' => Ok(Type::I32),
         b'u' => Ok(Type::U32),
+        b'x' => Ok(Type::I64),
         b't' => Ok(Type::U64),
+        b'h' => Ok(Type::Handle),
+        b'd' => Ok(Type::Double),
         b's' => Ok(Type::Str),
+        b'o' => Ok(Type::ObjectPath),
+        b'g' => Ok(Type::Signature),
         b'v' => Ok(Type::Variant),
+        b'm' => Ok(Type::Maybe(Box::new(parse_one(sig, pos, depth + 1)?))),
         b'a' => Ok(Type::Array(Box::new(parse_one(sig, pos, depth + 1)?))),
         b'(' => {
             let mut members = Vec::new();
@@ -202,9 +270,15 @@ mod tests {
         "as",
     ];
 
+    /// The type characters outside the on-disk format, which reach a
+    /// repository through `commit --add-metadata`.
+    const METADATA_SIGNATURES: &[&str] = &[
+        "n", "q", "i", "x", "h", "d", "o", "g", "ms", "mi", "ami", "a{sd}", "(sid)", "mmy",
+    ];
+
     #[test]
     fn parses_and_round_trips_every_ostree_signature() {
-        for sig in OSTREE_SIGNATURES {
+        for sig in OSTREE_SIGNATURES.iter().chain(METADATA_SIGNATURES) {
             let ty = Type::parse(sig).unwrap();
             assert_eq!(ty.signature(), *sig);
         }
@@ -229,6 +303,17 @@ mod tests {
             ("(yaytt)", 8, None),
             ("{sv}", 8, None),
             ("()", 1, Some(1)),
+            ("n", 2, Some(2)),
+            ("q", 2, Some(2)),
+            ("i", 4, Some(4)),
+            ("h", 4, Some(4)),
+            ("x", 8, Some(8)),
+            ("d", 8, Some(8)),
+            ("o", 1, None),
+            ("g", 1, None),
+            ("ms", 1, None),
+            ("mi", 4, None),
+            ("(id)", 8, Some(16)),
         ];
         for (sig, alignment, fixed) in cases {
             let ty = Type::parse(sig).unwrap();
@@ -239,16 +324,20 @@ mod tests {
 
     #[test]
     fn rejects_invalid_signatures() {
-        for sig in [
-            "", "d", "i", "x", "n", "q", "o", "g", "ms", "(s", "{vs}", "{s", "{sv", "ss", "a",
-        ] {
+        for sig in ["", "r", "*", "?", "(s", "{vs}", "{s", "{sv", "ss", "a", "m"] {
             assert!(Type::parse(sig).is_err(), "expected {sig:?} to be rejected");
         }
     }
 
     #[test]
     fn rejects_overdeep_nesting() {
-        let sig = format!("{}y", "a".repeat(100));
+        // The depth the value parser and the serializer accept, the first depth
+        // past it, and one further.
+        let sig = format!("{}y", "a".repeat(MAX_TYPE_DEPTH));
+        assert!(Type::parse(&sig).is_ok());
+        let sig = format!("{}y", "a".repeat(MAX_TYPE_DEPTH + 1));
+        assert!(Type::parse(&sig).is_err());
+        let sig = format!("{}y", "a".repeat(MAX_TYPE_DEPTH + 2));
         assert!(Type::parse(&sig).is_err());
     }
 }

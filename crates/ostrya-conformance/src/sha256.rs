@@ -30,6 +30,7 @@ impl Default for Sha256 {
 }
 
 impl Sha256 {
+    /// A digester over the empty message.
     pub fn new() -> Sha256 {
         Sha256 {
             state: [
@@ -42,6 +43,7 @@ impl Sha256 {
         }
     }
 
+    /// Feed `data` to the digester.
     pub fn update(&mut self, mut data: &[u8]) {
         self.length = self.length.wrapping_add(data.len() as u64);
         while !data.is_empty() {

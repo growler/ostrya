@@ -5,13 +5,18 @@ use std::fmt;
 pub enum Error {
     /// The type signature string is not one this codec accepts.
     InvalidTypeString {
+        /// The signature string as given.
         signature: String,
+        /// The byte offset within `signature` the refusal names.
         offset: usize,
+        /// Why the signature was refused.
         reason: &'static str,
     },
     /// The value's shape does not match the type it is serialized as.
     TypeMismatch {
+        /// The signature of the type the value was paired with.
         expected: String,
+        /// The kind of value that was found, such as `array` or `tuple`.
         found: &'static str,
     },
     /// The value cannot be represented in GVariant.
@@ -45,4 +50,5 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// The codec's result type.
 pub type Result<T> = std::result::Result<T, Error>;

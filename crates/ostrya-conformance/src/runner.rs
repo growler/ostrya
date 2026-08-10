@@ -22,12 +22,16 @@ use crate::tier::Host;
 /// What a cell reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
+    /// The cell ran and met its expectation.
     Pass,
+    /// The cell ran and did not meet its expectation.
     Fail,
+    /// The cell did not run.
     Skip,
 }
 
 impl Verdict {
+    /// The verdict's report spelling.
     pub fn as_str(self) -> &'static str {
         match self {
             Verdict::Pass => "pass",
@@ -43,7 +47,12 @@ pub enum OracleStatus {
     /// Both sides produced the same artifact.
     Equal,
     /// The two artifacts differ.
-    Different { port: String, reference: String },
+    Different {
+        /// The port's artifact.
+        port: String,
+        /// The reference's artifact.
+        reference: String,
+    },
     /// The reference has no equivalent invocation, so nothing was compared.
     Unpaired,
     /// The oracle could not read a side.
@@ -51,6 +60,7 @@ pub enum OracleStatus {
 }
 
 impl OracleStatus {
+    /// The status's report spelling.
     pub fn as_str(&self) -> &'static str {
         match self {
             OracleStatus::Equal => "equal",
@@ -64,23 +74,34 @@ impl OracleStatus {
 /// One cell's result.
 #[derive(Clone, Debug)]
 pub struct CellResult {
+    /// The cell id.
     pub id: String,
+    /// The family the cell belongs to.
     pub family: String,
+    /// The row key the report grid uses.
     pub row: String,
+    /// The repository mode the cell ran in, where it named one.
     pub mode: Option<String>,
+    /// The outcome the record declared.
     pub outcome: String,
+    /// The severity the record declared.
     pub severity: String,
     /// The tier the cell needs: the highest of the record's `tier` and the
     /// tier each named corpus declares.
     pub required_tier: Tier,
+    /// What the run decided.
     pub verdict: Verdict,
     /// The skip reason, one of the seven the design names.
     pub reason: Option<String>,
     /// The failure message, or the detail behind a skip.
     pub detail: Option<String>,
+    /// Each oracle the cell ran, and what it found.
     pub oracles: Vec<(String, OracleStatus)>,
+    /// The cell's artifact directory, where one was kept.
     pub artifact: Option<PathBuf>,
+    /// Anything the run recorded beside the verdict.
     pub notes: Vec<String>,
+    /// How long the cell took, in milliseconds.
     pub elapsed_ms: u64,
     /// Whether a `--require` flag turned this cell's skip into a failure.
     pub promoted: bool,
@@ -117,10 +138,15 @@ impl CellResult {
 /// Which cells to run.
 #[derive(Clone, Debug, Default)]
 pub struct Filters {
+    /// Run the cells of this family alone.
     pub family: Option<String>,
+    /// Run this cell alone.
     pub cell: Option<String>,
+    /// Run the cells over this corpus alone.
     pub corpus: Option<String>,
+    /// Run the cells in this repository mode alone.
     pub mode: Option<String>,
+    /// Run the cells this tier reaches alone.
     pub tier: Option<Tier>,
 }
 
@@ -157,15 +183,26 @@ impl Filters {
 
 /// How to run.
 pub struct Options {
+    /// The port to exercise.
     pub port: Tool,
+    /// The reference implementation, where the host has one.
     pub reference: Option<Tool>,
+    /// Where the run writes its artifacts.
     pub artifact_dir: PathBuf,
+    /// Keep the artifact directory of a cell that passed.
     pub keep: bool,
+    /// How many cells run at a time.
     pub jobs: usize,
+    /// Which cells to run.
     pub filters: Filters,
+    /// Fail a cell that a missing reference would have skipped.
     pub require_tool: bool,
+    /// Fail a cell that a host below this tier would have skipped.
     pub require_tier: Option<Tier>,
+    /// Hold every cell to byte identity, including the ones that record a
+    /// divergence.
     pub strict_identity: bool,
+    /// What the host offers.
     pub host: Host,
 }
 

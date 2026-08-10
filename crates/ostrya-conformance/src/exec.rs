@@ -15,6 +15,7 @@ use crate::tier;
 pub struct Tool {
     /// `port` or `reference`.
     pub role: &'static str,
+    /// The executable this role runs.
     pub path: PathBuf,
 }
 
@@ -56,14 +57,19 @@ fn executable(path: &Path) -> bool {
 /// What one invocation produced.
 #[derive(Clone, Debug)]
 pub struct Outcome {
+    /// The argument vector, program name first.
     pub argv: Vec<String>,
+    /// The working directory the process ran in.
     pub cwd: PathBuf,
     /// The exit status, or `None` when a signal ended the process.
     pub status: Option<i32>,
     /// The signal that ended the process, when one did.
     pub signal: Option<i32>,
+    /// What the process wrote to standard output.
     pub stdout: Vec<u8>,
+    /// What the process wrote to standard error.
     pub stderr: Vec<u8>,
+    /// How long the process took, in milliseconds.
     pub elapsed_ms: u64,
 }
 

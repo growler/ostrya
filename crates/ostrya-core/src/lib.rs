@@ -47,8 +47,8 @@ pub use xattr::{Xattrs, XattrsRef};
 // is a `Value`, so consuming crates need these to inspect, load, and serialize
 // arbitrary metadata dicts without depending on `ostrya-gvariant` directly.
 pub use ostrya_gvariant::{
-    ArrayIter, GvDecode, GvType, Type, Value, choose_offset_size, from_bytes, to_bytes, to_text,
-    to_text_unannotated, write_offset,
+    ArrayIter, GvDecode, GvType, Span, TextError, Type, Value, choose_offset_size, from_bytes,
+    from_text, to_bytes, to_text, to_text_unannotated, write_offset,
 };
 
 #[cfg(test)]

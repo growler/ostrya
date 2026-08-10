@@ -33,9 +33,27 @@ fn serialize(buf: &mut Vec<u8>, ty: &Type, value: &Value, depth: usize) -> Resul
         // check) with the typed encoders; the `Value` path only unwraps.
         (Type::Bool, Value::Bool(b)) => b.encode(buf)?,
         (Type::Byte, Value::Byte(b)) => b.encode(buf)?,
+        (Type::I16, Value::I16(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        (Type::U16, Value::U16(x)) => buf.extend_from_slice(&x.to_le_bytes()),
+        (Type::I32 | Type::Handle, Value::I32(x)) => buf.extend_from_slice(&x.to_le_bytes()),
         (Type::U32, Value::U32(x)) => x.encode(buf)?,
+        (Type::I64, Value::I64(x)) => buf.extend_from_slice(&x.to_le_bytes()),
         (Type::U64, Value::U64(x)) => x.encode(buf)?,
-        (Type::Str, Value::Str(s)) => s.as_str().encode(buf)?,
+        (Type::Double, Value::Double(bits)) => buf.extend_from_slice(&bits.to_le_bytes()),
+        (Type::Str | Type::ObjectPath | Type::Signature, Value::Str(s)) => {
+            s.as_str().encode(buf)?;
+        }
+        (Type::Maybe(elem), Value::Maybe(inner)) => {
+            // `Nothing` is the empty byte sequence. `Just` is the element's own
+            // bytes, followed by one zero byte when the element is
+            // variable-size, which is what tells the two apart.
+            if let Some(child) = inner {
+                serialize(buf, elem, child, depth + 1)?;
+                if elem.fixed_size().is_none() {
+                    buf.push(0);
+                }
+            }
+        }
         (Type::Array(elem), Value::Bytes(b)) if **elem == Type::Byte => {
             b.as_slice().encode(buf)?;
         }
@@ -258,12 +276,15 @@ mod tests {
 
     #[test]
     fn rejects_value_depth_bomb() {
-        // 129 nested variants exceed MAX_VALUE_DEPTH on the encode path.
+        // 128 nested variants are the deepest the encode path takes, and 129
+        // exceed MAX_VALUE_DEPTH.
         let mut value = Value::variant(Type::Byte, Value::Byte(1));
-        for _ in 0..128 {
+        for _ in 0..127 {
             value = Value::variant(Type::Variant, value);
         }
         let v = Type::parse("v").unwrap();
+        assert!(to_bytes(&v, &value).is_ok());
+        value = Value::variant(Type::Variant, value);
         assert_eq!(to_bytes(&v, &value), Err(Error::DepthExceeded));
     }
 

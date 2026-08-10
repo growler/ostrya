@@ -248,6 +248,49 @@ fn generate_sizes_is_a_noop_outside_archive() {
 }
 
 #[test]
+fn set_generate_sizes_settles_the_key_in_both_directions() {
+    // `set_generate_sizes` answers for the whole transaction: `true` reaches the
+    // key where no ingest asked for it, and `false` turns it off again after an
+    // ingest under GENERATE_SIZES did.
+    let commit_with = |ingest: bool, request: Option<bool>| {
+        let tmp = TmpDir::new("commit-sizes-request");
+        let base = tmp.path();
+        build_fixture_source(base);
+        let root_dir = base.join("repo");
+        block_on(async {
+            let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            let mut txn = repo.transaction().await.unwrap();
+            let root = ingest_fixture(&txn, base, ingest).await;
+            if let Some(enabled) = request {
+                txn.set_generate_sizes(enabled);
+            }
+            let commit = txn
+                .write_commit(fixture_commit_options(), &root)
+                .await
+                .unwrap();
+            txn.abort().await.unwrap();
+            commit
+        })
+    };
+    let sized = csum(SIZES_COMMIT);
+    let plain = csum(COMMIT);
+    assert_eq!(commit_with(true, None), sized, "the ingest flag alone");
+    assert_eq!(commit_with(false, None), plain, "no request at all");
+    assert_eq!(
+        commit_with(false, Some(true)),
+        sized,
+        "the request alone reaches the key"
+    );
+    assert_eq!(
+        commit_with(true, Some(false)),
+        plain,
+        "the request turns the ingest flag off again"
+    );
+}
+
+#[test]
 fn detached_metadata_round_trips() {
     // Writing an a{sv} and reading it back yields the same value; writing None
     // yields the zero-length "no metadata" file, read back as None.

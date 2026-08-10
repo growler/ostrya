@@ -14,8 +14,11 @@ use crate::syntax;
 
 /// What to observe.
 pub struct Options {
+    /// The reference implementation to observe.
     pub reference: Tool,
+    /// The port, observed beside the reference when given.
     pub port: Option<Tool>,
+    /// Where the observation artifacts are written.
     pub artifact_dir: PathBuf,
     /// The invocation to try, when the record states none.
     pub run: Option<String>,

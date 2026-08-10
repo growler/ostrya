@@ -18,21 +18,26 @@
 //!
 //! Import builds a [`MutableTree`]: regular files stream into content objects,
 //! symlinks and directory metadata become their objects, and hardlink members
-//! are resolved after the walk against the paths already ingested. A directory
-//! that the archive never names explicitly is given a default `0755` root-owned
-//! metadata object so the tree can serialize. With
-//! [`TarImportOptions::etc_to_usr_etc`], a top-level `etc` component is rewritten
-//! to `usr/etc`. [`TarImportOptions::owner_uid`] and
+//! are resolved after the walk against the paths already ingested. Each member
+//! is placed under a directory the tree already holds, so an archive naming a
+//! member before its parent is refused unless
+//! [`TarImportOptions::autocreate_parents`] permits synthesizing the parent.
+//! With [`TarImportOptions::etc_to_usr_etc`], a top-level `etc` component is
+//! rewritten to `usr/etc`. [`TarImportOptions::owner_uid`] and
 //! [`TarImportOptions::owner_gid`] replace the ownership every member records,
-//! the default directory metadata included, and
+//! a synthesized parent directory included, and
 //! [`TarImportOptions::skip_xattrs`] records no extended attributes at all.
-//! Device and FIFO members are rejected, since an ostree tree
-//! stores only regular files, symlinks, and directories. The returned tree is
-//! serialized and committed by the caller through
+//! [`TarImportOptions::rename`] rewrites each member's pathname before the
+//! member is placed. Device and FIFO members are rejected, since an ostree tree
+//! stores only regular files, symlinks, and directories.
+//! [`Repo::import_tar_into`] reads into a tree an earlier source already
+//! filled, and shapes each member with a
+//! [`CommitModifier`](crate::CommitModifier). The tree is serialized and
+//! committed by the caller through
 //! [`Transaction::write_mtree`](crate::Transaction::write_mtree) and
 //! [`Transaction::write_commit`](crate::Transaction::write_commit).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, UNIX_EPOCH};
@@ -46,13 +51,17 @@ use smol_tar::{
 
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
-use crate::mtree::MutableTree;
+use crate::ingest::{adjust_meta, finalize_meta, to_dirmeta};
+use crate::modifier::{CommitModifier, CommitModifierFlags, FilterResult, Owner};
+use crate::mtree::{ChildKind, MutableTree};
 use crate::repo::Repo;
 use crate::transaction::{FileMeta, Transaction};
 use crate::tree::{RepoTree, TreeEntry};
 
 /// The `S_IFDIR` file-type bits a directory's `st_mode` carries.
 const S_IFDIR: u32 = 0o040000;
+/// The `S_IFLNK` file-type bits a symlink's `st_mode` carries.
+const S_IFLNK: u32 = 0o120000;
 /// The permission bits kept in a tar header's octal mode field.
 const PERM_MASK: u32 = 0o7777;
 
@@ -76,8 +85,13 @@ impl TarExportOptions {
     }
 }
 
+/// A rename hook over member pathnames. It receives the normalized member name
+/// (see [`Repo::import_tar_into`]) and returns the name the member is imported
+/// under.
+pub type TarRename = Box<dyn FnMut(&str) -> Result<String> + Send>;
+
 /// Options for [`Repo::import_tar`].
-#[derive(Debug, Default, Clone)]
+#[derive(Default)]
 #[non_exhaustive]
 pub struct TarImportOptions {
     /// Rewrite a top-level `etc` component to `usr/etc`, matching the ostree
@@ -93,6 +107,28 @@ pub struct TarImportOptions {
     /// Record no extended attributes, whatever `SCHILY.xattr.*` records the
     /// archive carries.
     pub skip_xattrs: bool,
+    /// Create a parent directory the archive never names, in place of
+    /// refusing the member that needs it. A synthesized directory records
+    /// mode `0755`, empty extended attributes, and the ownership of the
+    /// member whose import created it; a synthesized root with no such
+    /// member records `0:0`.
+    pub autocreate_parents: bool,
+    /// Rewrite each member's pathname before it is imported. See
+    /// [`TarRename`].
+    pub rename: Option<TarRename>,
+}
+
+impl std::fmt::Debug for TarImportOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TarImportOptions")
+            .field("etc_to_usr_etc", &self.etc_to_usr_etc)
+            .field("owner_uid", &self.owner_uid)
+            .field("owner_gid", &self.owner_gid)
+            .field("skip_xattrs", &self.skip_xattrs)
+            .field("autocreate_parents", &self.autocreate_parents)
+            .field("rename", &self.rename.is_some())
+            .finish()
+    }
 }
 
 impl TarImportOptions {
@@ -211,75 +247,163 @@ impl Repo {
         Ok(())
     }
 
-    /// Read a filesystem tar from `input` into a [`MutableTree`] over `txn`,
-    /// staging one content object per regular file and symlink and one metadata
-    /// object per directory. The returned tree is ready for
-    /// [`write_mtree`](Transaction::write_mtree); the caller commits it.
+    /// Read a filesystem tar from `input` into a fresh [`MutableTree`] over
+    /// `txn`. A convenience over [`import_tar_into`](Repo::import_tar_into)
+    /// with no destination tree and no modifier.
     pub async fn import_tar(
         &self,
         txn: &Transaction,
         opts: TarImportOptions,
         input: impl AsyncRead,
     ) -> Result<MutableTree> {
-        let mut reader = TarReader::new(input);
+        let mut mtree = MutableTree::new();
+        self.import_tar_into(txn, opts, input, &mut mtree, None)
+            .await?;
+        Ok(mtree)
+    }
 
-        // Files and symlinks by path, in encounter order, plus an index for
-        // resolving hardlink targets. Directory dirmeta checksums and the set of
-        // every directory path (explicit entries and the ancestors of every
-        // member) are tracked so each directory ends up with a dirmeta.
-        let mut files: Vec<(Vec<String>, Checksum)> = Vec::new();
+    /// Read a filesystem tar from `input` into `mtree` over `txn`, staging one
+    /// content object per regular file and symlink and one metadata object per
+    /// directory. The tree is ready for
+    /// [`write_mtree`](Transaction::write_mtree); the caller commits it.
+    ///
+    /// Each member is placed under the directory its pathname names, which
+    /// must already be in the tree: an archive that names a member before its
+    /// parent directory is refused with [`Error::TarMissingParent`] unless
+    /// [`autocreate_parents`](TarImportOptions::autocreate_parents) is set. The
+    /// tree's own root is one such parent, so an archive that names no root
+    /// member leaves `mtree` without root metadata where the destination
+    /// supplied none.
+    ///
+    /// The pathname a member is placed under, and the name
+    /// [`rename`](TarImportOptions::rename) receives, drops one leading `./`
+    /// and one leading `/`, keeps a directory's trailing `/`, and is the empty
+    /// string for the archive's own root member.
+    ///
+    /// `modifier` shapes every member the way it shapes a filesystem walk, with
+    /// one difference:
+    /// [`CANONICAL_PERMISSIONS`](crate::CommitModifierFlags::CANONICAL_PERMISSIONS)
+    /// records the ownership and the mode it states and keeps the extended
+    /// attributes the archive carries, which
+    /// [`skip_xattrs`](TarImportOptions::skip_xattrs) drops instead. A
+    /// synthesized parent directory takes no part in the modifier.
+    pub async fn import_tar_into(
+        &self,
+        txn: &Transaction,
+        mut opts: TarImportOptions,
+        input: impl AsyncRead,
+        mtree: &mut MutableTree,
+        mut modifier: Option<&mut CommitModifier>,
+    ) -> Result<()> {
+        let mut reader = TarReader::new(input);
+        let flags = modifier
+            .as_deref()
+            .map_or(CommitModifierFlags::empty(), |m| m.flags);
+        let owner = Owner::of(modifier.as_deref());
+
+        // Files and symlinks by path, for resolving hardlink targets, and the
+        // hardlink members themselves, whose targets are resolved once the
+        // walk is over.
         let mut file_index: HashMap<Vec<String>, Checksum> = HashMap::new();
-        let mut dir_meta: HashMap<Vec<String>, Checksum> = HashMap::new();
-        let mut all_dirs: BTreeSet<Vec<String>> = BTreeSet::new();
-        all_dirs.insert(Vec::new());
         let mut hardlinks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        // The ownership the last synthesized parent directory recorded. The
+        // root's own metadata takes it too.
+        let mut synthesized: Option<(u32, u32)> = None;
 
         while let Some(entry) = reader.next().await {
-            let entry = entry.map_err(Error::Io)?;
+            let entry = entry.map_err(read_error)?;
             match entry {
                 TarEntry::Directory(dir) => {
-                    let comps = normalize(dir.path(), &opts)?;
-                    let meta = DirMeta {
+                    let comps = member_path(dir.path(), true, &mut opts)?;
+                    let base = FileMeta {
                         uid: opts.uid(dir.uid()),
                         gid: opts.gid(dir.gid()),
                         mode: S_IFDIR | (dir.mode() & PERM_MASK),
                         xattrs: attrs_to_xattrs(dir.attrs(), &opts)?,
                     };
-                    let checksum = self.stage_dirmeta(txn, &meta).await?;
-                    register_ancestors(&comps, &mut all_dirs);
-                    all_dirs.insert(comps.clone());
-                    dir_meta.insert(comps, checksum);
+                    let Some(meta) = shape(
+                        txn,
+                        modifier.as_deref_mut(),
+                        flags,
+                        owner,
+                        &comps,
+                        base,
+                        false,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let checksum = txn.write_dirmeta(&to_dirmeta(&meta)).await?;
+                    let raw = (opts.uid(dir.uid()), opts.gid(dir.gid()));
+                    place_dir(txn, mtree, &comps, checksum, &opts, raw, &mut synthesized).await?;
                 }
                 TarEntry::File(file) => {
-                    let comps = normalize(file.path(), &opts)?;
+                    let comps = member_path(file.path(), false, &mut opts)?;
                     require_leaf(&comps, "regular file")?;
-                    let mut meta = FileMeta::regular(
+                    let mut base = FileMeta::regular(
                         opts.uid(file.uid()),
                         opts.gid(file.gid()),
                         file.mode() & PERM_MASK,
                     );
-                    meta.xattrs = attrs_to_xattrs(file.attrs(), &opts)?;
+                    base.xattrs = attrs_to_xattrs(file.attrs(), &opts)?;
+                    let raw = (opts.uid(file.uid()), opts.gid(file.gid()));
+                    let Some(meta) = shape(
+                        txn,
+                        modifier.as_deref_mut(),
+                        flags,
+                        owner,
+                        &comps,
+                        base,
+                        false,
+                    )?
+                    else {
+                        continue;
+                    };
                     let checksum = txn.write_content(None, &meta, file).await?;
-                    register_ancestors(&comps, &mut all_dirs);
-                    file_index.insert(comps.clone(), checksum);
-                    files.push((comps, checksum));
+                    place(txn, mtree, &comps, checksum, &opts, raw, &mut synthesized).await?;
+                    file_index.insert(comps, checksum);
                 }
                 TarEntry::Symlink(link) => {
-                    let comps = normalize(link.path(), &opts)?;
+                    let comps = member_path(link.path(), false, &mut opts)?;
                     require_leaf(&comps, "symlink")?;
-                    let mut meta =
-                        FileMeta::regular(opts.uid(link.uid()), opts.gid(link.gid()), 0o777);
-                    meta.xattrs = attrs_to_xattrs(link.attrs(), &opts)?;
-                    let checksum = txn.write_symlink(link.link(), &meta, None).await?;
-                    register_ancestors(&comps, &mut all_dirs);
-                    file_index.insert(comps.clone(), checksum);
-                    files.push((comps, checksum));
+                    // The header's own permission bits, under the file type the
+                    // member kind states. The file type makes the mode callback
+                    // and the canonical reduction see a symlink, and lets the
+                    // permission bits a `--statoverride` entry states reach the
+                    // content object's header.
+                    let base = FileMeta {
+                        uid: opts.uid(link.uid()),
+                        gid: opts.gid(link.gid()),
+                        mode: S_IFLNK | (link.mode() & PERM_MASK),
+                        xattrs: attrs_to_xattrs(link.attrs(), &opts)?,
+                    };
+                    let raw = (opts.uid(link.uid()), opts.gid(link.gid()));
+                    let target = link.link().to_owned();
+                    let Some(meta) = shape(
+                        txn,
+                        modifier.as_deref_mut(),
+                        flags,
+                        owner,
+                        &comps,
+                        base,
+                        true,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let checksum = txn.write_symlink(&target, &meta, None).await?;
+                    place(txn, mtree, &comps, checksum, &opts, raw, &mut synthesized).await?;
+                    file_index.insert(comps, checksum);
                 }
                 TarEntry::Link(link) => {
-                    let comps = normalize(link.path(), &opts)?;
+                    let comps = member_path(link.path(), false, &mut opts)?;
                     require_leaf(&comps, "hardlink")?;
-                    let target = normalize(link.link(), &opts)?;
-                    register_ancestors(&comps, &mut all_dirs);
+                    // The target names another member, so it is read through
+                    // the same rename hook the member names went through.
+                    let target = member_path(link.link(), false, &mut opts)?;
+                    let raw = (opts.uid(0), opts.gid(0));
+                    let parents = &comps[..comps.len() - 1];
+                    descend(txn, mtree, parents, &opts, raw, &mut synthesized).await?;
                     hardlinks.push((comps, target));
                 }
                 TarEntry::Device(dev) => {
@@ -310,57 +434,162 @@ impl Repo {
                     join(&target)
                 ))
             })?;
-            file_index.insert(link.clone(), checksum);
-            files.push((link, checksum));
-        }
-
-        let mut root = MutableTree::new();
-        for (comps, checksum) in &files {
-            let (leaf, parents) = comps
+            let (leaf, parents) = link
                 .split_last()
-                .expect("a file path has at least one component");
-            let mut node = &mut root;
-            for parent in parents {
-                node = node.ensure_dir(parent).await?;
-            }
-            node.replace_file(leaf, *checksum)?;
+                .expect("a hardlink path has at least one component");
+            let node = mtree
+                .dir_at_mut(parents)
+                .expect("the hardlink's parents were created during the walk");
+            node.replace_file(leaf, checksum)?;
+            file_index.insert(link, checksum);
         }
 
-        // Give every directory its dirmeta: the explicit one where the archive
-        // named the directory, a shared default otherwise.
-        let mut default_dirmeta: Option<Checksum> = None;
-        for comps in &all_dirs {
-            let mut node = &mut root;
-            for component in comps {
-                node = node.ensure_dir(component).await?;
-            }
-            let checksum = match dir_meta.get(comps) {
-                Some(checksum) => *checksum,
-                None => match default_dirmeta {
-                    Some(checksum) => checksum,
-                    None => {
-                        let meta = DirMeta {
-                            uid: opts.uid(0),
-                            gid: opts.gid(0),
-                            mode: S_IFDIR | 0o755,
-                            xattrs: Xattrs::empty(),
-                        };
-                        let checksum = self.stage_dirmeta(txn, &meta).await?;
-                        default_dirmeta = Some(checksum);
-                        checksum
-                    }
-                },
+        // The root's own metadata: what the last synthesized parent recorded,
+        // else `0755 0:0` where the archive named no root and nothing else
+        // supplied one.
+        if opts.autocreate_parents
+            && let Some((uid, gid)) = synthesized.or_else(|| {
+                mtree
+                    .metadata_checksum()
+                    .is_none()
+                    .then_some((opts.uid(0), opts.gid(0)))
+            })
+        {
+            let meta = DirMeta {
+                uid,
+                gid,
+                mode: S_IFDIR | 0o755,
+                xattrs: Xattrs::empty(),
             };
-            node.set_metadata_checksum(checksum);
+            let checksum = txn.write_dirmeta(&meta).await?;
+            mtree.set_metadata_checksum(checksum);
         }
 
-        Ok(root)
+        Ok(())
     }
+}
 
-    /// Stage a dirmeta as a metadata object.
-    async fn stage_dirmeta(&self, txn: &Transaction, meta: &DirMeta) -> Result<Checksum> {
-        txn.write_dirmeta(meta).await
+/// Shape one member's metadata: the deterministic adjustments, then the
+/// modifier's filter, then its callbacks. `None` where the filter skipped the
+/// member.
+///
+/// Canonical permissions keep the extended attributes the archive carries,
+/// which is where the tar importer parts from the filesystem walk;
+/// [`TarImportOptions::skip_xattrs`] is what drops them.
+fn shape(
+    txn: &Transaction,
+    mut modifier: Option<&mut CommitModifier>,
+    flags: CommitModifierFlags,
+    owner: Owner,
+    comps: &[String],
+    base: FileMeta,
+    is_symlink: bool,
+) -> Result<Option<FileMeta>> {
+    let path = callback_path(comps);
+    let xattrs = base.xattrs.clone();
+    let mut adjusted = adjust_meta(flags, owner, base, is_symlink);
+    adjusted.xattrs = xattrs;
+
+    if let Some(m) = modifier.as_deref_mut()
+        && let Some(filter) = &mut m.filter
+        && filter(std::path::Path::new(&path), &adjusted) == FilterResult::Skip
+    {
+        txn.note_filtered();
+        return Ok(None);
     }
+    Ok(Some(finalize_meta(
+        modifier,
+        std::path::Path::new(&path),
+        adjusted,
+    )?))
+}
+
+/// The modifier callback path of a member: `/` for the archive's root member,
+/// and a leading-slash path with no trailing slash for every other.
+fn callback_path(comps: &[String]) -> String {
+    if comps.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", comps.join("/"))
+    }
+}
+
+/// Navigate to the directory node named by `ancestors`. Every component must
+/// already be in the tree, or
+/// [`autocreate_parents`](TarImportOptions::autocreate_parents) must permit
+/// synthesizing it.
+async fn descend<'a>(
+    txn: &Transaction,
+    root: &'a mut MutableTree,
+    ancestors: &[String],
+    opts: &TarImportOptions,
+    raw_owner: (u32, u32),
+    synthesized: &mut Option<(u32, u32)>,
+) -> Result<&'a mut MutableTree> {
+    let mut node = root;
+    for name in ancestors {
+        match node.child_kind(name) {
+            ChildKind::File(_) => return Err(Error::ReplaceFileWithDir(name.clone())),
+            ChildKind::Absent => {
+                if !opts.autocreate_parents {
+                    return Err(Error::TarMissingParent(name.clone()));
+                }
+                let meta = DirMeta {
+                    uid: raw_owner.0,
+                    gid: raw_owner.1,
+                    mode: S_IFDIR | 0o755,
+                    xattrs: Xattrs::empty(),
+                };
+                let checksum = txn.write_dirmeta(&meta).await?;
+                *synthesized = Some(raw_owner);
+                let child = node.ensure_dir(name).await?;
+                child.set_metadata_checksum(checksum);
+                node = child;
+            }
+            _ => node = node.ensure_dir(name).await?,
+        }
+    }
+    Ok(node)
+}
+
+/// Record a directory member's own metadata, creating the node it names under
+/// parents [`descend`] resolves. The archive's root member sets the tree root's
+/// metadata.
+async fn place_dir(
+    txn: &Transaction,
+    root: &mut MutableTree,
+    comps: &[String],
+    dirmeta: Checksum,
+    opts: &TarImportOptions,
+    raw_owner: (u32, u32),
+    synthesized: &mut Option<(u32, u32)>,
+) -> Result<()> {
+    let Some((leaf, parents)) = comps.split_last() else {
+        root.set_metadata_checksum(dirmeta);
+        return Ok(());
+    };
+    let node = descend(txn, root, parents, opts, raw_owner, synthesized).await?;
+    node.ensure_dir(leaf).await?.set_metadata_checksum(dirmeta);
+    Ok(())
+}
+
+/// Record a content object at the member's path, resolving its parents the way
+/// [`descend`] does.
+async fn place(
+    txn: &Transaction,
+    root: &mut MutableTree,
+    comps: &[String],
+    checksum: Checksum,
+    opts: &TarImportOptions,
+    raw_owner: (u32, u32),
+    synthesized: &mut Option<(u32, u32)>,
+) -> Result<()> {
+    let (leaf, parents) = comps
+        .split_last()
+        .expect("a content member has at least one component");
+    let node = descend(txn, root, parents, opts, raw_owner, synthesized).await?;
+    node.replace_file(leaf, checksum)?;
+    Ok(())
 }
 
 /// Walk `tree` depth-first, appending ordered [`Item`]s. Within a directory the
@@ -419,12 +648,51 @@ fn collect<'a>(
     })
 }
 
+/// The failure a tar member's header states. The reader reports a pathname that
+/// is not valid UTF-8 as an `InvalidData` i/o error; the port stores pathnames
+/// as text, so it reports that case the way the tool reports it.
+fn read_error(err: std::io::Error) -> Error {
+    // The refusal is recognized by the dependency's message text: smol-tar
+    // 0.1.7, the registry version the workspace resolves, spells it `utf8 in
+    // file path`. The exact pin `=0.1.7` in `crates/ostrya/Cargo.toml` holds
+    // that text. A change to that text upstream leaves the failure an
+    // `Error::Io`; `commit_tar_pathname_not_utf8_is_refused` in the CLI tests
+    // covers the case against the tool and fails when the text moves.
+    if err.kind() == std::io::ErrorKind::InvalidData
+        && err.to_string().contains("utf8 in file path")
+    {
+        return Error::TarPathname;
+    }
+    Error::Io(err)
+}
+
 /// The name of a directory entry regardless of kind.
 fn entry_name(entry: &TreeEntry) -> &str {
     match entry {
         TreeEntry::File { name, .. } => name,
         TreeEntry::Dir { name, .. } => name,
     }
+}
+
+/// The path components a member is imported under: the normalized name (one
+/// leading `./` and one leading `/` dropped, a directory keeping its trailing
+/// `/`, the archive's own root member being the empty string), put through the
+/// rename hook, then split.
+fn member_path(raw: &str, is_dir: bool, opts: &mut TarImportOptions) -> Result<Vec<String>> {
+    let stripped = raw.strip_prefix("./").unwrap_or(raw);
+    let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
+    let mut name = if stripped == "." {
+        String::new()
+    } else {
+        stripped.to_owned()
+    };
+    if is_dir && !name.is_empty() && !name.ends_with('/') {
+        name.push('/');
+    }
+    if let Some(rename) = &mut opts.rename {
+        name = rename(&name)?;
+    }
+    normalize(&name, opts)
 }
 
 /// Split a tar member name into path components, dropping empty and `.`
@@ -449,15 +717,6 @@ fn normalize(raw: &str, opts: &TarImportOptions) -> Result<Vec<String>> {
         comps = remapped;
     }
     Ok(comps)
-}
-
-/// Every proper ancestor directory of `comps` (the root is inserted once by the
-/// caller), so a member whose parents the archive never named still yields
-/// directory nodes with metadata.
-fn register_ancestors(comps: &[String], all_dirs: &mut BTreeSet<Vec<String>>) {
-    for i in 1..comps.len() {
-        all_dirs.insert(comps[..i].to_vec());
-    }
 }
 
 /// Reject an entry whose normalized path is empty (it would name the tree root
@@ -504,8 +763,11 @@ fn attrs_to_xattrs(attrs: &AttrList, opts: &TarImportOptions) -> Result<Xattrs> 
 }
 
 /// The tar option types move freely across tasks and threads.
+/// [`TarImportOptions`] holds a callback field, which is called through `&mut`
+/// and so is `Send` alone, the way [`CommitModifier`] is.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
+    fn assert_send<T: Send>() {}
     assert_send_sync::<TarExportOptions>();
-    assert_send_sync::<TarImportOptions>();
+    assert_send::<TarImportOptions>();
 };

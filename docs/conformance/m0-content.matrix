@@ -333,6 +333,11 @@ question: Observe the payload-link threshold behavior. Record whether the tool
  size, and which config key sets it. The port's config parser does not yet know
  a payload-link-threshold key. Record also how a sparse file is stored and
  whether the hole survives a checkout.
+note: `inventory` reports the stored size of each loose object, and this
+ corpus's `large.bin` compresses to 4424 bytes for the tool and 4421 for the
+ port (`cli-surface.md`, "P2"). The `archive` arm therefore needs a size-free
+ comparison, or the oracle parts on the DEFLATE divergence rather than on this
+ cell's subject.
 
 family: M0
 corpus: C10

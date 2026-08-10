@@ -34,13 +34,16 @@ pub(crate) const S_IFLNK: u32 = 0o120000;
 /// The metadata of one file content object, common to all header wire forms.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileHeader {
+    /// The owner uid.
     pub uid: u32,
+    /// The owner gid.
     pub gid: u32,
     /// Full logical `st_mode`; the file-type bits must name a regular file or
     /// a symlink.
     pub mode: u32,
     /// Symlink target; must be empty for regular files.
     pub symlink_target: String,
+    /// The file's extended attributes.
     pub xattrs: Xattrs,
 }
 

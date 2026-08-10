@@ -198,7 +198,10 @@ artifact. The set is closed and matches the vocabulary in `README.md`.
   comparable when its own invocation commits without a timestamp, which every
   cell that does not state a checksum as its claim is free to do.
 - `inventory` -- every loose object: relative path, extension, and size,
-  sorted by path.
+  sorted by path. The size is the stored size, so in `archive` mode the oracle
+  carries the DEFLATE divergence between the two implementations: it holds for
+  a payload the two encoders compress to one length and parts for the rest
+  (`cli-surface.md`, "P2").
 - `manifest` -- a checkout walked by the harness and reduced to one line per
   path: path, type, mode, uid, gid, the sorted xattr names and values, and a
   SHA-256 digest of the content. Sorted by path.
@@ -318,7 +321,7 @@ either way, so a port regression on such a cell still fails.
 The tolerance is narrow by construction:
 
 - It names a single signal. The reference ending on any other signal fails the
-  cell as before.
+  cell.
 - It applies to the reference alone. The port aborting is always a failure.
 - It costs nothing where the reference works. A build that exits normally is
   held to `ref-expect-exit` and the `ref-expect-*` claims, and the oracles
@@ -445,8 +448,9 @@ Binary exit status:
   vocabulary is in it, that the completeness rule in `README.md` holds for each
   family, that no two records state the same cell, that every placeholder in a
   `run:` line is bound by the record's setups, that every `expect-*` claim
-  parses, that every named corpus, setup, oracle, and probe is registered, and
-  that every registered probe is named by some record.
+  parses, that every named corpus, setup, oracle, and probe is registered,
+  that every registered probe is named by some record, and that every `spec:`
+  value names a heading its document holds.
 - `run` -- executes the selected cells. Selection comes from `--family`,
   `--cell`, `--corpus`, `--mode`, and `--tier`.
 - `observe` -- runs the reference alone against a cell's setup, writes the raw

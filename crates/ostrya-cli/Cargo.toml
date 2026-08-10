@@ -22,6 +22,11 @@ gpg = ["ostrya/sign-gpg"]
 ostrya = { path = "../ostrya", default-features = false }
 ostrya-rt = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+# `commit --tar-pathname-filter` compiles an expression. The tool compiles a
+# PCRE through GLib; the port compiles the `regex` dialect, which is a
+# functional equivalent and not a character-for-character one
+# (`docs/conformance/cli-surface.md`, "P2").
+regex = "1"
 
 # `tests/conformance.rs` runs the conformance matrix against the binary this
 # crate builds (`docs/conformance/harness.md`, "Cargo and CI wiring"). The

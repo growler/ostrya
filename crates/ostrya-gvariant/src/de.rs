@@ -26,9 +26,17 @@ fn parse(ty: &Type, data: &[u8], depth: usize) -> Result<Value> {
         // decoders; the `Value` path only wraps their results.
         Type::Bool => Ok(Value::Bool(bool::decode(data)?)),
         Type::Byte => Ok(Value::Byte(u8::decode(data)?)),
+        Type::I16 => Ok(Value::I16(i16::from_le_bytes(exact::<2>(data)?))),
+        Type::U16 => Ok(Value::U16(u16::from_le_bytes(exact::<2>(data)?))),
+        Type::I32 | Type::Handle => Ok(Value::I32(i32::from_le_bytes(exact::<4>(data)?))),
         Type::U32 => Ok(Value::U32(u32::decode(data)?)),
+        Type::I64 => Ok(Value::I64(i64::from_le_bytes(exact::<8>(data)?))),
         Type::U64 => Ok(Value::U64(u64::decode(data)?)),
-        Type::Str => Ok(Value::Str(<&str>::decode(data)?.to_owned())),
+        Type::Double => Ok(Value::Double(u64::from_le_bytes(exact::<8>(data)?))),
+        Type::Str | Type::ObjectPath | Type::Signature => {
+            Ok(Value::Str(<&str>::decode(data)?.to_owned()))
+        }
+        Type::Maybe(elem) => parse_maybe(elem, data, depth),
         Type::Array(elem) if **elem == Type::Byte => Ok(Value::Bytes(data.to_vec())),
         Type::Array(elem) => parse_array(elem, data, depth),
         Type::Tuple(members) => parse_struct(ty, members.iter(), data, depth),
@@ -49,6 +57,24 @@ fn parse(ty: &Type, data: &[u8], depth: usize) -> Result<Value> {
 /// input from forcing an allocation proportional to its own size; a genuinely
 /// large valid array still grows amortized past the cap.
 const ARRAY_PREALLOC_CAP: usize = 4096;
+
+/// Parse `m<T>`: no bytes is `Nothing`, and any other input is `Just`, whose
+/// element bytes are the whole input for a fixed-size element and the input
+/// less its trailing zero byte for a variable-size one.
+fn parse_maybe(elem: &Type, data: &[u8], depth: usize) -> Result<Value> {
+    if data.is_empty() {
+        return Ok(Value::Maybe(None));
+    }
+    let child = if elem.fixed_size().is_some() {
+        data
+    } else {
+        match data.split_last() {
+            Some((0, rest)) => rest,
+            _ => return Err(Error::NotNormal("maybe lacks its terminating zero byte")),
+        }
+    };
+    Ok(Value::Maybe(Some(Box::new(parse(elem, child, depth + 1)?))))
+}
 
 fn parse_array(elem: &Type, data: &[u8], depth: usize) -> Result<Value> {
     let mut reader = ArrayReader::new(data, elem.alignment(), elem.fixed_size())?;
@@ -175,6 +201,68 @@ mod tests {
                 Value::variant(Type::U32, Value::U32(5)),
             ),
         );
+    }
+
+    /// The types outside the on-disk format, which `commit --add-metadata`
+    /// writes into a commit's metadata dict.
+    #[test]
+    fn round_trips_the_metadata_only_types() {
+        round_trip("n", &Value::I16(-5));
+        round_trip("q", &Value::U16(5));
+        round_trip("i", &Value::I32(-42));
+        round_trip("h", &Value::I32(7));
+        round_trip("x", &Value::I64(-5));
+        round_trip("d", &Value::double(1.5));
+        round_trip("o", &Value::Str("/a/b".into()));
+        round_trip("g", &Value::Str("ay".into()));
+        round_trip("ms", &Value::Maybe(None));
+        round_trip("ms", &Value::Maybe(Some(Box::new(Value::Str("x".into())))));
+        round_trip(
+            "ms",
+            &Value::Maybe(Some(Box::new(Value::Str(String::new())))),
+        );
+        round_trip("mi", &Value::Maybe(None));
+        round_trip("mi", &Value::Maybe(Some(Box::new(Value::I32(3)))));
+        round_trip(
+            "ami",
+            &Value::Array(vec![
+                Value::Maybe(Some(Box::new(Value::I32(1)))),
+                Value::Maybe(None),
+            ]),
+        );
+        round_trip(
+            "(sid)",
+            &Value::Tuple(vec![
+                Value::Str("a".into()),
+                Value::I32(5),
+                Value::double(-0.5),
+            ]),
+        );
+    }
+
+    /// A maybe of a variable-size element ends in one zero byte, which is what
+    /// tells `Just ""` from `Nothing`.
+    #[test]
+    fn maybe_framing() {
+        let ty = Type::parse("ms").unwrap();
+        assert_eq!(
+            to_bytes(&ty, &Value::Maybe(None)).unwrap(),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            to_bytes(
+                &ty,
+                &Value::Maybe(Some(Box::new(Value::Str(String::new()))))
+            )
+            .unwrap(),
+            [0, 0]
+        );
+        assert_eq!(
+            from_bytes(&ty, &[]).unwrap(),
+            Value::Maybe(None),
+            "no bytes is Nothing"
+        );
+        assert!(from_bytes(&ty, &[1]).is_err(), "a missing terminator");
     }
 
     #[test]

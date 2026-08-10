@@ -491,3 +491,127 @@ fn dummy_round_trip_within_the_port() {
         assert!(!bad.valid);
     });
 }
+
+/// The dummy engine's stored signature blobs for `commit`, sorted, as text.
+async fn dummy_signatures(repo: &Repo, commit: &Checksum) -> Vec<String> {
+    let Some(dict) = repo.read_commit_detached_metadata(commit).await.unwrap() else {
+        return Vec::new();
+    };
+    let Some(array) = dict
+        .dict_get("ostree.sign.dummy")
+        .and_then(Value::as_variant)
+        .map(|(_, value)| value)
+    else {
+        return Vec::new();
+    };
+    let mut blobs: Vec<String> = array
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|blob| String::from_utf8(blob.as_bytes().unwrap().to_vec()).unwrap())
+        .collect();
+    blobs.sort();
+    blobs
+}
+
+/// Signatures two signers produce at the same time both reach the
+/// `.commitmeta`, whether they share one transaction, run in two, or pair a
+/// transaction with a [`Repo::sign_commit`] caller.
+///
+/// The append is queued under one lock with no await inside it, and the write
+/// reads, merges and replaces the file under a guard the process shares, so
+/// neither signer overwrites the other. The order the two take is whichever
+/// signer finishes first, so the claim is the set.
+#[test]
+fn concurrent_signatures_are_not_lost() {
+    let tmp = TmpDir::new("sign-concurrent");
+    let base = tmp.path();
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+
+        // Two signers sharing one transaction.
+        let txn = repo.transaction().await.unwrap();
+        let (one, two) = futures_lite::future::zip(
+            txn.sign_commit(&commit, &DummySigner::new("one")),
+            txn.sign_commit(&commit, &DummySigner::new("two")),
+        )
+        .await;
+        one.unwrap();
+        two.unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            dummy_signatures(&repo, &commit).await,
+            ["one", "two"],
+            "a signature was lost inside one transaction"
+        );
+
+        // Two transactions in one process signing the one commit. Each appends
+        // to what the other left, the way two sequential runs do.
+        async fn sign_in_own_transaction(repo: &Repo, commit: &Checksum, key: &str) {
+            let txn = repo.transaction().await.unwrap();
+            txn.sign_commit(commit, &DummySigner::new(key))
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+        }
+        futures_lite::future::zip(
+            sign_in_own_transaction(&repo, &commit, "three"),
+            sign_in_own_transaction(&repo, &commit, "four"),
+        )
+        .await;
+        assert_eq!(
+            dummy_signatures(&repo, &commit).await,
+            ["four", "one", "three", "two"],
+            "a signature was lost across two transactions"
+        );
+
+        // A queued replace still drops what stands, and the signatures queued
+        // after it survive.
+        let txn = repo.transaction().await.unwrap();
+        txn.set_commit_detached_metadata(&commit, Value::Array(Vec::new()));
+        let (five, six) = futures_lite::future::zip(
+            txn.sign_commit(&commit, &DummySigner::new("five")),
+            txn.sign_commit(&commit, &DummySigner::new("six")),
+        )
+        .await;
+        five.unwrap();
+        six.unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            dummy_signatures(&repo, &commit).await,
+            ["five", "six"],
+            "the replace did not clear the stored signatures"
+        );
+
+        // A `Repo::sign_commit` caller racing a transaction signer on the one
+        // commit. The two hold no queue in common, so the guard the
+        // read-modify-write takes is what keeps both signatures. Each pass adds
+        // two, and the count states that no earlier signature went with them.
+        for pass in 0usize..8 {
+            let direct = format!("direct-{pass}");
+            let queued = format!("queued-{pass}");
+            let txn = repo.transaction().await.unwrap();
+            let (one, two) = futures_lite::future::zip(
+                repo.sign_commit(&commit, &DummySigner::new(direct.as_str())),
+                async {
+                    txn.sign_commit(&commit, &DummySigner::new(queued.as_str()))
+                        .await?;
+                    txn.commit().await
+                },
+            )
+            .await;
+            one.unwrap();
+            two.unwrap();
+            let stored = dummy_signatures(&repo, &commit).await;
+            assert!(
+                stored.contains(&direct) && stored.contains(&queued),
+                "a signature was lost between Repo::sign_commit and a transaction: {stored:?}"
+            );
+            assert_eq!(
+                stored.len(),
+                2 + 2 * (pass + 1),
+                "an earlier signature was lost: {stored:?}"
+            );
+        }
+    });
+}

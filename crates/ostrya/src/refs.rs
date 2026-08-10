@@ -16,12 +16,15 @@
 //! fsync is enabled, and renamed over the target, with the parent directories
 //! created for a `/`-bearing name. Under fsync the directory holding the ref is
 //! `fsync`-ed after the rename, so the name is durable together with the
-//! content; a removal and an alias write, which carry no content of their own,
-//! sync that directory alone. A `None` checksum removes the ref file. A
-//! transaction queues its ref writes with [`Transaction::set_ref`] and applies
-//! them at commit after object publication;
-//! [`Repo::set_ref_immediate`](Repo::set_ref_immediate) writes one outside a
-//! transaction.
+//! content. Where the write created parent directories, the directory holding
+//! each created name is `fsync`-ed too, deepest first, so the whole path of a
+//! `/`-bearing name is durable and not the leaf entry alone. A removal and an
+//! alias write carry no content of their own and sync directories alone. A
+//! `None` checksum removes the ref file. A transaction queues its ref writes
+//! with [`Transaction::set_ref`] and applies them at commit after object
+//! publication, under the fsync policy the transaction resolved for its object
+//! writes; [`Repo::set_ref_immediate`](Repo::set_ref_immediate) writes one
+//! outside a transaction and reads `[core] fsync` itself.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -131,7 +134,10 @@ impl Transaction {
             .collect()
     }
 
-    /// Write the resolved refs on the blocking pool, each atomically.
+    /// Write the resolved refs on the blocking pool, each atomically, under the
+    /// transaction's resolved fsync policy, so the whole transaction -- the
+    /// per-object writes, the publication step, and the ref writes -- reads one
+    /// value.
     pub(crate) async fn write_resolved_refs(
         &self,
         refs: &[(String, Option<Checksum>)],
@@ -139,7 +145,7 @@ impl Transaction {
         if refs.is_empty() {
             return Ok(());
         }
-        let fsync = self.repo().config().fsync()?;
+        let (fsync, _) = self.fsync_flags()?;
         let repo_fd = self.repo().repo_fd().try_clone_to_owned()?;
         let refs = refs.to_vec();
         ostrya_rt::unblock(move || {
@@ -635,7 +641,9 @@ const REF_DIR_MODE: u32 = 0o777;
 /// `fsync` is set, and renames it over the target. `None` unlinks the ref,
 /// treating an already-absent file as success. Under `fsync` the directory
 /// holding the ref is `fsync`-ed after the rename or the unlink, so the name
-/// the operation created or removed is durable and not only the file's content.
+/// the operation created or removed is durable and not only the file's content,
+/// and [`sync_created_ref_parents`] then makes durable the name of every parent
+/// directory this write created.
 fn write_ref_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -655,7 +663,7 @@ fn write_ref_blocking(
         };
     };
 
-    create_ref_parents(repo_fd, relpath)?;
+    let created = create_ref_parents(repo_fd, relpath)?;
     let content = format!("{}\n", checksum.to_hex());
     let tmp = format!(
         "{relpath}.tmp-{}-{}",
@@ -680,6 +688,7 @@ fn write_ref_blocking(
         rustix::fs::renameat(repo_fd, tmp.as_str(), repo_fd, relpath)?;
         if fsync {
             sync_ref_parent(repo_fd, relpath)?;
+            sync_created_ref_parents(repo_fd, &created)?;
         }
         Ok(())
     };
@@ -693,14 +702,15 @@ fn write_ref_blocking(
 /// The link is created under a fresh temp name in the target's parent
 /// directory, then renamed over the target, so an existing ref file or an
 /// existing alias is replaced in one step. A symlink carries no content of its
-/// own to sync, so `fsync` reaches the directory holding the link alone.
+/// own to sync, so `fsync` reaches the directory holding the link and the
+/// directory holding each parent this write created.
 fn write_alias_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
     link: &str,
     fsync: bool,
 ) -> Result<()> {
-    create_ref_parents(repo_fd, relpath)?;
+    let created = create_ref_parents(repo_fd, relpath)?;
     let tmp = format!(
         "{relpath}.tmp-{}-{}",
         std::process::id(),
@@ -712,6 +722,7 @@ fn write_alias_blocking(
     })?;
     if fsync {
         sync_ref_parent(repo_fd, relpath)?;
+        sync_created_ref_parents(repo_fd, &created)?;
     }
     Ok(())
 }
@@ -732,8 +743,11 @@ fn sync_ref_parent(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<()> {
 }
 
 /// Create the parent directories of a ref path, idempotently. Every component
-/// but the last is created; existing directories are left in place.
-fn create_ref_parents(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<()> {
+/// but the last is created; existing directories are left in place. Returns the
+/// paths this call created, shallowest first, for
+/// [`sync_created_ref_parents`] to make durable.
+fn create_ref_parents(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<Vec<String>> {
+    let mut created = Vec::new();
     let mut acc = String::new();
     let mut components: Vec<&str> = relpath.split('/').collect();
     components.pop(); // the final component is the ref file itself
@@ -743,9 +757,33 @@ fn create_ref_parents(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<()> {
         }
         acc.push_str(component);
         match rustix::fs::mkdirat(repo_fd, acc.as_str(), Mode::from_raw_mode(REF_DIR_MODE)) {
-            Ok(()) | Err(Errno::EXIST) => {}
+            Ok(()) => created.push(acc.clone()),
+            Err(Errno::EXIST) => {}
             Err(e) => return Err(e.into()),
         }
+    }
+    Ok(created)
+}
+
+/// `fsync` the directory that holds each entry [`create_ref_parents`] created,
+/// deepest first.
+///
+/// A `mkdirat` adds a name to the directory it is called in, so the directory
+/// made durable for a created `refs/heads/deep/nest` is `refs/heads/deep`, the
+/// one that holds the `nest` entry. Syncing the created directory's own file
+/// descriptor makes its contents durable and leaves its name unrecorded.
+///
+/// The order is child before parent, the order the object fanout uses: the ref
+/// file's own name, which [`sync_ref_parent`] makes durable, then the name of
+/// the directory holding it, then the name of the directory above that. A crash
+/// part way through therefore leaves a prefix of the path recorded and never a
+/// directory entry naming a directory whose own contents are unrecorded.
+///
+/// A directory the call found already in place is not synced; its name is
+/// already durable.
+fn sync_created_ref_parents(repo_fd: BorrowedFd<'_>, created: &[String]) -> Result<()> {
+    for dir in created.iter().rev() {
+        sync_ref_parent(repo_fd, dir)?;
     }
     Ok(())
 }

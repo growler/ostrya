@@ -196,9 +196,7 @@ impl MutableTree {
     pub async fn ensure_dir(&mut self, name: &str) -> Result<&mut MutableTree> {
         validate_name(name)?;
         if self.files.contains_key(name) {
-            return Err(Error::MutableTree(format!(
-                "cannot create directory {name:?}: a file with that name exists"
-            )));
+            return Err(Error::ReplaceFileWithDir(name.to_owned()));
         }
         match self.dirs.get(name) {
             None => {
@@ -240,9 +238,7 @@ impl MutableTree {
     pub fn replace_file(&mut self, name: &str, checksum: Checksum) -> Result<()> {
         validate_name(name)?;
         if self.dirs.contains_key(name) {
-            return Err(Error::MutableTree(format!(
-                "cannot set file {name:?}: a directory with that name exists"
-            )));
+            return Err(Error::ReplaceDirWithFile(name.to_owned()));
         }
         self.files.insert(name.to_owned(), checksum);
         self.clean = None;
@@ -281,9 +277,38 @@ impl MutableTree {
         Ok(())
     }
 
-    /// This directory's dirmeta checksum, if set.
-    pub(crate) fn metadata_checksum(&self) -> Option<Checksum> {
+    /// This directory's dirmeta checksum, if set. A tree whose root has none
+    /// cannot be written, which is how a source list that supplied no root
+    /// directory is recognized.
+    pub fn metadata_checksum(&self) -> Option<Checksum> {
         self.metadata_checksum
+    }
+
+    /// Record a committed subdirectory at `name` without reading it, so the
+    /// overlay reads only the paths a later source names. `repo` is the
+    /// repository the child is read from when a later source does descend into
+    /// it.
+    ///
+    /// A name this tree already holds as a file is refused, which is the rule
+    /// every other mutator follows.
+    pub(crate) fn insert_lazy_dir(
+        &mut self,
+        name: &str,
+        dirtree: Checksum,
+        dirmeta: Checksum,
+        repo: &Repo,
+    ) -> Result<()> {
+        validate_name(name)?;
+        if self.files.contains_key(name) {
+            return Err(Error::ReplaceFileWithDir(name.to_owned()));
+        }
+        if self.repo.is_none() {
+            self.repo = Some(repo.clone());
+        }
+        self.dirs
+            .insert(name.to_owned(), Child::Lazy { dirtree, dirmeta });
+        self.clean = None;
+        Ok(())
     }
 
     /// The repository this tree hydrates lazy children from, if any.
@@ -391,6 +416,13 @@ impl Transaction {
     /// its committed dirtree checksum and is neither re-serialized nor
     /// re-staged. Each written directory requires its dirmeta checksum set;
     /// an unset checksum is an error naming the directory's path.
+    ///
+    /// The root it returns reads back through this transaction alone, the same
+    /// constraint [`Transaction::read_dir`](Transaction::read_dir) states:
+    /// passing it to [`RepoTree::read_dir`](crate::RepoTree::read_dir) before
+    /// the transaction commits reaches
+    /// [`Error::ObjectNotFound`](crate::Error::ObjectNotFound) for the staged
+    /// dirtree.
     pub async fn write_mtree(&self, mtree: &mut MutableTree) -> Result<RepoTree> {
         let emitted = write_node(self, mtree, "/".to_owned()).await?;
         Ok(RepoTree::from_parts(
@@ -464,3 +496,68 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<MutableTree>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CreateOptions;
+    use ostrya_core::RepoMode;
+    use ostrya_rt::block_on;
+
+    /// A throwaway directory removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("ostrya-mtree-{}-{tag}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `insert_lazy_dir` refuses the same names `replace_file` and `ensure_dir`
+    /// refuse, and records nothing for a refused name.
+    #[test]
+    fn insert_lazy_dir_rejects_invalid_names() {
+        let scratch = Scratch::new("lazy-names");
+        block_on(async {
+            let repo = Repo::create(
+                &scratch.0.join("repo"),
+                CreateOptions::new(RepoMode::BareUser),
+            )
+            .await
+            .unwrap();
+            let some = Checksum::from_hex(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap();
+
+            let mut mtree = MutableTree::new();
+            for name in ["", ".", "..", "a/b"] {
+                assert!(
+                    matches!(
+                        mtree.insert_lazy_dir(name, some, some, &repo),
+                        Err(Error::MutableTree(_))
+                    ),
+                    "insert_lazy_dir rejects {name:?}"
+                );
+            }
+            assert!(mtree.dirs.is_empty(), "a refused name records no child");
+            assert!(
+                mtree.repo.is_none(),
+                "a refused name adopts no repository handle"
+            );
+        });
+    }
+}

@@ -12,14 +12,20 @@
 //! owner has died. It takes each sibling lock non-blockingly; a directory whose
 //! lock it can take, with no live holder, is removed. A directory with no lock
 //! file is removed only once it is older than `tmp-expiry-secs`, since it may be
-//! mid-creation in another process. A process-global set of the staging
+//! mid-creation in another process. A process-global map of the staging
 //! directories this process currently owns keeps the reaper from touching them:
 //! the record locks are process-associated, so a second descriptor to a live
 //! sibling lock would neither conflict nor survive being closed. A directory
-//! enters that set before it is created and leaves it after it is removed, so
-//! every directory a same-process reaper can list is already in the set.
+//! enters that map before it is created and leaves it after it is removed, so
+//! every directory a same-process reaper can list is already in the map.
+//!
+//! Each entry of that map holds a descriptor for the `tmp/` directory the
+//! staging directory lives in, so [`reap_owned`] removes every one of them with
+//! no live [`StagingDir`] in hand. A process that ends without running
+//! destructors reaches it through
+//! [`reap_process_staging`](crate::reap_process_staging).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -44,10 +50,34 @@ const SUFFIX_LEN: usize = 6;
 /// The number of unique-name attempts before giving up.
 const MKDTEMP_ATTEMPTS: u32 = 128;
 
-/// The staging directory names this process currently owns.
-fn active() -> &'static Mutex<HashSet<String>> {
-    static ACTIVE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+/// The staging directories this process currently owns, each name mapped to a
+/// descriptor for the `tmp/` directory it lives in.
+fn active() -> &'static Mutex<HashMap<String, OwnedFd>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<String, OwnedFd>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Remove the staging directories this process owns, together with their
+/// sibling lock files.
+///
+/// A [`StagingDir`] removes its own directory when it drops, so this is for a
+/// process that ends without running destructors: it leaves `tmp/` as an
+/// unwound return would. Every owned directory is removed, so a transaction
+/// that continues afterward finds its staged objects gone.
+pub(crate) fn reap_owned() {
+    let owned = std::mem::take(&mut *active().lock().unwrap());
+    for (name, tmp_fd) in owned {
+        remove_staging(tmp_fd.as_fd(), &name);
+    }
+}
+
+/// Remove the staging directory `name` under `tmp_fd` and its sibling lock
+/// file. Absent entries are already in the wanted state, and a removal that
+/// fails leaves the entry for the next reaper.
+fn remove_staging(tmp_fd: BorrowedFd<'_>, name: &str) {
+    let _ = remove_tree_at(tmp_fd, name);
+    let lock_name = format!("{name}-lock");
+    let _ = rustix::fs::unlinkat(tmp_fd, lock_name.as_str(), AtFlags::empty());
 }
 
 /// A transaction's staging area: the directory, its held sibling lock, and the
@@ -116,12 +146,7 @@ impl StagingDir {
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
-        let _ = remove_tree_at(self.tmp_fd.as_fd(), &self.name);
-        let lock_name = format!("{}-lock", self.name);
-        match rustix::fs::unlinkat(&self.tmp_fd, lock_name.as_str(), AtFlags::empty()) {
-            Ok(()) | Err(Errno::NOENT) => {}
-            Err(_) => {}
-        }
+        remove_staging(self.tmp_fd.as_fd(), &self.name);
         // Release the in-process claim only after the directory and its lock
         // sibling are gone, so a concurrent same-process reaper never sees the
         // directory unprotected while its lock still exists.
@@ -171,14 +196,21 @@ fn boot_id() -> io::Result<&'static str> {
 /// a same-process reaper can list is already claimed. The claim is the only
 /// barrier that holds within one process: the record locks are
 /// process-associated, so a reaper reaching the sibling lock of a live directory
-/// takes it without conflict and removes the directory.
+/// takes it without conflict and removes the directory. The claim carries its
+/// own duplicate of `tmp_fd`, which is what [`reap_owned`] removes the
+/// directory through.
 fn mkdtemp(tmp_fd: BorrowedFd<'_>, prefix: &str) -> io::Result<(String, OwnedFd)> {
     for _ in 0..MKDTEMP_ATTEMPTS {
         let name = format!("{prefix}{}", random_suffix());
+        let claim = tmp_fd.try_clone_to_owned()?;
         // A name another live transaction in this process owns is left to its
         // owner: releasing that claim here would strip its protection.
-        if !active().lock().unwrap().insert(name.clone()) {
-            continue;
+        {
+            let mut active = active().lock().unwrap();
+            if active.contains_key(&name) {
+                continue;
+            }
+            active.insert(name.clone(), claim);
         }
         match rustix::fs::mkdirat(tmp_fd, name.as_str(), Mode::from_raw_mode(STAGING_DIR_MODE)) {
             Ok(()) => {
@@ -263,7 +295,7 @@ fn reap_one(tmp_fd: BorrowedFd<'_>, name: &str, expiry_secs: i64) {
     // Never touch a directory this process owns: its sibling lock is held on
     // another descriptor, and even opening and closing that lock file would drop
     // the hold under the process-associated record-lock semantics.
-    if active().lock().unwrap().contains(name) {
+    if active().lock().unwrap().contains_key(name) {
         return;
     }
     let lock_name = format!("{name}-lock");

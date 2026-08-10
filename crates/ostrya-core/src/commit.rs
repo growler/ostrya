@@ -37,10 +37,15 @@ pub struct Commit {
     /// Related objects: written as an empty array by the tool; parsed
     /// entries are retained verbatim for byte-exact reserialization.
     pub related: Vec<(String, Vec<u8>)>,
+    /// The commit subject, the first line of its message.
     pub subject: String,
+    /// The commit body, the rest of its message.
     pub body: String,
+    /// The commit time, in seconds since the Unix epoch, UTC.
     pub timestamp: u64,
+    /// The checksum of the root directory's dirtree object.
     pub root_dirtree: Checksum,
+    /// The checksum of the root directory's dirmeta object.
     pub root_dirmeta: Checksum,
 }
 

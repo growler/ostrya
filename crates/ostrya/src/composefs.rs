@@ -6,39 +6,46 @@
 //! injects the five top-level directories the tool adds (`boot`, `etc`,
 //! `sysroot`, `usr`, `var`), and drives the writer. Each regular file with
 //! content redirects to its `.file` loose path and carries the fs-verity digest
-//! of that backing object; the digest is computed by streaming the loose object
-//! through the fs-verity primitive on the blocking pool, so no unconstrained
-//! blob is buffered. The synchronous image assembly runs on the blocking pool
-//! too.
+//! of that content; the digest is computed by streaming the object's payload
+//! through the fs-verity primitive in bounded chunks, so no unconstrained blob
+//! is buffered. The synchronous image assembly runs on the blocking pool.
 //!
 //! [`Repo::commit_add_composefs_metadata`] computes the image digest for an
 //! existing commit and writes a new commit whose metadata dict carries
 //! `ostree.composefs.digest.v0`, the value the tool stores and verifies at boot.
+//! [`Transaction::composefs_digest`] computes the same digest over a tree the
+//! transaction has staged and not yet published, which is what a commit
+//! carrying the key in its own metadata needs.
+//!
+//! The image derives from the committed tree alone. Each regular file redirects
+//! to the `.file` loose path, the form the composefs backing modes store, and
+//! carries the fs-verity digest of the file's content, so a repository holding
+//! the same tree produces the same image and the same digest whatever its mode.
 //!
 //! The export applies to the composefs backing modes, `bare-user` and
 //! `bare-user-shared`: the EROFS metadata comes from the logical
 //! `user.ostreemeta` attributes and each regular file redirects to its `.file`
 //! loose object. Ownership is presented through composefs uid mapping at mount,
 //! so the stored uid/gid are the logical owners regardless of who runs the
-//! export. Other modes are rejected.
+//! export. Other modes are rejected. The digest a commit stores is computed in
+//! every mode, since the value is a fact about the tree.
 
 use std::future::Future;
-use std::os::fd::{AsFd, BorrowedFd};
 use std::pin::Pin;
 
 use ostrya_composefs::{
     Content, Directory, FsVerityHasher, Image, Metadata, Node, Regular, Symlink, build_image,
 };
-use ostrya_core::{Checksum, DirMeta, ObjectType, RepoMode, Type, Value, Xattrs, loose_path};
-use rustix::fs::{Mode, OFlags};
-use rustix::io::Errno;
+use ostrya_core::{
+    Checksum, DirMeta, DirTree, ObjectType, RepoMode, Type, Value, Xattrs, loose_path,
+};
 
 use crate::commit::append_dict_entry;
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
-use crate::tree::{RepoTree, TreeEntry};
+use crate::tree::RepoTree;
 
 /// The empty top-level directories the tool injects into every exported image.
 const INJECTED_DIRS: [&str; 5] = ["boot", "etc", "sysroot", "usr", "var"];
@@ -50,10 +57,61 @@ const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
 const DIGEST_SIGNATURE: &str = "ay";
 /// The chunk size used to stream a backing object through the digester.
 const DIGEST_CHUNK: usize = 128 * 1024;
+/// The repository mode whose loose-path form each backing redirect names. The
+/// image points at the `.file` objects a composefs backing store holds, whatever
+/// mode the repository the image was built from uses.
+const BACKING_MODE: RepoMode = RepoMode::BareUser;
 
 /// A boxed, `Send` future, used for the recursive tree walk (async recursion
 /// needs indirection).
 type TreeFuture<'a> = Pin<Box<dyn Future<Output = Result<Directory>> + Send + 'a>>;
+
+/// Where the composefs walk reads the tree's objects.
+#[derive(Clone, Copy)]
+enum ObjectSource<'a> {
+    /// A published repository: every object is a loose object under `objects/`.
+    Repo(&'a Repo),
+    /// A transaction: an object it staged is read from the staging directory,
+    /// and one that deduplicated from `objects/`.
+    Staged(&'a Transaction),
+}
+
+impl ObjectSource<'_> {
+    async fn dirtree(&self, checksum: &Checksum) -> Result<DirTree> {
+        match self {
+            ObjectSource::Repo(repo) => repo.load_dirtree(checksum).await,
+            ObjectSource::Staged(txn) => txn.load_dirtree_staged_first(checksum).await,
+        }
+    }
+
+    async fn dirmeta(&self, checksum: &Checksum) -> Result<DirMeta> {
+        match self {
+            ObjectSource::Repo(repo) => repo.load_dirmeta(checksum).await,
+            ObjectSource::Staged(txn) => txn.load_dirmeta_staged_first(checksum).await,
+        }
+    }
+
+    async fn file(&self, checksum: &Checksum) -> Result<FileObject> {
+        match self {
+            ObjectSource::Repo(repo) => repo.load_file(checksum).await,
+            ObjectSource::Staged(txn) => txn.load_file_staged_first(checksum).await,
+        }
+    }
+}
+
+impl Transaction {
+    /// The fs-verity digest of the composefs image for a tree this transaction
+    /// has staged, the value `ostree.composefs.digest.v0` holds.
+    ///
+    /// The image is built from the staged objects, so the digest is available
+    /// before the transaction publishes and can go into the metadata of the
+    /// commit the tree belongs to. The value depends on the tree alone, so a
+    /// repository of any mode holding that tree reaches the same digest.
+    pub async fn composefs_digest(&self, root: &RepoTree) -> Result<[u8; 32]> {
+        let image = build_composefs_image(ObjectSource::Staged(self), root).await?;
+        Ok(image.fs_verity)
+    }
+}
 
 impl Repo {
     /// Build the composefs EROFS image for `commit` and return its bytes and
@@ -69,9 +127,7 @@ impl Repo {
             commit_obj.root_dirtree,
             commit_obj.root_dirmeta,
         );
-        let mut root = self.build_directory(tree).await?;
-        inject_top_level_dirs(&mut root);
-        Ok(ostrya_rt::unblock(move || build_image(&root)).await)
+        build_composefs_image(ObjectSource::Repo(self), &tree).await
     }
 
     /// Compute the composefs image digest for `commit` and stage a new commit
@@ -111,99 +167,79 @@ impl Repo {
             ))),
         }
     }
+}
 
-    /// Build the composefs [`Directory`] model for one committed directory,
-    /// recursing into subdirectories. Boxed because the recursion is async.
-    fn build_directory(&self, tree: RepoTree) -> TreeFuture<'_> {
-        Box::pin(async move {
-            let dirmeta = self.load_dirmeta(tree.dirmeta_checksum()).await?;
-            let mut dir = Directory::new(dirmeta_to_metadata(&dirmeta));
-            for entry in tree.read_dir().await? {
-                match entry {
-                    TreeEntry::File { name, checksum } => {
-                        let node = self.file_node(&checksum).await?;
-                        dir.children.insert(name.into_bytes(), node);
-                    }
-                    TreeEntry::Dir { name, tree } => {
-                        let sub = self.build_directory(tree).await?;
-                        dir.children.insert(name.into_bytes(), Node::Directory(sub));
-                    }
-                }
-            }
-            Ok(dir)
-        })
-    }
+/// Build the composefs EROFS image for `root`, reading the tree's objects from
+/// `source`, and return its bytes and fs-verity digest.
+async fn build_composefs_image(source: ObjectSource<'_>, root: &RepoTree) -> Result<Image> {
+    let mut dir =
+        build_directory(source, *root.dirtree_checksum(), *root.dirmeta_checksum()).await?;
+    inject_top_level_dirs(&mut dir);
+    Ok(ostrya_rt::unblock(move || build_image(&dir)).await)
+}
 
-    /// Build the composefs [`Node`] for a file object: a symlink stores its
-    /// target inline, an empty regular file has no backing, and a regular file
-    /// with content redirects to its `.file` loose path and carries that
-    /// object's fs-verity digest.
-    async fn file_node(&self, checksum: &Checksum) -> Result<Node> {
-        let file = self.load_file(checksum).await?;
-        let meta = file_to_metadata(&file);
-        match &file.kind {
-            FileKind::Symlink { target } => Ok(Node::Symlink(Symlink {
-                meta,
-                target: target.clone().into_bytes(),
-            })),
-            FileKind::Regular { size } => {
-                let content = if *size == 0 {
-                    Content::Empty
-                } else {
-                    Content::Backed {
-                        size: *size,
-                        redirect: format!(
-                            "/{}",
-                            loose_path(checksum, ObjectType::File, self.mode())
-                        ),
-                        verity: self.backing_object_fs_verity(checksum).await?,
-                    }
-                };
-                Ok(Node::Regular(Regular { meta, content }))
-            }
+/// Build the composefs [`Directory`] model for one directory of a committed
+/// tree, recursing into subdirectories. Boxed because the recursion is async.
+fn build_directory(
+    source: ObjectSource<'_>,
+    dirtree: Checksum,
+    dirmeta: Checksum,
+) -> TreeFuture<'_> {
+    Box::pin(async move {
+        let meta = source.dirmeta(&dirmeta).await?;
+        let mut dir = Directory::new(dirmeta_to_metadata(&meta));
+        let tree = source.dirtree(&dirtree).await?;
+        for (name, checksum) in tree.files {
+            let node = file_node(source, &checksum).await?;
+            dir.children.insert(name.into_bytes(), node);
         }
-    }
+        for (name, subtree, submeta) in tree.dirs {
+            let sub = build_directory(source, subtree, submeta).await?;
+            dir.children.insert(name.into_bytes(), Node::Directory(sub));
+        }
+        Ok(dir)
+    })
+}
 
-    /// Compute the fs-verity digest of a regular file's backing `.file` loose
-    /// object by streaming its bytes through the digester on the blocking pool.
-    async fn backing_object_fs_verity(&self, checksum: &Checksum) -> Result<[u8; 32]> {
-        let path = loose_path(checksum, ObjectType::File, self.mode());
-        let objects_fd = self.objects_fd().try_clone_to_owned()?;
-        let key = *checksum;
-        ostrya_rt::unblock(move || fs_verity_of_object(objects_fd.as_fd(), &path, &key)).await
+/// Build the composefs [`Node`] for a file object: a symlink stores its target
+/// inline, an empty regular file has no backing, and a regular file with
+/// content redirects to its `.file` loose path and carries the fs-verity digest
+/// of its content.
+async fn file_node(source: ObjectSource<'_>, checksum: &Checksum) -> Result<Node> {
+    let file = source.file(checksum).await?;
+    let meta = file_to_metadata(&file);
+    match &file.kind {
+        FileKind::Symlink { target } => Ok(Node::Symlink(Symlink {
+            meta,
+            target: target.clone().into_bytes(),
+        })),
+        FileKind::Regular { size } => {
+            let content = if *size == 0 {
+                Content::Empty
+            } else {
+                Content::Backed {
+                    size: *size,
+                    redirect: format!("/{}", loose_path(checksum, ObjectType::File, BACKING_MODE)),
+                    verity: content_fs_verity(&file).await?,
+                }
+            };
+            Ok(Node::Regular(Regular { meta, content }))
+        }
     }
 }
 
-/// Stream a loose object at `path` through the fs-verity digester in bounded
-/// chunks, mapping a missing object to [`Error::ObjectNotFound`].
-fn fs_verity_of_object(
-    objects_fd: BorrowedFd<'_>,
-    path: &str,
-    checksum: &Checksum,
-) -> Result<[u8; 32]> {
-    use std::io::Read;
+/// Compute the fs-verity digest of a regular file's content by streaming the
+/// object's payload through the digester in bounded chunks. The content is what
+/// the digest covers, so a repository storing the object compressed reaches the
+/// same value as one storing it raw.
+async fn content_fs_verity(file: &FileObject) -> Result<[u8; 32]> {
+    use futures_lite::AsyncReadExt;
 
-    let fd = rustix::fs::openat(
-        objects_fd,
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| {
-        if e == Errno::NOENT {
-            Error::ObjectNotFound {
-                checksum: *checksum,
-                ty: ObjectType::File,
-            }
-        } else {
-            Error::Io(e.into())
-        }
-    })?;
-    let mut file = std::fs::File::from(fd);
+    let mut reader = file.reader().await?;
     let mut hasher = FsVerityHasher::new();
     let mut buf = vec![0u8; DIGEST_CHUNK];
     loop {
-        let n = file.read(&mut buf)?;
+        let n = reader.read(&mut buf).await.map_err(Error::Io)?;
         if n == 0 {
             break;
         }

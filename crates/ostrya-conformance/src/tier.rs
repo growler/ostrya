@@ -32,8 +32,11 @@ pub fn system_repo() -> Option<&'static Path> {
 /// What the host grants the running process.
 #[derive(Clone, Debug)]
 pub struct Host {
+    /// The highest tier this host reaches.
     pub tier: Tier,
+    /// The effective uid of the process.
     pub euid: u32,
+    /// How many supplementary groups the process holds.
     pub groups: usize,
     /// Whether the process runs in the initial user namespace.
     pub initial_namespace: bool,

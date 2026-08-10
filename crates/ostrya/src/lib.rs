@@ -51,9 +51,12 @@
 //! [`Repo::export_composefs`], which builds the EROFS/composefs image for a
 //! commit over the [`ostrya_composefs`] writer -- the tree model comes from the
 //! commit's [`RepoTree`], the five top-level directories are injected, and each
-//! regular file redirects to its `.file` loose object and carries that object's
-//! fs-verity digest -- and [`Repo::commit_add_composefs_metadata`], which stores
-//! the image digest in a commit's `ostree.composefs.digest.v0` metadata. It
+//! regular file redirects to its `.file` loose object and carries the fs-verity
+//! digest of that file's content -- [`Repo::commit_add_composefs_metadata`],
+//! which stores the image digest in a commit's `ostree.composefs.digest.v0`
+//! metadata, and [`Transaction::composefs_digest`], which computes the digest
+//! over a tree the transaction has staged, for a commit that carries the key in
+//! its own metadata. It
 //! also covers tar import and export (Phase 10): [`Repo::export_tar`], which
 //! writes a commit's tree as a filesystem tar stream (numeric ownership,
 //! commit-timestamp mtimes, `SCHILY.xattr.*` PAX records, content-checksum
@@ -219,14 +222,15 @@ pub use gpg::{GpgKey, GpgSigner, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter, VerifyingReader};
 pub use lock::LockKind;
 pub use modifier::{
-    CommitModifier, CommitModifierFlags, DevInoCache, FilterFn, FilterResult, LabelFn, XattrFn,
+    CommitModifier, CommitModifierFlags, DevInoCache, FilterFn, FilterResult, LabelFn, ModeFn,
+    XattrFn,
 };
 pub use mtree::MutableTree;
 pub use ostrya_composefs::Image;
 pub use ostrya_core::base64;
 pub use ostrya_core::{
-    Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Type, Value, Xattrs,
-    from_bytes, to_text, to_text_unannotated,
+    Checksum, Commit, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Span, TextError, Type,
+    Value, Xattrs, from_bytes, from_text, to_text, to_text_unannotated,
 };
 pub use prune::{PruneOptions, PruneStats};
 pub use pull::{PullFlags, PullOptions, PullStats, PullVerify, TimestampCheck};
@@ -242,6 +246,24 @@ pub use sign::{
 pub use spki::{SpkiSigner, SpkiVerifier};
 pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
 pub use summary::{Summary, SummaryOptions, SummaryRef};
-pub use tar::{TarExportOptions, TarImportOptions};
+pub use tar::{TarExportOptions, TarImportOptions, TarRename};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};
+
+/// Remove the staging directories the live transactions of this process own.
+///
+/// A [`Transaction`] removes its staging directory when it commits, when it
+/// aborts, and when it drops, so an unwound return leaves `tmp/` clean on its
+/// own. [`std::process::exit`] runs no destructor: a process that ends that way
+/// with a transaction still live leaves its `tmp/staging-<boot-id>-XXXXXX`
+/// directory and the sibling lock file behind, for a later transaction's
+/// stale-directory reaper to collect. A caller that ends the process without
+/// unwinding calls this immediately before it, and `tmp/` is left as an unwound
+/// return would leave it.
+///
+/// Call it only when the process is about to end. It removes the staging
+/// directory of every live transaction in the process, so a transaction that
+/// keeps running afterward finds its staged objects gone.
+pub fn reap_process_staging() {
+    staging::reap_owned();
+}

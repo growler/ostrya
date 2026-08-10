@@ -106,8 +106,11 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 /// The result of the workspace test gate.
 pub struct Gate {
+    /// One entry per cell the gate ran.
     pub results: Vec<runner::CellResult>,
+    /// The rendered report.
     pub text: String,
+    /// Whether any cell failed.
     pub failed: bool,
 }
 

@@ -101,6 +101,32 @@ pub enum Error {
     /// with no target in the archive, or a non-UTF-8 xattr name.
     #[error("tar: {0}")]
     Tar(String),
+    /// A tar member's pathname is not valid UTF-8. The port stores pathnames as
+    /// text, so such a member has no name to be imported under.
+    #[error("Archive entry pathname is not valid UTF-8")]
+    TarPathname,
+    /// A consuming walk could not remove one entry of its source. The payload
+    /// is the entry's own name and the reason the removal failed.
+    #[error("unlinkat({name}): {reason}")]
+    ConsumeUnlink {
+        /// The name of the entry that could not be removed.
+        name: String,
+        /// Why the removal failed.
+        reason: String,
+    },
+    /// A tree source names a file at a path an earlier source made a
+    /// directory. The payload is the entry's own name.
+    #[error("Can't replace directory with file: {0}")]
+    ReplaceDirWithFile(String),
+    /// A tree source names a directory at a path an earlier source made a
+    /// file. The payload is the entry's own name.
+    #[error("Can't replace file with directory: {0}")]
+    ReplaceFileWithDir(String),
+    /// A tar member names a parent directory the tree does not hold and
+    /// [`TarImportOptions::autocreate_parents`](crate::TarImportOptions::autocreate_parents)
+    /// is off. The payload is the name of the first ancestor that is absent.
+    #[error("No such file or directory: {0}")]
+    TarMissingParent(String),
     /// A signing engine rejected its key material or a signature blob: a
     /// wrong-length key, a public key that is not a valid curve point, or a
     /// malformed secret key.

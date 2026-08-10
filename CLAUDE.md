@@ -20,6 +20,38 @@ source and is never read, run, or vendored (see
 as a black box: its observed behavior and the public documentation are the only
 inputs.
 
+## CLI compatibility is functional, not literal
+
+The CLI aims at functional compatibility. A command the port carries takes the
+tool's option names and values, does the same work, and writes the same bytes
+into the repository. The commit checksum is the oracle wherever one exists.
+
+Character-for-character compatibility is not a goal, and time must not be spent
+pursuing it. Outside the scope, and recorded as a divergence rather than
+removed:
+
+- the wording, the punctuation, and the character offsets of a diagnostic;
+- the exit path a refusal takes, so long as the port exits non-zero and writes
+  no object and no ref;
+- the dialect an option's value is read in, where the tool reads it through a C
+  library the port does not link, together with that library's limits;
+- the order of lines the tool emits from a hash container.
+
+Byte-exact fidelity is required of the repository and never of the terminal.
+
+Two rules follow, and they decide the design of any option the port cannot
+reproduce exactly:
+
+1. Refuse rather than reinterpret. Where the port cannot carry a value, it
+   refuses it and exits non-zero. Accepting a value under a meaning of the
+   port's own writes different bytes, which is the failure this project exists
+   to avoid.
+2. Do not hand-roll a parser or an engine to imitate a C library. Take an
+   authorized crate and record where its dialect parts from the tool's. A
+   from-scratch implementation of somebody else's dialect carries the bugs of
+   both. `docs/conformance/cli-surface.md`, "Scope of CLI compatibility",
+   states this in full.
+
 ## Licensing and clean-room discipline
 
 The library is licensed MIT. The reference implementation (libostree) is LGPL,

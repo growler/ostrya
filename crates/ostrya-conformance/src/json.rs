@@ -9,11 +9,17 @@ use std::fmt::Write as _;
 /// A JSON value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Json {
+    /// `null`.
     Null,
+    /// `true` or `false`.
     Bool(bool),
+    /// A whole number.
     Int(i64),
+    /// A string.
     Str(String),
+    /// An array, in document order.
     Array(Vec<Json>),
+    /// An object, in document order.
     Object(Vec<(String, Json)>),
 }
 

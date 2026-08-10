@@ -46,12 +46,17 @@ struct GpgHome {
 }
 
 impl GpgHome {
-    /// Generate a signing key for `uid` in a new home directory under `base`.
-    fn create(base: &Path, name: &str, uid: &str) -> GpgHome {
+    /// A new home directory under `base` holding no key.
+    fn empty(base: &Path, name: &str) -> GpgHome {
         use std::os::unix::fs::DirBuilderExt;
         let dir = base.join(name);
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-        let home = GpgHome { dir };
+        GpgHome { dir }
+    }
+
+    /// Generate a signing key for `uid` in a new home directory under `base`.
+    fn create(base: &Path, name: &str, uid: &str) -> GpgHome {
+        let home = GpgHome::empty(base, name);
         let status = home
             .gpg()
             .args(["--pinentry-mode", "loopback", "--passphrase", ""])
@@ -273,6 +278,56 @@ fn unknown_signer_key_is_an_error() {
         let text = err.to_string();
         assert!(text.contains("gpg"), "unexpected error: {text}");
     });
+}
+
+/// The key selector reaches gpg as a key name, never as one of gpg's options.
+///
+/// `secret_key_fingerprints` puts the selector after `--`. An option-shaped
+/// selector therefore names no key in the home directory the signer carries, and
+/// it does not move the lookup to a home directory of its own choosing, where gpg
+/// would create a keybox and a trust database as a side effect of a read.
+#[test]
+fn an_option_shaped_selector_is_a_key_name() {
+    if !gpg_available() {
+        eprintln!("skipping: gpg/gpgv not available");
+        return;
+    }
+    let tmp = TmpDir::new("gpg-selector");
+    let base = tmp.path();
+    // The home directory holding the key, and the empty one the lookups run in.
+    let keyed = GpgHome::create(base, "gnupghome", "Selector <selector@ostrya.example>");
+    let lookup = GpgHome::empty(base, "lookup-home");
+    // A home directory no lookup may reach, kept as a home directory so any
+    // agent a failure starts for it is killed with the fixture.
+    let elsewhere = GpgHome::empty(base, "elsewhere");
+
+    block_on(async {
+        // A selector naming the keyed home directory does not re-home the
+        // lookup, so the key it holds is not found.
+        let redirect = format!("--homedir={}", keyed.dir.display());
+        let signer = GpgSigner::new(&redirect).with_homedir(&lookup.dir);
+        assert!(
+            signer.secret_key_fingerprints().await.unwrap().is_empty(),
+            "the selector re-homed the lookup onto the keyed home directory"
+        );
+
+        // A selector naming an untouched directory leaves it untouched.
+        let side_effect = format!("--homedir={}", elsewhere.dir.display());
+        let signer = GpgSigner::new(&side_effect).with_homedir(&lookup.dir);
+        assert!(signer.secret_key_fingerprints().await.unwrap().is_empty());
+        assert!(
+            !elsewhere.dir.join("pubring.kbx").exists(),
+            "the lookup created a keybox in the directory the selector named"
+        );
+        assert!(
+            !elsewhere.dir.join("trustdb.gpg").exists(),
+            "the lookup created a trust database in the directory the selector named"
+        );
+    });
+
+    // The keyed home directory keeps its own key: the lookups read nothing out
+    // of it and wrote nothing into it.
+    assert!(!keyed.fingerprint().is_empty());
 }
 
 #[test]

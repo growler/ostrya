@@ -134,6 +134,13 @@ impl Transaction {
             .collect();
         let mut entries = Vec::with_capacity(reachable.len());
         for (checksum, ty) in reachable {
+            // A commit composed from several tree sources scopes the key to the
+            // objects the last source contributed plus the directory objects the
+            // serialization wrote; see
+            // [`begin_tree_source`](Transaction::begin_tree_source).
+            if !self.in_size_scope(&checksum) {
+                continue;
+            }
             match staged.get(&checksum) {
                 Some(entry) => entries.push(entry.clone()),
                 None => entries.push(self.recover_size_entry(checksum, ty).await?),
@@ -275,6 +282,92 @@ impl Repo {
         self.write_commit_detached_bytes(checksum, bytes).await
     }
 
+    /// Apply one detached-metadata edit at a commit's `.commitmeta` loose path.
+    ///
+    /// `replace` is the dict that stands in for whatever the file holds; with
+    /// `None` the edit starts from the file's own dict, or from an empty dict
+    /// where the file is absent or is the zero-length marker. Each entry of
+    /// `appends` then appends one signature to its engine's `aay` array, in
+    /// order, and the result replaces the file atomically.
+    ///
+    /// The read, the merge and the replacing write run as one step under
+    /// [`DETACHED_MERGE`], a guard the whole process shares, so two signers of
+    /// one commit both reach the file whichever transactions they belong to.
+    /// The same guard covers the other read-modify-write paths of this crate,
+    /// [`Repo::sign_commit`] and [`Repo::delete_signatures`]. Two writers stand
+    /// outside it: a caller that replaces the file through
+    /// [`write_commit_detached_metadata`](Repo::write_commit_detached_metadata),
+    /// and a second process, since the guard lives in this process alone.
+    pub(crate) async fn merge_commit_detached_metadata(
+        &self,
+        checksum: &Checksum,
+        replace: Option<Value>,
+        appends: Vec<(String, Vec<u8>)>,
+        fsync: bool,
+    ) -> Result<()> {
+        let dest = loose_path(checksum, ObjectType::CommitMeta, self.mode());
+        let objects_fd = self.objects_fd().try_clone_to_owned()?;
+        ostrya_rt::unblock(move || {
+            edit_detached_blocking(objects_fd.as_fd(), &dest, fsync, |read| {
+                let mut dict = match replace {
+                    Some(dict) => dict,
+                    None => read()?.unwrap_or_else(|| Value::Array(Vec::new())),
+                };
+                for (key, signature) in appends {
+                    crate::sign::append_signature(&mut dict, &key, signature)?;
+                }
+                Ok((DetachedWrite::Dict(dict), ()))
+            })
+        })
+        .await
+    }
+
+    /// Remove signatures at a commit's `.commitmeta` loose path.
+    ///
+    /// `remove(payload, blob)` decides each blob stored under `metadata_key`,
+    /// where `payload` is the commit's canonical bytes. The read, the removal
+    /// and the replacing write run as one step under [`DETACHED_MERGE`], the
+    /// guard [`merge_commit_detached_metadata`](Repo::merge_commit_detached_metadata)
+    /// takes, so a signer that runs at the same time in this process keeps its
+    /// signature. Returns the number of blobs removed: zero leaves the file as
+    /// it stands, and a dict the removal empties is written as the zero-length
+    /// "no metadata" marker.
+    pub(crate) async fn prune_commit_detached_signatures(
+        &self,
+        checksum: &Checksum,
+        metadata_key: String,
+        payload: Vec<u8>,
+        mut remove: impl FnMut(&[u8], &[u8]) -> bool + Send + 'static,
+        fsync: bool,
+    ) -> Result<usize> {
+        let dest = loose_path(checksum, ObjectType::CommitMeta, self.mode());
+        let objects_fd = self.objects_fd().try_clone_to_owned()?;
+        ostrya_rt::unblock(move || {
+            edit_detached_blocking(objects_fd.as_fd(), &dest, fsync, |read| {
+                let Some(mut dict) = read()? else {
+                    return Ok((DetachedWrite::Keep, 0));
+                };
+                let removed = crate::sign::remove_signatures(
+                    &mut dict,
+                    &metadata_key,
+                    &payload,
+                    &mut remove,
+                )?;
+                if removed == 0 {
+                    return Ok((DetachedWrite::Keep, 0));
+                }
+                let empty = matches!(&dict, Value::Array(entries) if entries.is_empty());
+                let write = if empty {
+                    DetachedWrite::Marker
+                } else {
+                    DetachedWrite::Dict(dict)
+                };
+                Ok((write, removed))
+            })
+        })
+        .await
+    }
+
     /// Write a commit's detached metadata from its serialized bytes, replaced
     /// atomically. Used by the pull path, which copies a source repository's
     /// `.commitmeta` verbatim rather than re-serializing a decoded dict.
@@ -324,6 +417,73 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
             "commit metadata must be an a{sv} dict".into(),
         )),
     }
+}
+
+/// Serializes the read-modify-write cycle behind
+/// [`edit_detached_blocking`] across the whole process. The section holds one
+/// small read, one serialize and one atomic rename, and it holds no await, so
+/// it cannot block a task. It reaches this process alone: two processes that
+/// sign one commit at the same time can still lose a signature, which is what
+/// the `ostree` tool does.
+static DETACHED_MERGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// What one guarded edit leaves at a `.commitmeta` loose path.
+enum DetachedWrite {
+    /// Replace the file with this `a{sv}` dict's bytes.
+    Dict(Value),
+    /// Replace the file with the zero-length "no metadata" marker.
+    Marker,
+    /// Leave the file as it stands.
+    Keep,
+}
+
+/// Run one read-modify-write of a `.commitmeta` loose path under
+/// [`DETACHED_MERGE`].
+///
+/// `edit` receives a reader for the stored dict -- the `a{sv}` the file holds,
+/// or `None` where the file is absent or is the zero-length marker -- and
+/// returns what to leave at the path together with the value the caller wants
+/// back. The reader, `edit` and the write all run inside the guard, so no other
+/// edit of this process lands between them.
+fn edit_detached_blocking<T>(
+    objects_fd: BorrowedFd<'_>,
+    dest: &str,
+    fsync: bool,
+    edit: impl FnOnce(&dyn Fn() -> Result<Option<Value>>) -> Result<(DetachedWrite, T)>,
+) -> Result<T> {
+    let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
+    let _guard = DETACHED_MERGE.lock().unwrap_or_else(|err| err.into_inner());
+    let (write, value) = edit(&|| read_detached_blocking(objects_fd, dest, &ty))?;
+    match write {
+        DetachedWrite::Dict(dict) => {
+            let bytes = to_bytes(&ty, &dict).map_err(ostrya_core::Error::from)?;
+            write_detached_blocking(objects_fd, dest, &bytes, fsync)?;
+        }
+        DetachedWrite::Marker => write_detached_blocking(objects_fd, dest, &[], fsync)?,
+        DetachedWrite::Keep => {}
+    }
+    Ok(value)
+}
+
+/// Read the `a{sv}` dict at a `.commitmeta` loose path, or `None` where the
+/// file is absent or is the zero-length "no metadata" marker.
+fn read_detached_blocking(
+    objects_fd: BorrowedFd<'_>,
+    dest: &str,
+    ty: &Type,
+) -> Result<Option<Value>> {
+    let bytes =
+        match crate::object::read_meta_object(objects_fd, dest, crate::object::MAX_METADATA_SIZE) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::Io(err)),
+        };
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        ostrya_core::from_bytes(ty, &bytes).map_err(ostrya_core::Error::from)?,
+    ))
 }
 
 /// Write detached-metadata bytes to the `.commitmeta` loose path atomically:

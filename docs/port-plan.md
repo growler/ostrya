@@ -1295,8 +1295,10 @@ Definition:
   atomically). GPG and sign-api keys coexist in one dict.
 - `Repo::sign_commit(checksum, signer)` and
   `Repo::verify_commit(checksum, verifiers)`: load the commit bytes, invoke the
-  engine, and on the sign side append the signature to detached metadata; on
-  the verify side collect each engine's signature array and run its verifier.
+  engine, and on the sign side append the signature to detached metadata under
+  the guard that serializes the `.commitmeta` read-modify-write in this
+  process; on the verify side collect each engine's signature array and run its
+  verifier.
 - `VerifyOutcome` and `SignatureInfo` per `api-sketch.md`.
 - The dummy engine (`DummySigner` / `DummyVerifier`): the test engine whose
   secret and public keys are ASCII strings, whose signature and verification
@@ -1516,7 +1518,9 @@ in the trusted set lets the match consider the primary-key fingerprint.
 Delete is backed by `Repo::delete_signatures(checksum, metadata_key, predicate)`,
 which rewrites `.commitmeta`: an emptied engine array drops its dict entry, and
 an emptied dict is written as the zero-length marker, leaving other engines'
-arrays in place. The `spki` and `gpg` engines are enabled in the `ostrya-cli`
+arrays in place. The read, the predicate and the write run under the guard
+`Repo::sign_commit` and the transaction merge take, which reaches this process
+alone; the predicate runs on the blocking pool, so it is `Send + 'static`. The `spki` and `gpg` engines are enabled in the `ostrya-cli`
 build by default, so all three sign-types work without a rebuild.
 
 Verify: through the built binary, a commit it signs with ed25519 verifies under
@@ -3682,8 +3686,8 @@ callbacks, in both ingest walks (the filesystem walk and the overlay merge). And
 the tar import took no modifier at all, so `TarImportOptions` gains
 `owner_uid`, `owner_gid`, and `skip_xattrs`, which is what lets the three
 tree-shaping options reach the tar stream `commit` reads from standard input;
-`--canonical-permissions` still reaches the filesystem walk alone, and converging
-the port's stdin form with the tool's `--tree=tar=PATH` stays Phase 17f's.
+`--canonical-permissions` reached the filesystem walk alone until Phase 17f's
+`F4`, which converged the port's stdin form with the tool's `--tree=tar=PATH`.
 
 Each option's accepted values and refusals are the tool's, recovered by
 observation and recorded in `format-reference.md`, "CLI output formats":
@@ -3786,13 +3790,12 @@ byte happens to be zero prints as a bytestring too. And the string form escapes
 differently from the bytestring form -- one string holding the same bytes is
 `'a"b'` and `b'a\"b'` -- so the two literals needed separate escapers.
 
-Floating point is not part of the deliverable after all: `ostrya-gvariant`'s
-`Type` models the type set the on-disk format uses -- booleans, bytes, `u`, `t`,
-strings, variants, arrays, tuples, and dict entries -- and `d` is outside it, as
-are `i`, `n`, `q`, `x`, `o`, `g`, and the maybe types. Nothing the format stores
-needs them, so the printer covers the set the crate models and
-`show --print-variant-type` refuses a type outside it, which
-`cli-surface.md`, "P1", records.
+Floating point was outside the deliverable at this point: `ostrya-gvariant`'s
+`Type` modelled the type set the on-disk format uses -- booleans, bytes, `u`,
+`t`, strings, variants, arrays, tuples, and dict entries -- and `d`, `i`, `n`,
+`q`, `x`, `o`, `g`, and the maybe types sat outside it. Phase 17f brings them
+in, `commit --add-metadata` being a path that writes them into a commit's
+metadata dict (item `F2` in `phase-17-cli-conformance-plan.md`).
 
 The byte order turned out to be part of the printer's contract. The on-disk
 format places its numeric fields in the variant already big-endian while the
@@ -3931,7 +3934,8 @@ it, and reads the count of new keys out of the `IMPORT_RES` status line,
 which is what the tool's own `Imported <n> GPG key(s)` reports; the listing
 parses a `--with-colons` key listing. A `KEY-ID` selection exports each named
 key out of a second scratch keyring, so a selector naming nothing is refused
-by name. `remote delete` removes `<remote>.trustedkeys.gpg` with the section,
+by name; each selector stands after a `--` terminator, so gpg reads it as a key
+name rather than as one of its own options. `remote delete` removes `<remote>.trustedkeys.gpg` with the section,
 through `Repo::remove_remote_keyring`.
 
 Four facts the option help does not state came out of the comparison, and are
@@ -3990,17 +3994,285 @@ cells.
 Everything `cli-surface.md`'s P2 section lists that 17b1/17c/17d/17e do not
 already cover: the rest of `commit`'s and `checkout`'s missing options,
 `export --no-xattrs/--subpath/--prefix/-o`, the remaining `prune`, `fsck`,
-`diff`, and `summary` flags, and `static-delta show/delete/indexes`. The
+`diff`, and `summary` flags, and `static-delta show/delete/verify/indexes`. The
 `static-delta` additions need new public accessors into the
 superblock/part/index structures `delta.rs` already parses internally but
 does not yet expose.
 
-Deliverables: the remaining flags on each command, and read-only
-superblock/index accessors on `delta.rs` for `static-delta show`/`indexes`.
+The sub-phase is decomposed into thirty items in
+`phase-17-cli-conformance-plan.md`, one per command with the larger commands
+split by option topic, each carrying its own status, the library work it needs,
+and the observation pass it depends on. That file also carries the
+cross-cutting decisions several items share and the record of any option
+deliberately skipped.
+
+Deliverables: the remaining flags on each command, read-only
+superblock/index accessors on `delta.rs` for `static-delta show`/`indexes`, and
+the per-transaction fsync override and reporting counters `commit --fsync` and
+`commit --table-output` need (`Transaction::set_fsync`, and `metadata_total`,
+`content_total`, and `content_bytes_unpacked` on `TransactionStats`; item
+`F10`).
 
 Verify: each option's `m10` record and the option's owning `m0`/`m1` cells
 move from `unimplemented-cli`/`unobserved` to `full` (or a named, justified
 `lossy`/`needs-priv`) as it lands.
+
+Landed so far: `F10` (`commit --fsync`, `commit --table-output`) and `F1`, `F2`,
+and `F3`, which together give `commit` its message, its metadata dict, and its
+ref bindings. The three carry one library change between them, in
+`ostrya-gvariant`: the crate gained the reading half of the GVariant text form
+(`from_text`) and the type alphabet that half needs, so `Type` and `Value` now
+carry `n`, `q`, `i`, `x`, `h`, `d`, `o`, `g`, and the maybe types through the
+serializer, the parser, and the printer. `commit --add-metadata` is what reaches
+them, and the widening closes the `show --print-variant-type` type-set
+divergence `cli-surface.md` recorded at Phase 17d. The commit metadata dict's
+entry order is part of the commit checksum, and the rule the three items share
+is stated once in `format-reference.md`, "CLI output formats", `commit`: derived
+keys the tree walk produces, then the user keys group by group, then the binding
+keys, then the derived keys the commit assembly appends. Item `F9` fills that
+rule's first and last group with the keys it derives. The conformance run reports
+538 cells and 211 passes after the three (491 cells and 173 passes at the end of
+Phase 17e, 504 and 183 after `F10`).
+
+`F5` and `F6` follow, giving `commit` the four options that shape the filesystem
+walk -- `--statoverride`, `--skip-list`, `--mode-ro-executables`, and
+`--skip-if-unchanged` -- and the two that resolve a source entry by its inode,
+`--link-checkout-speedup` and `-I/--devino-canonical`. Both items needed library
+work the plan did not expect. `CommitModifier` gained a `mode_callback`, a
+per-path hook returning the `st_mode` an entry records: the filter takes its
+`FileMeta` by shared reference and returns an include-or-prune verdict, so
+`--statoverride` and `--mode-ro-executables` had no way to reach a mode through
+it. The `CANONICAL_PERMISSIONS` reduction of the permission bits moved to after
+that callback, which is the order the tool applies -- `--mode-ro-executables`,
+then `--statoverride`, then the reduction -- and the reduction records the file
+type the walk found, so a value carrying file-type bits of its own leaves the
+entry the kind it is. `FileMeta::symlink_header` records a mode that already
+names a symlink, permission bits included, which a `--statoverride` entry over a
+symlink needs, and refuses a mode naming any other file type, which is what the
+regular-file arm of the same class already did.
+`Repo::devino_cache` builds a `DevInoCache` from the repository's own
+uncompressed loose content objects, which is where the tool's own cache comes
+from: it is built at commit time from `--repo`, so a checkout any earlier process
+made resolves through it, and an `archive` repository contributes nothing because
+it stores every content object compressed. The ingest side gained the hit path
+the speedup needs -- the stored object supplies the metadata the modifier shapes,
+and the object is rewritten from the stored payload only where the shaped
+metadata differs -- and under `DEVINO_CANONICAL` the hit now stands ahead of the
+filter, the tool skipping the filter and every callback for an entry it resolves.
+
+Two observations corrected claims the plan carried. The first is that neither
+devino option changes a commit's checksum: it holds in twelve of the fourteen
+checkout variants and fails over a `bare-user` repository checked out with `-U`,
+where the plain walk captures the repository's own `user.ostreemeta` xattr off
+the hardlinked objects and the flagged commit is the faithful one. The oracle is
+therefore the tool's checksum and not the absence of a change. The second is that
+`-I` masks a real failure: `--owner-uid=0` against a `bare` repository as a
+non-root user fails plainly and under `--link-checkout-speedup` and succeeds
+under `-I`, no content object being written for a resolved file. Both are
+recorded in `cli-surface.md`, "P2", together with the nine divergences the six
+options carry: the order of the `Unmatched ... path:` lines, which the tool
+emits in a hash order; a `--statoverride` value naming a file type the object
+model does not hold, which the port refuses in every arm and the tool writes for
+a regular file and for a symlink, both refusing for a directory; the mode field
+itself, which the tool reads through a C `double` and the port reads in decimal,
+so a hexadecimal literal, an exponent, and a value past the 32-bit range part
+the two; the 128-mebibyte cap the port puts on either control file, matching the
+cap `-F/--body-file` takes; `--skip-if-unchanged` beside a `--parent` the
+repository does not hold, which ends the tool on a signal where the port reports
+the absent object; the wording of a content object that cannot be written, where
+the tool reports `Writing content object: fchown: Operation not permitted` and
+the port its own `i/o error:` line, both at exit 1; the work a root-pruning skip
+list still reaches, where the tool attempts the `--consume` source removal and
+reads a `tar=` source under the pruned walk and the port does neither; a
+`--skip-list` entry, which is spend-once in the tool and reaches every source in
+the port; and `--table-output` beside `--skip-if-unchanged`, which prints
+uninitialized counters from the tool, so the port prints the parent's checksum
+and zero for each counter and no cell states the combination. Both control files
+must hold UTF-8 in both implementations, and a byte that is not, or a NUL,
+reports `error: Invalid UTF-8` ahead of everything else the command does. The
+conformance run reported 561 cells and 220 passes after the two items.
+
+`F9` closes `commit`'s derived metadata: `--generate-sizes`, `--bootable`, and
+`--generate-composefs-metadata`. Three library additions carry it.
+`Transaction::set_generate_sizes` settles `ostree.sizes` for a transaction, so
+the tar ingest reaches the key the walk's `GENERATE_SIZES` flag already reached.
+It stores the caller's answer the way `set_fsync` does, so it wins over the
+ingest flag in both directions.
+`Transaction::read_dir` lists one directory of a tree the transaction has staged,
+reading its staged objects before `objects/`, which is what the kernel search
+under `--bootable` reads: the tool searches the committed tree, so a `--skip-list`
+that prunes `/usr/lib/modules` leaves no kernel to find. Deferred: a
+`TreeEntry::Dir` the call returns reads back through the transaction alone, so
+passing one to `RepoTree::read_dir` before the commit reaches
+`Error::ObjectNotFound`. The doc comment carries the constraint, and enforcing
+it in the type needs a staging-aware tree handle.
+`Transaction::composefs_digest` builds the composefs image over a staged tree and
+returns its fs-verity digest, so the value goes into the metadata of the commit
+it belongs to. The image builder became mode-independent for it: each backing
+file redirects to the `.file` loose path and carries the fs-verity digest of the
+file's content rather than of the loose object, so `archive`, `bare`, and
+`bare-user` holding one tree produce one image and one digest, which is what the
+tool stores. `bare-user-only` canonicalizes the tree and so reaches another
+digest, in both implementations.
+
+Four divergences came out of that comparison, all in `cli-surface.md`, "P2". The
+tool holds the commit metadata dict in a hash-ordered container while
+`--bootable` or `--generate-composefs-metadata` is given, so combining either
+with a caller-supplied metadata key parts the two orders and therefore the two
+checksums; the port keeps the four-group order in every case. `ostree.sizes`
+records the stored size of each object, so its values follow the writer's DEFLATE
+encoder, and the two encoders reach two lengths for most payloads -- 41 of 45
+file objects over the port's own Rust sources, 36 of 40 over a set of system
+binaries -- so an archive `--generate-sizes` commit of a real tree reaches two
+commit checksums. The kernel search sits after the walk and before the timestamp
+in the tool, where the port reads the timestamp earlier. A tree whose
+`/usr/lib/modules` is a non-directory, a regular file or a symlink alike, ends
+the reference build on an assertion, where the port reports `Not a directory`.
+The conformance run reported 582 cells and 230 passes after the item.
+
+`F4` gives `commit` its tree sources: `--tree=dir=`, `--tree=tar=`,
+`--tree=ref=`, `--base`, `--consume`, `--tar-autocreate-parents`, and
+`--tar-pathname-filter`. The commit is built from an ordered source list --
+`--base` at the bottom whatever its position, then each `--tree` in
+command-line order -- and the overlay is a recursive merge in which directories
+union, a later source's directory metadata replaces the earlier one whole, later
+files replace earlier files, and a name that changes between a file and a
+directory is refused. No commit modifier reaches an entry that survives from
+`--base`, and every modifier reaches an entry from any `--tree`, `ref=`
+included.
+
+Two library additions carry it. `Transaction::overlay_tree_to_mtree` reads a
+committed tree into a mutable tree under a `CommitModifier`, reusing the stored
+checksums where the shaped metadata equals the stored metadata and rewriting the
+object from the stored payload where it differs, and recording a subdirectory
+the destination does not hold without reading it. `Repo::import_tar_into` reads
+an archive into a tree an earlier source already filled, under the same
+modifier, which is what lets one command line mix an archive with a filesystem
+walk and a committed tree. The tar importer places each member under a directory
+the tree already holds, so an archive that names a member before its parent is
+refused; `TarImportOptions::autocreate_parents` synthesizes the missing parents
+instead. `TarImportOptions::rename` is the hook `--tar-pathname-filter` needs,
+and `Transaction::begin_tree_source` scopes `ostree.sizes` to one source, which
+is what makes a multi-source `--generate-sizes` commit reach the tool's
+checksum.
+
+The filter takes an expression. The tool compiles a PCRE through GLib's
+`GRegex`; the CLI compiles the `regex` crate's dialect, which is the one
+dependency this item adds. The two carry the constructs a pathname filter uses
+and part at the edges, measured in both directions and recorded in
+`conformance/cli-surface.md`, "P2": seven constructs the port refuses and the
+tool compiles, and two the port compiles and the tool refuses. No expression
+was found that both compile and answer differently, which is the property that
+matters, the commit checksum being the oracle. Refusing is the safe direction:
+a construct the port does not compile never rewrites a pathname under a meaning
+of the port's own. `regex` compiles to a finite automaton, so one match costs
+time linear in the length of the pathname and the option carries no step
+budget.
+
+The replacement half stays the port's own reader, GLib's replacement syntax
+being what an operator writes: `\0` to `\9`, `\g<name>`, `\g<number>`, `\\`,
+the seven control escapes, and `$` as a literal
+(`crates/ostrya-cli/src/main.rs`, `parse_replacement`).
+
+This is the worked example of `CLAUDE.md`, "CLI compatibility is functional,
+not literal", rule 2. The item first shipped a from-scratch backtracking
+matcher over a PCRE subset, to add no dependency. A review measured three
+constructs it read differently from PCRE and three unbounded-work paths in it,
+so the engine was removed in favour of the crate.
+
+This item closes the standing `--tree` divergence. `--tree=tar=PATH` joins the
+port's stdin form, and `--tree=tar=-` and `--tree=tar=/dev/stdin` name standard
+input in both implementations. The port keeps reading standard input where a
+command line names no source at all, where the tool walks the current working
+directory: an omitted argument would otherwise commit whatever directory the
+caller stands in, which is the accident the omitted `/sysroot/ostree/repo`
+fallback is also left out for. `--canonical-permissions` was then compared over
+one tree packaged two ways, which is where the two implementations part: the
+tool leaves an archive's extended attributes in place and drops a filesystem
+walk's, and the port does the same.
+
+Six divergences stand, all in `cli-surface.md`, "P2": the source a command
+line naming none states, the wording of an archive that opens and does not parse,
+the expression subset the filter compiles, the reference defect a file member
+filtered to an empty name reaches -- the tool aborts on a GLib assertion or
+writes a dirtree entry with an empty name, and the port refuses the member -- the
+wording of a tar entry the reader refuses, and the `--table-output` counters over
+a `ref` source that does not open the source list.
+Four wordings the port reproduces are the tool's own: `opendir(<path>):
+<reason>` for a source that does not open, the positional `PATH` included,
+`archive_read_open_filename: Failed to open '<path>'`,
+`unlinkat(<name>): <reason>` for an entry a consuming walk cannot remove, and
+`Archive entry pathname is not valid UTF-8`. The conformance run reported 615
+cells and 248 passes after the item.
+
+`F8` gives `commit` its five signing options: `--gpg-sign`, `--gpg-homedir`,
+`--sign`, `--sign-from-file`, and `--sign-type`. The engines are the ones Phase
+13 and Phase 14 landed, and the item is the ordering around them. The signature
+stands before the ref: the tree and the commit object are staged, every
+signature the invocation asks for is produced, the staged objects publish into
+`objects/` and the `.commitmeta` is written beside the commit, and the ref is
+written last. A key that cannot sign therefore leaves nothing published and the
+ref where it stood, and a ref write that cannot happen leaves the commit and its
+`.commitmeta` durable with no ref.
+
+Three library additions carry it. `Transaction::sign_commit` signs a commit the
+transaction staged, reading the commit object out of the staging directory
+before `objects/` and holding the signature in memory until the transaction
+publishes. `Transaction::set_commit_detached_metadata` queues the detached
+metadata dict a transaction writes, and the transaction writes the queue between
+object publication and the ref writes, which is what puts a `.commitmeta` and
+the commit it belongs to on disk together and both ahead of the ref.
+`GpgSigner::secret_key_fingerprints` resolves a selector through
+`gpg --list-secret-keys` without signing and answers the fingerprints it names,
+in listing order. An empty list is what the "no gpg key found" refusal reads,
+and a home directory that does not exist, one that cannot be read, and one
+holding no matching key all answer it. More than one fingerprint means the
+selector is ambiguous. The selector stands after a `--`
+terminator, so gpg reads it as a key name. Without the terminator gpg reads an
+option-shaped selector as one of its own options, and `--gpg-sign=--homedir=PATH`
+moves the lookup to `PATH` and creates a keybox and a trust database there, as a
+side effect of a read. `format-reference.md`, "Signing" states the outcome the
+terminator holds the lookup to.
+
+`--add-detached-metadata-string` and the signing options meet in the same dict,
+and they differ: the first replaces the whole stored dict and the second appends
+to what stands. The stored keys keep insertion order -- the caller's keys in
+command-line order, then `ostree.sign.<type>`, then `ostree.gpgsigs` -- whatever
+order the options take on the command line. `format-reference.md`, "Signing
+details" states both rules.
+
+Nine divergences stand, all in `cli-surface.md`, "P2": the engines the port
+carries and this tool build does not, where each refuses an engine it lacks in
+the same words; a `--sign-from-file` file whose first line is empty and one with
+no bytes, which end the reference on SIGSEGV and SIGABRT where the port reports
+the length refusal; what becomes of the staging directory after a run, where the
+port removes the directory and its `-lock` sibling ahead of every exit and the
+tool keeps one `staging-<bootid>-XXXXXX` entry and reuses it for every
+transaction of the boot; the wording of a ref-write failure, where the state each
+leaves is the same and that state is the ordering claim; the keypair check the
+port applies to a 64-byte `--sign` value, which the tool signs with; the
+65536-byte cap the port puts on a `--sign-from-file` first line; the path a
+`--sign-from-file` open failure names, where the tool names the absolute path and
+the port names the path as the command line spelled it; the branch-name
+term of the signing step's fault order, observable only over a name both ref-name
+grammars refuse; and the name-dependent order the tool stores some
+detached-metadata key sets in. The conformance run reports 643 cells and 256
+passes.
+
+`commit -e` settles the message before it takes any repository lock. The
+`[core]` keys the transaction reads -- `locking`, `lock-timeout-secs`,
+`tmp-expiry-secs`, and the `min-free-space-*` pair at the open, and the `fsync`
+and `per-object-fsync` pair in the write paths -- are parsed ahead of the edit,
+so a value their reader refuses is reported with the editor unstarted, as it is
+in the tool. The fsync pair is read there whatever `--fsync` says, because the
+option narrows the configured policy and so reads it (`format-reference.md`,
+"The fsync vocabulary"). The transaction opens once the editor has returned,
+which puts the repository lock, the staging directory, and the free-space budget
+behind the editing session. An exclusive operation on the same repository,
+`ostree prune` among them, runs while the message is being written; the tool
+takes its own lock at this same point. The wait for the editor runs on the
+blocking pool, so it holds no executor thread
+(`crates/ostrya-cli/src/main.rs`, `wait_for_editor`).
 
 #### Phase 17g -- P3 commands with no matrix weight
 
@@ -4013,6 +4285,10 @@ move from `unimplemented-cli`/`unobserved` to `full` (or a named, justified
   finder invoked standalone, or add a thin new entry point if not.
 - `create-usb` layers `pull-local`/mirror onto a destination-repo target; no
   new library primitive is expected.
+
+The five commands are items `G1` through `G5` of
+`phase-17-cli-conformance-plan.md`, where the cookie subcommands stand as `G6`
+with the reason they are out.
 
 Deliverables: the five commands.
 
@@ -4204,3 +4480,36 @@ Resolved:
     (`smol::process` / `tokio::process`, no new lockfile crates); the
     `gpg` and `gpgv` binaries are a runtime tool dependency of the
     `sign-gpg` feature only.
+
+14. `#[non_exhaustive]` on the public enums and option structs (Phase 17f):
+    the attribute marks a type whose member set the port itself owns and
+    expects to grow, and is left off a type whose member set an external
+    specification closes.
+
+    `ostrya::Error` carries it: its variants are the port's own error
+    vocabulary, and a phase that adds a failure mode adds a variant.
+    `TarExportOptions` and `TarImportOptions` carry it: their fields track the
+    CLI options the tar commands grow.
+
+    `ostrya_gvariant::Type` and `ostrya_gvariant::Value` do not carry it.
+    `Type` names every character of the GVariant type alphabet, which the
+    GVariant serialization specification fixes, and `Value` names every
+    representation those characters take. Phase 17f completed both sets and
+    closed them. An exhaustive `match` over either therefore stays valid, and
+    it is the gate that a new type character -- were the alphabet ever to gain
+    one -- reaches every site that must answer for it. The attribute has no
+    effect inside the defining crate, so adding it would move `ostrya`,
+    `ostrya-core`, and `ostrya-cli` from that compile-time gate to a wildcard
+    arm resolved at run time, which is the outcome the byte-exact fidelity
+    rule argues against. Widening either enum is a breaking change and takes a
+    major version.
+
+15. Staging-aware tree handle (deferred, opened in Phase 17f):
+    `Transaction::read_dir` returns `TreeEntry::Dir` values holding a
+    `RepoTree` that reads back through the transaction alone, so passing one
+    to `RepoTree::read_dir` before the commit reaches
+    `Error::ObjectNotFound`. The doc comment carries the constraint and the
+    one caller honours it. A tree handle that reads the transaction's staged
+    objects before `objects/` moves the constraint into the type; it is a
+    public API addition and lands with the phase that brings a second
+    caller.

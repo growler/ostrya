@@ -7,9 +7,15 @@
 //! form. The checksum of every metadata object is the hash of these bytes,
 //! so byte exactness here is the bedrock for every downstream phase.
 //!
-//! The supported types are booleans (`b`), bytes (`y`), 32- and 64-bit
+//! The on-disk format uses booleans (`b`), bytes (`y`), 32- and 64-bit
 //! unsigned integers (`u`, `t`), strings (`s`), variants (`v`), arrays,
-//! tuples, and dict entries. [`Type::parse`] rejects everything else.
+//! tuples, and dict entries. The rest of the GVariant type alphabet -- the
+//! signed and the narrow integers, the handle, the double, the object path, the
+//! signature, and the maybe -- reaches a repository through
+//! `commit --add-metadata`, so the codec carries it too.
+//! [`Type::parse`] rejects everything outside the alphabet.
+//!
+//! [`to_text`] writes the GVariant text form and [`from_text`] reads it back.
 //!
 //! Byte order: framing offsets and multi-byte scalars are written
 //! little-endian, the normal-form byte order on the little-endian targets
@@ -25,6 +31,7 @@ mod de;
 mod error;
 mod print;
 mod ser;
+mod text;
 mod ty;
 mod value;
 
@@ -35,5 +42,6 @@ pub use de::from_bytes;
 pub use error::{Error, Result};
 pub use print::{to_text, to_text_unannotated};
 pub use ser::{choose_offset_size, to_bytes, write_offset};
+pub use text::{Span, TextError, from_text};
 pub use ty::Type;
 pub use value::Value;

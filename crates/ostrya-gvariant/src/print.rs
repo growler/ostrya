@@ -24,6 +24,11 @@ use crate::{Error, Result, Type, Value};
 ///   pairs. A dict entry outside an array prints `{key, value}`, with a comma.
 /// - A variant prints as `<child>`, and the child is always annotated, since a
 ///   variant states no child type of its own.
+/// - A maybe prints the value it holds and nothing else, since its type states
+///   how many maybe levels that value sits under. A chain of nested maybes that
+///   ends at `nothing` states how many of its levels are set instead, with one
+///   `just ` for each set level: `@mmi nothing`, `@mmi just nothing`,
+///   `@mmi 5`.
 ///
 /// Returns [`Error::TypeMismatch`] when `value` does not match `ty`, the same
 /// pairing [`crate::to_bytes`] requires.
@@ -39,7 +44,9 @@ pub fn to_text(ty: &Type, value: &Value) -> Result<String> {
 /// The rules are [`to_text`]'s with every annotation left out: a byte and an
 /// unsigned integer print bare, an empty container prints `[]` or `{}` rather
 /// than its signature, and a tuple's members print bare. A variant child still
-/// carries an annotation, a variant stating no child type of its own.
+/// carries an annotation, a variant stating no child type of its own. The
+/// `just ` prefixes of a nested maybe are part of the value rather than an
+/// annotation, so they stay.
 ///
 /// This is the form a report that names the value itself uses, where the reader
 /// already knows what it is looking at (`docs/format-reference.md`, "The
@@ -61,9 +68,59 @@ fn write_value(out: &mut String, ty: &Type, value: &Value, annotate: bool) -> Re
             }
             write!(out, "0x{b:02x}").expect("writing to a String cannot fail");
         }
-        (Type::U32, Value::U32(x)) => write_number(out, annotate, "uint32", *x as u64),
-        (Type::U64, Value::U64(x)) => write_number(out, annotate, "uint64", *x),
+        (Type::I16, Value::I16(x)) => write_number(out, annotate, "int16", x),
+        (Type::U16, Value::U16(x)) => write_number(out, annotate, "uint16", x),
+        // An `i` literal states its own type, so it never carries a keyword.
+        (Type::I32, Value::I32(x)) => write_number(out, false, "int32", x),
+        (Type::Handle, Value::I32(x)) => write_number(out, annotate, "handle", x),
+        (Type::U32, Value::U32(x)) => write_number(out, annotate, "uint32", x),
+        (Type::I64, Value::I64(x)) => write_number(out, annotate, "int64", x),
+        (Type::U64, Value::U64(x)) => write_number(out, annotate, "uint64", x),
+        (Type::Double, Value::Double(bits)) => write_double(out, f64::from_bits(*bits)),
         (Type::Str, Value::Str(s)) => write_string(out, s),
+        (Type::ObjectPath, Value::Str(s)) => {
+            if annotate {
+                out.push_str("objectpath ");
+            }
+            write_string(out, s);
+        }
+        (Type::Signature, Value::Str(s)) => {
+            if annotate {
+                out.push_str("signature ");
+            }
+            write_string(out, s);
+        }
+        (Type::Maybe(elem), Value::Maybe(inner)) => {
+            // A maybe states no type of its own in either literal it has, so an
+            // annotated one carries its whole signature and its child then
+            // prints bare.
+            if annotate {
+                out.push('@');
+                out.push_str(&ty.signature());
+                out.push(' ');
+            }
+            // Walk the chain of nested maybes to its end. A chain that reaches a
+            // value prints that value alone, since the type states how many
+            // levels are set. A chain that ends at `nothing` states the set
+            // levels itself, with one `just ` for each of them.
+            let mut set = 0usize;
+            let mut elem: &Type = elem;
+            let mut inner: &Option<Box<Value>> = inner;
+            while let Some(child) = inner {
+                set += 1;
+                match (elem, &**child) {
+                    (Type::Maybe(next), Value::Maybe(rest)) => {
+                        elem = next.as_ref();
+                        inner = rest;
+                    }
+                    _ => return write_value(out, elem, child, false),
+                }
+            }
+            for _ in 0..set {
+                out.push_str("just ");
+            }
+            out.push_str("nothing");
+        }
         (Type::Array(elem), Value::Bytes(bytes)) if **elem == Type::Byte => {
             if bytes.is_empty() {
                 write_empty(out, ty, annotate, "[]");
@@ -146,13 +203,88 @@ fn write_value(out: &mut String, ty: &Type, value: &Value, annotate: bool) -> Re
     Ok(())
 }
 
-/// Write an unsigned integer, prefixed by `keyword` when annotated.
-fn write_number(out: &mut String, annotate: bool, keyword: &str, value: u64) {
+/// Write an integer, prefixed by `keyword` when annotated.
+fn write_number(out: &mut String, annotate: bool, keyword: &str, value: impl std::fmt::Display) {
     if annotate {
         out.push_str(keyword);
         out.push(' ');
     }
     write!(out, "{value}").expect("writing to a String cannot fail");
+}
+
+/// Write a `d` value. The literal states its own type, so it carries no
+/// keyword: it is the `%.17g` rendering of the double, with `.0` appended when
+/// that rendering holds none of `.`, `e`, `n`, and `N`, so the literal always
+/// reads back as a double. The `n` withholds the suffix from `nan`, `-nan`,
+/// `inf`, and `-inf`, the four renderings that carry one; `N` appears in no
+/// rendering `format_g17` writes.
+fn write_double(out: &mut String, value: f64) {
+    let text = format_g17(value);
+    if !text.contains(['.', 'e', 'n', 'N']) {
+        out.push_str(&text);
+        out.push_str(".0");
+        return;
+    }
+    out.push_str(&text);
+}
+
+/// The C `%.17g` rendering of a double, which is the shortest of a fixed-point
+/// and an exponent form at 17 significant digits, with the trailing zeros of the
+/// fraction removed. The exponent form carries a sign and at least two digits.
+fn format_g17(value: f64) -> String {
+    /// The significant-digit count `%.17g` asks for.
+    const PRECISION: i32 = 17;
+
+    if value.is_nan() {
+        // The sign bit is printed, so a not-a-number whose bits carry one comes
+        // out as `-nan`.
+        return if value.is_sign_negative() {
+            "-nan".to_owned()
+        } else {
+            "nan".to_owned()
+        };
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() {
+            "-inf".to_owned()
+        } else {
+            "inf".to_owned()
+        };
+    }
+    if value == 0.0 {
+        return if value.is_sign_negative() {
+            "-0".to_owned()
+        } else {
+            "0".to_owned()
+        };
+    }
+    let scientific = format!("{:.*e}", (PRECISION - 1) as usize, value);
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("Rust's `e` format writes an exponent");
+    let exponent: i32 = exponent.parse().expect("the exponent is an integer");
+    /// The exponent range `%g` renders in fixed-point form.
+    const FIXED_POINT: std::ops::Range<i32> = -4..PRECISION;
+
+    if !FIXED_POINT.contains(&exponent) {
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return format!(
+            "{}e{sign}{:02}",
+            trim_fraction(mantissa),
+            exponent.unsigned_abs()
+        );
+    }
+    let places = (PRECISION - 1 - exponent).max(0) as usize;
+    trim_fraction(&format!("{value:.places$}"))
+}
+
+/// Remove a fixed-point rendering's trailing fraction zeros, and the decimal
+/// point with them where nothing of the fraction is left.
+fn trim_fraction(text: &str) -> String {
+    if !text.contains('.') {
+        return text.to_owned();
+    }
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
 /// Write an empty container: `literal` alone, or `@signature literal` when the
@@ -501,6 +633,186 @@ mod tests {
             Value::variant(Type::parse("ay").unwrap(), bytes(&[0xeb, 0x57])),
         ])]);
         assert_eq!(bare("a{sv}", deltas), "{'from-to': <[byte 0xeb, 0x57]>}");
+    }
+
+    /// Build a maybe chain of `set` set levels over `inner`, or over `nothing`
+    /// when `inner` is `None`. `maybe_chain(1, None)` is `just nothing`.
+    fn maybe_chain(set: usize, inner: Option<Value>) -> Value {
+        let mut value = inner.unwrap_or(Value::Maybe(None));
+        for _ in 0..set {
+            value = Value::Maybe(Some(Box::new(value)));
+        }
+        value
+    }
+
+    /// The maybe forms, each recovered from
+    /// `ostree commit --add-metadata="k=@TYPE VALUE"` read back through
+    /// `ostree show -B --print-metadata-key=k` against `ostree` 2026.1
+    /// (`docs/format-reference.md`, "The GVariant text form").
+    #[test]
+    fn prints_the_just_prefix_of_a_nested_maybe() {
+        let int = || Value::I32(5);
+        let cases: &[(&str, Value, &str)] = &[
+            // One level: the value alone, or `nothing`.
+            ("mi", maybe_chain(1, Some(int())), "@mi 5"),
+            ("mi", maybe_chain(0, None), "@mi nothing"),
+            // Two levels. A set chain prints the value alone; a chain that ends
+            // at `nothing` counts its set levels.
+            ("mmi", maybe_chain(2, Some(int())), "@mmi 5"),
+            ("mmi", maybe_chain(1, None), "@mmi just nothing"),
+            ("mmi", maybe_chain(0, None), "@mmi nothing"),
+            // Three and four levels.
+            ("mmmi", maybe_chain(3, Some(int())), "@mmmi 5"),
+            ("mmmi", maybe_chain(2, None), "@mmmi just just nothing"),
+            ("mmmi", maybe_chain(1, None), "@mmmi just nothing"),
+            ("mmmi", maybe_chain(0, None), "@mmmi nothing"),
+            (
+                "mmmmi",
+                maybe_chain(3, None),
+                "@mmmmi just just just nothing",
+            ),
+            // The element type does not change the rule.
+            ("mms", maybe_chain(1, None), "@mms just nothing"),
+            ("mmb", maybe_chain(2, Some(Value::Bool(true))), "@mmb true"),
+            ("mmt", maybe_chain(1, None), "@mmt just nothing"),
+            ("mmd", maybe_chain(1, None), "@mmd just nothing"),
+            (
+                "mmo",
+                maybe_chain(2, Some(Value::Str("/a".into()))),
+                "@mmo '/a'",
+            ),
+            ("mmg", maybe_chain(1, None), "@mmg just nothing"),
+            // A maybe of a variant, of an array, and of the unit tuple.
+            (
+                "mmv",
+                maybe_chain(2, Some(Value::variant(Type::I32, int()))),
+                "@mmv <5>",
+            ),
+            ("mmv", maybe_chain(1, None), "@mmv just nothing"),
+            // The maybe consumed the annotation, so the array it holds prints
+            // unannotated and its first byte carries no keyword.
+            ("mmay", maybe_chain(2, Some(bytes(&[0x01]))), "@mmay [0x01]"),
+            ("mmay", maybe_chain(1, None), "@mmay just nothing"),
+            (
+                "mm()",
+                maybe_chain(2, Some(Value::Tuple(vec![]))),
+                "@mm() ()",
+            ),
+            ("mm()", maybe_chain(1, None), "@mm() just nothing"),
+            // Inside an array: the first element carries the annotation, and
+            // every element carries its own `just ` prefixes.
+            (
+                "ammi",
+                Value::Array(vec![
+                    maybe_chain(1, None),
+                    maybe_chain(0, None),
+                    maybe_chain(2, Some(int())),
+                ]),
+                "[@mmi just nothing, nothing, 5]",
+            ),
+            (
+                "ammmi",
+                Value::Array(vec![
+                    maybe_chain(2, None),
+                    maybe_chain(1, None),
+                    maybe_chain(0, None),
+                    maybe_chain(3, Some(int())),
+                ]),
+                "[@mmmi just just nothing, just nothing, nothing, 5]",
+            ),
+            // Inside a dict value, a lone dict entry, and a tuple member.
+            (
+                "a{smmi}",
+                Value::Array(vec![
+                    Value::Tuple(vec!["a".into(), maybe_chain(1, None)]),
+                    Value::Tuple(vec!["b".into(), maybe_chain(0, None)]),
+                    Value::Tuple(vec!["c".into(), maybe_chain(2, Some(int()))]),
+                ]),
+                "{'a': @mmi just nothing, 'b': nothing, 'c': 5}",
+            ),
+            (
+                "{smmi}",
+                Value::Tuple(vec!["a".into(), maybe_chain(1, None)]),
+                "{'a', @mmi just nothing}",
+            ),
+            (
+                "(mmimmimmi)",
+                Value::Tuple(vec![
+                    maybe_chain(1, None),
+                    maybe_chain(0, None),
+                    maybe_chain(2, Some(int())),
+                ]),
+                "(@mmi just nothing, @mmi nothing, @mmi 5)",
+            ),
+            (
+                "(mmi)",
+                Value::Tuple(vec![maybe_chain(1, None)]),
+                "(@mmi just nothing,)",
+            ),
+            // A maybe whose child is a maybe inside an array keeps both rules.
+            (
+                "mammi",
+                maybe_chain(1, Some(Value::Array(vec![maybe_chain(1, None)]))),
+                "@mammi [just nothing]",
+            ),
+            (
+                "mmammi",
+                maybe_chain(2, Some(Value::Array(vec![maybe_chain(1, None)]))),
+                "@mmammi [just nothing]",
+            ),
+            (
+                "amm()",
+                Value::Array(vec![
+                    maybe_chain(1, None),
+                    maybe_chain(2, Some(Value::Tuple(vec![]))),
+                    maybe_chain(0, None),
+                ]),
+                "[@mm() just nothing, (), nothing]",
+            ),
+            (
+                "ammay",
+                Value::Array(vec![
+                    maybe_chain(1, None),
+                    maybe_chain(2, Some(bytes(b"x\0"))),
+                    maybe_chain(0, None),
+                ]),
+                "[@mmay just nothing, b'x', nothing]",
+            ),
+        ];
+        for (signature, value, expected) in cases {
+            assert_eq!(
+                text(signature, value.clone()),
+                *expected,
+                "printing {signature}"
+            );
+        }
+    }
+
+    /// The `just ` prefixes are part of the value, so the unannotated form keeps
+    /// them and drops only the signature.
+    #[test]
+    fn keeps_the_just_prefix_in_the_unannotated_form() {
+        let bare = |signature: &str, value: Value| {
+            to_text_unannotated(&Type::parse(signature).unwrap(), &value).unwrap()
+        };
+        assert_eq!(bare("mmi", maybe_chain(1, None)), "just nothing");
+        assert_eq!(bare("mmmi", maybe_chain(2, None)), "just just nothing");
+        assert_eq!(bare("mmi", maybe_chain(0, None)), "nothing");
+        assert_eq!(bare("mmi", maybe_chain(2, Some(Value::I32(5)))), "5");
+        assert_eq!(bare("mmy", maybe_chain(2, Some(Value::Byte(1)))), "0x01");
+    }
+
+    #[test]
+    fn refuses_a_maybe_whose_chain_does_not_match_the_type() {
+        // A `just` where the type states a plain element.
+        let ty = Type::parse("mi").unwrap();
+        assert!(to_text(&ty, &maybe_chain(2, Some(Value::I32(5)))).is_err());
+        // A plain element where the type states another maybe.
+        let ty = Type::parse("mmi").unwrap();
+        assert!(to_text(&ty, &maybe_chain(1, Some(Value::I32(5)))).is_err());
+        // A mismatched leaf below a set chain.
+        let ty = Type::parse("mms").unwrap();
+        assert!(to_text(&ty, &maybe_chain(2, Some(Value::I32(5)))).is_err());
     }
 
     #[test]

@@ -79,9 +79,16 @@ objtype-as-u32).
 Well-known metadata keys: `version` (`s`, the only key without the `ostree.`
 prefix), `ostree.architecture` (`s`), `ostree.ref-binding` (`as`),
 `ostree.collection-binding` (`s`), `ostree.endoflife` /
-`ostree.endoflife-rebase` (`s`), `ostree.source-title` (`s`), `ostree.sizes`
-(see below). Ref and collection bindings are added by higher-level operations,
-not by the base commit metadata.
+`ostree.endoflife-rebase` (`s`), `ostree.source-title` (`s`), `ostree.linux`
+(`s`) and `ostree.bootable` (`b`) (see below), `ostree.composefs.digest.v0`
+(`ay`, see "composefs"), and `ostree.sizes` (see below). Ref and collection
+bindings are added by higher-level operations, not by the base commit metadata.
+
+`ostree.linux` and `ostree.bootable` mark a commit that carries a kernel.
+`ostree.linux` is an `s` holding the name of the directory under
+`/usr/lib/modules` that holds the kernel, and `ostree.bootable` is a `b` holding
+true. The tool writes the pair together, under `commit --bootable`; the search
+that produces the name is recorded in "CLI output formats", `commit`.
 
 `ostree.sizes` value type is `aay`; each entry is a packed byte buffer sorted
 by ASCII checksum:
@@ -112,6 +119,38 @@ unpacked sizes are equal. When the commit carries caller-supplied metadata,
 `ostree.sizes` is appended after it (observed: a branch commit's
 `ostree.ref-binding` precedes the `ostree.sizes` the tool adds).
 
+The sort key is the raw 32-byte checksum read as a byte string, which is the
+order the hex form gives as well. A decoded key, from a `commit
+--generate-sizes` of a tree holding four directories, one symlink, and three
+regular files, with each entry's length in bytes:
+
+```
+checksum (first 8 bytes)   archived  unpacked  type          length
+0cad59c0775ee80f...        80        80        2 dirtree     35
+1b6ba70951395486...        12        12        3 dirmeta     35
+1c16bd4554d0fb08...        41        51        1 file        35
+6e340b9c...                1         1         2 dirtree     35
+6e4aa995...                145       145       2 dirtree     37
+8c7b8dd4...                36        2         1 file        35
+8d81d4ff...                148       148       2 dirtree     37
+abadce0d...                48        12        1 file        35
+fe657422...                20044     20000     1 file        39
+```
+
+The first entry reads, byte for byte:
+
+```
+0c ad 59 c0 77 5e e8 0f 24 1e c8 58 2d 9c 1e 64
+6b 4f b5 59 8c 1a 6e 7a 9e 09 7a 61 20 d4 41 b5   32 checksum bytes
+50                                                archived  = 80
+50                                                unpacked  = 80
+02                                                dirtree
+```
+
+Every archived value equals the size of the object's file under `objects/`, so
+an entry's first size field grows past the second where the payload inflates
+under compression (the 20000-byte random file above stores 20044 bytes).
+
 `ostree.sizes` is written only by archive-mode repositories; the compressed
 size is the `.filez` storage size, which makes it the only storage-dependent
 commit-metadata field. Observed on ostree 2026.1: requesting size generation
@@ -121,6 +160,13 @@ byte-identical to the same commit without the request -- while in an archive
 repository it adds the key and changes the commit checksum. Cross-mode commit
 identity therefore holds exactly when size generation is off on the archive
 side.
+
+Because the archived size is the stored size, the key records what the writing
+implementation's DEFLATE encoder produced. Two implementations agree on the key
+exactly where their compressed payloads have equal length. The port and the tool
+reach two lengths for most payloads, so the key parts over a real tree;
+`conformance/cli-surface.md`, "P2" records the measured frequency and the named
+payloads.
 
 ### Dirtree -- `(a(say)a(sayay))`
 
@@ -589,9 +635,24 @@ the ref name, with no sync at all, and `refs --delete` issues `unlinkat` alone.
 The port `fdatasync`-es the ref file the same way and adds an `fsync` of the
 directory holding the ref after the rename, after an alias rename, and after a
 removal, so the name the operation created or removed survives a crash and not
-only the file's content. `fsync=false` turns all of that into a no-op. The
-syscall sequence carries no byte-exact requirement, and the ref bytes are
-identical either way.
+only the file's content.
+
+A ref name carrying `/` needs one more rule, because the write creates the
+directories the name passes through. A `mkdirat` records a name in the directory
+it is called in, so the directory made durable for a created
+`refs/heads/deep/nest` is `refs/heads/deep`, the one that holds the `nest` entry.
+The port therefore `fsync`-es the directory holding each parent directory the
+write created, after the `fsync` of the directory holding the ref, deepest
+first. The order is child before parent, the order the object fanout uses: a
+crash part way through leaves a prefix of the path recorded and never a
+directory entry naming a directory whose own contents are unrecorded. A
+directory the write found already in place is not synced, since its name is
+already durable. A single-component name creates no directory and issues this
+`fsync` not at all, so the count of directory syncs a ref write makes is one
+plus the number of directories it created.
+
+`fsync=false` turns all of that into a no-op. The syscall sequence carries no
+byte-exact requirement, and the ref bytes are identical either way.
 
 Repository lock and staging (recovered by tracing the tool). The tool opens
 `<repo>/.lock` `O_RDWR|O_CREAT` mode `0660` and takes an `fcntl` OFD lock on it,
@@ -603,7 +664,12 @@ six-character `mkdtemp` suffix. A sibling file `tmp/staging-<bootid>-XXXXXX-lock
 (mode `0600`) is held with an exclusive OFD lock while the staging directory is
 in use, so a later transaction can tell a live staging directory from one left
 by a dead transaction. These locks are advisory and cross-process; the checksums
-and object bytes do not depend on them.
+and object bytes do not depend on them. The port removes its staging directory
+and the lock sibling on every path out of a transaction, the refusals included,
+so a run that exits non-zero leaves `tmp/` holding no `staging-` entry
+(`conformance/cli-surface.md`, "P2"). A transaction that commits, aborts, or
+drops removes the pair itself; a process that ends without unwinding removes the
+pair of every transaction it still holds immediately ahead of the exit.
 
 Commit-state markers live at `state/<checksum>.commitpartial`. The reader only
 tests the marker's presence, which makes a commit `Partial`. When `fsck` finds a
@@ -884,10 +950,26 @@ the bytes `ostree config set` writes:
   surrounding space and tab. In the value, leading space and tab are removed
   and trailing whitespace is kept. A `#` inside a value is literal; there are
   no inline comments. A repeated key takes the last value.
-- A boolean is one of `true`, `false`, `1`, `0`, matched exactly. Any other
-  spelling (`yes`, `no`, `on`, `off`, mixed case such as `True`, an
-  out-of-range number such as `2`, or the empty string) is rejected with a
-  "value that cannot be interpreted" error.
+- A boolean is one of `true`, `false`, `1`, `0`. Any other spelling (`yes`,
+  `no`, `on`, `off`, mixed case such as `True`, an out-of-range number such as
+  `2`, or the empty string) is rejected with a "value that cannot be
+  interpreted" error. A run of trailing space, tab, or form feed is ignored
+  before the match, so `fsync=true ` reads as `true` while `ostree config get
+  core.fsync` still prints the trailing byte. A trailing vertical tab is not
+  ignored and fails the match. The port matches the four
+  literals against the value as written and refuses a value carrying any
+  trailing byte (`conformance/cli-surface.md`, "Global conventions").
+- An integer takes the leading run of decimal digits with an optional `-` sign
+  and ignores whatever follows: `101x`, `101 x`, and `101.9` all read as `101`,
+  measured through `min-free-space-percent`, whose out-of-range refusal quotes
+  the value as written. A value with no leading digit (`bogus`, `x101`,
+  `+101`, the empty string) reads as no value at all and the key's default
+  applies, silently: `lock-timeout-secs=bogus` and `tmp-expiry-secs=bogus` both
+  open. The port reads an integer key as a whole decimal value and refuses
+  anything else (`conformance/cli-surface.md`, "Global conventions").
+- `min-free-space-size` is read from the value as written, with no trailing
+  trim: `min-free-space-size=1MB ` is refused with `error: opening repo:
+  Invalid min-free-space-size '1MB '`. The port refuses it too.
 - Writing a string value escapes a backslash as `\\`, a newline as `\n`, and a
   carriage return as `\r` anywhere in the value; within the leading whitespace
   run each space becomes `\s` and each tab `\t`. A space or tab elsewhere, a
@@ -962,9 +1044,11 @@ Archive `.filez` layout (extends "File content object header"):
 - A symlink is the framed archive header alone (target in field 5, uncompressed
   size 0); no payload bytes follow, not even the empty-DEFLATE stream.
 - The raw-DEFLATE bytes the port emits (via miniz_oxide) match the tool's zlib
-  output byte-for-byte for the small fixture payloads at every level 1-9. The
-  object identity is over the uncompressed bytes, so byte-identity of the stored
-  compressed payload is not required for interoperability.
+  output byte-for-byte for the small fixture payloads at every level 1-9. Over a
+  real tree most payloads reach two encodings of two lengths (`conformance/
+  cli-surface.md`, "P2"). The object identity is over the uncompressed bytes, so
+  byte-identity of the stored compressed payload is not required for
+  interoperability.
 
 Object store fanout directories `objects/<xx>/` are created with request mode
 0777 (reduced by the umask); `objects/` itself is 0775. This is the same in
@@ -1107,7 +1191,19 @@ object checksums:
   all become `0644`; `0775`, `0777`, and `04755` become `0755`; `0640` stays
   `0640`; `0600`, `0644`, `0700`, and `0755` are unchanged. Directory mappings
   match: `0775`, `0777`, and `02755` become `0755`; `0700` stays `0700`.
-- A symlink is unchanged; its mode stays `S_IFLNK | 0o777`.
+- A symlink's mode is left as the reduction found it. The walk finds a symlink
+  at `S_IFLNK | 0o777` and records that. Where a `--statoverride` entry over the
+  same symlink ran first, the reduction keeps the mode the entry left, the bits
+  it drops from a regular file included: `=448 /link` gives `l00700` and
+  `2048 /link` gives `l04777`.
+- The file-type bits the reduction records are the ones the walk found the entry
+  with, so an entry whose mode names another type by the time the reduction runs
+  goes back to being the kind it is. This is reachable through `--statoverride`,
+  which is the one modifier that can state file-type bits: over a 0644 regular
+  file, each of `=4096`, `=16384`, `=40960`, `=49152`, and `=32768` beside
+  `--canonical-permissions` reaches the same commit, whose `/plain.txt` is
+  `-00000`; over a 0700 directory each of them reaches one commit whose `/dir1`
+  is `d00000`, and `=33261` reaches `d00755`.
 - The recorded xattr set is empty. Observed on a 0644 file carrying
   `user.demo=1`: its checksum is `a5ee0b1b...` under
   `--owner-uid=0 --owner-gid=0` and `fe042781...` under
@@ -1135,15 +1231,66 @@ avoids a copy; adoption is a performance optimization with no on-disk effect,
 so the port ingests by copy and then unlinks the source, producing byte-identical
 objects.
 
-Devino cache. The tool's `--link-checkout-speedup` builds a `(device, inode)`
-to checksum map so a source file that is a hardlink to an existing repository
-object is matched by its inode without being re-read, and `--devino-canonical`
-(`-I`, which implies the speedup) additionally assumes a matched object is
-unmodified and trusts the mapped checksum outright. The cache is populated by
-checkout (which records the inode of each object it writes) and consulted at
-ingest. A cache hit contributes the mapped checksum and stages no object. The
-mapping is a hashing shortcut with no on-disk effect: the object it names is
-identical to what re-hashing the file would produce.
+Devino cache. The tool's `--link-checkout-speedup` builds a `(device, inode)` to
+checksum map so a source entry that is a hardlink to one of the repository's own
+objects is resolved by its inode without being read, and `--devino-canonical`
+(`-I`, which implies the speedup) takes a resolved object as the entry's whole
+identity. Recovered by committing a tree, checking it out in each variant each
+repository mode accepts, recommitting the checkout three ways, and comparing the
+commit checksums and the `ostree ls -R -X` listings:
+
+- The cache is built from the repository `--repo` names, at commit time, by the
+  process that runs the commit. A checkout made by an earlier process resolves
+  through it, and no checkout in the same process is needed. The build reads
+  every fanout directory under `objects/` and stats each `.file` entry it
+  holds, so both options cost one pass over the repository's loose content
+  objects before any source is read.
+- It keys on `(st_dev, st_ino)`. A `cp -al` copy of a checkout resolves; a `cp
+  -a` copy of the same tree, with the same modes and the same content, does not.
+- It is scoped to that repository. A tree hardlinked into repository A's objects
+  and committed into repository B resolves nothing.
+- An `archive` repository stores every content object compressed, and no
+  checkout hardlinks a `.filez`, so both options are no-ops there. The
+  decompressed copies an archive checkout leaves in
+  `<repo>/uncompressed-objects-cache` are outside `objects/` and are not part of
+  the mapping. The port attaches no commit modifier for a cache that comes back
+  empty, so `--link-checkout-speedup` alone leaves a `ref` source on the
+  checksum-copy overlay path.
+- A directory never resolves. A symlink resolves where the repository stores
+  symlink objects as symlinks and the checkout hardlinked them, which is a
+  `bare` repository: there `-I --owner-uid=7` leaves the symlink at its stored
+  ownership and moves the directories to 7.
+- A resolved entry is taken whole: content and metadata come from the stored
+  object and what is on disk is not read. Rewriting a hardlinked file in place,
+  or changing its mode, its size, or its mtime, changes nothing for either
+  option.
+
+The two options part on whether the commit modifiers reach a resolved entry.
+Under `--link-checkout-speedup` the stored object supplies the metadata and the
+modifiers -- `--owner-uid`, `--owner-gid`, `--statoverride`,
+`--mode-ro-executables`, `--canonical-permissions`, `--no-xattrs` -- apply over
+it, so the object is rewritten from the stored payload where the shaped metadata
+differs from the stored metadata. Under `-I` the object is committed verbatim and
+the filter and the modifiers are skipped for that entry: a `--statoverride` or
+`--skip-list` entry naming a resolved path goes unmatched, and `--owner-uid`
+reaches only the entries that resolved nothing.
+
+Because a resolved regular file writes no content object under `-I`, that option
+also masks a write the other two hit. `--owner-uid=0` against a `bare`
+repository as a non-root user fails plainly and under
+`--link-checkout-speedup` -- `error: Writing content object: fchown: Operation
+not permitted`, exit 1 -- and succeeds under `-I`. `--canonical-permissions`
+behaves the same way.
+
+Neither option changes a commit's checksum in twelve of the fourteen checkout
+variants across `archive`, `bare-user`, and `bare`. The two that differ are a
+`bare-user` repository checked out with `-U`, with or without `-H`. That checkout
+hardlinks the stored objects, which carry the repository's own `user.ostreemeta`
+xattr, and the plain walk reads that xattr as a real xattr of the source file and
+commits it, so every file object and every dirtree changes. There the flagged
+commit is the faithful one: it reaches the checksum the source tree itself
+reaches, and `--no-xattrs` on the plain walk reaches the same. The xattr's
+12-byte payload is `uid(be32) gid(be32) mode(be32)`.
 
 ## Checkout
 
@@ -1550,6 +1697,35 @@ Signatures accumulate by appending an `ay` element to the per-engine `aay` in
 the `a{sv}` dict. GPG and the sign-api engines are independent and can both
 apply to one commit.
 
+A signature produced while a commit is being written stands before the ref that
+names the commit. The sequence is: stage the tree and the commit object; produce
+every signature the invocation asks for; publish the staged objects into
+`objects/` and write the `.commitmeta` beside the commit; write the ref. A
+signature that cannot be produced therefore leaves no object in `objects/`, no
+`.commitmeta`, and the ref where it stood, and a run naming several keys is all
+or nothing. A ref write that cannot happen leaves the commit and its
+`.commitmeta` durable with no ref pointing at them.
+
+The keys of the `a{sv}` dict hold the order the writer stored them in, which is
+not the order `ostree show --list-detached-metadata-keys` prints: that listing
+sorts. The port stores insertion order, and the insertion order a `commit`
+invocation produces is fixed and does not follow the command line -- the
+caller's own detached-metadata keys in command-line order, then
+`ostree.sign.<type>`, then `ostree.gpgsigs`. The reference tool stores that same
+order over most key sets and a name-dependent order over some of them, which
+`../conformance/cli-surface.md` records under "P2". The stored order carries no
+meaning: the dict is a mapping and every reader looks keys up by name.
+
+Adding a detached-metadata key and signing differ in what they do to the dict
+already stored for a commit checksum. A detached-metadata key replaces the whole
+stored dict; a signature appends to whatever stands at that moment. Committing
+the same checksum twice with one signing key each therefore leaves two elements
+in the engine's array, and a run naming both a detached-metadata key and a
+signing key writes the caller's key over the stored dict and appends the
+signature to that new dict, dropping any signature an earlier run left. A run
+that skips its write -- an unchanged tree under `--skip-if-unchanged` -- signs
+nothing and leaves the stored dict untouched.
+
 ed25519: 32-byte public key, 64-byte signature, 64-byte secret key (32-byte
 seed followed by 32-byte public key). Keys are passed as base64 strings or raw
 `ay`. Key files hold one base64 key per line. System key directories are
@@ -1641,7 +1817,11 @@ DESTINATION. `--composefs-noverity` writes the same structure without the
 per-file fs-verity digests. `ostree commit --generate-composefs-metadata` stores
 the image's fs-verity digest in the commit's `ostree.composefs.digest.v0` key.
 The image is derived from the commit's tree alone: it is byte-identical whether
-or not the commit carries that metadata.
+or not the commit carries that metadata, and whatever mode the repository holding
+the tree uses. Observed over one tree committed with
+`--generate-composefs-metadata` into `archive`, `bare`, and `bare-user`, which
+reach one commit checksum and so one digest; `bare-user-only` canonicalizes the
+tree and reaches another.
 
 The tool builds the image in an anonymous temporary file (`O_TMPFILE`) opened
 relative to the current directory and links it into place next to the
@@ -1809,11 +1989,15 @@ are:
 
 - `trusted.overlay.redirect`, the backing object's loose path with a leading
   slash, `/<xx>/<rest>.file` (for example
-  `/cf/ffd52f38d14c87cf46e18d5260074421ba5961f0895954e9921f165f9c91db.file`);
+  `/cf/ffd52f38d14c87cf46e18d5260074421ba5961f0895954e9921f165f9c91db.file`).
+  The `.file` form is what the image names whatever mode the source repository
+  holds, an `archive` repository storing that object as `.filez` included;
 - `trusted.overlay.metacopy`, a 36-byte record in the verity image: version
   byte 0, length byte 36, flags byte 0, digest-algorithm byte 1 (SHA-256), then
   the 32-byte fs-verity digest of the backing object.
   `composefs-info measure-file <object>.file` reports the same 32 bytes. The
+  digest covers the file's content, so an `archive` repository, which stores
+  that content compressed, records the same 32 bytes as a `bare-user` one. The
   noverity image writes an empty metacopy value.
 
 Empty regular files carry no overlay xattrs and no backing object. Symlinks
@@ -1875,6 +2059,75 @@ Observed `ostree export` output (tool version 2026.1, black-box):
 `ostree` import (`ostree commit --tree=tar=FILE`) commits an arbitrary
 filesystem tar into the repository, deferring hardlink resolution to the end and
 optionally applying the `/etc` -> `/usr/etc` convention.
+
+### The tar import
+
+The name a member is imported under drops one leading `./` and one leading `/`.
+A directory member keeps its trailing `/`, and the archive's own root member
+(`./`, or `/` before the strip) is the empty string. That name is what
+`--tar-pathname-filter` receives and what the member is placed by.
+
+Each member is placed under the directory the tree already holds, whether an
+earlier member of the same archive or an earlier source in the list created it.
+A member whose parent directory is absent is refused with
+`error: No such file or directory: <name>`, naming the first absent ancestor by
+its own name. The tree's root is not one of those ancestors: an archive naming
+no root member leaves the root without metadata, which the commit reports as
+`error: Can't commit an empty tree` where no other source supplied one, and
+which is no error at all where one did.
+
+Every member records the numeric ownership its header carries and the low 12
+bits of its octal mode field, `mode & 0o7777`, under the file type the typeflag
+states. Bits above those 12 are dropped, so a mode field holding a full
+`st_mode` records the permission part alone: `0120777` gives `0777`, `0100644`
+gives `0644`, and `0040755` gives `0755`. The setuid, setgid, and sticky bits
+are kept.
+
+A symlink member is read the same way. Its mode is the header's own permission
+bits under `S_IFLNK`: header mode `0000` gives `l00000`, `0600` gives `l00600`,
+`0755` gives `l00755`, `04777` gives `l04777`, and `07777` gives `l07777`. GNU
+tar writes `0777` for every symlink member it packs, so an archive from that
+writer carries that one value. The old-GNU, ustar, and pax header forms are
+read alike: the same archive written in the three formats commits to one tree
+checksum.
+`--canonical-permissions` leaves a symlink's mode as the member left it,
+matching the filesystem walk, so all of the values above survive the reduction
+unchanged.
+
+`--tar-autocreate-parents` supplies those directories instead of refusing:
+
+- A missing intermediate parent is created with mode `0755`, empty extended
+  attributes, and the ownership of the member whose import created it. Creating
+  one rewrites the tree root's own metadata to the same mode and ownership,
+  whatever the archive's root member recorded, and the last member to trigger a
+  creation wins for every ancestor they share.
+- A missing root with no such member is created with mode `0755`, owner `0:0`,
+  and empty extended attributes.
+- A synthesized directory takes no part in the commit modifiers, so
+  `--owner-uid` shapes the member and not the parent its import created.
+
+`--tar-pathname-filter=REGEX,REPLACEMENT` splits its value at the first comma:
+everything before it is the expression, everything after it, further commas
+included, is the replacement. The replacement is global -- every match in the
+name is replaced -- and a member the expression does not match is imported
+unchanged, so the option renames and never drops. A hardlink member's link name
+is another member's name and goes through the filter too; a symlink's target is
+not a member name and is left as it stands. Given more than once the last value
+wins, and the value is read as an archive is loaded, so a command line naming no
+`tar=` source carries a value neither reader accepts at exit 0. A value with no
+comma reports `error: Missing ',' in --tar-pathname-filter` and an expression
+that does not compile reports
+`error: --tar-pathname-filter: Error while compiling regular expression
+'<expression>' at char N: <reason>`, both at exit 1.
+
+The commit modifiers reach an archive the way they reach a filesystem walk, with
+one difference: `--canonical-permissions` records owner `0:0` and
+`mode & 0o755` and leaves the extended attributes the archive carries, where the
+filesystem walk drops them. `--no-xattrs` drops them for both.
+
+Port import (`Repo::import_tar_into`) follows every rule above and reads into a
+tree an earlier source already filled, so one archive composes with a filesystem
+source and with a committed tree under one modifier.
 
 Port export (`Repo::export_tar`) writes POSIX ustar/pax through the `smol-tar`
 writer. It reproduces the tool's member naming (`./` root, bare relative names,
@@ -2013,6 +2266,109 @@ a black box against repositories built for the purpose, and
 output to the tool's. `conformance/cli-surface.md` lists the commands whose
 formats are still to be recovered.
 
+### The fsync vocabulary
+
+One durability switch carries two spellings, and every command that takes
+either one reads the rule stated here.
+
+The valued spelling is `--fsync=POLICY`. `POLICY` is a boolean word, matched
+without regard to case: `true`, `yes`, and `1` turn fsync on, and `false`, `no`,
+and `0` turn it off. Every other value reports `error: Invalid boolean argument
+'<value>'` on standard error and exits 1, quoting the value verbatim and the
+empty value with it. The boolean spellings outside that set are refused as well:
+`on`, `off`, and the single letters `t`, `f`, `y`, and `n`. The option requires a
+value, so `--fsync` given none takes the next word on the command line as its
+value and refuses that word. Where that word is itself an option, every word
+after it shifts one position and the rest of the line is read in the shifted
+positions; both readers reach the value reader all the same and name the
+swallowed word, whether that word is an option the command holds
+(`--orphan`, `--table-output`, `-I`), an option it does not hold (`--nosuch`,
+`-Z`), or an option carrying a value (`--timestamp=@1700000000`,
+`--owner-uid=abc`).
+
+The option narrows the configured policy and never widens it. A repository
+holding `[core] fsync=false` performs no `fsync`, `fdatasync`, or `syncfs` call
+under `--fsync=true`; the resolved policy is the configured value and the option
+value ANDed.
+
+The counts below were measured with
+`strace -y -f -e trace=fsync,fdatasync,syncfs` over a `commit` of corpus `C0`
+into a fresh `archive` repository, under the single-component branch name
+`main`. `C0` is the tree `corpus::basic` builds in
+`crates/ostrya-conformance/src/corpus.rs`, and `conformance/README.md` lists
+it: a 0644 regular file, a 0644 empty file, a 0755 directory holding one 0644
+regular file, and a symlink. The commit writes 8 objects, which land in 8
+distinct fanout directories. The tool's own counts:
+
+```
+[core] fsync   option           sync calls
+unset (on)     --fsync=true     11  (9 fsync, 1 fdatasync, 1 syncfs)
+true           --fsync=false     0
+false          (none)            0
+false          --fsync=true      0
+```
+
+The nine `fsync` calls are one per fanout directory the commit wrote into plus
+one of `objects/`, so the count on the one row that syncs follows the corpus
+and is a property of the writer and not of the format. The `fdatasync` is of
+the ref's temp file, and the tool syncs no directory for the ref.
+
+The port issues that same `syncfs`, those same fanout and `objects/` syncs, and
+that same ref `fdatasync`, and adds the directory syncs a ref write needs: one
+`fsync` of the directory holding the ref, plus one per directory the ref write
+created for a `/`-bearing name, deepest first (see "Ref durability" above).
+Under `main` the write creates no directory, so the port's count on the syncing
+row is 12 (10 fsync, 1 fdatasync, 1 syncfs). Under `deep/nest/leaf` the write
+creates `deep` and `nest`, which makes three directory syncs and a count of 14
+(12 fsync, 1 fdatasync, 1 syncfs). The three rows that sync nothing are the
+rule, and the port matches them exactly.
+
+The valueless spelling is `--disable-fsync`, which equals `--fsync=false`. It
+takes no argument, so an `=VALUE` suffix is read and discarded:
+`--disable-fsync=false` disables fsync.
+
+Both spellings default to fsync on. Neither changes a byte the command writes to
+the repository. The same commit under `--fsync=true` and under `--fsync=false`
+reaches one checksum and one object store; the count of `fsync`, `fdatasync`,
+and `syncfs` calls is the whole observable difference.
+
+Which command takes which spelling:
+
+- `commit` and `checkout` document `--fsync=POLICY` and share the value set and
+  the refusal text. `commit` also accepts `--disable-fsync`, which its `--help`
+  does not list. `checkout` refuses `--disable-fsync` with `error: Unknown
+  option --disable-fsync` at exit 1.
+- `pull` and `pull-local` document `--disable-fsync` and refuse `--fsync` with
+  `error: Unknown option --fsync=<value>` at exit 1.
+- `--per-object-fsync` is a separate valueless flag on `pull` and `pull-local`,
+  covering write scheduling and standing outside this vocabulary. `commit`
+  refuses it with `error: Unknown option --per-object-fsync` at exit 1.
+
+The option value is read after the configured value, so an option value never
+conceals a configured one the reader refuses. A repository holding a `[core]
+fsync` value that is not a key-file boolean is refused at exit 1 under
+`--fsync=true`, under `--fsync=false`, and under no option at all, with no
+object and no ref written. The narrowing above applies to the value the reader
+returns, which requires that reader to run every time.
+
+The port accepts `--fsync=POLICY` on `commit` with that value set, that refusal
+text, and that narrowing rule; the resolved policy reaches the per-object
+writes, the publication step, and the ref write alike. It reads the configured
+`[core] fsync` under every state of the option, the way the tool does, and it
+reads it while the other `[core]` keys are read, ahead of the editor and ahead
+of the repository lock. It declines the undocumented `commit --disable-fsync`
+(`conformance/cli-surface.md`, "P2").
+
+The syscall counts a policy produces are the whole observable difference, and
+the conformance matrix reads standard output, standard error, the exit status,
+and the repository bytes alone, so no `run:` line can state them. Cell
+`commit/fsync-syscalls` cites `commit_fsync_policy_controls_the_syscalls`
+(`crates/ostrya-cli/tests/cli.rs`) instead, which measures the calls of both
+binaries over the four rows above with `strace -y`. It holds the three quiet
+rows to zero calls and the syncing row to the target of every call and to the
+total this table records, 11 for the tool and 12 for the port, so the table and
+the test stay one record. It asserts where `strace` is installed.
+
 ### `commit`
 
 Prints the new commit's 64-character checksum and a newline, and writes nothing
@@ -2053,9 +2409,178 @@ The parent:
   refuses is either resolved by the port or reported in the port's own resolution
   words (`conformance/cli-surface.md`, "P2").
 
-`ostree.ref-binding` carries one `as` entry per branch the commit names, so a
-`-b BRANCH` commit carries `[BRANCH]` and a commit that names no branch carries
-the empty array. The key is present in both cases.
+The subject and the body are commit-object fields, so each form below reaches the
+commit checksum.
+
+- `-s/--subject=SUBJECT` sets the subject and `-m/--body=BODY` the body. Each is
+  stored verbatim: no trimming, no newline normalization, and embedded newlines
+  survive. Given more than once, the last value wins. A commit carrying a body
+  and no subject is accepted, the subject field holding the empty string.
+- `-F/--body-file=FILE` reads the whole file as the body, byte for byte, with no
+  trailing-newline strip and no comment strip. An empty file gives an empty body.
+  `-F` and `-m` together are accepted and `-F` wins, whichever comes first.
+  `-F -` names a file called `-` rather than standard input. A path that does not
+  open reports `error: openat(<path>): <reason>`, naming the path as it was
+  given; a directory opens and then fails to read, so the reason stands alone,
+  `error: Is a directory`; and content that is not UTF-8 or holds a NUL reports
+  `error: Invalid UTF-8`. Each exits 1.
+- `-e/--editor` writes a template to a temporary file, runs an editor over it,
+  and takes the subject and the body from what the editor left. It replaces both
+  outright, so `-m` and `-F` are discarded and `-F` is not even read; only `-s`
+  reaches the template, as a prefill.
+
+The editor is the first of `OSTREE_EDITOR`, `VISUAL`, and `EDITOR` that is set,
+an empty value included, and `vi` where none is. `GIT_EDITOR` is not consulted.
+The value is a shell command line rather than a program path: the temporary
+file's path is appended to it shell-quoted and the whole line runs under
+`/bin/sh -c`, so the shell expands variables and globs in it and reports its own
+faults. The temporary file lives in `TMPDIR` (`/tmp` by default), is named `.`
+and six characters, and is removed after the run. It is created readable and
+writable by its owner alone, mode 0600, so no other local user can read the
+message while it is being edited. The editor runs after the branch check, after
+`--parent` resolution and after the metadata options are read, and before the
+tree opens and before the timestamp is read.
+
+The template, for a commit naming branch `BR`:
+
+```
+\n
+# Please enter the commit message for your changes. The first line will\n
+# become the subject, and the remainder the body. Lines starting\n
+# with '#' will be ignored, and an empty message aborts the commit.\n
+#\n
+# Branch: BR\n
+```
+
+Under `--orphan` the last two lines are absent and the file ends after
+`commit.\n`. A `-s` value and one newline are appended after the block, so the
+prefilled subject sits at the end of the file.
+
+The file the editor leaves is read under the rules `-F/--body-file` states: a
+byte that is not UTF-8 and a NUL both report `error: Invalid UTF-8`, and a file
+the editor removed reports `error: openat(<path>): <reason>`, naming the
+temporary file. Each exits 1.
+
+The edited text is read by these rules, in this order: every line loses its
+trailing whitespace; a line whose first character is `#` is dropped, so a `#`
+behind leading whitespace is not a comment; the leading blank lines go and the
+first line left is the subject; and the lines after it, less their own leading
+and trailing blank lines, are the body, joined by newlines, with the interior
+blank lines kept. An empty subject reports `error: Aborting commit due to empty
+commit subject.` and exits 1, which is what an unmodified template and a
+whitespace-only message both reach.
+
+A non-zero editor exit aborts the commit and discards what the editor wrote, so
+no ref and no commit object are produced. The message carries no separator
+between the quoted editor value and the reason, which is the tool's own wording:
+
+```
+error: There was a problem with the editor '<EDITOR>'Child process exited with code <N>
+```
+
+The process exits 1 whatever `<N>` is.
+
+The commit metadata dict is an `a{sv}`, and its entry order is part of the
+commit checksum, the dict being serialized in insertion order rather than
+sorted. The order is fixed and does not follow the command line:
+
+1. the keys the tree walk derives before the commit is assembled, `ostree.linux`
+   then `ostree.bootable`;
+2. the user keys, group by group: every `--add-metadata-string` in command-line
+   order, then every `--add-metadata`, then every `--keep-metadata`;
+3. the binding keys, `ostree.ref-binding` then `ostree.collection-binding`;
+4. the keys the commit assembly appends, `ostree.composefs.digest.v0` then
+   `ostree.sizes`.
+
+A key given twice is written twice: the dict really carries two entries of that
+name, and a user key may carry a name a binding key uses, which puts the two
+side by side. Two of the derived keys are exceptions:
+
+- `--bootable` removes every entry the command line supplied under
+  `ostree.linux` or `ostree.bootable`, so a commit carrying `--bootable
+  --add-metadata-string=ostree.linux=9.9.9` reaches the same object as one
+  carrying `--bootable` alone.
+- `--generate-composefs-metadata` stores the digest in the slot an entry named
+  `ostree.composefs.digest.v0` already stands in, whichever of groups 2 and 3
+  put it there, and removes every later entry of that name. The dict therefore
+  holds the derived digest once, ahead of the binding keys, and group 4 gets the
+  entry only where nothing else supplied the name. A supplied value reaches this
+  through any of `--add-metadata-string`, `--add-metadata`, and
+  `--keep-metadata`.
+
+`ostree.sizes` takes no such treatment: `--generate-sizes` appends its entry
+whatever the dict holds, so a commit naming both the option and
+`--add-metadata-string=ostree.sizes=...` carries two entries of that name.
+
+The tool holds the dict in a hash-ordered container while `--bootable` or
+`--generate-composefs-metadata` is given, so with either of those the order of
+the whole dict follows the key set rather than the list above. The port keeps
+the list above in every case; `conformance/cli-surface.md`, "P2" records the
+divergence and the key sets that expose it.
+
+- `--add-metadata-string=KEY=VALUE` splits at the first `=`, so a value may hold
+  further ones, and stores the value as an `s`. An empty value is accepted.
+- `--add-metadata=KEY=VALUE` splits the same way and reads the value in the
+  GVariant text form (see "The GVariant text form" above). The parsed value is
+  stored in host byte order and is not converted, so a numeric value reads back
+  byteswapped through `show --raw` and `show --print-metadata-key` and correctly
+  under `-B`.
+- `--keep-metadata=KEY` carries a key over from the resolved parent, byte for
+  byte. The resolved parent is `--parent` where it is given, `--orphan
+  --parent=<checksum>` included, and the branch tip otherwise.
+- `--add-detached-metadata-string=KEY=VALUE` writes an `a{sv}` to the commit's
+  `.commitmeta` file, in command-line order and with duplicates kept. It leaves
+  the commit checksum alone, so the same tree under it and without it reaches one
+  object.
+
+The refusals, each at exit 1:
+
+- an argument holding no `=` reports `error: Missing '=' in KEY=VALUE metadata
+  '<argument>'`, from all three options;
+- an empty key reports `error: Empty metadata key`, from
+  `--add-metadata-string` and `--add-metadata`. An empty key is accepted by
+  `--add-detached-metadata-string`;
+- a value the GVariant text reader refuses reports `error: Parsing
+  <KEY>=<VALUE>: <spans>:<reason>`, naming the whole argument and reporting
+  offsets into the value alone;
+- a `--keep-metadata` key the parent does not hold reports `error: Missing
+  metadata key '<key>' from commit '<checksum>'`;
+- a `--keep-metadata` with no resolved parent reports `error: Either --branch or
+  --parent must be specified when using --keep-metadata`, whether the parent is
+  absent because no branch was named, because the branch has no tip, or because
+  `--parent=none` was given.
+
+Their order, each fault observed alone and in pairs, is: the branch check; the
+declared-id conflict; `--parent` resolution; the `--keep-metadata` missing-parent
+check; the `--add-metadata-string` missing `=`; the `--add-metadata` missing `=`
+and its value parse; the `--add-detached-metadata-string` missing `=`; the
+`--keep-metadata` missing key; the body file; the editor; the tree; the
+timestamp; and last the empty-key check, which the dict assembly makes.
+
+`ostree.ref-binding` is an `as` holding the branch `-b` named together with
+every `--bind-ref=BRANCH` value, sorted byte-wise ascending with duplicates kept.
+The sort is over bytes rather than a locale collation, so uppercase sorts ahead
+of lowercase and `10` ahead of `2`. A commit that names no branch carries the
+empty array, and the key is present in that case too. No character-class check
+reaches a `--bind-ref` value: a name holding a space, a double slash, a leading
+`-`, a caret, a leading dot, a trailing slash, a tab, the empty name, and the 64
+lowercase hex characters `-b` refuses are all recorded as they stand, so the
+branch-name guard covers the ref the command writes and not the name it records.
+`--bind-ref` is accepted beside `--orphan`, where the array holds the bound names
+alone; `--bind-ref` alone names no branch, so a commit carrying it and neither
+`-b` nor `--orphan` draws the missing-branch line.
+
+`--no-bindings` writes no binding key at all -- an absent key rather than one
+holding an empty array -- and removes `ostree.collection-binding` with it. It
+overrides `--bind-ref`, so `commit -b X --no-bindings`,
+`commit --orphan --no-bindings`, and `commit -b X --no-bindings --bind-ref=Y`
+over one tree at one timestamp reach one commit object. It suppresses the
+automatic key alone: a binding added by `--add-metadata-string` or carried by
+`--keep-metadata` survives it.
+
+`ostree.collection-binding` is an `s` holding the repository's `[core]
+collection-id`, written after `ostree.ref-binding` in a repository that has one.
+`--bind-ref` does not touch it.
 
 The declared ownership. `--owner-uid=UID` and `--owner-gid=GID` replace the
 ownership every ingested entry records, independently of each other: the tree
@@ -2097,16 +2622,509 @@ typographic pair the integer messages use. A pre-epoch instant is recorded as th
 unsigned timestamp field's two's-complement form, so `@-1` and
 `1969-12-31T23:59:59Z` are one commit.
 
+`--fsync=POLICY` sets the durability of the writes the commit makes, and takes
+the vocabulary above. The policy reaches the per-object writes, the publication
+step, and the ref write, and it changes no byte the repository stores, so a
+commit made under either policy prints one checksum and leaves one object store.
+
+`--table-output` replaces the checksum line with a seven-line `KEY: VALUE` block
+on standard output. The field names, their order, and their count are fixed. A
+field carries one space after its colon, no padding, and no unit; every line
+ends with a newline and no trailing space. Standard error stays empty and the
+exit status is 0. Corpus `C0` committed into an empty `bare` repository with
+`-b conformance -s x --timestamp=@1700000000`:
+
+```
+Commit: 7f00c81575e97a12c9d34d44c232e56236d40be76fd457abd2d6d829d7f05592
+Metadata Total: 5
+Metadata Written: 4
+Content Total: 4
+Content Written: 4
+Content Cache Hits: 0
+Content Bytes Written: 45
+```
+
+That corpus holds two directories that share one dirmeta, three regular files of
+23, 0, and 22 bytes, and one symlink. Corpus `C0` is described in
+`conformance/README.md`. The fields:
+
+- `Commit` -- the new commit's checksum, the value the plain form prints alone.
+- `Metadata Total` -- the metadata objects the commit offered to the object
+  store, counted before dedup, with each directory's dirmeta counted for that
+  directory: two dirtree, two dirmeta, and the commit object.
+- `Metadata Written` -- the metadata objects stored. The two directories share
+  one dirmeta, so the count is two dirtree, one dirmeta, and the commit object.
+- `Content Total` -- the content objects the commit offered, counted before
+  dedup. An object a devino-cache hit resolves is never offered, so it leaves
+  this count.
+- `Content Written` -- the content objects stored.
+- `Content Cache Hits` -- the content objects a devino-cache hit resolved.
+- `Content Bytes Written` -- the payload byte counts of the stored regular
+  files, summed before any compression the mode applies: 23 + 0 + 22 here. A
+  symlink contributes nothing, and the count is the payload length rather than
+  the stored `.filez` length, which for a random payload runs larger.
+
+A second commit of a tree the repository already holds keeps both totals, prints
+`Metadata Written: 1` for the commit object, and prints zero for every content
+field. The block's shape holds across `archive`, `bare`, and `bare-user`.
+
+`--statoverride=PATH` names a file of mode changes, one entry per line:
+
+```
+[=]<decimal mode><one space><absolute in-tree path>
+```
+
+A sample, and what it does to a tree holding `/plain.txt` at 0644, `/dir2/b.txt`
+at 0644, `/grpx` at 0754, and `/dir1` at 0700:
+
+```
+=384 /plain.txt
+=448 /dir2/b.txt
+8 /grpx
+=511 /dir1
+```
+
+`/plain.txt` becomes 0600, `/dir2/b.txt` becomes 0700, `/grpx` stays 0754
+(decimal 8 is 0o10, which its mode already carries), and `/dir1` becomes 0777.
+The reading rules:
+
+- The mode is read in base 10, with an optional leading sign. A leading `=`
+  states the permission bits, giving `(mode & S_IFMT) | value`; without it the
+  value is ORed into the mode, giving `mode | value`. The file-type bits
+  therefore survive both forms, and a value carrying bits inside the file-type
+  field renames the type the mode holds.
+- The tool reads the field through a C `double` reader, so it also takes a
+  hexadecimal literal (`0x1ff` gives decimal 511, which is 0777), a decimal
+  point and an exponent (`1e3` gives decimal 1000 and `.7e3` gives decimal 700,
+  which over a 0644 file reach 01754 and 01674), and turns a
+  value past the 32-bit range into `0x80000000` (`inf`, `nan`, `1e100`,
+  `4294967296`, and `4294967295` all give mode 020000000644 over a 0644 file).
+  Those forms sit outside the documented format, which is a mode in decimal, and
+  the out-of-range conversion is platform-defined. The port reads decimal alone;
+  the difference is recorded in `conformance/cli-surface.md`, "P2".
+- The separator is exactly one space (0x20). Everything after it is the path,
+  further spaces included. A tab is not a separator.
+- The path is absolute and rooted at the committed tree, with no trailing slash.
+  `/`, `/plain.txt`, and `/dir1/sub/deep.txt` all match; `plain.txt`,
+  `./plain.txt`, and `/dir1/` never do.
+- An entry applies to exactly one entry of the tree and is not recursive. The
+  `=` form applies to regular files, to directories, to symlinks, and to the
+  walk root, and it applies in every source that offers the path.
+- The OR form reaches one entry of the tree per run. The first entry any source
+  offers under the path spends the entry, and a later source under that path
+  keeps the mode it brought. A directory below the walk root spends the entry
+  and takes no value from it, leaving the mode as the source found it; an
+  archive member is the exception, where the OR value reaches a directory as
+  well. Over `/dir1` at 0700, `16 /dir1` gives 0700 from a `dir=` walk and from
+  a `ref=` source, 0720 from a `tar=` source, and `=8 /dir1` gives 0010 from all
+  three. Over two sources that both hold `/dir1` at 0700, `16 /dir1` with
+  `--tree=dir=A --tree=tar=B` gives 0700, the walk having spent the entry before
+  the archive offered the path, and with `--tree=dir=C --tree=tar=B`, where `C`
+  holds no `/dir1`, gives 0720. A spent entry counts as reached, so it draws no
+  unmatched report.
+- A mode field holding no digit is the value zero, so `abc /plain.txt` changes
+  nothing and `= /plain.txt` gives mode 0.
+- Blank lines are ignored, a missing final newline is accepted, and there is no
+  comment syntax.
+- A path may be named more than once. Each form keeps one entry per path, the
+  value of the last line naming the path, and the OR form stands ahead of the
+  `=` form: where a path carries an entry of each form, the OR value alone
+  reaches the mode, whichever order the file states the two lines in. Over a
+  0644 file: `8 /f` then `16 /f` gives 0664, `=448 /f` then `=511 /f` gives
+  0777, `448 /f` then `=511 /f` gives 0744, `=511 /f` then `448 /f` gives 0744,
+  `=511 /f` then `0 /f` gives 0644, and `1 /f`, `=448 /f`, `2 /f` gives 0646.
+  Over a directory below the walk root of a `dir=` walk or of a `ref=` source
+  the OR form states no mode, so the `=` entry reaches it: over `/dir1` at 0700,
+  `16 /dir1` then `=8 /dir1` gives 0010. Over an archive member the OR form
+  states a mode, so it stands ahead as it does elsewhere and the same pair gives
+  0720.
+- The option given more than once takes the last value; the earlier files are
+  not read at all.
+
+`--skip-list=PATH` names a file of paths to leave out, one absolute in-tree path
+per line:
+
+```
+/plain.txt
+/dir2
+```
+
+A listed directory prunes its whole subtree, so `/dir2` removes `/dir2/b.txt`
+with it. A symlink can be listed. Blank lines are ignored, and the option given
+more than once takes the last value. A path may be named more than once and
+counts as one entry, which the unmatched report below states once. The path
+spelling is exact: a trailing space, a missing leading slash, and a trailing
+slash all match nothing. Listing every child of the root gives a commit whose
+tree holds the root alone. Listing `/` prunes the walk root, which leaves nothing
+to commit, and reports `error: Can't commit an empty tree` at exit 1. With
+`--base` the base is still the bottom layer under a pruned walk root, so the
+commit is written and holds the base tree unchanged. The pruned walk accounts no
+object, so such a commit carries no `ostree.sizes` key even under
+`--generate-sizes`. The tool carries two steps under the pruned walk that the
+port leaves out: `--consume`
+attempts the source removal, which takes an empty source directory away and over
+one holding an entry reports `error: unlinkat(<path>): Directory not empty`; and
+a `tar=` source is read, so a file that is not an archive reports `error:
+archive_read_open_filename: Unrecognized archive format`. Both are recorded in
+`conformance/cli-surface.md`, "P2".
+
+Both files are checked for entries the walk never reached. Every `--skip-list`
+entry is checked; only the `--statoverride` entries without a `=` are, so an `=`
+entry matching nothing is ignored. A path the skip list prunes counts as
+reached, the walk reaching the entry and pruning it there: over a skip list
+holding `/dir1`, both that entry and a `16 /dir1` statoverride entry are
+matched. A path inside a directory the skip list pruned counts as unmatched, the
+walk never having descended into it: over the same skip list, `/dir1/a.txt`,
+`/dir1/sub`, and `/dir1/sub/deep.txt` are unmatched in either file. A path
+neither file's walk reaches at all is unmatched, so a path both files name that
+the tree does not hold draws a report. The walk root counts as reached, so over
+a skip list holding `/` a `16 /` statoverride entry is matched and the
+empty-tree refusal is left alone to report. The order the command line gives the
+two options changes none of this. The report is one line per unmatched path and
+then a summary line, on standard error, at exit 1, with standard output empty
+and no ref written:
+
+```
+Unmatched statoverride path: /nope.txt
+error: Unmatched statoverride paths
+```
+
+```
+Unmatched skip-list path: /nope.txt
+error: Unmatched skip-list paths
+```
+
+The `<path>` is the raw text after the first space, so ` 448 /plain.txt` reports
+`Unmatched statoverride path: 448 /plain.txt`. A path named more than once by
+either file gets one line, and an `=` entry over a path an OR entry also names
+adds no line of its own. The statoverride check stands ahead of the skip-list
+check whichever order the command line gives the two options, and both stand
+ahead of the empty-tree refusal. The tool emits the per-path lines in a hash
+order rather than the file order, which `conformance/cli-surface.md`, "P2"
+records as a divergence.
+
+A statoverride line with no space is refused before the walk with `error:
+Malformed statoverride file (no space found)`. A control file that does not open
+is refused with `error: openat(<path>): <reason>`, naming the path as the command
+line spelled it, and a directory with `error: Is a directory`, which carries no
+path. An empty file of either kind is accepted and changes nothing.
+
+Either control file must hold UTF-8, and a NUL byte counts as invalid. A single
+invalid byte anywhere in the file reports `error: Invalid UTF-8` at exit 1, and
+that check stands ahead of everything else the command does: ahead of the walk,
+ahead of the unmatched-entry report of the other control file, and ahead of a
+tree path that does not open. Both files are checked, and the report names
+neither the file nor the line.
+
+`--mode-ro-executables` clears the write bits of every executable regular file:
+where `mode & 0o111` is non-zero, `mode &= ~0o222`. Any one of the three execute
+bits triggers it and all three write bits go, so 0766 becomes 0544 and 0621
+becomes 0401. The setuid, setgid, and sticky bits survive: 04755 becomes 04555
+and 01777 becomes 01555. A regular file with no execute bit is untouched, and so
+are directories, a world-writable one included, and symlinks.
+
+The three mode modifiers run in a fixed order: `--mode-ro-executables`, then
+`--statoverride`, then the `--canonical-permissions` reduction. The first two
+commute with each other, one being an AND mask and the other testing bits the
+mask keeps; `--statoverride` is the one that assigns or ORs, so it is the pair
+with the reduction that shows the order. Over a tree holding `/f0644` at 0644,
+`/f0700` at 0700, `/f0555` at 0555, and `/dir1` at 0700, beside
+`--canonical-permissions`:
+
+- `=511 /f0644` gives `-00755`, the reduction masking the 0777 the entry states.
+- `=2048 /f0700` gives `-00000`, the setuid bit the entry states not surviving
+  the mask.
+- `146 /f0555` (decimal 146 is 0o222) gives `-00755`.
+- `=511 /` gives `d00755` for the root, and `=511 /dir1` gives `d00755`.
+
+The reverse order would give 0777, 04000, 0777, and 0777. Without
+`--canonical-permissions`, `--statoverride` holding `146 /roexec` over a 0555
+file reaches 0777 rather than the 0555 the reverse order against
+`--mode-ro-executables` would give.
+
+`--skip-if-unchanged` compares the walked tree against the resolved parent -- the
+commit `--parent` names, else the tip of `--branch`. Both the root contents
+checksum and the root metadata checksum take part; the commit's own metadata does
+not, so a different `-s` or an added `--add-metadata-string` over an unchanged
+tree is still skipped. Where the two match, the parent's checksum is printed on
+standard output with a trailing newline, standard error stays empty, the exit
+status is 0, and no ref is written: a ref that existed stays where it stood and
+one that did not is not created. Where there is no parent -- a fresh branch,
+`--parent=none`, or `--orphan` -- the commit is written as usual. The walk runs
+either way, so an unmatched `--statoverride` entry still fails the command at
+exit 1.
+
+The derived metadata. Three options read the tree the commit carries and store
+what they find in the commit's own metadata dict.
+
+`--generate-sizes` writes `ostree.sizes` (see "Metadata object formats"). An
+archive repository alone holds the key; in `bare`, `bare-user`, and
+`bare-user-only` the option is accepted, writes no key, prints nothing on
+standard error, exits 0, and leaves the commit checksum equal to the same commit
+without it. Over a single source the key covers the whole tree, so a second
+commit onto a branch lists the objects that deduplicated against the first as
+well. The option reaches the tar form too: `--tree=tar=PATH` produces the key the
+same way.
+
+Over a source list the key is scoped, and the scope is what a multi-source
+commit's checksum turns on. Recovered by reading the key back over ten source
+lists, each entry matched against the objects `ls -R -C` reports for the tree:
+
+- a content object counts where the LAST `--tree` source contributed it. A
+  content object an earlier source contributed leaves the key even where it
+  survives into the committed tree, so `--tree=dir=t1 --tree=dir=t2` lists only
+  `t2`'s files and `--tree=dir=t1 --tree=dir=<empty directory>` lists no file at
+  all;
+- a directory object counts where any source contributed it or the tree
+  serialization wrote it, and it stays as later sources open;
+- a `--base` layer contributes nothing, so a subtree that reaches the commit
+  from the base unread is absent from the key;
+- a `ref=` source contributes every object of its own tree, whether the overlay
+  reads it or reuses the stored checksum;
+- the key is then narrowed to the objects the committed root reaches, so an
+  object a later source replaced is absent whatever contributed it.
+
+The port carries this as `Transaction::begin_tree_source`, called once per
+`--tree` source.
+
+`--bootable` writes `ostree.linux` and `ostree.bootable`. The value of
+`ostree.linux` is the name of the one directory under `/usr/lib/modules` in the
+committed tree that holds an entry named `vmlinuz`. The rule, each shape
+observed:
+
+- the search is exactly one level deep: a `vmlinuz` directly under
+  `/usr/lib/modules`, and one nested a further level down, are both unseen;
+- the entry's type is not read: a regular file, a symlink whose target the tree
+  does not hold, and a directory named `vmlinuz` each count as a kernel;
+- an entry under `/usr/lib/modules` that is not a directory takes no part, so a
+  stray file there and a symlink to a kernel directory are both ignored;
+- an initramfs is neither required nor consulted.
+
+The tree the option reads is the committed tree, so `--skip-list` pruning
+`/usr/lib/modules` leaves no kernel to find. The five refusals, each on standard
+error at exit 1 with standard output empty and no object published:
+
+```
+error: No such file or directory: /usr
+error: No such file or directory: /usr/lib
+error: No such file or directory: /usr/lib/modules
+error: No kernel found in /usr/lib/modules
+error: Multiple kernels found in /usr/lib/modules
+```
+
+The first three name the first component of the path the tree does not hold. A
+component the tree holds as something other than a directory reports `error: Not
+a directory`, which carries no path. Reference build 2026.1 reaches that message
+for `/usr` and `/usr/lib` and dies on an assertion where `/usr/lib/modules`
+itself is the non-directory, a regular file and a symlink alike
+(`conformance/cli-surface.md`, "P2").
+
+`--generate-composefs-metadata` writes `ostree.composefs.digest.v0`, an `ay`
+holding the 32-byte fs-verity digest of the tree's composefs image (see
+"composefs"). The image derives from the committed tree alone, so a repository in
+`archive`, `bare`, or `bare-user` holding one tree reaches one digest and one
+commit checksum; `bare-user-only` canonicalizes the tree and so reaches another.
+
+The three stand after the walk. Their order against the rest, each fault observed
+alone and in pairs: the control-file reports, the empty-tree refusal, and
+`--skip-if-unchanged` all stand ahead of the kernel search, so an unchanged tree
+under `--bootable --skip-if-unchanged` prints the parent's checksum and exits 0
+whether or not the tree holds a kernel. The kernel search stands ahead of the
+timestamp and ahead of the empty-key check.
+
+#### The tree sources
+
+The tree a commit records is built from an ordered source list:
+
+1. `--base=REV`, where one is given, is the bottom layer.
+2. Each `--tree=KIND=VALUE` in command-line order overlays the result.
+3. Where no `--tree` is given, the positional `PATH` is the one source.
+
+A positional `PATH` beside any `--tree` is ignored: it is not opened, not
+stat'ed, and the command exits 0. Every positional after the first is ignored
+the same way.
+
+`--tree` splits its value at the first `=`. The part before it names the kind
+and the part after it is the value:
+
+- `dir=PATH` -- a directory on the filesystem, opened no-follow, so a symlink
+  naming a directory is refused. A trailing slash is accepted.
+- `tar=PATH` -- an archive. `-` and `/dev/stdin` name standard input.
+- `ref=REV` -- any revision a `rev-parse` reads: a ref name, a checksum, or
+  either with a `^` ancestry suffix. The `REF:/path` subtree syntax is not a
+  revision and is refused as an invalid refspec.
+
+Overlaying is a recursive per-path merge, and the later source wins:
+
+- Directory over directory: the children union, so a child only the earlier
+  source held survives.
+- Directory metadata: the later source's dirmeta replaces the earlier one
+  whole. The extended attributes are replaced with it and are never unioned.
+- File over file: the later file replaces the earlier one whole.
+- A name that is a directory in one source and a file in another is refused:
+  `error: Can't replace directory with file: <name>` where the later source
+  holds the file, and `error: Can't replace file with directory: <name>` where
+  it holds the directory. The name is the entry's own name and not its path, so
+  `n1/a/b/p` against `n2/a/b/p` reports `p`. Both exit 1 and write no commit.
+
+`--base=REV` differs from `--tree=ref=REV` in one way: no commit modifier
+reaches an entry that survives from the base, so such an entry keeps the mode,
+the ownership, and the extended attributes the base recorded, where an entry
+from any `--tree` -- `ref=` included -- is shaped by `--owner-uid`,
+`--owner-gid`, `--canonical-permissions`, `--no-xattrs`, `--statoverride`,
+`--skip-list`, and `--mode-ro-executables`. `--base` is applied first whatever
+its position on the command line, given more than once keeps the last value,
+and is legal with no `--tree` beside it.
+
+`--consume` empties each filesystem source as that source is walked, before the
+commit object is written and before the ref moves, so a later failure leaves the
+files gone and no commit made. It removes the source directory itself as well,
+unless the path is spelled exactly `.`; the test is on the text the value
+carries, so `./` and an absolute path naming the working directory are both
+removed. It empties the source whatever a walk filter kept out of the commit: a
+path `--skip-list` names is removed with the rest, and the tree it sits in is
+removed too, so the commit is written and the whole source is gone. A removal
+that fails aborts the commit and reports the entry's own name as
+`unlinkat(<name>): <reason>`, so a source holding a mode-0500 directory reports
+`unlinkat(<entry inside it>): Permission denied` at exit 1, `--consume .` from
+the parent directory succeeds, and `--consume ./` from inside the directory
+reports `unlinkat(./): Invalid argument` at exit 1. The option has no effect on a
+`ref=` or a `tar=` source, which are left as they stand.
+
+A source list that supplies no root directory leaves nothing to write and
+reports `error: Can't commit an empty tree` at exit 1.
+
 The fault order among these options, each fault observed alone and in pairs: the
-declared ids are read first, ahead of the repository and ahead of the
-missing-branch check; then the missing-branch check; then the refusal of a
-non-zero declared id beside `--canonical-permissions` (`error: Cannot specify
-both --canonical-permissions and non-zero --owner-uid`, naming `--owner-uid`
-where both are non-zero, and accepting a declared zero); then `--parent`
-resolution; then the tree, whose failure to open is reported ahead of the
-timestamp; then the timestamp. A refused timestamp publishes no object, so the
-object store is empty afterwards, unlike the branch-name guard, which stands
-after the tree is written.
+declared ids and the fsync policy are read first, ahead of the repository and
+ahead of the missing-branch check; then the `--statoverride` file and the
+`--skip-list` file, in that order, whose open, read, and syntax faults all stand
+here; then the missing-branch check; then the
+refusal of a non-zero declared id beside `--canonical-permissions` (`error:
+Cannot specify both --canonical-permissions and non-zero --owner-uid`, naming
+`--owner-uid` where both are non-zero, and accepting a declared zero); then
+`--parent` resolution; then the metadata options and the body file; then
+`--base` resolution; then the sources, one at a time and in order, each opened
+as it is reached, so a source `--consume` has already emptied stays gone when a
+later one does not open; then the timestamp. A refused timestamp publishes no
+object, so the object store is empty afterwards, unlike the branch-name guard,
+which stands after the tree is written. A refused timestamp does not put back
+what `--consume` removed. Inside the first step the tool reads the options in
+command-line order, so an invocation carrying both a refusable id and a
+refusable policy reports the leftmost of the two.
+
+#### Signing
+
+Five options sign the commit the invocation writes. Their signatures land in the
+commit's detached metadata under the rules "Signing details" states, before the
+ref moves.
+
+- `--gpg-sign=KEY-ID` adds one `ostree.gpgsigs` element per occurrence, in
+  command-line order, with no deduplication. The key id is resolved by the
+  GnuPG installation, in the home directory `--gpg-homedir` names or the one
+  GnuPG resolves for itself, which honors `GNUPGHOME`. The selector must be at
+  least eight bytes long and must name exactly one secret key; the three
+  outcomes each carry their own line, below.
+- `--gpg-homedir=HOMEDIR` names the home directory `--gpg-sign` resolves its
+  keys in, and it wins over `GNUPGHOME`. In the port it names the same
+  directory for `--sign` and `--sign-from-file` under `--sign-type=gpg`, an
+  engine this tool build does not carry
+  (`../conformance/cli-surface.md`, "P2"). Alone, with no key to resolve, it is
+  accepted and changes nothing.
+- `--sign=KEY_ID` adds one signature per occurrence under the engine
+  `--sign-type` names, in command-line order, with no deduplication. For
+  `ed25519` the value is the base64 of the 64-byte secret key.
+- `--sign-from-file=PATH` adds one signature per occurrence, its key read from
+  the first line of the file. The rest of the file is ignored, a trailing
+  newline is optional, and surrounding whitespace is skipped by the decode.
+- `--sign-type=NAME` names the engine `--sign` and `--sign-from-file` use. It
+  defaults to `ed25519`, the match is exact and case sensitive with no
+  trimming, and the last occurrence wins. It does not reach `--gpg-sign`, whose
+  engine is fixed.
+
+`--sign` and `--sign-from-file` are two lists, not one. Every `--sign` key signs
+first and every `--sign-from-file` key after it, whatever the command line's
+order, and both stand before the `--gpg-sign` keys.
+
+The base64 decode a `--sign` value goes through skips every character outside
+the alphabet, so a value holding prose decodes to some byte count rather than
+failing as text. A padding character counts toward its group and carries the
+value zero. Three bytes come out of each complete four-character group, and each
+of that group's last two characters that is a padding character removes one of
+them again; a trailing group short of four characters contributes nothing.
+Padding therefore acts per group and per position:
+
+- `AAAA=` decodes to three bytes, the padding character opening an incomplete
+  group.
+- `AAA=` decodes to two and `AA==` to one.
+- `AA=A` decodes to two, the padding character sitting third in a complete
+  group, and `A=AA` to three, it sitting second.
+- `AA==AA==` decodes to two, one byte from each of its two groups.
+- `AAAAAAA====` decodes to five.
+
+A decoded length other than 64 reports `error: Invalid ed25519 secret key:
+Ill-formed input: expected 64 bytes, got N bytes`, naming the length it reached,
+so `--sign=zzz` reports zero bytes and `--sign=not-base64!!!` reports six. One
+stray character appended to a pasted 88-character key opens an incomplete group,
+so the key still decodes to 64 bytes and signs.
+
+`--sign-from-file` reads the first line as bytes and places no encoding
+requirement on it, so a line holding a byte sequence that is not UTF-8 reaches
+the decode and its alphabet characters carry the result. A NUL byte ends the
+line ahead of the newline: a file whose first line is `AAAA\0BBBB` yields the
+key `AAAA` and reports three bytes.
+
+The other refusals, all at exit 1 with standard output empty and no object
+published:
+
+```
+error: Requested signature type is not implemented
+error: dummy signature type is only for ostree testing
+error: Unable to lookup key ID <KEY-ID>: GPGME: Invalid value
+error: No gpg key found with ID <KEY-ID> (homedir: <path>)
+error: gpg key id <KEY-ID> ambiguous (homedir: <path>). Try the fingerprint instead
+error: Error opening file <path>: No such file or directory
+error: Error opening file <path>: Is a directory
+error: Operation not supported
+```
+
+The three GPG lines answer the three `--gpg-sign` outcomes. A selector under
+eight bytes draws the "Invalid value" line without a key lookup, whatever it
+would have named, so `--gpg-sign=` and a short user-id substring both draw it. A
+selector of eight bytes or more goes to the key lookup, which accepts every
+spelling GnuPG accepts -- a short key id, a long key id, a fingerprint in either
+case, a `0x` prefix, a trailing `!`, a bare email, a `<email>` or `=uid` exact
+form, and a user-id substring. A selector naming no secret key draws the "No gpg
+key found" line, and one naming more than one draws the "ambiguous" line. A
+selector shaped like a GnuPG option is a key selector like any other: it names no
+secret key and draws the "No gpg key found" line, and the home directory such a
+selector spells out is not opened and gains no keybox and no trust database. The
+port reaches the same outcome by passing the selector after a `--` terminator,
+which is what holds it to a key name.
+
+The homedir term of the two lookup lines is the `--gpg-homedir` path, or the
+literal `<default>` where the option is absent. A home directory that does not
+exist, one that cannot be read, and one holding no matching key all draw the
+"No gpg key found" line. The last line answers `--sign-from-file=` with an
+empty path. The `<path>` term of the two file-open lines is the absolute path in
+the tool and the path as the command line gave it in the port
+(`../conformance/cli-surface.md`, "P2").
+
+The signing step's own fault order, each fault observed alone and in pairs:
+`--sign-type` is read first, then every `--sign` key in order, then every
+`--sign-from-file` path in order, then every `--gpg-sign` key in order.
+`--sign-type` is read only where `--sign` or `--sign-from-file` names a key, so
+a name no engine carries commits successfully in a run that signs nothing, and
+`--gpg-sign` alone is unaffected by it.
+
+The step as a whole stands after the tree is written and after the branch-name
+guard, and before the ref write and the publication. So a tree path that does
+not open, a refused timestamp, and a branch name the guard refuses each win over
+a key that cannot sign, and a key that cannot sign wins over a ref write that
+cannot happen. The branch-name term is observable over a name both ref-name
+grammars refuse, `bad//name` among them; the port's guard covers path safety
+alone, so a name only the tool's wider grammar refuses -- one holding a space or
+a caret -- reaches the signing step in the port
+(`../conformance/cli-surface.md`, "P2").
 
 ### `refs`
 
@@ -2558,9 +3576,28 @@ by giving the tool one hand-written serialized value per rule through
 type:
 
 - A value whose literal does not state its own type carries a type annotation:
-  `byte 0x2a`, `uint32 42`, `uint64 42`. A byte is two lowercase hex digits
-  behind `0x`. A boolean prints `true` or `false` and a string prints quoted, and
-  neither carries an annotation.
+  `byte 0x2a`, `int16 -5`, `uint16 5`, `uint32 42`, `int64 -5`, `uint64 42`,
+  `handle 5`, `objectpath '/a/b'`, `signature 'ay'`. A byte is two lowercase hex
+  digits behind `0x`. A boolean prints `true` or `false`, a string prints quoted,
+  an `i` prints as the bare number, and a `d` prints as the bare `%.17g`
+  rendering of the double with `.0` appended where that rendering holds no `.`,
+  no exponent, and no `nan`: `1.5`, `1000.0`, `-0.0`,
+  `0.10000000000000001`, `1.7976931348623157e+308`. None of the four carries an
+  annotation.
+- A maybe states no type in either literal it has, so an annotated one carries
+  its whole signature and its child then prints bare: `@ms 'just'`,
+  `@ms nothing`, `@mi 5`. Unannotated it prints the child alone, or `nothing`.
+- A chain of nested maybes prints the value alone when every level of the chain
+  is set, since the type states the level count: `@mmi 5` names a chain of two
+  set levels over `5`, and `@mmmv <'x'>` a chain of three over a variant. A
+  chain that ends at `nothing` states its own set levels instead, one `just `
+  for each: `@mmi just nothing` has the outer level set and the inner one unset,
+  `@mmi nothing` has neither set, and the count runs to the depth of the type in
+  `@mmmi just just nothing` and `@mmmmi just just just nothing`. The prefixes
+  belong to the value, so they stay where the annotation is dropped:
+  `[@mmi just nothing, nothing, 5]` and
+  `{'a': @mmi just nothing, 'b': nothing, 'c': 5}`. This is what makes the
+  printed text read back as the value it came from.
 - A container holding at least one element delegates its annotation to its first
   element, and the elements after it print unannotated: `aay` holding two byte
   arrays prints `[[byte 0x63], [0x62]]`. A tuple annotates every member, whose
@@ -2608,6 +3645,208 @@ does: the commit whose stored timestamp field is `1700000000` big-endian reports
 `t`-valued metadata key written natively reports byteswapped. It reaches
 `--print-metadata-key` and `--print-detached-metadata-key` as well, and not
 `--print-variant-type`, whose report is byteswapped whether or not `-B` is given.
+
+#### Reading the text form back
+
+`commit --add-metadata=KEY=VALUE` takes a value in this form, so the port reads
+it as well as writes it (`ostrya-gvariant`, `from_text`). The reading rules,
+recovered by giving the tool one value per rule and reading the stored variant
+back with `show -B --print-metadata-key`:
+
+- A quoted literal is a string; single and double quotes both open one, and the
+  quote in use is the one that needs escaping. `\a`, `\b`, `\f`, `\n`, `\r`,
+  `\t`, `\v`, and `\\` take their short escape, `\uXXXX` and `\UXXXXXXXX` name a
+  character by code point, and every other escape drops the backslash and keeps
+  the character, so `'\x41'` is the three characters `x41`. A backslash before a
+  line feed is a line continuation: both characters leave the value, so
+  `'a\<LF>b'` is the two characters `ab`. The rule holds in a bytestring too.
+- A `\u` or `\U` escape naming U+0000 is refused, because a string value carries
+  no NUL. The refusal is `invalid 4-character unicode escape` for `\u` and
+  `invalid 8-character unicode escape` for `\U`, at the offset of the digits, so
+  `'\u0000'` gives `3-7:invalid 4-character unicode escape` and `'\U00000000'`
+  gives `3-11:invalid 8-character unicode escape`. The refusal comes from the
+  reader, so the offset follows the literal wherever it stands and the type
+  around it makes no difference: `@o '/a\u0000b'` gives `8-12`, `@g '\u0000'`
+  gives `6-10`, and `{'\u0000': 1}` gives `4-8`. A raw NUL byte in a string
+  literal is refused the same way, at the byte, with `NUL byte in string
+  constant`; the tool takes its value through `argv`, which carries no NUL, so
+  this refusal has no counterpart to compare against.
+- `b'...'` and `b"..."` are bytestrings, which name a NUL-terminated `ay`. An
+  octal escape of up to three digits names one byte, and the value ends at the
+  first NUL those escapes produce, so `b'\0'`, `b'\400'` and `b'\0001'` are all
+  the one-byte array holding the terminator alone. A bytestring has no `\u` or
+  `\U` escape, so `b'\u0000'` is the six-byte array holding `u0000` and the
+  terminator. A raw NUL byte in a bytestring literal ends the value the way an
+  octal escape naming it does.
+- A number is hexadecimal behind `0x`, binary behind `0b`, octal behind a
+  leading `0`, and decimal otherwise; both prefix letters take either case. The
+  reader a literal goes to when no type states one is the double reader for a
+  body carrying a decimal point, for a body carrying a lower-case `e` outside a
+  hexadecimal one, and for the words `nan` and `inf`; every other body goes to
+  the integer reader. So `1e3` is 1000.0, `1E3` is refused at the `E`, `0x1e5`
+  is 485, and `0x1.8p1` is 3.0. An integer literal with no other context is an
+  `i`.
+- The type a literal lands in picks the reader again, so the same text can carry
+  two values: `@d 017` is 17.0 where `017` alone is 15, and an integer type over
+  a literal the double reader would take reports the character the integer
+  reader stopped at, `byte 1.5` giving `6-7:invalid character in number`.
+- `nan`, `inf`, `-inf` and `-infinity` are doubles; the spelling is lower case
+  and a sign is needed for `infinity`. A magnitude the double range cannot hold
+  is refused as out of range, and so is a value that rounds to a subnormal the
+  literal does not state exactly, so `5e-324` and `1e-308` are refused where
+  `1e-400` is 0.0 and `2.2250738585072014e-308` is kept. The exact decimal form
+  of a subnormal needs at least 716 significant digits, which is where the port
+  parts from the tool (`conformance/cli-surface.md`, `commit`).
+- A hexadecimal body states its value in binary, and the reader rounds it to the
+  nearest double, ties to even, over a mantissa of any length:
+  `0xffffffffffffffffffffffffffffffffffffffffp0` is 1.461501637330903e+48 and
+  `0x1.0000000000000000000000000000000000001p0` is 1.0. The subnormal such a
+  body states exactly is kept, so `0x1p-1023` is 1.1125369292536007e-308 and
+  `0x1p-1074` is 4.9406564584124654e-324, where `0x1.8p-1074` and
+  `0x1.0000000000001p-1030` round to a subnormal they do not state and are
+  refused. `0x1p-1075` sits at the tie the rounding takes to even, so it is 0.0,
+  and every smaller magnitude is 0.0 as well. A zero mantissa is 0.0 under any
+  exponent, `0x0.0p2147483647` and `0x0.0p-9999999999` included. At the top of
+  the range `0x1.fffffffffffff7ffffffffp1023` rounds down to the largest double
+  and is kept, where `0x1p1024` and `0x1.fffffffffffff8p1023` are refused.
+- A leading `-` is read ahead of the body, and the body may carry a sign of its
+  own. `-` alone is zero, `-+5` is -5, and `--5` is the magnitude 2**64-5 with a
+  negative sign, which no target type holds.
+- `true` and `false` are booleans, `nothing` and `just <value>` are maybes,
+  `[...]` is an array, `{key: value, ...}` an array of dict entries,
+  `{key, value}` one dict entry, `(...)` a tuple, and `<value>` a variant. A
+  one-member tuple is `(x,)`; the comma is required and `(x)` is refused with
+  `expected ',' after first tuple element`. A trailing comma closes that one
+  member alone, so `(1,2,)` reports `expected value`.
+- A type keyword (`boolean`, `byte`, `int16`, `uint16`, `int32`, `handle`,
+  `uint32`, `int64`, `uint64`, `double`, `string`, `objectpath`, `signature`) or
+  a `@<signature>` declaration gives the value that follows it its type. A
+  keyword token is two or more characters long, starts with two letters, and
+  starts in lowercase; every other token that is not a literal is a place a
+  value was expected.
+- A `@` declaration runs to the first character that could close something
+  around it -- whitespace, `,`, `:`, `>`, `]`, and a `)` or `}` that matches no
+  `(` or `{` inside the declaration -- so `@i5` and `@**` are read whole and
+  reported as one bad declaration where `@i)` ends at the bracket. A declaration
+  naming one complete but indefinite type reports `type declarations must be
+  definite`; every other bad one reports `invalid type declaration`.
+- A declaration is read in three steps, each reporting ahead of the next. The
+  signature must spell one complete type, which takes 129 levels: a leaf is one
+  level, `m`, `a`, a tuple and a dict entry each add one over their deepest
+  member, and a signature past that is `invalid type declaration`. The type
+  must then fit in the nesting left where the declaration stands, which is 128
+  levels in all, counting the levels the type carries from the level the
+  declaration sits at; past that the report is `type declaration recurses too
+  deeply`. The type must then be definite. So `@<128 array codes>y` is refused
+  for its depth and `@<129 array codes>y` as an invalid signature, and the same
+  two counts with a trailing `r` in place of the `y` report the depth rather
+  than the definiteness. Under the depth rule the empty tuple carries no level
+  of its own, so `@<128 array codes>()` is accepted where `@<128 array
+  codes>y` is not, and a dict entry is measured by its value alone, so
+  `@<127 array codes>{s()}` is accepted where `@<127 array codes>{sy}` is not.
+  A declaration inside containers counts from their level, so
+  `[@<127 array codes>y []]` is refused where the same declaration alone is
+  accepted. The value beside the declaration takes one level, whatever the
+  levels the declared type carries.
+- An `o` value must be a valid object path: `/`, or `/` and one or more elements
+  of letters, digits and underscores separated by single slashes. A `g` value
+  must be zero or more complete D-Bus types, which excludes the maybe and the
+  indefinite characters, so `signature 'ii'` is accepted and `signature 'ms'` is
+  not. Each of those types takes the same 129 levels a declaration's signature
+  takes, so `signature '<128 array codes>y'` is accepted and one array code
+  more is `not a valid signature`. The levels are inside the string, so the
+  level the signature value stands at does not narrow them.
+- A container with no declaration takes one common type over its elements, so
+  `[2, 1.5]` is an array of doubles and `['a', @ms 'b']` an array of maybe
+  strings, the maybe absorbing the bare string beside it. A literal that states
+  no type and has no context -- `[]`, `{}`, `nothing` -- is refused, and the
+  refusal names the whole value being typed rather than the literal inside it.
+  A variant's child is a whole value of its own, so `[<[]>]` names the `[]`.
+- A declaration drives the check downwards instead: `@as [1]` names the element
+  `1` against `s`. Two members of an undeclared container that do not meet are
+  both named, `['a', 5]` reporting the two spans, and the keys of an undeclared
+  dictionary are checked that way.
+- The first entry of an undeclared dictionary settles the value type on its own,
+  and every later value is read against that type the way a declaration drives
+  the check downwards. `{'a': 1, 'b': uint32 2}` is `a{si}` and
+  `{'a': uint32 2, 'b': 1}` is `a{su}`. A later value that does not fit is named
+  against the settled type: `{'a': 1, 'b': just 2}` gives `14-20:can not parse
+  as value of type 'i'`, `{'a': 1, 'b': 1.5}` gives `15-16:invalid character in
+  number` at the character the integer reader stops on, and
+  `{'a': 1, 'b': ['x', 5]}` gives `14-22:can not parse as value of type 'i'`,
+  which names the whole array.
+  A first value that states no type is named against the whole value
+  being typed, and a later entry leaves it that way, so `{'a': [], 'b': 5}` is
+  `0-17:unable to infer type` and `{'a': nothing, 'b': 'y'}` is
+  `0-24:unable to infer type`. A key that does not meet the settled key type is
+  reported ahead of the value type, which then stays unresolved:
+  `{'a': [], [1]: 5}` gives `1-4,10-13:unable to find a common type`.
+- A type already in force takes the value beside a declaration and drops the
+  declaration. `@as [@o '/a']` stores a string, `{'a': 'x', 'b': @o '/y'}` is
+  `a{ss}`, and `{'a': 'x', 'b': @o 'notapath'}` is accepted, the object-path
+  check that `@o` alone runs staying out of the way. The value beside the
+  declaration is read against the type in force, so `@as [@i 5]` names the `5`
+  with `8-9:can not parse as value of type 's'` and
+  `{'a': 'x', 'b': @ms nothing}` names the `nothing` with `20-27:can not parse
+  as value of type 's'`.
+- A value nests inside at most 127 containers. A `[`, `(`, `{`, `<`, a `just`, a
+  type keyword and a `@` declaration each add one level, and the value at level
+  128 is refused with `variant nested too deeply`, the offset naming the token
+  at that level. A `@` declaration is held to the levels its own type carries
+  as well (see the declaration rule above).
+
+A refusal reports `<spans>:<reason>`, where a span is one byte offset for a
+place a value was expected and `<start>-<end>` for a token, and two spans
+separated by a comma where the reason names two: `0-2:unable to infer type`,
+`0:expected value`, `0-7:unknown keyword`, `1-2:invalid character in number`,
+`0-13:unterminated string constant`, `4:expected ',' or ')' to follow tuple
+element`, `4:expected ':' or ',' to follow dictionary entry key`,
+`3:expected end of input`, `0-1:invalid type declaration`,
+`3-8:can not parse as value of type 'i'`, `0-10:number out of range for type
+'i'`, `7-27:integer too big for any type`, `1-4,6-7:unable to find a common
+type`, `11-21:not a valid object path`, `10-14:not a valid signature`, and
+`0-10:dictionary keys must have basic types`. The offsets are into
+the value alone; `commit` prefixes the whole `KEY=VALUE` argument
+(see "`commit`" below).
+
+The whole value is parsed, typed and built before the text is checked for
+trailing input, so `@i 'x' 5` reports the member that does not fit and
+`nothing 5` the type it could not infer, each ahead of the trailing `5`.
+
+Four divergences stand between the two implementations here. The first two were
+measured over 776 value texts given to both through `commit --add-metadata`, of
+which 749 reach the same commit checksum or the same refusal; the last two over
+the 366 values both accept, read back in four modes:
+
+- A `\u` or `\U` escape naming a surrogate or a code point past U+10FFFF is
+  accepted by the tool, which then builds a string that is not UTF-8, prints
+  `GLib-CRITICAL **: g_variant_new_string(): requires valid UTF-8` and aborts
+  with a signal, writing no commit. `'\uD800'` and `'\U00110000'` both reach
+  that. The port refuses the escape with `3-7:invalid 4-character unicode
+  escape` and `3-11:invalid 8-character unicode escape` at exit 1.
+- The offset the nesting refusal carries agrees for `[`, `(` and `{`, where both
+  name the token at level 128. For `<`, for `just`, for a type keyword and for a
+  `@` declaration the tool prints an offset out of any relation to the text --
+  `18446646599957580430` for one input and `18446642783772371598` for another,
+  so the value is not reproducible -- where the port names the token as it does
+  for the brackets. The reason text and the exit status are the same on both
+  sides.
+- A string holding a code point GLib does not count as printable -- an
+  unassigned one, a non-character, or a control -- is printed by the tool as a
+  `\uXXXX` or `\UXXXXXXXX` escape and by the port as the character itself.
+  `'\uffff'`, `'\ud7ff'` and `'\U0010ffff'` from the tool are the three
+  measured. Both store the same bytes, so the commit checksum agrees and the
+  divergence is in the printed text alone.
+- The deepest nesting the two carry through a commit differs, the port's codec
+  holding a value-depth budget of 128 levels counted from the commit object and
+  the tool counting from the metadata value. Measured with `--add-metadata=k=`
+  and an array nested to each depth: through 123 the two write the same commit
+  and read the same text back; at 124 and 125 the commits still agree and the
+  read-back parts, the tool printing `()` for the value where the port prints
+  the value at 124 and reports `error: gvariant: container nesting exceeds the
+  supported depth` at 125; at 126 and 127 the tool writes the commit and the
+  port reports that same line at exit 1; and at 128 and past it both readers
+  refuse in the same words.
 
 ### `show`
 

@@ -43,7 +43,9 @@ pub enum TreeEntry {
 
 impl Repo {
     /// Open a commit's root tree, returning the tree handle and the resolved
-    /// commit checksum. `rev` may be a refspec or a bare commit checksum.
+    /// commit checksum. `rev` may be a refspec, a bare commit checksum, or
+    /// an abbreviated checksum naming the one commit whose checksum starts
+    /// with it.
     pub async fn read_commit(&self, rev: &str) -> Result<(RepoTree, Checksum)> {
         let checksum = self
             .resolve_rev(rev, false)

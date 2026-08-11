@@ -494,32 +494,78 @@ target as a name no ref holds and the port reports its `Is a directory` line
 (`conformance/cli-surface.md`, "P1"). The `PREFIX` form of the path rule is under
 "CLI output formats", "refs".
 
-An empty refspec is a search of the ref store in the tool rather than a name: it
-resolves to the repository's one ref where exactly one exists, reports `error:
-Refspec  not unique` where more than one does, and reports `error: Invalid
-refspec ` in an empty repository. The port refuses the empty name in every
-repository (`conformance/cli-surface.md`, "P1 -- reading and resolution").
+An empty revision is the zero-length case of the abbreviated-checksum scan
+below: every commit object carries the empty prefix. The tool resolves it to
+the repository's one commit where exactly one commit exists, reports
+`error: Refspec  not unique` where more than one does, and falls through to the
+ref store in a repository holding no commit, where the empty name fails the
+refspec rule and reports `error: Invalid refspec `. The count is of commits and
+not of refs, recovered by resolving the empty revision in a repository holding
+three refs and one commit, which resolves, and in one holding one ref and two
+commits, which reports the not-unique line. The port refuses the empty name in
+every repository (`conformance/cli-surface.md`, "P1 -- reading and resolution").
 
-Revision syntax. A revision names a commit three ways: a 64-character lowercase
-hex checksum, a refspec, or either of those followed by one or more `^` characters,
-each stepping one generation back along the commit's `parent` field. `~N` and
-`^N` are not revision syntax: `ostree rev-parse test/main~1` and
-`test/main^2` each report `error: Invalid refspec <rev>`. The port's ref rule
-accepts both names, so it reads the whole revision as a refspec and reports
-`error: Refspec '<rev>' not found`, the message the two implementations share
-for a name that resolves to nothing, wherever a revision is taken: `rev-parse`,
-`cat`, and the positional of `refs --create`. A checksum carrying either suffix
-takes that same path, the name holding more than 64 characters. Both
-implementations exit 1 and write nothing, and the wording follows from the
-ref-name character class the port does not validate
-(`conformance/cli-surface.md`, "P1"). Walking past a root
-commit reports `error: Commit <checksum> has no parent` and exits 1. The tool
-also resolves an abbreviated checksum -- a hex prefix as short as one character
-resolves when exactly one commit object's name starts with it, and a prefix
-matching only a dirtree, dirmeta, or file object does not resolve at all
-(recovered by resolving each one-character prefix present in a two-commit
-repository's `objects/` tree). The port does not resolve an abbreviated
-checksum; it requires the full 64 characters.
+Revision syntax. A revision names a commit four ways: a 64-character lowercase
+hex checksum, an abbreviated checksum, a refspec, or any of those followed by
+one or more `^` characters, each stepping one generation back along the
+commit's `parent` field. `~N` and `^N` are not revision syntax: `ostree
+rev-parse test/main~1` and `test/main^2` each report `error: Invalid refspec
+<rev>`. The port's ref rule accepts both names, so it reads the whole revision
+as a refspec and reports `error: Refspec '<rev>' not found`, the message the
+two implementations share for a name that resolves to nothing, wherever a
+revision is taken: `rev-parse`, `cat`, and the positional of `refs --create`. A
+checksum carrying either suffix takes that same path, the name holding more
+than 64 characters. Both implementations exit 1 and write nothing, and the
+wording follows from the ref-name character class the port does not validate
+(`conformance/cli-surface.md`, "P1"). Walking past a root commit reports
+`error: Commit <checksum> has no parent` and exits 1.
+
+An abbreviated checksum is a run of one to 63 lowercase hex characters, and it
+names the one commit object whose checksum starts with it. Both implementations
+resolve one, under one rule:
+
+- the match set holds commit objects alone. A prefix carried by a dirtree, a
+  dirmeta, or a file object and by no commit matches nothing and takes the
+  refspec path, and such an object sharing a prefix with a commit leaves that
+  commit's prefix resolvable (recovered by resolving the prefixes of every loose
+  object in a two-commit `archive` repository, and again over the `file` objects
+  of a `bare-user` one);
+- exactly one commit matching resolves to it, at any length from one character up
+  to 63;
+- the tool takes the zero-length prefix through the same scan, so an empty
+  revision resolves where the repository holds one commit. The port's rule
+  starts at one character and refuses the empty name in every repository, the
+  divergence the paragraph above records;
+- more than one commit matching reports `error: Refspec <prefix> not unique` at
+  exit 1, the prefix unquoted, and resolves to nothing thereafter -- the failure
+  stands wherever the revision was taken, `commit -b` included, and a following
+  `^` reports it too, nothing having resolved to walk back from;
+- the scan stands ahead of the ref store. A name the store carries as a ref
+  resolves to the commit it prefixes rather than to that ref's own target, so a
+  branch whose name prefixes a commit is unreachable by name as a revision, and
+  the ambiguous case stops there as well rather than falling back to the ref;
+- a prefix no commit carries falls through to the ref store, so a hex name is an
+  ordinary ref name for as long as no commit begins with it. `refs
+  --create=dddd <rev>` writes such a ref and `rev-parse dddd` reads it back;
+- the case rule of a full checksum holds: one uppercase character makes the name
+  a refspec, so `rev-parse <UPPER-PREFIX>` reports the not-found line;
+- the existence check of `refs --create=NEWREF` resolves NEWREF, so a NEWREF
+  prefixing a commit reports `error: --create specified but ref <NEWREF> already
+  exists`, the line a 64-character NEWREF draws below;
+- `refs -A --create` takes a ref name and not a revision, so a prefix there
+  reports `error: Cannot create alias to non-existent ref: <prefix>`, and a
+  `PREFIX` argument is matched rather than resolved.
+
+The branch-name guard below does not reach this shape: both implementations write
+a branch whose name prefixes a commit, leaving a ref no revision reaches, where
+they refuse a name of 64 lowercase hex characters outright. What a hex name
+shadows depends on the commits the store holds at the time, so the guard would
+refuse a name that is free today and shadowed after the next commit.
+
+The consequence at `commit -b BRANCH` is the parenting rule below: the implicit
+parent is what BRANCH resolves to as a revision, so a BRANCH naming no ref and
+prefixing a commit parents the new commit on that commit, and a further commit on
+that branch parents on it again rather than on the tip the ref file holds.
 
 The case of those 64 characters is part of the rule: a name is a checksum in
 lowercase hex alone, and one uppercase character makes it a ref name. Both
@@ -570,13 +616,16 @@ suffix names:
 - a base naming no ref: the tool dies on a signal
   (`conformance/cli-surface.md`, "P2").
 
-An empty base is a refspec the tool searches its ref store for, so `-b '^'`
-reports `error: Invalid refspec ` against a repository holding no ref, naming
-the empty base, and the walk's own line against one holding a single ref. Since
-the tool reads the name before the tree, a tree path that does not open is
-reported by the port and reached by the tool only after the name it already
-refused, and neither implementation publishes an object for the refusal, where
-the checksum guard leaves the tool's tree and commit objects in `objects/`.
+An empty base is the zero-length case of the abbreviated-checksum scan, and the
+count that decides it is of commits. Against a repository holding no commit the
+empty name reaches the ref store, fails the refspec rule, and `-b '^'` reports
+`error: Invalid refspec `, naming the empty base. Against one holding a single
+commit the base resolves to that commit, a root commit, so the trailing `^`
+walks past it and `-b '^'` reports the walk's own line. Since the tool reads
+the name before the tree, a tree path that does not open is reported by the
+port and reached by the tool only after the name it already refused, and
+neither implementation publishes an object for the refusal, where the checksum
+guard leaves the tool's tree and commit objects in `objects/`.
 A `^` inside the name is a separate rule: the tool refuses `a^b` as a ref name
 whatever the store holds, and the port writes it, which is the ref-name
 character class `conformance/cli-surface.md`, "P1" records.

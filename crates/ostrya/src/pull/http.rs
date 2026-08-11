@@ -914,7 +914,7 @@ impl Repo {
             TimestampCheck::Off => return Ok(()),
             TimestampCheck::CurrentRef => {
                 let current = self
-                    .resolve_rev(&refspec(ctx.ref_prefix, ref_name), true)
+                    .resolve_ref_tip(&refspec(ctx.ref_prefix, ref_name))
                     .await?;
                 // A ref this repository does not hold yet has nothing to be
                 // older than.

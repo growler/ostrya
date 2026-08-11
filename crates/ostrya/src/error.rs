@@ -39,6 +39,11 @@ pub enum Error {
     /// `<remote>:<name>` or `<collection-id>:<name>` where one is present.
     #[error("invalid refspec: {0}")]
     InvalidRefspec(String),
+    /// An abbreviated checksum prefixes more than one of the commit objects
+    /// present, so it names no single commit. The payload is the revision as
+    /// given.
+    #[error("refspec not unique: {0}")]
+    AmbiguousRefspec(String),
     /// A revision's `^` ancestry suffix asked for the parent of a root commit.
     #[error("commit {0} has no parent")]
     NoParentCommit(Checksum),

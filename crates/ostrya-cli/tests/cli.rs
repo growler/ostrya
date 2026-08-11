@@ -5809,8 +5809,9 @@ fn invalid_refspec_matches_the_tool() {
     // Two divergences the same surface carries, recorded in
     // `docs/conformance/cli-surface.md`, "P1".
     //
-    // The empty refspec is a search of the ref store in the tool, which reports
-    // the count it found; the port refuses the name.
+    // The empty refspec is the zero-length case of the tool's
+    // abbreviated-checksum scan, and the count that decides it is of commits;
+    // the port refuses the name.
     let (refused, searched) = run_both(&port, &tool, &["rev-parse", ""]);
     assert_eq!(refused.status.code(), Some(1));
     assert_eq!(
@@ -5820,7 +5821,7 @@ fn invalid_refspec_matches_the_tool() {
     assert_eq!(searched.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&searched.stderr).contains("error: Refspec  not unique"),
-        "the tool no longer searches the ref store for an empty refspec:\n{}",
+        "the empty refspec no longer matches the four commits this repository holds:\n{}",
         String::from_utf8_lossy(&searched.stderr),
     );
 
@@ -6741,9 +6742,10 @@ fn commit_ancestry_branch_name_matches_the_tool() {
         );
     }
 
-    // An empty base, which is a refspec the tool searches its ref store for, so
-    // over an empty repository it names nothing and both refuse: the port names
-    // the branch as given and the tool the base it split off.
+    // An empty base, which is the zero-length case of the tool's
+    // abbreviated-checksum scan, so over a repository holding no commit it
+    // reaches the ref store and names nothing there, and both refuse: the port
+    // names the branch as given and the tool the base it split off.
     for branch in ["^", "^^"] {
         let (port, tool) = run(&commit_args(branch, src), &port_repo, &tool_repo);
         refused("port", &port, &format!("error: Invalid refspec {branch}\n"));
@@ -13643,12 +13645,13 @@ fn commit_tar_pathname_filter_matches_the_tool() {
     let source = format!("--tree=tar={}", full.display());
 
     // The branch name holds a character that is not a hexadecimal digit, so it
-    // cannot read as an abbreviated commit checksum. The tool resolves the
-    // implicit parent of `commit -b NAME` through a revision parse that accepts
-    // one, so a hexadecimal name that prefixes a commit this repository already
-    // holds takes that commit as its parent where no such ref stands, and the
-    // port takes no parent. That divergence belongs to the parent lookup and
-    // not to this option, so the names here keep clear of it.
+    // cannot read as an abbreviated commit checksum. Both implementations
+    // resolve the implicit parent of `commit -b NAME` through a revision parse
+    // that accepts one, so a hexadecimal name prefixing a commit this repository
+    // already holds takes that commit as its parent where no such ref stands.
+    // The two agree on that, but it is a second variable in this sweep, whose
+    // subject is the filter, so the names here keep clear of it
+    // (`docs/format-reference.md`, "Revision syntax").
     let mut branch = 0;
     let mut agrees = |extra: &[&str]| {
         branch += 1;
@@ -15900,6 +15903,339 @@ fn commit_sign_keypair_mismatch_is_refused_cleanly() {
             );
         }
     }
+}
+
+// --- Phase 17f, X1 and F10a: abbreviated checksum resolution ------------------
+//
+// A revision shorter than a full checksum names the one commit object whose
+// checksum starts with it, wherever a revision is taken
+// (`docs/format-reference.md`, "Revision syntax"). Each test commits corpus `C0`
+// under a fixed timestamp, so the two implementations hold the same commit
+// checksum and one prefix string states the same case on both sides.
+
+/// Every loose object in a repository as `(checksum, extension)`.
+fn loose_objects(repo: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for fanout in object_fanouts(repo) {
+        let dir = repo.join(&fanout);
+        let name = dir.file_name().unwrap().to_str().unwrap().to_owned();
+        for entry in std::fs::read_dir(&dir).expect("the fanout reads") {
+            let entry = entry.expect("the entry reads");
+            let file = entry.file_name().to_str().unwrap().to_owned();
+            let (rest, ext) = file.rsplit_once('.').expect("an object name");
+            out.push((format!("{name}{rest}"), ext.to_owned()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The checksum of one loose object that is not a commit, for the prefix that
+/// must match nothing.
+fn a_non_commit_object(repo: &Path) -> String {
+    loose_objects(repo)
+        .into_iter()
+        .find(|(_, ext)| ext != "commit")
+        .expect("the store holds a non-commit object")
+        .0
+}
+
+/// Commit corpus `C0` into both repositories on `branch` under the fixed
+/// timestamp, asserting the two agree, and return the checksum they printed.
+fn commit_both(port_repo: &Path, tool_repo: &Path, tree: &Path, branch: &str) -> String {
+    let args = [
+        "commit",
+        "-b",
+        branch,
+        FIXED_TIMESTAMP,
+        tree.to_str().unwrap(),
+    ];
+    let (port, tool) = run_both(port_repo, tool_repo, &args);
+    assert_runs_agree(&port, &tool, &args.join(" "));
+    port.ok().stdout_trimmed()
+}
+
+/// A prefix resolves to the commit it names at every length, an object that is
+/// no commit is not reachable by prefix, and the case rule and the ancestry
+/// suffix hold over an abbreviated name as they do over a full checksum.
+#[test]
+fn abbreviated_checksum_resolves_like_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("abbrev-resolve");
+    let base = tmp.path();
+    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
+    let commit = commit_both(&port_repo, &tool_repo, &tree, "base");
+
+    // Every length from one character to one short of the whole checksum
+    // resolves, and the whole checksum keeps resolving to itself.
+    for len in [1usize, 2, 3, 4, 8, 32, 63, 64] {
+        assert_agrees(&port_repo, &tool_repo, &["rev-parse", &commit[..len]]);
+    }
+    // One character more than a checksum, and an uppercase rendering, are ref
+    // names that name nothing.
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["rev-parse", &format!("{commit}a")],
+    );
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["rev-parse", &commit[..8].to_uppercase()],
+    );
+    // A prefix carried by a dirtree, a dirmeta, or a file object alone matches
+    // nothing: the match set holds commit objects. Both stores hold the same
+    // object names, the corpus and the timestamp being fixed.
+    let other = a_non_commit_object(&port_repo);
+    assert_eq!(other, a_non_commit_object(&tool_repo));
+    for len in [1usize, 4, 8] {
+        assert_agrees(&port_repo, &tool_repo, &["rev-parse", &other[..len]]);
+    }
+    // A hex name no commit begins with is a ref name, so a ref of that name
+    // resolves through the ref store.
+    assert_agrees(&port_repo, &tool_repo, &["refs", "--create=dddd", "base"]);
+    assert_agrees(&port_repo, &tool_repo, &["rev-parse", "dddd"]);
+    // The existence check of `--create=NEWREF` resolves NEWREF, so a NEWREF
+    // that is a prefix of a commit names one.
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["refs", &format!("--create={}", &commit[..6]), "base"],
+    );
+    // `refs -A --create` takes a ref name and not a revision, so a prefix there
+    // names no ref: both report `Cannot create alias to non-existent ref` and
+    // neither writes an alias (`docs/format-reference.md`, "Revision syntax").
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["refs", "-A", "--create=al", &commit[..6]],
+    );
+    // A `-A` listing matches its PREFIX against the ref names and the alias
+    // names rather than resolving it, so a prefix naming neither prints nothing
+    // at exit 0 in both, where a resolution would print the commit it reaches.
+    // The alias written here is what an unfiltered `-A` listing prints, so the
+    // empty listing under the prefix states that the prefix selected by match
+    // (`docs/format-reference.md`, "Revision syntax").
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["refs", "-A", "--create=alforlist", "base"],
+    );
+    assert_agrees(&port_repo, &tool_repo, &["refs", "-A"]);
+    assert_agrees(&port_repo, &tool_repo, &["refs", "-A", &commit[..6]]);
+    // The ancestry suffix applies to what the prefix resolved to, and the one
+    // commit here is a root commit.
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["rev-parse", &format!("{}^", &commit[..6])],
+    );
+    // The other revision sites take an abbreviated name too.
+    let short = commit[..6].to_owned();
+    assert_agrees(&port_repo, &tool_repo, &["show", &short]);
+    assert_agrees(&port_repo, &tool_repo, &["log", &short]);
+    assert_agrees(&port_repo, &tool_repo, &["ls", &short]);
+    assert_agrees(&port_repo, &tool_repo, &["cat", &short, "/file.txt"]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &short, "base"]);
+    // `commit` resolves one at `--tree=ref=` and at `--base`, so the checksum
+    // both print states that each read the same tree.
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &[
+            "commit",
+            "-b",
+            "viatree",
+            FIXED_TIMESTAMP,
+            &format!("--tree=ref={short}"),
+        ],
+    );
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &[
+            "commit",
+            "-b",
+            "viabase",
+            FIXED_TIMESTAMP,
+            &format!("--base={short}"),
+            tree.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(describe_refs(&port_repo), describe_refs(&tool_repo));
+}
+
+/// `commit -b NAME`, where NAME is a prefix of a commit the repository holds and
+/// names no ref, parents the new commit on that commit. This is item `F10a`: the
+/// checksum both implementations print is the oracle, since a differing parent
+/// gives a differing commit object.
+#[test]
+fn commit_branch_name_as_abbreviated_checksum_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("abbrev-commit-b");
+    let base = tmp.path();
+    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
+    let first = commit_both(&port_repo, &tool_repo, &tree, "base");
+    let prefix = first[..4].to_owned();
+
+    // The branch names no ref, so the implicit parent is what the name resolves
+    // to as a revision: the commit it prefixes.
+    let second = commit_both(&port_repo, &tool_repo, &tree, &prefix);
+    assert_ne!(first, second);
+    assert_agrees(&port_repo, &tool_repo, &["show", &second]);
+    let shown = ostrya(
+        &["show", "--repo", port_repo.to_str().unwrap(), &second],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+    assert!(
+        shown.contains(&format!("Parent:  {first}")),
+        "the commit under a prefix branch name carries no parent:\n{shown}"
+    );
+
+    // The branch now holds `second`, and the name still resolves to `first`, so
+    // a further commit on it takes `first` as its parent again. The ref file is
+    // read as a file: resolving the name would give the prefix match, which is
+    // the behavior under test.
+    let ref_file = port_repo.join("refs").join("heads").join(&prefix);
+    assert_eq!(
+        std::fs::read_to_string(&ref_file).unwrap().trim(),
+        second,
+        "the ref file must hold the commit the branch was moved to"
+    );
+    assert_eq!(
+        resolve(&port_repo, &prefix).as_deref(),
+        Some(first.as_str()),
+        "the name must resolve to the commit it prefixes"
+    );
+    // The commit object it writes therefore reproduces `second` byte for byte,
+    // the tree and the timestamp being the same. A parent taken from the ref
+    // file would give another checksum, so this states which of the two the
+    // implicit parent read.
+    let third = commit_both(&port_repo, &tool_repo, &tree, &prefix);
+    assert_eq!(
+        third, second,
+        "the second commit on a prefix branch must parent on the prefix match"
+    );
+    assert_eq!(describe_refs(&port_repo), describe_refs(&tool_repo));
+}
+
+/// A prefix more than one commit carries resolves nowhere: both implementations
+/// report `Refspec <prefix> not unique` at exit 1, at every site that takes a
+/// revision, and `commit -b <prefix>` writes neither an object nor a ref.
+#[test]
+fn ambiguous_abbreviated_checksum_is_refused_like_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("abbrev-ambiguous");
+    let base = tmp.path();
+    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
+
+    // Commit distinct bodies until two commits share their first character. The
+    // checksums are content-addressed and the timestamp is fixed, so the
+    // collision falls the same way in both stores.
+    let mut heads: Vec<String> = Vec::new();
+    let mut prefix = None;
+    for n in 0..400 {
+        let branch = format!("probe-{n}");
+        let args = [
+            "commit",
+            "-b",
+            &branch,
+            FIXED_TIMESTAMP,
+            "-m",
+            &branch,
+            tree.to_str().unwrap(),
+        ];
+        let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+        assert_runs_agree(&port, &tool, &args.join(" "));
+        let commit = port.ok().stdout_trimmed();
+        let head = commit[..1].to_owned();
+        if heads.contains(&head) {
+            prefix = Some(head);
+            break;
+        }
+        heads.push(head);
+    }
+    let prefix = prefix.expect("two commits sharing a first character");
+
+    // Every revision site reports the same refusal, the ancestry suffix
+    // included: nothing resolved to walk back from.
+    for args in [
+        vec!["rev-parse", &prefix],
+        vec!["show", &prefix],
+        vec!["log", &prefix],
+        vec!["ls", &prefix],
+        vec!["cat", &prefix, "/file.txt"],
+        vec!["diff", &prefix, "probe-0"],
+        vec!["refs", "--create=fromamb", &prefix],
+    ] {
+        assert_agrees(&port_repo, &tool_repo, &args);
+        assert_agrees_on_error(
+            &port_repo,
+            &tool_repo,
+            &args,
+            &format!("error: Refspec {prefix} not unique"),
+        );
+    }
+    // `refs -A --create` takes a ref name and not a revision, so the prefix is
+    // matched against no commit there and the ambiguity is never reached: both
+    // report the line they report for a prefix one commit carries
+    // (`docs/format-reference.md`, "Revision syntax").
+    let alias_args = ["refs", "-A", "--create=alamb", &prefix];
+    assert_agrees(&port_repo, &tool_repo, &alias_args);
+    assert_agrees_on_error(
+        &port_repo,
+        &tool_repo,
+        &alias_args,
+        &format!("error: Cannot create alias to non-existent ref: {prefix}"),
+    );
+    // A `-A` listing matches its PREFIX rather than resolving it, so the
+    // ambiguity is never reached there: the prefix names no ref and no alias,
+    // and both print nothing at exit 0 in place of the `not unique` line every
+    // revision site reports. The alias written here is what an unfiltered `-A`
+    // listing prints, so the empty listing under the prefix states that the
+    // prefix selected by match (`docs/format-reference.md`, "Revision syntax").
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["refs", "-A", "--create=alforlist", "probe-0"],
+    );
+    assert_agrees(&port_repo, &tool_repo, &["refs", "-A"]);
+    assert_agrees(&port_repo, &tool_repo, &["refs", "-A", &prefix]);
+    let caret = format!("{prefix}^");
+    assert_agrees(&port_repo, &tool_repo, &["rev-parse", &caret]);
+
+    // `commit -b <ambiguous>` stops at the implicit parent, so no commit is
+    // written and no ref is created.
+    let before = (describe_refs(&port_repo), loose_objects(&port_repo));
+    let commit_args = [
+        "commit",
+        "-b",
+        &prefix,
+        FIXED_TIMESTAMP,
+        tree.to_str().unwrap(),
+    ];
+    assert_agrees(&port_repo, &tool_repo, &commit_args);
+    assert_agrees_on_error(
+        &port_repo,
+        &tool_repo,
+        &commit_args,
+        &format!("error: Refspec {prefix} not unique"),
+    );
+    assert_eq!(
+        (describe_refs(&port_repo), loose_objects(&port_repo)),
+        before,
+        "a refused commit changed the repository"
+    );
+    assert_eq!(describe_refs(&port_repo), describe_refs(&tool_repo));
 }
 
 /// Decode standard padded base64, for building the key fixtures the tests above

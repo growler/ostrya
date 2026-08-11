@@ -179,14 +179,17 @@ reproduced:
   reports `error: Invalid refspec NEWREF`, which is the tool's own refusal for
   that name at the step a resolvable base reaches (`../format-reference.md`,
   "refs");
-- an empty refspec searches the ref store in the tool, so `rev-parse ''`
-  resolves in a repository holding exactly one ref, reports `error: Refspec
-  not unique` where it holds more, and reports `error: Invalid refspec ` where
-  it holds none. `refs --create= REV` reads the same search as an existence
-  check, so it reports `error: --create specified but ref  already exists`
-  against the one-ref repository. The port refuses the empty name in every
-  repository with `error: Invalid refspec `, which is the tool's own text for
-  the empty repository, and exits 1 wherever the tool exits 1;
+- an empty refspec is the zero-length case of the abbreviated-checksum scan in
+  the tool, and the count that decides it is of commits: `rev-parse ''` resolves
+  in a repository holding exactly one commit, reports `error: Refspec  not
+  unique` where it holds more, and reports `error: Invalid refspec ` in a
+  repository holding no commit, where the empty name reaches the ref store and
+  fails the refspec rule. `refs --create= REV` reads the same scan as an
+  existence check, so it reports `error: --create specified but ref  already
+  exists` against the one-commit repository and `error: Refspec  not unique`
+  against a repository holding two commits. The port refuses the empty name in
+  every repository with `error: Invalid refspec `, which is the tool's own text
+  for the repository holding no commit, and exits 1 wherever the tool exits 1;
 - a `PREFIX` the ref rule refuses is reported by the tool as `error: Listing
   refs: Invalid refspec <PREFIX>` and by the port as `error: Invalid refspec
   <PREFIX>`, in every listing form and in `--delete`. Both exit 1, print the same
@@ -293,19 +296,19 @@ reproduced:
   64-character name agrees in both, and is in `../format-reference.md`,
   "Revision syntax".
 
-Two resolution behaviors the tool has and the port does not, each recorded in
+Abbreviated checksum resolution is shared: a run of one to 63 lowercase hex
+characters names the one commit object whose checksum starts with it, wherever a
+revision is taken, and a prefix more than one commit carries reports `error:
+Refspec <prefix> not unique` at exit 1 in both. The scan of `objects/` inside
+`Repo::resolve_rev` landed in Phase 17f as item `X1`, with the `commit -b`
+consequence as `F10a`: a branch name prefixing a commit and naming no ref parents
+its commit on that commit in both implementations. The rule, the sites it reaches,
+and the observations that recovered it are in `../format-reference.md`, "Revision
+syntax".
+
+One resolution behavior the tool has and the port does not, recorded in
 `../format-reference.md` with the observation that recovered it:
 
-- an abbreviated commit checksum resolves in the tool, from a hex prefix as
-  short as one character, wherever a revision is taken. Reproducing it needs a
-  scan of `objects/` inside `Repo::resolve_rev`, which is library work outside
-  Phase 17b's CLI wiring, and it changes resolution for every subcommand. One
-  consequence reaches `commit`'s implicit parent, observed while Phase 17c
-  compared its options: a branch name that is a hex prefix of an object the
-  repository already holds resolves for the tool, so `commit -b <prefix>` on a
-  fresh branch parents its commit on that object, where the port writes a root
-  commit. Against a repository holding one commit, `commit -b <the commit's first
-  two characters>` reproduces it;
 - the tool validates a ref name against a character class the port's own check
   does not, so `ostrya refs --create` writes some names the tool then refuses
   to resolve. Adopting the rule tightens `Repo::resolve_rev`, `commit -b`, and
@@ -985,8 +988,13 @@ a superset of that syntax like the leading `--repo` form above. Each side refuse
 what it cannot read, at exit 1, writing nothing:
 
 - an abbreviated checksum and a refspec report `error: Invalid rev <value>` from
-  the tool, where the port resolves a refspec naming a ref and reports `error:
-  Refspec '<value>' not found` for one naming none;
+  the tool, where the port resolves both. A refspec naming a ref, and an
+  abbreviated checksum naming one commit, each reach the parent field; one naming
+  nothing reports `error: Refspec '<value>' not found`, and a prefix more than one
+  commit carries reports `error: Refspec <value> not unique`. The tool refuses
+  every one of those values at this site alone: it resolves an abbreviated
+  checksum wherever else a revision is taken (`../format-reference.md`, "Revision
+  syntax"), so `--parent` is the narrower reader and not the narrower rule;
 - an empty value reports `error: Invalid rev ` from the tool and `error:
   Invalid refspec ` from the port, the one refusal at this site the port words
   with its refspec validator;
@@ -1032,11 +1040,14 @@ reads the branch name as a revision ahead of the tree and reports that walk:
 `Commit <checksum> has no parent` where it resolves to a root commit, and a
 SIGSEGV where the base names no ref. That crash site is a second one beside the
 `refs --create=NEWREF` site "P1" records, and `commit -b 'main^'` and `commit -b
-'a^^'` both reach it. An empty base searches the tool's ref store, so `-b '^'`
-against a repository holding no ref reports `Invalid refspec `, naming the base
-it split off. Reading the name ahead of the tree also moves one fault order: a
-tree path that does not open is reported by the port, which reads the tree
-first, and never reached by the tool.
+'a^^'` both reach it. An empty base is the zero-length case of the
+abbreviated-checksum scan, and the count that decides it is of commits:
+against a repository holding no commit `-b '^'` reports `Invalid refspec `,
+naming the base it split off, and against one holding a single commit the base
+resolves to that root commit, so the walk reports `Commit <checksum> has no
+parent`. Reading the name ahead of the tree also moves one fault order: a tree
+path that does not open is reported by the port, which reads the tree first,
+and never reached by the tool.
 
 The guard is what keeps a ref of that shape out of a repository the port writes.
 Where one stands, the tool's ref enumeration skips it without a word and its

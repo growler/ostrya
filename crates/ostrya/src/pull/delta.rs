@@ -181,10 +181,7 @@ async fn source_commit(
     to: &Checksum,
     ref_prefix: Option<&str>,
 ) -> Result<Option<Checksum>> {
-    let Some(current) = repo
-        .resolve_rev(&refspec(ref_prefix, ref_name), true)
-        .await?
-    else {
+    let Some(current) = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await? else {
         return Ok(None);
     };
     if current == *to || !complete_here(repo, &current).await? {

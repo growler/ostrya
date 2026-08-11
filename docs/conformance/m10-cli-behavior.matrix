@@ -925,10 +925,11 @@ outcome: refused-both
 severity: interop
 spec: format-reference.md#object-store-layout
 note: an empty NEWREF is refused by both and written by neither, in different
- words. The empty refspec is a search of the ref store in the tool, and this
- setup binds exactly one ref, so the search finds it and the existence check
- reports it as already present; the port refuses the empty name itself.
- `stderr-text` is therefore not an oracle here (`cli-surface.md`, "P1").
+ words. The empty refspec is the zero-length case of the tool's
+ abbreviated-checksum scan, and this setup holds exactly one commit, so the
+ scan resolves and the existence check reports the ref as already present; the
+ port refuses the empty name itself. `stderr-text` is therefore not an oracle
+ here (`cli-surface.md`, "P1").
 
 family: M10
 subcommand: refs
@@ -963,8 +964,9 @@ note: the refused-name cases the single-branch setup does not bind: every shape
  refuses parting the two over a ref `ostrya commit -b` wrote; and a remote half
  holding a `/`, which is one
  component in both. The cited test also pins the two divergences
- `cli-surface.md`, "P1" records -- the empty refspec as a search of a ref store
- holding several refs, and what a ref name that names a directory draws: the
+ `cli-surface.md`, "P1" records -- the empty refspec as the zero-length case of
+ the tool's abbreviated-checksum scan, which the repository's four commits
+ make not unique, and what a ref name that names a directory draws: the
  tool's three refusals, and its `--create` scan for a ref below the name, which
  runs under `refs/heads` alone and leaves the write to replace an empty directory
  and any directory under `refs/remotes`, where the port refuses both -- against a
@@ -1721,8 +1723,9 @@ severity: interop
 spec: format-reference.md#object-store-layout
 note: the suffix alone, whose base is empty. Both refuse at exit 1 and write
  nothing, and each names what it read: the port the branch as given and the tool
- the empty base it split off, the tool's empty refspec being a name it searches
- its ref store for and this repository holding no ref. The two texts part, so
+ the empty base it split off, the tool's empty refspec being the zero-length
+ case of its abbreviated-checksum scan and this repository holding no commit,
+ so the name reaches the ref store and its refspec rule. The two texts part, so
  `stderr-text` is no oracle and the two `expect-stderr` fields state each side's
  own substring. `inventory` holds here where the 64-character guard leaves it
  out: the tool reads an ancestry name before it commits the tree, so neither
@@ -6372,3 +6375,222 @@ note: the port stores insertion order -- the caller's detached-metadata keys in
  the two stored orders against each other over `zzz` and `zzy`, the names where
  they meet, and over the rest requires them to differ, so the divergence the
  `loss` field states cannot go stale.
+
+# ---------------------------------------------------------------------------
+# Abbreviated checksum resolution, Phase 17f (`X1` and `F10a`).
+#
+# A revision shorter than a full checksum names the one commit object whose
+# checksum starts with it (`../format-reference.md`, "Revision syntax"). Every
+# case rests on a prefix of a checksum, which no placeholder holds a substring
+# of, so these cells cite `evidence:` and the tests they name derive the prefix
+# from the checksum the two implementations printed for the same fixed-timestamp
+# commit. A prefix placeholder bound by `repo-with-commit` would turn the
+# single-invocation cases into `run:` cells; that is a harness change.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/abbreviated-checksum-lengths
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::abbreviated_checksum_resolves_like_the_tool
+spec: format-reference.md#object-store-layout
+note: a prefix of the one commit resolves to it at one, two, three, four, eight,
+ 32, and 63 characters, and the whole 64 resolve as they did before. One
+ character past a checksum, and an uppercase rendering of a prefix, are ref names
+ naming nothing in both. The cited test compares `rev-parse` for each length
+ against the tool over one repository per implementation.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/abbreviated-checksum-commits-only
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::abbreviated_checksum_resolves_like_the_tool
+spec: format-reference.md#object-store-layout
+note: the match set holds commit objects alone, so a prefix carried by a dirtree,
+ a dirmeta, or a file object and by no commit resolves to nothing in both, at one,
+ four, and eight characters. The cited test reads the object it names out of
+ `objects/` and holds the two stores to the same object names first, the corpus
+ and the timestamp being fixed.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/abbreviated-checksum-no-match-falls-through
+setup: repo-with-commit
+run: rev-parse --repo=$REPO ffffffff
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Refspec 'ffffffff' not found"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Refspec 'ffffffff' not found"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#object-store-layout
+note: a hex prefix no commit object carries is a ref name, so resolution falls
+ through to the ref store and reports the not-found line both implementations
+ share. `rev-parse/abbreviated-checksum-ref-fall-through` states the case where
+ the store carries a ref of that name.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/abbreviated-checksum-ref-fall-through
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::abbreviated_checksum_resolves_like_the_tool
+spec: format-reference.md#object-store-layout
+note: a hex name no commit begins with is an ordinary ref name: `refs
+ --create=dddd` writes it and `rev-parse dddd` reads it back in both. Two
+ invocations, so the claim is the cited test's.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/abbreviated-checksum-ancestry
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::abbreviated_checksum_resolves_like_the_tool
+spec: format-reference.md#object-store-layout
+note: the ancestry suffix applies to what the prefix resolved to, so
+ `rev-parse <prefix>^` over a root commit reports `error: Commit <checksum> has
+ no parent` in both, naming the resolved checksum in full.
+
+family: M10
+subcommand: rev-parse
+cell: rev-parse/abbreviated-checksum-ambiguous
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::ambiguous_abbreviated_checksum_is_refused_like_the_tool
+spec: format-reference.md#object-store-layout
+note: a prefix more than one commit carries reports `error: Refspec <prefix> not
+ unique` at exit 1, the prefix unquoted, and the same line stands at `show`,
+ `log`, `ls`, `cat`, `diff`, `refs --create`, and a following `^`. The cited test
+ commits distinct bodies until two commits share their first character, which is
+ how it holds a case no fixed corpus states, and asserts the line at every one of
+ those sites.
+
+family: M10
+subcommand: refs
+cell: refs/create-newref-is-an-abbreviated-checksum
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::abbreviated_checksum_resolves_like_the_tool
+spec: format-reference.md#object-store-layout
+note: the existence check of `--create=NEWREF` resolves NEWREF, so a NEWREF
+ prefixing a commit reports `error: --create specified but ref <NEWREF> already
+ exists` in both and writes nothing, the line a NEWREF of 64 lowercase hex
+ characters already drew.
+
+family: M10
+subcommand: refs
+cell: refs/alias-target-is-an-abbreviated-checksum
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::abbreviated_checksum_resolves_like_the_tool,
+ ostrya_cli::cli::ambiguous_abbreviated_checksum_is_refused_like_the_tool
+spec: format-reference.md#object-store-layout
+note: `refs -A --create` takes a ref name and not a revision, so a prefix there
+ reports `error: Cannot create alias to non-existent ref: <prefix>` in both, for a
+ unique prefix and an ambiguous one alike, and neither writes a ref. The first
+ cited test states the unique prefix and the second the ambiguous one, where the
+ alias line stands in place of the `not unique` line every revision site reports.
+ Each test holds the refs tree of its two repositories against each other at the
+ end, so the alias absent from both is part of the claim.
+
+family: M10
+subcommand: refs
+cell: refs/alias-listing-prefix-is-an-abbreviated-checksum
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::abbreviated_checksum_resolves_like_the_tool,
+ ostrya_cli::cli::ambiguous_abbreviated_checksum_is_refused_like_the_tool
+spec: format-reference.md#object-store-layout
+note: a `refs -A <prefix>` listing matches the prefix against the ref names and
+ the alias names rather than resolving it, so a prefix naming no ref and no alias
+ prints nothing at exit 0 in both, whether one commit carries the prefix or more
+ than one. Each cited test writes an alias to a ref the repository holds first, so
+ an unfiltered `refs -A` prints that alias and the empty listing under the prefix
+ states the match. The first cited test states the unique prefix and the second
+ the ambiguous one, where the empty listing stands in place of the `not unique`
+ line every revision site reports.
+
+family: M10
+subcommand: show
+cell: show/abbreviated-checksum
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::abbreviated_checksum_resolves_like_the_tool
+spec: format-reference.md#object-store-layout
+note: `show`, `log`, `ls`, `cat`, and `diff` each take an abbreviated name.
+ `show` and `log` print the resolved commit, `ls` lists its tree, and `cat
+ <prefix> /file.txt` prints the content that commit holds, identically in both.
+ `diff <prefix> <ref>`, the ref holding the resolved commit, prints nothing at
+ exit 0 in both, which states that the prefix and the ref name reached one
+ commit. One cell states the five, the resolution being one rule reached through
+ one call.
+
+family: M10
+subcommand: commit
+cell: commit/tree-ref-and-base-abbreviated
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+oracle: checksum-agreement
+evidence: ostrya_cli::cli::abbreviated_checksum_resolves_like_the_tool
+spec: format-reference.md#object-store-layout
+note: `--tree=ref=<prefix>` and `--base=<prefix>` resolve one, so the commit
+ checksum both implementations print states that each read the same committed
+ tree through the abbreviated name.
+
+family: M10
+subcommand: commit
+cell: commit/branch-name-is-an-abbreviated-checksum
+modes: archive
+setup: repo tree
+outcome: full
+severity: interop
+oracle: checksum-agreement
+evidence: ostrya_cli::cli::commit_branch_name_as_abbreviated_checksum_matches_the_tool
+spec: format-reference.md#commit
+note: item `F10a`. `commit -b NAME`, where NAME names no ref and prefixes a
+ commit the repository holds, takes that commit as the implicit parent in both,
+ so the checksum each prints is the oracle: a differing parent gives a differing
+ commit object. The branch is written to the prefix match's own name, and the
+ name still resolves to the commit it prefixes rather than to the ref, so a
+ further commit on that branch parents on the prefix match again and reproduces
+ the first one byte for byte. The cited test states both, and reads the ref file
+ as a file to tell the two apart.
+
+family: M10
+subcommand: commit
+cell: commit/branch-name-is-an-ambiguous-abbreviation
+modes: archive
+setup: repo tree
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::ambiguous_abbreviated_checksum_is_refused_like_the_tool
+spec: format-reference.md#commit
+note: `commit -b <prefix>` where the prefix names more than one commit stops at
+ the implicit parent: both report `error: Refspec <prefix> not unique` at exit 1,
+ and neither writes a ref. The cited test holds the refs tree and the loose-object
+ inventory of the run to what stood before it.

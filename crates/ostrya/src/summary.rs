@@ -446,7 +446,7 @@ impl Repo {
         collection_id: &str,
         opts: &SummaryOptions,
     ) -> Result<Checksum> {
-        let parent = self.resolve_rev(OSTREE_METADATA_REF, true).await?;
+        let parent = self.resolve_ref_tip(OSTREE_METADATA_REF).await?;
 
         let txn = self.transaction().await?;
         let dirmeta = DirMeta {

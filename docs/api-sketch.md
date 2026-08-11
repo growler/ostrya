@@ -196,11 +196,16 @@ impl Repo {
     pub async fn remove_remote_keyring(&self, remote: &str) -> Result<()>;
 
     // --- reading ---
-    /// A refspec, a 64-char lowercase checksum, or either with a trailing run
-    /// of `^`, each stepping one generation back along `parent`. A 64-char name
-    /// holding an uppercase character is a refspec.
+    /// A refspec, a 64-char lowercase checksum, an abbreviated checksum -- a
+    /// shorter run of lowercase hex naming the one commit whose checksum
+    /// starts with it -- or any of those with a trailing run of `^`, each
+    /// stepping one generation back along `parent`. A 64-char name holding
+    /// an uppercase character is a refspec.
     pub async fn resolve_rev(&self, rev: &str, allow_noent: bool)
         -> Result<Option<Checksum>>;
+    /// The ref store alone, for a caller holding a ref name rather than a
+    /// revision: no checksum syntax and no ancestry suffix.
+    pub async fn resolve_ref_tip(&self, refspec: &str) -> Result<Option<Checksum>>;
     pub async fn list_refs(&self, prefix: Option<&str>)            // refs/heads
         -> Result<Vec<(String, Checksum)>>;
     /// refs/remotes, each named by its `remote:name` refspec.

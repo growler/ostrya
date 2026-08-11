@@ -1071,11 +1071,15 @@ fn main() -> std::process::ExitCode {
 /// The text a library error reaches standard error as. A refspec the ref rule
 /// refuses is reported in the tool's own words, wherever a revision, a NEWREF,
 /// or a branch name reaches the library, so one condition has one message
-/// (`docs/format-reference.md`, "Ref name validation"). Every other error
-/// carries the library's own `Display`.
+/// (`docs/format-reference.md`, "Ref name validation"). An abbreviated checksum
+/// more than one commit carries is reported here for the same reason: it arises
+/// wherever a revision is taken, including the sites that read one through the
+/// library rather than through [`resolve`] (`docs/format-reference.md`,
+/// "Revision syntax"). Every other error carries the library's own `Display`.
 fn error_line(err: &Error) -> String {
     match err {
         Error::InvalidRefspec(refspec) => format!("Invalid refspec {refspec}"),
+        Error::AmbiguousRefspec(refspec) => format!("Refspec {refspec} not unique"),
         other => other.to_string(),
     }
 }
@@ -3619,9 +3623,17 @@ fn is_collection_id(id: &str) -> bool {
 /// bare checksum and an ancestry suffix each name a commit and no ref file, and
 /// a name no ref file can carry names no ref either, which is the answer the
 /// alias refusal reports, the way the tool reports it for `..` and for an empty
-/// target. An i/o error reaching the ref file is returned, so the caller
-/// decides whether a name that is a directory, or a path through a ref file, is
-/// a refusal or a miss.
+/// target. An abbreviated checksum -- a run of one to 63 lowercase hex
+/// characters -- is revision syntax as well, so `refs -A --create` and the
+/// `refs -A` prefix selection take the name as written and match it against no
+/// commit: a prefix the ref store carries no ref for names no ref, and an
+/// ambiguous prefix is no different from a unique one here, neither naming a
+/// ref (`docs/format-reference.md`, "Revision syntax"). An i/o error reaching
+/// the ref file is returned, so the caller decides whether a name that is a
+/// directory, or a path through a ref file, is a refusal or a miss.
+///
+/// The lookup is the ref store alone (`Repo::resolve_ref_tip`), which is what
+/// keeps the revision syntax out of this site.
 async fn resolve_ref_name(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
     // A 64-character name is a checksum in lowercase hex alone, the split
     // resolution takes, so an uppercase one is looked up as a ref name and an
@@ -3629,7 +3641,7 @@ async fn resolve_ref_name(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
     if rev.ends_with('^') || Checksum::from_hex_lower(rev).is_ok() {
         return Ok(None);
     }
-    match repo.resolve_rev(rev, true).await {
+    match repo.resolve_ref_tip(rev).await {
         Ok(found) => Ok(found),
         Err(Error::InvalidRefspec(_)) => Ok(None),
         Err(err) => Err(err),

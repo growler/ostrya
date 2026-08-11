@@ -3426,9 +3426,10 @@ assertion line precedes its `Invalid ref name (null)` where a `-c --create`
 NEWREF holds no ref name; a self-referencing symlink makes `cat` die on a
 signal; `refs --create=NEWREF`
 dies on a signal where NEWREF ends in `^` and its base names no ref; an empty
-refspec searches the ref store, so it resolves against a one-ref repository and
-reports `Refspec  not unique` against a larger one where the port refuses the
-name; a ref name that names a directory under `refs/` draws three messages from
+refspec is the zero-length case of the tool's abbreviated-checksum scan, so
+it resolves against a repository holding one commit and reports `Refspec  not
+unique` against one holding more, where the port refuses the name; a ref name
+that names a directory under `refs/` draws three messages from
 the tool, two of them naming a ref read in directory order or its own temporary
 file, where the port reports one, and the tool's `--create` scans for a ref below
 the name under `refs/heads` alone, so it replaces an empty directory, a directory
@@ -3458,7 +3459,8 @@ characters is refused by the tool wherever that ref is resolved, with `Invalid
 character '<byte>' in rev '<content>'`, where the port's reader takes either case
 and resolves it, and only an out-of-band write puts such content there, both
 implementations writing the lowercase form; an
-abbreviated commit checksum resolves anywhere a revision is taken; and a ref
+abbreviated commit checksum resolves anywhere a revision is taken, which the port
+adopted in Phase 17f as item `X1` and no longer diverges on; and a ref
 name is validated against a character class narrower than the port's, so a name
 of that shape draws `Invalid refspec <name>` from the tool wherever it is taken
 as a revision or a NEWREF and `Refspec '<name>' not found` from the port at a
@@ -3466,9 +3468,10 @@ resolution site, which is
 what `rev-parse <name>~1` and `rev-parse <name>^2` report, the tool's ref
 enumeration skips such a name without a word, so its `prune --refs-only` deletes
 the commit that ref holds, and the tool holds such a name to name no ref as an
-`-A --create` target, where the port writes the alias. The last two are
-resolution behaviors that would change every subcommand at once, so they
-belong with a phase that reviews those paths. Building the fixtures also found
+`-A --create` target, where the port writes the alias. Both were resolution
+behaviors that change every subcommand at once, so they
+belonged with a phase that reviews those paths; the ref-name character class is
+the one still open. Building the fixtures also found
 three `commit` divergences recorded under "P2": the parent `ostree commit -b
 BRANCH` takes from the branch tip, which Phase 17b1 below reproduces; the
 checksum arm of the branch-name guard leaves the tool's
@@ -3611,9 +3614,11 @@ Observed with `ostree` 2026.1, and reproduced:
   abbreviated checksum and a refspec are both rejected with `error: Invalid rev
   <value>`, an uppercase rendering with `error: Invalid character '<byte>' in rev
   '<value>'`, and the checksum's existence is not checked -- a `--parent` naming
-  no object commits successfully. The port resolves a refspec here too, which
-  stays a superset of the tool's syntax the way the leading `--repo` form is
-  (17a), so this sub-phase added `none` and narrowed nothing. A 64-character
+  no object commits successfully. The port resolves a refspec here too, and an
+  abbreviated checksum since `X1`, which stays a superset of the tool's syntax the
+  way the leading `--repo` form is (17a), so this sub-phase added `none` and
+  narrowed nothing. `--parent` is the one site where the tool refuses an
+  abbreviated checksum, resolving one everywhere else. A 64-character
   uppercase value is a refspec to the port, by the case rule 17b landed, and
   `NONE` is one for the same reason, so both refuse either value and word the
   refusal differently (`cli-surface.md`, "P2").
@@ -4281,6 +4286,44 @@ term of the signing step's fault order, observable only over a name both ref-nam
 grammars refuse; and the name-dependent order the tool stores some
 detached-metadata key sets in. The conformance run reports 646 cells and 256
 passes.
+
+`X1` and `F10a` land abbreviated checksum resolution. A revision of one to 63
+lowercase hex characters names the one commit object whose checksum starts with
+it, wherever a revision is taken, which is the last of the two cross-cutting
+resolution behaviors "P1" recorded and the larger of the two: it reaches every
+subcommand through one call. `Repo::resolve_rev` gained the scan
+(`crates/ostrya/src/refs.rs`), and it stands between the full-checksum parse and
+the ref store, so a name the ref store carries resolves to the commit it prefixes
+rather than to that ref's target. The match set holds commit objects alone, more
+than one match is `Error::AmbiguousRefspec`, which the CLI words `Refspec <rev>
+not unique` in `error_line` so every site reporting it reports it identically, and
+no match falls through to the ref store, which is what keeps a hex name an
+ordinary ref name until a commit begins with it. Ambiguity is an error whatever
+`allow_noent` says, as walking past a root commit already was.
+
+`Repo::resolve_ref_tip` came with it: the ref-store lookup on its own, for a
+caller that holds a ref name rather than a revision -- a pull's local tip in
+`pull/delta.rs` and `pull/http.rs`, and the metadata ref
+`summary.rs` chains. Those read a ref, so the revision parse is the wrong reader
+for them, and the split keeps the new behavior inside the revision syntax. It is
+public API, the CLI reading the alias target of `refs -A --create` through it: an
+alias records a name, so a prefix there names no ref and is refused with `Cannot
+create alias to non-existent ref: <prefix>`, whether one commit carries the
+prefix or more than one. A `refs -A` listing reads the same lookup for its
+`PREFIX`, which it matches against the ref names and the alias names, so a prefix
+naming neither prints nothing at exit 0 under either count.
+
+`F10a` is the consequence at `commit -b`: the implicit parent is what the branch
+name resolves to, so a name prefixing a commit and naming no ref parents the new
+commit on that commit in both implementations, where the port wrote a root commit
+before. A further commit on that branch parents on the prefix match again rather
+than on the tip the ref file now holds, so it reproduces the first commit byte for
+byte, which is the oracle that tells the two parents apart. The rule and its
+sites are in `format-reference.md`, "Revision syntax"; `cli-surface.md`, "P1"
+records the resolution as shared and no longer as a divergence, and the
+`--parent` divergence there widened, the tool refusing at that one site the
+abbreviated checksum it resolves everywhere else. The conformance run reports 659
+cells and 257 passes.
 
 `commit -e` settles the message before it takes any repository lock. The
 `[core]` keys the transaction reads -- `locking`, `lock-timeout-secs`,

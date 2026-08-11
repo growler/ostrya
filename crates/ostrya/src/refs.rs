@@ -8,9 +8,11 @@
 //! checksum. Refspec components are validated to keep resolution inside the
 //! `refs/` tree.
 //!
-//! A revision string is a refspec, a 64-char hex checksum, or either of those
-//! followed by one or more `^` characters, each of which steps one generation
-//! back along the commit's `parent` field.
+//! A revision string is a refspec, a 64-char lowercase hex checksum, an
+//! abbreviated checksum -- a shorter run of lowercase hex naming the one commit
+//! object whose checksum starts with it -- or any of those followed by one or
+//! more `^` characters, each of which steps one generation back along the
+//! commit's `parent` field.
 //!
 //! Writes are individually atomic -- a fresh file written, `fdatasync`-ed when
 //! fsync is enabled, and renamed over the target, with the parent directories
@@ -163,12 +165,14 @@ const REF_READ_CAP: u64 = 4096;
 
 impl Repo {
     /// Resolve a revision string to a commit id. A 64-char lowercase hex string
-    /// resolves to itself; anything else is a refspec. A trailing run of `^` characters
-    /// steps that many generations back along the resolved commit's `parent`
-    /// field. When the refspec names no ref, `allow_noent` chooses between
-    /// `Ok(None)` and [`Error::RefNotFound`]; walking past a root commit is
-    /// [`Error::NoParentCommit`] whatever `allow_noent` says, since the ref
-    /// itself resolved.
+    /// resolves to itself; a shorter run of lowercase hex resolves to the one
+    /// commit object whose checksum it prefixes; anything else is a refspec. A
+    /// trailing run of `^` characters steps that many generations back along the
+    /// resolved commit's `parent` field. When the refspec names no ref,
+    /// `allow_noent` chooses between `Ok(None)` and [`Error::RefNotFound`];
+    /// walking past a root commit is [`Error::NoParentCommit`] and a prefix more
+    /// than one commit carries is [`Error::AmbiguousRefspec`] whatever
+    /// `allow_noent` says, since neither is an absent name.
     pub async fn resolve_rev(&self, rev: &str, allow_noent: bool) -> Result<Option<Checksum>> {
         let (base, generations) = split_ancestry(rev);
         let Some(mut checksum) = self.resolve_base_rev(base, allow_noent).await? else {
@@ -181,26 +185,55 @@ impl Repo {
         Ok(Some(checksum))
     }
 
-    /// Resolve a revision with no ancestry suffix: a bare checksum or a
-    /// refspec.
+    /// Resolve a revision with no ancestry suffix: a bare checksum, an
+    /// abbreviated checksum, or a refspec, tried in that order.
     ///
     /// A 64-character name is a checksum in lowercase hex alone, so an
     /// uppercase or mixed-case name of that length is read as a refspec
     /// (`docs/format-reference.md`, "Revision syntax"). The checksum parser
     /// keeps its tolerance where a checksum is read as stored bytes, which is
     /// ref file content and delta metadata.
+    ///
+    /// A shorter run of lowercase hex is an abbreviated checksum, and it stands
+    /// ahead of the ref store: a name the store carries as a ref resolves to the
+    /// commit it prefixes rather than to that ref's target. A prefix no commit
+    /// object carries falls through to the ref store, so a hex name is a ref
+    /// name for as long as no commit begins with it.
     async fn resolve_base_rev(&self, rev: &str, allow_noent: bool) -> Result<Option<Checksum>> {
         if let Ok(checksum) = Checksum::from_hex_lower(rev) {
             return Ok(Some(checksum));
         }
 
-        let relpath = refspec_to_relpath(rev)?;
+        if is_abbreviated_checksum(rev) {
+            let repo = self.clone();
+            let prefix = rev.to_owned();
+            match ostrya_rt::unblock(move || match_abbreviated(repo.objects_fd(), &prefix)).await? {
+                AbbrevMatch::One(checksum) => return Ok(Some(checksum)),
+                AbbrevMatch::Ambiguous => return Err(Error::AmbiguousRefspec(rev.to_owned())),
+                AbbrevMatch::None => {}
+            }
+        }
+
+        match self.resolve_ref_tip(rev).await? {
+            Some(checksum) => Ok(Some(checksum)),
+            None if allow_noent => Ok(None),
+            None => Err(Error::RefNotFound(rev.to_owned())),
+        }
+    }
+
+    /// The commit a refspec names, reading the ref store alone: no checksum
+    /// syntax, no abbreviated checksum, and no ancestry suffix. This is the
+    /// ref-store read for a caller that holds a ref name rather than a
+    /// revision -- a pull's local tip, the metadata ref a summary chains, and
+    /// the CLI's alias-target check, an alias recording a name. `None` says the
+    /// store carries no such ref.
+    pub async fn resolve_ref_tip(&self, refspec: &str) -> Result<Option<Checksum>> {
+        let relpath = refspec_to_relpath(refspec)?;
         let repo = self.clone();
         let bytes = ostrya_rt::unblock(move || read_ref_file(repo.repo_fd(), &relpath)).await?;
         match bytes {
             Some(bytes) => Ok(Some(parse_ref_content(&bytes)?)),
-            None if allow_noent => Ok(None),
-            None => Err(Error::RefNotFound(rev.to_owned())),
+            None => Ok(None),
         }
     }
 
@@ -321,6 +354,108 @@ impl Repo {
 fn split_ancestry(rev: &str) -> (&str, usize) {
     let base = rev.trim_end_matches('^');
     (base, rev.len() - base.len())
+}
+
+/// Whether a revision names a commit by an abbreviated checksum: a run of one
+/// to 63 lowercase hex characters. A 64-character run is the checksum itself,
+/// and one uppercase character makes the name a refspec, the case rule a full
+/// checksum carries (`docs/format-reference.md`, "Revision syntax").
+fn is_abbreviated_checksum(rev: &str) -> bool {
+    !rev.is_empty()
+        && rev.len() < 64
+        && rev
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// What an abbreviated checksum matched among the commit objects present.
+enum AbbrevMatch {
+    /// No commit object's checksum starts with the prefix.
+    None,
+    /// Exactly one does.
+    One(Checksum),
+    /// More than one does.
+    Ambiguous,
+}
+
+/// Scan the loose commit objects for the ones whose checksum starts with
+/// `prefix`.
+///
+/// The match set holds commit objects alone: a `dirtree`, a `dirmeta`, or a file
+/// object sharing the prefix takes no part, and a prefix only such an object
+/// carries matches nothing. The `objects/<xx>/` fanout carries the first two
+/// characters of a checksum. A prefix of two or more characters names one
+/// fanout with its first two characters, and that directory is opened by name.
+/// A one-character prefix scans the sixteen fanouts whose name starts with it,
+/// found by listing `objects/`.
+fn match_abbreviated(objects_fd: BorrowedFd<'_>, prefix: &str) -> Result<AbbrevMatch> {
+    let mut found: Option<Checksum> = None;
+    if prefix.len() >= 2 {
+        let (fanout, within) = prefix.split_at(2);
+        if scan_fanout(objects_fd, fanout, within, &mut found)? {
+            return Ok(AbbrevMatch::Ambiguous);
+        }
+    } else {
+        for fanout in read_dir_names(objects_fd)? {
+            // Object fanout directories are exactly two hex characters; anything
+            // else under `objects/` is not a loose-object fanout.
+            if fanout.len() != 2 || !fanout.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            if !fanout.starts_with(prefix) {
+                continue;
+            }
+            if scan_fanout(objects_fd, &fanout, "", &mut found)? {
+                return Ok(AbbrevMatch::Ambiguous);
+            }
+        }
+    }
+    Ok(match found {
+        Some(checksum) => AbbrevMatch::One(checksum),
+        None => AbbrevMatch::None,
+    })
+}
+
+/// Scan one `objects/<fanout>/` directory for the commit objects whose name
+/// starts with `within`, recording each in `found`. An absent fanout directory
+/// holds no match. The returned flag reports the prefix ambiguous.
+fn scan_fanout(
+    objects_fd: BorrowedFd<'_>,
+    fanout: &str,
+    within: &str,
+    found: &mut Option<Checksum>,
+) -> Result<bool> {
+    let dir = match rustix::fs::openat(
+        objects_fd,
+        fanout,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(false),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    for entry in read_dir_names(dir.as_fd())? {
+        let Some(checksum) = matching_commit(fanout, &entry, within) else {
+            continue;
+        };
+        // The fanout carries a checksum's first two characters, so two entries
+        // are two commits and a second match is ambiguity.
+        if found.replace(checksum).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The checksum of one `objects/<fanout>/<rest>.commit` entry whose name starts
+/// with `within`, or `None` for any other entry.
+fn matching_commit(fanout: &str, entry: &str, within: &str) -> Option<Checksum> {
+    let (rest, ext) = entry.rsplit_once('.')?;
+    if ext != "commit" || rest.len() != 62 || !rest.starts_with(within) {
+        return None;
+    }
+    Checksum::from_hex_lower(&format!("{fanout}{rest}")).ok()
 }
 
 /// The symlink body an alias at `from_relpath` needs to point at

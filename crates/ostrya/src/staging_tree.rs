@@ -28,6 +28,31 @@
 //! final component; objects load from the transaction's staged set before
 //! `objects/`, so content staged in the current transaction is visible before it
 //! publishes.
+//!
+//! Refusals. Each condition carries its own [`Error`] variant naming the path
+//! resolution stopped at, so a caller branches on the variant:
+//! [`PathNotFound`](Error::PathNotFound),
+//! [`NotADirectory`](Error::NotADirectory),
+//! [`DanglingSymlink`](Error::DanglingSymlink),
+//! [`SymlinkLoop`](Error::SymlinkLoop), and
+//! [`EntryExists`](Error::EntryExists).
+//! [`Staging`](Error::Staging) carries what none of those names. Every typed
+//! refusal the staging tree raises reports one path form: the resolved literal
+//! component path, unrooted, with the tree root spelled `.`. A path that
+//! crosses a symlink reports the target's components, so a write under
+//! `opt -> usr/opt` reports `usr/opt`. An absent component reached while a
+//! symlink's target components are still queued reports
+//! [`DanglingSymlink`](Error::DanglingSymlink) for the innermost such symlink;
+//! once a target is spent, an absent component reports
+//! [`PathNotFound`](Error::PathNotFound). A `Staging` condition raised before
+//! resolution begins -- a path with no final component, a path ending in `..`,
+//! a path component that is not UTF-8 -- reports the path as the caller gave
+//! it, because no resolved form exists. A symlink target that is not UTF-8
+//! names no path. A directory in the way of a write reports
+//! [`ReplaceDirWithFile`](Error::ReplaceDirWithFile), whichever moment the
+//! directory appeared at; that variant names the entry rather than the
+//! resolved path, because the mutable-tree layer raises it, and it is the one
+//! carve-out from the path form.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -62,8 +87,15 @@ enum Comp {
 enum WalkEnd {
     /// A directory at the given literal component path (all loaded directories).
     Dir(Vec<String>),
-    /// A file or symlink leaf, with its entry name and content checksum.
-    Leaf { name: String, checksum: Checksum },
+    /// A file or symlink leaf, with the literal component path of its parent,
+    /// its entry name, and its content checksum. The parent path and the name
+    /// are what a refusal names, so a message reports where resolution actually
+    /// ended rather than the path the caller passed.
+    Leaf {
+        parent: Vec<String>,
+        name: String,
+        checksum: Checksum,
+    },
 }
 
 /// Options for [`StagingTree::merge`].
@@ -171,10 +203,11 @@ impl<'txn> StagingTree<'txn> {
     /// A streaming writer for one regular-file payload at `path`. The parent
     /// directory must exist (intermediate components resolve through symlinks);
     /// the final component never follows a symlink. Replaces an existing file or
-    /// symlink; fails on a directory.
+    /// symlink; a directory at `path` is refused with
+    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
     pub async fn write_file(&self, path: &Path, meta: &FileMeta) -> Result<StagedFileWriter<'txn>> {
         let (parent, name) = self.resolve_parent(path).await?;
-        self.check_writable_leaf(path, &parent, &name)?;
+        self.check_writable_leaf(&parent, &name)?;
         let writer = self.txn.content_writer(None, meta).await?;
         self.writers.fetch_add(1, Ordering::AcqRel);
         Ok(StagedFileWriter {
@@ -187,6 +220,8 @@ impl<'txn> StagingTree<'txn> {
     }
 
     /// Write a regular file at `path` whose content the caller already holds.
+    /// Replaces an existing file or symlink; a directory at `path` is refused
+    /// with [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
     pub async fn write_file_content(
         &self,
         path: &Path,
@@ -194,7 +229,7 @@ impl<'txn> StagingTree<'txn> {
         content: &[u8],
     ) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
-        self.check_writable_leaf(path, &parent, &name)?;
+        self.check_writable_leaf(&parent, &name)?;
         let checksum = self.txn.write_regfile_inline(None, meta, content).await?;
         self.with_dir_mut(&parent, |dir| dir.replace_file(&name, checksum))
     }
@@ -204,18 +239,12 @@ impl<'txn> StagingTree<'txn> {
     pub async fn make_dir(&self, path: &Path, meta: &DirMeta) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
         if !matches!(self.peek(&parent, &name)?, ChildKind::Absent) {
-            return Err(Error::Staging(format!(
-                "cannot create directory {}: an entry already exists there",
-                path.display()
-            )));
+            return Err(entry_exists(&parent, &name));
         }
         let dirmeta = self.stage_dirmeta(meta).await?;
         self.with_dir_mut(&parent, |dir| {
             if !matches!(dir.child_kind(&name), ChildKind::Absent) {
-                return Err(Error::Staging(format!(
-                    "cannot create directory {}: an entry already exists there",
-                    path.display()
-                )));
+                return Err(entry_exists(&parent, &name));
             }
             dir.insert_empty_dir(&name, Some(dirmeta));
             Ok(())
@@ -259,10 +288,9 @@ impl<'txn> StagingTree<'txn> {
                             // still absent, and reject a non-directory in the way.
                             ChildKind::Absent => dir.insert_empty_dir(&name, Some(dm)),
                             ChildKind::File(_) => {
-                                return Err(Error::Staging(format!(
-                                    "cannot create directory {}: {name:?} is a file",
-                                    path.display()
-                                )));
+                                return Err(Error::NotADirectory {
+                                    path: join(&cur, &name),
+                                });
                             }
                             ChildKind::Dir | ChildKind::LazyDir { .. } => {}
                         }
@@ -279,10 +307,9 @@ impl<'txn> StagingTree<'txn> {
                             cur = self.resolve_symlink_dir(&cur, &target).await?;
                         }
                         FileKind::Regular { .. } => {
-                            return Err(Error::Staging(format!(
-                                "cannot create directory {}: {name:?} is a file",
-                                path.display()
-                            )));
+                            return Err(Error::NotADirectory {
+                                path: join(&cur, &name),
+                            });
                         }
                     }
                 }
@@ -297,10 +324,7 @@ impl<'txn> StagingTree<'txn> {
     pub async fn symlink(&self, path: &Path, target: &Path, meta: &FileMeta) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
         if !matches!(self.peek(&parent, &name)?, ChildKind::Absent) {
-            return Err(Error::Staging(format!(
-                "cannot create symlink {}: an entry already exists there",
-                path.display()
-            )));
+            return Err(entry_exists(&parent, &name));
         }
         let target = target
             .to_str()
@@ -308,10 +332,7 @@ impl<'txn> StagingTree<'txn> {
         let checksum = self.txn.write_symlink(target, meta, None).await?;
         self.with_dir_mut(&parent, |dir| {
             if !matches!(dir.child_kind(&name), ChildKind::Absent) {
-                return Err(Error::Staging(format!(
-                    "cannot create symlink {}: an entry already exists there",
-                    path.display()
-                )));
+                return Err(entry_exists(&parent, &name));
             }
             dir.replace_file(&name, checksum)
         })
@@ -327,20 +348,17 @@ impl<'txn> StagingTree<'txn> {
             .await?
         {
             WalkEnd::Leaf { checksum, .. } => checksum,
-            WalkEnd::Dir(_) => {
+            WalkEnd::Dir(dir) => {
                 return Err(Error::Staging(format!(
-                    "cannot hardlink from {}: the target is a directory",
-                    target.display()
+                    "cannot hardlink from {}: the source is a directory",
+                    spell_path(&dir)
                 )));
             }
         };
         let (parent, name) = self.resolve_parent(path).await?;
         self.with_dir_mut(&parent, |dir| {
             if !matches!(dir.child_kind(&name), ChildKind::Absent) {
-                return Err(Error::Staging(format!(
-                    "cannot hardlink {}: an entry already exists there",
-                    path.display()
-                )));
+                return Err(entry_exists(&parent, &name));
             }
             dir.replace_file(&name, checksum)
         })
@@ -357,9 +375,9 @@ impl<'txn> StagingTree<'txn> {
             .await?
         {
             WalkEnd::Leaf { checksum, .. } => self.txn.load_file_staged_first(&checksum).await,
-            WalkEnd::Dir(_) => Err(Error::Staging(format!(
+            WalkEnd::Dir(dir) => Err(Error::Staging(format!(
                 "{} is a directory, not a file",
-                path.display()
+                spell_path(&dir)
             ))),
         }
     }
@@ -373,8 +391,12 @@ impl<'txn> StagingTree<'txn> {
             .await?
         {
             WalkEnd::Dir(p) => p,
-            WalkEnd::Leaf { name, .. } => {
-                return Err(Error::Staging(format!("{name:?} is not a directory")));
+            WalkEnd::Leaf {
+                parent: dir, name, ..
+            } => {
+                return Err(Error::NotADirectory {
+                    path: join(&dir, &name),
+                });
             }
         };
         self.with_dir(&dir_path, |dir| {
@@ -413,12 +435,11 @@ impl<'txn> StagingTree<'txn> {
 
     /// Fail if a write to a leaf at `parent/name` would clobber a directory. A
     /// file or symlink is replaced; an absent entry is created.
-    fn check_writable_leaf(&self, path: &Path, parent: &[String], name: &str) -> Result<()> {
+    fn check_writable_leaf(&self, parent: &[String], name: &str) -> Result<()> {
         match self.peek(parent, name)? {
-            ChildKind::Dir | ChildKind::LazyDir { .. } => Err(Error::Staging(format!(
-                "cannot write file {}: a directory exists at that path",
-                path.display()
-            ))),
+            ChildKind::Dir | ChildKind::LazyDir { .. } => {
+                Err(Error::ReplaceDirWithFile(name.to_owned()))
+            }
             _ => Ok(()),
         }
     }
@@ -438,11 +459,12 @@ impl<'txn> StagingTree<'txn> {
         };
         let parent = match self.walk_from(Vec::new(), init.to_vec(), true).await? {
             WalkEnd::Dir(dir) => dir,
-            WalkEnd::Leaf { .. } => {
-                return Err(Error::Staging(format!(
-                    "cannot resolve {}: a parent component is not a directory",
-                    path.display()
-                )));
+            WalkEnd::Leaf {
+                parent: dir, name, ..
+            } => {
+                return Err(Error::NotADirectory {
+                    path: join(&dir, &name),
+                });
             }
         };
         Ok((parent, name))
@@ -454,9 +476,11 @@ impl<'txn> StagingTree<'txn> {
         let start = if absolute { Vec::new() } else { base.to_vec() };
         match self.walk_from(start, comps, true).await? {
             WalkEnd::Dir(dir) => Ok(dir),
-            WalkEnd::Leaf { name, .. } => Err(Error::Staging(format!(
-                "symlink target {target:?} resolves to the file {name:?}, not a directory"
-            ))),
+            WalkEnd::Leaf {
+                parent: dir, name, ..
+            } => Err(Error::NotADirectory {
+                path: join(&dir, &name),
+            }),
         }
     }
 
@@ -472,9 +496,22 @@ impl<'txn> StagingTree<'txn> {
         let mut cur = start;
         let mut pending: VecDeque<Comp> = comps.into();
         let mut symlink_depth = 0usize;
-        let mut last_symlink: Option<(String, String)> = None;
+        // Each entry is a symlink whose target components are still being
+        // consumed: its path, its target, and the pending length the walk returns
+        // to once the target is spent. A failure belongs to the innermost open
+        // entry.
+        let mut open_symlinks: Vec<(String, String, usize)> = Vec::new();
 
         while let Some(comp) = pending.pop_front() {
+            // Drop every symlink whose target is spent: the walk is back on the
+            // caller's own components, so an absent entry is not a dangling
+            // target.
+            while open_symlinks
+                .last()
+                .is_some_and(|(_, _, mark)| pending.len() < *mark)
+            {
+                open_symlinks.pop();
+            }
             let is_final = pending.is_empty();
             let name = match comp {
                 Comp::Parent => {
@@ -486,15 +523,14 @@ impl<'txn> StagingTree<'txn> {
 
             match self.peek(&cur, &name)? {
                 ChildKind::Absent => {
-                    return Err(match &last_symlink {
-                        Some((symlink, target)) => Error::Staging(format!(
-                            "dangling symlink {symlink} -> {target}: no entry {name:?} under /{}",
-                            cur.join("/")
-                        )),
-                        None => Error::Staging(format!(
-                            "path not found: no entry {name:?} under /{}",
-                            cur.join("/")
-                        )),
+                    return Err(match open_symlinks.last() {
+                        Some((path, target, _)) => Error::DanglingSymlink {
+                            path: path.clone(),
+                            target: target.clone(),
+                        },
+                        None => Error::PathNotFound {
+                            path: join(&cur, &name),
+                        },
                     });
                 }
                 ChildKind::Dir | ChildKind::LazyDir { .. } => {
@@ -503,21 +539,27 @@ impl<'txn> StagingTree<'txn> {
                 }
                 ChildKind::File(checksum) => {
                     if is_final && !follow_final {
-                        return Ok(WalkEnd::Leaf { name, checksum });
+                        return Ok(WalkEnd::Leaf {
+                            parent: cur,
+                            name,
+                            checksum,
+                        });
                     }
                     let obj = self.txn.load_file_staged_first(&checksum).await?;
                     match obj.kind {
                         FileKind::Symlink { target } => {
                             symlink_depth += 1;
                             if symlink_depth > MAX_SYMLINK_DEPTH {
-                                return Err(Error::Staging(format!(
-                                    "symlink chain too deep (possible loop) resolving {name:?} \
-                                     under /{}",
-                                    cur.join("/")
-                                )));
+                                return Err(Error::SymlinkLoop {
+                                    path: join(&cur, &name),
+                                });
                             }
-                            last_symlink = Some((join(&cur, &name), target.clone()));
                             let (absolute, target_comps) = split_target(&target)?;
+                            // The mark is the count of the components queued
+                            // behind this target: the caller's own, plus any
+                            // outer symlink's target remainder.
+                            let mark = pending.len();
+                            open_symlinks.push((join(&cur, &name), target.clone(), mark));
                             if absolute {
                                 cur.clear();
                             }
@@ -527,12 +569,15 @@ impl<'txn> StagingTree<'txn> {
                         }
                         FileKind::Regular { .. } => {
                             if is_final {
-                                return Ok(WalkEnd::Leaf { name, checksum });
+                                return Ok(WalkEnd::Leaf {
+                                    parent: cur,
+                                    name,
+                                    checksum,
+                                });
                             }
-                            return Err(Error::Staging(format!(
-                                "not a directory: {name:?} under /{} is a regular file",
-                                cur.join("/")
-                            )));
+                            return Err(Error::NotADirectory {
+                                path: join(&cur, &name),
+                            });
                         }
                     }
                 }
@@ -557,7 +602,10 @@ impl<'txn> StagingTree<'txn> {
                 ChildKind::Dir => return Ok(()),
                 ChildKind::LazyDir { dirtree, dirmeta } => {
                     let repo = repo.ok_or_else(|| {
-                        Error::Staging(format!("cannot hydrate {name:?}: no repository handle"))
+                        Error::Staging(format!(
+                            "cannot hydrate {}: no repository handle",
+                            join(path, name)
+                        ))
                     })?;
                     let loaded = MutableTree::hydrate(&repo, dirtree, dirmeta).await?;
                     let mut tree = self.tree.lock().unwrap();
@@ -569,16 +617,14 @@ impl<'txn> StagingTree<'txn> {
                     // Loop to re-read; the child is a loaded directory now.
                 }
                 ChildKind::File(_) => {
-                    return Err(Error::Staging(format!(
-                        "not a directory: {name:?} under /{}",
-                        path.join("/")
-                    )));
+                    return Err(Error::NotADirectory {
+                        path: join(path, name),
+                    });
                 }
                 ChildKind::Absent => {
-                    return Err(Error::Staging(format!(
-                        "path not found: no entry {name:?} under /{}",
-                        path.join("/")
-                    )));
+                    return Err(Error::PathNotFound {
+                        path: join(path, name),
+                    });
                 }
             }
         }
@@ -720,8 +766,8 @@ fn merge_into<'a>(
                 Some(left) if left == right_dm => {}
                 Some(_) if !opts.allow_overwrite => {
                     return Err(Error::MergeConflict(format!(
-                        "directory metadata differs at /{}",
-                        left_path.join("/")
+                        "directory metadata differs at {}",
+                        spell_path(&left_path)
                     )));
                 }
                 _ => {
@@ -744,7 +790,7 @@ fn merge_into<'a>(
                 ChildKind::File(_) => {
                     if !opts.allow_overwrite {
                         return Err(Error::MergeConflict(format!(
-                            "file differs at /{}",
+                            "file differs at {}",
                             join(&left_path, &name)
                         )));
                     }
@@ -753,7 +799,7 @@ fn merge_into<'a>(
                 ChildKind::Dir | ChildKind::LazyDir { .. } => {
                     if !opts.allow_overwrite {
                         return Err(Error::MergeConflict(format!(
-                            "a file cannot overwrite the directory at /{}",
+                            "a file cannot overwrite the directory at {}",
                             join(&left_path, &name)
                         )));
                     }
@@ -793,7 +839,7 @@ fn merge_into<'a>(
                     }
                     if !opts.allow_overwrite {
                         return Err(Error::MergeConflict(format!(
-                            "a directory cannot overwrite the file at /{}",
+                            "a directory cannot overwrite the file at {}",
                             join(&left_path, &name)
                         )));
                     }
@@ -829,7 +875,8 @@ pub struct StagedFileWriter<'txn> {
 
 impl StagedFileWriter<'_> {
     /// Complete the content object and record it at the path. Releases the
-    /// writer slot on every path.
+    /// writer slot on every path. A directory at the path is refused with
+    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
     pub async fn finish(mut self) -> Result<()> {
         let writer = self.writer.take().expect("writer present until finish");
         let outcome = match writer.finish().await {
@@ -939,9 +986,26 @@ fn join(path: &[String], name: &str) -> String {
     }
 }
 
+/// A whole component path spelled for a message. The tree root has no
+/// components, so it spells as `.`.
+fn spell_path(path: &[String]) -> String {
+    if path.is_empty() {
+        ".".to_owned()
+    } else {
+        path.join("/")
+    }
+}
+
 /// The message for a directory that is no longer present under the lock.
 fn dir_gone(path: &[String]) -> String {
-    format!("directory /{} is no longer present", path.join("/"))
+    format!("directory {} is no longer present", spell_path(path))
+}
+
+/// The refusal for an operation that requires a fresh entry at `parent/name`.
+fn entry_exists(parent: &[String], name: &str) -> Error {
+    Error::EntryExists {
+        path: join(parent, name),
+    }
 }
 
 /// The new staging-tree types move freely across tasks and threads.

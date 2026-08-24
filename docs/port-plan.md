@@ -4394,6 +4394,60 @@ config parsing, bootloader integration, `admin` subcommands. This is the
 heaviest cluster (root, mount namespaces, bootloaders) and unlocks the ~25%
 admin tests. Recommend deferring or descoping unless explicitly required.
 
+### Phase 21 -- Library API for the debles migration
+
+The library changes debles needs before it can replace libostree with ostrya.
+debles is an out-of-tree consumer that builds Debian OSTree images; its demand
+side is `ostrya-gaps.md` in that project. The detailed plan is
+`ostrya-debles-api-improvements.md` in this repository: the measured
+conditions, the decisions taken, and the public surface each deliverable adds.
+This section is the roadmap entry for it.
+
+Each deliverable is reviewed before the next begins. No deliverable adds a
+crate to any manifest, and `api-sketch.md` is updated in the same change as
+each. Three public breaks are deliberate and recorded in the plan:
+`Content::Backed`'s `verity` field becomes an `Option`,
+`Repo::export_composefs` gains a parameter, and `MergeOptions` gains a field.
+
+Execution order, three independent chains:
+
+```
+D5 -> D1 -> D2 -> D3a -> D3b -> D3c -> D4   (chained on staging_tree.rs)
+D7a -> D8 -> D7b                            (chained on the composefs crates)
+D6 -> D9                                    (independent of both chains)
+```
+
+D5 leads because it re-types errors on code paths that already exist, so every
+later deliverable writes its tests against the final variants. The composefs
+chain runs library-first, and D7b is its single CLI deliverable, which puts the
+whole chain's conformance gate in one place. D9 follows D6 because
+`insert_bootable` is a method on the builder D6 introduces.
+
+Deliverables, one line each; `ostrya-debles-api-improvements.md` carries each
+deliverable's full surface and Verify list:
+
+- `D5` -- structured staging errors (DONE): `PathNotFound`, `NotADirectory`,
+  `DanglingSymlink`, `SymlinkLoop`, and `EntryExists`, each with an
+  `std::io::Error` mapping; `Error::Staging` keeps the residue.
+- `D1` -- `lookup`, `ensure_dir`, and `place_object`, plus replace semantics
+  on `symlink` and `hardlink`.
+- `D2` -- `with_implied_dirmeta`: the six write operations create absent
+  ancestors under one dirmeta.
+- `D3a` -- the writer registry: structural changes fail only under a live
+  writer's path.
+- `D3b` -- `remove` and `clear_dir`, path-addressed and guarded.
+- `D3c` -- `rename`, which moves a node with its subtree and its dirmeta.
+- `D4` -- `merge_at` and `RootDirmeta` on `MergeOptions`.
+- `D7a` -- `VerityPolicy` and `ComposefsOptions`.
+- `D8` -- `write_image_to` and `Repo::export_composefs_to`, streaming the
+  image through the caller's sink.
+- `D7b` -- `checkout --composefs-noverity` and the destination-fd rewiring,
+  with their cells.
+- `D6` -- `DictBuilder`, the `loose_path` re-export, and a public
+  `Transaction::write_dirmeta`.
+- `D9` -- `kernel_version`, `BootableRefusal`, and
+  `DictBuilder::insert_bootable`.
+
 ## Risk register
 
 - composefs/EROFS byte-exactness (Phase 9): the EROFS and composefs on-disk

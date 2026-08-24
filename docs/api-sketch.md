@@ -84,9 +84,33 @@ pub enum Error {
     ChecksumMismatch { expected: Checksum, actual: Checksum },
     InsufficientFreeSpace { shortfall: u64 },
     Signature(String),
+    // The path-resolution conditions, each naming the path it refused. A
+    // consumer branches on the variant; `Staging` carries the residue.
+    PathNotFound { path: String },
+    NotADirectory { path: String },
+    DanglingSymlink { path: String, target: String },
+    SymlinkLoop { path: String },
+    EntryExists { path: String },
+    Staging(String),
+    MergeConflict(String),
     // ... one variant per class of refusal the library reports
 }
+
+/// Map an error onto the closest `std::io::ErrorKind`, keeping the error as
+/// the payload so its `Display` and its source chain survive.
+impl From<Error> for std::io::Error;
 ```
+
+The `io::ErrorKind` an error converts to:
+
+- `NotFound`: `PathNotFound`, `DanglingSymlink`, `ObjectNotFound`,
+  `RefNotFound`.
+- `NotADirectory`: `NotADirectory`, `ReplaceFileWithDir`.
+- `AlreadyExists`: `EntryExists`, `MergeConflict`, `ReplaceDirWithFile`.
+- `InvalidInput`: `MutableTree`.
+- The inner error itself: `Io`.
+- `Other`: everything else, `SymlinkLoop` included, since
+  `ErrorKind::FilesystemLoop` is unstable.
 
 ## GVariant types and values (`ostrya-gvariant`)
 
@@ -772,6 +796,32 @@ or symlink entry and fail on a directory; `make_dir`, `symlink`, and
 `hardlink` fail on any existing entry; `make_dir_all` applies its
 `DirMeta` to the directories it creates and leaves existing ones
 untouched.
+
+Each refusal carries its own `Error` variant naming the path resolution
+stopped at, so a consumer branches on the condition: `PathNotFound` for
+an absent component, `NotADirectory` for a file or a resolved symlink
+where a directory was required, `DanglingSymlink` and `SymlinkLoop`
+from the walker, and `EntryExists` where an operation requires a fresh
+entry. Every typed refusal the staging tree raises reports one path
+form: the resolved literal component path, unrooted, with the tree root
+spelled `.`. A path that crosses a symlink reports the target's
+components, so a write under `opt -> usr/opt` reports `usr/opt`. An
+absent component reached while a symlink's target components are still
+queued reports `DanglingSymlink` for the innermost such symlink; once a
+target is spent, an absent component reports `PathNotFound`.
+`Staging` carries the conditions none of those names: the
+outstanding-writer refusal from `close`, a read of a directory where a
+file was wanted, a `hardlink` whose source resolves to a directory, a
+directory a concurrent operation removed under the lock, a path with no
+final component or one ending in `..`, a non-UTF-8 path component or
+symlink target, and a hydration with no repository handle. A `Staging`
+condition raised before resolution begins reports the path as the
+caller gave it, because no resolved form exists. A symlink target that
+is not UTF-8 names no path. A directory in the way of a write reports
+`ReplaceDirWithFile`, whichever moment the directory appeared at; the
+variant names the entry rather than the resolved path, because the
+mutable-tree layer raises it, and it is the one carve-out from the path
+form.
 
 ## Checkout options
 

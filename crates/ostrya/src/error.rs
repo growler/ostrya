@@ -85,9 +85,47 @@ pub enum Error {
     /// the overlay must be mounted with that feature disabled.
     #[error("unsupported overlay feature: {0}")]
     UnsupportedOverlayFeature(String),
-    /// A staging-tree path could not be resolved: a missing component, a
-    /// non-directory where a directory was expected, an existing entry where a
-    /// fresh one was required, or a dangling or looping symlink.
+    /// A path names a component that is not present.
+    #[error("path not found: {path}")]
+    PathNotFound {
+        /// The path of the component that is absent.
+        path: String,
+    },
+    /// A path component that had to be a directory is a file, or a symlink
+    /// resolved to one.
+    #[error("not a directory: {path}")]
+    NotADirectory {
+        /// The path of the component that is not a directory.
+        path: String,
+    },
+    /// A symlink's target does not resolve.
+    #[error("dangling symlink: {path} -> {target}")]
+    DanglingSymlink {
+        /// The path of the symlink.
+        path: String,
+        /// The target it names.
+        target: String,
+    },
+    /// A path resolution followed more symlinks than the depth cap allows.
+    #[error("symlink chain too deep (possible loop): {path}")]
+    SymlinkLoop {
+        /// The path of the symlink the walk gave up on.
+        path: String,
+    },
+    /// An operation that requires a fresh entry found one already there.
+    #[error("entry already exists: {path}")]
+    EntryExists {
+        /// The path the entry occupies.
+        path: String,
+    },
+    /// A staging-tree operation could not proceed for a condition none of the
+    /// variants above names: an outstanding file writer blocking
+    /// [`StagingTree::close`](crate::StagingTree::close), a read that wanted a
+    /// file where a directory sits, a hardlink whose source resolves to a
+    /// directory, a directory that a concurrent operation removed while the
+    /// operation held its path, a path with no final component or one ending
+    /// in `..`, a non-UTF-8 path component or symlink target, or a hydration
+    /// with no repository handle to read through.
     #[error("staging tree: {0}")]
     Staging(String),
     /// A staging-tree merge hit a conflict the [`MergeOptions`](crate::MergeOptions)
@@ -177,6 +215,37 @@ impl From<rustix::io::Errno> for Error {
     }
 }
 
+impl From<Error> for std::io::Error {
+    /// Map a library error onto the closest `std::io::ErrorKind`, keeping the
+    /// error itself as the payload so its `Display` and its source chain
+    /// survive. An [`Error::Io`] is handed back unchanged.
+    ///
+    /// A kind is given only where the standard set names the condition. A
+    /// symlink loop falls to [`Other`](std::io::ErrorKind::Other), since
+    /// `ErrorKind::FilesystemLoop` is unstable.
+    fn from(err: Error) -> std::io::Error {
+        use std::io::ErrorKind;
+
+        let err = match err {
+            Error::Io(e) => return e,
+            other => other,
+        };
+        let kind = match &err {
+            Error::PathNotFound { .. }
+            | Error::DanglingSymlink { .. }
+            | Error::ObjectNotFound { .. }
+            | Error::RefNotFound(_) => ErrorKind::NotFound,
+            Error::NotADirectory { .. } | Error::ReplaceFileWithDir(_) => ErrorKind::NotADirectory,
+            Error::EntryExists { .. } | Error::MergeConflict(_) | Error::ReplaceDirWithFile(_) => {
+                ErrorKind::AlreadyExists
+            }
+            Error::MutableTree(_) => ErrorKind::InvalidInput,
+            _ => ErrorKind::Other,
+        };
+        std::io::Error::new(kind, err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +257,74 @@ mod tests {
         assert!(matches!(err, Error::Io(_)));
         assert!(err.to_string().contains("i/o error"));
         assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn errors_convert_to_the_documented_io_kinds() {
+        use std::io::ErrorKind;
+
+        let path = || "usr/lib/modules".to_owned();
+        let cases: Vec<(Error, ErrorKind)> = vec![
+            (Error::PathNotFound { path: path() }, ErrorKind::NotFound),
+            (
+                Error::DanglingSymlink {
+                    path: path(),
+                    target: "nowhere".into(),
+                },
+                ErrorKind::NotFound,
+            ),
+            (
+                Error::ObjectNotFound {
+                    checksum: Checksum::from_hex(&"ab".repeat(32)).unwrap(),
+                    ty: ObjectType::Commit,
+                },
+                ErrorKind::NotFound,
+            ),
+            (Error::RefNotFound("x/y".into()), ErrorKind::NotFound),
+            (
+                Error::NotADirectory { path: path() },
+                ErrorKind::NotADirectory,
+            ),
+            (
+                Error::ReplaceFileWithDir("etc".into()),
+                ErrorKind::NotADirectory,
+            ),
+            (
+                Error::EntryExists { path: path() },
+                ErrorKind::AlreadyExists,
+            ),
+            (
+                Error::MergeConflict("file differs at a".into()),
+                ErrorKind::AlreadyExists,
+            ),
+            (
+                Error::ReplaceDirWithFile("etc".into()),
+                ErrorKind::AlreadyExists,
+            ),
+            (
+                Error::MutableTree("bad name".into()),
+                ErrorKind::InvalidInput,
+            ),
+            (Error::SymlinkLoop { path: path() }, ErrorKind::Other),
+            (Error::Staging("directory is gone".into()), ErrorKind::Other),
+        ];
+
+        for (err, expected) in cases {
+            let rendered = err.to_string();
+            let io: std::io::Error = err.into();
+            assert_eq!(io.kind(), expected, "kind for {rendered}");
+            assert_eq!(io.to_string(), rendered, "the message survives");
+        }
+    }
+
+    #[test]
+    fn an_io_error_converts_back_unchanged() {
+        use std::io::ErrorKind;
+
+        let err = Error::Io(std::io::Error::new(ErrorKind::PermissionDenied, "nope"));
+        let io: std::io::Error = err.into();
+        assert_eq!(io.kind(), ErrorKind::PermissionDenied);
+        assert_eq!(io.to_string(), "nope");
     }
 
     #[test]

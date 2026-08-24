@@ -316,7 +316,7 @@ fn reads_staged_content_and_follows_symlinks() {
             .unwrap();
         let err = st.read_file(Path::new("loop1"), true).await.unwrap_err();
         assert!(
-            matches!(err, Error::Staging(_)),
+            matches!(err, Error::SymlinkLoop { .. }),
             "a loop is an error: {err:?}"
         );
 
@@ -326,7 +326,7 @@ fn reads_staged_content_and_follows_symlinks() {
             .unwrap();
         let err = st.read_file(Path::new("dangling"), true).await.unwrap_err();
         assert!(
-            matches!(err, Error::Staging(_)),
+            matches!(err, Error::DanglingSymlink { .. }),
             "a dangling target is an error: {err:?}"
         );
 
@@ -651,7 +651,7 @@ fn merge_conflict_names_the_path() {
             .unwrap_err();
         match err {
             Error::MergeConflict(msg) => {
-                assert!(msg.contains("a.txt"), "the conflict names the path: {msg}");
+                assert_eq!(msg, "file differs at a.txt", "the conflict names the path");
             }
             other => panic!("expected a merge conflict, got {other:?}"),
         }
@@ -728,10 +728,15 @@ fn close_fails_with_an_outstanding_writer() {
         let writer = st.write_file(Path::new("f.txt"), &reg()).await.unwrap();
         // A different handle cannot be closed while a writer is live; keep the
         // writer alive across the check.
-        assert!(
-            matches!(st.close(), Err(Error::Staging(_))),
-            "close is refused while a writer is outstanding"
-        );
+        match st.close() {
+            Err(Error::Staging(msg)) => {
+                assert_eq!(
+                    msg, "cannot close the staging tree: 1 file writer(s) still outstanding",
+                    "the refusal carries the outstanding count"
+                );
+            }
+            other => panic!("close is refused while a writer is outstanding: {other:?}"),
+        }
         drop(writer);
         txn.abort().await.unwrap();
     });
@@ -808,6 +813,425 @@ fn non_utf8_path_component_is_rejected() {
         );
 
         drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// Each staging refusal carries its own variant and names the path the walk
+/// stopped at, so a consumer branches on the condition instead of matching a
+/// message. The path a walk reports is the literal path resolution reached,
+/// which is the symlink-resolved form rather than the path as given.
+#[test]
+fn staging_refusals_are_typed_by_condition() {
+    let tmp = TmpDir::new("staging-typed-errors");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+        st.write_file_content(Path::new("f.txt"), &reg(), b"content")
+            .await
+            .unwrap();
+        st.symlink(Path::new("dangling"), Path::new("nowhere"), &symlink_meta())
+            .await
+            .unwrap();
+        st.symlink(Path::new("loop1"), Path::new("loop2"), &symlink_meta())
+            .await
+            .unwrap();
+        st.symlink(Path::new("loop2"), Path::new("loop1"), &symlink_meta())
+            .await
+            .unwrap();
+
+        // An absent component along the path.
+        match st.read_file(Path::new("missing/f.txt"), false).await {
+            Err(Error::PathNotFound { path }) => assert_eq!(path, "missing"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+        // The same condition on a write, reported from the parent resolution.
+        match st
+            .write_file_content(Path::new("missing/f.txt"), &reg(), b"x")
+            .await
+        {
+            Err(Error::PathNotFound { path }) => assert_eq!(path, "missing"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+
+        // A regular file where the walk needed a directory.
+        match st.read_file(Path::new("f.txt/inner"), false).await {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+        // The same, where the file is the final component of a parent path.
+        match st
+            .write_file_content(Path::new("f.txt/inner"), &reg(), b"x")
+            .await
+        {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+        // And through make_dir_all, which resolves its own components.
+        match st.make_dir_all(Path::new("f.txt/inner"), &dir_meta()).await {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+
+        // A symlink whose target does not resolve.
+        match st.read_file(Path::new("dangling"), true).await {
+            Err(Error::DanglingSymlink { path, target }) => {
+                assert_eq!(path, "dangling");
+                assert_eq!(target, "nowhere");
+            }
+            other => panic!("expected DanglingSymlink, got {other:?}"),
+        }
+
+        // A symlink chain past the depth cap. The name the refusal carries is
+        // fixed: the walk starts at `loop1` and the two links alternate, so
+        // visit n resolves `loop1` for odd n and `loop2` for even n. Visit n
+        // raises the depth to n, and the cap refuses the first visit with a
+        // depth above MAX_SYMLINK_DEPTH (40), which is visit 41. 41 is odd, so
+        // the refusal names `loop1`.
+        match st.read_file(Path::new("loop1"), true).await {
+            Err(Error::SymlinkLoop { path }) => assert_eq!(path, "loop1"),
+            other => panic!("expected SymlinkLoop, got {other:?}"),
+        }
+
+        // An operation that requires a fresh entry.
+        match st.make_dir(Path::new("d"), &dir_meta()).await {
+            Err(Error::EntryExists { path }) => assert_eq!(path, "d"),
+            other => panic!("expected EntryExists, got {other:?}"),
+        }
+
+        // A directory where a write wanted a file, from the checked path.
+        match st.write_file_content(Path::new("d"), &reg(), b"x").await {
+            Err(Error::ReplaceDirWithFile(name)) => assert_eq!(name, "d"),
+            other => panic!("expected ReplaceDirWithFile, got {other:?}"),
+        }
+        // A directory where a read wanted a file stays in `Staging`.
+        match st.read_file(Path::new("d"), false).await {
+            Err(Error::Staging(msg)) => {
+                assert_eq!(msg, "d is a directory, not a file");
+            }
+            other => panic!("expected Staging, got {other:?}"),
+        }
+        // A hardlink whose source resolves to a directory stays in `Staging`.
+        match st.hardlink(Path::new("copy"), Path::new("d")).await {
+            Err(Error::Staging(msg)) => {
+                assert_eq!(msg, "cannot hardlink from d: the source is a directory");
+            }
+            other => panic!("expected Staging, got {other:?}"),
+        }
+
+        // read_dir over a file is the not-a-directory condition. It sits
+        // outside the walker.
+        match st.read_dir(Path::new("f.txt"), false).await {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// A symlink whose target resolves does not shadow an absent component reached
+/// under it: once the target is spent, the walk is back on the caller's own
+/// components, so an absent entry is the path-not-found condition. `opt ->
+/// usr/opt` is the alias the merge tests build, and both the read path and the
+/// write path (through `resolve_parent`) reach the same walk.
+#[test]
+fn absent_under_a_resolved_symlink_is_path_not_found() {
+    let tmp = TmpDir::new("staging-absent-under-symlink");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir_all(Path::new("usr/opt"), &dir_meta())
+            .await
+            .unwrap();
+        st.symlink(Path::new("opt"), Path::new("usr/opt"), &symlink_meta())
+            .await
+            .unwrap();
+
+        // The read side: the walk crosses `opt`, resolves it, and stops at the
+        // absent entry under the target.
+        match st.read_file(Path::new("opt/absent"), false).await {
+            Err(Error::PathNotFound { path }) => assert_eq!(path, "usr/opt/absent"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+
+        // The write side reaches the same walk through `resolve_parent`.
+        match st
+            .write_file_content(Path::new("opt/absent/f.txt"), &reg(), b"x")
+            .await
+        {
+            Err(Error::PathNotFound { path }) => assert_eq!(path, "usr/opt/absent"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// With one symlink reached through another, the refusal names the innermost
+/// symlink whose target is still being consumed. `a -> b` resolves; `b`'s own
+/// target is the one that does not, so `b` is what the walk reports.
+#[test]
+fn nested_symlinks_name_the_innermost_open_symlink() {
+    let tmp = TmpDir::new("staging-nested-symlinks");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("c"), &dir_meta()).await.unwrap();
+        st.symlink(Path::new("a"), Path::new("b"), &symlink_meta())
+            .await
+            .unwrap();
+        st.symlink(Path::new("b"), Path::new("c/missing"), &symlink_meta())
+            .await
+            .unwrap();
+
+        match st.read_file(Path::new("a"), true).await {
+            Err(Error::DanglingSymlink { path, target }) => {
+                assert_eq!(path, "b");
+                assert_eq!(target, "c/missing");
+            }
+            other => panic!("expected DanglingSymlink, got {other:?}"),
+        }
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// Every refusal names the resolved literal component path, so an operation
+/// reached through the alias `opt -> usr/opt` reports the `usr/opt` form for the
+/// conditions raised outside the walker as well: the existing entry `make_dir`
+/// refuses and the file `read_dir` refuses. The write over a directory is the
+/// carve-out: `ReplaceDirWithFile` names the entry, because the mutable-tree
+/// layer raises it and that layer is addressed by name.
+#[test]
+fn refusals_through_a_symlinked_parent_name_the_resolved_path() {
+    let tmp = TmpDir::new("staging-resolved-refusal-paths");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir_all(Path::new("usr/opt/d"), &dir_meta())
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("usr/opt/f.txt"), &reg(), b"content")
+            .await
+            .unwrap();
+        st.symlink(Path::new("opt"), Path::new("usr/opt"), &symlink_meta())
+            .await
+            .unwrap();
+
+        // An operation that requires a fresh entry, refused at the alias.
+        match st.make_dir(Path::new("opt/d"), &dir_meta()).await {
+            Err(Error::EntryExists { path }) => assert_eq!(path, "usr/opt/d"),
+            other => panic!("expected EntryExists, got {other:?}"),
+        }
+
+        // A write over a directory, reached through the alias, names the entry.
+        match st
+            .write_file_content(Path::new("opt/d"), &reg(), b"x")
+            .await
+        {
+            Err(Error::ReplaceDirWithFile(name)) => assert_eq!(name, "d"),
+            other => panic!("expected ReplaceDirWithFile, got {other:?}"),
+        }
+
+        // A listing of a file, refused at the alias.
+        match st.read_dir(Path::new("opt/f.txt"), false).await {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "usr/opt/f.txt"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// A directory in the way of a write is one condition, whichever moment the
+/// directory appeared at. The check in `write_file`/`write_file_content` and
+/// the record step a raced directory reaches both refuse with
+/// [`Error::ReplaceDirWithFile`] naming the entry, because the mutable-tree
+/// layer raises it and that layer is addressed by name, and both convert to
+/// `io::ErrorKind::AlreadyExists`. A `StagedFileWriter` is a handle held
+/// across calls, so the interleave needs no threads.
+#[test]
+fn checked_and_raced_directory_clash_report_one_variant() {
+    use std::io;
+
+    let tmp = TmpDir::new("staging-checked-vs-raced");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+
+        // The checked half: the directory is already there when the check runs.
+        st.make_dir(Path::new("d/sub"), &dir_meta()).await.unwrap();
+        let err = st
+            .write_file_content(Path::new("d/sub"), &reg(), b"x")
+            .await
+            .unwrap_err();
+        match &err {
+            Error::ReplaceDirWithFile(name) => {
+                assert_eq!(name, "sub", "the checked refusal names the entry");
+            }
+            other => panic!("expected ReplaceDirWithFile, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::AlreadyExists);
+
+        // The raced half: the check passed, then the directory appeared.
+        let mut writer = st.write_file(Path::new("d/raced"), &reg()).await.unwrap();
+        writer.write_all(b"x").await.unwrap();
+        st.make_dir(Path::new("d/raced"), &dir_meta())
+            .await
+            .unwrap();
+        let err = writer.finish().await.unwrap_err();
+        match &err {
+            Error::ReplaceDirWithFile(name) => {
+                assert_eq!(name, "raced", "the raced refusal names the entry");
+            }
+            other => panic!("expected ReplaceDirWithFile, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::AlreadyExists);
+
+        // The failed `finish` released its writer slot, so the tree still closes.
+        st.close().unwrap();
+        txn.abort().await.unwrap();
+    });
+}
+
+/// A merge that follows a left-side symlink resolving to a regular file reports
+/// the not-a-directory condition. The refusal comes from the merge's symlink
+/// resolution, which is the third re-typed site outside the walker.
+#[test]
+fn merge_through_a_symlink_to_a_file_is_not_a_directory() {
+    let tmp = TmpDir::new("staging-merge-symlink-to-file");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+
+        // The right side holds a directory named `link`.
+        let pkg_st = txn.staging_tree(None).await.unwrap();
+        pkg_st
+            .make_dir(Path::new("link"), &dir_meta())
+            .await
+            .unwrap();
+        pkg_st
+            .write_file_content(Path::new("link/foo.txt"), &reg(), b"foo")
+            .await
+            .unwrap();
+        let package = pkg_st.close().unwrap();
+
+        // The left side has `link -> f.txt`, a symlink to a regular file, so
+        // following it reaches no directory to merge into.
+        let base_st = txn.staging_tree(None).await.unwrap();
+        base_st
+            .write_file_content(Path::new("f.txt"), &reg(), b"base")
+            .await
+            .unwrap();
+        base_st
+            .symlink(Path::new("link"), Path::new("f.txt"), &symlink_meta())
+            .await
+            .unwrap();
+
+        let err = base_st
+            .merge(
+                &package,
+                MergeOptions {
+                    allow_overwrite: false,
+                    follow_symlinks: true,
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            Error::NotADirectory { path } => assert_eq!(path, "f.txt"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+
+        drop(base_st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// The tree root has no components, so a refusal that names the whole path
+/// spells it `.`. Both the walker's directory end and the merge's root dirmeta
+/// conflict reach that spelling.
+#[test]
+fn a_refusal_at_the_tree_root_spells_it_as_a_dot() {
+    let tmp = TmpDir::new("staging-root-path-form");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+
+        // The right side's root carries a dirmeta the left side's root does not,
+        // so the merge conflicts on the root's own metadata before it descends.
+        let shared = stage_dir_meta(&txn).await;
+        let novel = DirMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o040700,
+            xattrs: Xattrs::empty(),
+        };
+        let novel = txn
+            .write_metadata(ObjectType::DirMeta, None, &novel.serialize().unwrap())
+            .await
+            .unwrap();
+
+        let mut package = MutableTree::new();
+        package.set_metadata_checksum(novel);
+        let mut base = MutableTree::new();
+        base.set_metadata_checksum(shared);
+        let base_st = txn.staging_tree_from_mutable_tree(base);
+
+        // A read of `.` resolves to no components, so the walk ends on the root.
+        match base_st.read_file(Path::new("."), false).await {
+            Err(Error::Staging(msg)) => assert_eq!(msg, ". is a directory, not a file"),
+            other => panic!("expected Staging, got {other:?}"),
+        }
+
+        let err = base_st
+            .merge(&package, MergeOptions::default())
+            .await
+            .unwrap_err();
+        match err {
+            Error::MergeConflict(msg) => assert_eq!(msg, "directory metadata differs at ."),
+            other => panic!("expected a merge conflict, got {other:?}"),
+        }
+
+        drop(base_st);
         txn.abort().await.unwrap();
     });
 }

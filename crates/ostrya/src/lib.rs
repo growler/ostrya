@@ -244,7 +244,7 @@ pub use sign::{
 };
 #[cfg(feature = "sign-spki")]
 pub use spki::{SpkiSigner, SpkiVerifier};
-pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingTree};
+pub use staging_tree::{MergeOptions, StagedFileWriter, StagingEntry, StagingLookup, StagingTree};
 pub use summary::{Summary, SummaryOptions, SummaryRef};
 pub use tar::{TarExportOptions, TarImportOptions, TarRename};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};

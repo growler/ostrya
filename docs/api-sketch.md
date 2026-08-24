@@ -744,14 +744,28 @@ impl StagingTree<'_> {
         content: &[u8]) -> Result<()>;
     pub async fn make_dir(&self, path: &Path, meta: &DirMeta) -> Result<()>;
     pub async fn make_dir_all(&self, path: &Path, meta: &DirMeta) -> Result<()>;
+    /// Create the directory, or reuse an existing one and stamp `meta`
+    /// onto it. Stages the dirmeta only when it creates the directory or
+    /// the recorded dirmeta differs, and restamps a lazy committed child
+    /// in place without hydrating it.
+    pub async fn ensure_dir(&self, path: &Path, meta: &DirMeta) -> Result<()>;
     pub async fn symlink(&self, path: &Path, target: &Path, meta: &FileMeta)
         -> Result<()>;
     /// A second tree entry for the content object found at `target`;
     /// the object carries all metadata, so none is taken.
     pub async fn hardlink(&self, path: &Path, target: &Path) -> Result<()>;
+    /// Record `checksum` as the entry at `path`. An identical entry is
+    /// silent; a differing entry or a directory is `MergeConflict`. The
+    /// rule is decided and applied under one lock acquisition, so
+    /// concurrent placements never silently overwrite. The object's
+    /// presence in the store is not checked, the same as `write_mtree`.
+    pub async fn place_object(&self, path: &Path, checksum: &Checksum)
+        -> Result<()>;
 
     /// Path resolution against the staged tree; objects load from the
     /// transaction's staged set first, then from `objects/`.
+    pub async fn lookup(&self, path: &Path, follow_symlinks: bool)
+        -> Result<StagingLookup>;
     pub async fn read_file(&self, path: &Path, follow_symlinks: bool)
         -> Result<FileObject>;
     pub async fn read_dir(&self, path: &Path, follow_symlinks: bool)
@@ -765,6 +779,17 @@ impl StagedFileWriter<'_> { pub async fn finish(self) -> Result<()>; }
 pub enum StagingEntry {
     File { name: String, checksum: Checksum },
     Dir  { name: String },                     // no checksum until written
+}
+
+/// An absent component anywhere along the path is `Absent`, never an
+/// error; a non-directory intermediate component and a dangling symlink
+/// stay the typed errors. The file/symlink distinction is not recorded
+/// in the tree, so `File` covers both; read_file loads the object where
+/// the kind matters.
+pub enum StagingLookup {
+    Absent,
+    File { checksum: Checksum },
+    Dir,
 }
 
 #[derive(Default)]
@@ -791,11 +816,12 @@ only transaction scope sees objects staged in the current transaction.
 
 Path semantics for the write operations: intermediate components resolve
 through symlinks with the same walker; the final component never
-follows. `write_file` and `write_file_content` replace an existing file
-or symlink entry and fail on a directory; `make_dir`, `symlink`, and
-`hardlink` fail on any existing entry; `make_dir_all` applies its
-`DirMeta` to the directories it creates and leaves existing ones
-untouched.
+follows. `write_file`, `write_file_content`, `symlink`, and `hardlink`
+replace an existing file or symlink entry and fail on a directory with
+`ReplaceDirWithFile`; `make_dir` fails on any existing entry;
+`ensure_dir` creates the directory or restamps an existing one and fails
+on a file or symlink; `make_dir_all` applies its `DirMeta` to the
+directories it creates and leaves existing ones untouched.
 
 Each refusal carries its own `Error` variant naming the path resolution
 stopped at, so a consumer branches on the condition: `PathNotFound` for

@@ -512,12 +512,26 @@ impl Transaction {
     /// elsewhere -- a pull or a delta -- keeps the bytes it is named for and goes
     /// through [`write_metadata`](Transaction::write_metadata).
     pub(crate) async fn write_dirmeta(&self, meta: &DirMeta) -> Result<Checksum> {
-        let bytes = if self.repo().mode() == RepoMode::BareUserOnly {
+        let bytes = self.dirmeta_bytes(meta)?;
+        self.write_metadata(ObjectType::DirMeta, None, &bytes).await
+    }
+
+    /// The serialized bytes [`write_dirmeta`](Transaction::write_dirmeta)
+    /// records for `meta` under this repository's mode.
+    fn dirmeta_bytes(&self, meta: &DirMeta) -> Result<Vec<u8>> {
+        Ok(if self.repo().mode() == RepoMode::BareUserOnly {
             canonical_dirmeta(meta).serialize()?
         } else {
             meta.serialize()?
-        };
-        self.write_metadata(ObjectType::DirMeta, None, &bytes).await
+        })
+    }
+
+    /// The checksum [`write_dirmeta`](Transaction::write_dirmeta) would record
+    /// for `meta`, computed without staging an object. Lets a caller compare
+    /// against a recorded dirmeta before deciding to stage.
+    pub(crate) fn dirmeta_checksum(&self, meta: &DirMeta) -> Result<Checksum> {
+        let bytes = self.dirmeta_bytes(meta)?;
+        Ok(Checksum::from_bytes(Sha256::digest(&bytes).into()))
     }
 
     /// Write a metadata object from its normal-form serialized bytes. The

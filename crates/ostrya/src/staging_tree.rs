@@ -23,7 +23,8 @@
 //! final component never follows for a write. A relative symlink target resolves
 //! from the symlink's parent, an absolute target from the tree root, `..` clamps
 //! at the root, chains are capped, and a dangling target is an error. Reads
-//! ([`read_file`](StagingTree::read_file), [`read_dir`](StagingTree::read_dir))
+//! ([`read_file`](StagingTree::read_file), [`read_dir`](StagingTree::read_dir),
+//! [`lookup`](StagingTree::lookup))
 //! and [`merge`](StagingTree::merge) take a `follow_symlinks` flag governing the
 //! final component; objects load from the transaction's staged set before
 //! `objects/`, so content staged in the current transaction is visible before it
@@ -124,6 +125,22 @@ pub enum StagingEntry {
         /// The entry name.
         name: String,
     },
+}
+
+/// What [`lookup`](StagingTree::lookup) found at a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagingLookup {
+    /// No entry: a component along the path is absent.
+    Absent,
+    /// A regular file or symlink, named by its content checksum. The kind is
+    /// not recorded in the tree, so telling them apart means loading the
+    /// object; [`read_file`](StagingTree::read_file) does that.
+    File {
+        /// The content object checksum.
+        checksum: Checksum,
+    },
+    /// A directory.
+    Dir,
 }
 
 /// Path-addressed construction over a transaction.
@@ -318,30 +335,71 @@ impl<'txn> StagingTree<'txn> {
         Ok(())
     }
 
+    /// Create the directory at `path`, or reuse an existing one and stamp
+    /// `meta` onto it. A file or symlink at `path` is
+    /// [`NotADirectory`](Error::NotADirectory). The dirmeta object is staged
+    /// only when the directory is created or its recorded dirmeta differs, so
+    /// an unchanged call materializes no object. A lazily-loaded committed
+    /// directory is never hydrated: its recorded dirmeta is compared, and a
+    /// differing one is rewritten in place, because the child's contents do
+    /// not change.
+    pub async fn ensure_dir(&self, path: &Path, meta: &DirMeta) -> Result<()> {
+        let (parent, name) = self.resolve_parent(path).await?;
+        let new_dirmeta = self.txn.dirmeta_checksum(meta)?;
+        let unchanged = match self.peek(&parent, &name)? {
+            ChildKind::File(_) => {
+                return Err(Error::NotADirectory {
+                    path: join(&parent, &name),
+                });
+            }
+            ChildKind::Absent => false,
+            ChildKind::LazyDir { dirmeta, .. } => dirmeta == new_dirmeta,
+            ChildKind::Dir => {
+                let mut child = parent.clone();
+                child.push(name.clone());
+                self.with_dir(&child, |dir| dir.metadata_checksum())? == Some(new_dirmeta)
+            }
+        };
+        if unchanged {
+            return Ok(());
+        }
+        // Staging is async and runs outside the lock, so the mutating
+        // acquisition repeats the decision: still absent inserts, a directory
+        // takes the new dirmeta, and a file that appeared in the way is
+        // rejected.
+        let dirmeta = self.stage_dirmeta(meta).await?;
+        self.with_dir_mut(&parent, |dir| match dir.child_kind(&name) {
+            ChildKind::Absent => {
+                dir.insert_empty_dir(&name, Some(dirmeta));
+                Ok(())
+            }
+            ChildKind::Dir | ChildKind::LazyDir { .. } => dir.set_child_dirmeta(&name, dirmeta),
+            ChildKind::File(_) => Err(Error::NotADirectory {
+                path: join(&parent, &name),
+            }),
+        })
+    }
+
     /// Create a symlink at `path` pointing at `target`. The mode is fixed by the
-    /// object model, so only `meta`'s owner and xattrs are used. Fails on any
-    /// existing entry.
+    /// object model, so only `meta`'s owner and xattrs are used. Replaces an
+    /// existing file or symlink; a directory at `path` is refused with
+    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
     pub async fn symlink(&self, path: &Path, target: &Path, meta: &FileMeta) -> Result<()> {
         let (parent, name) = self.resolve_parent(path).await?;
-        if !matches!(self.peek(&parent, &name)?, ChildKind::Absent) {
-            return Err(entry_exists(&parent, &name));
-        }
+        self.check_writable_leaf(&parent, &name)?;
         let target = target
             .to_str()
             .ok_or_else(|| Error::Staging("symlink target is not valid UTF-8".into()))?;
         let checksum = self.txn.write_symlink(target, meta, None).await?;
-        self.with_dir_mut(&parent, |dir| {
-            if !matches!(dir.child_kind(&name), ChildKind::Absent) {
-                return Err(entry_exists(&parent, &name));
-            }
-            dir.replace_file(&name, checksum)
-        })
+        self.with_dir_mut(&parent, |dir| dir.replace_file(&name, checksum))
     }
 
     /// Record a second tree entry at `path` for the content object found at
     /// `target`. The object carries all metadata, so none is taken. The final
     /// component of `target` is not followed, so a symlink is hardlinked as the
-    /// symlink object. Fails on any existing entry at `path`.
+    /// symlink object. Replaces an existing file or symlink at `path`; a
+    /// directory there is refused with
+    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
     pub async fn hardlink(&self, path: &Path, target: &Path) -> Result<()> {
         let checksum = match self
             .walk_from(Vec::new(), components_of(target)?, false)
@@ -356,15 +414,53 @@ impl<'txn> StagingTree<'txn> {
             }
         };
         let (parent, name) = self.resolve_parent(path).await?;
-        self.with_dir_mut(&parent, |dir| {
-            if !matches!(dir.child_kind(&name), ChildKind::Absent) {
-                return Err(entry_exists(&parent, &name));
-            }
-            dir.replace_file(&name, checksum)
+        self.check_writable_leaf(&parent, &name)?;
+        self.with_dir_mut(&parent, |dir| dir.replace_file(&name, checksum))
+    }
+
+    /// Record `checksum` as the file entry at `path`. An identical checksum
+    /// already there is silent; a differing entry or a directory is
+    /// [`MergeConflict`](Error::MergeConflict). The rule is decided and applied
+    /// under one lock acquisition, so concurrent placements of differing
+    /// checksums at one path resolve to one recorded winner and a conflict for
+    /// each losing call, never a silent overwrite. The object's presence in
+    /// the store is not checked, the same as
+    /// [`write_mtree`](crate::Transaction::write_mtree).
+    pub async fn place_object(&self, path: &Path, checksum: &Checksum) -> Result<()> {
+        let (parent, name) = self.resolve_parent(path).await?;
+        self.with_dir_mut(&parent, |dir| match dir.child_kind(&name) {
+            ChildKind::Absent => dir.replace_file(&name, *checksum),
+            ChildKind::File(existing) if existing == *checksum => Ok(()),
+            ChildKind::File(_) => Err(Error::MergeConflict(format!(
+                "placed object differs at {}",
+                join(&parent, &name)
+            ))),
+            ChildKind::Dir | ChildKind::LazyDir { .. } => Err(Error::MergeConflict(format!(
+                "an object cannot overwrite the directory at {}",
+                join(&parent, &name)
+            ))),
         })
     }
 
     // --- reads (staged-first) ---
+
+    /// Resolve `path` and report what sits there. Intermediate components
+    /// follow symlinks; the final component follows only with
+    /// `follow_symlinks`. An absent component anywhere along the path is
+    /// [`StagingLookup::Absent`], so probing a path whose ancestors do not
+    /// exist is not an error. A non-directory intermediate component and a
+    /// dangling symlink stay the errors the walk types for them.
+    pub async fn lookup(&self, path: &Path, follow_symlinks: bool) -> Result<StagingLookup> {
+        match self
+            .walk_from(Vec::new(), components_of(path)?, follow_symlinks)
+            .await
+        {
+            Ok(WalkEnd::Dir(_)) => Ok(StagingLookup::Dir),
+            Ok(WalkEnd::Leaf { checksum, .. }) => Ok(StagingLookup::File { checksum }),
+            Err(Error::PathNotFound { .. }) => Ok(StagingLookup::Absent),
+            Err(e) => Err(e),
+        }
+    }
 
     /// Read the file object at `path`, resolving through the staged tree and
     /// loading its bytes from the transaction's staged set before `objects/`.
@@ -1014,6 +1110,7 @@ const _: fn() = || {
     assert_send_sync::<StagingTree<'static>>();
     assert_send_sync::<StagedFileWriter<'static>>();
     assert_send_sync::<StagingEntry>();
+    assert_send_sync::<StagingLookup>();
     assert_send_sync::<MergeOptions>();
 };
 

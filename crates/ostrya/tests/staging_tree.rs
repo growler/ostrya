@@ -18,8 +18,8 @@ use common::TmpDir;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DirMeta, Error,
-    FileMeta, FileObject, MergeOptions, MutableTree, Repo, RepoMode, StagingEntry, Transaction,
-    TreeEntry,
+    FileMeta, FileObject, MergeOptions, MutableTree, Repo, RepoMode, StagingEntry, StagingLookup,
+    Transaction, TreeEntry,
 };
 use ostrya_core::{ObjectType, Xattrs};
 use ostrya_rt::block_on;
@@ -1243,4 +1243,638 @@ fn value_types_are_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<MergeOptions>();
     assert_send_sync::<StagingEntry>();
+    assert_send_sync::<StagingLookup>();
+}
+
+/// A dirmeta with the given full mode, for tests that need one distinct from
+/// the shared 0755 dirmeta.
+fn dir_meta_mode(mode: u32) -> DirMeta {
+    DirMeta {
+        uid: 0,
+        gid: 0,
+        mode,
+        xattrs: Xattrs::empty(),
+    }
+}
+
+/// Remove one loose object file, so a later read of it fails. Used to prove an
+/// operation does not read the object: with the file gone, a read errors, so an
+/// operation that succeeds provably never issued one.
+fn delete_loose_object(repo_root: &Path, checksum: &Checksum, ext: &str) {
+    let hex = checksum.to_hex();
+    let path = repo_root
+        .join("objects")
+        .join(&hex[..2])
+        .join(format!("{}.{ext}", &hex[2..]));
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// The dirtree and dirmeta checksums of the committed subdirectory `name`
+/// directly under `rev`'s root, plus the root's own dirtree checksum.
+async fn committed_subdir(repo: &Repo, rev: &str, name: &str) -> (Checksum, Checksum, Checksum) {
+    let (tree, _) = repo.read_commit(rev).await.unwrap();
+    let root_dirtree = *tree.dirtree_checksum();
+    match tree.lookup(Path::new(name)).await.unwrap() {
+        Some(TreeEntry::Dir { tree: sub, .. }) => (
+            *sub.dirtree_checksum(),
+            *sub.dirmeta_checksum(),
+            root_dirtree,
+        ),
+        other => panic!("{name} is not a committed directory: {other:?}"),
+    }
+}
+
+/// `lookup` answers `Absent` for a missing component anywhere along the path,
+/// and reports files, symlinks, and directories by kind. A symlink's final
+/// component follows only with `follow_symlinks`.
+#[test]
+fn lookup_reports_kind_and_absent_without_error() {
+    let tmp = TmpDir::new("staging-lookup");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+        st.write_file_content(Path::new("f.txt"), &reg(), b"content")
+            .await
+            .unwrap();
+        st.symlink(Path::new("link"), Path::new("f.txt"), &symlink_meta())
+            .await
+            .unwrap();
+        st.symlink(Path::new("dird"), Path::new("d"), &symlink_meta())
+            .await
+            .unwrap();
+
+        // An absent final component, and an absent path whose parent is also
+        // absent: both are `Absent`, not an error.
+        assert_eq!(
+            st.lookup(Path::new("missing"), false).await.unwrap(),
+            StagingLookup::Absent
+        );
+        assert_eq!(
+            st.lookup(Path::new("usr/share/doc/copyright"), false)
+                .await
+                .unwrap(),
+            StagingLookup::Absent
+        );
+
+        // A file, a directory, and a symlink with and without following.
+        let file = st.lookup(Path::new("f.txt"), false).await.unwrap();
+        assert!(matches!(file, StagingLookup::File { .. }));
+        assert_eq!(
+            st.lookup(Path::new("d"), false).await.unwrap(),
+            StagingLookup::Dir
+        );
+        let unfollowed = st.lookup(Path::new("link"), false).await.unwrap();
+        assert!(
+            matches!(unfollowed, StagingLookup::File { .. }) && unfollowed != file,
+            "not following yields the symlink object's own checksum"
+        );
+        assert_eq!(
+            st.lookup(Path::new("link"), true).await.unwrap(),
+            file,
+            "following resolves to the target file's checksum"
+        );
+        assert_eq!(
+            st.lookup(Path::new("dird"), true).await.unwrap(),
+            StagingLookup::Dir,
+            "following a symlink to a directory reports the directory"
+        );
+
+        // A non-directory intermediate component stays an error.
+        match st.lookup(Path::new("f.txt/inner"), false).await {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "f.txt"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// `symlink` and `hardlink` replace an existing file or symlink, the same rule
+/// `write_file` and `write_file_content` follow.
+#[test]
+fn symlink_and_hardlink_replace_files_and_symlinks() {
+    let tmp = TmpDir::new("staging-replace-writes");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.write_file_content(Path::new("fa"), &reg(), b"aaa")
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("f-dst1"), &reg(), b"one")
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("f-dst2"), &reg(), b"two")
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("fc"), &reg(), b"ccc")
+            .await
+            .unwrap();
+        st.symlink(Path::new("s1"), Path::new("fa"), &symlink_meta())
+            .await
+            .unwrap();
+        st.symlink(Path::new("s2"), Path::new("fa"), &symlink_meta())
+            .await
+            .unwrap();
+        let fa = match st.lookup(Path::new("fa"), false).await.unwrap() {
+            StagingLookup::File { checksum } => checksum,
+            other => panic!("fa is not a file: {other:?}"),
+        };
+
+        // A symlink over an absent entry, over a file, and over a symlink.
+        st.symlink(Path::new("s-new"), Path::new("fa"), &symlink_meta())
+            .await
+            .unwrap();
+        assert!(
+            st.read_file(Path::new("s-new"), false)
+                .await
+                .unwrap()
+                .is_symlink()
+        );
+        st.symlink(Path::new("f-dst1"), Path::new("fa"), &symlink_meta())
+            .await
+            .unwrap();
+        assert!(
+            st.read_file(Path::new("f-dst1"), false)
+                .await
+                .unwrap()
+                .is_symlink(),
+            "the file was replaced by a symlink"
+        );
+        st.symlink(Path::new("s1"), Path::new("fc"), &symlink_meta())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(&st.read_file(Path::new("s1"), true).await.unwrap()).await,
+            b"ccc",
+            "the symlink was replaced and points at the new target"
+        );
+
+        // A hardlink over an absent entry, over a file, and over a symlink.
+        st.hardlink(Path::new("h-new"), Path::new("fa"))
+            .await
+            .unwrap();
+        assert_eq!(
+            st.lookup(Path::new("h-new"), false).await.unwrap(),
+            StagingLookup::File { checksum: fa }
+        );
+        st.hardlink(Path::new("f-dst2"), Path::new("fa"))
+            .await
+            .unwrap();
+        assert_eq!(
+            st.lookup(Path::new("f-dst2"), false).await.unwrap(),
+            StagingLookup::File { checksum: fa },
+            "the file was replaced by the source's object"
+        );
+        st.hardlink(Path::new("s2"), Path::new("fa")).await.unwrap();
+        assert_eq!(
+            st.lookup(Path::new("s2"), false).await.unwrap(),
+            StagingLookup::File { checksum: fa },
+            "the symlink was replaced by the source's object"
+        );
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// A `symlink` or `hardlink` whose destination holds a directory reports
+/// `ReplaceDirWithFile` converting to `AlreadyExists`, the answer every write
+/// over a destination directory gives. A `hardlink` whose source resolves to a
+/// directory is a distinct condition and stays in `Staging`, converting to
+/// `Other`.
+#[test]
+fn symlink_and_hardlink_over_a_directory_report_replace_dir_with_file() {
+    use std::io;
+
+    let tmp = TmpDir::new("staging-replace-dir-refusal");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+        st.write_file_content(Path::new("fa"), &reg(), b"aaa")
+            .await
+            .unwrap();
+
+        let err = st
+            .symlink(Path::new("d"), Path::new("fa"), &symlink_meta())
+            .await
+            .unwrap_err();
+        match &err {
+            Error::ReplaceDirWithFile(name) => assert_eq!(name, "d"),
+            other => panic!("expected ReplaceDirWithFile, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::AlreadyExists);
+
+        let err = st
+            .hardlink(Path::new("d"), Path::new("fa"))
+            .await
+            .unwrap_err();
+        match &err {
+            Error::ReplaceDirWithFile(name) => assert_eq!(name, "d"),
+            other => panic!("expected ReplaceDirWithFile, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::AlreadyExists);
+
+        let err = st
+            .hardlink(Path::new("copy"), Path::new("d"))
+            .await
+            .unwrap_err();
+        match &err {
+            Error::Staging(msg) => {
+                assert_eq!(msg, "cannot hardlink from d: the source is a directory");
+            }
+            other => panic!("expected Staging, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::Other);
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// `ensure_dir` creates an absent directory with its `meta` and restamps an
+/// existing one, reaching the same dirtree bytes as `make_dir` given the same
+/// input. A file at the path is the not-a-directory condition.
+#[test]
+fn ensure_dir_creates_and_restamps_like_make_dir() {
+    use std::io;
+
+    let tmp = TmpDir::new("staging-ensure-dir");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let meta1 = dir_meta_mode(0o040700);
+        let meta2 = dir_meta_mode(0o040750);
+
+        async fn root_checksum(
+            txn: &Transaction,
+            st: ostrya::StagingTree<'_>,
+            root_dm: Checksum,
+        ) -> Checksum {
+            let mut built = st.close().unwrap();
+            built.set_metadata_checksum(root_dm);
+            *txn.write_mtree(&mut built)
+                .await
+                .unwrap()
+                .dirtree_checksum()
+        }
+
+        // Created over an absent entry, then restamped with a differing meta.
+        let st = txn.staging_tree(None).await.unwrap();
+        st.ensure_dir(Path::new("d"), &meta1).await.unwrap();
+        assert_eq!(
+            st.lookup(Path::new("d"), false).await.unwrap(),
+            StagingLookup::Dir
+        );
+        st.ensure_dir(Path::new("d"), &meta2).await.unwrap();
+        let ensured = root_checksum(&txn, st, root_dm).await;
+
+        // The oracle: the same tree built with a single make_dir.
+        let st = txn.staging_tree(None).await.unwrap();
+        st.make_dir(Path::new("d"), &meta2).await.unwrap();
+        let made = root_checksum(&txn, st, root_dm).await;
+        assert_eq!(ensured, made, "restamping reaches the make_dir tree");
+
+        // A file or symlink at the path is an error.
+        let st = txn.staging_tree(None).await.unwrap();
+        st.write_file_content(Path::new("f"), &reg(), b"x")
+            .await
+            .unwrap();
+        let err = st.ensure_dir(Path::new("f"), &meta1).await.unwrap_err();
+        match &err {
+            Error::NotADirectory { path } => assert_eq!(path, "f"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::NotADirectory);
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// An `ensure_dir` whose `meta` matches the directory's recorded dirmeta
+/// offers nothing for staging. `metadata_total` counts every offer before
+/// dedup, so the exact count is the assertion.
+#[test]
+fn unchanged_ensure_dir_stages_no_dirmeta() {
+    let tmp = TmpDir::new("staging-ensure-dir-noop");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let novel = dir_meta_mode(0o040700);
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("a"), &novel).await.unwrap();
+        st.ensure_dir(Path::new("a"), &novel).await.unwrap();
+
+        let mut built = st.close().unwrap();
+        built.set_metadata_checksum(root_dm);
+        txn.write_mtree(&mut built).await.unwrap();
+        let stats = txn.commit().await.unwrap();
+
+        // The offers: the root dirmeta, make_dir's novel dirmeta, and the two
+        // dirtrees write_mtree assembles. The unchanged ensure_dir adds none.
+        assert_eq!(
+            stats.metadata_total, 4,
+            "the unchanged ensure_dir offered no dirmeta"
+        );
+    });
+}
+
+/// An `ensure_dir` whose `meta` matches a lazy committed directory's dirmeta
+/// hydrates nothing and stages nothing. The subdirectory's dirtree object is
+/// deleted first, so any hydration would fail; the unchanged root dirtree and
+/// the zero offer count carry the rest.
+#[test]
+fn matching_ensure_dir_on_a_lazy_child_hydrates_nothing() {
+    let tmp = TmpDir::new("staging-ensure-dir-lazy-match");
+    let base = tmp.path();
+    let repo_root = base.join("repo");
+
+    let src = base.join("base");
+    mkdir(&src, 0o755);
+    mkdir(&src.join("sub"), 0o755);
+    write_file(&src.join("sub/inner.txt"), b"inner", 0o644);
+
+    block_on(async {
+        let repo = Repo::create(&repo_root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        commit_dir(&repo, dfd.as_fd(), Path::new("base"), "test/base").await;
+        let (sub_dirtree, _, root_dirtree) = committed_subdir(&repo, "test/base", "sub").await;
+        delete_loose_object(&repo_root, &sub_dirtree, "dirtree");
+
+        let checksum = repo.resolve_rev("test/base", false).await.unwrap().unwrap();
+        let (commit, _) = repo.load_commit(&checksum).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(Some(&commit)).await.unwrap();
+
+        st.ensure_dir(Path::new("sub"), &dir_meta()).await.unwrap();
+
+        let mut built = st.close().unwrap();
+        let rebuilt = txn.write_mtree(&mut built).await.unwrap();
+        assert_eq!(
+            *rebuilt.dirtree_checksum(),
+            root_dirtree,
+            "the matching ensure_dir left the tree byte-identical"
+        );
+        let stats = txn.commit().await.unwrap();
+        assert_eq!(stats.metadata_total, 0, "nothing was offered for staging");
+    });
+}
+
+/// An `ensure_dir` with a differing `meta` restamps a lazy committed directory
+/// in place: the entry keeps its dirtree checksum and takes the new dirmeta,
+/// and no dirtree is read (the object is deleted, so a read would fail).
+#[test]
+fn differing_ensure_dir_restamps_a_lazy_child_without_hydrating() {
+    let tmp = TmpDir::new("staging-ensure-dir-lazy-differ");
+    let base = tmp.path();
+    let repo_root = base.join("repo");
+
+    let src = base.join("base");
+    mkdir(&src, 0o755);
+    mkdir(&src.join("sub"), 0o755);
+    write_file(&src.join("sub/inner.txt"), b"inner", 0o644);
+
+    block_on(async {
+        let repo = Repo::create(&repo_root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        commit_dir(&repo, dfd.as_fd(), Path::new("base"), "test/base").await;
+        let (sub_dirtree, sub_dirmeta, _) = committed_subdir(&repo, "test/base", "sub").await;
+        delete_loose_object(&repo_root, &sub_dirtree, "dirtree");
+
+        let checksum = repo.resolve_rev("test/base", false).await.unwrap().unwrap();
+        let (commit, _) = repo.load_commit(&checksum).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn
+            .write_metadata(
+                ostrya_core::ObjectType::DirMeta,
+                None,
+                &novel.serialize().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(novel_csum, sub_dirmeta, "the new dirmeta differs");
+        let st = txn.staging_tree(Some(&commit)).await.unwrap();
+
+        st.ensure_dir(Path::new("sub"), &novel).await.unwrap();
+
+        let mut built = st.close().unwrap();
+        let rebuilt = txn.write_mtree(&mut built).await.unwrap();
+        let new_root_dirtree = *rebuilt.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&repo_root).await.unwrap();
+        let tree = repo.load_dirtree(&new_root_dirtree).await.unwrap();
+        let (_, dirtree, dirmeta) = tree.dirs.iter().find(|(n, _, _)| n == "sub").unwrap();
+        assert_eq!(
+            *dirtree, sub_dirtree,
+            "the entry keeps its dirtree checksum"
+        );
+        assert_eq!(*dirmeta, novel_csum, "the entry carries the new dirmeta");
+    });
+}
+
+/// `place_object` records a checksum at a path, is silent for an identical
+/// placement, and answers a differing entry or a directory with
+/// `MergeConflict`.
+#[test]
+fn place_object_records_dedups_and_conflicts() {
+    use std::io;
+
+    let tmp = TmpDir::new("staging-place-object");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("pool"), &dir_meta()).await.unwrap();
+        st.write_file_content(Path::new("a"), &reg(), b"aaa")
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("b"), &reg(), b"bbb")
+            .await
+            .unwrap();
+        let ca = match st.lookup(Path::new("a"), false).await.unwrap() {
+            StagingLookup::File { checksum } => checksum,
+            other => panic!("a is not a file: {other:?}"),
+        };
+        let cb = match st.lookup(Path::new("b"), false).await.unwrap() {
+            StagingLookup::File { checksum } => checksum,
+            other => panic!("b is not a file: {other:?}"),
+        };
+
+        st.place_object(Path::new("pool/x"), &ca).await.unwrap();
+        assert_eq!(
+            st.lookup(Path::new("pool/x"), false).await.unwrap(),
+            StagingLookup::File { checksum: ca }
+        );
+
+        // An identical placement is silent.
+        st.place_object(Path::new("pool/x"), &ca).await.unwrap();
+
+        // A differing checksum is a conflict, and the entry is unchanged.
+        let err = st.place_object(Path::new("pool/x"), &cb).await.unwrap_err();
+        match &err {
+            Error::MergeConflict(msg) => {
+                assert_eq!(msg, "placed object differs at pool/x");
+            }
+            other => panic!("expected MergeConflict, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            st.lookup(Path::new("pool/x"), false).await.unwrap(),
+            StagingLookup::File { checksum: ca }
+        );
+
+        // A directory at the path is a conflict too.
+        let err = st.place_object(Path::new("pool"), &ca).await.unwrap_err();
+        match &err {
+            Error::MergeConflict(msg) => {
+                assert_eq!(msg, "an object cannot overwrite the directory at pool");
+            }
+            other => panic!("expected MergeConflict, got {other:?}"),
+        }
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// Concurrent `place_object` calls with two differing checksums at one path
+/// resolve to one recorded winner; every call carrying the winner succeeds and
+/// every other call conflicts. The rule is decided under the mutating lock
+/// acquisition, so no interleaving produces a silent overwrite.
+#[test]
+fn concurrent_place_object_never_silently_overwrites() {
+    let tmp = TmpDir::new("staging-place-concurrent");
+    let root = tmp.path().join("repo");
+    let repo = block_on(Repo::create(&root, CreateOptions::new(RepoMode::BareUser))).unwrap();
+    let txn = block_on(repo.transaction()).unwrap();
+    let st = block_on(txn.staging_tree(None)).unwrap();
+
+    block_on(async {
+        st.make_dir(Path::new("pool"), &dir_meta()).await.unwrap();
+        st.write_file_content(Path::new("a"), &reg(), b"aaa")
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("b"), &reg(), b"bbb")
+            .await
+            .unwrap();
+    });
+    let ca = match block_on(st.lookup(Path::new("a"), false)).unwrap() {
+        StagingLookup::File { checksum } => checksum,
+        other => panic!("a is not a file: {other:?}"),
+    };
+    let cb = match block_on(st.lookup(Path::new("b"), false)).unwrap() {
+        StagingLookup::File { checksum } => checksum,
+        other => panic!("b is not a file: {other:?}"),
+    };
+
+    const N: usize = 8;
+    let results = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for i in 0..N {
+            let st = &st;
+            let results = &results;
+            let placed = if i % 2 == 0 { ca } else { cb };
+            scope.spawn(move || {
+                let outcome = block_on(st.place_object(Path::new("pool/x"), &placed));
+                results.lock().unwrap().push((placed, outcome));
+            });
+        }
+    });
+
+    let winner = match block_on(st.lookup(Path::new("pool/x"), false)).unwrap() {
+        StagingLookup::File { checksum } => checksum,
+        other => panic!("pool/x is not a file: {other:?}"),
+    };
+    assert!(winner == ca || winner == cb, "the winner is one of the two");
+    for (placed, outcome) in results.into_inner().unwrap() {
+        if placed == winner {
+            outcome.unwrap();
+        } else {
+            match outcome {
+                Err(Error::MergeConflict(_)) => {}
+                other => panic!("a losing call must conflict, got {other:?}"),
+            }
+        }
+    }
+
+    drop(st);
+    block_on(txn.abort()).unwrap();
+}
+
+/// Concurrent `ensure_dir` calls at one absent path create one directory and
+/// publish one dirmeta object for the whole set.
+#[test]
+fn concurrent_ensure_dir_creates_one_directory() {
+    let tmp = TmpDir::new("staging-ensure-dir-concurrent");
+    let root = tmp.path().join("repo");
+    let repo = block_on(Repo::create(&root, CreateOptions::new(RepoMode::BareUser))).unwrap();
+    let txn = block_on(repo.transaction()).unwrap();
+    let root_dm = block_on(stage_dir_meta(&txn));
+    let st = block_on(txn.staging_tree(None)).unwrap();
+    let novel = dir_meta_mode(0o040700);
+
+    const N: usize = 8;
+    std::thread::scope(|scope| {
+        for _ in 0..N {
+            let st = &st;
+            let novel = &novel;
+            scope.spawn(move || {
+                block_on(st.ensure_dir(Path::new("shared"), novel)).unwrap();
+            });
+        }
+    });
+
+    assert_eq!(
+        block_on(st.lookup(Path::new("shared"), false)).unwrap(),
+        StagingLookup::Dir
+    );
+    let mut built = st.close().unwrap();
+    built.set_metadata_checksum(root_dm);
+    block_on(txn.write_mtree(&mut built)).unwrap();
+    block_on(txn.commit()).unwrap();
+
+    // The 0755 root dirmeta and the novel one: two objects, however many
+    // concurrent calls staged the same bytes.
+    assert_eq!(
+        count_objects_with_ext(&root, ".dirmeta"),
+        2,
+        "the set staged one dirmeta object"
+    );
 }

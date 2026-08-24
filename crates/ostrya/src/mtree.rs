@@ -363,6 +363,31 @@ impl MutableTree {
         self.dirs.insert(name.to_owned(), Child::Loaded(loaded));
     }
 
+    /// Set the dirmeta checksum recorded for the subdirectory `name` without
+    /// hydrating a lazy child: a loaded child takes it as its own metadata
+    /// checksum, and a lazy child's entry is rewritten in place keeping its
+    /// dirtree, because the child's contents do not change. This directory's
+    /// dirtree embeds the child's dirmeta, so a changed lazy entry marks it
+    /// dirty; a loaded child already forces its parent to reassemble.
+    pub(crate) fn set_child_dirmeta(&mut self, name: &str, dirmeta: Checksum) -> Result<()> {
+        match self.dirs.get_mut(name) {
+            Some(Child::Loaded(child)) => {
+                child.metadata_checksum = Some(dirmeta);
+                Ok(())
+            }
+            Some(Child::Lazy { dirmeta: dm, .. }) => {
+                if *dm != dirmeta {
+                    *dm = dirmeta;
+                    self.clean = None;
+                }
+                Ok(())
+            }
+            None => Err(Error::MutableTree(format!(
+                "no subdirectory named {name:?}"
+            ))),
+        }
+    }
+
     /// Insert a fresh empty loaded subdirectory named `name` with the given
     /// dirmeta checksum, replacing any existing entry of that name. Marks this
     /// directory dirty.

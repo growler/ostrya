@@ -2011,9 +2011,9 @@ fn writes_with_an_existing_parent_stage_no_policy_dirmeta() {
     });
 }
 
-/// With a policy set, `lookup`, the reads, `remove`, and `clear_dir` resolve
-/// a path whose ancestors are absent without creating a directory and without
-/// staging an object.
+/// With a policy set, `lookup`, the reads, `remove`, `clear_dir`, and the
+/// `from` side of a `rename` resolve a path whose ancestors are absent
+/// without creating a directory and without staging an object.
 #[test]
 fn resolution_for_a_read_creates_nothing_under_a_policy() {
     let tmp = TmpDir::new("staging-implied-reads");
@@ -2046,7 +2046,15 @@ fn resolution_for_a_read_creates_nothing_under_a_policy() {
         );
         st.remove(Path::new("r/s/t"), true).await.unwrap();
         st.clear_dir(Path::new("c/d"), true).await.unwrap();
-        for name in ["x", "r", "c"] {
+        let err = st
+            .rename(Path::new("m/n"), Path::new("q"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PathNotFound { .. }),
+            "the from side reports the absent ancestor: {err:?}"
+        );
+        for name in ["x", "r", "c", "m"] {
             assert_eq!(
                 st.lookup(Path::new(name), false).await.unwrap(),
                 StagingLookup::Absent,
@@ -2753,6 +2761,335 @@ fn remove_and_clear_dir_are_refused_while_a_writer_is_live() {
             st.lookup(Path::new("d"), false).await.unwrap(),
             StagingLookup::Absent,
             "once the writer was dropped, remove takes the directory out"
+        );
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// `rename` moves a file, a symlink (the symlink object, not its target),
+/// and a populated directory with its subtree and dirmeta, and the renamed
+/// tree reaches the same root dirtree checksum as the same tree assembled by
+/// explicit writes at the final locations.
+#[test]
+fn rename_moves_each_kind_and_matches_explicit_writes() {
+    let tmp = TmpDir::new("staging-rename");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let novel = dir_meta_mode(0o040700);
+
+        let renamed = txn.staging_tree(None).await.unwrap();
+        renamed
+            .write_file_content(Path::new("f"), &reg(), b"f")
+            .await
+            .unwrap();
+        renamed
+            .symlink(Path::new("l"), Path::new("f2"), &symlink_meta())
+            .await
+            .unwrap();
+        renamed.make_dir(Path::new("d"), &novel).await.unwrap();
+        renamed
+            .write_file_content(Path::new("d/inner"), &reg(), b"inner")
+            .await
+            .unwrap();
+        renamed
+            .make_dir(Path::new("dest"), &dir_meta())
+            .await
+            .unwrap();
+
+        let link_csum = staged_file(&renamed, "l").await;
+        renamed
+            .rename(Path::new("f"), Path::new("f2"))
+            .await
+            .unwrap();
+        renamed
+            .rename(Path::new("l"), Path::new("dest/l"))
+            .await
+            .unwrap();
+        renamed
+            .rename(Path::new("d"), Path::new("dest/d"))
+            .await
+            .unwrap();
+
+        for gone in ["f", "l", "d"] {
+            assert_eq!(
+                renamed.lookup(Path::new(gone), false).await.unwrap(),
+                StagingLookup::Absent,
+                "{gone} left its old path"
+            );
+        }
+        assert_eq!(
+            staged_file(&renamed, "dest/l").await,
+            link_csum,
+            "the symlink moved as the symlink object"
+        );
+        let inner = renamed
+            .read_file(Path::new("dest/d/inner"), false)
+            .await
+            .unwrap();
+        assert_eq!(read_all(&inner).await, b"inner", "the subtree moved along");
+
+        let explicit = txn.staging_tree(None).await.unwrap();
+        explicit
+            .write_file_content(Path::new("f2"), &reg(), b"f")
+            .await
+            .unwrap();
+        explicit
+            .make_dir(Path::new("dest"), &dir_meta())
+            .await
+            .unwrap();
+        explicit
+            .symlink(Path::new("dest/l"), Path::new("f2"), &symlink_meta())
+            .await
+            .unwrap();
+        explicit
+            .make_dir(Path::new("dest/d"), &novel)
+            .await
+            .unwrap();
+        explicit
+            .write_file_content(Path::new("dest/d/inner"), &reg(), b"inner")
+            .await
+            .unwrap();
+
+        let mut built_renamed = renamed.close().unwrap();
+        built_renamed.set_metadata_checksum(root_dm);
+        let renamed_root = txn.write_mtree(&mut built_renamed).await.unwrap();
+        let mut built_explicit = explicit.close().unwrap();
+        built_explicit.set_metadata_checksum(root_dm);
+        let explicit_root = txn.write_mtree(&mut built_explicit).await.unwrap();
+        assert_eq!(
+            renamed_root.dirtree_checksum(),
+            explicit_root.dirtree_checksum(),
+            "the two builds agree on the root dirtree"
+        );
+        txn.abort().await.unwrap();
+    });
+}
+
+/// `rename` of a lazily-loaded committed subtree hydrates nothing: the
+/// subdirectory's dirtree object is deleted first, so any read would fail,
+/// and the moved entry keeps the child's dirtree and dirmeta checksums, which
+/// tells a moved lazy child from a rebuilt one -- a rebuild would have had to
+/// read the deleted dirtree. The one metadata offer is the new root dirtree.
+#[test]
+fn rename_of_a_lazy_subtree_hydrates_nothing() {
+    let tmp = TmpDir::new("staging-rename-lazy");
+    let base = tmp.path();
+    let repo_root = base.join("repo");
+
+    let src = base.join("base");
+    mkdir(&src, 0o755);
+    mkdir(&src.join("sub"), 0o755);
+    write_file(&src.join("sub/inner.txt"), b"inner", 0o644);
+
+    block_on(async {
+        let repo = Repo::create(&repo_root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        commit_dir(&repo, dfd.as_fd(), Path::new("base"), "test/base").await;
+        let (sub_dirtree, sub_dirmeta, _) = committed_subdir(&repo, "test/base", "sub").await;
+        delete_loose_object(&repo_root, &sub_dirtree, "dirtree");
+
+        let checksum = repo.resolve_rev("test/base", false).await.unwrap().unwrap();
+        let (commit, _) = repo.load_commit(&checksum).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(Some(&commit)).await.unwrap();
+
+        st.rename(Path::new("sub"), Path::new("moved"))
+            .await
+            .unwrap();
+
+        let mut built = st.close().unwrap();
+        let rebuilt = txn.write_mtree(&mut built).await.unwrap();
+        let new_root_dirtree = *rebuilt.dirtree_checksum();
+        let stats = txn.commit().await.unwrap();
+        assert_eq!(
+            stats.metadata_total, 1,
+            "only the new root dirtree was offered for staging"
+        );
+
+        let repo = Repo::open(&repo_root).await.unwrap();
+        let (moved_dt, moved_dm) = dirtree_subdir(&repo, &new_root_dirtree, "moved").await;
+        assert_eq!(
+            moved_dt, sub_dirtree,
+            "the moved entry keeps its dirtree checksum"
+        );
+        assert_eq!(
+            moved_dm, sub_dirmeta,
+            "the moved entry keeps its dirmeta checksum"
+        );
+    });
+}
+
+/// `rename` onto an existing entry -- the source's own path included -- is
+/// `EntryExists`, converting to `AlreadyExists`; an absent source is
+/// `PathNotFound`; a destination under the moved entry is refused; and a
+/// missing destination parent follows the implied-dirmeta policy: an error
+/// without one, created under it.
+#[test]
+fn rename_refusals_and_destination_parents() {
+    use std::io;
+
+    let tmp = TmpDir::new("staging-rename-refusals");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.write_file_content(Path::new("a"), &reg(), b"a")
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("b"), &reg(), b"b")
+            .await
+            .unwrap();
+        st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+
+        let err = st.rename(Path::new("a"), Path::new("b")).await.unwrap_err();
+        match &err {
+            Error::EntryExists { path } => assert_eq!(path, "b"),
+            other => panic!("expected EntryExists, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::AlreadyExists);
+        match st.rename(Path::new("a"), Path::new("a")).await {
+            Err(Error::EntryExists { path }) => assert_eq!(path, "a"),
+            other => panic!("a rename onto its own path is EntryExists: {other:?}"),
+        }
+
+        let err = st
+            .rename(Path::new("ghost"), Path::new("g2"))
+            .await
+            .unwrap_err();
+        match &err {
+            Error::PathNotFound { path } => assert_eq!(path, "ghost"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+
+        match st.rename(Path::new("d"), Path::new("d/x")).await {
+            Err(Error::Staging(msg)) => assert_eq!(
+                msg, "cannot rename d to d/x: the destination is under the moved entry",
+                "the refusal names both resolved paths"
+            ),
+            other => panic!("a destination under the moved entry is refused: {other:?}"),
+        }
+        assert_eq!(
+            st.lookup(Path::new("d"), false).await.unwrap(),
+            StagingLookup::Dir,
+            "the refused rename leaves the directory in place"
+        );
+
+        // A missing destination parent without a policy is the walk's error,
+        // and the source stays where it was.
+        let err = st
+            .rename(Path::new("a"), Path::new("no/where"))
+            .await
+            .unwrap_err();
+        match &err {
+            Error::PathNotFound { path } => assert_eq!(path, "no"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+        staged_file(&st, "a").await;
+
+        // Under a policy the destination parent chain is created.
+        let stp = txn
+            .staging_tree(None)
+            .await
+            .unwrap()
+            .with_implied_dirmeta(dir_meta_mode(0o040750));
+        stp.write_file_content(Path::new("src"), &reg(), b"s")
+            .await
+            .unwrap();
+        stp.rename(Path::new("src"), Path::new("n/e/w"))
+            .await
+            .unwrap();
+        staged_file(&stp, "n/e/w").await;
+        assert_eq!(
+            stp.lookup(Path::new("src"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "the source left its old path"
+        );
+
+        drop(st);
+        drop(stp);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// `rename` is refused while any file writer is live -- a writer in a branch
+/// disjoint from both paths included -- leaves both sides as they were, and
+/// succeeds once the writer has finished or been dropped.
+#[test]
+fn rename_is_refused_while_a_writer_is_live() {
+    let tmp = TmpDir::new("staging-rename-writer-guard");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+        st.write_file_content(Path::new("d/keep.txt"), &reg(), b"keep")
+            .await
+            .unwrap();
+        st.make_dir(Path::new("other"), &dir_meta()).await.unwrap();
+        let mut writer = st
+            .write_file(Path::new("other/w.txt"), &reg())
+            .await
+            .unwrap();
+        writer.write_all(b"w").await.unwrap();
+
+        match st.rename(Path::new("d"), Path::new("moved")).await {
+            Err(Error::Staging(msg)) => assert_eq!(
+                msg, "cannot rename d to moved: 1 file writer(s) still outstanding",
+                "the refusal names both paths and the count"
+            ),
+            other => panic!("rename is refused while a writer is live: {other:?}"),
+        }
+        staged_file(&st, "d/keep.txt").await;
+        assert_eq!(
+            st.lookup(Path::new("moved"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "the blocked rename recorded nothing at the destination"
+        );
+
+        writer.finish().await.unwrap();
+        st.rename(Path::new("d"), Path::new("moved")).await.unwrap();
+        staged_file(&st, "moved/keep.txt").await;
+        assert_eq!(
+            st.lookup(Path::new("d"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "once the writer finished, the rename moved the directory"
+        );
+
+        // An abandoned writer releases the guard too.
+        let writer = st
+            .write_file(Path::new("other/w2.txt"), &reg())
+            .await
+            .unwrap();
+        match st.rename(Path::new("moved"), Path::new("again")).await {
+            Err(Error::Staging(_)) => {}
+            other => panic!("rename is refused while a writer is live: {other:?}"),
+        }
+        drop(writer);
+        st.rename(Path::new("moved"), Path::new("again"))
+            .await
+            .unwrap();
+        staged_file(&st, "again/keep.txt").await;
+        assert_eq!(
+            st.lookup(Path::new("moved"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "once the writer was dropped, the rename moved the directory"
         );
 
         drop(st);

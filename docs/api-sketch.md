@@ -775,6 +775,12 @@ impl StagingTree<'_> {
     /// committed directory is emptied in place, keeping its recorded
     /// dirmeta checksum, without hydration.
     pub async fn clear_dir(&self, path: &Path, allow_noent: bool) -> Result<()>;
+    /// Move the entry at `from` to `to`, subtree and dirmeta included.
+    /// Neither final component is followed. An existing entry at `to` is
+    /// `EntryExists`, and a destination at or under the moved entry is
+    /// refused. A moved lazy committed directory stays lazy, so no
+    /// dirtree is read for the moved subtree.
+    pub async fn rename(&self, from: &Path, to: &Path) -> Result<()>;
 
     /// Path resolution against the staged tree; objects load from the
     /// transaction's staged set first, then from `objects/`.
@@ -839,15 +845,21 @@ transaction.
 Path semantics for the write operations: intermediate components resolve
 through symlinks with the same walker; the final component never
 follows. With an implied dirmeta set, `write_file`,
-`write_file_content`, `symlink`, `hardlink`, `place_object`, and
-`ensure_dir` create missing ancestors as directories carrying it,
-staging that dirmeta at most once per operation and only when a
+`write_file_content`, `symlink`, `hardlink`, `place_object`,
+`ensure_dir`, and the destination side of a `rename` create missing
+ancestors as directories carrying it, staging that dirmeta at most
+once per operation and only when a
 directory is created; the leaf takes what the operation itself
 supplies. Ancestors created before a refused leaf stay in the tree, and
 a component a later `..` steps back out of is created like any other
-ancestor. Resolution for a read, a `lookup`, a `remove`, a `clear_dir`,
-or the source side of a `hardlink` never creates a directory, whatever
-the policy. `make_dir` and `make_dir_all` keep their own rules.
+ancestor. A `rename` resolves its destination before it decides any
+refusal, so a refused `rename` keeps those ancestors too; where the
+destination is under the moved entry they sit inside that entry, and a
+lazily-loaded source is hydrated to reach them. Resolution for a read,
+a `lookup`, a `remove`, a `clear_dir`,
+the source side of a `hardlink`, or the `from` side of a `rename`
+never creates a directory, whatever the policy. `make_dir` and
+`make_dir_all` keep their own rules.
 `write_file`, `write_file_content`, `symlink`, and `hardlink`
 replace an existing file or symlink entry and fail on a directory with
 `ReplaceDirWithFile`; `make_dir` fails on any existing entry;
@@ -860,7 +872,7 @@ root itself cannot be cleared. A `remove` that takes an entry out and a
 `clear_dir` that reaches a directory are refused with `Staging` while
 any `write_file` writer is outstanding, wherever in the tree it sits,
 the rule the merge overwrite follows; a call that removes nothing is
-not.
+not. A `rename` that reaches its two checks is refused the same way.
 
 Each refusal carries its own `Error` variant naming the path resolution
 stopped at, so a consumer branches on the condition: `PathNotFound` for
@@ -876,10 +888,12 @@ queued reports `DanglingSymlink` for the innermost such symlink; once a
 target is spent, an absent component reports `PathNotFound`.
 `Staging` carries the conditions none of those names: the
 outstanding-writer refusals from `close`, from a merge overwrite that
-replaces a directory with a file, from `remove`, and from `clear_dir`,
-a read of a directory where a file was wanted, a `hardlink` whose
-source resolves to a directory, a directory a concurrent operation
-removed under the lock, a path with no final component or one ending
+replaces a directory with a file, from `remove`, from `clear_dir`, and
+from `rename`, a read of a directory where a file was wanted, a
+`hardlink` whose source resolves to a directory, a `rename` whose
+destination is at or under the moved entry, a directory a concurrent
+operation removed under the lock, a path with no final component or
+one ending
 in `..`, a non-UTF-8 path component or symlink target, and a hydration
 with no repository handle. A `Staging`
 condition raised before resolution begins reports the path as the

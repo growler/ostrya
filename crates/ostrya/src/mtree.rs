@@ -105,6 +105,20 @@ pub(crate) enum ChildRef<'a> {
     },
 }
 
+/// An entry taken out of one directory by
+/// [`take_child`](MutableTree::take_child) for reinsertion under another name
+/// with [`insert_child`](MutableTree::insert_child). The node is carried as it
+/// was taken, so a lazy subdirectory stays lazy.
+pub(crate) struct TakenEntry {
+    inner: TakenInner,
+}
+
+/// The taken node: a file entry's checksum, or a subdirectory.
+enum TakenInner {
+    File(Checksum),
+    Dir(Child),
+}
+
 /// The checksums a written directory contributes to its parent's dirtree entry.
 struct Emitted {
     dirtree: Checksum,
@@ -261,6 +275,50 @@ impl MutableTree {
             self.dirs.clear();
             self.clean = None;
         }
+    }
+
+    /// Take the entry named `name` out of this directory, file or
+    /// subdirectory, for reinsertion under another name with
+    /// [`insert_child`](MutableTree::insert_child). Marks this directory
+    /// dirty. The taken node itself is untouched, so a moved subtree keeps
+    /// its own `clean` state and a lazy child stays lazy. An absent name
+    /// yields `None`.
+    pub(crate) fn take_child(&mut self, name: &str) -> Option<TakenEntry> {
+        let inner = if let Some(checksum) = self.files.remove(name) {
+            TakenInner::File(checksum)
+        } else if let Some(child) = self.dirs.remove(name) {
+            TakenInner::Dir(child)
+        } else {
+            return None;
+        };
+        self.clean = None;
+        Some(TakenEntry { inner })
+    }
+
+    /// Insert a taken entry under `name`, marking this directory dirty. The
+    /// name must be fresh: an existing entry of that name is refused, which
+    /// keeps the one-name-one-entry rule every other mutator holds. A moved
+    /// lazy child hydrates from this directory's own repository handle: every
+    /// directory takes that handle from its parent, and a lazy child exists
+    /// only under a tree [`hydrate`](MutableTree::hydrate) built, so a
+    /// directory that can receive one always holds a handle.
+    pub(crate) fn insert_child(&mut self, name: &str, entry: TakenEntry) -> Result<()> {
+        validate_name(name)?;
+        if self.files.contains_key(name) || self.dirs.contains_key(name) {
+            return Err(Error::MutableTree(format!(
+                "an entry named {name:?} already exists"
+            )));
+        }
+        match entry.inner {
+            TakenInner::File(checksum) => {
+                self.files.insert(name.to_owned(), checksum);
+            }
+            TakenInner::Dir(child) => {
+                self.dirs.insert(name.to_owned(), child);
+            }
+        }
+        self.clean = None;
+        Ok(())
     }
 
     /// Remove the file or subdirectory named `name`. With `allow_noent`, an

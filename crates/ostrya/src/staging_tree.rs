@@ -19,9 +19,10 @@
 //! [`MutableTree`](crate::MutableTree) and fails while any file writer is still
 //! outstanding, counted on the tree. A [`merge`](StagingTree::merge) overwrite
 //! that replaces a directory with a file, a [`remove`](StagingTree::remove)
-//! that takes an entry out, and a [`clear_dir`](StagingTree::clear_dir) that
-//! reaches a directory are refused the same way while any file writer is
-//! outstanding, wherever in the tree it sits: a writer records its entry at
+//! that takes an entry out, a [`clear_dir`](StagingTree::clear_dir) that
+//! reaches a directory, and a [`rename`](StagingTree::rename) are refused the
+//! same way while any file writer is outstanding, wherever in the tree it
+//! sits: a writer records its entry at
 //! [`finish`](StagedFileWriter::finish) under the component path it captured,
 //! and an entry dropped in between would leave that path stale.
 //!
@@ -217,13 +218,15 @@ impl<'txn> StagingTree<'txn> {
     /// The policy applies to [`write_file`](StagingTree::write_file),
     /// [`write_file_content`](StagingTree::write_file_content),
     /// [`symlink`](StagingTree::symlink), [`hardlink`](StagingTree::hardlink),
-    /// [`place_object`](StagingTree::place_object), and
-    /// [`ensure_dir`](StagingTree::ensure_dir): ancestors the operation
+    /// [`place_object`](StagingTree::place_object),
+    /// [`ensure_dir`](StagingTree::ensure_dir), and the destination side of a
+    /// [`rename`](StagingTree::rename): ancestors the operation
     /// creates take the policy dirmeta, and the leaf takes whatever the
     /// operation itself supplies. Path resolution for a read, a
     /// [`lookup`](StagingTree::lookup), a [`remove`](StagingTree::remove), a
-    /// [`clear_dir`](StagingTree::clear_dir), or the source side of a
-    /// [`hardlink`](StagingTree::hardlink) never creates a directory and never
+    /// [`clear_dir`](StagingTree::clear_dir), the source side of a
+    /// [`hardlink`](StagingTree::hardlink), or the `from` side of a
+    /// [`rename`](StagingTree::rename) never creates a directory and never
     /// stages a dirmeta object. [`make_dir`](StagingTree::make_dir) and
     /// [`make_dir_all`](StagingTree::make_dir_all) keep their own rules.
     ///
@@ -598,6 +601,80 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
+    /// Move the entry at `from` to `to`, subtree and dirmeta included.
+    /// Neither final component is followed, so renaming a symlink moves the
+    /// symlink. An existing entry at `to` is
+    /// [`EntryExists`](Error::EntryExists), and a destination at or under
+    /// the moved entry is refused with [`Staging`](Error::Staging), because
+    /// the move would detach the directory that must receive it. A missing
+    /// destination parent is created under an implied dirmeta
+    /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)) and is
+    /// an error without one; the `from` side never creates a directory. The
+    /// moved node is carried as it is, so a lazily-loaded committed
+    /// directory stays lazy and no dirtree is read for the moved subtree.
+    /// The call is refused with [`Staging`](Error::Staging) while any
+    /// [`write_file`](StagingTree::write_file) writer is outstanding,
+    /// wherever in the tree it sits.
+    ///
+    /// The destination is resolved before any refusal is decided, so a
+    /// refused call keeps the ancestors the policy created for it, the rule
+    /// every write follows. Where the destination is under the moved entry,
+    /// those ancestors sit inside that entry, and a lazily-loaded source is
+    /// hydrated to reach them; the refusal reports whatever that resolution
+    /// raises.
+    pub async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let (from_parent, from_name) = self.resolve_parent(from).await?;
+        let (to_parent, to_name) = self.resolve_write_parent(to).await?;
+        let mut from_path = from_parent.clone();
+        from_path.push(from_name.clone());
+        // Both sides are resolved literal component paths, so the prefix
+        // comparison is exact: a destination parent at or under the moved
+        // entry would be detached by the take and could never receive it.
+        if to_parent.starts_with(&from_path) {
+            return Err(Error::Staging(format!(
+                "cannot rename {} to {}: the destination is under the moved entry",
+                spell_path(&from_path),
+                join(&to_parent, &to_name)
+            )));
+        }
+        // Decide and move under one lock acquisition: the destination and
+        // the source are re-read and the writer guard is consulted where
+        // the entry is about to move, so no concurrent operation slots in
+        // between the checks and the two mutations.
+        let mut tree = self.tree.lock().unwrap();
+        let to_dir = tree
+            .dir_at(&to_parent)
+            .ok_or_else(|| Error::Staging(dir_gone(&to_parent)))?;
+        if !matches!(to_dir.child_kind(&to_name), ChildKind::Absent) {
+            return Err(entry_exists(&to_parent, &to_name));
+        }
+        let from_dir = tree
+            .dir_at_mut(&from_parent)
+            .ok_or_else(|| Error::Staging(dir_gone(&from_parent)))?;
+        if matches!(from_dir.child_kind(&from_name), ChildKind::Absent) {
+            return Err(Error::PathNotFound {
+                path: join(&from_parent, &from_name),
+            });
+        }
+        self.check_no_live_writers(&format!(
+            "rename {} to {}",
+            join(&from_parent, &from_name),
+            join(&to_parent, &to_name)
+        ))?;
+        let entry = from_dir
+            .take_child(&from_name)
+            .expect("an entry present under the same lock acquisition");
+        // The entry is out of the tree here, so a failed insertion would drop
+        // it. Neither of the two refusals can fire: the name comes from a
+        // `Component::Normal`, which `validate_name` accepts, and the
+        // destination was read absent under this same acquisition.
+        tree.dir_at_mut(&to_parent)
+            .expect("a destination parent present under the same lock acquisition")
+            .insert_child(&to_name, entry)
+            .expect("a fresh name in a present directory under the same lock acquisition");
+        Ok(())
+    }
+
     // --- reads (staged-first) ---
 
     /// Resolve `path` and report what sits there. Intermediate components
@@ -692,8 +769,8 @@ impl<'txn> StagingTree<'txn> {
     }
 
     /// Refuse a structural change -- dropping a directory, removing an
-    /// entry, clearing a directory's children -- while any file writer is
-    /// live. A writer records its entry at
+    /// entry, clearing a directory's children, moving an entry -- while any
+    /// file writer is live. A writer records its entry at
     /// [`finish`](StagedFileWriter::finish) under the component path it
     /// captured, and a directory dropped in between would leave that path
     /// stale, or pointing at a different directory created there later. A

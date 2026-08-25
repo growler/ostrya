@@ -18,8 +18,8 @@ use common::TmpDir;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DirMeta, Error,
-    FileMeta, FileObject, MergeOptions, MutableTree, Repo, RepoMode, StagingEntry, StagingLookup,
-    Transaction, TreeEntry,
+    FileMeta, FileObject, MergeOptions, MutableTree, Repo, RepoMode, RootDirmeta, StagingEntry,
+    StagingLookup, Transaction, TreeEntry,
 };
 use ostrya_core::{ObjectType, Xattrs};
 use ostrya_rt::block_on;
@@ -379,6 +379,7 @@ fn package_merges_through_opt_symlink() {
                 MergeOptions {
                     allow_overwrite: false,
                     follow_symlinks: true,
+                    ..MergeOptions::default()
                 },
             )
             .await
@@ -458,6 +459,7 @@ fn file_over_localtime_symlink_replaces_without_writing_through() {
                 MergeOptions {
                     allow_overwrite: true,
                     follow_symlinks: true,
+                    ..MergeOptions::default()
                 },
             )
             .await
@@ -532,6 +534,7 @@ fn merge_resolves_a_symlink_staged_in_this_transaction() {
                 MergeOptions {
                     allow_overwrite: false,
                     follow_symlinks: true,
+                    ..MergeOptions::default()
                 },
             )
             .await
@@ -601,6 +604,7 @@ fn merge_reads_committed_right_side_subtrees() {
                 MergeOptions {
                     allow_overwrite: false,
                     follow_symlinks: false,
+                    ..MergeOptions::default()
                 },
             )
             .await
@@ -1169,6 +1173,7 @@ fn merge_through_a_symlink_to_a_file_is_not_a_directory() {
                 MergeOptions {
                     allow_overwrite: false,
                     follow_symlinks: true,
+                    ..MergeOptions::default()
                 },
             )
             .await
@@ -2122,6 +2127,49 @@ fn implied_and_explicit_ancestors_agree_on_the_checksum() {
             explicit_root.dirtree_checksum(),
             "the two builds agree on the root dirtree"
         );
+        txn.abort().await.unwrap();
+    });
+}
+
+/// A policy creates an absent ancestor, and does not create the target of a
+/// symlink that has one, so the creating walk names the symlink with
+/// `DanglingSymlink` the way the non-creating walk does. The refusal creates
+/// nothing.
+#[test]
+fn a_dangling_symlink_ancestor_under_a_policy_is_dangling_not_absent() {
+    let tmp = TmpDir::new("staging-implied-dangling");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn
+            .staging_tree(None)
+            .await
+            .unwrap()
+            .with_implied_dirmeta(dir_meta_mode(0o040750));
+        st.symlink(Path::new("gone"), Path::new("nowhere"), &symlink_meta())
+            .await
+            .unwrap();
+
+        match st
+            .write_file_content(Path::new("gone/f"), &reg(), b"x")
+            .await
+        {
+            Err(Error::DanglingSymlink { path, target }) => {
+                assert_eq!(path, "gone");
+                assert_eq!(target, "nowhere");
+            }
+            other => panic!("the creating walk names the symlink: {other:?}"),
+        }
+        assert_eq!(
+            st.lookup(Path::new("nowhere"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "the policy created no target directory"
+        );
+
+        drop(st);
         txn.abort().await.unwrap();
     });
 }
@@ -3093,6 +3141,498 @@ fn rename_is_refused_while_a_writer_is_live() {
         );
 
         drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// `merge_at` lands the right side under an existing base, and the tree it
+/// produces reaches the same root dirtree checksum as the same union assembled
+/// by explicit writes.
+#[test]
+fn merge_at_matches_explicit_writes() {
+    let tmp = TmpDir::new("staging-merge-at");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &novel.serialize().unwrap())
+            .await
+            .unwrap();
+
+        let pkg_st = txn.staging_tree(None).await.unwrap();
+        pkg_st
+            .write_file_content(Path::new("f"), &reg(), b"pkg")
+            .await
+            .unwrap();
+        pkg_st
+            .make_dir(Path::new("sub"), &dir_meta())
+            .await
+            .unwrap();
+        pkg_st
+            .write_file_content(Path::new("sub/g"), &reg(), b"deep")
+            .await
+            .unwrap();
+        let mut package = pkg_st.close().unwrap();
+        package.set_metadata_checksum(novel_csum);
+
+        let merged_st = txn.staging_tree(None).await.unwrap();
+        merged_st.make_dir(Path::new("dest"), &novel).await.unwrap();
+        merged_st
+            .write_file_content(Path::new("dest/own"), &reg(), b"own")
+            .await
+            .unwrap();
+        merged_st
+            .merge_at(Path::new("dest"), &package, MergeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(
+                &merged_st
+                    .read_file(Path::new("dest/f"), false)
+                    .await
+                    .unwrap()
+            )
+            .await,
+            b"pkg",
+            "the right side landed under the base"
+        );
+        assert_eq!(
+            merged_st.lookup(Path::new("f"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "nothing landed at the tree root"
+        );
+
+        // `/` and the empty path name the tree root, like `.`. Each takes a
+        // fresh tree, since a base that reached nothing would pass on a tree
+        // the merge already filled.
+        for spelling in ["/", ""] {
+            let at_root = txn.staging_tree(None).await.unwrap();
+            at_root
+                .merge_at(Path::new(spelling), &package, MergeOptions::default())
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    at_root.lookup(Path::new("f"), false).await.unwrap(),
+                    StagingLookup::File { .. }
+                ),
+                "`{spelling}` merged at the tree root"
+            );
+            at_root.close().unwrap();
+        }
+
+        let explicit = txn.staging_tree(None).await.unwrap();
+        explicit.make_dir(Path::new("dest"), &novel).await.unwrap();
+        explicit
+            .write_file_content(Path::new("dest/own"), &reg(), b"own")
+            .await
+            .unwrap();
+        explicit
+            .write_file_content(Path::new("dest/f"), &reg(), b"pkg")
+            .await
+            .unwrap();
+        explicit
+            .make_dir(Path::new("dest/sub"), &dir_meta())
+            .await
+            .unwrap();
+        explicit
+            .write_file_content(Path::new("dest/sub/g"), &reg(), b"deep")
+            .await
+            .unwrap();
+
+        let mut built_merged = merged_st.close().unwrap();
+        built_merged.set_metadata_checksum(root_dm);
+        let merged_root = txn.write_mtree(&mut built_merged).await.unwrap();
+        let mut built_explicit = explicit.close().unwrap();
+        built_explicit.set_metadata_checksum(root_dm);
+        let explicit_root = txn.write_mtree(&mut built_explicit).await.unwrap();
+        assert_eq!(
+            merged_root.dirtree_checksum(),
+            explicit_root.dirtree_checksum(),
+            "the two builds agree on the root dirtree"
+        );
+        txn.abort().await.unwrap();
+    });
+}
+
+/// `root_dirmeta` governs the merge root alone. A base whose dirmeta equals the
+/// right root's is silent under either value; a differing one is a conflict
+/// under `Reconcile` and is taken with `allow_overwrite`; `KeepLeft` keeps the
+/// base's own dirmeta and merges the entries all the same. A directory below
+/// the root reconciles whatever the value is.
+#[test]
+fn merge_at_root_dirmeta_governs_the_base_alone() {
+    let tmp = TmpDir::new("staging-merge-at-root-dirmeta");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        // `dir_meta()` is the 0755 meta the bases below take, so they carry
+        // the same checksum the tree root does.
+        let base_dm = root_dm;
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &novel.serialize().unwrap())
+            .await
+            .unwrap();
+
+        // The right side: a 0700 root holding a file and a 0700 subdirectory.
+        let pkg_st = txn.staging_tree(None).await.unwrap();
+        pkg_st
+            .write_file_content(Path::new("f"), &reg(), b"pkg")
+            .await
+            .unwrap();
+        pkg_st.make_dir(Path::new("sub"), &novel).await.unwrap();
+        let mut package = pkg_st.close().unwrap();
+        package.set_metadata_checksum(novel_csum);
+
+        let st = txn.staging_tree(None).await.unwrap();
+        let keep_left = MergeOptions {
+            root_dirmeta: RootDirmeta::KeepLeft,
+            ..MergeOptions::default()
+        };
+        // A base whose dirmeta equals the right root's: silent either way.
+        st.make_dir(Path::new("equal"), &novel).await.unwrap();
+        st.merge_at(Path::new("equal"), &package, MergeOptions::default())
+            .await
+            .unwrap();
+        st.make_dir(Path::new("equal_kept"), &novel).await.unwrap();
+        st.merge_at(Path::new("equal_kept"), &package, keep_left)
+            .await
+            .unwrap();
+
+        // A differing base under `Reconcile`: a conflict naming the base, and
+        // the right dirmeta with `allow_overwrite`.
+        st.make_dir(Path::new("differ"), &dir_meta()).await.unwrap();
+        match st
+            .merge_at(Path::new("differ"), &package, MergeOptions::default())
+            .await
+        {
+            Err(Error::MergeConflict(msg)) => assert_eq!(
+                msg, "directory metadata differs at differ",
+                "the conflict names the base"
+            ),
+            other => panic!("a differing base dirmeta conflicts: {other:?}"),
+        }
+        assert_eq!(
+            st.lookup(Path::new("differ/f"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "the conflict was raised before the entries were applied"
+        );
+        st.merge_at(
+            Path::new("differ"),
+            &package,
+            MergeOptions {
+                allow_overwrite: true,
+                ..MergeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // The same differing base under `KeepLeft`: no conflict, and the base
+        // keeps its own dirmeta.
+        st.make_dir(Path::new("keep"), &dir_meta()).await.unwrap();
+        st.merge_at(Path::new("keep"), &package, keep_left)
+            .await
+            .unwrap();
+
+        let mut built = st.close().unwrap();
+        built.set_metadata_checksum(root_dm);
+        let built_root = txn.write_mtree(&mut built).await.unwrap();
+        let root_dirtree = *built_root.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&root).await.unwrap();
+        for base in ["equal", "equal_kept", "differ"] {
+            let (dt, dm) = dirtree_subdir(&repo, &root_dirtree, base).await;
+            assert_eq!(dm, novel_csum, "{base} carries the right root's dirmeta");
+            let (_, sub_dm) = dirtree_subdir(&repo, &dt, "sub").await;
+            assert_eq!(sub_dm, novel_csum, "{base}/sub reconciled its own dirmeta");
+        }
+        let (keep_dt, keep_dm) = dirtree_subdir(&repo, &root_dirtree, "keep").await;
+        assert_eq!(keep_dm, base_dm, "KeepLeft kept the base's own dirmeta");
+        let (_, keep_sub_dm) = dirtree_subdir(&repo, &keep_dt, "sub").await;
+        assert_eq!(
+            keep_sub_dm, novel_csum,
+            "a directory below the root reconciles under KeepLeft too"
+        );
+    });
+}
+
+/// A missing `merge_at` base is created under the implied dirmeta and stays in
+/// the tree when the merge then conflicts on it. `KeepLeft` keeps the policy
+/// dirmeta and lands the right side under it. Without a policy, an absent base
+/// is `PathNotFound`, a file at the base and a symlink to one are
+/// `NotADirectory`, and a symlink to a directory is a valid base.
+#[test]
+fn merge_at_creates_its_base_under_the_implied_policy() {
+    let tmp = TmpDir::new("staging-merge-at-implied-base");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let policy = dir_meta_mode(0o040750);
+        let policy_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &policy.serialize().unwrap())
+            .await
+            .unwrap();
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &novel.serialize().unwrap())
+            .await
+            .unwrap();
+
+        let pkg_st = txn.staging_tree(None).await.unwrap();
+        pkg_st
+            .write_file_content(Path::new("f"), &reg(), b"pkg")
+            .await
+            .unwrap();
+        let mut package = pkg_st.close().unwrap();
+        package.set_metadata_checksum(novel_csum);
+
+        let st = txn
+            .staging_tree(None)
+            .await
+            .unwrap()
+            .with_implied_dirmeta(policy);
+
+        // The base's every component is created under the policy, its own
+        // final component included. The right root's dirmeta is not the policy
+        // dirmeta, so `Reconcile` conflicts on it.
+        match st
+            .merge_at(Path::new("pool/x"), &package, MergeOptions::default())
+            .await
+        {
+            Err(Error::MergeConflict(msg)) => assert_eq!(
+                msg, "directory metadata differs at pool/x",
+                "the conflict names the created base"
+            ),
+            other => panic!("the policy dirmeta conflicts with the right root: {other:?}"),
+        }
+        assert_eq!(
+            st.lookup(Path::new("pool/x"), false).await.unwrap(),
+            StagingLookup::Dir,
+            "the refused merge keeps the base the policy created"
+        );
+
+        // `KeepLeft` is the case that needs the policy dirmeta kept.
+        st.merge_at(
+            Path::new("pool/y"),
+            &package,
+            MergeOptions {
+                root_dirmeta: RootDirmeta::KeepLeft,
+                ..MergeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_all(&st.read_file(Path::new("pool/y/f"), false).await.unwrap()).await,
+            b"pkg",
+            "the right side landed under the created base"
+        );
+
+        // Without a policy, the base must exist and must be a directory.
+        let plain = txn.staging_tree(None).await.unwrap();
+        plain
+            .write_file_content(Path::new("file"), &reg(), b"x")
+            .await
+            .unwrap();
+        match plain
+            .merge_at(Path::new("absent/base"), &package, MergeOptions::default())
+            .await
+        {
+            Err(Error::PathNotFound { path }) => assert_eq!(path, "absent"),
+            other => panic!("an absent base without a policy is PathNotFound: {other:?}"),
+        }
+        match plain
+            .merge_at(Path::new("file"), &package, MergeOptions::default())
+            .await
+        {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "file"),
+            other => panic!("a file at the base is NotADirectory: {other:?}"),
+        }
+        plain
+            .symlink(Path::new("to_file"), Path::new("file"), &symlink_meta())
+            .await
+            .unwrap();
+        match plain
+            .merge_at(Path::new("to_file"), &package, MergeOptions::default())
+            .await
+        {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "file"),
+            other => panic!("a symlink to a file is NotADirectory: {other:?}"),
+        }
+
+        // A base that is a dangling symlink names the symlink either way: the
+        // creating walk and the plain walk agree on the variant, so a policy
+        // does not change the condition a caller branches on.
+        for (tree, label) in [(&plain, "without a policy"), (&st, "under a policy")] {
+            tree.symlink(Path::new("gone"), Path::new("nowhere"), &symlink_meta())
+                .await
+                .unwrap();
+            match tree
+                .merge_at(Path::new("gone"), &package, MergeOptions::default())
+                .await
+            {
+                Err(Error::DanglingSymlink { path, target }) => {
+                    assert_eq!(path, "gone");
+                    assert_eq!(target, "nowhere");
+                }
+                other => panic!("a dangling base {label} is DanglingSymlink: {other:?}"),
+            }
+        }
+
+        // A symlink to a directory is a valid base, and the base's final
+        // component follows without `follow_symlinks`. The right root's
+        // dirmeta is the one `real` carries, so the base reconciles silently.
+        plain.make_dir(Path::new("real"), &novel).await.unwrap();
+        plain
+            .symlink(Path::new("to_dir"), Path::new("real"), &symlink_meta())
+            .await
+            .unwrap();
+        plain
+            .merge_at(Path::new("to_dir"), &package, MergeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(&plain.read_file(Path::new("real/f"), false).await.unwrap()).await,
+            b"pkg",
+            "the right side landed in the symlink's target directory"
+        );
+        assert!(
+            matches!(
+                plain.lookup(Path::new("to_dir"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "the base symlink is still a symlink"
+        );
+        plain.close().unwrap();
+
+        let mut built = st.close().unwrap();
+        built.set_metadata_checksum(root_dm);
+        let built_root = txn.write_mtree(&mut built).await.unwrap();
+        let root_dirtree = *built_root.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&root).await.unwrap();
+        let (pool_dt, pool_dm) = dirtree_subdir(&repo, &root_dirtree, "pool").await;
+        assert_eq!(
+            pool_dm, policy_csum,
+            "the base's ancestor carries the policy"
+        );
+        let (_, x_dm) = dirtree_subdir(&repo, &pool_dt, "x").await;
+        assert_eq!(
+            x_dm, policy_csum,
+            "the refused merge left the base's dirmeta as the policy set it"
+        );
+        let (_, y_dm) = dirtree_subdir(&repo, &pool_dt, "y").await;
+        assert_eq!(y_dm, policy_csum, "KeepLeft kept the policy dirmeta");
+    });
+}
+
+/// The writer guard covers the merge arms that drop a directory and no others.
+/// A right-side directory arriving over an absent name or over a file drops no
+/// directory, so both land with a writer live; a right-side file over a
+/// directory is refused. The branch where the name holds a directory the merge
+/// did not read has no cell: one task reaches the re-read with no await between
+/// it and the read, so only another task can put a directory there.
+#[test]
+fn merge_at_guards_only_the_arms_that_drop_a_directory() {
+    let tmp = TmpDir::new("staging-merge-at-guard-scope");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+
+        // One right side holds directories at `f` and `e`, the other a file at
+        // `d`. They merge separately, since the merge applies a directory's
+        // file entries before it descends into its subdirectories.
+        let dirs_st = txn.staging_tree(None).await.unwrap();
+        dirs_st.make_dir(Path::new("f"), &dir_meta()).await.unwrap();
+        dirs_st
+            .write_file_content(Path::new("f/x"), &reg(), b"x")
+            .await
+            .unwrap();
+        dirs_st.make_dir(Path::new("e"), &dir_meta()).await.unwrap();
+        dirs_st
+            .write_file_content(Path::new("e/y"), &reg(), b"y")
+            .await
+            .unwrap();
+        let dirs_pkg = dirs_st.close().unwrap();
+
+        let file_st = txn.staging_tree(None).await.unwrap();
+        file_st
+            .write_file_content(Path::new("d"), &reg(), b"a file where the dir was")
+            .await
+            .unwrap();
+        let file_pkg = file_st.close().unwrap();
+
+        // The left side: a file at `f`, nothing at `e`, a directory at `d`.
+        let st = txn.staging_tree(None).await.unwrap();
+        st.write_file_content(Path::new("f"), &reg(), b"left")
+            .await
+            .unwrap();
+        st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+        st.write_file_content(Path::new("d/keep.txt"), &reg(), b"keep")
+            .await
+            .unwrap();
+        st.make_dir(Path::new("w"), &dir_meta()).await.unwrap();
+        let mut writer = st.write_file(Path::new("w/pending"), &reg()).await.unwrap();
+        writer.write_all(b"pending").await.unwrap();
+
+        let opts = MergeOptions {
+            allow_overwrite: true,
+            ..MergeOptions::default()
+        };
+        // A directory over a file and a directory over an absent entry drop no
+        // directory, so the live writer blocks neither.
+        st.merge_at(Path::new("."), &dirs_pkg, opts).await.unwrap();
+        assert_eq!(
+            read_all(&st.read_file(Path::new("f/x"), false).await.unwrap()).await,
+            b"x",
+            "a directory replaced the file with the writer live"
+        );
+        assert_eq!(
+            read_all(&st.read_file(Path::new("e/y"), false).await.unwrap()).await,
+            b"y",
+            "a directory landed at an absent name with the writer live"
+        );
+
+        // A file over a directory drops one, so the same writer blocks it.
+        match st.merge_at(Path::new("."), &file_pkg, opts).await {
+            Err(Error::Staging(msg)) => assert_eq!(
+                msg, "cannot drop the directory at d: 1 file writer(s) still outstanding",
+                "the refusal names the directory and the count"
+            ),
+            other => panic!("the file over the directory is refused: {other:?}"),
+        }
+        staged_file(&st, "d/keep.txt").await;
+
+        writer.finish().await.unwrap();
+        st.merge_at(Path::new("."), &file_pkg, opts).await.unwrap();
+        assert!(
+            matches!(
+                st.lookup(Path::new("d"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "once the writer finished, the file replaces the directory"
+        );
+        st.close().unwrap();
         txn.abort().await.unwrap();
     });
 }

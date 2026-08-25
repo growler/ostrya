@@ -4435,9 +4435,12 @@ deliverable's full surface and Verify list:
   absent ancestors under one dirmeta.
 - `D3a` -- the writer guard, whole-tree form (DONE): a merge overwrite that
   replaces a directory with a file fails while any file writer is live.
-- `D3b` -- `remove` and `clear_dir`, path-addressed and guarded.
-- `D3c` -- `rename`, which moves a node with its subtree and its dirmeta.
-- `D4` -- `merge_at` and `RootDirmeta` on `MergeOptions`.
+- `D3b` -- `remove` and `clear_dir`, path-addressed and guarded (DONE).
+- `D3c` -- `rename`, which moves a node with its subtree and its dirmeta
+  (DONE).
+- `D4` -- `merge_at` and `RootDirmeta` on `MergeOptions` (DONE): `merge` is
+  the root case of `merge_at`, and the merge arms that drop a directory read
+  the entry inside the acquisition that mutates it.
 - `D7a` -- `VerityPolicy` and `ComposefsOptions`.
 - `D8` -- `write_image_to` and `Repo::export_composefs_to`, streaming the
   image through the caller's sink.

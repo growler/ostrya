@@ -740,7 +740,14 @@ impl StagingTree<'_> {
     /// are outstanding.
     pub fn close(self) -> Result<MutableTree>;
 
+    /// Merge at the tree root, which is merge_at with a base of `.`.
     pub async fn merge(&self, other: &MutableTree, opts: MergeOptions) -> Result<()>;
+    /// Merge into the directory at `base`. A missing base is created under
+    /// an implied dirmeta and is an error without one; `base` resolves
+    /// through symlinks, its final component included. A base with no
+    /// components names the tree root.
+    pub async fn merge_at(&self, base: &Path, other: &MutableTree,
+        opts: MergeOptions) -> Result<()>;
 
     pub async fn write_file(&self, path: &Path, meta: &FileMeta)
         -> Result<StagedFileWriter<'txn>>;
@@ -812,8 +819,20 @@ pub enum StagingLookup {
     Dir,
 }
 
+/// How the merge treats the merge root's own dirmeta. Reconcile is the
+/// default and treats the root like any other directory; KeepLeft ignores
+/// the right root's dirmeta, so a left root that carries none keeps none
+/// and the tree cannot be written. Every directory below the root
+/// reconciles either way.
 #[derive(Default)]
-pub struct MergeOptions { pub allow_overwrite: bool, pub follow_symlinks: bool }
+pub enum RootDirmeta { #[default] Reconcile, KeepLeft }
+
+#[derive(Default)]
+pub struct MergeOptions {
+    pub allow_overwrite: bool,
+    pub follow_symlinks: bool,
+    pub root_dirmeta: RootDirmeta,
+}
 ```
 
 Merge rules: entries with equal checksums merge silently; differing
@@ -830,17 +849,32 @@ leaves the zoneinfo object untouched. Resolution walks the left tree at
 every level of the descent: relative targets resolve from the symlink's
 parent, absolute targets from the tree root, `..` clamps at the root,
 chains are capped at depth 40, and a dangling target is an error naming
-the symlink and the missing target. An overwrite that replaces a
-directory with a file is refused with `Staging` while any `write_file`
+the symlink and the missing target. The flag governs the left-side entry
+names the merge reaches; a `merge_at` base's own final component follows
+either way. `root_dirmeta` governs the merge
+root alone: the directory at `base` reconciles its own dirmeta under
+`Reconcile` and keeps the dirmeta it has under `KeepLeft`, and every
+directory below the root reconciles either way. A merge that drops a
+directory is refused with `Staging` while any `write_file`
 writer is outstanding, wherever in the tree it sits, and leaves that
 directory and its subtree in place: a writer records its entry at
 `finish` under the component path it captured, and a directory dropped
-in between would leave that path stale. A merge that fails, on this
-refusal or on a conflict, keeps the entries it applied before the
-failure. Merge lives on `StagingTree`
-rather than `MutableTree` because resolution loads symlink content
-objects, and only transaction scope sees objects staged in the current
-transaction.
+in between would leave that path stale. Two cases drop one: an
+overwrite that replaces a directory with a file, and a right-side
+directory arriving at a name a concurrent operation turned into a
+directory after the merge read it. The merge re-reads that name inside
+the lock acquisition that mutates it, so the guard cannot be stepped
+past, and the second case is a `MergeConflict` without
+`allow_overwrite`, the answer the same clash gets when the merge reads
+the directory itself. A leaf a concurrent operation puts at a name the
+merge already read is taken whatever `allow_overwrite` says, the
+last-writer-wins rule the other staging writes follow on a raced name;
+only a raced directory is re-read, because dropping one loses a
+subtree. A merge that fails, on either refusal or on a
+conflict, keeps the entries it applied before the failure. Merge lives
+on `StagingTree` rather than `MutableTree` because resolution loads
+symlink content objects, and only transaction scope sees objects staged
+in the current transaction.
 
 Path semantics for the write operations: intermediate components resolve
 through symlinks with the same walker; the final component never
@@ -850,7 +884,9 @@ follows. With an implied dirmeta set, `write_file`,
 ancestors as directories carrying it, staging that dirmeta at most
 once per operation and only when a
 directory is created; the leaf takes what the operation itself
-supplies. Ancestors created before a refused leaf stay in the tree, and
+supplies. A `merge_at` base is created under the same policy, its own
+final component included, since the base names a directory rather than
+a leaf. Ancestors created before a refused leaf stay in the tree, and
 a component a later `..` steps back out of is created like any other
 ancestor. A `rename` resolves its destination before it decides any
 refusal, so a refused `rename` keeps those ancestors too; where the
@@ -871,8 +907,13 @@ points at a directory, and names a directory below the root, so the
 root itself cannot be cleared. A `remove` that takes an entry out and a
 `clear_dir` that reaches a directory are refused with `Staging` while
 any `write_file` writer is outstanding, wherever in the tree it sits,
-the rule the merge overwrite follows; a call that removes nothing is
-not. A `rename` that reaches its two checks is refused the same way.
+the rule a merge that drops a directory follows; a call that removes
+nothing is not. A `rename` that reaches its two checks is refused the
+same way. A `write_file` writer is counted from its registration, not
+from the call, so in the window between path resolution and that
+registration the guard holds off no concurrent operation; a parent
+dropped in that window is refused with `Staging` by the re-check the
+registration makes under the lock.
 
 Each refusal carries its own `Error` variant naming the path resolution
 stopped at, so a consumer branches on the condition: `PathNotFound` for
@@ -887,8 +928,8 @@ absent component reached while a symlink's target components are still
 queued reports `DanglingSymlink` for the innermost such symlink; once a
 target is spent, an absent component reports `PathNotFound`.
 `Staging` carries the conditions none of those names: the
-outstanding-writer refusals from `close`, from a merge overwrite that
-replaces a directory with a file, from `remove`, from `clear_dir`, and
+outstanding-writer refusals from `close`, from a merge that drops a
+directory, from `remove`, from `clear_dir`, and
 from `rename`, a read of a directory where a file was wanted, a
 `hardlink` whose source resolves to a directory, a `rename` whose
 destination is at or under the moved entry, a directory a concurrent

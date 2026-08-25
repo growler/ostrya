@@ -2011,8 +2011,9 @@ fn writes_with_an_existing_parent_stage_no_policy_dirmeta() {
     });
 }
 
-/// With a policy set, `lookup` and the reads resolve a path whose ancestors
-/// are absent without creating a directory and without staging an object.
+/// With a policy set, `lookup`, the reads, `remove`, and `clear_dir` resolve
+/// a path whose ancestors are absent without creating a directory and without
+/// staging an object.
 #[test]
 fn resolution_for_a_read_creates_nothing_under_a_policy() {
     let tmp = TmpDir::new("staging-implied-reads");
@@ -2043,11 +2044,15 @@ fn resolution_for_a_read_creates_nothing_under_a_policy() {
             matches!(err, Error::PathNotFound { .. }),
             "read_dir reports the absent path: {err:?}"
         );
-        assert_eq!(
-            st.lookup(Path::new("x"), false).await.unwrap(),
-            StagingLookup::Absent,
-            "resolution created no directory"
-        );
+        st.remove(Path::new("r/s/t"), true).await.unwrap();
+        st.clear_dir(Path::new("c/d"), true).await.unwrap();
+        for name in ["x", "r", "c"] {
+            assert_eq!(
+                st.lookup(Path::new(name), false).await.unwrap(),
+                StagingLookup::Absent,
+                "resolution created no directory"
+            );
+        }
 
         let mut built = st.close().unwrap();
         built.set_metadata_checksum(root_dm);
@@ -2411,6 +2416,346 @@ fn merge_overwrite_is_refused_by_a_writer_in_a_disjoint_branch() {
         );
         base_st.close().unwrap();
 
+        txn.abort().await.unwrap();
+    });
+}
+
+/// `remove` takes out a file, a symlink (the symlink object, not its target),
+/// and a populated directory with its subtree, under either `allow_noent`
+/// value. An absent entry, an absent ancestor, and a path through a dangling
+/// symlink are `Ok` with `allow_noent`; without it, the absent entry is
+/// `PathNotFound` (converting to `NotFound`) and the walk conditions keep
+/// their own variants.
+#[test]
+fn remove_covers_each_kind_and_absent_paths() {
+    use std::io;
+
+    let tmp = TmpDir::new("staging-remove");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.write_file_content(Path::new("f1"), &reg(), b"one")
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("f2"), &reg(), b"two")
+            .await
+            .unwrap();
+        st.symlink(Path::new("s1"), Path::new("f1"), &symlink_meta())
+            .await
+            .unwrap();
+        st.symlink(Path::new("s2"), Path::new("f1"), &symlink_meta())
+            .await
+            .unwrap();
+        st.make_dir_all(Path::new("d1/sub"), &dir_meta())
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("d1/sub/x"), &reg(), b"x")
+            .await
+            .unwrap();
+        st.make_dir_all(Path::new("d2/sub"), &dir_meta())
+            .await
+            .unwrap();
+        st.symlink(Path::new("dangling"), Path::new("nowhere"), &symlink_meta())
+            .await
+            .unwrap();
+
+        // A symlink: the symlink goes, its target stays.
+        st.remove(Path::new("s1"), false).await.unwrap();
+        assert_eq!(
+            st.lookup(Path::new("s1"), false).await.unwrap(),
+            StagingLookup::Absent
+        );
+        assert!(
+            matches!(
+                st.lookup(Path::new("f1"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "removing the symlink leaves its target in place"
+        );
+        st.remove(Path::new("s2"), true).await.unwrap();
+
+        // A file.
+        st.remove(Path::new("f1"), false).await.unwrap();
+        st.remove(Path::new("f2"), true).await.unwrap();
+        assert_eq!(
+            st.lookup(Path::new("f2"), false).await.unwrap(),
+            StagingLookup::Absent
+        );
+
+        // A populated directory, subtree and all.
+        st.remove(Path::new("d1"), false).await.unwrap();
+        assert_eq!(
+            st.lookup(Path::new("d1"), false).await.unwrap(),
+            StagingLookup::Absent
+        );
+        assert_eq!(
+            st.lookup(Path::new("d1/sub/x"), false).await.unwrap(),
+            StagingLookup::Absent
+        );
+        st.remove(Path::new("d2"), true).await.unwrap();
+
+        // An absent entry: the variant, its conversion, and the noent form.
+        let err = st.remove(Path::new("f1"), false).await.unwrap_err();
+        match &err {
+            Error::PathNotFound { path } => assert_eq!(path, "f1"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::NotFound);
+        st.remove(Path::new("f1"), true).await.unwrap();
+
+        // An absent ancestor.
+        match st.remove(Path::new("missing/deeper/f"), false).await {
+            Err(Error::PathNotFound { path }) => assert_eq!(path, "missing"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+        st.remove(Path::new("missing/deeper/f"), true)
+            .await
+            .unwrap();
+
+        // A path through a dangling intermediate symlink.
+        match st.remove(Path::new("dangling/f"), false).await {
+            Err(Error::DanglingSymlink { path, target }) => {
+                assert_eq!(path, "dangling");
+                assert_eq!(target, "nowhere");
+            }
+            other => panic!("expected DanglingSymlink, got {other:?}"),
+        }
+        st.remove(Path::new("dangling/f"), true).await.unwrap();
+        // The dangling symlink itself removes as the symlink.
+        st.remove(Path::new("dangling"), false).await.unwrap();
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// `clear_dir` empties the directory and the entry keeps its dirmeta
+/// checksum; a file at the path, and a symlink there even where it points at
+/// a directory, are the not-a-directory condition, and an absent directory
+/// follows `allow_noent`.
+#[test]
+fn clear_dir_empties_and_keeps_the_dirmeta() {
+    use std::io;
+
+    let tmp = TmpDir::new("staging-clear-dir");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &novel.serialize().unwrap())
+            .await
+            .unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("d"), &novel).await.unwrap();
+        st.write_file_content(Path::new("d/f"), &reg(), b"f")
+            .await
+            .unwrap();
+        st.make_dir(Path::new("d/sub"), &dir_meta()).await.unwrap();
+        st.write_file_content(Path::new("d/sub/x"), &reg(), b"x")
+            .await
+            .unwrap();
+        st.write_file_content(Path::new("plain"), &reg(), b"p")
+            .await
+            .unwrap();
+
+        st.clear_dir(Path::new("d"), false).await.unwrap();
+        assert_eq!(
+            st.lookup(Path::new("d"), false).await.unwrap(),
+            StagingLookup::Dir,
+            "the directory itself stays"
+        );
+        assert!(
+            st.read_dir(Path::new("d"), false).await.unwrap().is_empty(),
+            "every entry under the directory is gone"
+        );
+
+        // A file at the path, and a symlink pointing at a directory: the
+        // final component never follows, so neither is cleared.
+        match st.clear_dir(Path::new("plain"), false).await {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "plain"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+        st.write_file_content(Path::new("d/keep"), &reg(), b"k")
+            .await
+            .unwrap();
+        st.symlink(Path::new("link"), Path::new("d"), &symlink_meta())
+            .await
+            .unwrap();
+        match st.clear_dir(Path::new("link"), false).await {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "link"),
+            other => panic!("expected NotADirectory, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                st.lookup(Path::new("d/keep"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "the symlink's target directory keeps its entries"
+        );
+        st.remove(Path::new("d/keep"), false).await.unwrap();
+        st.remove(Path::new("link"), false).await.unwrap();
+
+        // An absent directory, with and without `allow_noent`.
+        let err = st.clear_dir(Path::new("absent"), false).await.unwrap_err();
+        match &err {
+            Error::PathNotFound { path } => assert_eq!(path, "absent"),
+            other => panic!("expected PathNotFound, got {other:?}"),
+        }
+        assert_eq!(io::Error::from(err).kind(), io::ErrorKind::NotFound);
+        st.clear_dir(Path::new("absent"), true).await.unwrap();
+        st.clear_dir(Path::new("no/ancestor"), true).await.unwrap();
+
+        let mut built = st.close().unwrap();
+        built.set_metadata_checksum(root_dm);
+        let built_root = txn.write_mtree(&mut built).await.unwrap();
+        let root_dirtree = *built_root.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&root).await.unwrap();
+        let (_, d_dm) = dirtree_subdir(&repo, &root_dirtree, "d").await;
+        assert_eq!(d_dm, novel_csum, "the emptied directory keeps its dirmeta");
+    });
+}
+
+/// `clear_dir` over a lazily-loaded committed directory hydrates nothing: the
+/// subdirectory's dirtree object is deleted first, so any read would fail,
+/// and the emptied directory keeps the lazy child's dirmeta checksum.
+#[test]
+fn clear_dir_on_a_lazy_child_hydrates_nothing() {
+    let tmp = TmpDir::new("staging-clear-dir-lazy");
+    let base = tmp.path();
+    let repo_root = base.join("repo");
+
+    let src = base.join("base");
+    mkdir(&src, 0o755);
+    mkdir(&src.join("sub"), 0o755);
+    write_file(&src.join("sub/inner.txt"), b"inner", 0o644);
+
+    block_on(async {
+        let repo = Repo::create(&repo_root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        commit_dir(&repo, dfd.as_fd(), Path::new("base"), "test/base").await;
+        let (sub_dirtree, sub_dirmeta, _) = committed_subdir(&repo, "test/base", "sub").await;
+        delete_loose_object(&repo_root, &sub_dirtree, "dirtree");
+
+        let checksum = repo.resolve_rev("test/base", false).await.unwrap().unwrap();
+        let (commit, _) = repo.load_commit(&checksum).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(Some(&commit)).await.unwrap();
+
+        st.clear_dir(Path::new("sub"), false).await.unwrap();
+        assert!(
+            st.read_dir(Path::new("sub"), false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the lazy child was emptied without a read"
+        );
+
+        let mut built = st.close().unwrap();
+        let rebuilt = txn.write_mtree(&mut built).await.unwrap();
+        let new_root_dirtree = *rebuilt.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&repo_root).await.unwrap();
+        let (sub_dt, sub_dm) = dirtree_subdir(&repo, &new_root_dirtree, "sub").await;
+        assert_eq!(
+            sub_dm, sub_dirmeta,
+            "the emptied directory keeps the lazy child's dirmeta"
+        );
+        let emptied = repo.load_dirtree(&sub_dt).await.unwrap();
+        assert!(
+            emptied.files.is_empty() && emptied.dirs.is_empty(),
+            "the rewritten subdirectory is empty"
+        );
+    });
+}
+
+/// `remove` and `clear_dir` are refused while any file writer is live -- a
+/// writer in a branch disjoint from the affected path included -- leave the
+/// tree in place, and succeed once every writer has finished or been dropped.
+#[test]
+fn remove_and_clear_dir_are_refused_while_a_writer_is_live() {
+    let tmp = TmpDir::new("staging-remove-writer-guard");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+        st.write_file_content(Path::new("d/keep.txt"), &reg(), b"keep")
+            .await
+            .unwrap();
+        st.make_dir(Path::new("other"), &dir_meta()).await.unwrap();
+        let mut writer = st
+            .write_file(Path::new("other/w.txt"), &reg())
+            .await
+            .unwrap();
+        writer.write_all(b"w").await.unwrap();
+
+        match st.remove(Path::new("d"), false).await {
+            Err(Error::Staging(msg)) => assert_eq!(
+                msg, "cannot remove d: 1 file writer(s) still outstanding",
+                "the refusal names the removed path and the count"
+            ),
+            other => panic!("remove is refused while a writer is live: {other:?}"),
+        }
+        match st.clear_dir(Path::new("d"), false).await {
+            Err(Error::Staging(msg)) => assert_eq!(
+                msg, "cannot clear the directory at d: 1 file writer(s) still outstanding",
+                "the refusal names the cleared directory and the count"
+            ),
+            other => panic!("clear_dir is refused while a writer is live: {other:?}"),
+        }
+        assert!(
+            matches!(
+                st.lookup(Path::new("d/keep.txt"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "the blocked calls leave the subtree in place"
+        );
+
+        writer.finish().await.unwrap();
+        st.clear_dir(Path::new("d"), false).await.unwrap();
+        assert!(
+            st.read_dir(Path::new("d"), false).await.unwrap().is_empty(),
+            "once the writer finished, clear_dir empties the directory"
+        );
+
+        // An abandoned writer releases the guard too.
+        let writer = st
+            .write_file(Path::new("other/w2.txt"), &reg())
+            .await
+            .unwrap();
+        match st.remove(Path::new("d"), false).await {
+            Err(Error::Staging(_)) => {}
+            other => panic!("remove is refused while a writer is live: {other:?}"),
+        }
+        drop(writer);
+        st.remove(Path::new("d"), false).await.unwrap();
+        assert_eq!(
+            st.lookup(Path::new("d"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "once the writer was dropped, remove takes the directory out"
+        );
+
+        drop(st);
         txn.abort().await.unwrap();
     });
 }

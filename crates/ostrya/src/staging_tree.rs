@@ -18,11 +18,12 @@
 //! never across one. [`close`](StagingTree::close) hands back the assembled
 //! [`MutableTree`](crate::MutableTree) and fails while any file writer is still
 //! outstanding, counted on the tree. A [`merge`](StagingTree::merge) overwrite
-//! that replaces a directory with a file is refused the same way while any
-//! file writer is outstanding, wherever in the tree it sits: a writer records
-//! its entry at [`finish`](StagedFileWriter::finish) under the component path
-//! it captured, and a directory dropped in between would leave that path
-//! stale.
+//! that replaces a directory with a file, a [`remove`](StagingTree::remove)
+//! that takes an entry out, and a [`clear_dir`](StagingTree::clear_dir) that
+//! reaches a directory are refused the same way while any file writer is
+//! outstanding, wherever in the tree it sits: a writer records its entry at
+//! [`finish`](StagedFileWriter::finish) under the component path it captured,
+//! and an entry dropped in between would leave that path stale.
 //!
 //! Path semantics. Intermediate path components resolve through symlinks; the
 //! final component never follows for a write. A relative symlink target resolves
@@ -220,7 +221,8 @@ impl<'txn> StagingTree<'txn> {
     /// [`ensure_dir`](StagingTree::ensure_dir): ancestors the operation
     /// creates take the policy dirmeta, and the leaf takes whatever the
     /// operation itself supplies. Path resolution for a read, a
-    /// [`lookup`](StagingTree::lookup), or the source side of a
+    /// [`lookup`](StagingTree::lookup), a [`remove`](StagingTree::remove), a
+    /// [`clear_dir`](StagingTree::clear_dir), or the source side of a
     /// [`hardlink`](StagingTree::hardlink) never creates a directory and never
     /// stages a dirmeta object. [`make_dir`](StagingTree::make_dir) and
     /// [`make_dir_all`](StagingTree::make_dir_all) keep their own rules.
@@ -510,6 +512,92 @@ impl<'txn> StagingTree<'txn> {
         })
     }
 
+    /// Remove the entry at `path`, subtree and all. The final component is
+    /// never followed, so removing a symlink removes the symlink. With
+    /// `allow_noent`, an absent entry, an absent ancestor, and a dangling
+    /// intermediate symlink are all `Ok`; without it, an absent entry is
+    /// [`PathNotFound`](Error::PathNotFound) and the other two stay the
+    /// errors the walk types. A call that takes an entry out is refused with
+    /// [`Staging`](Error::Staging) while any
+    /// [`write_file`](StagingTree::write_file) writer is outstanding, wherever
+    /// in the tree it sits; a call that removes nothing is not.
+    pub async fn remove(&self, path: &Path, allow_noent: bool) -> Result<()> {
+        let (parent, name) = match self.resolve_parent(path).await {
+            Ok(resolved) => resolved,
+            Err(Error::PathNotFound { .. } | Error::DanglingSymlink { .. }) if allow_noent => {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        // The absent-entry outcome is decided under the same acquisition that
+        // removes the entry, so an entry appearing in between cannot be
+        // missed; the mutable-tree refusal is never the answer a caller sees.
+        // A call that removes nothing consults no writer guard, matching the
+        // merge arm, which asks only where it is about to drop.
+        self.with_dir_mut(&parent, |dir| match dir.child_kind(&name) {
+            ChildKind::Absent if allow_noent => Ok(()),
+            ChildKind::Absent => Err(Error::PathNotFound {
+                path: join(&parent, &name),
+            }),
+            _ => {
+                self.check_no_live_writers(&format!("remove {}", join(&parent, &name)))?;
+                dir.remove(&name, true)
+            }
+        })
+    }
+
+    /// Remove every entry under `path`, keeping the directory and its
+    /// dirmeta. The final component is never followed, so a file at `path`,
+    /// and a symlink there even where it points at a directory, is
+    /// [`NotADirectory`](Error::NotADirectory). `path` names a directory
+    /// below the root, so the root itself cannot be cleared. With
+    /// `allow_noent`, an absent directory -- an absent ancestor and a
+    /// dangling intermediate symlink included -- is `Ok`. A lazily-loaded
+    /// committed directory is never hydrated: its entry is replaced by an
+    /// empty loaded directory keeping the recorded dirmeta checksum, so no
+    /// dirtree is read. A call that reaches a directory is refused with
+    /// [`Staging`](Error::Staging) while any
+    /// [`write_file`](StagingTree::write_file) writer is outstanding,
+    /// wherever in the tree it sits, whether or not that directory holds
+    /// entries; a call over an absent directory under `allow_noent` is not.
+    pub async fn clear_dir(&self, path: &Path, allow_noent: bool) -> Result<()> {
+        let (parent, name) = match self.resolve_parent(path).await {
+            Ok(resolved) => resolved,
+            Err(Error::PathNotFound { .. } | Error::DanglingSymlink { .. }) if allow_noent => {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        self.with_dir_mut(&parent, |dir| match dir.child_kind(&name) {
+            ChildKind::Absent if allow_noent => Ok(()),
+            ChildKind::Absent => Err(Error::PathNotFound {
+                path: join(&parent, &name),
+            }),
+            ChildKind::File(_) => Err(Error::NotADirectory {
+                path: join(&parent, &name),
+            }),
+            ChildKind::Dir => {
+                self.check_no_live_writers(&format!(
+                    "clear the directory at {}",
+                    join(&parent, &name)
+                ))?;
+                let child = dir
+                    .dir_at_mut(std::slice::from_ref(&name))
+                    .expect("a loaded child under the same lock acquisition");
+                child.clear_children();
+                Ok(())
+            }
+            ChildKind::LazyDir { dirmeta, .. } => {
+                self.check_no_live_writers(&format!(
+                    "clear the directory at {}",
+                    join(&parent, &name)
+                ))?;
+                dir.insert_empty_dir(&name, Some(dirmeta));
+                Ok(())
+            }
+        })
+    }
+
     // --- reads (staged-first) ---
 
     /// Resolve `path` and report what sits there. Intermediate components
@@ -603,11 +691,15 @@ impl<'txn> StagingTree<'txn> {
         self.txn.write_dirmeta(meta).await
     }
 
-    /// Refuse a structural change -- dropping a directory -- while any file
-    /// writer is live. A writer records its entry at
+    /// Refuse a structural change -- dropping a directory, removing an
+    /// entry, clearing a directory's children -- while any file writer is
+    /// live. A writer records its entry at
     /// [`finish`](StagedFileWriter::finish) under the component path it
     /// captured, and a directory dropped in between would leave that path
-    /// stale, or pointing at a different directory created there later. Call
+    /// stale, or pointing at a different directory created there later. A
+    /// removed file entry cannot stale a captured path; it is refused
+    /// because the guard is the whole-tree form, which reads a count and no
+    /// paths. `action` spells the refused change and the path it targets. Call
     /// this under the tree lock, where
     /// [`write_file`](StagingTree::write_file) registers its writers, so the
     /// count read here cannot race a registration. Deregistration cannot be
@@ -615,12 +707,11 @@ impl<'txn> StagingTree<'txn> {
     /// under this same lock before it decrements, so a zero count read here
     /// means every departed writer has already recorded.
     /// [`close`](StagingTree::close) states the full argument.
-    fn check_no_live_writers(&self, path: &str) -> Result<()> {
+    fn check_no_live_writers(&self, action: &str) -> Result<()> {
         let outstanding = self.writers.load(Ordering::Acquire);
         if outstanding != 0 {
             return Err(Error::Staging(format!(
-                "cannot drop the directory at {path}: \
-                 {outstanding} file writer(s) still outstanding"
+                "cannot {action}: {outstanding} file writer(s) still outstanding"
             )));
         }
         Ok(())
@@ -1000,7 +1091,10 @@ fn merge_into<'a>(
                         )));
                     }
                     st.with_dir_mut(&left_path, |dir| {
-                        st.check_no_live_writers(&join(&left_path, &name))?;
+                        st.check_no_live_writers(&format!(
+                            "drop the directory at {}",
+                            join(&left_path, &name)
+                        ))?;
                         dir.remove(&name, true)?;
                         dir.replace_file(&name, right_csum)
                     })?;

@@ -22,7 +22,11 @@
 //! Path semantics. Intermediate path components resolve through symlinks; the
 //! final component never follows for a write. A relative symlink target resolves
 //! from the symlink's parent, an absolute target from the tree root, `..` clamps
-//! at the root, chains are capped, and a dangling target is an error. Reads
+//! at the root, chains are capped, and a dangling target is an error. A write's
+//! parent directory must exist unless an implied dirmeta is set
+//! ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)), in which case
+//! the write creates its missing ancestors as directories carrying that
+//! dirmeta; resolution for a read never creates a directory. Reads
 //! ([`read_file`](StagingTree::read_file), [`read_dir`](StagingTree::read_dir),
 //! [`lookup`](StagingTree::lookup))
 //! and [`merge`](StagingTree::merge) take a `follow_symlinks` flag governing the
@@ -160,6 +164,9 @@ pub struct StagingTree<'txn> {
     /// Outstanding [`StagedFileWriter`] count; [`close`](StagingTree::close)
     /// fails while it is nonzero.
     writers: Arc<AtomicUsize>,
+    /// The dirmeta applied to ancestors a write creates; `None` keeps a
+    /// missing parent an error.
+    implied_dirmeta: Option<DirMeta>,
 }
 
 impl Transaction {
@@ -189,7 +196,32 @@ impl<'txn> StagingTree<'txn> {
             txn,
             tree: Arc::new(Mutex::new(tree)),
             writers: Arc::new(AtomicUsize::new(0)),
+            implied_dirmeta: None,
         }
+    }
+
+    /// The dirmeta applied to ancestors a write creates. Set once, at
+    /// construction; consuming the tree keeps the type free of interior
+    /// mutability. Left unset, a missing parent stays an error.
+    ///
+    /// The policy applies to [`write_file`](StagingTree::write_file),
+    /// [`write_file_content`](StagingTree::write_file_content),
+    /// [`symlink`](StagingTree::symlink), [`hardlink`](StagingTree::hardlink),
+    /// [`place_object`](StagingTree::place_object), and
+    /// [`ensure_dir`](StagingTree::ensure_dir): ancestors the operation
+    /// creates take the policy dirmeta, and the leaf takes whatever the
+    /// operation itself supplies. Path resolution for a read, a
+    /// [`lookup`](StagingTree::lookup), or the source side of a
+    /// [`hardlink`](StagingTree::hardlink) never creates a directory and never
+    /// stages a dirmeta object. [`make_dir`](StagingTree::make_dir) and
+    /// [`make_dir_all`](StagingTree::make_dir_all) keep their own rules.
+    ///
+    /// Ancestors created before a refused leaf stay in the tree, and a
+    /// component a later `..` steps back out of is created like any other
+    /// ancestor.
+    pub fn with_implied_dirmeta(mut self, meta: DirMeta) -> StagingTree<'txn> {
+        self.implied_dirmeta = Some(meta);
+        self
     }
 
     /// Hand the assembled tree to the caller, for
@@ -218,12 +250,14 @@ impl<'txn> StagingTree<'txn> {
     // --- write operations ---
 
     /// A streaming writer for one regular-file payload at `path`. The parent
-    /// directory must exist (intermediate components resolve through symlinks);
-    /// the final component never follows a symlink. Replaces an existing file or
+    /// directory must exist (intermediate components resolve through symlinks)
+    /// unless an implied dirmeta is set
+    /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)); the final
+    /// component never follows a symlink. Replaces an existing file or
     /// symlink; a directory at `path` is refused with
     /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
     pub async fn write_file(&self, path: &Path, meta: &FileMeta) -> Result<StagedFileWriter<'txn>> {
-        let (parent, name) = self.resolve_parent(path).await?;
+        let (parent, name) = self.resolve_write_parent(path).await?;
         self.check_writable_leaf(&parent, &name)?;
         let writer = self.txn.content_writer(None, meta).await?;
         self.writers.fetch_add(1, Ordering::AcqRel);
@@ -245,7 +279,7 @@ impl<'txn> StagingTree<'txn> {
         meta: &FileMeta,
         content: &[u8],
     ) -> Result<()> {
-        let (parent, name) = self.resolve_parent(path).await?;
+        let (parent, name) = self.resolve_write_parent(path).await?;
         self.check_writable_leaf(&parent, &name)?;
         let checksum = self.txn.write_regfile_inline(None, meta, content).await?;
         self.with_dir_mut(&parent, |dir| dir.replace_file(&name, checksum))
@@ -271,9 +305,16 @@ impl<'txn> StagingTree<'txn> {
     /// Create `path` and any missing ancestors, applying `meta` to the
     /// directories it creates and leaving existing ones untouched.
     pub async fn make_dir_all(&self, path: &Path, meta: &DirMeta) -> Result<()> {
-        let comps = components_of(path)?;
+        self.walk_creating(components_of(path)?, meta).await?;
+        Ok(())
+    }
+
+    /// Walk `comps` from the tree root, creating each absent component as a
+    /// directory carrying `meta` and following symlinks to directories.
+    /// Returns the literal component path the walk reached.
+    async fn walk_creating(&self, comps: Vec<Comp>, meta: &DirMeta) -> Result<Vec<String>> {
         // Stage `meta` at most once, and only when a directory is actually
-        // created. A `make_dir_all` whose every component already exists creates
+        // created. A walk whose every component already exists creates
         // nothing and must not materialize an orphan dirmeta into `objects/`.
         let mut dirmeta: Option<Checksum> = None;
         let mut cur: Vec<String> = Vec::new();
@@ -332,7 +373,7 @@ impl<'txn> StagingTree<'txn> {
                 }
             }
         }
-        Ok(())
+        Ok(cur)
     }
 
     /// Create the directory at `path`, or reuse an existing one and stamp
@@ -344,7 +385,7 @@ impl<'txn> StagingTree<'txn> {
     /// differing one is rewritten in place, because the child's contents do
     /// not change.
     pub async fn ensure_dir(&self, path: &Path, meta: &DirMeta) -> Result<()> {
-        let (parent, name) = self.resolve_parent(path).await?;
+        let (parent, name) = self.resolve_write_parent(path).await?;
         let new_dirmeta = self.txn.dirmeta_checksum(meta)?;
         let unchanged = match self.peek(&parent, &name)? {
             ChildKind::File(_) => {
@@ -385,7 +426,7 @@ impl<'txn> StagingTree<'txn> {
     /// existing file or symlink; a directory at `path` is refused with
     /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
     pub async fn symlink(&self, path: &Path, target: &Path, meta: &FileMeta) -> Result<()> {
-        let (parent, name) = self.resolve_parent(path).await?;
+        let (parent, name) = self.resolve_write_parent(path).await?;
         self.check_writable_leaf(&parent, &name)?;
         let target = target
             .to_str()
@@ -413,7 +454,7 @@ impl<'txn> StagingTree<'txn> {
                 )));
             }
         };
-        let (parent, name) = self.resolve_parent(path).await?;
+        let (parent, name) = self.resolve_write_parent(path).await?;
         self.check_writable_leaf(&parent, &name)?;
         self.with_dir_mut(&parent, |dir| dir.replace_file(&name, checksum))
     }
@@ -427,7 +468,7 @@ impl<'txn> StagingTree<'txn> {
     /// the store is not checked, the same as
     /// [`write_mtree`](crate::Transaction::write_mtree).
     pub async fn place_object(&self, path: &Path, checksum: &Checksum) -> Result<()> {
-        let (parent, name) = self.resolve_parent(path).await?;
+        let (parent, name) = self.resolve_write_parent(path).await?;
         self.with_dir_mut(&parent, |dir| match dir.child_kind(&name) {
             ChildKind::Absent => dir.replace_file(&name, *checksum),
             ChildKind::File(existing) if existing == *checksum => Ok(()),
@@ -540,20 +581,23 @@ impl<'txn> StagingTree<'txn> {
         }
     }
 
+    /// Resolve a path's parent directory for a write. With an implied dirmeta
+    /// set, absent ancestors are created as directories carrying it; without
+    /// one, an absent ancestor is the error the walk types.
+    async fn resolve_write_parent(&self, path: &Path) -> Result<(Vec<String>, String)> {
+        let Some(meta) = &self.implied_dirmeta else {
+            return self.resolve_parent(path).await;
+        };
+        let (init, name) = split_final(path)?;
+        let parent = self.walk_creating(init, meta).await?;
+        Ok((parent, name))
+    }
+
     /// Resolve a path's parent directory (following symlinks on intermediate
     /// components) and return its literal component path plus the final name.
     async fn resolve_parent(&self, path: &Path) -> Result<(Vec<String>, String)> {
-        let comps = components_of(path)?;
-        let (last, init) = comps
-            .split_last()
-            .ok_or_else(|| Error::Staging(format!("{} has no final component", path.display())))?;
-        let name = match last {
-            Comp::Normal(name) => name.clone(),
-            Comp::Parent => {
-                return Err(Error::Staging(format!("{} ends in `..`", path.display())));
-            }
-        };
-        let parent = match self.walk_from(Vec::new(), init.to_vec(), true).await? {
+        let (init, name) = split_final(path)?;
+        let parent = match self.walk_from(Vec::new(), init, true).await? {
             WalkEnd::Dir(dir) => dir,
             WalkEnd::Leaf {
                 parent: dir, name, ..
@@ -1065,6 +1109,26 @@ fn components_of(path: &Path) -> Result<Vec<Comp>> {
             Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
         })
         .collect()
+}
+
+/// Split a path into its parent components and its final name. A path with no
+/// final component and a path ending in `..` are refused before resolution
+/// begins, so both report the path as the caller gave it.
+fn split_final(path: &Path) -> Result<(Vec<Comp>, String)> {
+    let mut comps = components_of(path)?;
+    let name = match comps.pop() {
+        Some(Comp::Normal(name)) => name,
+        Some(Comp::Parent) => {
+            return Err(Error::Staging(format!("{} ends in `..`", path.display())));
+        }
+        None => {
+            return Err(Error::Staging(format!(
+                "{} has no final component",
+                path.display()
+            )));
+        }
+    };
+    Ok((comps, name))
 }
 
 /// Split a symlink target into an absolute flag and its meaningful components.

@@ -732,6 +732,10 @@ version in place.
 pub struct StagingTree<'txn> { /* &'txn Transaction, Mutex<MutableTree>, writer count */ }
 
 impl StagingTree<'_> {
+    /// The dirmeta applied to ancestors a write creates. Set once, at
+    /// construction; left unset, a missing parent stays an error.
+    pub fn with_implied_dirmeta(self, meta: DirMeta) -> Self;
+
     /// Hands the tree to write_mtree; fails while write_file writers
     /// are outstanding.
     pub fn close(self) -> Result<MutableTree>;
@@ -816,7 +820,17 @@ only transaction scope sees objects staged in the current transaction.
 
 Path semantics for the write operations: intermediate components resolve
 through symlinks with the same walker; the final component never
-follows. `write_file`, `write_file_content`, `symlink`, and `hardlink`
+follows. With an implied dirmeta set, `write_file`,
+`write_file_content`, `symlink`, `hardlink`, `place_object`, and
+`ensure_dir` create missing ancestors as directories carrying it,
+staging that dirmeta at most once per operation and only when a
+directory is created; the leaf takes what the operation itself
+supplies. Ancestors created before a refused leaf stay in the tree, and
+a component a later `..` steps back out of is created like any other
+ancestor. Resolution for a read, a `lookup`, or the source side of a
+`hardlink` never creates a directory, whatever the policy. `make_dir`
+and `make_dir_all` keep their own rules. `write_file`,
+`write_file_content`, `symlink`, and `hardlink`
 replace an existing file or symlink entry and fail on a directory with
 `ReplaceDirWithFile`; `make_dir` fails on any existing entry;
 `ensure_dir` creates the directory or restamps an existing one and fails

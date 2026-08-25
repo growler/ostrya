@@ -1878,3 +1878,396 @@ fn concurrent_ensure_dir_creates_one_directory() {
         "the set staged one dirmeta object"
     );
 }
+
+/// The checksum `lookup` reports for the file at `path`.
+async fn staged_file(st: &ostrya::StagingTree<'_>, path: &str) -> Checksum {
+    match st.lookup(Path::new(path), false).await.unwrap() {
+        StagingLookup::File { checksum } => checksum,
+        other => panic!("{path} is not a file: {other:?}"),
+    }
+}
+
+/// The dirtree and dirmeta checksums of the subdirectory `name` recorded in
+/// the dirtree object `dirtree`.
+async fn dirtree_subdir(repo: &Repo, dirtree: &Checksum, name: &str) -> (Checksum, Checksum) {
+    let tree = repo.load_dirtree(dirtree).await.unwrap();
+    let (_, dt, dm) = tree
+        .dirs
+        .iter()
+        .find(|(n, _, _)| n == name)
+        .unwrap_or_else(|| panic!("{name} is not a subdirectory"));
+    (*dt, *dm)
+}
+
+/// Ancestors created by each of the six write operations under an implied
+/// dirmeta carry the policy dirmeta, and the `ensure_dir` leaf takes the meta
+/// the call itself supplies.
+#[test]
+fn implied_ancestors_carry_the_policy_dirmeta() {
+    let tmp = TmpDir::new("staging-implied-ancestors");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let policy = dir_meta_mode(0o040750);
+        let policy_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &policy.serialize().unwrap())
+            .await
+            .unwrap();
+        let leaf_meta = dir_meta_mode(0o040700);
+        let leaf_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &leaf_meta.serialize().unwrap())
+            .await
+            .unwrap();
+        let st = txn
+            .staging_tree(None)
+            .await
+            .unwrap()
+            .with_implied_dirmeta(policy);
+
+        let mut writer = st.write_file(Path::new("w1/a/f"), &reg()).await.unwrap();
+        writer.write_all(b"one").await.unwrap();
+        writer.finish().await.unwrap();
+        st.write_file_content(Path::new("w2/a/f"), &reg(), b"two")
+            .await
+            .unwrap();
+        st.symlink(Path::new("w3/a/l"), Path::new("f"), &symlink_meta())
+            .await
+            .unwrap();
+        st.hardlink(Path::new("w4/a/h"), Path::new("w2/a/f"))
+            .await
+            .unwrap();
+        let placed = staged_file(&st, "w2/a/f").await;
+        st.place_object(Path::new("w5/a/p"), &placed).await.unwrap();
+        st.ensure_dir(Path::new("w6/a/d"), &leaf_meta)
+            .await
+            .unwrap();
+
+        let mut built = st.close().unwrap();
+        built.set_metadata_checksum(root_dm);
+        let built_root = txn.write_mtree(&mut built).await.unwrap();
+        let root_dirtree = *built_root.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&root).await.unwrap();
+        for w in ["w1", "w2", "w3", "w4", "w5", "w6"] {
+            let (w_dt, w_dm) = dirtree_subdir(&repo, &root_dirtree, w).await;
+            assert_eq!(w_dm, policy_csum, "{w} carries the policy dirmeta");
+            let (a_dt, a_dm) = dirtree_subdir(&repo, &w_dt, "a").await;
+            assert_eq!(a_dm, policy_csum, "{w}/a carries the policy dirmeta");
+            if w == "w6" {
+                let (_, d_dm) = dirtree_subdir(&repo, &a_dt, "d").await;
+                assert_eq!(d_dm, leaf_csum, "the ensure_dir leaf carries its own meta");
+            }
+        }
+    });
+}
+
+/// A write whose parent already exists stages no policy dirmeta, and a
+/// `make_dir_all` over a path whose every component exists still stages
+/// nothing. `metadata_total` counts every offer before dedup, so the exact
+/// count is the assertion.
+#[test]
+fn writes_with_an_existing_parent_stage_no_policy_dirmeta() {
+    let tmp = TmpDir::new("staging-implied-existing-parent");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let novel = dir_meta_mode(0o040700);
+        let st = txn
+            .staging_tree(None)
+            .await
+            .unwrap()
+            .with_implied_dirmeta(dir_meta_mode(0o040750));
+
+        st.make_dir(Path::new("d"), &novel).await.unwrap();
+        st.write_file_content(Path::new("d/f"), &reg(), b"x")
+            .await
+            .unwrap();
+        st.symlink(Path::new("d/l"), Path::new("f"), &symlink_meta())
+            .await
+            .unwrap();
+        st.make_dir_all(Path::new("d"), &dir_meta()).await.unwrap();
+
+        let mut built = st.close().unwrap();
+        built.set_metadata_checksum(root_dm);
+        txn.write_mtree(&mut built).await.unwrap();
+        let stats = txn.commit().await.unwrap();
+
+        // The offers: the root dirmeta, make_dir's novel dirmeta, and the two
+        // dirtrees write_mtree assembles. The writes into the existing parent
+        // and the all-existing make_dir_all add none.
+        assert_eq!(
+            stats.metadata_total, 4,
+            "no policy dirmeta was offered for staging"
+        );
+    });
+}
+
+/// With a policy set, `lookup` and the reads resolve a path whose ancestors
+/// are absent without creating a directory and without staging an object.
+#[test]
+fn resolution_for_a_read_creates_nothing_under_a_policy() {
+    let tmp = TmpDir::new("staging-implied-reads");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let st = txn
+            .staging_tree(None)
+            .await
+            .unwrap()
+            .with_implied_dirmeta(dir_meta_mode(0o040750));
+
+        assert_eq!(
+            st.lookup(Path::new("x/y/z"), false).await.unwrap(),
+            StagingLookup::Absent
+        );
+        let err = st.read_file(Path::new("x/y/z"), false).await.unwrap_err();
+        assert!(
+            matches!(err, Error::PathNotFound { .. }),
+            "read_file reports the absent path: {err:?}"
+        );
+        let err = st.read_dir(Path::new("x/y"), false).await.unwrap_err();
+        assert!(
+            matches!(err, Error::PathNotFound { .. }),
+            "read_dir reports the absent path: {err:?}"
+        );
+        assert_eq!(
+            st.lookup(Path::new("x"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "resolution created no directory"
+        );
+
+        let mut built = st.close().unwrap();
+        built.set_metadata_checksum(root_dm);
+        txn.write_mtree(&mut built).await.unwrap();
+        let stats = txn.commit().await.unwrap();
+
+        // The offers: the root dirmeta and the one dirtree of the empty root.
+        assert_eq!(stats.metadata_total, 2, "resolution staged no object");
+    });
+}
+
+/// A tree built entirely through implied ancestors and the same tree built
+/// with explicit `make_dir` calls reach the same root dirtree checksum.
+#[test]
+fn implied_and_explicit_ancestors_agree_on_the_checksum() {
+    let tmp = TmpDir::new("staging-implied-equivalence");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let policy = dir_meta_mode(0o040750);
+
+        let implied = txn
+            .staging_tree(None)
+            .await
+            .unwrap()
+            .with_implied_dirmeta(policy.clone());
+        implied
+            .write_file_content(Path::new("usr/share/doc/copyright"), &reg(), b"text")
+            .await
+            .unwrap();
+
+        let explicit = txn.staging_tree(None).await.unwrap();
+        explicit.make_dir(Path::new("usr"), &policy).await.unwrap();
+        explicit
+            .make_dir(Path::new("usr/share"), &policy)
+            .await
+            .unwrap();
+        explicit
+            .make_dir(Path::new("usr/share/doc"), &policy)
+            .await
+            .unwrap();
+        explicit
+            .write_file_content(Path::new("usr/share/doc/copyright"), &reg(), b"text")
+            .await
+            .unwrap();
+
+        let mut built_implied = implied.close().unwrap();
+        built_implied.set_metadata_checksum(root_dm);
+        let implied_root = txn.write_mtree(&mut built_implied).await.unwrap();
+        let mut built_explicit = explicit.close().unwrap();
+        built_explicit.set_metadata_checksum(root_dm);
+        let explicit_root = txn.write_mtree(&mut built_explicit).await.unwrap();
+        assert_eq!(
+            implied_root.dirtree_checksum(),
+            explicit_root.dirtree_checksum(),
+            "the two builds agree on the root dirtree"
+        );
+        txn.abort().await.unwrap();
+    });
+}
+
+/// Without a policy, every write operation still fails on a missing parent.
+#[test]
+fn writes_without_a_policy_still_fail_on_a_missing_parent() {
+    let tmp = TmpDir::new("staging-no-policy-missing-parent");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+        st.write_file_content(Path::new("src"), &reg(), b"s")
+            .await
+            .unwrap();
+        let src = staged_file(&st, "src").await;
+
+        let assert_missing = |err: Error, op: &str| match &err {
+            Error::PathNotFound { path } => assert_eq!(path, "missing", "{op}"),
+            other => panic!("{op}: expected PathNotFound, got {other:?}"),
+        };
+        assert_missing(
+            st.write_file(Path::new("missing/f"), &reg())
+                .await
+                .map(|_| ())
+                .unwrap_err(),
+            "write_file",
+        );
+        assert_missing(
+            st.write_file_content(Path::new("missing/f"), &reg(), b"x")
+                .await
+                .unwrap_err(),
+            "write_file_content",
+        );
+        assert_missing(
+            st.symlink(Path::new("missing/l"), Path::new("t"), &symlink_meta())
+                .await
+                .unwrap_err(),
+            "symlink",
+        );
+        assert_missing(
+            st.hardlink(Path::new("missing/h"), Path::new("src"))
+                .await
+                .unwrap_err(),
+            "hardlink",
+        );
+        assert_missing(
+            st.place_object(Path::new("missing/p"), &src)
+                .await
+                .unwrap_err(),
+            "place_object",
+        );
+        assert_missing(
+            st.ensure_dir(Path::new("missing/d"), &dir_meta())
+                .await
+                .unwrap_err(),
+            "ensure_dir",
+        );
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// Concurrent writes to distinct leaves under one absent ancestor chain
+/// create each ancestor once and publish one policy dirmeta object for the
+/// whole set.
+#[test]
+fn concurrent_implied_writes_create_each_ancestor_once() {
+    let tmp = TmpDir::new("staging-implied-concurrent");
+    let root = tmp.path().join("repo");
+    let repo = block_on(Repo::create(&root, CreateOptions::new(RepoMode::BareUser))).unwrap();
+    let txn = block_on(repo.transaction()).unwrap();
+    let root_dm = block_on(stage_dir_meta(&txn));
+    let st = block_on(txn.staging_tree(None))
+        .unwrap()
+        .with_implied_dirmeta(dir_meta_mode(0o040700));
+
+    const N: usize = 8;
+    std::thread::scope(|scope| {
+        for i in 0..N {
+            let st = &st;
+            scope.spawn(move || {
+                let path = format!("shared/a/f{i}");
+                let payload = format!("payload {i}").into_bytes();
+                block_on(st.write_file_content(Path::new(&path), &reg(), &payload)).unwrap();
+            });
+        }
+    });
+
+    for i in 0..N {
+        block_on(staged_file(&st, &format!("shared/a/f{i}")));
+    }
+    let mut built = st.close().unwrap();
+    built.set_metadata_checksum(root_dm);
+    block_on(txn.write_mtree(&mut built)).unwrap();
+    block_on(txn.commit()).unwrap();
+
+    // The 0755 root dirmeta and the policy one: two objects, however many
+    // concurrent walks staged the same bytes.
+    assert_eq!(
+        count_objects_with_ext(&root, ".dirmeta"),
+        2,
+        "the set published one policy dirmeta object"
+    );
+}
+
+/// A write racing a `write_file_content` at an ancestor's own name reaches an
+/// error: exactly one call wins, and the tree holds the winner's entry rather
+/// than a directory silently replacing a file or the reverse.
+#[test]
+fn a_write_racing_a_file_at_an_ancestor_name_errors() {
+    let tmp = TmpDir::new("staging-implied-race");
+    let root = tmp.path().join("repo");
+    let repo = block_on(Repo::create(&root, CreateOptions::new(RepoMode::BareUser))).unwrap();
+    let txn = block_on(repo.transaction()).unwrap();
+    let st = block_on(txn.staging_tree(None))
+        .unwrap()
+        .with_implied_dirmeta(dir_meta_mode(0o040700));
+
+    const ROUNDS: usize = 8;
+    for i in 0..ROUNDS {
+        let file_path = format!("x{i}");
+        let leaf_path = format!("x{i}/y");
+        let (file_res, leaf_res) = std::thread::scope(|scope| {
+            let st = &st;
+            let file = scope
+                .spawn(|| block_on(st.write_file_content(Path::new(&file_path), &reg(), b"file")));
+            let leaf = scope
+                .spawn(|| block_on(st.write_file_content(Path::new(&leaf_path), &reg(), b"leaf")));
+            (file.join().unwrap(), leaf.join().unwrap())
+        });
+
+        match (file_res, leaf_res) {
+            (Ok(()), Err(_)) => {
+                assert!(
+                    matches!(
+                        block_on(st.lookup(Path::new(&file_path), false)).unwrap(),
+                        StagingLookup::File { .. }
+                    ),
+                    "{file_path} holds the file that won"
+                );
+            }
+            (Err(_), Ok(())) => {
+                assert_eq!(
+                    block_on(st.lookup(Path::new(&file_path), false)).unwrap(),
+                    StagingLookup::Dir,
+                    "{file_path} holds the implied directory that won"
+                );
+                block_on(staged_file(&st, &leaf_path));
+            }
+            (Ok(()), Ok(())) => panic!("both writes succeeded at {file_path}"),
+            (Err(f), Err(l)) => panic!("both writes failed at {file_path}: {f:?} / {l:?}"),
+        }
+    }
+
+    drop(st);
+    block_on(txn.abort()).unwrap();
+}

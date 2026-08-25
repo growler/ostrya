@@ -17,7 +17,12 @@
 //! object during resolution, streaming payloads -- run between lock acquisitions,
 //! never across one. [`close`](StagingTree::close) hands back the assembled
 //! [`MutableTree`](crate::MutableTree) and fails while any file writer is still
-//! outstanding, counted on the tree.
+//! outstanding, counted on the tree. A [`merge`](StagingTree::merge) overwrite
+//! that replaces a directory with a file is refused the same way while any
+//! file writer is outstanding, wherever in the tree it sits: a writer records
+//! its entry at [`finish`](StagedFileWriter::finish) under the component path
+//! it captured, and a directory dropped in between would leave that path
+//! stale.
 //!
 //! Path semantics. Intermediate path components resolve through symlinks; the
 //! final component never follows for a write. A relative symlink target resolves
@@ -162,7 +167,11 @@ pub struct StagingTree<'txn> {
     txn: &'txn Transaction,
     tree: Arc<Mutex<MutableTree>>,
     /// Outstanding [`StagedFileWriter`] count; [`close`](StagingTree::close)
-    /// fails while it is nonzero.
+    /// and a [`merge`](StagingTree::merge) overwrite that replaces a
+    /// directory with a file both fail while it is nonzero.
+    /// [`write_file`](StagingTree::write_file) increments it under the tree
+    /// lock and the merge check reads it under the same lock, so a
+    /// registration and a directory drop cannot miss each other.
     writers: Arc<AtomicUsize>,
     /// The dirmeta applied to ancestors a write creates; `None` keeps a
     /// missing parent an error.
@@ -255,12 +264,30 @@ impl<'txn> StagingTree<'txn> {
     /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)); the final
     /// component never follows a symlink. Replaces an existing file or
     /// symlink; a directory at `path` is refused with
-    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile).
+    /// [`ReplaceDirWithFile`](Error::ReplaceDirWithFile). A parent directory a
+    /// concurrent [`merge`](StagingTree::merge) drops between path resolution
+    /// and the writer's registration is refused with
+    /// [`Staging`](Error::Staging).
     pub async fn write_file(&self, path: &Path, meta: &FileMeta) -> Result<StagedFileWriter<'txn>> {
         let (parent, name) = self.resolve_write_parent(path).await?;
         self.check_writable_leaf(&parent, &name)?;
         let writer = self.txn.content_writer(None, meta).await?;
-        self.writers.fetch_add(1, Ordering::AcqRel);
+        {
+            // Register under the tree lock, re-checking the parent: a merge
+            // overwrite that replaces a directory with a file drops that
+            // directory only after reading a zero count under this same lock,
+            // so a writer registered against a parent that still exists keeps
+            // its captured path valid for its whole life, and a parent a
+            // concurrent merge already dropped is refused here rather than
+            // surfacing at finish. The merge arm that replaces a left-side
+            // file with a right-side directory drops whatever sits at the name
+            // without the guard; D4 owns that arm.
+            let tree = self.tree.lock().unwrap();
+            if tree.dir_at(&parent).is_none() {
+                return Err(Error::Staging(dir_gone(&parent)));
+            }
+            self.writers.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(StagedFileWriter {
             tree: self.tree.clone(),
             writers: self.writers.clone(),
@@ -558,7 +585,13 @@ impl<'txn> StagingTree<'txn> {
     /// metadata are conflicts without `allow_overwrite` and take the right side
     /// with it. With `follow_symlinks`, a right-side directory over a left-side
     /// symlink merges into the symlink's target directory; right-side files and
-    /// symlinks replace the left entry and never write through.
+    /// symlinks replace the left entry and never write through. An overwrite
+    /// that replaces a directory with a file is refused with
+    /// [`Staging`](Error::Staging) while any
+    /// [`write_file`](StagingTree::write_file) writer is outstanding,
+    /// wherever in the tree it sits, and leaves that directory and its
+    /// subtree in place. A merge that fails keeps the entries it applied
+    /// before the failure.
     pub async fn merge(&self, other: &MutableTree, opts: MergeOptions) -> Result<()> {
         merge_into(self, Vec::new(), RightDir::Mutable(other), &opts).await
     }
@@ -568,6 +601,29 @@ impl<'txn> StagingTree<'txn> {
     /// Stage a directory-metadata object and return its checksum.
     async fn stage_dirmeta(&self, meta: &DirMeta) -> Result<Checksum> {
         self.txn.write_dirmeta(meta).await
+    }
+
+    /// Refuse a structural change -- dropping a directory -- while any file
+    /// writer is live. A writer records its entry at
+    /// [`finish`](StagedFileWriter::finish) under the component path it
+    /// captured, and a directory dropped in between would leave that path
+    /// stale, or pointing at a different directory created there later. Call
+    /// this under the tree lock, where
+    /// [`write_file`](StagingTree::write_file) registers its writers, so the
+    /// count read here cannot race a registration. Deregistration cannot be
+    /// missed either: [`finish`](StagedFileWriter::finish) records its entry
+    /// under this same lock before it decrements, so a zero count read here
+    /// means every departed writer has already recorded.
+    /// [`close`](StagingTree::close) states the full argument.
+    fn check_no_live_writers(&self, path: &str) -> Result<()> {
+        let outstanding = self.writers.load(Ordering::Acquire);
+        if outstanding != 0 {
+            return Err(Error::Staging(format!(
+                "cannot drop the directory at {path}: \
+                 {outstanding} file writer(s) still outstanding"
+            )));
+        }
+        Ok(())
     }
 
     /// Fail if a write to a leaf at `parent/name` would clobber a directory. A
@@ -944,6 +1000,7 @@ fn merge_into<'a>(
                         )));
                     }
                     st.with_dir_mut(&left_path, |dir| {
+                        st.check_no_live_writers(&join(&left_path, &name))?;
                         dir.remove(&name, true)?;
                         dir.replace_file(&name, right_csum)
                     })?;

@@ -2271,3 +2271,146 @@ fn a_write_racing_a_file_at_an_ancestor_name_errors() {
     drop(st);
     block_on(txn.abort()).unwrap();
 }
+
+/// A merge overwrite that would drop a directory is refused while a file
+/// writer is outstanding, names the directory it refused to drop, and leaves
+/// the directory and its subtree in place. Once the writer finishes, the same
+/// merge succeeds.
+#[test]
+fn merge_overwrite_of_a_directory_is_refused_while_a_writer_is_live() {
+    let tmp = TmpDir::new("staging-merge-writer-guard");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+
+        let pkg_st = txn.staging_tree(None).await.unwrap();
+        pkg_st
+            .write_file_content(Path::new("d"), &reg(), b"a file where the dir was")
+            .await
+            .unwrap();
+        let package = pkg_st.close().unwrap();
+
+        let base_st = txn.staging_tree(None).await.unwrap();
+        base_st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+        base_st
+            .write_file_content(Path::new("d/keep.txt"), &reg(), b"keep")
+            .await
+            .unwrap();
+        let mut writer = base_st
+            .write_file(Path::new("d/pending.txt"), &reg())
+            .await
+            .unwrap();
+        writer.write_all(b"pending").await.unwrap();
+
+        let opts = MergeOptions {
+            allow_overwrite: true,
+            ..MergeOptions::default()
+        };
+        match base_st.merge(&package, opts).await {
+            Err(Error::Staging(msg)) => assert_eq!(
+                msg, "cannot drop the directory at d: 1 file writer(s) still outstanding",
+                "the refusal names the directory and the count"
+            ),
+            other => panic!("the overwrite is refused while a writer is live: {other:?}"),
+        }
+        assert_eq!(
+            base_st.lookup(Path::new("d"), false).await.unwrap(),
+            StagingLookup::Dir,
+            "the blocked overwrite leaves the directory in place"
+        );
+        assert!(
+            matches!(
+                base_st
+                    .lookup(Path::new("d/keep.txt"), false)
+                    .await
+                    .unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "the blocked overwrite leaves the subtree in place"
+        );
+
+        writer.finish().await.unwrap();
+        base_st.merge(&package, opts).await.unwrap();
+        assert!(
+            matches!(
+                base_st.lookup(Path::new("d"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "once the writer finished, the overwrite replaces the directory"
+        );
+
+        drop(base_st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// The guard counts writers over the whole tree: a live writer in a branch
+/// disjoint from the dropped directory blocks the overwrite too, and an
+/// abandoned writer releases the guard.
+#[test]
+fn merge_overwrite_is_refused_by_a_writer_in_a_disjoint_branch() {
+    let tmp = TmpDir::new("staging-merge-writer-guard-disjoint");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+
+        let pkg_st = txn.staging_tree(None).await.unwrap();
+        pkg_st
+            .write_file_content(Path::new("d"), &reg(), b"a file where the dir was")
+            .await
+            .unwrap();
+        let package = pkg_st.close().unwrap();
+
+        let base_st = txn.staging_tree(None).await.unwrap();
+        base_st.make_dir(Path::new("d"), &dir_meta()).await.unwrap();
+        base_st
+            .write_file_content(Path::new("d/keep.txt"), &reg(), b"keep")
+            .await
+            .unwrap();
+        base_st
+            .make_dir(Path::new("other"), &dir_meta())
+            .await
+            .unwrap();
+        let writer = base_st
+            .write_file(Path::new("other/w.txt"), &reg())
+            .await
+            .unwrap();
+
+        let opts = MergeOptions {
+            allow_overwrite: true,
+            ..MergeOptions::default()
+        };
+        match base_st.merge(&package, opts).await {
+            Err(Error::Staging(msg)) => assert_eq!(
+                msg, "cannot drop the directory at d: 1 file writer(s) still outstanding",
+                "a writer outside the dropped directory blocks the overwrite too"
+            ),
+            other => panic!("the overwrite is refused while a writer is live: {other:?}"),
+        }
+        assert_eq!(
+            base_st.lookup(Path::new("d"), false).await.unwrap(),
+            StagingLookup::Dir,
+            "the blocked overwrite leaves the directory in place"
+        );
+
+        // Abandoning the writer (drop without finish) releases the guard.
+        drop(writer);
+        base_st.merge(&package, opts).await.unwrap();
+        assert!(
+            matches!(
+                base_st.lookup(Path::new("d"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "an abandoned writer no longer blocks the overwrite"
+        );
+        base_st.close().unwrap();
+
+        txn.abort().await.unwrap();
+    });
+}

@@ -4429,12 +4429,12 @@ deliverable's full surface and Verify list:
 - `D5` -- structured staging errors (DONE): `PathNotFound`, `NotADirectory`,
   `DanglingSymlink`, `SymlinkLoop`, and `EntryExists`, each with an
   `std::io::Error` mapping; `Error::Staging` keeps the residue.
-- `D1` -- `lookup`, `ensure_dir`, and `place_object`, plus replace semantics
-  on `symlink` and `hardlink`.
-- `D2` -- `with_implied_dirmeta`: the six write operations create absent
-  ancestors under one dirmeta.
-- `D3a` -- the writer registry: structural changes fail only under a live
-  writer's path.
+- `D1` -- `lookup`, `ensure_dir`, and `place_object` (DONE), plus replace
+  semantics on `symlink` and `hardlink`.
+- `D2` -- `with_implied_dirmeta` (DONE): the six write operations create
+  absent ancestors under one dirmeta.
+- `D3a` -- the writer guard, whole-tree form (DONE): a merge overwrite that
+  replaces a directory with a file fails while any file writer is live.
 - `D3b` -- `remove` and `clear_dir`, path-addressed and guarded.
 - `D3c` -- `rename`, which moves a node with its subtree and its dirmeta.
 - `D4` -- `merge_at` and `RootDirmeta` on `MergeOptions`.

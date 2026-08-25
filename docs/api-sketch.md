@@ -814,9 +814,17 @@ leaves the zoneinfo object untouched. Resolution walks the left tree at
 every level of the descent: relative targets resolve from the symlink's
 parent, absolute targets from the tree root, `..` clamps at the root,
 chains are capped at depth 40, and a dangling target is an error naming
-the symlink and the missing target. Merge lives on `StagingTree` rather
-than `MutableTree` because resolution loads symlink content objects, and
-only transaction scope sees objects staged in the current transaction.
+the symlink and the missing target. An overwrite that replaces a
+directory with a file is refused with `Staging` while any `write_file`
+writer is outstanding, wherever in the tree it sits, and leaves that
+directory and its subtree in place: a writer records its entry at
+`finish` under the component path it captured, and a directory dropped
+in between would leave that path stale. A merge that fails, on this
+refusal or on a conflict, keeps the entries it applied before the
+failure. Merge lives on `StagingTree`
+rather than `MutableTree` because resolution loads symlink content
+objects, and only transaction scope sees objects staged in the current
+transaction.
 
 Path semantics for the write operations: intermediate components resolve
 through symlinks with the same walker; the final component never
@@ -850,7 +858,8 @@ absent component reached while a symlink's target components are still
 queued reports `DanglingSymlink` for the innermost such symlink; once a
 target is spent, an absent component reports `PathNotFound`.
 `Staging` carries the conditions none of those names: the
-outstanding-writer refusal from `close`, a read of a directory where a
+outstanding-writer refusals from `close` and from a merge overwrite
+that replaces a directory with a file, a read of a directory where a
 file was wanted, a `hardlink` whose source resolves to a directory, a
 directory a concurrent operation removed under the lock, a path with no
 final component or one ending in `..`, a non-UTF-8 path component or

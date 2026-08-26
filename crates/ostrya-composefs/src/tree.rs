@@ -4,7 +4,8 @@
 //! logical [`Metadata`] (mode, ownership, mtime, xattrs). Regular files are
 //! either empty or backed by a loose object referenced through overlay
 //! redirect and metacopy xattrs; the writer never stores file content in the
-//! image.
+//! image. A backed file whose `verity` is `None` carries the metacopy xattr
+//! with an empty value.
 
 use std::collections::BTreeMap;
 
@@ -82,8 +83,9 @@ pub enum Content {
         /// The overlay redirect target, an absolute path such as
         /// `/cf/ffd5....file`.
         redirect: String,
-        /// The backing object's fs-verity digest.
-        verity: [u8; 32],
+        /// The backing object's fs-verity digest, or `None` to write the
+        /// metacopy xattr with an empty value.
+        verity: Option<[u8; 32]>,
     },
 }
 

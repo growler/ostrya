@@ -57,10 +57,10 @@ use std::sync::{Arc, Mutex};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
     CheckoutMode, CheckoutOptions, Checksum, CollectionRef, CommitModifier, CommitModifierFlags,
-    CommitOptions, CreateOptions, DeltaOptions, DevInoCache, DiffChange, Ed25519Signer,
-    Ed25519Verifier, Error, FileKind, FileObject, FilterResult, FsckOptions, MutableTree,
-    ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias, Repo,
-    RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef,
+    CommitOptions, ComposefsOptions, CreateOptions, DeltaOptions, DevInoCache, DiffChange,
+    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileObject, FilterResult, FsckOptions,
+    MutableTree, ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias,
+    Repo, RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef,
     TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
     Type, Value, Verifier, VerifyOutcome, Xattrs, base64, from_bytes, load_sign_keys,
     load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
@@ -3459,7 +3459,9 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     let commit = resolve(&repo, &args.commit).await?;
 
     if args.composefs {
-        let image = repo.export_composefs(&commit).await?;
+        let image = repo
+            .export_composefs(&commit, &ComposefsOptions::default())
+            .await?;
         std::fs::write(&args.destination, &image.bytes).map_err(Error::Io)?;
         return Ok(());
     }

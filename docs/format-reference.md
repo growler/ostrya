@@ -2046,8 +2046,24 @@ are:
   the 32-byte fs-verity digest of the backing object.
   `composefs-info measure-file <object>.file` reports the same 32 bytes. The
   digest covers the file's content, so an `archive` repository, which stores
-  that content compressed, records the same 32 bytes as a `bare-user` one. The
-  noverity image writes an empty metacopy value.
+  that content compressed, records the same 32 bytes as a `bare-user` one.
+
+The metacopy xattr is present in both images. `--composefs` gives it the
+36-byte record above. `--composefs-noverity` gives it a zero-length value on
+every backed file.
+
+The value decides the xattr layout. A metacopy value held by more than one inode
+moves into the shared-xattr area, and each of those inodes holds a reference in
+its place. A verity record is common to the files whose content is identical and
+stays local otherwise, so the verity image of a tree of distinct file contents
+carries one record per backed inode. The one empty value is common to every
+backed file, so a tree with two or more backed files shares it. The inode and
+xattr offsets shift accordingly. `composefs-info dump` prints the digest column
+as `-` for a file in the noverity image.
+
+The noverity image has its own fs-verity digest, and it differs from the value
+a commit records under `ostree.composefs.digest.v0`. The recorded value is the
+digest of the verity image, the artifact a target machine reproduces at boot.
 
 Empty regular files carry no overlay xattrs and no backing object. Symlinks
 store their target inline (mode 0120777) and are not redirected.
@@ -2062,6 +2078,12 @@ MANIFEST records `composefs_commit` (the commit made with
 `--generate-composefs-metadata`) and `composefs_digest` (the image's fs-verity
 digest, equal to that commit's stored `ostree.composefs.digest.v0`).
 
+`tree-noverity.cfs` is the same commit exported with
+`checkout --composefs-noverity`, and `tree-noverity.dump` is its
+`composefs-info dump`. The MANIFEST records `composefs_noverity_digest`, the
+image's own fs-verity digest, which is unrelated to the commit's stored
+`ostree.composefs.digest.v0`.
+
 `tree-rich.cfs` is a second verity image whose source tree carries user
 xattrs, and `tree-rich.dump` is its `composefs-info dump` (xattrs appear as
 trailing `name=value` tokens). Its commit is made without `--no-xattrs`, so it
@@ -2071,7 +2093,16 @@ shared-xattr promotion (`user.shared` on six inodes), inline xattrs, a
 multi-block directory with an inline dirent tail, xattr values of varied length,
 and a 4063-byte inline symlink. A 4064-byte symlink target is the point at which
 the tool aborts rather than promote a no-xattr symlink to a data block, so 4063
-is the largest reachable inline target.
+is the largest reachable inline target. `tree-rich-noverity.cfs` and
+`tree-rich-noverity.dump` are that tree's noverity export, and the MANIFEST
+records `composefs_rich_noverity_digest`. The pair holds the mixed case of the
+sharing rule. `tree-rich.cfs` carries 312 backed inodes over nine distinct
+verity records: two are shared, by 300 inodes and by 5, and seven are local to
+one inode each. All 312 reference the one empty value in
+`tree-rich-noverity.cfs`, so the seven local records move into the shared area
+and the shared area holds one metacopy entry in place of two. The minimal pair
+holds the plain case: `tree.cfs` has two local records and no shared metacopy
+entry, and `tree-noverity.cfs` has one shared entry and none local.
 
 ## tar
 

@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ostrya::{CreateOptions, LockKind, Repo, RepoMode, base64};
+use ostrya::{ComposefsOptions, CreateOptions, LockKind, Repo, RepoMode, base64};
 use ostrya_rt::block_on;
 
 /// The fixture commit id, branch, and timestamp from `generate.sh`/MANIFEST.
@@ -2166,7 +2166,10 @@ fn composefs_checkout_matches_library() {
     let lib_bytes = block_on(async {
         let repo = Repo::open(&repo).await.unwrap();
         let checksum = repo.resolve_rev(&commit, false).await.unwrap().unwrap();
-        repo.export_composefs(&checksum).await.unwrap().bytes
+        repo.export_composefs(&checksum, &ComposefsOptions::default())
+            .await
+            .unwrap()
+            .bytes
     });
     assert_eq!(
         cli_bytes, lib_bytes,

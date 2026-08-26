@@ -5,10 +5,23 @@
 //! regular file into the tree model the [`ostrya_composefs`] writer consumes,
 //! injects the five top-level directories the tool adds (`boot`, `etc`,
 //! `sysroot`, `usr`, `var`), and drives the writer. Each regular file with
-//! content redirects to its `.file` loose path and carries the fs-verity digest
-//! of that content; the digest is computed by streaming the object's payload
-//! through the fs-verity primitive in bounded chunks, so no unconstrained blob
-//! is buffered. The synchronous image assembly runs on the blocking pool.
+//! content redirects to its `.file` loose path and, under the default verity
+//! policy, carries the fs-verity digest of that content; the digest is computed
+//! by streaming the object's payload through the fs-verity primitive in bounded
+//! chunks, so no unconstrained blob is buffered. The synchronous image
+//! assembly runs on the blocking pool.
+//!
+//! [`ComposefsOptions`] carries the verity policy. Under
+//! [`VerityPolicy::Computed`], the default, each backed file carries the
+//! 36-byte metacopy record holding its content's fs-verity digest. Under
+//! [`VerityPolicy::Disabled`] the metacopy xattr is present with an empty
+//! value, no payload is streamed, and the image the export writes has its own
+//! fs-verity digest, distinct from the value a commit records under
+//! `ostree.composefs.digest.v0`. The recorded value is the digest of the
+//! verity-form image, which is what a target machine reproduces at boot, so
+//! the two are not compared. Every backing object is still opened under both
+//! policies, because the inode's mode, ownership, size, and xattrs come from
+//! the file object.
 //!
 //! [`Repo::commit_add_composefs_metadata`] computes the image digest for an
 //! existing commit and writes a new commit whose metadata dict carries
@@ -99,6 +112,34 @@ impl ObjectSource<'_> {
     }
 }
 
+/// Whether an exported image carries the backing objects' fs-verity digests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerityPolicy {
+    /// Each backed file carries the 36-byte metacopy record holding the
+    /// fs-verity digest of its content. The payload of every backing object is
+    /// streamed to compute it.
+    #[default]
+    Computed,
+    /// Each backed file carries the metacopy xattr with an empty value. No
+    /// payload is read.
+    Disabled,
+}
+
+/// Options for a composefs export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ComposefsOptions {
+    /// The verity policy the image is written under.
+    pub verity: VerityPolicy,
+}
+
+/// The policy the recorded digest is taken under. `ostree.composefs.digest.v0`
+/// holds the digest of the verity-form image, the artifact a target machine
+/// reproduces at boot, so the two sites that compute the recorded value name
+/// [`VerityPolicy::Computed`] rather than take it from the default.
+const RECORDED_POLICY: ComposefsOptions = ComposefsOptions {
+    verity: VerityPolicy::Computed,
+};
+
 impl Transaction {
     /// The fs-verity digest of the composefs image for a tree this transaction
     /// has staged, the value `ostree.composefs.digest.v0` holds.
@@ -108,7 +149,8 @@ impl Transaction {
     /// commit the tree belongs to. The value depends on the tree alone, so a
     /// repository of any mode holding that tree reaches the same digest.
     pub async fn composefs_digest(&self, root: &RepoTree) -> Result<[u8; 32]> {
-        let image = build_composefs_image(ObjectSource::Staged(self), root).await?;
+        let image =
+            build_composefs_image(ObjectSource::Staged(self), root, &RECORDED_POLICY).await?;
         Ok(image.fs_verity)
     }
 }
@@ -119,7 +161,16 @@ impl Repo {
     ///
     /// The repository must be a composefs backing mode (`bare-user` or
     /// `bare-user-shared`); any other mode is [`Error::Unsupported`].
-    pub async fn export_composefs(&self, commit: &Checksum) -> Result<Image> {
+    ///
+    /// `opts.verity` decides whether each backed file carries the fs-verity
+    /// digest of its content. Under [`VerityPolicy::Disabled`] the image's own
+    /// digest differs from the value a commit records under
+    /// `ostree.composefs.digest.v0`.
+    pub async fn export_composefs(
+        &self,
+        commit: &Checksum,
+        opts: &ComposefsOptions,
+    ) -> Result<Image> {
         self.ensure_composefs_backing_mode()?;
         let (commit_obj, _) = self.load_commit(commit).await?;
         let tree = RepoTree::from_parts(
@@ -127,7 +178,7 @@ impl Repo {
             commit_obj.root_dirtree,
             commit_obj.root_dirmeta,
         );
-        build_composefs_image(ObjectSource::Repo(self), &tree).await
+        build_composefs_image(ObjectSource::Repo(self), &tree, opts).await
     }
 
     /// Compute the composefs image digest for `commit` and stage a new commit
@@ -143,7 +194,7 @@ impl Repo {
         txn: &Transaction,
         commit: &Checksum,
     ) -> Result<Checksum> {
-        let image = self.export_composefs(commit).await?;
+        let image = self.export_composefs(commit, &RECORDED_POLICY).await?;
         let (mut commit_obj, _) = self.load_commit(commit).await?;
         if commit_obj.metadata.dict_get(COMPOSEFS_DIGEST_KEY).is_some() {
             return Err(Error::InvalidFormat(format!(
@@ -171,9 +222,18 @@ impl Repo {
 
 /// Build the composefs EROFS image for `root`, reading the tree's objects from
 /// `source`, and return its bytes and fs-verity digest.
-async fn build_composefs_image(source: ObjectSource<'_>, root: &RepoTree) -> Result<Image> {
-    let mut dir =
-        build_directory(source, *root.dirtree_checksum(), *root.dirmeta_checksum()).await?;
+async fn build_composefs_image(
+    source: ObjectSource<'_>,
+    root: &RepoTree,
+    opts: &ComposefsOptions,
+) -> Result<Image> {
+    let mut dir = build_directory(
+        source,
+        *root.dirtree_checksum(),
+        *root.dirmeta_checksum(),
+        opts.verity,
+    )
+    .await?;
     inject_top_level_dirs(&mut dir);
     Ok(ostrya_rt::unblock(move || build_image(&dir)).await)
 }
@@ -184,17 +244,18 @@ fn build_directory(
     source: ObjectSource<'_>,
     dirtree: Checksum,
     dirmeta: Checksum,
+    verity: VerityPolicy,
 ) -> TreeFuture<'_> {
     Box::pin(async move {
         let meta = source.dirmeta(&dirmeta).await?;
         let mut dir = Directory::new(dirmeta_to_metadata(&meta));
         let tree = source.dirtree(&dirtree).await?;
         for (name, checksum) in tree.files {
-            let node = file_node(source, &checksum).await?;
+            let node = file_node(source, &checksum, verity).await?;
             dir.children.insert(name.into_bytes(), node);
         }
         for (name, subtree, submeta) in tree.dirs {
-            let sub = build_directory(source, subtree, submeta).await?;
+            let sub = build_directory(source, subtree, submeta, verity).await?;
             dir.children.insert(name.into_bytes(), Node::Directory(sub));
         }
         Ok(dir)
@@ -204,8 +265,13 @@ fn build_directory(
 /// Build the composefs [`Node`] for a file object: a symlink stores its target
 /// inline, an empty regular file has no backing, and a regular file with
 /// content redirects to its `.file` loose path and carries the fs-verity digest
-/// of its content.
-async fn file_node(source: ObjectSource<'_>, checksum: &Checksum) -> Result<Node> {
+/// of its content under [`VerityPolicy::Computed`]. The file object is read
+/// under either policy, because the inode's metadata comes from it.
+async fn file_node(
+    source: ObjectSource<'_>,
+    checksum: &Checksum,
+    verity: VerityPolicy,
+) -> Result<Node> {
     let file = source.file(checksum).await?;
     let meta = file_to_metadata(&file);
     match &file.kind {
@@ -217,10 +283,14 @@ async fn file_node(source: ObjectSource<'_>, checksum: &Checksum) -> Result<Node
             let content = if *size == 0 {
                 Content::Empty
             } else {
+                let digest = match verity {
+                    VerityPolicy::Computed => Some(content_fs_verity(&file).await?),
+                    VerityPolicy::Disabled => None,
+                };
                 Content::Backed {
                     size: *size,
                     redirect: format!("/{}", loose_path(checksum, ObjectType::File, BACKING_MODE)),
-                    verity: content_fs_verity(&file).await?,
+                    verity: digest,
                 }
             };
             Ok(Node::Regular(Regular { meta, content }))

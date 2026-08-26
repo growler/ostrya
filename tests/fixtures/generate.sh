@@ -219,10 +219,18 @@ emit_tree "$sizes_repo" "sizes"
 # and links it next to the destination, so the checkout must run with a working
 # directory on the destination's filesystem; it runs inside $WORK, and the
 # finished image is copied into the project tree afterward.
+#
+# Each tree is exported twice. --composefs-noverity writes the same structure
+# with an empty trusted.overlay.metacopy value on every backed file, so the
+# single empty value is shared across inodes and the inode and xattr offsets
+# differ from the verity image. The noverity image has its own fs-verity digest,
+# unrelated to the ostree.composefs.digest.v0 value the commit records.
 COMPOSEFS_COMMIT=""
 COMPOSEFS_DIGEST=""
+COMPOSEFS_NOVERITY_DIGEST=""
 COMPOSEFS_RICH_COMMIT=""
 COMPOSEFS_RICH_DIGEST=""
+COMPOSEFS_RICH_NOVERITY_DIGEST=""
 if ostree --version | grep -q composefs && command -v composefs-info >/dev/null 2>&1; then
     mkdir -p "$OUT_DIR/composefs"
 
@@ -239,6 +247,14 @@ if ostree --version | grep -q composefs && command -v composefs-info >/dev/null 
     cp "$WORK/tree.cfs" "$OUT_DIR/composefs/tree.cfs"
     composefs-info dump "$WORK/tree.cfs" >"$OUT_DIR/composefs/tree.dump"
     COMPOSEFS_DIGEST="$(composefs-info measure-file "$WORK/tree.cfs")"
+    ( cd "$WORK" && TMPDIR="$WORK" \
+        ostree --repo="$cfs_repo" checkout --composefs-noverity \
+        "$COMPOSEFS_COMMIT" "$WORK/tree-noverity.cfs" )
+    cp "$WORK/tree-noverity.cfs" "$OUT_DIR/composefs/tree-noverity.cfs"
+    composefs-info dump "$WORK/tree-noverity.cfs" \
+        >"$OUT_DIR/composefs/tree-noverity.dump"
+    COMPOSEFS_NOVERITY_DIGEST="$(composefs-info measure-file \
+        "$WORK/tree-noverity.cfs")"
 
     # --- rich composefs fixture ---
     # A second export that drives the writer branches the minimal tree above
@@ -304,6 +320,15 @@ if ostree --version | grep -q composefs && command -v composefs-info >/dev/null 
     cp "$WORK/tree-rich.cfs" "$OUT_DIR/composefs/tree-rich.cfs"
     composefs-info dump "$WORK/tree-rich.cfs" >"$OUT_DIR/composefs/tree-rich.dump"
     COMPOSEFS_RICH_DIGEST="$(composefs-info measure-file "$WORK/tree-rich.cfs")"
+    ( cd "$WORK" && TMPDIR="$WORK" \
+        ostree --repo="$rich_repo" checkout --composefs-noverity \
+        "$COMPOSEFS_RICH_COMMIT" "$WORK/tree-rich-noverity.cfs" )
+    cp "$WORK/tree-rich-noverity.cfs" \
+        "$OUT_DIR/composefs/tree-rich-noverity.cfs"
+    composefs-info dump "$WORK/tree-rich-noverity.cfs" \
+        >"$OUT_DIR/composefs/tree-rich-noverity.dump"
+    COMPOSEFS_RICH_NOVERITY_DIGEST="$(composefs-info measure-file \
+        "$WORK/tree-rich-noverity.cfs")"
 else
     echo "warning: ostree lacks composefs or composefs-info missing;" \
          "skipping composefs fixture" >&2
@@ -386,8 +411,10 @@ xattr_commit=${XATTR_COMMIT}
 sizes_commit=${SIZES_COMMIT}
 composefs_commit=${COMPOSEFS_COMMIT}
 composefs_digest=${COMPOSEFS_DIGEST}
+composefs_noverity_digest=${COMPOSEFS_NOVERITY_DIGEST}
 composefs_rich_commit=${COMPOSEFS_RICH_COMMIT}
 composefs_rich_digest=${COMPOSEFS_RICH_DIGEST}
+composefs_rich_noverity_digest=${COMPOSEFS_RICH_NOVERITY_DIGEST}
 summary_last_modified=${SUMMARY_EPOCH}
 summary_collection_id=${SUMMARY_COLLECTION_ID}
 summary_anchor_commit=${SUMMARY_ANCHOR_COMMIT}

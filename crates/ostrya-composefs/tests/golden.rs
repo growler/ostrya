@@ -7,9 +7,14 @@
 //! digest must equal the digest recorded in the fixture MANIFEST (the value the
 //! tool stored in `ostree.composefs.digest.v0`).
 //!
-//! Two fixtures are checked. `tree.cfs` is a minimal tree. `tree-rich.cfs`
+//! Four fixtures are checked. `tree.cfs` is a minimal tree. `tree-rich.cfs`
 //! exercises shared xattrs, inline xattrs, a multi-block directory, and a long
-//! inline symlink, so a regression in those paths fails a committed test.
+//! inline symlink, so a regression in those paths fails a committed test. Each
+//! has a `-noverity` counterpart, the image the tool writes with
+//! `checkout --composefs-noverity`: every backed file takes an empty
+//! `trusted.overlay.metacopy` value, so the one shared value moves into the
+//! shared-xattr table and the inode and xattr offsets shift. A dump prints the
+//! digest column as `-` for those files.
 
 use std::path::{Path, PathBuf};
 
@@ -89,7 +94,7 @@ fn node_from_fields(fields: &[&str]) -> Node {
                 Content::Backed {
                     size,
                     redirect: format!("/{payload}"),
-                    verity: hex32(digest),
+                    verity: (digest != "-").then(|| hex32(digest)),
                 }
             };
             Node::Regular(Regular { meta, content })
@@ -184,6 +189,16 @@ fn image_matches_golden_bytes_and_digest() {
 }
 
 #[test]
+fn noverity_image_matches_golden_bytes_and_digest() {
+    check_fixture("tree-noverity", "composefs_noverity_digest");
+}
+
+#[test]
 fn rich_image_matches_golden_bytes_and_digest() {
     check_fixture("tree-rich", "composefs_rich_digest");
+}
+
+#[test]
+fn rich_noverity_image_matches_golden_bytes_and_digest() {
+    check_fixture("tree-rich-noverity", "composefs_rich_noverity_digest");
 }

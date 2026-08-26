@@ -5,8 +5,9 @@
 //! This crate has no ostree or repository knowledge. It is the composefs
 //! counterpart to `ostrya-gvariant`: it takes a tree model -- directories,
 //! symlinks, and regular-file entries carrying logical metadata, extended
-//! attributes, a backing loose path, and a backing fs-verity digest -- and
-//! emits the EROFS image bytes plus the image's fs-verity digest.
+//! attributes, a backing loose path, and an optional backing fs-verity
+//! digest -- and emits the EROFS image bytes plus the image's fs-verity
+//! digest.
 //!
 //! The output reproduces the composefs project's EROFS layout, format version
 //! 0, the format the `ostree` tool writes when it exports a commit with

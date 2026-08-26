@@ -1379,6 +1379,17 @@ pub struct TarImportOptions {
 /// The EROFS image bytes and the fs-verity digest over them.
 pub struct Image { pub bytes: Vec<u8>, pub fs_verity: [u8; 32] }
 
+/// Whether an exported image carries the backing objects' fs-verity digests.
+/// `Computed` is the default: each backed file takes the 36-byte metacopy
+/// record holding the digest of its content. `Disabled` gives the metacopy
+/// xattr an empty value and reads no payload; the image it produces has its own
+/// fs-verity digest, distinct from the `ostree.composefs.digest.v0` value a
+/// commit records.
+pub enum VerityPolicy { Computed, Disabled }
+
+/// Options for a composefs export.
+pub struct ComposefsOptions { pub verity: VerityPolicy }
+
 impl Repo {
     /// Produce the EROFS/composefs image for a commit and its fs-verity digest.
     /// Inode metadata always comes from the real file attributes (no canonical
@@ -1386,8 +1397,10 @@ impl Repo {
     /// and each regular file redirects to its `.file` loose path. Ownership is
     /// presented via composefs uid mapping at mount. A repository outside the
     /// composefs backing modes (`bare-user`, `bare-user-shared`) is
-    /// `Error::Unsupported`.
-    pub async fn export_composefs(&self, commit: &Checksum) -> Result<Image>;
+    /// `Error::Unsupported`. Every backing object is opened under either
+    /// policy, because the inode's metadata comes from it.
+    pub async fn export_composefs(&self, commit: &Checksum,
+        opts: &ComposefsOptions) -> Result<Image>;
     /// Compute and store `ostree.composefs.digest.v0` in the commit's metadata.
     pub async fn commit_add_composefs_metadata(&self, txn: &Transaction,
         commit: &Checksum) -> Result<Checksum>;

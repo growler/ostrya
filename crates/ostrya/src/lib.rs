@@ -51,8 +51,9 @@
 //! [`Repo::export_composefs`], which builds the EROFS/composefs image for a
 //! commit over the [`ostrya_composefs`] writer -- the tree model comes from the
 //! commit's [`RepoTree`], the five top-level directories are injected, and each
-//! regular file redirects to its `.file` loose object and carries the fs-verity
-//! digest of that file's content -- [`Repo::commit_add_composefs_metadata`],
+//! regular file redirects to its `.file` loose object and, under the default
+//! [`ComposefsOptions`] verity policy, carries the fs-verity digest of that
+//! file's content -- [`Repo::commit_add_composefs_metadata`],
 //! which stores the image digest in a commit's `ostree.composefs.digest.v0`
 //! metadata, and [`Transaction::composefs_digest`], which computes the digest
 //! over a tree the transaction has staged, for a commit that carries the key in
@@ -207,6 +208,7 @@ mod write;
 
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 pub use commit::CommitOptions;
+pub use composefs::{ComposefsOptions, VerityPolicy};
 pub use config::{MinFreeSpace, Remote, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate};
 pub use deltagen::DeltaOptions;
 pub use diff::{DiffChange, DiffEntry};

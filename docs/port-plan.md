@@ -4441,7 +4441,9 @@ deliverable's full surface and Verify list:
 - `D4` -- `merge_at` and `RootDirmeta` on `MergeOptions` (DONE): `merge` is
   the root case of `merge_at`, and the merge arms that drop a directory read
   the entry inside the acquisition that mutates it.
-- `D7a` -- `VerityPolicy` and `ComposefsOptions`.
+- `D7a` -- `VerityPolicy` and `ComposefsOptions` (DONE): `Disabled` gives
+  the metacopy xattr an empty value and reads no payload, and the noverity
+  golden fixtures hold the xattr-sharing consequence.
 - `D8` -- `write_image_to` and `Repo::export_composefs_to`, streaming the
   image through the caller's sink.
 - `D7b` -- `checkout --composefs-noverity` and the destination-fd rewiring,

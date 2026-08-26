@@ -540,7 +540,11 @@ impl<'a> Collector<'a> {
                 redirect,
                 verity,
             } => {
-                xattrs.add(XATTR_METACOPY, &metacopy_record(verity));
+                let record = match verity {
+                    Some(v) => metacopy_record(v),
+                    None => Vec::new(),
+                };
+                xattrs.add(XATTR_METACOPY, &record);
                 xattrs.add(XATTR_REDIRECT, redirect.as_bytes());
                 // Chunk indices are always written inline. A single chunk
                 // covers files up to 8 TiB (chunk size caps at 2^43), so

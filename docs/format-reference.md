@@ -1965,9 +1965,22 @@ the logical permission bits.
 Directory inodes are flat-inline when their entries fit within one block after
 the inode header and xattrs, and flat-plain when the entries occupy one or more
 whole blocks. Empty regular files are flat-plain with size 0. Symlinks are
-flat-inline with the target stored inline, promoted to a data block only when
-the inode header, xattrs, and target would fill a block. Whiteout stubs are
-character devices, flat-plain, `i_u` 0.
+flat-inline with the target stored inline. Whiteout stubs are character devices,
+flat-plain, `i_u` 0.
+
+A symlink target shares its inode's block with the inode header and the inode's
+extended attributes, so the target is at most 4096 bytes less those two. A
+header is 32 bytes, or 64 bytes for an inode the compact form does not hold,
+which puts a target carrying no attributes at 4063 bytes. The tool aborts on a
+longer one. Measured against libostree 2026.1 over one symlink and no
+attributes: at 4063 bytes `checkout --composefs` writes the image, and at 4064
+and at 4095 bytes it exits on
+`lcfs_write_erofs_to: Assertion 'ctx_erofs->current_end == ctx->bytes_written'
+failed` and writes nothing. 4064 bytes is where the header and the target first
+fill a block. The port refuses the same trees with `Error::Unsupported`, so no
+composefs image either side writes holds a symlink target outside its inode's
+block. `PATH_MAX` is 4096, so a checkout produces no tree that reaches the
+bound; a tar import does.
 
 ### Overlay whiteout table
 
@@ -2011,7 +2024,46 @@ follows the inode header:
 `i_xattr_icount` encodes the area size: 0 when absent, otherwise
 `1 + (size - 12) / 4`. Each inline entry is a 4-byte header (name-length byte,
 name-index byte, 2-byte value size), then the name suffix, then the value,
-padded to a 4-byte boundary.
+padded to a 4-byte boundary. The value size is 2 bytes, so an entry holds at
+most 65535 bytes of value. The name length is 1 byte, so an entry holds at most
+255 bytes of name suffix. Both widths are readable in the golden images.
+
+An inode holds at most 128 shared-xattr references. Its repeated attributes are
+taken in ascending full-key order until the inode holds 128 of them, and the
+rest stay inline. The shared table itself holds every repeated entry, including
+entries no inode ends up referencing. Measured against libostree 2026.1 over
+two files carrying the same 10, 100, 127, 128, 129, 200, and 256 attributes:
+the count field reads back the attribute count up to 128 and 128 from there on,
+and the inode's area grows by one inline entry for each attribute past 128. The
+ordering was measured over three further trees. Two files carrying 300
+attributes of which the even-numbered 150 repeat: the 128 lowest even keys are
+shared and the 22 highest even keys join the odd ones inline. Three files where
+100 `user.t*` keys repeat three times and 100 `user.d*` keys repeat twice: the
+inode carrying both shares all 100 `user.d*` keys and the 28 lowest `user.t*`
+keys, so the repeat count does not decide the order and the key does. And a
+`--composefs-noverity` export of two files carrying 200 repeated attributes,
+where the empty `trusted.overlay.metacopy` value repeats across the backed
+inodes and sorts below `user.`, taking one of the 128 and moving one more key
+inline. `tree-rich.cfs` holds the case and the port reproduces all six trees
+byte-for-byte.
+
+The tool binds an inode's attributes well under the value field. Each attribute
+spends its full name, its value, and 7 bytes from a budget of 32755 bytes for
+the inode. Past the budget the tool writes no image, records no digest, and
+exits non-zero. Measured against libostree 2026.1 over one attribute at name
+lengths 6, 8, 37, and 200; over 2, 3, 8, and 100 attributes; over a directory
+as well as a regular file; and over `system.posix_acl_access`, whose 22-byte
+name shows that the budget counts the full name and not the prefix-stripped
+suffix. A regular file is held to the same 32755 bytes as a directory, so the
+`trusted.overlay.redirect` and `trusted.overlay.metacopy` attributes the export
+adds to a backed inode sit outside the budget. At the budget the tool and the
+port write the same image.
+
+The budget leaves the name-length field unbound: 255 bytes of name sit inside
+32755 bytes. The port holds a name to that width as well, refusing past it, so
+no field is written behind a truncated length. Whether the tool refuses the
+same trees is unobserved. A name above 255 bytes is outside what a Linux
+filesystem stores, since the kernel caps an attribute name at 255 bytes.
 
 Names are stored with a prefix index and the remaining suffix. The prefixes are:
 0 empty (full name in the suffix), 1 `user.`, 2 `system.posix_acl_access`, 3
@@ -2084,25 +2136,26 @@ digest, equal to that commit's stored `ostree.composefs.digest.v0`).
 image's own fs-verity digest, which is unrelated to the commit's stored
 `ostree.composefs.digest.v0`.
 
-`tree-rich.cfs` is a second verity image whose source tree carries user
-xattrs, and `tree-rich.dump` is its `composefs-info dump` (xattrs appear as
-trailing `name=value` tokens). Its commit is made without `--no-xattrs`, so it
-is generated on a host that applies no SELinux labels. The MANIFEST records
+`tree-rich.cfs` is a second verity image whose source tree carries user xattrs,
+and `tree-rich.dump` is its `composefs-info dump` (xattrs appear as trailing
+`name=value` tokens). Its commit is made without `--no-xattrs`, so it is
+generated on a host that applies no SELinux labels. The MANIFEST records
 `composefs_rich_commit` and `composefs_rich_digest`. The tree exercises
-shared-xattr promotion (`user.shared` on six inodes), inline xattrs, a
-multi-block directory with an inline dirent tail, xattr values of varied length,
-and a 4063-byte inline symlink. A 4064-byte symlink target is the point at which
-the tool aborts rather than promote a no-xattr symlink to a data block, so 4063
-is the largest reachable inline target. `tree-rich-noverity.cfs` and
-`tree-rich-noverity.dump` are that tree's noverity export, and the MANIFEST
-records `composefs_rich_noverity_digest`. The pair holds the mixed case of the
-sharing rule. `tree-rich.cfs` carries 312 backed inodes over nine distinct
-verity records: two are shared, by 300 inodes and by 5, and seven are local to
-one inode each. All 312 reference the one empty value in
-`tree-rich-noverity.cfs`, so the seven local records move into the shared area
-and the shared area holds one metacopy entry in place of two. The minimal pair
-holds the plain case: `tree.cfs` has two local records and no shared metacopy
-entry, and `tree-noverity.cfs` has one shared entry and none local.
+shared-xattr promotion (`user.shared` on six inodes), inline xattrs, an inode
+past the 128-reference cap (`user.m000` through `user.m149` on both files under
+`manyshared/`), a multi-block directory with an inline dirent tail, xattr
+values of varied length, and a 4063-byte inline symlink, the longest target an
+inode carrying no attributes holds.
+`tree-rich-noverity.cfs` and `tree-rich-noverity.dump` are that tree's noverity
+export, and the MANIFEST records `composefs_rich_noverity_digest`. The pair
+holds the mixed case of the sharing rule. `tree-rich.cfs` carries 314 backed
+inodes over eleven distinct verity records: two are shared, by 300 inodes and
+by 5, and nine are local to one inode each. All 314 reference the one empty
+value in `tree-rich-noverity.cfs`, so the nine local records move into the
+shared area and the shared area holds one metacopy entry in place of two. The
+minimal pair holds the plain case: `tree.cfs` has two local records and no
+shared metacopy entry, and `tree-noverity.cfs` has one shared entry and none
+local.
 
 ## tar
 

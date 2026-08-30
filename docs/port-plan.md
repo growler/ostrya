@@ -1042,8 +1042,9 @@ images. Always compiled, not feature-gated. Split into sub-phases:
   digest is a streaming SHA-256 Merkle primitive (4096-byte blocks, zero salt,
   256-byte descriptor), reused for both the whole image and each backing
   object. Byte assembly is hand-rolled; the digest is computed over `sha2`. The
-  crate is synchronous and builds the image in a single in-memory buffer, as
-  the tool does, so it takes no runtime dependency. The field-level layout is
+  crate is synchronous and takes no runtime dependency; emission is
+  append-only, so it writes through a `std::io::Write` sink and buffers the
+  image only for the caller that asks for the bytes. The field-level layout is
   recorded in `format-reference.md` as it is verified against the golden bytes.
   Dependency set: `sha2` (an approved foundation crate, already used) for the
   fs-verity digest. The XATTR_FILTER field hashes each xattr-name suffix with
@@ -4123,14 +4124,27 @@ that prunes `/usr/lib/modules` leaves no kernel to find. Deferred: a
 passing one to `RepoTree::read_dir` before the commit reaches
 `Error::ObjectNotFound`. The doc comment carries the constraint, and enforcing
 it in the type needs a staging-aware tree handle.
-`Transaction::composefs_digest` builds the composefs image over a staged tree and
-returns its fs-verity digest, so the value goes into the metadata of the commit
-it belongs to. The image builder became mode-independent for it: each backing
-file redirects to the `.file` loose path and carries the fs-verity digest of the
-file's content rather than of the loose object, so `archive`, `bare`, and
-`bare-user` holding one tree produce one image and one digest, which is what the
-tool stores. `bare-user-only` canonicalizes the tree and so reaches another
-digest, in both implementations.
+`Transaction::composefs_digest` writes the composefs image for a staged tree
+through `std::io::sink` and returns its fs-verity digest, so the value goes into
+the metadata of the commit it belongs to and no image-sized buffer is held. The
+image builder became mode-independent for it: each backing file redirects to the
+`.file` loose path and carries the fs-verity digest of the file's content rather
+than of the loose object, so `archive`, `bare`, and `bare-user` holding one tree
+produce one image and one digest, which is what the tool stores.
+`bare-user-only` canonicalizes the tree and so reaches another digest, in both
+implementations. `Repo::commit_add_composefs_metadata` runs in every mode for
+the same reason: it builds no image, so the composefs backing-mode check sits on
+`Repo::export_composefs` and `Repo::export_composefs_to`, the two forms that
+write one. A symlink states its target inline in its inode, so a target the
+inode's block does not hold has no place in the image, and the writer refuses it
+with `Error::Unsupported`. The tool aborts on the same trees
+(`format-reference.md`, "composefs", records the measurement), so both sides
+write no image there. The bound depends on the inode's header and its extended
+attributes, and an inode's attribute area is known only after shared-xattr
+promotion, which spans the whole tree; the refusal therefore sits in the writer,
+where the block is measured, and not in the walk that builds the model.
+`PATH_MAX` keeps a target that long out of a tree a checkout produces, and a tar
+import or a hand-built tree reaches it.
 
 Four divergences came out of that comparison, all in `cli-surface.md`, "P2". The
 tool holds the commit metadata dict in a hash-ordered container while
@@ -4444,8 +4458,18 @@ deliverable's full surface and Verify list:
 - `D7a` -- `VerityPolicy` and `ComposefsOptions` (DONE): `Disabled` gives
   the metacopy xattr an empty value and reads no payload, and the noverity
   golden fixtures hold the xattr-sharing consequence.
-- `D8` -- `write_image_to` and `Repo::export_composefs_to`, streaming the
-  image through the caller's sink.
+- `D8` -- `write_image_to` and `Repo::export_composefs_to` (DONE): the
+  emitting pass writes through the caller's sink and feeds the fs-verity
+  hasher as it goes, `build_image` buffers that same pass, and the two
+  digest-only paths, `Transaction::composefs_digest` and
+  `Repo::commit_add_composefs_metadata`, run it into `std::io::sink` and so
+  need no backing mode. The walk refuses a tree whose inode spends more than
+  the 32755 bytes the tool allows an inode's attributes, and holds the one EROFS
+  length field that budget leaves unbound: 255 bytes of name. The writer refuses
+  a symlink target its inode's block does not hold, the bound the tool aborts
+  on. Those are the two tree facts the export has no room for. The writer holds
+  an inode to the 128 shared-xattr references the tool gives it and keeps the
+  rest inline, which `tree-rich.cfs` pins.
 - `D7b` -- `checkout --composefs-noverity` and the destination-fd rewiring,
   with their cells.
 - `D6` -- `DictBuilder`, the `loose_path` re-export, and a public

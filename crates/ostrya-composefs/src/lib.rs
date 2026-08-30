@@ -17,8 +17,16 @@
 //! trusted-namespace overlay xattrs (`overlay.redirect`, `overlay.metacopy`,
 //! `overlay.opaque`) with the shared-xattr area and the EROFS xattr name
 //! filter. There is no EROFS compression, no fragments, and no multi-device
-//! support. The image is assembled in a single in-memory buffer, so the crate
-//! is synchronous and takes no runtime dependency.
+//! support. The crate is synchronous and takes no runtime dependency.
+//!
+//! Emission is append-only, so [`write_image_to`] serializes the image straight
+//! through a [`std::io::Write`] sink and returns the digest without holding the
+//! image. [`build_image`] runs the same emission into a buffer for a caller
+//! that wants the bytes.
+//!
+//! A symlink target sits inline in its inode, so a target that does not fit the
+//! inode's block has no place in the image and both forms refuse it with
+//! [`Error::Unsupported`].
 //!
 //! The field-level layout is documented in `docs/format-reference.md`,
 //! "composefs", and pinned by the golden-image test.
@@ -28,8 +36,45 @@ mod tree;
 mod writer;
 mod xxhash;
 
+use std::fmt;
+
 pub use fsverity::FsVerityHasher;
 pub use tree::{Content, Directory, Metadata, Node, Regular, Symlink};
+pub use writer::write_image_to;
+
+/// A tree the writer has no image for, or a sink that failed.
+#[derive(Debug)]
+pub enum Error {
+    /// The tree carries something the image has no place for. The message
+    /// names it.
+    Unsupported(String),
+    /// The sink returned an error.
+    Io(std::io::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Unsupported(msg) => f.write_str(msg),
+            Error::Io(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Unsupported(_) => None,
+            Error::Io(err) => Some(err),
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::Io(err)
+    }
+}
 
 /// A generated composefs EROFS image and its fs-verity digest.
 pub struct Image {
@@ -48,10 +93,16 @@ pub struct Image {
 /// stubs named `00`..`ff`) into the root directory and marks the root opaque,
 /// as the composefs image writer does; those entries are format mechanics and
 /// are not part of the caller's tree.
-pub fn build_image(root: &Directory) -> Image {
-    let bytes = writer::write_image(root);
-    let fs_verity = FsVerityHasher::hash(&bytes);
-    Image { bytes, fs_verity }
+///
+/// A symlink whose target does not fit its inode's block is
+/// [`Error::Unsupported`], as [`Symlink`] states. Panics when an xattr name or
+/// a value exceeds what [`Metadata`] states.
+pub fn build_image(root: &Directory) -> Result<Image, Error> {
+    let plan = writer::plan(root)?;
+    let mut bytes = Vec::with_capacity(plan.size);
+    // A `Vec<u8>` sink accepts every write, so the emitting pass cannot fail.
+    let fs_verity = writer::emit(&plan, &mut bytes).expect("a Vec sink never fails");
+    Ok(Image { bytes, fs_verity })
 }
 
 #[cfg(test)]

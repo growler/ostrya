@@ -53,7 +53,9 @@
 //! commit's [`RepoTree`], the five top-level directories are injected, and each
 //! regular file redirects to its `.file` loose object and, under the default
 //! [`ComposefsOptions`] verity policy, carries the fs-verity digest of that
-//! file's content -- [`Repo::commit_add_composefs_metadata`],
+//! file's content -- [`Repo::export_composefs_to`], which writes that image
+//! through a file descriptor and returns its fs-verity digest without holding
+//! the image, [`Repo::commit_add_composefs_metadata`],
 //! which stores the image digest in a commit's `ostree.composefs.digest.v0`
 //! metadata, and [`Transaction::composefs_digest`], which computes the digest
 //! over a tree the transaction has staged, for a commit that carries the key in

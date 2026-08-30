@@ -27,6 +27,14 @@ pub struct Metadata {
     /// Modification time as `(seconds, nanoseconds)`.
     pub mtime: (u64, u32),
     /// Extended attributes as `(name, value)` pairs.
+    ///
+    /// A value is at most 65535 bytes, and a name suffix -- the name past its
+    /// prefix -- is at most 255 bytes, the ranges of the two EROFS length
+    /// fields. A longer name or value panics the writer, because the image
+    /// would carry it in full behind a truncated length. The count itself is
+    /// unbounded; the area the attributes occupy is not, and the EROFS count
+    /// field holds it to 262148 bytes. The writer shares an entry that repeats
+    /// across inodes and keeps the entries one inode cannot reference inline.
     pub xattrs: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -59,6 +67,12 @@ pub struct Symlink {
     /// Logical metadata for the symlink inode.
     pub meta: Metadata,
     /// The link target bytes.
+    ///
+    /// The target shares its inode's block with the inode header and the
+    /// inode's extended attributes, so it is at most `4096` bytes less those
+    /// two. A header is 32 bytes, or 64 bytes for an inode the compact form
+    /// does not hold, which puts a target with no attributes at 4063 bytes. A
+    /// longer target is [`Error::Unsupported`](crate::Error::Unsupported).
     pub target: Vec<u8>,
 }
 

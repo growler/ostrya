@@ -18,7 +18,38 @@
 
 use std::path::{Path, PathBuf};
 
-use ostrya_composefs::{Content, Directory, Metadata, Node, Regular, Symlink, build_image};
+use ostrya_composefs::{
+    Content, Directory, FsVerityHasher, Metadata, Node, Regular, Symlink, build_image,
+    write_image_to,
+};
+
+/// A sink that records what it received: the total byte count and the largest
+/// single write. The emitting pass is append-only, so the largest write bounds
+/// what the writer holds at once.
+#[derive(Default)]
+struct CountingSink {
+    total: usize,
+    largest: usize,
+    digest: FsVerityHasher,
+}
+
+impl std::io::Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.total += buf.len();
+        self.largest = self.largest.max(buf.len());
+        self.digest.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The largest single write the emitting pass makes. One write carries at most
+/// one field, and the largest field is an xattr value, which the EROFS
+/// value-length field states in two bytes.
+const MAX_WRITE: usize = u16::MAX as usize;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/generated/composefs")
@@ -156,7 +187,7 @@ fn check_fixture(stem: &str, digest_key: &str) {
     };
 
     let root = tree_from_dump(&dump);
-    let image = build_image(&root);
+    let image = build_image(&root).expect("build the image");
 
     assert_eq!(
         image.bytes.len(),
@@ -172,6 +203,39 @@ fn check_fixture(stem: &str, digest_key: &str) {
             image.bytes[pos], golden[pos]
         );
     }
+
+    // The streaming form emits the same image and reaches the same digest, and
+    // it passes the image through field by field, never as one buffer.
+    let mut sink = CountingSink::default();
+    let streamed = write_image_to(&root, &mut sink).expect("stream the image");
+    assert_eq!(
+        sink.total,
+        image.bytes.len(),
+        "{stem}: streamed length differs from the buffered image"
+    );
+    // One write carries at most one field. Two bounds hold that, and both are
+    // needed: MAX_WRITE is the bound for any tree, and it sits above every
+    // fixture image, so on these fixtures the image length is the bound that
+    // binds.
+    assert!(
+        sink.largest <= MAX_WRITE,
+        "{stem}: one write of {} bytes exceeds the largest field",
+        sink.largest
+    );
+    assert!(
+        sink.largest < image.bytes.len(),
+        "{stem}: one write of {} bytes carried the whole image",
+        sink.largest
+    );
+    assert_eq!(
+        streamed, image.fs_verity,
+        "{stem}: streamed digest differs from the buffered digest"
+    );
+    assert_eq!(
+        sink.digest.finalize(),
+        streamed,
+        "{stem}: the digest differs from the digest of the bytes the sink received"
+    );
 
     let expected = manifest_value(digest_key).unwrap_or_else(|| panic!("MANIFEST {digest_key}"));
     if !expected.is_empty() {

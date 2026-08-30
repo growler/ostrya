@@ -1401,7 +1401,27 @@ impl Repo {
     /// policy, because the inode's metadata comes from it.
     pub async fn export_composefs(&self, commit: &Checksum,
         opts: &ComposefsOptions) -> Result<Image>;
+    /// Write that image through `out` and return its fs-verity digest. Emission
+    /// is append-only, so the image reaches the descriptor as it is serialized
+    /// and no image-sized buffer is held. `out` is written from its current
+    /// offset onward and is never seeked, and a call that fails leaves the
+    /// prefix it had already written. The mode rule and `opts` are those of
+    /// `export_composefs`.
+    ///
+    /// Every path here refuses a tree whose inode spends more than 32755 bytes
+    /// on extended attributes, counting each name, each value, and 7 bytes an
+    /// attribute, with `Error::Unsupported`. This is the budget the tool holds
+    /// (`format-reference.md`, "composefs"). A commit past it would carry a
+    /// composefs digest no `ostree` reproduces. The one EROFS field the budget
+    /// leaves unbound is refused there as well: a name above 255 bytes. A
+    /// symlink target that fills its inode's block reaches the same refusal
+    /// from the writer, which is where the block is measured.
+    pub async fn export_composefs_to(&self, commit: &Checksum,
+        opts: &ComposefsOptions, out: BorrowedFd<'_>) -> Result<[u8; 32]>;
     /// Compute and store `ostree.composefs.digest.v0` in the commit's metadata.
+    /// The digest derives from the tree alone, so this builds no image and runs
+    /// in every repository mode, as `Transaction::composefs_digest` does. The
+    /// mode rule applies to the two forms that write an image.
     pub async fn commit_add_composefs_metadata(&self, txn: &Transaction,
         commit: &Checksum) -> Result<Checksum>;
 }
@@ -1410,9 +1430,39 @@ impl Transaction {
     /// The fs-verity digest of the composefs image for a tree this transaction
     /// has staged, for a commit that carries the key in its own metadata. The
     /// image derives from the tree alone, so the value is the same in every
-    /// repository mode holding that tree.
+    /// repository mode holding that tree. The image goes through
+    /// `std::io::sink`, so the digest costs no image-sized buffer.
     pub async fn composefs_digest(&self, root: &RepoTree) -> Result<[u8; 32]>;
 }
+```
+
+The `ostrya-composefs` crate carries the emitting half of that pair. Both forms
+run one emission pass:
+
+```rust
+/// Write the image for `root` through `out` and return its fs-verity digest.
+/// The sink takes the image in many small writes, so a caller writing to a file
+/// wraps it in a `std::io::BufWriter`. One write carries at most one field, and
+/// the largest field is an xattr value, which the EROFS length field caps at
+/// 65535 bytes. A call that succeeds flushes the sink before it returns; a call
+/// that fails returns the sink's first error and does not flush, though a sink
+/// that flushes on drop, such as a `std::io::BufWriter`, still does.
+///
+/// A symlink states its target inline in its inode, so a target the inode's
+/// block does not hold is `Error::Unsupported`; `Symlink` states the bound. An
+/// xattr value above 65535 bytes, an xattr name suffix above 255 bytes, or an
+/// xattr area above 262148 bytes is a broken precondition of the `Directory`
+/// the caller built, and panics; `Metadata` states all three. The split is that
+/// a caller reads the xattr bounds off the values it holds, and the symlink
+/// bound off the inode the writer lays out.
+pub fn write_image_to(root: &Directory, out: &mut impl std::io::Write)
+    -> Result<[u8; 32], Error>;
+
+/// Run that same pass into a buffer sized by the sizing pass.
+pub fn build_image(root: &Directory) -> Result<Image, Error>;
+
+/// A tree the writer has no image for, or a sink that failed.
+pub enum Error { Unsupported(String), Io(std::io::Error) }
 ```
 
 `TarExportOptions` is `Send + Sync`. `TarImportOptions` is `Send` alone: it

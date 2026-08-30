@@ -304,6 +304,22 @@ if ostree --version | grep -q composefs && command -v composefs-info >/dev/null 
         chmod 0644 "$d/f"
         setfattr -n user.v -v "$(printf 'v%.0s' $(seq 1 "$n"))" "$d/f"
     done
+    # Two files carrying 150 repeated attributes each, above the 128
+    # shared-xattr references one inode holds. The tool references the 128
+    # lowest keys through the shared table and keeps the remaining 22 inline,
+    # so the pair pins the cap and the spill order. The noverity export shares
+    # the empty metacopy as well, which sorts below user.* and takes one of the
+    # 128, moving one more key inline.
+    mkdir -p "$CFS_RICH/manyshared"
+    chmod 0755 "$CFS_RICH/manyshared"
+    for f in m1 m2; do
+        p="$CFS_RICH/manyshared/$f.txt"
+        printf '%s\n' "$f" >"$p"
+        chmod 0644 "$p"
+        for i in $(seq -w 0 149); do
+            setfattr -n "user.m$i" -v sharedvalue "$p"
+        done
+    done
     # A long inline symlink near the block boundary.
     ln -s "$(printf 'z%.0s' $(seq 1 4063))" "$CFS_RICH/longlink"
 

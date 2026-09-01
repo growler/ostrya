@@ -1459,10 +1459,16 @@ Definition:
   per-remote `<remote>.trustedkeys.gpg` and `/etc/ostree/remotes.d/`
   resolution, and the global `<datadir>/ostree/trusted.gpg.d/` directory, per
   `format-reference.md`. Each keyring is parsed with the `pgp` crate as it is
-  loaded, so a keyring the parser rejects fails the load. A keyring is held to
-  four mebibytes and to 256 certificates, a GnuPG keybox (`KBXf`) is refused by
-  the name of the file or the blob that carries it, and the parse runs inside
-  `catch_unwind`, since a keyring is untrusted input.
+  loaded, so a keyring the parser rejects fails the load. Trust packets are
+  dropped from the packet stream before the certificate parser reads it. A
+  Trust packet holds GnuPG-local state and carries no part of a transferable
+  public key, and a legacy GnuPG keyring carries one after the primary key
+  packet, after each user id packet, and after each signature packet, so a
+  legacy keyring and the `gpg --export` stream of the same keys parse to the
+  same certificates. A keyring is held to four mebibytes and to 256
+  certificates, a GnuPG keybox (`KBXf`) is refused by the name of the file or
+  the blob that carries it, and the parse runs inside `catch_unwind`, since a
+  keyring is untrusted input.
 - Verification reads each stored blob with rPGP on the blocking pool, resolves
   each signature's issuer against the loaded certificates by issuer
   fingerprint and then by issuer key id over primary keys and subkeys, and
@@ -1490,6 +1496,55 @@ Definition:
   `tokio::process` (the `process` feature on the existing tokio
   dependency). It needs no crate of its own.
 
+Five divergences from GnuPG 2.4.9 stand, none of them a repository fact:
+
+- the digest policy is the port's own and is fixed. MD5 is refused and SHA-1 is
+  accepted, which is what `gpgv` 2.4.9 answers at its defaults. GnuPG's set is
+  configurable and moves between versions, so the record states that class and
+  no version number. `gpg --verify --allow-weak-digest-algos <sig> <data>`
+  reports `GOODSIG` over an MD5 data signature the port refuses, and
+  `gpgv --weak-digest SHA1 --keyring <ring> <sig> <data>` reports `ERRSIG ... 5`
+  over a SHA-1 data signature the port accepts;
+- a keyring file or keyring blob carrying the `KBXf` magic at offset 8 is
+  refused by the name of the path or the blob that carries it.
+  `gpgv --keyring <homedir>/pubring.kbx <sig> <data>` reads a GnuPG keybox and
+  reports `GOODSIG`;
+- a keyring the parser rejects fails the load, so a command reading it exits
+  non-zero with a diagnostic naming the keyring. Over a keyring holding one
+  intact certificate followed by 40 bytes of a second one,
+  `ostree show --gpg-verify-remote=<remote> <ref>` reports
+  `Can't check signature: public key not found` and exits 0, and
+  `gpgv --keyring <that keyring> <sig> <data>` reports
+  `keyring_get_keyblock: read error: Invalid packet`,
+  `keydb_search failed: Invalid keyring`, `ERRSIG ... 9`, and `NO_PUBKEY`, and
+  exits 2. Neither implementation trusts the certificate such a keyring
+  carries;
+- an Ed25519 or an EdDSA-legacy key with a digest under 256 bits verifies
+  against nothing, so a SHA-1 or a SHA-224 data signature by such a key reports
+  the field set a signature that does not verify reports. The `pgp` crate holds
+  such a verification to a digest of at least 256 bits (0.20.0,
+  `src/crypto/ed25519.rs`, `MIN_HASH_LEN_BITS`).
+  `gpg --digest-algo SHA1 --detach-sign --local-user <ed25519 key>` writes such
+  a signature, and `gpgv --keyring <ring> <sig> <data>` reports `GOODSIG` over
+  it;
+- a stored signature blob over one mebibyte or holding more than 64 signature
+  packets is refused by name, and a keyring over four mebibytes or holding more
+  than 256 certificates is refused by name. `gpgv` reads an input of any of
+  those four shapes and reports on it.
+
+The reported user id agrees with the tool. Measured against `gpgv` 2.4.9 over
+multi-user-id certificates, in the three states such a certificate reaches: no
+user id marked primary, where both name the newest self-signed one; a marked
+primary user id that is not the newest, where both name the marked one; and a
+marked primary user id that is revoked, where both name the newest user id that
+is not revoked.
+
+The public-key algorithm name agrees with the tool. Id 22 is reported as
+`EdDSA`, which is the name the tool prints, and id 27 as `Ed25519`. The `pgp`
+crate names id 22 `EdDSALegacy`. `gpg --version` lists `EDDSA` and no `Ed25519`
+among the public-key algorithms it supports, so a fixture built with `gpg`
+2.4.9 carries id 22 and the differential matrix holds no cell for id 27.
+
 Dependency set: `pgp` (rPGP), behind `verify-gpg`, for keyring parsing and
 signature verification. Signing and the keyring management of
 `Repo::gpg_import_keys` and `Repo::gpg_list_keys` add a runtime tool dependency
@@ -1505,7 +1560,17 @@ exported keyring and is rejected under an empty trusted set; armored and file
 keyrings load; a wrong payload reports an invalid signature; GPG and dummy
 signatures coexist on one commit; each policy rule is measured against the
 `gpgv` status stream for the same inputs; the suite passes under both runtime
-backends, with and without `sign-gpg`. Tool cross-verification
+backends, with and without `sign-gpg`. One differential test
+(`crates/ostrya/tests/verify_gpg_agreement.rs`) puts a fixture matrix through
+the public verify path and through `gpgv`, compares the two reports field by
+field, declares the divergences above, and feeds the parser a corpus of
+keyrings and signature blobs derived from the good fixtures by truncation and
+by single-bit flipping. Two of its cases read the keyring
+`Repo::gpg_import_keys` writes, which carries Trust packets: a signature by a
+signing subkey and a signature by the primary key each reach the verdict and
+the user id `gpgv` reports over the same file. It skips itself and names the
+absent binary where `gpg` or `gpgv` is absent, since `gpg` builds the fixtures
+and `gpgv` is the reference. Tool cross-verification
 (`ostree gpg-sign` in both directions) lands in
 `conformance/m10-cli-behavior.matrix` once the CLI-compatible surface lands
 (Phase 17).
@@ -3875,12 +3940,16 @@ Three tool behaviors are observed and deliberately not reproduced, each recorded
 in `cli-surface.md`, "P1": a variant type outside the codec's set, a second
 `OBJECT` operand, which the tool reads the first of and ignores the rest, and the
 instant a GPG signature was made, which the tool renders through gpgme in the
-host's locale and time zone and the port renders in UTC. Everything else in the
-signature report -- the algorithm, the short key id, the user id, and the three
-verdict lines -- agrees. Two more facts came out of the comparison: `show`'s
-absent-object line carries an `Opening content object <checksum>: ` prefix in
-every mode but `archive`, and `config`'s operand-count check stands ahead of the
-operation name with a one-operand allowance for everything except `set`.
+host's locale and time zone and the port renders in UTC. The signature report
+carries two more differences of its own, both recorded in the same place: the
+port writes one blank line more before the `Found N signatures:` heading, and
+the tool writes a `Primary key ID <key-id>` line after the verdict line for a
+signature a signing subkey made. The algorithm, the short key id, the user id,
+and the three verdict lines agree. Two more facts came out of the comparison:
+`show`'s absent-object line carries an `Opening content object <checksum>: `
+prefix in every mode but `archive`, and `config`'s operand-count check stands
+ahead of the operation name with a one-operand allowance for everything except
+`set`.
 
 Verify: `cargo test --workspace --all-features` is green, `cargo fmt --all
 --check` and `cargo clippy --workspace --all-features --all-targets` are clean.

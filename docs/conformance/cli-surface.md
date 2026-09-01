@@ -381,14 +381,25 @@ deliberately not reproduced:
   `show` is the one command of the three where the two agree, the tool's own
   wording there being `error: Couldn't find file object '<checksum>'`, which the
   port reproduces because a bare checksum reaches `show` with no type;
-- the GPG signature report a signed commit draws agrees line for line except the
-  instant the signature was made: the tool renders it through gpgme in the host's
-  locale and time zone (`Wed 05 Aug 2026 17:11:19 CEST`) and the port renders it
-  in UTC in the shape its own `Date:` line carries (`2026-08-05 15:11:19 +0000`).
-  Matching the tool would need a locale database and the host time zone, neither
-  of which the port carries, and the rendering states no repository fact. The
-  algorithm name, the short key id, the user id, and the three verdict lines are
-  the same in both.
+- the GPG signature report a signed commit draws carries three differences from
+  the tool's, none of them a repository fact. The instant the signature was made
+  is rendered by the tool through gpgme in the host's locale and time zone
+  (`Wed 05 Aug 2026 17:11:19 CEST`) and by the port in UTC in the shape its own
+  `Date:` line carries (`2026-08-05 15:11:19 +0000`); matching the tool would
+  need a locale database and the host time zone, neither of which the port
+  carries. The port writes one blank line more before the `Found N signatures:`
+  heading. For a signature a signing subkey made, the tool writes a
+  `Primary key ID <key-id>` line after the verdict line, and the port writes the
+  signing subkey's key id alone. The algorithm name, the short key id, the user
+  id, and the three verdict lines are the same in both, measured against
+  `ostree` 2026.1 over a commit each implementation signed with the same key,
+  read back through the other's `show --gpg-verify-remote=<remote>`;
+- the verdict the report states rests on the port's own trust and validity
+  policy, which `../port-plan.md`, "Phase 13d", enumerates against GnuPG 2.4.9.
+  Five differences stand there, and each one can make a `show` verdict part
+  from the tool's: the fixed digest policy, the GnuPG keybox refusal, the
+  refusal a keyring the parser rejects draws, the 256-bit minimum digest an
+  Ed25519 key carries, and the keyring and signature-blob input caps.
 
 `config set` and `config unset` write the document through the config write path
 Phase 17e landed. Both accept what the tool accepts and word every refusal the

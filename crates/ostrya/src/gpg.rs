@@ -1,12 +1,12 @@
 //! GPG (OpenPGP) commit-signing engine (Phase 13d).
 //!
-//! Behind the `verify-gpg` feature: keyrings are parsed and signatures are
-//! verified in the process with the `pgp` crate (rPGP). The `sign-gpg` feature
-//! adds signing through `gpg --detach-sign` and turns on `verify-gpg` with it.
-//! Each `gpg` run is a short-lived subprocess through [`ostrya_rt::Command`],
-//! with results read from the machine-readable `--status-fd` line protocol.
-//! The private key stays with GnuPG and its agent and never passes through the
-//! library.
+//! Behind the `verify-gpg` feature: keyrings are parsed, signatures are
+//! verified, and a remote's trusted keyring is managed in the process with the
+//! `pgp` crate (rPGP). The `sign-gpg` feature adds signing through
+//! `gpg --detach-sign` and turns on `verify-gpg` with it. That signing run is a
+//! short-lived subprocess through [`ostrya_rt::Command`], and it is the one
+//! `gpg` run the library makes. The private key stays with GnuPG and its agent
+//! and never passes through the library.
 //!
 //! Format (`format-reference.md`, "Signing details -- GPG"):
 //!
@@ -54,12 +54,20 @@
 //! the trust and validity policy it applies, and the input caps a stored blob
 //! is held to. No process is spawned and no scratch directory is written.
 //!
-//! A remote's own trusted keyring is managed through subprocess plumbing:
+//! A remote's own trusted keyring is managed in the process:
 //! [`Repo::gpg_import_keys`] adds certificates to `<remote>.trustedkeys.gpg`
 //! and reports how many the keyring did not already hold, and
 //! [`Repo::gpg_list_keys`] reads back the keys it holds as
-//! [`GpgKey`] records. Both run `gpg` in a private scratch directory, so the
-//! invoking user's GnuPG home takes no part.
+//! [`GpgKey`] records. The keyring the import writes keeps the bytes it already
+//! held and carries the packets of each added certificate as the offered stream
+//! wrote them, with the Trust packets dropped. `gpg` and the `ostree` tool both
+//! read a keyring of that form. A certificate for a key the keyring already
+//! holds is left as the keyring holds it, so an updated certificate reaches the
+//! keyring through [`Repo::remove_remote_keyring`] and a fresh import. A keyring
+//! offered for import is untrusted input and is held to the same caps and the
+//! same containment a keyring loaded for verification is, and a stream the
+//! certificate parser does not read fails the import, which leaves the keyring
+//! as it was.
 //!
 //! A signature is valid only where it verifies against a trusted key whose
 //! bindings hold and which is neither expired nor revoked. An expired key, a
@@ -68,14 +76,16 @@
 //! membership in the verifier's keyrings; GnuPG's ownertrust model plays no
 //! part.
 
+use std::collections::BTreeSet;
+use std::io::Cursor;
+use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use ostrya_core::base64;
 use pgp::composed::{Deserializable, SignedPublicKey};
 use pgp::packet::PacketHeader;
-use pgp::types::{PacketLength, Tag};
+use pgp::types::{KeyDetails, PacketLength, Tag};
 
 use crate::config::remote_keyring_name;
 use crate::error::{Error, Result};
@@ -100,13 +110,8 @@ const OSTREE_GPG_HOME_ENV: &str = "OSTREE_GPG_HOME";
 /// The system directory holding per-remote configuration and keyrings.
 const SYSTEM_REMOTES_D: &str = "/etc/ostree/remotes.d";
 /// The prefix of a machine-readable status line on the status fd.
+#[cfg(any(feature = "sign-gpg", test))]
 const STATUS_PREFIX: &str = "[GNUPG:] ";
-/// The scratch-directory name of the keyring an import writes and a listing
-/// reads.
-const RING_FILE: &str = "ring.gpg";
-/// The scratch-directory name of the keyring holding the keys offered to an
-/// import, out of which a `KEY-ID` selection exports.
-const OFFERED_FILE: &str = "offered.gpg";
 /// The ceiling on one keyring file, whose whole content is read into memory.
 /// One exported ed25519 certificate is a few hundred bytes, so four mebibytes
 /// holds thousands of them, and a remote's trusted set is a handful.
@@ -385,24 +390,31 @@ impl GpgVerifier {
     /// `subject` names the source, so a refusal states which keyring reached
     /// which cap.
     fn add_keyring(&mut self, bytes: &[u8], subject: &str) -> Result<()> {
-        if bytes.len() as u64 > MAX_KEYRING {
-            return Err(Error::Signature(format!(
-                "{subject} is over the {MAX_KEYRING}-byte ceiling"
-            )));
-        }
-        let binary = dearmor(bytes)?;
-        if binary.len() >= KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()
-            && &binary[KEYBOX_MAGIC_OFFSET..KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()]
-                == KEYBOX_MAGIC
-        {
-            return Err(Error::Signature(format!(
-                "{subject} is a GnuPG keybox, and a keyring is read as an OpenPGP \
-                 packet stream"
-            )));
-        }
+        let binary = keyring_stream(bytes, subject)?;
         self.certs.extend(parse_keyring(&binary, subject)?);
         Ok(())
     }
+}
+
+/// The binary packet stream one keyring blob carries: armor decoded, the blob
+/// held to [`MAX_KEYRING`], and a GnuPG keybox refused. `subject` names the
+/// source, so a refusal states which keyring reached which cap.
+fn keyring_stream(bytes: &[u8], subject: &str) -> Result<Vec<u8>> {
+    if bytes.len() as u64 > MAX_KEYRING {
+        return Err(Error::Signature(format!(
+            "{subject} is over the {MAX_KEYRING}-byte ceiling"
+        )));
+    }
+    let binary = dearmor(bytes)?;
+    if binary.len() >= KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()
+        && &binary[KEYBOX_MAGIC_OFFSET..KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()] == KEYBOX_MAGIC
+    {
+        return Err(Error::Signature(format!(
+            "{subject} is a GnuPG keybox, and a keyring is read as an OpenPGP \
+             packet stream"
+        )));
+    }
+    Ok(binary)
 }
 
 /// The packet stream of `binary` with every Trust packet removed.
@@ -416,17 +428,34 @@ impl GpgVerifier {
 /// user id and no subkey. With the Trust packets gone, a legacy keyring parses
 /// to the certificates the `gpg --export` form of the same keys parses to.
 ///
-/// The walk frames each packet with rPGP's own header parser, which is the
-/// parser the packet stream is read with, so a packet boundary here is a
-/// packet boundary there. A header the parser refuses, a length form other
-/// than a fixed one, and a length that runs past the end each stop the walk,
-/// and the bytes from that point to the end pass through as they stand. The
-/// result is at most as long as the input, which
-/// [`GpgVerifier::add_keyring`] has already held to [`MAX_KEYRING`].
+/// The walk frames each packet with [`packet_spans`], and the bytes past the
+/// framed prefix pass through as they stand. The result is at most as long as
+/// the input, which [`keyring_stream`] has already held to [`MAX_KEYRING`].
 fn without_trust_packets(binary: &[u8]) -> Vec<u8> {
+    let (spans, framed) = packet_spans(binary);
     let mut kept: Vec<u8> = Vec::with_capacity(binary.len());
-    let mut rest = binary;
-    while !rest.is_empty() {
+    for (tag, span) in spans {
+        if tag != Tag::Trust {
+            kept.extend_from_slice(&binary[span]);
+        }
+    }
+    kept.extend_from_slice(&binary[framed..]);
+    kept
+}
+
+/// The packets a binary OpenPGP stream carries, each as its tag and the byte
+/// range it occupies, together with the length of the prefix that framed.
+///
+/// The walk frames each packet with rPGP's own header parser, which is the
+/// parser the packet stream is read with, so a packet boundary here is a packet
+/// boundary there. A header the parser refuses, a length form other than a
+/// fixed one, and a length that runs past the end each stop the walk, and the
+/// reported prefix length then falls short of the input.
+fn packet_spans(binary: &[u8]) -> (Vec<(Tag, Range<usize>)>, usize) {
+    let mut spans: Vec<(Tag, Range<usize>)> = Vec::new();
+    let mut at = 0usize;
+    while at < binary.len() {
+        let rest = &binary[at..];
         let mut reader = rest;
         let Ok(header) = PacketHeader::try_from_reader(&mut reader) else {
             break;
@@ -438,13 +467,38 @@ fn without_trust_packets(binary: &[u8]) -> Vec<u8> {
         if total == 0 || total > rest.len() {
             break;
         }
-        if header.tag() != Tag::Trust {
-            kept.extend_from_slice(&rest[..total]);
-        }
-        rest = &rest[total..];
+        spans.push((header.tag(), at..at + total));
+        at += total;
     }
-    kept.extend_from_slice(rest);
-    kept
+    (spans, at)
+}
+
+/// The certificates a binary keyring stream carries, each as the packets of one
+/// transferable public key with the Trust packets dropped.
+///
+/// A Public-Key packet opens a certificate and every packet up to the next one
+/// belongs to it. A packet standing before the first Public-Key packet belongs
+/// to no certificate and is dropped. `None` where the packet stream does not
+/// frame to its end, which is what a truncated keyring reaches, and which the
+/// `ostree` tool refuses as well.
+fn certificate_chunks(binary: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let (spans, framed) = packet_spans(binary);
+    if framed != binary.len() {
+        return None;
+    }
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    for (tag, span) in spans {
+        match tag {
+            Tag::Trust => {}
+            Tag::PublicKey => chunks.push(binary[span].to_vec()),
+            _ => {
+                if let Some(chunk) = chunks.last_mut() {
+                    chunk.extend_from_slice(&binary[span]);
+                }
+            }
+        }
+    }
+    Some(chunks)
 }
 
 /// Parse a binary OpenPGP keyring into the certificates it carries, holding
@@ -453,21 +507,17 @@ fn without_trust_packets(binary: &[u8]) -> Vec<u8> {
 /// [`without_trust_packets`]), so a legacy GnuPG keyring and a `gpg --export`
 /// stream of the same keys parse to the same certificates.
 ///
-/// A keyring is untrusted input, so the parse runs inside
-/// [`std::panic::catch_unwind`] and a caught panic reads as a keyring the
-/// parser rejects. Two limits hold: `catch_unwind` catches nothing where the
-/// final binary is built with `panic = "abort"`, and it says nothing about a
-/// parser that returns a wrong answer without panicking.
+/// The parse runs inside [`contained`], since a keyring is untrusted input.
 fn parse_keyring(binary: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
-    let parse = || -> Result<Vec<SignedPublicKey>> {
+    let refusal = format!("{subject} is not readable as an OpenPGP keyring: the parser panicked");
+    contained(&refusal, || {
         let refuse = |e: pgp::errors::Error| {
             Error::Signature(format!(
                 "{subject} is not readable as an OpenPGP keyring: {e}"
             ))
         };
         let stream = without_trust_packets(binary);
-        let certs =
-            SignedPublicKey::from_bytes_many(std::io::Cursor::new(&stream)).map_err(refuse)?;
+        let certs = SignedPublicKey::from_bytes_many(Cursor::new(&stream)).map_err(refuse)?;
         let mut held: Vec<SignedPublicKey> = Vec::new();
         for cert in certs {
             if held.len() == MAX_KEYRING_CERTS {
@@ -478,12 +528,21 @@ fn parse_keyring(binary: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
             held.push(cert.map_err(refuse)?);
         }
         Ok(held)
-    };
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(parse)) {
+    })
+}
+
+/// Run `work`, which reads OpenPGP packets, with a panic inside it converted to
+/// the refusal `refusal` states.
+///
+/// A keyring is untrusted input, so every read over one runs here and a caught
+/// panic reads as input the parser rejects. Two limits hold: `catch_unwind`
+/// catches nothing where the final binary is built with `panic = "abort"`, and
+/// it says nothing about a parser that returns a wrong answer without
+/// panicking.
+fn contained<T>(refusal: &str, work: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
         Ok(result) => result,
-        Err(_) => Err(Error::Signature(format!(
-            "{subject} is not readable as an OpenPGP keyring: the parser panicked"
-        ))),
+        Err(_) => Err(Error::Signature(refusal.to_owned())),
     }
 }
 
@@ -509,10 +568,9 @@ impl Verifier for GpgVerifier {
 
 /// One key in a remote's trusted keyring, as `remote gpg-list-keys` reports it.
 ///
-/// The fields are what `gpg`'s machine-readable key listing states about the
-/// primary key: its fingerprint, the instant it was created, and its user ids in
-/// listing order. Subkeys are not reported on their own; a subkey's parent
-/// carries it.
+/// The fields are what a certificate states about its primary key: the
+/// fingerprint, the instant it was created, and its user ids in listing order.
+/// Subkeys are not reported on their own; a subkey's parent carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpgKey {
     /// The primary key fingerprint, uppercase hex.
@@ -530,13 +588,21 @@ impl Repo {
     ///
     /// `keys` is a binary or ASCII-armored certificate stream, which is what an
     /// exported public keyring is. With `key_ids` non-empty only the keys those
-    /// selectors name are imported, each selector resolved the way `gpg` resolves
-    /// one (a fingerprint, key id, or user id substring); a selector that names
-    /// nothing in `keys` fails the import and the keyring is left as it was.
+    /// selectors name are imported (a fingerprint, a key id, or a user id
+    /// substring); a selector that names nothing in `keys` fails the import and
+    /// the keyring is left as it was, as does a `keys` holding no certificate.
     ///
-    /// The work runs as `gpg` subprocesses in a private scratch directory, so
-    /// neither the invoking user's GnuPG home nor any agent takes part, and the
-    /// keyring is replaced atomically at the repository root.
+    /// The keyring is replaced atomically at the repository root. It keeps the
+    /// bytes it already held and carries the packets of each added certificate
+    /// as `keys` wrote them, with the Trust packets dropped (see
+    /// [`merge_keyring`]).
+    ///
+    /// A certificate for a key the keyring already holds is left as the keyring
+    /// holds it, and is counted as a key the keyring already held. So a
+    /// revocation, a new user id, or a new subkey for a held key reaches the
+    /// keyring through [`Repo::remove_remote_keyring`] and a fresh import, and
+    /// not through a second call here. `docs/conformance/cli-surface.md`, "P3",
+    /// records what the `ostree` tool does instead.
     pub async fn gpg_import_keys(
         &self,
         remote: &str,
@@ -545,233 +611,272 @@ impl Repo {
     ) -> Result<usize> {
         let name = remote_keyring_name(remote);
         let existing = self.read_root_file(&name).await?.unwrap_or_default();
-        let dir = scratch_dir();
-
-        let result = self
-            .import_into_scratch(&dir, existing, keys, key_ids)
-            .await;
-        let cleanup = dir.clone();
-        let _ = ostrya_rt::unblock(move || std::fs::remove_dir_all(cleanup)).await;
-
-        let (imported, keyring) = result?;
+        // Parsing untrusted certificate streams is CPU work over owned copies
+        // of its inputs, so it runs on the blocking pool.
+        let offered = keys.to_vec();
+        let ids = key_ids.to_vec();
+        let subject = format!("the keyring '{name}'");
+        let (imported, keyring) =
+            ostrya_rt::unblock(move || merge_keyring(&existing, &offered, &ids, &subject)).await?;
         let fsync = self.config().fsync()?;
         self.write_root_file(&name, keyring, fsync).await?;
         Ok(imported)
     }
 
     /// The keys `remote`'s trusted keyring holds. An absent keyring holds none.
-    ///
-    /// The keyring is read through a `gpg` key listing in a private scratch
-    /// directory, so the invoking user's own keyring plays no part.
     pub async fn gpg_list_keys(&self, remote: &str) -> Result<Vec<GpgKey>> {
-        let Some(keyring) = self.read_root_file(&remote_keyring_name(remote)).await? else {
+        let name = remote_keyring_name(remote);
+        let Some(keyring) = self.read_root_file(&name).await? else {
             return Ok(Vec::new());
         };
-        let dir = scratch_dir();
-        let result = list_keys_in_scratch(&dir, keyring).await;
-        let cleanup = dir.clone();
-        let _ = ostrya_rt::unblock(move || std::fs::remove_dir_all(cleanup)).await;
-        result
-    }
-
-    /// Stage the current keyring in `dir`, import into it, and return the number
-    /// of keys added and the resulting keyring bytes.
-    async fn import_into_scratch(
-        &self,
-        dir: &Path,
-        existing: Vec<u8>,
-        keys: &[u8],
-        key_ids: &[String],
-    ) -> Result<(usize, Vec<u8>)> {
-        let setup_dir = dir.to_owned();
-        let staged = existing;
-        ostrya_rt::unblock(move || -> std::io::Result<()> {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new().mode(0o700).create(&setup_dir)?;
-            std::fs::write(setup_dir.join(RING_FILE), &staged)
-        })
-        .await?;
-
-        let selected = if key_ids.is_empty() {
-            keys.to_vec()
-        } else {
-            select_keys(dir, keys, key_ids).await?
-        };
-        let imported = import_keyring(dir, RING_FILE, &selected).await?;
-        let read_dir = dir.to_owned();
-        let keyring = ostrya_rt::unblock(move || std::fs::read(read_dir.join(RING_FILE))).await?;
-        Ok((imported, keyring))
+        let subject = format!("the keyring '{name}'");
+        ostrya_rt::unblock(move || keyring_keys(&keyring, &subject)).await
     }
 }
 
-/// Export the keys `key_ids` names out of `keys`, through a scratch keyring of
-/// its own so the selection reads only what was offered. A selector that names
-/// nothing is refused by name. Each selector stands after `--`, so gpg reads it
-/// as a key name rather than as one of its own options.
-async fn select_keys(dir: &Path, keys: &[u8], key_ids: &[String]) -> Result<Vec<u8>> {
-    import_keyring(dir, OFFERED_FILE, keys).await?;
+/// Merge the certificates `offered` holds into the keyring `existing` holds and
+/// report how many certificates the keyring did not already hold.
+///
+/// The bytes `existing` carries are kept as they stand and the packets of each
+/// certificate the keyring does not hold are appended, so a keyring another
+/// implementation wrote keeps its own bytes and an added certificate stands as
+/// the offered stream wrote it. The keyring carries no Trust packet of this
+/// import's making. A certificate whose fingerprint the keyring already holds is
+/// left as the keyring holds it, and it is counted as a key the keyring already
+/// held.
+///
+/// Both streams are untrusted input, so each is held to [`MAX_KEYRING`] and to
+/// [`MAX_KEYRING_CERTS`], a keybox is refused, and every packet read runs inside
+/// [`contained`]. `subject` names the keyring the repository holds, so a refusal
+/// over it states which file was read.
+fn merge_keyring(
+    existing: &[u8],
+    offered: &[u8],
+    key_ids: &[String],
+    subject: &str,
+) -> Result<(usize, Vec<u8>)> {
+    let source = "the keyring to import";
+    let mut keyring = keyring_stream(existing, subject)?;
+    let stream = keyring_stream(offered, source)?;
+    let refusal = format!("{source} cannot be merged into {subject}: the parser panicked");
+    let (imported, appended) = contained(&refusal, || {
+        let mut fingerprints: BTreeSet<String> = parse_keyring(&keyring, subject)?
+            .iter()
+            .map(fingerprint_hex)
+            .collect();
+        let offered = offered_certificates(&stream, source)?;
+        if offered.is_empty() {
+            return Err(Error::Signature(format!(
+                "{source} holds no OpenPGP certificate"
+            )));
+        }
+        let mut appended: Vec<u8> = Vec::new();
+        let mut imported = 0;
+        for index in select_keys(&offered, key_ids)? {
+            let (cert, packets) = &offered[index];
+            if fingerprints.insert(fingerprint_hex(cert)) {
+                appended.extend_from_slice(packets);
+                imported += 1;
+            }
+        }
+        Ok((imported, appended))
+    })?;
+    keyring.extend_from_slice(&appended);
+    Ok((imported, keyring))
+}
+
+/// The certificates an offered keyring stream carries, each with the packets it
+/// is made of, held to [`MAX_KEYRING_CERTS`].
+///
+/// A stream the packet walk cannot frame to its end and a certificate the parser
+/// rejects each fail the import by the name of the source, which is what the
+/// `ostree` tool answers over a truncated keyring as well. The caller runs this
+/// inside [`contained`].
+fn offered_certificates(binary: &[u8], subject: &str) -> Result<Vec<(SignedPublicKey, Vec<u8>)>> {
+    let Some(chunks) = certificate_chunks(binary) else {
+        return Err(Error::Signature(format!(
+            "{subject} is not readable as an OpenPGP keyring"
+        )));
+    };
+    if chunks.len() > MAX_KEYRING_CERTS {
+        return Err(Error::Signature(format!(
+            "{subject} holds more than {MAX_KEYRING_CERTS} certificates"
+        )));
+    }
+    let mut certs = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let cert = SignedPublicKey::from_bytes(Cursor::new(&chunk)).map_err(|e| {
+            Error::Signature(format!(
+                "{subject} is not readable as an OpenPGP keyring: {e}"
+            ))
+        })?;
+        certs.push((cert, chunk));
+    }
+    Ok(certs)
+}
+
+/// The offered certificates `key_ids` names, by index, in selector order. An
+/// empty `key_ids` names every offered certificate, and a selector that names
+/// none is refused by name, which leaves the keyring as it was.
+fn select_keys(offered: &[(SignedPublicKey, Vec<u8>)], key_ids: &[String]) -> Result<Vec<usize>> {
+    if key_ids.is_empty() {
+        return Ok((0..offered.len()).collect());
+    }
     let mut selected = Vec::new();
     for id in key_ids {
-        let mut cmd = gpg_in(dir, OFFERED_FILE);
-        cmd.arg("--export").arg("--").arg(id);
-        let output = cmd.output(&[]).await.map_err(|e| spawn_err("gpg", &e))?;
-        if !output.status.success() || output.stdout.is_empty() {
+        let matched = offered
+            .iter()
+            .enumerate()
+            .filter(|(_, (cert, _))| selector_matches(cert, id))
+            .map(|(index, _)| index);
+        let before = selected.len();
+        selected.extend(matched);
+        if selected.len() == before {
             return Err(Error::Signature(format!(
                 "no key matching '{id}' among the keys to import"
             )));
         }
-        selected.extend_from_slice(&output.stdout);
     }
     Ok(selected)
 }
 
-/// Import `keys` into the scratch keyring `ring` and report how many keys the
-/// keyring did not already hold, read from the `IMPORT_RES` status line.
-async fn import_keyring(dir: &Path, ring: &str, keys: &[u8]) -> Result<usize> {
-    let mut cmd = gpg_in(dir, ring);
-    cmd.arg("--status-fd").arg("1").arg("--import");
-    let output = cmd.output(keys).await.map_err(|e| spawn_err("gpg", &e))?;
-    if !output.status.success() {
-        return Err(Error::Signature(format!(
-            "gpg --import failed: {}",
-            failure_text(&output)
-        )));
+/// Whether `selector` names `cert`.
+///
+/// A selector names a key, a user id, or nothing, per [`read_selector`]. A key
+/// selector is read over the primary key and over every subkey; a user id
+/// selector is a case-insensitive substring of one of the certificate's user
+/// ids, folded over ASCII alone.
+fn selector_matches(cert: &SignedPublicKey, selector: &str) -> bool {
+    match read_selector(selector) {
+        Selector::Key(hex) => {
+            key_matches(cert, &hex)
+                || cert
+                    .public_subkeys
+                    .iter()
+                    .any(|subkey| key_matches(subkey, &hex))
+        }
+        Selector::UserId(wanted) => cert.details.users.iter().any(|user| {
+            String::from_utf8_lossy(user.id.id())
+                .to_ascii_lowercase()
+                .contains(&wanted)
+        }),
+        Selector::Nothing => false,
     }
-    Ok(parse_import_count(&output.stdout))
 }
 
-/// List the keys of a keyring staged in `dir`.
-async fn list_keys_in_scratch(dir: &Path, keyring: Vec<u8>) -> Result<Vec<GpgKey>> {
-    let setup_dir = dir.to_owned();
-    ostrya_rt::unblock(move || -> std::io::Result<()> {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(&setup_dir)?;
-        std::fs::write(setup_dir.join(RING_FILE), &keyring)
-    })
-    .await?;
-
-    let mut cmd = gpg_in(dir, RING_FILE);
-    cmd.arg("--with-colons")
-        .arg("--fixed-list-mode")
-        .arg("--list-keys");
-    let output = cmd.output(&[]).await.map_err(|e| spawn_err("gpg", &e))?;
-    if !output.status.success() {
-        return Err(Error::Signature(format!(
-            "gpg --list-keys failed: {}",
-            failure_text(&output)
-        )));
-    }
-    Ok(parse_key_listing(&output.stdout))
+/// What a `KEY-ID` selector names.
+enum Selector {
+    /// A key, by the lowercase hex a key id or a fingerprint holds.
+    Key(String),
+    /// A substring of a user id, ASCII-lowercased.
+    UserId(String),
+    /// Nothing.
+    Nothing,
 }
 
-/// A `gpg` command bound to the scratch directory as its GnuPG home and to
-/// `ring` as its one keyring, so no keyring of the invoking user is read or
-/// written.
-fn gpg_in(dir: &Path, ring: &str) -> ostrya_rt::Command {
-    let mut cmd = ostrya_rt::Command::new("gpg");
-    cmd.arg("--homedir")
-        .arg(dir)
-        .arg("--batch")
-        .arg("--no-default-keyring")
-        .arg("--keyring")
-        .arg(dir.join(ring));
-    cmd
-}
-
-/// The count of newly imported keys an import run reports: field 3 of
-/// `IMPORT_RES`, which counts the keys the keyring did not already hold. A run
-/// that imported nothing new reports `0` there.
-fn parse_import_count(stdout: &[u8]) -> usize {
-    let text = String::from_utf8_lossy(stdout);
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix(STATUS_PREFIX) else {
-            continue;
+/// What `selector` names, read as `gpg --export` reads a key name.
+///
+/// Measured against `gpg` 2.4.9 over `gpg --export -- <selector>`, where a
+/// selector read as a key exports nothing when no key answers to it and a
+/// selector read as a user id substring exports the key whose user id holds it:
+///
+/// - Hex digits alone name a key at five lengths: 8 digits a short key id, 16 a
+///   key id, and 32, 40, or 64 a fingerprint. Any other length is a user id
+///   substring -- `0123456789ab` exports the key whose user id holds those
+///   twelve digits.
+/// - A `0x` prefix names a key and never a user id: `0xhello` reports
+///   `key "0xhello" not found: Invalid user ID` over a certificate whose user id
+///   holds `0xhello`. The prefix is read in lower case alone, so `0X1234` is a
+///   user id substring and exports the key whose user id holds `0X1234`.
+/// - Interior spaces are admitted in one shape, the printed v4 fingerprint: ten
+///   groups of four hex digits with one space between them. Every other spaced
+///   shape is a user id substring -- forty hex digits in groups of two, and
+///   thirty-two or sixty-four in groups of four, each export the key whose user
+///   id holds them, and a `0x` prefix with a space reports `Invalid user ID`.
+/// - Leading and trailing whitespace around a key selector is dropped, and
+///   leading whitespace before a user id selector is dropped as well.
+/// - A selector holding no character other than whitespace names nothing:
+///   `gpg --export -- ''` reports `key "" not found: Invalid user ID`.
+/// - The user id search folds ASCII case alone. Over the user id `Ärger`,
+///   `ÄRGER` exports the key and `ärger` exports nothing.
+fn read_selector(selector: &str) -> Selector {
+    // `gpg` reads a space and a tab as the whitespace it drops, and no other
+    // character, so a selector opening with one of those loses it here.
+    let space = |c: char| c == ' ' || c == '\t';
+    let head = selector.trim_start_matches(space);
+    if let Some(rest) = head.strip_prefix("0x") {
+        return match key_hex(rest.trim_end_matches(space)) {
+            Some(hex) => Selector::Key(hex),
+            None => Selector::Nothing,
         };
-        let mut fields = rest.split(' ');
-        if fields.next() != Some("IMPORT_RES") {
-            continue;
-        }
-        // IMPORT_RES <count> <no-user-id> <imported> <imported-rsa> <unchanged> ...
-        return fields
-            .nth(2)
-            .and_then(|field| field.parse::<usize>().ok())
-            .unwrap_or(0);
     }
-    0
+    if head.is_empty() {
+        return Selector::Nothing;
+    }
+    let bare = head.trim_end_matches(space);
+    if let Some(hex) = key_hex(bare).or_else(|| spaced_fingerprint(bare)) {
+        return Selector::Key(hex);
+    }
+    Selector::UserId(head.to_ascii_lowercase())
 }
 
-/// Parse a `--with-colons` key listing into one record per primary key. A `pub`
-/// record starts a key, the `fpr` record that follows it carries the
-/// fingerprint, and each `uid` record adds a user id; the records of a subkey
-/// (`sub` and what follows it) belong to the key they were listed under.
-fn parse_key_listing(stdout: &[u8]) -> Vec<GpgKey> {
-    let text = String::from_utf8_lossy(stdout);
-    let mut keys: Vec<GpgKey> = Vec::new();
-    let mut in_subkey = false;
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        match fields.first().copied() {
-            Some("pub") => {
-                in_subkey = false;
-                keys.push(GpgKey {
-                    fingerprint: String::new(),
-                    created: fields.get(5).and_then(|f| parse_epoch(f)),
-                    user_ids: Vec::new(),
-                });
-            }
-            Some("sub") => in_subkey = true,
-            Some("fpr") if !in_subkey => {
-                if let Some(key) = keys.last_mut()
-                    && key.fingerprint.is_empty()
-                    && let Some(fpr) = fields.get(9)
-                {
-                    key.fingerprint = (*fpr).to_owned();
+/// The lowercase hex `text` holds, where it is hex digits alone of a key id's or
+/// a fingerprint's length.
+fn key_hex(text: &str) -> Option<String> {
+    let named = matches!(text.len(), 8 | 16 | 32 | 40 | 64);
+    (named && text.chars().all(|c| c.is_ascii_hexdigit())).then(|| text.to_ascii_lowercase())
+}
+
+/// The lowercase hex a printed v4 fingerprint holds: ten groups of four hex
+/// digits with one space between them.
+fn spaced_fingerprint(text: &str) -> Option<String> {
+    let groups: Vec<&str> = text.split(' ').collect();
+    let shaped = groups.len() == 10
+        && groups
+            .iter()
+            .all(|group| group.len() == 4 && group.chars().all(|c| c.is_ascii_hexdigit()));
+    shaped.then(|| groups.concat().to_ascii_lowercase())
+}
+
+/// Whether one key answers to the hex a key selector holds.
+fn key_matches<K: KeyDetails>(key: &K, hex: &str) -> bool {
+    let id = key.legacy_key_id().to_string();
+    match hex.len() {
+        8 => id.ends_with(hex),
+        16 => id == hex,
+        _ => format!("{:x}", key.fingerprint()) == hex,
+    }
+}
+
+/// The primary key fingerprint of a certificate, uppercase hex.
+fn fingerprint_hex(cert: &SignedPublicKey) -> String {
+    format!("{:X}", cert.fingerprint())
+}
+
+/// The keys a keyring holds, in the order its certificates stand in. The read
+/// runs inside [`contained`], since a keyring is untrusted input.
+fn keyring_keys(keyring: &[u8], subject: &str) -> Result<Vec<GpgKey>> {
+    let binary = keyring_stream(keyring, subject)?;
+    let refusal = format!("{subject} is not readable as an OpenPGP keyring: the parser panicked");
+    contained(&refusal, || {
+        let keys = parse_keyring(&binary, subject)?
+            .iter()
+            .map(|cert| {
+                let created = cert.primary_key.created_at().as_secs();
+                GpgKey {
+                    fingerprint: fingerprint_hex(cert),
+                    created: (created != 0).then(|| u64::from(created)),
+                    user_ids: cert
+                        .details
+                        .users
+                        .iter()
+                        .map(|user| String::from_utf8_lossy(user.id.id()).into_owned())
+                        .collect(),
                 }
-            }
-            Some("uid") => {
-                if let Some(key) = keys.last_mut()
-                    && let Some(uid) = fields.get(9)
-                    && !uid.is_empty()
-                {
-                    key.user_ids.push(unescape_colon_field(uid));
-                }
-            }
-            _ => {}
-        }
-    }
-    keys
-}
-
-/// Undo the escaping a `--with-colons` field carries: `\x3a` for a colon, and
-/// the same `\xNN` form for any other byte gpg escapes.
-fn unescape_colon_field(field: &str) -> String {
-    let mut out = String::with_capacity(field.len());
-    let mut rest = field;
-    while let Some(index) = rest.find("\\x") {
-        out.push_str(&rest[..index]);
-        let hex = rest.get(index + 2..index + 4);
-        match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
-            Some(byte) => {
-                out.push(byte as char);
-                rest = &rest[index + 4..];
-            }
-            None => {
-                out.push_str("\\x");
-                rest = &rest[index + 2..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Parse a status-line epoch field, treating `0` as absent.
-fn parse_epoch(field: &str) -> Option<u64> {
-    match field.parse::<u64>() {
-        Ok(0) => None,
-        Ok(secs) => Some(secs),
-        Err(_) => None,
-    }
+            })
+            .collect();
+        Ok(keys)
+    })
 }
 
 /// Decode ASCII-armored OpenPGP data (RFC 4880 radix-64) into the binary
@@ -872,9 +977,13 @@ pub(crate) fn read_keyring_fd(fd: OwnedFd, name: &str) -> Result<Vec<u8>> {
     read_key_source(fd, &format!("the keyring '{name}'"), MAX_KEYRING)
 }
 
-/// A process-unique scratch directory path for one `gpg` run: the GnuPG home
-/// directory an import or a listing works in.
+/// A process-unique scratch directory path for one test fixture: the GnuPG home
+/// directory its `gpg` runs work in, or a directory of keyring files. The
+/// fixtures of this module and of [`verify`] both take their paths from it.
+#[cfg(test)]
 fn scratch_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
         "ostrya-gpg-{}-{}",
@@ -883,7 +992,20 @@ fn scratch_dir() -> PathBuf {
     ))
 }
 
+/// Parse a status-line epoch field, treating `0` as absent. The reference
+/// reader the differential cases in [`verify`] compare against reads the
+/// `gpgv` status stream through it.
+#[cfg(test)]
+fn parse_epoch(field: &str) -> Option<u64> {
+    match field.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(secs),
+        Err(_) => None,
+    }
+}
+
 /// Wrap a spawn failure, naming the missing program when that is the cause.
+#[cfg(feature = "sign-gpg")]
 fn spawn_err(program: &str, err: &std::io::Error) -> Error {
     if err.kind() == std::io::ErrorKind::NotFound {
         Error::Signature(format!("{program}: program not found in PATH"))
@@ -894,6 +1016,7 @@ fn spawn_err(program: &str, err: &std::io::Error) -> Error {
 
 /// The human-readable failure text of a finished gpg run: the non-status
 /// stderr lines, or the exit status when gpg said nothing.
+#[cfg(feature = "sign-gpg")]
 fn failure_text(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let text = stderr
@@ -919,69 +1042,6 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The two `IMPORT_RES` lines a first and a repeated import produce: field 3
-    /// counts the keys the keyring did not already hold.
-    #[test]
-    fn parses_the_import_count() {
-        let first = b"[GNUPG:] IMPORTED EA11F223F7A88090 T <t@e.invalid>\n\
-[GNUPG:] IMPORT_OK 1 A98EFC84DC1176AFDF076367EA11F223F7A88090\n\
-[GNUPG:] IMPORT_RES 1 0 1 0 0 0 0 0 0 0 0 0 0 0 0\n";
-        assert_eq!(parse_import_count(first), 1);
-        let repeated = b"[GNUPG:] IMPORT_OK 0 A98EFC84DC1176AFDF076367EA11F223F7A88090\n\
-[GNUPG:] IMPORT_RES 1 0 0 0 1 0 0 0 0 0 0 0 0 0 0\n";
-        assert_eq!(parse_import_count(repeated), 0);
-        let two = b"[GNUPG:] IMPORT_RES 2 0 2 0 0 0 0 0 0 0 0 0 0 0 0\n";
-        assert_eq!(parse_import_count(two), 2);
-        // A run whose status stream says nothing about the result counts none.
-        assert_eq!(parse_import_count(b""), 0);
-    }
-
-    /// A `--with-colons` listing of one ed25519 key and one RSA key with an
-    /// encryption subkey, as `gpg --list-keys` wrote it.
-    #[test]
-    fn parses_the_key_listing() {
-        let listing = b"tru::1:1785958949:0:3:1:5\n\
-pub:-:255:22:CA965442280A3BB5:1785958949:::-:::scSC:::::ed25519:::0:\n\
-fpr:::::::::FA2B2317C9966572B5D729EDCA965442280A3BB5:\n\
-uid:-::::1785958949::2002AD890A7DC86C5CE36C4EB351537E74CBC5E9::Ostrya Test <test@example.invalid>::::::::::0:\n\
-uid:-::::1785958949::AA02AD890A7DC86C5CE36C4EB351537E74CBC5E8::Second Id <second@example.invalid>::::::::::0:\n\
-pub:-:2048:1:56A674CB09BADB3E:1785958950:::-:::scSC::::::23::0:\n\
-fpr:::::::::8EB5022E57DB2BB28470F20A56A674CB09BADB3E:\n\
-uid:-::::1785958950::FA8A955FF9BB9C4540D030246F056A7DB9E282FA::No Email Person::::::::::0:\n\
-sub:-:2048:1:9A5C1E4D2F3B7A81:1785958950::::::e::::::23:\n\
-fpr:::::::::1111111111111111111111119A5C1E4D2F3B7A81:\n";
-        let keys = parse_key_listing(listing);
-        assert_eq!(keys.len(), 2);
-        assert_eq!(
-            keys[0].fingerprint,
-            "FA2B2317C9966572B5D729EDCA965442280A3BB5"
-        );
-        assert_eq!(keys[0].created, Some(1_785_958_949));
-        assert_eq!(
-            keys[0].user_ids,
-            [
-                "Ostrya Test <test@example.invalid>",
-                "Second Id <second@example.invalid>"
-            ]
-        );
-        // The subkey's own fingerprint record does not become a third key, and
-        // it does not replace its parent's.
-        assert_eq!(
-            keys[1].fingerprint,
-            "8EB5022E57DB2BB28470F20A56A674CB09BADB3E"
-        );
-        assert_eq!(keys[1].user_ids, ["No Email Person"]);
-    }
-
-    #[test]
-    fn unescapes_a_colon_field() {
-        assert_eq!(unescape_colon_field("plain"), "plain");
-        assert_eq!(unescape_colon_field("a\\x3ab"), "a:b");
-        assert_eq!(unescape_colon_field("a\\x5cb"), "a\\b");
-        // A `\x` that is not a byte escape stays as written.
-        assert_eq!(unescape_colon_field("a\\xzz"), "a\\xzz");
-    }
 
     #[test]
     fn dearmor_passes_binary_through() {
@@ -1126,10 +1186,99 @@ IHdvcmxk\n\
             std::fs::read(self.dir.join("pubring.kbx")).unwrap()
         }
 
+        /// Bind one more user id to the home's first key.
+        fn add_uid(&self, uid: &str) {
+            let primary = self.fingerprint();
+            let status = self
+                .gpg()
+                .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                .args(["--quick-add-uid", &primary, uid])
+                .status()
+                .unwrap();
+            assert!(status.success(), "gpg --quick-add-uid failed");
+        }
+
+        /// The `--with-colons` key listing of this home, as `gpg` writes it.
+        /// The differential listing case reads its `pub`, `fpr`, and `uid`
+        /// records as the reference.
+        fn listing(&self) -> String {
+            let out = self
+                .gpg()
+                .args(["--with-colons", "--fixed-list-mode", "--list-keys"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "gpg --list-keys failed");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        /// The primary-key fingerprints `gpg` reports over `keyring`, in
+        /// listing order. This is the reader the `ostree` tool drives through
+        /// gpgme, so a keyring it lists is a keyring the tool reads.
+        fn fingerprints_of(&self, keyring: &[u8]) -> Vec<String> {
+            let path = self.dir.join("listed.gpg");
+            std::fs::write(&path, keyring).unwrap();
+            let out = std::process::Command::new("gpg")
+                .arg("--homedir")
+                .arg(&self.dir)
+                .arg("--batch")
+                .arg("--no-default-keyring")
+                .arg("--keyring")
+                .arg(&path)
+                .args(["--with-colons", "--list-keys"])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "gpg --list-keys over a keyring failed"
+            );
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let mut found = Vec::new();
+            let mut wanted = false;
+            for line in text.lines() {
+                let mut fields = line.split(':');
+                match fields.next() {
+                    Some("pub") => wanted = true,
+                    Some("fpr") if wanted => {
+                        wanted = false;
+                        found.push(fields.nth(8).unwrap().to_owned());
+                    }
+                    Some("sub") => wanted = false,
+                    _ => {}
+                }
+            }
+            found
+        }
+
+        /// The `gpg --export-secret-keys` stream of this home's keys, which
+        /// carries no transferable public key.
+        fn export_secret(&self) -> Vec<u8> {
+            let out = self
+                .gpg()
+                .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                .arg("--export-secret-keys")
+                .output()
+                .unwrap();
+            assert!(out.status.success() && !out.stdout.is_empty());
+            out.stdout
+        }
+
+        /// The `gpg --export` stream of the one key `selector` names.
+        fn export_one(&self, selector: &str) -> Vec<u8> {
+            let out = self
+                .gpg()
+                .arg("--export")
+                .arg("--")
+                .arg(selector)
+                .output()
+                .unwrap();
+            assert!(out.status.success() && !out.stdout.is_empty());
+            out.stdout
+        }
+
         /// The legacy keyring `gpg --import` writes for this home's own keys.
         /// GnuPG puts a Trust packet after the primary key packet, after each
         /// user id packet, and after each signature packet of such a keyring,
-        /// which is the form [`Repo::gpg_import_keys`] leaves at the
+        /// which is the form the `ostree` tool's own import leaves at the
         /// repository root.
         fn legacy_keyring(&self) -> Vec<u8> {
             use std::os::unix::fs::DirBuilderExt;
@@ -1137,14 +1286,13 @@ IHdvcmxk\n\
             std::fs::write(&exported, self.export(false)).unwrap();
             // `gpg` writes a keybox when it creates a keyring file itself, and
             // a legacy keyring when the file is already there, so the import
-            // runs in a home of its own over an empty keyring file, as the
-            // import path's scratch directory does.
+            // runs in a home of its own over an empty keyring file.
             let home = self.dir.join("legacy");
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&home)
                 .unwrap();
-            let ring = home.join(RING_FILE);
+            let ring = home.join("ring.gpg");
             std::fs::write(&ring, b"").unwrap();
             let status = std::process::Command::new("gpg")
                 .arg("--homedir")
@@ -1418,5 +1566,388 @@ IHdvcmxk\n\
         // A truncated keyring keeps every byte it had.
         let cut = &exported[..exported.len() / 2];
         assert_eq!(without_trust_packets(cut), cut);
+    }
+
+    /// The subject a refusal over the repository's own keyring names.
+    const SUBJECT: &str = "the keyring 'origin.trustedkeys.gpg'";
+
+    /// An import into no keyring writes the offered stream as it stands and
+    /// counts each certificate, `gpg` reads the result, and a repeated import
+    /// counts none and leaves the bytes alone.
+    #[test]
+    fn an_import_writes_the_offered_certificates() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("First <first@ostrya.example>");
+        home.add_key("Second <second@ostrya.example>");
+        let offered = home.export(false);
+
+        let (imported, keyring) = merge_keyring(b"", &offered, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 2);
+        assert_eq!(keyring, offered);
+        // The keyring the import writes is one `gpg` reads, which is the
+        // reader the `ostree` tool drives through gpgme.
+        assert_eq!(home.fingerprints_of(&keyring).len(), 2);
+
+        let (again, repeated) = merge_keyring(&keyring, &offered, &[], SUBJECT).unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(repeated, keyring);
+    }
+
+    /// An import onto a keyring GnuPG wrote keeps that keyring byte for byte
+    /// and appends the packets of the added certificate. `gpg` reads the
+    /// result, which holds both keys, so a keyring carrying Trust packets for
+    /// one key and none for another is a keyring both implementations read.
+    #[test]
+    fn an_import_keeps_the_keyring_it_was_given() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let held = KeyFixture::new("Held <held@ostrya.example>");
+        let added = KeyFixture::new("Added <added@ostrya.example>");
+        let existing = held.legacy_keyring();
+        let offered = added.export(false);
+
+        let (imported, keyring) = merge_keyring(&existing, &offered, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 1);
+        assert_eq!(&keyring[..existing.len()], &existing[..]);
+        assert_eq!(&keyring[existing.len()..], &offered[..]);
+        let listed = held.fingerprints_of(&keyring);
+        assert_eq!(listed, [held.fingerprint(), added.fingerprint()]);
+    }
+
+    /// The Trust packets are the whole difference between the keyring GnuPG
+    /// writes and the keyring this import writes for the same keys.
+    ///
+    /// A legacy keyring offered for import loses its Trust packets, so the
+    /// keyring the import writes carries none whichever form the offered stream
+    /// took.
+    #[test]
+    fn the_trust_packets_are_the_whole_difference() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Same <same@ostrya.example>");
+        home.add_signing_subkey();
+        let exported = home.export(false);
+        let legacy = home.legacy_keyring();
+        assert!(legacy.len() > exported.len());
+        assert_eq!(without_trust_packets(&legacy), exported);
+        for offered in [&exported, &legacy] {
+            let (imported, keyring) = merge_keyring(b"", offered, &[], SUBJECT).unwrap();
+            assert_eq!(imported, 1);
+            assert_eq!(keyring, exported);
+        }
+        // A selection off a legacy keyring writes the selected certificate
+        // without its Trust packets as well.
+        let selector = [home.fingerprint()];
+        let (imported, keyring) = merge_keyring(b"", &legacy, &selector, SUBJECT).unwrap();
+        assert_eq!(imported, 1);
+        assert_eq!(keyring, exported);
+    }
+
+    /// Each selector form takes the key it names out of the offered stream: a
+    /// fingerprint plain, `0x`-prefixed, and spaced, a key id long and short, a
+    /// subkey fingerprint, and a user id substring in another case.
+    #[test]
+    fn a_selector_takes_the_key_it_names() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Wanted <wanted@ostrya.example>");
+        home.add_signing_subkey();
+        home.add_key("Other <other@ostrya.example>");
+        let primary = home.fingerprint();
+        let wanted = home.export_one(&primary);
+        let offered = home.export(false);
+        assert!(offered.len() > wanted.len());
+        let subkey = {
+            let verifier = GpgVerifier::from_keyring_bytes([&wanted]).unwrap();
+            format!("{:X}", verifier.certs[0].public_subkeys[0].fingerprint())
+        };
+        let spaced = primary
+            .as_bytes()
+            .chunks(4)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for selector in [
+            primary.clone(),
+            format!("0x{primary}"),
+            spaced,
+            primary[24..].to_owned(),
+            primary[32..].to_owned(),
+            subkey,
+            "wanted".to_owned(),
+            "WANTED@ostrya".to_owned(),
+            "Wanted <wanted@ostrya.example>".to_owned(),
+        ] {
+            let (imported, keyring) =
+                merge_keyring(b"", &offered, std::slice::from_ref(&selector), SUBJECT).unwrap();
+            assert_eq!(imported, 1, "the selector '{selector}' took no key");
+            assert_eq!(
+                keyring, wanted,
+                "the selector '{selector}' took another key"
+            );
+        }
+
+        // Two selectors take two keys, and one selector matching both user ids
+        // takes both.
+        let both = [primary.clone(), "other".to_owned()];
+        assert_eq!(merge_keyring(b"", &offered, &both, SUBJECT).unwrap().0, 2);
+        let shared = ["ostrya.example".to_owned()];
+        assert_eq!(merge_keyring(b"", &offered, &shared, SUBJECT).unwrap().0, 2);
+    }
+
+    /// A selector naming no offered key is refused by name, and the keyring is
+    /// then left as it was. A hex selector names a key alone: it is no user id
+    /// substring, which is how `gpg --export` reads one.
+    #[test]
+    fn a_selector_naming_nothing_is_refused() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("DEADBEEF Person <hex@ostrya.example>");
+        let offered = home.export(false);
+        for selector in ["nomatch", "0000000000000000", "DEADBEEF", "", "  "] {
+            let err = merge_keyring(b"", &offered, &[selector.to_owned()], SUBJECT).unwrap_err();
+            assert!(
+                matches!(&err, Error::Signature(m)
+                    if m == &format!("no key matching '{selector}' among the keys to import")),
+                "{err}"
+            );
+        }
+        // The person's own name is a user id substring and takes the key.
+        let taken = ["DEADBEEF Person".to_owned()];
+        assert_eq!(merge_keyring(b"", &offered, &taken, SUBJECT).unwrap().0, 1);
+    }
+
+    /// A selector `gpg --export` reads as a user id substring is no key
+    /// selector here either, so a shape the key reader does not carry names
+    /// nothing rather than a key of its own choosing.
+    ///
+    /// Each row was measured against `gpg --export -- <selector>` on
+    /// `gpg` 2.4.9, and none of them exports the key the hex names.
+    #[test]
+    fn a_selector_the_key_reader_does_not_carry_names_nothing() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        // The user id holds a `0x`-prefixed word, so a `0x` selector that is no
+        // key would take this key if it were read as a user id substring.
+        let home = KeyFixture::new("Narrow 0xnope <narrow@ostrya.example>");
+        let offered = home.export(false);
+        let primary = home.fingerprint();
+        let group = |width: usize| -> String {
+            primary
+                .as_bytes()
+                .chunks(width)
+                .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // Ten groups the same fingerprint splits into at uneven widths.
+        let uneven = format!(
+            "{} {} {}",
+            &primary[..3],
+            &primary[3..8],
+            group(4)[10..].to_owned()
+        );
+        // The `0x` prefix is read in lower case alone and names a key or
+        // nothing; a key id carries no interior space; the one spaced shape is a
+        // printed v4 fingerprint, ten groups of four; a tab is no space; and
+        // `0x` admits no space.
+        let narrowed = [
+            format!("0X{primary}"),
+            format!("0X{}", &primary[32..]),
+            format!("{} {}", &primary[24..32], &primary[32..]),
+            format!("{} {}", &primary[32..36], &primary[36..]),
+            group(2),
+            uneven,
+            primary.replace(&primary[20..21], &format!("\t{}", &primary[20..21])),
+            format!("0x{}", group(4)),
+            format!("0x{}", &primary[..7]),
+            "0xnope".to_owned(),
+        ];
+        for selector in narrowed {
+            let err =
+                merge_keyring(b"", &offered, std::slice::from_ref(&selector), SUBJECT).unwrap_err();
+            assert!(
+                matches!(&err, Error::Signature(m)
+                    if m == &format!("no key matching '{selector}' among the keys to import")),
+                "the selector '{selector}' took a key: {err}"
+            );
+            // The reference: the selector exports nothing through `gpg`.
+            let out = home
+                .gpg()
+                .arg("--export")
+                .arg("--")
+                .arg(&selector)
+                .output()
+                .unwrap();
+            assert!(
+                out.stdout.is_empty(),
+                "gpg --export took a key for '{selector}'"
+            );
+        }
+        // The forms the reader does carry still take the key: a printed
+        // fingerprint in its ten groups of four, and either hex case, with
+        // leading and trailing spaces dropped.
+        for selector in [group(4), format!(" {} ", primary.to_lowercase())] {
+            assert_eq!(
+                merge_keyring(b"", &offered, std::slice::from_ref(&selector), SUBJECT)
+                    .unwrap()
+                    .0,
+                1,
+                "the selector '{selector}' took no key"
+            );
+        }
+    }
+
+    /// The user id search folds ASCII case alone, which is what `gpg` folds:
+    /// over the user id `Ärger`, `ÄRGER` takes the key and `ärger` takes none.
+    #[test]
+    fn a_user_id_selector_folds_ascii_case_alone() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Umlaut Ärger <umlaut@ostrya.example>");
+        let offered = home.export(false);
+        for selector in ["Ärger", "ÄRGER", "ärgER"] {
+            let taken = merge_keyring(b"", &offered, &[selector.to_owned()], SUBJECT)
+                .map(|(count, _)| count);
+            let exported = !home
+                .gpg()
+                .arg("--export")
+                .arg("--")
+                .arg(selector)
+                .output()
+                .unwrap()
+                .stdout
+                .is_empty();
+            assert_eq!(
+                taken.is_ok(),
+                exported,
+                "the selector '{selector}' parts from gpg --export"
+            );
+        }
+    }
+
+    /// A stream carrying no certificate, one the packet walk cannot frame to
+    /// its end, and a keybox are each refused, and the keyring is then left as
+    /// it was. The `ostree` tool refuses all three as well.
+    #[test]
+    fn an_unreadable_offered_stream_is_refused() {
+        let empty = merge_keyring(b"", b"", &[], SUBJECT).unwrap_err();
+        assert!(
+            matches!(&empty, Error::Signature(m) if m.contains("no OpenPGP certificate")),
+            "{empty}"
+        );
+        let oversized = vec![0u8; MAX_KEYRING as usize + 1];
+        let err = merge_keyring(b"", &oversized, &[], SUBJECT).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("ceiling")),
+            "{err}"
+        );
+        if !gpg_available() {
+            eprintln!("skipping the keyring half: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Cut <cut@ostrya.example>");
+        let offered = home.export(false);
+        let cut = &offered[..offered.len() - 1];
+        let err = merge_keyring(b"", cut, &[], SUBJECT).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("OpenPGP keyring")),
+            "{err}"
+        );
+        let err = merge_keyring(b"", &home.keybox(), &[], SUBJECT).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("keybox")),
+            "{err}"
+        );
+        // A keyring holds transferable public keys, so a secret-key export
+        // holds none. The `ostree` tool takes the public part of such a stream;
+        // `cli-surface.md`, "P3", records the divergence.
+        let err = merge_keyring(b"", &home.export_secret(), &[], SUBJECT).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no OpenPGP certificate")),
+            "{err}"
+        );
+        // The certificate cap holds over an offered stream as well: 257 are
+        // refused by name and 256 are taken.
+        let many = offered.repeat(MAX_KEYRING_CERTS + 1);
+        assert!(many.len() as u64 <= MAX_KEYRING);
+        let err = merge_keyring(b"", &many, &[], SUBJECT).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("the keyring to import")
+                && m.contains("256 certificates")),
+            "{err}"
+        );
+        let allowed = offered.repeat(MAX_KEYRING_CERTS);
+        assert_eq!(merge_keyring(b"", &allowed, &[], SUBJECT).unwrap().0, 1);
+    }
+
+    /// The listing reports what `gpg` reports over the same keyring: the
+    /// fingerprint, the creation instant, and the user ids in listing order.
+    /// A keyring holding no key lists none.
+    #[test]
+    fn the_listing_agrees_with_gpg() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Listed <listed@ostrya.example>");
+        home.add_uid("Second <second@ostrya.example>");
+        home.add_signing_subkey();
+        home.add_key("Another <another@ostrya.example>");
+
+        // The reference: the `pub`, `fpr`, and `uid` records of gpg's own
+        // machine-readable listing, one record set per primary key.
+        let listing = home.listing();
+        let mut reference: Vec<GpgKey> = Vec::new();
+        let mut in_subkey = false;
+        for line in listing.lines() {
+            let fields: Vec<&str> = line.split(':').collect();
+            match fields[0] {
+                "pub" => {
+                    in_subkey = false;
+                    reference.push(GpgKey {
+                        fingerprint: String::new(),
+                        created: parse_epoch(fields[5]),
+                        user_ids: Vec::new(),
+                    });
+                }
+                "sub" => in_subkey = true,
+                "fpr" if !in_subkey => {
+                    let key = reference.last_mut().unwrap();
+                    if key.fingerprint.is_empty() {
+                        key.fingerprint = fields[9].to_owned();
+                    }
+                }
+                "uid" => reference
+                    .last_mut()
+                    .unwrap()
+                    .user_ids
+                    .push(fields[9].to_owned()),
+                _ => {}
+            }
+        }
+        assert_eq!(reference.len(), 2);
+        assert_eq!(reference[0].user_ids.len(), 2);
+
+        for keyring in [home.export(false), home.legacy_keyring()] {
+            assert_eq!(keyring_keys(&keyring, SUBJECT).unwrap(), reference);
+        }
+        assert!(keyring_keys(b"", SUBJECT).unwrap().is_empty());
     }
 }

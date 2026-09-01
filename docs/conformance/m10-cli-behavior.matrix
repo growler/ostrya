@@ -3787,9 +3787,21 @@ setup: repo
 outcome: lossy
 severity: interop
 loss: `gpg-list-keys` omits the two Web Key Directory URL lines the tool prints
- per user id, and renders the key's creation instant in UTC rather than the host
- locale and time zone. The fingerprint, the creation instant, and the user ids
- are the same in both.
+ per user id and the `Subkey:` line it prints per subkey, and renders the key's
+ creation instant in UTC rather than the host locale and time zone. The
+ fingerprint, the creation instant, and the user ids are the same in both. The
+ keyring `gpg-import` writes carries no Trust packet, where the tool's carries
+ one after the primary key packet, after each user id packet, and after each
+ signature packet; with those packets dropped the two hold
+ the same packets in the same order, and each implementation reads the keyring the
+ other wrote. A `KEY-ID` is read as the dialect `gpg --export` carries, and each
+ implementation takes a key the other does not. A certificate offered for a key
+ the keyring already holds leaves that key as the keyring holds it, where the tool
+ merges the offered material into it, so a revocation reaches the port's trusted
+ set only after `remote delete` and a fresh import, and until then the port
+ reports a signature that key made as good where the tool reports it revoked. A
+ certificate carrying no user id is taken by the port and refused by the tool
+ (`cli-surface.md`, "P3", states them all).
 evidence: ostrya_cli::cli::remote_gpg_keyring_round_trips_with_the_tool
 spec: format-reference.md#remote
 note: importing keys needs a generated key and a remote, which no setup binds.
@@ -3800,8 +3812,9 @@ note: importing keys needs a generated key and a remote, which no setup binds.
  that deleting the remote takes its keyring with it. `gpg-list-keys` is the
  divergence the outcome names:
  the port reports the fingerprint, the creation instant, and the user ids, and
- leaves out the two Web Key Directory URL lines, rendering the instant in UTC
- rather than the host locale (`cli-surface.md`, "P3").
+ leaves out the two Web Key Directory URL lines and the per-subkey `Subkey:`
+ line, rendering the instant in UTC rather than the host locale
+ (`cli-surface.md`, "P3").
 
 # ---------------------------------------------------------------------------
 # commit -- the message and the body, the metadata dict, and the ref bindings

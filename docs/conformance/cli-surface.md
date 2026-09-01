@@ -1360,7 +1360,7 @@ No matrix cell needs these. The shell suite invokes them.
 `remote` landed in Phase 17e: `add`, `delete`, `list`, `show-url`, `refs`,
 `summary`, `gpg-import`, and `gpg-list-keys`, with the option set the tool
 carries on each and the output formats `../format-reference.md`, "`remote`",
-records. Five divergences stand:
+records. Ten divergences stand:
 
 - the tool's `remote` accepts no `--repo` of its own -- `ostree remote --repo=R
   list` reports `error: Unknown option --repo=R`, where the leading position
@@ -1383,17 +1383,115 @@ records. Five divergences stand:
   the user ids in the tool's own shape, and leaves out the `Advanced update URL`
   and `Direct update URL` lines the tool prints per user id: they name the key's
   OpenPGP Web Key Directory location, derived from a hash of the address, and
-  state no repository fact. The creation instant parts the same way the GPG
-  signature report in "P1" does -- the tool renders it in the host locale and
-  time zone and the port in UTC. `remote summary` renders its `Timestamp` and
-  `Last-Modified` lines the same way, so a report compares byte for byte with
-  `TZ=UTC` set.
+  state no repository fact. It also leaves out the `Subkey:` line and the
+  `Created:` line under it that the tool prints for each subkey a key carries:
+  the port reports a certificate by its primary key, and a subkey reaches the
+  trusted set through the certificate holding it. The creation instant parts the
+  same way the GPG signature report in "P1" does -- the tool renders it in the
+  host locale and time zone and the port in UTC. `remote summary` renders its
+  `Timestamp` and `Last-Modified` lines the same way, so a report compares byte
+  for byte with `TZ=UTC` set;
+- `remote gpg-import` writes a keyring that carries no Trust packet, where the
+  tool's own import writes one after the primary key packet, after each user id
+  packet, and after each signature packet. A Trust packet holds a GnuPG-local
+  trust value and carries no part of a transferable public key: with those
+  packets dropped, the tool's keyring holds the packets the port's holds, in the
+  same order, measured byte for byte over a key carrying a signing subkey
+  (`crates/ostrya/src/gpg.rs`, `the_trust_packets_are_the_whole_difference`).
+  The tool's file is the longer one by those packets alone, whose size varies
+  from one to the next. Each implementation reads the keyring the other
+  wrote: `ostree remote gpg-list-keys` and
+  `gpg --no-default-keyring --keyring <file> --list-keys` both list the keys of a
+  keyring the port wrote, and `ostrya remote gpg-list-keys` lists the keys of a
+  keyring the tool wrote. The port also verifies a signature against a keyring
+  carrying those packets, which `crates/ostrya/tests/verify_gpg_agreement.rs`
+  states against `gpgv` over the same file;
+- a `KEY-ID` operand of `remote gpg-import` is read as a fingerprint, a key id,
+  or a user id substring, which is the dialect `gpg --export -- <selector>`
+  carries. Hex digits alone name a key -- 8 digits a short key id, 16 a key id,
+  and 32, 40, or 64 a fingerprint, each read over the primary key and over every
+  subkey -- and so do the same digits under a lower-case `0x` prefix and a
+  printed v4 fingerprint in its ten groups of four. Every other selector is a
+  substring of a user id, folded over ASCII case alone. The tool resolves a
+  narrower set through gpgme, and each implementation therefore takes a key the
+  other does not. Over a keyring holding `Alpha <alpha@ostrya.example>`,
+  `Umlaut Ärger <u@ostrya.example>`, and one more key:
+  - the tool takes the key for `=Alpha <alpha@ostrya.example>` and for the
+    fingerprint with a `!` suffix, and the port reports
+    `error: signature: no key matching '<selector>' among the keys to import` at
+    exit 1 for both, writing no keyring;
+  - the port takes the key for `alpha`, for `Ärger`, and for `ÄRGER`, where the
+    tool reports `error: GPG: Unable to find key "<selector>": GPGME: Invalid
+    value` at exit 1 and writes no keyring; and it takes both keys for
+    `ostrya.example`, where the tool reports
+    `error: GPG: Unable to find key "ostrya.example": GPGME: Ambiguous name`,
+    refusing a selector that names more than one key;
+  - both refuse `ärger`, an upper-case `0X` before a key id or a fingerprint, a
+    key id carrying a space, a fingerprint spaced in groups of two, a
+    fingerprint carrying a tab, a `0x` prefix carrying a space, and a selector
+    holding no character other than whitespace. Both read a hex selector as a
+    key alone: over a certificate whose user id opens `DEADBEEF`, neither takes
+    the key for `DEADBEEF`
+    (`crates/ostrya/src/gpg.rs`,
+    `a_selector_the_key_reader_does_not_carry_names_nothing` and
+    `a_user_id_selector_folds_ascii_case_alone`, hold the port against
+    `gpg --export` over each of those forms);
+- a certificate offered for a key the keyring already holds leaves that key as
+  the keyring holds it, where the tool merges the offered user ids, signatures,
+  and subkeys into it. Both report `Imported 0 GPG keys`. Over a keyring holding
+  a one-user-id key, importing that key again with a second user id added leaves
+  the port's keyring at the bytes it held and grows the tool's, whose listing
+  then reports both user ids where the port's reports one. The rule holds inside
+  one offered stream as well: where a stream carries two states of one key, the
+  port keeps the first and drops the second, so two `--keyring` options reach
+  the same outcome on a repository holding no keyring at all.
 
-Two messages the port words for itself, each reporting a condition the tool
+  A key revocation reaches the trusted set through a fresh certificate for a key
+  the keyring already holds. The port therefore keeps the state it holds and
+  reports a signature that key made as `Good signature`, where the tool reports
+  `Key revoked`. Each implementation holds a commit signed with `$FPR`, a remote
+  `origin`, and `cert1.gpg` imported into that remote:
+
+      gpg --export "$FPR" > cert1.gpg
+      printf 'y\n0\n\ny\n' | gpg --command-fd 0 --no-tty --yes \
+        --output revoke.asc --gen-revoke "$FPR"
+      gpg --import revoke.asc
+      gpg --export "$FPR" > cert2.gpg
+      ostrya remote gpg-import origin --keyring cert2.gpg  # Imported 0 GPG keys
+      ostree remote gpg-import origin --keyring cert2.gpg  # Imported 0 GPG keys
+      ostrya show --gpg-verify-remote=origin main          # Good signature
+      ostree show --gpg-verify-remote=origin main          # Key revoked
+
+  The port's keyring stays at the bytes it held and the tool's grows. The port
+  reads a revocation the keyring holds: over the keyring the tool wrote, and over
+  its own keyring after `remote delete` and a fresh import of `cert2.gpg`, the
+  same `show` reports the signature as not good. So the trusted set carries the
+  revocation once it reaches the file, and `remote gpg-import` is the one path
+  that does not carry it there;
+- a `gpg --export-secret-keys` stream offered to `remote gpg-import` is refused
+  by the port and taken by the tool, which imports the public part of each key it
+  holds and lists it afterwards. The port reads a keyring as transferable public
+  keys, so such a stream holds none: it reports
+  `error: signature: the keyring to import holds no OpenPGP certificate` at exit
+  1 and writes no keyring. `gpg --export` of the same keys is what a keyring for
+  a remote holds, and both implementations take it;
+- a certificate carrying no user id is taken by the port and refused by the tool.
+  The port reads a certificate as the packets one Public-Key packet opens and
+  verifies no self-signature over them, so a stream holding a Public-Key packet
+  alone -- the first 53 bytes of an exported ed25519 certificate -- reports
+  `Imported 1 GPG key to remote "<name>"`, writes a 53-byte keyring, and lists
+  the key. The tool reports `error: GPG: Unable to export keys: GPGME: No data`
+  at exit 1 and writes no keyring, which is also what it answers over a
+  certificate whose self-signature does not verify.
+
+Three messages the port words for itself, each reporting a condition the tool
 reports through gpgme: `remote gpg-import` with no `--keyring` and no `--stdin`
-(the tool's `GPG: Unable to export keys: GPGME: No data`), and a `KEY-ID` naming
+(the tool's `GPG: Unable to export keys: GPGME: No data`), a `KEY-ID` naming
 no key in the source (the tool's `GPG: Unable to find key "<id>": GPGME: End of
-file`).
+file`), and a keyring the certificate parser does not read -- one holding no
+OpenPGP packet, one cut short of a packet boundary, and a GnuPG keybox -- which
+the tool reports as `GPG: Unable to export keys: GPGME: No data`. Both refuse all
+three at exit 1 and write no keyring.
 
 `--cache-dir`, which the tool's `remote refs` and `remote summary` accept, is not
 carried: the port fetches a summary without a cache directory of its own. The

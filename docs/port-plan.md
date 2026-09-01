@@ -32,10 +32,10 @@ library is MIT-licensed.
    of the `ostree` tool; the upstream test suite is LGPL source and is never
    run or vendored.
 5. Extensions: GPG commit signing through the system GnuPG binaries (no
-   gpgme linkage), GPG signature verification in the process over the `pgp`
-   crate (rPGP), which is permissively licensed and links no C library,
-   composefs/EROFS export, tar import/export, AWS S3 push/pull, ssh git-style
-   push/pull.
+   gpgme linkage), GPG signature verification and key management in the process
+   over the `pgp` crate (rPGP), which is permissively licensed and links no C
+   library, composefs/EROFS export, tar import/export, AWS S3 push/pull, ssh
+   git-style push/pull.
 
 The port is a library. It is not a drop-in replacement for the `ostree` tool.
 A minimal `ostrya` binary lands once the ingest and checkout paths are ready
@@ -1479,6 +1479,19 @@ Definition:
   blob count. A blob is held to one mebibyte and to 64 signature packets, and
   the parse and the public-key operations run inside `catch_unwind`, since a
   stored blob is untrusted input.
+- A remote's trusted keyring is managed in the process.
+  `Repo::gpg_import_keys` parses the offered certificate stream, resolves each
+  `KEY-ID` selector against it, appends the packets of every certificate the
+  keyring does not already hold, and reports that count.
+  `Repo::gpg_list_keys` reads the fingerprint, the creation instant, and the
+  user ids off the parsed certificates. Both hold their input to the keyring
+  caps, refuse a keybox, and parse inside `catch_unwind`, since a keyring
+  offered for import is untrusted input. No self-signature over an offered
+  certificate is verified, so a certificate carrying no user id enters the
+  keyring. The keyring the import writes keeps the bytes it already held and
+  carries no Trust packet; `cli-surface.md`, "P3", records those four, the
+  selector dialect, and what a certificate for a key the keyring already holds
+  does.
 - The port owns the trust and validity policy. A signature is valid where it
   verifies, where the certificate holding the signing key is loaded, where the
   signature is over a document, where the subkey bindings hold, where the
@@ -1545,10 +1558,12 @@ crate names id 22 `EdDSALegacy`. `gpg --version` lists `EDDSA` and no `Ed25519`
 among the public-key algorithms it supports, so a fixture built with `gpg`
 2.4.9 carries id 22 and the differential matrix holds no cell for id 27.
 
-Dependency set: `pgp` (rPGP), behind `verify-gpg`, for keyring parsing and
-signature verification. Signing and the keyring management of
-`Repo::gpg_import_keys` and `Repo::gpg_list_keys` add a runtime tool dependency
-on `gpg`; a missing binary surfaces as a signature error naming the program.
+Dependency set: `pgp` (rPGP), behind `verify-gpg`, for keyring parsing,
+signature verification, and keyring management. Signing adds a runtime tool
+dependency on `gpg`; a missing binary surfaces as a signature error naming the
+program. A `verify-gpg` build without `sign-gpg` runs no binary, and the whole
+suite passes with the GnuPG installation absent from `PATH`, the cases that
+build their fixtures with `gpg` skipping themselves.
 
 Deliverables: `GpgSigner`, `GpgVerifier`, keyring loading (binary and
 armored), the in-process verify engine and the validity policy it applies,
@@ -1565,10 +1580,11 @@ backends, with and without `sign-gpg`. One differential test
 the public verify path and through `gpgv`, compares the two reports field by
 field, declares the divergences above, and feeds the parser a corpus of
 keyrings and signature blobs derived from the good fixtures by truncation and
-by single-bit flipping. Two of its cases read the keyring
-`Repo::gpg_import_keys` writes, which carries Trust packets: a signature by a
-signing subkey and a signature by the primary key each reach the verdict and
-the user id `gpgv` reports over the same file. It skips itself and names the
+by single-bit flipping. Two of its cases read two keyrings each -- one GnuPG
+wrote, which carries Trust packets, and the one `Repo::gpg_import_keys` writes,
+which carries none: a signature by a signing subkey and a signature by the
+primary key each reach the verdict and the user id `gpgv` reports over both
+files. It skips itself and names the
 absent binary where `gpg` or `gpgv` is absent, since `gpg` builds the fixtures
 and `gpgv` is the reference. Tool cross-verification
 (`ostree gpg-sign` in both directions) lands in
@@ -3998,9 +4014,9 @@ New library work, not just CLI wiring:
   `[remote "name"]` group through the same config-write path; `refs` and
   `summary` reuse the pull machinery's existing remote resolution against a
   live remote.
-- `gpg-import`/`gpg-list-keys`: thin wrappers over the `gpg` subprocess
-  plumbing `gpg.rs` already runs for signing and verification, importing
-  into or listing a remote's `trustedkeys.gpg`.
+- `gpg-import`/`gpg-list-keys`: thin wrappers over the certificate parsing
+  `gpg.rs` already does for verification, importing into or listing a remote's
+  `trustedkeys.gpg`.
 - Excluded: `remote add-cookie`/`delete-cookie`/`list-cookies`. `fetch.rs`
   currently refuses any `Cookie` header at construction whenever a mirror is
   cleartext `http`, as a deliberate choice (a cookie's value is a secret
@@ -4041,15 +4057,15 @@ The report prints an unannotated value where `--print-metadata-key` prints an
 annotated one, so `ostrya-gvariant` gained `to_text_unannotated` beside
 `to_text`.
 
-`gpg-import` and `gpg-list-keys` run `gpg` in a private scratch directory:
-the import stages the remote's current keyring, imports the offered keys into
-it, and reads the count of new keys out of the `IMPORT_RES` status line,
-which is what the tool's own `Imported <n> GPG key(s)` reports; the listing
-parses a `--with-colons` key listing. A `KEY-ID` selection exports each named
-key out of a second scratch keyring, so a selector naming nothing is refused
-by name; each selector stands after a `--` terminator, so gpg reads it as a key
-name rather than as one of its own options. `remote delete` removes `<remote>.trustedkeys.gpg` with the section,
-through `Repo::remove_remote_keyring`.
+`gpg-import` and `gpg-list-keys` answer over the parsed certificates: the
+import appends the packets of every offered certificate the remote's keyring
+does not already hold and reports that count, which is what the tool's own
+`Imported <n> GPG key(s)` reports; the listing reads the fingerprint, the
+creation instant, and the user ids off each certificate. A `KEY-ID` selection
+takes the certificates its selectors name, and a selector naming nothing is
+refused by name, which leaves the keyring as it was. `remote delete` removes
+`<remote>.trustedkeys.gpg` with the section, through
+`Repo::remove_remote_keyring`.
 
 Four facts the option help does not state came out of the comparison, and are
 recorded in `format-reference.md`, "CLI output formats": `--no-sign-verify`
@@ -4060,15 +4076,29 @@ order the sections appear in, and `-u` pads each name to the longest name of
 the whole list plus two, counted in bytes; and the `metalink=` URL prefix
 names its own key while a `mirrorlist=` prefix stays in the `url` value.
 
-Five divergences are recorded in `cli-surface.md`, "P3", none of them a
-repository fact: the tool's `remote` container accepts no `--repo` of its own
-where the port accepts one in every position; an unknown nested subcommand
-draws clap's own text; `remote delete` removing the document's last section
-leaves the tool one trailing blank line and the port none, both reparsing
-equal; `--sign-verify=spki=...` is refused by the tool's build and accepted by
-the port's `spki` feature; and `gpg-list-keys` leaves out the two Web Key
-Directory URL lines and renders the creation instant in UTC, the same locale
-and time-zone divergence the GPG signature report in "P1" already carries.
+Ten divergences are recorded in `cli-surface.md`, "P3": the tool's `remote`
+container accepts no `--repo` of its own where the port accepts one in every
+position; an unknown nested subcommand draws clap's own text; `remote delete`
+removing the document's last section leaves the tool one trailing blank line
+and the port none, both reparsing equal; `--sign-verify=spki=...` is refused by
+the tool's build and accepted by the port's `spki` feature; `gpg-list-keys`
+leaves out the two Web Key Directory URL lines and the per-subkey `Subkey:`
+line, and renders the creation instant in UTC, the same locale and time-zone
+divergence the GPG signature report in "P1" already carries; the keyring
+`gpg-import` writes carries no Trust packet where the tool's carries one after
+the primary key packet, after each user id
+packet, and after each signature packet, and each implementation reads the
+keyring the other wrote; a `KEY-ID` selector is read as the dialect
+`gpg --export` carries, where the tool resolves a narrower set through gpgme, so
+each implementation takes a key the other does not; a certificate offered for a
+key the keyring already holds leaves that key as the keyring holds it, where the
+tool merges the offered user ids, signatures, and subkeys into it, both reporting
+the same count, so a revocation reaches the port's trusted set only after
+`remote delete` and a fresh import; a `gpg --export-secret-keys` stream offered
+for import is refused by the port, which reads a keyring as transferable public
+keys, where the tool imports the public part of each key it holds; and a
+certificate carrying no user id is taken by the port, which verifies no
+self-signature over an offered certificate, and refused by the tool.
 `remote refs`/`summary` also drop `--cache-dir`, and the port's fetcher reads
 `http` and `https` where the tool also reads `file://`.
 
@@ -4077,8 +4107,13 @@ Verify: `cargo test --workspace --all-features` is green, `cargo fmt --all
 clean. `crates/ostrya-core` gains five `KeyFile` tests holding the removers
 and the rewrite rule; `crates/ostrya-gvariant` one printer test holding the
 unannotated form; `crates/ostrya` one summary test for the retained per-ref
-detail, three `gpg` tests for the import count, the key listing, and the
-colon-field unescaping, and one `repo` test holding the config rewrite -- the
+detail, nine `gpg` tests over the keyring merge and the listing -- the bytes an
+import writes and the count it reports, the keyring it was given, the Trust
+packets that are the whole difference against the keyring GnuPG writes, each
+selector form, the shapes the key reader does not carry, the ASCII case the user
+id search folds, the refusal of a selector naming nothing, the refusal of a
+keyring the parser does not read, and the listing against gpg's own listing of
+the same keys -- and one `repo` test holding the config rewrite -- the
 document, the file mode, the stale handle, and the keyring removal. `crates/ostrya-cli/tests/cli.rs` gains four tests.
 `config_set_and_unset_match_the_tool` runs twenty-four invocations, each side
 against its own repository, comparing both streams, the exit status, and the

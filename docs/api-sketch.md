@@ -1113,7 +1113,7 @@ impl GpgSigner {
     pub async fn secret_key_fingerprints(&self) -> Result<Vec<String>>;
 }
 
-/// One key of a remote's trusted keyring, as a `gpg` key listing states it.
+/// One key of a remote's trusted keyring, as its certificate states it.
 pub struct GpgKey {
     pub fingerprint: String,
     pub created: Option<u64>,
@@ -1123,7 +1123,12 @@ pub struct GpgKey {
 impl Repo {                                   // feature = "verify-gpg"
     /// Add the certificates `keys` holds to `<remote>.trustedkeys.gpg`, and
     /// report how many the keyring did not already hold. With `key_ids`
-    /// non-empty only the keys those selectors name are imported.
+    /// non-empty only the keys those selectors name are imported. The keyring
+    /// keeps the bytes it already held and carries the packets of each added
+    /// certificate as `keys` wrote them, with the Trust packets dropped. A
+    /// certificate for a key the keyring already holds is not merged in, so a
+    /// revocation or a new binding for a held key reaches the keyring through
+    /// `Repo::remove_remote_keyring` and a fresh import.
     pub async fn gpg_import_keys(&self, remote: &str, keys: &[u8], key_ids: &[String])
         -> Result<usize>;
     /// The keys that keyring holds. An absent keyring holds none.
@@ -1138,8 +1143,9 @@ types.
 
 `GpgVerifier` is behind the `verify-gpg` feature, together with `GpgKey`,
 `Repo::gpg_import_keys`, and `Repo::gpg_list_keys`, which manage the
-verification trust set. `GpgSigner` is behind `sign-gpg`, which turns on
-`verify-gpg` with it. A constructor of `GpgVerifier` parses each keyring into
+verification trust set over the `pgp` crate and spawn no process. `GpgSigner` is
+behind `sign-gpg`, which turns on `verify-gpg` with it and is the one path that
+runs the `gpg` binary. A constructor of `GpgVerifier` parses each keyring into
 certificates as it loads it, so a keyring the parser rejects fails the
 construction. One keyring is held to four mebibytes and to 256 certificates,
 and a GnuPG keybox is refused by the name of the file or the blob that carries

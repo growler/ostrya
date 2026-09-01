@@ -4340,7 +4340,9 @@ or of standard input under `--stdin`, to the remote's `<remote>.trustedkeys.gpg`
 keyring, and prints `Imported <n> GPG key to remote "<name>"` -- `keys` for any
 count but one. The count is the keys the keyring did not already hold, so a
 repeated import reports `0`. A `KEY-ID` selects the keys it names out of the
-source, each resolved the way `gpg` resolves one. Naming both sources reports the
+source: a fingerprint, a key id, or a user id substring, with
+`../conformance/cli-surface.md`, "P3", recording where the two dialects part.
+Naming both sources reports the
 usage text and `error: --keyring and --stdin are mutually exclusive`; a
 `--keyring` naming no file reports `error: Error opening file <path>: <reason>`,
 which is read before the remote is looked up; and a remote the configuration does

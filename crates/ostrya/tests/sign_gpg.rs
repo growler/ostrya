@@ -9,8 +9,10 @@
 //! never touched, and the agent GnuPG auto-starts for the scratch home is
 //! killed when the fixture drops.
 //!
-//! Tool cross-verification against `ostree gpg-sign` is exercised by the
-//! upstream shell tests at the CLI-compatibility phase.
+//! Every case here signs, so each needs the `gpg` binary and skips itself
+//! where it is absent. Tool cross-verification against `ostree gpg-sign` is
+//! stated by `docs/conformance/m10-cli-behavior.matrix`,
+//! `commit/gpg-sign-round-trip`.
 
 #![cfg(feature = "sign-gpg")]
 

@@ -875,9 +875,10 @@ fn next_second() {
 /// key's Trust packet, so this is the case such a keyring reaches over the
 /// certificate parser's tag runs.
 ///
-/// The keyring under test is the one `Repo::gpg_import_keys` writes, which is
-/// what `remote gpg-import` leaves at the repository root, and `gpgv` reads
-/// that same file as the reference.
+/// Two keyrings hold the key here, and `gpgv` reads each of them as the
+/// reference: the one GnuPG writes, which carries the Trust packets and is what
+/// the `ostree` tool's own import leaves at the repository root, and the one
+/// `Repo::gpg_import_keys` writes, which carries none.
 #[test]
 fn a_subkey_signature_over_a_trust_packet_keyring_agrees_with_gpgv() {
     if !tools_available() {
@@ -888,39 +889,44 @@ fn a_subkey_signature_over_a_trust_packet_keyring_agrees_with_gpgv() {
     let home = Home::eddsa(base, "trust", "Trust <trust@ostrya.example>");
     let subkey = home.add_signing_subkey();
     let exported = home.keyring();
+    let legacy = gnupg_keyring(&home);
     let imported = imported_keyring(base, &exported);
 
-    // The fixture is the shape under test: the import wrote Trust packets and
-    // the export carries none.
+    // The fixture is the shape under test: GnuPG's keyring carries Trust
+    // packets, and the export and the import carry none.
     assert!(
-        lists_a_trust_packet(&home, &imported),
-        "the imported keyring carries no Trust packet",
+        lists_a_trust_packet(&home, &legacy),
+        "the GnuPG keyring carries no Trust packet",
     );
     assert!(
         !lists_a_trust_packet(&home, &exported),
         "the exported keyring carries a Trust packet",
     );
+    assert!(
+        !lists_a_trust_packet(&home, &imported),
+        "the imported keyring carries a Trust packet",
+    );
 
     let blob = home.sign(&subkey, PAYLOAD, &[]);
-    let records = assert_cell_agrees(
-        "an imported keyring over a subkey signature",
-        &home,
-        &imported,
-        &blob,
-        PAYLOAD,
-    );
-    assert!(records[0].valid, "not valid");
-    assert!(!records[0].key_missing, "the subkey is missing");
-    assert_eq!(records[0].fingerprint.as_deref(), Some(subkey.as_str()));
-    assert_eq!(
-        records[0].primary_fingerprint.as_deref(),
-        Some(home.primary.as_str())
-    );
+    for (label, keyring) in [
+        ("a GnuPG keyring over a subkey signature", &legacy),
+        ("an imported keyring over a subkey signature", &imported),
+    ] {
+        let records = assert_cell_agrees(label, &home, keyring, &blob, PAYLOAD);
+        assert!(records[0].valid, "{label}: not valid");
+        assert!(!records[0].key_missing, "{label}: the subkey is missing");
+        assert_eq!(records[0].fingerprint.as_deref(), Some(subkey.as_str()));
+        assert_eq!(
+            records[0].primary_fingerprint.as_deref(),
+            Some(home.primary.as_str())
+        );
+    }
 }
 
 /// A primary-key signature over a legacy GnuPG keyring reports the
 /// certificate's user id. The user id packet stands after the primary key's
 /// Trust packet, so a keyring of this shape reaches it over the same tag runs.
+/// The keyring the port's own import writes reports the same user id.
 #[test]
 fn a_trust_packet_keyring_reports_the_user_id() {
     if !tools_available() {
@@ -929,26 +935,59 @@ fn a_trust_packet_keyring_reports_the_user_id() {
     let tmp = TmpDir::new("verify-gpg-trust-uid");
     let base = tmp.path();
     let home = Home::eddsa(base, "trust", "Trust <trust@ostrya.example>");
+    let legacy = gnupg_keyring(&home);
     let imported = imported_keyring(base, &home.keyring());
     assert!(
-        lists_a_trust_packet(&home, &imported),
-        "the imported keyring carries no Trust packet",
+        lists_a_trust_packet(&home, &legacy),
+        "the GnuPG keyring carries no Trust packet",
     );
 
     let blob = home.sign(&home.primary, PAYLOAD, &[]);
-    let records = assert_cell_agrees(
-        "an imported keyring over a primary-key signature",
-        &home,
-        &imported,
-        &blob,
-        PAYLOAD,
-    );
-    assert!(records[0].valid, "not valid");
-    assert_eq!(records[0].user_name.as_deref(), Some("Trust"));
-    assert_eq!(
-        records[0].user_email.as_deref(),
-        Some("trust@ostrya.example")
-    );
+    for (label, keyring) in [
+        ("a GnuPG keyring over a primary-key signature", &legacy),
+        (
+            "an imported keyring over a primary-key signature",
+            &imported,
+        ),
+    ] {
+        let records = assert_cell_agrees(label, &home, keyring, &blob, PAYLOAD);
+        assert!(records[0].valid, "{label}: not valid");
+        assert_eq!(records[0].user_name.as_deref(), Some("Trust"));
+        assert_eq!(
+            records[0].user_email.as_deref(),
+            Some("trust@ostrya.example")
+        );
+    }
+}
+
+/// The keyring GnuPG writes for `home`'s own keys, which carries a Trust packet
+/// after the primary key packet, after each user id packet, and after each
+/// signature packet.
+///
+/// `gpg` writes a keybox when it creates a keyring file itself and a legacy
+/// keyring when the file is already there, so the import runs over an empty
+/// keyring file in a home of its own.
+fn gnupg_keyring(home: &Home) -> Vec<u8> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let source = home.write("gnupg-source.gpg", &home.keyring());
+    let dir = home.dir.join("gnupg-ring");
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+    let ring = dir.join("ring.gpg");
+    std::fs::write(&ring, b"").unwrap();
+    let status = Command::new("gpg")
+        .arg("--homedir")
+        .arg(&dir)
+        .arg("--batch")
+        .arg("--no-default-keyring")
+        .arg("--keyring")
+        .arg(&ring)
+        .arg("--import")
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success(), "gpg --import into a keyring failed");
+    std::fs::read(&ring).unwrap()
 }
 
 /// The keyring `Repo::gpg_import_keys` writes for `keys`, read back out of the

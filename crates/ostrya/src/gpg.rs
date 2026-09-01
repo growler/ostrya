@@ -81,6 +81,8 @@ use crate::sign::{
     SignatureInfo, Verifier, VerifyFuture, VerifyOutcome, read_key_path, read_key_source,
 };
 
+mod verify;
+
 /// The GPG engine's short name.
 #[cfg(feature = "sign-gpg")]
 const GPG_SIGN_TYPE: &str = "gpg";

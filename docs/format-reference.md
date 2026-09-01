@@ -1822,15 +1822,17 @@ any difference here.
 GPG (signature key `ostree.gpgsigs`). Each `ay` element is one detached
 OpenPGP signature: the binary signature packet stream, unarmored. A blob may
 hold more than one signature packet, and each packet is verified
-independently. The port signs and verifies through the system GnuPG
-installation (`gpg --detach-sign` and `gpgv`, driven over the machine-readable
-`--status-fd` interface), so the stored blobs are the OpenPGP interchange form
-GnuPG itself produces and consumes. A signature is reported valid only when
-GnuPG reports a good signature; a signature by an expired, revoked, or unknown
-key is invalid, with the state surfaced per signature: the signing-key and
-primary-key fingerprints, the creation and expiry timestamps, the key's expiry
-time when it has passed, the expired/revoked/missing flags, the public-key and
-digest algorithm names, and the signer's user id split into name and email.
+independently. The port signs through the system GnuPG installation
+(`gpg --detach-sign`, driven over the machine-readable `--status-fd`
+interface) and verifies in the process over the `pgp` crate (rPGP), so the
+stored blobs are the OpenPGP interchange form GnuPG itself produces and
+consumes. A signature is reported valid only where it verifies against a
+trusted key whose bindings hold; a signature by an expired, revoked, or
+unknown key is invalid, with the state surfaced per signature: the
+signing-key and primary-key fingerprints, the creation and expiry timestamps,
+the key's expiry time when it has passed, the expired/revoked/missing flags,
+the public-key and digest algorithm names, and the signer's user id split into
+name and email.
 Trust is membership in the supplied keyrings; GnuPG's ownertrust model does
 not participate.
 

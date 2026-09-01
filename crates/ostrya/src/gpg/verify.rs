@@ -61,11 +61,9 @@ const MAX_SIGNATURE_PACKETS: usize = 64;
 /// valid signature among several makes the outcome valid.
 ///
 /// The work is public-key cryptography over untrusted input and belongs on the
-/// blocking pool.
-// The `Verifier` implementation for `GpgVerifier` runs `gpgv`, so this entry
-// point has its callers in the tests below alone. The allow covers the
-// functions it reaches as well, so it is the one the module needs.
-#[allow(dead_code)]
+/// blocking pool, which is where
+/// [`Verifier::verify`](crate::sign::Verifier::verify) for
+/// [`GpgVerifier`](super::GpgVerifier) calls it.
 pub(super) fn verify_signatures(
     certs: &[SignedPublicKey],
     payload: &[u8],
@@ -584,8 +582,26 @@ fn reported_user_id(cert: &SignedPublicKey) -> (Option<String>, Option<String>) 
         .find(|user| user.is_primary())
         .or_else(|| usable.iter().copied().max_by_key(newest_certification));
     match user {
-        Some(user) => super::split_uid(&String::from_utf8_lossy(user.id.id())),
+        Some(user) => split_uid(&String::from_utf8_lossy(user.id.id())),
         None => (None, None),
+    }
+}
+
+/// Split an OpenPGP user id into name and email: the trailing `<address>` is
+/// the email and what precedes it is the name. A user id without an address is
+/// all name.
+fn split_uid(uid: &str) -> (Option<String>, Option<String>) {
+    let non_empty = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| s.to_owned())
+    };
+    if let Some(start) = uid.rfind('<')
+        && let Some(end) = uid.rfind('>')
+        && end > start
+    {
+        (non_empty(&uid[..start]), non_empty(&uid[start + 1..end]))
+    } else {
+        (non_empty(uid), None)
     }
 }
 
@@ -611,7 +627,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::gpg::{GpgVerifier, parse_status, scratch_dir};
+    use crate::gpg::{GpgVerifier, STATUS_PREFIX, parse_epoch, scratch_dir};
 
     /// The payload every fixture signs.
     const PAYLOAD: &[u8] = b"ostrya commit payload";
@@ -2442,5 +2458,247 @@ mod tests {
             return;
         }
         panic!("the clock turned over on every attempt");
+    }
+
+    /// Parse the machine-readable status stream of one `gpgv` run into
+    /// per-signature records. Each `NEWSIG` starts a record; the verdict
+    /// keywords and the `VALIDSIG` and `ERRSIG` detail lines fill it.
+    ///
+    /// This is the reference reader the cases above compare the engine
+    /// against, so it states what `gpgv` reports in the same shape the engine
+    /// answers in.
+    fn parse_status(stdout: &[u8]) -> Vec<SignatureInfo> {
+        let text = String::from_utf8_lossy(stdout);
+        let mut infos: Vec<SignatureInfo> = Vec::new();
+        let mut current: Option<SignatureInfo> = None;
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix(STATUS_PREFIX) else {
+                continue;
+            };
+            let mut fields = rest.split(' ');
+            let keyword = fields.next().unwrap_or("");
+            match keyword {
+                "NEWSIG" => {
+                    if let Some(info) = current.take() {
+                        infos.push(info);
+                    }
+                    current = Some(SignatureInfo::default());
+                }
+                "GOODSIG" | "EXPKEYSIG" | "REVKEYSIG" | "BADSIG" => {
+                    let info = current.get_or_insert_with(SignatureInfo::default);
+                    let _keyid = fields.next();
+                    let uid = fields.collect::<Vec<_>>().join(" ");
+                    let (name, email) = split_uid(&uid);
+                    info.user_name = name;
+                    info.user_email = email;
+                    match keyword {
+                        "GOODSIG" => info.valid = true,
+                        "EXPKEYSIG" => info.expired = true,
+                        "REVKEYSIG" => info.revoked = true,
+                        _ => {}
+                    }
+                }
+                // VALIDSIG <fpr> <date> <sig-epoch> <sig-expire-epoch> <version>
+                //          <reserved> <pk-algo> <hash-algo> <class> [<primary-fpr>]
+                "VALIDSIG" => {
+                    let info = current.get_or_insert_with(SignatureInfo::default);
+                    let fpr = fields.next().map(str::to_owned);
+                    let _date = fields.next();
+                    info.created = fields.next().and_then(parse_epoch);
+                    info.expires = fields.next().and_then(parse_epoch);
+                    let _version = fields.next();
+                    let _reserved = fields.next();
+                    info.pubkey_algorithm = fields.next().map(pubkey_algo_name);
+                    info.hash_algorithm = fields.next().map(hash_algo_name);
+                    let _class = fields.next();
+                    info.primary_fingerprint =
+                        fields.next().map(str::to_owned).or_else(|| fpr.clone());
+                    info.fingerprint = fpr;
+                }
+                // ERRSIG <keyid> <pk-algo> <hash-algo> <class> <epoch> <rc> <fpr>
+                "ERRSIG" => {
+                    let info = current.get_or_insert_with(SignatureInfo::default);
+                    let _keyid = fields.next();
+                    info.pubkey_algorithm = fields.next().map(pubkey_algo_name);
+                    info.hash_algorithm = fields.next().map(hash_algo_name);
+                    let _class = fields.next();
+                    info.created = fields.next().and_then(parse_epoch);
+                    let _rc = fields.next();
+                    info.fingerprint = fields.next().filter(|f| *f != "-").map(str::to_owned);
+                }
+                "NO_PUBKEY" => {
+                    current
+                        .get_or_insert_with(SignatureInfo::default)
+                        .key_missing = true;
+                }
+                "KEYEXPIRED" => {
+                    let info = current.get_or_insert_with(SignatureInfo::default);
+                    info.key_expires = fields.next().and_then(parse_epoch);
+                }
+                _ => {}
+            }
+        }
+        if let Some(info) = current.take() {
+            infos.push(info);
+        }
+        infos
+    }
+
+    /// The OpenPGP public-key algorithm name for a status-line algorithm id.
+    fn pubkey_algo_name(id: &str) -> String {
+        match id {
+            "1" | "2" | "3" => "RSA".to_owned(),
+            "17" => "DSA".to_owned(),
+            "18" => "ECDH".to_owned(),
+            "19" => "ECDSA".to_owned(),
+            "22" => "EdDSA".to_owned(),
+            "27" => "Ed25519".to_owned(),
+            "28" => "Ed448".to_owned(),
+            other => other.to_owned(),
+        }
+    }
+
+    /// The OpenPGP hash algorithm name for a status-line algorithm id.
+    fn hash_algo_name(id: &str) -> String {
+        match id {
+            "1" => "MD5".to_owned(),
+            "2" => "SHA1".to_owned(),
+            "3" => "RIPEMD160".to_owned(),
+            "8" => "SHA256".to_owned(),
+            "9" => "SHA384".to_owned(),
+            "10" => "SHA512".to_owned(),
+            "11" => "SHA224".to_owned(),
+            other => other.to_owned(),
+        }
+    }
+
+    #[test]
+    fn reference_reads_a_good_signature_group() {
+        let status = b"[GNUPG:] NEWSIG\n\
+[GNUPG:] KEY_CONSIDERED A8F57B71FCDE8767005FED7BD1960140B3A73EF1 0\n\
+[GNUPG:] SIG_ID JFFMsT+jReslGyUGdsIHB0VWYmc 2026-07-23 1784843948\n\
+[GNUPG:] GOODSIG D1960140B3A73EF1 Ostrya Obs <obs@ostrya.example>\n\
+[GNUPG:] VALIDSIG A8F57B71FCDE8767005FED7BD1960140B3A73EF1 2026-07-23 1784843948 0 4 0 22 10 00 A8F57B71FCDE8767005FED7BD1960140B3A73EF1\n\
+[GNUPG:] TRUST_ULTIMATE 0 pgp\n";
+        let infos = parse_status(status);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
+        assert!(info.valid);
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some("A8F57B71FCDE8767005FED7BD1960140B3A73EF1")
+        );
+        assert_eq!(
+            info.primary_fingerprint.as_deref(),
+            Some("A8F57B71FCDE8767005FED7BD1960140B3A73EF1")
+        );
+        assert_eq!(info.created, Some(1_784_843_948));
+        assert_eq!(info.expires, None);
+        assert_eq!(info.pubkey_algorithm.as_deref(), Some("EdDSA"));
+        assert_eq!(info.hash_algorithm.as_deref(), Some("SHA512"));
+        assert_eq!(info.user_name.as_deref(), Some("Ostrya Obs"));
+        assert_eq!(info.user_email.as_deref(), Some("obs@ostrya.example"));
+        assert!(!info.expired && !info.revoked && !info.key_missing);
+    }
+
+    #[test]
+    fn reference_reads_a_missing_key_group() {
+        let status = b"[GNUPG:] NEWSIG\n\
+[GNUPG:] ERRSIG D1960140B3A73EF1 22 10 00 1784843948 9 A8F57B71FCDE8767005FED7BD1960140B3A73EF1\n\
+[GNUPG:] NO_PUBKEY D1960140B3A73EF1\n";
+        let infos = parse_status(status);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
+        assert!(!info.valid);
+        assert!(info.key_missing);
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some("A8F57B71FCDE8767005FED7BD1960140B3A73EF1")
+        );
+        assert_eq!(info.created, Some(1_784_843_948));
+        assert_eq!(info.pubkey_algorithm.as_deref(), Some("EdDSA"));
+        assert_eq!(info.hash_algorithm.as_deref(), Some("SHA512"));
+    }
+
+    #[test]
+    fn reference_reads_a_bad_signature_group() {
+        let status = b"[GNUPG:] NEWSIG\n\
+[GNUPG:] KEY_CONSIDERED A8F57B71FCDE8767005FED7BD1960140B3A73EF1 0\n\
+[GNUPG:] BADSIG D1960140B3A73EF1 Ostrya Obs <obs@ostrya.example>\n";
+        let infos = parse_status(status);
+        assert_eq!(infos.len(), 1);
+        assert!(!infos[0].valid);
+        assert!(!infos[0].key_missing);
+        assert_eq!(infos[0].user_email.as_deref(), Some("obs@ostrya.example"));
+    }
+
+    #[test]
+    fn reference_reads_an_expired_key_group() {
+        let status = b"[GNUPG:] NEWSIG\n\
+[GNUPG:] KEY_CONSIDERED 6AD5971478704B77113ADBB848D090AA43A2A526 0\n\
+[GNUPG:] KEYEXPIRED 1704153600\n\
+[GNUPG:] SIG_ID +XcyGaLbMGu3b/KdjZwUEMjugoA 2024-01-01 1704070800\n\
+[GNUPG:] EXPKEYSIG 48D090AA43A2A526 Expired <exp@ostrya.example>\n\
+[GNUPG:] VALIDSIG 6AD5971478704B77113ADBB848D090AA43A2A526 2024-01-01 1704070800 0 4 0 22 10 00 6AD5971478704B77113ADBB848D090AA43A2A526\n";
+        let infos = parse_status(status);
+        assert_eq!(infos.len(), 1);
+        let info = &infos[0];
+        assert!(!info.valid);
+        assert!(info.expired);
+        assert_eq!(info.key_expires, Some(1_704_153_600));
+        assert_eq!(info.created, Some(1_704_070_800));
+    }
+
+    #[test]
+    fn reference_reads_a_revoked_key_group() {
+        let status = b"[GNUPG:] NEWSIG\n\
+[GNUPG:] KEY_CONSIDERED 159446FE5B9606A44046DCE5A3106528346CA760 0\n\
+[GNUPG:] SIG_ID 9+MSlwFSpYu41OSggWc6zYgnd5Y 2026-07-23 1784844103\n\
+[GNUPG:] REVKEYSIG A3106528346CA760 Obs Two <obs2@ostrya.example>\n\
+[GNUPG:] VALIDSIG 159446FE5B9606A44046DCE5A3106528346CA760 2026-07-23 1784844103 0 4 0 22 10 00 159446FE5B9606A44046DCE5A3106528346CA760\n";
+        let infos = parse_status(status);
+        assert_eq!(infos.len(), 1);
+        assert!(!infos[0].valid);
+        assert!(infos[0].revoked);
+    }
+
+    #[test]
+    fn reference_reads_two_signature_groups() {
+        let status = b"[GNUPG:] NEWSIG\n\
+[GNUPG:] GOODSIG A3106528346CA760 Obs Two <obs2@ostrya.example>\n\
+[GNUPG:] VALIDSIG 159446FE5B9606A44046DCE5A3106528346CA760 2026-07-23 1784844103 0 4 0 22 10 00 159446FE5B9606A44046DCE5A3106528346CA760\n\
+[GNUPG:] NEWSIG\n\
+[GNUPG:] ERRSIG A6E1C7D5D3E3ECB2 22 10 00 1784844139 9 778742FE807AADB2F6419736A6E1C7D5D3E3ECB2\n\
+[GNUPG:] NO_PUBKEY A6E1C7D5D3E3ECB2\n";
+        let infos = parse_status(status);
+        assert_eq!(infos.len(), 2);
+        assert!(infos[0].valid);
+        assert!(!infos[1].valid);
+        assert!(infos[1].key_missing);
+    }
+
+    #[test]
+    fn reference_reads_an_empty_status_as_no_records() {
+        assert!(parse_status(b"").is_empty());
+        assert!(parse_status(b"gpgv: verification error\n").is_empty());
+    }
+
+    #[test]
+    fn splits_uids() {
+        assert_eq!(
+            split_uid("Ostrya Obs <obs@ostrya.example>"),
+            (
+                Some("Ostrya Obs".to_owned()),
+                Some("obs@ostrya.example".to_owned())
+            )
+        );
+        assert_eq!(
+            split_uid("no-address"),
+            (Some("no-address".to_owned()), None)
+        );
+        assert_eq!(
+            split_uid("<only@address>"),
+            (None, Some("only@address".to_owned()))
+        );
     }
 }

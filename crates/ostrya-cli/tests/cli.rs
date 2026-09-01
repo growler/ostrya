@@ -33,16 +33,13 @@ const ED25519_SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
 const ED25519_PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
-/// Whether the gpg and gpgv binaries are available.
+/// Whether the gpg binary is available.
 #[cfg(feature = "gpg")]
 fn gpg_available() -> bool {
-    let has = |program: &str| {
-        Command::new(program)
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| out.status.success())
-    };
-    has("gpg") && has("gpgv")
+    Command::new("gpg")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// A private GnuPG home directory holding one freshly generated,
@@ -2576,7 +2573,7 @@ fn sign_verify_spki_selects_the_engine() {
 #[test]
 fn sign_verify_delete_gpg() {
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("sign-gpg");
@@ -2682,7 +2679,7 @@ fn sign_verify_delete_gpg() {
 #[test]
 fn sign_verify_gpg_default_trust() {
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("sign-gpg-default");
@@ -7807,7 +7804,7 @@ fn log_forms_match_the_tool() {
 #[test]
 fn log_verifies_signatures_against_the_repo_not_the_cwd() {
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("log-gpg-repo-path");
@@ -15678,7 +15675,7 @@ fn commit_gpg_sign_matches_the_tool() {
         return;
     }
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("commit-gpg-sign");

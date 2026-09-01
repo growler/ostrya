@@ -1,12 +1,12 @@
 //! GPG (OpenPGP) commit-signing engine (Phase 13d).
 //!
-//! Behind the `verify-gpg` feature: keyrings are parsed in the process with
-//! the `pgp` crate (rPGP), and verification runs `gpgv` over the system GnuPG
-//! installation. The `sign-gpg` feature adds signing through
-//! `gpg --detach-sign` and turns on `verify-gpg` with it. Each GnuPG run is a
-//! short-lived subprocess through [`ostrya_rt::Command`], with results read
-//! from the machine-readable `--status-fd` line protocol. The private key
-//! stays with GnuPG and its agent and never passes through the library.
+//! Behind the `verify-gpg` feature: keyrings are parsed and signatures are
+//! verified in the process with the `pgp` crate (rPGP). The `sign-gpg` feature
+//! adds signing through `gpg --detach-sign` and turns on `verify-gpg` with it.
+//! Each `gpg` run is a short-lived subprocess through [`ostrya_rt::Command`],
+//! with results read from the machine-readable `--status-fd` line protocol.
+//! The private key stays with GnuPG and its agent and never passes through the
+//! library.
 //!
 //! Format (`format-reference.md`, "Signing details -- GPG"):
 //!
@@ -21,13 +21,12 @@
 //! the private-key operation itself, consulting its `gpg-agent` -- and any
 //! hardware token behind it -- as needed.
 //!
-//! [`GpgVerifier`] holds the certificates its keyrings parse to, together with
-//! the binary keyring blobs `gpgv` reads. Keyrings are loaded through
-//! [`from_keyring_bytes`](GpgVerifier::from_keyring_bytes) and
+//! [`GpgVerifier`] holds the certificates its keyrings parse to. Keyrings are
+//! loaded through [`from_keyring_bytes`](GpgVerifier::from_keyring_bytes) and
 //! [`from_keyring_files`](GpgVerifier::from_keyring_files) (armored input is
-//! decoded to the binary form on load, since `gpgv` reads only binary
-//! keyrings). [`from_system_trust`](GpgVerifier::from_system_trust) loads the
-//! global trusted set -- every `*.gpg` keyring in the directory named by the
+//! decoded to the binary packet stream the parser reads).
+//! [`from_system_trust`](GpgVerifier::from_system_trust) loads the global
+//! trusted set -- every `*.gpg` keyring in the directory named by the
 //! `OSTREE_GPG_HOME` environment variable, or `<datadir>/ostree/trusted.gpg.d/`
 //! when it is unset. [`for_remote`](GpgVerifier::for_remote) adds the
 //! per-remote keyring (`<remote>.trustedkeys.gpg` in the repo or under
@@ -48,22 +47,24 @@
 //! keyring the parser rejects fails the load, so the trusted set a
 //! verification works over is one that was read whole.
 //!
-//! Verification writes the merged keyring to a private scratch directory and
-//! runs `gpgv` once per stored blob; `gpgv` performs public-key operations only
-//! and starts no agent.
+//! Verification reads the stored blobs and the loaded certificates and answers
+//! in the process, on the blocking pool. The `verify` module holds the engine,
+//! the trust and validity policy it applies, and the input caps a stored blob
+//! is held to. No process is spawned and no scratch directory is written.
 //!
-//! A remote's own trusted keyring is managed through the same subprocess
-//! plumbing: [`Repo::gpg_import_keys`] adds certificates to
-//! `<remote>.trustedkeys.gpg` and reports how many the keyring did not already
-//! hold, and [`Repo::gpg_list_keys`] reads back the keys it holds as
+//! A remote's own trusted keyring is managed through subprocess plumbing:
+//! [`Repo::gpg_import_keys`] adds certificates to `<remote>.trustedkeys.gpg`
+//! and reports how many the keyring did not already hold, and
+//! [`Repo::gpg_list_keys`] reads back the keys it holds as
 //! [`GpgKey`] records. Both run `gpg` in a private scratch directory, so the
 //! invoking user's GnuPG home takes no part.
 //!
-//! A signature is valid only when `gpgv` reports `GOODSIG`. An expired key
-//! (`EXPKEYSIG`), a revoked key (`REVKEYSIG`), a bad signature (`BADSIG`),
-//! and an absent key (`ERRSIG`/`NO_PUBKEY`) are reported per signature in
-//! [`SignatureInfo`]. Trust is membership in the verifier's keyrings; GnuPG's
-//! ownertrust model plays no part.
+//! A signature is valid only where it verifies against a trusted key whose
+//! bindings hold and which is neither expired nor revoked. An expired key, a
+//! revoked key, a bad signature, and an absent key are each reported per
+//! signature in [`SignatureInfo`](crate::sign::SignatureInfo). Trust is
+//! membership in the verifier's keyrings; GnuPG's ownertrust model plays no
+//! part.
 
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
@@ -77,9 +78,7 @@ use crate::error::{Error, Result};
 use crate::repo::Repo;
 #[cfg(feature = "sign-gpg")]
 use crate::sign::{SignFuture, Signer};
-use crate::sign::{
-    SignatureInfo, Verifier, VerifyFuture, VerifyOutcome, read_key_path, read_key_source,
-};
+use crate::sign::{Verifier, VerifyFuture, VerifyOutcome, read_key_path, read_key_source};
 
 mod verify;
 
@@ -254,10 +253,9 @@ impl Signer for GpgSigner {
 }
 
 /// The GPG commit-verifying engine, holding the trusted certificates its
-/// keyrings parse to and the binary keyring blobs `gpgv` reads.
+/// keyrings parse to.
 #[derive(Debug, Clone, Default)]
 pub struct GpgVerifier {
-    keyrings: Vec<Vec<u8>>,
     /// The certificates the loaded keyrings hold, in load order. The parse
     /// happens as a keyring is loaded, so a keyring the parser rejects fails
     /// the load rather than a verification made over it.
@@ -399,7 +397,6 @@ impl GpgVerifier {
             )));
         }
         self.certs.extend(parse_keyring(&binary, subject)?);
-        self.keyrings.push(binary);
         Ok(())
     }
 }
@@ -448,35 +445,15 @@ impl Verifier for GpgVerifier {
 
     fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
         Box::pin(async move {
-            let mut outcome = VerifyOutcome::default();
             if signatures.is_empty() {
-                return Ok(outcome);
+                return Ok(VerifyOutcome::default());
             }
-
-            // Materialize the merged keyring and the signature blobs in a
-            // private scratch directory on the blocking pool.
-            let ring: Vec<u8> = self.keyrings.concat();
-            let blobs: Vec<Vec<u8>> = signatures.to_vec();
-            let count = blobs.len();
-            let dir = scratch_dir();
-            let setup_dir = dir.clone();
-            ostrya_rt::unblock(move || -> std::io::Result<()> {
-                use std::os::unix::fs::DirBuilderExt;
-                std::fs::DirBuilder::new().mode(0o700).create(&setup_dir)?;
-                std::fs::write(setup_dir.join("ring.gpg"), &ring)?;
-                for (i, blob) in blobs.iter().enumerate() {
-                    std::fs::write(setup_dir.join(format!("sig{i}")), blob)?;
-                }
-                Ok(())
-            })
-            .await?;
-
-            let result = run_gpgv(&dir, count, data, &mut outcome).await;
-
-            let cleanup_dir = dir.clone();
-            let _ = ostrya_rt::unblock(move || std::fs::remove_dir_all(cleanup_dir)).await;
-
-            result.map(|()| outcome)
+            // Public-key cryptography over untrusted input, so it runs on the
+            // blocking pool over owned copies of its inputs.
+            let certs = self.certs.clone();
+            let payload = data.to_vec();
+            let blobs = signatures.to_vec();
+            ostrya_rt::unblock(move || verify::verify_signatures(&certs, &payload, &blobs)).await
         })
     }
 }
@@ -739,176 +716,12 @@ fn unescape_colon_field(field: &str) -> String {
     out
 }
 
-/// Verify each staged signature blob with one `gpgv` run, accumulating the
-/// per-signature outcomes.
-async fn run_gpgv(
-    dir: &Path,
-    count: usize,
-    payload: &[u8],
-    outcome: &mut VerifyOutcome,
-) -> Result<()> {
-    for i in 0..count {
-        let mut cmd = ostrya_rt::Command::new("gpgv");
-        cmd.arg("--homedir")
-            .arg(dir)
-            .arg("--status-fd")
-            .arg("1")
-            .arg("--keyring")
-            .arg(dir.join("ring.gpg"))
-            .arg(dir.join(format!("sig{i}")))
-            .arg("-");
-        let output = cmd
-            .output(payload)
-            .await
-            .map_err(|e| spawn_err("gpgv", &e))?;
-        // A nonzero exit reports a signature that did not verify; the status
-        // lines carry the verdict. Only an empty status stream -- an
-        // unparsable blob with no signature packet -- has no record, and is
-        // reported so the count matches the stored blobs.
-        let infos = parse_status(&output.stdout);
-        if infos.is_empty() {
-            outcome.signatures.push(SignatureInfo::default());
-        } else {
-            for info in infos {
-                outcome.valid |= info.valid;
-                outcome.signatures.push(info);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Parse the machine-readable status stream of one `gpgv` (or `gpg --verify`)
-/// run into per-signature records. Each `NEWSIG` starts a record; the verdict
-/// keywords and `VALIDSIG` detail lines fill it.
-fn parse_status(stdout: &[u8]) -> Vec<SignatureInfo> {
-    let text = String::from_utf8_lossy(stdout);
-    let mut infos: Vec<SignatureInfo> = Vec::new();
-    let mut current: Option<SignatureInfo> = None;
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix(STATUS_PREFIX) else {
-            continue;
-        };
-        let mut fields = rest.split(' ');
-        let keyword = fields.next().unwrap_or("");
-        match keyword {
-            "NEWSIG" => {
-                if let Some(info) = current.take() {
-                    infos.push(info);
-                }
-                current = Some(SignatureInfo::default());
-            }
-            "GOODSIG" | "EXPKEYSIG" | "REVKEYSIG" | "BADSIG" => {
-                let info = current.get_or_insert_with(SignatureInfo::default);
-                let _keyid = fields.next();
-                let uid = fields.collect::<Vec<_>>().join(" ");
-                let (name, email) = split_uid(&uid);
-                info.user_name = name;
-                info.user_email = email;
-                match keyword {
-                    "GOODSIG" => info.valid = true,
-                    "EXPKEYSIG" => info.expired = true,
-                    "REVKEYSIG" => info.revoked = true,
-                    _ => {}
-                }
-            }
-            // VALIDSIG <fpr> <date> <sig-epoch> <sig-expire-epoch> <version>
-            //          <reserved> <pk-algo> <hash-algo> <class> [<primary-fpr>]
-            "VALIDSIG" => {
-                let info = current.get_or_insert_with(SignatureInfo::default);
-                let fpr = fields.next().map(str::to_owned);
-                let _date = fields.next();
-                info.created = fields.next().and_then(parse_epoch);
-                info.expires = fields.next().and_then(parse_epoch);
-                let _version = fields.next();
-                let _reserved = fields.next();
-                info.pubkey_algorithm = fields.next().map(pubkey_algo_name);
-                info.hash_algorithm = fields.next().map(hash_algo_name);
-                let _class = fields.next();
-                info.primary_fingerprint = fields.next().map(str::to_owned).or_else(|| fpr.clone());
-                info.fingerprint = fpr;
-            }
-            // ERRSIG <keyid> <pk-algo> <hash-algo> <class> <epoch> <rc> <fpr>
-            "ERRSIG" => {
-                let info = current.get_or_insert_with(SignatureInfo::default);
-                let _keyid = fields.next();
-                info.pubkey_algorithm = fields.next().map(pubkey_algo_name);
-                info.hash_algorithm = fields.next().map(hash_algo_name);
-                let _class = fields.next();
-                info.created = fields.next().and_then(parse_epoch);
-                let _rc = fields.next();
-                info.fingerprint = fields.next().filter(|f| *f != "-").map(str::to_owned);
-            }
-            "NO_PUBKEY" => {
-                current
-                    .get_or_insert_with(SignatureInfo::default)
-                    .key_missing = true;
-            }
-            "KEYEXPIRED" => {
-                let info = current.get_or_insert_with(SignatureInfo::default);
-                info.key_expires = fields.next().and_then(parse_epoch);
-            }
-            _ => {}
-        }
-    }
-    if let Some(info) = current.take() {
-        infos.push(info);
-    }
-    infos
-}
-
 /// Parse a status-line epoch field, treating `0` as absent.
 fn parse_epoch(field: &str) -> Option<u64> {
     match field.parse::<u64>() {
         Ok(0) => None,
         Ok(secs) => Some(secs),
         Err(_) => None,
-    }
-}
-
-/// Split a GnuPG user-id string into name and email: the trailing
-/// `<address>` is the email and what precedes it is the name. A uid without
-/// an address is all name.
-fn split_uid(uid: &str) -> (Option<String>, Option<String>) {
-    let non_empty = |s: &str| {
-        let s = s.trim();
-        (!s.is_empty()).then(|| s.to_owned())
-    };
-    if let Some(start) = uid.rfind('<')
-        && let Some(end) = uid.rfind('>')
-        && end > start
-    {
-        (non_empty(&uid[..start]), non_empty(&uid[start + 1..end]))
-    } else {
-        (non_empty(uid), None)
-    }
-}
-
-/// The OpenPGP public-key algorithm name for a status-line algorithm id.
-fn pubkey_algo_name(id: &str) -> String {
-    match id {
-        "1" | "2" | "3" => "RSA".to_owned(),
-        "17" => "DSA".to_owned(),
-        "18" => "ECDH".to_owned(),
-        "19" => "ECDSA".to_owned(),
-        "22" => "EdDSA".to_owned(),
-        "27" => "Ed25519".to_owned(),
-        "28" => "Ed448".to_owned(),
-        other => other.to_owned(),
-    }
-}
-
-/// The OpenPGP hash algorithm name for a status-line algorithm id.
-fn hash_algo_name(id: &str) -> String {
-    match id {
-        "1" => "MD5".to_owned(),
-        "2" => "SHA1".to_owned(),
-        "3" => "RIPEMD160".to_owned(),
-        "8" => "SHA256".to_owned(),
-        "9" => "SHA384".to_owned(),
-        "10" => "SHA512".to_owned(),
-        "11" => "SHA224".to_owned(),
-        other => other.to_owned(),
     }
 }
 
@@ -1010,8 +823,8 @@ pub(crate) fn read_keyring_fd(fd: OwnedFd, name: &str) -> Result<Vec<u8>> {
     read_key_source(fd, &format!("the keyring '{name}'"), MAX_KEYRING)
 }
 
-/// A process-unique scratch directory path for one `gpg` or `gpgv` run: the
-/// GnuPG home directory a verification, an import, or a listing works in.
+/// A process-unique scratch directory path for one `gpg` run: the GnuPG home
+/// directory an import or a listing works in.
 fn scratch_dir() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     std::env::temp_dir().join(format!(
@@ -1057,35 +870,6 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_a_good_signature_group() {
-        let status = b"[GNUPG:] NEWSIG\n\
-[GNUPG:] KEY_CONSIDERED A8F57B71FCDE8767005FED7BD1960140B3A73EF1 0\n\
-[GNUPG:] SIG_ID JFFMsT+jReslGyUGdsIHB0VWYmc 2026-07-23 1784843948\n\
-[GNUPG:] GOODSIG D1960140B3A73EF1 Ostrya Obs <obs@ostrya.example>\n\
-[GNUPG:] VALIDSIG A8F57B71FCDE8767005FED7BD1960140B3A73EF1 2026-07-23 1784843948 0 4 0 22 10 00 A8F57B71FCDE8767005FED7BD1960140B3A73EF1\n\
-[GNUPG:] TRUST_ULTIMATE 0 pgp\n";
-        let infos = parse_status(status);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert!(info.valid);
-        assert_eq!(
-            info.fingerprint.as_deref(),
-            Some("A8F57B71FCDE8767005FED7BD1960140B3A73EF1")
-        );
-        assert_eq!(
-            info.primary_fingerprint.as_deref(),
-            Some("A8F57B71FCDE8767005FED7BD1960140B3A73EF1")
-        );
-        assert_eq!(info.created, Some(1_784_843_948));
-        assert_eq!(info.expires, None);
-        assert_eq!(info.pubkey_algorithm.as_deref(), Some("EdDSA"));
-        assert_eq!(info.hash_algorithm.as_deref(), Some("SHA512"));
-        assert_eq!(info.user_name.as_deref(), Some("Ostrya Obs"));
-        assert_eq!(info.user_email.as_deref(), Some("obs@ostrya.example"));
-        assert!(!info.expired && !info.revoked && !info.key_missing);
-    }
 
     /// The two `IMPORT_RES` lines a first and a repeated import produce: field 3
     /// counts the keys the keyring did not already hold.
@@ -1148,107 +932,6 @@ fpr:::::::::1111111111111111111111119A5C1E4D2F3B7A81:\n";
         assert_eq!(unescape_colon_field("a\\x5cb"), "a\\b");
         // A `\x` that is not a byte escape stays as written.
         assert_eq!(unescape_colon_field("a\\xzz"), "a\\xzz");
-    }
-
-    #[test]
-    fn parses_a_missing_key_group() {
-        let status = b"[GNUPG:] NEWSIG\n\
-[GNUPG:] ERRSIG D1960140B3A73EF1 22 10 00 1784843948 9 A8F57B71FCDE8767005FED7BD1960140B3A73EF1\n\
-[GNUPG:] NO_PUBKEY D1960140B3A73EF1\n";
-        let infos = parse_status(status);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert!(!info.valid);
-        assert!(info.key_missing);
-        assert_eq!(
-            info.fingerprint.as_deref(),
-            Some("A8F57B71FCDE8767005FED7BD1960140B3A73EF1")
-        );
-        assert_eq!(info.created, Some(1_784_843_948));
-        assert_eq!(info.pubkey_algorithm.as_deref(), Some("EdDSA"));
-        assert_eq!(info.hash_algorithm.as_deref(), Some("SHA512"));
-    }
-
-    #[test]
-    fn parses_a_bad_signature_group() {
-        let status = b"[GNUPG:] NEWSIG\n\
-[GNUPG:] KEY_CONSIDERED A8F57B71FCDE8767005FED7BD1960140B3A73EF1 0\n\
-[GNUPG:] BADSIG D1960140B3A73EF1 Ostrya Obs <obs@ostrya.example>\n";
-        let infos = parse_status(status);
-        assert_eq!(infos.len(), 1);
-        assert!(!infos[0].valid);
-        assert!(!infos[0].key_missing);
-        assert_eq!(infos[0].user_email.as_deref(), Some("obs@ostrya.example"));
-    }
-
-    #[test]
-    fn parses_an_expired_key_group() {
-        let status = b"[GNUPG:] NEWSIG\n\
-[GNUPG:] KEY_CONSIDERED 6AD5971478704B77113ADBB848D090AA43A2A526 0\n\
-[GNUPG:] KEYEXPIRED 1704153600\n\
-[GNUPG:] SIG_ID +XcyGaLbMGu3b/KdjZwUEMjugoA 2024-01-01 1704070800\n\
-[GNUPG:] EXPKEYSIG 48D090AA43A2A526 Expired <exp@ostrya.example>\n\
-[GNUPG:] VALIDSIG 6AD5971478704B77113ADBB848D090AA43A2A526 2024-01-01 1704070800 0 4 0 22 10 00 6AD5971478704B77113ADBB848D090AA43A2A526\n";
-        let infos = parse_status(status);
-        assert_eq!(infos.len(), 1);
-        let info = &infos[0];
-        assert!(!info.valid);
-        assert!(info.expired);
-        assert_eq!(info.key_expires, Some(1_704_153_600));
-        assert_eq!(info.created, Some(1_704_070_800));
-    }
-
-    #[test]
-    fn parses_a_revoked_key_group() {
-        let status = b"[GNUPG:] NEWSIG\n\
-[GNUPG:] KEY_CONSIDERED 159446FE5B9606A44046DCE5A3106528346CA760 0\n\
-[GNUPG:] SIG_ID 9+MSlwFSpYu41OSggWc6zYgnd5Y 2026-07-23 1784844103\n\
-[GNUPG:] REVKEYSIG A3106528346CA760 Obs Two <obs2@ostrya.example>\n\
-[GNUPG:] VALIDSIG 159446FE5B9606A44046DCE5A3106528346CA760 2026-07-23 1784844103 0 4 0 22 10 00 159446FE5B9606A44046DCE5A3106528346CA760\n";
-        let infos = parse_status(status);
-        assert_eq!(infos.len(), 1);
-        assert!(!infos[0].valid);
-        assert!(infos[0].revoked);
-    }
-
-    #[test]
-    fn parses_two_signature_groups() {
-        let status = b"[GNUPG:] NEWSIG\n\
-[GNUPG:] GOODSIG A3106528346CA760 Obs Two <obs2@ostrya.example>\n\
-[GNUPG:] VALIDSIG 159446FE5B9606A44046DCE5A3106528346CA760 2026-07-23 1784844103 0 4 0 22 10 00 159446FE5B9606A44046DCE5A3106528346CA760\n\
-[GNUPG:] NEWSIG\n\
-[GNUPG:] ERRSIG A6E1C7D5D3E3ECB2 22 10 00 1784844139 9 778742FE807AADB2F6419736A6E1C7D5D3E3ECB2\n\
-[GNUPG:] NO_PUBKEY A6E1C7D5D3E3ECB2\n";
-        let infos = parse_status(status);
-        assert_eq!(infos.len(), 2);
-        assert!(infos[0].valid);
-        assert!(!infos[1].valid);
-        assert!(infos[1].key_missing);
-    }
-
-    #[test]
-    fn empty_status_yields_no_records() {
-        assert!(parse_status(b"").is_empty());
-        assert!(parse_status(b"gpgv: verification error\n").is_empty());
-    }
-
-    #[test]
-    fn splits_uids() {
-        assert_eq!(
-            split_uid("Ostrya Obs <obs@ostrya.example>"),
-            (
-                Some("Ostrya Obs".to_owned()),
-                Some("obs@ostrya.example".to_owned())
-            )
-        );
-        assert_eq!(
-            split_uid("no-address"),
-            (Some("no-address".to_owned()), None)
-        );
-        assert_eq!(
-            split_uid("<only@address>"),
-            (None, Some("only@address".to_owned()))
-        );
     }
 
     #[test]
@@ -1378,8 +1061,7 @@ IHdvcmxk\n\
         }
     }
 
-    /// A binary keyring holding one certificate loads, and the blob `gpgv`
-    /// reads is kept beside the certificate.
+    /// A binary keyring holding one certificate loads to that certificate.
     #[test]
     fn loads_a_binary_keyring() {
         if !gpg_available() {
@@ -1387,14 +1069,13 @@ IHdvcmxk\n\
             return;
         }
         let home = KeyFixture::new("Binary <binary@ostrya.example>");
-        let keyring = home.export(false);
-        let verifier = GpgVerifier::from_keyring_bytes([&keyring]).unwrap();
+        let verifier = GpgVerifier::from_keyring_bytes([home.export(false)]).unwrap();
         assert_eq!(verifier.certs.len(), 1);
-        assert_eq!(verifier.keyrings, [keyring]);
     }
 
     /// An armored keyring loads to the same certificate as the binary form,
-    /// and the blob kept beside it is the binary form.
+    /// and the armor decoder reaches the binary export byte for byte, so the
+    /// parser reads the same packet stream out of either form.
     #[test]
     fn loads_an_armored_keyring() {
         if !gpg_available() {
@@ -1402,10 +1083,12 @@ IHdvcmxk\n\
             return;
         }
         let home = KeyFixture::new("Armored <armored@ostrya.example>");
-        let binary = home.export(false);
-        let verifier = GpgVerifier::from_keyring_bytes([home.export(true)]).unwrap();
-        assert_eq!(verifier.certs.len(), 1);
-        assert_eq!(verifier.keyrings, [binary]);
+        let exported = home.export(false);
+        assert_eq!(dearmor(&home.export(true)).unwrap(), exported);
+        let binary = GpgVerifier::from_keyring_bytes([&exported]).unwrap();
+        let armored = GpgVerifier::from_keyring_bytes([home.export(true)]).unwrap();
+        assert_eq!(armored.certs.len(), 1);
+        assert_eq!(armored.certs, binary.certs);
     }
 
     /// A keyring holding two certificates loads both.
@@ -1427,7 +1110,6 @@ IHdvcmxk\n\
     fn loads_an_empty_keyring() {
         let verifier = GpgVerifier::from_keyring_bytes([b""]).unwrap();
         assert!(verifier.certs.is_empty());
-        assert_eq!(verifier.keyrings, [Vec::<u8>::new()]);
     }
 
     /// A truncated keyring is refused by the name of the blob that carried it.

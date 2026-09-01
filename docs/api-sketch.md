@@ -457,7 +457,7 @@ impl File {
 pub struct Timer;                       // Timer::after(Duration)
 pub struct Deadline;                    // a restartable inactivity window
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>;
-pub struct Command;                     // subprocess, for the gpg engines
+pub struct Command;                     // subprocess, for gpg signing and keys
 pub struct TcpListener;  pub struct TcpStream;
 ```
 
@@ -1074,7 +1074,7 @@ pub trait Verifier: Send + Sync {
 pub struct Ed25519Signer { /* 64-byte secret */ }
 pub struct Ed25519Verifier { /* trusted + revoked 32-byte keys */ }
 pub struct GpgSigner { /* key id/fingerprint + optional GNUPGHOME; signs via gpg */ }
-pub struct GpgVerifier { /* parsed certificates + binary keyrings; verifies via gpgv */ }
+pub struct GpgVerifier { /* parsed certificates; verifies in the process */ }
 pub struct SpkiSigner;   pub struct SpkiVerifier;    // optional
 pub struct DummySigner;  pub struct DummyVerifier;   // test-only
 
@@ -1144,6 +1144,13 @@ certificates as it loads it, so a keyring the parser rejects fails the
 construction. One keyring is held to four mebibytes and to 256 certificates,
 and a GnuPG keybox is refused by the name of the file or the blob that carries
 it; each refusal states the cap or the cause it names.
+
+`Verifier::verify` for `GpgVerifier` answers in the process on the blocking
+pool, over the `pgp` crate (rPGP). It spawns no process. One stored blob is
+held to one mebibyte and to 64 signature packets. The port owns the trust and
+validity policy: issuer resolution over primary keys and subkeys, the subkey
+binding and its embedded primary-key binding, key expiry, revocation, the
+signature class, and the digest policy.
 
 ## Fetcher
 

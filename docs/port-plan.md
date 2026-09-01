@@ -32,9 +32,10 @@ library is MIT-licensed.
    of the `ostree` tool; the upstream test suite is LGPL source and is never
    run or vendored.
 5. Extensions: GPG commit signing through the system GnuPG binaries (no
-   gpgme linkage), GPG keyring parsing over the `pgp` crate (rPGP), which is
-   permissively licensed and links no C library, composefs/EROFS export, tar
-   import/export, AWS S3 push/pull, ssh git-style push/pull.
+   gpgme linkage), GPG signature verification in the process over the `pgp`
+   crate (rPGP), which is permissively licensed and links no C library,
+   composefs/EROFS export, tar import/export, AWS S3 push/pull, ssh git-style
+   push/pull.
 
 The port is a library. It is not a drop-in replacement for the `ostree` tool.
 A minimal `ostrya` binary lands once the ingest and checkout paths are ready
@@ -84,9 +85,9 @@ crates below are all pure Rust:
   generation for static deltas. Its output is the interleaved
   control/diff/extra layout the port's own bspatch reads.
 - `pgp` 0.20.0 (rPGP, `MIT OR Apache-2.0`, `default-features = false`) --
-  OpenPGP keyring parsing behind the `verify-gpg` feature. GPG signing and the
-  verification verdict run the system `gpg`/`gpgv` binaries as subprocesses
-  (see Decisions).
+  OpenPGP keyring parsing and signature verification behind the `verify-gpg`
+  feature. GPG signing runs the system `gpg` binary as a subprocess (see
+  Decisions).
 - `rustls` plus `webpki-roots` / `rustls-native-certs` -- TLS for pull.
 - `smol-tar` -- async tar import/export in the smol ecosystem.
 - `clap` -- command-line argument parsing for the `ostrya` binary
@@ -1267,11 +1268,11 @@ elsewhere. The suite passes under both runtime backends.
 
 Four sub-phases, each an independently reviewable unit with its own gate: 13a
 is the signing framework and the dummy test engine, 13b the ed25519 engine and
-the sign-api key store, 13c the spki (ECDSA/SPKI) engine, 13d GPG over the
-system GnuPG binaries. Each sub-phase consumes only the public surface of the
-ones before it. All four engines sign and verify commit objects through the shared
-13a framework; summary signing (Phase 14) reuses the same engines on the
-summary bytes.
+the sign-api key store, 13c the spki (ECDSA/SPKI) engine, 13d GPG signing over
+the system GnuPG binaries and GPG verification in the process. Each sub-phase
+consumes only the public surface of the ones before it. All four engines sign
+and verify commit objects through the shared 13a framework; summary signing
+(Phase 14) reuses the same engines on the summary bytes.
 
 The ed25519 and dummy engines are always compiled; spki is behind the
 `sign-spki` feature, GPG verification behind `verify-gpg`, and GPG signing
@@ -1433,16 +1434,17 @@ convention resolves spki keys; `test-signed-commit-spki` targeted through the
 harness when the CLI lands; the suite passes under both runtime backends, with
 and without the `sign-spki` feature.
 
-### Phase 13d -- GPG signing and verification (system GnuPG) (DONE)
+### Phase 13d -- GPG signing and verification (DONE)
 
-GPG commit signing and verification over the system GnuPG installation: the
-engine runs the `gpg` and `gpgv` binaries as short-lived subprocesses, the way
-git drives them, and reads results from the machine-readable `--status-fd` line
-protocol. Verification sits behind the `verify-gpg` feature and signing behind
-`sign-gpg`, which turns on `verify-gpg` with it. The private key never passes
-through the library -- `gpg` performs the private-key operation itself,
-consulting its `gpg-agent` (and any hardware token behind it) as needed, so
-agent-held keys work with no dedicated code path.
+GPG commit signing over the system GnuPG installation, and GPG signature
+verification in the process over the `pgp` crate (rPGP). Signing runs the `gpg`
+binary as a short-lived subprocess, the way git drives it, and reads results
+from the machine-readable `--status-fd` line protocol. Verification sits behind
+the `verify-gpg` feature and signing behind `sign-gpg`, which turns on
+`verify-gpg` with it. The private key never passes through the library --
+`gpg` performs the private-key operation itself, consulting its `gpg-agent`
+(and any hardware token behind it) as needed, so agent-held keys work with no
+dedicated code path.
 
 Definition:
 
@@ -1451,10 +1453,9 @@ Definition:
   directory override. Signing runs `gpg --batch --detach-sign` with the
   commit bytes on stdin and appends the binary signature from stdout to
   `ostree.gpgsigs` through the 13a append path.
-- `GpgVerifier` holds the certificates its keyrings parse to and the binary
-  keyring blobs `gpgv` reads; armored input is decoded to the binary form on
-  load by a hand-rolled RFC 4880 radix-64 decoder, since `gpgv` reads only
-  binary keyrings. Keyring resolution: N keyrings from bytes or files, the
+- `GpgVerifier` holds the certificates its keyrings parse to; armored input is
+  decoded to the binary packet stream on load by a hand-rolled RFC 4880
+  radix-64 decoder. Keyring resolution: N keyrings from bytes or files, the
   per-remote `<remote>.trustedkeys.gpg` and `/etc/ostree/remotes.d/`
   resolution, and the global `<datadir>/ostree/trusted.gpg.d/` directory, per
   `format-reference.md`. Each keyring is parsed with the `pgp` crate as it is
@@ -1462,43 +1463,52 @@ Definition:
   four mebibytes and to 256 certificates, a GnuPG keybox (`KBXf`) is refused by
   the name of the file or the blob that carries it, and the parse runs inside
   `catch_unwind`, since a keyring is untrusted input.
-- Verification materializes the merged keyring in a private scratch
-  directory and runs `gpgv --keyring` once per stored blob with the payload
-  on stdin. `gpgv` performs public-key operations only and starts no agent.
-  A blob may hold several signature packets; each `NEWSIG` status group
-  yields one `SignatureInfo`.
-- Validity is `GOODSIG` alone. `EXPKEYSIG`, `REVKEYSIG`, `BADSIG`, and
-  `ERRSIG`/`NO_PUBKEY` map to the expired, revoked, and missing flags;
-  `VALIDSIG` supplies the fingerprints, timestamps, and algorithm ids;
-  `KEYEXPIRED` supplies the key expiry. The vocabulary was pinned by
-  black-box observation of GnuPG 2.4 (good, bad, unknown-key, expired-key,
-  revoked-key, and multi-packet cases); unit tests parse the captured
-  streams verbatim.
+- Verification reads each stored blob with rPGP on the blocking pool, resolves
+  each signature's issuer against the loaded certificates by issuer
+  fingerprint and then by issuer key id over primary keys and subkeys, and
+  performs the public-key operation in the process. It spawns no process and
+  writes no scratch directory. A blob may hold several signature packets; each
+  packet yields one `SignatureInfo`, and a blob the parser reads no signature
+  out of yields one record of its own, so the record count follows the stored
+  blob count. A blob is held to one mebibyte and to 64 signature packets, and
+  the parse and the public-key operations run inside `catch_unwind`, since a
+  stored blob is untrusted input.
+- The port owns the trust and validity policy. A signature is valid where it
+  verifies, where the certificate holding the signing key is loaded, where the
+  signature is over a document, where the subkey bindings hold, where the
+  digest is allowed, where the signature's own expiry has not passed, and
+  where the key is neither expired nor revoked. The expired, revoked, and
+  missing-key flags, the fingerprints, the times, and the algorithm names come
+  from the certificate and the signature packet. Each rule reproduces `gpgv`
+  2.4.9 as observed in an isolated `GNUPGHOME` on fixtures the unit tests
+  build.
 - `Verifier::verify` is async (a boxed `VerifyFuture` mirroring
-  `SignFuture`), so a verifying engine can await a subprocess; the
-  in-process engines resolve immediately.
+  `SignFuture`), so a verifying engine can await work on the blocking pool;
+  the in-process engines resolve immediately.
 - Subprocess plumbing is `rt::Command` in `ostrya-rt`: piped standard
   streams over `smol::process` (part of the `smol` facade) or
   `tokio::process` (the `process` feature on the existing tokio
   dependency). It needs no crate of its own.
 
-Dependency set: `pgp` (rPGP), behind `verify-gpg`, for keyring parsing. The
-engine adds a runtime tool dependency on `gpg` and `gpgv`; a missing binary
-surfaces as a signature error naming the program.
+Dependency set: `pgp` (rPGP), behind `verify-gpg`, for keyring parsing and
+signature verification. Signing and the keyring management of
+`Repo::gpg_import_keys` and `Repo::gpg_list_keys` add a runtime tool dependency
+on `gpg`; a missing binary surfaces as a signature error naming the program.
 
 Deliverables: `GpgSigner`, `GpgVerifier`, keyring loading (binary and
-armored), per-signature `SignatureInfo` from the status stream,
-`rt::Command`, the async `Verifier` trait, the `verify-gpg` and `sign-gpg`
-feature wiring.
+armored), the in-process verify engine and the validity policy it applies,
+per-signature `SignatureInfo`, `rt::Command`, the async `Verifier` trait, the
+`verify-gpg` and `sign-gpg` feature wiring.
 
-Verify: a commit the port signs round-trips through `gpgv` with the exported
-keyring and is rejected under an empty trusted set; armored and file
-keyrings load; a wrong payload reports `BADSIG`; GPG and dummy signatures
-coexist on one commit; the status parser reproduces the observed GnuPG 2.4
-streams; the suite passes under both runtime backends, with and without
-`sign-gpg`. Tool cross-verification (`ostree gpg-sign` in both directions)
-lands in `conformance/m10-cli-behavior.matrix` once the CLI-compatible
-surface lands (Phase 17).
+Verify: a commit the port signs round-trips through the verifier with the
+exported keyring and is rejected under an empty trusted set; armored and file
+keyrings load; a wrong payload reports an invalid signature; GPG and dummy
+signatures coexist on one commit; each policy rule is measured against the
+`gpgv` status stream for the same inputs; the suite passes under both runtime
+backends, with and without `sign-gpg`. Tool cross-verification
+(`ostree gpg-sign` in both directions) lands in
+`conformance/m10-cli-behavior.matrix` once the CLI-compatible surface lands
+(Phase 17).
 
 ### Phase 13f -- Native `ostrya sign` command (DONE)
 
@@ -1536,11 +1546,12 @@ the default trusted set the `ostree` tool uses -- every `*.gpg` keyring in the
 directory named by `OSTREE_GPG_HOME`, or `/usr/share/ostree/trusted.gpg.d/`
 when that variable is unset, plus, when `--remote <name>` is given, that
 remote's `<name>.trustedkeys.gpg` in the repo and under
-`/etc/ostree/remotes.d/`. Verify runs `gpgv`, which starts no agent, and exits
-nonzero when no signature is valid, including when the trusted set is empty. A
-delete matches by the signature's issuer or primary-key fingerprint; the issuer
-fingerprint is reported even for a key absent from the keyrings, and a keyring
-in the trusted set lets the match consider the primary-key fingerprint.
+`/etc/ostree/remotes.d/`. Verify answers in the process, starts no agent, and
+exits nonzero when no signature is valid, including when the trusted set is
+empty. A delete matches by the signature's issuer or primary-key fingerprint;
+the issuer fingerprint is reported even for a key absent from the keyrings, and
+a keyring in the trusted set lets the match consider the primary-key
+fingerprint.
 
 Delete is backed by `Repo::delete_signatures(checksum, metadata_key, predicate)`,
 which rewrites `.commitmeta`: an emptied engine array drops its dict entry, and
@@ -4533,10 +4544,12 @@ deliverable's full surface and Verify list:
   supported architectures to x86_64 and aarch64 -- a Linux target outside those
   two needs a provider swap, which is a `ClientConfig` change confined to
   `fetch/tls.rs`.
-- GPG semantics ride on the installed GnuPG: the engine drives `gpg`/`gpgv`
-  through the documented, stable `--status-fd` interface and pins no
-  version; a vocabulary change in a future GnuPG would surface in the
-  round-trip tests.
+- GPG signing rides on the installed GnuPG: the signer drives `gpg` through
+  the documented, stable `--status-fd` interface and pins no version; a
+  vocabulary change in a future GnuPG would surface in the round-trip tests.
+  Verification carries the trust and validity policy in the port, measured
+  against `gpgv` 2.4.9; a policy change in a future GnuPG parts the two, and
+  the differential tests state where.
 - Conformance scope: the CLI-behavior tier requires a compatible CLI (Phase
   17) and is authored from scratch, since the upstream shell suite is LGPL
   source and out of scope; the admin tier requires the sysroot track
@@ -4652,21 +4665,23 @@ Resolved:
     `sign-gpg`, so the core stays free of the ECDSA/SPKI crate tree and of the
     OpenPGP crate tree unless opted in (see decision 13).
 
-13. GPG engine (Phase 13d): signing and the verification verdict run the
-    system `gpg` and `gpgv` binaries as short-lived subprocesses over the
-    documented `--status-fd` interface, the way git drives them. Agent-held
-    and hardware-token keys work through `gpg` itself with no dedicated code
-    path, which is why the private-key operation stays there.
-    `Verifier::verify` is async so a verifying engine can await a subprocess.
-    Subprocesses go through `rt::Command` (`smol::process` /
-    `tokio::process`); the `gpg` and `gpgv` binaries are a runtime tool
-    dependency of the GPG features.
+13. GPG engine (Phase 13d): signing runs the system `gpg` binary as a
+    short-lived subprocess over the documented `--status-fd` interface, the
+    way git drives it. Agent-held and hardware-token keys work through `gpg`
+    itself with no dedicated code path, which is why the private-key operation
+    stays there. `Verifier::verify` is async so a verifying engine can await
+    work on the blocking pool. Subprocesses go through `rt::Command`
+    (`smol::process` / `tokio::process`); the `gpg` binary is a runtime tool
+    dependency of signing and of the keyring management behind `verify-gpg`.
 
-    Keyring parsing is in the process, over the `pgp` crate (rPGP) behind the
-    `verify-gpg` feature. rPGP is `MIT OR Apache-2.0` and, with
-    `default-features = false`, its graph declares no `links` key and holds no
-    `-sys` package, so it links no C library. `sequoia-openpgp` was considered
-    and set aside for its LGPL licensing.
+    Keyring parsing and signature verification are in the process, over the
+    `pgp` crate (rPGP) behind the `verify-gpg` feature. rPGP is
+    `MIT OR Apache-2.0` and, with `default-features = false`, its graph
+    declares no `links` key and holds no `-sys` package, so it links no C
+    library. `sequoia-openpgp` was considered and set aside for its LGPL
+    licensing. rPGP answers the cryptographic question alone, so the port owns
+    the trust and validity policy: issuer resolution, subkey bindings, key
+    expiry, revocation, the signature class, and the digest policy.
 
 14. `#[non_exhaustive]` on the public enums and option structs (Phase 17f):
     the attribute marks a type whose member set the port itself owns and

@@ -93,13 +93,14 @@
 //! SubjectPublicKeyInfo public keys, reusing the sign-api key store as
 //! `trusted.spki` / `revoked.spki`. Under the `verify-gpg` feature it also
 //! covers the GPG engine (Phase 13d): [`GpgVerifier`] holds binary or armored
-//! keyrings, parses each into certificates as it loads it, and runs `gpgv` for
-//! the verdict; detached OpenPGP signatures accumulate under
-//! `ostree.gpgsigs` with per-signature metadata parsed from the `--status-fd`
-//! stream. The `sign-gpg` feature adds [`GpgSigner`], which runs
-//! `gpg --detach-sign` with the key resolved by fingerprint, key id, or user
-//! id in an optional GnuPG home directory (agent-held and hardware-token keys
-//! included), and turns on `verify-gpg` with it. It also covers static deltas
+//! keyrings, parses each into certificates as it loads it, and answers the
+//! verdict in the process over the `pgp` crate (rPGP); detached OpenPGP
+//! signatures accumulate under `ostree.gpgsigs` with per-signature metadata
+//! read from the certificate and the signature packet. The `sign-gpg` feature
+//! adds [`GpgSigner`], which runs `gpg --detach-sign` with the key resolved by
+//! fingerprint, key id, or user id in an optional GnuPG home directory
+//! (agent-held and hardware-token keys included), and turns on `verify-gpg`
+//! with it. It also covers static deltas
 //! in both directions (Phase 15): [`Repo::apply_static_delta_offline`] reads a
 //! delta -- the superblock, the xz-compressed parts, and the operation stream
 //! (splice, open/close, set-read-source, rollsum write, and bspatch) -- and

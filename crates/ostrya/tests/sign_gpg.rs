@@ -3,7 +3,7 @@
 //! These exercise [`GpgSigner`] / [`GpgVerifier`] against the system GnuPG
 //! installation: a throwaway signing key is generated in a private GnuPG home
 //! directory under the test's scratch tree, the port signs a commit through
-//! the `gpg` binary, and verification runs through `gpgv` over exported
+//! the `gpg` binary, and verification runs in the process over exported
 //! keyrings (binary and armored). Every gpg invocation passes an explicit
 //! `--homedir`; the user's GnuPG home and any running agent of theirs are
 //! never touched, and the agent GnuPG auto-starts for the scratch home is
@@ -27,15 +27,12 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// Whether the gpg and gpgv binaries are available.
+/// Whether the gpg binary is available.
 fn gpg_available() -> bool {
-    let has = |program: &str| {
-        Command::new(program)
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| out.status.success())
-    };
-    has("gpg") && has("gpgv")
+    Command::new("gpg")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// A private GnuPG home directory holding one freshly generated,
@@ -165,7 +162,7 @@ async fn build_committed_repo(base: &Path) -> (Repo, Checksum) {
 #[test]
 fn gpg_round_trip_within_the_port() {
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-roundtrip");
@@ -203,7 +200,7 @@ fn gpg_round_trip_within_the_port() {
 #[test]
 fn armored_and_file_keyrings_load() {
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-keyrings");
@@ -233,7 +230,7 @@ fn armored_and_file_keyrings_load() {
 #[test]
 fn wrong_payload_is_rejected() {
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-badsig");
@@ -265,7 +262,7 @@ fn wrong_payload_is_rejected() {
 #[test]
 fn unknown_signer_key_is_an_error() {
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-nokey");
@@ -289,7 +286,7 @@ fn unknown_signer_key_is_an_error() {
 #[test]
 fn an_option_shaped_selector_is_a_key_name() {
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-selector");
@@ -333,7 +330,7 @@ fn an_option_shaped_selector_is_a_key_name() {
 #[test]
 fn gpg_coexists_with_the_dummy_engine() {
     if !gpg_available() {
-        eprintln!("skipping: gpg/gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-coexist");

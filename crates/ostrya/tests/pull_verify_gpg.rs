@@ -5,8 +5,8 @@
 //! keyrings come from and what each refusal reports. A throwaway signing key is
 //! generated in a private GnuPG home directory under the test's scratch tree,
 //! the port signs a commit through the `gpg` binary, and the pull verifies it
-//! through `gpgv` over the exported keyring. The user's GnuPG home and any agent
-//! of theirs are never touched.
+//! in the process over the exported keyring. The user's GnuPG home and any
+//! agent of theirs are never touched.
 
 #![cfg(feature = "sign-gpg")]
 
@@ -26,15 +26,12 @@ use ostrya_rt::block_on;
 /// A fixed timestamp, so a source repository's commit is reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// Whether the gpg and gpgv binaries are available.
+/// Whether the gpg binary is available.
 fn gpg_available() -> bool {
-    let has = |program: &str| {
-        Command::new(program)
-            .arg("--version")
-            .output()
-            .is_ok_and(|out| out.status.success())
-    };
-    has("gpg") && has("gpgv")
+    Command::new("gpg")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// A private GnuPG home directory holding one freshly generated,
@@ -189,7 +186,7 @@ async fn gpg_pull(dst: &Repo, src: &Repo) -> Result<(), Error> {
 #[test]
 fn the_repository_keyring_is_what_a_remote_trusts() {
     if !gpg_available() {
-        eprintln!("skipping: gpg or gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("pull-verify-gpg-keyring");
@@ -242,7 +239,7 @@ fn the_repository_keyring_is_what_a_remote_trusts() {
 #[test]
 fn a_symlinked_repository_keyring_is_followed() {
     if !gpg_available() {
-        eprintln!("skipping: gpg or gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("pull-verify-gpg-symlink");
@@ -274,7 +271,7 @@ fn a_symlinked_repository_keyring_is_followed() {
 #[test]
 fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
     if !gpg_available() {
-        eprintln!("skipping: gpg or gpgv not available");
+        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("pull-verify-gpg-keypath");

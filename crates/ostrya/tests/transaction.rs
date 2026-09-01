@@ -15,7 +15,10 @@ use std::thread;
 use std::time::Duration;
 
 use common::TmpDir;
-use ostrya::{CreateOptions, Error, LockKind, Repo, RepoMode};
+use ostrya::{
+    Checksum, CreateOptions, DirMeta, Error, LockKind, ObjectType, Repo, RepoMode, Xattrs,
+    loose_path,
+};
 use ostrya_rt::block_on;
 
 /// The staging directory names present under `<repo>/tmp`.
@@ -300,4 +303,82 @@ fn lock_holder_subprocess() {
         ostrya_rt::Timer::after(Duration::from_millis(hold_ms)).await;
         txn.commit().await.expect("release lock");
     });
+}
+
+/// `Transaction::write_dirmeta` and `loose_path` reach a consumer through the
+/// `ostrya` crate alone, and the pair locates the object a dirmeta write leaves
+/// in `objects/`.
+///
+/// The two modes name one directory by two checksums: `bare` records the
+/// ownership, the mode, and the xattrs `meta` states, and `bare-user-only`
+/// records the canonical form of the same directory. The object's identity
+/// covers the form the mode records, which is what this method holds for a
+/// caller assembling a tree.
+#[test]
+fn write_dirmeta_and_loose_path_are_public() {
+    let dir = TmpDir::new("public-dirmeta");
+
+    // A directory whose every canonicalized field carries something to lose:
+    // a non-zero owner, an xattr, and permission bits outside the 0o755 a
+    // `bare-user-only` repository keeps.
+    let meta = DirMeta {
+        uid: 1000,
+        gid: 1000,
+        mode: 0o042_771,
+        xattrs: Xattrs::new([(b"user.mark\0".to_vec(), b"value".to_vec())]).unwrap(),
+    };
+    let canonical = DirMeta {
+        uid: 0,
+        gid: 0,
+        mode: 0o040_751,
+        xattrs: Xattrs::empty(),
+    };
+
+    let stored = |mode: RepoMode, meta: &DirMeta| -> Checksum {
+        let repo_path = dir.path().join(format!("repo-{}", mode.as_mode_str()));
+        let meta = meta.clone();
+        block_on(async move {
+            Repo::create(&repo_path, CreateOptions::new(mode))
+                .await
+                .unwrap();
+            let repo = Repo::open(&repo_path).await.unwrap();
+            let txn = repo.transaction().await.unwrap();
+            let checksum = txn.write_dirmeta(&meta).await.unwrap();
+            txn.commit().await.unwrap();
+
+            let path =
+                repo_path
+                    .join("objects")
+                    .join(loose_path(&checksum, ObjectType::DirMeta, mode));
+            assert!(path.exists(), "{} names the written object", path.display());
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                meta.serialize().unwrap(),
+                "the object holds the bytes the mode records"
+            );
+            checksum
+        })
+    };
+
+    let bare = stored(RepoMode::Bare, &meta);
+    let bare_user_only = stored(RepoMode::BareUserOnly, &canonical);
+    assert_ne!(
+        bare, bare_user_only,
+        "the two modes record the directory under different identities"
+    );
+
+    // The `bare-user-only` write of the stated form reaches the identity of the
+    // canonical form, which is the checksum the mode records.
+    let repo_path = dir.path().join("repo-canonical");
+    let recorded = block_on(async {
+        Repo::create(&repo_path, CreateOptions::new(RepoMode::BareUserOnly))
+            .await
+            .unwrap();
+        let repo = Repo::open(&repo_path).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let checksum = txn.write_dirmeta(&meta).await.unwrap();
+        txn.commit().await.unwrap();
+        checksum
+    });
+    assert_eq!(recorded, bare_user_only);
 }

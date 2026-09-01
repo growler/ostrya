@@ -508,10 +508,17 @@ impl Transaction {
     /// records the canonical form and the dirmeta's identity covers that form.
     /// Every other mode records `meta` as given.
     ///
-    /// This is the path a commit's own directories take. A dirmeta arriving from
-    /// elsewhere -- a pull or a delta -- keeps the bytes it is named for and goes
-    /// through [`write_metadata`](Transaction::write_metadata).
-    pub(crate) async fn write_dirmeta(&self, meta: &DirMeta) -> Result<Checksum> {
+    /// This is the path a commit's own directories take, and it is the path a
+    /// caller assembling a tree takes as well. Serializing a [`DirMeta`] and
+    /// handing the bytes to
+    /// [`write_metadata`](Transaction::write_metadata) stores the form `meta`
+    /// states and names the object for it, which parts from the checksum a
+    /// `bare-user-only` repository records for the same directory.
+    ///
+    /// A dirmeta arriving from elsewhere -- a pull or a delta -- keeps the bytes
+    /// it is named for and goes through
+    /// [`write_metadata`](Transaction::write_metadata).
+    pub async fn write_dirmeta(&self, meta: &DirMeta) -> Result<Checksum> {
         let bytes = self.dirmeta_bytes(meta)?;
         self.write_metadata(ObjectType::DirMeta, None, &bytes).await
     }

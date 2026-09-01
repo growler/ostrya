@@ -28,6 +28,7 @@
 
 mod codec;
 mod de;
+mod dict;
 mod error;
 mod print;
 mod ser;
@@ -39,6 +40,7 @@ pub use codec::{
     ArrayIter, GvDecode, GvEncode, GvType, Slice, Variant, encode_to_vec, write_array,
 };
 pub use de::from_bytes;
+pub use dict::DictBuilder;
 pub use error::{Error, Result};
 pub use print::{to_text, to_text_unannotated};
 pub use ser::{choose_offset_size, to_bytes, write_offset};

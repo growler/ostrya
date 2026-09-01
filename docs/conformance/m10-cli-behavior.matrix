@@ -3984,9 +3984,12 @@ oracle: exit-status checksum-agreement
 outcome: full
 severity: interop
 identity: full
+evidence: ostrya_cli::cli::commit_duplicate_metadata_key_reads_back_the_first
 spec: format-reference.md#commit
 note: a key given twice is written twice; the dict really carries two entries of
- that name.
+ that name. A read-back by that name needs a second invocation, which no setup
+ binds, so the cited test states it: both implementations print the value of the
+ entry standing first.
 
 family: M10
 subcommand: commit
@@ -4004,6 +4007,25 @@ note: the entries come out grouped by option and not in command-line order --
  both `--add-metadata-string` keys, then both `--add-metadata` keys, then the
  binding key. The order is part of the commit checksum, so the agreeing checksum
  is what states it.
+
+family: M10
+subcommand: commit
+cell: commit/metadata-nonsorted-read-back
+setup: repo tree
+outcome: full
+severity: interop
+identity: full
+evidence: ostrya_cli::cli::commit_metadata_reads_back_in_any_key_order
+spec: format-reference.md#commit
+note: reading a key back needs a second invocation over a commit carrying
+ several user keys, which no setup binds, so the claim stands in the cited test.
+ It commits a dict whose stored order is `zulu`, `alpha`, `mike`, `bravo`,
+ `ostree.ref-binding` -- the command line's order under neither reading, and
+ sorted under none -- then reads every one of the five keys back through
+ `show --print-metadata-key` and lists them through `show
+ --list-metadata-keys`. The commit's agreeing checksum states the stored order,
+ and the agreeing read-backs state that a reader reaches a key by name whatever
+ slot it stands in.
 
 family: M10
 subcommand: commit

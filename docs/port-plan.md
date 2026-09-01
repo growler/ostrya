@@ -4480,7 +4480,11 @@ deliverable's full surface and Verify list:
   once the image is whole, so a refused export leaves a destination that
   already existed as it was and an export that finishes replaces it.
 - `D6` -- `DictBuilder`, the `loose_path` re-export, and a public
-  `Transaction::write_dirmeta`.
+  `Transaction::write_dirmeta` (DONE): the builder appends, so an `a{sv}` holds
+  its entries in insertion order, which is the order the dict holds on disk and
+  part of the commit checksum. `write_dirmeta` is the path a caller assembling a
+  tree takes, because the object's identity covers the form the repository mode
+  records and `bare-user-only` records a canonical one.
 - `D9` -- `kernel_version`, `BootableRefusal`, and
   `DictBuilder::insert_bootable`.
 

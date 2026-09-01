@@ -76,6 +76,21 @@ objtype-as-u32).
 6. `ay` root dirtree checksum, 32 raw bytes.
 7. `ay` root dirmeta checksum, 32 raw bytes.
 
+The metadata dict is an array of key-value tuples, and it holds the order its
+writer produced. That order is part of the commit checksum, so the port
+serializes the dict in insertion order and a caller reproducing a tool commit
+supplies the keys in the order the tool supplies them (see "CLI output
+formats", `commit`). A reader addresses the dict by name: it reaches a key
+whatever slot the entry stands in. A name may stand twice, and a lookup by that
+name reaches the entry standing first.
+The `conformance/m10-cli-behavior.matrix` cells state this over commits both
+implementations write. `commit/metadata-group-order` and
+`commit/metadata-duplicate-key` reach the tool's own checksum over dicts whose
+stored order follows neither the command line nor a sort.
+`commit/metadata-nonsorted-read-back` reads every key of such a dict back by
+name, and the duplicate-key cell reads a repeated name back to its first
+entry.
+
 Well-known metadata keys: `version` (`s`, the only key without the `ostree.`
 prefix), `ostree.architecture` (`s`), `ostree.ref-binding` (`as`),
 `ostree.collection-binding` (`s`), `ostree.endoflife` /

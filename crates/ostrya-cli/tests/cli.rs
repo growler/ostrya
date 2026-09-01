@@ -10086,6 +10086,100 @@ fn commit_keep_metadata_matches_the_tool() {
     );
 }
 
+/// A commit metadata dict holding several keys in an order that is neither the
+/// command-line order nor a sorted one reaches one checksum in both
+/// implementations, and every key of it reads back by name.
+#[test]
+fn commit_metadata_reads_back_in_any_key_order() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-metadata-order");
+    let base = tmp.path();
+    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
+    let src = tree.to_str().unwrap();
+
+    // The option groups put both `--add-metadata` keys after both
+    // `--add-metadata-string` keys, so the dict stands as `zulu`, `alpha`,
+    // `mike`, `bravo`, `ostree.ref-binding`. That order is the command line's
+    // order under neither reading and is sorted under none. The agreeing
+    // checksum states the stored bytes, the entry order among them.
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &[
+            "commit",
+            "-b",
+            "order",
+            "-s",
+            "x",
+            FIXED_TIMESTAMP,
+            "--add-metadata-string=zulu=z",
+            "--add-metadata=mike='m'",
+            "--add-metadata-string=alpha=a",
+            "--add-metadata=bravo=uint64 4",
+            src,
+        ],
+    );
+
+    // Every key reads back by name, whatever slot it stands in, and both
+    // implementations print the same value for it.
+    for key in ["zulu", "alpha", "mike", "bravo", "ostree.ref-binding"] {
+        let arg = format!("--print-metadata-key={key}");
+        assert_agrees(&port_repo, &tool_repo, &["show", &arg, "order"]);
+    }
+
+    // The listing sorts the names, so it states nothing about the stored order
+    // and reaches the same five keys on both sides.
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["show", "--list-metadata-keys", "order"],
+    );
+}
+
+/// A metadata key given twice stands twice in the dict, and a read-back by that
+/// name reaches the entry standing first in both implementations.
+#[test]
+fn commit_duplicate_metadata_key_reads_back_the_first() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-metadata-duplicate");
+    let base = tmp.path();
+    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
+    let src = tree.to_str().unwrap();
+
+    // The agreeing checksum states that both entries stand, which is what
+    // `commit/metadata-duplicate-key` holds.
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &[
+            "commit",
+            "-b",
+            "dup",
+            "-s",
+            "x",
+            FIXED_TIMESTAMP,
+            "--add-metadata-string=foo=first",
+            "--add-metadata-string=foo=second",
+            src,
+        ],
+    );
+
+    // The name reaches the first of the two entries, so the slot an entry
+    // stands in decides the value a reader by name gets.
+    let args = ["show", "--print-metadata-key=foo", "dup"];
+    let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+    assert_runs_agree(&port, &tool, &args.join(" "));
+    assert_eq!(
+        tool.stdout_trimmed(),
+        "'first'",
+        "the name reaches the entry standing first"
+    );
+}
+
 /// `commit --add-detached-metadata-string` writes the `.commitmeta` file beside
 /// the commit and leaves the commit checksum alone.
 #[test]

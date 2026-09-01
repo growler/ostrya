@@ -63,6 +63,12 @@ pub enum RepoMode {
     BareUserShared,   // port extension: bare-user storage, logical mode never on the inode
 }
 
+/// The path of a loose object relative to the repository's `objects/`
+/// directory, `<first 2 hex>/<remaining 62 hex>.<ext>`. `ostrya` re-exports it,
+/// so a consumer addressing an object on disk needs no dependency on
+/// `ostrya-core`.
+pub fn loose_path(checksum: &Checksum, ty: ObjectType, mode: RepoMode) -> String;
+
 pub struct CollectionRef { pub collection_id: Option<String>, pub ref_name: String }
 
 /// Sorted xattr set, canonicalized on construction.
@@ -163,6 +169,34 @@ impl Value {
 Neither enum is `#[non_exhaustive]`. Both enumerate a closed external
 specification, so an exhaustive `match` stays valid and stays a compile-time
 gate; `port-plan.md`, decision 14, records the rule.
+
+### Building an `a{sv}`
+
+`DictBuilder` assembles the dict a caller hands to `CommitOptions::metadata`
+and to `write_commit_detached_metadata`. It appends, so the entries stand in
+insertion order, which is the order the dict holds on disk and part of the
+commit checksum (`format-reference.md`, "Commit"). A key inserted twice yields
+two entries of that name.
+
+```rust
+pub struct DictBuilder { /* the entries so far */ }
+
+impl DictBuilder {
+    pub fn new() -> DictBuilder;
+    /// Append `key` holding `value` of type `ty`, wrapped as the `v` the
+    /// dict's value member carries.
+    pub fn insert(&mut self, key: &str, ty: Type, value: Value) -> &mut Self;
+    pub fn insert_str(&mut self, key: &str, value: &str) -> &mut Self;
+    pub fn insert_u64(&mut self, key: &str, value: u64) -> &mut Self;
+    pub fn insert_bool(&mut self, key: &str, value: bool) -> &mut Self;
+    pub fn insert_strv(&mut self, key: &str, values: &[String]) -> &mut Self;
+    pub fn insert_bytes(&mut self, key: &str, value: &[u8]) -> &mut Self;
+    /// The assembled `a{sv}`, its entries in insertion order.
+    pub fn build(self) -> Value;
+}
+```
+
+`ostrya` re-exports `DictBuilder` alongside `Type` and `Value`.
 
 ### The GVariant text form
 
@@ -524,6 +558,12 @@ impl Transaction {
     /// `bytes` is one already-serialized metadata object.
     pub async fn write_metadata(&self, ty: ObjectType, expected: Option<&Checksum>,
         bytes: &[u8]) -> Result<Checksum>;
+    /// Write the dirmeta object the repository mode records for `meta`.
+    /// `bare-user-only` discards ownership and xattrs and reduces the
+    /// permission bits, and the object's identity covers that form, so a
+    /// caller assembling a tree takes this path rather than serializing a
+    /// `DirMeta` itself and passing the bytes to `write_metadata`.
+    pub async fn write_dirmeta(&self, meta: &DirMeta) -> Result<Checksum>;
 
     // tree building
     pub async fn write_dfd_to_mtree(&self, dfd: BorrowedFd<'_>, path: &Path,

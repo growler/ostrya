@@ -24,7 +24,9 @@
 //! [`GpgVerifier`] holds the certificates its keyrings parse to. Keyrings are
 //! loaded through [`from_keyring_bytes`](GpgVerifier::from_keyring_bytes) and
 //! [`from_keyring_files`](GpgVerifier::from_keyring_files) (armored input is
-//! decoded to the binary packet stream the parser reads).
+//! decoded to the binary packet stream the parser reads, and Trust packets are
+//! dropped from that stream, so a legacy GnuPG keyring and the `gpg --export`
+//! stream of the same keys parse to the same certificates).
 //! [`from_system_trust`](GpgVerifier::from_system_trust) loads the global
 //! trusted set -- every `*.gpg` keyring in the directory named by the
 //! `OSTREE_GPG_HOME` environment variable, or `<datadir>/ostree/trusted.gpg.d/`
@@ -72,6 +74,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ostrya_core::base64;
 use pgp::composed::{Deserializable, SignedPublicKey};
+use pgp::packet::PacketHeader;
+use pgp::types::{PacketLength, Tag};
 
 use crate::config::remote_keyring_name;
 use crate::error::{Error, Result};
@@ -401,9 +405,53 @@ impl GpgVerifier {
     }
 }
 
+/// The packet stream of `binary` with every Trust packet removed.
+///
+/// A Trust packet (tag 12) holds a GnuPG-local trust value and carries no part
+/// of a transferable public key. A legacy GnuPG keyring writes one after the
+/// primary key packet, after each user id packet, and after each signature
+/// packet. rPGP's certificate parser reads the packets of one certificate
+/// through runs of tag tests, and a packet of any other tag ends a run, so a
+/// Trust packet standing after the primary key leaves the certificate with no
+/// user id and no subkey. With the Trust packets gone, a legacy keyring parses
+/// to the certificates the `gpg --export` form of the same keys parses to.
+///
+/// The walk frames each packet with rPGP's own header parser, which is the
+/// parser the packet stream is read with, so a packet boundary here is a
+/// packet boundary there. A header the parser refuses, a length form other
+/// than a fixed one, and a length that runs past the end each stop the walk,
+/// and the bytes from that point to the end pass through as they stand. The
+/// result is at most as long as the input, which
+/// [`GpgVerifier::add_keyring`] has already held to [`MAX_KEYRING`].
+fn without_trust_packets(binary: &[u8]) -> Vec<u8> {
+    let mut kept: Vec<u8> = Vec::with_capacity(binary.len());
+    let mut rest = binary;
+    while !rest.is_empty() {
+        let mut reader = rest;
+        let Ok(header) = PacketHeader::try_from_reader(&mut reader) else {
+            break;
+        };
+        let PacketLength::Fixed(body) = header.packet_length() else {
+            break;
+        };
+        let total = (rest.len() - reader.len()).saturating_add(body as usize);
+        if total == 0 || total > rest.len() {
+            break;
+        }
+        if header.tag() != Tag::Trust {
+            kept.extend_from_slice(&rest[..total]);
+        }
+        rest = &rest[total..];
+    }
+    kept.extend_from_slice(rest);
+    kept
+}
+
 /// Parse a binary OpenPGP keyring into the certificates it carries, holding
 /// the result to [`MAX_KEYRING_CERTS`]. A keyring carrying no packet parses to
-/// no certificate.
+/// no certificate. Trust packets are dropped first (see
+/// [`without_trust_packets`]), so a legacy GnuPG keyring and a `gpg --export`
+/// stream of the same keys parse to the same certificates.
 ///
 /// A keyring is untrusted input, so the parse runs inside
 /// [`std::panic::catch_unwind`] and a caught panic reads as a keyring the
@@ -417,8 +465,9 @@ fn parse_keyring(binary: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
                 "{subject} is not readable as an OpenPGP keyring: {e}"
             ))
         };
+        let stream = without_trust_packets(binary);
         let certs =
-            SignedPublicKey::from_bytes_many(std::io::Cursor::new(binary)).map_err(refuse)?;
+            SignedPublicKey::from_bytes_many(std::io::Cursor::new(&stream)).map_err(refuse)?;
         let mut held: Vec<SignedPublicKey> = Vec::new();
         for cert in certs {
             if held.len() == MAX_KEYRING_CERTS {
@@ -1025,6 +1074,34 @@ IHdvcmxk\n\
             assert!(status.success(), "gpg --quick-gen-key failed");
         }
 
+        /// Add a signing subkey to the home's first key.
+        fn add_signing_subkey(&self) {
+            let primary = self.fingerprint();
+            let status = self
+                .gpg()
+                .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                .args(["--quick-add-key", &primary, "ed25519", "sign", "never"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "gpg --quick-add-key failed");
+        }
+
+        /// The fingerprint of the home's first key, uppercase hex.
+        fn fingerprint(&self) -> String {
+            let out = self
+                .gpg()
+                .args(["--with-colons", "--list-keys"])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "gpg --list-keys failed");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| line.strip_prefix("fpr:"))
+                .filter_map(|rest| rest.split(':').nth(8).map(str::to_owned))
+                .next()
+                .unwrap()
+        }
+
         /// A `gpg` command bound to this home directory, batch mode.
         fn gpg(&self) -> std::process::Command {
             let mut cmd = std::process::Command::new("gpg");
@@ -1047,6 +1124,41 @@ IHdvcmxk\n\
         /// The keybox `gpg` keeps this home directory's public keys in.
         fn keybox(&self) -> Vec<u8> {
             std::fs::read(self.dir.join("pubring.kbx")).unwrap()
+        }
+
+        /// The legacy keyring `gpg --import` writes for this home's own keys.
+        /// GnuPG puts a Trust packet after the primary key packet, after each
+        /// user id packet, and after each signature packet of such a keyring,
+        /// which is the form [`Repo::gpg_import_keys`] leaves at the
+        /// repository root.
+        fn legacy_keyring(&self) -> Vec<u8> {
+            use std::os::unix::fs::DirBuilderExt;
+            let exported = self.dir.join("exported.gpg");
+            std::fs::write(&exported, self.export(false)).unwrap();
+            // `gpg` writes a keybox when it creates a keyring file itself, and
+            // a legacy keyring when the file is already there, so the import
+            // runs in a home of its own over an empty keyring file, as the
+            // import path's scratch directory does.
+            let home = self.dir.join("legacy");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&home)
+                .unwrap();
+            let ring = home.join(RING_FILE);
+            std::fs::write(&ring, b"").unwrap();
+            let status = std::process::Command::new("gpg")
+                .arg("--homedir")
+                .arg(&home)
+                .arg("--batch")
+                .arg("--no-default-keyring")
+                .arg("--keyring")
+                .arg(&ring)
+                .arg("--import")
+                .arg(&exported)
+                .status()
+                .unwrap();
+            assert!(status.success(), "gpg --import into a keyring failed");
+            std::fs::read(&ring).unwrap()
         }
     }
 
@@ -1189,5 +1301,122 @@ IHdvcmxk\n\
         let allowed = one.repeat(MAX_KEYRING_CERTS);
         let verifier = GpgVerifier::from_keyring_bytes([&allowed]).unwrap();
         assert_eq!(verifier.certs.len(), MAX_KEYRING_CERTS);
+    }
+    /// The user ids each certificate carries, one list per certificate, with
+    /// both the certificates and the ids sorted, so two trusted sets compare as
+    /// one value whatever order their keyrings held them in.
+    fn user_ids(verifier: &GpgVerifier) -> Vec<Vec<String>> {
+        let mut all: Vec<Vec<String>> = verifier
+            .certs
+            .iter()
+            .map(|cert| {
+                let mut ids: Vec<String> = cert
+                    .details
+                    .users
+                    .iter()
+                    .map(|user| String::from_utf8_lossy(user.id.id()).into_owned())
+                    .collect();
+                ids.sort();
+                ids
+            })
+            .collect();
+        all.sort();
+        all
+    }
+
+    /// A legacy keyring, which carries a Trust packet after the primary key
+    /// packet and after each user id and signature packet, parses to what the
+    /// `gpg --export` stream of the same keys parses to: the same certificate
+    /// count, the same user ids, and the same subkeys.
+    #[test]
+    fn loads_a_trust_packet_keyring() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Trust <trust@ostrya.example>");
+        home.add_key("Second <second@ostrya.example>");
+        let exported = home.export(false);
+        let legacy = home.legacy_keyring();
+        // The fixture is the shape under test: the two forms differ in bytes.
+        assert_ne!(legacy, exported);
+        assert!(legacy.len() > exported.len());
+
+        let from_export = GpgVerifier::from_keyring_bytes([&exported]).unwrap();
+        let from_legacy = GpgVerifier::from_keyring_bytes([&legacy]).unwrap();
+        assert_eq!(from_legacy.certs.len(), 2);
+        assert_eq!(from_legacy.certs.len(), from_export.certs.len());
+        assert_eq!(user_ids(&from_legacy), user_ids(&from_export));
+        assert_eq!(
+            user_ids(&from_legacy),
+            [
+                ["Second <second@ostrya.example>"],
+                ["Trust <trust@ostrya.example>"]
+            ]
+        );
+        let subkeys = |v: &GpgVerifier| -> usize {
+            v.certs.iter().map(|cert| cert.public_subkeys.len()).sum()
+        };
+        assert_eq!(subkeys(&from_legacy), subkeys(&from_export));
+    }
+
+    /// A signing subkey reaches the trusted set out of a legacy keyring. The
+    /// subkey packet stands after the primary key's Trust packet, so this is
+    /// what a keyring holding Trust packets loses when they reach the parser.
+    #[test]
+    fn loads_a_subkey_from_a_trust_packet_keyring() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Subkey <subkey@ostrya.example>");
+        home.add_signing_subkey();
+        let verifier = GpgVerifier::from_keyring_bytes([home.legacy_keyring()]).unwrap();
+        assert_eq!(verifier.certs.len(), 1);
+        assert_eq!(verifier.certs[0].public_subkeys.len(), 1);
+    }
+
+    /// The certificate cap counts the certificates a keyring parses to,
+    /// whether or not the keyring carries Trust packets: 257 legacy
+    /// certificates are refused by name and 256 load.
+    #[test]
+    fn refuses_too_many_certificates_with_trust_packets() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Capped <capped@ostrya.example>");
+        let one = home.legacy_keyring();
+        let many = one.repeat(MAX_KEYRING_CERTS + 1);
+        assert!(many.len() as u64 <= MAX_KEYRING);
+        let err = GpgVerifier::from_keyring_bytes([&many]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("keyring blob 0")
+                && m.contains("256 certificates")),
+            "{err}"
+        );
+        let allowed = one.repeat(MAX_KEYRING_CERTS);
+        let verifier = GpgVerifier::from_keyring_bytes([&allowed]).unwrap();
+        assert_eq!(verifier.certs.len(), MAX_KEYRING_CERTS);
+    }
+
+    /// A stream carrying no Trust packet passes through the filter byte for
+    /// byte, and a stream the header parser cannot frame passes through whole,
+    /// so such a keyring reaches the certificate parser as it stands.
+    #[test]
+    fn without_trust_packets_leaves_other_streams_alone() {
+        assert!(without_trust_packets(b"").is_empty());
+        // No OpenPGP packet header opens with these bits.
+        assert_eq!(without_trust_packets(b"\x00\x01\x02"), b"\x00\x01\x02");
+        if !gpg_available() {
+            eprintln!("skipping the exported-keyring half: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Untouched <untouched@ostrya.example>");
+        let exported = home.export(false);
+        assert_eq!(without_trust_packets(&exported), exported);
+        // A truncated keyring keeps every byte it had.
+        let cut = &exported[..exported.len() / 2];
+        assert_eq!(without_trust_packets(cut), cut);
     }
 }

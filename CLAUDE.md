@@ -98,15 +98,29 @@ reference, or reading material.
    running or vendoring the upstream suite (scope is phased: library format
    and format-primitive unit tests first, the port's own CLI-driven
    conformance suite later, admin/sysroot optional).
-5. Extensions: GPG commit signing through the system GnuPG binaries (no gpgme
-   linkage, no OpenPGP crate), composefs/EROFS export, tar import/export,
-   AWS S3 push/pull, and ssh git-style push/pull.
+5. Extensions: GPG commit signing through the system GnuPG binaries (no
+   gpgme linkage), GPG signature verification and key management in the
+   process over the `pgp` crate (rPGP), which is permissively licensed and
+   links no C library, composefs/EROFS export, tar import/export, AWS S3
+   push/pull, and ssh git-style push/pull.
 6. A development-only repository mode, `bare-user-shared`, as an optional
    nice-to-have add-on.
 
 Faithful on disk means byte-for-byte identical format, checksums, and
 algorithms. The API is redesigned to be idiomatic Rust rather than mirroring the
 C GObject surface.
+
+## Advisory exceptions
+
+RUSTSEC-2023-0071 against `rsa` 0.9.10, the Marvin timing attack, has no
+patched version and holds a written exception. The advisory covers RSA
+private-key operations. This port performs public-key verification alone, RSA
+private keys stay with GnuPG and its agent, and no code path in the tree
+performs an RSA private-key operation. The exception is reviewed if a later
+phase adds such an operation.
+
+RUSTSEC-2024-0447 against `pgp` is patched at 0.14.1. The tree takes 0.20.0,
+so the advisory is closed for the version in the graph.
 
 ## Authoritative design docs
 
@@ -144,6 +158,33 @@ confirming note.
 At the start of each phase, before writing any code, list the crates that phase
 is expected to need and discuss them with the maintainer. Coding for a phase
 begins only once its dependency set is agreed.
+
+### Authorized: the `pgp` crate
+
+`pgp` 0.20.0 (rPGP) is authorized for `crates/ostrya` alone. It supplies
+in-process GPG signature verification and key management. Each term below is
+measured on the resolved dependency graph.
+
+- License `MIT OR Apache-2.0`.
+- Minimum supported Rust version 1.88. The workspace pins 1.92, so the
+  requirement holds.
+- `default-features = false` is mandatory.
+- The `default` feature stays off. It pulls `bzip2` 0.6, whose own default
+  feature pulls `libbz2-rs-sys` 0.2.5 under license `bzip2-1.0.6`, which the
+  list in "Requirement: permissive licenses only" does not carry, and whose
+  `bzip2-sys` feature reaches the C library. A detached signature carries no
+  compressed packet, so the verification path has no use for the feature.
+- The `asm` feature stays off. It pulls `sha1-asm` and turns on the assembly
+  paths in `sha2`.
+- With `default-features = false` the graph holds 152 packages under 150
+  distinct names, of which 91 are new to `Cargo.lock`. Two names appear at two
+  versions: `serdect` 0.2.0 and 0.3.0, `syn` 2.0.119 and 3.0.4. No package in
+  the graph declares a `links` key, and no package name in it ends in `-sys`.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only". Nine packages state a permissive choice in the
+  legacy slash form, `A/B` or `A / B`. The CI license guard must normalize
+  both forms to `A OR B` before it matches, so these nine pass and a copyleft
+  license still fails.
 
 ## Requirement: permissive licenses only
 

@@ -32,18 +32,18 @@
 //! included, and so is one this repository already holds, since the pull is what
 //! states the policy rather than the stored object.
 
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "verify-gpg")]
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
 
 use ostrya_core::{Checksum, Value, base64};
 use rustix::fs::{Mode, OFlags};
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "verify-gpg")]
 use rustix::io::Errno;
 
 use crate::config::{Remote, SignVerify};
 use crate::error::{Error, Result};
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "verify-gpg")]
 use crate::gpg::read_keyring_fd;
 use crate::repo::Repo;
 use crate::sign::{
@@ -478,7 +478,7 @@ fn each_engine_once(names: &[String]) -> Vec<String> {
 /// The GPG verifier for a remote: the repository's own keyring for it, read
 /// through the repository descriptor, plus the system trusted set and whatever
 /// `gpgkeypath` names.
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "verify-gpg")]
 async fn gpg_verifier(
     repo: &Repo,
     remote: &str,
@@ -499,7 +499,7 @@ async fn gpg_verifier(
 
 /// A build without the GPG engine cannot make the check `gpg-verify` asks for,
 /// so it refuses the pull rather than pass a commit it did not check.
-#[cfg(not(feature = "sign-gpg"))]
+#[cfg(not(feature = "verify-gpg"))]
 async fn gpg_verifier(
     _repo: &Repo,
     remote: &str,
@@ -507,7 +507,7 @@ async fn gpg_verifier(
 ) -> Result<Arc<dyn Verifier>> {
     Err(Error::Unsupported(format!(
         "remote '{remote}' asks for GPG verification, which this build has no \
-         engine for; build with the sign-gpg feature or set gpg-verify=false"
+         engine for; build with the verify-gpg feature or set gpg-verify=false"
     )))
 }
 
@@ -622,7 +622,7 @@ fn read_sign_keys(
 /// The name is resolved through the repository descriptor, on the blocking pool,
 /// so a keyring on a slow filesystem holds a pool thread and not an executor
 /// thread.
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "verify-gpg")]
 async fn read_repo_keyring(repo: &Repo, remote: &str) -> Result<Option<Vec<u8>>> {
     let repo_fd = repo.repo_fd().try_clone_to_owned()?;
     let name = format!("{remote}.trustedkeys.gpg");
@@ -633,7 +633,7 @@ async fn read_repo_keyring(repo: &Repo, remote: &str) -> Result<Option<Vec<u8>>>
 /// repository descriptor and the bytes come through [`read_keyring_fd`], which
 /// is the rule every other keyring source is read under. A symlink at the name
 /// is followed, which the tool was observed to do.
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "verify-gpg")]
 fn read_keyring_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<Option<Vec<u8>>> {
     // `NONBLOCK` so a fifo answers the open rather than waiting for a writer.
     // On a regular file the flag has no effect on the read the reader makes.
@@ -872,7 +872,7 @@ mod tests {
     /// A repository keyring over the ceiling is refused by its own name. Reading
     /// the part the ceiling admits would hand the pull a trusted set the
     /// operator never placed there, with nothing said about it.
-    #[cfg(feature = "sign-gpg")]
+    #[cfg(feature = "verify-gpg")]
     #[test]
     fn an_oversized_repository_keyring_is_refused_by_name() {
         use crate::gpg::MAX_KEYRING;
@@ -908,7 +908,7 @@ mod tests {
     /// fifo answers a read with is what its writers sent, so a pull reading one
     /// would take its trusted set from them. This test returns only because the
     /// read refuses the kind before it reads.
-    #[cfg(feature = "sign-gpg")]
+    #[cfg(feature = "verify-gpg")]
     #[test]
     fn a_fifo_repository_keyring_is_refused_by_name() {
         use crate::{CreateOptions, RepoMode};

@@ -32,8 +32,9 @@ library is MIT-licensed.
    of the `ostree` tool; the upstream test suite is LGPL source and is never
    run or vendored.
 5. Extensions: GPG commit signing through the system GnuPG binaries (no
-   gpgme linkage), composefs/EROFS export, tar import/export, AWS S3
-   push/pull, ssh git-style push/pull.
+   gpgme linkage), GPG keyring parsing over the `pgp` crate (rPGP), which is
+   permissively licensed and links no C library, composefs/EROFS export, tar
+   import/export, AWS S3 push/pull, ssh git-style push/pull.
 
 The port is a library. It is not a drop-in replacement for the `ostree` tool.
 A minimal `ostrya` binary lands once the ingest and checkout paths are ready
@@ -71,15 +72,21 @@ crates below are all pure Rust:
 - `sha2` (RustCrypto) -- SHA-256; `digest` -- the hashing trait surface the
   hashing streams are generic over.
 - `async-compression`, with its `deflate` and `xz` codec features plus the
-  trait-family features -- streaming raw DEFLATE for archive-mode content
-  objects (over `flate2` with the pure-Rust `miniz_oxide` backend) and
-  streaming xz for static-delta parts (over statically-linked `liblzma`).
+  trait-family features -- streaming raw-DEFLATE inflate for archive-mode
+  content objects (over `flate2`) and streaming xz for static-delta parts (over
+  statically-linked `liblzma`).
+- `miniz_oxide` (MIT OR Zlib OR Apache-2.0) -- the raw-DEFLATE encoder behind
+  archive-mode content objects. A direct dependency pins the compressor, so the
+  stored `.filez` bytes for a given `[archive] zlib-level` are fixed for every
+  feature set the build enables.
 - `ed25519-dalek` -- the ed25519 sign engine.
 - `bsdiff` (BSD-2-Clause, no dependencies of its own) -- bspatch stream
   generation for static deltas. Its output is the interleaved
   control/diff/extra layout the port's own bspatch reads.
-- GPG signing and verification: no crate -- the engine runs the system
-  `gpg`/`gpgv` binaries as subprocesses (see Decisions).
+- `pgp` 0.20.0 (rPGP, `MIT OR Apache-2.0`, `default-features = false`) --
+  OpenPGP keyring parsing behind the `verify-gpg` feature. GPG signing and the
+  verification verdict run the system `gpg`/`gpgv` binaries as subprocesses
+  (see Decisions).
 - `rustls` plus `webpki-roots` / `rustls-native-certs` -- TLS for pull.
 - `smol-tar` -- async tar import/export in the smol ecosystem.
 - `clap` -- command-line argument parsing for the `ostrya` binary
@@ -130,9 +137,9 @@ bounded:
   binaries as subprocesses, so it observes the surface a user observes. Its
   design is `conformance/harness.md`.
 
-Feature flags on `ostrya`: `pull`, `sign-spki`, `sign-gpg`, `deltas`, `s3`,
-`ssh`, plus the runtime backend selectors `smol` (default) and `tokio`,
-forwarded to `ostrya-rt`. Each
+Feature flags on `ostrya`: `pull`, `sign-spki`, `verify-gpg`, `sign-gpg`,
+`deltas`, `s3`, `ssh`, plus the runtime backend selectors `smol` (default) and
+`tokio`, forwarded to `ostrya-rt`. Each
 heavier or riskier subsystem is opt-in so the core stays small. Tar
 import/export (built on `smol-tar`) and composefs export are always
 compiled, not feature-gated.
@@ -454,7 +461,7 @@ Dependency set for the phase: `ostrya-rt` uses `smol`, `futures-io`, and
 optional `tokio` (features `fs`, `io-util`, `rt`, `time`); `ostrya` adds
 `pin-project-lite`, `digest`, and `async-compression` (`deflate` plus
 trait-family features only), routes all pool offload through `ostrya-rt`,
-and keeps no direct `blocking` or `miniz_oxide` dependency.
+and keeps no direct `blocking` dependency.
 
 Verify: the test suite passes under both backends (default features, and
 with the `tokio` feature selecting the tokio backend); reads from a
@@ -542,8 +549,7 @@ Staging and metadata application use `rustix` under the already-enabled
 `renameat`, `fchmod`, `fchown`, `fsetxattr`, `fstatvfs`, `syncfs`, `Dir`
 iteration), offloaded through `rt::unblock` at per-object granularity;
 hashing is the Phase 5a `HashingWriter` over `sha2`; archive compression
-is the encoder half of the `async-compression` raw-DEFLATE codec whose
-decoder the read path uses.
+is a streaming raw-DEFLATE encoder over `miniz_oxide`.
 
 Format facts the write path needs that `format-reference.md` does not yet
 state -- the inode modes the tool gives loose metadata objects, the exact
@@ -1268,7 +1274,8 @@ ones before it. All four engines sign and verify commit objects through the shar
 summary bytes.
 
 The ed25519 and dummy engines are always compiled; spki is behind the
-`sign-spki` feature and GPG behind `sign-gpg`. spki is a required engine, not
+`sign-spki` feature, GPG verification behind `verify-gpg`, and GPG signing
+behind `sign-gpg`. spki is a required engine, not
 deferred: the reference tool gates it on OpenSSL, the port implements it in
 pure Rust behind its own feature so the core stays free of the ECDSA/SPKI crate
 tree (see Decisions).
@@ -1428,14 +1435,14 @@ and without the `sign-spki` feature.
 
 ### Phase 13d -- GPG signing and verification (system GnuPG) (DONE)
 
-GPG commit signing and verification over the system GnuPG installation,
-behind the `sign-gpg` feature: the engine runs the `gpg` and `gpgv` binaries
-as short-lived subprocesses, the way git drives them, and reads results from
-the machine-readable `--status-fd` line protocol. No OpenPGP implementation
-is linked into the library, and the private key never passes through it --
-`gpg` performs the private-key operation itself, consulting its `gpg-agent`
-(and any hardware token behind it) as needed, so agent-held keys work with
-no dedicated code path.
+GPG commit signing and verification over the system GnuPG installation: the
+engine runs the `gpg` and `gpgv` binaries as short-lived subprocesses, the way
+git drives them, and reads results from the machine-readable `--status-fd` line
+protocol. Verification sits behind the `verify-gpg` feature and signing behind
+`sign-gpg`, which turns on `verify-gpg` with it. The private key never passes
+through the library -- `gpg` performs the private-key operation itself,
+consulting its `gpg-agent` (and any hardware token behind it) as needed, so
+agent-held keys work with no dedicated code path.
 
 Definition:
 
@@ -1444,12 +1451,17 @@ Definition:
   directory override. Signing runs `gpg --batch --detach-sign` with the
   commit bytes on stdin and appends the binary signature from stdout to
   `ostree.gpgsigs` through the 13a append path.
-- `GpgVerifier` holds binary keyring blobs; armored input is decoded to the
-  binary form on load by a hand-rolled RFC 4880 radix-64 decoder, since
-  `gpgv` reads only binary keyrings. Keyring resolution: N keyrings from
-  bytes or files, the per-remote `<remote>.trustedkeys.gpg` and
-  `/etc/ostree/remotes.d/` resolution, and the global
-  `<datadir>/ostree/trusted.gpg.d/` directory, per `format-reference.md`.
+- `GpgVerifier` holds the certificates its keyrings parse to and the binary
+  keyring blobs `gpgv` reads; armored input is decoded to the binary form on
+  load by a hand-rolled RFC 4880 radix-64 decoder, since `gpgv` reads only
+  binary keyrings. Keyring resolution: N keyrings from bytes or files, the
+  per-remote `<remote>.trustedkeys.gpg` and `/etc/ostree/remotes.d/`
+  resolution, and the global `<datadir>/ostree/trusted.gpg.d/` directory, per
+  `format-reference.md`. Each keyring is parsed with the `pgp` crate as it is
+  loaded, so a keyring the parser rejects fails the load. A keyring is held to
+  four mebibytes and to 256 certificates, a GnuPG keybox (`KBXf`) is refused by
+  the name of the file or the blob that carries it, and the parse runs inside
+  `catch_unwind`, since a keyring is untrusted input.
 - Verification materializes the merged keyring in a private scratch
   directory and runs `gpgv --keyring` once per stored blob with the payload
   on stdin. `gpgv` performs public-key operations only and starts no agent.
@@ -1468,15 +1480,16 @@ Definition:
 - Subprocess plumbing is `rt::Command` in `ostrya-rt`: piped standard
   streams over `smol::process` (part of the `smol` facade) or
   `tokio::process` (the `process` feature on the existing tokio
-  dependency). No new crate enters the lockfile.
+  dependency). It needs no crate of its own.
 
-Dependency set: none. The engine adds a runtime tool dependency on `gpg`
-and `gpgv`; a missing binary surfaces as a signature error naming the
-program.
+Dependency set: `pgp` (rPGP), behind `verify-gpg`, for keyring parsing. The
+engine adds a runtime tool dependency on `gpg` and `gpgv`; a missing binary
+surfaces as a signature error naming the program.
 
 Deliverables: `GpgSigner`, `GpgVerifier`, keyring loading (binary and
 armored), per-signature `SignatureInfo` from the status stream,
-`rt::Command`, the async `Verifier` trait, the `sign-gpg` feature wiring.
+`rt::Command`, the async `Verifier` trait, the `verify-gpg` and `sign-gpg`
+feature wiring.
 
 Verify: a commit the port signs round-trips through `gpgv` with the exported
 keyring and is rejected under an empty trusted set; armored and file
@@ -2934,9 +2947,9 @@ and a from-to delta alike, with verification configured or off, while
 Two more port rules with no tool behavior behind them. A remote the configuration
 does not describe, which only the port can pull from (`PullOptions::url`), takes
 the configuration defaults, `gpg-verify` among them, so such a pull states its own
-policy or is refused. A build without the `sign-gpg` feature refuses a pull whose
-policy asks for the GPG axis, naming the feature, rather than passing a commit it
-did not check.
+policy or is refused. A build without the `verify-gpg` feature refuses a pull
+whose policy asks for the GPG axis, naming the feature, rather than passing a
+commit it did not check.
 
 Config reading grows `SignVerify` and the `Remote` accessors `sign_verify`,
 `sign_verify_summary`, `verification_key`, and `verification_file`;
@@ -2991,7 +3004,7 @@ configuration in both directions; a delta signed by a foreign key fails with no
 part fetched and the same delta signed by the trusted key is applied; a local
 pull checks nothing by default even where the remote it writes under asks for
 both axes, checks the commits and the source's own summary when asked, and
-refuses a check that names no remote. Behind the `sign-gpg` feature, over a
+refuses a check that names no remote. Behind the `verify-gpg` feature, over a
 generated GnuPG home: the repository's `<remote>.trustedkeys.gpg` is what a
 remote trusts, a symlink at that name is followed to the keyring it names, an
 unsigned commit and one signed by another key are each refused, `gpgkeypath`
@@ -4588,8 +4601,8 @@ Resolved:
    `futures-io` traits (tokio callers adapt with `tokio_util::compat`).
    The hashing streams are concrete types with inherent methods; a trait
    abstraction over them waits for a second consumer. Archive DEFLATE
-   streams through `async-compression` (deflate feature only) over
-   `flate2`/`miniz_oxide`.
+   compresses through `miniz_oxide` and inflates through `async-compression`
+   (deflate feature only) over `flate2`.
 
 8. Repository lock and transactions (Phase 6): the lock on `<repo>/.lock` is a
    classic `fcntl` record lock (`F_SETLK`, via `rustix::fs::fcntl_lock`), chosen
@@ -4635,21 +4648,25 @@ Resolved:
     Rust (RustCrypto ECDSA over the NIST curve the tool uses, with SPKI
     SubjectPublicKeyInfo PEM public keys) in Phase 13c. The ed25519 and
     dummy engines are always compiled; spki is behind the `sign-spki`
-    feature and GPG behind `sign-gpg`, so the core stays free of the
-    ECDSA/SPKI crate tree unless opted in (the GPG engine adds no crates;
-    see decision 13).
+    feature, GPG verification behind `verify-gpg`, and GPG signing behind
+    `sign-gpg`, so the core stays free of the ECDSA/SPKI crate tree and of the
+    OpenPGP crate tree unless opted in (see decision 13).
 
-13. GPG engine (Phase 13d): signing and verification run the system `gpg`
-    and `gpgv` binaries as short-lived subprocesses over the documented
-    `--status-fd` interface, the way git drives them. No OpenPGP crate is
-    linked: `sequoia-openpgp` was considered and set aside -- LGPL
-    licensing, a heavy transitive tree, and no agent surface, whereas
-    agent-held and hardware-token keys work through `gpg` itself with no
-    dedicated code path. `Verifier::verify` is async so a verifying engine
-    can await a subprocess. Subprocesses go through `rt::Command`
-    (`smol::process` / `tokio::process`, no new lockfile crates); the
-    `gpg` and `gpgv` binaries are a runtime tool dependency of the
-    `sign-gpg` feature only.
+13. GPG engine (Phase 13d): signing and the verification verdict run the
+    system `gpg` and `gpgv` binaries as short-lived subprocesses over the
+    documented `--status-fd` interface, the way git drives them. Agent-held
+    and hardware-token keys work through `gpg` itself with no dedicated code
+    path, which is why the private-key operation stays there.
+    `Verifier::verify` is async so a verifying engine can await a subprocess.
+    Subprocesses go through `rt::Command` (`smol::process` /
+    `tokio::process`); the `gpg` and `gpgv` binaries are a runtime tool
+    dependency of the GPG features.
+
+    Keyring parsing is in the process, over the `pgp` crate (rPGP) behind the
+    `verify-gpg` feature. rPGP is `MIT OR Apache-2.0` and, with
+    `default-features = false`, its graph declares no `links` key and holds no
+    `-sys` package, so it links no C library. `sequoia-openpgp` was considered
+    and set aside for its LGPL licensing.
 
 14. `#[non_exhaustive]` on the public enums and option structs (Phase 17f):
     the attribute marks a type whose member set the port itself owns and

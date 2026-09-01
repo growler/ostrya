@@ -3358,14 +3358,14 @@ fn an_unsigned_commit_is_refused_under_the_default_policy() {
         .await;
 
         let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
-        if cfg!(feature = "sign-gpg") {
+        if cfg!(feature = "verify-gpg") {
             assert!(
                 matches!(&err, Error::Signature(m) if m.contains("carries no signature")),
                 "{err}"
             );
         } else {
             assert!(
-                matches!(&err, Error::Unsupported(m) if m.contains("sign-gpg")),
+                matches!(&err, Error::Unsupported(m) if m.contains("verify-gpg")),
                 "{err}"
             );
         }

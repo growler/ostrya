@@ -80,7 +80,8 @@ The project is a Cargo workspace of focused crates:
 - `ostrya-cli` -- the command-line front-end (builds the `ostrya` binary).
 
 Feature flags on `ostrya`: the runtime selectors `smol` (default) and `tokio`;
-later phases add `pull`, `sign-gpg`, `deltas`, `s3`, and `ssh`.
+later phases add `pull`, `verify-gpg`, `sign-gpg` (which turns on `verify-gpg`),
+`deltas`, `s3`, and `ssh`.
 
 ## Clean-room provenance and licensing
 

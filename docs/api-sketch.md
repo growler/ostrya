@@ -1074,7 +1074,7 @@ pub trait Verifier: Send + Sync {
 pub struct Ed25519Signer { /* 64-byte secret */ }
 pub struct Ed25519Verifier { /* trusted + revoked 32-byte keys */ }
 pub struct GpgSigner { /* key id/fingerprint + optional GNUPGHOME; signs via gpg */ }
-pub struct GpgVerifier { /* binary keyring blobs; verifies via gpgv */ }
+pub struct GpgVerifier { /* parsed certificates + binary keyrings; verifies via gpgv */ }
 pub struct SpkiSigner;   pub struct SpkiVerifier;    // optional
 pub struct DummySigner;  pub struct DummyVerifier;   // test-only
 
@@ -1120,7 +1120,7 @@ pub struct GpgKey {
     pub user_ids: Vec<String>,
 }
 
-impl Repo {                                   // feature = "sign-gpg"
+impl Repo {                                   // feature = "verify-gpg"
     /// Add the certificates `keys` holds to `<remote>.trustedkeys.gpg`, and
     /// report how many the keyring did not already hold. With `key_ids`
     /// non-empty only the keys those selectors name are imported.
@@ -1135,6 +1135,15 @@ Key loading helpers (ed25519 base64-per-line files and the
 `trusted.ed25519[.d]` / `revoked.ed25519[.d]` directory convention; GPG keyring
 files binary and armored) are free functions or `impl` on the concrete signer
 types.
+
+`GpgVerifier` is behind the `verify-gpg` feature, together with `GpgKey`,
+`Repo::gpg_import_keys`, and `Repo::gpg_list_keys`, which manage the
+verification trust set. `GpgSigner` is behind `sign-gpg`, which turns on
+`verify-gpg` with it. A constructor of `GpgVerifier` parses each keyring into
+certificates as it loads it, so a keyring the parser rejects fails the
+construction. One keyring is held to four mebibytes and to 256 certificates,
+and a GnuPG keybox is refused by the name of the file or the blob that carries
+it; each refusal states the cap or the cause it names.
 
 ## Fetcher
 

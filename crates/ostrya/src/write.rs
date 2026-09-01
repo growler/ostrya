@@ -10,9 +10,10 @@
 //! directory, materialized with `linkat`) where the filesystem allows it, and a
 //! named temp file otherwise. A regular file's payload streams through an
 //! `rt::File` in bounded chunks and is hashed on the way down; in archive mode
-//! the same pass feeds a raw-DEFLATE encoder. The object identity is the
-//! SHA-256 of the framed uncompressed header followed by the raw payload, so it
-//! is complete when the stream ends regardless of how the bytes are stored.
+//! the same pass feeds a raw-DEFLATE encoder over `miniz_oxide` at
+//! `[archive] zlib-level`. The object identity is the SHA-256 of the framed
+//! uncompressed header followed by the raw payload, so it is complete when the
+//! stream ends regardless of how the bytes are stored.
 //!
 //! Per-mode inode application is always by explicit `fchmod`/`fchown`, never the
 //! umask, reproducing the modes recovered from the `ostree` tool (see
@@ -25,9 +26,11 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use async_compression::Level;
-use async_compression::futures::write::{DeflateDecoder, DeflateEncoder};
+use async_compression::futures::write::DeflateDecoder;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
+use miniz_oxide::deflate::core::CompressorOxide;
+use miniz_oxide::deflate::stream::deflate;
+use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 use ostrya_core::filehdr::frame;
 use ostrya_core::{
     Checksum, ContentHasher, DirMeta, FileHeader, ObjectType, RepoMode, Xattrs, loose_path,
@@ -57,6 +60,9 @@ const CANONICAL_PERM_MASK: u32 = 0o755;
 const FIXED_MODE: u32 = 0o644;
 /// The chunk size for the streaming copy in [`Transaction::write_content`].
 const COPY_CHUNK: usize = 64 * 1024;
+/// The size of the output buffer [`DeflateSink`] compresses into before it
+/// writes the compressed bytes through to the file under it.
+const DEFLATE_CHUNK: usize = 64 * 1024;
 /// Attempts made at an `ETXTBSY` fs-verity enable before it is reported. The
 /// kernel refuses to seal an inode any writable descriptor still holds, and
 /// `fork` copies the file descriptor table, so a child carries a copy of the
@@ -208,7 +214,7 @@ enum Sink {
     /// The temp file receives the raw payload (bare family).
     Plain(RtFile),
     /// The temp file receives a framed archive header then DEFLATE output.
-    Archive(DeflateEncoder<NoClose<RtFile>>),
+    Archive(DeflateSink<RtFile>),
 }
 
 impl ContentWriter<'_> {
@@ -234,7 +240,7 @@ impl ContentWriter<'_> {
             }
             Sink::Archive(mut enc) => {
                 close(&mut enc).await?;
-                let mut file = enc.into_inner().into_inner();
+                let mut file = enc.into_inner();
                 // Patch the reserved uncompressed-size field: the archive header
                 // begins after the 4-byte length prefix and 4-byte NUL pad, and
                 // its first member is the big-endian `t` size.
@@ -345,7 +351,7 @@ impl Transaction {
             let placeholder = frame(&header.serialize_archive(0)?)?;
             write_all(&mut file, &placeholder).await?;
             let level = archive_level(self.repo().config().zlib_level()?);
-            Sink::Archive(DeflateEncoder::with_quality(NoClose::new(file), level))
+            Sink::Archive(DeflateSink::new(file, level))
         } else {
             Sink::Plain(file)
         };
@@ -574,8 +580,8 @@ impl Transaction {
 
 /// The raw-DEFLATE encoder level for an `[archive] zlib-level` value, clamped to
 /// the 1-9 range the tool accepts.
-fn archive_level(zlib_level: i64) -> Level {
-    Level::Precise(zlib_level.clamp(1, 9) as i32)
+fn archive_level(zlib_level: i64) -> u8 {
+    zlib_level.clamp(1, 9) as u8
 }
 
 /// Open an ingestion temp file in the staging directory: `O_TMPFILE` where the
@@ -1471,38 +1477,166 @@ fn gid(value: u32) -> Gid {
     Gid::from_raw(value)
 }
 
-/// A writer wrapper whose `poll_close` only flushes, so an inner file survives
-/// the DEFLATE encoder finalizing its stream and can be recovered for the
-/// header size-patch.
-struct NoClose<W> {
+/// A streaming raw-DEFLATE encoder over an async writer.
+///
+/// Each `poll_write` compresses the caller's chunk into a bounded output
+/// buffer and passes that buffer on to the writer under it, so a payload of
+/// any size goes through in fixed-size pieces. `poll_flush` ends the current
+/// DEFLATE block with a sync flush. `poll_close` ends the stream and leaves
+/// the writer under it open, which the header size-patch in
+/// [`ContentWriter::finish`] needs.
+struct DeflateSink<W> {
     inner: W,
+    compressor: Box<CompressorOxide>,
+    /// The compressed bytes the compressor has produced.
+    out: Vec<u8>,
+    /// How many bytes of `out` have reached `inner`.
+    sent: usize,
+    /// How many bytes of `out` the compressor filled.
+    filled: usize,
+    /// Whether a sync flush is under way, so the sequence resumes with the
+    /// drain steps that follow the sync step rather than a second sync step.
+    syncing: bool,
+    /// Whether the current DEFLATE block is closed and no input has arrived
+    /// since.
+    flushed: bool,
+    /// Whether the compressor has reached the end of the stream.
+    done: bool,
 }
 
-impl<W> NoClose<W> {
-    fn new(inner: W) -> NoClose<W> {
-        NoClose { inner }
+impl<W> DeflateSink<W> {
+    /// A raw-DEFLATE encoder over `inner` at `level`, which the format holds to
+    /// 1 through 9.
+    fn new(inner: W, level: u8) -> DeflateSink<W> {
+        let mut compressor = Box::<CompressorOxide>::default();
+        compressor.set_format_and_level(DataFormat::Raw, level);
+        DeflateSink {
+            inner,
+            compressor,
+            out: vec![0u8; DEFLATE_CHUNK],
+            sent: 0,
+            filled: 0,
+            syncing: false,
+            flushed: true,
+            done: false,
+        }
     }
 
+    /// The writer under the encoder.
     fn into_inner(self) -> W {
         self.inner
     }
 }
 
-impl<W: AsyncWrite + Unpin> AsyncWrite for NoClose<W> {
+impl<W: AsyncWrite + Unpin> DeflateSink<W> {
+    /// Pass the compressed bytes held in `out` on to `inner`.
+    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.sent < self.filled {
+            let n = std::task::ready!(
+                Pin::new(&mut self.inner).poll_write(cx, &self.out[self.sent..self.filled])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write returned zero",
+                )));
+            }
+            self.sent += n;
+        }
+        self.sent = 0;
+        self.filled = 0;
+        Poll::Ready(Ok(()))
+    }
+
+    /// Run the compressor once over `input` under `flush`, into an empty output
+    /// buffer. The step drains first, so a `Pending` return leaves the
+    /// compressor untouched and the caller repeats the same step.
+    ///
+    /// Returns the bytes of `input` the compressor took, the bytes it produced,
+    /// and whether it reached the end of the stream. A `Buf` result reports
+    /// that the compressor made no progress, which the flush and close
+    /// sequences read as the end of the output they wait for.
+    fn poll_step(
+        &mut self,
+        cx: &mut Context<'_>,
+        input: &[u8],
+        flush: MZFlush,
+    ) -> Poll<io::Result<(usize, usize, bool)>> {
+        std::task::ready!(self.poll_drain(cx))?;
+        let res = deflate(&mut self.compressor, input, &mut self.out, flush);
+        self.filled = res.bytes_written;
+        let end = match res.status {
+            Ok(MZStatus::StreamEnd) => true,
+            Ok(_) | Err(MZError::Buf) => false,
+            Err(e) => {
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "the DEFLATE encoder failed: {e:?}"
+                ))));
+            }
+        };
+        Poll::Ready(Ok((res.bytes_consumed, res.bytes_written, end)))
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for DeflateSink<W> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let me = self.get_mut();
+        loop {
+            let (taken, produced, _) = std::task::ready!(me.poll_step(cx, buf, MZFlush::None))?;
+            // The compressor has now run over the caller's chunk, so the block
+            // is open and a flush sequence that was under way is abandoned. A
+            // `Pending` return above leaves both flags as they stood.
+            me.flushed = false;
+            me.syncing = false;
+            if taken > 0 {
+                return Poll::Ready(Ok(taken));
+            }
+            if produced == 0 {
+                return Poll::Ready(Err(io::Error::other(
+                    "the DEFLATE encoder took no input and produced no output",
+                )));
+            }
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let me = self.get_mut();
+        // End the block with a sync step, then take the rest of the output the
+        // compressor still holds until a step produces nothing.
+        while !me.flushed {
+            let flush = if me.syncing {
+                MZFlush::None
+            } else {
+                MZFlush::Sync
+            };
+            let (_, produced, _) = std::task::ready!(me.poll_step(cx, &[], flush))?;
+            me.syncing = true;
+            if produced == 0 {
+                me.flushed = true;
+                me.syncing = false;
+            }
+        }
+        std::task::ready!(me.poll_drain(cx))?;
+        Pin::new(&mut me.inner).poll_flush(cx)
     }
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let me = self.get_mut();
+        while !me.done {
+            let (_, _, end) = std::task::ready!(me.poll_step(cx, &[], MZFlush::Finish))?;
+            me.done = end;
+        }
+        std::task::ready!(me.poll_drain(cx))?;
+        // The stream ends here; the file under the encoder stays open for the
+        // header size-patch.
+        Pin::new(&mut me.inner).poll_flush(cx)
     }
 }
 

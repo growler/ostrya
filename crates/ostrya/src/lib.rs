@@ -91,23 +91,24 @@
 //! it also covers the spki engine (Phase 13c): [`SpkiSigner`] / [`SpkiVerifier`]
 //! over ECDSA on NIST P-256 with SHA-256, DER-encoded signatures, and
 //! SubjectPublicKeyInfo public keys, reusing the sign-api key store as
-//! `trusted.spki` / `revoked.spki`. Under the `sign-gpg` feature it also covers
-//! the GPG engine (Phase 13d): [`GpgSigner`] / [`GpgVerifier`] over the system
-//! GnuPG binaries -- signing runs `gpg --detach-sign` with the key resolved by
-//! fingerprint, key id, or user id in an optional GnuPG home directory
-//! (agent-held and hardware-token keys included), verification runs `gpgv`
-//! over binary or armored keyrings, and detached OpenPGP signatures accumulate
-//! under `ostree.gpgsigs` with per-signature metadata parsed from the
-//! `--status-fd` stream. It also covers static deltas in both directions
-//! (Phase 15): [`Repo::apply_static_delta_offline`] reads a delta -- the
-//! superblock, the xz-compressed parts, and the operation stream (splice,
-//! open/close, set-read-source, rollsum write, and bspatch) -- and produces the
-//! target commit's objects, asserting each checksum as written, while
-//! [`Repo::generate_static_delta`] writes one, choosing per object between a
-//! splice, a rollsum copy-from-source stream, a bspatch stream, and a loose
-//! fallback. [`Repo::sign_static_delta`] wraps a superblock in the signed
-//! envelope, [`Repo::verify_static_delta`] checks those signatures with the
-//! signing engines over the raw superblock bytes, and
+//! `trusted.spki` / `revoked.spki`. Under the `verify-gpg` feature it also
+//! covers the GPG engine (Phase 13d): [`GpgVerifier`] holds binary or armored
+//! keyrings, parses each into certificates as it loads it, and runs `gpgv` for
+//! the verdict; detached OpenPGP signatures accumulate under
+//! `ostree.gpgsigs` with per-signature metadata parsed from the `--status-fd`
+//! stream. The `sign-gpg` feature adds [`GpgSigner`], which runs
+//! `gpg --detach-sign` with the key resolved by fingerprint, key id, or user
+//! id in an optional GnuPG home directory (agent-held and hardware-token keys
+//! included), and turns on `verify-gpg` with it. It also covers static deltas
+//! in both directions (Phase 15): [`Repo::apply_static_delta_offline`] reads a
+//! delta -- the superblock, the xz-compressed parts, and the operation stream
+//! (splice, open/close, set-read-source, rollsum write, and bspatch) -- and
+//! produces the target commit's objects, asserting each checksum as written,
+//! while [`Repo::generate_static_delta`] writes one, choosing per object
+//! between a splice, a rollsum copy-from-source stream, a bspatch stream, and
+//! a loose fallback. [`Repo::sign_static_delta`] wraps a superblock in the
+//! signed envelope, [`Repo::verify_static_delta`] checks those signatures with
+//! the signing engines over the raw superblock bytes, and
 //! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache. It also
 //! covers the fetcher pull is built on (Phase 16a): [`Fetcher`] serves
 //! [`FetchRequest`]s for paths under a remote's mirrors over HTTP/1.1 and
@@ -163,7 +164,7 @@
 //! [`Repo::write_config`] replaces `config` atomically with a document edited
 //! through [`KeyFile`](ostrya_core::KeyFile), which is how a remote's section is
 //! added or removed, and [`Repo::remove_remote_keyring`] deletes the keyring that
-//! section owns. Under the `sign-gpg` feature, `Repo::gpg_import_keys` and
+//! section owns. Under the `verify-gpg` feature, `Repo::gpg_import_keys` and
 //! `Repo::gpg_list_keys` add certificates to a remote's
 //! `<remote>.trustedkeys.gpg` and read back the key records it holds (see the
 //! [`gpg`] module). It also covers the bootable commit metadata (Phase 21):
@@ -187,7 +188,7 @@ pub mod error;
 pub mod fetch;
 pub mod file;
 pub mod fsck;
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "verify-gpg")]
 pub mod gpg;
 mod hashing;
 mod inflate;
@@ -230,7 +231,9 @@ pub use fetch::{
 pub use file::{ContentReader, FileKind, FileObject};
 pub use fsck::{FsckError, FsckErrorKind, FsckOptions, FsckReport};
 #[cfg(feature = "sign-gpg")]
-pub use gpg::{GpgKey, GpgSigner, GpgVerifier};
+pub use gpg::GpgSigner;
+#[cfg(feature = "verify-gpg")]
+pub use gpg::{GpgKey, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter, VerifyingReader};
 pub use lock::LockKind;
 pub use modifier::{

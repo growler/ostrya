@@ -156,7 +156,7 @@ impl FileObject {
             ReaderSource::Plain => ContentReaderInner::Plain(self.open_payload(0).await?),
             ReaderSource::Archive { payload_offset } => {
                 let file = self.open_payload(*payload_offset).await?;
-                ContentReaderInner::Inflate(archive_decoder(file))
+                ContentReaderInner::Inflate(Box::new(archive_decoder(file)))
             }
         };
         Ok(ContentReader { inner })
@@ -592,7 +592,8 @@ pub struct ContentReader {
 enum ContentReaderInner {
     Empty,
     Plain(RtFile),
-    Inflate(ArchiveDecoder),
+    /// Boxed: the decoder state is large beside the other variants.
+    Inflate(Box<ArchiveDecoder>),
 }
 
 impl ContentReader {
@@ -603,7 +604,7 @@ impl ContentReader {
         match &mut self.inner {
             ContentReaderInner::Empty => Poll::Ready(Ok(0)),
             ContentReaderInner::Plain(inner) => Pin::new(inner).poll_read(cx, out),
-            ContentReaderInner::Inflate(inner) => Pin::new(inner).poll_read(cx, out),
+            ContentReaderInner::Inflate(inner) => Pin::new(&mut **inner).poll_read(cx, out),
         }
     }
 }

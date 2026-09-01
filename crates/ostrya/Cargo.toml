@@ -13,7 +13,8 @@ default = ["smol"]
 smol = ["ostrya-rt/smol"]
 tokio = ["ostrya-rt/tokio"]
 sign-spki = ["dep:p256"]
-sign-gpg = []
+verify-gpg = ["dep:pgp"]
+sign-gpg = ["verify-gpg"]
 
 [dependencies]
 ostrya-core = { workspace = true }
@@ -37,6 +38,10 @@ liblzma = { version = "0.4", features = ["static"] }
 # unsafe, and its output is the interleaved control/diff/extra layout
 # `bspatch.rs` reads.
 bsdiff = "0.2.1"
+# The raw-DEFLATE encoder behind archive-mode content objects. Pinning the
+# compressor directly keeps the stored `.filez` bytes fixed for a given
+# `[archive] zlib-level`, independent of the feature set the build enables.
+miniz_oxide = "0.8"
 pin-project-lite = "0.2"
 futures-io = "0.3"
 futures-lite = "2"
@@ -71,6 +76,12 @@ p256 = { version = "0.13.2", default-features = false, features = [
     "pkcs8",
     "std",
 ], optional = true }
+# rPGP reads OpenPGP keyrings and signatures in the process. `default-features
+# = false` is mandatory: the `default` feature reaches `bzip2` and the C
+# library behind it, and the `asm` feature turns on assembly paths. A detached
+# signature carries no compressed packet, so the verification path needs
+# neither.
+pgp = { version = "0.20.0", default-features = false, optional = true }
 
 [dev-dependencies]
 ostrya-rt = { workspace = true }

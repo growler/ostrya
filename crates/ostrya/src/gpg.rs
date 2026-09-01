@@ -1,11 +1,12 @@
 //! GPG (OpenPGP) commit-signing engine (Phase 13d).
 //!
-//! Behind the `sign-gpg` feature, over the system GnuPG installation: signing
-//! runs `gpg --detach-sign` and verification runs `gpgv`, each as a
+//! Behind the `verify-gpg` feature: keyrings are parsed in the process with
+//! the `pgp` crate (rPGP), and verification runs `gpgv` over the system GnuPG
+//! installation. The `sign-gpg` feature adds signing through
+//! `gpg --detach-sign` and turns on `verify-gpg` with it. Each GnuPG run is a
 //! short-lived subprocess through [`ostrya_rt::Command`], with results read
-//! from the machine-readable `--status-fd` line protocol. No OpenPGP
-//! implementation is linked into the library, and the private key never
-//! passes through it.
+//! from the machine-readable `--status-fd` line protocol. The private key
+//! stays with GnuPG and its agent and never passes through the library.
 //!
 //! Format (`format-reference.md`, "Signing details -- GPG"):
 //!
@@ -20,7 +21,8 @@
 //! the private-key operation itself, consulting its `gpg-agent` -- and any
 //! hardware token behind it -- as needed.
 //!
-//! [`GpgVerifier`] holds binary keyring blobs, loaded through
+//! [`GpgVerifier`] holds the certificates its keyrings parse to, together with
+//! the binary keyring blobs `gpgv` reads. Keyrings are loaded through
 //! [`from_keyring_bytes`](GpgVerifier::from_keyring_bytes) and
 //! [`from_keyring_files`](GpgVerifier::from_keyring_files) (armored input is
 //! decoded to the binary form on load, since `gpgv` reads only binary
@@ -35,10 +37,20 @@
 //! names, which is what a pull trusts. Every keyring file reaches the trusted
 //! set through one reader: only a regular file is read, and only up to four
 //! mebibytes, so a path naming a fifo and a keyring over that ceiling are each
-//! refused by that path's own name. Verification writes
-//! the merged keyring to a private scratch directory and runs `gpgv` once per
-//! stored blob; `gpgv` performs public-key operations only and starts no
-//! agent.
+//! refused by that path's own name.
+//!
+//! A keyring is untrusted input, so its load is bounded and its parse is
+//! contained. The four-mebibyte ceiling holds over a keyring supplied as bytes
+//! as well, and one keyring holds at most 256 certificates; each refusal names
+//! the cap it reached. A GnuPG keybox, which carries the `KBXf` magic, is
+//! refused by the name of the file or the blob that holds it, since rPGP reads
+//! OpenPGP packet streams and a keybox is a container of another kind. A
+//! keyring the parser rejects fails the load, so the trusted set a
+//! verification works over is one that was read whole.
+//!
+//! Verification writes the merged keyring to a private scratch directory and
+//! runs `gpgv` once per stored blob; `gpgv` performs public-key operations only
+//! and starts no agent.
 //!
 //! A remote's own trusted keyring is managed through the same subprocess
 //! plumbing: [`Repo::gpg_import_keys`] adds certificates to
@@ -58,16 +70,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ostrya_core::base64;
+use pgp::composed::{Deserializable, SignedPublicKey};
 
 use crate::config::remote_keyring_name;
 use crate::error::{Error, Result};
 use crate::repo::Repo;
+#[cfg(feature = "sign-gpg")]
+use crate::sign::{SignFuture, Signer};
 use crate::sign::{
-    SignFuture, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, read_key_path,
-    read_key_source,
+    SignatureInfo, Verifier, VerifyFuture, VerifyOutcome, read_key_path, read_key_source,
 };
 
 /// The GPG engine's short name.
+#[cfg(feature = "sign-gpg")]
 const GPG_SIGN_TYPE: &str = "gpg";
 /// The GPG engine's detached-metadata dict key. Unlike the sign-api engines,
 /// GPG signatures live under `ostree.gpgsigs`, not `ostree.sign.<type>`.
@@ -91,6 +106,15 @@ const OFFERED_FILE: &str = "offered.gpg";
 /// One exported ed25519 certificate is a few hundred bytes, so four mebibytes
 /// holds thousands of them, and a remote's trusted set is a handful.
 pub(crate) const MAX_KEYRING: u64 = 4 * 1024 * 1024;
+/// The ceiling on the certificates one keyring may hold. A remote's trusted
+/// set is a handful of certificates, and the ceiling bounds the work a keyring
+/// from a remote or from `trusted.gpg.d` can ask the parser for.
+const MAX_KEYRING_CERTS: usize = 256;
+/// The magic a GnuPG keybox carries, and the offset it stands at. A keybox
+/// opens with a header blob: a four-byte length, a one-byte blob type, a
+/// one-byte version, and two bytes of flags stand before the magic.
+const KEYBOX_MAGIC: &[u8] = b"KBXf";
+const KEYBOX_MAGIC_OFFSET: usize = 8;
 
 /// The GPG commit-signing engine.
 ///
@@ -98,12 +122,14 @@ pub(crate) const MAX_KEYRING: u64 = 4 * 1024 * 1024;
 /// id, or a user id -- and an optional GnuPG home directory. Signing runs
 /// `gpg --detach-sign` with the payload on stdin and reads the binary
 /// signature from stdout.
+#[cfg(feature = "sign-gpg")]
 #[derive(Debug, Clone)]
 pub struct GpgSigner {
     key: String,
     homedir: Option<PathBuf>,
 }
 
+#[cfg(feature = "sign-gpg")]
 impl GpgSigner {
     /// A signer for the key `gpg` resolves from `key` (a fingerprint, key id,
     /// or user id) in the default GnuPG home directory.
@@ -167,6 +193,7 @@ impl GpgSigner {
 /// Each `sec` record opens one key and the `fpr` record that follows it carries
 /// that key's fingerprint in field ten. A `ssb` record opens a subkey, whose own
 /// `fpr` record names the subkey and is skipped.
+#[cfg(feature = "sign-gpg")]
 fn primary_fingerprints(listing: &[u8]) -> Vec<String> {
     let mut found = Vec::new();
     let mut wanted = false;
@@ -190,6 +217,7 @@ fn primary_fingerprints(listing: &[u8]) -> Vec<String> {
     found
 }
 
+#[cfg(feature = "sign-gpg")]
 impl Signer for GpgSigner {
     fn name(&self) -> &str {
         GPG_SIGN_TYPE
@@ -223,11 +251,15 @@ impl Signer for GpgSigner {
     }
 }
 
-/// The GPG commit-verifying engine, holding the trusted keyrings as binary
-/// blobs.
+/// The GPG commit-verifying engine, holding the trusted certificates its
+/// keyrings parse to and the binary keyring blobs `gpgv` reads.
 #[derive(Debug, Clone, Default)]
 pub struct GpgVerifier {
     keyrings: Vec<Vec<u8>>,
+    /// The certificates the loaded keyrings hold, in load order. The parse
+    /// happens as a keyring is loaded, so a keyring the parser rejects fails
+    /// the load rather than a verification made over it.
+    certs: Vec<SignedPublicKey>,
 }
 
 impl GpgVerifier {
@@ -235,16 +267,20 @@ impl GpgVerifier {
     /// blobs. Each blob is a binary or ASCII-armored OpenPGP keyring and may
     /// hold several certificates; armored input is decoded to the binary
     /// form, and all blobs merge into one trusted set.
+    ///
+    /// Each blob is held to four mebibytes and to 256 certificates, and a blob
+    /// carrying a GnuPG keybox is refused. A refusal names the blob by its
+    /// position in the sequence and states the cap it reached.
     pub fn from_keyring_bytes<I, B>(keyrings: I) -> Result<GpgVerifier>
     where
         I: IntoIterator<Item = B>,
         B: AsRef<[u8]>,
     {
-        let mut blobs = Vec::new();
-        for keyring in keyrings {
-            blobs.push(dearmor(keyring.as_ref())?);
+        let mut verifier = GpgVerifier::default();
+        for (index, keyring) in keyrings.into_iter().enumerate() {
+            verifier.add_keyring(keyring.as_ref(), &format!("the keyring blob {index}"))?;
         }
-        Ok(GpgVerifier { keyrings: blobs })
+        Ok(verifier)
     }
 
     /// Build a verifier from keyring files on disk (binary or armored). A
@@ -257,13 +293,9 @@ impl GpgVerifier {
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        let mut blobs: Vec<Vec<u8>> = Vec::new();
-        for path in paths {
-            if let Some(bytes) = read_keyring_path(path.as_ref())? {
-                blobs.push(bytes);
-            }
-        }
-        GpgVerifier::from_keyring_bytes(blobs)
+        let mut verifier = GpgVerifier::default();
+        verifier.add_keyring_files(paths)?;
+        Ok(verifier)
     }
 
     /// Build a verifier from the keyrings trusted for `remote` in the
@@ -310,10 +342,11 @@ impl GpgVerifier {
                 paths.push(path.to_owned());
             }
         }
-        let mut verifier = GpgVerifier::from_keyring_files(paths)?;
+        let mut verifier = GpgVerifier::default();
         if let Some(bytes) = repo_keyring {
-            verifier.keyrings.insert(0, dearmor(&bytes)?);
+            verifier.add_keyring(&bytes, &format!("the keyring '{remote}.trustedkeys.gpg'"))?;
         }
+        verifier.add_keyring_files(paths)?;
         Ok(verifier)
     }
 
@@ -325,6 +358,84 @@ impl GpgVerifier {
     /// remote. A missing directory yields an empty trusted set.
     pub fn from_system_trust() -> Result<GpgVerifier> {
         GpgVerifier::from_keyring_files(keyring_files_in(&global_trusted_dir())?)
+    }
+
+    /// Add every keyring `paths` names to the trusted set, in the order given.
+    /// A path naming no file is skipped.
+    fn add_keyring_files<I, P>(&mut self, paths: I) -> Result<()>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        for path in paths {
+            let path = path.as_ref();
+            if let Some(bytes) = read_keyring_path(path)? {
+                self.add_keyring(&bytes, &format!("the keyring '{}'", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Add one keyring to the trusted set: decode armor, hold the blob to the
+    /// input caps, refuse a keybox, and parse the certificates it carries.
+    /// `subject` names the source, so a refusal states which keyring reached
+    /// which cap.
+    fn add_keyring(&mut self, bytes: &[u8], subject: &str) -> Result<()> {
+        if bytes.len() as u64 > MAX_KEYRING {
+            return Err(Error::Signature(format!(
+                "{subject} is over the {MAX_KEYRING}-byte ceiling"
+            )));
+        }
+        let binary = dearmor(bytes)?;
+        if binary.len() >= KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()
+            && &binary[KEYBOX_MAGIC_OFFSET..KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()]
+                == KEYBOX_MAGIC
+        {
+            return Err(Error::Signature(format!(
+                "{subject} is a GnuPG keybox, and a keyring is read as an OpenPGP \
+                 packet stream"
+            )));
+        }
+        self.certs.extend(parse_keyring(&binary, subject)?);
+        self.keyrings.push(binary);
+        Ok(())
+    }
+}
+
+/// Parse a binary OpenPGP keyring into the certificates it carries, holding
+/// the result to [`MAX_KEYRING_CERTS`]. A keyring carrying no packet parses to
+/// no certificate.
+///
+/// A keyring is untrusted input, so the parse runs inside
+/// [`std::panic::catch_unwind`] and a caught panic reads as a keyring the
+/// parser rejects. Two limits hold: `catch_unwind` catches nothing where the
+/// final binary is built with `panic = "abort"`, and it says nothing about a
+/// parser that returns a wrong answer without panicking.
+fn parse_keyring(binary: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
+    let parse = || -> Result<Vec<SignedPublicKey>> {
+        let refuse = |e: pgp::errors::Error| {
+            Error::Signature(format!(
+                "{subject} is not readable as an OpenPGP keyring: {e}"
+            ))
+        };
+        let certs =
+            SignedPublicKey::from_bytes_many(std::io::Cursor::new(binary)).map_err(refuse)?;
+        let mut held: Vec<SignedPublicKey> = Vec::new();
+        for cert in certs {
+            if held.len() == MAX_KEYRING_CERTS {
+                return Err(Error::Signature(format!(
+                    "{subject} holds more than {MAX_KEYRING_CERTS} certificates"
+                )));
+            }
+            held.push(cert.map_err(refuse)?);
+        }
+        Ok(held)
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(parse)) {
+        Ok(result) => result,
+        Err(_) => Err(Error::Signature(format!(
+            "{subject} is not readable as an OpenPGP keyring: the parser panicked"
+        ))),
     }
 }
 
@@ -936,6 +1047,7 @@ fn failure_text(output: &std::process::Output) -> String {
 /// The GPG public types move freely across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
+    #[cfg(feature = "sign-gpg")]
     assert_send_sync::<GpgSigner>();
     assert_send_sync::<GpgVerifier>();
 };
@@ -1186,5 +1298,212 @@ IHdvcmxk\n\
     #[test]
     fn keyring_files_in_missing_dir_is_empty() {
         assert!(keyring_files_in(&scratch_dir()).unwrap().is_empty());
+    }
+
+    /// Whether the `gpg` binary answers. The keyring cases below build their
+    /// fixtures with it, so an absent binary skips them and never passes one.
+    fn gpg_available() -> bool {
+        std::process::Command::new("gpg")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    /// A private GnuPG home holding freshly generated, passphrase-free ed25519
+    /// signing keys, under the test scratch tree. Every `gpg` run names this
+    /// directory with `--homedir`, so the invoking user's GnuPG home and any
+    /// agent of theirs take no part. Dropping the fixture kills the agent
+    /// GnuPG auto-started for the directory and removes the directory.
+    struct KeyFixture {
+        dir: PathBuf,
+    }
+
+    impl KeyFixture {
+        /// A new home directory holding one key for `uid`.
+        fn new(uid: &str) -> KeyFixture {
+            use std::os::unix::fs::DirBuilderExt;
+            let dir = scratch_dir();
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            let fixture = KeyFixture { dir };
+            fixture.add_key(uid);
+            fixture
+        }
+
+        /// Generate one more key, for `uid`, in the same home directory.
+        fn add_key(&self, uid: &str) {
+            let status = self
+                .gpg()
+                .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                .args(["--quick-gen-key", uid, "ed25519", "sign", "never"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "gpg --quick-gen-key failed");
+        }
+
+        /// A `gpg` command bound to this home directory, batch mode.
+        fn gpg(&self) -> std::process::Command {
+            let mut cmd = std::process::Command::new("gpg");
+            cmd.arg("--homedir").arg(&self.dir).arg("--batch");
+            cmd
+        }
+
+        /// The exported public keyring, binary or ASCII-armored.
+        fn export(&self, armored: bool) -> Vec<u8> {
+            let mut cmd = self.gpg();
+            cmd.arg("--export");
+            if armored {
+                cmd.arg("--armor");
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success() && !out.stdout.is_empty());
+            out.stdout
+        }
+
+        /// The keybox `gpg` keeps this home directory's public keys in.
+        fn keybox(&self) -> Vec<u8> {
+            std::fs::read(self.dir.join("pubring.kbx")).unwrap()
+        }
+    }
+
+    impl Drop for KeyFixture {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("gpgconf")
+                .arg("--homedir")
+                .arg(&self.dir)
+                .args(["--kill", "gpg-agent"])
+                .status();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A binary keyring holding one certificate loads, and the blob `gpgv`
+    /// reads is kept beside the certificate.
+    #[test]
+    fn loads_a_binary_keyring() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Binary <binary@ostrya.example>");
+        let keyring = home.export(false);
+        let verifier = GpgVerifier::from_keyring_bytes([&keyring]).unwrap();
+        assert_eq!(verifier.certs.len(), 1);
+        assert_eq!(verifier.keyrings, [keyring]);
+    }
+
+    /// An armored keyring loads to the same certificate as the binary form,
+    /// and the blob kept beside it is the binary form.
+    #[test]
+    fn loads_an_armored_keyring() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Armored <armored@ostrya.example>");
+        let binary = home.export(false);
+        let verifier = GpgVerifier::from_keyring_bytes([home.export(true)]).unwrap();
+        assert_eq!(verifier.certs.len(), 1);
+        assert_eq!(verifier.keyrings, [binary]);
+    }
+
+    /// A keyring holding two certificates loads both.
+    #[test]
+    fn loads_a_two_certificate_keyring() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("First <first@ostrya.example>");
+        home.add_key("Second <second@ostrya.example>");
+        let verifier = GpgVerifier::from_keyring_bytes([home.export(false)]).unwrap();
+        assert_eq!(verifier.certs.len(), 2);
+    }
+
+    /// An empty keyring loads and holds no certificate. An optional keyring
+    /// that is there and holds nothing is not a failure.
+    #[test]
+    fn loads_an_empty_keyring() {
+        let verifier = GpgVerifier::from_keyring_bytes([b""]).unwrap();
+        assert!(verifier.certs.is_empty());
+        assert_eq!(verifier.keyrings, [Vec::<u8>::new()]);
+    }
+
+    /// A truncated keyring is refused by the name of the blob that carried it.
+    #[test]
+    fn refuses_a_truncated_keyring() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Cut <cut@ostrya.example>");
+        let keyring = home.export(false);
+        let cut = &keyring[..keyring.len() / 2];
+        let err = GpgVerifier::from_keyring_bytes([cut]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("keyring blob 0")
+                && m.contains("OpenPGP keyring")),
+            "{err}"
+        );
+    }
+
+    /// A GnuPG keybox is refused by name. rPGP reads an OpenPGP packet stream,
+    /// and a keybox is a container of another kind, so reading it as a keyring
+    /// would leave the trusted set empty with nothing said about it.
+    #[test]
+    fn refuses_a_keybox() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Box <box@ostrya.example>");
+        let keybox = home.keybox();
+        assert_eq!(
+            &keybox[KEYBOX_MAGIC_OFFSET..KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()],
+            KEYBOX_MAGIC
+        );
+        let err = GpgVerifier::from_keyring_bytes([keybox]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("keyring blob 0")
+                && m.contains("keybox")),
+            "{err}"
+        );
+    }
+
+    /// A keyring over the four-mebibyte ceiling is refused by name, and the
+    /// refusal states the ceiling. The blob is bounded before it is parsed.
+    #[test]
+    fn refuses_an_oversized_keyring() {
+        let oversized = vec![0u8; MAX_KEYRING as usize + 1];
+        let err = GpgVerifier::from_keyring_bytes([oversized]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("keyring blob 0")
+                && m.contains("ceiling")),
+            "{err}"
+        );
+    }
+
+    /// A keyring holding more than 256 certificates is refused by name, and
+    /// the refusal states the cap. The keyring is one certificate repeated,
+    /// which is 257 transferable public keys in one packet stream.
+    #[test]
+    fn refuses_too_many_certificates() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Many <many@ostrya.example>");
+        let one = home.export(false);
+        let many = one.repeat(MAX_KEYRING_CERTS + 1);
+        assert!(many.len() as u64 <= MAX_KEYRING);
+        let err = GpgVerifier::from_keyring_bytes([&many]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("keyring blob 0")
+                && m.contains("256 certificates")),
+            "{err}"
+        );
+        // One certificate short of the cap loads, so the cap is what refused.
+        let allowed = one.repeat(MAX_KEYRING_CERTS);
+        let verifier = GpgVerifier::from_keyring_bytes([&allowed]).unwrap();
+        assert_eq!(verifier.certs.len(), MAX_KEYRING_CERTS);
     }
 }

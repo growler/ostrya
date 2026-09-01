@@ -198,6 +198,39 @@ impl DictBuilder {
 
 `ostrya` re-exports `DictBuilder` alongside `Type` and `Value`.
 
+### The bootable pair
+
+A bootable commit holds `ostree.linux` and `ostree.bootable`, in that order at
+the head of the dict (`format-reference.md`, "CLI output formats", `commit`).
+The value of `ostree.linux` is the name of the one directory under
+`/usr/lib/modules` in the commit's tree that holds an entry named `vmlinuz`.
+`BootableRefusal` names the four tree shapes that give no such name; a consumer
+words them itself.
+
+`DictBuilder` holds the value model and no ostree key names, so the pair goes
+in through an extension trait `ostrya` defines.
+
+```rust
+pub enum BootableRefusal {
+    MissingComponent { path: String },
+    NotADirectory { path: String },
+    NoKernel,
+    MultipleKernels,
+}
+
+pub trait BootableMetadata {
+    /// Append `ostree.linux` holding `kernel_version`, then `ostree.bootable`
+    /// holding true. The pair goes in where the builder has reached, so a
+    /// caller reproducing the tool's dict inserts it first.
+    fn insert_bootable(&mut self, kernel_version: &str) -> &mut Self;
+}
+
+impl BootableMetadata for DictBuilder { /* ... */ }
+```
+
+The version itself comes from `Transaction::kernel_version` over a staged tree
+or `RepoTree::kernel_version` over a published one.
+
 ### The GVariant text form
 
 The pair also converts to and from the GVariant text form, which is the form
@@ -523,6 +556,11 @@ impl RepoTree {
     pub async fn read_dir(&self) -> Result<Vec<TreeEntry>>;  // files then dirs, name-sorted
     pub fn dirtree_checksum(&self) -> &Checksum;
     pub fn dirmeta_checksum(&self) -> &Checksum;
+
+    /// The value `ostree.linux` holds for this tree, over `objects/` alone.
+    /// `Transaction::kernel_version` covers a tree that is still staged.
+    pub async fn kernel_version(&self)
+        -> Result<std::result::Result<String, BootableRefusal>>;
 }
 pub enum TreeEntry {
     File { name: String, checksum: Checksum },
@@ -617,6 +655,12 @@ impl Transaction {
     /// tree it is about to publish. Each `TreeEntry::Dir` it returns is read
     /// back the same way; `RepoTree::read_dir` reads `objects/` alone.
     pub async fn read_dir(&self, tree: &RepoTree) -> Result<Vec<TreeEntry>>;
+
+    /// The value `ostree.linux` holds for a tree this transaction staged,
+    /// read through `read_dir` so it is available before the transaction
+    /// publishes.
+    pub async fn kernel_version(&self, root: &RepoTree)
+        -> Result<std::result::Result<String, BootableRefusal>>;
 
     // detached metadata and signatures, written at `commit` after the staged
     // objects publish and before the queued refs, so a commit and its

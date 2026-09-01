@@ -166,8 +166,15 @@
 //! section owns. Under the `sign-gpg` feature, `Repo::gpg_import_keys` and
 //! `Repo::gpg_list_keys` add certificates to a remote's
 //! `<remote>.trustedkeys.gpg` and read back the key records it holds (see the
-//! [`gpg`] module).
+//! [`gpg`] module). It also covers the bootable commit metadata (Phase 21):
+//! [`Transaction::kernel_version`] and [`RepoTree::kernel_version`] derive the
+//! value `ostree.linux` holds from a tree, staged and published respectively,
+//! answering the shapes that name no kernel with a [`BootableRefusal`], and
+//! [`BootableMetadata`] adds `ostree.linux` and `ostree.bootable` to a
+//! [`DictBuilder`] in the order they hold on disk (see the [`bootable`]
+//! module).
 
+pub mod bootable;
 mod bspatch;
 pub mod checkout;
 pub mod commit;
@@ -208,6 +215,7 @@ pub mod traverse;
 pub mod tree;
 mod write;
 
+pub use bootable::{BootableMetadata, BootableRefusal};
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 pub use commit::CommitOptions;
 pub use composefs::{ComposefsOptions, VerityPolicy};

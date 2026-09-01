@@ -56,14 +56,15 @@ use std::sync::{Arc, Mutex};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
-    CheckoutMode, CheckoutOptions, Checksum, CollectionRef, CommitModifier, CommitModifierFlags,
-    CommitOptions, ComposefsOptions, CreateOptions, DeltaOptions, DevInoCache, DiffChange,
-    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileObject, FilterResult, FsckOptions,
-    MutableTree, ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias,
-    Repo, RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef,
-    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
-    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
-    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
+    BootableMetadata, BootableRefusal, CheckoutMode, CheckoutOptions, Checksum, CollectionRef,
+    CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions,
+    DeltaOptions, DevInoCache, DictBuilder, DiffChange, Ed25519Signer, Ed25519Verifier, Error,
+    FileKind, FileObject, FilterResult, FsckOptions, MutableTree, ObjectType, PruneOptions,
+    PullFlags, PullOptions, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result,
+    SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef, TarExportOptions, TarImportOptions,
+    TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome,
+    VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text,
+    to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -1916,16 +1917,12 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         // carrying `--add-metadata-string=ostree.linux=...` beside `--bootable`
         // reaches the same object as one carrying `--bootable` alone.
         drop_metadata_keys(&mut metadata, &[LINUX_KEY, BOOTABLE_KEY])?;
-        prepend_metadata_entries(
-            &mut metadata,
-            vec![
-                string_entry(LINUX_KEY, &version),
-                Value::Tuple(vec![
-                    Value::Str(BOOTABLE_KEY.to_owned()),
-                    Value::variant(Type::Bool, Value::Bool(true)),
-                ]),
-            ],
-        )?;
+        let mut pair = DictBuilder::new();
+        pair.insert_bootable(&version);
+        let Value::Array(entries) = pair.build() else {
+            unreachable!("DictBuilder builds an a{{sv}} array")
+        };
+        prepend_metadata_entries(&mut metadata, entries)?;
     }
     // The composefs digest stands after the binding keys, and the library
     // appends `ostree.sizes` after it. A value the command line supplied under
@@ -6440,67 +6437,29 @@ const BOOTABLE_KEY: &str = "ostree.bootable";
 /// The metadata key `--generate-composefs-metadata` fills with the tree's
 /// composefs image digest.
 const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
-/// The directory `--bootable` searches, one level deep, for the kernel.
+/// The directory two of the `--bootable` refusals name.
 const MODULES_DIR: &str = "/usr/lib/modules";
-/// The entry name a kernel directory must hold. Its type is not read: a
-/// regular file, a symlink, and a directory of that name all count.
-const KERNEL_ENTRY: &str = "vmlinuz";
 
-/// The kernel version `--bootable` stores in `ostree.linux`: the name of the
-/// single directory under `/usr/lib/modules` in the committed tree that holds an
-/// entry named `vmlinuz`. The search is one level deep, and an entry under
-/// `/usr/lib/modules` that is not a directory takes no part
-/// (`docs/format-reference.md`, "CLI output formats", `commit`).
+/// The kernel version `--bootable` stores in `ostree.linux`, taken from the
+/// tree the transaction has staged.
 ///
 /// The refusals carry the tool's own wording: the first component of the path
 /// the tree does not hold, a component that is not a directory, and the two
-/// counts that are not one.
+/// counts that are not one. The tool's `Not a directory` names no path, so the
+/// path the refusal carries is dropped here.
 async fn kernel_version(
     txn: &Transaction,
     root: &RepoTree,
 ) -> Result<std::result::Result<String, String>> {
-    let mut dir = root.clone();
-    let mut walked = String::new();
-    for component in MODULES_DIR.split('/').filter(|part| !part.is_empty()) {
-        walked.push('/');
-        walked.push_str(component);
-        let entry = txn
-            .read_dir(&dir)
-            .await?
-            .into_iter()
-            .find(|entry| entry_name(entry) == component);
-        match entry {
-            None => {
-                return Ok(Err(format!("No such file or directory: {walked}")));
-            }
-            Some(TreeEntry::File { .. }) => return Ok(Err("Not a directory".to_owned())),
-            Some(TreeEntry::Dir { tree, .. }) => dir = tree,
+    let found = txn.kernel_version(root).await?;
+    Ok(found.map_err(|refusal| match refusal {
+        BootableRefusal::MissingComponent { path } => {
+            format!("No such file or directory: {path}")
         }
-    }
-    let mut found = Vec::new();
-    for entry in txn.read_dir(&dir).await? {
-        if let TreeEntry::Dir { name, tree } = entry
-            && txn
-                .read_dir(&tree)
-                .await?
-                .iter()
-                .any(|entry| entry_name(entry) == KERNEL_ENTRY)
-        {
-            found.push(name);
-        }
-    }
-    match found.len() {
-        0 => Ok(Err(format!("No kernel found in {MODULES_DIR}"))),
-        1 => Ok(Ok(found.remove(0))),
-        _ => Ok(Err(format!("Multiple kernels found in {MODULES_DIR}"))),
-    }
-}
-
-/// The name of a directory entry, whichever kind it is.
-fn entry_name(entry: &TreeEntry) -> &str {
-    match entry {
-        TreeEntry::File { name, .. } | TreeEntry::Dir { name, .. } => name,
-    }
+        BootableRefusal::NotADirectory { .. } => "Not a directory".to_owned(),
+        BootableRefusal::NoKernel => format!("No kernel found in {MODULES_DIR}"),
+        BootableRefusal::MultipleKernels => format!("Multiple kernels found in {MODULES_DIR}"),
+    }))
 }
 
 /// Insert entries at the head of an `a{sv}` metadata dict, the slot the keys a

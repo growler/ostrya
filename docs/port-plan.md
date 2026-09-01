@@ -4485,8 +4485,13 @@ deliverable's full surface and Verify list:
   part of the commit checksum. `write_dirmeta` is the path a caller assembling a
   tree takes, because the object's identity covers the form the repository mode
   records and `bare-user-only` records a canonical one.
-- `D9` -- `kernel_version`, `BootableRefusal`, and
-  `DictBuilder::insert_bootable`.
+- `D9` -- `kernel_version`, `BootableRefusal`, and `BootableMetadata` (DONE):
+  one walk descends `/usr/lib/modules` and is exposed twice, staged-first
+  through `Transaction::kernel_version` and over `objects/` through
+  `RepoTree::kernel_version`. The four tree shapes that name no version arrive
+  through an inner `Result`, and a consumer words them itself. The two metadata
+  keys go into a dict through an extension trait `ostrya` defines over
+  `DictBuilder`, which keeps the ostree key names out of the GVariant codec.
 
 ## Risk register
 

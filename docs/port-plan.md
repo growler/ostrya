@@ -1127,10 +1127,12 @@ Phase 17. Subcommands:
   with no path, read a tar stream from stdin (Phase 10 import). The timestamp
   comes from `SOURCE_DATE_EPOCH` when set, else the current time.
 - `ostrya checkout [--repo <repo>] [-H|--require-hardlinks]
-  [-C|--force-copy] [--composefs] <commit> <destination>` -- Phase 8
-  faithful checkout; `-C` forces copies, `-H` (its conflicting opposite)
-  requests the hardlink-preferring default path; `--composefs` writes the
-  Phase 9 EROFS image to `destination` instead of a tree.
+  [-C|--force-copy] [--composefs] [--composefs-noverity] <commit>
+  <destination>` -- Phase 8 faithful checkout; `-C` forces copies, `-H` (its
+  conflicting opposite) requests the hardlink-preferring default path;
+  `--composefs` writes the Phase 9 EROFS image to `destination` instead of a
+  tree, and `--composefs-noverity` writes that image with no fs-verity digest
+  in it, deciding whatever the order the two switches take.
 - `ostrya export [--repo <repo>] <commit>` -- write the commit to stdout as
   a tar stream (Phase 10 export).
 
@@ -4471,7 +4473,12 @@ deliverable's full surface and Verify list:
   an inode to the 128 shared-xattr references the tool gives it and keeps the
   rest inline, which `tree-rich.cfs` pins.
 - `D7b` -- `checkout --composefs-noverity` and the destination-fd rewiring,
-  with their cells.
+  with their cells (DONE): the two switches are independent and the no-verity
+  one decides whatever their order, and all four forms write the tool's image
+  bytes. Both switches export through `Repo::export_composefs_to` into a
+  temporary file in the destination's directory, renamed over the destination
+  once the image is whole, so a refused export leaves a destination that
+  already existed as it was and an export that finishes replaces it.
 - `D6` -- `DictBuilder`, the `loose_path` re-export, and a public
   `Transaction::write_dirmeta`.
 - `D9` -- `kernel_version`, `BootableRefusal`, and

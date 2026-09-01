@@ -2178,6 +2178,239 @@ fn composefs_checkout_matches_library() {
     assert!(!cli_bytes.is_empty(), "composefs image is non-empty");
 }
 
+/// The two composefs switches of `checkout`, over a `bare-user` repository
+/// holding one tree. `--composefs` writes the verity image, and
+/// `--composefs-noverity` writes the image whose metacopy xattr carries no
+/// digest. The switches are independent and the no-verity switch decides, so
+/// the two combined forms write the no-verity image whatever their order. Each
+/// form is held against the tool's own image for the same commit.
+///
+/// Every destination is created at mode 0600 first, so each form also states
+/// that both implementations replace a destination that already exists rather
+/// than write into it: the image lands at the process umask on both sides.
+#[test]
+fn checkout_composefs_switches_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-composefs-switches");
+    let base = tmp.path();
+    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::BareUser);
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &[
+            "commit",
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            FIXED_TIMESTAMP,
+            "--orphan",
+            tree.to_str().unwrap(),
+        ],
+    );
+    let rev = ostrya(
+        &[
+            "rev-parse",
+            &format!("--repo={}", port_repo.display()),
+            BRANCH,
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+
+    // The tool writes the image through a temporary file it creates in the
+    // working directory and links to the destination, so both implementations
+    // run from the directory the destinations sit in. One image per form and
+    // per implementation leaves eight files to compare.
+    let mut written = Vec::new();
+    for (n, flags) in [
+        ["--composefs"].as_slice(),
+        ["--composefs-noverity"].as_slice(),
+        ["--composefs", "--composefs-noverity"].as_slice(),
+        ["--composefs-noverity", "--composefs"].as_slice(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let label = flags.join(" ");
+        let port_image = base.join(format!("port{n}.cfs"));
+        let tool_image = base.join(format!("tool{n}.cfs"));
+        for dest in [&port_image, &tool_image] {
+            std::fs::write(dest, b"stale destination").unwrap();
+            std::fs::set_permissions(dest, PermissionsExt::from_mode(0o600)).unwrap();
+        }
+        let line = |repo: &Path, dest: &Path| {
+            let mut args = vec!["checkout".to_owned(), format!("--repo={}", repo.display())];
+            args.extend(flags.iter().map(|flag| (*flag).to_owned()));
+            args.push(rev.clone());
+            args.push(dest.display().to_string());
+            args
+        };
+        let port_args = line(&port_repo, &port_image);
+        let tool_args = line(&tool_repo, &tool_image);
+        let port = ostrya_in(
+            Some(base),
+            &port_args.iter().map(String::as_str).collect::<Vec<_>>(),
+            None,
+            &[],
+        );
+        let tool = ostree_in(
+            base,
+            &tool_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        assert_runs_agree(&port, &tool, &format!("checkout {label}"));
+        let port_bytes = std::fs::read(&port_image).unwrap();
+        let tool_bytes = std::fs::read(&tool_image).unwrap();
+        assert!(!port_bytes.is_empty(), "`{label}` wrote an empty image");
+        assert_eq!(
+            port_bytes, tool_bytes,
+            "`checkout {label}` and the tool wrote different image bytes",
+        );
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&port_image),
+            mode(&tool_image),
+            "`checkout {label}` and the tool left the replaced destination at \
+             different modes",
+        );
+        assert_ne!(
+            mode(&port_image),
+            0o600,
+            "`checkout {label}` wrote into the destination instead of \
+             replacing it",
+        );
+        written.push(port_bytes);
+    }
+    assert_ne!(
+        written[0], written[1],
+        "the verity image and the no-verity image are the same bytes",
+    );
+    assert_eq!(
+        written[1], written[2],
+        "`--composefs --composefs-noverity` did not write the no-verity image",
+    );
+    assert_eq!(
+        written[1], written[3],
+        "`--composefs-noverity --composefs` did not write the no-verity image",
+    );
+}
+
+/// The composefs export refuses a repository outside the backing modes, where
+/// the tool exports an image whose redirects name loose paths that repository
+/// does not hold. `cli-surface.md`, "P2" records the divergence. The refusal
+/// writes no destination and leaves a destination that already exists as it
+/// was, byte for byte and at the mode it carried.
+#[test]
+fn checkout_composefs_refuses_an_archive_repository() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-composefs-archive");
+    let base = tmp.path();
+    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &[
+            "commit",
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            FIXED_TIMESTAMP,
+            "--orphan",
+            tree.to_str().unwrap(),
+        ],
+    );
+
+    for flag in ["--composefs", "--composefs-noverity"] {
+        let name = flag.trim_start_matches('-');
+        let refuse = |dest: &Path| {
+            let port = ostrya_in(
+                Some(base),
+                &[
+                    "checkout",
+                    &format!("--repo={}", port_repo.display()),
+                    flag,
+                    BRANCH,
+                    dest.to_str().unwrap(),
+                ],
+                None,
+                &[],
+            );
+            assert_eq!(port.status.code(), Some(1), "the port took `{flag}`");
+            let stderr = String::from_utf8_lossy(&port.stderr).into_owned();
+            assert!(
+                stderr.contains("composefs export requires a bare-user or bare-user-shared"),
+                "the refusal for `{flag}` does not name the mode rule:\n{stderr}",
+            );
+        };
+
+        // A destination the refusal would have had to create is not created.
+        let port_image = base.join(format!("port-{name}.cfs"));
+        refuse(&port_image);
+        assert!(
+            !port_image.exists(),
+            "the refusal for `{flag}` left a destination behind",
+        );
+
+        // A destination that already exists is left as it was. The export
+        // serializes as it builds, so a destination it opened directly would be
+        // truncated before the refusal reached it.
+        let kept = base.join(format!("kept-{name}.cfs"));
+        std::fs::write(&kept, b"a file the export has no claim on").unwrap();
+        std::fs::set_permissions(&kept, PermissionsExt::from_mode(0o600)).unwrap();
+        refuse(&kept);
+        assert_eq!(
+            std::fs::read(&kept).unwrap(),
+            b"a file the export has no claim on",
+            "the refusal for `{flag}` changed a destination that already existed",
+        );
+        assert_eq!(
+            std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the refusal for `{flag}` changed the destination's mode",
+        );
+
+        let tool_image = base.join(format!("tool-{name}.cfs"));
+        let tool = ostree_in(
+            base,
+            &[
+                "checkout",
+                &format!("--repo={}", tool_repo.display()),
+                flag,
+                BRANCH,
+                tool_image.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            tool.status.code(),
+            Some(0),
+            "the tool refused `{flag}` against an archive repository",
+        );
+        assert!(
+            !std::fs::read(&tool_image).unwrap().is_empty(),
+            "the tool wrote an empty image for `{flag}`",
+        );
+    }
+
+    // The port exports through a temporary file in the destination's directory.
+    // A refusal removes it, so four refusals leave the directory with none.
+    let leftover: Vec<_> = std::fs::read_dir(base)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".ostrya-composefs-"))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "the refusals left temporary files behind: {leftover:?}",
+    );
+}
+
 /// Commit the fixture tree into a fresh archive repo and return its path.
 fn commit_fixture(base: &Path) -> PathBuf {
     build_fixture_source(base);

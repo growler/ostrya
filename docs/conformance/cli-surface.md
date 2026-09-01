@@ -1221,18 +1221,22 @@ stand.
   stored order too.
 
 `checkout` accepts `--repo`, `-H/--require-hardlinks`, `-C/--force-copy`,
-`--composefs`, and, since Phase 17c, `-U/--user-mode` and `--subpath=PATH`.
-Missing: `--disable-cache`,
+`--composefs`, `--composefs-noverity`, and, since Phase 17c, `-U/--user-mode`
+and `--subpath=PATH`. Missing: `--disable-cache`,
 `--union`, `--union-add`, `--union-identical`, `--whiteouts`,
 `--process-passthrough-whiteouts`, `--allow-noent`, `--from-stdin`,
 `--from-file=FILE`, `--fsync=POLICY`, `-M/--bareuseronly-dirs`,
-`--skip-list=FILE`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`,
-`--composefs-noverity`.
+`--skip-list=FILE`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
 
 The destination trees `-U` and `--subpath` produce agree with the tool's file for
 file, in `archive`, `bare-user`, and `bare` (`../format-reference.md`,
-"Checkout"). Three divergences stand at the values `--subpath` takes and one at
-`-H`:
+"Checkout"). The two composefs switches are independent, and the no-verity one
+decides whatever the command-line order: `--composefs`, `--composefs-noverity`,
+and the two orders of the pair each write the tool's image bytes over a
+`bare-user` repository
+(`ostrya_cli::cli::checkout_composefs_switches_match_the_tool`). Three
+divergences stand at the values `--subpath` takes, one at `-H`, and two at the
+composefs switches:
 
 - a subpath naming nothing ends the checkout at exit 1 in both, leaving no
   destination, and the words part: the tool reports `error: No such file or
@@ -1260,7 +1264,32 @@ file, in `archive`, `bare-user`, and `bare` (`../format-reference.md`,
   `bare` repository out with `-H` on both sides and reads 14 devino-cache hits
   out of each side's own `--table-output` block, against 13 for a `bare-user`
   repository checked out with `-U` and 0 for the two forms that hardlink
-  nothing.
+  nothing;
+- the tool exports a composefs image from any repository mode, and from an
+  `archive` repository it writes `trusted.overlay.redirect` values naming
+  `.file` loose paths that repository does not hold, whose objects are
+  `.filez`, so the image cannot be mounted against the repository that produced
+  it. The port refuses a repository outside the composefs backing modes
+  (`bare-user` and `bare-user-shared`) at exit 1 and leaves no destination
+  behind, naming the mode it got: `error: unsupported: composefs export
+  requires a bare-user or bare-user-shared repository, not Archive`. `commit
+  --generate-composefs-metadata` is unaffected and works in every mode in both,
+  the digest path applying no mode check (`../format-reference.md`,
+  "composefs"). Both sides of the divergence stand in
+  `ostrya_cli::cli::checkout_composefs_refuses_an_archive_repository`;
+- the tool writes the image through a temporary file it creates in the working
+  directory and links to the destination, so a destination on another
+  filesystem ends the export at exit 1 with `error: linkat: Invalid
+  cross-device link`. The port writes its temporary file in the destination's
+  own directory and renames it over the destination, so the rename stays inside
+  one filesystem and every destination is taken. The two agree on what the
+  temporary file buys: an export that finishes replaces the destination rather
+  than writes into it, so the image carries the process umask and not the mode
+  the destination held
+  (`ostrya_cli::cli::checkout_composefs_switches_match_the_tool`), and an
+  export that does not finish leaves a destination that already existed as it
+  was, byte for byte and at its own mode
+  (`ostrya_cli::cli::checkout_composefs_refuses_an_archive_repository`).
 
 `export` accepts `--repo`. Missing: `--no-xattrs`, `--subpath=PATH`,
 `--prefix=PATH`, `-o/--output=PATH`.

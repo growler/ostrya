@@ -62,7 +62,7 @@ use ostrya::{
     MutableTree, ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias,
     Repo, RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef,
     TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
-    Type, Value, Verifier, VerifyOutcome, Xattrs, base64, from_bytes, load_sign_keys,
+    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
     load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
@@ -384,6 +384,11 @@ struct CheckoutArgs {
     /// tree (requires a bare-user or bare-user-shared repository).
     #[arg(long)]
     composefs: bool,
+    /// Write the composefs EROFS image with no fs-verity digest in it
+    /// (requires a bare-user or bare-user-shared repository). The two composefs
+    /// switches are independent, and this one decides in any order.
+    #[arg(long)]
+    composefs_noverity: bool,
     /// The commit to check out (a checksum or a ref).
     commit: String,
     /// The destination path.
@@ -3458,11 +3463,37 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     let commit = resolve(&repo, &args.commit).await?;
 
-    if args.composefs {
-        let image = repo
-            .export_composefs(&commit, &ComposefsOptions::default())
-            .await?;
-        std::fs::write(&args.destination, &image.bytes).map_err(Error::Io)?;
+    if args.composefs || args.composefs_noverity {
+        let opts = ComposefsOptions {
+            verity: if args.composefs_noverity {
+                VerityPolicy::Disabled
+            } else {
+                VerityPolicy::Computed
+            },
+        };
+        // The image is serialized as it is built, so a refusal and a failed
+        // write both come after part of the file is on disk. The export goes to
+        // a temporary file beside the destination and is renamed over it once
+        // the image is whole: an export that does not finish leaves no
+        // destination behind and leaves a destination that already existed as
+        // it was, and one that finishes replaces it in a single step. The
+        // temporary file shares the destination's directory, so the rename
+        // stays inside one filesystem whatever destination is named.
+        let dir = args
+            .destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        let temp = dir.join(format!(".ostrya-composefs-{}.tmp", std::process::id()));
+        let out = std::fs::File::create(&temp).map_err(Error::Io)?;
+        let written = repo
+            .export_composefs_to(&commit, &opts, out.as_fd())
+            .await
+            .and_then(|_| std::fs::rename(&temp, &args.destination).map_err(Error::Io));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        written?;
         return Ok(());
     }
 

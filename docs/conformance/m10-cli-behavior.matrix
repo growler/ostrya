@@ -2426,7 +2426,7 @@ note: the counters over a growing tree, which one `run:` line cannot state: the
  block's shape.
 
 # ---------------------------------------------------------------------------
-# checkout -- the unprivileged mode and the subpath, Phase 17c
+# checkout -- the unprivileged mode, the subpath, and the composefs switches
 # (`../port-plan.md`). No oracle reads a cell's own checkout destination: the
 # `manifest` oracle checks the setup's revision out itself, faithfully, into
 # work space of its own. The cells that state a destination tree therefore cite
@@ -2480,6 +2480,47 @@ note: a subpath naming nothing ends the checkout at exit 1 with no destination
  directory: <path>` and the port its own `checkout: subpath not found: <path>`,
  which cli-surface.md, "P2" records, so each side states its own text and
  `stderr-text` is no oracle here.
+
+family: M10
+subcommand: checkout
+cell: checkout/composefs-noverity
+modes: bare-user
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_composefs_switches_match_the_tool
+spec: format-reference.md#composefs
+note: `--composefs-noverity` writes the EROFS image whose metacopy xattr carries
+ no fs-verity digest. No oracle reads a cell's own checkout destination, so the
+ cited test reads the image both implementations wrote for one commit and states
+ the bytes equal.
+
+family: M10
+subcommand: checkout
+cell: checkout/composefs-then-noverity
+modes: bare-user
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_composefs_switches_match_the_tool
+spec: format-reference.md#composefs
+note: `--composefs --composefs-noverity` writes the no-verity image. The two
+ switches are independent and the no-verity switch decides. The cited test holds
+ the bytes against the tool's own image and against the image
+ `--composefs-noverity` alone wrote.
+
+family: M10
+subcommand: checkout
+cell: checkout/noverity-then-composefs
+modes: bare-user
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_composefs_switches_match_the_tool
+spec: format-reference.md#composefs
+note: `--composefs-noverity --composefs` writes the no-verity image too, so the
+ command-line order does not decide. The cited test states the same bytes for
+ both orders.
 
 # ---------------------------------------------------------------------------
 # show -- the commit report, the raw variant, the metadata modes, and the

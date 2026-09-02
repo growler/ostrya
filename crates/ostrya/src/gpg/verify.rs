@@ -16,6 +16,13 @@
 //! fields the report then carries -- the fingerprint, the creation time, and
 //! the two algorithm names -- come out of the signature packet itself.
 //!
+//! Every certificate that answers for the issuer takes part in the verdict.
+//! The key state is read over all of them: a revocation or an expiry any of
+//! them states refuses the signature, and the load order of the trusted set
+//! decides neither. The first match supplies the rest -- the reported user id,
+//! the primary-key fingerprint, the cryptography, and the cross-certification
+//! gate -- so the load order still decides those.
+//!
 //! The engine also owns the trust and validity policy: which signature classes
 //! and which digest algorithms a data signature may use, when a subkey speaks
 //! for its certificate, when a key has expired, and when it is revoked. A
@@ -157,11 +164,15 @@ fn describe(
     // names the digest as the cause only where the issuer resolved. No rule
     // below can make such a record valid, so a refused digest and a refused
     // class stay refused on every path.
-    let Some(issuer) = resolve_issuer(certs, sig) else {
+    let Some(issuers) = resolve_issuers(certs, sig) else {
         info.key_missing = true;
         describe_packet(&mut info, sig);
         return info;
     };
+    // The fields below name one key and one certificate, and the
+    // cross-certification rule below reads one binding. The first match is the
+    // one all of them read.
+    let issuer = issuers.reported();
     // `gpgv` over a class 0x02 signature reports
     // `ERRSIG <keyid> 22 10 02 <created> 32 <fingerprint>` and no user id,
     // where a class 0x00 signature by the same key over the same payload
@@ -206,12 +217,12 @@ fn describe(
     // expires and expires from the next second: polled second by second across
     // its expiry instant, `gpgv` reports `GOODSIG` through that instant and
     // `EXPKEYSIG` from the second after it.
-    let key_expires = issuer.key_expires_at();
+    let key_expires = issuers.key_expires_at();
     if key_expires.is_some_and(|instant| instant < now) {
         info.expired = true;
         info.key_expires = key_expires;
     }
-    info.revoked = issuer.revoked();
+    info.revoked = issuers.revoked();
     // A signature past its own expiry reports `EXPSIG` and no `GOODSIG`, so it
     // is not valid, and no status keyword states more about it. The signature
     // expires at the instant it names: polled second by second across that
@@ -330,9 +341,18 @@ impl Issuer<'_> {
         }
     }
 
-    /// Whether the signing key is revoked: a key revocation signature the
-    /// primary key made over itself, or, where a subkey signed, a subkey
-    /// revocation the primary key made over that subkey.
+    /// Whether this certificate revokes the signing key. Two revocation sites
+    /// answer, each with its own reach:
+    ///
+    /// - a key revocation signature the primary key made over itself revokes
+    ///   the whole certificate, so every key it binds stops speaking for it,
+    ///   the signing subkey included;
+    /// - a subkey revocation signature the primary key made over the signing
+    ///   subkey revokes that subkey alone, and leaves the primary key and the
+    ///   certificate's other subkeys as they stand.
+    ///
+    /// A certificate that answers for the issuer through a subkey is read at
+    /// both sites, and one that answers through its primary key at the first.
     ///
     /// A revocation is verified before it is honored. A key revocation
     /// signature another key made and anyone can staple onto a certificate
@@ -356,48 +376,103 @@ impl Issuer<'_> {
     }
 }
 
-/// Resolve the key a signature names as its issuer, over the loaded
-/// certificates: by issuer fingerprint first, then by issuer key id, and each
-/// over the primary key before the subkeys.
+/// Every key the loaded certificates hold that answers for the issuer one
+/// signature names, in the order the trusted set holds them. The list is never
+/// empty: it is built only where a match was found.
+///
+/// One key reaches the trusted set through more than one certificate on
+/// ordinary paths: a repository's `<remote>.trustedkeys.gpg` beside the global
+/// trusted directory, two `gpgkeypath` entries, or one keyring file holding two
+/// exports of one key. The certificates need not state the same thing about the
+/// key. The key state is therefore read over every match, so a revocation or an
+/// expiry any of them states refuses the signature and the load order decides
+/// neither.
+struct Issuers<'a> {
+    matched: Vec<Issuer<'a>>,
+}
+
+impl<'a> Issuers<'a> {
+    /// The match the report's own fields come from: the signing key, its
+    /// certificate, that certificate's user id, the cryptography, and
+    /// [`Issuer::cross_certified`].
+    ///
+    /// Where the issuer fingerprint answered, every match holds the same
+    /// signing key, so the reported signing-key fingerprint stands whichever
+    /// match answers. The certificate around that key can differ: one
+    /// certificate holds the key as its primary key where another binds it as
+    /// a subkey. The reported user id, the primary-key fingerprint, and the
+    /// cross-certification gate therefore follow the order of the trusted set.
+    fn reported(&self) -> &Issuer<'a> {
+        &self.matched[0]
+    }
+
+    /// Whether any matching certificate revokes the signing key. Each is read
+    /// at the sites [`Issuer::revoked`] gives it, so a key revocation on one
+    /// copy of a certificate refuses a signature another copy answers for.
+    fn revoked(&self) -> bool {
+        self.matched.iter().any(Issuer::revoked)
+    }
+
+    /// The earliest instant any matching certificate states the signing key
+    /// expires at. A certificate stating no expiry states nothing here, and
+    /// does not extend a life another one bounds.
+    fn key_expires_at(&self) -> Option<u64> {
+        self.matched.iter().filter_map(Issuer::key_expires_at).min()
+    }
+}
+
+/// Resolve every key the loaded certificates hold for the issuer a signature
+/// names: by issuer fingerprint first, then by issuer key id, and each over the
+/// primary key before the subkeys. The matches of the first identifier that
+/// answers are the whole set, so an issuer fingerprint the trusted set holds
+/// keeps the issuer key id out of the answer.
 ///
 /// A subkey answers only where the primary key made a binding signature over
 /// it that verifies. A subkey whose binding does not verify -- one taken from
 /// another certificate and attached with the binding it carried there --
 /// belongs to no loaded certificate, and `gpgv` answers the same way: it
 /// reports `ERRSIG ... 9` and `NO_PUBKEY` for a signature such a subkey made.
-fn resolve_issuer<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<Issuer<'a>> {
+fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<Issuers<'a>> {
     for wanted in sig.issuer_fingerprint() {
+        let mut matched: Vec<Issuer<'a>> = Vec::new();
         for cert in certs {
             if &cert.fingerprint() == wanted {
-                return Some(Issuer { cert, subkey: None });
+                matched.push(Issuer { cert, subkey: None });
             }
             for subkey in &cert.public_subkeys {
                 if &subkey.fingerprint() == wanted
                     && let Some(binding) = verified_binding(cert, subkey)
                 {
-                    return Some(Issuer {
+                    matched.push(Issuer {
                         cert,
                         subkey: Some((subkey, binding)),
                     });
                 }
             }
         }
+        if !matched.is_empty() {
+            return Some(Issuers { matched });
+        }
     }
     for wanted in sig.issuer_key_id() {
+        let mut matched: Vec<Issuer<'a>> = Vec::new();
         for cert in certs {
             if &cert.legacy_key_id() == wanted {
-                return Some(Issuer { cert, subkey: None });
+                matched.push(Issuer { cert, subkey: None });
             }
             for subkey in &cert.public_subkeys {
                 if &subkey.legacy_key_id() == wanted
                     && let Some(binding) = verified_binding(cert, subkey)
                 {
-                    return Some(Issuer {
+                    matched.push(Issuer {
                         cert,
                         subkey: Some((subkey, binding)),
                     });
                 }
             }
+        }
+        if !matched.is_empty() {
+            return Some(Issuers { matched });
         }
     }
     None
@@ -843,6 +918,23 @@ mod tests {
             assert!(status.success(), "gpg --quick-set-primary-uid failed");
         }
 
+        /// Set the primary key's expiry, with `gpg` standing at `when`.
+        ///
+        /// A fresh self-signature carries a creation time, and `gpg` refuses to
+        /// write one at the instant the self-signature it replaces carries: it
+        /// reports "make_keysig_packet failed: Time conflict". The clock option
+        /// stated last answers, so a run at a later instant writes the
+        /// signature a run at the fixture's own instant cannot.
+        fn set_expire_at(&self, when: &str, expiry: &str) {
+            let status = self
+                .gpg()
+                .args(["--faked-system-time", when])
+                .args(["--quick-set-expire", &self.primary, expiry])
+                .status()
+                .unwrap();
+            assert!(status.success(), "gpg --quick-set-expire failed");
+        }
+
         /// Revoke a user id.
         fn revoke_uid(&self, uid: &str) {
             let status = self
@@ -962,10 +1054,24 @@ mod tests {
         }
     }
 
+    /// The environment variable that turns the absent-GnuPG skip into a
+    /// failure. A harness setting it declares that the GnuPG binaries are
+    /// installed, so a run where one is not is a broken harness rather than a
+    /// test to pass over. The integration tests read the same variable.
+    const REQUIRE_GNUPG: &str = "OSTRYA_REQUIRE_GNUPG";
+
     /// Whether both binaries answer, naming the absent one when they do not.
+    /// These cases state each policy rule against `gpgv`, so a harness without
+    /// a binary would otherwise report the rules as tested while no assertion
+    /// ran. With [`REQUIRE_GNUPG`] set the absence fails.
     fn tools_available() -> bool {
         for program in ["gpg", "gpgv"] {
             if !available(program) {
+                assert!(
+                    std::env::var_os(REQUIRE_GNUPG).is_none(),
+                    "{REQUIRE_GNUPG} is set and `{program}` is not available, \
+                     so the GPG tests cannot run"
+                );
                 eprintln!("skipping: {program} not available");
                 return false;
             }
@@ -2054,6 +2160,134 @@ mod tests {
         .unwrap();
         assert!(outcome.signatures[0].revoked);
         assert!(!outcome.valid);
+    }
+
+    /// A key that reaches the trusted set through two certificates, one of
+    /// them revoked, is refused whichever order the two stand in.
+    ///
+    /// Two certificates for one key reach the trusted set on ordinary paths: a
+    /// repository's `<remote>.trustedkeys.gpg` beside the global trusted
+    /// directory, two `gpgkeypath` entries, or one keyring file holding two
+    /// exports of one key. The verdict therefore reads every certificate that
+    /// answers for the issuer, and a revocation any of them carries refuses
+    /// the signature.
+    ///
+    /// `gpgv` 2.4.9 answers on the load order here, so the verdict is not
+    /// compared against it: over the keyring whose unrevoked certificate
+    /// stands first it reports `GOODSIG`, and over the reverse order
+    /// `REVKEYSIG`. The engine reports the revocation in both. The case states
+    /// what the reference answers, so it fails where the reference stops
+    /// answering that way, and each certificate on its own is a control the
+    /// two engines do agree on.
+    #[test]
+    fn a_revocation_on_a_duplicate_certificate_refuses_the_signature() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::new("Dup <dup@ostrya.example>");
+        let blob = home.sign(&home.primary, PAYLOAD);
+        let unrevoked = home.keyring();
+        home.revoke_primary();
+        let revoked = home.keyring();
+        for (label, keyring, is_revoked) in [
+            ("the unrevoked certificate", &unrevoked, false),
+            ("the revoked certificate", &revoked, true),
+        ] {
+            let certs = certs_of(keyring);
+            assert_eq!(certs.len(), 1, "{label}: the trusted set");
+            let outcome = verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+            let reference = home.gpgv_records(keyring, &blob, PAYLOAD);
+            assert_eq!(outcome.signatures.len(), 1);
+            assert_eq!(reference.len(), 1);
+            assert_agrees(&outcome.signatures[0], &reference[0]);
+            assert_eq!(outcome.signatures[0].revoked, is_revoked, "{label}");
+            assert_eq!(outcome.signatures[0].valid, !is_revoked, "{label}");
+        }
+        for (label, first, second, reference_revoked) in [
+            ("the revocation second", &unrevoked, &revoked, false),
+            ("the revocation first", &revoked, &unrevoked, true),
+        ] {
+            let mut keyring = first.clone();
+            keyring.extend_from_slice(second);
+            let certs = certs_of(&keyring);
+            // Both certificates reached the trusted set, so it is the verdict
+            // that reads them and not the parse that dropped one.
+            assert_eq!(certs.len(), 2, "{label}: the trusted set");
+            let outcome = verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+            assert_eq!(outcome.signatures.len(), 1);
+            let info = &outcome.signatures[0];
+            assert!(info.revoked, "{label}: the revocation was not read");
+            assert!(!info.valid, "{label}: a revoked key reported valid");
+            assert!(!outcome.valid, "{label}: the outcome");
+            // The fields the report names come from the first match, and the
+            // two certificates state the same key and the same user id.
+            assert_eq!(info.fingerprint.as_deref(), Some(&*home.primary), "{label}");
+            assert_eq!(
+                info.user_email.as_deref(),
+                Some("dup@ostrya.example"),
+                "{label}"
+            );
+            let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+            assert_eq!(reference.len(), 1, "{label}: the reference record count");
+            assert_eq!(
+                reference[0].revoked, reference_revoked,
+                "{label}: gpgv no longer answers on the load order, so this \
+                 case states the wrong thing about the reference",
+            );
+        }
+    }
+
+    /// A key that reaches the trusted set through two certificates, one of
+    /// them stating an expiry that has passed, is refused whichever order the
+    /// two stand in: the key expires at the earliest instant any certificate
+    /// that answers for the issuer states, and a certificate stating no expiry
+    /// does not extend the life another one states.
+    ///
+    /// The fixture's key was created at [`KEY_CREATED`] and lived for a day.
+    /// The second certificate lifts the expiry, written with `gpg` standing a
+    /// day later so the fresh self-signature carries a creation time of its
+    /// own.
+    ///
+    /// `gpgv` 2.4.9 answers on the load order here as it does over a
+    /// duplicated revocation, so the verdict is not compared against it: over
+    /// the keyring whose unexpiring certificate stands first it reports
+    /// `GOODSIG`, and over the reverse order `EXPKEYSIG`.
+    #[test]
+    fn an_expiry_on_a_duplicate_certificate_refuses_the_signature() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::at("Twice <twice@ostrya.example>", "1d");
+        let blob = home.sign(&home.primary, PAYLOAD);
+        let expiring = home.keyring();
+        home.set_expire_at("20250102T000000!", "never");
+        let unexpiring = home.keyring();
+        for (label, first, second, reference_expired) in [
+            ("the expiry second", &unexpiring, &expiring, false),
+            ("the expiry first", &expiring, &unexpiring, true),
+        ] {
+            let mut keyring = first.clone();
+            keyring.extend_from_slice(second);
+            let certs = certs_of(&keyring);
+            assert_eq!(certs.len(), 2, "{label}: the trusted set");
+            let outcome = verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+            assert_eq!(outcome.signatures.len(), 1);
+            let info = &outcome.signatures[0];
+            assert!(info.expired, "{label}: the expiry was not read");
+            assert!(!info.valid, "{label}: an expired key reported valid");
+            assert_eq!(
+                info.key_expires,
+                Some(KEY_CREATED + ONE_DAY),
+                "{label}: the instant reported"
+            );
+            let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+            assert_eq!(reference.len(), 1, "{label}: the reference record count");
+            assert_eq!(
+                reference[0].expired, reference_expired,
+                "{label}: gpgv no longer answers on the load order, so this \
+                 case states the wrong thing about the reference",
+            );
+        }
     }
 
     /// A certification self-signature (type 0x13) over the certificate's first

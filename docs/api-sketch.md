@@ -1158,7 +1158,11 @@ pool, over the `pgp` crate (rPGP). It spawns no process. One stored blob is
 held to one mebibyte and to 64 signature packets. The port owns the trust and
 validity policy: issuer resolution over primary keys and subkeys, the subkey
 binding and its embedded primary-key binding, key expiry, revocation, the
-signature class, and the digest policy.
+signature class, and the digest policy. Issuer resolution answers with every
+certificate that holds the key. A revocation any of them carries refuses the
+signature, and the key expires at the earliest instant any of them states, so
+the keyring load order decides neither. The first of them supplies the reported
+fingerprints and user id.
 
 ## Fetcher
 

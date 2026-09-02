@@ -270,6 +270,11 @@ pub struct GpgVerifier {
     /// The certificates the loaded keyrings hold, in load order. The parse
     /// happens as a keyring is loaded, so a keyring the parser rejects fails
     /// the load rather than a verification made over it.
+    ///
+    /// A key the sources hold several certificates for keeps every one of
+    /// them here. The verdict reads all the certificates that answer for a
+    /// signature's issuer, so a revocation any of them carries refuses the
+    /// signature whatever order the sources loaded in.
     certs: Vec<SignedPublicKey>,
 }
 

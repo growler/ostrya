@@ -19,7 +19,7 @@
 //! set, the keyring encoding, the legacy keyring form that carries Trust
 //! packets, and a corpus of malformed keyrings and blobs.
 //!
-//! Three divergences are declared here rather than compared, each with the
+//! Four divergences are declared here rather than compared, each with the
 //! `gpgv` behavior it parts from:
 //!
 //! - an Ed25519 or EdDSA-legacy key with a digest under 256 bits
@@ -27,7 +27,10 @@
 //! - the digest policy, which is fixed here and configurable in GnuPG
 //!   ([`DIVERGENCE_DIGEST_POLICY`]);
 //! - public-key algorithm id 27, which this GnuPG build carries no support for
-//!   ([`DIVERGENCE_ED25519_ALGORITHM`]).
+//!   ([`DIVERGENCE_ED25519_ALGORITHM`]);
+//! - a key the trusted set holds through two certificates that state
+//!   different things about it
+//!   ([`DIVERGENCE_DUPLICATE_CERTIFICATE`]).
 
 #![cfg(feature = "verify-gpg")]
 
@@ -62,6 +65,13 @@ const DIVERGENCE_DIGEST_POLICY: &str = "the digest policy is fixed here and conf
 /// algorithms and generates id 22 for the `ed25519` curve, so no fixture on
 /// this reference can carry id 27 and the matrix holds no cell for it.
 const DIVERGENCE_ED25519_ALGORITHM: &str = "public-key algorithm id 27 has no reference fixture";
+/// The verdict reads every certificate that answers for the issuer, so a
+/// revocation any of them carries refuses the signature. `gpgv` 2.4.9 reads the
+/// first certificate its keyrings hold for the key and answers on the load
+/// order: over a keyring whose unrevoked certificate stands first it reports
+/// `GOODSIG`, and over the reverse order `REVKEYSIG`.
+const DIVERGENCE_DUPLICATE_CERTIFICATE: &str =
+    "a revocation on any certificate for the key refuses the signature";
 
 /// Whether both binaries answer, naming the absent one when they do not. An
 /// absent reference tool skips a case and never passes one. These cases are the
@@ -810,6 +820,88 @@ fn keyring_forms_agree_with_gpgv() {
     let records = port_records(&[&binary, &second_ring], &[&second_blob], PAYLOAD);
     assert_eq!(records.len(), 1);
     assert!(records[0].valid, "two keyring blobs did not merge");
+}
+
+/// A key the trusted set holds through two certificates, one of them revoked,
+/// is refused whichever order the two stand in and whether they arrive in one
+/// keyring blob or in two.
+///
+/// Two certificates for one key reach the trusted set on ordinary paths: a
+/// repository's `<remote>.trustedkeys.gpg` beside the global trusted
+/// directory, two `gpgkeypath` entries, or one keyring file holding two exports
+/// of one key. Where one copy carries a revocation and the other does not, the
+/// verdict reads both.
+///
+/// This is [`DIVERGENCE_DUPLICATE_CERTIFICATE`], so the verdict is not
+/// compared over the two-certificate keyrings. Each certificate on its own is
+/// a control the two engines do agree on, the case states what the reference
+/// answers over each order, and it holds the divergence to the two verdict
+/// fields: every other field the reference names is compared.
+#[test]
+fn a_duplicate_certificate_carries_its_revocation() {
+    if !tools_available() {
+        return;
+    }
+    let tmp = TmpDir::new("verify-gpg-duplicate");
+    let base = tmp.path();
+    let home = Home::eddsa(base, "duplicate", "Dup <dup@ostrya.example>");
+    let blob = home.sign(&home.primary, PAYLOAD, &[]);
+    let unrevoked = home.keyring();
+    home.revoke_primary();
+    let revoked = home.keyring();
+
+    // Each certificate alone, which both engines agree on.
+    let records = assert_cell_agrees(
+        "one unrevoked certificate",
+        &home,
+        &unrevoked,
+        &blob,
+        PAYLOAD,
+    );
+    assert!(records[0].valid && !records[0].revoked);
+    let records = assert_cell_agrees("one revoked certificate", &home, &revoked, &blob, PAYLOAD);
+    assert!(records[0].revoked && !records[0].valid);
+
+    for (label, first, second, reference_revoked) in [
+        ("the revocation second", &unrevoked, &revoked, false),
+        ("the revocation first", &revoked, &unrevoked, true),
+    ] {
+        let mut keyring = first.clone();
+        keyring.extend_from_slice(second);
+        let port = port_records(&[&keyring], &[&blob], PAYLOAD);
+        assert_eq!(port.len(), 1, "{label}: the record count");
+        // The two orders together hold that both certificates reached the
+        // trusted set, so it is the verdict that reads them and not the parse
+        // that dropped one: a parse keeping the leading certificate alone
+        // fails the second order, and one keeping the trailing certificate
+        // alone fails the first.
+        assert!(port[0].revoked, "{label}: the revocation was not read");
+        assert!(!port[0].valid, "{label}: a revoked key reported valid");
+
+        // The same two certificates as two keyring blobs reach the same
+        // trusted set and the same verdict.
+        let split = port_records(&[first, second], &[&blob], PAYLOAD);
+        assert_eq!(split.len(), 1, "{label}: the record count over two blobs");
+        assert_eq!(
+            summary(&split[0]),
+            summary(&port[0]),
+            "{label}: two keyring blobs and one concatenated blob part",
+        );
+
+        let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1, "{label}: the reference record count");
+        assert_eq!(
+            reference[0].revoked, reference_revoked,
+            "{DIVERGENCE_DUPLICATE_CERTIFICATE}: gpgv no longer answers on the \
+             load order, so this case states the wrong thing about the reference",
+        );
+        // The divergence is confined to the verdict: with the two fields the
+        // engine answers on its own set aside, every other field agrees.
+        let mut adjusted = reference[0].clone();
+        adjusted.revoked = true;
+        adjusted.valid = false;
+        assert_agrees(label, &port[0], &adjusted);
+    }
 }
 
 /// Which user id the report names for a certificate holding several. The rule

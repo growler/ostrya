@@ -1502,6 +1502,16 @@ Definition:
   from the certificate and the signature packet. Each rule reproduces `gpgv`
   2.4.9 as observed in an isolated `GNUPGHOME` on fixtures the unit tests
   build.
+- The key state is read over every certificate that answers for a signature's
+  issuer. A key reaches the trusted set through several certificates on
+  ordinary paths: a repository's `<remote>.trustedkeys.gpg` beside the global
+  trusted directory, two `gpgkeypath` entries, or one keyring file holding two
+  exports of one key. The certificates need not state the same thing about the
+  key. A revocation any match carries refuses the signature, and the key
+  expires at the earliest instant any match states, so the load order decides
+  neither. The first match supplies the reported fingerprints and user id and
+  answers the cross-certification rule, so those three follow the load order.
+  This is the sixth divergence below.
 - `Verifier::verify` is async (a boxed `VerifyFuture` mirroring
   `SignFuture`), so a verifying engine can await work on the blocking pool;
   the in-process engines resolve immediately.
@@ -1510,7 +1520,7 @@ Definition:
   `tokio::process` (the `process` feature on the existing tokio
   dependency). It needs no crate of its own.
 
-Five divergences from GnuPG 2.4.9 stand, none of them a repository fact:
+Six divergences from GnuPG 2.4.9 stand, none of them a repository fact:
 
 - the digest policy is the port's own and is fixed. MD5 is refused and SHA-1 is
   accepted, which is what `gpgv` 2.4.9 answers at its defaults. GnuPG's set is
@@ -1544,7 +1554,23 @@ Five divergences from GnuPG 2.4.9 stand, none of them a repository fact:
 - a stored signature blob over one mebibyte or holding more than 64 signature
   packets is refused by name, and a keyring over four mebibytes or holding more
   than 256 certificates is refused by name. `gpgv` reads an input of any of
-  those four shapes and reports on it.
+  those four shapes and reports on it;
+- a key the trusted set holds several certificates for is read over all of
+  them, so a revocation or an expiry any copy states refuses the signature.
+  Both reference tools answer on the load order instead, reading the first
+  certificate their keyrings hold for the key. Over a keyring holding an
+  unrevoked export of a key followed by a revoked export of the same key,
+  `gpgv --keyring <that keyring> <sig> <data>` reports `GOODSIG` and
+  `ostree show <ref>` reports `Good signature from "..."`, and over the reverse
+  order each reports the revocation. The two exports split over two sources
+  answer the same way: in two keyring files of the `OSTREE_GPG_HOME` directory
+  the tool answers on the order their names sort in, and with the unrevoked
+  export in a remote's `<remote>.trustedkeys.gpg` and the revoked one in that
+  directory, `ostree show --gpg-verify-remote=<remote> <ref>` reports
+  `Good signature from "..."` where `ostrya show` reports the signature as not
+  good. A duplicated key expiry answers the same way: `gpgv` reports `GOODSIG`
+  where the unexpiring export stands first and `EXPKEYSIG` over the reverse
+  order. The port refuses the signature in every one of those orders.
 
 The reported user id agrees with the tool. Measured against `gpgv` 2.4.9 over
 multi-user-id certificates, in the three states such a certificate reaches: no

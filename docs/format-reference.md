@@ -1850,7 +1850,12 @@ Trust is membership in the supplied keyrings; GnuPG's ownertrust model does
 not participate.
 
 GPG keyrings are binary or ASCII-armored, each holding one or more
-certificates, all merged into one trusted set. The keyring trusted for a
+certificates, all merged into one trusted set. A key the trusted set holds
+several certificates for keeps every one of them, and the verdict reads all the
+certificates that answer for a signature's issuer. A revocation any of them
+carries refuses the signature, and the key expires at the earliest instant any
+of them states, so the keyring load order decides neither. The first of them
+supplies the reported fingerprints and user id. The keyring trusted for a
 remote is `<remote>.trustedkeys.gpg` in the repo or under
 `/etc/ostree/remotes.d/`; every `*.gpg` keyring in the global trusted-keyring
 directory is trusted for all remotes. That directory is

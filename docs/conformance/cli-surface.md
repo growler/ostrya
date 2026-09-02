@@ -381,7 +381,7 @@ deliberately not reproduced:
   `show` is the one command of the three where the two agree, the tool's own
   wording there being `error: Couldn't find file object '<checksum>'`, which the
   port reproduces because a bare checksum reaches `show` with no type;
-- the GPG signature report a signed commit draws carries three differences from
+- the GPG signature report a signed commit draws carries four differences from
   the tool's, none of them a repository fact. The instant the signature was made
   is rendered by the tool through gpgme in the host's locale and time zone
   (`Wed 05 Aug 2026 17:11:19 CEST`) and by the port in UTC in the shape its own
@@ -390,16 +390,27 @@ deliberately not reproduced:
   carries. The port writes one blank line more before the `Found N signatures:`
   heading. For a signature a signing subkey made, the tool writes a
   `Primary key ID <key-id>` line after the verdict line, and the port writes the
-  signing subkey's key id alone. The algorithm name, the short key id, the user
-  id, and the three verdict lines are the same in both, measured against
-  `ostree` 2026.1 over a commit each implementation signed with the same key,
-  read back through the other's `show --gpg-verify-remote=<remote>`;
+  signing subkey's key id alone. The fourth difference is the line a key state
+  draws. The port states three verdict lines: `Can't check signature: public key
+  not found`, `Good signature from "<user id>"`, and `BAD signature from
+  "<user id>"`. Over a good signature, over an absent key, and over a signature
+  that does not verify, the tool states the same line word for word. Over a
+  revoked key the tool states `Key revoked` and the port states `BAD signature
+  from "<user id>"`. Over a key that states an expiry the tool adds one line
+  after the verdict line -- `Key expires <instant>` while the key is live, and
+  `Key expired <instant>` from the instant it has passed -- which the port
+  leaves out. The algorithm name, the short key id, and the user id are the same
+  in both, measured against `ostree` 2026.1 over a commit each implementation
+  signed with the same key, read back through the other's
+  `show --gpg-verify-remote=<remote>`;
 - the verdict the report states rests on the port's own trust and validity
   policy, which `../port-plan.md`, "Phase 13d", enumerates against GnuPG 2.4.9.
-  Five differences stand there, and each one can make a `show` verdict part
+  Six differences stand there, and each one can make a `show` verdict part
   from the tool's: the fixed digest policy, the GnuPG keybox refusal, the
   refusal a keyring the parser rejects draws, the 256-bit minimum digest an
-  Ed25519 key carries, and the keyring and signature-blob input caps.
+  Ed25519 key carries, the keyring and signature-blob input caps, and the key
+  state read over every certificate the trusted set holds for the key rather
+  than over the first alone.
 
 `config set` and `config unset` write the document through the config write path
 Phase 17e landed. Both accept what the tool accepts and word every refusal the
@@ -1466,10 +1477,15 @@ records. Ten divergences stand:
 
   The port's keyring stays at the packet stream it held and the tool's grows.
   The port reads a revocation the keyring holds: over the keyring the tool
-  wrote, and over its own keyring after `remote delete` and a fresh import of
-  `cert2.gpg`, the same `show` reports the signature as not good. So the trusted
-  set carries the revocation once it reaches the file, and `remote gpg-import`
-  is the one path that does not carry it there;
+  wrote, over its own keyring after `remote delete` and a fresh import of
+  `cert2.gpg`, and over a trusted set holding both certificates -- `cert1.gpg`
+  in the remote's keyring and `cert2.gpg` in the `OSTREE_GPG_HOME` directory --
+  the same `show` reports the signature as not good. So the trusted set carries
+  the revocation once it reaches a file the verify path reads, and `remote
+  gpg-import` is the one path that does not carry it there. On the third of
+  those paths the tool answers on which certificate it reads first, where the
+  port reads the revocation whichever certificate stands first. That is the
+  sixth verify divergence `../port-plan.md`, "Phase 13d", records;
 - a `gpg --export-secret-keys` stream offered to `remote gpg-import` is refused
   by the port and taken by the tool, which imports the public part of each key it
   holds and lists it afterwards. The port reads a keyring as transferable public

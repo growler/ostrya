@@ -1489,10 +1489,10 @@ Definition:
   caps, refuse a keybox, and parse inside `catch_unwind`, since a keyring
   offered for import is untrusted input. No self-signature over an offered
   certificate is verified, so a certificate carrying no user id enters the
-  keyring. The keyring the import writes keeps the bytes it already held and
-  carries no Trust packet; `cli-surface.md`, "P3", records those four, the
-  selector dialect, and what a certificate for a key the keyring already holds
-  does.
+  keyring. The keyring the import writes keeps the packet stream it already
+  held and carries no Trust packet of this import's making; `cli-surface.md`,
+  "P3", records those four, the selector dialect, and what a certificate for a
+  key the keyring already holds does.
 - The port owns the trust and validity policy. A signature is valid where it
   verifies, where the certificate holding the signing key is loaded, where the
   signature is over a document, where the subkey bindings hold, where the

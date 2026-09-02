@@ -1124,11 +1124,13 @@ impl Repo {                                   // feature = "verify-gpg"
     /// Add the certificates `keys` holds to `<remote>.trustedkeys.gpg`, and
     /// report how many the keyring did not already hold. With `key_ids`
     /// non-empty only the keys those selectors name are imported. The keyring
-    /// keeps the bytes it already held and carries the packets of each added
-    /// certificate as `keys` wrote them, with the Trust packets dropped. A
-    /// certificate for a key the keyring already holds is not merged in, so a
-    /// revocation or a new binding for a held key reaches the keyring through
-    /// `Repo::remove_remote_keyring` and a fresh import.
+    /// keeps the packet stream it already held and carries the packets of each
+    /// added certificate as `keys` wrote them, with the Trust packets dropped.
+    /// It is written in the binary form, so an armored keyring keeps its
+    /// packets and loses its armor. A certificate for a key the keyring
+    /// already holds is not merged in, so a revocation or a new binding for a
+    /// held key reaches the keyring through `Repo::remove_remote_keyring` and
+    /// a fresh import.
     pub async fn gpg_import_keys(&self, remote: &str, keys: &[u8], key_ids: &[String])
         -> Result<usize>;
     /// The keys that keyring holds. An absent keyring holds none.

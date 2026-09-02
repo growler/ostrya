@@ -1440,11 +1440,13 @@ records. Ten divergences stand:
   the keyring holds it, where the tool merges the offered user ids, signatures,
   and subkeys into it. Both report `Imported 0 GPG keys`. Over a keyring holding
   a one-user-id key, importing that key again with a second user id added leaves
-  the port's keyring at the bytes it held and grows the tool's, whose listing
-  then reports both user ids where the port's reports one. The rule holds inside
-  one offered stream as well: where a stream carries two states of one key, the
-  port keeps the first and drops the second, so two `--keyring` options reach
-  the same outcome on a repository holding no keyring at all.
+  the port's keyring at the packet stream it held and grows the tool's, whose
+  listing then reports both user ids where the port's reports one. An armored
+  keyring keeps that packet stream and is written back in the binary form. The
+  rule holds inside one offered stream as well: where a stream carries two
+  states of one key, the port keeps the first and drops the second, so two
+  `--keyring` options reach the same outcome on a repository holding no keyring
+  at all.
 
   A key revocation reaches the trusted set through a fresh certificate for a key
   the keyring already holds. The port therefore keeps the state it holds and
@@ -1462,12 +1464,12 @@ records. Ten divergences stand:
       ostrya show --gpg-verify-remote=origin main          # Good signature
       ostree show --gpg-verify-remote=origin main          # Key revoked
 
-  The port's keyring stays at the bytes it held and the tool's grows. The port
-  reads a revocation the keyring holds: over the keyring the tool wrote, and over
-  its own keyring after `remote delete` and a fresh import of `cert2.gpg`, the
-  same `show` reports the signature as not good. So the trusted set carries the
-  revocation once it reaches the file, and `remote gpg-import` is the one path
-  that does not carry it there;
+  The port's keyring stays at the packet stream it held and the tool's grows.
+  The port reads a revocation the keyring holds: over the keyring the tool
+  wrote, and over its own keyring after `remote delete` and a fresh import of
+  `cert2.gpg`, the same `show` reports the signature as not good. So the trusted
+  set carries the revocation once it reaches the file, and `remote gpg-import`
+  is the one path that does not carry it there;
 - a `gpg --export-secret-keys` stream offered to `remote gpg-import` is refused
   by the port and taken by the tool, which imports the public part of each key it
   holds and lists it afterwards. The port reads a keyring as transferable public

@@ -227,9 +227,58 @@ impl Home {
         assert!(status.success(), "gpg --import of the revocation failed");
     }
 
+    /// Import a public keyring, so this home holds another home's certificate
+    /// and can certify a user id on it.
+    fn import(&self, keyring: &[u8]) {
+        let path = self.write("import.gpg", keyring);
+        let status = self.gpg().arg("--import").arg(path).status().unwrap();
+        assert!(status.success(), "gpg --import of a public keyring failed");
+    }
+
+    /// Certify the one user id of the key `key` names that `uid` matches, with
+    /// this home's own key. The certification is exportable, so it rides on
+    /// the certificate this home exports.
+    fn certify_uid(&self, key: &str, uid: &str) {
+        let status = self
+            .gpg()
+            .args(["--quick-sign-key", key, uid])
+            .status()
+            .unwrap();
+        assert!(status.success(), "gpg --quick-sign-key failed");
+    }
+
     /// The exported binary public keyring.
     fn keyring(&self) -> Vec<u8> {
         let out = self.gpg().arg("--export").output().unwrap();
+        assert!(out.status.success() && !out.stdout.is_empty());
+        out.stdout
+    }
+
+    /// The diagnostics `gpg` writes when it imports `keyring` into a scratch
+    /// home named `into` under this one. `gpg` verifies each self-signature it
+    /// imports, so a certificate carrying one that does not verify is named
+    /// here.
+    fn import_diagnostics(&self, into: &str, keyring: &[u8]) -> String {
+        use std::os::unix::fs::DirBuilderExt;
+        let home = self.dir.join(into);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&home)
+            .unwrap();
+        let path = self.write(&format!("{into}.gpg"), keyring);
+        let out = Command::new("gpg")
+            .arg("--homedir")
+            .arg(&home)
+            .args(["--batch", "--import"])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// The exported binary certificate of the one key `key` names.
+    fn export_key(&self, key: &str) -> Vec<u8> {
+        let out = self.gpg().args(["--export", key]).output().unwrap();
         assert!(out.status.success() && !out.stdout.is_empty());
         out.stdout
     }
@@ -838,6 +887,203 @@ fn multi_uid_certificates_agree_with_gpgv() {
         Some("bravo@ostrya.example")
     );
     assert!(records[0].valid && !records[0].revoked);
+}
+
+/// A certification the certificate's own key did not make does not choose the
+/// user id the report names.
+///
+/// The fixture holds two user ids and marks neither primary, so the user ids
+/// rank by their self-signatures and Bravo's stands after Alpha's. A second
+/// key then certifies Alpha alone, later again, so Alpha carries the newest
+/// signature of any kind while Bravo carries the newest self-signature. `gpgv`
+/// names Bravo: a certification that does not verify under the certificate's
+/// own key stands outside the ranking.
+///
+/// The whole fixture comes from the `gpg` binary. The stranger's home imports
+/// the certificate, certifies one user id on it with `--quick-sign-key`, and
+/// exports it again, so the certification is a real signature packet and no
+/// packet is spliced by hand.
+#[test]
+fn a_third_party_certification_does_not_choose_the_reported_user_id() {
+    if !tools_available() {
+        return;
+    }
+    const ALPHA: &str = "Alpha <alpha@ostrya.example>";
+    const BRAVO: &str = "Bravo <bravo@ostrya.example>";
+    let tmp = TmpDir::new("verify-gpg-third-party-uid");
+    let base = tmp.path();
+
+    let home = Home::eddsa(base, "certified", ALPHA);
+    next_second();
+    home.add_uid(BRAVO);
+    let plain = home.keyring();
+
+    let stranger = Home::eddsa(base, "stranger", "Stranger <stranger@ostrya.example>");
+    stranger.import(&plain);
+    next_second();
+    stranger.certify_uid(&home.primary, "alpha@ostrya.example");
+    let keyring = stranger.export_key(&home.primary);
+    // The certification states its issuer fingerprint in a hashed subpacket,
+    // so the stranger's fingerprint standing in the exported certificate is
+    // the proof that a packet the stranger's key made rides on it.
+    let issuer = from_hex(&stranger.primary);
+    assert!(
+        keyring.len() > plain.len() && keyring.windows(issuer.len()).any(|run| run == issuer),
+        "the exported certificate carries no third-party certification",
+    );
+
+    let blob = home.sign(&home.primary, PAYLOAD, &[]);
+    let records = assert_cell_agrees(
+        "a user id carrying a newer third-party certification",
+        &home,
+        &keyring,
+        &blob,
+        PAYLOAD,
+    );
+    assert_eq!(
+        records[0].user_email.as_deref(),
+        Some("bravo@ostrya.example")
+    );
+    assert!(records[0].valid);
+}
+
+/// A primary mark riding on a self-signature that does not verify does not
+/// choose the user id the report names.
+///
+/// The fixture marks Alpha primary and adds Bravo afterwards, so Alpha wins on
+/// its mark alone while Bravo carries the newest self-signature. One byte
+/// inside Alpha's signature is then flipped, so that signature no longer
+/// verifies while the primary-user-id subpacket stands where it stood. `gpgv`
+/// names Alpha over the intact certificate and Bravo over the spliced one: a
+/// mark on a certification that does not verify marks nothing.
+///
+/// The splice is located by reading the exported certificate, not by an offset
+/// taken off one run. `gpg --export` writes the marked user id first, so
+/// Alpha's signature packet is the one that ends where the Bravo user id packet
+/// opens, and the last byte of that packet stands in the signature's trailing
+/// MPI, past every subpacket. The case states that the splice landed and that
+/// it left the mark alone before it compares the two reports, and it puts the
+/// intact certificate through the same comparison as a control.
+///
+/// `gpg` writes the whole certificate. The splice is made on the exported bytes
+/// afterwards, since no `gpg` option makes a signature stop verifying.
+#[test]
+fn an_unverified_primary_mark_does_not_choose_the_reported_user_id() {
+    if !tools_available() {
+        return;
+    }
+    const ALPHA: &str = "Alpha <alpha@ostrya.example>";
+    const BRAVO: &str = "Bravo <bravo@ostrya.example>";
+    /// A primary-user-id subpacket stating true: subpacket length 2,
+    /// subpacket type 25, value 1.
+    const MARK: [u8; 3] = [0x02, 0x19, 0x01];
+    /// A user id packet header over a body under 192 bytes: the old-format tag
+    /// byte for tag 13, then one length byte.
+    const UID_TAG: u8 = 0xb4;
+    let tmp = TmpDir::new("verify-gpg-unverified-primary");
+    let base = tmp.path();
+
+    let home = Home::eddsa(base, "marked", ALPHA);
+    next_second();
+    home.set_primary_uid(ALPHA);
+    next_second();
+    home.add_uid(BRAVO);
+    let intact = home.keyring();
+    let blob = home.sign(&home.primary, PAYLOAD, &[]);
+
+    let alpha_at = find_once(&intact, ALPHA.as_bytes());
+    let bravo_at = find_once(&intact, BRAVO.as_bytes());
+    assert!(
+        alpha_at < bravo_at,
+        "the marked user id is not written first"
+    );
+    assert_eq!(
+        intact[bravo_at - 2..bravo_at],
+        [UID_TAG, BRAVO.len() as u8],
+        "the Bravo user id packet does not open two bytes before its text",
+    );
+    let at = bravo_at - 3;
+    let mark_at = alpha_at
+        + intact[alpha_at..bravo_at]
+            .windows(MARK.len())
+            .position(|run| run == MARK)
+            .expect("Alpha's signature packet carries the primary mark");
+    assert!(
+        mark_at + MARK.len() <= at,
+        "the byte to splice stands inside the primary mark",
+    );
+    let mut spliced = intact.clone();
+    spliced[at] ^= 0xff;
+    assert_eq!(
+        spliced.iter().zip(&intact).filter(|(a, b)| a != b).count(),
+        1,
+        "the splice changed more than the one byte",
+    );
+    assert_eq!(
+        spliced[mark_at..mark_at + MARK.len()],
+        MARK,
+        "the splice moved the primary mark",
+    );
+    // `gpg` states that the splice landed and that the intact certificate
+    // carries nothing of the kind, so the one flipped byte is what stops
+    // Alpha's self-signature verifying.
+    assert!(
+        home.import_diagnostics("spliced", &spliced)
+            .contains("bad signature"),
+        "the splice left every signature on the certificate verifying",
+    );
+    assert!(
+        !home
+            .import_diagnostics("intact", &intact)
+            .contains("bad signature"),
+        "the intact certificate carries a signature that does not verify",
+    );
+
+    // The control: the mark answers over the intact certificate, where the
+    // ranking would name Bravo.
+    let records = assert_cell_agrees(
+        "a marked primary user id under a self-signature that verifies",
+        &home,
+        &intact,
+        &blob,
+        PAYLOAD,
+    );
+    assert_eq!(
+        records[0].user_email.as_deref(),
+        Some("alpha@ostrya.example")
+    );
+    let records = assert_cell_agrees(
+        "a primary mark under a self-signature that does not verify",
+        &home,
+        &spliced,
+        &blob,
+        PAYLOAD,
+    );
+    assert_eq!(
+        records[0].user_email.as_deref(),
+        Some("bravo@ostrya.example")
+    );
+    assert!(records[0].valid);
+}
+
+/// The one offset `needle` stands at in `haystack`.
+fn find_once(haystack: &[u8], needle: &[u8]) -> usize {
+    let mut found = haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, run)| *run == needle)
+        .map(|(at, _)| at);
+    let at = found.next().expect("the needle stands in the haystack");
+    assert!(found.next().is_none(), "the needle stands more than once");
+    at
+}
+
+/// The bytes an uppercase-hex fingerprint states.
+fn from_hex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 /// Wait for the wall clock to reach the next second, so a self-signature `gpg`

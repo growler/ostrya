@@ -566,6 +566,15 @@ fn hash_algorithm_name(sig: &Signature) -> Option<String> {
 /// second user id is not, it names the second one. Where every user id is
 /// revoked it names a revoked one, so a certificate holding nothing else still
 /// reports a user id.
+///
+/// A user id is chosen on its certifications that verify under the primary key
+/// alone, both where it is marked primary and where it is ranked. A
+/// third-party certification and a packet anyone stapled onto the certificate
+/// therefore choose nothing. This too is what `gpgv` names. Over a certificate
+/// where one user id carries the newest self-signature and another carries a
+/// newer third-party certification, it names the user id the self-signature
+/// stands on; and over a certificate whose primary mark rides on a
+/// self-signature that does not verify, it names the other user id.
 fn reported_user_id(cert: &SignedPublicKey) -> (Option<String>, Option<String>) {
     let mut usable: Vec<&SignedUser> = cert
         .details
@@ -579,8 +588,13 @@ fn reported_user_id(cert: &SignedPublicKey) -> (Option<String>, Option<String>) 
     let user = usable
         .iter()
         .copied()
-        .find(|user| user.is_primary())
-        .or_else(|| usable.iter().copied().max_by_key(newest_certification));
+        .find(|user| user_marked_primary(cert, user))
+        .or_else(|| {
+            usable
+                .iter()
+                .copied()
+                .max_by_key(|user| newest_certification(cert, user))
+        });
     match user {
         Some(user) => split_uid(&String::from_utf8_lossy(user.id.id())),
         None => (None, None),
@@ -605,14 +619,47 @@ fn split_uid(uid: &str) -> (Option<String>, Option<String>) {
     }
 }
 
-/// The creation time of the newest certification over a user id.
-fn newest_certification(user: &&SignedUser) -> u32 {
+/// Over a user id, the creation time of the newest certification that verifies
+/// under the certificate's primary key. A third-party certification and a
+/// packet anyone stapled onto the certificate do not verify under that key, so
+/// neither ranks a user id. A user id holding no such certification ranks at
+/// the epoch.
+///
+/// The check is the signature mathematics alone, the same check
+/// [`primary_key_lifetime`] applies. A certification that states its own
+/// expiry, and a certification another signature revokes, both still rank. The
+/// reference tool's rule for those two cases is unmeasured, and the field the
+/// rule decides is the reported name.
+fn newest_certification(cert: &SignedPublicKey, user: &SignedUser) -> u32 {
+    let primary = &cert.primary_key;
     user.signatures
         .iter()
-        .filter_map(Signature::created)
+        .filter(|sig| {
+            is_certification(sig)
+                && sig
+                    .verify_certification(primary, Tag::UserId, &user.id)
+                    .is_ok()
+        })
+        .filter_map(|sig| sig.created())
         .map(Timestamp::as_secs)
         .max()
         .unwrap_or(0)
+}
+
+/// Whether a certification that verifies under the certificate's primary key
+/// marks a user id primary. A primary-user-id subpacket on a packet the
+/// primary key did not make marks nothing, which is what `gpgv` names: over a
+/// certificate whose primary-marked self-signature was altered, it names the
+/// other user id.
+fn user_marked_primary(cert: &SignedPublicKey, user: &SignedUser) -> bool {
+    let primary = &cert.primary_key;
+    user.signatures.iter().any(|sig| {
+        sig.is_primary()
+            && is_certification(sig)
+            && sig
+                .verify_certification(primary, Tag::UserId, &user.id)
+                .is_ok()
+    })
 }
 
 /// The creation time a signature packet states, with an absent one reading as

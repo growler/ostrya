@@ -58,14 +58,16 @@
 //! [`Repo::gpg_import_keys`] adds certificates to `<remote>.trustedkeys.gpg`
 //! and reports how many the keyring did not already hold, and
 //! [`Repo::gpg_list_keys`] reads back the keys it holds as
-//! [`GpgKey`] records. The keyring the import writes keeps the bytes it already
-//! held and carries the packets of each added certificate as the offered stream
-//! wrote them, with the Trust packets dropped. `gpg` and the `ostree` tool both
-//! read a keyring of that form. A certificate for a key the keyring already
-//! holds is left as the keyring holds it, so an updated certificate reaches the
-//! keyring through [`Repo::remove_remote_keyring`] and a fresh import. A keyring
-//! offered for import is untrusted input and is held to the same caps and the
-//! same containment a keyring loaded for verification is, and a stream the
+//! [`GpgKey`] records. The keyring the import writes keeps the packet stream it
+//! already held and carries the packets of each added certificate as the
+//! offered stream wrote them, with the Trust packets dropped. The keyring is
+//! written in the binary form, so an armored keyring keeps its packets and
+//! loses its armor. `gpg` and the `ostree` tool both read a keyring of that
+//! form. A certificate for a key the keyring already holds is left as the
+//! keyring holds it, so an updated certificate reaches the keyring through
+//! [`Repo::remove_remote_keyring`] and a fresh import. A keyring offered for
+//! import is untrusted input and is held to the same caps and the same
+//! containment a keyring loaded for verification is, and a stream the
 //! certificate parser does not read fails the import, which leaves the keyring
 //! as it was.
 //!
@@ -593,9 +595,10 @@ impl Repo {
     /// the keyring is left as it was, as does a `keys` holding no certificate.
     ///
     /// The keyring is replaced atomically at the repository root. It keeps the
-    /// bytes it already held and carries the packets of each added certificate
-    /// as `keys` wrote them, with the Trust packets dropped (see
-    /// [`merge_keyring`]).
+    /// packet stream it already held and carries the packets of each added
+    /// certificate as `keys` wrote them, with the Trust packets dropped (see
+    /// [`merge_keyring`]). It is written in the binary form, so an armored
+    /// keyring keeps its packets and loses its armor.
     ///
     /// A certificate for a key the keyring already holds is left as the keyring
     /// holds it, and is counted as a key the keyring already held. So a
@@ -637,10 +640,12 @@ impl Repo {
 /// Merge the certificates `offered` holds into the keyring `existing` holds and
 /// report how many certificates the keyring did not already hold.
 ///
-/// The bytes `existing` carries are kept as they stand and the packets of each
-/// certificate the keyring does not hold are appended, so a keyring another
-/// implementation wrote keeps its own bytes and an added certificate stands as
-/// the offered stream wrote it. The keyring carries no Trust packet of this
+/// The packet stream `existing` carries is kept as it stands and the packets of
+/// each certificate the keyring does not hold are appended, so a keyring another
+/// implementation wrote keeps its own packets and an added certificate stands as
+/// the offered stream wrote it. The result is a binary packet stream: an armored
+/// `existing` decodes to the packets it holds, the merge keeps those packets,
+/// and the result carries no armor. The keyring carries no Trust packet of this
 /// import's making. A certificate whose fingerprint the keyring already holds is
 /// left as the keyring holds it, and it is counted as a key the keyring already
 /// held.
@@ -1615,6 +1620,32 @@ IHdvcmxk\n\
         assert_eq!(imported, 1);
         assert_eq!(&keyring[..existing.len()], &existing[..]);
         assert_eq!(&keyring[existing.len()..], &offered[..]);
+        let listed = held.fingerprints_of(&keyring);
+        assert_eq!(listed, [held.fingerprint(), added.fingerprint()]);
+    }
+
+    /// An import onto an armored keyring keeps the packet stream that keyring
+    /// held and writes it back in the binary form: the armor decodes to the
+    /// packets the binary export of the same key holds, those packets open the
+    /// result, and the added certificate's packets follow them. `gpg` reads the
+    /// result and lists both keys.
+    #[test]
+    fn an_import_keeps_the_packet_stream_of_an_armored_keyring() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let held = KeyFixture::new("Armored <armored@ostrya.example>");
+        let added = KeyFixture::new("Added <added@ostrya.example>");
+        let binary = held.export(false);
+        let armored = held.export(true);
+        let offered = added.export(false);
+        assert!(armored.starts_with(b"-----BEGIN PGP"));
+
+        let (imported, keyring) = merge_keyring(&armored, &offered, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 1);
+        assert_eq!(&keyring[..binary.len()], &binary[..]);
+        assert_eq!(&keyring[binary.len()..], &offered[..]);
         let listed = held.fingerprints_of(&keyring);
         assert_eq!(listed, [held.fingerprint(), added.fingerprint()]);
     }

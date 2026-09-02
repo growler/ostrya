@@ -34,9 +34,11 @@
 //! signature is valid where it verifies, where the certificate that holds the
 //! signing key is loaded, where the signature is over a document, where the
 //! bindings hold, where the digest is allowed, where the signature's own expiry
-//! has not passed, and where the key is neither expired nor revoked. Each rule
-//! below cites the `gpgv` 2.4.9 behavior it reproduces, observed in an isolated
-//! `GNUPGHOME` on fixtures the unit tests build.
+//! has not passed, and where the key is neither expired nor revoked. A
+//! self-signature whose own expiration time has passed sets no key expiry,
+//! binds no subkey, and ranks no user id. Each rule below cites the `gpgv`
+//! 2.4.9 behavior it reproduces, observed in an isolated `GNUPGHOME` on
+//! fixtures the unit tests build.
 //!
 //! A stored blob is untrusted input, so it is bounded and the parse is
 //! contained. One blob is held to one mebibyte, which is checked before the
@@ -472,10 +474,11 @@ impl<'a> Issuers<'a> {
 /// every copy verify under that key and their signatures form one set. The key
 /// expiry the group states is read over that set: [`key_expiry_over`] runs the
 /// tiered rule of [`primary_key_lifetime`] once over the direct signatures and
-/// the user ids of every copy, and a subkey's own lifetime comes from the newest
-/// binding signature that verifies out of the bindings every copy carries over
-/// it. A copy stating a lifetime the owner has replaced therefore states nothing
-/// on its own, and the newest statement answers.
+/// the user ids of every copy, and a subkey's own lifetime comes from the
+/// binding signature [`verified_binding`] answers with out of the bindings
+/// every copy carries over it. A copy stating a lifetime the owner has
+/// replaced therefore states nothing on its own, and the newest statement
+/// answers.
 ///
 /// The group holds at least one match and at least one copy: it is built from a
 /// match.
@@ -502,8 +505,8 @@ impl Group<'_> {
     }
 
     /// The instant `subkey` expires at on its own terms: its creation time plus
-    /// the lifetime the newest binding signature that verifies states, read
-    /// over the bindings every copy carries for that subkey.
+    /// the lifetime the binding signature [`verified_binding`] answers with
+    /// states, read over the bindings every copy carries for that subkey.
     fn subkey_expires_at(&self, subkey: &SignedPublicSubKey) -> Option<u64> {
         let wanted = subkey.fingerprint();
         let bindings = self
@@ -537,10 +540,12 @@ fn earlier(one: Option<u64>, two: Option<u64>) -> Option<u64> {
 /// keeps the issuer key id out of the answer.
 ///
 /// A subkey answers only where the primary key made a binding signature over
-/// it that verifies. A subkey whose binding does not verify -- one taken from
-/// another certificate and attached with the binding it carried there --
-/// belongs to no loaded certificate, and `gpgv` answers the same way: it
-/// reports `ERRSIG ... 9` and `NO_PUBKEY` for a signature such a subkey made.
+/// it that [`verified_binding`] answers with. A subkey whose binding does not
+/// verify -- one taken from another certificate and attached with the binding
+/// it carried there -- belongs to no loaded certificate, and so does a subkey
+/// whose every binding signature has itself expired. `gpgv` answers the same
+/// way: it reports `ERRSIG ... 9` and `NO_PUBKEY` for a signature such a
+/// subkey made.
 fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<Issuers<'a>> {
     for wanted in sig.issuer_fingerprint() {
         let mut matched: Vec<Issuer<'a>> = Vec::new();
@@ -595,12 +600,21 @@ fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<
     None
 }
 
-/// The newest binding signature `primary` made over `subkey` that verifies,
-/// out of `signatures`.
+/// The newest binding signature `primary` made over `subkey` that verifies and
+/// that has not itself expired, out of `signatures`.
 ///
 /// The signatures a subkey carries are one source, and the bindings every copy
 /// of one certificate carries over that subkey are another, so the caller
 /// states the set the rule runs over.
+///
+/// A binding signature whose own expiration time has passed binds nothing, and
+/// a live older binding beside it still binds. `gpgv` 2.4.9 answers the same
+/// way. Over a certificate whose one binding signature carries signature
+/// subpacket 3 with an instant already past, it reports
+/// `ERRSIG <keyid> 22 10 00 <created> 9 <fingerprint>` and `NO_PUBKEY` for a
+/// signature that subkey made, and exits 2; the same binding without
+/// subpacket 3 reports `GOODSIG`. Over a certificate carrying that expired
+/// binding beside the live one, it reports `GOODSIG`.
 fn verified_binding<'a, I>(
     primary: &PublicKey,
     subkey: &SignedPublicSubKey,
@@ -613,6 +627,7 @@ where
         .into_iter()
         .filter(|sig| {
             sig.typ() == Some(SignatureType::SubkeyBinding)
+                && !signature_expired(sig)
                 && sig.verify_subkey_binding(primary, &subkey.key).is_ok()
         })
         .max_by_key(|sig| created_secs(sig))
@@ -670,6 +685,15 @@ where
 /// an older certification self-signature states a lifetime already past. An
 /// altered newest one is passed over, and `gpgv` then reports the expiry the
 /// older one states.
+///
+/// A self-signature whose own expiration time has passed states no lifetime
+/// (see [`key_lifetime`]). The two tiers carry that rule differently, and
+/// `gpgv` 2.4.9 answers the same way in both. In the direct-key tier such a
+/// signature is passed over, so the newest live one that states a lifetime
+/// answers and, where every direct-key self-signature has expired, the
+/// certification tier answers. Among the certification self-signatures the
+/// newest one answers whether or not it has itself expired, so an expired
+/// newest one leaves the tier stating nothing.
 fn primary_key_lifetime<'a, D, U>(primary: &PublicKey, direct: D, users: U) -> Option<u64>
 where
     D: IntoIterator<Item = &'a Signature>,
@@ -714,8 +738,41 @@ fn is_certification(sig: &Signature) -> bool {
 /// The key lifetime a self-signature states, in seconds after the key creation
 /// time. A zero lifetime means no expiry, so it reads as absent, as a zero
 /// `gpgv` status field does.
+///
+/// A self-signature whose own expiration time has passed states no lifetime.
+/// This is what `gpgv` 2.4.9 answers, measured over a certificate whose newest
+/// certification self-signature carries signature subpacket 3 with an instant
+/// already past:
+///
+/// - where that signature states a one-day key lifetime and an older
+///   certification self-signature states ten years, `gpgv` reports `GOODSIG`,
+///   so the expired signature's own statement is unread;
+/// - where it states no key lifetime and an older certification self-signature
+///   states one day, `gpgv` reports `GOODSIG`, so the older signature does not
+///   answer in place of it.
+///
+/// The same holds over a direct-key self-signature. Where the one direct-key
+/// self-signature of a certificate has itself expired and states ten years,
+/// `gpgv` reports `EXPKEYSIG` with the instant the certification
+/// self-signature's one-day lifetime names, and the same signature without
+/// subpacket 3 reports `GOODSIG`. Where a live older direct-key
+/// self-signature stating ten years stands beside it, `gpgv` reports
+/// `GOODSIG`, so the direct-key tier reads the newest one that states a
+/// lifetime and the expired one states none.
 fn key_lifetime(sig: &Signature) -> Option<u64> {
+    if signature_expired(sig) {
+        return None;
+    }
     epoch(sig.key_expiration_time()?.as_secs())
+}
+
+/// Whether a signature's own expiration time has passed. A signature expires
+/// at the instant it names. This is the boundary [`describe`] measures on a
+/// data signature, and signature subpacket 3 is the same field on a
+/// self-signature, so one boundary answers for both. The boundary second on a
+/// self-signature is itself unmeasured.
+fn signature_expired(sig: &Signature) -> bool {
+    expires_at(sig).is_some_and(|instant| instant <= now())
 }
 
 /// Whether a verified key revocation signature stands over `cert`'s primary
@@ -744,7 +801,10 @@ fn key_lifetime(sig: &Signature) -> Option<u64> {
 /// Every revocation is verified before it is honored: the certificate's own
 /// primary key verifies one through [`Signature::verify_key`], and a
 /// designated revoker verifies one over the revoked primary key through
-/// [`Signature::verify_key_third_party`].
+/// [`Signature::verify_key_third_party`]. A revocation past its own
+/// expiration time still revokes. The reference tool's rule for that case is
+/// unmeasured, and the check here therefore reads the signature mathematics
+/// alone.
 ///
 /// The keyring import reads a certificate offered for a key the keyring
 /// already holds through this function. It passes the certificates it decides
@@ -791,11 +851,14 @@ where
 ///
 /// A designation rides on a self-signature, and only a self-signature that
 /// verifies under the primary key designates: the direct-key signatures and
-/// the certifications over a user id are read, each through the same check
-/// [`primary_key_lifetime`] applies before it reads a lifetime. A designation
-/// on a signature that does not verify designates nothing. [`revocation_keys`]
-/// reads the hashed subpacket area alone, so a subpacket 12 anyone can staple
-/// onto a certificate names no revoker either way.
+/// the certifications over a user id are read, each verified under the primary
+/// key. A designation on a signature that does not verify designates nothing.
+/// [`revocation_keys`] reads the hashed subpacket area alone, so a subpacket
+/// 12 anyone can staple onto a certificate names no revoker either way.
+///
+/// A designation on a self-signature past its own expiration time still names
+/// a revoker. The reference tool's rule for that case is unmeasured, and the
+/// check here therefore reads the signature mathematics alone.
 ///
 /// Both designation classes are read, the default one and the sensitive one.
 /// The class states whether the designation is to be published.
@@ -972,22 +1035,28 @@ fn split_uid(uid: &str) -> (Option<String>, Option<String>) {
 }
 
 /// Over a user id, the creation time of the newest certification that verifies
-/// under the certificate's primary key. A third-party certification and a
-/// packet anyone stapled onto the certificate do not verify under that key, so
-/// neither ranks a user id. A user id holding no such certification ranks at
-/// the epoch.
+/// under the certificate's primary key and that has not itself expired. A
+/// third-party certification and a packet anyone stapled onto the certificate
+/// do not verify under that key, so neither ranks a user id. A user id holding
+/// no such certification ranks at the epoch.
 ///
-/// The check is the signature mathematics alone, the same check
-/// [`primary_key_lifetime`] applies. A certification that states its own
-/// expiry, and a certification another signature revokes, both still rank. The
-/// reference tool's rule for those two cases is unmeasured, and the field the
-/// rule decides is the reported name.
+/// A certification whose own expiration time has passed ranks nothing, which
+/// is what `gpgv` 2.4.9 names. Over a certificate whose newest certification
+/// self-signature over one user id carries signature subpacket 3 with an
+/// instant already past, it names the other user id, whose own self-signature
+/// stands older than that signature and is live; the same signature without
+/// subpacket 3 makes it name the first user id.
+///
+/// A certification another signature revokes still ranks. The reference tool's
+/// rule for that case is unmeasured, and the field the rule decides is the
+/// reported name.
 fn newest_certification(cert: &SignedPublicKey, user: &SignedUser) -> u32 {
     let primary = &cert.primary_key;
     user.signatures
         .iter()
         .filter(|sig| {
             is_certification(sig)
+                && !signature_expired(sig)
                 && sig
                     .verify_certification(primary, Tag::UserId, &user.id)
                     .is_ok()
@@ -999,15 +1068,22 @@ fn newest_certification(cert: &SignedPublicKey, user: &SignedUser) -> u32 {
 }
 
 /// Whether a certification that verifies under the certificate's primary key
-/// marks a user id primary. A primary-user-id subpacket on a packet the
-/// primary key did not make marks nothing, which is what `gpgv` names: over a
-/// certificate whose primary-marked self-signature was altered, it names the
-/// other user id.
+/// and that has not itself expired marks a user id primary. A primary-user-id
+/// subpacket on a packet the primary key did not make marks nothing, which is
+/// what `gpgv` names: over a certificate whose primary-marked self-signature
+/// was altered, it names the other user id.
+///
+/// A certification whose own expiration time has passed marks nothing either.
+/// `gpgv` 2.4.9 answers the same way: over a certificate whose primary mark
+/// rides on a self-signature carrying signature subpacket 3 with an instant
+/// already past, it names the other user id, and the same signature without
+/// subpacket 3 makes it name the marked one.
 fn user_marked_primary(cert: &SignedPublicKey, user: &SignedUser) -> bool {
     let primary = &cert.primary_key;
     user.signatures.iter().any(|sig| {
         sig.is_primary()
             && is_certification(sig)
+            && !signature_expired(sig)
             && sig
                 .verify_certification(primary, Tag::UserId, &user.id)
                 .is_ok()
@@ -1299,6 +1375,19 @@ mod tests {
         fn add_uid(&self, uid: &str) {
             let status = self
                 .gpg()
+                .args(["--quick-add-uid", &self.primary, uid])
+                .status()
+                .unwrap();
+            assert!(status.success(), "gpg --quick-add-uid failed");
+        }
+
+        /// Add a user id, with `gpg` standing at `when`, so that the
+        /// self-signature it makes over the new user id carries a creation
+        /// time the caller chooses. The clock option stated last answers.
+        fn add_uid_at(&self, when: &str, uid: &str) {
+            let status = self
+                .gpg()
+                .args(["--faked-system-time", when])
                 .args(["--quick-add-uid", &self.primary, uid])
                 .status()
                 .unwrap();
@@ -2084,16 +2173,108 @@ mod tests {
         join_packets(&kept)
     }
 
-    /// A direct-key self-signature (type 0x1F) over a primary key, created at
-    /// `created` and stating the key lifetime `lifetime`.
+    /// What one self-signature the cases build states about itself.
     ///
-    /// `gpg` 2.4.9 writes the key expiration time into the certification
-    /// self-signature alone, so a certificate carrying both statements is
-    /// built by signing the direct-key signature here, over the secret key the
-    /// same GnuPG home exported.
-    fn direct_key_signature(secret: &[u8], created: u64, lifetime: u64) -> Vec<u8> {
+    /// `gpg` 2.4.9 writes no signature expiration time into a self-signature,
+    /// and it writes the key expiration time into the certification
+    /// self-signature alone, so every state that needs another combination is
+    /// built here with the `pgp` crate, over the secret key the same GnuPG
+    /// home exported.
+    #[derive(Clone, Copy)]
+    struct SelfSig {
+        /// The instant the signature was made.
+        created: u64,
+        /// The key lifetime signature subpacket 9 states, in seconds after the
+        /// key creation time. Absent where the signature carries no such
+        /// subpacket.
+        key_lifetime: Option<u64>,
+        /// The signature lifetime signature subpacket 3 states, in seconds
+        /// after the signature creation time. Absent where the signature
+        /// carries no such subpacket.
+        sig_lifetime: Option<u64>,
+        /// Whether the signature marks the user id it stands over primary.
+        marks_primary: bool,
+    }
+
+    impl SelfSig {
+        /// A self-signature made at `created` that states nothing else.
+        fn at(created: u64) -> SelfSig {
+            SelfSig {
+                created,
+                key_lifetime: None,
+                sig_lifetime: None,
+                marks_primary: false,
+            }
+        }
+
+        /// The same, stating the key lifetime `lifetime` where one is given.
+        fn key_lifetime(self, lifetime: Option<u64>) -> SelfSig {
+            SelfSig {
+                key_lifetime: lifetime,
+                ..self
+            }
+        }
+
+        /// The same, expiring `lifetime` seconds after it was made.
+        fn expiring_after(self, lifetime: u64) -> SelfSig {
+            SelfSig {
+                sig_lifetime: Some(lifetime),
+                ..self
+            }
+        }
+
+        /// The same, marking the user id it stands over primary.
+        fn marking_primary(self) -> SelfSig {
+            SelfSig {
+                marks_primary: true,
+                ..self
+            }
+        }
+    }
+
+    /// The hashed subpackets a self-signature `spec` describes carries: the
+    /// creation time, the issuer fingerprint, and the subpackets `spec` states.
+    fn self_signature_subpackets<K: pgp::types::KeyDetails>(
+        spec: SelfSig,
+        public: &K,
+    ) -> Vec<pgp::packet::Subpacket> {
+        use pgp::packet::{Subpacket, SubpacketData};
+        use pgp::types::Duration;
+
+        let mut hashed = vec![
+            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
+                u32::try_from(spec.created).unwrap(),
+            )))
+            .unwrap(),
+            Subpacket::regular(SubpacketData::IssuerFingerprint(public.fingerprint())).unwrap(),
+        ];
+        if let Some(lifetime) = spec.key_lifetime {
+            hashed.push(
+                Subpacket::regular(SubpacketData::KeyExpirationTime(Duration::from_secs(
+                    u32::try_from(lifetime).unwrap(),
+                )))
+                .unwrap(),
+            );
+        }
+        if let Some(lifetime) = spec.sig_lifetime {
+            hashed.push(
+                Subpacket::regular(SubpacketData::SignatureExpirationTime(Duration::from_secs(
+                    u32::try_from(lifetime).unwrap(),
+                )))
+                .unwrap(),
+            );
+        }
+        if spec.marks_primary {
+            hashed.push(Subpacket::regular(SubpacketData::IsPrimary(true)).unwrap());
+        }
+        hashed
+    }
+
+    /// A direct-key self-signature (type 0x1F) over a primary key, as `spec`
+    /// states it.
+    fn direct_self_signature(secret: &[u8], spec: SelfSig) -> Vec<u8> {
         use pgp::packet::{PacketTrait, SignatureConfig, Subpacket, SubpacketData};
-        use pgp::types::{Duration, Password};
+        use pgp::types::Password;
 
         let secret_key = pgp::composed::SignedSecretKey::from_bytes(Cursor::new(secret)).unwrap();
         let public = secret_key.primary_key.public_key();
@@ -2102,17 +2283,7 @@ mod tests {
             PublicKeyAlgorithm::EdDSALegacy,
             HashAlgorithm::Sha512,
         );
-        config.hashed_subpackets = vec![
-            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
-                u32::try_from(created).unwrap(),
-            )))
-            .unwrap(),
-            Subpacket::regular(SubpacketData::IssuerFingerprint(public.fingerprint())).unwrap(),
-            Subpacket::regular(SubpacketData::KeyExpirationTime(Duration::from_secs(
-                u32::try_from(lifetime).unwrap(),
-            )))
-            .unwrap(),
-        ];
+        config.hashed_subpackets = self_signature_subpackets(spec, &public);
         config.unhashed_subpackets =
             vec![Subpacket::regular(SubpacketData::IssuerKeyId(public.legacy_key_id())).unwrap()];
         let signature = config
@@ -2121,6 +2292,144 @@ mod tests {
         let mut bytes = Vec::new();
         signature.to_writer_with_header(&mut bytes).unwrap();
         bytes
+    }
+
+    /// A certification self-signature (type 0x13) over the certificate's first
+    /// user id, as `spec` states it.
+    fn certification_self_signature(secret: &[u8], spec: SelfSig) -> Vec<u8> {
+        use pgp::packet::{PacketTrait, SignatureConfig, Subpacket, SubpacketData};
+        use pgp::types::Password;
+
+        let secret_key = pgp::composed::SignedSecretKey::from_bytes(Cursor::new(secret)).unwrap();
+        let public = secret_key.primary_key.public_key();
+        let user = &secret_key.details.users[0];
+        let mut config = SignatureConfig::v4(
+            SignatureType::CertPositive,
+            PublicKeyAlgorithm::EdDSALegacy,
+            HashAlgorithm::Sha512,
+        );
+        config.hashed_subpackets = self_signature_subpackets(spec, &public);
+        config.unhashed_subpackets =
+            vec![Subpacket::regular(SubpacketData::IssuerKeyId(public.legacy_key_id())).unwrap()];
+        let signature = config
+            .sign_certification(
+                &secret_key.primary_key,
+                &public,
+                &Password::empty(),
+                Tag::UserId,
+                &user.id,
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        signature.to_writer_with_header(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// A subkey binding signature (type 0x18) the primary key makes over the
+    /// certificate's first subkey, created at `created`, carrying the
+    /// signing key flag, the back-signature the subkey makes, and the
+    /// signature lifetime `sig_lifetime` where one is given.
+    fn subkey_binding_signature(secret: &[u8], created: u64, sig_lifetime: Option<u64>) -> Vec<u8> {
+        use pgp::packet::{KeyFlags, PacketTrait, SignatureConfig, Subpacket, SubpacketData};
+        use pgp::types::Password;
+
+        let secret_key = pgp::composed::SignedSecretKey::from_bytes(Cursor::new(secret)).unwrap();
+        let primary = secret_key.primary_key.public_key();
+        let sub = &secret_key.secret_subkeys[0];
+        let sub_public = sub.key.public_key();
+
+        let mut back = SignatureConfig::v4(
+            SignatureType::KeyBinding,
+            PublicKeyAlgorithm::EdDSALegacy,
+            HashAlgorithm::Sha512,
+        );
+        back.hashed_subpackets = self_signature_subpackets(SelfSig::at(created), &sub_public);
+        back.unhashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::IssuerKeyId(sub_public.legacy_key_id())).unwrap(),
+        ];
+        let back = back
+            .sign_primary_key_binding(&sub.key, &sub_public, &Password::empty(), &primary)
+            .unwrap();
+
+        let mut flags = KeyFlags::default();
+        flags.set_sign(true);
+        let mut config = SignatureConfig::v4(
+            SignatureType::SubkeyBinding,
+            PublicKeyAlgorithm::EdDSALegacy,
+            HashAlgorithm::Sha512,
+        );
+        let spec = SelfSig::at(created);
+        config.hashed_subpackets = self_signature_subpackets(
+            match sig_lifetime {
+                Some(lifetime) => spec.expiring_after(lifetime),
+                None => spec,
+            },
+            &primary,
+        );
+        config
+            .hashed_subpackets
+            .push(Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap());
+        config.unhashed_subpackets = vec![
+            Subpacket::regular(SubpacketData::IssuerKeyId(primary.legacy_key_id())).unwrap(),
+            Subpacket::regular(SubpacketData::EmbeddedSignature(Box::new(back))).unwrap(),
+        ];
+        let signature = config
+            .sign_subkey_binding(
+                &secret_key.primary_key,
+                &primary,
+                &Password::empty(),
+                &sub_public,
+            )
+            .unwrap();
+        let mut bytes = Vec::new();
+        signature.to_writer_with_header(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// Replace the one subkey binding signature a certificate carries with
+    /// `packet`.
+    fn replace_subkey_binding(cert: &[u8], packet: &[u8]) -> Vec<u8> {
+        let mut inserted = split_packets(packet);
+        assert_eq!(inserted.len(), 1);
+        let replacement = inserted.remove(0);
+        let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
+        let mut replaced = 0;
+        for (tag, body) in split_packets(cert) {
+            if tag == 2 && body[0] == 4 && body[1] == 0x18 {
+                out.push(replacement.clone());
+                replaced += 1;
+            } else {
+                out.push((tag, body));
+            }
+        }
+        assert_eq!(replaced, 1, "one binding signature was replaced");
+        join_packets(&out)
+    }
+
+    /// Insert one packet right after the signatures that stand under the user
+    /// id `id`, which is where a certification over that user id belongs.
+    fn insert_after_user_id(cert: &[u8], id: &str, packet: &[u8]) -> Vec<u8> {
+        let packets = split_packets(cert);
+        let at = packets
+            .iter()
+            .position(|(tag, body)| *tag == 13 && body == id.as_bytes())
+            .expect("the certificate holds the user id");
+        let mut end = at + 1;
+        while end < packets.len() && packets[end].0 == 2 {
+            end += 1;
+        }
+        let mut inserted = split_packets(packet);
+        assert_eq!(inserted.len(), 1);
+        let mut out = packets[..end].to_vec();
+        out.push(inserted.remove(0));
+        out.extend_from_slice(&packets[end..]);
+        join_packets(&out)
+    }
+
+    /// A direct-key self-signature created at `created` and stating the key
+    /// lifetime `lifetime`.
+    fn direct_key_signature(secret: &[u8], created: u64, lifetime: u64) -> Vec<u8> {
+        direct_self_signature(secret, SelfSig::at(created).key_lifetime(Some(lifetime)))
     }
 
     /// A signature by a primary key is valid where the key is live, is not
@@ -3239,55 +3548,14 @@ mod tests {
         }
     }
 
-    /// A certification self-signature (type 0x13) over the certificate's first
-    /// user id, created at `created`, stating the key lifetime `lifetime` where
-    /// one is given and carrying no key-expiration-time subpacket where none
-    /// is.
+    /// A certification self-signature over the certificate's first user id,
+    /// created at `created`, stating the key lifetime `lifetime` where one is
+    /// given and carrying no key-expiration-time subpacket where none is.
     ///
     /// `gpg` 2.4.9 keeps one certification self-signature per user id, so a
-    /// certificate carrying two is built by signing the second one here, over
-    /// the secret key the same GnuPG home exported.
+    /// certificate carrying two is built by signing the second one here.
     fn certification_signature(secret: &[u8], created: u64, lifetime: Option<u64>) -> Vec<u8> {
-        use pgp::packet::{PacketTrait, SignatureConfig, Subpacket, SubpacketData};
-        use pgp::types::{Duration, Password};
-
-        let secret_key = pgp::composed::SignedSecretKey::from_bytes(Cursor::new(secret)).unwrap();
-        let public = secret_key.primary_key.public_key();
-        let user = &secret_key.details.users[0];
-        let mut config = SignatureConfig::v4(
-            SignatureType::CertPositive,
-            PublicKeyAlgorithm::EdDSALegacy,
-            HashAlgorithm::Sha512,
-        );
-        config.hashed_subpackets = vec![
-            Subpacket::regular(SubpacketData::SignatureCreationTime(Timestamp::from_secs(
-                u32::try_from(created).unwrap(),
-            )))
-            .unwrap(),
-            Subpacket::regular(SubpacketData::IssuerFingerprint(public.fingerprint())).unwrap(),
-        ];
-        if let Some(lifetime) = lifetime {
-            config.hashed_subpackets.push(
-                Subpacket::regular(SubpacketData::KeyExpirationTime(Duration::from_secs(
-                    u32::try_from(lifetime).unwrap(),
-                )))
-                .unwrap(),
-            );
-        }
-        config.unhashed_subpackets =
-            vec![Subpacket::regular(SubpacketData::IssuerKeyId(public.legacy_key_id())).unwrap()];
-        let signature = config
-            .sign_certification(
-                &secret_key.primary_key,
-                &public,
-                &Password::empty(),
-                Tag::UserId,
-                &user.id,
-            )
-            .unwrap();
-        let mut bytes = Vec::new();
-        signature.to_writer_with_header(&mut bytes).unwrap();
-        bytes
+        certification_self_signature(secret, SelfSig::at(created).key_lifetime(lifetime))
     }
 
     /// A signature of the class `typ` over one byte of `payload`, which is what
@@ -3599,6 +3867,313 @@ mod tests {
             assert_eq!(info.key_expires, case.expires, "case {index}");
             assert_eq!(info.expired, case.expires.is_some(), "case {index}");
             assert_eq!(info.valid, case.expires.is_none(), "case {index}");
+        }
+    }
+
+    /// A signature lifetime that is spent, in seconds after the signature
+    /// creation time. The cases below make a self-signature within a minute of
+    /// [`KEY_CREATED`], so a signature carrying this lifetime expired long
+    /// before the clock every `gpgv` run reads.
+    const SPENT_LIFETIME: u64 = 100;
+
+    /// The first signature packet of a detached signature blob.
+    fn signature_of(blob: &[u8]) -> DetachedSignature {
+        DetachedSignature::from_bytes_many(Cursor::new(blob))
+            .expect("the blob opens as a packet stream")
+            .next()
+            .expect("the blob holds a signature packet")
+            .expect("the signature packet is whole")
+    }
+
+    /// A certification self-signature whose own expiration time has passed
+    /// states no key lifetime, and no older certification self-signature
+    /// answers in its place.
+    #[test]
+    fn an_expired_certification_self_signature_states_no_key_lifetime() {
+        if !tools_available() {
+            return;
+        }
+        /// What one certificate carries and what it states.
+        struct Case {
+            /// The lifetime the fixture's own certification self-signature
+            /// states.
+            own: &'static str,
+            /// The key lifetime the spliced newer certification states.
+            spliced: Option<u64>,
+            /// Whether the spliced certification has itself expired.
+            expired: bool,
+            /// The instant the key expires at, absent where it does not.
+            expires: Option<u64>,
+        }
+        let cases = [
+            // The spliced certification states no lifetime. The older one
+            // states a lifetime already past and does not answer in its
+            // place, whether the spliced one has expired or not.
+            Case {
+                own: "1d",
+                spliced: Some(0),
+                expired: true,
+                expires: None,
+            },
+            Case {
+                own: "1d",
+                spliced: Some(0),
+                expired: false,
+                expires: None,
+            },
+            // The spliced certification states a lifetime already past. It
+            // answers where it is live, and it states nothing where it has
+            // itself expired.
+            Case {
+                own: "10y",
+                spliced: Some(ONE_DAY),
+                expired: true,
+                expires: None,
+            },
+            Case {
+                own: "10y",
+                spliced: Some(ONE_DAY),
+                expired: false,
+                expires: Some(KEY_CREATED + ONE_DAY),
+            },
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            let home = Fixture::at(
+                &format!("Cexp{index} <cexp{index}@ostrya.example>"),
+                case.own,
+            );
+            let blob = home.sign(&home.primary, PAYLOAD);
+            let mut spec = SelfSig::at(KEY_CREATED + 20).key_lifetime(case.spliced);
+            if case.expired {
+                spec = spec.expiring_after(SPENT_LIFETIME);
+            }
+            let spliced = certification_self_signature(&home.secret_key(), spec);
+            let keyring = append_packet(&home.keyring(), &spliced);
+            let outcome =
+                verify_signatures(&certs_of(&keyring), PAYLOAD, std::slice::from_ref(&blob))
+                    .unwrap();
+            let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+            assert_eq!(outcome.signatures.len(), 1, "case {index}");
+            assert_eq!(reference.len(), 1, "case {index}");
+            assert_agrees(&outcome.signatures[0], &reference[0]);
+            let info = &outcome.signatures[0];
+            assert_eq!(info.key_expires, case.expires, "case {index}");
+            assert_eq!(info.expired, case.expires.is_some(), "case {index}");
+            assert_eq!(info.valid, case.expires.is_none(), "case {index}");
+        }
+    }
+
+    /// A direct-key self-signature whose own expiration time has passed states
+    /// no key lifetime. The newest live one that states a lifetime answers,
+    /// and where every direct-key self-signature has expired the certification
+    /// self-signature answers.
+    #[test]
+    fn an_expired_direct_key_self_signature_states_no_key_lifetime() {
+        if !tools_available() {
+            return;
+        }
+        /// What one certificate carries and what it states. Every fixture's
+        /// own certification self-signature states one day, an instant
+        /// already past.
+        struct Case {
+            /// The direct-key self-signatures spliced onto the certificate:
+            /// the creation time after [`KEY_CREATED`], the key lifetime, and
+            /// whether the signature has itself expired.
+            spliced: &'static [(u64, u64, bool)],
+            /// The instant the key expires at, absent where it does not.
+            expires: Option<u64>,
+        }
+        let cases = [
+            // One direct-key self-signature that has expired. It states
+            // nothing, so the certification self-signature answers. A zero
+            // key lifetime already states nothing, so the first case holds
+            // whether the signature has expired or not and the second case is
+            // the one the expiration time decides.
+            Case {
+                spliced: &[(20, 0, true)],
+                expires: Some(KEY_CREATED + ONE_DAY),
+            },
+            Case {
+                spliced: &[(20, TEN_YEARS, true)],
+                expires: Some(KEY_CREATED + ONE_DAY),
+            },
+            // The same signature while it is live answers, and the key stands
+            // live for ten years.
+            Case {
+                spliced: &[(20, TEN_YEARS, false)],
+                expires: None,
+            },
+            // A live older direct-key self-signature beside an expired newer
+            // one answers, so the tier does not fall through where one of its
+            // signatures is live.
+            Case {
+                spliced: &[(10, TEN_YEARS, false), (20, TEN_YEARS, true)],
+                expires: None,
+            },
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            let home = Fixture::at(&format!("Dexp{index} <dexp{index}@ostrya.example>"), "1d");
+            let blob = home.sign(&home.primary, PAYLOAD);
+            let secret = home.secret_key();
+            let mut keyring = home.keyring();
+            for (created, lifetime, expired) in case.spliced {
+                let mut spec = SelfSig::at(KEY_CREATED + created).key_lifetime(Some(*lifetime));
+                if *expired {
+                    spec = spec.expiring_after(SPENT_LIFETIME);
+                }
+                keyring = insert_after_primary(&keyring, &direct_self_signature(&secret, spec));
+            }
+            let outcome =
+                verify_signatures(&certs_of(&keyring), PAYLOAD, std::slice::from_ref(&blob))
+                    .unwrap();
+            let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+            assert_eq!(outcome.signatures.len(), 1, "case {index}");
+            assert_eq!(reference.len(), 1, "case {index}");
+            assert_agrees(&outcome.signatures[0], &reference[0]);
+            let info = &outcome.signatures[0];
+            assert_eq!(info.key_expires, case.expires, "case {index}");
+            assert_eq!(info.expired, case.expires.is_some(), "case {index}");
+            assert_eq!(info.valid, case.expires.is_none(), "case {index}");
+        }
+    }
+
+    /// A subkey binding signature whose own expiration time has passed binds
+    /// nothing, so a signature the subkey made resolves to no key and reports
+    /// `key_missing`. A live older binding beside it still binds.
+    #[test]
+    fn an_expired_subkey_binding_signature_binds_nothing() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::at("Bexp <bexp@ostrya.example>", "never");
+        let subkey = home.add_signing_subkey();
+        let blob = home.sign(&subkey, PAYLOAD);
+        let secret = home.secret_key();
+
+        // The control: the binding built here, carrying no expiration time,
+        // binds the subkey, so the expiration time is what the case below
+        // states and not the way the binding was made.
+        let live = replace_subkey_binding(
+            &home.keyring(),
+            &subkey_binding_signature(&secret, KEY_CREATED + 20, None),
+        );
+        let certs = certs_of(&live);
+        let outcome = verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+        let reference = home.gpgv_records(&live, &blob, PAYLOAD);
+        assert_eq!(outcome.signatures.len(), 1);
+        assert_eq!(reference.len(), 1);
+        assert_agrees(&outcome.signatures[0], &reference[0]);
+        assert!(outcome.signatures[0].valid);
+        assert_eq!(outcome.signatures[0].fingerprint.as_deref(), Some(&*subkey));
+        assert!(resolve_issuers(&certs, &signature_of(&blob).signature).is_some());
+
+        // The same binding, expired. The subkey belongs to no loaded
+        // certificate.
+        let expired = replace_subkey_binding(
+            &home.keyring(),
+            &subkey_binding_signature(&secret, KEY_CREATED + 20, Some(SPENT_LIFETIME)),
+        );
+        let certs = certs_of(&expired);
+        let outcome = verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+        let reference = home.gpgv_records(&expired, &blob, PAYLOAD);
+        assert_eq!(outcome.signatures.len(), 1);
+        assert_eq!(reference.len(), 1);
+        assert_agrees(&outcome.signatures[0], &reference[0]);
+        let info = &outcome.signatures[0];
+        assert!(info.key_missing, "the subkey resolved to a certificate");
+        assert!(!info.valid);
+        assert!(!outcome.valid);
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some(&*subkey),
+            "the fingerprint the signature packet names"
+        );
+        assert_eq!(info.user_name, None);
+        assert!(resolve_issuers(&certs, &signature_of(&blob).signature).is_none());
+
+        // The expired binding beside the live one `gpg` wrote. The live one
+        // binds, so one expired binding does not unbind a subkey.
+        let both = append_packet(
+            &home.keyring(),
+            &subkey_binding_signature(&secret, KEY_CREATED + 20, Some(SPENT_LIFETIME)),
+        );
+        let outcome =
+            verify_signatures(&certs_of(&both), PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+        let reference = home.gpgv_records(&both, &blob, PAYLOAD);
+        assert_eq!(outcome.signatures.len(), 1);
+        assert_eq!(reference.len(), 1);
+        assert_agrees(&outcome.signatures[0], &reference[0]);
+        assert!(outcome.signatures[0].valid);
+        assert!(!outcome.signatures[0].key_missing);
+    }
+
+    /// A certification self-signature whose own expiration time has passed
+    /// ranks no user id and marks none primary, so the report names the user
+    /// id whose own certification is live.
+    #[test]
+    fn an_expired_certification_self_signature_ranks_no_user_id() {
+        if !tools_available() {
+            return;
+        }
+        const ALPHA: &str = "Alpha <alpha@ostrya.example>";
+        const BRAVO: &str = "Bravo <bravo@ostrya.example>";
+        /// What the certification spliced onto the first user id carries.
+        struct Case {
+            /// The instant it was made, after [`KEY_CREATED`].
+            created: u64,
+            /// Whether it marks the user id primary.
+            marks_primary: bool,
+        }
+        let cases = [
+            // The mark outranks recency, so a live signature older than the
+            // second user id's own certification names the first user id.
+            Case {
+                created: 20,
+                marks_primary: true,
+            },
+            // Recency alone ranks, so a live signature newer than the second
+            // user id's own certification names the first user id.
+            Case {
+                created: 40,
+                marks_primary: false,
+            },
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            let home = Fixture::at(ALPHA, "never");
+            // The second user id's own certification stands 30 seconds after
+            // the key creation time, between the two instants the cases use.
+            home.add_uid_at("20250101T000030!", BRAVO);
+            let blob = home.sign(&home.primary, PAYLOAD);
+            let secret = home.secret_key();
+            for expired in [false, true] {
+                let mut spec = SelfSig::at(KEY_CREATED + case.created);
+                if case.marks_primary {
+                    spec = spec.marking_primary();
+                }
+                if expired {
+                    spec = spec.expiring_after(SPENT_LIFETIME);
+                }
+                let keyring = insert_after_user_id(
+                    &home.keyring(),
+                    ALPHA,
+                    &certification_self_signature(&secret, spec),
+                );
+                let outcome =
+                    verify_signatures(&certs_of(&keyring), PAYLOAD, std::slice::from_ref(&blob))
+                        .unwrap();
+                let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+                assert_eq!(outcome.signatures.len(), 1, "case {index}");
+                assert_eq!(reference.len(), 1, "case {index}");
+                assert_agrees(&outcome.signatures[0], &reference[0]);
+                let info = &outcome.signatures[0];
+                let named = if expired { "bravo" } else { "alpha" };
+                assert_eq!(
+                    info.user_email.as_deref(),
+                    Some(&*format!("{named}@ostrya.example")),
+                    "case {index}, expired {expired}"
+                );
+                assert!(info.valid, "case {index}, expired {expired}");
+            }
         }
     }
 

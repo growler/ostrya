@@ -1857,11 +1857,13 @@ carries refuses the signature. Two exports of one certificate are read as one
 certificate, so the key expiry the newest self-signature of either export
 states answers; across certificates holding different primary keys the key
 expires at the earliest instant any of them states. The keyring load order
-decides none of the three. The first certificate that answers supplies the
-reported fingerprints and user id. The keyring trusted for a remote is
-`<remote>.trustedkeys.gpg` in the repo or under `/etc/ostree/remotes.d/`; every
-`*.gpg` keyring in the global trusted-keyring directory is trusted for all
-remotes. That directory is `<datadir>/ostree/trusted.gpg.d/`
+decides none of the three. A self-signature whose own expiration time has
+passed states no key expiry, binds no subkey, and ranks no user id. The first
+certificate that answers supplies the reported fingerprints and user id. The
+keyring trusted for a remote is `<remote>.trustedkeys.gpg` in the repo or under
+`/etc/ostree/remotes.d/`; every `*.gpg` keyring in the global trusted-keyring
+directory is trusted for all remotes. That directory is
+`<datadir>/ostree/trusted.gpg.d/`
 (`/usr/share/ostree/trusted.gpg.d/`), and the `OSTREE_GPG_HOME` environment
 variable overrides it with the directory it names, observed by running `ostree
 show` on a signed commit with `OSTREE_GPG_HOME` set to a directory holding the

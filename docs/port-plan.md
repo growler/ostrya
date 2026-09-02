@@ -1583,6 +1583,55 @@ Definition:
   is a key revocation over the primary key. The measured states therefore cover
   the primary key, and they state nothing about a designated revoker of a
   subkey. The subkey rule stays at the primary key's own signature.
+- A self-signature whose own expiration time has passed sets no key expiry,
+  binds no subkey, and ranks no user id. The primary key expiry comes from the
+  newest direct-key self-signature that verifies, stands live, and states a
+  lifetime; where the certificate carries no such signature it comes from the
+  newest certification self-signature that verifies, and that signature states
+  no lifetime once its own expiration time has passed, with no older
+  certification standing in for it. A subkey binding signature whose own
+  expiration time has passed binds nothing, so a signature that subkey made
+  resolves to no loaded certificate and reports a missing key, and a live older
+  binding beside it still binds. A certification whose own expiration time has
+  passed ranks no user id and marks none primary. The rules reproduce `gpgv`
+  2.4.9, measured over certificates carrying a self-signature whose signature
+  subpacket 3 names an instant already past, each beside the same signature
+  without that subpacket:
+  - the newest certification self-signature expired and stating a one-day
+    lifetime, over a certificate whose older certification states ten years:
+    `GOODSIG`, where the same signature while it is live reports `EXPKEYSIG`
+    with the one-day instant;
+  - the newest certification self-signature expired and stating no lifetime,
+    over a certificate whose older certification states one day: `GOODSIG`, so
+    no older certification answers in its place;
+  - the one direct-key self-signature expired and stating ten years, over a
+    certificate whose certification self-signature states one day: `EXPKEYSIG`
+    with the one-day instant, where the same signature while it is live reports
+    `GOODSIG`;
+  - a live older direct-key self-signature stating ten years beside an expired
+    newer one stating ten years, over the same certificate: `GOODSIG`;
+  - the one subkey binding signature expired: `ERRSIG ... 9` and `NO_PUBKEY`
+    for a signature that subkey made, with exit status 2, where the same
+    binding while it is live reports `GOODSIG`; the expired binding beside the
+    live one `gpg` wrote reports `GOODSIG`;
+  - the newest certification of one user id expired and marking that user id
+    primary, beside a second user id whose own certification is live: the
+    report names the second user id, where the same signature while it is live
+    makes it name the marked one;
+  - the newest certification of the certificate expired and marking nothing,
+    over a certificate whose second user id carries the next newest
+    certification: the report names the second user id, where the same
+    signature while it is live makes it name the first one.
+
+  `gpg` 2.4.9 writes no signature expiration time into a self-signature, so
+  each state is built with the `pgp` crate over the secret key the fixture's
+  own GnuPG home exported. The states cover the key expiry, the subkey
+  binding, and the reported user id. Three neighboring rules are unmeasured
+  and stay as they stand: a designation through signature subpacket 12 on a
+  self-signature past its own expiration time still names a revoker, a
+  revocation signature past its own expiration time still revokes, and a
+  self-signature expires at the boundary second the data signature rule
+  measures.
 - The key state is read over every certificate that answers for a signature's
   issuer. A key reaches the trusted set through several certificates on
   ordinary paths: a repository's `<remote>.trustedkeys.gpg` beside the global

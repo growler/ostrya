@@ -64,9 +64,12 @@
 //! written in the binary form, so an armored keyring keeps its packets and
 //! loses its armor. `gpg` and the `ostree` tool both read a keyring of that
 //! form. A certificate for a key the keyring already holds is left as the
-//! keyring holds it, so an updated certificate reaches the keyring through
-//! [`Repo::remove_remote_keyring`] and a fresh import. A keyring offered for
-//! import is untrusted input and is held to the same caps and the same
+//! keyring holds it, so a new user id or a new subkey for a held key reaches
+//! the keyring through [`Repo::remove_remote_keyring`] and a fresh import. A
+//! certificate carrying a key revocation that verifies under the key it revokes
+//! is the exception: it replaces the held certificate, which rewrites the
+//! keyring, so a revoked key stops speaking for the remote. A keyring offered
+//! for import is untrusted input and is held to the same caps and the same
 //! containment a keyring loaded for verification is, and a stream the
 //! certificate parser does not read fails the import, which leaves the keyring
 //! as it was.
@@ -78,7 +81,7 @@
 //! membership in the verifier's keyrings; GnuPG's ownertrust model plays no
 //! part.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::ops::Range;
 use std::os::fd::OwnedFd;
@@ -606,11 +609,24 @@ impl Repo {
     /// keyring keeps its packets and loses its armor.
     ///
     /// A certificate for a key the keyring already holds is left as the keyring
-    /// holds it, and is counted as a key the keyring already held. So a
-    /// revocation, a new user id, or a new subkey for a held key reaches the
-    /// keyring through [`Repo::remove_remote_keyring`] and a fresh import, and
-    /// not through a second call here. `docs/conformance/cli-surface.md`, "P3",
-    /// records what the `ostree` tool does instead.
+    /// holds it, and is counted as a key the keyring already held. So a new user
+    /// id or a new subkey for a held key reaches the keyring through
+    /// [`Repo::remove_remote_keyring`] and a fresh import, and not through a
+    /// second call here. `docs/conformance/cli-surface.md`, "P3", records what
+    /// the `ostree` tool does instead.
+    ///
+    /// A key revocation is the exception. A certificate carrying a key
+    /// revocation signature that verifies under the key it revokes replaces the
+    /// held certificate, so a revoked key stops speaking for the remote. The
+    /// replacement rewrites the keyring and drops the Trust packets it carried
+    /// (see [`merge_keyring`]), and the key is still counted as one the keyring
+    /// already held. A keyring carrying bytes past its last framed packet takes
+    /// no replacement, and such an import is refused by the name of the
+    /// keyring, which leaves the keyring as it was.
+    ///
+    /// A bare revocation certificate carries no public-key packet
+    /// and holds no certificate, so it is refused; the re-export of the revoked
+    /// key is the stream that carries a revocation in.
     pub async fn gpg_import_keys(
         &self,
         remote: &str,
@@ -651,9 +667,24 @@ impl Repo {
 /// the offered stream wrote it. The result is a binary packet stream: an armored
 /// `existing` decodes to the packets it holds, the merge keeps those packets,
 /// and the result carries no armor. The keyring carries no Trust packet of this
-/// import's making. A certificate whose fingerprint the keyring already holds is
-/// left as the keyring holds it, and it is counted as a key the keyring already
-/// held.
+/// import's making.
+///
+/// A certificate whose fingerprint the keyring already holds is left as the
+/// keyring holds it, with one exception: an offered certificate carrying a key
+/// revocation that verifies replaces a held certificate that carries none, so a
+/// revoked key stops speaking for the remote. The replacement rewrites the
+/// keyring, since a keyring is a run of packets per certificate and a revocation
+/// written at the end of the stream would attach to the last certificate in it,
+/// and the rewrite drops the Trust packets the keyring carried (see
+/// [`replace_certificates`]). Either way the certificate is counted as a key the
+/// keyring already held.
+///
+/// The replacement needs a keyring whose packet stream frames to its end.
+/// Where a keyring carries bytes past its last framed packet and a replacement
+/// is due, the merge refuses by the name of the keyring, so the import writes
+/// no keyring and the file keeps the bytes it held. Where no replacement is due
+/// such a keyring merges as any other does: the bytes it holds are kept and the
+/// packets of each added certificate follow them.
 ///
 /// Both streams are untrusted input, so each is held to [`MAX_KEYRING`] and to
 /// [`MAX_KEYRING_CERTS`], a keybox is refused, and every packet read runs inside
@@ -669,30 +700,95 @@ fn merge_keyring(
     let mut keyring = keyring_stream(existing, subject)?;
     let stream = keyring_stream(offered, source)?;
     let refusal = format!("{source} cannot be merged into {subject}: the parser panicked");
-    let (imported, appended) = contained(&refusal, || {
-        let mut fingerprints: BTreeSet<String> = parse_keyring(&keyring, subject)?
-            .iter()
-            .map(fingerprint_hex)
-            .collect();
+    let (imported, rewritten, appended) = contained(&refusal, || {
+        // Every key the merge holds, by fingerprint, and whether the keyring
+        // revokes it. A keyring holding one key through two certificates
+        // answers once here, revoked where either of them revokes it, which is
+        // the reach the verify path gives a revocation.
+        let mut held: BTreeMap<String, bool> = BTreeMap::new();
+        for cert in parse_keyring(&keyring, subject)? {
+            let revoked = verify::key_revoked(&cert);
+            *held.entry(fingerprint_hex(&cert)).or_default() |= revoked;
+        }
         let offered = offered_certificates(&stream, source)?;
         if offered.is_empty() {
             return Err(Error::Signature(format!(
                 "{source} holds no OpenPGP certificate"
             )));
         }
-        let mut appended: Vec<u8> = Vec::new();
+        // The certificates to append, in append order, each with whether it
+        // revokes its key, and the held certificates a revocation replaces.
+        let mut added: Vec<(String, bool, Vec<u8>)> = Vec::new();
+        let mut replaced: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut imported = 0;
         for index in select_keys(&offered, key_ids)? {
             let (cert, packets) = &offered[index];
-            if fingerprints.insert(fingerprint_hex(cert)) {
-                appended.extend_from_slice(packets);
+            let fingerprint = fingerprint_hex(cert);
+            let revoked = verify::key_revoked(cert);
+            if let Some(state) = held.get_mut(&fingerprint) {
+                if revoked && !*state {
+                    *state = true;
+                    replaced.insert(fingerprint, packets.clone());
+                }
+            } else if let Some(entry) = added.iter_mut().find(|(f, _, _)| *f == fingerprint) {
+                if revoked && !entry.1 {
+                    entry.1 = true;
+                    entry.2 = packets.clone();
+                }
+            } else {
+                added.push((fingerprint, revoked, packets.clone()));
                 imported += 1;
             }
         }
-        Ok((imported, appended))
+        let rewritten = if replaced.is_empty() {
+            None
+        } else {
+            Some(replace_certificates(&keyring, &replaced).ok_or_else(|| {
+                Error::Signature(format!(
+                    "{subject} holds bytes past its last framed packet, so a key \
+                     revocation cannot be written into it; remove the keyring and \
+                     import the keys afresh"
+                ))
+            })?)
+        };
+        let appended: Vec<u8> = added
+            .into_iter()
+            .flat_map(|(_, _, packets)| packets)
+            .collect();
+        Ok((imported, rewritten, appended))
     })?;
+    if let Some(bytes) = rewritten {
+        keyring = bytes;
+    }
     keyring.extend_from_slice(&appended);
     Ok((imported, keyring))
+}
+
+/// The keyring `binary` holds with the certificate run of each fingerprint
+/// `replaced` names written as those packets state it.
+///
+/// A keyring is a run of packets per certificate, so a certificate is replaced
+/// where it stands. Every other run passes through as it stands, and a run the
+/// certificate parser does not read keeps its bytes, so the rewrite refuses
+/// nothing the keyring already held. A keyring holding one key through two runs
+/// takes the replacement in both, which leaves the offered packets twice over
+/// and the key revoked. The Trust packets go, and so does a packet standing
+/// ahead of the first Public-Key packet, since [`certificate_chunks`] drops
+/// both: the keyring the rewrite writes is of the same form the import writes
+/// for a certificate it adds.
+///
+/// `None` where the packet stream does not frame to its end, which the caller
+/// reports as a refusal. The caller runs this inside [`contained`].
+fn replace_certificates(binary: &[u8], replaced: &BTreeMap<String, Vec<u8>>) -> Option<Vec<u8>> {
+    let chunks = certificate_chunks(binary)?;
+    let mut rewritten: Vec<u8> = Vec::with_capacity(binary.len());
+    for chunk in chunks {
+        let packets = SignedPublicKey::from_bytes(Cursor::new(&chunk))
+            .ok()
+            .and_then(|cert| replaced.get(&fingerprint_hex(&cert)));
+        rewritten.extend_from_slice(packets.map_or(&chunk[..], |bytes| &bytes[..]));
+    }
+    Some(rewritten)
 }
 
 /// The certificates an offered keyring stream carries, each with the packets it
@@ -1291,32 +1387,74 @@ IHdvcmxk\n\
         /// which is the form the `ostree` tool's own import leaves at the
         /// repository root.
         fn legacy_keyring(&self) -> Vec<u8> {
+            self.imported_keyring("legacy", &[&self.export(false)])
+        }
+
+        /// The legacy keyring `gpg --import` writes for `streams`, imported in
+        /// the order they stand in. `name` names the home directory the import
+        /// runs in, so one fixture builds more than one such keyring.
+        ///
+        /// `gpg` writes a keybox when it creates a keyring file itself, and a
+        /// legacy keyring when the file is already there, so the import runs
+        /// in a home of its own over an empty keyring file.
+        fn imported_keyring(&self, name: &str, streams: &[&[u8]]) -> Vec<u8> {
             use std::os::unix::fs::DirBuilderExt;
-            let exported = self.dir.join("exported.gpg");
-            std::fs::write(&exported, self.export(false)).unwrap();
-            // `gpg` writes a keybox when it creates a keyring file itself, and
-            // a legacy keyring when the file is already there, so the import
-            // runs in a home of its own over an empty keyring file.
-            let home = self.dir.join("legacy");
+            let home = self.dir.join(name);
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&home)
                 .unwrap();
             let ring = home.join("ring.gpg");
             std::fs::write(&ring, b"").unwrap();
-            let status = std::process::Command::new("gpg")
-                .arg("--homedir")
-                .arg(&home)
-                .arg("--batch")
-                .arg("--no-default-keyring")
-                .arg("--keyring")
-                .arg(&ring)
-                .arg("--import")
-                .arg(&exported)
-                .status()
-                .unwrap();
-            assert!(status.success(), "gpg --import into a keyring failed");
+            for (index, stream) in streams.iter().enumerate() {
+                let source = home.join(format!("offered-{index}.gpg"));
+                std::fs::write(&source, stream).unwrap();
+                let status = std::process::Command::new("gpg")
+                    .arg("--homedir")
+                    .arg(&home)
+                    .arg("--batch")
+                    .arg("--no-default-keyring")
+                    .arg("--keyring")
+                    .arg(&ring)
+                    .arg("--import")
+                    .arg(&source)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "gpg --import into a keyring failed");
+            }
             std::fs::read(&ring).unwrap()
+        }
+
+        /// Revoke the home's first key by importing the revocation certificate
+        /// `gpg` stored when it generated it.
+        fn revoke_primary(&self) {
+            let path = self.dir.join("revocation.asc");
+            std::fs::write(&path, self.revocation_armor()).unwrap();
+            let status = self.gpg().arg("--import").arg(&path).status().unwrap();
+            assert!(status.success(), "gpg --import of the revocation failed");
+        }
+
+        /// The key revocation signature packet `gpg` stored for the home's
+        /// first key, in the binary form.
+        fn revocation_packet(&self) -> Vec<u8> {
+            let packet = dearmor(&self.revocation_armor()).unwrap();
+            let (spans, framed) = packet_spans(&packet);
+            assert_eq!((spans.len(), framed), (1, packet.len()));
+            packet
+        }
+
+        /// The armored block of the revocation certificate `gpg` stored for
+        /// the home's first key. The stored file carries prose before the
+        /// block, and a colon before the block's first dash so that an
+        /// accidental import does nothing.
+        fn revocation_armor(&self) -> Vec<u8> {
+            let stored = self
+                .dir
+                .join("openpgp-revocs.d")
+                .join(format!("{}.rev", self.fingerprint()));
+            let text = std::fs::read_to_string(&stored).unwrap();
+            let at = text.find("-----BEGIN PGP").unwrap();
+            text.as_bytes()[at..].to_vec()
         }
     }
 
@@ -1684,6 +1822,175 @@ IHdvcmxk\n\
         let (imported, keyring) = merge_keyring(b"", &legacy, &selector, SUBJECT).unwrap();
         assert_eq!(imported, 1);
         assert_eq!(keyring, exported);
+    }
+
+    /// Splice one packet in right after a certificate's primary key packet,
+    /// where a key revocation signature stands.
+    fn insert_after_primary(cert: &[u8], packet: &[u8]) -> Vec<u8> {
+        let (spans, framed) = packet_spans(cert);
+        assert_eq!(framed, cert.len());
+        assert_eq!(spans[0].0, Tag::PublicKey);
+        let at = spans[0].1.end;
+        let mut spliced = cert[..at].to_vec();
+        spliced.extend_from_slice(packet);
+        spliced.extend_from_slice(&cert[at..]);
+        spliced
+    }
+
+    /// A re-export carrying a key revocation replaces the certificate the
+    /// keyring holds for that key, and the import counts no key.
+    ///
+    /// The keyring the merge is given is the one the `ostree` tool's own import
+    /// leaves at the repository root, which carries the Trust packets. The
+    /// merged keyring holds the offered certificate where the held one stood,
+    /// which is the shape the tool writes: measured against `ostree` 2026.1
+    /// over the re-export of a revoked RSA key, the merged run carried the key
+    /// revocation right after the primary key packet and ahead of the first
+    /// user id packet, and the tool reported `Imported 0 GPG keys`.
+    #[test]
+    fn a_revoked_re_export_replaces_the_held_certificate() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Revoked <revoked@ostrya.example>");
+        let unrevoked = home.export(false);
+        let held = home.legacy_keyring();
+        home.revoke_primary();
+        let revoked = home.export(false);
+        // The fixture is the shape under test: the revoked export carries the
+        // revocation packet the unrevoked one does not.
+        assert!(revoked.len() > unrevoked.len());
+
+        let (imported, keyring) = merge_keyring(&held, &revoked, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        assert_ne!(keyring, without_trust_packets(&held));
+        // One certificate run per key, holding the offered packets.
+        assert_eq!(keyring, revoked);
+        // `gpg` reads the result, which is the reader the `ostree` tool drives
+        // through gpgme, and the certificate it holds revokes the key.
+        assert_eq!(home.fingerprints_of(&keyring), [home.fingerprint()]);
+        let certs = GpgVerifier::from_keyring_bytes([&keyring]).unwrap().certs;
+        assert_eq!(certs.len(), 1);
+        assert!(verify::key_revoked(&certs[0]));
+
+        // The Trust packets stay the whole difference against the keyring
+        // GnuPG writes for the same two imports.
+        let gnupg = home.imported_keyring("merged", &[&unrevoked, &revoked]);
+        assert!(gnupg.len() > keyring.len());
+        assert_eq!(without_trust_packets(&gnupg), keyring);
+
+        // One offered stream carrying both states of the key reaches the same
+        // keyring whichever order they stand in, and counts one key. The tool
+        // answers the same way: over the revoked export alone and over the two
+        // exports concatenated in either order, `ostree` 2026.1 reported
+        // `Imported 1 GPG key` and wrote three byte-identical keyrings, each
+        // holding the revocation.
+        for stream in [
+            revoked.clone(),
+            [unrevoked.clone(), revoked.clone()].concat(),
+            [revoked.clone(), unrevoked.clone()].concat(),
+        ] {
+            let (imported, fresh) = merge_keyring(b"", &stream, &[], SUBJECT).unwrap();
+            assert_eq!(imported, 1);
+            assert_eq!(fresh, revoked);
+        }
+    }
+
+    /// A key revocation signature another key made, stapled onto an offered
+    /// certificate, does not strike the held key out of the keyring.
+    ///
+    /// A revocation is verified before it is honored, so a packet anyone can
+    /// attach carries no weight and the keyring keeps the bytes it held. This
+    /// is the rule the verify engine applies to the same packet.
+    #[test]
+    fn a_stapled_revocation_does_not_replace_the_held_certificate() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Kept <kept@ostrya.example>");
+        let other = KeyFixture::new("Other <other@ostrya.example>");
+        let existing = home.export(false);
+        let offered = insert_after_primary(&existing, &other.revocation_packet());
+
+        // The stapled packet reaches the parsed certificate, so it is the
+        // merge that refused it and not the parse.
+        let certs = GpgVerifier::from_keyring_bytes([&offered]).unwrap().certs;
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].details.revocation_signatures.len(), 1);
+        assert!(!verify::key_revoked(&certs[0]));
+
+        let (imported, keyring) = merge_keyring(&existing, &offered, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        assert_eq!(keyring, existing);
+
+        // The same packet over the certificate it was made for replaces it.
+        let own = other.export(false);
+        let revoked = insert_after_primary(&own, &other.revocation_packet());
+        let (imported, keyring) = merge_keyring(&own, &revoked, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        assert_eq!(keyring, revoked);
+    }
+
+    /// A held keyring carrying bytes past its last framed packet takes no
+    /// replacement, so an offered revocation for a key it holds is refused by
+    /// the name of the keyring and the merge writes no keyring.
+    ///
+    /// The certificate parser reads such a keyring, so the merge reaches the
+    /// replacement, and the packet walk stops at the trailing byte, so
+    /// [`certificate_chunks`] cannot say where each certificate run stands.
+    /// Writing the revocation at the end of the stream would attach it to the
+    /// last certificate the keyring holds, so the merge refuses and the keyring
+    /// keeps the bytes it held. What the `ostree` tool answers over a keyring
+    /// of this shape is not measured.
+    #[test]
+    fn a_revocation_over_an_unframeable_keyring_is_refused() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Tailed <tailed@ostrya.example>");
+        let unrevoked = home.export(false);
+        home.revoke_primary();
+        let revoked = home.export(false);
+        let mut held = unrevoked.clone();
+        held.push(0xff);
+        // The fixture is the shape under test: the walk frames the export and
+        // stops at the trailing byte, the run split answers nothing, and the
+        // certificate parser still reads the key the keyring holds.
+        assert_eq!(packet_spans(&held).1, unrevoked.len());
+        assert!(certificate_chunks(&held).is_none());
+        assert_eq!(parse_keyring(&held, SUBJECT).unwrap().len(), 1);
+
+        let refusal = merge_keyring(&held, &revoked, &[], SUBJECT).unwrap_err();
+        let text = refusal.to_string();
+        assert!(text.contains(SUBJECT), "{text}");
+        assert!(text.contains("bytes past its last framed packet"), "{text}");
+    }
+
+    /// The refusal reaches the replacement alone. The same keyring takes a
+    /// certificate for a fingerprint it does not hold: it keeps the bytes it
+    /// held, the packets of the added certificate follow them, and the import
+    /// counts the key.
+    #[test]
+    fn an_unframeable_keyring_still_takes_a_new_certificate() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::new("Tailed <tailed@ostrya.example>");
+        let added = KeyFixture::new("Added <added@ostrya.example>");
+        let mut held = home.export(false);
+        held.push(0xff);
+        assert!(certificate_chunks(&held).is_none());
+        assert_eq!(parse_keyring(&held, SUBJECT).unwrap().len(), 1);
+        let offered = added.export(false);
+
+        let (imported, keyring) = merge_keyring(&held, &offered, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 1);
+        assert_eq!(&keyring[..held.len()], &held[..]);
+        assert_eq!(&keyring[held.len()..], &offered[..]);
     }
 
     /// Each selector form takes the key it names out of the offered stream: a

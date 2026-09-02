@@ -359,13 +359,10 @@ impl Issuer<'_> {
     /// revokes nothing, which is what `gpgv` answers: over a certificate
     /// carrying such a packet it still reports `GOODSIG`.
     fn revoked(&self) -> bool {
-        let primary = &self.cert.primary_key;
-        let key_revoked = self.cert.details.revocation_signatures.iter().any(|sig| {
-            sig.typ() == Some(SignatureType::KeyRevocation) && sig.verify_key(primary).is_ok()
-        });
-        if key_revoked {
+        if key_revoked(self.cert) {
             return true;
         }
+        let primary = &self.cert.primary_key;
         let Some((subkey, _)) = self.subkey else {
             return false;
         };
@@ -563,6 +560,21 @@ fn is_certification(sig: &Signature) -> bool {
 /// `gpgv` status field does.
 fn key_lifetime(sig: &Signature) -> Option<u64> {
     epoch(sig.key_expiration_time()?.as_secs())
+}
+
+/// Whether a key revocation signature the certificate's own primary key made
+/// stands over that key, which revokes the whole certificate.
+///
+/// The revocation is verified before it is honored. A key revocation signature
+/// another key made, and that anyone can staple onto a certificate, revokes
+/// nothing, which is what `gpgv` answers: over a certificate carrying such a
+/// packet it still reports `GOODSIG`. The keyring import applies the same rule
+/// to a certificate offered for a key the keyring already holds.
+pub(super) fn key_revoked(cert: &SignedPublicKey) -> bool {
+    let primary = &cert.primary_key;
+    cert.details.revocation_signatures.iter().any(|sig| {
+        sig.typ() == Some(SignatureType::KeyRevocation) && sig.verify_key(primary).is_ok()
+    })
 }
 
 /// Whether a verified revocation stands over a user id.

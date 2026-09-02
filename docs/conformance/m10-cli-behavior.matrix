@@ -3787,7 +3787,9 @@ setup: repo
 outcome: lossy
 severity: interop
 loss: `gpg-list-keys` omits the two Web Key Directory URL lines the tool prints
- per user id and the `Subkey:` line it prints per subkey, and renders the key's
+ per user id, the `Subkey:` line it prints per subkey, and the `(revoked)`
+ marker it prints after a revoked key's fingerprint and after each of its
+ revoked user ids, and renders the key's
  creation instant in UTC rather than the host locale and time zone. The
  fingerprint, the creation instant, and the user ids are the same in both. The
  keyring `gpg-import` writes carries no Trust packet, where the tool's carries
@@ -3797,10 +3799,12 @@ loss: `gpg-list-keys` omits the two Web Key Directory URL lines the tool prints
  other wrote. A `KEY-ID` is read as the dialect `gpg --export` carries, and each
  implementation takes a key the other does not. A certificate offered for a key
  the keyring already holds leaves that key as the keyring holds it, where the tool
- merges the offered material into it, so a revocation reaches the port's trusted
- set only after `remote delete` and a fresh import, and until then the port
- reports a signature that key made as good where the tool reports it revoked. A
- certificate carrying no user id is taken by the port and refused by the tool
+ merges the offered material into it, so a new user id, a new subkey, and a subkey
+ revocation reach the port's trusted set only after `remote delete` and a fresh
+ import. A key revocation that verifies is carried in by both: it replaces the
+ held certificate in the port's keyring and is merged into it in the tool's, and
+ each implementation then refuses a signature that key made. A certificate
+ carrying no user id is taken by the port and refused by the tool
  (`cli-surface.md`, "P3", states them all).
 evidence: ostrya_cli::cli::remote_gpg_keyring_round_trips_with_the_tool
 spec: format-reference.md#remote
@@ -3812,8 +3816,12 @@ note: importing keys needs a generated key and a remote, which no setup binds.
  that deleting the remote takes its keyring with it. `gpg-list-keys` is the
  divergence the outcome names:
  the port reports the fingerprint, the creation instant, and the user ids, and
- leaves out the two Web Key Directory URL lines and the per-subkey `Subkey:`
- line, rendering the instant in UTC rather than the host locale
+ leaves out the two Web Key Directory URL lines, the per-subkey `Subkey:` line,
+ and the `(revoked)` marker, rendering the instant in UTC rather than the host
+ locale. The revoked re-export of a held key is the one
+ offered certificate that changes a keyring the count reports nothing for; the
+ keyring the port rewrites for it is the one `ostree remote gpg-list-keys` reads
+ and reports `(revoked)`, and `ostree show` reports `Key revoked` over it
  (`cli-surface.md`, "P3").
 
 # ---------------------------------------------------------------------------

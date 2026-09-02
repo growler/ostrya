@@ -1493,6 +1493,33 @@ Definition:
   held and carries no Trust packet of this import's making; `cli-surface.md`,
   "P3", records those four, the selector dialect, and what a certificate for a
   key the keyring already holds does.
+- A key revocation is the one thing an import carries into a certificate the
+  keyring already holds. An offered certificate holding a key revocation
+  signature that verifies under the key it revokes replaces the held
+  certificate, so a revoked key stops speaking for the remote; the count the
+  import reports counts that key as one the keyring already held. The
+  revocation is verified with the rule the verify engine applies, so a key
+  revocation signature another key made and anyone stapled onto an offered
+  certificate strikes nothing out. A keyring is a run of packets per
+  certificate, so the replacement rewrites the keyring and writes the offered
+  packets where the held run stood: a signature packet written at the end of
+  the stream would attach to the last certificate in it. That same reason makes
+  the replacement need a keyring whose packet stream frames to its end: where a
+  keyring carries bytes past its last framed packet and a replacement is due,
+  the import refuses by the name of the keyring and writes no keyring. The
+  refusal is that narrow, and such a keyring still takes a certificate for a
+  key it does not hold. The port's certificate parser reads the certificates of
+  such a keyring and gpgme reads none, so the tool trusts no key out of the
+  same file and its own import of the re-export reports a count of zero and
+  writes nothing (`cli-surface.md`, "P3"). The rewrite drops the Trust packets
+  the keyring carried, which leaves it in the form the import writes for a
+  certificate it adds and which `gpg` and the `ostree` tool both read. Nothing
+  else about a held certificate changes: a new user id, a new subkey, and a
+  subkey revocation reach the keyring through `Repo::remove_remote_keyring` and
+  a fresh import. A bare revocation certificate, the single signature packet
+  `gpg --gen-revoke` writes, carries no public-key packet, so it holds no
+  certificate and the import refuses it by the name of the source, as the
+  `ostree` tool refuses it too (`cli-surface.md`, "P3").
 - The port owns the trust and validity policy. A signature is valid where it
   verifies, where the certificate holding the signing key is loaded, where the
   signature is over a document, where the subkey bindings hold, where the
@@ -4113,9 +4140,11 @@ position; an unknown nested subcommand draws clap's own text; `remote delete`
 removing the document's last section leaves the tool one trailing blank line
 and the port none, both reparsing equal; `--sign-verify=spki=...` is refused by
 the tool's build and accepted by the port's `spki` feature; `gpg-list-keys`
-leaves out the two Web Key Directory URL lines and the per-subkey `Subkey:`
-line, and renders the creation instant in UTC, the same locale and time-zone
-divergence the GPG signature report in "P1" already carries; the keyring
+leaves out the two Web Key Directory URL lines, the per-subkey `Subkey:` line,
+and the `(revoked)` marker the tool prints after a revoked key's fingerprint
+and after each of its revoked user ids, and renders the creation instant in
+UTC, the same locale and time-zone divergence the GPG signature report in "P1"
+already carries; the keyring
 `gpg-import` writes carries no Trust packet where the tool's carries one after
 the primary key packet, after each user id
 packet, and after each signature packet, and each implementation reads the
@@ -4124,8 +4153,11 @@ keyring the other wrote; a `KEY-ID` selector is read as the dialect
 each implementation takes a key the other does not; a certificate offered for a
 key the keyring already holds leaves that key as the keyring holds it, where the
 tool merges the offered user ids, signatures, and subkeys into it, both reporting
-the same count, so a revocation reaches the port's trusted set only after
-`remote delete` and a fresh import; a `gpg --export-secret-keys` stream offered
+the same count, so a new user id, a new subkey, and a subkey revocation reach the
+port's trusted set only after `remote delete` and a fresh import, while a key
+revocation that verifies replaces the held certificate in the port's keyring and
+is merged into it in the tool's, each implementation then refusing a signature
+that key made; a `gpg --export-secret-keys` stream offered
 for import is refused by the port, which reads a keyring as transferable public
 keys, where the tool imports the public part of each key it holds; and a
 certificate carrying no user id is taken by the port, which verifies no
@@ -4138,13 +4170,17 @@ Verify: `cargo test --workspace --all-features` is green, `cargo fmt --all
 clean. `crates/ostrya-core` gains five `KeyFile` tests holding the removers
 and the rewrite rule; `crates/ostrya-gvariant` one printer test holding the
 unannotated form; `crates/ostrya` one summary test for the retained per-ref
-detail, nine `gpg` tests over the keyring merge and the listing -- the bytes an
-import writes and the count it reports, the keyring it was given, the Trust
-packets that are the whole difference against the keyring GnuPG writes, each
-selector form, the shapes the key reader does not carry, the ASCII case the user
-id search folds, the refusal of a selector naming nothing, the refusal of a
-keyring the parser does not read, and the listing against gpg's own listing of
-the same keys -- and one `repo` test holding the config rewrite -- the
+detail, fourteen `gpg` tests over the keyring merge and the listing -- the
+bytes an import writes and the count it reports, the keyring it was given, the
+packet stream an armored keyring is written back in, the Trust packets that are
+the whole difference against the keyring GnuPG writes, each selector form, the
+shapes the key reader does not carry, the ASCII case the user id search folds,
+the refusal of a selector naming nothing, the refusal of a keyring the parser
+does not read, the listing against gpg's own listing of the same keys, the
+certificate a revoked re-export replaces, the stapled revocation that replaces
+none, the refusal of a revocation over a keyring that does not frame to its
+end, and the certificate such a keyring still takes -- and one `repo` test
+holding the config rewrite -- the
 document, the file mode, the stale handle, and the keyring removal. `crates/ostrya-cli/tests/cli.rs` gains four tests.
 `config_set_and_unset_match_the_tool` runs twenty-four invocations, each side
 against its own repository, comparing both streams, the exit status, and the

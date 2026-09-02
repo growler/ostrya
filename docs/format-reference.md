@@ -4359,9 +4359,20 @@ the GVariant text form with no type annotation and no byte-order conversion, so 
 or of standard input under `--stdin`, to the remote's `<remote>.trustedkeys.gpg`
 keyring, and prints `Imported <n> GPG key to remote "<name>"` -- `keys` for any
 count but one. The count is the keys the keyring did not already hold, so a
-repeated import reports `0`. A `KEY-ID` selects the keys it names out of the
+repeated import reports `0`. The keyring the port writes keeps the packets it
+held and carries the packets of each added certificate, with the Trust packets
+of the offered stream dropped. A certificate offered for a key the keyring
+already holds changes nothing, with one exception: one carrying a key
+revocation signature that verifies under the key it revokes replaces the held
+certificate, which rewrites the keyring and drops the Trust packets it carried.
+That key is still counted as one the keyring already held, so such an import
+reports `0` and writes a keyring holding the revocation. A keyring carrying
+bytes past its last framed packet takes no replacement: such an import is
+refused by the name of the keyring and writes no keyring. A `KEY-ID` selects the
+keys it names out of the
 source: a fingerprint, a key id, or a user id substring, with
-`../conformance/cli-surface.md`, "P3", recording where the two dialects part.
+`../conformance/cli-surface.md`, "P3", recording where the two dialects part
+and what the tool's own keyring holds instead.
 Naming both sources reports the
 usage text and `error: --keyring and --stdin are mutually exclusive`; a
 `--keyring` naming no file reports `error: Error opening file <path>: <reason>`,

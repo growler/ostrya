@@ -102,6 +102,24 @@ impl GpgHome {
         assert!(out.status.success() && !out.stdout.is_empty());
         out.stdout
     }
+
+    /// Revoke the primary key by importing the revocation certificate `gpg`
+    /// stored when it generated the key. The stored file carries prose before
+    /// the armored block, and a colon before the block's first dash so that an
+    /// accidental import does nothing. The import therefore runs over the
+    /// armored block alone.
+    fn revoke_primary(&self) {
+        let stored = self
+            .dir
+            .join("openpgp-revocs.d")
+            .join(format!("{}.rev", self.fingerprint()));
+        let text = std::fs::read_to_string(&stored).unwrap();
+        let at = text.find("-----BEGIN PGP").unwrap();
+        let path = self.dir.join("revocation.asc");
+        std::fs::write(&path, &text.as_bytes()[at..]).unwrap();
+        let status = self.gpg().arg("--import").arg(&path).status().unwrap();
+        assert!(status.success(), "gpg --import of the revocation failed");
+    }
 }
 
 impl Drop for GpgHome {
@@ -349,5 +367,118 @@ fn gpg_coexists_with_the_dummy_engine() {
         assert!(outcome.valid);
         assert_eq!(outcome.signatures.len(), 2);
         assert!(outcome.signatures.iter().all(|info| info.valid));
+    });
+}
+
+/// A revoked re-export of a key a remote's keyring already holds revokes that
+/// key: the import reports no key added, and the signature that key made is no
+/// longer valid.
+///
+/// `ostree remote gpg-import` merges the offered signatures into the held
+/// certificate and reports `Imported 0 GPG keys` while doing so. Measured
+/// against `ostree` 2026.1 over the re-export of a revoked RSA key: the
+/// keyring grew from 690 to 1053 bytes, the merged run carried the key
+/// revocation right after the primary key packet, and `ostree show` moved from
+/// `Good signature from "..."` to `Key revoked`.
+#[test]
+fn a_revoked_re_export_revokes_the_held_key() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("gpg-revoke-import");
+    let base = tmp.path();
+    let home = GpgHome::create(base, "gnupghome", "Revoked <revoked@ostrya.example>");
+    let fpr = home.fingerprint();
+    let root = base.join("repo");
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        let signer = GpgSigner::new(&fpr).with_homedir(&home.dir);
+        repo.sign_commit(&commit, &signer).await.unwrap();
+
+        // The unrevoked certificate reaches the remote's keyring, and the
+        // signature it made is good.
+        let count = repo
+            .gpg_import_keys("origin", &home.export(), &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let verifier = GpgVerifier::for_remote(&root, "origin").unwrap();
+        let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+        assert!(outcome.valid);
+        assert!(!outcome.signatures[0].revoked);
+
+        // The re-export of the revoked key adds no key and carries the
+        // revocation into the keyring.
+        home.revoke_primary();
+        let count = repo
+            .gpg_import_keys("origin", &home.export(), &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let verifier = GpgVerifier::for_remote(&root, "origin").unwrap();
+        let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+        assert_eq!(outcome.signatures.len(), 1);
+        assert!(
+            outcome.signatures[0].revoked,
+            "the keyring did not carry the revocation"
+        );
+        assert!(!outcome.signatures[0].key_missing);
+        assert!(!outcome.valid);
+    });
+}
+
+/// A remote keyring carrying bytes past its last framed packet takes no
+/// replacement: the revoked re-export of a key it holds is refused, the file
+/// keeps the bytes it held, and the import writes no keyring.
+///
+/// The refusal reaches the replacement alone, so the same file still takes a
+/// certificate for a key it does not hold. What the `ostree` tool answers over
+/// a keyring of this shape is not measured.
+#[test]
+fn a_revocation_over_an_unframeable_keyring_writes_no_keyring() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("gpg-revoke-unframeable");
+    let base = tmp.path();
+    let home = GpgHome::create(base, "gnupghome", "Tailed <tailed@ostrya.example>");
+    let other = GpgHome::create(base, "othergnupghome", "Other <other@ostrya.example>");
+    let keyring = base.join("repo").join("origin.trustedkeys.gpg");
+    block_on(async {
+        let (repo, _) = build_committed_repo(base).await;
+        let count = repo
+            .gpg_import_keys("origin", &home.export(), &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // One byte past the last packet the walk frames. The certificate
+        // parser still reads the key, so the import reaches the replacement.
+        let mut tailed = std::fs::read(&keyring).unwrap();
+        tailed.push(0xff);
+        std::fs::write(&keyring, &tailed).unwrap();
+        assert_eq!(repo.gpg_list_keys("origin").await.unwrap().len(), 1);
+
+        home.revoke_primary();
+        let refusal = repo
+            .gpg_import_keys("origin", &home.export(), &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal.contains("bytes past its last framed packet"),
+            "{refusal}"
+        );
+        assert_eq!(std::fs::read(&keyring).unwrap(), tailed);
+
+        // A certificate for a key the file does not hold still reaches it.
+        let count = repo
+            .gpg_import_keys("origin", &other.export(), &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let written = std::fs::read(&keyring).unwrap();
+        assert_eq!(&written[..tailed.len()], &tailed[..]);
+        assert_eq!(&written[tailed.len()..], &other.export()[..]);
     });
 }

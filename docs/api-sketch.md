@@ -1128,9 +1128,14 @@ impl Repo {                                   // feature = "verify-gpg"
     /// added certificate as `keys` wrote them, with the Trust packets dropped.
     /// It is written in the binary form, so an armored keyring keeps its
     /// packets and loses its armor. A certificate for a key the keyring
-    /// already holds is not merged in, so a revocation or a new binding for a
+    /// already holds is not merged in, so a new user id or a new binding for a
     /// held key reaches the keyring through `Repo::remove_remote_keyring` and
-    /// a fresh import.
+    /// a fresh import. A certificate carrying a key revocation that verifies
+    /// under the key it revokes is the exception: it replaces the held
+    /// certificate, which rewrites the keyring and drops the Trust packets it
+    /// carried, and the key is still counted as one the keyring already held. A
+    /// keyring carrying bytes past its last framed packet takes no
+    /// replacement, and such an import is refused by the name of the keyring.
     pub async fn gpg_import_keys(&self, remote: &str, keys: &[u8], key_ids: &[String])
         -> Result<usize>;
     /// The keys that keyring holds. An absent keyring holds none.

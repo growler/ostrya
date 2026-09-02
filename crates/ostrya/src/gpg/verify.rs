@@ -1488,9 +1488,11 @@ mod tests {
 
         /// The certificates a verifier loads the exported keyring into.
         fn certs(&self) -> Vec<SignedPublicKey> {
-            GpgVerifier::from_keyring_bytes([self.keyring()])
-                .unwrap()
-                .certs
+            std::sync::Arc::unwrap_or_clone(
+                GpgVerifier::from_keyring_bytes([self.keyring()])
+                    .unwrap()
+                    .certs,
+            )
         }
 
         /// One detached signature over `payload`, made by the key `key`
@@ -1990,7 +1992,7 @@ mod tests {
 
     /// The certificates a verifier loads a keyring blob into.
     fn certs_of(keyring: &[u8]) -> Vec<SignedPublicKey> {
-        GpgVerifier::from_keyring_bytes([keyring]).unwrap().certs
+        std::sync::Arc::unwrap_or_clone(GpgVerifier::from_keyring_bytes([keyring]).unwrap().certs)
     }
 
     /// Split an OpenPGP packet stream into (tag, body) pairs. Both packet

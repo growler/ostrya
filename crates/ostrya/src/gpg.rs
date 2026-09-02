@@ -90,6 +90,7 @@ use std::io::Cursor;
 use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ostrya_core::base64;
 use pgp::composed::{Deserializable, SignedPublicKey};
@@ -282,7 +283,11 @@ pub struct GpgVerifier {
     /// them here. The verdict reads all the certificates that answer for a
     /// signature's issuer, so a revocation any of them carries refuses the
     /// signature whatever order the sources loaded in.
-    certs: Vec<SignedPublicKey>,
+    ///
+    /// One reference count holds the set. A verification hands the set to the
+    /// blocking pool through a count of its own. The certificates are parsed
+    /// once and shared by every commit a pull verifies.
+    certs: Arc<Vec<SignedPublicKey>>,
 }
 
 impl GpgVerifier {
@@ -403,10 +408,15 @@ impl GpgVerifier {
     /// input caps, refuse a keybox, and parse the certificates it carries.
     /// `subject` names the source, so a refusal states which keyring reached
     /// which cap.
+    ///
+    /// The extend runs in place. Every constructor calls this on a value it
+    /// owns alone, so the count over the set is one and no certificate is
+    /// copied. A caller holding a second count would extend a copy, which is
+    /// why this stays private.
     fn add_keyring(&mut self, bytes: &[u8], subject: &str) -> Result<()> {
         let binary = keyring_stream(bytes, subject)?;
         let certs = parse_keyring(&binary, subject)?;
-        self.certs.extend(certs.into_iter().map(|(cert, _)| cert));
+        Arc::make_mut(&mut self.certs).extend(certs.into_iter().map(|(cert, _)| cert));
         Ok(())
     }
 }
@@ -571,8 +581,10 @@ impl Verifier for GpgVerifier {
                 return Ok(VerifyOutcome::default());
             }
             // Public-key cryptography over untrusted input, so it runs on the
-            // blocking pool over owned copies of its inputs.
-            let certs = self.certs.clone();
+            // blocking pool. The pool holds each input for itself: the payload
+            // and the signature blobs as copies, the trusted set as a
+            // reference count over the one parse.
+            let certs = Arc::clone(&self.certs);
             let payload = data.to_vec();
             let blobs = signatures.to_vec();
             ostrya_rt::unblock(move || verify::verify_signatures(&certs, &payload, &blobs)).await
@@ -2106,7 +2118,7 @@ IHdvcmxk\n\
         assert_eq!(home.fingerprints_of(&keyring), [home.fingerprint()]);
         let certs = GpgVerifier::from_keyring_bytes([&keyring]).unwrap().certs;
         assert_eq!(certs.len(), 1);
-        assert!(verify::key_revoked(&certs[0], &certs));
+        assert!(verify::key_revoked(&certs[0], certs.as_slice()));
 
         // The Trust packets stay the whole difference against the keyring
         // GnuPG writes for the same two imports.
@@ -2153,7 +2165,7 @@ IHdvcmxk\n\
         let certs = GpgVerifier::from_keyring_bytes([&offered]).unwrap().certs;
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].details.revocation_signatures.len(), 1);
-        assert!(!verify::key_revoked(&certs[0], &certs));
+        assert!(!verify::key_revoked(&certs[0], certs.as_slice()));
 
         let (imported, keyring) = merge_keyring(&existing, &offered, &[], SUBJECT).unwrap();
         assert_eq!(imported, 0);

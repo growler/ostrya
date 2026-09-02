@@ -1135,9 +1135,10 @@ impl Repo {                                   // feature = "verify-gpg"
     /// it carried: a key revocation that verifies under the key it revokes, and
     /// a key expiry later than the held certificate states, an absent expiry
     /// counting as later than any instant. The key is still counted as one the
-    /// keyring already held. A keyring carrying bytes past its last framed
-    /// packet takes no replacement, and such an import is refused by the name
-    /// of the keyring.
+    /// keyring already held. `keys` and the keyring the remote already holds
+    /// reach one keyring reader, so a keyring carrying bytes past its last
+    /// framed packet takes no import, and such an import is refused by the
+    /// name of the keyring.
     pub async fn gpg_import_keys(&self, remote: &str, keys: &[u8], key_ids: &[String])
         -> Result<usize>;
     /// The keys that keyring holds. An absent keyring holds none.

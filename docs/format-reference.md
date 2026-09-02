@@ -4373,9 +4373,10 @@ one carrying a key revocation signature that verifies under the key it revokes,
 and one stating a key expiry later than the held certificate states, an absent
 expiry counting as later than any instant. That key is still counted as one the
 keyring already held, so such an import reports `0` and writes a keyring
-holding the offered certificate. A keyring carrying bytes past its last framed
-packet takes no replacement: such an import is refused by the name of the
-keyring and writes no keyring. A `KEY-ID` selects the
+holding the offered certificate. The offered stream and the keyring the remote
+already holds reach one keyring reader, so a keyring carrying bytes past its
+last framed packet takes no import: such an import is refused by the name of
+the keyring and writes no keyring. A `KEY-ID` selects the
 keys it names out of the
 source: a fingerprint, a key id, or a user id substring, with
 `../conformance/cli-surface.md`, "P3", recording where the two dialects part

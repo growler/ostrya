@@ -46,8 +46,9 @@
 //! the cap it reached. A GnuPG keybox, which carries the `KBXf` magic, is
 //! refused by the name of the file or the blob that holds it, since rPGP reads
 //! OpenPGP packet streams and a keybox is a container of another kind. A
-//! keyring the parser rejects fails the load, so the trusted set a
-//! verification works over is one that was read whole.
+//! keyring the parser rejects fails the load, and so does a keyring whose
+//! packet stream does not frame to its end, so the trusted set a verification
+//! works over is one that was read whole.
 //!
 //! Verification reads the stored blobs and the loaded certificates and answers
 //! in the process, on the blocking pool. The `verify` module holds the engine,
@@ -72,8 +73,10 @@
 //! later than the held certificate states, so a key whose owner has extended
 //! its life speaks again. A keyring offered for import is untrusted input and
 //! is held to the same caps and the same containment a keyring loaded for
-//! verification is, and a stream the certificate parser does not read fails
-//! the import, which leaves the keyring as it was.
+//! verification is. Both streams reach the reader a verification load uses,
+//! the offered one and the one the keyring already holds, so a stream that
+//! reader does not read whole fails the import and leaves the keyring as it
+//! was.
 //!
 //! A signature is valid only where it verifies against a trusted key whose
 //! bindings hold and which is neither expired nor revoked. An expired key, a
@@ -402,7 +405,8 @@ impl GpgVerifier {
     /// which cap.
     fn add_keyring(&mut self, bytes: &[u8], subject: &str) -> Result<()> {
         let binary = keyring_stream(bytes, subject)?;
-        self.certs.extend(parse_keyring(&binary, subject)?);
+        let certs = parse_keyring(&binary, subject)?;
+        self.certs.extend(certs.into_iter().map(|(cert, _)| cert));
         Ok(())
     }
 }
@@ -426,32 +430,6 @@ fn keyring_stream(bytes: &[u8], subject: &str) -> Result<Vec<u8>> {
         )));
     }
     Ok(binary)
-}
-
-/// The packet stream of `binary` with every Trust packet removed.
-///
-/// A Trust packet (tag 12) holds a GnuPG-local trust value and carries no part
-/// of a transferable public key. A legacy GnuPG keyring writes one after the
-/// primary key packet, after each user id packet, and after each signature
-/// packet. rPGP's certificate parser reads the packets of one certificate
-/// through runs of tag tests, and a packet of any other tag ends a run, so a
-/// Trust packet standing after the primary key leaves the certificate with no
-/// user id and no subkey. With the Trust packets gone, a legacy keyring parses
-/// to the certificates the `gpg --export` form of the same keys parses to.
-///
-/// The walk frames each packet with [`packet_spans`], and the bytes past the
-/// framed prefix pass through as they stand. The result is at most as long as
-/// the input, which [`keyring_stream`] has already held to [`MAX_KEYRING`].
-fn without_trust_packets(binary: &[u8]) -> Vec<u8> {
-    let (spans, framed) = packet_spans(binary);
-    let mut kept: Vec<u8> = Vec::with_capacity(binary.len());
-    for (tag, span) in spans {
-        if tag != Tag::Trust {
-            kept.extend_from_slice(&binary[span]);
-        }
-    }
-    kept.extend_from_slice(&binary[framed..]);
-    kept
 }
 
 /// The packets a binary OpenPGP stream carries, each as its tag and the byte
@@ -489,9 +467,22 @@ fn packet_spans(binary: &[u8]) -> (Vec<(Tag, Range<usize>)>, usize) {
 ///
 /// A Public-Key packet opens a certificate and every packet up to the next one
 /// belongs to it. A packet standing before the first Public-Key packet belongs
-/// to no certificate and is dropped. `None` where the packet stream does not
-/// frame to its end, which is what a truncated keyring reaches, and which the
-/// `ostree` tool refuses as well.
+/// to no certificate, and it is dropped.
+///
+/// A Trust packet (tag 12) holds a GnuPG-local trust value and carries no part
+/// of a transferable public key, so it is dropped as well. A legacy GnuPG
+/// keyring writes one after the primary key packet, after each user id packet,
+/// and after each signature packet. rPGP's certificate parser reads the packets
+/// of one certificate through runs of tag tests, and a packet of any other tag
+/// ends a run, so a Trust packet standing after the primary key leaves the
+/// certificate with no user id and no subkey. With the Trust packets gone, a
+/// legacy keyring parses to the certificates the `gpg --export` form of the
+/// same keys parses to.
+///
+/// `None` where the packet stream does not frame to its end, which is what a
+/// truncated keyring reaches, and which the `ostree` tool refuses as well. The
+/// result is at most as long as the input, which [`keyring_stream`] has already
+/// held to [`MAX_KEYRING`].
 fn certificate_chunks(binary: &[u8]) -> Option<Vec<Vec<u8>>> {
     let (spans, framed) = packet_spans(binary);
     if framed != binary.len() {
@@ -512,33 +503,45 @@ fn certificate_chunks(binary: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(chunks)
 }
 
-/// Parse a binary OpenPGP keyring into the certificates it carries, holding
-/// the result to [`MAX_KEYRING_CERTS`]. A keyring carrying no packet parses to
-/// no certificate. Trust packets are dropped first (see
-/// [`without_trust_packets`]), so a legacy GnuPG keyring and a `gpg --export`
-/// stream of the same keys parse to the same certificates.
+/// Parse a binary OpenPGP keyring into the certificates it carries, each with
+/// the packets it is made of, holding the result to [`MAX_KEYRING_CERTS`].
+///
+/// The stream is split into one packet run per certificate and each run is
+/// parsed on its own (see [`certificate_chunks`]), so the Trust packets and a
+/// packet standing ahead of the first certificate reach no parser: a legacy
+/// GnuPG keyring and a `gpg --export` stream of the same keys parse to the same
+/// certificates. A keyring carrying no packet parses to no certificate.
+///
+/// A stream that does not frame to its end and a certificate the parser rejects
+/// each fail the read by the name of the source, so a keyring reaches a caller
+/// whole. `subject` names the source, so a refusal states which keyring was
+/// read. Every path that reads a keyring reads it here: a verification load, a
+/// key listing, and both streams of an import.
 ///
 /// The parse runs inside [`contained`], since a keyring is untrusted input.
-fn parse_keyring(binary: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
+fn parse_keyring(binary: &[u8], subject: &str) -> Result<Vec<(SignedPublicKey, Vec<u8>)>> {
     let refusal = format!("{subject} is not readable as an OpenPGP keyring: the parser panicked");
     contained(&refusal, || {
-        let refuse = |e: pgp::errors::Error| {
-            Error::Signature(format!(
-                "{subject} is not readable as an OpenPGP keyring: {e}"
-            ))
+        let Some(chunks) = certificate_chunks(binary) else {
+            return Err(Error::Signature(format!(
+                "{subject} is not readable as an OpenPGP keyring"
+            )));
         };
-        let stream = without_trust_packets(binary);
-        let certs = SignedPublicKey::from_bytes_many(Cursor::new(&stream)).map_err(refuse)?;
-        let mut held: Vec<SignedPublicKey> = Vec::new();
-        for cert in certs {
-            if held.len() == MAX_KEYRING_CERTS {
-                return Err(Error::Signature(format!(
-                    "{subject} holds more than {MAX_KEYRING_CERTS} certificates"
-                )));
-            }
-            held.push(cert.map_err(refuse)?);
+        if chunks.len() > MAX_KEYRING_CERTS {
+            return Err(Error::Signature(format!(
+                "{subject} holds more than {MAX_KEYRING_CERTS} certificates"
+            )));
         }
-        Ok(held)
+        let mut certs = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let cert = SignedPublicKey::from_bytes(Cursor::new(&chunk)).map_err(|e| {
+                Error::Signature(format!(
+                    "{subject} is not readable as an OpenPGP keyring: {e}"
+                ))
+            })?;
+            certs.push((cert, chunk));
+        }
+        Ok(certs)
     })
 }
 
@@ -624,9 +627,10 @@ impl Repo {
     /// replaces it as well, so a key whose owner has extended its life speaks
     /// again. Each replacement rewrites the keyring and drops the Trust packets
     /// it carried (see [`merge_keyring`]), and the key is still counted as one
-    /// the keyring already held. A keyring carrying bytes past its last framed
-    /// packet takes no replacement, and such an import is refused by the name of
-    /// the keyring, which leaves the keyring as it was.
+    /// the keyring already held. The offered stream and the keyring the remote
+    /// already holds reach one keyring reader, so a keyring carrying bytes past
+    /// its last framed packet is refused by the name of the keyring, which
+    /// leaves the keyring as it was.
     ///
     /// A bare revocation certificate carries no public-key packet
     /// and holds no certificate, so it is refused; the re-export of the revoked
@@ -689,12 +693,10 @@ impl Repo {
 /// several states of one key, the first state stands unless a later one revokes
 /// the key or states a later expiry, and the key is counted once.
 ///
-/// A replacement needs a keyring whose packet stream frames to its end.
-/// Where a keyring carries bytes past its last framed packet and a replacement
-/// is due, the merge refuses by the name of the keyring, so the import writes
-/// no keyring and the file keeps the bytes it held. Where no replacement is due
-/// such a keyring merges as any other does: the bytes it holds are kept and the
-/// packets of each added certificate follow them.
+/// Each stream is read with [`parse_keyring`], the reader a verification load
+/// uses, so each of them frames to its end. A keyring carrying bytes past its
+/// last framed packet fails the merge by its own name, and the file keeps the
+/// bytes it held.
 ///
 /// Both streams are untrusted input, so each is held to [`MAX_KEYRING`] and to
 /// [`MAX_KEYRING_CERTS`], a keybox is refused, and every packet read runs inside
@@ -711,18 +713,22 @@ fn merge_keyring(
     let stream = keyring_stream(offered, source)?;
     let refusal = format!("{source} cannot be merged into {subject}: the parser panicked");
     let (imported, rewritten, appended) = contained(&refusal, || {
-        // The state of every key the keyring holds, by fingerprint. A keyring
+        // The certificate runs the keyring holds, in the order they stand in,
+        // and the state of every key it holds, by fingerprint. A keyring
         // holding one key through two certificates answers once here, over both
         // of them, which is the reach the verify path gives them.
+        let mut runs: Vec<(String, Vec<u8>)> = Vec::new();
         let mut copies: BTreeMap<String, Vec<SignedPublicKey>> = BTreeMap::new();
-        for cert in parse_keyring(&keyring, subject)? {
-            copies.entry(fingerprint_hex(&cert)).or_default().push(cert);
+        for (cert, packets) in parse_keyring(&keyring, subject)? {
+            let fingerprint = fingerprint_hex(&cert);
+            runs.push((fingerprint.clone(), packets));
+            copies.entry(fingerprint).or_default().push(cert);
         }
         let mut held: BTreeMap<String, KeyState> = copies
             .iter()
             .map(|(fingerprint, copies)| (fingerprint.clone(), KeyState::over(copies)))
             .collect();
-        let offered = offered_certificates(&stream, source)?;
+        let offered = parse_keyring(&stream, source)?;
         if offered.is_empty() {
             return Err(Error::Signature(format!(
                 "{source} holds no OpenPGP certificate"
@@ -755,13 +761,7 @@ fn merge_keyring(
         let rewritten = if replaced.is_empty() {
             None
         } else {
-            Some(replace_certificates(&keyring, &replaced).ok_or_else(|| {
-                Error::Signature(format!(
-                    "{subject} holds bytes past its last framed packet, so a \
-                     replacement certificate cannot be written into it; remove the \
-                     keyring and import the keys afresh"
-                ))
-            })?)
+            Some(replace_certificates(&runs, &replaced))
         };
         let appended: Vec<u8> = added
             .into_iter()
@@ -855,61 +855,26 @@ fn states_later(offered: Option<u64>, held: Option<u64>) -> bool {
     }
 }
 
-/// The keyring `binary` holds with the certificate run of each fingerprint
-/// `replaced` names written as those packets state it.
+/// The keyring the certificate runs `runs` hold, with the run of each
+/// fingerprint `replaced` names written as those packets state it.
 ///
 /// A keyring is a run of packets per certificate, so a certificate is replaced
-/// where it stands. Every other run passes through as it stands, and a run the
-/// certificate parser does not read keeps its bytes, so the rewrite refuses
-/// nothing the keyring already held. A keyring holding one key through two runs
-/// takes the replacement in both, which leaves the offered packets twice over
-/// and the key in the state those packets state. The Trust packets go, and so
-/// does a packet standing ahead of the first Public-Key packet, since
-/// [`certificate_chunks`] drops both: the keyring the rewrite writes is of the
-/// same form the import writes for a certificate it adds.
+/// where it stands and every other run passes through as it stands. A keyring
+/// holding one key through two runs takes the replacement in both, which leaves
+/// the offered packets twice over and the key in the state those packets state.
 ///
-/// `None` where the packet stream does not frame to its end, which the caller
-/// reports as a refusal. The caller runs this inside [`contained`].
-fn replace_certificates(binary: &[u8], replaced: &BTreeMap<String, Vec<u8>>) -> Option<Vec<u8>> {
-    let chunks = certificate_chunks(binary)?;
-    let mut rewritten: Vec<u8> = Vec::with_capacity(binary.len());
-    for chunk in chunks {
-        let packets = SignedPublicKey::from_bytes(Cursor::new(&chunk))
-            .ok()
-            .and_then(|cert| replaced.get(&fingerprint_hex(&cert)));
-        rewritten.extend_from_slice(packets.map_or(&chunk[..], |bytes| &bytes[..]));
+/// `runs` comes from [`parse_keyring`], which drops the Trust packets and a
+/// packet standing ahead of the first Public-Key packet: the keyring the rewrite
+/// writes is of the same form the import writes for a certificate it adds.
+fn replace_certificates(
+    runs: &[(String, Vec<u8>)],
+    replaced: &BTreeMap<String, Vec<u8>>,
+) -> Vec<u8> {
+    let mut rewritten: Vec<u8> = Vec::new();
+    for (fingerprint, packets) in runs {
+        rewritten.extend_from_slice(replaced.get(fingerprint).unwrap_or(packets));
     }
-    Some(rewritten)
-}
-
-/// The certificates an offered keyring stream carries, each with the packets it
-/// is made of, held to [`MAX_KEYRING_CERTS`].
-///
-/// A stream the packet walk cannot frame to its end and a certificate the parser
-/// rejects each fail the import by the name of the source, which is what the
-/// `ostree` tool answers over a truncated keyring as well. The caller runs this
-/// inside [`contained`].
-fn offered_certificates(binary: &[u8], subject: &str) -> Result<Vec<(SignedPublicKey, Vec<u8>)>> {
-    let Some(chunks) = certificate_chunks(binary) else {
-        return Err(Error::Signature(format!(
-            "{subject} is not readable as an OpenPGP keyring"
-        )));
-    };
-    if chunks.len() > MAX_KEYRING_CERTS {
-        return Err(Error::Signature(format!(
-            "{subject} holds more than {MAX_KEYRING_CERTS} certificates"
-        )));
-    }
-    let mut certs = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        let cert = SignedPublicKey::from_bytes(Cursor::new(&chunk)).map_err(|e| {
-            Error::Signature(format!(
-                "{subject} is not readable as an OpenPGP keyring: {e}"
-            ))
-        })?;
-        certs.push((cert, chunk));
-    }
-    Ok(certs)
+    rewritten
 }
 
 /// The offered certificates `key_ids` names, by index, in selector order. An
@@ -1057,11 +1022,11 @@ fn keyring_keys(keyring: &[u8], subject: &str) -> Result<Vec<GpgKey>> {
     let refusal = format!("{subject} is not readable as an OpenPGP keyring: the parser panicked");
     contained(&refusal, || {
         let keys = parse_keyring(&binary, subject)?
-            .iter()
-            .map(|cert| {
+            .into_iter()
+            .map(|(cert, _)| {
                 let created = cert.primary_key.created_at().as_secs();
                 GpgKey {
-                    fingerprint: fingerprint_hex(cert),
+                    fingerprint: fingerprint_hex(&cert),
                     created: (created != 0).then(|| u64::from(created)),
                     user_ids: cert
                         .details
@@ -1832,6 +1797,65 @@ IHdvcmxk\n\
         assert_eq!(verifier.certs[0].public_subkeys.len(), 1);
     }
 
+    /// A keyring whose packet stream stops framing part way through is refused
+    /// by the name of the blob that carried it, and every certificate it holds
+    /// goes with it.
+    ///
+    /// The stream holds one whole certificate, then a second one whose primary
+    /// key packet is followed by a Trust packet written with an indeterminate
+    /// length. The packet walk frames a fixed length alone, so it stops there,
+    /// while the certificate parser reads the rest of the stream as the body of
+    /// that packet. The second certificate stands past the point the walk
+    /// framed to and carries its own Trust packets there, so it would reach the
+    /// trusted set with no user id and no subkey. The refusal covers the whole
+    /// keyring, so a verification works over a keyring that was read whole.
+    ///
+    /// The reference tools read such a keyring up to the packet they stop at
+    /// and trust the certificates that stand before it. Measured over this
+    /// shape, `gpgv` 2.4.9 reports `GOODSIG` at exit 0 over a signature the
+    /// first certificate made and
+    /// `[don't know]: indeterminate length for invalid packet type 12`,
+    /// `keydb_search failed: Invalid packet`, `ERRSIG`, and `NO_PUBKEY` at
+    /// exit 2 over a signature the second one made; `gpg --list-keys` over the
+    /// file lists the first key alone; and `ostree show --gpg-verify-remote`
+    /// reports `Good signature from "..."` for the first and
+    /// `Can't check signature: public key not found` for the second.
+    #[test]
+    fn refuses_a_keyring_holding_a_certificate_past_its_framed_prefix() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let first = KeyFixture::new("First <first@ostrya.example>");
+        let second = KeyFixture::new("Second <second@ostrya.example>");
+        second.add_signing_subkey();
+        // A Trust packet, tag 12, in the old header form with length type 3,
+        // the indeterminate length.
+        let indeterminate_trust = [0xb3];
+        let legacy = second.legacy_keyring();
+        let mut keyring = first.export(false);
+        keyring.extend_from_slice(&insert_after_primary(&legacy, &indeterminate_trust));
+        // The fixture is the shape under test: the walk stops inside the second
+        // certificate and the run split answers nothing.
+        assert!(packet_spans(&keyring).1 < keyring.len());
+        assert!(certificate_chunks(&keyring).is_none());
+
+        let err = GpgVerifier::from_keyring_bytes([&keyring]).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("keyring blob 0")
+                && m.contains("OpenPGP keyring")),
+            "{err}"
+        );
+
+        // The same two certificates, in a keyring holding that packet nowhere,
+        // load with the user id and the subkey each of them states.
+        let intact = [first.export(false), legacy].concat();
+        let verifier = GpgVerifier::from_keyring_bytes([&intact]).unwrap();
+        assert_eq!(verifier.certs.len(), 2);
+        assert_eq!(verifier.certs[1].details.users.len(), 1);
+        assert_eq!(verifier.certs[1].public_subkeys.len(), 1);
+    }
+
     /// The certificate cap counts the certificates a keyring parses to,
     /// whether or not the keyring carries Trust packets: 257 legacy
     /// certificates are refused by name and 256 load.
@@ -1856,24 +1880,57 @@ IHdvcmxk\n\
         assert_eq!(verifier.certs.len(), MAX_KEYRING_CERTS);
     }
 
-    /// A stream carrying no Trust packet passes through the filter byte for
-    /// byte, and a stream the header parser cannot frame passes through whole,
-    /// so such a keyring reaches the certificate parser as it stands.
+    /// A keyring carrying no Trust packet parses to the packets it holds, byte
+    /// for byte, and a packet standing ahead of its first certificate is
+    /// dropped. A keyring holding no packet parses to no certificate, and a
+    /// stream the header parser cannot frame to its end is refused by the name
+    /// of the source.
     #[test]
-    fn without_trust_packets_leaves_other_streams_alone() {
-        assert!(without_trust_packets(b"").is_empty());
+    fn parse_keyring_reads_the_packets_of_a_trust_free_stream() {
+        assert!(parse_keyring(b"", SUBJECT).unwrap().is_empty());
         // No OpenPGP packet header opens with these bits.
-        assert_eq!(without_trust_packets(b"\x00\x01\x02"), b"\x00\x01\x02");
+        refuses_the_stream(b"\x00\x01\x02");
         if !gpg_available() {
             eprintln!("skipping the exported-keyring half: gpg not available");
             return;
         }
         let home = KeyFixture::new("Untouched <untouched@ostrya.example>");
         let exported = home.export(false);
-        assert_eq!(without_trust_packets(&exported), exported);
-        // A truncated keyring keeps every byte it had.
-        let cut = &exported[..exported.len() / 2];
-        assert_eq!(without_trust_packets(cut), cut);
+        let read = parse_keyring(&exported, SUBJECT).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].1, exported);
+        // A packet standing ahead of the first Public-Key packet belongs to no
+        // certificate, so the keyring parses to the certificate after it.
+        let mut prefixed = home.revocation_packet();
+        prefixed.extend_from_slice(&exported);
+        let read = parse_keyring(&prefixed, SUBJECT).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].1, exported);
+        // A truncated keyring is refused by the name of the source.
+        refuses_the_stream(&exported[..exported.len() / 2]);
+    }
+
+    /// Assert that [`parse_keyring`] refuses `stream` by the name of the
+    /// source, which is what a keyring the certificate reader does not read
+    /// whole draws.
+    fn refuses_the_stream(stream: &[u8]) {
+        let err = parse_keyring(stream, SUBJECT).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains(SUBJECT)
+                && m.contains("OpenPGP keyring")),
+            "{err}"
+        );
+    }
+
+    /// The packets a keyring parses to, concatenated: the stream with its Trust
+    /// packets dropped and with any packet standing ahead of its first
+    /// certificate dropped.
+    fn certificate_stream(keyring: &[u8]) -> Vec<u8> {
+        parse_keyring(keyring, SUBJECT)
+            .unwrap()
+            .into_iter()
+            .flat_map(|(_, packets)| packets)
+            .collect()
     }
 
     /// The subject a refusal over the repository's own keyring names.
@@ -1987,7 +2044,7 @@ IHdvcmxk\n\
         let exported = home.export(false);
         let legacy = home.legacy_keyring();
         assert!(legacy.len() > exported.len());
-        assert_eq!(without_trust_packets(&legacy), exported);
+        assert_eq!(certificate_stream(&legacy), exported);
         for offered in [&exported, &legacy] {
             let (imported, keyring) = merge_keyring(b"", offered, &[], SUBJECT).unwrap();
             assert_eq!(imported, 1);
@@ -2041,7 +2098,7 @@ IHdvcmxk\n\
 
         let (imported, keyring) = merge_keyring(&held, &revoked, &[], SUBJECT).unwrap();
         assert_eq!(imported, 0);
-        assert_ne!(keyring, without_trust_packets(&held));
+        assert_ne!(keyring, certificate_stream(&held));
         // One certificate run per key, holding the offered packets.
         assert_eq!(keyring, revoked);
         // `gpg` reads the result, which is the reader the `ostree` tool drives
@@ -2055,7 +2112,7 @@ IHdvcmxk\n\
         // GnuPG writes for the same two imports.
         let gnupg = home.imported_keyring("merged", &[&unrevoked, &revoked]);
         assert!(gnupg.len() > keyring.len());
-        assert_eq!(without_trust_packets(&gnupg), keyring);
+        assert_eq!(certificate_stream(&gnupg), keyring);
 
         // One offered stream carrying both states of the key reaches the same
         // keyring whichever order they stand in, and counts one key. The tool
@@ -2140,7 +2197,7 @@ IHdvcmxk\n\
 
         let (imported, keyring) = merge_keyring(&held, &extended, &[], SUBJECT).unwrap();
         assert_eq!(imported, 0);
-        assert_ne!(keyring, without_trust_packets(&held));
+        assert_ne!(keyring, certificate_stream(&held));
         // One certificate run per key, holding the offered packets.
         assert_eq!(keyring, extended);
         // `gpg` reads the result, which is the reader the `ostree` tool drives
@@ -2156,7 +2213,7 @@ IHdvcmxk\n\
         // self-signature the earlier export carried, where the replacement
         // writes the offered packets alone. Both keyrings report the key live.
         let gnupg = home.imported_keyring("merged", &[&expiring, &extended]);
-        let merged = without_trust_packets(&gnupg);
+        let merged = certificate_stream(&gnupg);
         let signatures = |bytes: &[u8]| {
             packet_spans(bytes)
                 .0
@@ -2280,92 +2337,49 @@ IHdvcmxk\n\
         assert_eq!(keyring, held);
     }
 
-    /// A held keyring carrying bytes past its last framed packet takes no
-    /// replacement, so an offered revocation for a key it holds is refused by
-    /// the name of the keyring and the merge writes no keyring.
+    /// A keyring carrying bytes past its last framed packet takes no import.
+    /// The merge reads the keyring the repository holds with the reader a
+    /// verification load uses, so the refusal names the keyring and the merge
+    /// writes none.
     ///
-    /// The certificate parser reads such a keyring, so the merge reaches the
-    /// replacement, and the packet walk stops at the trailing byte, so
-    /// [`certificate_chunks`] cannot say where each certificate run stands.
-    /// Writing the revocation at the end of the stream would attach it to the
-    /// last certificate the keyring holds, so the merge refuses and the keyring
-    /// keeps the bytes it held. What the `ostree` tool answers over a keyring
-    /// of this shape is not measured.
+    /// The refusal stands whatever the offered stream holds: a revocation for
+    /// the key the keyring holds, which a replacement would write where the
+    /// held run stands, and a certificate for a key it does not hold, which an
+    /// append would write after the bytes it holds.
+    ///
+    /// Measured over the same shape -- one exported ed25519 certificate with
+    /// one `0xff` byte appended -- `gpgv` 2.4.9 reports
+    /// `[don't know]: 1st length byte missing`,
+    /// `keyring_get_keyblock: read error: Invalid packet`,
+    /// `keydb_search failed: Invalid keyring`, `ERRSIG`, and `NO_PUBKEY` at
+    /// exit 2 over a signature that key made, `gpg --list-keys` over the file
+    /// lists no key, and `ostree show --gpg-verify-remote` reports
+    /// `Can't check signature: public key not found`. No implementation trusts
+    /// a key out of a file of that shape.
     #[test]
-    fn a_revocation_over_an_unframeable_keyring_is_refused() {
-        if !gpg_available() {
-            eprintln!("skipping: gpg not available");
-            return;
-        }
-        let home = KeyFixture::new("Tailed <tailed@ostrya.example>");
-        let unrevoked = home.export(false);
-        home.revoke_primary();
-        let revoked = home.export(false);
-        let mut held = unrevoked.clone();
-        held.push(0xff);
-        // The fixture is the shape under test: the walk frames the export and
-        // stops at the trailing byte, the run split answers nothing, and the
-        // certificate parser still reads the key the keyring holds.
-        assert_eq!(packet_spans(&held).1, unrevoked.len());
-        assert!(certificate_chunks(&held).is_none());
-        assert_eq!(parse_keyring(&held, SUBJECT).unwrap().len(), 1);
-
-        let refusal = merge_keyring(&held, &revoked, &[], SUBJECT).unwrap_err();
-        let text = refusal.to_string();
-        assert!(text.contains(SUBJECT), "{text}");
-        assert!(text.contains("bytes past its last framed packet"), "{text}");
-    }
-
-    /// The same refusal stands over the other replacement: a keyring carrying
-    /// bytes past its last framed packet takes no expiry extension either, and
-    /// the merge writes no keyring.
-    #[test]
-    fn an_expiry_extension_over_an_unframeable_keyring_is_refused() {
-        if !gpg_available() {
-            eprintln!("skipping: gpg not available");
-            return;
-        }
-        let home = KeyFixture::expiring("Tailed <tailed@ostrya.example>", "1d");
-        let expiring = home.export(false);
-        home.set_expire_at("20250102T000000!", "10y");
-        let extended = home.export(false);
-        let mut held = expiring.clone();
-        held.push(0xff);
-        // The fixture is the shape under test: the walk frames the export and
-        // stops at the trailing byte, the run split answers nothing, and the
-        // certificate parser still reads the key the keyring holds.
-        assert_eq!(packet_spans(&held).1, expiring.len());
-        assert!(certificate_chunks(&held).is_none());
-        assert_eq!(parse_keyring(&held, SUBJECT).unwrap().len(), 1);
-
-        let refusal = merge_keyring(&held, &extended, &[], SUBJECT).unwrap_err();
-        let text = refusal.to_string();
-        assert!(text.contains(SUBJECT), "{text}");
-        assert!(text.contains("bytes past its last framed packet"), "{text}");
-    }
-
-    /// The refusal reaches the replacement alone. The same keyring takes a
-    /// certificate for a fingerprint it does not hold: it keeps the bytes it
-    /// held, the packets of the added certificate follow them, and the import
-    /// counts the key.
-    #[test]
-    fn an_unframeable_keyring_still_takes_a_new_certificate() {
+    fn an_unframeable_keyring_takes_no_import() {
         if !gpg_available() {
             eprintln!("skipping: gpg not available");
             return;
         }
         let home = KeyFixture::new("Tailed <tailed@ostrya.example>");
         let added = KeyFixture::new("Added <added@ostrya.example>");
-        let mut held = home.export(false);
+        let unrevoked = home.export(false);
+        home.revoke_primary();
+        let revoked = home.export(false);
+        let mut held = unrevoked.clone();
         held.push(0xff);
+        // The fixture is the shape under test: the walk frames the export and
+        // stops at the trailing byte, so the run split answers nothing.
+        assert_eq!(packet_spans(&held).1, unrevoked.len());
         assert!(certificate_chunks(&held).is_none());
-        assert_eq!(parse_keyring(&held, SUBJECT).unwrap().len(), 1);
-        let offered = added.export(false);
 
-        let (imported, keyring) = merge_keyring(&held, &offered, &[], SUBJECT).unwrap();
-        assert_eq!(imported, 1);
-        assert_eq!(&keyring[..held.len()], &held[..]);
-        assert_eq!(&keyring[held.len()..], &offered[..]);
+        for offered in [&revoked, &added.export(false)] {
+            let refusal = merge_keyring(&held, offered, &[], SUBJECT).unwrap_err();
+            let text = refusal.to_string();
+            assert!(text.contains(SUBJECT), "{text}");
+            assert!(text.contains("OpenPGP keyring"), "{text}");
+        }
     }
 
     /// Each selector form takes the key it names out of the offered stream: a

@@ -427,15 +427,16 @@ fn a_revoked_re_export_revokes_the_held_key() {
     });
 }
 
-/// A remote keyring carrying bytes past its last framed packet takes no
-/// replacement: the revoked re-export of a key it holds is refused, the file
-/// keeps the bytes it held, and the import writes no keyring.
+/// A remote keyring carrying bytes past its last framed packet is refused by
+/// the name of the keyring: the key listing reports it, every import reports
+/// it, and the file keeps the bytes it held.
 ///
-/// The refusal reaches the replacement alone, so the same file still takes a
-/// certificate for a key it does not hold. What the `ostree` tool answers over
-/// a keyring of this shape is not measured.
+/// One reader reads the keyring for every path, so the refusal covers the whole
+/// file: a revoked re-export of a key it holds and a certificate for a key it
+/// does not hold are refused alike. `port-plan.md`, "Phase 13d", carries what
+/// the reference tools answer over a file of this shape.
 #[test]
-fn a_revocation_over_an_unframeable_keyring_writes_no_keyring() {
+fn an_unframeable_remote_keyring_is_refused() {
     if !gpg_available() {
         return;
     }
@@ -452,33 +453,27 @@ fn a_revocation_over_an_unframeable_keyring_writes_no_keyring() {
             .unwrap();
         assert_eq!(count, 1);
 
-        // One byte past the last packet the walk frames. The certificate
-        // parser still reads the key, so the import reaches the replacement.
+        // One byte past the last packet the walk frames.
         let mut tailed = std::fs::read(&keyring).unwrap();
         tailed.push(0xff);
         std::fs::write(&keyring, &tailed).unwrap();
-        assert_eq!(repo.gpg_list_keys("origin").await.unwrap().len(), 1);
 
+        let refusal = repo.gpg_list_keys("origin").await.unwrap_err().to_string();
+        assert!(refusal.contains("origin.trustedkeys.gpg"), "{refusal}");
+        assert!(refusal.contains("OpenPGP keyring"), "{refusal}");
+
+        // The revoked re-export of the key the file holds, and a certificate
+        // for a key it does not hold, are refused alike.
         home.revoke_primary();
-        let refusal = repo
-            .gpg_import_keys("origin", &home.export(), &[])
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(
-            refusal.contains("bytes past its last framed packet"),
-            "{refusal}"
-        );
-        assert_eq!(std::fs::read(&keyring).unwrap(), tailed);
-
-        // A certificate for a key the file does not hold still reaches it.
-        let count = repo
-            .gpg_import_keys("origin", &other.export(), &[])
-            .await
-            .unwrap();
-        assert_eq!(count, 1);
-        let written = std::fs::read(&keyring).unwrap();
-        assert_eq!(&written[..tailed.len()], &tailed[..]);
-        assert_eq!(&written[tailed.len()..], &other.export()[..]);
+        for offered in [home.export(), other.export()] {
+            let refusal = repo
+                .gpg_import_keys("origin", &offered, &[])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(refusal.contains("origin.trustedkeys.gpg"), "{refusal}");
+            assert!(refusal.contains("OpenPGP keyring"), "{refusal}");
+            assert_eq!(std::fs::read(&keyring).unwrap(), tailed);
+        }
     });
 }

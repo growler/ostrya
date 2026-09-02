@@ -1459,17 +1459,20 @@ Definition:
   radix-64 decoder. Keyring resolution: N keyrings from bytes or files, the
   per-remote `<remote>.trustedkeys.gpg` and `/etc/ostree/remotes.d/`
   resolution, and the global `<datadir>/ostree/trusted.gpg.d/` directory, per
-  `format-reference.md`. Each keyring is parsed with the `pgp` crate as it is
-  loaded, so a keyring the parser rejects fails the load. Trust packets are
-  dropped from the packet stream before the certificate parser reads it. A
-  Trust packet holds GnuPG-local state and carries no part of a transferable
-  public key, and a legacy GnuPG keyring carries one after the primary key
-  packet, after each user id packet, and after each signature packet, so a
-  legacy keyring and the `gpg --export` stream of the same keys parse to the
-  same certificates. A keyring is held to four mebibytes and to 256
-  certificates, a GnuPG keybox (`KBXf`) is refused by the name of the file or
-  the blob that carries it, and the parse runs inside `catch_unwind`, since a
-  keyring is untrusted input.
+  `format-reference.md`. One reader reads every keyring, whichever path asks
+  for it: the packet stream is split into one run per certificate at each
+  Public-Key packet and each run is parsed with the `pgp` crate on its own, so
+  a keyring the parser rejects fails the load, and so does a keyring whose
+  packet stream does not frame to its end. The split drops the Trust packets
+  and any packet standing ahead of the first certificate, so neither reaches
+  the certificate parser. A Trust packet holds GnuPG-local state and carries no
+  part of a transferable public key, and a legacy GnuPG keyring carries one
+  after the primary key packet, after each user id packet, and after each
+  signature packet, so a legacy keyring and the `gpg --export` stream of the
+  same keys parse to the same certificates. A keyring is held to four mebibytes
+  and to 256 certificates, a GnuPG keybox (`KBXf`) is refused by the name of
+  the file or the blob that carries it, and the parse runs inside
+  `catch_unwind`, since a keyring is untrusted input.
 - Verification reads each stored blob with rPGP on the blocking pool, resolves
   each signature's issuer against the loaded certificates by issuer
   fingerprint and then by issuer key id over primary keys and subkeys, and
@@ -1521,15 +1524,15 @@ Definition:
   expiry replaces a shorter statement the keyring holds. A keyring is a run of
   packets per certificate, so the replacement rewrites the keyring and writes
   the offered packets where the held run stood: a signature packet written at
-  the end of the stream would attach to the last certificate in it. That same
-  reason makes the replacement need a keyring whose packet stream frames to its
-  end: where a keyring carries bytes past its last framed packet and a
-  replacement is due, the import refuses by the name of the keyring and writes
-  no keyring. The refusal is that narrow, and such a keyring still takes a
-  certificate for a key it does not hold. The port's certificate parser reads
-  the certificates of such a keyring and gpgme reads none, so the tool trusts no
-  key out of the same file and its own import of the re-export reports a count
-  of zero and writes nothing (`cli-surface.md`, "P3"). The rewrite drops the
+  the end of the stream would attach to the last certificate in it. The import
+  reads the offered stream and the keyring the repository holds with the one
+  keyring reader, so each of them frames to its end: a keyring carrying bytes
+  past its last framed packet fails the import by the name of the keyring,
+  which writes no keyring and leaves the file as it stood, whatever the offered
+  stream holds. Over the keyring the tool's own import wrote with one `0xff`
+  byte appended, gpgme reads no certificate either, so the tool's own import of
+  the re-export reports a count of zero and writes nothing (`cli-surface.md`,
+  "P3"). The rewrite drops the
   Trust packets the keyring carried, which leaves it in the form the import
   writes for a certificate it adds and which `gpg` and the `ostree` tool both
   read. Nothing else about a held certificate changes: a new user id, a new
@@ -1668,16 +1671,30 @@ Seven divergences from GnuPG 2.4.9 stand, none of them a repository fact:
   refused by the name of the path or the blob that carries it.
   `gpgv --keyring <homedir>/pubring.kbx <sig> <data>` reads a GnuPG keybox and
   reports `GOODSIG`;
-- a keyring the parser rejects fails the load, so a command reading it exits
-  non-zero with a diagnostic naming the keyring. Over a keyring holding one
-  intact certificate followed by 40 bytes of a second one,
+- a keyring the parser rejects fails the load, and so does a keyring whose
+  packet stream does not frame to its end, so a command reading either one
+  exits non-zero with a diagnostic naming the keyring. The refusal covers the
+  whole file, so no key of it reaches the trusted set. The reference tools read
+  such a keyring up to the packet they stop at, and what they then trust
+  depends on where that packet stands. Over a keyring holding one intact
+  certificate followed by 40 bytes of a second one,
   `ostree show --gpg-verify-remote=<remote> <ref>` reports
   `Can't check signature: public key not found` and exits 0, and
   `gpgv --keyring <that keyring> <sig> <data>` reports
   `keyring_get_keyblock: read error: Invalid packet`,
   `keydb_search failed: Invalid keyring`, `ERRSIG ... 9`, and `NO_PUBKEY`, and
-  exits 2. Neither implementation trusts the certificate such a keyring
-  carries;
+  exits 2: neither implementation trusts the certificate such a keyring
+  carries. Over a keyring holding one intact certificate and then a second
+  certificate whose primary key packet is followed by a Trust packet written
+  with an indeterminate length, the port refuses the file by its own name while
+  `gpgv` reports `GOODSIG` at exit 0 over a signature the first certificate
+  made and `[don't know]: indeterminate length for invalid packet type 12`,
+  `keydb_search failed: Invalid packet`, `ERRSIG`, and `NO_PUBKEY` at exit 2
+  over a signature the second one made, `gpg --list-keys` over the file lists
+  the first key alone, and `ostree show --gpg-verify-remote=<remote> <ref>`
+  reports `Good signature from "..."` for the first and
+  `Can't check signature: public key not found` for the second. The port trusts
+  no key out of a keyring it did not read whole;
 - an Ed25519 or an EdDSA-legacy key with a digest under 256 bits verifies
   against nothing, so a SHA-1 or a SHA-224 data signature by such a key reports
   the field set a signature that does not verify reports. The `pgp` crate holds
@@ -4293,7 +4310,7 @@ Verify: `cargo test --workspace --all-features` is green, `cargo fmt --all
 clean. `crates/ostrya-core` gains five `KeyFile` tests holding the removers
 and the rewrite rule; `crates/ostrya-gvariant` one printer test holding the
 unannotated form; `crates/ostrya` one summary test for the retained per-ref
-detail, fourteen `gpg` tests over the keyring merge and the listing -- the
+detail, thirteen `gpg` tests over the keyring merge and the listing -- the
 bytes an import writes and the count it reports, the keyring it was given, the
 packet stream an armored keyring is written back in, the Trust packets that are
 the whole difference against the keyring GnuPG writes, each selector form, the
@@ -4301,9 +4318,8 @@ shapes the key reader does not carry, the ASCII case the user id search folds,
 the refusal of a selector naming nothing, the refusal of a keyring the parser
 does not read, the listing against gpg's own listing of the same keys, the
 certificate a revoked re-export replaces, the stapled revocation that replaces
-none, the refusal of a revocation over a keyring that does not frame to its
-end, and the certificate such a keyring still takes -- and one `repo` test
-holding the config rewrite -- the
+none, and the refusal an import into a keyring that does not frame to its end
+draws -- and one `repo` test holding the config rewrite -- the
 document, the file mode, the stale handle, and the keyring removal. `crates/ostrya-cli/tests/cli.rs` gains four tests.
 `config_set_and_unset_match_the_tool` runs twenty-four invocations, each side
 against its own repository, comparing both streams, the exit status, and the

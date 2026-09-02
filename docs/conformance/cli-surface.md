@@ -1578,26 +1578,26 @@ records. Ten divergences stand:
   neither writing a keyring. The re-export of the revoked key is the path that
   carries a revocation in.
 
-  A keyring carrying bytes past its last framed packet takes no replacement.
-  The port cannot say where each certificate run stands in such a keyring, and
-  a signature written at the end of the stream would attach to the last
-  certificate the keyring holds, so a revoked re-export of a key it holds, and
-  a re-export stating a later expiry alike, report `error: signature: the
-  keyring '<name>' holds bytes past its last framed packet, so a replacement
-  certificate cannot be written into it; remove the keyring and import the keys
-  afresh` at exit 1 and leave the file byte for byte as it stood. The refusal is
-  that narrow: the same keyring still takes a certificate for a key it does not
-  hold (`crates/ostrya/src/gpg.rs`,
-  `a_revocation_over_an_unframeable_keyring_is_refused`,
-  `an_expiry_extension_over_an_unframeable_keyring_is_refused`, and
-  `an_unframeable_keyring_still_takes_a_new_certificate`). Measured over a
-  keyring the tool's own import wrote with one `0xff` byte appended, the tool
-  reports `Imported 0 GPG keys` at exit 0 and writes nothing. The two answers
-  part because the two readers do: the port's certificate parser reads the key
-  out of that file where gpgme reads none, so `ostrya remote gpg-list-keys`
-  reports the key and `ostrya show` reports `Good signature from "..."` where
-  `ostree remote gpg-list-keys` prints nothing and `ostree show` reports
-  `Can't check signature: public key not found`.
+  A keyring carrying bytes past its last framed packet takes no import. The
+  port reads the keyring the remote holds with the reader a verification load
+  uses, and that reader reads a keyring whole or refuses it. Every import into
+  such a keyring reports `error: signature: the keyring '<name>' is not
+  readable as an OpenPGP keyring` at exit 1 and leaves the file byte for byte
+  as it stood -- a revoked re-export of a key it holds, a re-export stating a
+  later expiry, and a certificate for a key it does not hold alike
+  (`crates/ostrya/src/gpg.rs`, `an_unframeable_keyring_takes_no_import`).
+  Measured over a keyring the tool's own import wrote with one `0xff` byte
+  appended, the tool reports `Imported 0 GPG keys` at exit 0 and writes
+  nothing, `ostree remote gpg-list-keys` prints nothing at exit 0, and
+  `ostree show` reports `Can't check signature: public key not found`. Neither
+  implementation trusts a key out of that file, and the two answers part in the
+  exit status and the diagnostic: `ostrya remote gpg-list-keys` reports the
+  same refusal over such a file, since it reads the keyring with the same
+  reader. Where the bytes the packet walk stops at stand inside a later
+  certificate run, the answers part further: the port refuses the whole file,
+  and the tool reads the certificates standing ahead of that point and trusts
+  them (`../port-plan.md`, "Phase 13d", the divergence for a keyring the parser
+  rejects).
 
   Both rules hold inside one offered stream as well: where a stream carries two
   states of one key the port keeps the first, unless a later one revokes the key

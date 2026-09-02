@@ -17,11 +17,16 @@
 //! the two algorithm names -- come out of the signature packet itself.
 //!
 //! Every certificate that answers for the issuer takes part in the verdict.
-//! The key state is read over all of them: a revocation or an expiry any of
-//! them states refuses the signature, and the load order of the trusted set
-//! decides neither. The first match supplies the rest -- the reported user id,
-//! the primary-key fingerprint, the cryptography, and the cross-certification
-//! gate -- so the load order still decides those.
+//! The matches are grouped by the primary key of the certificate each one came
+//! from, and one group is read as one certificate: the direct signatures, the
+//! user ids with their certifications, and the binding signatures over a
+//! signing subkey of every copy form one set, and the key expiry rule runs
+//! once over that set, so the newest statement any copy carries answers.
+//! Across groups a revocation any group states refuses the signature, and the
+//! key expires at the earliest instant any group states, so the load order of
+//! the trusted set decides neither. The first match supplies the rest -- the
+//! reported user id, the primary-key fingerprint, the cryptography, and the
+//! cross-certification gate -- so the load order still decides those.
 //!
 //! The engine also owns the trust and validity policy: which signature classes
 //! and which digest algorithms a data signature may use, when a subkey speaks
@@ -45,7 +50,7 @@ use std::io::Cursor;
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::public_key::PublicKeyAlgorithm;
-use pgp::packet::{Signature, SignatureType};
+use pgp::packet::{PublicKey, Signature, SignatureType};
 use pgp::types::{Fingerprint, KeyDetails, SignedUser, Tag, Timestamp};
 
 use crate::error::{Error, Result};
@@ -274,6 +279,7 @@ fn now() -> u64 {
 
 /// The key a signature names as its issuer: a certificate, and the subkey of
 /// it that signed where a subkey did.
+#[derive(Clone, Copy)]
 struct Issuer<'a> {
     cert: &'a SignedPublicKey,
     /// The subkey that signed, together with the newest binding signature the
@@ -320,27 +326,6 @@ impl Issuer<'_> {
         })
     }
 
-    /// The instant the signing key expires: the key creation time plus the key
-    /// expiration time its newest verified self-signature states. For a subkey
-    /// this is the earlier of the primary key's instant and the binding
-    /// signature's own, because a subkey stops with its certificate. `gpgv`
-    /// over a certificate whose primary key expired and whose signing subkey
-    /// states no expiry of its own reports `EXPKEYSIG` with the primary key's
-    /// `KEYEXPIRED` instant.
-    fn key_expires_at(&self) -> Option<u64> {
-        let primary = primary_key_lifetime(self.cert)
-            .map(|life| u64::from(self.cert.primary_key.created_at().as_secs()) + life);
-        let Some((subkey, binding)) = self.subkey else {
-            return primary;
-        };
-        let own =
-            key_lifetime(binding).map(|life| u64::from(subkey.key.created_at().as_secs()) + life);
-        match (primary, own) {
-            (Some(primary), Some(own)) => Some(primary.min(own)),
-            (primary, own) => primary.or(own),
-        }
-    }
-
     /// Whether this certificate revokes the signing key. Two revocation sites
     /// answer, each with its own reach:
     ///
@@ -381,9 +366,11 @@ impl Issuer<'_> {
 /// ordinary paths: a repository's `<remote>.trustedkeys.gpg` beside the global
 /// trusted directory, two `gpgkeypath` entries, or one keyring file holding two
 /// exports of one key. The certificates need not state the same thing about the
-/// key. The key state is therefore read over every match, so a revocation or an
-/// expiry any of them states refuses the signature and the load order decides
-/// neither.
+/// key. The key state is therefore read over every match: the matches of one
+/// certificate are read as one certificate (see [`Issuers::groups`]), a
+/// revocation any match states refuses the signature, and the key expires at
+/// the earliest instant any group states, so the load order decides neither the
+/// revocation nor the expiry.
 struct Issuers<'a> {
     matched: Vec<Issuer<'a>>,
 }
@@ -405,16 +392,126 @@ impl<'a> Issuers<'a> {
 
     /// Whether any matching certificate revokes the signing key. Each is read
     /// at the sites [`Issuer::revoked`] gives it, so a key revocation on one
-    /// copy of a certificate refuses a signature another copy answers for.
+    /// copy of a certificate refuses a signature another copy answers for. A
+    /// revocation is permanent, so it is read over every copy on its own and
+    /// no copy stands in for another.
     fn revoked(&self) -> bool {
         self.matched.iter().any(Issuer::revoked)
     }
 
-    /// The earliest instant any matching certificate states the signing key
-    /// expires at. A certificate stating no expiry states nothing here, and
-    /// does not extend a life another one bounds.
+    /// The earliest instant any group states the signing key expires at. A
+    /// group stating no expiry states nothing here, and does not extend a life
+    /// another group bounds.
     fn key_expires_at(&self) -> Option<u64> {
-        self.matched.iter().filter_map(Issuer::key_expires_at).min()
+        self.groups().iter().filter_map(Group::key_expires_at).min()
+    }
+
+    /// The matches read as merged certificates: one group per primary key, in
+    /// load order, each holding the certificates its matches came from.
+    ///
+    /// Two exports of one certificate fall in one group and are read as one
+    /// certificate. A certificate that holds the signing key as its primary key
+    /// and one that binds it as a subkey fall in two groups, since their
+    /// self-signatures verify under different primary keys.
+    ///
+    /// The group key is the primary key packet and not the fingerprint that
+    /// names it. A fingerprint is a digest over that packet, so every producer
+    /// answers the same either way, and a certificate whose fingerprint
+    /// collides with another's under a broken digest stands in its own group,
+    /// where the cross-group rule holds it to the earliest instant any group
+    /// states.
+    fn groups(&self) -> Vec<Group<'a>> {
+        let mut groups: Vec<Group<'a>> = Vec::new();
+        for issuer in &self.matched {
+            let primary = &issuer.cert.primary_key;
+            let group = match groups
+                .iter_mut()
+                .find(|group| group.primary_key() == primary)
+            {
+                Some(group) => group,
+                None => {
+                    groups.push(Group {
+                        matched: Vec::new(),
+                        copies: vec![issuer.cert],
+                    });
+                    groups.last_mut().expect("the group pushed above")
+                }
+            };
+            group.matched.push(*issuer);
+            if !group
+                .copies
+                .iter()
+                .any(|cert| std::ptr::eq(*cert, issuer.cert))
+            {
+                group.copies.push(issuer.cert);
+            }
+        }
+        groups
+    }
+}
+
+/// The matches that came from certificates holding one primary key, read as
+/// one certificate.
+///
+/// Every copy in a group states the same primary key, so the self-signatures of
+/// every copy verify under that key and their signatures form one set. The key
+/// expiry the group states is read over that set: [`key_expiry_over`] runs the
+/// tiered rule of [`primary_key_lifetime`] once over the direct signatures and
+/// the user ids of every copy, and a subkey's own lifetime comes from the newest
+/// binding signature that verifies out of the bindings every copy carries over
+/// it. A copy stating a lifetime the owner has replaced therefore states nothing
+/// on its own, and the newest statement answers.
+///
+/// The group holds at least one match and at least one copy: it is built from a
+/// match.
+struct Group<'a> {
+    /// The matches, in load order.
+    matched: Vec<Issuer<'a>>,
+    /// The certificates those matches came from, one entry per certificate, in
+    /// load order.
+    copies: Vec<&'a SignedPublicKey>,
+}
+
+impl Group<'_> {
+    /// The instant the group states the signing key expires at: the earliest
+    /// instant its matches state, absent where none of them states one.
+    fn key_expires_at(&self) -> Option<u64> {
+        let primary = key_expiry_over(self.copies.iter().copied());
+        self.matched
+            .iter()
+            .filter_map(|issuer| match issuer.subkey {
+                None => primary,
+                Some((subkey, _)) => earlier(primary, self.subkey_expires_at(subkey)),
+            })
+            .min()
+    }
+
+    /// The instant `subkey` expires at on its own terms: its creation time plus
+    /// the lifetime the newest binding signature that verifies states, read
+    /// over the bindings every copy carries for that subkey.
+    fn subkey_expires_at(&self, subkey: &SignedPublicSubKey) -> Option<u64> {
+        let wanted = subkey.fingerprint();
+        let bindings = self
+            .copies
+            .iter()
+            .flat_map(|cert| &cert.public_subkeys)
+            .filter(|held| held.fingerprint() == wanted)
+            .flat_map(|held| &held.signatures);
+        let lifetime = key_lifetime(verified_binding(self.primary_key(), subkey, bindings)?)?;
+        Some(u64::from(subkey.key.created_at().as_secs()) + lifetime)
+    }
+
+    /// The primary key every copy states.
+    fn primary_key(&self) -> &PublicKey {
+        &self.copies[0].primary_key
+    }
+}
+
+/// The earlier of two instants, where an absent one states nothing.
+fn earlier(one: Option<u64>, two: Option<u64>) -> Option<u64> {
+    match (one, two) {
+        (Some(one), Some(two)) => Some(one.min(two)),
+        (one, two) => one.or(two),
     }
 }
 
@@ -438,7 +535,8 @@ fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<
             }
             for subkey in &cert.public_subkeys {
                 if &subkey.fingerprint() == wanted
-                    && let Some(binding) = verified_binding(cert, subkey)
+                    && let Some(binding) =
+                        verified_binding(&cert.primary_key, subkey, &subkey.signatures)
                 {
                     matched.push(Issuer {
                         cert,
@@ -459,7 +557,8 @@ fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<
             }
             for subkey in &cert.public_subkeys {
                 if &subkey.legacy_key_id() == wanted
-                    && let Some(binding) = verified_binding(cert, subkey)
+                    && let Some(binding) =
+                        verified_binding(&cert.primary_key, subkey, &subkey.signatures)
                 {
                     matched.push(Issuer {
                         cert,
@@ -475,28 +574,64 @@ fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<
     None
 }
 
-/// The newest binding signature the primary key made over `subkey` that
-/// verifies.
-fn verified_binding<'a>(
-    cert: &'a SignedPublicKey,
-    subkey: &'a SignedPublicSubKey,
-) -> Option<&'a Signature> {
-    subkey
-        .signatures
-        .iter()
+/// The newest binding signature `primary` made over `subkey` that verifies,
+/// out of `signatures`.
+///
+/// The signatures a subkey carries are one source, and the bindings every copy
+/// of one certificate carries over that subkey are another, so the caller
+/// states the set the rule runs over.
+fn verified_binding<'a, I>(
+    primary: &PublicKey,
+    subkey: &SignedPublicSubKey,
+    signatures: I,
+) -> Option<&'a Signature>
+where
+    I: IntoIterator<Item = &'a Signature>,
+{
+    signatures
+        .into_iter()
         .filter(|sig| {
             sig.typ() == Some(SignatureType::SubkeyBinding)
-                && sig
-                    .verify_subkey_binding(&cert.primary_key, &subkey.key)
-                    .is_ok()
+                && sig.verify_subkey_binding(primary, &subkey.key).is_ok()
         })
         .max_by_key(|sig| created_secs(sig))
 }
 
-/// The key expiration time a certificate's primary key carries: the newest
-/// verified direct-key self-signature that states a lifetime, and, where the
-/// certificate carries no such signature, the lifetime the newest verified
-/// certification self-signature states.
+/// The instant the copies of one certificate state their primary key expires
+/// at: the key creation time plus the lifetime [`primary_key_lifetime`] reads
+/// over the union of those copies. Absent where they state no lifetime, and
+/// absent over an empty set.
+///
+/// Every copy states one primary key, which is the key the caller grouped them
+/// by, so the first copy supplies it. The verdict reads a match group through
+/// this function and the keyring import reads the copies a keyring holds for
+/// one key through it, so the two answer off the same signature.
+pub(super) fn key_expiry_over<'a, I>(copies: I) -> Option<u64>
+where
+    I: IntoIterator<Item = &'a SignedPublicKey> + Clone,
+{
+    let primary = &copies.clone().into_iter().next()?.primary_key;
+    let lifetime = primary_key_lifetime(
+        primary,
+        copies
+            .clone()
+            .into_iter()
+            .flat_map(|cert| &cert.details.direct_signatures),
+        copies.into_iter().flat_map(|cert| &cert.details.users),
+    )?;
+    Some(u64::from(primary.created_at().as_secs()) + lifetime)
+}
+
+/// The key expiration time a primary key carries, in seconds after the key
+/// creation time: the newest verified direct-key self-signature of `direct`
+/// that states a lifetime, and, where there is no such signature, the lifetime
+/// the newest verified certification self-signature over a user id of `users`
+/// states.
+///
+/// The two sets are the signatures of one certificate, or the signatures of
+/// every copy of one certificate the trusted set holds. The tier outranks
+/// recency in either set, so a direct-key self-signature answers over a
+/// certification self-signature that stands newer.
 ///
 /// A direct-key signature that states a lifetime is what `gpgv` reads.
 /// Measured on a certificate carrying both a direct-key and a certification
@@ -514,21 +649,21 @@ fn verified_binding<'a>(
 /// an older certification self-signature states a lifetime already past. An
 /// altered newest one is passed over, and `gpgv` then reports the expiry the
 /// older one states.
-fn primary_key_lifetime(cert: &SignedPublicKey) -> Option<u64> {
-    let primary = &cert.primary_key;
-    let direct = cert
-        .details
-        .direct_signatures
-        .iter()
+fn primary_key_lifetime<'a, D, U>(primary: &PublicKey, direct: D, users: U) -> Option<u64>
+where
+    D: IntoIterator<Item = &'a Signature>,
+    U: IntoIterator<Item = &'a SignedUser>,
+{
+    let newest = direct
+        .into_iter()
         .filter(|sig| sig.typ() == Some(SignatureType::Key) && sig.verify_key(primary).is_ok())
         .filter_map(|sig| Some((created_secs(sig), key_lifetime(sig)?)))
         .max_by_key(|(created, _)| *created);
-    if let Some((_, lifetime)) = direct {
+    if let Some((_, lifetime)) = newest {
         return Some(lifetime);
     }
-    cert.details
-        .users
-        .iter()
+    users
+        .into_iter()
         .flat_map(|user| user.signatures.iter().map(move |sig| (user, sig)))
         .filter(|(user, sig)| {
             is_certification(sig)
@@ -827,14 +962,46 @@ mod tests {
                 primary: String::new(),
                 faked,
             };
-            let status = fixture
+            for _ in 0..16 {
+                let status = fixture
+                    .gpg()
+                    .args(["--quick-gen-key", uid, algorithm, "sign", expiry])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "gpg --quick-gen-key failed");
+                fixture.primary = fixture.fingerprints().remove(0);
+                if fixture.secret_key_is_read() {
+                    return fixture;
+                }
+                fixture.delete_key();
+            }
+            panic!("no generated key exported a secret key the pgp crate reads");
+        }
+
+        /// Whether the `pgp` crate reads the home's exported secret key.
+        ///
+        /// `gpg` writes the ed25519 secret scalar as an MPI declaring 256 bits
+        /// even where its leading octet is zero, and the two-octet checksum it
+        /// writes covers the octets it wrote. The `pgp` crate reads the MPI,
+        /// drops the leading zero, and sums the shorter form, so it refuses
+        /// such a key with "Invalid checksum". One scalar in 256 carries that
+        /// octet, so a key whose secret export the crate refuses is generated
+        /// again and the cases that sign with it stand on every run.
+        fn secret_key_is_read(&self) -> bool {
+            pgp::composed::SignedSecretKey::from_bytes(Cursor::new(self.secret_key())).is_ok()
+        }
+
+        /// Remove the home's key, both its secret and its public part.
+        fn delete_key(&self) {
+            let status = self
                 .gpg()
-                .args(["--quick-gen-key", uid, algorithm, "sign", expiry])
+                .args(["--yes", "--delete-secret-and-public-key", &self.primary])
                 .status()
                 .unwrap();
-            assert!(status.success(), "gpg --quick-gen-key failed");
-            fixture.primary = fixture.fingerprints().remove(0);
-            fixture
+            assert!(
+                status.success(),
+                "gpg --delete-secret-and-public-key failed"
+            );
         }
 
         /// A `gpg` command bound to this home directory, batch mode and with
@@ -1593,6 +1760,23 @@ mod tests {
         join_packets(&packets)
     }
 
+    /// The first subkey of a certificate as a certificate of its own: the
+    /// Public-Subkey packet (tag 14) written as a Public-Key packet (tag 6),
+    /// with no signature under it.
+    ///
+    /// A v4 key fingerprint is over the key material, so the certificate this
+    /// builds holds the key the subkey is and answers for the same issuer. It
+    /// is the shape a certificate carrying a key and nothing else takes, which
+    /// the keyring parser reads.
+    fn subkey_as_certificate(cert: &[u8]) -> Vec<u8> {
+        let packets = split_packets(cert);
+        let (_, body) = packets
+            .iter()
+            .find(|(tag, _)| *tag == 14)
+            .expect("the certificate holds a subkey");
+        join_packets(&[(6, body.clone())])
+    }
+
     /// Remove one user id, and the signatures that stand under it, from a
     /// certificate.
     fn remove_user_id(cert: &[u8], id: &str) -> Vec<u8> {
@@ -2249,34 +2433,248 @@ mod tests {
         }
     }
 
-    /// A key that reaches the trusted set through two certificates, one of
-    /// them stating an expiry that has passed, is refused whichever order the
-    /// two stand in: the key expires at the earliest instant any certificate
-    /// that answers for the issuer states, and a certificate stating no expiry
-    /// does not extend the life another one states.
+    /// Two exports of one certificate are read as one certificate, so the key
+    /// expiry the newest self-signature of either export states answers,
+    /// whichever order the two stand in.
     ///
-    /// The fixture's key was created at [`KEY_CREATED`] and lived for a day.
-    /// The second certificate lifts the expiry, written with `gpg` standing a
-    /// day later so the fresh self-signature carries a creation time of its
-    /// own.
+    /// Two exports of one certificate reach the trusted set on ordinary paths:
+    /// a repository's `<remote>.trustedkeys.gpg` beside the global trusted
+    /// directory, two `gpgkeypath` entries, or one keyring file holding two
+    /// exports of one key. An expiry is renewable, so an export the key's owner
+    /// has replaced states a lifetime the newer export answers for.
     ///
-    /// `gpgv` 2.4.9 answers on the load order here as it does over a
-    /// duplicated revocation, so the verdict is not compared against it: over
-    /// the keyring whose unexpiring certificate stands first it reports
-    /// `GOODSIG`, and over the reverse order `EXPKEYSIG`.
+    /// Each fixture's key was created at [`KEY_CREATED`]. The second export is
+    /// written with `gpg` standing a day later, so its fresh self-signature
+    /// carries a creation time of its own and stands as the newer statement.
+    ///
+    /// `gpgv` 2.4.9 answers on the load order here, so the verdict is not
+    /// compared against it: it reads the first certificate its keyrings hold
+    /// for the key. `gpg --import` merges the two exports into one keyblock and
+    /// answers on the newest statement, which is the answer this engine reaches
+    /// over the two exports in either order. Measured over the three pairs
+    /// below, imported in both orders, `gpgv` reports `GOODSIG` over the merged
+    /// keyring of the first two pairs and `EXPKEYSIG` over the third.
     #[test]
-    fn an_expiry_on_a_duplicate_certificate_refuses_the_signature() {
+    fn a_duplicate_certificate_states_the_newest_expiry() {
         if !tools_available() {
             return;
         }
-        let home = Fixture::at("Twice <twice@ostrya.example>", "1d");
+        /// One pair of exports of one certificate.
+        struct Case {
+            /// The lifetime the key was created with.
+            created: &'static str,
+            /// Whether that lifetime has passed.
+            created_expired: bool,
+            /// The lifetime the second export states, written a day later.
+            replaced: &'static str,
+            /// Whether that lifetime has passed.
+            replaced_expired: bool,
+            /// The instant the two exports together state the key expires at,
+            /// absent where they leave it live.
+            expires: Option<u64>,
+        }
+        let cases = [
+            // An expiry already past, extended by ten years.
+            Case {
+                created: "1d",
+                created_expired: true,
+                replaced: "10y",
+                replaced_expired: false,
+                expires: None,
+            },
+            // The same expiry, lifted altogether.
+            Case {
+                created: "1d",
+                created_expired: true,
+                replaced: "never",
+                replaced_expired: false,
+                expires: None,
+            },
+            // A key that stated no expiry, given one that has passed. The
+            // newest statement answers and not the widest one.
+            Case {
+                created: "never",
+                created_expired: false,
+                replaced: "1d",
+                replaced_expired: true,
+                expires: Some(KEY_CREATED + 2 * ONE_DAY),
+            },
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            let email = format!("twice{index}@ostrya.example");
+            let home = Fixture::at(&format!("Twice{index} <{email}>"), case.created);
+            let blob = home.sign(&home.primary, PAYLOAD);
+            let created = home.keyring();
+            home.set_expire_at("20250102T000000!", case.replaced);
+            let replaced = home.keyring();
+            for (label, first, second, reference_expired) in [
+                (
+                    "the replacement second",
+                    &created,
+                    &replaced,
+                    case.created_expired,
+                ),
+                (
+                    "the replacement first",
+                    &replaced,
+                    &created,
+                    case.replaced_expired,
+                ),
+            ] {
+                let mut keyring = first.clone();
+                keyring.extend_from_slice(second);
+                let certs = certs_of(&keyring);
+                assert_eq!(certs.len(), 2, "case {index}, {label}: the trusted set");
+                let outcome =
+                    verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+                assert_eq!(outcome.signatures.len(), 1);
+                let info = &outcome.signatures[0];
+                assert_eq!(
+                    info.key_expires, case.expires,
+                    "case {index}, {label}: the instant reported"
+                );
+                assert_eq!(
+                    info.expired,
+                    case.expires.is_some(),
+                    "case {index}, {label}: the expired flag"
+                );
+                assert_eq!(
+                    info.valid,
+                    case.expires.is_none(),
+                    "case {index}, {label}: the verdict"
+                );
+                // The fields the report names come from the first match, and
+                // the two exports state the same key and the same user id.
+                assert_eq!(
+                    info.user_email.as_deref(),
+                    Some(&*email),
+                    "case {index}, {label}"
+                );
+                let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+                assert_eq!(
+                    reference.len(),
+                    1,
+                    "case {index}, {label}: the reference record count"
+                );
+                assert_eq!(
+                    reference[0].expired, reference_expired,
+                    "case {index}, {label}: gpgv no longer answers on the load \
+                     order, so this case states the wrong thing about the \
+                     reference",
+                );
+            }
+        }
+    }
+
+    /// The direct-key tier answers over two exports of one certificate: a
+    /// direct-key self-signature one export carries states the key expiry where
+    /// the other export carries a certification self-signature that stands
+    /// newer and states another.
+    ///
+    /// The tier outranks recency inside one certificate, and it outranks it
+    /// over the union of two exports of one certificate the same way. The
+    /// direct-key self-signature here states ten years and the newer
+    /// certification self-signature states a lifetime already past, so the
+    /// union leaves the key live where each copy read on its own would bound
+    /// it and where recency alone would bound it.
+    ///
+    /// `gpgv` 2.4.9 answers on the load order over the pair, so the verdict is
+    /// not compared against it: over the keyring whose export carrying the
+    /// direct-key self-signature stands first it reports `GOODSIG`, and over
+    /// the reverse order `EXPKEYSIG`.
+    #[test]
+    fn the_direct_key_tier_answers_over_a_duplicate_certificate() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::at("Tier <tier@ostrya.example>", "10y");
         let blob = home.sign(&home.primary, PAYLOAD);
-        let expiring = home.keyring();
-        home.set_expire_at("20250102T000000!", "never");
-        let unexpiring = home.keyring();
+        // One export carries a direct-key self-signature stating ten years.
+        let direct = insert_after_primary(
+            &home.keyring(),
+            &direct_key_signature(&home.secret_key(), KEY_CREATED + 10, TEN_YEARS),
+        );
+        // The other export carries a certification self-signature that stands
+        // newer than that direct-key self-signature and states a lifetime
+        // already past.
+        home.set_expire_at("20250102T000000!", "1d");
+        let bounded = home.keyring();
+        // The controls: each export on its own states what the tiered rule
+        // reads over it.
+        let outcome =
+            verify_signatures(&certs_of(&direct), PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+        assert!(
+            outcome.signatures[0].valid,
+            "the export carrying the direct-key self-signature leaves the key live"
+        );
+        let outcome =
+            verify_signatures(&certs_of(&bounded), PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+        assert!(
+            outcome.signatures[0].expired,
+            "the newer certification self-signature bounds the key over one export"
+        );
         for (label, first, second, reference_expired) in [
-            ("the expiry second", &unexpiring, &expiring, false),
-            ("the expiry first", &expiring, &unexpiring, true),
+            ("the direct-key export second", &bounded, &direct, true),
+            ("the direct-key export first", &direct, &bounded, false),
+        ] {
+            let mut keyring = first.clone();
+            keyring.extend_from_slice(second);
+            let certs = certs_of(&keyring);
+            assert_eq!(certs.len(), 2, "{label}: the trusted set");
+            let outcome = verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+            assert_eq!(outcome.signatures.len(), 1);
+            let info = &outcome.signatures[0];
+            assert!(!info.expired, "{label}: the direct-key tier did not answer");
+            assert!(info.valid, "{label}: a live key reported not valid");
+            assert_eq!(info.key_expires, None, "{label}: the instant reported");
+            let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+            assert_eq!(reference.len(), 1, "{label}: the reference record count");
+            assert_eq!(
+                reference[0].expired, reference_expired,
+                "{label}: gpgv no longer answers on the load order, so this \
+                 case states the wrong thing about the reference",
+            );
+        }
+    }
+
+    /// A certificate that holds the signing key as its primary key and one that
+    /// binds it as a subkey are two certificates and not two copies of one, so
+    /// the key state is read over each of them and the earlier expiry answers.
+    /// Their self-signatures verify under different primary keys, which is what
+    /// keeps their signatures out of one set.
+    ///
+    /// The certificate that states no expiry does not extend the life the other
+    /// one bounds, so the signature is refused whichever order the two stand
+    /// in.
+    #[test]
+    fn a_subkey_and_a_primary_key_certificate_state_two_key_states() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::at("Split <split@ostrya.example>", "1d");
+        let subkey = home.add_signing_subkey();
+        let full = home.keyring();
+        let blob = home.sign(&subkey, PAYLOAD);
+        // The subkey as a certificate of its own. A v4 fingerprint is over the
+        // key material, so this certificate holds the key the subkey is, and
+        // it carries no signature and therefore states no expiry.
+        let alone = subkey_as_certificate(&full);
+        // The control: over that certificate alone the key is live, since
+        // nothing states an expiry for it.
+        let outcome =
+            verify_signatures(&certs_of(&alone), PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+        assert_eq!(
+            outcome.signatures[0].fingerprint.as_deref(),
+            Some(&*subkey),
+            "the subkey certificate answers for the signature"
+        );
+        assert!(
+            outcome.signatures[0].valid,
+            "the subkey certificate states no expiry"
+        );
+        for (label, first, second) in [
+            ("the subkey certificate second", &full, &alone),
+            ("the subkey certificate first", &alone, &full),
         ] {
             let mut keyring = first.clone();
             keyring.extend_from_slice(second);
@@ -2291,13 +2689,6 @@ mod tests {
                 info.key_expires,
                 Some(KEY_CREATED + ONE_DAY),
                 "{label}: the instant reported"
-            );
-            let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
-            assert_eq!(reference.len(), 1, "{label}: the reference record count");
-            assert_eq!(
-                reference[0].expired, reference_expired,
-                "{label}: gpgv no longer answers on the load order, so this \
-                 case states the wrong thing about the reference",
             );
         }
     }

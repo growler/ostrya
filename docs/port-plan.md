@@ -1493,33 +1493,45 @@ Definition:
   held and carries no Trust packet of this import's making; `cli-surface.md`,
   "P3", records those four, the selector dialect, and what a certificate for a
   key the keyring already holds does.
-- A key revocation is the one thing an import carries into a certificate the
-  keyring already holds. An offered certificate holding a key revocation
-  signature that verifies under the key it revokes replaces the held
-  certificate, so a revoked key stops speaking for the remote; the count the
-  import reports counts that key as one the keyring already held. The
-  revocation is verified with the rule the verify engine applies, so a key
-  revocation signature another key made and anyone stapled onto an offered
-  certificate strikes nothing out. A keyring is a run of packets per
-  certificate, so the replacement rewrites the keyring and writes the offered
-  packets where the held run stood: a signature packet written at the end of
-  the stream would attach to the last certificate in it. That same reason makes
-  the replacement need a keyring whose packet stream frames to its end: where a
-  keyring carries bytes past its last framed packet and a replacement is due,
-  the import refuses by the name of the keyring and writes no keyring. The
-  refusal is that narrow, and such a keyring still takes a certificate for a
-  key it does not hold. The port's certificate parser reads the certificates of
-  such a keyring and gpgme reads none, so the tool trusts no key out of the
-  same file and its own import of the re-export reports a count of zero and
-  writes nothing (`cli-surface.md`, "P3"). The rewrite drops the Trust packets
-  the keyring carried, which leaves it in the form the import writes for a
-  certificate it adds and which `gpg` and the `ostree` tool both read. Nothing
-  else about a held certificate changes: a new user id, a new subkey, and a
-  subkey revocation reach the keyring through `Repo::remove_remote_keyring` and
-  a fresh import. A bare revocation certificate, the single signature packet
-  `gpg --gen-revoke` writes, carries no public-key packet, so it holds no
-  certificate and the import refuses it by the name of the source, as the
-  `ostree` tool refuses it too (`cli-surface.md`, "P3").
+- A key revocation and a later key expiry are the two things an import carries
+  into a certificate the keyring already holds, and each of them replaces that
+  certificate with the offered one. An offered certificate holding a key
+  revocation signature that verifies under the key it revokes replaces the held
+  certificate, so a revoked key stops speaking for the remote. An offered
+  certificate stating a key expiry later than the held certificate states
+  replaces it as well, an absent expiry counting as later than any instant, so a
+  key whose owner has extended its life speaks for the remote again. Either way
+  the count the import reports counts that key as one the keyring already held.
+  Both statements are read with the rules the verify engine applies, so the
+  import and the verdict answer off the same signature: a key revocation
+  signature another key made and anyone stapled onto an offered certificate
+  strikes nothing out, and the expiry each certificate states comes from the
+  tiered self-signature rule. A held certificate that revokes its key takes no
+  expiry replacement, since the replacement writes the offered packets where the
+  held run stood and an offered certificate carrying no revocation would leave
+  the keyring stating none. The expiry rule holds in one direction: a shortened
+  expiry does not reach the keyring, and an older certificate stating a longer
+  expiry replaces a shorter statement the keyring holds. A keyring is a run of
+  packets per certificate, so the replacement rewrites the keyring and writes
+  the offered packets where the held run stood: a signature packet written at
+  the end of the stream would attach to the last certificate in it. That same
+  reason makes the replacement need a keyring whose packet stream frames to its
+  end: where a keyring carries bytes past its last framed packet and a
+  replacement is due, the import refuses by the name of the keyring and writes
+  no keyring. The refusal is that narrow, and such a keyring still takes a
+  certificate for a key it does not hold. The port's certificate parser reads
+  the certificates of such a keyring and gpgme reads none, so the tool trusts no
+  key out of the same file and its own import of the re-export reports a count
+  of zero and writes nothing (`cli-surface.md`, "P3"). The rewrite drops the
+  Trust packets the keyring carried, which leaves it in the form the import
+  writes for a certificate it adds and which `gpg` and the `ostree` tool both
+  read. Nothing else about a held certificate changes: a new user id, a new
+  subkey, and a subkey revocation reach the keyring through
+  `Repo::remove_remote_keyring` and a fresh import. A bare revocation
+  certificate, the single signature packet `gpg --gen-revoke` writes, carries
+  no public-key packet, so it holds no certificate and the import refuses it by
+  the name of the source, as the `ostree` tool refuses it too
+  (`cli-surface.md`, "P3").
 - The port owns the trust and validity policy. A signature is valid where it
   verifies, where the certificate holding the signing key is loaded, where the
   signature is over a document, where the subkey bindings hold, where the
@@ -1534,11 +1546,16 @@ Definition:
   ordinary paths: a repository's `<remote>.trustedkeys.gpg` beside the global
   trusted directory, two `gpgkeypath` entries, or one keyring file holding two
   exports of one key. The certificates need not state the same thing about the
-  key. A revocation any match carries refuses the signature, and the key
-  expires at the earliest instant any match states, so the load order decides
-  neither. The first match supplies the reported fingerprints and user id and
-  answers the cross-certification rule, so those three follow the load order.
-  This is the sixth divergence below.
+  key. The matches are grouped by the primary key of the certificate each one
+  came from, and one group is read as one certificate: the direct signatures,
+  the user ids with their certifications, and the binding signatures over a
+  signing subkey of every copy form one set, and the key expiry rule runs once
+  over that set, so the newest statement any copy carries answers. A revocation
+  any match carries refuses the signature, and across groups the key expires at
+  the earliest instant any group states, so the load order decides neither. The
+  first match supplies the reported fingerprints and user id and answers the
+  cross-certification rule, so those three follow the load order. These are the
+  sixth and the seventh divergences below.
 - `Verifier::verify` is async (a boxed `VerifyFuture` mirroring
   `SignFuture`), so a verifying engine can await work on the blocking pool;
   the in-process engines resolve immediately.
@@ -1547,7 +1564,7 @@ Definition:
   `tokio::process` (the `process` feature on the existing tokio
   dependency). It needs no crate of its own.
 
-Six divergences from GnuPG 2.4.9 stand, none of them a repository fact:
+Seven divergences from GnuPG 2.4.9 stand, none of them a repository fact:
 
 - the digest policy is the port's own and is fixed. MD5 is refused and SHA-1 is
   accepted, which is what `gpgv` 2.4.9 answers at its defaults. GnuPG's set is
@@ -1583,7 +1600,7 @@ Six divergences from GnuPG 2.4.9 stand, none of them a repository fact:
   than 256 certificates is refused by name. `gpgv` reads an input of any of
   those four shapes and reports on it;
 - a key the trusted set holds several certificates for is read over all of
-  them, so a revocation or an expiry any copy states refuses the signature.
+  them for a revocation, so a revocation any copy states refuses the signature.
   Both reference tools answer on the load order instead, reading the first
   certificate their keyrings hold for the key. Over a keyring holding an
   unrevoked export of a key followed by a revoked export of the same key,
@@ -1595,9 +1612,22 @@ Six divergences from GnuPG 2.4.9 stand, none of them a repository fact:
   export in a remote's `<remote>.trustedkeys.gpg` and the revoked one in that
   directory, `ostree show --gpg-verify-remote=<remote> <ref>` reports
   `Good signature from "..."` where `ostrya show` reports the signature as not
-  good. A duplicated key expiry answers the same way: `gpgv` reports `GOODSIG`
-  where the unexpiring export stands first and `EXPKEYSIG` over the reverse
-  order. The port refuses the signature in every one of those orders.
+  good. The port refuses the signature in every one of those orders;
+- the key expiry two exports of one certificate state is the newest statement
+  either of them carries, where `gpgv --keyring` over a file holding both
+  answers on the load order. The port parts from that reference in one
+  direction: over a keyring holding an export whose expiry has passed followed
+  by an export that lifts it, `gpgv` reports `EXPKEYSIG` and the port reports a
+  good signature, so the port accepts where that reference refuses; over the
+  reverse order both report a good signature. `gpg --import` of the two exports
+  merges them into one keyblock and answers on the newest statement, which is
+  the answer the port's own reading reaches, and `gpgv --keyring` over the
+  merged keyring reports the same verdict whichever order the two were imported
+  in. Measured over three pairs of exports of one certificate -- a one-day
+  expiry extended to ten years, the same expiry lifted altogether, and a key
+  that stated no expiry given one that has passed -- the merged keyring and the
+  port agree on all three, and `gpgv` over the two exports concatenated answers
+  on which export stands first.
 
 The reported user id agrees with the tool. Measured against `gpgv` 2.4.9 over
 multi-user-id certificates, in the three states such a certificate reaches: no
@@ -4157,11 +4187,13 @@ the same count, so a new user id, a new subkey, and a subkey revocation reach th
 port's trusted set only after `remote delete` and a fresh import, while a key
 revocation that verifies replaces the held certificate in the port's keyring and
 is merged into it in the tool's, each implementation then refusing a signature
-that key made; a `gpg --export-secret-keys` stream offered
-for import is refused by the port, which reads a keyring as transferable public
-keys, where the tool imports the public part of each key it holds; and a
-certificate carrying no user id is taken by the port, which verifies no
-self-signature over an offered certificate, and refused by the tool.
+that key made, and a later key expiry replaces it the same way, each
+implementation then reporting a good signature over a key that had expired; a
+`gpg --export-secret-keys` stream offered for import is refused by the port,
+which reads a keyring as transferable public keys, where the tool imports the
+public part of each key it holds; and a certificate carrying no user id is
+taken by the port, which verifies no self-signature over an offered
+certificate, and refused by the tool.
 `remote refs`/`summary` also drop `--cache-dir`, and the port's fetcher reads
 `http` and `https` where the tool also reads `file://`.
 

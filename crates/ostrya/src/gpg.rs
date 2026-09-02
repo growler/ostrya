@@ -65,14 +65,15 @@
 //! loses its armor. `gpg` and the `ostree` tool both read a keyring of that
 //! form. A certificate for a key the keyring already holds is left as the
 //! keyring holds it, so a new user id or a new subkey for a held key reaches
-//! the keyring through [`Repo::remove_remote_keyring`] and a fresh import. A
-//! certificate carrying a key revocation that verifies under the key it revokes
-//! is the exception: it replaces the held certificate, which rewrites the
-//! keyring, so a revoked key stops speaking for the remote. A keyring offered
-//! for import is untrusted input and is held to the same caps and the same
-//! containment a keyring loaded for verification is, and a stream the
-//! certificate parser does not read fails the import, which leaves the keyring
-//! as it was.
+//! the keyring through [`Repo::remove_remote_keyring`] and a fresh import. Two
+//! statements are the exceptions, and each replaces the held certificate, which
+//! rewrites the keyring: a key revocation that verifies under the key it
+//! revokes, so a revoked key stops speaking for the remote, and a key expiry
+//! later than the held certificate states, so a key whose owner has extended
+//! its life speaks again. A keyring offered for import is untrusted input and
+//! is held to the same caps and the same containment a keyring loaded for
+//! verification is, and a stream the certificate parser does not read fails
+//! the import, which leaves the keyring as it was.
 //!
 //! A signature is valid only where it verifies against a trusted key whose
 //! bindings hold and which is neither expired nor revoked. An expired key, a
@@ -615,14 +616,17 @@ impl Repo {
     /// second call here. `docs/conformance/cli-surface.md`, "P3", records what
     /// the `ostree` tool does instead.
     ///
-    /// A key revocation is the exception. A certificate carrying a key
-    /// revocation signature that verifies under the key it revokes replaces the
-    /// held certificate, so a revoked key stops speaking for the remote. The
-    /// replacement rewrites the keyring and drops the Trust packets it carried
-    /// (see [`merge_keyring`]), and the key is still counted as one the keyring
-    /// already held. A keyring carrying bytes past its last framed packet takes
-    /// no replacement, and such an import is refused by the name of the
-    /// keyring, which leaves the keyring as it was.
+    /// A key revocation and a later key expiry are the exceptions. A
+    /// certificate carrying a key revocation signature that verifies under the
+    /// key it revokes replaces the held certificate, so a revoked key stops
+    /// speaking for the remote. A certificate stating a later key expiry than
+    /// the held one states, an absent expiry counting as later than any instant,
+    /// replaces it as well, so a key whose owner has extended its life speaks
+    /// again. Each replacement rewrites the keyring and drops the Trust packets
+    /// it carried (see [`merge_keyring`]), and the key is still counted as one
+    /// the keyring already held. A keyring carrying bytes past its last framed
+    /// packet takes no replacement, and such an import is refused by the name of
+    /// the keyring, which leaves the keyring as it was.
     ///
     /// A bare revocation certificate carries no public-key packet
     /// and holds no certificate, so it is refused; the re-export of the revoked
@@ -670,16 +674,22 @@ impl Repo {
 /// import's making.
 ///
 /// A certificate whose fingerprint the keyring already holds is left as the
-/// keyring holds it, with one exception: an offered certificate carrying a key
-/// revocation that verifies replaces a held certificate that carries none, so a
-/// revoked key stops speaking for the remote. The replacement rewrites the
-/// keyring, since a keyring is a run of packets per certificate and a revocation
+/// keyring holds it, with two exceptions, each of which replaces the held
+/// certificate with the offered one (see [`replaces`]): an offered certificate
+/// carrying a key revocation that verifies, so a revoked key stops speaking for
+/// the remote, and an offered certificate stating a later key expiry, so a key
+/// whose owner has extended its life speaks again. The replacement rewrites the
+/// keyring, since a keyring is a run of packets per certificate and a signature
 /// written at the end of the stream would attach to the last certificate in it,
 /// and the rewrite drops the Trust packets the keyring carried (see
 /// [`replace_certificates`]). Either way the certificate is counted as a key the
 /// keyring already held.
 ///
-/// The replacement needs a keyring whose packet stream frames to its end.
+/// The same two rules hold inside one offered stream: where a stream carries
+/// several states of one key, the first state stands unless a later one revokes
+/// the key or states a later expiry, and the key is counted once.
+///
+/// A replacement needs a keyring whose packet stream frames to its end.
 /// Where a keyring carries bytes past its last framed packet and a replacement
 /// is due, the merge refuses by the name of the keyring, so the import writes
 /// no keyring and the file keeps the bytes it held. Where no replacement is due
@@ -701,42 +711,44 @@ fn merge_keyring(
     let stream = keyring_stream(offered, source)?;
     let refusal = format!("{source} cannot be merged into {subject}: the parser panicked");
     let (imported, rewritten, appended) = contained(&refusal, || {
-        // Every key the merge holds, by fingerprint, and whether the keyring
-        // revokes it. A keyring holding one key through two certificates
-        // answers once here, revoked where either of them revokes it, which is
-        // the reach the verify path gives a revocation.
-        let mut held: BTreeMap<String, bool> = BTreeMap::new();
+        // The state of every key the keyring holds, by fingerprint. A keyring
+        // holding one key through two certificates answers once here, over both
+        // of them, which is the reach the verify path gives them.
+        let mut copies: BTreeMap<String, Vec<SignedPublicKey>> = BTreeMap::new();
         for cert in parse_keyring(&keyring, subject)? {
-            let revoked = verify::key_revoked(&cert);
-            *held.entry(fingerprint_hex(&cert)).or_default() |= revoked;
+            copies.entry(fingerprint_hex(&cert)).or_default().push(cert);
         }
+        let mut held: BTreeMap<String, KeyState> = copies
+            .iter()
+            .map(|(fingerprint, copies)| (fingerprint.clone(), KeyState::over(copies)))
+            .collect();
         let offered = offered_certificates(&stream, source)?;
         if offered.is_empty() {
             return Err(Error::Signature(format!(
                 "{source} holds no OpenPGP certificate"
             )));
         }
-        // The certificates to append, in append order, each with whether it
-        // revokes its key, and the held certificates a revocation replaces.
-        let mut added: Vec<(String, bool, Vec<u8>)> = Vec::new();
+        // The certificates to append, in append order, each with the state it
+        // states, and the held certificates a replacement rewrites.
+        let mut added: Vec<(String, KeyState, Vec<u8>)> = Vec::new();
         let mut replaced: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut imported = 0;
         for index in select_keys(&offered, key_ids)? {
             let (cert, packets) = &offered[index];
             let fingerprint = fingerprint_hex(cert);
-            let revoked = verify::key_revoked(cert);
-            if let Some(state) = held.get_mut(&fingerprint) {
-                if revoked && !*state {
-                    *state = true;
+            let state = KeyState::of(cert);
+            if let Some(entry) = held.get_mut(&fingerprint) {
+                if replaces(entry, &state) {
+                    *entry = state;
                     replaced.insert(fingerprint, packets.clone());
                 }
             } else if let Some(entry) = added.iter_mut().find(|(f, _, _)| *f == fingerprint) {
-                if revoked && !entry.1 {
-                    entry.1 = true;
+                if replaces(&entry.1, &state) {
+                    entry.1 = state;
                     entry.2 = packets.clone();
                 }
             } else {
-                added.push((fingerprint, revoked, packets.clone()));
+                added.push((fingerprint, state, packets.clone()));
                 imported += 1;
             }
         }
@@ -745,9 +757,9 @@ fn merge_keyring(
         } else {
             Some(replace_certificates(&keyring, &replaced).ok_or_else(|| {
                 Error::Signature(format!(
-                    "{subject} holds bytes past its last framed packet, so a key \
-                     revocation cannot be written into it; remove the keyring and \
-                     import the keys afresh"
+                    "{subject} holds bytes past its last framed packet, so a \
+                     replacement certificate cannot be written into it; remove the \
+                     keyring and import the keys afresh"
                 ))
             })?)
         };
@@ -764,6 +776,73 @@ fn merge_keyring(
     Ok((imported, keyring))
 }
 
+/// What the certificates for one key state about it.
+#[derive(Clone, Copy)]
+struct KeyState {
+    /// Whether a key revocation signature that verifies under the key stands
+    /// over it.
+    revoked: bool,
+    /// The instant the key expires at, absent where they state no expiry. The
+    /// instant is read through the verify engine, so the import and the verdict
+    /// answer off the same signature.
+    expires: Option<u64>,
+}
+
+impl KeyState {
+    /// What `cert` states.
+    fn of(cert: &SignedPublicKey) -> KeyState {
+        KeyState::over(std::slice::from_ref(cert))
+    }
+
+    /// What the copies of one certificate state together: a revocation any copy
+    /// carries, and the key expiry the newest self-signature of the union
+    /// states. This is the reach the verify path gives a keyring that holds one
+    /// key through several certificates.
+    fn over(copies: &[SignedPublicKey]) -> KeyState {
+        KeyState {
+            revoked: copies.iter().any(verify::key_revoked),
+            expires: verify::key_expiry_over(copies),
+        }
+    }
+}
+
+/// Whether an offered certificate stating `offered` replaces a held
+/// certificate stating `held`.
+///
+/// Two statements are carried into a held certificate, and each of them is one
+/// the keyring has no other way to take in:
+///
+/// - a key revocation the held certificate does not carry. A revocation is
+///   permanent, so a keyring holding a certificate that states none takes it;
+/// - a key expiry later than the held certificate states, where an absent
+///   expiry counts as later than any instant. An expiry is renewable, so a held
+///   certificate can state a lifetime the key's owner has replaced.
+///
+/// A held certificate that revokes its key takes no expiry replacement. The
+/// replacement writes the offered packets where the held run stood, so an
+/// offered certificate carrying no revocation would leave the keyring stating
+/// none.
+///
+/// Two consequences follow from the direction of the expiry rule. A shortened
+/// expiry does not reach the keyring. An older certificate that states a longer
+/// expiry replaces a shorter statement the keyring holds.
+fn replaces(held: &KeyState, offered: &KeyState) -> bool {
+    let revocation = offered.revoked && !held.revoked;
+    let extension = !held.revoked && states_later(offered.expires, held.expires);
+    revocation || extension
+}
+
+/// Whether `offered` states a later key expiry than `held`. An absent instant
+/// is the later statement, since a key stating no expiry outlives one that
+/// states any instant.
+fn states_later(offered: Option<u64>, held: Option<u64>) -> bool {
+    match (offered, held) {
+        (None, Some(_)) => true,
+        (Some(offered), Some(held)) => offered > held,
+        (_, None) => false,
+    }
+}
+
 /// The keyring `binary` holds with the certificate run of each fingerprint
 /// `replaced` names written as those packets state it.
 ///
@@ -772,10 +851,10 @@ fn merge_keyring(
 /// certificate parser does not read keeps its bytes, so the rewrite refuses
 /// nothing the keyring already held. A keyring holding one key through two runs
 /// takes the replacement in both, which leaves the offered packets twice over
-/// and the key revoked. The Trust packets go, and so does a packet standing
-/// ahead of the first Public-Key packet, since [`certificate_chunks`] drops
-/// both: the keyring the rewrite writes is of the same form the import writes
-/// for a certificate it adds.
+/// and the key in the state those packets state. The Trust packets go, and so
+/// does a packet standing ahead of the first Public-Key packet, since
+/// [`certificate_chunks`] drops both: the keyring the rewrite writes is of the
+/// same form the import writes for a certificate it adds.
 ///
 /// `None` where the packet stream does not frame to its end, which the caller
 /// reports as a refusal. The caller runs this inside [`contained`].
@@ -1216,28 +1295,94 @@ IHdvcmxk\n\
     /// GnuPG auto-started for the directory and removes the directory.
     struct KeyFixture {
         dir: PathBuf,
+        /// Whether every `gpg` run in this home stands at [`FAKED_CLOCK`].
+        faked: bool,
     }
 
     impl KeyFixture {
-        /// A new home directory holding one key for `uid`.
+        /// A new home directory holding one key for `uid` that never expires.
         fn new(uid: &str) -> KeyFixture {
-            use std::os::unix::fs::DirBuilderExt;
-            let dir = scratch_dir();
-            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
-            let fixture = KeyFixture { dir };
+            let fixture = KeyFixture {
+                dir: KeyFixture::make_dir(),
+                faked: false,
+            };
             fixture.add_key(uid);
             fixture
         }
 
+        /// A new home directory holding one key for `uid` that was created at
+        /// the instant [`FAKED_CLOCK`] names and lives for `expiry` from it.
+        ///
+        /// Every `gpg` run in this home stands at that instant, so a signature
+        /// it makes was made while the key was live. The verify path reads the
+        /// real clock, which is what makes an expired key expired.
+        fn expiring(uid: &str, expiry: &str) -> KeyFixture {
+            let fixture = KeyFixture {
+                dir: KeyFixture::make_dir(),
+                faked: true,
+            };
+            fixture.generate(uid, expiry);
+            fixture
+        }
+
+        /// A fresh directory under the test scratch tree, readable by its owner
+        /// alone, which is what `gpg` asks of a home directory.
+        fn make_dir() -> PathBuf {
+            use std::os::unix::fs::DirBuilderExt;
+            let dir = scratch_dir();
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+            dir
+        }
+
         /// Generate one more key, for `uid`, in the same home directory.
         fn add_key(&self, uid: &str) {
+            self.generate(uid, "never");
+        }
+
+        /// Generate one key for `uid` with the lifetime `expiry`.
+        fn generate(&self, uid: &str, expiry: &str) {
             let status = self
                 .gpg()
                 .args(["--pinentry-mode", "loopback", "--passphrase", ""])
-                .args(["--quick-gen-key", uid, "ed25519", "sign", "never"])
+                .args(["--quick-gen-key", uid, "ed25519", "sign", expiry])
                 .status()
                 .unwrap();
             assert!(status.success(), "gpg --quick-gen-key failed");
+        }
+
+        /// Set the first key's expiry, with `gpg` standing at `when`.
+        ///
+        /// A fresh self-signature carries a creation time, and `gpg` refuses to
+        /// write one at the instant the self-signature it replaces carries: it
+        /// reports "make_keysig_packet failed: Time conflict". The clock option
+        /// stated last answers, so a run at a later instant writes the
+        /// signature a run at the fixture's own instant cannot.
+        fn set_expire_at(&self, when: &str, expiry: &str) {
+            let primary = self.fingerprint();
+            let status = self
+                .gpg()
+                .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                .args(["--faked-system-time", when])
+                .args(["--quick-set-expire", &primary, expiry])
+                .status()
+                .unwrap();
+            assert!(status.success(), "gpg --quick-set-expire failed");
+        }
+
+        /// One detached signature over `payload` by the home's first key.
+        fn sign(&self, payload: &[u8]) -> Vec<u8> {
+            let file = self.dir.join("payload");
+            std::fs::write(&file, payload).unwrap();
+            let out = self
+                .gpg()
+                .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                .args(["--detach-sign", "--output", "-", "--local-user"])
+                .arg(format!("{}!", self.fingerprint()))
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(out.status.success() && !out.stdout.is_empty());
+            out.stdout
         }
 
         /// Add a signing subkey to the home's first key.
@@ -1272,6 +1417,9 @@ IHdvcmxk\n\
         fn gpg(&self) -> std::process::Command {
             let mut cmd = std::process::Command::new("gpg");
             cmd.arg("--homedir").arg(&self.dir).arg("--batch");
+            if self.faked {
+                cmd.args(["--faked-system-time", FAKED_CLOCK]);
+            }
             cmd
         }
 
@@ -1719,6 +1867,23 @@ IHdvcmxk\n\
     /// The subject a refusal over the repository's own keyring names.
     const SUBJECT: &str = "the keyring 'origin.trustedkeys.gpg'";
 
+    /// The instant a faked-clock fixture stands at, 2025-01-01T00:00:00Z.
+    const FAKED_CLOCK: &str = "20250101T000000!";
+
+    /// The payload a fixture's signature covers.
+    const PAYLOAD: &[u8] = b"ostrya commit payload";
+
+    /// Whether the certificates `keyring` holds report `blob` as a valid
+    /// signature over [`PAYLOAD`]. This is the verdict a remote's trusted
+    /// keyring draws after an import, read through the same engine a
+    /// verification runs.
+    fn signature_is_valid(keyring: &[u8], blob: &[u8]) -> bool {
+        let certs = GpgVerifier::from_keyring_bytes([keyring]).unwrap().certs;
+        verify::verify_signatures(&certs, PAYLOAD, &[blob.to_vec()])
+            .unwrap()
+            .valid
+    }
+
     /// An import into no keyring writes the offered stream as it stands and
     /// counts each certificate, `gpg` reads the result, and a repeated import
     /// counts none and leaves the bytes alone.
@@ -1933,6 +2098,176 @@ IHdvcmxk\n\
         assert_eq!(keyring, revoked);
     }
 
+    /// A re-export stating a later key expiry replaces the certificate the
+    /// keyring holds for that key, the import counts no key, and the key the
+    /// keyring then holds verifies a signature it made.
+    ///
+    /// The keyring the merge is given is the one the `ostree` tool's own import
+    /// leaves at the repository root, which carries the Trust packets. The
+    /// merged keyring holds the offered certificate where the held one stood.
+    #[test]
+    fn an_expiry_extension_replaces_the_held_certificate() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::expiring("Renew <renew@ostrya.example>", "1d");
+        let blob = home.sign(PAYLOAD);
+        let expiring = home.export(false);
+        let held = home.legacy_keyring();
+        home.set_expire_at("20250102T000000!", "10y");
+        let extended = home.export(false);
+        // The fixture is the shape under test: the held keyring states an
+        // expiry that has passed, so it refuses the signature, and the offered
+        // re-export states one ten years out.
+        assert_ne!(extended, expiring);
+        assert!(
+            !signature_is_valid(&held, &blob),
+            "the held keyring must state an expiry that has passed"
+        );
+
+        let (imported, keyring) = merge_keyring(&held, &extended, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        assert_ne!(keyring, without_trust_packets(&held));
+        // One certificate run per key, holding the offered packets.
+        assert_eq!(keyring, extended);
+        // `gpg` reads the result, which is the reader the `ostree` tool drives
+        // through gpgme, and the key it holds is live again.
+        assert_eq!(home.fingerprints_of(&keyring), [home.fingerprint()]);
+        assert!(
+            signature_is_valid(&keyring, &blob),
+            "the merged keyring must state the extended expiry"
+        );
+
+        // The keyring GnuPG writes for the same two imports states the same
+        // expiry and carries one signature packet more: its merge keeps the
+        // self-signature the earlier export carried, where the replacement
+        // writes the offered packets alone. Both keyrings report the key live.
+        let gnupg = home.imported_keyring("merged", &[&expiring, &extended]);
+        let merged = without_trust_packets(&gnupg);
+        let signatures = |bytes: &[u8]| {
+            packet_spans(bytes)
+                .0
+                .iter()
+                .filter(|(tag, _)| *tag == Tag::Signature)
+                .count()
+        };
+        assert_eq!(signatures(&keyring), 1, "the offered packets alone");
+        assert_eq!(
+            signatures(&merged),
+            2,
+            "GnuPG keeps the self-signature the earlier export carried"
+        );
+        assert!(signature_is_valid(&gnupg, &blob));
+    }
+
+    /// A keyring holding one key through two certificates states the expiry
+    /// their newest self-signature states, which is the instant the verify path
+    /// reads over the pair, so a re-export later than that instant replaces
+    /// both runs.
+    ///
+    /// The two held certificates disagree in the direction that parts the newest
+    /// statement from the widest one: the older one states ten years and the
+    /// newer one an instant that has passed. The offered re-export states five
+    /// years, which stands later than the newest held statement and earlier
+    /// than the widest.
+    #[test]
+    fn two_held_certificates_state_their_newest_expiry() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::expiring("Pair <pair@ostrya.example>", "10y");
+        let blob = home.sign(PAYLOAD);
+        let widest = home.export(false);
+        home.set_expire_at("20250102T000000!", "1d");
+        let newest = home.export(false);
+        home.set_expire_at("20250103T000000!", "5y");
+        let offered = home.export(false);
+        let mut held = widest.clone();
+        held.extend_from_slice(&newest);
+        // The fixture is the shape under test: the pair reads as expired, so
+        // the widest statement does not answer for it.
+        assert!(
+            !signature_is_valid(&held, &blob),
+            "the pair must read as expired"
+        );
+        assert!(
+            signature_is_valid(&widest, &blob),
+            "the older certificate must state a lifetime that has not passed"
+        );
+
+        let (imported, keyring) = merge_keyring(&held, &offered, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        // A keyring holding one key through two runs takes the replacement in
+        // both.
+        assert_eq!(keyring, [&offered[..], &offered[..]].concat());
+        assert!(
+            signature_is_valid(&keyring, &blob),
+            "the merged keyring must state the offered expiry"
+        );
+    }
+
+    /// An offered certificate stating an expiry no later than the held one's
+    /// leaves the keyring at the bytes it held. Two directions state it: a
+    /// shortened expiry over a longer held one, and an expiry over a held
+    /// certificate that states none.
+    #[test]
+    fn an_earlier_expiry_leaves_the_held_certificate() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let long = KeyFixture::expiring("Long <long@ostrya.example>", "10y");
+        let held = long.export(false);
+        long.set_expire_at("20250102T000000!", "1d");
+        let shortened = long.export(false);
+        assert_ne!(shortened, held);
+        let (imported, keyring) = merge_keyring(&held, &shortened, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        assert_eq!(keyring, held);
+
+        let never = KeyFixture::expiring("Never <never@ostrya.example>", "never");
+        let held = never.export(false);
+        never.set_expire_at("20250102T000000!", "1d");
+        let expiring = never.export(false);
+        assert_ne!(expiring, held);
+        let (imported, keyring) = merge_keyring(&held, &expiring, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        assert_eq!(keyring, held);
+    }
+
+    /// A held certificate that revokes its key takes no expiry replacement. A
+    /// revocation is permanent, so the keyring keeps the bytes that carry it
+    /// where the offered certificate carries none.
+    #[test]
+    fn a_revoked_key_takes_no_expiry_replacement() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::expiring("Struck <struck@ostrya.example>", "1d");
+        // The held certificate revokes the key and states the shorter expiry.
+        let held = insert_after_primary(&home.export(false), &home.revocation_packet());
+        home.set_expire_at("20250102T000000!", "10y");
+        let extended = home.export(false);
+        // The fixture is the shape under test: the held certificate revokes the
+        // key, the offered one does not, and the offered one states the later
+        // expiry.
+        let certs = GpgVerifier::from_keyring_bytes([&held]).unwrap().certs;
+        assert_eq!(certs.len(), 1);
+        let held_state = KeyState::over(&certs);
+        assert!(held_state.revoked);
+        let offered = GpgVerifier::from_keyring_bytes([&extended]).unwrap().certs;
+        let offered_state = KeyState::over(&offered);
+        assert!(!offered_state.revoked);
+        assert!(states_later(offered_state.expires, held_state.expires));
+
+        let (imported, keyring) = merge_keyring(&held, &extended, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        assert_eq!(keyring, held);
+    }
+
     /// A held keyring carrying bytes past its last framed packet takes no
     /// replacement, so an offered revocation for a key it holds is refused by
     /// the name of the keyring and the merge writes no keyring.
@@ -1964,6 +2299,34 @@ IHdvcmxk\n\
         assert_eq!(parse_keyring(&held, SUBJECT).unwrap().len(), 1);
 
         let refusal = merge_keyring(&held, &revoked, &[], SUBJECT).unwrap_err();
+        let text = refusal.to_string();
+        assert!(text.contains(SUBJECT), "{text}");
+        assert!(text.contains("bytes past its last framed packet"), "{text}");
+    }
+
+    /// The same refusal stands over the other replacement: a keyring carrying
+    /// bytes past its last framed packet takes no expiry extension either, and
+    /// the merge writes no keyring.
+    #[test]
+    fn an_expiry_extension_over_an_unframeable_keyring_is_refused() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let home = KeyFixture::expiring("Tailed <tailed@ostrya.example>", "1d");
+        let expiring = home.export(false);
+        home.set_expire_at("20250102T000000!", "10y");
+        let extended = home.export(false);
+        let mut held = expiring.clone();
+        held.push(0xff);
+        // The fixture is the shape under test: the walk frames the export and
+        // stops at the trailing byte, the run split answers nothing, and the
+        // certificate parser still reads the key the keyring holds.
+        assert_eq!(packet_spans(&held).1, expiring.len());
+        assert!(certificate_chunks(&held).is_none());
+        assert_eq!(parse_keyring(&held, SUBJECT).unwrap().len(), 1);
+
+        let refusal = merge_keyring(&held, &extended, &[], SUBJECT).unwrap_err();
         let text = refusal.to_string();
         assert!(text.contains(SUBJECT), "{text}");
         assert!(text.contains("bytes past its last framed packet"), "{text}");

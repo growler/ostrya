@@ -405,12 +405,13 @@ deliberately not reproduced:
   `show --gpg-verify-remote=<remote>`;
 - the verdict the report states rests on the port's own trust and validity
   policy, which `../port-plan.md`, "Phase 13d", enumerates against GnuPG 2.4.9.
-  Six differences stand there, and each one can make a `show` verdict part
+  Seven differences stand there, and each one can make a `show` verdict part
   from the tool's: the fixed digest policy, the GnuPG keybox refusal, the
   refusal a keyring the parser rejects draws, the 256-bit minimum digest an
-  Ed25519 key carries, the keyring and signature-blob input caps, and the key
-  state read over every certificate the trusted set holds for the key rather
-  than over the first alone.
+  Ed25519 key carries, the keyring and signature-blob input caps, a revocation
+  read over every certificate the trusted set holds for the key rather than over
+  the first alone, and the key expiry read as the newest statement two exports
+  of one certificate carry rather than as the statement the first export makes.
 
 `config set` and `config unset` write the document through the config write path
 Phase 17e landed. Both accept what the tool accepts and word every refusal the
@@ -1457,13 +1458,15 @@ records. Ten divergences stand:
   listing then reports both user ids where the port's reports one. An armored
   keyring keeps that packet stream and is written back in the binary form. A new
   subkey and a subkey revocation part the same way, and reach the port's keyring
-  through `remote delete` and a fresh import.
+  through `remote delete` and a fresh import. Two statements are the exceptions,
+  a key revocation and a later key expiry, and both are recorded below.
 
-  A key revocation is the one certificate both implementations carry in. An
-  offered certificate holding a key revocation signature that verifies under the
-  key it revokes replaces the certificate the keyring holds for that key, and the
-  count stays `Imported 0 GPG keys`. Each implementation holds a commit signed
-  with `$FPR`, a remote `origin`, and `cert1.gpg` imported into that remote:
+  A key revocation is one of the two certificates both implementations carry
+  in. An offered certificate holding a key revocation signature that verifies
+  under the key it revokes replaces the certificate the keyring holds for that
+  key, and the count stays `Imported 0 GPG keys`. Each implementation holds a
+  commit signed with `$FPR`, a remote `origin`, and `cert1.gpg` imported into
+  that remote:
 
       gpg --export "$FPR" > cert1.gpg
       printf 'y\n1\n\ny\n' | gpg --command-fd 0 --no-tty --yes \
@@ -1499,6 +1502,46 @@ records. Ten divergences stand:
   `a_revoked_re_export_replaces_the_held_certificate`, states the same
   comparison against the keyring GnuPG writes for the same two imports).
 
+  A later key expiry is the other. An offered certificate that states a later
+  key expiry than the held one replaces the certificate the keyring holds for
+  that key, an absent expiry counting as later than any instant, and the count
+  stays `Imported 0 GPG keys`. Each implementation holds a commit signed with
+  `$FPR`, whose lifetime was one day and whose signature was made while the key
+  was live, a remote `origin`, and `cert1.gpg` imported into that remote.
+  Measured against `ostree` 2026.1 and `gpg` 2.4.9:
+
+      gpg --quick-set-expire "$FPR" 10y
+      gpg --export "$FPR" > cert2.gpg
+      ostrya remote gpg-import origin --keyring cert2.gpg  # Imported 0 GPG keys
+      ostree remote gpg-import origin --keyring cert2.gpg  # Imported 0 GPG keys
+      ostrya show --gpg-verify-remote=origin main   # Good signature from "..."
+      ostree show --gpg-verify-remote=origin main   # Good signature from "..."
+
+  Over the same commit before that import each implementation reported `BAD
+  signature from "..."`, the tool adding the `Key expired <instant>` line the
+  report wording in "P1" above records. Each implementation reads the keyring
+  the other wrote and reports the good signature over it
+  (`crates/ostrya-cli/tests/cli.rs`,
+  `remote_gpg_import_carries_a_key_expiry_extension`).
+
+  The bytes part here as well, and by more than the Trust packets. The port
+  writes the offered certificate where the held one stood, so its keyring is the
+  `gpg --export` stream of the extended key byte for byte; the tool merges the
+  offered packets into the held certificate run, so its file keeps the
+  self-signature the earlier export carried along with its own Trust packets and
+  is the longer one -- 439 bytes against 235 over an ed25519 key carrying one
+  user id. Both files state the extended expiry, which is why the two reports
+  agree.
+
+  The expiry rule holds in one direction. An offered certificate stating an
+  expiry no later than the held one leaves the port's keyring at the bytes it
+  held, so a shortened expiry does not reach a remote's trusted set, and a held
+  certificate that revokes its key takes no expiry replacement
+  (`crates/ostrya/src/gpg.rs`,
+  `an_expiry_extension_replaces_the_held_certificate`,
+  `an_earlier_expiry_leaves_the_held_certificate`, and
+  `a_revoked_key_takes_no_expiry_replacement`).
+
   A revocation another key made carries no weight. The signature is verified
   under the key it revokes before it is honored, so a key revocation signature
   anyone stapled onto an offered certificate leaves the keyring at the bytes it
@@ -1517,14 +1560,16 @@ records. Ten divergences stand:
 
   A keyring carrying bytes past its last framed packet takes no replacement.
   The port cannot say where each certificate run stands in such a keyring, and
-  a revocation written at the end of the stream would attach to the last
-  certificate the keyring holds, so a revoked re-export of a key it holds
-  reports `error: signature: the keyring '<name>' holds bytes past its last
-  framed packet, so a key revocation cannot be written into it; remove the
-  keyring and import the keys afresh` at exit 1 and leaves the file byte for
-  byte as it stood. The refusal is that narrow: the same keyring still takes a
-  certificate for a key it does not hold (`crates/ostrya/src/gpg.rs`,
-  `a_revocation_over_an_unframeable_keyring_is_refused` and
+  a signature written at the end of the stream would attach to the last
+  certificate the keyring holds, so a revoked re-export of a key it holds, and
+  a re-export stating a later expiry alike, report `error: signature: the
+  keyring '<name>' holds bytes past its last framed packet, so a replacement
+  certificate cannot be written into it; remove the keyring and import the keys
+  afresh` at exit 1 and leave the file byte for byte as it stood. The refusal is
+  that narrow: the same keyring still takes a certificate for a key it does not
+  hold (`crates/ostrya/src/gpg.rs`,
+  `a_revocation_over_an_unframeable_keyring_is_refused`,
+  `an_expiry_extension_over_an_unframeable_keyring_is_refused`, and
   `an_unframeable_keyring_still_takes_a_new_certificate`). Measured over a
   keyring the tool's own import wrote with one `0xff` byte appended, the tool
   reports `Imported 0 GPG keys` at exit 0 and writes nothing. The two answers
@@ -1534,20 +1579,21 @@ records. Ten divergences stand:
   `ostree remote gpg-list-keys` prints nothing and `ostree show` reports
   `Can't check signature: public key not found`.
 
-  The rule holds inside one offered stream as well: where a stream carries two
-  states of one key the port keeps the first, unless a later one revokes the key.
-  The revoked export alone and the two exports concatenated in either order
-  therefore reach one keyring, which the port's own test states, and every
-  `--keyring` option of one invocation reaches the import as one stream. The tool
-  answers the same way: over each of those three streams it reported
-  `Imported 1 GPG key`, wrote three byte-identical keyrings, and reported the
-  signature `Key revoked`.
+  Both rules hold inside one offered stream as well: where a stream carries two
+  states of one key the port keeps the first, unless a later one revokes the key
+  or states a later expiry. The revoked export alone and the two exports
+  concatenated in either order therefore reach one keyring, which the port's own
+  test states, and every `--keyring` option of one invocation reaches the import
+  as one stream. The tool answers the same way: over each of those three streams
+  it reported `Imported 1 GPG key`, wrote three byte-identical keyrings, and
+  reported the signature `Key revoked`.
 
   A trusted set holding both certificates parts a second way -- `cert1.gpg` in
   the remote's keyring and `cert2.gpg` in the `OSTREE_GPG_HOME` directory. The
-  tool answers on which certificate it reads first, and the port reads the
-  revocation whichever one stands first. That is the sixth verify divergence
-  `../port-plan.md`, "Phase 13d", records;
+  tool answers on which certificate it reads first. The port reads the
+  revocation whichever one stands first, and reads the newest expiry statement
+  of the two whichever one stands first. Those are the sixth and the seventh
+  verify divergences `../port-plan.md`, "Phase 13d", records;
 - a `gpg --export-secret-keys` stream offered to `remote gpg-import` is refused
   by the port and taken by the tool, which imports the public part of each key it
   holds and lists it afterwards. The port reads a keyring as transferable public

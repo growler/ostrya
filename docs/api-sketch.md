@@ -1130,12 +1130,14 @@ impl Repo {                                   // feature = "verify-gpg"
     /// packets and loses its armor. A certificate for a key the keyring
     /// already holds is not merged in, so a new user id or a new binding for a
     /// held key reaches the keyring through `Repo::remove_remote_keyring` and
-    /// a fresh import. A certificate carrying a key revocation that verifies
-    /// under the key it revokes is the exception: it replaces the held
-    /// certificate, which rewrites the keyring and drops the Trust packets it
-    /// carried, and the key is still counted as one the keyring already held. A
-    /// keyring carrying bytes past its last framed packet takes no
-    /// replacement, and such an import is refused by the name of the keyring.
+    /// a fresh import. Two statements are the exceptions, and each replaces the
+    /// held certificate, which rewrites the keyring and drops the Trust packets
+    /// it carried: a key revocation that verifies under the key it revokes, and
+    /// a key expiry later than the held certificate states, an absent expiry
+    /// counting as later than any instant. The key is still counted as one the
+    /// keyring already held. A keyring carrying bytes past its last framed
+    /// packet takes no replacement, and such an import is refused by the name
+    /// of the keyring.
     pub async fn gpg_import_keys(&self, remote: &str, keys: &[u8], key_ids: &[String])
         -> Result<usize>;
     /// The keys that keyring holds. An absent keyring holds none.
@@ -1165,9 +1167,12 @@ validity policy: issuer resolution over primary keys and subkeys, the subkey
 binding and its embedded primary-key binding, key expiry, revocation, the
 signature class, and the digest policy. Issuer resolution answers with every
 certificate that holds the key. A revocation any of them carries refuses the
-signature, and the key expires at the earliest instant any of them states, so
-the keyring load order decides neither. The first of them supplies the reported
-fingerprints and user id.
+signature. Two exports of one certificate are read as one certificate, so the
+key expiry the newest self-signature of either export states answers; across
+certificates holding different primary keys the key expires at the earliest
+instant any of them states. The keyring load order decides none of the three.
+The first certificate that answers supplies the reported fingerprints and user
+id.
 
 ## Fetcher
 

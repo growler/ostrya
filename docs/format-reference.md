@@ -1853,16 +1853,19 @@ GPG keyrings are binary or ASCII-armored, each holding one or more
 certificates, all merged into one trusted set. A key the trusted set holds
 several certificates for keeps every one of them, and the verdict reads all the
 certificates that answer for a signature's issuer. A revocation any of them
-carries refuses the signature, and the key expires at the earliest instant any
-of them states, so the keyring load order decides neither. The first of them
-supplies the reported fingerprints and user id. The keyring trusted for a
-remote is `<remote>.trustedkeys.gpg` in the repo or under
-`/etc/ostree/remotes.d/`; every `*.gpg` keyring in the global trusted-keyring
-directory is trusted for all remotes. That directory is
-`<datadir>/ostree/trusted.gpg.d/` (`/usr/share/ostree/trusted.gpg.d/`), and
-the `OSTREE_GPG_HOME` environment variable overrides it with the directory it
-names, observed by running `ostree show` on a signed commit with
-`OSTREE_GPG_HOME` set to a directory holding the exported keyring.
+carries refuses the signature. Two exports of one certificate are read as one
+certificate, so the key expiry the newest self-signature of either export
+states answers; across certificates holding different primary keys the key
+expires at the earliest instant any of them states. The keyring load order
+decides none of the three. The first certificate that answers supplies the
+reported fingerprints and user id. The keyring trusted for a remote is
+`<remote>.trustedkeys.gpg` in the repo or under `/etc/ostree/remotes.d/`; every
+`*.gpg` keyring in the global trusted-keyring directory is trusted for all
+remotes. That directory is `<datadir>/ostree/trusted.gpg.d/`
+(`/usr/share/ostree/trusted.gpg.d/`), and the `OSTREE_GPG_HOME` environment
+variable overrides it with the directory it names, observed by running `ostree
+show` on a signed commit with `OSTREE_GPG_HOME` set to a directory holding the
+exported keyring.
 End-to-end cross-verification against the tool runs in the conformance record
 `commit/gpg-sign-round-trip`: each implementation's `--gpg-sign` signature
 verifies through the other's `show --gpg-verify-remote` over a remote holding
@@ -4362,13 +4365,15 @@ count but one. The count is the keys the keyring did not already hold, so a
 repeated import reports `0`. The keyring the port writes keeps the packets it
 held and carries the packets of each added certificate, with the Trust packets
 of the offered stream dropped. A certificate offered for a key the keyring
-already holds changes nothing, with one exception: one carrying a key
-revocation signature that verifies under the key it revokes replaces the held
-certificate, which rewrites the keyring and drops the Trust packets it carried.
-That key is still counted as one the keyring already held, so such an import
-reports `0` and writes a keyring holding the revocation. A keyring carrying
-bytes past its last framed packet takes no replacement: such an import is
-refused by the name of the keyring and writes no keyring. A `KEY-ID` selects the
+already holds changes nothing, with two exceptions, each of which replaces the
+held certificate, rewrites the keyring, and drops the Trust packets it carried:
+one carrying a key revocation signature that verifies under the key it revokes,
+and one stating a key expiry later than the held certificate states, an absent
+expiry counting as later than any instant. That key is still counted as one the
+keyring already held, so such an import reports `0` and writes a keyring
+holding the offered certificate. A keyring carrying bytes past its last framed
+packet takes no replacement: such an import is refused by the name of the
+keyring and writes no keyring. A `KEY-ID` selects the
 keys it names out of the
 source: a fingerprint, a key id, or a user id substring, with
 `../conformance/cli-surface.md`, "P3", recording where the two dialects part

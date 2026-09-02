@@ -33,6 +33,10 @@ const ED25519_SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
 const ED25519_PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
+/// The instant a faked-clock GnuPG home stands at, 2025-01-01T00:00:00Z.
+#[cfg(feature = "gpg")]
+const FAKED_CLOCK: &str = "20250101T000000!";
+
 /// Whether the gpg binary is available.
 #[cfg(feature = "gpg")]
 fn gpg_available() -> bool {
@@ -66,6 +70,53 @@ impl GpgHome {
             .unwrap();
         assert!(status.success(), "gpg --quick-gen-key failed");
         home
+    }
+
+    /// Generate a signing key for `uid` in a new home directory under `base`
+    /// that was created at the instant [`FAKED_CLOCK`] names and lives for
+    /// `expiry` from it.
+    ///
+    /// The instant stands in the home's `gpg.conf`, so every `gpg` run bound to
+    /// it reads that clock, the signing run gpgme drives included. A signature
+    /// this home makes is therefore made while the key is live. Verification
+    /// reads the real clock in each implementation, which is what makes an
+    /// expired key expired.
+    fn expiring(base: &Path, uid: &str, expiry: &str) -> GpgHome {
+        let dir = base.join("gnupghome");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            dir.join("gpg.conf"),
+            format!("faked-system-time {FAKED_CLOCK}\n"),
+        )
+        .unwrap();
+        let home = GpgHome { dir };
+        let status = home
+            .gpg()
+            .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+            .args(["--quick-gen-key", uid, "ed25519", "sign", expiry])
+            .status()
+            .unwrap();
+        assert!(status.success(), "gpg --quick-gen-key failed");
+        home
+    }
+
+    /// Set the key's expiry, with `gpg` standing at `when`.
+    ///
+    /// A fresh self-signature carries a creation time, and `gpg` refuses to
+    /// write one at the instant the self-signature it replaces carries. The
+    /// clock option stated last answers, so a run at a later instant writes the
+    /// signature a run at the home's own instant cannot.
+    fn set_expire_at(&self, when: &str, expiry: &str) {
+        let primary = self.fingerprint();
+        let status = self
+            .gpg()
+            .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+            .args(["--faked-system-time", when])
+            .args(["--quick-set-expire", &primary, expiry])
+            .status()
+            .unwrap();
+        assert!(status.success(), "gpg --quick-set-expire failed");
     }
 
     /// Generate a second signing key for `uid` in this home directory, so a
@@ -8562,6 +8613,138 @@ fn remote_gpg_keyring_round_trips_with_the_tool() {
         assert!(
             !repo.join("origin.trustedkeys.gpg").exists(),
             "{repo:?} kept the deleted remote's keyring"
+        );
+    }
+}
+
+/// A re-export stating a later key expiry reaches a remote's trusted keyring
+/// in both implementations: the count stays at zero, the key that had expired
+/// verifies the commit again, and each implementation reads the keyring the
+/// other wrote.
+///
+/// The key was created with a lifetime of one day and signed the commit while
+/// it was live. The keyring the first import writes therefore states an expiry
+/// that has passed, and both implementations refuse the signature over it. The
+/// bytes the second import writes part: the port writes the offered certificate
+/// where the held one stood and the tool merges the offered packets into it
+/// (`cli-surface.md`, "P3").
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_gpg_import_carries_a_key_expiry_extension() {
+    if !ostree_available() || !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("remote-gpg-expiry");
+    let base = tmp.path();
+    let home = GpgHome::expiring(base, "Renew <renew@ostrya.example>", "1d");
+    let fpr = home.fingerprint();
+    let expiring = base.join("expiring.gpg");
+    home.export_to(&expiring);
+    let expiring_arg = format!("--keyring={}", expiring.display());
+
+    // One repository per implementation, each holding the same commit, signed
+    // with that key and read through the remote the keyring belongs to.
+    build_fixture_source(base);
+    let src = base.join("src");
+    let mut repos = Vec::new();
+    for name in ["port", "tool"] {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = create_repo(&dir, RepoMode::Archive);
+        let repo_s = repo.to_str().unwrap().to_owned();
+        ostrya(
+            &[
+                "commit",
+                "--repo",
+                &repo_s,
+                "-b",
+                BRANCH,
+                "-s",
+                SUBJECT,
+                "--canonical-permissions",
+                src.to_str().unwrap(),
+            ],
+            None,
+            &[("SOURCE_DATE_EPOCH", SOURCE_DATE_EPOCH)],
+        )
+        .ok();
+        configure_remote(&repo, "https://example.invalid/r", "");
+        ostree(&[
+            "gpg-sign",
+            "--repo",
+            &repo_s,
+            "--gpg-homedir",
+            home.dir.to_str().unwrap(),
+            COMMIT,
+            &fpr,
+        ])
+        .ok();
+        repos.push(repo);
+    }
+    let (port, tool) = (repos[0].clone(), repos[1].clone());
+
+    // The keyring stating the expiry that has passed. Both implementations
+    // count the key and then refuse the signature it made.
+    let args = ["remote", "gpg-import", "origin", &expiring_arg];
+    let (port_run, tool_run) = run_remote_both(&port, &tool, &args, &[]);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, the first import");
+    let show = ["show", "--gpg-verify-remote=origin", BRANCH];
+    let (port_run, tool_run) = run_remote_both(&port, &tool, &show, &[]);
+    for (label, run) in [("the port", &port_run), ("the tool", &tool_run)] {
+        let text = run.ok().stdout_trimmed();
+        assert!(
+            text.contains("BAD signature from") && !text.contains("Good signature from"),
+            "{label} accepted a signature by an expired key:\n{text}"
+        );
+    }
+
+    // The re-export stating ten years. Both count no key and both then report
+    // a good signature.
+    home.set_expire_at("20250102T000000!", "10y");
+    let extended = base.join("extended.gpg");
+    home.export_to(&extended);
+    let extended_arg = format!("--keyring={}", extended.display());
+    let args = ["remote", "gpg-import", "origin", &extended_arg];
+    let (port_run, tool_run) = run_remote_both(&port, &tool, &args, &[]);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, the extension");
+    assert!(
+        port_run
+            .ok()
+            .stdout_trimmed()
+            .contains("Imported 0 GPG keys"),
+        "the extension must count no key"
+    );
+    let (port_run, tool_run) = run_remote_both(&port, &tool, &show, &[]);
+    for (label, run) in [("the port", &port_run), ("the tool", &tool_run)] {
+        let text = run.ok().stdout_trimmed();
+        assert!(
+            text.contains("Good signature from"),
+            "{label} refused a signature by a key whose expiry was extended:\n{text}"
+        );
+    }
+
+    // The bytes part. The port's keyring is the offered export, and the tool's
+    // merge keeps the packets the earlier export carried and its own Trust
+    // packets, so its file is the longer one.
+    let name = "origin.trustedkeys.gpg";
+    let port_ring = std::fs::read(port.join(name)).unwrap();
+    let tool_ring = std::fs::read(tool.join(name)).unwrap();
+    assert_eq!(port_ring, std::fs::read(&extended).unwrap());
+    assert!(
+        tool_ring.len() > port_ring.len(),
+        "the tool's merged keyring must carry more than the offered export"
+    );
+
+    // Each implementation reads the keyring the other wrote and reports a good
+    // signature over it.
+    std::fs::write(port.join(name), &tool_ring).unwrap();
+    std::fs::write(tool.join(name), &port_ring).unwrap();
+    let (port_run, tool_run) = run_remote_both(&port, &tool, &show, &[]);
+    for (label, run) in [("the port", &port_run), ("the tool", &tool_run)] {
+        let text = run.ok().stdout_trimmed();
+        assert!(
+            text.contains("Good signature from"),
+            "{label} refused the keyring the other implementation wrote:\n{text}"
         );
     }
 }

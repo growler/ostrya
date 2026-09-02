@@ -457,7 +457,7 @@ impl File {
 pub struct Timer;                       // Timer::after(Duration)
 pub struct Deadline;                    // a restartable inactivity window
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>;
-pub struct Command;                     // subprocess, for gpg signing and keys
+pub struct Command;                     // subprocess, for gpg signing
 pub struct TcpListener;  pub struct TcpStream;
 ```
 

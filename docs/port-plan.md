@@ -4776,7 +4776,7 @@ Resolved:
     stays there. `Verifier::verify` is async so a verifying engine can await
     work on the blocking pool. Subprocesses go through `rt::Command`
     (`smol::process` / `tokio::process`); the `gpg` binary is a runtime tool
-    dependency of signing and of the keyring management behind `verify-gpg`.
+    dependency of signing alone.
 
     Keyring parsing and signature verification are in the process, over the
     `pgp` crate (rPGP) behind the `verify-gpg` feature. rPGP is

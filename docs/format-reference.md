@@ -1845,8 +1845,10 @@ directory is trusted for all remotes. That directory is
 the `OSTREE_GPG_HOME` environment variable overrides it with the directory it
 names, observed by running `ostree show` on a signed commit with
 `OSTREE_GPG_HOME` set to a directory holding the exported keyring.
-End-to-end cross-verification against `ostree gpg-sign` runs with the upstream
-shell tests at the CLI-compatibility phase.
+End-to-end cross-verification against the tool runs in the conformance record
+`commit/gpg-sign-round-trip`: each implementation's `--gpg-sign` signature
+verifies through the other's `show --gpg-verify-remote` over a remote holding
+the exported public keyring, in all four pairings.
 
 Dummy engine (test only). Signature key `ostree.sign.dummy`, value `aay` like
 the other engines. The engine is gated in the tool behind the

@@ -52,6 +52,82 @@ jobs:
           cargo build -p ostrya-cli
           ! readelf -d target/debug/ostrya | grep -qi pcre2
 
+      # Every package in the graph, under every feature, must carry a
+      # permissive license (`CLAUDE.md`, "Requirement: permissive licenses
+      # only"), so the MIT library puts no copyleft obligation on a downstream
+      # consumer. The expression normalizes the legacy slash forms `A/B` and
+      # `A / B` to `A OR B` before it matches, because nine packages in the
+      # graph state a permissive choice that way and an SPDX-strict match would
+      # reject all nine. It reads an expression as a set of `AND` terms and
+      # asks each term for one permissive option, so `MIT OR Apache-2.0 OR
+      # LGPL-2.1-or-later` passes and `MIT AND GPL-3.0-only` fails. A null or an
+      # empty license field fails as well, and such a package is inspected by
+      # hand before it is accepted.
+      - name: Every license is permissive
+        run: |
+          cargo metadata --format-version 1 --all-features \
+            | jq -e -r '
+                ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
+                 "0BSD", "BSD-1-Clause", "BSD-2-Clause", "BSD-3-Clause",
+                 "ISC", "Zlib", "Unlicense", "BSL-1.0", "Unicode-3.0"] as $ok
+                | [ .packages[]
+                    | { crate: "\(.name) \(.version)",
+                        spdx: (.license // ""
+                               | gsub("\\s*/\\s*"; " OR ")
+                               | gsub("[()]"; "")) }
+                    | select(
+                        [ .spdx
+                          | split(" AND ")[]
+                          | [ split(" OR ")[] | sub("^ +"; "") | sub(" +$"; "") ]
+                          | any(. as $t | $ok | index($t)) ]
+                        | length == 0 or (all | not))
+                    | "  \(.crate): \(if .spdx == "" then "<no license field>"
+                                      else .spdx end)" ]
+                | if length == 0
+                  then "every package in the graph carries a permissive license"
+                  else ("packages whose license is not permissive:\n"
+                        + join("\n") + "\n" | halt_error(1))
+                  end'
+
+      # A package that declares a `links` key builds and links a native
+      # library, and the tree allows two names. `liblzma-sys` is the static xz
+      # build for the delta paths (`CLAUDE.md`, goal 1). `ring` is an optional
+      # dependency of `rustls-webpki` that no feature turns on, so it sits in
+      # the resolved graph and nothing builds it: `cargo tree --all-features -i
+      # ring` prints nothing and `target/debug/build` holds no `ring` artifact.
+      # Remove the `ring` entry when the graph stops resolving it. The step
+      # reads `.resolve.nodes`, so a package the lock file names and the
+      # resolver leaves out is not asked about.
+      #
+      # The step applies no test over the `-sys` name suffix. `linux-raw-sys`
+      # and `ostrya-sys` carry the suffix and are pure Rust, and a crate that
+      # links C need not carry it. `pcre2-sys` builds the vendored PCRE2 and
+      # declares no `links` key, which is why the two steps above hold that
+      # crate by name and by the linkage of the shipped binary.
+      - name: Only allowlisted packages link a native library
+        run: |
+          cargo metadata --format-version 1 --all-features \
+            | jq -e -r '
+                ["liblzma-sys", "ring"] as $ok
+                | [ .resolve.nodes[].id ] as $resolved
+                | [ .packages[]
+                    | select(.id as $id | $resolved | index($id))
+                    | select(.links != null)
+                    | select(.name as $n | $ok | index($n) | not)
+                    | "  \(.name) \(.version) links=\(.links)" ]
+                | if length == 0
+                  then "no package outside the allowlist links a native library"
+                  else ("packages linking a native library outside the "
+                        + "allowlist:\n" + join("\n") + "\n" | halt_error(1))
+                  end'
+
+      # `sign-gpg` turns on `verify-gpg`, so every other build in this workflow
+      # carries both. A consumer that verifies and does not sign takes
+      # `verify-gpg` alone, and this compiles that combination, so a cfg gate
+      # placed on the signing side of a verification item fails here.
+      - name: verify-gpg without sign-gpg compiles
+        run: cargo check -p ostrya --no-default-features --features smol,verify-gpg
+
       # The local-pull ownership-gate tests need the process to belong to more
       # than one group, and skip themselves where it does not. The runner user
       # belongs to several, so this job demands the coverage rather than

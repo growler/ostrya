@@ -79,7 +79,8 @@ crates below are all pure Rust:
 - `miniz_oxide` (MIT OR Zlib OR Apache-2.0) -- the raw-DEFLATE encoder behind
   archive-mode content objects. A direct dependency pins the compressor, so the
   stored `.filez` bytes for a given `[archive] zlib-level` are fixed for every
-  feature set the build enables.
+  feature set the build enables. Golden SHA-256 vectors over the encoder output,
+  one per level 1-9, hold that surface in `crates/ostrya/src/write.rs`.
 - `ed25519-dalek` -- the ed25519 sign engine.
 - `bsdiff` (BSD-2-Clause, no dependencies of its own) -- bspatch stream
   generation for static deltas. Its output is the interleaved

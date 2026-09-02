@@ -1857,3 +1857,155 @@ mod verity_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+mod deflate_tests {
+    use std::collections::BTreeSet;
+
+    use super::{Checksum, DEFLATE_CHUNK, DeflateSink, archive_level, close, flush, write_all};
+    use ostrya_rt::block_on;
+    use sha2::{Digest, Sha256};
+
+    /// The SHA-256 of the encoder output over [`golden_payload`], one entry
+    /// per `[archive] zlib-level`: index 0 holds level 1, index 8 holds level
+    /// 9. The nine entries differ, because `miniz_oxide` gives each level its
+    /// own match-search depth and its own choice of greedy or lazy parsing.
+    ///
+    /// A mismatch states that the encoder output changed, which changes the
+    /// bytes stored in every archive-mode content object at that level. Find
+    /// the cause -- a `miniz_oxide` release, or an edit to [`DeflateSink`].
+    /// Then check the stored bytes against the tool's own with
+    /// `archive_objects_are_byte_identical_to_the_fixture` in
+    /// `crates/ostrya/tests/write.rs` before you record a constant here
+    /// again.
+    const GOLDEN: [&str; 9] = [
+        "a1fd96479b110a51c3b9c333da0ff6879cd295fc27a98b48c88b70a0ea558bb4",
+        "7964fd5c5e4ffb18bf953852b31704681eaf7a4590d488a01be5f213978c0876",
+        "e5ff230c2f7715f8883cbd5c19ee1255f165c7e25fc886516c290b0d246954a0",
+        "7ae743a6aa5027a1ef08604f6c0a4e6062d39f73879dd0789780aca2e8027932",
+        "95b7d927a18b71b941598bf6411029653910307881528355a5b18cccfd3dea0a",
+        "b9b31232e8e4458ff831e1de64ba695c0c07b630215e2ce01d372fa2fd8bbcc3",
+        "8436585ce3c3eea757ab9d5020de4b41c3f32ac29fdd8b5c02ec8ec51df9067d",
+        "c1bc0d4abcb002a3e15241b86c7f200ddc4c71ff30752a7ce933755433ceb88c",
+        "b6ddd39fc7e629dfcc81b42ba9706eb6e4e46cd4f90527d3e1ccda0d072faca7",
+    ];
+
+    /// The SHA-256 of the encoder output over [`golden_payload`] at the
+    /// default level 6 when the caller flushes once, at the halfway point of
+    /// the payload. [`super::ContentWriter`] passes a flush on to the encoder,
+    /// which ends the DEFLATE block with a sync flush, so a caller that
+    /// flushes stores different bytes for the same content. The identity of the object is over
+    /// the uncompressed bytes, so both forms carry the same checksum and the
+    /// tool reads both. The ingest paths
+    /// [`write_content`](super::Transaction::write_content) and
+    /// [`write_regfile_inline`](super::Transaction::write_regfile_inline)
+    /// write straight through and reach [`GOLDEN`] instead.
+    const GOLDEN_FLUSHED: &str = "009e2fd466deb6af8f1828281fccd0a7be5fef1356215f1eaa10708a86caa4b3";
+
+    /// One xorshift32 step.
+    fn xorshift(state: &mut u32) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        *state
+    }
+
+    /// A payload of one and a half [`DEFLATE_CHUNK`] in three half-chunk
+    /// blocks: one block over a four-symbol alphabet, whose long match chains
+    /// let the search depth of a level change the output, then two blocks of
+    /// an xorshift32 stream the encoder cannot compress. The output holds
+    /// literal and match coding, spans more than one [`DEFLATE_CHUNK`], and
+    /// takes nine distinct forms over the nine levels.
+    fn golden_payload() -> Vec<u8> {
+        const BLOCK: usize = DEFLATE_CHUNK / 2;
+        let mut out = Vec::with_capacity(3 * BLOCK);
+        let mut state: u32 = 0x1234_5678;
+        // Two bits per byte, sixteen bytes per step, over `A` to `D`.
+        for _ in 0..BLOCK / 16 {
+            let word = xorshift(&mut state);
+            for k in 0..16 {
+                out.push(b'A' + ((word >> (2 * k)) & 3) as u8);
+            }
+        }
+        for _ in 0..2 * BLOCK {
+            out.push((xorshift(&mut state) >> 24) as u8);
+        }
+        out
+    }
+
+    /// The encoder output over `data` at the level an `[archive] zlib-level`
+    /// value of `zlib_level` selects, driven in `chunk`-byte writes and ended
+    /// the way [`super::ContentWriter::finish`] ends it.
+    fn encode(data: &[u8], zlib_level: i64, chunk: usize) -> Vec<u8> {
+        block_on(async {
+            let mut sink = DeflateSink::new(Vec::new(), archive_level(zlib_level));
+            for part in data.chunks(chunk) {
+                write_all(&mut sink, part).await.unwrap();
+            }
+            close(&mut sink).await.unwrap();
+            sink.into_inner()
+        })
+    }
+
+    /// The encoder output over `data` at the default level when the caller
+    /// flushes once, at the halfway point of the payload.
+    fn encode_with_a_flush(data: &[u8]) -> Vec<u8> {
+        block_on(async {
+            let mut sink = DeflateSink::new(Vec::new(), archive_level(6));
+            let (head, tail) = data.split_at(data.len() / 2);
+            write_all(&mut sink, head).await.unwrap();
+            flush(&mut sink).await.unwrap();
+            write_all(&mut sink, tail).await.unwrap();
+            close(&mut sink).await.unwrap();
+            sink.into_inner()
+        })
+    }
+
+    fn hash(bytes: &[u8]) -> String {
+        Checksum::from_bytes(Sha256::digest(bytes).into()).to_hex()
+    }
+
+    #[test]
+    fn deflate_output_matches_the_golden_hashes() {
+        let data = golden_payload();
+        assert!(
+            data.len() > DEFLATE_CHUNK,
+            "the payload spans more than one chunk"
+        );
+        assert_eq!(
+            GOLDEN.iter().collect::<BTreeSet<_>>().len(),
+            GOLDEN.len(),
+            "each level reaches its own bytes"
+        );
+        for (i, &want) in GOLDEN.iter().enumerate() {
+            let level = i as i64 + 1;
+            let out = encode(&data, level, 1);
+            assert!(
+                out.len() > DEFLATE_CHUNK,
+                "level {level}: output spans more than one chunk"
+            );
+            // The write sizes the ingest path gives the encoder do not change
+            // its output: one byte at a time, an odd size that divides neither
+            // the payload nor the chunk, and the whole payload in one write
+            // all agree.
+            for chunk in [4093, data.len()] {
+                assert_eq!(
+                    encode(&data, level, chunk),
+                    out,
+                    "level {level}, {chunk}-byte writes"
+                );
+            }
+            assert_eq!(hash(&out), want, "DEFLATE level {level} output hash");
+        }
+
+        let flushed = hash(&encode_with_a_flush(&data));
+        assert_eq!(
+            flushed, GOLDEN_FLUSHED,
+            "DEFLATE level 6 output hash after a flush"
+        );
+        assert_ne!(
+            flushed, GOLDEN[5],
+            "a flush ends the DEFLATE block, so it reaches the output"
+        );
+    }
+}

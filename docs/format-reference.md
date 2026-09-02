@@ -1113,6 +1113,19 @@ Archive `.filez` layout (extends "File content object header"):
   cli-surface.md`, "P2"). The object identity is over the uncompressed bytes, so
   byte-identity of the stored compressed payload is not required for
   interoperability.
+- Golden SHA-256 vectors pin the bytes the port's encoder emits, one vector per
+  level 1-9, over a payload of one and a half output chunks
+  (`crates/ostrya/src/write.rs`, `deflate_tests`). The nine vectors differ, so a
+  change to the map from `[archive] zlib-level` to the encoder's parameters
+  fails the gate. A tenth vector holds the stream a caller who flushes in the
+  middle of a payload writes: a flush ends the DEFLATE block, which changes the
+  stored bytes and leaves the object checksum the same.
+- Observed at level 1 on a 160 KiB payload: one write of the whole payload
+  produces different bytes than 64 KiB writes of the same payload. The ingest
+  path streams through a 64 KiB copy buffer, so the stored bytes follow the
+  level alone for a payload that arrives that way. A caller that gives
+  `write_regfile_inline` one buffer larger than that can store the second
+  form.
 
 Object store fanout directories `objects/<xx>/` are created with request mode
 0777 (reduced by the umask); `objects/` itself is 0775. This is the same in

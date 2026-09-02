@@ -779,8 +779,16 @@ fn merge_keyring(
 /// What the certificates for one key state about it.
 #[derive(Clone, Copy)]
 struct KeyState {
-    /// Whether a key revocation signature that verifies under the key stands
-    /// over it.
+    /// Whether a key revocation signature the key itself made stands over it.
+    ///
+    /// A revocation is read through the verify engine, so the import reads the
+    /// signature the verdict reads. The engine resolves a designated revoker
+    /// among the certificates it is given, and the import gives it the
+    /// certificates it is deciding over: the copies the keyring holds for one
+    /// key, and an offered certificate on its own. Each set states one key, so
+    /// the revoker of another key stands out of reach here. An offered
+    /// certificate carrying a revocation a designated revoker made therefore
+    /// states no revocation, and the keyring keeps the bytes it held.
     revoked: bool,
     /// The instant the key expires at, absent where they state no expiry. The
     /// instant is read through the verify engine, so the import and the verdict
@@ -798,9 +806,13 @@ impl KeyState {
     /// carries, and the key expiry the newest self-signature of the union
     /// states. This is the reach the verify path gives a keyring that holds one
     /// key through several certificates.
+    ///
+    /// The copies are the set a designated revoker is resolved among, which is
+    /// the reach [`KeyState::revoked`] states. [`KeyState::of`] gives one
+    /// offered certificate as that whole set.
     fn over(copies: &[SignedPublicKey]) -> KeyState {
         KeyState {
-            revoked: copies.iter().any(verify::key_revoked),
+            revoked: copies.iter().any(|cert| verify::key_revoked(cert, copies)),
             expires: verify::key_expiry_over(copies),
         }
     }
@@ -2037,7 +2049,7 @@ IHdvcmxk\n\
         assert_eq!(home.fingerprints_of(&keyring), [home.fingerprint()]);
         let certs = GpgVerifier::from_keyring_bytes([&keyring]).unwrap().certs;
         assert_eq!(certs.len(), 1);
-        assert!(verify::key_revoked(&certs[0]));
+        assert!(verify::key_revoked(&certs[0], &certs));
 
         // The Trust packets stay the whole difference against the keyring
         // GnuPG writes for the same two imports.
@@ -2084,7 +2096,7 @@ IHdvcmxk\n\
         let certs = GpgVerifier::from_keyring_bytes([&offered]).unwrap().certs;
         assert_eq!(certs.len(), 1);
         assert_eq!(certs[0].details.revocation_signatures.len(), 1);
-        assert!(!verify::key_revoked(&certs[0]));
+        assert!(!verify::key_revoked(&certs[0], &certs));
 
         let (imported, keyring) = merge_keyring(&existing, &offered, &[], SUBJECT).unwrap();
         assert_eq!(imported, 0);

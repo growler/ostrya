@@ -1506,7 +1506,14 @@ Definition:
   import and the verdict answer off the same signature: a key revocation
   signature another key made and anyone stapled onto an offered certificate
   strikes nothing out, and the expiry each certificate states comes from the
-  tiered self-signature rule. A held certificate that revokes its key takes no
+  tiered self-signature rule. The import resolves a designated revoker among
+  the certificates it decides over: the copies the keyring holds for one key,
+  and an offered certificate on its own. Each set states one key, so a
+  revocation a designated revoker made stays out of the import's reach. A
+  remote's keyring that holds the signing key and the revoker therefore keeps
+  trusting the signing key when a re-export carrying that revocation is
+  offered: the import writes nothing and reports a count of zero. A held
+  certificate that revokes its key takes no
   expiry replacement, since the replacement writes the offered packets where the
   held run stood and an offered certificate carrying no revocation would leave
   the keyring stating none. The expiry rule holds in one direction: a shortened
@@ -1526,12 +1533,12 @@ Definition:
   Trust packets the keyring carried, which leaves it in the form the import
   writes for a certificate it adds and which `gpg` and the `ostree` tool both
   read. Nothing else about a held certificate changes: a new user id, a new
-  subkey, and a subkey revocation reach the keyring through
-  `Repo::remove_remote_keyring` and a fresh import. A bare revocation
-  certificate, the single signature packet `gpg --gen-revoke` writes, carries
-  no public-key packet, so it holds no certificate and the import refuses it by
-  the name of the source, as the `ostree` tool refuses it too
-  (`cli-surface.md`, "P3").
+  subkey, a subkey revocation, and a key revocation a designated revoker made
+  reach the keyring through `Repo::remove_remote_keyring` and a fresh import.
+  A bare revocation certificate, the single signature packet
+  `gpg --gen-revoke` writes, carries no public-key packet, so it holds no
+  certificate and the import refuses it by the name of the source, as the
+  `ostree` tool refuses it too (`cli-surface.md`, "P3").
 - The port owns the trust and validity policy. A signature is valid where it
   verifies, where the certificate holding the signing key is loaded, where the
   signature is over a document, where the subkey bindings hold, where the
@@ -1541,6 +1548,41 @@ Definition:
   from the certificate and the signature packet. Each rule reproduces `gpgv`
   2.4.9 as observed in an isolated `GNUPGHOME` on fixtures the unit tests
   build.
+- A key revocation signature over the primary key revokes the whole
+  certificate, so every key it binds stops speaking for the trusted set, the
+  signing subkey included. Two keys may make one: the certificate's own primary
+  key, and a key that a verified self-signature of the certificate designates
+  as a revoker through signature subpacket 12, where the loaded trusted set
+  holds that revoker's certificate. The designation is read from the
+  self-signatures that verify under the primary key, which are the direct-key
+  signatures and the certifications over a user id. It is read from the hashed
+  subpacket area of those signatures alone, so a subpacket 12 that stands
+  outside the bytes the self-signature covers names no revoker, and so does a
+  subpacket 12 on a signature that does not verify. Both designation classes
+  count, the default one and the sensitive one. A subkey revocation signature
+  the primary key made over the signing subkey revokes that subkey alone and
+  leaves the primary key and the certificate's other subkeys as they stand.
+  Every revocation is verified before it is honored, so a key revocation
+  signature another key made that no self-signature designates, and that anyone
+  can staple onto a certificate, revokes nothing. The rule reproduces `gpgv`
+  2.4.9, measured over keyrings that hold one signing key, one revoker, and the
+  class 0x20 revocation the revoker made:
+  - the designation present and the revoker's certificate absent: `GOODSIG`,
+    with no `KEY_CONSIDERED` line for the revoker;
+  - the designation present and the revoker's certificate loaded: `REVKEYSIG`;
+  - the byte-identical revocation over a certificate that carries no
+    subpacket 12: `GOODSIG`, with the revoker's certificate loaded and with it
+    absent;
+  - the second state with the last byte of the designating self-signature
+    flipped: `GOODSIG`, with no `KEY_CONSIDERED` line for the revoker;
+  - the third state with the designation stapled into the unhashed subpacket
+    area of a self-signature that still verifies, and the revoker's certificate
+    loaded: `GOODSIG`.
+
+  `gpg --desig-revoke` writes the revocation a designated revoker makes, which
+  is a key revocation over the primary key. The measured states therefore cover
+  the primary key, and they state nothing about a designated revoker of a
+  subkey. The subkey rule stays at the primary key's own signature.
 - The key state is read over every certificate that answers for a signature's
   issuer. A key reaches the trusted set through several certificates on
   ordinary paths: a repository's `<remote>.trustedkeys.gpg` beside the global

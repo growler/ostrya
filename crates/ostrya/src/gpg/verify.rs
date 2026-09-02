@@ -50,7 +50,7 @@ use std::io::Cursor;
 use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey, SignedPublicSubKey};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::public_key::PublicKeyAlgorithm;
-use pgp::packet::{PublicKey, Signature, SignatureType};
+use pgp::packet::{PublicKey, Signature, SignatureType, SubpacketData};
 use pgp::types::{Fingerprint, KeyDetails, SignedUser, Tag, Timestamp};
 
 use crate::error::{Error, Result};
@@ -329,9 +329,10 @@ impl Issuer<'_> {
     /// Whether this certificate revokes the signing key. Two revocation sites
     /// answer, each with its own reach:
     ///
-    /// - a key revocation signature the primary key made over itself revokes
-    ///   the whole certificate, so every key it binds stops speaking for it,
-    ///   the signing subkey included;
+    /// - a key revocation signature over the primary key revokes the whole
+    ///   certificate, so every key it binds stops speaking for it, the signing
+    ///   subkey included. [`key_revoked`] states which keys may make one, and
+    ///   `trusted` is the set a designated revoker is resolved among;
     /// - a subkey revocation signature the primary key made over the signing
     ///   subkey revokes that subkey alone, and leaves the primary key and the
     ///   certificate's other subkeys as they stand.
@@ -339,12 +340,19 @@ impl Issuer<'_> {
     /// A certificate that answers for the issuer through a subkey is read at
     /// both sites, and one that answers through its primary key at the first.
     ///
+    /// The second site admits the primary key's own signature alone. `gpg`
+    /// 2.4.9 writes a designated revoker's revocation with `--desig-revoke`,
+    /// which produces a key revocation over the primary key, so the observed
+    /// states cover the first site and state nothing about a designated
+    /// revoker at the second.
+    ///
     /// A revocation is verified before it is honored. A key revocation
-    /// signature another key made and anyone can staple onto a certificate
-    /// revokes nothing, which is what `gpgv` answers: over a certificate
-    /// carrying such a packet it still reports `GOODSIG`.
-    fn revoked(&self) -> bool {
-        if key_revoked(self.cert) {
+    /// signature another key made that no self-signature designates, and that
+    /// anyone can staple onto a certificate, revokes nothing, which is what
+    /// `gpgv` answers: over a certificate carrying such a packet it still
+    /// reports `GOODSIG`.
+    fn revoked(&self, trusted: &[SignedPublicKey]) -> bool {
+        if key_revoked(self.cert, trusted) {
             return true;
         }
         let primary = &self.cert.primary_key;
@@ -373,6 +381,11 @@ impl Issuer<'_> {
 /// revocation nor the expiry.
 struct Issuers<'a> {
     matched: Vec<Issuer<'a>>,
+    /// Every loaded certificate, which is the set a designated revoker is
+    /// resolved among (see [`key_revoked`]). A revoker speaks for a
+    /// certificate it stands outside of, so the whole trusted set answers
+    /// here.
+    trusted: &'a [SignedPublicKey],
 }
 
 impl<'a> Issuers<'a> {
@@ -396,7 +409,9 @@ impl<'a> Issuers<'a> {
     /// revocation is permanent, so it is read over every copy on its own and
     /// no copy stands in for another.
     fn revoked(&self) -> bool {
-        self.matched.iter().any(Issuer::revoked)
+        self.matched
+            .iter()
+            .any(|issuer| issuer.revoked(self.trusted))
     }
 
     /// The earliest instant any group states the signing key expires at. A
@@ -546,7 +561,10 @@ fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<
             }
         }
         if !matched.is_empty() {
-            return Some(Issuers { matched });
+            return Some(Issuers {
+                matched,
+                trusted: certs,
+            });
         }
     }
     for wanted in sig.issuer_key_id() {
@@ -568,7 +586,10 @@ fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<
             }
         }
         if !matched.is_empty() {
-            return Some(Issuers { matched });
+            return Some(Issuers {
+                matched,
+                trusted: certs,
+            });
         }
     }
     None
@@ -697,18 +718,127 @@ fn key_lifetime(sig: &Signature) -> Option<u64> {
     epoch(sig.key_expiration_time()?.as_secs())
 }
 
-/// Whether a key revocation signature the certificate's own primary key made
-/// stands over that key, which revokes the whole certificate.
+/// Whether a verified key revocation signature stands over `cert`'s primary
+/// key, which revokes the whole certificate. Two keys may make one:
 ///
-/// The revocation is verified before it is honored. A key revocation signature
-/// another key made, and that anyone can staple onto a certificate, revokes
-/// nothing, which is what `gpgv` answers: over a certificate carrying such a
-/// packet it still reports `GOODSIG`. The keyring import applies the same rule
-/// to a certificate offered for a key the keyring already holds.
-pub(super) fn key_revoked(cert: &SignedPublicKey) -> bool {
+/// - the certificate's own primary key;
+/// - a key that a verified self-signature of the certificate designates as a
+///   revoker through signature subpacket 12, where `trusted` holds that
+///   revoker's certificate.
+///
+/// The revoker's certificate must be reachable, which is what `gpgv` 2.4.9
+/// answers. Measured over two keyrings holding the same bytes for the revoked
+/// key, one of them holding the revoker's certificate as well: the keyring
+/// without it reports `GOODSIG` and prints no `KEY_CONSIDERED` line for the
+/// revoker, and the keyring with it reports `REVKEYSIG`. So `trusted` is the
+/// whole loaded set, and the designation is matched against the primary key of
+/// each certificate it holds.
+///
+/// The designation is what admits the revocation. Over a keyring holding the
+/// byte-identical revocation and a primary key that carries no subpacket 12,
+/// `gpgv` reports `GOODSIG`, and it reports `GOODSIG` again where the
+/// revoker's certificate stands in that keyring too. A key revocation
+/// signature another key made that no self-signature designates, and that
+/// anyone can staple onto a certificate, therefore revokes nothing.
+///
+/// Every revocation is verified before it is honored: the certificate's own
+/// primary key verifies one through [`Signature::verify_key`], and a
+/// designated revoker verifies one over the revoked primary key through
+/// [`Signature::verify_key_third_party`].
+///
+/// The keyring import reads a certificate offered for a key the keyring
+/// already holds through this function. It passes the certificates it decides
+/// over as `trusted`, and each of those sets states one key, so a designated
+/// revoker of another key stands out of the import's reach.
+pub(super) fn key_revoked<'a, I>(cert: &SignedPublicKey, trusted: I) -> bool
+where
+    I: IntoIterator<Item = &'a SignedPublicKey>,
+{
     let primary = &cert.primary_key;
-    cert.details.revocation_signatures.iter().any(|sig| {
-        sig.typ() == Some(SignatureType::KeyRevocation) && sig.verify_key(primary).is_ok()
+    let revocations: Vec<&Signature> = cert
+        .details
+        .revocation_signatures
+        .iter()
+        .filter(|sig| sig.typ() == Some(SignatureType::KeyRevocation))
+        .collect();
+    if revocations.is_empty() {
+        return false;
+    }
+    if revocations
+        .iter()
+        .any(|sig| sig.verify_key(primary).is_ok())
+    {
+        return true;
+    }
+    let designated = designated_revokers(cert);
+    if designated.is_empty() {
+        return false;
+    }
+    trusted.into_iter().any(|revoker| {
+        let fingerprint = revoker.fingerprint();
+        designated
+            .iter()
+            .any(|named| *named == fingerprint.as_bytes())
+            && revocations.iter().any(|sig| {
+                sig.verify_key_third_party(primary, &revoker.primary_key)
+                    .is_ok()
+            })
+    })
+}
+
+/// The keys a certificate designates as revokers, each as the fingerprint
+/// bytes the designation names.
+///
+/// A designation rides on a self-signature, and only a self-signature that
+/// verifies under the primary key designates: the direct-key signatures and
+/// the certifications over a user id are read, each through the same check
+/// [`primary_key_lifetime`] applies before it reads a lifetime. A designation
+/// on a signature that does not verify designates nothing. [`revocation_keys`]
+/// reads the hashed subpacket area alone, so a subpacket 12 anyone can staple
+/// onto a certificate names no revoker either way.
+///
+/// Both designation classes are read, the default one and the sensitive one.
+/// The class states whether the designation is to be published.
+fn designated_revokers(cert: &SignedPublicKey) -> Vec<&[u8]> {
+    let primary = &cert.primary_key;
+    let direct = cert
+        .details
+        .direct_signatures
+        .iter()
+        .filter(|sig| sig.typ() == Some(SignatureType::Key) && sig.verify_key(primary).is_ok());
+    let certifications = cert
+        .details
+        .users
+        .iter()
+        .flat_map(|user| user.signatures.iter().map(move |sig| (user, sig)))
+        .filter(|(user, sig)| {
+            is_certification(sig)
+                && sig
+                    .verify_certification(primary, Tag::UserId, &user.id)
+                    .is_ok()
+        })
+        .map(|(_, sig)| sig);
+    direct
+        .chain(certifications)
+        .flat_map(revocation_keys)
+        .collect()
+}
+
+/// The fingerprints the revocation-key subpackets of one signature name.
+///
+/// The hashed area alone is read, so a subpacket the signature does not cover
+/// names no revoker. `gpgv` 2.4.9 answers the same way: over a keyring holding
+/// the revocation, the revoker's certificate, and a subpacket 12 stapled into
+/// the unhashed area of a self-signature that still verifies, it reports
+/// `GOODSIG`. A signature may carry several of them, and each one names a key.
+fn revocation_keys(sig: &Signature) -> impl Iterator<Item = &[u8]> {
+    sig.config().into_iter().flat_map(|config| {
+        config
+            .hashed_subpackets()
+            .filter_map(|packet| match &packet.data {
+                SubpacketData::RevocationKey(key) => Some(&key.fingerprint[..]),
+                _ => None,
+            })
     })
 }
 
@@ -950,18 +1080,25 @@ mod tests {
             Fixture::build(uid, "ed25519", true, expiry)
         }
 
-        fn build(uid: &str, algorithm: &str, faked: bool, expiry: &str) -> Fixture {
+        /// A new home directory holding no key, for building a keyring out of
+        /// the certificates other homes export.
+        fn bare() -> Fixture {
             use std::os::unix::fs::DirBuilderExt;
             let dir = scratch_dir();
             let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
             builder.create(&dir).unwrap();
             builder.create(dir.join("gv")).unwrap();
-            let mut fixture = Fixture {
+            Fixture {
                 dir,
                 primary: String::new(),
-                faked,
-            };
+                faked: false,
+            }
+        }
+
+        fn build(uid: &str, algorithm: &str, faked: bool, expiry: &str) -> Fixture {
+            let mut fixture = Fixture::bare();
+            fixture.faked = faked;
             for _ in 0..16 {
                 let status = fixture
                     .gpg()
@@ -1018,6 +1155,87 @@ mod tests {
                 cmd.args(["--faked-system-time", "20250101T000000!"]);
             }
             cmd
+        }
+
+        /// A `gpg` command bound to this home directory that reads the answers
+        /// to an interactive command's prompts from standard input. Batch mode
+        /// answers no prompt, so the commands that ask one run through this.
+        fn gpg_interactive(&self) -> Command {
+            let mut cmd = Command::new("gpg");
+            cmd.arg("--homedir").arg(&self.dir).args([
+                "--no-tty",
+                "--no-batch",
+                "--command-fd",
+                "0",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+            ]);
+            if self.faked {
+                cmd.args(["--faked-system-time", "20250101T000000!"]);
+            }
+            cmd
+        }
+
+        /// Import a certificate stream into this home.
+        fn import(&self, bytes: &[u8]) {
+            let path = self.write("import.gpg", bytes);
+            let status = self.gpg().arg("--import").arg(path).status().unwrap();
+            assert!(status.success(), "gpg --import failed");
+        }
+
+        /// Import a stream `gpg` merges while it reports a failure.
+        ///
+        /// `gpg --import` exits 2 over a designated revoker's revocation, with
+        /// "no public key - can't apply revocation certificate", and it exits 2
+        /// whether or not the home holds the revoker's certificate. It merges
+        /// the class 0x20 signature into the certificate it holds either way:
+        /// the export of the home carries the packet, and the case that reads
+        /// the export states that the packet is there.
+        fn import_merging(&self, bytes: &[u8]) {
+            let path = self.write("import.gpg", bytes);
+            self.gpg().arg("--import").arg(path).status().unwrap();
+        }
+
+        /// The exported binary certificates of the keys `keys` names, in the
+        /// order they are named.
+        fn export_keys(&self, keys: &[&str]) -> Vec<u8> {
+            let out = self.gpg().arg("--export").args(keys).output().unwrap();
+            assert!(out.status.success() && !out.stdout.is_empty());
+            out.stdout
+        }
+
+        /// Designate the key `revoker` names as a revoker of this home's
+        /// primary key. `gpg` writes a fresh direct-key self-signature
+        /// carrying signature subpacket 12, so this home must already hold the
+        /// revoker's certificate.
+        fn add_revoker(&self, revoker: &str) {
+            let mut cmd = self.gpg_interactive();
+            cmd.arg("--edit-key").arg(&self.primary);
+            answer(
+                cmd,
+                format!("addrevoker\n{revoker}\ny\ny\nsave\n").as_bytes(),
+                "gpg --edit-key addrevoker",
+            );
+        }
+
+        /// The key revocation a designated revoker makes over the key `key`
+        /// names, as the binary packet stream `gpg --desig-revoke` writes: a
+        /// transferable public key of the revoked key carrying the class 0x20
+        /// signature right after the primary key packet. This home must hold
+        /// the revoker's secret key and a certificate of the revoked key that
+        /// designates the revoker.
+        fn desig_revoke(&self, key: &str) -> Vec<u8> {
+            let path = self.dir.join("desig-revoke.asc");
+            let mut cmd = self.gpg_interactive();
+            cmd.arg("--armor")
+                .arg("--output")
+                .arg(&path)
+                .arg("--desig-revoke")
+                .arg(key);
+            answer(cmd, b"y\n0\n\ny\n", "gpg --desig-revoke");
+            crate::gpg::dearmor(&std::fs::read(&path).unwrap()).unwrap()
         }
 
         /// The exported secret key, which `gpg` writes unprotected because the
@@ -1231,6 +1449,23 @@ mod tests {
                 .status();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// Run `cmd`, writing `answers` to its standard input, and assert that it
+    /// reported success. `what` names the command in the assertion message.
+    fn answer(mut cmd: Command, answers: &[u8], what: &str) {
+        use std::io::Write;
+
+        let out = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().unwrap().write_all(answers)?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(out.status.success(), "{what} failed");
     }
 
     /// The environment variable that turns the absent-GnuPG skip into a
@@ -1743,6 +1978,61 @@ mod tests {
         assert_eq!(inserted.len(), 1);
         packets.insert(1, inserted.remove(0));
         join_packets(&packets)
+    }
+
+    /// Staple a revocation-key subpacket naming the key `revoker` names, as
+    /// uppercase hex, into the unhashed area of the one certification
+    /// self-signature a certificate carries.
+    ///
+    /// The unhashed area stands outside the bytes the signature covers, so the
+    /// self-signature still verifies over what it covered before. This is the
+    /// shape anyone who holds no key of the certificate can build: the
+    /// designation is stapled on and the certificate still parses and
+    /// verifies.
+    fn staple_revocation_key(cert: &[u8], revoker: &str) -> Vec<u8> {
+        let fingerprint: Vec<u8> = (0..revoker.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&revoker[i..i + 2], 16).unwrap())
+            .collect();
+        assert_eq!(fingerprint.len(), 20, "a version 4 key fingerprint");
+        // Signature subpacket 12 carries a class octet and a public-key
+        // algorithm octet ahead of the fingerprint. Class 0x80 and algorithm
+        // 22 are what `gpg` writes for an ed25519 revoker.
+        let mut body = vec![12, 0x80, 22];
+        body.extend_from_slice(&fingerprint);
+        let mut subpacket = vec![u8::try_from(body.len()).unwrap()];
+        subpacket.extend_from_slice(&body);
+
+        let mut packets = split_packets(cert);
+        let mut stapled = 0;
+        for (tag, body) in &mut packets {
+            if *tag != 2 || body[0] != 4 || body[1] != 0x13 {
+                continue;
+            }
+            let hashed = usize::from(u16::from_be_bytes([body[4], body[5]]));
+            let start = 6 + hashed;
+            let len = usize::from(u16::from_be_bytes([body[start], body[start + 1]]));
+            let mut new = body[..start].to_vec();
+            new.extend_from_slice(&(u16::try_from(len + subpacket.len()).unwrap()).to_be_bytes());
+            new.extend_from_slice(&body[start + 2..start + 2 + len]);
+            new.extend_from_slice(&subpacket);
+            new.extend_from_slice(&body[start + 2 + len..]);
+            *body = new;
+            stapled += 1;
+        }
+        assert_eq!(stapled, 1, "one designation was stapled");
+        join_packets(&packets)
+    }
+
+    /// The key revocation signature packet a certificate carries, as a stream
+    /// of one packet.
+    fn key_revocation_packet(cert: &[u8]) -> Vec<u8> {
+        let packets = split_packets(cert);
+        let found = packets
+            .iter()
+            .find(|(tag, body)| *tag == 2 && body[0] == 4 && body[1] == 0x20)
+            .expect("a key revocation signature packet");
+        join_packets(std::slice::from_ref(found))
     }
 
     /// Attach the first subkey of `donor`, with the binding signature it
@@ -2356,6 +2646,262 @@ mod tests {
         .unwrap();
         assert!(outcome.signatures[0].revoked);
         assert!(!outcome.valid);
+    }
+
+    /// The signature and the keyrings the designated-revoker cases stand on.
+    ///
+    /// Two keys are generated: the signing key, which makes the data
+    /// signature, and the revoker, which the signing key designates through
+    /// signature subpacket 12. `gpg --desig-revoke` writes the class 0x20
+    /// revocation the revoker makes over the signing key, and the four
+    /// keyrings below hold the states the cases read.
+    struct Designated {
+        /// The signing key's home. Its key made [`Designated::blob`] and its
+        /// `gv` directory is the `--homedir` of every `gpgv` run.
+        home: Fixture,
+        /// The revoker's primary key fingerprint, uppercase hex.
+        revoker: String,
+        /// The revoker's exported certificate.
+        revoker_cert: Vec<u8>,
+        /// The detached signature the signing key made over [`PAYLOAD`].
+        blob: Vec<u8>,
+        /// The signing key carrying the designation, with the revocation the
+        /// designated revoker made.
+        designated: Vec<u8>,
+        /// The same, with the revoker's certificate beside it.
+        designated_with_revoker: Vec<u8>,
+        /// The signing key carrying the same revocation and no designation.
+        undesignated: Vec<u8>,
+        /// The same, with the revoker's certificate beside it.
+        undesignated_with_revoker: Vec<u8>,
+    }
+
+    impl Designated {
+        fn build() -> Designated {
+            let home = Fixture::new("Signing K <k@ostrya.example>");
+            let revoker = Fixture::new("Revoker R <r@ostrya.example>");
+            let blob = home.sign(&home.primary, PAYLOAD);
+            let plain = home.export_keys(&[&home.primary]);
+            let revoker_cert = revoker.export_keys(&[&revoker.primary]);
+            // The designation names the revoker by fingerprint, so the signing
+            // key's home holds the revoker's certificate while it writes the
+            // self-signature that carries the designation.
+            home.import(&revoker_cert);
+            home.add_revoker(&revoker.primary);
+            let designating = home.export_keys(&[&home.primary]);
+            // The revocation is made in a home holding the revoker's secret
+            // key and the certificate that designates it.
+            revoker.import(&designating);
+            let revocation = revoker.desig_revoke(&home.primary);
+
+            // Each keyring is built the way the states were measured: a home
+            // imports the certificates the state names and exports them.
+            let with_designation = Fixture::bare();
+            with_designation.import(&designating);
+            with_designation.import_merging(&revocation);
+            let designated = with_designation.export_keys(&[&home.primary]);
+            let and_revoker = Fixture::bare();
+            and_revoker.import(&designating);
+            and_revoker.import_merging(&revocation);
+            and_revoker.import(&revoker_cert);
+            let designated_with_revoker =
+                and_revoker.export_keys(&[&home.primary, &revoker.primary]);
+
+            // An import of the revocation merges the self-signature that
+            // carries the designation along with it, so the state holding the
+            // revocation and no designation is spliced: the revocation packet
+            // stands after the primary key packet of a certificate that
+            // carries no subpacket 12.
+            let undesignated = insert_after_primary(&plain, &key_revocation_packet(&designated));
+            let undesignated_with_revoker = [&undesignated[..], &revoker_cert[..]].concat();
+            Designated {
+                home,
+                revoker: revoker.primary.clone(),
+                revoker_cert,
+                blob,
+                designated,
+                designated_with_revoker,
+                undesignated,
+                undesignated_with_revoker,
+            }
+        }
+
+        /// Assert that `keyring` holds `certs` certificates, that the first of
+        /// them carries one key revocation signature, and that it names
+        /// `designations` revokers. This states the shape each case reads, so
+        /// a case fails where its fixture is not the state it names.
+        fn assert_state(keyring: &[u8], certs: usize, designations: usize) -> Vec<SignedPublicKey> {
+            let parsed = certs_of(keyring);
+            assert_eq!(parsed.len(), certs, "the trusted set");
+            assert_eq!(
+                parsed[0].details.revocation_signatures.len(),
+                1,
+                "the key revocation signature reached the parsed certificate"
+            );
+            assert_eq!(
+                designated_revokers(&parsed[0]).len(),
+                designations,
+                "the designations the certificate carries"
+            );
+            parsed
+        }
+    }
+
+    /// A key revocation a designated revoker made is passed over where the
+    /// revoker's certificate is absent from the trusted set, so the signature
+    /// stands good. `gpgv` 2.4.9 answers the same way: over this keyring it
+    /// reports `GOODSIG`, and it prints no `KEY_CONSIDERED` line for the
+    /// revoker, so the revoker was not resolved.
+    #[test]
+    fn an_unloaded_designated_revoker_does_not_revoke() {
+        if !tools_available() {
+            return;
+        }
+        let state = Designated::build();
+        let certs = Designated::assert_state(&state.designated, 1, 1);
+        let outcome =
+            verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&state.blob)).unwrap();
+        let reference = state
+            .home
+            .gpgv_records(&state.designated, &state.blob, PAYLOAD);
+        assert_eq!(outcome.signatures.len(), 1);
+        assert_eq!(reference.len(), 1);
+        assert_agrees(&outcome.signatures[0], &reference[0]);
+        assert!(!outcome.signatures[0].revoked);
+        assert!(outcome.signatures[0].valid);
+        assert!(outcome.valid);
+    }
+
+    /// A key revocation a designated revoker made revokes the key where the
+    /// revoker's certificate is loaded, so the signature is refused. `gpgv`
+    /// 2.4.9 reports `REVKEYSIG` over this keyring.
+    ///
+    /// The keyring holds the same bytes for the signing key as the keyring
+    /// the case above reads, so the revoker's certificate is the whole
+    /// difference between the two states.
+    #[test]
+    fn a_loaded_designated_revoker_revokes_the_key() {
+        if !tools_available() {
+            return;
+        }
+        let state = Designated::build();
+        assert_eq!(
+            &state.designated_with_revoker[..state.designated.len()],
+            &state.designated[..],
+            "the keyring holds the signing key as the unloaded state holds it"
+        );
+        let certs = Designated::assert_state(&state.designated_with_revoker, 2, 1);
+        assert_eq!(format!("{:X}", certs[1].fingerprint()), state.revoker);
+        let outcome =
+            verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&state.blob)).unwrap();
+        let reference =
+            state
+                .home
+                .gpgv_records(&state.designated_with_revoker, &state.blob, PAYLOAD);
+        assert_eq!(outcome.signatures.len(), 1);
+        assert_eq!(reference.len(), 1);
+        assert_agrees(&outcome.signatures[0], &reference[0]);
+        let info = &outcome.signatures[0];
+        assert!(info.revoked);
+        assert!(!info.valid);
+        assert!(!outcome.valid);
+        // The record still names the key and the user id, which is what the
+        // `REVKEYSIG` and `VALIDSIG` pair carries.
+        assert_eq!(
+            info.fingerprint.as_deref(),
+            Some(&*state.home.primary),
+            "the signing key"
+        );
+        assert_eq!(info.user_email.as_deref(), Some("k@ostrya.example"));
+    }
+
+    /// The designation is what admits the revocation. The byte-identical
+    /// revocation over a certificate that designates no revoker revokes
+    /// nothing, whether the revoker's certificate is loaded or not, so the
+    /// signature stands good. `gpgv` 2.4.9 reports `GOODSIG` over both
+    /// keyrings.
+    #[test]
+    fn an_undesignated_revocation_does_not_revoke() {
+        if !tools_available() {
+            return;
+        }
+        let state = Designated::build();
+        assert_eq!(
+            key_revocation_packet(&state.undesignated),
+            key_revocation_packet(&state.designated),
+            "the two states carry the same revocation packet"
+        );
+        for (label, keyring, certs) in [
+            ("the revoker absent", &state.undesignated, 1),
+            ("the revoker loaded", &state.undesignated_with_revoker, 2),
+        ] {
+            let certs = Designated::assert_state(keyring, certs, 0);
+            let outcome =
+                verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&state.blob)).unwrap();
+            let reference = state.home.gpgv_records(keyring, &state.blob, PAYLOAD);
+            assert_eq!(outcome.signatures.len(), 1, "{label}");
+            assert_eq!(reference.len(), 1, "{label}");
+            assert_agrees(&outcome.signatures[0], &reference[0]);
+            assert!(!outcome.signatures[0].revoked, "{label}");
+            assert!(outcome.signatures[0].valid, "{label}");
+            assert!(outcome.valid, "{label}");
+        }
+    }
+
+    /// A designation the self-signature does not cover names no revoker. The
+    /// unhashed subpacket area stands outside the bytes the signature covers,
+    /// so anyone can staple a subpacket 12 onto a certificate and leave the
+    /// self-signature verifying. The hashed area alone is read, so the
+    /// revocation the named key made revokes nothing and the signature stands
+    /// good. `gpgv` 2.4.9 answers the same way: over a keyring holding the
+    /// revocation, the revoker's certificate, and the designation stapled into
+    /// the unhashed area, it reports `GOODSIG`.
+    #[test]
+    fn a_stapled_designation_names_no_revoker() {
+        if !tools_available() {
+            return;
+        }
+        let state = Designated::build();
+        let stapled = staple_revocation_key(&state.undesignated, &state.revoker);
+        let keyring = [&stapled[..], &state.revoker_cert[..]].concat();
+        let certs = Designated::assert_state(&keyring, 2, 0);
+        assert_eq!(format!("{:X}", certs[1].fingerprint()), state.revoker);
+        let outcome =
+            verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&state.blob)).unwrap();
+        let reference = state.home.gpgv_records(&keyring, &state.blob, PAYLOAD);
+        assert_eq!(outcome.signatures.len(), 1);
+        assert_eq!(reference.len(), 1);
+        assert_agrees(&outcome.signatures[0], &reference[0]);
+        assert!(!outcome.signatures[0].revoked);
+        assert!(outcome.signatures[0].valid);
+        assert!(outcome.valid);
+    }
+
+    /// A designation on a self-signature that does not verify names no
+    /// revoker, so the revocation the designated revoker made revokes nothing
+    /// and the signature stands good. `gpgv` 2.4.9 answers the same way: over
+    /// the state that reports `REVKEYSIG`, with the last byte of the
+    /// designating self-signature flipped, it reports `GOODSIG` and prints no
+    /// `KEY_CONSIDERED` line for the revoker.
+    #[test]
+    fn an_unverified_designation_names_no_revoker() {
+        if !tools_available() {
+            return;
+        }
+        let state = Designated::build();
+        // `gpg` writes the designation into a direct-key self-signature, which
+        // is the one class 0x1f signature the state carries.
+        let keyring = alter_signature(&state.designated_with_revoker, 0x1f);
+        let certs = Designated::assert_state(&keyring, 2, 0);
+        let outcome =
+            verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&state.blob)).unwrap();
+        let reference = state.home.gpgv_records(&keyring, &state.blob, PAYLOAD);
+        assert_eq!(outcome.signatures.len(), 1);
+        assert_eq!(reference.len(), 1);
+        assert_agrees(&outcome.signatures[0], &reference[0]);
+        assert!(!outcome.signatures[0].revoked);
+        assert!(outcome.signatures[0].valid);
+        assert!(outcome.valid);
     }
 
     /// A key that reaches the trusted set through two certificates, one of

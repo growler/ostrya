@@ -41,7 +41,13 @@ bsdiff = "0.2.1"
 # The raw-DEFLATE encoder behind archive-mode content objects. Pinning the
 # compressor directly keeps the stored `.filez` bytes fixed for a given
 # `[archive] zlib-level`, independent of the feature set the build enables.
-miniz_oxide = "0.8"
+# The requirement is exact, since the encoder output is the bytes stored in
+# every archive-mode content object. The gate on that output is the golden
+# vectors in `src/write.rs` and
+# `archive_objects_are_byte_identical_to_the_fixture` in `tests/write.rs`. A
+# move to another version is a deliberate step, and it re-measures both
+# records.
+miniz_oxide = "=0.8.9"
 pin-project-lite = "0.2"
 futures-io = "0.3"
 futures-lite = "2"

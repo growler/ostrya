@@ -127,14 +127,17 @@ fn verify_blob(
             return Ok(infos);
         };
         for signature in signatures {
+            // The packets that were read whole keep their records, and the
+            // stream stops at the first one that was not. Each packet is read
+            // ahead of the cap test, so the cap refuses a blob on a packet the
+            // stream carried whole. A blob that holds the cap and ends in a
+            // partial packet reports the whole packets and stops there.
+            let Ok(signature) = signature else { break };
             if infos.len() == MAX_SIGNATURE_PACKETS {
                 return Err(Error::Signature(format!(
                     "{subject} holds more than {MAX_SIGNATURE_PACKETS} signature packets"
                 )));
             }
-            // The packets that were read whole keep their records, and the
-            // stream stops at the first one that was not.
-            let Ok(signature) = signature else { break };
             infos.push(describe(certs, payload, &signature));
         }
         Ok(infos)
@@ -1963,6 +1966,36 @@ mod tests {
         let allowed = one.repeat(MAX_SIGNATURE_PACKETS);
         let outcome = verify_signatures(&certs, PAYLOAD, &[allowed]).unwrap();
         assert_eq!(outcome.signatures.len(), MAX_SIGNATURE_PACKETS);
+    }
+
+    /// A blob that holds the cap in whole packets and ends in a partial packet
+    /// reports one record per whole packet. The stream stops at the partial
+    /// packet, and every blob ending in a partial packet gets that report. The
+    /// cap refuses a blob on a packet the stream carried whole, which
+    /// `too_many_signature_packets_is_refused` states.
+    ///
+    /// `gpgv` reads the same whole packets and states one record each. Over
+    /// this blob it reports one `GOODSIG` line per whole packet and exits 0,
+    /// so it passes over the partial packet with no diagnostic.
+    #[test]
+    fn a_partial_packet_after_the_cap_ends_the_stream() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::new("Cap <cap@ostrya.example>");
+        let keyring = home.keyring();
+        let one = home.sign(&home.primary, PAYLOAD);
+        let mut blob = one.repeat(MAX_SIGNATURE_PACKETS);
+        blob.extend_from_slice(&one[..one.len() / 2]);
+        assert!(blob.len() <= MAX_SIGNATURE_BLOB);
+        let outcome =
+            verify_signatures(&home.certs(), PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+        assert_eq!(outcome.signatures.len(), MAX_SIGNATURE_PACKETS);
+        assert!(outcome.valid);
+        assert_eq!(
+            home.gpgv_records(&keyring, &blob, PAYLOAD).len(),
+            MAX_SIGNATURE_PACKETS
+        );
     }
 
     /// Every stored blob contributes at least one record, so a run over

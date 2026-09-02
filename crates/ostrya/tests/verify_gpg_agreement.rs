@@ -38,6 +38,8 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::TmpDir;
 use ostrya::{CreateOptions, GpgVerifier, Repo, RepoMode, SignatureInfo, Verifier};
@@ -1389,19 +1391,41 @@ fn lists_a_trust_packet(home: &Home, keyring: &[u8]) -> bool {
 /// reaches the parser rather than the cryptography alone.
 const FLIP_PREFIX: usize = 64;
 
+/// The number of times the corpus case's panic hook was called. The hook is
+/// process-global, so the count holds a panic from any thread that panicked
+/// while the hook stood.
+static CORPUS_PANICS: AtomicUsize = AtomicUsize::new(0);
+
 /// A corpus of malformed input: keyrings and signature blobs derived from the
 /// good fixtures by truncation and by single-bit flipping.
 ///
-/// Two properties are asserted over every input.
+/// Three properties hold over every input.
 ///
 /// The first is that the call returns. A malformed keyring either fails the
 /// load or loads to a trusted set, and a malformed blob either is refused by
-/// name or reports records. A panic inside rPGP is contained and converted to
-/// an error, so a panicking parser shows up here as a refusal; a panic that
-/// escapes ends this test with the panic message, which is what makes the
-/// containment testable.
+/// name or reports records. The case puts every input through the load and the
+/// verify call and reaches its end, which is what shows this property. No
+/// assertion states it.
 ///
-/// The second is that no altered input reaches a valid verdict over a payload
+/// The second is that no input panics. A panic inside rPGP is contained and
+/// converted to an error, so a panicking parser reads as a refusal and the
+/// assertions over the returned value pass over it. The panic itself is
+/// counted: a hook stands over the two corpus loops, adds one to
+/// [`CORPUS_PANICS`] per call, and calls the hook that stood before it, so a
+/// panic still writes its message. The count is asserted to be zero once the
+/// previous hook is back. The hook is process-global and this binary runs its
+/// cases on several threads, so the count covers every panic that happens
+/// while the hook stands. No case in this binary carries `#[should_panic]`,
+/// and a case that panics for another reason fails the run on its own
+/// account. A count over zero is therefore a defect in either case.
+///
+/// An assertion that fails inside the corpus loops leaves the counting hook
+/// installed, because [`std::panic::set_hook`] panics where a panicking thread
+/// calls it. The case has already failed at that point, the installed hook
+/// still writes the message of every panic that follows, and no later case
+/// reads the count.
+///
+/// The third is that no altered input reaches a valid verdict over a payload
 /// nothing signed. Altering the bytes cannot forge a signature, so this holds
 /// whatever the alteration did, and it is the property a caller depends on.
 ///
@@ -1433,12 +1457,28 @@ fn a_malformed_keyring_or_blob_never_reaches_a_valid_verdict() {
     let keyring_inputs = keyrings.len();
     let blob_inputs = blobs.len();
 
+    let stood = Arc::new(std::panic::take_hook());
+    let counting = Arc::clone(&stood);
+    std::panic::set_hook(Box::new(move |info| {
+        CORPUS_PANICS.fetch_add(1, Ordering::Relaxed);
+        (*counting)(info);
+    }));
+
     for (label, altered) in &keyrings {
         assert_bounded(label, &[altered], &[&blob], &home.primary);
     }
     for (label, altered) in &blobs {
         assert_bounded(label, &[&keyring], &[altered], &home.primary);
     }
+
+    // The hook that stood before the corpus ran goes back here, so the count
+    // reads the corpus run alone. That hook is shared with the counting
+    // closure, so it goes back inside a closure that calls it through the
+    // `Arc`.
+    std::panic::set_hook(Box::new(move |info| (*stood)(info)));
+    let panics = CORPUS_PANICS.load(Ordering::Relaxed);
+    assert_eq!(panics, 0, "the corpus panicked {panics} times");
+
     // Each count is asserted against its fixture length plus 64 bytes times
     // eight bits, which is the flip axis written out rather than read back off
     // [`FLIP_PREFIX`], so that a shrinking fixture and a shrinking axis both
@@ -1480,7 +1520,8 @@ fn corpus(bytes: &[u8], subject: &str) -> Vec<(String, Vec<u8>)> {
     inputs
 }
 
-/// Assert the two properties the corpus states over one input pair.
+/// Assert the two properties the corpus states over the value each call in
+/// one input pair returns.
 ///
 /// `primary` is the fingerprint of the one key the good fixtures hold, so a
 /// record reported valid must name it.

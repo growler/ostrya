@@ -9,7 +9,8 @@
 //!
 //! `gpg` builds the fixtures and `gpgv` is the reference, so both binaries are
 //! required: a case skips itself and names the absent binary rather than
-//! passing without a comparison.
+//! passing without a comparison. A harness that holds both binaries sets
+//! [`common::REQUIRE_GNUPG`], which turns that skip into a failure.
 //!
 //! The engine's own unit tests state each policy rule against `gpgv` over the
 //! internal entry point. These cases run the public path -- keyring loading,
@@ -62,24 +63,13 @@ const DIVERGENCE_DIGEST_POLICY: &str = "the digest policy is fixed here and conf
 /// this reference can carry id 27 and the matrix holds no cell for it.
 const DIVERGENCE_ED25519_ALGORITHM: &str = "public-key algorithm id 27 has no reference fixture";
 
-/// Whether the named binary answers.
-fn available(program: &str) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success())
-}
-
 /// Whether both binaries answer, naming the absent one when they do not. An
-/// absent reference tool skips a case and never passes one.
+/// absent reference tool skips a case and never passes one. These cases are the
+/// whole of the differential gate's coverage, so a runner image without `gpg` or
+/// `gpgv` would otherwise report the gate as tested when nothing compared the
+/// two reports.
 fn tools_available() -> bool {
-    for program in ["gpg", "gpgv"] {
-        if !available(program) {
-            eprintln!("skipping: {program} not available");
-            return false;
-        }
-    }
-    true
+    common::gnupg_available(&["gpg", "gpgv"])
 }
 
 /// A private GnuPG home holding one generated, passphrase-free signing key.

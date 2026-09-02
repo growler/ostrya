@@ -26,12 +26,11 @@ use ostrya_rt::block_on;
 /// A fixed timestamp, so a source repository's commit is reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// Whether the gpg binary is available.
+/// Whether the gpg binary is available. The GnuPG cases build their fixtures
+/// with it, so a harness without it skips them rather than passing them, and
+/// [`common::REQUIRE_GNUPG`] turns that skip into a failure.
 fn gpg_available() -> bool {
-    Command::new("gpg")
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success())
+    common::gnupg_available(&["gpg"])
 }
 
 /// A private GnuPG home directory holding one freshly generated,
@@ -186,7 +185,6 @@ async fn gpg_pull(dst: &Repo, src: &Repo) -> Result<(), Error> {
 #[test]
 fn the_repository_keyring_is_what_a_remote_trusts() {
     if !gpg_available() {
-        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("pull-verify-gpg-keyring");
@@ -239,7 +237,6 @@ fn the_repository_keyring_is_what_a_remote_trusts() {
 #[test]
 fn a_symlinked_repository_keyring_is_followed() {
     if !gpg_available() {
-        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("pull-verify-gpg-symlink");
@@ -271,7 +268,6 @@ fn a_symlinked_repository_keyring_is_followed() {
 #[test]
 fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
     if !gpg_available() {
-        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("pull-verify-gpg-keypath");

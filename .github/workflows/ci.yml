@@ -101,9 +101,15 @@ jobs:
       #
       # The step applies no test over the `-sys` name suffix. `linux-raw-sys`
       # and `ostrya-sys` carry the suffix and are pure Rust, and a crate that
-      # links C need not carry it. `pcre2-sys` builds the vendored PCRE2 and
-      # declares no `links` key, which is why the two steps above hold that
-      # crate by name and by the linkage of the shipped binary.
+      # links C need not carry it.
+      #
+      # The step holds the packages that declare `links` and holds nothing else.
+      # A crate that builds and links a C library without a `links` key is
+      # invisible to it. `pcre2-sys` is the one such crate in this tree, and the
+      # two PCRE2 steps above hold it by name and by the linkage of the shipped
+      # binary. The `cargo metadata` call names no `--filter-platform`, so
+      # `.resolve.nodes` carries the resolution for every target, and a crate
+      # that links C on one target alone is asked about as well.
       - name: Only allowlisted packages link a native library
         run: |
           cargo metadata --format-version 1 --all-features \
@@ -122,21 +128,32 @@ jobs:
                   end'
 
       # `sign-gpg` turns on `verify-gpg`, so every other build in this workflow
-      # carries both. A consumer that verifies and does not sign takes
-      # `verify-gpg` alone, and this compiles that combination, so a cfg gate
-      # placed on the signing side of a verification item fails here.
+      # that carries `verify-gpg` carries `sign-gpg` as well. A consumer that
+      # verifies and does not sign takes `verify-gpg` alone, and this compiles
+      # that combination, so a cfg gate placed on the signing side of a
+      # verification item fails here.
       - name: verify-gpg without sign-gpg compiles
         run: cargo check -p ostrya --no-default-features --features smol,verify-gpg
 
+      # Every other build of the library in this workflow carries a GPG
+      # feature. This one carries none, which covers the arm that refuses a
+      # pull asking for GPG verification where the build holds no verify
+      # engine.
+      - name: A build without a GPG feature compiles
+        run: cargo check -p ostrya --no-default-features --features smol
+
       # The local-pull ownership-gate tests need the process to belong to more
-      # than one group, and skip themselves where it does not. The runner user
-      # belongs to several, so this job demands the coverage rather than
-      # accepting a silent skip: OSTRYA_REQUIRE_MULTIGROUP turns that skip into
-      # a failure.
+      # than one group. The GPG cases need `gpg` to build their fixtures, and
+      # the agreement gate needs `gpgv` as its reference. Each skips itself
+      # where the arrangement is absent. The runner user belongs to several
+      # groups and the image carries both binaries, so this job demands the
+      # coverage rather than accepting a silent skip: OSTRYA_REQUIRE_MULTIGROUP
+      # and OSTRYA_REQUIRE_GNUPG turn those skips into a failure.
       - name: Test
         run: cargo test --workspace --all-features
         env:
           OSTRYA_REQUIRE_MULTIGROUP: "1"
+          OSTRYA_REQUIRE_GNUPG: "1"
 
       # A record carrying `evidence:` cites a library test by name, so a rename
       # would void its cells with no signal. This resolves every citation

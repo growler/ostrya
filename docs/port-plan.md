@@ -1584,9 +1584,13 @@ by single-bit flipping. Two of its cases read two keyrings each -- one GnuPG
 wrote, which carries Trust packets, and the one `Repo::gpg_import_keys` writes,
 which carries none: a signature by a signing subkey and a signature by the
 primary key each reach the verdict and the user id `gpgv` reports over both
-files. It skips itself and names the
-absent binary where `gpg` or `gpgv` is absent, since `gpg` builds the fixtures
-and `gpgv` is the reference. Tool cross-verification
+files. It skips itself and names the absent binary where `gpg` or `gpgv` is
+absent, since `gpg` builds the fixtures and `gpgv` is the reference. The test
+is the whole of the differential gate's coverage, so `OSTRYA_REQUIRE_GNUPG`
+turns that skip into a failure. The variable covers every GPG case in the
+suite, not the agreement gate alone. The CI job sets it, and its runner image
+carries both binaries.
+Tool cross-verification
 (`ostree gpg-sign` in both directions) lands in
 `conformance/m10-cli-behavior.matrix` once the CLI-compatible surface lands
 (Phase 17).

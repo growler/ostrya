@@ -29,12 +29,11 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// Whether the gpg binary is available.
+/// Whether the gpg binary is available. The GnuPG cases build their fixtures
+/// with it, so a harness without it skips them rather than passing them, and
+/// [`common::REQUIRE_GNUPG`] turns that skip into a failure.
 fn gpg_available() -> bool {
-    Command::new("gpg")
-        .arg("--version")
-        .output()
-        .is_ok_and(|out| out.status.success())
+    common::gnupg_available(&["gpg"])
 }
 
 /// A private GnuPG home directory holding one freshly generated,
@@ -164,7 +163,6 @@ async fn build_committed_repo(base: &Path) -> (Repo, Checksum) {
 #[test]
 fn gpg_round_trip_within_the_port() {
     if !gpg_available() {
-        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-roundtrip");
@@ -202,7 +200,6 @@ fn gpg_round_trip_within_the_port() {
 #[test]
 fn armored_and_file_keyrings_load() {
     if !gpg_available() {
-        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-keyrings");
@@ -232,7 +229,6 @@ fn armored_and_file_keyrings_load() {
 #[test]
 fn wrong_payload_is_rejected() {
     if !gpg_available() {
-        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-badsig");
@@ -264,7 +260,6 @@ fn wrong_payload_is_rejected() {
 #[test]
 fn unknown_signer_key_is_an_error() {
     if !gpg_available() {
-        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-nokey");
@@ -288,7 +283,6 @@ fn unknown_signer_key_is_an_error() {
 #[test]
 fn an_option_shaped_selector_is_a_key_name() {
     if !gpg_available() {
-        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-selector");
@@ -332,7 +326,6 @@ fn an_option_shaped_selector_is_a_key_name() {
 #[test]
 fn gpg_coexists_with_the_dummy_engine() {
     if !gpg_available() {
-        eprintln!("skipping: gpg not available");
         return;
     }
     let tmp = TmpDir::new("gpg-coexist");

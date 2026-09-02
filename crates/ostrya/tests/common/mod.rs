@@ -158,3 +158,34 @@ pub fn openssl_available() -> bool {
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
+
+/// The environment variable that turns the absent-GnuPG skip into a failure. A
+/// harness setting it declares that the GnuPG binaries are installed, so a run
+/// where one is not is a broken harness rather than a test to pass over.
+pub const REQUIRE_GNUPG: &str = "OSTRYA_REQUIRE_GNUPG";
+
+/// Whether every named GnuPG binary answers, naming the absent one when one
+/// does not. The GPG cases build their fixtures with `gpg`, and the agreement
+/// gate compares against `gpgv`, so a harness without a binary would otherwise
+/// report those cases as tested while no assertion ran. With [`REQUIRE_GNUPG`]
+/// set the absence fails; without it the caller skips and the name of the
+/// absent binary is written to stderr.
+pub fn gnupg_available(programs: &[&str]) -> bool {
+    for program in programs {
+        let found = Command::new(program)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !found {
+            assert!(
+                std::env::var_os(REQUIRE_GNUPG).is_none(),
+                "{REQUIRE_GNUPG} is set and `{program}` is not available, so \
+                 the GPG tests cannot run"
+            );
+            eprintln!("skipping: {program} not available");
+            return false;
+        }
+    }
+    true
+}

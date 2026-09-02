@@ -119,6 +119,41 @@ impl GpgHome {
         assert!(status.success(), "gpg --quick-set-expire failed");
     }
 
+    /// Add a signing subkey to the key this home holds and report its
+    /// fingerprint. `gpg` 2.4.9 signs with a signing subkey where the
+    /// certificate carries one, so a signature made after this call is the
+    /// subkey's and names two keys: the subkey and the primary key that binds
+    /// it.
+    fn add_signing_subkey(&self) -> String {
+        let status = self
+            .gpg()
+            .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+            .args([
+                "--quick-add-key",
+                &self.fingerprint(),
+                "ed25519",
+                "sign",
+                "never",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "gpg --quick-add-key failed");
+        let out = self
+            .gpg()
+            .args(["--with-colons", "--list-keys"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        let fingerprints: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("fpr:"))
+            .filter_map(|rest| rest.split(':').nth(8))
+            .collect();
+        assert_eq!(fingerprints.len(), 2, "the primary key and one subkey");
+        fingerprints[1].to_owned()
+    }
+
     /// Generate a second signing key for `uid` in this home directory, so a
     /// selector matching both user ids is ambiguous.
     fn add_key(&self, uid: &str) {
@@ -8745,6 +8780,272 @@ fn remote_gpg_import_carries_a_key_expiry_extension() {
         assert!(
             text.contains("Good signature from"),
             "{label} refused the keyring the other implementation wrote:\n{text}"
+        );
+    }
+}
+
+/// A repository holding two GPG signatures that do not verify, with the
+/// signing key in the trusted keyring of the remote `origin`.
+///
+/// The commit on `bad/one` is signed, and the commits on `bad/two` and
+/// `bad/three` each hold a copy of that commit's detached metadata, so each of
+/// those two stored signatures stands over a payload other than the one it was
+/// made over and the cryptography refuses it. The issuer stays resolvable, so
+/// the report names the signing key. The return value is the repository and
+/// the checksums of the commits on `bad/two` and `bad/three`, which carry one
+/// refused signature each.
+#[cfg(feature = "gpg")]
+fn bad_signature_repo(base: &Path, home: &GpgHome, keyring: &Path) -> (PathBuf, String, String) {
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_s = repo.to_str().unwrap().to_owned();
+    let mut checksums: Vec<String> = Vec::new();
+    for (branch, subject) in [
+        ("bad/one", "signed commit"),
+        ("bad/two", "other commit"),
+        ("bad/three", "third commit"),
+    ] {
+        let run = ostrya(
+            &[
+                "commit",
+                "--repo",
+                &repo_s,
+                "-b",
+                branch,
+                "-s",
+                subject,
+                "--canonical-permissions",
+                src.to_str().unwrap(),
+            ],
+            None,
+            &[("SOURCE_DATE_EPOCH", SOURCE_DATE_EPOCH)],
+        );
+        checksums.push(run.ok().stdout_trimmed());
+    }
+    ostrya(
+        &[
+            "sign",
+            "--repo",
+            &repo_s,
+            "-s",
+            "gpg",
+            "--gpg-homedir",
+            home.dir.to_str().unwrap(),
+            &checksums[0],
+            &home.fingerprint(),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let meta = |checksum: &str| {
+        repo.join(format!(
+            "objects/{}/{}.commitmeta",
+            &checksum[..2],
+            &checksum[2..]
+        ))
+    };
+    std::fs::copy(meta(&checksums[0]), meta(&checksums[1])).unwrap();
+    std::fs::copy(meta(&checksums[0]), meta(&checksums[2])).unwrap();
+    configure_remote(&repo, "https://example.invalid/r", "");
+    ostrya(
+        &[
+            &format!("--repo={repo_s}"),
+            "remote",
+            "gpg-import",
+            "origin",
+            &format!("--keyring={}", keyring.display()),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let third = checksums.remove(2);
+    (repo, checksums.remove(1), third)
+}
+
+/// The one `Signature made` line a signature report draws, with the leading
+/// indent removed.
+#[cfg(feature = "gpg")]
+fn signature_made_line(report: &str) -> &str {
+    report
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("Signature made"))
+        .unwrap_or_else(|| panic!("no `Signature made` line in the report:\n{report}"))
+}
+
+/// The `key ID` field of that line.
+#[cfg(feature = "gpg")]
+fn reported_key_id(report: &str) -> &str {
+    let line = signature_made_line(report);
+    line.split(" key ID")
+        .nth(1)
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("no `key ID` field in `{line}`"))
+}
+
+/// The signature report line `show` draws over a signature that does not
+/// verify names the same key in both implementations, and both refuse the
+/// signature in the same words.
+///
+/// A signing subkey made the signature, so the report names two keys: the
+/// subkey on the report line and the primary key that binds it on the tool's
+/// `Primary key ID` line. Three differences stand here, all of them recorded
+/// in `cli-surface.md`, "P1". The tool holds no instant and no algorithm for a
+/// signature the cryptography refused, so it draws the Unix epoch and
+/// `[unknown name]` in their places, where the port draws an empty instant and
+/// `unknown`. The host time zone and locale decide how the tool renders that
+/// instant, so the epoch stands here as the year alone, with `TZ=UTC` set to
+/// hold the run inside 1970. The `Primary key ID` line is one the port draws
+/// nowhere, and the key it names stands in the port's record, where
+/// `sign --delete` reads it
+/// (`sign_delete_reaches_a_signature_that_does_not_verify`).
+#[cfg(feature = "gpg")]
+#[test]
+fn show_reports_a_bad_signature_like_the_tool() {
+    if !ostree_available() || !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("show-bad-sig");
+    let base = tmp.path();
+    let home = GpgHome::create(base, "Badsig <badsig@ostrya.example>");
+    let subkey = home.add_signing_subkey();
+    let keyring = base.join("public.gpg");
+    home.export_to(&keyring);
+    let (repo, checksum, _) = bad_signature_repo(base, &home, &keyring);
+    let repo_arg = format!("--repo={}", repo.display());
+    let args = [
+        repo_arg.as_str(),
+        "show",
+        "--gpg-verify-remote=origin",
+        &checksum,
+    ];
+    let port = ostrya(&args, None, &[]).ok().stdout_trimmed();
+    let tool = ostree_env(&args, &[("TZ", "UTC")]).ok().stdout_trimmed();
+
+    // Both refuse the signature, word for word.
+    let verdict = "BAD signature from \"Badsig <badsig@ostrya.example>\"";
+    for (label, report) in [("the port", &port), ("the tool", &tool)] {
+        assert!(
+            report.contains(verdict),
+            "{label} drew no `{verdict}` line:\n{report}"
+        );
+    }
+
+    // Both name the signing subkey on the line above the verdict.
+    let key_id = &subkey[subkey.len() - 16..];
+    assert_eq!(reported_key_id(&port), key_id, "the port's key ID");
+    assert_eq!(reported_key_id(&tool), key_id, "the tool's key ID");
+
+    // The recorded differences, stated so a change in either is reported. Each
+    // one is read off the report line, so no other line of the report answers
+    // for it.
+    assert_eq!(
+        signature_made_line(&port),
+        format!("Signature made  using unknown key ID {key_id}"),
+        "the port now states an instant or an algorithm here"
+    );
+    let tool_line = signature_made_line(&tool);
+    assert!(
+        tool_line.contains("1970") && tool_line.contains("[unknown name]"),
+        "the tool now states an instant or an algorithm here: `{tool_line}`"
+    );
+    let primary = home.fingerprint();
+    assert!(
+        tool.contains(&format!(
+            "Primary key ID {}",
+            &primary[primary.len() - 16..]
+        )),
+        "the tool drew no `Primary key ID` line:\n{tool}"
+    );
+    assert!(
+        !port.contains("Primary key ID"),
+        "the port now draws a `Primary key ID` line:\n{port}"
+    );
+}
+
+/// `sign --delete KEY-ID` removes a signature whose issuer the trusted set
+/// holds and whose cryptography fails, under the key id of the signing key and
+/// under the key id of the certificate that holds it. A signing subkey made
+/// the signature here, so those two key ids differ. The record such a
+/// signature draws names both keys, and the delete matches a KEY-ID against
+/// either field. `ostree gpg-sign --delete` over the same commit removes the
+/// signature under either key id and under either whole fingerprint, measured
+/// against `ostree` 2026.1.
+#[cfg(feature = "gpg")]
+#[test]
+fn sign_delete_reaches_a_signature_that_does_not_verify() {
+    if !gpg_available() {
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tmp = TmpDir::new("sign-delete-bad-sig");
+    let base = tmp.path();
+    let home = GpgHome::create(base, "Doomed <doomed@ostrya.example>");
+    let subkey = home.add_signing_subkey();
+    let keyring = base.join("public.gpg");
+    home.export_to(&keyring);
+    let (repo, by_subkey, by_primary) = bad_signature_repo(base, &home, &keyring);
+    let repo_arg = format!("--repo={}", repo.display());
+    let primary = home.fingerprint();
+    let signing_key_id = subkey[subkey.len() - 16..].to_owned();
+    let primary_key_id = primary[primary.len() - 16..].to_owned();
+    let report = |checksum: &str| {
+        ostrya(
+            &[
+                repo_arg.as_str(),
+                "show",
+                "--gpg-verify-remote=origin",
+                checksum,
+            ],
+            None,
+            &[],
+        )
+        .ok()
+        .stdout_trimmed()
+    };
+
+    // One commit per KEY-ID, so each delete runs over a signature of its own.
+    for (checksum, key_id, named) in [
+        (&by_subkey, &signing_key_id, "the signing subkey"),
+        (&by_primary, &primary_key_id, "the primary key"),
+    ] {
+        // The commit holds one signature, the trusted set resolves its issuer,
+        // and the cryptography refuses it.
+        let before = report(checksum);
+        assert!(
+            before.contains("Found 1 signature:") && before.contains("BAD signature from"),
+            "the fixture holds no refused signature:\n{before}"
+        );
+        assert_eq!(reported_key_id(&before), signing_key_id);
+
+        let deleted = ostrya(
+            &[
+                repo_arg.as_str(),
+                "sign",
+                "-d",
+                "-s",
+                "gpg",
+                "--remote",
+                "origin",
+                checksum,
+                key_id,
+            ],
+            None,
+            &[],
+        );
+        assert!(
+            deleted.ok().stdout_trimmed().contains("Deleted 1"),
+            "the KEY-ID of {named} reached no signature"
+        );
+
+        // Nothing is left to report over the commit.
+        let after = report(checksum);
+        assert!(
+            !after.contains("signature"),
+            "the commit kept a signature:\n{after}"
         );
     }
 }

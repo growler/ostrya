@@ -531,6 +531,29 @@ fn assert_agrees(label: &str, port: &SignatureInfo, reference: &SignatureInfo) {
     );
 }
 
+/// Assert one record states what `gpgv` states about the same signature, apart
+/// from the two key fingerprints.
+///
+/// The two references part on those two fields where the issuer resolved and
+/// the cryptography failed. `gpgv` draws `BADSIG <keyid> <uid>`, which names
+/// the issuer by eight bytes where the field holds a whole fingerprint, so
+/// [`gpgv_records`] passes that key id over and the reference record states
+/// neither fingerprint. `ostree` 2026.1 names both keys on the lines it draws
+/// over such a signature: a signature a subkey made draws `key ID
+/// <subkey-key-id>`, the subkey's own key id, with `Primary key ID
+/// <primary-key-id>` under it, and a signature the primary key made draws that
+/// same pair with the primary key in both places. The report a user reads is
+/// the oracle here, so the engine states both keys. The instant and the
+/// algorithm stay absent: `gpgv` states neither on this path, the tool draws
+/// the Unix epoch and `[unknown name]` in their places, and the engine states
+/// neither.
+fn assert_agrees_but_fingerprints(label: &str, port: &SignatureInfo, reference: &SignatureInfo) {
+    let mut port = port.clone();
+    port.fingerprint = reference.fingerprint.clone();
+    port.primary_fingerprint = reference.primary_fingerprint.clone();
+    assert_agrees(label, &port, reference);
+}
+
 /// Put one cell through both engines and assert they agree record for record.
 fn assert_cell_agrees(
     label: &str,
@@ -572,15 +595,23 @@ fn the_agreement_matrix_agrees_with_gpgv() {
     let records = assert_cell_agrees("a good signature", &trusted, &keyring, &good, PAYLOAD);
     assert!(records[0].valid, "the good signature is not valid");
 
-    // The same signature against another payload.
-    let records = assert_cell_agrees(
-        "a changed payload",
-        &trusted,
-        &keyring,
-        &good,
-        OTHER_PAYLOAD,
+    // The same signature against another payload. The engine names the
+    // resolved signing key and its certificate on this path and the reference
+    // names neither, which `assert_agrees_but_fingerprints` declares. The
+    // primary key signed here, so both fields name it.
+    let port = port_records(&[&keyring], &[&good], OTHER_PAYLOAD);
+    let reference = trusted.gpgv_records(&keyring, &good, OTHER_PAYLOAD);
+    assert_eq!(port.len(), 1);
+    assert_eq!(reference.len(), 1);
+    assert_agrees_but_fingerprints("a changed payload", &port[0], &reference[0]);
+    assert!(!port[0].valid);
+    assert_eq!(port[0].fingerprint.as_deref(), Some(&*trusted.primary));
+    assert_eq!(
+        port[0].primary_fingerprint.as_deref(),
+        Some(&*trusted.primary)
     );
-    assert!(!records[0].valid);
+    assert_eq!(reference[0].fingerprint, None);
+    assert_eq!(reference[0].primary_fingerprint, None);
 
     // A signature whose issuer no loaded certificate holds.
     let foreign = stranger.sign(&stranger.primary, PAYLOAD, &[]);
@@ -725,13 +756,25 @@ fn key_algorithms_agree_with_gpgv() {
              divergence is gone and this case states the wrong thing",
         );
         // The record takes the shape a signature that does not verify takes:
-        // the certificate's user id, and no field the signature claims about
-        // itself, since none of them was checked. The reference names the key
-        // and the two algorithms, so the divergence covers those fields too.
+        // the resolved signing key, its certificate, and the certificate's
+        // user id, and no field the signature claims about itself, since none
+        // of them was checked. The primary key signed here, so both
+        // fingerprints name it and both agree with the reference, which reads
+        // them off the `VALIDSIG` line its `GOODSIG` carries. The reference
+        // names the creation instant and the two algorithms, so the divergence
+        // covers those fields.
         assert_eq!(port[0].user_email, reference[0].user_email);
         assert!(!port[0].key_missing && !port[0].expired && !port[0].revoked);
-        assert_eq!(port[0].fingerprint, None);
-        assert_eq!(port[0].primary_fingerprint, None);
+        assert_eq!(port[0].fingerprint.as_deref(), Some(&*eddsa.primary));
+        assert_eq!(port[0].fingerprint, reference[0].fingerprint);
+        assert_eq!(
+            port[0].primary_fingerprint.as_deref(),
+            Some(&*eddsa.primary)
+        );
+        assert_eq!(
+            port[0].primary_fingerprint,
+            reference[0].primary_fingerprint
+        );
         assert_eq!(port[0].created, None);
         assert_eq!(port[0].pubkey_algorithm, None);
         assert_eq!(port[0].hash_algorithm, None);

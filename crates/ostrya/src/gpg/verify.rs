@@ -154,10 +154,11 @@ fn verify_blob(
 /// whose class is not a document signature, one whose digest algorithm the
 /// policy refuses, and one by a signing subkey the primary key did not
 /// cross-certify report the same fields without `key_missing`. A signature
-/// whose issuer resolved and whose cryptography failed reports the user id
-/// alone, since nothing else it claims was checked. A signature a resolved key
-/// verifies reports the signing key, its certificate, the certificate's user
-/// id, and the validity policy's answer.
+/// whose issuer resolved and whose cryptography failed reports the resolved
+/// signing key, its certificate, and the certificate's user id, and states
+/// nothing else the packet claims, since nothing else was checked. A signature
+/// a resolved key verifies reports the signing key, its certificate, the
+/// certificate's user id, and the validity policy's answer.
 fn describe(
     certs: &[SignedPublicKey],
     payload: &[u8],
@@ -207,11 +208,23 @@ fn describe(
     let (user_name, user_email) = reported_user_id(issuer.cert);
     info.user_name = user_name;
     info.user_email = user_email;
+    // The signing key the lookup resolved, and the certificate that holds it,
+    // name themselves on both paths. A signature the cryptography refuses
+    // therefore states which key made it, and `sign --delete` reaches it under
+    // the key id or the fingerprint of either key. `ostree` 2026.1 names both
+    // keys over a commit whose payload changed: a signature a subkey made
+    // draws `key ID <subkey-key-id>`, the subkey's own key id, with `Primary
+    // key ID <primary-key-id>` under it, and its own `gpg-sign --delete`
+    // removes such a signature under either key's key id and under either
+    // key's fingerprint. Each value here comes from the key the lookup
+    // resolved, so a packet answers for no key of its own naming, and each is
+    // a whole fingerprint even where the signature named its issuer by eight
+    // bytes alone.
+    info.fingerprint = Some(format!("{:X}", issuer.fingerprint()));
+    info.primary_fingerprint = Some(format!("{:X}", issuer.cert.fingerprint()));
     if !issuer.verify(signature, payload) {
         return info;
     }
-    info.fingerprint = Some(format!("{:X}", issuer.fingerprint()));
-    info.primary_fingerprint = Some(format!("{:X}", issuer.cert.fingerprint()));
     info.created = created_at(sig);
     info.expires = expires_at(sig);
     info.pubkey_algorithm = pubkey_algorithm_name(sig);
@@ -1610,6 +1623,29 @@ mod tests {
         assert_eq!(port.key_expires, reference.key_expires, "key_expires");
     }
 
+    /// Assert one record states what `gpgv` states about the same signature,
+    /// apart from the two key fingerprints.
+    ///
+    /// The two references part on those two fields where the issuer resolved
+    /// and the cryptography failed. `gpgv` draws `BADSIG <keyid> <uid>`, which
+    /// names the issuer by eight bytes where the field holds a whole
+    /// fingerprint, so [`parse_status`] passes that key id over and the
+    /// reference record states neither fingerprint. `ostree` 2026.1 names both
+    /// keys on the lines it draws over such a signature: a signature a subkey
+    /// made draws `key ID <subkey-key-id>`, the subkey's own key id, with
+    /// `Primary key ID <primary-key-id>` under it, and a signature the primary
+    /// key made draws that same pair with the primary key in both places. The
+    /// report a user reads is the oracle here, so the engine states both keys.
+    /// The instant and the algorithm stay absent: `gpgv` states neither on
+    /// this path, the tool draws the Unix epoch and `[unknown name]` in their
+    /// places, and the engine states neither.
+    fn assert_agrees_but_fingerprints(port: &SignatureInfo, reference: &SignatureInfo) {
+        let mut port = port.clone();
+        port.fingerprint = reference.fingerprint.clone();
+        port.primary_fingerprint = reference.primary_fingerprint.clone();
+        assert_agrees(&port, reference);
+    }
+
     /// A signature the primary key made reports the primary key as both the
     /// signing key and the certificate, with the certificate's user id.
     #[test]
@@ -1756,8 +1792,9 @@ mod tests {
     }
 
     /// A signature over a payload other than the one it was made over reports
-    /// the certificate's user id alone. Nothing else the signature claims was
-    /// checked, and `gpgv` names nothing else either.
+    /// the resolved signing key, its certificate, and the certificate's user
+    /// id. Nothing else the signature claims was checked, so the record states
+    /// nothing else, and neither reference states more.
     #[test]
     fn changed_payload_agrees_with_gpgv() {
         if !tools_available() {
@@ -1771,14 +1808,55 @@ mod tests {
         let reference = home.gpgv_records(&keyring, &blob, OTHER_PAYLOAD);
         assert_eq!(outcome.signatures.len(), 1);
         assert_eq!(reference.len(), 1);
-        assert_agrees(&outcome.signatures[0], &reference[0]);
+        assert_agrees_but_fingerprints(&outcome.signatures[0], &reference[0]);
         let info = &outcome.signatures[0];
         assert!(!reference[0].valid);
-        assert_eq!(info.user_email.as_deref(), Some("bad@ostrya.example"));
-        assert_eq!(info.fingerprint, None);
-        assert_eq!(info.primary_fingerprint, None);
-        assert_eq!(info.created, None);
         assert!(!info.key_missing);
+        // The fields the record carries on this path: the resolved signing key,
+        // its certificate, and the certificate's user id. The signing key is
+        // the primary key here, so both fingerprints name it, and it is the key
+        // `gpgv` names by eight bytes on its `BADSIG` line and `ostree` names
+        // on the line it draws.
+        assert_eq!(info.fingerprint.as_deref(), Some(&*home.primary));
+        assert_eq!(info.primary_fingerprint.as_deref(), Some(&*home.primary));
+        assert_eq!(reference[0].fingerprint, None);
+        assert_eq!(reference[0].primary_fingerprint, None);
+        assert_eq!(info.user_name.as_deref(), Some("Bad"));
+        assert_eq!(info.user_email.as_deref(), Some("bad@ostrya.example"));
+        // Nothing else the packet claims is stated. `gpgv` names no instant and
+        // no algorithm on `BADSIG`, and `ostree` 2026.1 draws the epoch instant
+        // and `[unknown name]` in their places.
+        assert_eq!(info.created, None);
+        assert_eq!(info.pubkey_algorithm, None);
+        assert_eq!(info.hash_algorithm, None);
+    }
+
+    /// A signature a signing subkey made over a payload other than the one it
+    /// was made over reports the subkey as the signing key and its certificate
+    /// as the primary fingerprint. `ostree` 2026.1 names those same two keys
+    /// over such a signature, on the `key ID` field of the report line and on
+    /// the `Primary key ID` line under the verdict, and its `gpg-sign
+    /// --delete` removes the signature under either key's key id.
+    #[test]
+    fn changed_payload_by_a_subkey_reports_both_keys() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::new("Subbad <subbad@ostrya.example>");
+        let subkey = home.add_signing_subkey();
+        let keyring = home.keyring();
+        let blob = home.sign(&subkey, PAYLOAD);
+        let outcome =
+            verify_signatures(&home.certs(), OTHER_PAYLOAD, std::slice::from_ref(&blob)).unwrap();
+        let reference = home.gpgv_records(&keyring, &blob, OTHER_PAYLOAD);
+        assert_eq!(outcome.signatures.len(), 1);
+        assert_eq!(reference.len(), 1);
+        assert_agrees_but_fingerprints(&outcome.signatures[0], &reference[0]);
+        let info = &outcome.signatures[0];
+        assert!(!info.valid && !reference[0].valid);
+        assert_eq!(info.fingerprint.as_deref(), Some(&*subkey));
+        assert_eq!(info.primary_fingerprint.as_deref(), Some(&*home.primary));
+        assert_eq!(info.user_email.as_deref(), Some("subbad@ostrya.example"));
     }
 
     /// A blob holding half a signature packet reports one record and nothing
@@ -2911,7 +2989,18 @@ mod tests {
         assert_eq!(reference.len(), 1);
         assert!(reference[0].valid, "the reference accepts it");
         assert!(!outcome.signatures[0].valid, "the port does not");
-        assert_eq!(outcome.signatures[0].fingerprint, None);
+        // The record takes the shape a signature that verified against nothing
+        // takes: the resolved signing key, its certificate, and the
+        // certificate's user id. The primary key signed here, so both
+        // fingerprints name it.
+        assert_eq!(
+            outcome.signatures[0].fingerprint.as_deref(),
+            Some(&*eddsa.primary)
+        );
+        assert_eq!(
+            outcome.signatures[0].primary_fingerprint.as_deref(),
+            Some(&*eddsa.primary)
+        );
         assert_eq!(
             outcome.signatures[0].user_email.as_deref(),
             Some("ed@ostrya.example")

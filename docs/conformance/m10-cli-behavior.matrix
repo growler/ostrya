@@ -2828,6 +2828,33 @@ note: the object argument is a filename here, and the repository's own `config`
  The type set the port takes is narrower than the tool's, which cli-surface.md,
  "P1" records; every type the on-disk format uses is inside it.
 
+family: M10
+subcommand: show
+cell: show/bad-signature-report
+modes: archive
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the instant and the algorithm name of the `Signature made` line, and the
+ line under the verdict. The tool holds no instant and no algorithm for a
+ signature the cryptography refused, so it draws the Unix epoch in the host
+ locale and time zone (`Thu 01 Jan 1970 01:00:00 CET`) and `[unknown name]`,
+ and the port draws an empty instant and `unknown`. The tool draws a
+ `Primary key ID <key-id>` line under the verdict, which the port draws nowhere
+ (`cli-surface.md`, "P1", states them all). The key id and the verdict line
+ agree.
+evidence: ostrya_cli::cli::show_reports_a_bad_signature_like_the_tool
+spec: format-reference.md#show
+note: a signature the cryptography refuses needs a generated key, a remote
+ keyring, and a stored signature that stands over another commit, which no
+ setup binds. The cited test signs one commit with a key carrying a signing
+ subkey, copies that commit's detached metadata onto another commit, and
+ imports the public keyring into the remote the report reads. Both
+ implementations name the signing subkey on the report line, by the trailing
+ sixteen hex digits of its fingerprint, and both refuse the signature in the
+ words `BAD signature from "<user id>"`. The same test states the three
+ differences the outcome names, so a move in either implementation is reported.
+
 # ---------------------------------------------------------------------------
 # log -- the parent-chain walk (Phase 17d).
 # ---------------------------------------------------------------------------

@@ -381,28 +381,48 @@ deliberately not reproduced:
   `show` is the one command of the three where the two agree, the tool's own
   wording there being `error: Couldn't find file object '<checksum>'`, which the
   port reproduces because a bare checksum reaches `show` with no type;
-- the GPG signature report a signed commit draws carries four differences from
-  the tool's, none of them a repository fact. The instant the signature was made
-  is rendered by the tool through gpgme in the host's locale and time zone
+- the GPG signature report a signed commit draws carries five differences from
+  the tool's, none of them a repository fact. The instant the signature was
+  made is rendered by the tool through gpgme in the host's locale and time zone
   (`Wed 05 Aug 2026 17:11:19 CEST`) and by the port in UTC in the shape its own
   `Date:` line carries (`2026-08-05 15:11:19 +0000`); matching the tool would
   need a locale database and the host time zone, neither of which the port
   carries. The port writes one blank line more before the `Found N signatures:`
-  heading. For a signature a signing subkey made, the tool writes a
-  `Primary key ID <key-id>` line after the verdict line, and the port writes the
-  signing subkey's key id alone. The fourth difference is the line a key state
-  draws. The port states three verdict lines: `Can't check signature: public key
-  not found`, `Good signature from "<user id>"`, and `BAD signature from
-  "<user id>"`. Over a good signature, over an absent key, and over a signature
-  that does not verify, the tool states the same line word for word. Over a
-  revoked key the tool states `Key revoked` and the port states `BAD signature
-  from "<user id>"`. Over a key that states an expiry the tool adds one line
-  after the verdict line -- `Key expires <instant>` while the key is live, and
-  `Key expired <instant>` from the instant it has passed -- which the port
-  leaves out. The algorithm name, the short key id, and the user id are the same
-  in both, measured against `ostree` 2026.1 over a commit each implementation
-  signed with the same key, read back through the other's
-  `show --gpg-verify-remote=<remote>`;
+  heading. For a signature a signing subkey made, the tool writes a `Primary
+  key ID <key-id>` line after the verdict line, and the port writes the signing
+  subkey's key id alone; over a signature the cryptography refuses the tool
+  writes that line whichever key made the signature, the primary key included,
+  and the port draws no such line in either case. The fourth difference is the
+  line a key state draws. The port states three verdict lines: `Can't check
+  signature: public key not found`, `Good signature from "<user id>"`, and `BAD
+  signature from "<user id>"`. Over a good signature, over an absent key, and
+  over a signature that does not verify, the tool states the same line word for
+  word. Over a revoked key the tool states `Key revoked` and the port states
+  `BAD signature from "<user id>"`. Over a key that states an expiry the tool
+  adds one line after the verdict line -- `Key expires <instant>` while the key
+  is live, and `Key expired <instant>` from the instant it has passed -- which
+  the port leaves out. The fifth difference stands over a signature the
+  cryptography refused, where neither implementation holds the instant or the
+  algorithm name: the tool draws the Unix epoch in the host locale and time
+  zone (`Thu 01 Jan 1970 01:00:00 CET`) and `[unknown name]`, and the port
+  draws an empty instant and `unknown`. Over a good signature the algorithm
+  name, the short key id, and the user id are the same in both, measured
+  against `ostree` 2026.1 over a commit each implementation signed with the
+  same key, read back through the other's `show --gpg-verify-remote=<remote>`.
+  The short key id and the user id are the same in both over a signature that
+  does not verify as well: both name the signing key by its trailing sixteen
+  hex digits, and the tool names the certificate that holds that key on its
+  `Primary key ID` line. The key the port names there is the one its own
+  trusted keyring resolved for the signature. `ostree gpg-sign --delete` in
+  2026.1 removes such a signature under four selectors -- the key id and the
+  whole fingerprint of the signing key, and the key id and the whole
+  fingerprint of the certificate -- measured over a signature a signing subkey
+  made. The port holds both keys in its own record, so `ostrya sign --delete`
+  reaches the same signature under the key id of either key
+  (`crates/ostrya-cli/tests/cli.rs`,
+  `sign_delete_reaches_a_signature_that_does_not_verify`). It matches a KEY-ID
+  against the tail of either fingerprint, so the whole fingerprint of either
+  key reaches it as well;
 - the verdict the report states rests on the port's own trust and validity
   policy, which `../port-plan.md`, "Phase 13d", enumerates against GnuPG 2.4.9.
   Seven differences stand there, and each one can make a `show` verdict part

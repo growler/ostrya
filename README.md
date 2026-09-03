@@ -115,11 +115,12 @@ cargo test -p ostrya --no-default-features --features tokio
 
 The checked-in golden fixtures under `tests/fixtures/` are outside every
 crate root, so a crate published to crates.io carries none of them.
-Consuming the fixtures from a git checkout needs no `ostree` tool;
-generating or regenerating them with `tests/fixtures/generate.sh` does. See
-`docs/port-plan.md`, "Golden fixtures: layout, packaging, and how to run
-them", for the fixture layout, the generator's requirements, the exact test
-commands, and how to tell a skipped fixture test from a passing one.
+Consuming the fixtures from a git checkout needs no `ostree` tool.
+Generating or regenerating them with `tests/fixtures/generate.sh` needs the
+tool. See `docs/port-plan.md`, "Golden fixtures: layout, packaging, and how
+to run them", for the fixture layout and the generator's requirements. The
+section also gives the exact test commands. It explains how to tell a
+skipped fixture test from a passing one.
 
 ## Documentation
 

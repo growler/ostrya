@@ -134,6 +134,13 @@ impl Value {
         }
     }
 
+    /// The strings an array holds, or `None` for any other type. One element
+    /// that is not a string yields `None` for the whole array. The empty
+    /// array yields the empty list.
+    pub fn as_strv(&self) -> Option<Vec<&str>> {
+        self.as_array()?.iter().map(Value::as_str).collect()
+    }
+
     /// The tuple members this value holds, or `None` for any other type.
     pub fn as_tuple(&self) -> Option<&[Value]> {
         match self {
@@ -242,5 +249,127 @@ impl From<Vec<u8>> for Value {
 impl From<&[u8]> for Value {
     fn from(v: &[u8]) -> Value {
         Value::Bytes(v.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DictBuilder, from_bytes, to_bytes};
+
+    /// A key written as an `as` reads back as the same strings in the same
+    /// order, through the dict the builder produces.
+    #[test]
+    fn reads_back_an_inserted_strv() {
+        let mut builder = DictBuilder::new();
+        builder.insert_strv(
+            "ostree.ref-binding",
+            &["one".to_owned(), "two".to_owned(), "three".to_owned()],
+        );
+        let dict = builder.build();
+
+        let (_, value) = dict
+            .dict_get("ostree.ref-binding")
+            .unwrap()
+            .as_variant()
+            .unwrap();
+        assert_eq!(value.as_strv(), Some(vec!["one", "two", "three"]));
+    }
+
+    /// A serialized `a{sv}` carrying an `as` key hands the strings back after a
+    /// parse of its bytes.
+    #[test]
+    fn reads_back_a_parsed_strv() {
+        let mut builder = DictBuilder::new();
+        builder
+            .insert_str("version", "1")
+            .insert_strv("ostree.ref-binding", &["alpha".to_owned(), "".to_owned()]);
+        let dict = builder.build();
+
+        let ty = Type::parse("a{sv}").unwrap();
+        let bytes = to_bytes(&ty, &dict).unwrap();
+        let parsed = from_bytes(&ty, &bytes).unwrap();
+
+        let (_, value) = parsed
+            .dict_get("ostree.ref-binding")
+            .unwrap()
+            .as_variant()
+            .unwrap();
+        assert_eq!(value.as_strv(), Some(vec!["alpha", ""]));
+    }
+
+    /// The empty array yields the empty list, which is what a key written as an
+    /// empty `as` holds.
+    #[test]
+    fn reads_an_empty_array_as_an_empty_list() {
+        assert_eq!(Value::Array(Vec::new()).as_strv(), Some(Vec::new()));
+
+        let mut builder = DictBuilder::new();
+        builder.insert_strv("k", &[]);
+        let dict = builder.build();
+        let (_, value) = dict.dict_get("k").unwrap().as_variant().unwrap();
+        assert_eq!(value.as_strv(), Some(Vec::new()));
+    }
+
+    /// An `o` and a `g` are held as strings, so an `ao` and an `ag` hand their
+    /// strings back the way an `as` does.
+    #[test]
+    fn reads_a_folded_object_path_and_signature_array() {
+        let paths = Value::Array(vec![
+            Value::Str("/org/example/One".to_owned()),
+            Value::Str("/org/example/Two".to_owned()),
+        ]);
+        let ty = Type::parse("ao").unwrap();
+        let parsed = from_bytes(&ty, &to_bytes(&ty, &paths).unwrap()).unwrap();
+        assert_eq!(
+            parsed.as_strv(),
+            Some(vec!["/org/example/One", "/org/example/Two"])
+        );
+
+        let signatures = Value::Array(vec![Value::Str("a{sv}".to_owned())]);
+        let ty = Type::parse("ag").unwrap();
+        let parsed = from_bytes(&ty, &to_bytes(&ty, &signatures).unwrap()).unwrap();
+        assert_eq!(parsed.as_strv(), Some(vec!["a{sv}"]));
+    }
+
+    /// An array holding an element that is not a string yields `None` for the
+    /// whole array. A byte array, a nested array, and a dict entry are such
+    /// elements.
+    #[test]
+    fn refuses_an_array_with_a_non_string_element() {
+        let mixed = Value::Array(vec![Value::Str("one".to_owned()), Value::U32(2)]);
+        assert_eq!(mixed.as_strv(), None);
+        assert_eq!(Value::Array(vec![Value::Bytes(vec![0x41])]).as_strv(), None);
+        let nested = Value::Array(vec![Value::Array(vec![Value::Str("one".to_owned())])]);
+        assert_eq!(nested.as_strv(), None);
+        let entries = Value::Array(vec![Value::Tuple(vec![
+            Value::Str("k".to_owned()),
+            Value::Str("v".to_owned()),
+        ])]);
+        assert_eq!(entries.as_strv(), None);
+    }
+
+    /// Only an array yields the strings. The string, the byte array, the
+    /// tuple, the maybe, and the variant all yield `None`.
+    #[test]
+    fn refuses_every_other_type() {
+        assert_eq!(Value::Str("one".to_owned()).as_strv(), None);
+        assert_eq!(Value::Bytes(vec![0x41, 0x42]).as_strv(), None);
+        assert_eq!(
+            Value::Tuple(vec![Value::Str("one".to_owned())]).as_strv(),
+            None
+        );
+        assert_eq!(
+            Value::Maybe(Some(Box::new(Value::Array(vec![Value::Str(
+                "one".to_owned()
+            )]))))
+            .as_strv(),
+            None
+        );
+        assert_eq!(Value::Maybe(None).as_strv(), None);
+        assert_eq!(
+            Value::variant(Type::Array(Box::new(Type::Str)), Value::Array(Vec::new())).as_strv(),
+            None
+        );
     }
 }

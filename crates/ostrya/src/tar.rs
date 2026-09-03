@@ -671,10 +671,12 @@ fn collect<'a>(
 fn read_error(err: std::io::Error) -> Error {
     // The refusal is recognized by the dependency's message text: smol-tar
     // 0.1.7, the registry version the workspace resolves, spells it `utf8 in
-    // file path`. The exact pin `=0.1.7` in `crates/ostrya/Cargo.toml` holds
-    // that text. A change to that text upstream leaves the failure an
-    // `Error::Io`; `commit_tar_pathname_not_utf8_is_refused` in the CLI tests
-    // covers the case against the tool and fails when the text moves.
+    // file path`, and `Cargo.lock` records that version. A change to that
+    // text upstream leaves the failure an `Error::Io`;
+    // `import_rejects_a_pathname_that_is_not_utf8` in
+    // `crates/ostrya/tests/tar.rs` asserts `Error::TarPathname` and fails
+    // when the text moves. `commit_tar_pathname_not_utf8_is_refused` in the
+    // CLI tests holds the same case against the tool where it is installed.
     if err.kind() == std::io::ErrorKind::InvalidData
         && err.to_string().contains("utf8 in file path")
     {

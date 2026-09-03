@@ -82,16 +82,16 @@ all pure Rust:
   content objects (over `flate2`) and streaming xz for static-delta parts (over
   `liblzma`, statically linked under the `lzma-static` feature).
 - `miniz_oxide` (MIT OR Zlib OR Apache-2.0) -- the raw-DEFLATE encoder behind
-  archive-mode content objects. A direct dependency pins the compressor, so the
-  stored `.filez` bytes for a given `[archive] zlib-level` are fixed for every
-  feature set the build enables. The requirement is exact, `=0.8.9`, since the
-  encoder output is the bytes the repository stores. Golden SHA-256 vectors over
-  the encoder output, one per level 1-9, hold that surface in
-  `crates/ostrya/src/write.rs`.
+  archive-mode content objects. A direct dependency on the compressor holds the
+  stored `.filez` bytes for a given `[archive] zlib-level` the same under every
+  feature set the build enables. The requirement is a minimum bound, `0.8.9`,
+  and `Cargo.lock` records the version a build resolves. The encoder output is
+  the bytes the repository stores. Golden SHA-256 vectors over the encoder
+  output, one per level 1-9, hold that surface in `crates/ostrya/src/write.rs`.
   `archive_objects_are_byte_identical_to_the_fixture` in
   `crates/ostrya/tests/write.rs` holds it against a fixture the `ostree` tool
-  wrote. A move to another version is a deliberate step, and it re-measures both
-  records.
+  wrote. A resolved version whose output differs from those records fails the
+  test suite.
 - `ed25519-dalek` -- the ed25519 sign engine.
 - `bsdiff` (BSD-2-Clause, no dependencies of its own) -- bspatch stream
   generation for static deltas. Its output is the interleaved

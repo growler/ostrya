@@ -14,13 +14,17 @@ library is MIT-licensed.
 
 ## Goals and constraints
 
-1. Rust-native. `liblzma` is the one C library the library links: statically
-   built from source for xz in static deltas, requiring no C runtime of its own
-   beyond the libc `std` already links. PCRE2 joins it on the same terms in the
-   `ostrya-cli` binary alone, where it compiles the `commit
-   --tar-pathname-filter` expression the tool also compiles with PCRE2; that
-   crate sets `publish = false`, so no published crate links it, and CI holds
-   the rule that no other manifest may name `pcre2`. Nothing else links C.
+1. Rust-native. `liblzma` is the one C library the library links, for xz in
+   static deltas. The `lzma-static` feature builds it from source and links it
+   statically, requiring no C runtime of its own beyond the libc `std` already
+   links. The feature is off by default, and a build without it links the
+   system liblzma. `ostrya-cli` carries `lzma-static` in its default set, so
+   the shipped `ostrya` binary needs no runtime liblzma. PCRE2 links on the
+   same static terms in the `ostrya-cli` binary alone, where it compiles the
+   `commit --tar-pathname-filter` expression the tool also compiles with
+   PCRE2; that crate sets `publish = false`, so no published crate links it,
+   and CI holds the rule that no other manifest may name `pcre2`. Nothing
+   else links C.
    `rustix` handles the syscalls a portable async file API cannot express
    (fd-relative opens and metadata, xattrs, statx, FICLONE reflink, O_TMPFILE +
    linkat, OFD locks); streaming file I/O goes through the runtime's async file.
@@ -50,12 +54,13 @@ redesigned to be idiomatic Rust (see `api-sketch.md`).
 ## Interpretation of "no dependencies except rust"
 
 Read as: the Rust crate ecosystem is in scope and C libraries are avoided. The
-library links `liblzma` statically for xz, and the `ostrya-cli` binary links
-PCRE2 statically for the `commit --tar-pathname-filter` expression (see the
-Decisions section); each requires no C runtime beyond the libc `std` already
-links. PCRE2 belongs to that binary alone, which sets `publish = false`. Every
-crate is authorized by the operator before it enters a manifest. The foundation
-crates below are all pure Rust:
+library links `liblzma` for xz, statically under its `lzma-static` feature,
+and the `ostrya-cli` binary links PCRE2 statically for the `commit
+--tar-pathname-filter` expression (see the Decisions section); each static
+build requires no C runtime beyond the libc `std` already links. PCRE2 belongs
+to that binary alone, which sets `publish = false`. Every crate is authorized
+by the operator before it enters a manifest. The foundation crates below are
+all pure Rust:
 
 - `rustix` -- the syscalls a portable async file API cannot express:
   fd-relative open/stat/link/rename/readlink/mkdir, xattrs, statx, statvfs,
@@ -75,7 +80,7 @@ crates below are all pure Rust:
 - `async-compression`, with its `deflate` and `xz` codec features plus the
   trait-family features -- streaming raw-DEFLATE inflate for archive-mode
   content objects (over `flate2`) and streaming xz for static-delta parts (over
-  statically-linked `liblzma`).
+  `liblzma`, statically linked under the `lzma-static` feature).
 - `miniz_oxide` (MIT OR Zlib OR Apache-2.0) -- the raw-DEFLATE encoder behind
   archive-mode content objects. A direct dependency pins the compressor, so the
   stored `.filez` bytes for a given `[archive] zlib-level` are fixed for every
@@ -104,13 +109,14 @@ crates below are all pure Rust:
   crate vendors the PCRE2 C library and builds it statically; `ostrya-cli` sets
   `publish = false`, so no published crate links it.
 - HTTP client, INI parsing, fs-verity, and EROFS: see the Decisions section;
-  each has a pure-Rust path. LZMA/xz links `liblzma` statically (see the
-  Decisions section).
+  each has a pure-Rust path. LZMA/xz links `liblzma`, statically under the
+  `lzma-static` feature (see the Decisions section).
 
 Anything else that would pull in C (openssl-sys, libgpg-error/gpgme, libcurl,
 libsoup, libarchive, libcomposefs, glib) is excluded by constraint 1;
-statically-linked `liblzma` and statically-linked PCRE2 are the two authorized
-exceptions, and PCRE2 is authorized in the `ostrya-cli` binary alone.
+`liblzma`, statically linked under the `lzma-static` feature, and
+statically-linked PCRE2 are the two authorized exceptions, and PCRE2 is
+authorized in the `ostrya-cli` binary alone.
 
 ## Architecture
 
@@ -146,8 +152,8 @@ bounded:
   design is `conformance/harness.md`.
 
 Feature flags on `ostrya`: `pull`, `sign-spki`, `verify-gpg`, `sign-gpg`,
-`deltas`, `s3`, `ssh`, plus the runtime backend selectors `smol` (default) and
-`tokio`, forwarded to `ostrya-rt`. Each
+`deltas`, `s3`, `ssh`, `lzma-static` for the static xz build, plus the runtime
+backend selectors `smol` (default) and `tokio`, forwarded to `ostrya-rt`. Each
 heavier or riskier subsystem is opt-in so the core stays small. Tar
 import/export (built on `smol-tar`) and composefs export are always
 compiled, not feature-gated.
@@ -1994,11 +2000,11 @@ source across the `R` that ends a run and reuses it when a later `r` names the
 same checksum; objects are content-addressed, so a checksum match means
 identical bytes. One source object is held at a time.
 
-Dependency: `liblzma` (MIT/Apache-2.0), statically linked and built from source
-(bundled xz 5.8, no runtime liblzma), backing `async-compression`'s xz codec in
-both directions. It is one of the two authorized C-linking exceptions, the
-other being PCRE2 in `ostrya-cli` (see the Interpretation section and decision
-#1).
+Dependency: `liblzma` (MIT/Apache-2.0), built from source and statically linked
+under the `lzma-static` feature (bundled xz 5.8, no runtime liblzma), backing
+`async-compression`'s xz codec in both directions. It is one of the two
+authorized C-linking exceptions, the other being PCRE2 in `ostrya-cli` (see
+the Interpretation section and decision #1).
 
 Verify: the port applies the tool's from-scratch, from->to bspatch, and from->to
 rollsum deltas and reproduces the target commit's objects, the tool's `fsck` and
@@ -4961,9 +4967,9 @@ Deliverables, one line each:
 - GVariant byte-exactness (Phase 1): everything downstream depends on it.
   Mitigation: extensive golden fixtures before building on it.
 - xz coding (Phases 15a/15b): resolved. Decode (15a) and encode (15b) both go
-  through `async-compression`'s xz codec over statically-linked `liblzma`, the
-  reference implementation the tool itself uses, so the parts we write are
-  ordinary liblzma-produced xz the tool decodes.
+  through `async-compression`'s xz codec over `liblzma`, the reference
+  implementation the tool itself uses, so the parts we write are ordinary
+  liblzma-produced xz the tool decodes.
 - HTTP client (Phase 16a): resolved. `hyper` speaks both versions over its own
   I/O traits, which a ~90-line safe adapter bridges to `futures-io`, so
   `ostrya-rt` stays the only crate that knows the backend. `h2` pulls `tokio`
@@ -4990,14 +4996,18 @@ Resolved:
 
 1. Dependency policy: every crate is authorized by the operator before it
    enters a manifest. C libraries are avoided; the two authorized exceptions
-   are `liblzma`, statically linked for xz, and PCRE2, statically linked in the
-   `ostrya-cli` binary for the `commit --tar-pathname-filter` expression (both
-   bundled and built from source, needing no C runtime beyond the libc `std`
-   links). `ostrya-cli` sets `publish = false`, so no published crate links
-   PCRE2, and CI holds the rule that no other manifest may name `pcre2`
-   (`.github/workflows/ci.yml`, "PCRE2 stays in ostrya-cli"). The Rust crate
-   ecosystem is in scope (rustix, smol, sha2, ed25519-dalek, rustls,
-   miniz_oxide, and so on).
+   are `liblzma` for xz, statically linked under the library's `lzma-static`
+   feature, and PCRE2, statically linked in the `ostrya-cli` binary for the
+   `commit --tar-pathname-filter` expression (each static build is bundled and
+   built from source, needing no C runtime beyond the libc `std` links).
+   `ostrya-cli` carries `lzma-static` in its default set, so the shipped
+   binary needs no runtime liblzma, and CI holds that the feature stays in
+   that set (`.github/workflows/ci.yml`, "The shipped binary links xz
+   statically"). `ostrya-cli` sets `publish = false`, so no
+   published crate links PCRE2, and CI holds the rule that no other manifest
+   may name `pcre2` (`.github/workflows/ci.yml`, "PCRE2 stays in ostrya-cli").
+   The Rust crate ecosystem is in scope (rustix, smol, sha2, ed25519-dalek,
+   rustls, miniz_oxide, and so on).
 
    Two CI steps hold the dependency rules over the whole graph, both reading
    `cargo metadata --format-version 1 --all-features`. One holds the

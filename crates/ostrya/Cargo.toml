@@ -15,6 +15,10 @@ tokio = ["ostrya-rt/tokio"]
 sign-spki = ["dep:p256"]
 verify-gpg = ["dep:pgp"]
 sign-gpg = ["verify-gpg"]
+# Builds xz from source and links it statically, so the build needs no
+# runtime liblzma. The feature is off by default, and a build without it
+# takes the system liblzma.
+lzma-static = ["liblzma/static"]
 
 [dependencies]
 ostrya-core = { workspace = true }
@@ -30,10 +34,15 @@ async-compression = { version = "0.4", default-features = false, features = [
     "futures-io",
 ] }
 # liblzma backs async-compression's xz codec (delta parts, both directions).
-# This direct dependency exists only to force static linking via feature
-# unification: bundled xz built from source, no runtime liblzma, no C runtime
-# beyond the libc std already links.
-liblzma = { version = "0.4", features = ["static"] }
+# The library reaches the codec through async-compression and names no
+# liblzma item of its own. This direct dependency carries the `lzma-static`
+# feature: Cargo unifies features per crate, so the feature turns on
+# `liblzma/static` across the whole graph, and xz is then built from source
+# with no runtime liblzma and no C runtime beyond the libc std already links.
+# A build without the feature links the system liblzma 5.8 or later where
+# `pkg-config` finds one, and builds the bundled source where it does not.
+# `ostrya-cli` carries `lzma-static` in its default set.
+liblzma = { version = "0.4" }
 # bsdiff patch generation for static-delta `B` ops. Zero dependencies, no
 # unsafe, and its output is the interleaved control/diff/extra layout
 # `bspatch.rs` reads.

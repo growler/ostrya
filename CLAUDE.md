@@ -79,13 +79,17 @@ reference, or reading material.
 
 ## Goals
 
-1. Rust-native. `liblzma` is the one C library the library links: statically
-   built from source for xz in static deltas, requiring no C runtime of its own
-   beyond the libc `std` already links. PCRE2 joins it on the same terms in the
-   `ostrya-cli` binary alone, where it compiles the `commit
-   --tar-pathname-filter` expression the tool also compiles with PCRE2; that
-   crate sets `publish = false`, so no published crate links it, and CI holds
-   the rule that no other manifest may name `pcre2`. Nothing else links C.
+1. Rust-native. `liblzma` is the one C library the library links, for xz in
+   static deltas. The `lzma-static` feature builds it from source and links it
+   statically, requiring no C runtime of its own beyond the libc `std` already
+   links. The feature is off by default, and a build without it links the
+   system liblzma. `ostrya-cli` carries `lzma-static` in its default set, so
+   the shipped `ostrya` binary needs no runtime liblzma. PCRE2 links on the
+   same static terms in the `ostrya-cli` binary alone, where it compiles the
+   `commit --tar-pathname-filter` expression the tool also compiles with
+   PCRE2; that crate sets `publish = false`, so no published crate links it,
+   and CI holds the rule that no other manifest may name `pcre2`. Nothing
+   else links C.
    `rustix` handles the syscalls a portable async file API cannot express
    (fd-relative opens and metadata, xattrs, statx, FICLONE reflink, O_TMPFILE +
    linkat, OFD locks); streaming file I/O goes through the runtime's async file.
@@ -215,7 +219,7 @@ by hand before it is accepted.
 - Every added crate must be authorized by the operator before it enters any
   manifest. Do not suggest a crate that links a C library unless that library
   is statically linked and requires no C runtime of its own beyond the libc
-  `std` already links (as `liblzma` does).
+  `std` already links (as `liblzma` does under the `lzma-static` feature).
 - Byte-exact format fidelity is non-negotiable. Verify against golden fixtures
   produced by running the `ostree` tool as a black box, and cross-check both
   directions: the tool reads what the port writes, and the port reads what the

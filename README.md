@@ -37,15 +37,18 @@ roadmap.
 
 ## Design
 
-- Pure Rust, with two static C-linking exceptions, each requiring no C runtime
-  of its own beyond the libc `std` already links: `liblzma`, which the library
-  links for xz in static deltas, and PCRE2, which the `ostrya-cli` binary
-  links for the `commit --tar-pathname-filter` expression. PCRE2 belongs to
-  that binary alone, which sets `publish = false`. `rustix` provides the
-  syscalls a portable async file API cannot express (fd-relative opens and
-  metadata, xattrs, statx, FICLONE reflink, `O_TMPFILE` + linkat,
-  OFD-compatible record locks). Streaming file I/O goes through the runtime's
-  async file.
+- Pure Rust, with two C-linking exceptions: `liblzma`, which the library links
+  for xz in static deltas, and PCRE2, which the `ostrya-cli` binary links for
+  the `commit --tar-pathname-filter` expression. The library's `lzma-static`
+  feature builds xz from source and links it statically; the feature is off by
+  default, and a build without it links the system liblzma. `ostrya-cli`
+  carries the feature in its default set, so the shipped `ostrya` binary needs
+  no runtime liblzma. Each static build requires no C runtime of its own
+  beyond the libc `std` already links. PCRE2 belongs to that binary alone,
+  which sets `publish = false`. `rustix` provides the syscalls a portable
+  async file API cannot express (fd-relative opens and metadata, xattrs,
+  statx, FICLONE reflink, `O_TMPFILE` + linkat, OFD-compatible record locks).
+  Streaming file I/O goes through the runtime's async file.
 - Async throughout. The runtime backend sits behind the internal `ostrya-rt`
   crate: `smol` by default, `tokio` under the `tokio` feature.
 - Multiple concurrent transactions within a single process. A `Transaction` is
@@ -79,9 +82,10 @@ The project is a Cargo workspace of focused crates:
   reading, and the paths listed under Status. Feature-gated.
 - `ostrya-cli` -- the command-line front-end (builds the `ostrya` binary).
 
-Feature flags on `ostrya`: the runtime selectors `smol` (default) and `tokio`;
-later phases add `pull`, `verify-gpg`, `sign-gpg` (which turns on `verify-gpg`),
-`deltas`, `s3`, and `ssh`.
+Feature flags on `ostrya`: the runtime selectors `smol` (default) and `tokio`,
+and `lzma-static` for the static xz build; later phases add `pull`,
+`verify-gpg`, `sign-gpg` (which turns on `verify-gpg`), `deltas`, `s3`, and
+`ssh`.
 
 ## Clean-room provenance and licensing
 

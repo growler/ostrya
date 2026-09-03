@@ -52,6 +52,20 @@ jobs:
           cargo build -p ostrya-cli
           ! readelf -d target/debug/ostrya | grep -qi pcre2
 
+      # `ostrya-cli` carries `lzma-static` in its default set, so the shipped
+      # binary needs no runtime liblzma (`CLAUDE.md`, goal 1). The library's
+      # own default set leaves the feature off, so the binary's default build
+      # is the one configuration that holds the invariant, and dropping the
+      # feature from that set is what this step catches. The assertion reads
+      # the resolved feature list rather than the linked binary, because
+      # `liblzma-sys` builds the vendored xz sources wherever `pkg-config`
+      # reports a system liblzma older than 5.8.0, which makes a `readelf`
+      # check pass on such a runner with the feature off.
+      - name: The shipped binary links xz statically
+        run: |
+          cargo tree -p ostrya-cli -e normal,build -f "{p} {f}" \
+            | grep -qE 'liblzma-sys v[0-9.]+ .*\bstatic\b'
+
       # Every package in the graph, under every feature, must carry a
       # permissive license (`CLAUDE.md`, "Requirement: permissive licenses
       # only"), so the MIT library puts no copyleft obligation on a downstream
@@ -90,8 +104,8 @@ jobs:
                   end'
 
       # A package that declares a `links` key builds and links a native
-      # library, and the tree allows two names. `liblzma-sys` is the static xz
-      # build for the delta paths (`CLAUDE.md`, goal 1). `ring` is an optional
+      # library, and the tree allows two names. `liblzma-sys` is the xz build
+      # for the delta paths (`CLAUDE.md`, goal 1). `ring` is an optional
       # dependency of `rustls-webpki` that no feature turns on, so it sits in
       # the resolved graph and nothing builds it: `cargo tree --all-features -i
       # ring` prints nothing and `target/debug/build` holds no `ring` artifact.

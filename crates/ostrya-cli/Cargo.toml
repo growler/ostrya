@@ -12,11 +12,13 @@ name = "ostrya"
 path = "src/main.rs"
 
 [features]
-default = ["smol", "spki", "gpg"]
+default = ["smol", "spki", "gpg", "lzma-static"]
 smol = ["ostrya/smol", "ostrya-rt/smol"]
 tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
 spki = ["ostrya/sign-spki"]
 gpg = ["ostrya/sign-gpg"]
+# The shipped binary links xz statically, so it needs no runtime liblzma.
+lzma-static = ["ostrya/lzma-static"]
 
 [dependencies]
 ostrya = { path = "../ostrya", default-features = false }

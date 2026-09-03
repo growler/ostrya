@@ -1710,6 +1710,246 @@ fn differing_ensure_dir_restamps_a_lazy_child_without_hydrating() {
     });
 }
 
+/// `ensure_dir` at a path with no components stamps the tree root, so the
+/// tree `close` hands back carries its root dirmeta and `write_mtree` and the
+/// commit take it as it stands. A second call with a differing `meta`
+/// replaces the recorded one, and the committed root dirmeta reads back as
+/// the second stamp. The file written between the two stamps stays in the
+/// tree, because a stamp drops no entry.
+#[test]
+fn ensure_dir_stamps_and_restamps_the_tree_root() {
+    let tmp = TmpDir::new("staging-ensure-dir-root");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let meta1 = dir_meta_mode(0o040700);
+        let meta2 = dir_meta_mode(0o040750);
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.ensure_dir(Path::new("."), &meta1).await.unwrap();
+        st.write_file_content(Path::new("a.txt"), &reg(), b"aaa")
+            .await
+            .unwrap();
+        st.ensure_dir(Path::new("."), &meta2).await.unwrap();
+
+        // The tree goes to write_mtree with the stamp as its only root
+        // dirmeta: no set_metadata_checksum call stands between them.
+        let mut built = st.close().unwrap();
+        let tree = txn.write_mtree(&mut built).await.unwrap();
+        let root_dirmeta = *tree.dirmeta_checksum();
+        let commit = txn
+            .write_commit(CommitOptions::default(), &tree)
+            .await
+            .unwrap();
+        txn.set_ref("test/root", Some(&commit));
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&root).await.unwrap();
+        let (committed, _) = repo.read_commit("test/root").await.unwrap();
+        assert_eq!(
+            *committed.dirmeta_checksum(),
+            root_dirmeta,
+            "the commit carries the stamped root dirmeta"
+        );
+        assert_eq!(
+            repo.load_dirmeta(&root_dirmeta).await.unwrap(),
+            meta2,
+            "the recorded root dirmeta is the second stamp"
+        );
+        let body = repo
+            .load_dirtree(committed.dirtree_checksum())
+            .await
+            .unwrap();
+        let names: Vec<&str> = body.files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a.txt"], "the stamps dropped no entry");
+    });
+}
+
+/// A root `ensure_dir` whose `meta` matches the root's recorded dirmeta
+/// offers nothing for staging. `metadata_total` counts every offer before
+/// dedup, so the exact count is the assertion.
+#[test]
+fn unchanged_root_ensure_dir_stages_no_dirmeta() {
+    let tmp = TmpDir::new("staging-ensure-dir-root-noop");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let novel = dir_meta_mode(0o040700);
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.ensure_dir(Path::new("."), &novel).await.unwrap();
+        st.ensure_dir(Path::new("."), &novel).await.unwrap();
+
+        let mut built = st.close().unwrap();
+        txn.write_mtree(&mut built).await.unwrap();
+        let stats = txn.commit().await.unwrap();
+
+        // The offers: the first stamp's dirmeta and the root dirtree
+        // write_mtree assembles. The second stamp adds none.
+        assert_eq!(
+            stats.metadata_total, 2,
+            "the unchanged root ensure_dir offered no dirmeta"
+        );
+    });
+}
+
+/// The three spellings of a path with no components -- `.`, `/`, and the
+/// empty path -- each stamp the tree root. A path ending in `..` carries a
+/// final component the split refuses before resolution begins.
+#[test]
+fn every_root_spelling_stamps_the_tree_root() {
+    let tmp = TmpDir::new("staging-ensure-dir-root-spellings");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn.write_dirmeta(&novel).await.unwrap();
+
+        for spelling in [".", "/", ""] {
+            let st = txn.staging_tree(None).await.unwrap();
+            st.ensure_dir(Path::new(spelling), &novel).await.unwrap();
+            let mut built = st.close().unwrap();
+            let tree = txn.write_mtree(&mut built).await.unwrap();
+            assert_eq!(
+                *tree.dirmeta_checksum(),
+                novel_csum,
+                "{spelling:?} names the tree root"
+            );
+        }
+
+        let st = txn.staging_tree(None).await.unwrap();
+        let err = st.ensure_dir(Path::new(".."), &novel).await.unwrap_err();
+        match &err {
+            Error::Staging(msg) => assert_eq!(msg, ".. ends in `..`"),
+            other => panic!("expected Staging, got {other:?}"),
+        }
+
+        drop(st);
+        txn.abort().await.unwrap();
+    });
+}
+
+/// A root `ensure_dir` on a tree hydrated from a commit replaces the commit's
+/// root dirmeta and leaves the tree body as it was: the root keeps its
+/// committed dirtree checksum and is never reassembled, and the new commit
+/// carries the stamp.
+#[test]
+fn root_ensure_dir_restamps_a_committed_root() {
+    let tmp = TmpDir::new("staging-ensure-dir-root-commit");
+    let base = tmp.path();
+    let repo_root = base.join("repo");
+
+    let src = base.join("base");
+    mkdir(&src, 0o755);
+    write_file(&src.join("a.txt"), b"aaa", 0o644);
+
+    block_on(async {
+        let repo = Repo::create(&repo_root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let dfd = std::fs::File::open(base).unwrap();
+        commit_dir(&repo, dfd.as_fd(), Path::new("base"), "test/base").await;
+        let (committed, _) = repo.read_commit("test/base").await.unwrap();
+        let committed_dirtree = *committed.dirtree_checksum();
+        let committed_dirmeta = *committed.dirmeta_checksum();
+
+        let checksum = repo.resolve_rev("test/base", false).await.unwrap().unwrap();
+        let (commit, _) = repo.load_commit(&checksum).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let novel = dir_meta_mode(0o040700);
+        let st = txn.staging_tree(Some(&commit)).await.unwrap();
+
+        st.ensure_dir(Path::new("."), &novel).await.unwrap();
+
+        let mut built = st.close().unwrap();
+        let rebuilt = txn.write_mtree(&mut built).await.unwrap();
+        let new_root_dirmeta = *rebuilt.dirmeta_checksum();
+        assert_eq!(
+            *rebuilt.dirtree_checksum(),
+            committed_dirtree,
+            "the root keeps its committed dirtree checksum"
+        );
+        assert_ne!(
+            new_root_dirmeta, committed_dirmeta,
+            "the stamp replaced the committed root dirmeta"
+        );
+        let recommit = txn
+            .write_commit(CommitOptions::default(), &rebuilt)
+            .await
+            .unwrap();
+        txn.set_ref("test/restamped", Some(&recommit));
+        let stats = txn.commit().await.unwrap();
+
+        // The offers: the stamped dirmeta and the commit object. A reassembled
+        // root dirtree would be a third, whatever checksum it landed on.
+        assert_eq!(stats.metadata_total, 2, "the stamp reassembled no dirtree");
+
+        let repo = Repo::open(&repo_root).await.unwrap();
+        let (restamped, _) = repo.read_commit("test/restamped").await.unwrap();
+        assert_eq!(
+            *restamped.dirmeta_checksum(),
+            new_root_dirmeta,
+            "the new commit carries the stamped root dirmeta"
+        );
+        assert_eq!(
+            repo.load_dirmeta(&new_root_dirmeta).await.unwrap(),
+            novel,
+            "the stamped root dirmeta reads back as the meta the call carried"
+        );
+    });
+}
+
+/// A root `ensure_dir` stamps a dirmeta and drops no entry, so no
+/// outstanding-writer guard holds it off: the stamp lands while a `write_file`
+/// writer is live, and that writer's entry lands after it.
+#[test]
+fn root_ensure_dir_runs_with_an_outstanding_writer() {
+    let tmp = TmpDir::new("staging-ensure-dir-root-writer");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn.write_dirmeta(&novel).await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        let mut writer = st.write_file(Path::new("f.txt"), &reg()).await.unwrap();
+        writer.write_all(b"payload").await.unwrap();
+        st.ensure_dir(Path::new("."), &novel).await.unwrap();
+        writer.finish().await.unwrap();
+
+        let mut built = st.close().unwrap();
+        let tree = txn.write_mtree(&mut built).await.unwrap();
+        assert_eq!(
+            *tree.dirmeta_checksum(),
+            novel_csum,
+            "the stamp landed with a writer outstanding"
+        );
+        let root_dirtree = *tree.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&root).await.unwrap();
+        let body = repo.load_dirtree(&root_dirtree).await.unwrap();
+        let names: Vec<&str> = body.files.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["f.txt"],
+            "the writer's entry landed after the stamp"
+        );
+    });
+}
+
 /// `place_object` records a checksum at a path, is silent for an identical
 /// placement, and answers a differing entry or a directory with
 /// `MergeConflict`.

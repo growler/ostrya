@@ -38,9 +38,12 @@
 //! [`lookup`](StagingTree::lookup)) take a `follow_symlinks` flag governing the
 //! final component. The [`merge_at`](StagingTree::merge_at) flag of that name
 //! governs the left-side entry names the merge reaches; the base's own final
-//! component follows either way. Objects load from the transaction's staged set
-//! before `objects/`, so content staged in the current transaction is visible
-//! before it publishes.
+//! component follows either way. A path with no components -- `.`, `/`, and
+//! the empty path -- names the tree root, which
+//! [`ensure_dir`](StagingTree::ensure_dir) stamps and
+//! [`merge_at`](StagingTree::merge_at) merges into. Objects load from the
+//! transaction's staged set before `objects/`, so content staged in the
+//! current transaction is visible before it publishes.
 //!
 //! Refusals. Each condition carries its own [`Error`] variant naming the path
 //! resolution stopped at, so a caller branches on the variant:
@@ -450,7 +453,34 @@ impl<'txn> StagingTree<'txn> {
     /// directory is never hydrated: its recorded dirmeta is compared, and a
     /// differing one is rewritten in place, because the child's contents do
     /// not change.
+    ///
+    /// A `path` with no components -- `.`, `/`, and the empty path -- names
+    /// the tree root, which takes the same comparison and the same stamp. No
+    /// parent directory holds the root, so the root is a directory in every
+    /// call. [`close`](StagingTree::close) hands back a tree whose root
+    /// carries the stamped dirmeta, and
+    /// [`write_mtree`](crate::Transaction::write_mtree) records it as the
+    /// root dirmeta of the tree it returns.
     pub async fn ensure_dir(&self, path: &Path, meta: &DirMeta) -> Result<()> {
+        if components_of(path)?.is_empty() {
+            // The tree root, which no parent directory holds: the comparison
+            // reads the root's own recorded dirmeta and the stamp sets it
+            // there. Staging is async and runs outside the lock, and the root
+            // is a directory in every acquisition, so the mutating
+            // acquisition repeats no decision: it stamps what the comparison
+            // read. Two stamps of differing dirmetas leave the last one
+            // recorded, the last-writer-wins rule a raced staging write
+            // follows.
+            let new_dirmeta = self.txn.dirmeta_checksum(meta)?;
+            if self.with_dir(&[], |dir| dir.metadata_checksum())? == Some(new_dirmeta) {
+                return Ok(());
+            }
+            let dirmeta = self.stage_dirmeta(meta).await?;
+            return self.with_dir_mut(&[], |dir| {
+                dir.set_metadata_checksum(dirmeta);
+                Ok(())
+            });
+        }
         let (parent, name) = self.resolve_write_parent(path).await?;
         let new_dirmeta = self.txn.dirmeta_checksum(meta)?;
         let unchanged = match self.peek(&parent, &name)? {

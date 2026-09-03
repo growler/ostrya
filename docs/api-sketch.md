@@ -842,7 +842,8 @@ impl StagingTree<'_> {
     /// Create the directory, or reuse an existing one and stamp `meta`
     /// onto it. Stages the dirmeta only when it creates the directory or
     /// the recorded dirmeta differs, and restamps a lazy committed child
-    /// in place without hydrating it.
+    /// in place without hydrating it. A path with no components names the
+    /// tree root, which takes the same comparison and the same stamp.
     pub async fn ensure_dir(&self, path: &Path, meta: &DirMeta) -> Result<()>;
     pub async fn symlink(&self, path: &Path, target: &Path, meta: &FileMeta)
         -> Result<()>;
@@ -984,7 +985,9 @@ never creates a directory, whatever the policy. `make_dir` and
 replace an existing file or symlink entry and fail on a directory with
 `ReplaceDirWithFile`; `make_dir` fails on any existing entry;
 `ensure_dir` creates the directory or restamps an existing one and fails
-on a file or symlink; `make_dir_all` applies its `DirMeta` to the
+on a file or symlink, and takes a path with no components -- `.`, `/`,
+and the empty path -- as the tree root, which it stamps under the same
+comparison; `make_dir_all` applies its `DirMeta` to the
 directories it creates and leaves existing ones untouched; `clear_dir`
 fails with `NotADirectory` on a file, and on a symlink even where it
 points at a directory, and names a directory below the root, so the

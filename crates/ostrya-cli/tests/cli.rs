@@ -4727,12 +4727,17 @@ fn refs_alias_matches_the_tool() {
         assert_agrees(&port, &tool, &args);
     }
 
-    // An alias records a name, so a target naming a commit is refused.
+    // An alias records a name, so a target naming a commit is refused. NEWREF
+    // holds a name outside the hex alphabet, which keeps this step reachable
+    // whatever the corpus hashes to: the existence check resolves NEWREF, both
+    // implementations read a run of lowercase hex as an abbreviated checksum,
+    // and a NEWREF prefixing a commit of this repository is answered by the
+    // existence refusal instead (`docs/conformance/cli-surface.md`, "X1").
     for target in [head.as_str(), "test/main^", "nosuch"] {
         assert_agrees_on_error(
             &port,
             &tool,
-            &["refs", "-A", "--create=bad", target],
+            &["refs", "-A", "--create=nope", target],
             &format!("error: Cannot create alias to non-existent ref: {target}"),
         );
     }

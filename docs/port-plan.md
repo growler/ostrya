@@ -4862,18 +4862,17 @@ config parsing, bootloader integration, `admin` subcommands. This is the
 heaviest cluster (root, mount namespaces, bootloaders) and unlocks the ~25%
 admin tests. Recommend deferring or descoping unless explicitly required.
 
-### Phase 21 -- Library API for the debles migration
+### Phase 21 -- Library API for the debles migration (DONE)
 
 The library changes debles needs before it can replace libostree with ostrya.
 debles is an out-of-tree consumer that builds Debian OSTree images; its demand
-side is `ostrya-gaps.md` in that project. The detailed plan is
-`ostrya-debles-api-improvements.md` in this repository: the measured
-conditions, the decisions taken, and the public surface each deliverable adds.
-This section is the roadmap entry for it.
+side is `ostrya-gaps.md` in that project. This section holds the record of the
+work: the execution order, the deliberate public breaks, and the public
+surface each deliverable adds.
 
 Each deliverable is reviewed before the next begins. No deliverable adds a
 crate to any manifest, and `api-sketch.md` is updated in the same change as
-each. Three public breaks are deliberate and recorded in the plan:
+each. Three public breaks are deliberate and recorded here:
 `Content::Backed`'s `verity` field becomes an `Option`,
 `Repo::export_composefs` gains a parameter, and `MergeOptions` gains a field.
 
@@ -4891,8 +4890,7 @@ chain runs library-first, and D7b is its single CLI deliverable, which puts the
 whole chain's conformance gate in one place. D9 follows D6 because
 `insert_bootable` is a method on the builder D6 introduces.
 
-Deliverables, one line each; `ostrya-debles-api-improvements.md` carries each
-deliverable's full surface and Verify list:
+Deliverables, one line each:
 
 - `D5` -- structured staging errors (DONE): `PathNotFound`, `NotADirectory`,
   `DanglingSymlink`, `SymlinkLoop`, and `EntryExists`, each with an

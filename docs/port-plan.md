@@ -869,7 +869,10 @@ Definition:
 - Merged (non-opaque) directories take dirmeta from the upper inode;
   overlayfs copies directories up with their metadata, so an upper
   entry is authoritative.
-- `overlay.*` xattrs are stripped from ingested entries.
+- Every xattr whose name starts with `trusted.overlay.` or
+  `user.overlay.` is stripped from every ingested file, symlink, and
+  directory, dirmeta included; every other xattr is kept, including
+  one that merely contains `overlay`.
 - Entries carrying `overlay.metacopy` or `overlay.redirect` are a hard
   error naming the feature: such an entry is not self-contained, and
   the overlay must be mounted with these features off.
@@ -896,11 +899,13 @@ Verify: merging a synthesized changeset over a base mtree yields the
 same root checksum as applying the same changeset to a scratch checkout
 by hand (copy, delete, opaque-replace) and ingesting the result through
 `write_dfd_to_mtree`; whiteouts remove exactly the whited-out paths; an
-opaque directory drops base-only entries beneath it; `overlay.*`
-xattrs appear in no staged object; metacopy and redirect inputs fail
-with their dedicated errors; an upper directory over a base symlink and
-upper leaves over base directories apply as cross-type replacements;
-the modifier filter skips upper entries without disturbing base ones.
+opaque directory drops base-only entries beneath it; no
+`trusted.overlay.` or `user.overlay.` xattr appears in any staged
+object, while a name that merely contains `overlay` is kept; metacopy
+and redirect inputs fail with their dedicated errors; an upper
+directory over a base symlink and upper leaves over base directories
+apply as cross-type replacements; the modifier filter skips upper
+entries without disturbing base ones.
 
 ### Phase 7f -- Staging tree and tree merge (port extension) (DONE)
 

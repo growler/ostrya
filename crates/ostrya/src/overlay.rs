@@ -23,7 +23,10 @@
 //!   writes `user.*`, while `trusted.*` is invisible to an unprivileged reader.
 //! - A merged (non-opaque) directory takes its dirmeta from the upper inode,
 //!   since overlayfs copies a directory up with its metadata.
-//! - `overlay.*` control xattrs are stripped from every ingested object.
+//! - Every xattr whose name starts with `trusted.overlay.` or `user.overlay.`
+//!   is stripped from every ingested file, symlink, and directory, dirmeta
+//!   included; every other xattr is kept, including one whose name only
+//!   contains `overlay`.
 //! - `overlay.metacopy` and `overlay.redirect` entries are hard errors: such an
 //!   entry is not self-contained, so the overlay must be mounted with those
 //!   features disabled.
@@ -37,7 +40,10 @@
 //!
 //! Whiteouts and opaque markers are merge mechanics, not content: the modifier
 //! callbacks never see them, and a filter `Skip` on an upper entry leaves the
-//! base version untouched.
+//! base version untouched. The overlay-namespace strip runs before the filter
+//! and the modifier callbacks see an entry's xattr set; a modifier's xattr
+//! callback can still write a stripped name back, since nothing strips it
+//! again afterward.
 
 use std::future::Future;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -121,9 +127,9 @@ struct OverlayEntry {
     gid: u32,
     /// The full `st_mode`, including the file-type bits.
     mode: u32,
-    /// The entry's full on-disk xattr set, including any `overlay.*` control
-    /// attributes; the merge reads those for its decisions and strips them from
-    /// the ingested object.
+    /// The entry's full on-disk xattr set, including any `trusted.overlay.`
+    /// or `user.overlay.` attribute; the merge reads those for its decisions
+    /// and strips them from the ingested object.
     xattrs: Xattrs,
 }
 
@@ -358,7 +364,8 @@ fn open_dir(parent: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
 }
 
 /// The xattr set an ingested object should carry: the on-disk set with every
-/// `overlay.*` control attribute removed, or empty under SKIP_XATTRS.
+/// `trusted.overlay.` or `user.overlay.` attribute removed, or empty under
+/// SKIP_XATTRS.
 fn content_xattrs(skip: bool, full: &Xattrs) -> Result<Xattrs> {
     if skip {
         return Ok(Xattrs::empty());

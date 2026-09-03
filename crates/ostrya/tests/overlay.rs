@@ -305,8 +305,9 @@ fn opaque_directory_drops_base_only_entries() {
 
 #[test]
 fn overlay_xattrs_appear_in_no_staged_object() {
-    // overlay.* control xattrs are stripped from every ingested object, while a
-    // genuine user.* xattr survives. Committed without SKIP_XATTRS so content
+    // Every xattr under `trusted.overlay.` or `user.overlay.` is stripped from
+    // every ingested object; every other xattr, including a name that merely
+    // contains `overlay`, survives. Committed without SKIP_XATTRS so content
     // xattrs are captured.
     let tmp = TmpDir::new("overlay-xattr-strip");
     let base = tmp.path();
@@ -316,6 +317,10 @@ fn overlay_xattrs_appear_in_no_staged_object() {
     write_file(&upper.join("file.txt"), b"content", 0o644);
     set_xattr(&upper.join("file.txt"), "user.keep", b"1");
     set_xattr(&upper.join("file.txt"), "user.overlay.foo", b"bar");
+    // Neither is the overlay prefix: no trailing dot, and the suffix is not
+    // dot-separated. Both must survive the strip.
+    set_xattr(&upper.join("file.txt"), "user.overlay", b"kept-no-dot");
+    set_xattr(&upper.join("file.txt"), "user.overlayish", b"kept-suffix");
     mkdir(&upper.join("od"), 0o755);
     opaque(&upper.join("od")); // user.overlay.opaque=y
     set_xattr(&upper.join("od"), "user.dirkeep", b"1");
@@ -340,7 +345,8 @@ fn overlay_xattrs_appear_in_no_staged_object() {
         let repo = Repo::open(&base.join("repo")).await.unwrap();
         let tree = repo.load_dirtree(&root_dirtree).await.unwrap();
 
-        // The file keeps user.keep and carries no overlay.* xattr.
+        // The file keeps user.keep and carries no trusted.overlay. or
+        // user.overlay. xattr.
         let file = tree.files.iter().find(|(n, _)| n == "file.txt").unwrap().1;
         let file = repo.load_file(&file).await.unwrap();
         assert!(
@@ -352,6 +358,22 @@ fn overlay_xattrs_appear_in_no_staged_object() {
         assert!(
             !file.xattrs.iter().any(|(n, _)| is_overlay(n)),
             "no overlay.* xattr on the file object: {:?}",
+            file.xattrs
+        );
+        // A name that only contains `overlay`, without matching either
+        // prefix exactly, is not a control xattr and survives untouched.
+        assert!(
+            file.xattrs
+                .iter()
+                .any(|(n, v)| n == b"user.overlay\0" && v == b"kept-no-dot"),
+            "user.overlay (no trailing dot) is not the overlay prefix: {:?}",
+            file.xattrs
+        );
+        assert!(
+            file.xattrs
+                .iter()
+                .any(|(n, v)| n == b"user.overlayish\0" && v == b"kept-suffix"),
+            "user.overlayish does not start with the overlay prefix: {:?}",
             file.xattrs
         );
 

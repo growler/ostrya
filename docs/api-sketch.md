@@ -797,15 +797,19 @@ unmounted, which is not checked. Char 0:0 whiteout devices delete the
 corresponding mtree path. Directories carrying `trusted.overlay.opaque`
 or `user.overlay.opaque` clear the mtree subtree before fresh ingest;
 both xattr namespaces are honored (rootless `userxattr` overlays write
-`user.*`). Merged directories take dirmeta from the upper inode.
-`overlay.*` xattrs are stripped from ingested entries. Entries carrying
-`overlay.metacopy` or `overlay.redirect` are errors naming the feature,
-since such entries are not self-contained. An upper directory over an
-mtree symlink is a malformed-changeset error: the VFS resolves symlinks
-at lookup, so a genuine upperdir never contains one relative to its
-base. The modifier callbacks see real entries only, never whiteouts or
-opaque markers; a filter `Skip` on an upper entry leaves the base
-version in place.
+`user.*`). Merged directories take dirmeta from the upper inode. Every
+xattr whose name starts with `trusted.overlay.` or `user.overlay.` is
+stripped from every ingested file, symlink, and directory, dirmeta
+included; every other xattr, including one that merely contains
+`overlay`, is kept. Entries carrying `overlay.metacopy` or
+`overlay.redirect` are errors naming the feature, since such entries
+are not self-contained. An upper directory over an mtree symlink is a
+malformed-changeset error: the VFS resolves symlinks at lookup, so a
+genuine upperdir never contains one relative to its base. The modifier
+callbacks see real entries only, never whiteouts or opaque markers; the
+xattr strip runs before they see an entry, and an xattr callback can
+still write a stripped name back. A filter `Skip` on an upper entry
+leaves the base version in place.
 
 ```rust
 /// Path-addressed construction over a transaction. Borrowing the

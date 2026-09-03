@@ -4755,8 +4755,8 @@ byte, which is the oracle that tells the two parents apart. The rule and its
 sites are in `format-reference.md`, "Revision syntax"; `cli-surface.md`, "P1"
 records the resolution as shared and no longer as a divergence, and the
 `--parent` divergence there widened, the tool refusing at that one site the
-abbreviated checksum it resolves everywhere else. The conformance run reports 659
-cells and 257 passes.
+abbreviated checksum it resolves everywhere else. The conformance run reported
+659 cells and 257 passes after the two items.
 
 `commit -e` settles the message before it takes any repository lock. The
 `[core]` keys the transaction reads -- `locking`, `lock-timeout-secs`,
@@ -4772,6 +4772,41 @@ behind the editing session. An exclusive operation on the same repository,
 takes its own lock at this same point. The wait for the editor runs on the
 blocking pool, so it holds no executor thread
 (`crates/ostrya-cli/src/main.rs`, `wait_for_editor`).
+
+`F17` completes `export`. `TarExportOptions` gained `subpath`, `prefix`, and
+`skip_xattrs`, and the CLI gained `--no-xattrs`, `--subpath=PATH`,
+`--prefix=PATH`, and `-o/--output=PATH`, so the command's option set is whole.
+`subpath` resolves through the commit tree the way `CheckoutOptions::subpath`
+does, `is_root_path` in `checkout.rs` being the one rule both read, and it
+refuses a subpath naming a file or a symlink, which has no tree to walk.
+`prefix` reaches the walk as the initial member-name prefix, so the prefixed
+name is what the hardlink map records and a coalesced member's link name
+carries the prefix while a symlink's stored target does not. `-o` opens the
+destination with create and truncate after the repository resolves and before
+the revision does, which is the tool's own order, so the two agree on the mode
+a fresh destination takes and on the inode and the mode an existing one keeps.
+
+The stream stays a transport interface: the correctness claim is the member
+list, the member metadata, and the tree the stream extracts to, and never the
+bytes, which Phase 10 settled and `format-reference.md`, "tar" states. The one
+byte-level oracle is `--no-xattrs`, whose stream carries every fact an ostree
+tree holds in a dialect both implementations read: each side's archive imports
+into one commit checksum under either importer, over the whole tree, over a
+`--subpath` subtree, and under `--prefix=./`. Eight divergences stand, all in
+`cli-surface.md`, "export": the member order and the hardlink direction that
+follows from it, where a content-sharing group spanning two directories
+coalesces the opposite way; the xattr records, which Phase 10 already recorded
+and which `--no-xattrs` removes; the value dialect `--subpath` takes, on the
+terms `checkout --subpath` already parts on; a `--subpath` naming a file or a
+symlink, which ends the reference build on SIGABRT and which the port refuses
+at exit 1; an empty `-o` value, which the tool reads as standard output and the
+port refuses; a repeated `--no-xattrs`, which the tool takes and the port
+refuses, as it refuses every repeated boolean flag; what a destination holds
+after a refusal, where both truncate it and the tool leaves the two trailing
+zero blocks of the archive it had opened; and the words a destination that
+cannot be opened is refused in. The three options that take a value each take
+the last occurrence, which is what the tool does. The conformance run reports
+681 cells and 270 passes.
 
 #### Phase 17g -- P3 commands with no matrix weight
 

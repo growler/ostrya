@@ -2228,8 +2228,68 @@ Observed `ostree export` output (tool version 2026.1, black-box):
 - This version emitted no PAX extended headers and no xattrs, even for a file
   that carried a `user.demo` xattr committed without `--no-xattrs`: the exported
   stream contained no `SCHILY.xattr.*` record by any encoding.
-- The stream is padded to a full 10240-byte tar record (more than the two
-  trailing zero blocks POSIX requires).
+- Standard output is padded up to a multiple of 10240 bytes (more than the two
+  trailing zero blocks POSIX requires): 8192 bytes of members reached 10240, and
+  41472 bytes of members reached 51200. A `-o` destination carries the members
+  followed by the two zero blocks alone, with no record padding: the same two
+  archives reached 9216 and 42496 bytes. The shorter stream is the longer one
+  with fewer trailing NUL bytes.
+- Within a directory the non-directory entries come first in name order, then
+  the subdirectories in name order, each subdirectory's own members following
+  it. The first member the walk reaches for a content object is the one written
+  in full.
+
+### The tar export options
+
+Four options shape the stream, and none of them changes the member order.
+
+`--no-xattrs` skips the extended attributes. This version emits none in any
+case, so the option leaves the stream it writes byte for byte the same.
+
+`--subpath=PATH` makes the directory `PATH` names the archive root: that
+directory's own dirmeta becomes the `./` member's metadata, and every member
+below it takes a name relative to it. A leading `/` is optional, and `/` names
+the whole tree. Each `/`-separated span of the value is read as a child name to
+look up, so a span that no directory holds as a name refuses the export at exit
+1 with `error: No such file or directory: <path>`, naming the value with the
+leading slash the tool adds. This covers a trailing `/` (`--subpath=/dir/`
+reports `/dir/`), the empty value (which reports `/`), and the spans `.` and
+`..` wherever they stand: `--subpath=.` reports `/.`, `--subpath=..` reports
+`/..`, `--subpath=/./dir` reports `/.`, and `--subpath=/dir/..` reports
+`/dir/..`. A `PATH` naming a regular file or a symlink ends the process on
+SIGABRT with `ostree_repo_file_tree_query_child: assertion failed:
+(self->tree_contents)`, printing that text on standard error and a `Bail out!`
+line carrying the same text on standard output.
+
+`--prefix=PATH` puts `PATH` in front of every member name. The root member's
+name is `PATH` with one `/` appended where `PATH` does not already end in one,
+and every other member's name is `PATH` joined to the member's own relative
+path with no separator between them. So `--prefix=pre` names the root `pre/`
+and a root file `prefile.txt`, where `--prefix=pre/` names them `pre/` and
+`pre/file.txt`. A hardlink's link name carries the prefix; a symlink's target
+is the stored target and carries none. An empty value leaves the `./` root and
+the bare relative names. The option names the members `--subpath` rerooted, so
+the two compose in one order.
+
+`-o PATH`, spelled `--output=PATH` as well, writes the stream to `PATH` and
+writes nothing to standard output. The destination is opened with create and
+truncate after the repository resolves and before the revision does, so an
+existing destination keeps its inode and its mode and is truncated whether or
+not the export proceeds, and a fresh one takes `0o666` reduced by the umask. A
+refusal that comes after that open leaves the two trailing zero blocks at the
+destination and no tar member: 1024 NUL bytes in a `-o` file, and 10240 on
+standard output, where those blocks are padded to one record. A destination
+that does not open reports `error: Failed to open '<path>'` at exit 1, which
+covers a path whose parent directory is absent and a path naming a directory;
+the parent is not created. The value `-` names a file called `-`, and the empty
+value names standard output. A missing positional is refused before the open,
+so `export -o PATH` with no revision creates nothing.
+
+Each of `--subpath`, `--prefix`, and `-o` takes the last occurrence where the
+command line names it more than once: `--prefix=a --prefix=b` names the root
+`b/`, `--subpath=/nope --subpath=/` exports the whole tree at exit 0, and
+`-o o1.tar -o o2.tar` writes `o2.tar` and creates no `o1.tar`. A repeated
+`--no-xattrs` is accepted.
 
 `ostree` import (`ostree commit --tree=tar=FILE`) commits an arbitrary
 filesystem tar into the repository, deferring hardlink resolution to the end and
@@ -2328,6 +2388,19 @@ re-imports a port export into a byte-identical tree (same dirtree and dirmeta
 objects). Members the ostree object model cannot represent -- device nodes and
 FIFOs -- are rejected on import, since a tree stores only regular files,
 symlinks, and directories.
+
+`TarExportOptions` carries the four options. `subpath` and `prefix` reproduce
+the member naming above, `skip_xattrs` drops every xattr record, and the CLI's
+`-o` opens the destination the way the tool opens it. Three facts of the port's
+own stream part from the tool's, and `conformance/cli-surface.md`, "export"
+records them with the rest: every entry of a directory is emitted in one name
+order, so a content-sharing group spanning two directories coalesces in the
+opposite direction and a hardlink member's header carries zeros; `subpath` is a
+path, so its `.` and `..` components and a trailing slash fall away and a
+subpath naming a file or a symlink is refused at exit 1 with `tar: subpath is
+not a directory: <path>`; and standard output carries the two trailing zero
+blocks alone, the way a `-o` destination does, with no padding up to a
+10240-byte record.
 
 ## bare-split-xattrs mode
 
@@ -4401,3 +4474,10 @@ that is absent or holds no key prints nothing at exit 0. The tool follows each
 `UID` line with an `Advanced update URL` and a `Direct update URL` line naming
 the key's Web Key Directory location, and renders `Created` in the host locale
 and time zone; `../conformance/cli-surface.md`, "P3", records both.
+
+### `export`
+
+The command writes the tar stream and no line of its own. The stream's member
+naming, its metadata conventions, its member order, and the four options that
+shape it are stated under "tar" above, together with what `-o` does to its
+destination.

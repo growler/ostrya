@@ -6725,3 +6725,368 @@ note: `commit -b <prefix>` where the prefix names more than one commit stops at
  the implicit parent: both report `error: Refspec <prefix> not unique` at exit 1,
  and neither writes a ref. The cited test holds the refs tree and the loose-object
  inventory of the run to what stood before it.
+
+# ---------------------------------------------------------------------------
+# `export`, Phase 17f (`F17`).
+#
+# The tar stream is a transport interface. The two implementations write
+# different tar dialects, so the claim over a stream is the member list, the
+# member metadata, and the tree the stream extracts to, and never the bytes
+# (`../format-reference.md`, "tar"). No text oracle reads standard output for
+# a cell whose invocation writes a stream there: such a cell states a member
+# name the stream holds and cites the test that compares the two streams
+# member by member.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: export
+cell: export/no-xattrs
+setup: repo-with-commit
+run: export --repo=$REPO --no-xattrs $REV
+expect-exit: 0
+expect-stdout: contains "dir/nested.txt"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: contains "dir/nested.txt"
+ref-expect-stderr: empty
+oracle: exit-status
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::export_options_match_the_tool,
+ ostrya_cli::cli::export_no_xattrs_imports_to_one_commit
+spec: format-reference.md#tar
+note: item `F17`. The option drops every `SCHILY.xattr.*` record the port
+ emits, and the tool emits none in any case, so this is the form whose stream
+ the two write in agreement over every fact an ostree tree carries. The second
+ cited test writes each side's archive to a file, imports it with each
+ implementation, and states one commit checksum for all four imports, which is
+ the checksum oracle for the option.
+
+family: M10
+subcommand: export
+cell: export/subpath
+setup: repo-with-commit
+run: export --repo=$REPO --subpath=/dir $REV
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::export_options_match_the_tool
+spec: format-reference.md#tar
+note: the directory the value names becomes the archive root, carrying its own
+ dirmeta, and every member below it takes a name relative to it. The leading
+ slash is optional. The rerooting is stated by `export/subpath-and-prefix`
+ below, whose prefixed names hold no `dir` component, and by the cited test,
+ which compares the member list, the member metadata, and the extracted tree
+ for the absolute, the relative, and the `/` form.
+
+family: M10
+subcommand: export
+cell: export/subpath-root
+setup: repo-with-commit
+run: export --repo=$REPO --subpath=/ $REV
+expect-exit: 0
+expect-stdout: contains "dir/nested.txt"
+ref-expect-exit: 0
+ref-expect-stdout: contains "dir/nested.txt"
+oracle: exit-status
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::export_options_match_the_tool
+spec: format-reference.md#tar
+note: `/` names the whole tree in both, so the nested member keeps its `dir`
+ component and the stream is the one the option-free export writes.
+
+family: M10
+subcommand: export
+cell: export/prefix
+setup: repo-with-commit
+run: export --repo=$REPO --prefix=pre/ $REV
+expect-exit: 0
+expect-stdout: contains "pre/dir/nested.txt"
+ref-expect-exit: 0
+ref-expect-stdout: contains "pre/dir/nested.txt"
+oracle: exit-status
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::export_options_match_the_tool
+spec: format-reference.md#tar
+note: the value goes in front of every member name, the directory members
+ included, and the root member is the value itself where it ends in `/`. A
+ hardlink's link name carries the prefix and a symlink's target does not, which
+ the cited test states.
+
+family: M10
+subcommand: export
+cell: export/prefix-without-a-trailing-slash
+setup: repo-with-commit
+run: export --repo=$REPO --prefix=pre $REV
+expect-exit: 0
+expect-stdout: contains "predir/nested.txt"
+ref-expect-exit: 0
+ref-expect-stdout: contains "predir/nested.txt"
+oracle: exit-status
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::export_options_match_the_tool
+spec: format-reference.md#tar
+note: the value and the member name are joined with no separator between them,
+ so a value that is to act as a directory ends in `/`. The root member is the
+ one name that takes a separator: it is the value with one `/` appended. The
+ asserted member name states both halves of the rule at once.
+
+family: M10
+subcommand: export
+cell: export/subpath-and-prefix
+setup: repo-with-commit
+run: export --repo=$REPO --subpath=/dir --prefix=pfx/ $REV
+expect-exit: 0
+expect-stdout: contains "pfx/nested.txt"
+ref-expect-exit: 0
+ref-expect-stdout: contains "pfx/nested.txt"
+oracle: exit-status
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::export_options_match_the_tool
+spec: format-reference.md#tar
+note: the two compose in one order: `--subpath` reroots the walk and `--prefix`
+ names the rerooted members. The asserted name holds no `dir` component, which
+ states the rerooting, and carries the prefix, which states the order.
+
+family: M10
+subcommand: export
+cell: export/prefix-given-twice
+setup: repo-with-commit
+run: export --repo=$REPO --prefix=first/ --prefix=second/ $REV
+expect-exit: 0
+expect-stdout: contains "second/dir/nested.txt"
+ref-expect-exit: 0
+ref-expect-stdout: contains "second/dir/nested.txt"
+oracle: exit-status
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::export_repeated_options_take_the_last_value
+spec: format-reference.md#tar
+note: item `F17`. Each of `--subpath`, `--prefix`, and `-o` takes the last
+ occurrence where the command line names it more than once. The asserted member
+ name carries the second value, which states that the last value decides. The
+ cited test states that the repeated form names the members the last value alone
+ names for `--prefix` and for `--subpath`, and that a repeated `-o` writes the
+ last destination and creates no other.
+
+family: M10
+subcommand: export
+cell: export/output
+setup: repo-with-commit
+run: export --repo=$REPO -o $SCRATCH/out.tar $REV
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::export_output_switch_matches_the_tool
+spec: format-reference.md#tar
+note: the stream goes to the named path and standard output stays empty in
+ both. The cited test states that the destination holds the same members as the
+ stream, that a fresh destination takes `0o666` reduced by the umask, and that
+ an existing destination keeps its inode and its mode.
+
+family: M10
+subcommand: export
+cell: export/output-long-form
+setup: repo-with-commit
+run: export --repo=$REPO --output=$SCRATCH/long.tar $REV
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::export_output_switch_matches_the_tool
+spec: format-reference.md#tar
+note: `--output=PATH` and `-o PATH` name one option, and the cited test holds
+ the two archives to each other.
+
+family: M10
+subcommand: export
+cell: export/output-cannot-be-opened
+setup: repo-with-commit
+run: export --repo=$REPO -o $SCRATCH/nodir/out.tar $REV
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Failed to open"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#tar
+note: a destination whose parent directory is absent ends the export at exit 1
+ in both, and neither creates the parent. The words part: the tool reports
+ `Failed to open '<path>'` and the port reports the system's own reason, so
+ `stderr-text` is no oracle here (`cli-surface.md`, "P2").
+
+family: M10
+subcommand: export
+cell: export/subpath-names-nothing
+setup: repo-with-commit
+run: export --repo=$REPO --subpath=/nope $REV
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "subpath not found: /nope"
+ref-expect-exit: 1
+ref-expect-stderr: contains "No such file or directory: /nope"
+oracle: exit-status
+outcome: refused-both
+severity: interop
+spec: format-reference.md#tar
+note: a subpath naming nothing ends the export at exit 1 in both, and neither
+ writes a tar member. The words part the way they part at `checkout`
+ (`cli-surface.md`, "P2"), so `stderr-text` is no oracle here. Standard output
+ is no oracle either: the port leaves it empty and the tool leaves the padding
+ of the archive it had opened, which
+ `export/output-opens-before-the-revision-resolves` below records.
+
+family: M10
+subcommand: export
+cell: export/subpath-names-a-file
+setup: repo-with-commit
+run: export --repo=$REPO --subpath=/file.txt $REV
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "subpath is not a directory: /file.txt"
+ref-expect-exit: 1
+ref-may-abort: 6
+oracle: exit-status
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::export_subpath_refusals_match_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a subpath naming a regular file or a symlink has no tree to walk. The
+ port refuses it at exit 1 and writes nothing. The reference build dies on
+ SIGABRT: it prints `ostree_repo_file_tree_query_child: assertion failed:
+ (self->tree_contents)` on standard error, a `Bail out!` line carrying the same
+ text on standard output, and no tar member, so the port's refusal has no
+ counterpart. `ref-may-abort: 6` records the crash; `ref-expect-exit: 1` states
+ the status a build that stops crashing would have to reach, a refusal being
+ the only outcome the port accepts here. The cited test states the crash and
+ the port's refusal over a regular file and over a symlink.
+
+family: M10
+subcommand: export
+cell: export/subpath-trailing-slash
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the value dialect. The tool reads the whole value as a name to look up,
+ so `/dir/` names nothing and the export ends at exit 1 with `No such file or
+ directory: /dir/`. The port reads a path, where the trailing slash names the
+ same directory as the form without it, so the export succeeds and writes the
+ archive `--subpath=/dir` writes. This is the dialect `checkout --subpath`
+ already parts on (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::export_subpath_refusals_match_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two sides reach different exit statuses, so no oracle reads the pair.
+ The cited test states the tool's refusal text and holds the port's
+ trailing-slash archive to its own `--subpath=/dir` archive byte for byte.
+
+family: M10
+subcommand: export
+cell: export/output-opens-before-the-revision-resolves
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: what the destination holds after a refusal. Both implementations open
+ the destination before the revision resolves, so both truncate a destination
+ that already existed and keep its inode and its mode, and neither writes an
+ archive into it. The tool then leaves the two trailing zero blocks of the
+ archive it had opened, all NUL -- 1024 bytes into a `-o` destination, and 10240
+ onto standard output, where those blocks are padded up to one record -- and the
+ port leaves nothing (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::export_output_switch_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the case needs a destination that already exists, which no setup binds.
+ The cited test writes content into the destination, sets its mode to 0640,
+ runs `export -o <dest> no-such-ref`, and holds each side to exit 1, to the
+ inode and the mode the destination had, to the size that side leaves, and to
+ a content of NUL bytes alone. It states the same over standard output, where
+ a refused revision and a subpath naming nothing both leave the tool's
+ 10240 bytes and the port's none.
+
+family: M10
+subcommand: export
+cell: export/member-order
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the member order, and with it which path of a content-sharing group is
+ written in full. The tool emits a directory's non-directory entries in name
+ order and then its subdirectories in name order, each subdirectory's own
+ members following it; the port emits every entry of a directory in one name
+ order. The first member the walk reaches for a content object is the one
+ written in full, so a group whose paths lie in one directory coalesces the same
+ way in both and a group spanning two directories coalesces in opposite
+ directions. A hardlink's own header carries the linked-to member's metadata in
+ the tool and zeros in the port. The port emits one `SCHILY.xattr.*` record per
+ stored xattr and the tool emits none (`../format-reference.md`, "tar"). Neither
+ option in this section changes either side's order.
+evidence: ostrya_cli::cli::export_options_match_the_tool,
+ ostrya_cli::cli::export_hardlink_direction_parts_from_the_tool
+spec: format-reference.md#tar
+note: the order is a property of the stream and no oracle reads it. The first
+ cited test holds each side's member order under every option to the order that
+ side set in its option-free export, which is the claim that no option reorders
+ a stream, and compares the extracted tree, where a hardlink reads the metadata
+ and the content of the member it links to, so the direction of a coalesced
+ group leaves the tree unchanged. The second exports a tree holding `/z.txt` and
+ `/adir/a.txt` on one content object and states that the tool writes `z.txt` in
+ full while the port writes `adir/a.txt` in full.
+
+family: M10
+subcommand: export
+cell: export/output-empty-value
+setup: repo-with-commit
+run: export --repo=$REPO -o '' $REV
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: contains "dir/nested.txt"
+outcome: lossy
+severity: interop
+loss: an empty `-o` value. The tool reads it as standard output and writes the
+ stream there at exit 0. The port refuses the value at exit 1 and writes
+ nothing, its value reading holding no path there (`cli-surface.md`, "P2").
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ absolute claims state each side: the reference writes the archive to standard
+ output, and the port writes nothing there.
+
+family: M10
+subcommand: export
+cell: export/no-xattrs-given-twice
+setup: repo-with-commit
+run: export --repo=$REPO --no-xattrs --no-xattrs $REV
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: contains "dir/nested.txt"
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag. The tool takes a second occurrence of
+ `--no-xattrs` and exports as it does for one. The port refuses it at exit 1,
+ as it refuses every repeated boolean flag in its CLI (`cli-surface.md`, "P2").
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ three `export` options that take a value each take the last occurrence in both
+ implementations, which `export/prefix-given-twice` above records.

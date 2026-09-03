@@ -20,7 +20,8 @@
 //! - `commit` -- ingest a tree from a path, or a tar stream on stdin, into a
 //!   commit and print its checksum.
 //! - `checkout` -- materialize a commit's tree, or write its composefs image.
-//! - `export` -- write a commit's tree to stdout as a tar stream.
+//! - `export` -- write a commit's tree as a tar stream, to standard output or
+//!   to a named file.
 //! - `refs` -- list, create, or delete refs, aliases, and collection refs.
 //! - `rev-parse` -- print the commit a revision names.
 //! - `cat` -- write a commit's files to stdout.
@@ -48,7 +49,7 @@
 //! buffered in memory.
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,7 +109,7 @@ enum Command {
     Commit(CommitArgs),
     /// Check a commit out onto the filesystem, or write its composefs image.
     Checkout(CheckoutArgs),
-    /// Write a commit's tree to stdout as a tar stream.
+    /// Write a commit's tree as a tar stream, to stdout or to --output.
     Export(ExportArgs),
     /// List, create, or delete refs.
     Refs(RefsArgs),
@@ -398,6 +399,21 @@ struct CheckoutArgs {
 
 #[derive(Args)]
 struct ExportArgs {
+    /// Emit no extended attributes.
+    #[arg(long)]
+    no_xattrs: bool,
+    /// Export this directory within the commit as the archive root instead of
+    /// the whole tree. Given more than once, the last value wins.
+    #[arg(long, value_name = "PATH", overrides_with = "subpath")]
+    subpath: Option<PathBuf>,
+    /// Put PATH in front of every member pathname. Given more than once, the
+    /// last value wins.
+    #[arg(long, value_name = "PATH", overrides_with = "prefix")]
+    prefix: Option<String>,
+    /// Write the archive to PATH instead of standard output. Given more than
+    /// once, the last value wins.
+    #[arg(short = 'o', long, value_name = "PATH", overrides_with = "output")]
+    output: Option<PathBuf>,
     /// The commit to export (a checksum or a ref). Required; checked after
     /// the repository resolves, matching the tool's error-ordering
     /// (`docs/conformance/cli-surface.md`, "Global conventions").
@@ -3516,14 +3532,30 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
         .await
 }
 
+/// Write a commit's tree to standard output, or to `--output`, as a tar stream.
+///
+/// The destination is opened before the revision resolves, matching the tool's
+/// own order: an existing destination is truncated in place, so it keeps its
+/// inode and its mode, and a refusal that comes after the open leaves it
+/// truncated. A destination the open creates takes `0o666` reduced by the
+/// umask (`docs/conformance/cli-surface.md`, "export").
 async fn export(repo: Repo, name: &str, args: ExportArgs) -> Result<()> {
-    let Some(commit) = args.commit.as_deref() else {
+    let Some(rev) = args.commit.as_deref() else {
         exit_with_error(name, "A COMMIT argument is required");
     };
-    let commit = resolve(&repo, commit).await?;
-    let stdout = stdout_file()?;
-    repo.export_tar(&commit, TarExportOptions::new(), stdout)
-        .await
+    let out = match &args.output {
+        Some(path) => {
+            let file = std::fs::File::create(path).map_err(Error::Io)?;
+            ostrya_rt::File::from(OwnedFd::from(file))
+        }
+        None => stdout_file()?,
+    };
+    let commit = resolve(&repo, rev).await?;
+    let mut opts = TarExportOptions::new();
+    opts.subpath = args.subpath;
+    opts.prefix = args.prefix;
+    opts.skip_xattrs = args.no_xattrs;
+    repo.export_tar(&commit, opts, out).await
 }
 
 /// List, create, or delete refs. `--create` wins over `--delete`, and

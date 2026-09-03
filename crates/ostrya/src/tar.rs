@@ -15,6 +15,9 @@
 //! same object identity -- identical ownership, mode, xattrs, and content, since
 //! all of those feed the object checksum -- is written as a hardlink to it.
 //! Symlinks are written as symlink members and never coalesced.
+//! [`TarExportOptions::subpath`] makes one directory of the tree the archive
+//! root, [`TarExportOptions::prefix`] puts a prefix in front of every member
+//! name, and [`TarExportOptions::skip_xattrs`] emits no xattr records.
 //!
 //! Import builds a [`MutableTree`]: regular files stream into content objects,
 //! symlinks and directory metadata become their objects, and hardlink members
@@ -39,16 +42,18 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, UNIX_EPOCH};
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::StreamExt;
-use ostrya_core::{Checksum, DirMeta, Xattrs};
+use ostrya_core::{Checksum, Commit, DirMeta, Xattrs};
 use smol_tar::{
     AttrList, TarDirectory, TarEntry, TarLink, TarReader, TarRegularFile, TarSymlink, TarWriter,
 };
 
+use crate::checkout::is_root_path;
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
 use crate::ingest::{adjust_meta, finalize_meta, to_dirmeta};
@@ -71,12 +76,26 @@ const PERM_MASK: u32 = 0o7777;
 type BodyReader = Pin<Box<dyn AsyncRead + Send>>;
 
 /// Options for [`Repo::export_tar`].
-///
-/// Export follows fixed conventions (see the module docs), so there is nothing
-/// to configure yet; the type is a placeholder for options the CLI adds later.
 #[derive(Debug, Default, Clone)]
 #[non_exhaustive]
-pub struct TarExportOptions {}
+pub struct TarExportOptions {
+    /// A path within the commit tree whose directory becomes the archive root,
+    /// in place of the commit root. A path with no component names the whole
+    /// tree. A path naming a file or a symlink, and a path naming nothing, are
+    /// both refused with [`Error::Tar`].
+    pub subpath: Option<PathBuf>,
+    /// A prefix over every member pathname. The root member's name is the
+    /// prefix with one `/` appended where it does not end in one; every other
+    /// member's name is the prefix joined to the member's own relative path
+    /// with no separator between them, so a prefix that is to act as a
+    /// directory ends in `/`. A hardlink's link name carries the prefix; a
+    /// symlink's target is the stored target and carries none. An empty prefix
+    /// and an absent one leave the `./` root and the bare relative names.
+    pub prefix: Option<String>,
+    /// Emit no `SCHILY.xattr.*` records, whatever extended attributes the tree
+    /// carries.
+    pub skip_xattrs: bool,
+}
 
 impl TarExportOptions {
     /// Default export options.
@@ -184,24 +203,22 @@ impl Repo {
     pub async fn export_tar(
         &self,
         commit: &Checksum,
-        _opts: TarExportOptions,
+        opts: TarExportOptions,
         out: impl AsyncWrite,
     ) -> Result<()> {
         let (commit_obj, _) = self.load_commit(commit).await?;
         let mtime = UNIX_EPOCH + Duration::from_secs(commit_obj.timestamp);
-        let root = RepoTree::from_parts(
-            self.clone(),
-            commit_obj.root_dirtree,
-            commit_obj.root_dirmeta,
-        );
-        let root_meta = self.load_dirmeta(&commit_obj.root_dirmeta).await?;
+        let (dirtree, dirmeta) = export_root(self, &commit_obj, opts.subpath.as_deref()).await?;
+        let root = RepoTree::from_parts(self.clone(), dirtree, dirmeta);
+        let root_meta = self.load_dirmeta(&dirmeta).await?;
 
+        let (root_path, member_prefix) = prefix_parts(opts.prefix.as_deref());
         let mut items = vec![Item::Dir {
-            path: "./".to_owned(),
+            path: root_path,
             meta: root_meta,
         }];
         let mut seen: HashMap<Checksum, String> = HashMap::new();
-        collect(self, root, String::new(), &mut items, &mut seen).await?;
+        collect(self, root, member_prefix, &mut items, &mut seen).await?;
 
         let mut writer = TarWriter::<'_, '_, _, BodyReader>::new(out);
         for item in items {
@@ -212,11 +229,11 @@ impl Repo {
                         .with_gid(meta.gid)
                         .with_mode(meta.mode & PERM_MASK)
                         .with_mtime(mtime)
-                        .with_attrs(xattrs_to_attrs(&meta.xattrs)?);
+                        .with_attrs(export_attrs(&meta.xattrs, &opts)?);
                     writer.write(entry.into()).await.map_err(Error::Io)?;
                 }
                 Item::Regular { path, file, size } => {
-                    let attrs = xattrs_to_attrs(&file.xattrs)?;
+                    let attrs = export_attrs(&file.xattrs, &opts)?;
                     let body: BodyReader = Box::pin(file.reader().await?);
                     let entry = TarRegularFile::new(path, size, body)
                         .with_uid(file.uid)
@@ -232,7 +249,7 @@ impl Repo {
                         .with_gid(file.gid)
                         .with_mode(file.mode & PERM_MASK)
                         .with_mtime(mtime)
-                        .with_attrs(xattrs_to_attrs(&file.xattrs)?);
+                        .with_attrs(export_attrs(&file.xattrs, &opts)?);
                     writer.write(entry.into()).await.map_err(Error::Io)?;
                 }
                 Item::Hardlink { path, target } => {
@@ -731,6 +748,56 @@ fn require_leaf(comps: &[String], kind: &str) -> Result<()> {
 /// Render path components as a slash-joined string for diagnostics.
 fn join(comps: &[String]) -> String {
     comps.join("/")
+}
+
+/// The dirtree and dirmeta the archive's root member stands for: the commit
+/// root, or the directory a subpath names inside it. A subpath with no path
+/// component names the whole tree, matching
+/// [`CheckoutOptions::subpath`](crate::CheckoutOptions::subpath). A subpath
+/// naming a file or a symlink has no tree to walk, and one naming nothing at
+/// all has no node, so both are refused.
+async fn export_root(
+    repo: &Repo,
+    commit: &Commit,
+    subpath: Option<&Path>,
+) -> Result<(Checksum, Checksum)> {
+    let root = (commit.root_dirtree, commit.root_dirmeta);
+    let Some(sub) = subpath else {
+        return Ok(root);
+    };
+    if is_root_path(sub) {
+        return Ok(root);
+    }
+    let tree = RepoTree::from_parts(repo.clone(), commit.root_dirtree, commit.root_dirmeta);
+    match tree.lookup(sub).await? {
+        Some(TreeEntry::Dir { tree, .. }) => {
+            Ok((*tree.dirtree_checksum(), *tree.dirmeta_checksum()))
+        }
+        Some(TreeEntry::File { .. }) => Err(Error::Tar(format!(
+            "subpath is not a directory: {}",
+            sub.display()
+        ))),
+        None => Err(Error::Tar(format!("subpath not found: {}", sub.display()))),
+    }
+}
+
+/// The archive root's member name and the prefix every other member's name
+/// carries, for the [`prefix`](TarExportOptions::prefix) option.
+fn prefix_parts(prefix: Option<&str>) -> (String, String) {
+    match prefix.filter(|p| !p.is_empty()) {
+        None => ("./".to_owned(), String::new()),
+        Some(p) if p.ends_with('/') => (p.to_owned(), p.to_owned()),
+        Some(p) => (format!("{p}/"), p.to_owned()),
+    }
+}
+
+/// The PAX attributes an exported entry carries: its extended attributes, or
+/// none where [`skip_xattrs`](TarExportOptions::skip_xattrs) is set.
+fn export_attrs(xattrs: &Xattrs, opts: &TarExportOptions) -> Result<AttrList> {
+    if opts.skip_xattrs {
+        return Ok(AttrList::new());
+    }
+    xattrs_to_attrs(xattrs)
 }
 
 /// Convert an ostrya xattr set to tar PAX attributes: drop the stored

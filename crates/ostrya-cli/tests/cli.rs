@@ -2083,6 +2083,973 @@ fn tar_roundtrip_via_stdin_reproduces_tree() {
     );
 }
 
+// --- `export` option comparison ----------------------------------------------
+
+/// One member of a tar stream, reduced to the fields the `export` comparison
+/// reads. The payload is held whole: every member of the corpus is small.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TarMember {
+    name: String,
+    kind: u8,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime: u64,
+    link: String,
+    payload: Vec<u8>,
+    xattrs: Vec<(String, Vec<u8>)>,
+}
+
+/// The `key=value` records a PAX extended header holds. Each record is
+/// `LENGTH SPACE key=value NEWLINE`, and `LENGTH` counts the whole record.
+fn pax_records(body: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < body.len() && body[at] != 0 {
+        let space = at
+            + body[at..]
+                .iter()
+                .position(|byte| *byte == b' ')
+                .expect("a PAX record states its length");
+        let len: usize = std::str::from_utf8(&body[at..space])
+            .expect("a PAX record length is text")
+            .parse()
+            .expect("a PAX record length is a number");
+        let record = &body[space + 1..at + len - 1];
+        let split = record
+            .iter()
+            .position(|byte| *byte == b'=')
+            .expect("a PAX record holds a key");
+        out.push((
+            String::from_utf8(record[..split].to_vec()).expect("a PAX key is UTF-8"),
+            record[split + 1..].to_vec(),
+        ));
+        at += len;
+    }
+    out
+}
+
+/// The members of a tar stream, in stream order. A PAX extended header
+/// (typeflag `x`) is folded into the member that follows it, so a
+/// `SCHILY.xattr.*` record reads as that member's extended attributes. The
+/// stream ends at the first header block whose name field starts with a NUL,
+/// which covers both dialects the two implementations write
+/// (`../docs/format-reference.md`, "tar").
+fn tar_members(bytes: &[u8]) -> Vec<TarMember> {
+    let octal = |field: &[u8]| -> u64 {
+        let digits: Vec<u8> = field
+            .iter()
+            .copied()
+            .take_while(|byte| *byte != 0 && *byte != b' ')
+            .collect();
+        if digits.is_empty() {
+            return 0;
+        }
+        let text = std::str::from_utf8(&digits).expect("an octal header field is text");
+        u64::from_str_radix(text, 8).expect("an octal header field is octal")
+    };
+    let text = |field: &[u8]| -> String {
+        let end = field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(field.len());
+        String::from_utf8(field[..end].to_vec()).expect("a header field is UTF-8")
+    };
+    let mut out = Vec::new();
+    let mut pending: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut at = 0;
+    while at + 512 <= bytes.len() {
+        let head = &bytes[at..at + 512];
+        if head[0] == 0 {
+            break;
+        }
+        at += 512;
+        let size = usize::try_from(octal(&head[124..136])).expect("a member size fits");
+        let body = &bytes[at..at + size];
+        at += size.next_multiple_of(512);
+        let kind = head[156];
+        if kind == b'x' || kind == b'g' {
+            pending = pax_records(body);
+            continue;
+        }
+        out.push(TarMember {
+            name: text(&head[0..100]),
+            kind,
+            mode: u32::try_from(octal(&head[100..108])).expect("a mode fits"),
+            uid: u32::try_from(octal(&head[108..116])).expect("a uid fits"),
+            gid: u32::try_from(octal(&head[116..124])).expect("a gid fits"),
+            size: u64::try_from(size).expect("a member size fits"),
+            mtime: octal(&head[136..148]),
+            link: text(&head[157..257]),
+            payload: body.to_vec(),
+            xattrs: std::mem::take(&mut pending)
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    key.strip_prefix("SCHILY.xattr.")
+                        .map(|name| (name.to_owned(), value))
+                })
+                .collect(),
+        });
+    }
+    out
+}
+
+/// The member names of a stream, in stream order.
+fn tar_names(members: &[TarMember]) -> Vec<String> {
+    members.iter().map(|member| member.name.clone()).collect()
+}
+
+/// The tree a tar stream extracts to, one line per path, sorted. A hardlink
+/// member reads the metadata and the content of the member it links to, so the
+/// description states the same tree whichever of the two members each
+/// implementation wrote in full. A directory's trailing slash and the root
+/// member's own name are normalized, since the two dialects agree on the
+/// content of a tree and not on how a name spells it.
+fn tar_extracted(members: &[TarMember]) -> Vec<String> {
+    let mut out = Vec::new();
+    for member in members {
+        let source = if member.kind == b'1' {
+            members
+                .iter()
+                .find(|other| other.name == member.link)
+                .expect("a hardlink names a member of the same stream")
+        } else {
+            member
+        };
+        let kind = match source.kind {
+            b'0' | 0 => "file",
+            b'2' => "symlink",
+            b'5' => "dir",
+            other => panic!("unexpected tar typeflag {other:#04x}"),
+        };
+        let path = member.name.trim_end_matches('/');
+        let path = if path.is_empty() { "." } else { path };
+        let target = if source.kind == b'2' {
+            source.link.as_str()
+        } else {
+            ""
+        };
+        out.push(format!(
+            "{path} {kind} {:04o} {}:{} -> {target} {:?}",
+            source.mode & 0o7777,
+            source.uid,
+            source.gid,
+            source.payload,
+        ));
+    }
+    out.sort();
+    out
+}
+
+/// The member names `--subpath` and `--prefix` map a plain export's names to.
+///
+/// `--subpath` keeps the names under the directory it holds and rebases them on
+/// the archive root. `--prefix` puts its value in front of every name with no
+/// separator, and gives the root member one trailing slash where the value does
+/// not already end in one (`cli-surface.md`, "export"). The order the plain
+/// export set is kept, which is the claim that neither option reorders a
+/// stream.
+fn transformed_names(base: &[String], subpath: Option<&str>, prefix: Option<&str>) -> Vec<String> {
+    let under = subpath
+        .map(|path| path.trim_matches('/').to_owned())
+        .filter(|path| !path.is_empty());
+    let root = match prefix.filter(|value| !value.is_empty()) {
+        None => "./".to_owned(),
+        Some(value) if value.ends_with('/') => value.to_owned(),
+        Some(value) => format!("{value}/"),
+    };
+    let mut names = vec![root];
+    for name in base.iter().filter(|name| name.as_str() != "./") {
+        let relative = match &under {
+            None => name.clone(),
+            Some(dir) => match name.strip_prefix(&format!("{dir}/")) {
+                Some(rest) if !rest.is_empty() => rest.to_owned(),
+                _ => continue,
+            },
+        };
+        names.push(format!("{}{relative}", prefix.unwrap_or("")));
+    }
+    names
+}
+
+/// The members of a stream sorted by name, with the hardlink members left out.
+/// A hardlink's own header carries no metadata in the port and carries the
+/// linked-to member's metadata in the tool, and which member of a
+/// content-sharing group becomes the hardlink follows each side's own walk
+/// order (`cli-surface.md`, "export"), so the metadata claim is stated over the
+/// members written in full and the hardlinks are stated by `tar_extracted`.
+fn tar_metadata(members: &[TarMember]) -> Vec<String> {
+    let mut out: Vec<String> = members
+        .iter()
+        .filter(|member| member.kind != b'1')
+        .map(|member| {
+            format!(
+                "{} {} {:04o} {}:{} {} {} {} {:?}",
+                member.name,
+                char::from(if member.kind == 0 { b'0' } else { member.kind }),
+                member.mode & 0o7777,
+                member.uid,
+                member.gid,
+                member.size,
+                member.mtime,
+                member.link,
+                member.payload,
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// One `export` case: its name, the options it passes, and the `--subpath` and
+/// `--prefix` values those options carry, which
+/// [`transformed_names`] reads to say what member names the case must produce.
+type ExportCase<'a> = (&'a str, &'a [&'a str], Option<&'a str>, Option<&'a str>);
+
+/// Run `export` under both implementations over one repository and return the
+/// two tar streams.
+fn export_both(repo: &Path, options: &[&str], rev: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut args = vec!["export", "--repo", repo.to_str().unwrap()];
+    args.extend(options.iter().copied());
+    args.push(rev);
+    let port = ostrya(&args, None, &[]);
+    port.ok();
+    let tool = ostree(&args);
+    tool.ok();
+    (port.stdout.clone(), tool.stdout.clone())
+}
+
+/// `export --no-xattrs`, `--subpath=PATH`, and `--prefix=PATH` against the
+/// tool's export of the same commit.
+///
+/// The two write different tar dialects, so the claim is the member list, the
+/// member metadata, and the tree the stream extracts to, and not the bytes
+/// (`../docs/format-reference.md`, "tar"). Each side's own member order is held
+/// to the order its plain export set, which states that no option reorders a
+/// stream.
+#[test]
+fn export_options_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("export-options");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    ostrya_conformance::corpus::materialize("C4", &tree.join("attrs")).unwrap();
+    ostrya_conformance::corpus::materialize("C8", &tree.join("links")).unwrap();
+    let repo = create_repo(base, RepoMode::BareUser);
+    let rev = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    let rev = rev.ok().stdout_trimmed();
+
+    let (port_base, tool_base) = export_both(&repo, &[], &rev);
+    let port_base = tar_names(&tar_members(&port_base));
+    let tool_base = tar_names(&tar_members(&tool_base));
+
+    let cases: [ExportCase; 12] = [
+        ("plain", &[], None, None),
+        ("no-xattrs", &["--no-xattrs"], None, None),
+        ("prefix-bare", &["--prefix=pre"], None, Some("pre")),
+        ("prefix-slash", &["--prefix=pre/"], None, Some("pre/")),
+        ("prefix-two", &["--prefix=a/b"], None, Some("a/b")),
+        ("prefix-dot", &["--prefix=."], None, Some(".")),
+        ("prefix-dot-slash", &["--prefix=./"], None, Some("./")),
+        ("prefix-empty", &["--prefix="], None, Some("")),
+        ("subpath-absolute", &["--subpath=/dir"], Some("/dir"), None),
+        ("subpath-relative", &["--subpath=dir"], Some("dir"), None),
+        ("subpath-root", &["--subpath=/"], Some("/"), None),
+        (
+            "subpath-and-prefix",
+            &["--subpath=/dir", "--prefix=pfx/"],
+            Some("/dir"),
+            Some("pfx/"),
+        ),
+    ];
+
+    for (case, options, subpath, prefix) in cases {
+        let (port, tool) = export_both(&repo, options, &rev);
+        let port = tar_members(&port);
+        let tool = tar_members(&tool);
+
+        let mut port_names = tar_names(&port);
+        let mut tool_names = tar_names(&tool);
+        assert_eq!(
+            transformed_names(&port_base, subpath, prefix),
+            port_names,
+            "case `{case}`: the port's member order under the options",
+        );
+        assert_eq!(
+            transformed_names(&tool_base, subpath, prefix),
+            tool_names,
+            "case `{case}`: the tool's member order under the options",
+        );
+        port_names.sort();
+        tool_names.sort();
+        assert_eq!(
+            tool_names, port_names,
+            "case `{case}`: the two member lists differ",
+        );
+        assert_eq!(
+            tar_metadata(&tool),
+            tar_metadata(&port),
+            "case `{case}`: the two member metadata sets differ",
+        );
+        assert_eq!(
+            tar_extracted(&tool),
+            tar_extracted(&port),
+            "case `{case}`: the two streams extract to different trees",
+        );
+
+        // The tool emits no xattr record at all, and the port emits one per
+        // stored xattr unless `--no-xattrs` drops them
+        // (`../docs/format-reference.md`, "tar").
+        assert!(
+            tool.iter().all(|member| member.xattrs.is_empty()),
+            "case `{case}`: the tool emitted an xattr record",
+        );
+        let port_xattrs: Vec<&(String, Vec<u8>)> =
+            port.iter().flat_map(|member| &member.xattrs).collect();
+        // Only the whole tree carries the `C4` names; the `dir` subtree holds
+        // one file with no extended attribute at all.
+        let carries_xattrs = !options.contains(&"--no-xattrs")
+            && subpath.is_none_or(|path| path.trim_matches('/').is_empty());
+        if carries_xattrs {
+            assert!(
+                port_xattrs
+                    .iter()
+                    .any(|(name, value)| name == "user.demo" && value == b"value"),
+                "case `{case}`: the port emitted no `user.demo` record",
+            );
+        } else {
+            assert!(
+                port_xattrs.is_empty(),
+                "case `{case}`: {} xattr records were left",
+                port_xattrs.len(),
+            );
+        }
+    }
+
+    // A hardlink member states which of the content-sharing paths each side
+    // wrote in full, and the two differ because the walk orders differ.
+    let (port, tool) = export_both(&repo, &[], &rev);
+    let port_links: Vec<String> = tar_members(&port)
+        .iter()
+        .filter(|member| member.kind == b'1')
+        .map(|member| format!("{} -> {}", member.name, member.link))
+        .collect();
+    let tool_links: Vec<String> = tar_members(&tool)
+        .iter()
+        .filter(|member| member.kind == b'1')
+        .map(|member| format!("{} -> {}", member.name, member.link))
+        .collect();
+    assert_eq!(
+        port_links.len(),
+        2,
+        "two of the three shared paths coalesce"
+    );
+    assert_eq!(
+        tool_links.len(),
+        2,
+        "two of the three shared paths coalesce"
+    );
+}
+
+/// `export --no-xattrs` is the form whose stream carries every fact an ostree
+/// tree holds in a dialect the two implementations agree on, so the tool's own
+/// import of each side's archive is a checksum oracle: the commit checksum the
+/// import prints states the tree the archive described.
+#[test]
+fn export_no_xattrs_imports_to_one_commit() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("export-import");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    ostrya_conformance::corpus::materialize("C8", &tree.join("links")).unwrap();
+    let repo = create_repo(base, RepoMode::Archive);
+    let rev = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    let rev = rev.ok().stdout_trimmed();
+
+    // `--prefix=./` is the one prefix whose names normalize back to the bare
+    // ones on import, so it reaches the same tree as the plain export. Every
+    // other prefix leaves the archive without a root member, which the import
+    // refuses (`cli-surface.md`, "export").
+    let cases: [(&str, &[&str]); 3] = [
+        ("whole-tree", &["--no-xattrs"]),
+        ("subpath", &["--no-xattrs", "--subpath=/dir"]),
+        ("prefix-dot-slash", &["--no-xattrs", "--prefix=./"]),
+    ];
+    for (case, options) in cases {
+        let (port_tar, tool_tar) = export_both(&repo, options, &rev);
+        let port_path = base.join(format!("{case}-port.tar"));
+        let tool_path = base.join(format!("{case}-tool.tar"));
+        std::fs::write(&port_path, &port_tar).unwrap();
+        std::fs::write(&tool_path, &tool_tar).unwrap();
+
+        // One destination repository per archive, under one branch name, so the
+        // ref binding the commit carries is the same and the checksum states
+        // the tree alone.
+        let mut checksums = Vec::new();
+        for (importer, archive) in [("port", &port_path), ("tool", &tool_path)] {
+            for reader in ["port", "tool"] {
+                let dest = base.join(format!("{case}-{importer}-{reader}"));
+                block_on(async {
+                    Repo::create(&dest, CreateOptions::new(RepoMode::Archive))
+                        .await
+                        .unwrap();
+                });
+                let args = [
+                    "commit".to_owned(),
+                    format!("--repo={}", dest.display()),
+                    "-b".to_owned(),
+                    BRANCH.to_owned(),
+                    "-s".to_owned(),
+                    SUBJECT.to_owned(),
+                    format!("--tree=tar={}", archive.display()),
+                    "--timestamp=@1700000000".to_owned(),
+                ];
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let run = if reader == "port" {
+                    ostrya(&args, None, &[])
+                } else {
+                    ostree(&args)
+                };
+                checksums.push(format!("{importer}/{reader} {}", run.ok().stdout_trimmed()));
+            }
+        }
+        let checksum = checksums[0]
+            .split_once(' ')
+            .expect("a checksum line")
+            .1
+            .to_owned();
+        for line in &checksums {
+            assert_eq!(
+                line.split_once(' ').expect("a checksum line").1,
+                checksum,
+                "case `{case}`: the four imports of the two archives differ: {checksums:?}",
+            );
+        }
+    }
+}
+
+/// `export -o PATH` and `export --output=PATH`: the archive the destination
+/// holds, the mode a fresh destination takes, and what an existing destination
+/// keeps.
+#[test]
+fn export_output_switch_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("export-output");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    let repo = create_repo(base, RepoMode::Archive);
+    let rev = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    let rev = rev.ok().stdout_trimmed();
+    let repo_arg = repo.to_str().unwrap().to_owned();
+
+    // A fresh destination takes the mode an ordinary create takes on this host,
+    // which is `0o666` reduced by the umask; comparing against a plain create
+    // in the same directory states that without setting the umask.
+    let reference = base.join("umask-probe");
+    std::fs::write(&reference, b"").unwrap();
+    let expected_mode = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o7777;
+
+    let mut streams = Vec::new();
+    for (side, switch) in [("port", "-o"), ("port", "--output"), ("tool", "-o")] {
+        let dest = base.join(format!("{side}{switch}.tar"));
+        let arg = if switch == "-o" {
+            vec![
+                "export".to_owned(),
+                format!("--repo={repo_arg}"),
+                "-o".to_owned(),
+                dest.display().to_string(),
+                rev.clone(),
+            ]
+        } else {
+            vec![
+                "export".to_owned(),
+                format!("--repo={repo_arg}"),
+                format!("--output={}", dest.display()),
+                rev.clone(),
+            ]
+        };
+        let args: Vec<&str> = arg.iter().map(String::as_str).collect();
+        if side == "port" {
+            ostrya(&args, None, &[]).ok();
+        } else {
+            ostree(&args).ok();
+        }
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o7777,
+            expected_mode,
+            "{side} {switch}: a fresh destination takes the umask's mode",
+        );
+        streams.push(tar_members(&std::fs::read(&dest).unwrap()));
+    }
+    assert_eq!(
+        tar_metadata(&streams[0]),
+        tar_metadata(&streams[1]),
+        "the port's `-o` and `--output` write one archive",
+    );
+    assert_eq!(
+        tar_metadata(&streams[2]),
+        tar_metadata(&streams[0]),
+        "the two implementations' `-o` archives hold the same members",
+    );
+
+    // The destination is opened for writing in place, so an existing one keeps
+    // its inode and its mode and is truncated. Both write the same archive into
+    // it, and each pads its own stream, so the sizes are read per side.
+    for side in ["port", "tool"] {
+        let dest = base.join(format!("{side}-existing.tar"));
+        std::fs::write(&dest, b"pre-existing content").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let inode = std::fs::metadata(&dest).unwrap().ino();
+        let args = [
+            "export".to_owned(),
+            format!("--repo={repo_arg}"),
+            "-o".to_owned(),
+            dest.display().to_string(),
+            rev.clone(),
+        ];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        if side == "port" {
+            ostrya(&args, None, &[]).ok();
+        } else {
+            ostree(&args).ok();
+        }
+        let meta = std::fs::metadata(&dest).unwrap();
+        assert_eq!(meta.ino(), inode, "{side}: the destination keeps its inode");
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o600,
+            "{side}: the destination keeps its mode",
+        );
+        assert_eq!(
+            tar_metadata(&tar_members(&std::fs::read(&dest).unwrap())),
+            tar_metadata(&streams[0]),
+            "{side}: the destination holds the archive",
+        );
+    }
+
+    // A destination that cannot be opened ends the run at exit 1 in both, and
+    // neither creates anything on the way to it.
+    let missing = base.join("nodir").join("out.tar");
+    for side in ["port", "tool"] {
+        let args = [
+            "export".to_owned(),
+            format!("--repo={repo_arg}"),
+            "-o".to_owned(),
+            missing.display().to_string(),
+            rev.clone(),
+        ];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = if side == "port" {
+            ostrya(&args, None, &[])
+        } else {
+            ostree(&args)
+        };
+        assert_eq!(run.status.code(), Some(1), "{side}: a missing parent");
+        assert!(run.stdout.is_empty(), "{side}: nothing on standard output");
+        assert!(!base.join("nodir").exists(), "{side}: no directory created");
+    }
+
+    // The destination is opened before the revision resolves, so a revision
+    // naming nothing leaves it truncated at its own mode and inode. Neither
+    // side writes an archive into it; the tool leaves the 1024 bytes its writer
+    // had buffered and the port leaves it empty (`cli-surface.md`, "export").
+    for (side, size) in [("port", 0), ("tool", 1024)] {
+        let dest = base.join(format!("{side}-refused.tar"));
+        std::fs::write(&dest, b"pre-existing content").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let inode = std::fs::metadata(&dest).unwrap().ino();
+        let args = [
+            "export".to_owned(),
+            format!("--repo={repo_arg}"),
+            "-o".to_owned(),
+            dest.display().to_string(),
+            "no-such-ref".to_owned(),
+        ];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let run = if side == "port" {
+            ostrya(&args, None, &[])
+        } else {
+            ostree(&args)
+        };
+        assert_eq!(run.status.code(), Some(1), "{side}: a refused revision");
+        let meta = std::fs::metadata(&dest).unwrap();
+        assert_eq!(meta.ino(), inode, "{side}: the destination keeps its inode");
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o640,
+            "{side}: the destination keeps its mode",
+        );
+        assert_eq!(meta.len(), size, "{side}: the truncated destination's size");
+        let held = std::fs::read(&dest).unwrap();
+        assert!(
+            held.iter().all(|byte| *byte == 0),
+            "{side}: the destination holds no archive",
+        );
+    }
+
+    // Standard output is the same destination under another name: a refusal
+    // that comes after the archive is opened leaves the tool's padding there
+    // and leaves the port's stream empty.
+    for (side, size) in [("port", 0), ("tool", 10240)] {
+        for revision in ["no-such-ref", &rev] {
+            let mut args = vec!["export", "--repo", &repo_arg, revision];
+            if revision == rev {
+                args.insert(3, "--subpath=/nope");
+            }
+            let run = if side == "port" {
+                ostrya(&args, None, &[])
+            } else {
+                ostree(&args)
+            };
+            assert_eq!(run.status.code(), Some(1), "{side}: {revision} is refused");
+            assert_eq!(
+                run.stdout.len(),
+                size,
+                "{side}: the refused stream's length over {revision}",
+            );
+            assert!(
+                run.stdout.iter().all(|byte| *byte == 0),
+                "{side}: the refused stream holds no archive",
+            );
+        }
+    }
+}
+
+/// The `--subpath` values the two implementations part on: a trailing slash the
+/// tool reads as part of a name, and a subpath naming a file or a symlink,
+/// which the reference build dies on.
+#[test]
+fn export_subpath_refusals_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("export-subpath");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    let repo = create_repo(base, RepoMode::Archive);
+    let rev = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    let rev = rev.ok().stdout_trimmed();
+    let repo_arg = repo.to_str().unwrap();
+
+    // A subpath naming nothing ends the export at exit 1 in both, in each
+    // side's own words.
+    for subpath in ["--subpath=/nope", "--subpath=/dir/nope"] {
+        let args = ["export", "--repo", repo_arg, subpath, &rev];
+        let port = ostrya(&args, None, &[]);
+        let tool = ostree(&args);
+        assert_eq!(port.status.code(), Some(1), "the port refuses {subpath}");
+        assert_eq!(tool.status.code(), Some(1), "the tool refuses {subpath}");
+        assert!(
+            String::from_utf8_lossy(&port.stderr).contains("subpath not found"),
+            "the port names the cause: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&tool.stderr).contains("No such file or directory"),
+            "the tool names the cause: {}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
+    }
+
+    // A subpath naming a file or a symlink has no tree to walk. The port
+    // refuses it at exit 1; the reference build dies on SIGABRT and writes no
+    // archive, which states nothing about the port
+    // (`cli-surface.md`, "export").
+    for subpath in ["--subpath=/file.txt", "--subpath=/link"] {
+        let args = ["export", "--repo", repo_arg, subpath, &rev];
+        let port = ostrya(&args, None, &[]);
+        assert_eq!(port.status.code(), Some(1), "the port refuses {subpath}");
+        assert!(
+            String::from_utf8_lossy(&port.stderr).contains("subpath is not a directory"),
+            "the port names the cause: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        let tool = ostree(&args);
+        assert!(!tool.status.success(), "the tool refuses {subpath}");
+        assert!(
+            tar_members(&tool.stdout).is_empty(),
+            "the tool writes no archive for {subpath}",
+        );
+        assert!(
+            String::from_utf8_lossy(&tool.stderr)
+                .contains("ostree_repo_file_tree_query_child: assertion failed"),
+            "the reference build states the assertion it died on: {}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
+        // The crash puts a `Bail out!` line on standard output, which is what
+        // stands there in place of a tar member (`cli-surface.md`, "export").
+        let out = String::from_utf8_lossy(&tool.stdout);
+        assert!(
+            out.starts_with("Bail out! ")
+                && out.contains("ostree_repo_file_tree_query_child: assertion failed"),
+            "the reference build bails out on standard output: {out}",
+        );
+    }
+
+    // The tool reads each `/`-separated span of the value as a child name, so a
+    // trailing slash and the spans `.` and `..` all name nothing. The port
+    // reads a path, where the trailing slash names the same directory and a `.`
+    // or a `..` component falls away.
+    for (subpath, named) in [
+        ("--subpath=/dir/", "/dir/"),
+        ("--subpath=.", "/."),
+        ("--subpath=..", "/.."),
+        ("--subpath=/./dir", "/."),
+        ("--subpath=/dir/..", "/dir/.."),
+    ] {
+        let args = ["export", "--repo", repo_arg, subpath, &rev];
+        let tool = ostree(&args);
+        assert_eq!(tool.status.code(), Some(1), "the tool refuses {subpath}");
+        assert!(
+            String::from_utf8_lossy(&tool.stderr)
+                .contains(&format!("No such file or directory: {named}")),
+            "the tool names the span it looked up: {}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
+        let port = ostrya(&args, None, &[]);
+        assert_eq!(
+            port.status.code(),
+            Some(0),
+            "the port takes {subpath}: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+    }
+
+    // The port's archive under the trailing-slash form is the one it writes
+    // without it, and `.` and `..` name the whole tree.
+    let dir_args = ["export", "--repo", repo_arg, "--subpath=/dir", &rev];
+    let plain_dir = ostrya(&dir_args, None, &[]).ok().stdout.clone();
+    let plain_root = ostrya(&["export", "--repo", repo_arg, &rev], None, &[])
+        .ok()
+        .stdout
+        .clone();
+    for (subpath, expected) in [
+        ("--subpath=/dir/", &plain_dir),
+        ("--subpath=/./dir", &plain_dir),
+        ("--subpath=.", &plain_root),
+        ("--subpath=..", &plain_root),
+    ] {
+        let run = ostrya(&["export", "--repo", repo_arg, subpath, &rev], None, &[]);
+        assert_eq!(&run.ok().stdout, expected, "the port's `{subpath}` archive",);
+    }
+}
+
+/// A repeated `--subpath`, `--prefix`, or `-o` takes the last occurrence in
+/// both implementations (`../docs/format-reference.md`, "The tar export
+/// options").
+#[test]
+fn export_repeated_options_take_the_last_value() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("export-repeated");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    let repo = create_repo(base, RepoMode::BareUser);
+    let rev = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    let rev = rev.ok().stdout_trimmed();
+
+    // The last value decides, so the repeated form names the members the last
+    // value alone names, and the value passed first leaves no trace.
+    for (repeated, once) in [
+        (
+            ["--prefix=first/", "--prefix=second/"].as_slice(),
+            ["--prefix=second/"].as_slice(),
+        ),
+        (
+            ["--subpath=/nope", "--subpath=/dir"].as_slice(),
+            ["--subpath=/dir"].as_slice(),
+        ),
+    ] {
+        let (port_repeated, tool_repeated) = export_both(&repo, repeated, &rev);
+        let (port_once, tool_once) = export_both(&repo, once, &rev);
+        assert_eq!(
+            tar_names(&tar_members(&port_repeated)),
+            tar_names(&tar_members(&port_once)),
+            "the port takes the last of {repeated:?}",
+        );
+        assert_eq!(
+            tar_names(&tar_members(&tool_repeated)),
+            tar_names(&tar_members(&tool_once)),
+            "the tool takes the last of {repeated:?}",
+        );
+    }
+
+    // A repeated `-o` writes the last destination and creates no other.
+    for side in ["port", "tool"] {
+        let first = base.join(format!("{side}-first.tar"));
+        let last = base.join(format!("{side}-last.tar"));
+        let args = [
+            "export".to_owned(),
+            format!("--repo={}", repo.display()),
+            "-o".to_owned(),
+            first.display().to_string(),
+            "-o".to_owned(),
+            last.display().to_string(),
+            rev.clone(),
+        ];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        if side == "port" {
+            ostrya(&args, None, &[]).ok();
+        } else {
+            ostree(&args).ok();
+        }
+        assert!(
+            !first.exists(),
+            "{side}: the first `-o` value is passed over"
+        );
+        assert!(
+            !tar_members(&std::fs::read(&last).unwrap()).is_empty(),
+            "{side}: the last `-o` value holds the archive",
+        );
+    }
+}
+
+/// Which path of a content-sharing group is written in full follows each side's
+/// own walk order, so a group whose paths lie in two directories coalesces in
+/// opposite directions (`../docs/conformance/cli-surface.md`, "export").
+#[test]
+fn export_hardlink_direction_parts_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("export-hardlink-direction");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(tree.join("adir")).unwrap();
+    std::fs::write(tree.join("z.txt"), b"shared content\n").unwrap();
+    std::fs::write(tree.join("adir/a.txt"), b"shared content\n").unwrap();
+    let repo = create_repo(base, RepoMode::BareUser);
+    let rev = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    let rev = rev.ok().stdout_trimmed();
+
+    let (port, tool) = export_both(&repo, &[], &rev);
+    let port = tar_members(&port);
+    let tool = tar_members(&tool);
+    let links = |members: &[TarMember]| -> Vec<String> {
+        members
+            .iter()
+            .filter(|member| member.kind == b'1')
+            .map(|member| format!("{} -> {}", member.name, member.link))
+            .collect()
+    };
+    // The tool reaches `z.txt` first, its walk taking a directory's
+    // non-directory entries before its subdirectories; the port reaches
+    // `adir/a.txt` first, its walk taking every entry in one name order.
+    assert_eq!(
+        links(&tool),
+        vec!["adir/a.txt -> z.txt".to_owned()],
+        "the tool writes the top-level path in full",
+    );
+    assert_eq!(
+        links(&port),
+        vec!["z.txt -> adir/a.txt".to_owned()],
+        "the port writes the nested path in full",
+    );
+    // The direction leaves the tree the stream extracts to unchanged.
+    assert_eq!(
+        tar_extracted(&tool),
+        tar_extracted(&port),
+        "the two streams extract to different trees",
+    );
+}
+
 #[test]
 fn checkout_roundtrips_and_matches_tool() {
     let tmp = TmpDir::new("checkout");

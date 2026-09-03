@@ -1512,7 +1512,14 @@ impl Repo {
 }
 
 #[non_exhaustive]
-pub struct TarExportOptions {}
+pub struct TarExportOptions {
+    /// The directory within the commit tree that becomes the archive root.
+    pub subpath: Option<PathBuf>,
+    /// A prefix over every member pathname.
+    pub prefix: Option<String>,
+    /// Emit no `SCHILY.xattr.*` records.
+    pub skip_xattrs: bool,
+}
 
 /// A rename hook over member pathnames. It takes the normalized member name
 /// and returns the name the member is imported under.

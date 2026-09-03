@@ -292,7 +292,7 @@ async fn resolve_target(repo: &Repo, commit: &Commit, subpath: Option<&Path>) ->
 }
 
 /// Whether a path has no meaningful component, so it names the tree root.
-fn is_root_path(p: &Path) -> bool {
+pub(crate) fn is_root_path(p: &Path) -> bool {
     use std::path::Component;
     !p.components().any(|c| matches!(c, Component::Normal(_)))
 }

@@ -1334,8 +1334,83 @@ composefs switches:
   was, byte for byte and at its own mode
   (`ostrya_cli::cli::checkout_composefs_refuses_an_archive_repository`).
 
-`export` accepts `--repo`. Missing: `--no-xattrs`, `--subpath=PATH`,
-`--prefix=PATH`, `-o/--output=PATH`.
+`export` accepts `--repo`, `--no-xattrs`, `--subpath=PATH`, `--prefix=PATH`,
+and `-o/--output=PATH`, and nothing is missing.
+
+The tar stream is a transport interface, so the two implementations are held to
+the member list, the member metadata, and the tree the stream extracts to, and
+never to the bytes (`../format-reference.md`, "tar"). Over corpora `C0`, `C4`,
+and `C8` in `bare-user` mode the two agree on all three under each option and
+under the `--subpath` and `--prefix` pair, and `--no-xattrs` is the form whose
+stream both implementations import into one commit checksum
+(`ostrya_cli::cli::export_options_match_the_tool`,
+`ostrya_cli::cli::export_no_xattrs_imports_to_one_commit`). Eight divergences
+stand:
+
+- the member order, and with it which path of a content-sharing group is
+  written in full. The tool emits a directory's non-directory entries in name
+  order and then its subdirectories in name order, each subdirectory's own
+  members following it; the port emits every entry of a directory in one name
+  order. The first member the walk reaches for a content object is the one
+  written in full, so a group whose paths lie in one directory coalesces the
+  same way in both, and a group spanning two directories coalesces in opposite
+  directions: over a tree holding `/z.txt` and `/adir/a.txt` on one content
+  object, the tool writes `z.txt` in full and `adir/a.txt` as the hardlink, and
+  the port writes `adir/a.txt` in full and `z.txt` as the hardlink
+  (`ostrya_cli::cli::export_hardlink_direction_parts_from_the_tool`). A
+  hardlink member's own header carries the linked-to member's metadata in the
+  tool and zeros in the port. Extraction resolves a hardlink against the member
+  it names, so the extracted tree is the same. Neither `--subpath` nor
+  `--prefix` changes either side's order, which
+  `ostrya_cli::cli::export_options_match_the_tool` states by holding each
+  side's member order under every option to the order that side set with no
+  option at all;
+- the extended attributes. The port emits one `SCHILY.xattr.<name>` record per
+  stored xattr and this tool version emits none, which Phase 10 recorded
+  (`../format-reference.md`, "tar"). `--no-xattrs` drops the port's records, so
+  the option is what brings the two streams into agreement over an
+  xattr-bearing tree, and it leaves the tool's stream unchanged;
+- the value dialect `--subpath` takes, on the terms `checkout --subpath`
+  already parts on. The tool reads each `/`-separated span of the value as a
+  child name to look up, so `--subpath=/dir/`, `--subpath=.`, `--subpath=..`,
+  and `--subpath=/dir/..` all name nothing and end the export at exit 1 (`error:
+  No such file or directory:` and the value, with a leading slash the tool
+  adds). The port reads a path, so a trailing slash names the same directory as
+  the form without it, and a `.` or a `..` component falls away, which leaves
+  `.` and `..` naming the whole tree. The two agree on the empty value, which
+  both refuse at exit 1: the tool looks up `/` and the port refuses the value
+  before the export starts. Both accept a leading-slash and a relative spelling
+  of a name that exists, and `/` names the whole tree in both;
+- a `--subpath` naming a regular file or a symlink, which has no tree to walk.
+  The port refuses it at exit 1 with `error: tar: subpath is not a directory:
+  <path>` and writes nothing. The reference build ends on SIGABRT: it prints
+  `ostree_repo_file_tree_query_child: assertion failed: (self->tree_contents)`
+  on standard error and a `Bail out!` line carrying the same text on standard
+  output, so the port's refusal has no counterpart;
+- an empty `-o` value. The tool reads it as standard output and writes the
+  stream there at exit 0; the port refuses the value at exit 1 and writes
+  nothing. An empty `--prefix` value is taken by both and leaves the `./` root
+  and the bare relative names;
+- a repeated `--no-xattrs`. The tool takes a second occurrence of the flag and
+  exports as it does for one; the port refuses it at exit 1 with `error: the
+  argument '--no-xattrs' cannot be used multiple times`. The port refuses a
+  repeated boolean flag throughout its CLI. The three `export` options that
+  take a value each take the last occurrence, which is what the tool does for
+  all four (`../format-reference.md`, "The tar export options");
+- what the destination holds after a refusal. Both implementations open the
+  destination before the revision resolves, so both truncate a `-o` destination
+  that already existed and keep its inode and its mode, and neither writes a
+  tar member. The tool then leaves the two trailing zero blocks of the archive
+  it had opened, all NUL -- 1024 bytes in a `-o` file, and 10240 on standard
+  output, where those blocks are padded up to one record -- and the port leaves
+  nothing. A stream that finishes carries the same difference on standard
+  output alone: the tool pads standard output up to a multiple of 10240 bytes
+  and the port ends it at the two zero blocks, which is what both write to a
+  `-o` destination;
+- the words a destination that cannot be opened is refused in. The tool reports
+  `error: Failed to open '<path>'` for a path whose parent directory is absent
+  and for a path naming a directory; the port reports the system's own reason
+  for each. Both exit 1 and neither creates the parent.
 
 `prune` accepts `--repo`, `--refs-only`, `--depth`, `--no-prune`, and
 `--delete-commit`. Missing: `--keep-younger-than=DATE`, `--static-deltas-only`,

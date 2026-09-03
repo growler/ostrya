@@ -4805,8 +4805,8 @@ refuses, as it refuses every repeated boolean flag; what a destination holds
 after a refusal, where both truncate it and the tool leaves the two trailing
 zero blocks of the archive it had opened; and the words a destination that
 cannot be opened is refused in. The three options that take a value each take
-the last occurrence, which is what the tool does. The conformance run reports
-681 cells and 270 passes.
+the last occurrence, which is what the tool does. The conformance run reported
+681 cells and 270 passes after the item.
 
 #### Phase 17g -- P3 commands with no matrix weight
 
@@ -4930,7 +4930,10 @@ deliverable's full surface and Verify list:
   bytes. Both switches export through `Repo::export_composefs_to` into a
   temporary file in the destination's directory, renamed over the destination
   once the image is whole, so a refused export leaves a destination that
-  already existed as it was and an export that finishes replaces it.
+  already existed as it was and an export that finishes replaces it. The port
+  refuses a repository outside the composefs backing modes, where the tool
+  exports from any mode. Five `m10` cells hold the switches, four of them the
+  image a form writes and one the refusal.
 - `D6` -- `DictBuilder`, the `loose_path` re-export, and a public
   `Transaction::write_dirmeta` (DONE): the builder appends, so an `a{sv}` holds
   its entries in insertion order, which is the order the dict holds on disk and

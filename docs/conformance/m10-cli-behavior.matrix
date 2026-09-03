@@ -2483,6 +2483,21 @@ note: a subpath naming nothing ends the checkout at exit 1 with no destination
 
 family: M10
 subcommand: checkout
+cell: checkout/composefs
+modes: bare-user
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_composefs_switches_match_the_tool
+spec: format-reference.md#composefs
+note: `--composefs` writes the EROFS image whose metacopy xattr carries the
+ 36-byte fs-verity record of each backed object. This is the image the
+ no-verity cells below contrast against. No oracle reads a cell's own checkout
+ destination, so the cited test reads the image both implementations wrote for
+ one commit and states the bytes equal.
+
+family: M10
+subcommand: checkout
 cell: checkout/composefs-noverity
 modes: bare-user
 setup: repo-with-commit
@@ -2521,6 +2536,35 @@ spec: format-reference.md#composefs
 note: `--composefs-noverity --composefs` writes the no-verity image too, so the
  command-line order does not decide. The cited test states the same bytes for
  both orders.
+
+family: M10
+subcommand: checkout
+cell: checkout/composefs-outside-the-backing-modes
+modes: archive
+setup: repo-with-commit
+run: checkout --repo=$REPO --composefs $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "requires a bare-user or bare-user-shared repository"
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+outcome: lossy
+severity: interop
+loss: the composefs export from a repository outside the backing modes. The
+ tool exports an image from any mode, and from an `archive` repository it writes
+ `trusted.overlay.redirect` values naming `.file` loose paths that repository
+ does not hold, so the image cannot be mounted against the repository that
+ produced it. The port refuses the mode at exit 1, naming it: `error:
+ unsupported: composefs export requires a bare-user or bare-user-shared
+ repository, not Archive` (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::checkout_composefs_refuses_an_archive_repository
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. Both
+ composefs switches carry the refusal. The cited test states it for each switch
+ and holds the two facts an exit status does not: the refusal creates no
+ destination, and it leaves a destination that already existed byte for byte and
+ at the mode it carried.
 
 # ---------------------------------------------------------------------------
 # show -- the commit report, the raw variant, the metadata modes, and the

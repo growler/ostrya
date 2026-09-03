@@ -694,7 +694,10 @@ impl Repo {
 /// certificate with the offered one (see [`replaces`]): an offered certificate
 /// carrying a key revocation that verifies, so a revoked key stops speaking for
 /// the remote, and an offered certificate stating a later key expiry, so a key
-/// whose owner has extended its life speaks again. The replacement rewrites the
+/// whose owner has extended its life speaks again. A designated revoker is
+/// resolved among every certificate the two streams hold, so a revocation such
+/// a revoker made carries in where either stream states the revoker (see
+/// [`KeyState`]). The replacement rewrites the
 /// keyring, since a keyring is a run of packets per certificate and a signature
 /// written at the end of the stream would attach to the last certificate in it,
 /// and the rewrite drops the Trust packets the keyring carried (see
@@ -736,16 +739,24 @@ fn merge_keyring(
             runs.push((fingerprint.clone(), packets));
             copies.entry(fingerprint).or_default().push(cert);
         }
-        let mut held: BTreeMap<String, KeyState> = copies
-            .iter()
-            .map(|(fingerprint, copies)| (fingerprint.clone(), KeyState::over(copies)))
-            .collect();
         let offered = parse_keyring(&stream, source)?;
         if offered.is_empty() {
             return Err(Error::Signature(format!(
                 "{source} holds no OpenPGP certificate"
             )));
         }
+        // The set a designated revoker is resolved among: every certificate the
+        // two streams hold, whatever key each of them states and whether or not
+        // the selector names it (see [`KeyState`]).
+        let known: Vec<&SignedPublicKey> = copies
+            .values()
+            .flatten()
+            .chain(offered.iter().map(|(cert, _)| cert))
+            .collect();
+        let mut held: BTreeMap<String, KeyState> = copies
+            .iter()
+            .map(|(fingerprint, copies)| (fingerprint.clone(), KeyState::over(copies, &known)))
+            .collect();
         // The certificates to append, in append order, each with the state it
         // states, and the held certificates a replacement rewrites.
         let mut added: Vec<(String, KeyState, Vec<u8>)> = Vec::new();
@@ -754,7 +765,7 @@ fn merge_keyring(
         for index in select_keys(&offered, key_ids)? {
             let (cert, packets) = &offered[index];
             let fingerprint = fingerprint_hex(cert);
-            let state = KeyState::of(cert);
+            let state = KeyState::of(cert, &known);
             if let Some(entry) = held.get_mut(&fingerprint) {
                 if replaces(entry, &state) {
                     *entry = state;
@@ -791,16 +802,28 @@ fn merge_keyring(
 /// What the certificates for one key state about it.
 #[derive(Clone, Copy)]
 struct KeyState {
-    /// Whether a key revocation signature the key itself made stands over it.
+    /// Whether a verified key revocation signature stands over the key: one the
+    /// key itself made, or one a key the certificate designates as a revoker
+    /// made, where the certificate of that revoker is among the ones the import
+    /// knows.
     ///
     /// A revocation is read through the verify engine, so the import reads the
     /// signature the verdict reads. The engine resolves a designated revoker
-    /// among the certificates it is given, and the import gives it the
-    /// certificates it is deciding over: the copies the keyring holds for one
-    /// key, and an offered certificate on its own. Each set states one key, so
-    /// the revoker of another key stands out of reach here. An offered
-    /// certificate carrying a revocation a designated revoker made therefore
-    /// states no revocation, and the keyring keeps the bytes it held.
+    /// among the certificates it is given, and the import gives it every
+    /// certificate the two streams it was handed hold: the certificates of the
+    /// keyring under edit and the certificates of the offered stream. A
+    /// selector governs what the import writes and not what it knows, so a
+    /// certificate the selector leaves out still resolves a revoker.
+    ///
+    /// Two states stand outside that set, and in each of them the keyring keeps
+    /// trusting a key the `ostree` tool's own keyring stops trusting
+    /// (`docs/conformance/cli-surface.md`, "P3"): a revoker whose certificate
+    /// stands in the global trusted directory or in a `gpgkeypath` entry rather
+    /// than in the keyring under edit, and a revoker imported after the
+    /// revocation was offered. The import is a function of the two byte streams
+    /// it is given, so one import writes the same bytes on every host, and it
+    /// writes no revocation it cannot verify, so an offered keyring is no way
+    /// to strike a held certificate out.
     revoked: bool,
     /// The instant the key expires at, absent where they state no expiry. The
     /// instant is read through the verify engine, so the import and the verdict
@@ -809,9 +832,9 @@ struct KeyState {
 }
 
 impl KeyState {
-    /// What `cert` states.
-    fn of(cert: &SignedPublicKey) -> KeyState {
-        KeyState::over(std::slice::from_ref(cert))
+    /// What `cert` states, with a designated revoker resolved among `known`.
+    fn of(cert: &SignedPublicKey, known: &[&SignedPublicKey]) -> KeyState {
+        KeyState::over(std::slice::from_ref(cert), known)
     }
 
     /// What the copies of one certificate state together: a revocation any copy
@@ -819,12 +842,15 @@ impl KeyState {
     /// states. This is the reach the verify path gives a keyring that holds one
     /// key through several certificates.
     ///
-    /// The copies are the set a designated revoker is resolved among, which is
-    /// the reach [`KeyState::revoked`] states. [`KeyState::of`] gives one
-    /// offered certificate as that whole set.
-    fn over(copies: &[SignedPublicKey]) -> KeyState {
+    /// `known` is the set a designated revoker is resolved among, which is the
+    /// reach [`KeyState::revoked`] states. The copies of the key under decision
+    /// are one thing and that set is another: a revocation stands over the key
+    /// these copies state, and the revoker is a key of its own.
+    fn over(copies: &[SignedPublicKey], known: &[&SignedPublicKey]) -> KeyState {
         KeyState {
-            revoked: copies.iter().any(|cert| verify::key_revoked(cert, copies)),
+            revoked: copies
+                .iter()
+                .any(|cert| verify::key_revoked(cert, known.iter().copied())),
             expires: verify::key_expiry_over(copies),
         }
     }
@@ -1580,6 +1606,79 @@ IHdvcmxk\n\
             packet
         }
 
+        /// Import a certificate stream into this home.
+        fn import(&self, bytes: &[u8]) {
+            let path = self.dir.join("import.gpg");
+            std::fs::write(&path, bytes).unwrap();
+            let status = self.gpg().arg("--import").arg(&path).status().unwrap();
+            assert!(status.success(), "gpg --import failed");
+        }
+
+        /// Import a stream `gpg` merges while it reports a failure.
+        ///
+        /// `gpg --import` exits 2 over the stream `gpg --desig-revoke` writes,
+        /// and it does so whether or not the home holds the revoker's
+        /// certificate: without it the run reports "no public key - can't apply
+        /// revocation certificate", and with it "invalid revocation
+        /// certificate: Bad signature - rejected" against the revoker's own key
+        /// id. Either way it reports "revocation certificate added" for the
+        /// revoked key and merges the class 0x20 signature into the certificate
+        /// it holds, so the export of the home carries the packet.
+        fn import_merging(&self, bytes: &[u8]) {
+            let path = self.dir.join("import.gpg");
+            std::fs::write(&path, bytes).unwrap();
+            self.gpg().arg("--import").arg(&path).status().unwrap();
+        }
+
+        /// Designate the key `revoker` names as a revoker of this home's first
+        /// key. `gpg` writes a fresh direct-key self-signature carrying
+        /// signature subpacket 12, so this home must already hold the revoker's
+        /// certificate.
+        fn add_revoker(&self, revoker: &str) {
+            let mut cmd = self.gpg_interactive();
+            cmd.arg("--edit-key").arg(self.fingerprint());
+            answer(
+                cmd,
+                format!("addrevoker\n{revoker}\ny\ny\nsave\n").as_bytes(),
+                "gpg --edit-key addrevoker",
+            );
+        }
+
+        /// The key revocation a designated revoker makes over the key `key`
+        /// names, as the binary packet stream `gpg --desig-revoke` writes: a
+        /// transferable public key of the revoked key carrying the class 0x20
+        /// signature right after the primary key packet. This home must hold
+        /// the revoker's secret key and a certificate of the revoked key that
+        /// designates the revoker.
+        fn desig_revoke(&self, key: &str) -> Vec<u8> {
+            let path = self.dir.join("desig-revoke.asc");
+            let mut cmd = self.gpg_interactive();
+            cmd.arg("--armor")
+                .arg("--output")
+                .arg(&path)
+                .arg("--desig-revoke")
+                .arg(key);
+            answer(cmd, b"y\n0\n\ny\n", "gpg --desig-revoke");
+            dearmor(&std::fs::read(&path).unwrap()).unwrap()
+        }
+
+        /// A `gpg` command bound to this home that reads its answers from
+        /// standard input, for the commands that take no batch form.
+        fn gpg_interactive(&self) -> std::process::Command {
+            let mut cmd = std::process::Command::new("gpg");
+            cmd.arg("--homedir").arg(&self.dir).args([
+                "--no-tty",
+                "--no-batch",
+                "--command-fd",
+                "0",
+                "--pinentry-mode",
+                "loopback",
+                "--passphrase",
+                "",
+            ]);
+            cmd
+        }
+
         /// The armored block of the revocation certificate `gpg` stored for
         /// the home's first key. The stored file carries prose before the
         /// block, and a colon before the block's first dash so that an
@@ -1593,6 +1692,23 @@ IHdvcmxk\n\
             let at = text.find("-----BEGIN PGP").unwrap();
             text.as_bytes()[at..].to_vec()
         }
+    }
+
+    /// Run `cmd`, writing `answers` to its standard input, and assert that it
+    /// reported success. `what` names the command in the assertion message.
+    fn answer(mut cmd: std::process::Command, answers: &[u8], what: &str) {
+        use std::io::Write;
+
+        let out = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut child| {
+                child.stdin.take().unwrap().write_all(answers)?;
+                child.wait_with_output()
+            })
+            .unwrap();
+        assert!(out.status.success(), "{what} failed");
     }
 
     impl Drop for KeyFixture {
@@ -2179,6 +2295,259 @@ IHdvcmxk\n\
         assert_eq!(keyring, revoked);
     }
 
+    /// The certificate streams a revocation a designated revoker made is
+    /// stated over: a signing key K that designates a revoker R, R's own
+    /// certificate, and the re-export of K carrying the class 0x20 signature R
+    /// made over it.
+    ///
+    /// [`verify`] has its own builder for these states, which splices a
+    /// revocation into a certificate that carries no designation. The import
+    /// cases need no such state, so this builder reaches every stream it needs
+    /// through `gpg` runs alone and the splicing stays where it is.
+    struct Revoked {
+        /// K's home, which made [`Revoked::blob`] and reads every keyring the
+        /// cases build.
+        home: KeyFixture,
+        /// K's primary key fingerprint, uppercase hex.
+        key: String,
+        /// R's primary key fingerprint, uppercase hex.
+        revoker: String,
+        /// R's certificate.
+        revoker_cert: Vec<u8>,
+        /// K carrying the designation and no revocation.
+        designating: Vec<u8>,
+        /// The re-export of K carrying the revocation R made.
+        revoked: Vec<u8>,
+        /// The detached signature K made over [`PAYLOAD`].
+        blob: Vec<u8>,
+    }
+
+    impl Revoked {
+        fn build() -> Revoked {
+            let home = KeyFixture::new("Signing K <k@ostrya.example>");
+            let revoker_home = KeyFixture::new("Revoker R <r@ostrya.example>");
+            let (key, revoker) = (home.fingerprint(), revoker_home.fingerprint());
+            let blob = home.sign(PAYLOAD);
+            let revoker_cert = revoker_home.export(false);
+            // The designation names the revoker by fingerprint, so K's home
+            // holds R's certificate while it writes the self-signature that
+            // carries the designation.
+            home.import(&revoker_cert);
+            home.add_revoker(&revoker);
+            let designating = home.export_one(&key);
+            // The revocation is made in the home holding R's secret key and a
+            // certificate of K that designates it.
+            revoker_home.import(&designating);
+            let revocation = revoker_home.desig_revoke(&key);
+            // The re-export of K carries the class 0x20 signature `gpg`
+            // merges into the certificate the home holds.
+            home.import_merging(&revocation);
+            let revoked = home.export_one(&key);
+            let state = Revoked {
+                home,
+                key,
+                revoker,
+                revoker_cert,
+                designating,
+                revoked,
+                blob,
+            };
+            state.assert_shape();
+            state
+        }
+
+        /// Assert that the streams are the state the cases name: the re-export
+        /// carries one key revocation signature the designating certificate
+        /// does not, and that revocation is the one R made, so a case fails
+        /// where its fixture is not the state it names.
+        fn assert_shape(&self) {
+            let designating = self.certs(&self.designating);
+            assert_eq!(designating[0].details.revocation_signatures.len(), 0);
+            let revoked = self.certs(&self.revoked);
+            assert_eq!(revoked[0].details.revocation_signatures.len(), 1);
+            let revoker = self.certs(&self.revoker_cert);
+            assert!(!verify::key_revoked(&revoked[0], &designating));
+            assert!(verify::key_revoked(&revoked[0], &revoker));
+        }
+
+        /// The certificates `keyring` holds.
+        fn certs(&self, keyring: &[u8]) -> Vec<SignedPublicKey> {
+            GpgVerifier::from_keyring_bytes([keyring])
+                .unwrap()
+                .certs
+                .to_vec()
+        }
+
+        /// What a verifier built over `keyring` answers about the signature K
+        /// made: whether it reports the key revoked, and whether the load is
+        /// valid.
+        fn verdict(&self, keyring: &[u8]) -> (bool, bool) {
+            let certs = self.certs(keyring);
+            let outcome =
+                verify::verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&self.blob))
+                    .unwrap();
+            assert_eq!(outcome.signatures.len(), 1);
+            (outcome.signatures[0].revoked, outcome.valid)
+        }
+    }
+
+    /// A re-export carrying a key revocation a designated revoker made
+    /// replaces the certificate a keyring holding the revoker holds for the
+    /// revoked key, the import counts no key, and a verifier built over the
+    /// result refuses a signature that key made.
+    ///
+    /// The revoker is resolved among the certificates of both streams, so the
+    /// import and the verdict answer off the same signature for every key one
+    /// keyring holds. The `ostree` tool carries the same revocation in by
+    /// merging the offered packets into its own keyblock: measured against
+    /// `ostree` 2026.1, over a remote whose keyring held K and R, the import
+    /// of the re-export reported `Imported 0 GPG keys` at exit 0, the keyring
+    /// grew by the class 0x20 packet, and `ostree show
+    /// --gpg-verify-remote=origin` then reported `Key revoked`
+    /// (`docs/conformance/cli-surface.md`, "P3").
+    #[test]
+    fn a_designated_revokers_revocation_replaces_the_held_certificate() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let state = Revoked::build();
+        // The keyring the `ostree` tool's own import leaves at the repository
+        // root, holding the signing key and the revoker, in that order.
+        let held = state
+            .home
+            .imported_keyring("held", &[&state.designating, &state.revoker_cert]);
+        // Over the keyring as it stands the signature is good, so the merge is
+        // what changes the answer.
+        assert_eq!(state.verdict(&certificate_stream(&held)), (false, true));
+
+        let (imported, keyring) = merge_keyring(&held, &state.revoked, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        // The revoked re-export stands where the held run stood, and the
+        // revoker's run passes through as it stands.
+        assert_eq!(
+            keyring,
+            [&state.revoked[..], &state.revoker_cert[..]].concat()
+        );
+        // `gpg` reads the result, which is the reader the `ostree` tool drives
+        // through gpgme, and both keys stand in it.
+        assert_eq!(
+            state.home.fingerprints_of(&keyring),
+            [state.key.clone(), state.revoker.clone()]
+        );
+        assert_eq!(state.verdict(&keyring), (true, false));
+    }
+
+    /// The offered stream is read for the revoker as well: a stream carrying
+    /// the revoked re-export and the revoker's certificate revokes the key a
+    /// keyring holds, whether or not the keyring held the revoker, and the
+    /// count reports the revoker as the one key added.
+    ///
+    /// A `KEY-ID` selector governs what the import writes and not what it
+    /// knows. Where the selector names the revoked key alone the revocation
+    /// still carries in and the revoker's certificate is not written, so the
+    /// keyring states the revocation and no key in it resolves the revoker.
+    /// The `ostree` tool answers the same way over both selections: measured
+    /// against `ostree` 2026.1, the unselected import reported `Imported 1 GPG
+    /// key` and `ostree show --gpg-verify-remote=origin` then reported `Key
+    /// revoked`, and the import naming the revoked key reported `Imported 0
+    /// GPG keys`, wrote the class 0x20 packet into the keyring, and reported a
+    /// good signature (`docs/conformance/cli-surface.md`, "P3").
+    #[test]
+    fn an_offered_revoker_certificate_resolves_the_revocation() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let state = Revoked::build();
+        let held = state.home.imported_keyring("held", &[&state.designating]);
+        let offered = [&state.revoked[..], &state.revoker_cert[..]].concat();
+
+        let (imported, keyring) = merge_keyring(&held, &offered, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 1);
+        assert_eq!(
+            keyring,
+            [&state.revoked[..], &state.revoker_cert[..]].concat()
+        );
+        assert_eq!(state.verdict(&keyring), (true, false));
+
+        // The selector names the revoked key alone. The revocation carries in
+        // and the revoker's certificate is left out, so the keyring holds one
+        // key and the revocation it states resolves no revoker.
+        let (imported, keyring) =
+            merge_keyring(&held, &offered, std::slice::from_ref(&state.key), SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        assert_eq!(keyring, state.revoked);
+        assert_eq!(
+            state.home.fingerprints_of(&keyring),
+            std::slice::from_ref(&state.key)
+        );
+        assert_eq!(state.verdict(&keyring), (false, true));
+    }
+
+    /// The wider set does not let one key's revoker strike another key out of
+    /// the keyring. A key revocation signature R made over the key K, stapled
+    /// onto an offered certificate of a third key that designates R too,
+    /// leaves the keyring at the bytes it held.
+    ///
+    /// The designation is resolved and the revoker's certificate stands in the
+    /// keyring, so the requirement the revocation verify over the key it
+    /// stands on is the whole of what refuses it.
+    #[test]
+    fn a_revocation_over_another_key_strikes_out_no_held_key() {
+        if !gpg_available() {
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let state = Revoked::build();
+        let packet = revocation_packet_of(&state.revoked);
+        // The packet is the revocation R made: over a certificate of K it
+        // stands on, with R's certificate in the trusted set, it revokes.
+        let spliced = insert_after_primary(&state.designating, &packet);
+        let revoker = state.certs(&state.revoker_cert);
+        assert!(verify::key_revoked(&state.certs(&spliced)[0], &revoker));
+
+        // A third key that designates R as a revoker too.
+        let third = KeyFixture::new("Third <third@ostrya.example>");
+        third.import(&state.revoker_cert);
+        third.add_revoker(&state.revoker);
+        let designating = third.export_one(&third.fingerprint());
+        let stapled = insert_after_primary(&designating, &packet);
+        // The stapled packet reaches the parsed certificate, so it is the merge
+        // that refuses it and not the parse.
+        assert_eq!(
+            state.certs(&stapled)[0].details.revocation_signatures.len(),
+            1
+        );
+
+        let held = third.imported_keyring("held", &[&designating, &state.revoker_cert]);
+        let (imported, keyring) = merge_keyring(&held, &stapled, &[], SUBJECT).unwrap();
+        assert_eq!(imported, 0);
+        // No replacement is due, so the file keeps every byte it held, the
+        // Trust packets the tool's own import wrote included.
+        assert_eq!(keyring, held);
+    }
+
+    /// `certs` as the set a designated revoker is resolved among, which is what
+    /// [`merge_keyring`] hands [`KeyState::over`] for the streams it was given.
+    fn known(certs: &[SignedPublicKey]) -> Vec<&SignedPublicKey> {
+        certs.iter().collect()
+    }
+
+    /// The key revocation signature packet the certificate stream `cert`
+    /// carries, which `gpg --desig-revoke` writes right after the primary key
+    /// packet.
+    fn revocation_packet_of(cert: &[u8]) -> Vec<u8> {
+        let (spans, _) = packet_spans(cert);
+        let span = spans
+            .iter()
+            .find(|(tag, _)| *tag == Tag::Signature)
+            .expect("a signature packet in the certificate")
+            .1
+            .clone();
+        cert[span].to_vec()
+    }
+
     /// A re-export stating a later key expiry replaces the certificate the
     /// keyring holds for that key, the import counts no key, and the key the
     /// keyring then holds verifies a signature it made.
@@ -2337,10 +2706,10 @@ IHdvcmxk\n\
         // expiry.
         let certs = GpgVerifier::from_keyring_bytes([&held]).unwrap().certs;
         assert_eq!(certs.len(), 1);
-        let held_state = KeyState::over(&certs);
+        let held_state = KeyState::over(&certs, &known(&certs));
         assert!(held_state.revoked);
         let offered = GpgVerifier::from_keyring_bytes([&extended]).unwrap().certs;
-        let offered_state = KeyState::over(&offered);
+        let offered_state = KeyState::over(&offered, &known(&offered));
         assert!(!offered_state.revoked);
         assert!(states_later(offered_state.expires, held_state.expires));
 

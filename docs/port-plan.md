@@ -1516,12 +1516,21 @@ Definition:
   signature another key made and anyone stapled onto an offered certificate
   strikes nothing out, and the expiry each certificate states comes from the
   tiered self-signature rule. The import resolves a designated revoker among
-  the certificates it decides over: the copies the keyring holds for one key,
-  and an offered certificate on its own. Each set states one key, so a
-  revocation a designated revoker made stays out of the import's reach. A
-  remote's keyring that holds the signing key and the revoker therefore keeps
-  trusting the signing key when a re-export carrying that revocation is
-  offered: the import writes nothing and reports a count of zero. A held
+  every certificate the two streams it was given hold: the certificates of the
+  keyring under edit and the certificates of the offered stream. A `KEY-ID`
+  selector governs what the import writes and not what it knows, so a
+  certificate the selector leaves out still resolves a revoker. A remote's
+  keyring that holds the signing key and the revoker therefore stops trusting
+  the signing key when a re-export carrying that revocation is offered, and so
+  does one holding the signing key alone where the offered stream states the
+  revoker. Two states keep the keyring trusting the key, and in each of them
+  the `ostree` tool's own keyring stops: a revoker whose certificate stands in
+  the global trusted directory or in a `gpgkeypath` entry rather than in either
+  stream, and a revoker imported after the revocation was offered. The import
+  is a function of the two byte streams it is given, so one import writes the
+  same bytes on every host, and it writes no revocation it cannot verify, so an
+  offered keyring is no way to strike a held certificate out
+  (`cli-surface.md`, "P3"). A held
   certificate that revokes its key takes no
   expiry replacement, since the replacement writes the offered packets where the
   held run stood and an offered certificate carrying no revocation would leave
@@ -1542,8 +1551,8 @@ Definition:
   Trust packets the keyring carried, which leaves it in the form the import
   writes for a certificate it adds and which `gpg` and the `ostree` tool both
   read. Nothing else about a held certificate changes: a new user id, a new
-  subkey, a subkey revocation, and a key revocation a designated revoker made
-  reach the keyring through `Repo::remove_remote_keyring` and a fresh import.
+  subkey and a subkey revocation reach the keyring through
+  `Repo::remove_remote_keyring` and a fresh import.
   A bare revocation certificate, the single signature packet
   `gpg --gen-revoke` writes, carries no public-key packet, so it holds no
   certificate and the import refuses it by the name of the source, as the
@@ -1562,7 +1571,13 @@ Definition:
   signing subkey included. Two keys may make one: the certificate's own primary
   key, and a key that a verified self-signature of the certificate designates
   as a revoker through signature subpacket 12, where the loaded trusted set
-  holds that revoker's certificate. The designation is read from the
+  holds that revoker's certificate. The trusted set is every certificate the
+  load carries, whichever source it came from: a remote's keyring, the global
+  trusted directory, or a `gpgkeypath` entry. The `ostree` tool resolves no
+  revoker standing in a keyring source other than the one carrying the
+  revocation, so a load whose sources part answers differently in the two
+  implementations and the port is the stricter one (`cli-surface.md`, "P3").
+  The designation is read from the
   self-signatures that verify under the primary key, which are the direct-key
   signatures and the certifications over a user id. It is read from the hashed
   subpacket area of those signatures alone, so a subpacket 12 that stands

@@ -190,12 +190,139 @@ impl GpgHome {
             .expect("a fpr record in the key listing")
     }
 
+    /// The primary-key fingerprint of the one key `selector` names, as
+    /// uppercase hex. A home holding more than one key is read through this,
+    /// since the listing order of two keys is `gpg`'s to choose.
+    fn fingerprint_of(&self, selector: &str) -> String {
+        let out = self
+            .gpg()
+            .args(["--with-colons", "--list-keys", "--"])
+            .arg(selector)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "gpg --list-keys failed");
+        let text = String::from_utf8(out.stdout).unwrap();
+        let fingerprints: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("fpr:"))
+            .filter_map(|rest| rest.split(':').nth(8))
+            .collect();
+        assert!(!fingerprints.is_empty(), "no key matched {selector:?}");
+        fingerprints[0].to_owned()
+    }
+
+    /// Designate the key `revoker` names as a revoker of the key `key` names.
+    /// `gpg` writes a fresh direct-key self-signature carrying signature
+    /// subpacket 12, so this home must hold both certificates.
+    fn add_revoker(&self, key: &str, revoker: &str) {
+        let mut cmd = self.gpg_interactive();
+        cmd.arg("--edit-key").arg(key);
+        answer(
+            cmd,
+            format!("addrevoker\n{revoker}\ny\ny\nsave\n").as_bytes(),
+            "gpg --edit-key addrevoker",
+        );
+    }
+
+    /// Write to `path` the key revocation a designated revoker makes over the
+    /// key `key` names: a transferable public key of the revoked key carrying
+    /// the class 0x20 signature. This home must hold the revoker's secret key
+    /// and a certificate of the revoked key that designates it.
+    fn desig_revoke(&self, key: &str, path: &Path) {
+        let mut cmd = self.gpg_interactive();
+        cmd.arg("--armor")
+            .arg("--output")
+            .arg(path)
+            .arg("--desig-revoke")
+            .arg(key);
+        answer(cmd, b"y\n0\n\ny\n", "gpg --desig-revoke");
+    }
+
+    /// A `gpg` command bound to this home that reads its answers from standard
+    /// input, for the commands that take no batch form.
+    fn gpg_interactive(&self) -> Command {
+        let mut cmd = Command::new("gpg");
+        cmd.arg("--homedir").arg(&self.dir).args([
+            "--no-tty",
+            "--no-batch",
+            "--command-fd",
+            "0",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+        ]);
+        cmd
+    }
+
+    /// Export the certificate of the one key `selector` names to `path`.
+    fn export_one_to(&self, selector: &str, path: &Path) {
+        let out = self
+            .gpg()
+            .arg("--export")
+            .arg("--")
+            .arg(selector)
+            .output()
+            .unwrap();
+        assert!(out.status.success() && !out.stdout.is_empty());
+        std::fs::write(path, out.stdout).unwrap();
+    }
+
     /// Export the public keyring to `path`.
     fn export_to(&self, path: &Path) {
         let out = self.gpg().arg("--export").output().unwrap();
         assert!(out.status.success() && !out.stdout.is_empty());
         std::fs::write(path, out.stdout).unwrap();
     }
+}
+
+/// The export of the key `key` names out of a fresh GnuPG home holding the
+/// streams `streams` names, imported in the order they stand in, written to
+/// `out`.
+///
+/// The merge runs in a home of its own because `gpg` signs with no key its own
+/// keyring reports revoked: it reports "Unusable secret key". The import of the
+/// stream `gpg --desig-revoke` writes exits 2 and merges the class 0x20
+/// signature into the certificate it holds either way, so the exit status of an
+/// import is not read here.
+#[cfg(feature = "gpg")]
+fn merged_export(dir: &Path, key: &str, streams: &[&Path], out: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let gpg = || {
+        let mut cmd = Command::new("gpg");
+        cmd.arg("--homedir").arg(dir).arg("--batch");
+        cmd
+    };
+    for stream in streams {
+        gpg().arg("--import").arg(stream).status().unwrap();
+    }
+    let export = gpg().arg("--export").arg("--").arg(key).output().unwrap();
+    assert!(export.status.success() && !export.stdout.is_empty());
+    std::fs::write(out, export.stdout).unwrap();
+    let _ = Command::new("gpgconf")
+        .arg("--homedir")
+        .arg(dir)
+        .args(["--kill", "gpg-agent"])
+        .status();
+}
+
+/// Run `cmd`, writing `answers` to its standard input, and assert that it
+/// reported success. `what` names the command in the assertion message.
+#[cfg(feature = "gpg")]
+fn answer(mut cmd: Command, answers: &[u8], what: &str) {
+    use std::io::Write;
+
+    let out = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(answers)?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(out.status.success(), "{what} failed");
 }
 
 #[cfg(feature = "gpg")]
@@ -8784,6 +8911,382 @@ fn remote_gpg_import_carries_a_key_expiry_extension() {
     }
 }
 
+/// A re-export carrying a key revocation a designated revoker made reaches a
+/// remote's trusted keyring in both implementations, where the keyring under
+/// edit or the offered stream states the revoker: each implementation then
+/// refuses the signature the revoked key made.
+///
+/// Two states, measured against `ostree` 2026.1 and `gpg` 2.4.9
+/// (`docs/conformance/cli-surface.md`, "P3"):
+///
+/// - H, the keyring holds the signing key K and the revoker R and the offered
+///   stream carries the re-export of K. Both count no key and both then refuse
+///   the signature;
+/// - J, the keyring holds K alone and the offered stream carries the re-export
+///   of K together with R's certificate. Both count one key, R, and both then
+///   refuse the signature. With the selector naming K alone, R is not written,
+///   both count no key, and both then report a good signature, since no key in
+///   the keyring resolves the revoker.
+///
+/// The two verdict lines part in their wording, which "P1" of
+/// `cli-surface.md` records: the port reports `BAD signature from` and the tool
+/// `Key revoked`. The bytes part as the two carry the revocation in: the port
+/// writes the offered certificate where the held one stood and the tool merges
+/// the offered packets into it (`cli-surface.md`, "P3").
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_gpg_import_carries_a_designated_revokers_revocation() {
+    if !ostree_available() || !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("remote-gpg-desig-revoke");
+    let base = tmp.path();
+    let state = RevokedKey::build(base);
+
+    // State H. The keyring the seed import writes holds K and R.
+    let (port, tool) = state.repositories(base, "h");
+    let (port_run, tool_run) = state.import(&port, &tool, &state.pair);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, K and R");
+    state.assert_good(&port, &tool);
+    let (port_run, tool_run) = state.import(&port, &tool, &state.revoked);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, the revocation");
+    assert!(
+        port_run
+            .ok()
+            .stdout_trimmed()
+            .contains("Imported 0 GPG keys"),
+        "the revocation must count no key"
+    );
+    state.assert_revoked(&port, &tool);
+
+    // State J. The keyring holds K alone, and the offered stream states R.
+    let (port, tool) = state.repositories(base, "j");
+    let (port_run, tool_run) = state.import(&port, &tool, &state.designating);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, K alone");
+    state.assert_good(&port, &tool);
+    let (port_run, tool_run) = state.import(&port, &tool, &state.revoked_pair);
+    assert_runs_agree(
+        &port_run,
+        &tool_run,
+        "remote gpg-import, the revocation and R",
+    );
+    assert!(
+        port_run
+            .ok()
+            .stdout_trimmed()
+            .contains("Imported 1 GPG key"),
+        "the revoker must count as the one key added"
+    );
+    state.assert_revoked(&port, &tool);
+
+    // The same offered stream with the selector naming K alone. R is not
+    // written, so the keyring states a revocation no key in it resolves.
+    let (port, tool) = state.repositories(base, "j2");
+    let (port_run, tool_run) = state.import(&port, &tool, &state.designating);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, K alone");
+    let keyring = format!("--keyring={}", state.revoked_pair.display());
+    let args = ["remote", "gpg-import", "origin", &keyring, &state.key];
+    let (port_run, tool_run) = run_remote_both(&port, &tool, &args, &[]);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, K selected");
+    assert!(
+        port_run
+            .ok()
+            .stdout_trimmed()
+            .contains("Imported 0 GPG keys"),
+        "the selected key must count as one the keyring held"
+    );
+    for repo in [&port, &tool] {
+        assert_eq!(
+            state.keys_in(repo).len(),
+            1,
+            "{repo:?} wrote a key the selector did not name"
+        );
+    }
+    state.assert_good(&port, &tool);
+}
+
+/// The two states where the revocation reaches the tool's keyring and not the
+/// port's, so the revoked key keeps speaking for the port's remote.
+///
+/// The port's import is a function of the two byte streams it is given and
+/// writes no revocation it cannot verify. The tool merges the offered packets
+/// into its keyblock whether or not it can verify them, so a revoker that
+/// arrives by another route makes the merged packet speak. Measured against
+/// `ostree` 2026.1 and `gpg` 2.4.9
+/// (`docs/conformance/cli-surface.md`, "P3"):
+///
+/// - I, R's certificate stands in the global trusted directory and the
+///   remote's keyring holds K alone. The port writes nothing and the tool
+///   merges the revocation, and both report a good signature, since neither
+///   resolves a revoker across the boundary between two keyring sources;
+/// - K, R is absent everywhere when the re-export is offered and is imported
+///   after. The port writes nothing for the re-export, so R's later arrival
+///   revokes nothing, and the port reports a good signature where the tool
+///   reports `Key revoked`.
+///
+/// `cli-surface.md`, "P3", records both, and `docs/port-plan.md`,
+/// "Phase 13d", states the rule they follow from.
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_gpg_import_leaves_an_unverifiable_revocation_out() {
+    if !ostree_available() || !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("remote-gpg-desig-unreached");
+    let base = tmp.path();
+    let state = RevokedKey::build(base);
+    let global = base.join("global");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::copy(&state.revoker, global.join("r.gpg")).unwrap();
+    let env = [("OSTREE_GPG_HOME", global.to_str().unwrap())];
+
+    // State I. The import reads the two streams alone, so R in the global
+    // trusted directory reaches neither implementation's import.
+    let (port, tool) = state.repositories(base, "i");
+    let (port_run, tool_run) = state.import(&port, &tool, &state.designating);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, K alone");
+    let keyring = format!("--keyring={}", state.revoked.display());
+    let args = ["remote", "gpg-import", "origin", &keyring];
+    let (port_run, tool_run) = run_remote_both(&port, &tool, &args, &env);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, the revocation");
+    // The bytes part: the port's keyring is the one it held and the tool's
+    // carries the merged revocation.
+    let name = "origin.trustedkeys.gpg";
+    let held = std::fs::read(&state.designating).unwrap();
+    assert_eq!(std::fs::read(port.join(name)).unwrap(), held);
+    assert!(std::fs::read(tool.join(name)).unwrap().len() > held.len());
+    // The verdict agrees, for reasons that part: the port's keyring states no
+    // revocation, and the tool holds one and passes it over.
+    for (label, repo, is_port) in [("the port", &port, true), ("the tool", &tool, false)] {
+        let text = state.show(repo, is_port, &env);
+        assert!(
+            text.contains("Good signature from"),
+            "{label} resolved a revoker out of the global trusted directory:\n{text}"
+        );
+    }
+
+    // Over the keyring the tool's own import wrote, the two verdicts part and
+    // the port is the stricter one: the port's verify path resolves a revoker
+    // among every certificate it loads, whichever source carried it, and the
+    // tool resolves none standing in another keyring source.
+    let merged = std::fs::read(tool.join(name)).unwrap();
+    std::fs::write(port.join(name), &merged).unwrap();
+    let port_text = state.show(&port, true, &env);
+    assert!(
+        port_text.contains("BAD signature from"),
+        "the port passed over a revocation its own keyring states:\n{port_text}"
+    );
+    let tool_text = state.show(&tool, false, &env);
+    assert!(
+        tool_text.contains("Good signature from"),
+        "the tool resolved a revoker out of the global trusted directory:\n{tool_text}"
+    );
+
+    // State K. The re-export is offered with R absent everywhere, and R is
+    // imported after. The tool's merged packet then speaks and the port has
+    // written none.
+    let (port, tool) = state.repositories(base, "k");
+    let (port_run, tool_run) = state.import(&port, &tool, &state.designating);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, K alone");
+    let (port_run, tool_run) = state.import(&port, &tool, &state.revoked);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, the revocation");
+    let (port_run, tool_run) = state.import(&port, &tool, &state.revoker);
+    assert_runs_agree(&port_run, &tool_run, "remote gpg-import, R after the fact");
+    let port_text = state.show(&port, true, &[]);
+    assert!(
+        port_text.contains("Good signature from"),
+        "the port refused a revocation it never wrote:\n{port_text}"
+    );
+    let tool_text = state.show(&tool, false, &[]);
+    assert!(
+        tool_text.contains("Key revoked"),
+        "the tool accepted a revocation it merged:\n{tool_text}"
+    );
+}
+
+/// A signing key K that designates a revoker R, and the certificate streams a
+/// revocation R made over K is stated over. Each stream is a file, since an
+/// import names one with `--keyring`.
+#[cfg(feature = "gpg")]
+struct RevokedKey {
+    /// The home holding both secret keys, which signs each commit.
+    home: GpgHome,
+    /// K's primary key fingerprint, uppercase hex.
+    key: String,
+    /// K carrying the designation and no revocation.
+    designating: PathBuf,
+    /// R's certificate.
+    revoker: PathBuf,
+    /// The two of them, in that order.
+    pair: PathBuf,
+    /// The re-export of K carrying the revocation R made.
+    revoked: PathBuf,
+    /// That re-export and R's certificate, in that order.
+    revoked_pair: PathBuf,
+}
+
+#[cfg(feature = "gpg")]
+impl RevokedKey {
+    /// Build the keys and the streams under `base`. The home keeps signing
+    /// with K, since the revocation is merged in a home of its own (see
+    /// [`merged_export`]).
+    fn build(base: &Path) -> RevokedKey {
+        let home = GpgHome::create(base, "Signing K <k@ostrya.example>");
+        home.add_key("Revoker R <r@ostrya.example>");
+        let key = home.fingerprint_of("k@ostrya.example");
+        let revoker_key = home.fingerprint_of("r@ostrya.example");
+        home.add_revoker(&key, &revoker_key);
+        let designating = base.join("k-designating.gpg");
+        home.export_one_to(&key, &designating);
+        let revoker = base.join("r.gpg");
+        home.export_one_to(&revoker_key, &revoker);
+        let pair = base.join("k-and-r.gpg");
+        Self::concat(&pair, &[&designating, &revoker]);
+        let revocation = base.join("rev-by-r.asc");
+        home.desig_revoke(&key, &revocation);
+        let revoked = base.join("k-revoked.gpg");
+        merged_export(
+            &base.join("merge-home"),
+            &key,
+            &[&designating, &revocation],
+            &revoked,
+        );
+        let revoked_pair = base.join("k-revoked-and-r.gpg");
+        Self::concat(&revoked_pair, &[&revoked, &revoker]);
+        build_fixture_source(base);
+        RevokedKey {
+            home,
+            key,
+            designating,
+            revoker,
+            pair,
+            revoked,
+            revoked_pair,
+        }
+    }
+
+    /// One repository per implementation under `base/<tag>-<name>`, each
+    /// holding the same commit signed with K and the remote `origin`.
+    fn repositories(&self, base: &Path, tag: &str) -> (PathBuf, PathBuf) {
+        let src = base.join("src");
+        let mut repos = Vec::new();
+        for name in ["port", "tool"] {
+            let dir = base.join(format!("{tag}-{name}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let repo = create_repo(&dir, RepoMode::Archive);
+            let repo_s = repo.to_str().unwrap().to_owned();
+            ostrya(
+                &[
+                    "commit",
+                    "--repo",
+                    &repo_s,
+                    "-b",
+                    BRANCH,
+                    "-s",
+                    SUBJECT,
+                    "--canonical-permissions",
+                    src.to_str().unwrap(),
+                ],
+                None,
+                &[("SOURCE_DATE_EPOCH", SOURCE_DATE_EPOCH)],
+            )
+            .ok();
+            configure_remote(&repo, "https://example.invalid/r", "");
+            ostree(&[
+                "gpg-sign",
+                "--repo",
+                &repo_s,
+                "--gpg-homedir",
+                self.home.dir.to_str().unwrap(),
+                COMMIT,
+                &self.key,
+            ])
+            .ok();
+            repos.push(repo);
+        }
+        (repos[0].clone(), repos[1].clone())
+    }
+
+    /// One `remote gpg-import` of the stream at `keyring` on both sides.
+    fn import(&self, port: &Path, tool: &Path, keyring: &Path) -> (Run, Run) {
+        let arg = format!("--keyring={}", keyring.display());
+        run_remote_both(port, tool, &["remote", "gpg-import", "origin", &arg], &[])
+    }
+
+    /// What `show --gpg-verify-remote=origin` reports over `repo`, read by the
+    /// port where `port` is set and by the tool where it is not.
+    fn show(&self, repo: &Path, port: bool, env: &[(&str, &str)]) -> String {
+        let args = ["show", "--gpg-verify-remote=origin", BRANCH];
+        let mut all = vec![format!("--repo={}", repo.display())];
+        all.extend(args.iter().map(|arg| (*arg).to_owned()));
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let run = if port {
+            ostrya(&all, None, env)
+        } else {
+            ostree_env(&all, env)
+        };
+        run.ok().stdout_trimmed()
+    }
+
+    /// Assert that each implementation reports the signature good.
+    fn assert_good(&self, port: &Path, tool: &Path) {
+        for (label, repo, is_port) in [("the port", port, true), ("the tool", tool, false)] {
+            let text = self.show(repo, is_port, &[]);
+            assert!(
+                text.contains("Good signature from"),
+                "{label} refused a signature by a live key:\n{text}"
+            );
+        }
+    }
+
+    /// Assert that each implementation refuses the signature, each in its own
+    /// wording.
+    fn assert_revoked(&self, port: &Path, tool: &Path) {
+        let text = self.show(port, true, &[]);
+        assert!(
+            text.contains("BAD signature from") && !text.contains("Good signature"),
+            "the port accepted a signature by a revoked key:\n{text}"
+        );
+        let text = self.show(tool, false, &[]);
+        assert!(
+            text.contains("Key revoked") && !text.contains("Good signature"),
+            "the tool accepted a signature by a revoked key:\n{text}"
+        );
+    }
+
+    /// The primary-key fingerprints the remote's trusted keyring holds, as
+    /// `gpg` reports them.
+    fn keys_in(&self, repo: &Path) -> Vec<String> {
+        let out = self
+            .home
+            .gpg()
+            .arg("--no-default-keyring")
+            .arg("--keyring")
+            .arg(repo.join("origin.trustedkeys.gpg"))
+            .args(["--with-colons", "--list-keys"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "gpg --list-keys over a keyring failed"
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("fpr:"))
+            .filter_map(|rest| rest.split(':').nth(8).map(str::to_owned))
+            .collect()
+    }
+
+    /// Write the concatenation of `parts` to `path`.
+    fn concat(path: &Path, parts: &[&Path]) {
+        let mut bytes = Vec::new();
+        for part in parts {
+            bytes.extend_from_slice(&std::fs::read(part).unwrap());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+}
+
 /// A repository holding two GPG signatures that do not verify, with the
 /// signing key in the trusted keyring of the remote `origin`.
 ///
@@ -9509,7 +10012,7 @@ fn commit_editor_matches_the_tool() {
     );
     // A timestamp the reader refuses and a tree that does not open stand behind
     // it. The tree refusal is worded per implementation
-    // (`../../docs/conformance/cli-surface.md`, "P2"), so only the order is
+    // (`docs/conformance/cli-surface.md`, "P2"), so only the order is
     // compared here.
     order_agrees(&["--timestamp=notatime"], src, true);
     order_agrees(
@@ -9523,7 +10026,7 @@ fn commit_editor_matches_the_tool() {
 /// `-F/--body-file` takes. A file of exactly that size commits, and the tool
 /// reaches the same commit; one byte more reports `Commit message larger than
 /// 134217728 bytes` at exit 1 and writes no ref, which is the port's own bound
-/// (`../../docs/conformance/cli-surface.md`, "Scope of CLI compatibility").
+/// (`docs/conformance/cli-surface.md`, "Scope of CLI compatibility").
 ///
 /// Ignored by default: it writes a 128 mebibyte file and copies it once per
 /// case; run with `cargo test -p ostrya-cli --test cli -- --ignored`.

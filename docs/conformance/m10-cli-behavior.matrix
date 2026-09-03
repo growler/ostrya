@@ -3830,7 +3830,15 @@ loss: `gpg-list-keys` omits the two Web Key Directory URL lines the tool prints
  revocation reach the port's trusted set only after `remote delete` and a fresh
  import. Two statements are carried in by both. A key revocation that verifies
  replaces the held certificate in the port's keyring and is merged into it in the
- tool's, and each implementation then refuses a signature that key made. A key
+ tool's, and each implementation then refuses a signature that key made: the key
+ itself signs the revocation, or a key a verified self-signature designates as a
+ revoker does, and the port resolves such a revoker among the certificates of the
+ keyring under edit and of the offered stream. Two states reach the tool's
+ keyring and not the port's, and the port then reports a good signature over a
+ key the tool reports revoked: a revoker whose certificate stands in the global
+ trusted directory rather than in either stream, where both implementations
+ report a good signature and the bytes alone part, and a revoker imported after
+ the revocation was offered. A key
  expiry later than the held certificate states replaces it the same way, and each
  implementation then reports a good signature where it reported a bad one before;
  the port's keyring is the offered export byte for byte and the tool's merge
@@ -3838,7 +3846,9 @@ loss: `gpg-list-keys` omits the two Web Key Directory URL lines the tool prints
  the Trust packets. A certificate carrying no user id is taken by the port and
  refused by the tool (`cli-surface.md`, "P3", states them all).
 evidence: ostrya_cli::cli::remote_gpg_keyring_round_trips_with_the_tool,
- ostrya_cli::cli::remote_gpg_import_carries_a_key_expiry_extension
+ ostrya_cli::cli::remote_gpg_import_carries_a_key_expiry_extension,
+ ostrya_cli::cli::remote_gpg_import_carries_a_designated_revokers_revocation,
+ ostrya_cli::cli::remote_gpg_import_leaves_an_unverifiable_revocation_out
 spec: format-reference.md#remote
 note: importing keys needs a generated key and a remote, which no setup binds.
  The test imports one keyring into each implementation's repository and states
@@ -3856,7 +3866,10 @@ note: importing keys needs a generated key and a remote, which no setup binds.
  `ostree remote gpg-list-keys` reads and reports `(revoked)`, and `ostree show`
  reports `Key revoked` over it. The second test carries the expiry extension
  through both implementations over a commit each signed with the key while it
- was live (`cli-surface.md`, "P3").
+ was live. The third and the fourth carry a revocation a designated revoker
+ made: the third states the two keyrings that resolve the revoker out of the
+ streams the import reads, and the fourth the two that do not
+ (`cli-surface.md`, "P3").
 
 # ---------------------------------------------------------------------------
 # commit -- the message and the body, the metadata dict, and the ref bindings

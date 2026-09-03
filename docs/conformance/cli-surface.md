@@ -1483,10 +1483,13 @@ records. Ten divergences stand:
 
   A key revocation is one of the two certificates both implementations carry
   in. An offered certificate holding a key revocation signature that verifies
-  under the key it revokes replaces the certificate the keyring holds for that
-  key, and the count stays `Imported 0 GPG keys`. Each implementation holds a
-  commit signed with `$FPR`, a remote `origin`, and `cert1.gpg` imported into
-  that remote:
+  replaces the certificate the keyring holds for that key, and the count stays
+  `Imported 0 GPG keys`. Two keys sign a revocation the port honors: the key it
+  revokes, and a key a verified self-signature of that certificate designates
+  as a revoker. The designated-revoker case carries two conditions of its own
+  and is recorded under "A revocation another key made" below. Each
+  implementation holds a commit signed with `$FPR`, a remote `origin`, and
+  `cert1.gpg` imported into that remote:
 
       gpg --export "$FPR" > cert1.gpg
       printf 'y\n1\n\ny\n' | gpg --command-fd 0 --no-tty --yes \
@@ -1562,13 +1565,92 @@ records. Ten divergences stand:
   `an_earlier_expiry_leaves_the_held_certificate`, and
   `a_revoked_key_takes_no_expiry_replacement`).
 
-  A revocation another key made carries no weight. The signature is verified
-  under the key it revokes before it is honored, so a key revocation signature
+  A revocation another key made carries weight where a verified self-signature
+  of the revoked certificate designates that key as a revoker through signature
+  subpacket 12, and the certificate of that revoker stands in the keyring under
+  edit or in the offered stream. Those are the two streams the import reads, so
+  one import writes the same bytes on every host. The revoker is resolved among
+  every certificate the two streams hold, whatever key each of them states and
+  whether or not a `KEY-ID` selector names it: a selector governs what the
+  import writes and not what the import knows.
+
+  Two states carry such a revocation into the tool's keyring and not into the
+  port's, since the tool merges the offered packets into its keyblock whether
+  or not it can verify them:
+
+  - the revoker's certificate stands in the global trusted directory or in a
+    `gpgkeypath` entry rather than in either stream. The port writes nothing,
+    since the import reads the two streams alone, and the tool merges the
+    revocation. Both then report a good signature, for reasons that part: the
+    port's keyring states no revocation, and the tool holds one and passes it
+    over. Over the keyring the tool's own import wrote, with the revoker's
+    certificate in the global trusted directory, the port reports `BAD
+    signature from` and the tool `Good signature from`: the port's verify path
+    resolves a revoker among every certificate it loads, whichever source
+    carried it, and the tool resolves none standing in another keyring source.
+    The port is the stricter of the two here;
+  - the revoker is absent everywhere when the re-export is offered and is
+    imported after. The tool's merged packet then speaks and the port has
+    written none, so the port reports `Good signature from` where the tool
+    reports `Key revoked`.
+
+  Each implementation holds a commit signed with `$K`, a remote `origin`, and a
+  certificate of `$K` designating `$R` imported into that remote. Measured
+  against `ostree` 2026.1 and `gpg` 2.4.9:
+
+      gpg --desig-revoke "$K" > rev.asc     # signed with $R's secret key
+      gpg --homedir merge --import k.gpg rev.asc   # exits 2, merges the packet
+      gpg --homedir merge --export "$K" > revoked.gpg
+      # the keyring holds $K and $R
+      ostrya remote gpg-import origin --keyring revoked.gpg # Imported 0 GPG keys
+      ostree remote gpg-import origin --keyring revoked.gpg # Imported 0 GPG keys
+      ostrya show --gpg-verify-remote=origin main   # BAD signature from "..."
+      ostree show --gpg-verify-remote=origin main   # Key revoked
+      # the keyring holds $K alone, and the offered stream states $R
+      cat revoked.gpg r.gpg > offered.gpg
+      ostrya remote gpg-import origin --keyring offered.gpg # Imported 1 GPG key
+      ostree remote gpg-import origin --keyring offered.gpg # Imported 1 GPG key
+      ostrya show --gpg-verify-remote=origin main   # BAD signature from "..."
+      ostree show --gpg-verify-remote=origin main   # Key revoked
+      # the same offered stream with the selector naming $K alone
+      ostrya remote gpg-import origin --keyring offered.gpg "$K"
+      ostree remote gpg-import origin --keyring offered.gpg "$K"
+      # both Imported 0 GPG keys, both keyrings hold one key and state the
+      # revocation, and both report Good signature from "..."
+      # $R in the global trusted directory and the keyring holding $K alone
+      OSTREE_GPG_HOME=global ostrya remote gpg-import origin         --keyring revoked.gpg                       # Imported 0 GPG keys
+      OSTREE_GPG_HOME=global ostree remote gpg-import origin         --keyring revoked.gpg                       # Imported 0 GPG keys
+      # both report Good signature from "...", and the port's keyring is the
+      # one it held while the tool's grew by the revocation packet
+      cp tool/origin.trustedkeys.gpg port/origin.trustedkeys.gpg
+      OSTREE_GPG_HOME=global ostrya show --gpg-verify-remote=origin main
+      # BAD signature from "...", where the tool over that same keyring and
+      # the same global directory reports Good signature from "..."
+      # $R absent everywhere, offered, then imported after
+      ostrya remote gpg-import origin --keyring revoked.gpg # Imported 0 GPG keys
+      ostrya remote gpg-import origin --keyring r.gpg       # Imported 1 GPG key
+      ostrya show --gpg-verify-remote=origin main   # Good signature from "..."
+      ostree show --gpg-verify-remote=origin main   # Key revoked
+
+  `gpg --desig-revoke` writes the revocation, and `gpg --import` of it exits 2
+  while merging the class 0x20 signature into the certificate it holds, whether
+  or not the home holds the revoker's certificate
+  (`crates/ostrya-cli/tests/cli.rs`,
+  `remote_gpg_import_carries_a_designated_revokers_revocation` and
+  `remote_gpg_import_leaves_an_unverifiable_revocation_out`).
+
+  Every revocation is verified before it is honored. A key revocation signature
   anyone stapled onto an offered certificate leaves the keyring at the bytes it
-  held (`crates/ostrya/src/gpg.rs`,
-  `a_stapled_revocation_does_not_replace_the_held_certificate`). Without that
-  rule an offered keyring would be a way to strike any trusted key out of a
-  repository.
+  held: one no self-signature designates, and one a designation names whose
+  signature does not verify over the certificate it stands on
+  (`crates/ostrya/src/gpg.rs`,
+  `a_stapled_revocation_does_not_replace_the_held_certificate`,
+  `a_designated_revokers_revocation_replaces_the_held_certificate`,
+  `an_offered_revoker_certificate_resolves_the_revocation`, and
+  `a_revocation_over_another_key_strikes_out_no_held_key`). Without that rule an
+  offered keyring would be a way to strike any trusted key out of a repository,
+  since the port's replacement writes the offered packets where the held run
+  stood.
 
   A bare revocation certificate -- the single signature packet
   `gpg --gen-revoke` writes -- carries no public-key packet, so it holds no

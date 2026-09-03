@@ -402,7 +402,12 @@ struct Issuers<'a> {
     /// Every loaded certificate, which is the set a designated revoker is
     /// resolved among (see [`key_revoked`]). A revoker speaks for a
     /// certificate it stands outside of, so the whole trusted set answers
-    /// here.
+    /// here, whichever source carried each certificate: a remote's keyring,
+    /// the global trusted directory, or a `gpgkeypath` entry. The `ostree`
+    /// tool resolves no revoker standing in a keyring source other than the
+    /// one carrying the revocation, so a load whose sources part answers
+    /// differently in the two implementations and the port is the stricter one
+    /// (`docs/conformance/cli-surface.md`, "P3").
     trusted: &'a [SignedPublicKey],
 }
 
@@ -823,9 +828,10 @@ fn signature_expired(sig: &Signature) -> bool {
 /// alone.
 ///
 /// The keyring import reads a certificate offered for a key the keyring
-/// already holds through this function. It passes the certificates it decides
-/// over as `trusted`, and each of those sets states one key, so a designated
-/// revoker of another key stands out of the import's reach.
+/// already holds through this function. It passes as `trusted` every
+/// certificate the keyring under edit and the offered stream hold, so a
+/// revocation a designated revoker made carries into a keyring where either
+/// stream states the revoker.
 pub(super) fn key_revoked<'a, I>(cert: &SignedPublicKey, trusted: I) -> bool
 where
     I: IntoIterator<Item = &'a SignedPublicKey>,

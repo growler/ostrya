@@ -338,6 +338,120 @@ Cross-compatibility (the tool reads the port's output and the reverse) is the
 strongest correctness signal and is a required gate at each format-producing
 phase.
 
+### Golden fixtures: layout, packaging, and how to run them
+
+`tests/fixtures/` sits outside every crate root, so a crate published to
+crates.io carries none of it. `cargo package -p ostrya --list --allow-dirty`
+and the same command for `ostrya-composefs` list no path under
+`tests/fixtures/`. Git tracks every fixture, so a checkout always has them.
+Whether a fixture-consuming test skips or fails when a fixture is absent
+depends on the test; see "Fixture-absence skips" below.
+
+Fixture layout under `tests/fixtures/`:
+
+- `generated/MANIFEST` -- key=value facts the generator recorded: the shared
+  cross-mode commit checksum, the `bare` fixture's owner, and the commit
+  checksums and digests each fixture family produced.
+- `generated/.gitattributes` -- marks the tarballs, the composefs images,
+  and the two `summary` files binary, so git applies no text normalization
+  or diff to them.
+- `generated/<mode>/repo/` -- the `archive`, `bare`, `sizes`, `summary`, and
+  `summary-collection` fixtures, each a plain tree of `config`, `objects`,
+  and `refs`.
+- `generated/<name>.tar` -- the `bare-user`, `canon`, and `xattr` fixtures.
+  Each file's logical metadata lives in a `user.ostreemeta` xattr, which a
+  plain checked-in tree cannot carry, so these ship as xattr-preserving
+  tarballs, unpacked on demand by
+  `crates/ostrya/tests/common/mod.rs`'s `unpack_fixture`.
+- `generated/export.tar` -- the tool's `ostree export` of the shared commit,
+  a plain filesystem tar consumed by the tar import tests.
+- `generated/composefs/` -- four EROFS images, `tree.cfs`,
+  `tree-noverity.cfs`, `tree-rich.cfs`, and `tree-rich-noverity.cfs`, each
+  paired with a `composefs-info dump` text file of the same stem (`tree.dump`,
+  and so on).
+- `tls/` -- TLS certificates for the fetcher's HTTPS tests, held under their
+  own `tls/generate.sh`, run independently of `generate.sh` and only when the
+  certificates need replacing (their stated validity is 100 years).
+
+#### The generator
+
+`tests/fixtures/generate.sh` regenerates the whole `generated/` tree in one
+run: it wipes and rebuilds `generated/` from scratch and takes no argument to
+select a single family. Invoke it with no arguments:
+
+```sh
+tests/fixtures/generate.sh
+```
+
+It needs the `ostree` tool on `PATH` and exits before writing anything if the
+tool is absent. It also calls `tar` (with the `--xattrs` option and POSIX pax
+format), `setfattr`, and `python3`, and needs no root privilege. The
+composefs fixtures need `composefs-info` and an `ostree` build that reports
+`composefs` in `ostree --version`; when either is missing the script prints a
+warning and skips only that section, still regenerating every other fixture
+family. A fixed branch, a fixed commit timestamp, a fixed owner, and
+`--no-xattrs` where the fixture calls for it keep every content-addressed
+object and ref byte-stable, so a re-run yields byte-identical tracked files,
+which the script's own header states as its determinism invariant.
+
+#### Running the composefs fixture tests
+
+Two test binaries consume the composefs fixtures:
+
+```sh
+cargo test -p ostrya-composefs --test golden
+cargo test -p ostrya --test composefs
+```
+
+Both pass against the fixtures checked into this tree: `golden` runs 4
+tests, all reading a composefs fixture. `composefs` runs 11 tests, of which 5
+read a composefs fixture (`export_matches_golden_image_and_digest`,
+`noverity_export_matches_golden_image_and_digest`,
+`stores_digest_in_commit_metadata`,
+`transaction_digest_matches_recorded_digest`,
+`digest_metadata_runs_in_a_non_backing_mode`); the other 6 build and check a
+composefs image without reading one. Neither command needs the `ostree`
+tool: each fixture-reading test loads only the checked-in `.cfs`, `.dump`,
+and `MANIFEST` files, and building or comparing an image is pure Rust.
+
+#### Fixture-absence skips
+
+The nine composefs tests above, plus
+`imports_tool_export_into_matching_tree` in `crates/ostrya/tests/tar.rs`,
+are the only fixture-consuming tests in the tree that tolerate a missing
+fixture. Each prints a message to stderr, for example `composefs fixture
+tree absent; skipping`, and returns without failing, so `cargo test` still
+reports it as passed. Cargo captures a passing test's stdout and stderr and
+shows it only for a failing test, so the message stays invisible in a
+normal run. To tell a skip from a pass, run with `--nocapture` and check
+for the message:
+
+```sh
+cargo test -p ostrya-composefs --test golden -- --nocapture
+cargo test -p ostrya --test composefs -- --nocapture
+```
+
+No flag turns a fixture-absence skip into a failure. Short of that
+`--nocapture` check, the way to confirm the fixtures were present for a run
+is to confirm the fixture files exist under
+`tests/fixtures/generated/composefs/` before running the tests.
+
+Every other fixture-consuming test in the tree needs its fixture present
+and fails, rather than skipping, when it is not: the write-path, checkout,
+mtree, read, repo, commit, ingest, and summary tests, and the rest of
+`tests/tar.rs`, elsewhere under `crates/ostrya/tests/`; the golden-object
+tests under `crates/ostrya-core/tests/` and `crates/ostrya-gvariant/tests/`,
+which read the same `tests/fixtures/generated/` objects; and the
+TLS-backed fetcher tests (`crates/ostrya/tests/fetch.rs`,
+`crates/ostrya/tests/pull_http.rs`, and the unit tests in `src/fetch.rs`
+and `src/fetch/tls.rs`), which compile `tests/fixtures/tls/` in with
+`include_bytes!` and so fail to build, not just to run, without it. None of
+this shows up from a checkout, where every fixture is present. It does
+distinguish the two crates' published packages: `ostrya-composefs` carries
+only the guarded `tests/golden.rs`, so its published test run stays green
+without the fixtures; `ostrya`'s published package also carries the
+unguarded tests, so its published test run does not.
+
 ## Phased roadmap
 
 Phases are ordered by dependency and priority. Early phases are small and

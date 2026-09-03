@@ -1175,6 +1175,35 @@ instant any of them states. The keyring load order decides none of the three.
 The first certificate that answers supplies the reported fingerprints and user
 id.
 
+A `SignatureInfo` carries one of three field sets, and which one it carries
+states how far the verification reached.
+
+- A signature a resolved key verifies reports the signing key in
+  `fingerprint`, the certificate that holds it in `primary_fingerprint`, that
+  certificate's user id in `user_name` and `user_email`, the instants and the
+  algorithm names the signature packet states, and the answer of the validity
+  policy in `valid`. `expires` is the absolute instant the signature's own
+  expiry names, which is the creation time plus the lifetime the packet
+  states, and it is absent where the packet states no lifetime.
+- A signature whose issuer no loaded certificate holds reports what its own
+  packet states: the issuer fingerprint it names, or no fingerprint where the
+  packet names none, its creation instant, and the two algorithm names, with
+  `key_missing` set. A signature the policy
+  refuses for its class, for its digest algorithm, or for a signing subkey the
+  primary key did not cross-certify reports those same fields with
+  `key_missing` clear. Neither set names a user id.
+- A signature whose issuer resolved and whose cryptography failed reports the
+  resolved signing key, the certificate that holds it, and that certificate's
+  user id, and states no instant and no algorithm name, since nothing the
+  packet claims was checked. `ostrya sign --delete` reaches such a signature
+  under the key id or the whole fingerprint of either key.
+
+`valid` on the outcome is the OR over the per-signature flags, so one good
+signature among several makes the outcome valid. A blob the parser reads no
+signature out of yields one record of its own, so the record count follows the
+stored blob count. A signature past its own expiry is reported not valid and
+carries no field of its own.
+
 ## Fetcher
 
 The HTTP client pull is built on. One `Fetcher` serves one remote: it holds the

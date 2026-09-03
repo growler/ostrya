@@ -1489,6 +1489,20 @@ Definition:
   blob count. A blob is held to one mebibyte and to 64 signature packets, and
   the parse and the public-key operations run inside `catch_unwind`, since a
   stored blob is untrusted input.
+- Each cap bounds one input, and the panic containment bounds one call. Four
+  mebibytes and 256 certificates bound one keyring blob, and one mebibyte and
+  64 signature packets bound one stored blob. No cap covers the trusted set
+  across its sources, so a global trusted directory of many keyring files
+  reaches a larger set than one file carries; the contents of that directory
+  are placed by the operator, which is why it takes no bound. The containment
+  turns a panic inside the `pgp` crate into a signature error, so a malformed
+  blob reads as an invalid signature. Two limits stand on it.
+  `catch_unwind` does nothing where the final binary is built with
+  `panic = "abort"`, and it covers no parser that returns a wrong answer
+  without panicking, which the differential gate is the one check on. The
+  panic hook stays as the program set it, so a contained panic still writes
+  its message to the standard error of the program that embeds the library,
+  ahead of the error the caller receives.
 - A remote's trusted keyring is managed in the process.
   `Repo::gpg_import_keys` parses the offered certificate stream, resolves each
   `KEY-ID` selector against it, appends the packets of every certificate the
@@ -1566,6 +1580,31 @@ Definition:
   from the certificate and the signature packet. Each rule reproduces `gpgv`
   2.4.9 as observed in an isolated `GNUPGHOME` on fixtures the unit tests
   build.
+  The rules run in the order the status stream states them, so the issuer
+  resolves before the digest is read: a signature whose issuer no loaded
+  certificate holds reports a missing key whatever digest it names.
+  The two expiry instants carry opposite boundaries. A key stands live through
+  the instant its expiry names, and a signature is expired at the instant its
+  own expiry names.
+  A signature past its own expiry is not valid and carries no field of its
+  own. `gpgv` reports `EXPSIG` for it and no status keyword states more, so
+  the record carries the fields a verified signature carries and states
+  `valid` false. `api-sketch.md` states the three field sets in full.
+  A signature over a document is one of the Binary class and the Text class.
+  The `pgp` crate verifies a signature without reading its class, and it
+  hashes one byte of the payload for the Standalone class and the Timestamp
+  class, so one signature of either class by a trusted key would stand for
+  every payload that shares its first byte. `gpgv` 2.4.9 reports "Invalid
+  signature class" and no `GOODSIG` over a class 0x02 signature and over a
+  class 0x40 signature.
+  A Text signature hashes the payload with CRLF line endings, which is the
+  OpenPGP rule the `pgp` crate applies; no fixture in the suite carries one.
+  A user id revocation leaves the verdict alone. `gpgv` 2.4.9 reports
+  `GOODSIG` at exit 0 over a signature by a key whose reported user id is
+  revoked, and over one by a key every user id of which is revoked, so a
+  revoked user id sets no flag and leaves the signature valid. A user id
+  revocation decides the reported name alone, and the paragraph on the
+  reported user id below states that rule.
 - A key revocation signature over the primary key revokes the whole
   certificate, so every key it binds stops speaking for the trusted set, the
   signing subkey included. Two keys may make one: the certificate's own primary
@@ -1613,7 +1652,17 @@ Definition:
   lifetime; where the certificate carries no such signature it comes from the
   newest certification self-signature that verifies, and that signature states
   no lifetime once its own expiration time has passed, with no older
-  certification standing in for it. A subkey binding signature whose own
+  certification standing in for it. The tier decides before recency: a
+  direct-key self-signature answers whether it stands older or newer than the
+  certification self-signature, and the lifetime it states makes an expired key
+  live and a live key expired. A key expiration time of zero states no
+  lifetime, and so does an absent key-expiration-time subpacket, so a
+  direct-key self-signature carrying either one leaves the certification
+  self-signature to answer. The instant is the key creation time plus the
+  lifetime the signature states, and the creation time of the signature takes
+  no part in it: over a key created at 1735689600 whose 86400-second lifetime
+  is stated by a signature created at 1735689610, `gpgv` reports
+  `KEYEXPIRED 1735776000`. A subkey binding signature whose own
   expiration time has passed binds nothing, so a signature that subkey made
   resolves to no loaded certificate and reports a missing key, and a live older
   binding beside it still binds. A certification whose own expiration time has
@@ -1758,12 +1807,17 @@ Seven divergences from GnuPG 2.4.9 stand, none of them a repository fact:
   port agree on all three, and `gpgv` over the two exports concatenated answers
   on which export stands first.
 
-The reported user id agrees with the tool. Measured against `gpgv` 2.4.9 over
-multi-user-id certificates, in the three states such a certificate reaches: no
-user id marked primary, where both name the newest self-signed one; a marked
-primary user id that is not the newest, where both name the marked one; and a
-marked primary user id that is revoked, where both name the newest user id that
-is not revoked.
+The reported user id agrees with the tool. The rule reads the user ids that are
+not revoked, and it takes the one marked primary, or the newest self-signed one
+where none is marked. A user id revocation therefore outranks the
+primary-user-id subpacket a revoked user id still carries. Only where every
+user id of the certificate is revoked does a revoked one get reported.
+Measured against `gpgv` 2.4.9 over multi-user-id certificates, in the four
+states such a certificate reaches: no user id marked primary, where both name
+the newest self-signed one; a marked primary user id that is not the newest,
+where both name the marked one; a marked primary user id that is revoked, where
+both name the newest user id that is not revoked; and every user id revoked,
+where both name the one revoked user id the certificate holds.
 
 The public-key algorithm name agrees with the tool. Id 22 is reported as
 `EdDSA`, which is the name the tool prints, and id 27 as `Ed25519`. The `pgp`
@@ -1793,16 +1847,24 @@ backends, with and without `sign-gpg`. One differential test
 the public verify path and through `gpgv`, compares the two reports field by
 field, declares the divergences above, and feeds the parser a corpus of
 keyrings and signature blobs derived from the good fixtures by truncation and
-by single-bit flipping. Two of its cases read two keyrings each -- one GnuPG
-wrote, which carries Trust packets, and the one `Repo::gpg_import_keys` writes,
-which carries none: a signature by a signing subkey and a signature by the
-primary key each reach the verdict and the user id `gpgv` reports over both
-files. It skips itself and names the absent binary where `gpg` or `gpgv` is
-absent, since `gpg` builds the fixtures and `gpgv` is the reference. The test
-is the whole of the differential gate's coverage, so `OSTRYA_REQUIRE_GNUPG`
-turns that skip into a failure. The variable covers every GPG case in the
-suite, not the agreement gate alone. The CI job sets it, and its runner image
-carries both binaries.
+by single-bit flipping. An altered input can still carry a whole certificate
+or a whole signature: a keyring cut after its public-key packet keeps the
+trusted key, and a bit flipped in an unhashed subpacket area leaves the signed
+material whole, so either one verifies. The corpus therefore asserts three
+properties. No altered input reaches a valid verdict over a payload nothing
+signed. A valid record over the signed payload names the fixture's own key. No
+case panics, measured through a hook that counts its calls and passes each one
+to the hook that stood before it, so a panic still writes its message and the
+count is asserted to be zero. Two of its cases read two keyrings each -- one
+GnuPG wrote, which carries Trust packets, and the one `Repo::gpg_import_keys`
+writes, which carries none: a signature by a signing subkey and a signature by
+the primary key each reach the verdict and the user id `gpgv` reports over
+both files. It skips itself and names the absent binary where `gpg` or `gpgv`
+is absent, since `gpg` builds the fixtures and `gpgv` is the reference. The
+test is the whole of the differential gate's coverage, so
+`OSTRYA_REQUIRE_GNUPG` turns that skip into a failure. The variable covers
+every GPG case in the suite, not the agreement gate alone. The CI job sets it,
+and its runner image carries both binaries.
 Tool cross-verification
 (`ostree gpg-sign` in both directions) lands in
 `conformance/m10-cli-behavior.matrix` once the CLI-compatible surface lands
@@ -4900,6 +4962,31 @@ Resolved:
    (`.github/workflows/ci.yml`, "PCRE2 stays in ostrya-cli"). The Rust crate
    ecosystem is in scope (rustix, smol, sha2, ed25519-dalek, rustls,
    miniz_oxide, and so on).
+
+   Two CI steps hold the dependency rules over the whole graph, both reading
+   `cargo metadata --format-version 1 --all-features`. One holds the
+   permissive-license rule against the SPDX list `CLAUDE.md` carries, failing
+   on anything else and on a null or empty license field. It normalizes the
+   legacy slash forms `A/B` and `A / B` to `A OR B` before it matches, since
+   nine packages in the graph state a permissive choice that way and an
+   SPDX-strict match would refuse all nine. It reads an expression as a set of
+   `AND` terms and asks each term for one permissive option, so `MIT OR
+   Apache-2.0 OR LGPL-2.1-or-later` passes and `MIT AND GPL-3.0-only` fails.
+   One holds the no-C-linkage rule: it reads `.resolve.nodes`, which is the
+   resolved graph, and fails on any package that declares a `links` key and
+   stands on no named allowlist. The allowlist is `liblzma-sys`, xz for static
+   deltas, and `ring`, which `rustls-webpki` resolves and nothing builds --
+   `cargo tree --all-features -i ring` prints nothing and `target/debug/build`
+   holds no `ring` artifact, so the entry carries that reason and goes when
+   the graph stops resolving it. A crate that builds and links a C library
+   without declaring a `links` key is invisible to this step. `pcre2-sys` is
+   the one such crate in the tree, and the two PCRE2 steps hold it by name and
+   by the linkage of the shipped binary. The step applies no test over the
+   `-sys` name suffix: `linux-raw-sys` and `ostrya-sys` carry the suffix and
+   are pure Rust, and a crate that links C need not carry it, so the `links`
+   key is the property that decides. Each guard was shown to refuse a
+   deliberately bad input before it was trusted, a copyleft license for the
+   first and an unlisted `links` key for the second.
 2. GVariant: hand-roll a minimal codec (`ostrya-gvariant`) tailored to
    ostree's fixed type set, fuzzed against golden bytes from the tool.
 3. Test-suite scope: phased. Target the library-format-testable subset plus
@@ -5009,10 +5096,37 @@ Resolved:
     `pgp` crate (rPGP) behind the `verify-gpg` feature. rPGP is
     `MIT OR Apache-2.0` and, with `default-features = false`, its graph
     declares no `links` key and holds no `-sys` package, so it links no C
-    library. `sequoia-openpgp` was considered and set aside for its LGPL
-    licensing. rPGP answers the cryptographic question alone, so the port owns
-    the trust and validity policy: issuer resolution, subkey bindings, key
-    expiry, revocation, the signature class, and the digest policy.
+    library. The `default` feature stays off: it pulls `bzip2`, whose own
+    default pulls a package under a license the permissive list does not
+    carry and whose `bzip2-sys` feature reaches the C library. A detached
+    signature holds no compressed packet, so the verification path has no use
+    for the feature. The `asm` feature stays off as well, since it pulls
+    `sha1-asm` and turns on the assembly paths in `sha2`. `sequoia-openpgp` was
+    considered and set aside for its LGPL licensing. rPGP answers the
+    cryptographic question alone, so the port owns the trust and validity
+    policy: issuer resolution, subkey bindings, key expiry, revocation, the
+    signature class, and the digest policy. No compiled fallback to the
+    `gpgv` binary stands beside it, so one engine answers and one policy
+    decides every report.
+
+    Every other build in the workflow carries `sign-gpg`, so two CI steps
+    compile the two combinations that leaves out.
+    `cargo check -p ostrya --no-default-features --features smol,verify-gpg`
+    fails where a cfg gate is placed on the signing side of a verification
+    item. The same command with `smol` alone carries no GPG feature and
+    covers the arm that refuses a pull asking for GPG verification where the
+    build holds no verify engine.
+
+    An advisory scan over the whole graph is postponed, and the two advisories
+    known against the graph hold written statements in `CLAUDE.md`:
+    RUSTSEC-2024-0447 against `pgp` is patched at 0.14.1 and closed for the
+    0.20.0 the tree takes, and RUSTSEC-2023-0071 against `rsa` has no patched
+    version and holds an exception, since it covers RSA private-key
+    operations and this port performs public-key verification alone. Picking
+    the scan up needs a scanner that reads the RustSec database over
+    `Cargo.lock`, run from a pinned version rather than an ad-hoc install,
+    with RUSTSEC-2023-0071 on a reviewed ignore list, so that an unexplained
+    advisory fails the build and an explained one is a recorded decision.
 
 14. `#[non_exhaustive]` on the public enums and option structs (Phase 17f):
     the attribute marks a type whose member set the port itself owns and

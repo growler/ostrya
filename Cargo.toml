@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -20,8 +20,8 @@ repository = "https://github.com/growler/ostrya"
 readme = "README.md"
 
 [workspace.dependencies]
-ostrya-gvariant = { path = "crates/ostrya-gvariant", version = "0.0.1" }
-ostrya-core = { path = "crates/ostrya-core", version = "0.0.1" }
-ostrya-composefs = { path = "crates/ostrya-composefs", version = "0.0.1" }
-ostrya-rt = { path = "crates/ostrya-rt", version = "0.0.1", default-features = false }
-ostrya-sys = { path = "crates/ostrya-sys", version = "0.0.1" }
+ostrya-gvariant = { path = "crates/ostrya-gvariant", version = "0.2.0" }
+ostrya-core = { path = "crates/ostrya-core", version = "0.2.0" }
+ostrya-composefs = { path = "crates/ostrya-composefs", version = "0.2.0" }
+ostrya-rt = { path = "crates/ostrya-rt", version = "0.2.0", default-features = false }
+ostrya-sys = { path = "crates/ostrya-sys", version = "0.2.0" }

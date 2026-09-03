@@ -1506,7 +1506,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "ostrya"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "async-compression",
  "bsdiff",
@@ -1536,7 +1536,7 @@ dependencies = [
 
 [[package]]
 name = "ostrya-cli"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "clap",
  "ostrya",
@@ -1547,21 +1547,21 @@ dependencies = [
 
 [[package]]
 name = "ostrya-composefs"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "sha2",
 ]
 
 [[package]]
 name = "ostrya-conformance"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "rustix",
 ]
 
 [[package]]
 name = "ostrya-core"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "ostrya-gvariant",
  "sha2",
@@ -1569,11 +1569,11 @@ dependencies = [
 
 [[package]]
 name = "ostrya-gvariant"
-version = "0.0.1"
+version = "0.2.0"
 
 [[package]]
 name = "ostrya-rt"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "futures-io",
  "futures-lite",
@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "ostrya-sys"
-version = "0.0.1"
+version = "0.2.0"
 dependencies = [
  "rustix",
 ]

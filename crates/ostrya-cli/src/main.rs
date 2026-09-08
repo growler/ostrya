@@ -3551,10 +3551,11 @@ async fn export(repo: Repo, name: &str, args: ExportArgs) -> Result<()> {
         None => stdout_file()?,
     };
     let commit = resolve(&repo, rev).await?;
-    let mut opts = TarExportOptions::new();
-    opts.subpath = args.subpath;
-    opts.prefix = args.prefix;
-    opts.skip_xattrs = args.no_xattrs;
+    let opts = TarExportOptions {
+        subpath: args.subpath,
+        prefix: args.prefix,
+        skip_xattrs: args.no_xattrs,
+    };
     repo.export_tar(&commit, opts, out).await
 }
 
@@ -5785,6 +5786,9 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 }
 
 async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
+    if args.no_prune && args.delete_commit.is_some() {
+        exit_error("Cannot specify both --delete-commit and --no-prune");
+    }
     let delete_commit = match args.delete_commit.as_deref() {
         Some(rev) => Some(resolve(&repo, rev).await?),
         None => None,
@@ -5794,6 +5798,7 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         depth: args.depth,
         no_prune: args.no_prune,
         delete_commit,
+        ..PruneOptions::default()
     };
     let stats = repo.prune(&opts).await?;
     println!("Total objects: {}", stats.total_objects);

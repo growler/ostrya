@@ -185,8 +185,8 @@ use super::delta::{self, DeltaJob, PART_CAP};
 use super::drive::Slots;
 use super::verify::{Defaults, Verification};
 use super::{
-    ModeChecks, PullFlags, PullOptions, PullStats, READ_CHUNK, TimestampCheck, check_ref_binding,
-    refspec,
+    DetachedMetadataFilter, ModeChecks, PullFlags, PullOptions, PullStats, READ_CHUNK,
+    TimestampCheck, check_ref_binding, refspec,
 };
 
 /// How many fetches are in flight when the caller names no limit.
@@ -475,6 +475,7 @@ impl Repo {
             tips: &tips,
             deltas,
             verification,
+            detached_filter: &opts.detached_metadata_filter,
         };
         let mut plan = Plan::default();
         for (_, tip) in targets {
@@ -659,8 +660,14 @@ impl Repo {
         // ahead of the ref that names it, which is what a verifier reading the
         // signatures alongside the commit requires. A commit this repository
         // already holds has the remote's copy written over its own, which is
-        // what re-reading a mutable file on every pull is for.
-        if let Some(meta) = detached {
+        // what re-reading a mutable file on every pull is for. The filter runs
+        // here, after the checks above read the metadata as the remote holds it,
+        // so what a filter drops is dropped from what is stored and not from
+        // what was verified. A filter that allows no property writes nothing,
+        // which leaves the copy this repository holds as it stands.
+        if let Some(meta) = detached
+            && let Some(meta) = ctx.detached_filter.apply(&checksum, meta)?
+        {
             self.write_commit_detached_bytes(&checksum, meta).await?;
         }
         // Where the commit's objects come from. A commit already complete here
@@ -966,6 +973,9 @@ struct StepCtx<'a> {
     /// The signature checks this pull makes, which every commit a step carries
     /// is held to before its bytes are staged.
     verification: &'a Verification,
+    /// Which properties of a commit's detached metadata this pull stores,
+    /// applied once the commit's checks have passed.
+    detached_filter: &'a DetachedMetadataFilter,
 }
 
 /// One commit to fetch.

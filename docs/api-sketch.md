@@ -360,6 +360,32 @@ pub struct SummaryOptions {
     pub last_modified: Option<u64>,
     pub metadata_commit_timestamp: Option<u64>,
 }
+
+/// What a prune keeps. The first four fields are the tool's; the last two are
+/// port extensions the tool has no counterpart for, and their defaults are what
+/// the tool does.
+pub struct PruneOptions {
+    pub refs_only: bool,                  // roots are the refs alone
+    pub depth: i32,                       // parents kept: -1 all, 0 the head
+    pub no_prune: bool,                   // count, delete nothing, keep the
+                                          // commit delete_commit names
+    pub delete_commit: Option<Checksum>,  // remove this commit, walk it as gone
+    /// Metadata property names naming further commits to keep. Each is read
+    /// from a reached commit's own metadata and from its detached metadata;
+    /// the value is an `aay` of commit checksums, and each commit it names is
+    /// walked as a root of its own. A property holding anything else fails the
+    /// prune with `Error::InvalidGcRoot`. Empty by default.
+    pub gc_root_properties: Vec<String>,
+    /// Whether a commit's `parent` is reachable from it. True by default,
+    /// which is the edge `depth` bounds.
+    pub traverse_parent: bool,
+}
+impl PruneOptions {
+    /// Refs alone, no `parent` edge, and the named properties as the extra
+    /// roots: what an application recording its own reachability prunes with.
+    pub fn gc_roots<I: IntoIterator<Item = S>, S: Into<String>>(properties: I)
+        -> PruneOptions;
+}
 ```
 
 ## Commit / tree value types
@@ -1364,6 +1390,17 @@ a commit before its bytes are staged, so a refusal costs no object fetch. A
 fetched static delta is held to the sign-api axis over its raw superblock bytes
 before any part is requested.
 
+`detached_metadata_filter` decides, property by property, which of a commit's
+detached metadata reaches this repository. The pull calls it once per property of
+each commit's `.commitmeta`, with the commit, the property's key, and the variant
+the dict holds, and stores the properties it allows. It runs after every
+signature check and over the metadata the source holds, so a filter that drops a
+signature leaves the pull's own verification intact and stores a commit that
+carries none. A filter that allows everything stores the source's bytes
+verbatim; one that drops every property stores the zero-length "no metadata"
+marker. The callback is shared rather than exclusive, because an HTTP pull
+carries several commits at once and calls it from each.
+
 Still remote-only and unimplemented: `subdirs`, `override_commit_ids`, and a
 progress callback.
 
@@ -1408,6 +1445,23 @@ pub struct PullOptions {
     pub disable_static_deltas: bool,      // fetch every object loose
     pub require_static_deltas: bool,      // refuse a remote advertising none
     pub verify: PullVerify,               // the signature checks to make
+    pub detached_metadata_filter: DetachedMetadataFilter,  // what to store
+}
+
+/// A verdict on one property of a commit's detached metadata: the commit, the
+/// property's key, and the `v` member the dict holds for it.
+pub type DetachedMetadataFilterFn =
+    Arc<dyn Fn(&Checksum, &str, &Value) -> FilterResult + Send + Sync>;
+
+/// The detached-metadata filter a pull applies, unset by default, which stores
+/// every property.
+#[derive(Clone, Default)]
+pub struct DetachedMetadataFilter(Option<DetachedMetadataFilterFn>);
+impl DetachedMetadataFilter {
+    pub fn new<F: Fn(&Checksum, &str, &Value) -> FilterResult + Send + Sync + 'static>(f: F)
+        -> DetachedMetadataFilter;
+    // Over a callback the caller holds, for one shared with another PullOptions.
+    pub fn from_fn(f: DetachedMetadataFilterFn) -> DetachedMetadataFilter;
 }
 
 /// The signature checks a pull makes. `None` reads the remote's configuration
@@ -1518,7 +1572,6 @@ impl Repo {
         modifier: Option<&mut CommitModifier>) -> Result<()>;
 }
 
-#[non_exhaustive]
 pub struct TarExportOptions {
     /// The directory within the commit tree that becomes the archive root.
     pub subpath: Option<PathBuf>,
@@ -1532,7 +1585,6 @@ pub struct TarExportOptions {
 /// and returns the name the member is imported under.
 pub type TarRename = Box<dyn FnMut(&str) -> Result<String> + Send>;
 
-#[non_exhaustive]
 pub struct TarImportOptions {
     pub etc_to_usr_etc: bool,
     pub owner_uid: Option<u32>,

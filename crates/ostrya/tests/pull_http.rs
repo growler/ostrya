@@ -34,8 +34,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState, CreateOptions,
-    DeltaOptions, Ed25519Signer, Error, FsckOptions, MutableTree, PullFlags, PullOptions,
-    PullStats, PullVerify, Repo, RepoMode, SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
+    DeltaOptions, DetachedMetadataFilter, Ed25519Signer, Error, FilterResult, FsckOptions,
+    MutableTree, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions,
+    TimestampCheck, TreeEntry, Type, Value,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 
@@ -727,6 +728,70 @@ fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
                 "config".to_owned(),
                 meta_path(&commit, "commitmeta"),
             ]
+        );
+    });
+}
+
+/// The detached-metadata filter shapes what an HTTP pull stores, the same as it
+/// does for a local pull: the remote serves the whole `.commitmeta` and the
+/// destination keeps the properties the filter allows.
+#[test]
+fn a_filter_shapes_the_detached_metadata_an_http_pull_stores() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-detached-filter");
+        let (remote, commit) = build_remote(dir.path()).await;
+        let meta = Value::Array(vec![
+            Value::Tuple(vec![
+                Value::Str("test.detached".to_owned()),
+                Value::Variant(Box::new((
+                    Type::parse("s").unwrap(),
+                    Value::Str("present".to_owned()),
+                ))),
+            ]),
+            Value::Tuple(vec![
+                Value::Str("test.private".to_owned()),
+                Value::Variant(Box::new((
+                    Type::parse("s").unwrap(),
+                    Value::Str("repository-local".to_owned()),
+                ))),
+            ]),
+        ]);
+        remote
+            .write_commit_detached_metadata(&commit, Some(&meta))
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                detached_metadata_filter: DetachedMetadataFilter::new(|_, key, _| {
+                    if key == "test.private" {
+                        FilterResult::Skip
+                    } else {
+                        FilterResult::Allow
+                    }
+                }),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let stored = dest
+            .read_commit_detached_metadata(&commit)
+            .await
+            .unwrap()
+            .expect("the allowed property is stored");
+        assert!(
+            stored.dict_get("test.detached").is_some(),
+            "an allowed property is stored"
+        );
+        assert!(
+            stored.dict_get("test.private").is_none(),
+            "a skipped property is not"
         );
     });
 }

@@ -5078,6 +5078,58 @@ Deliverables, one line each:
   keys go into a dict through an extension trait `ostrya` defines over
   `DictBuilder`, which keeps the ostree key names out of the GVariant codec.
 
+### Phase 22 -- Extended prune and detached-metadata filtering (DONE)
+
+Two library capabilities an application that keeps its own reachability
+information in commit metadata needs. Neither has a counterpart in the `ostree`
+tool, so neither has a black-box oracle and neither changes the CLI: the tool
+prunes what a port prune with default options prunes, and the port's own tests
+carry the extensions. The default of every new field is the behavior that stood
+before it.
+
+`E1` -- the traversal core (DONE). `GcRoots` carries two edges into the walk in
+`traverse.rs`: the commit `parent` edge, which becomes optional, and any number
+of metadata properties. For each configured property the walk reads the value in
+a reached commit's own metadata and then in its detached metadata, and each
+element of the `aay` it holds is a commit checksum the walk seeds as a root of
+its own. Depth counts parent hops, so a commit a property names is given the
+walk's full depth rather than the remaining depth of the commit that named it. A
+property that is present and holds anything but an `aay` of 32-byte checksums
+fails the walk with `Error::InvalidGcRoot`, because objects are deleted for what
+the walk does not find, and a value it cannot read is an edge it cannot follow. A
+property naming a commit that is absent stays tolerated, which is what a dangling
+ref target already is. The detached metadata is read once per expansion of a
+commit and only for a walk with properties configured, so a commit reached again
+at a depth that follows more parents is read again. Prune passes the commit its
+`delete_commit` names into the walk as absent and unlinks it once the walk has
+succeeded, so a walk that refuses the prune leaves the store as it found it.
+
+`E2` -- the prune options (DONE). `PruneOptions` gains `gc_root_properties` and
+`traverse_parent`, and `PruneOptions::gc_roots` is the constructor for the
+extended use: refs alone, no `parent` edge, and the named properties as the extra
+roots. The property list adds no reachability with `refs_only` unset, since a
+prune that is not restricted to refs already roots every commit in the store. The
+properties are read under either setting, so a property of the wrong type fails
+the prune either way.
+
+`E3` -- the detached-metadata filter (DONE). `PullOptions` gains
+`detached_metadata_filter`, which a pull calls once per property of each commit's
+`.commitmeta` and stores what it allows. The filter runs after every signature
+check, over the metadata the source holds, so a filter that drops a signature
+leaves the verification the pull was asked for intact; the commit that is stored
+then carries none, which a later verify reads. A filter that allows every
+property stores the source bytes verbatim, and one that allows no property
+stores nothing, which leaves the detached metadata the destination holds as it
+stands. Two sites write detached metadata,
+`Repo::import_detached_metadata` for a local pull and `fetch_commit` for an HTTP
+one, and a static delta takes the second, so the two cover all three pull
+flavors. The callback is `Arc<dyn Fn + Send + Sync>` rather than the
+`Box<dyn FnMut>` the ingest and checkout callbacks use, because an HTTP pull
+carries several commits at once and no exclusive borrow exists there; a filter
+holding state carries its own interior mutability. It is wrapped in a newtype
+with a hand-written `Debug`, so `PullOptions` keeps its `Debug`, `Clone`, and
+`Default`.
+
 ## Risk register
 
 - composefs/EROFS byte-exactness (Phase 9): the EROFS and composefs on-disk
@@ -5300,15 +5352,25 @@ Resolved:
     with RUSTSEC-2023-0071 on a reviewed ignore list, so that an unexplained
     advisory fails the build and an explained one is a recorded decision.
 
-14. `#[non_exhaustive]` on the public enums and option structs (Phase 17f):
-    the attribute marks a type whose member set the port itself owns and
-    expects to grow, and is left off a type whose member set an external
-    specification closes.
+14. `#[non_exhaustive]` on the public enums and option structs (Phase 17f,
+    amended in Phase 22): the attribute marks a type a caller matches over and
+    never builds, whose member set the port itself owns and expects to grow. It
+    is left off a type whose member set an external specification closes, and
+    off every option struct.
 
     `ostrya::Error` carries it: its variants are the port's own error
-    vocabulary, and a phase that adds a failure mode adds a variant.
-    `TarExportOptions` and `TarImportOptions` carry it: their fields track the
-    CLI options the tar commands grow.
+    vocabulary, a phase that adds a failure mode adds a variant, and a caller
+    reads the enum rather than constructing it.
+
+    No option struct carries it -- `PruneOptions`, `PullOptions`,
+    `TarExportOptions`, `TarImportOptions`, and the rest. The attribute blocks
+    the struct expression outside the defining crate, the functional-update
+    form `..Default::default()` included, which leaves default-then-assign as
+    the only way to build one. The port is pre-release with no downstream
+    consumer, so the field-addition break the attribute would prevent costs
+    nothing today, and the ergonomics of the literal form are worth more up to
+    1.0. Adding a field to an option struct is a breaking change and takes a
+    minor version before 1.0.
 
     `ostrya_gvariant::Type` and `ostrya_gvariant::Value` do not carry it.
     `Type` names every character of the GVariant type alphabet, which the

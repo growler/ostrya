@@ -542,6 +542,12 @@ pub(crate) fn parse_signature_dict(bytes: &[u8]) -> Result<Option<Value>> {
     ))
 }
 
+/// Serialize an `a{sv}` dict, the inverse of [`parse_signature_dict`].
+pub(crate) fn serialize_signature_dict(dict: &Value) -> Result<Vec<u8>> {
+    let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
+    Ok(to_bytes(&ty, dict).map_err(ostrya_core::Error::from)?)
+}
+
 /// Build one ref-array entry `(s, (t, ay, a{sv}))`: the ref name, the commit
 /// object size in host order, the 32-byte commit checksum, and the per-ref
 /// metadata (`ostree.commit.version` when present, then a big-endian

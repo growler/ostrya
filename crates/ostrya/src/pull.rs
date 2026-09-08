@@ -153,14 +153,18 @@
 //! source the policy refuses imports nothing.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use futures_lite::AsyncReadExt;
-use ostrya_core::{Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType, RepoMode};
+use ostrya_core::{
+    Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType, RepoMode, Value,
+};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::file::FileKind;
+use crate::modifier::FilterResult;
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
@@ -289,6 +293,101 @@ pub struct PullVerify {
     pub sign_summary: Option<bool>,
 }
 
+/// A verdict on one property of a commit's detached metadata, taken as the pull
+/// is about to store it.
+///
+/// The arguments are the commit the metadata belongs to, the property's key, and
+/// the value the dict holds for it, which is the `v` member of the `a{sv}` entry
+/// and so a [`Value::Variant`](ostrya_core::Value::Variant).
+/// [`Allow`](FilterResult::Allow) stores the property,
+/// [`Skip`](FilterResult::Skip) leaves it out.
+pub type DetachedMetadataFilterFn =
+    Arc<dyn Fn(&Checksum, &str, &Value) -> FilterResult + Send + Sync>;
+
+/// The detached-metadata filter a pull applies, unset by default.
+///
+/// The pull calls it once per property of each commit's `.commitmeta`, and
+/// stores the properties it allows. It runs after every signature check, over
+/// the metadata as the source holds it, so a filter that drops a signature does
+/// not defeat the pull's own verification; the commit it stores then carries no
+/// signature for a later verify to read. A filter that allows no property
+/// stores nothing, and the destination keeps the detached metadata it holds.
+///
+/// The callback is shared rather than exclusive, because an HTTP pull carries
+/// several commits at once and calls it from each. A filter that accumulates
+/// state carries its own interior mutability.
+#[derive(Clone, Default)]
+pub struct DetachedMetadataFilter(Option<DetachedMetadataFilterFn>);
+
+impl DetachedMetadataFilter {
+    /// A filter that calls `f` for every property.
+    pub fn new<F>(f: F) -> DetachedMetadataFilter
+    where
+        F: Fn(&Checksum, &str, &Value) -> FilterResult + Send + Sync + 'static,
+    {
+        DetachedMetadataFilter(Some(Arc::new(f)))
+    }
+
+    /// A filter over a callback the caller already holds, for a callback shared
+    /// with another [`PullOptions`].
+    pub fn from_fn(f: DetachedMetadataFilterFn) -> DetachedMetadataFilter {
+        DetachedMetadataFilter(Some(f))
+    }
+
+    /// The properties of `bytes` this filter allows, serialized, and `None`
+    /// where the caller writes nothing.
+    ///
+    /// An unset filter, a filter that allows every property, and the zero-length
+    /// "no metadata" marker each give the input bytes back unchanged, so a pull
+    /// that filters nothing out stores what the source holds byte for byte. A
+    /// filter that allows no property gives `None`, which leaves the detached
+    /// metadata the destination holds as it stands.
+    pub(crate) fn apply(&self, commit: &Checksum, bytes: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        let Some(filter) = &self.0 else {
+            return Ok(Some(bytes));
+        };
+        let Some(dict) = crate::summary::parse_signature_dict(&bytes)? else {
+            return Ok(Some(bytes));
+        };
+        let entries = dict.as_array().ok_or_else(|| {
+            Error::InvalidFormat(format!("detached metadata of {commit} is not a dict"))
+        })?;
+        let mut kept: Vec<Value> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let (key, value) = entry
+                .as_tuple()
+                .and_then(|fields| match fields {
+                    [key, value] => key.as_str().map(|key| (key, value)),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "detached metadata of {commit} holds an entry that is not `{{sv}}`"
+                    ))
+                })?;
+            if filter(commit, key, value) == FilterResult::Allow {
+                kept.push(entry.clone());
+            }
+        }
+        if kept.len() == entries.len() {
+            return Ok(Some(bytes));
+        }
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        crate::summary::serialize_signature_dict(&Value::Array(kept)).map(Some)
+    }
+}
+
+impl std::fmt::Debug for DetachedMetadataFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("DetachedMetadataFilter(set)"),
+            None => f.write_str("DetachedMetadataFilter(unset)"),
+        }
+    }
+}
+
 /// What to pull and how.
 ///
 /// The defaults are what [`Repo::pull_local`] does; the fields an HTTP pull adds
@@ -342,6 +441,9 @@ pub struct PullOptions {
     /// The signature checks this pull makes, over the remote's configured
     /// policy.
     pub verify: PullVerify,
+    /// Which properties of a commit's detached metadata this pull stores. The
+    /// default keeps every one, which stores the source's bytes verbatim.
+    pub detached_metadata_filter: DetachedMetadataFilter,
 }
 
 /// What a pull imported.
@@ -428,10 +530,11 @@ impl Repo {
         if verification.checks_commits() {
             for commit in &commits {
                 let bytes = load_object_from(&sources, ObjectType::Commit, commit).await?;
-                // The check reads the detached metadata this pull leaves in
-                // place: a source's `.commitmeta` where one holds it, and this
-                // repository's own where none does, which is the metadata a
-                // later verify of the stored commit reads.
+                // The check reads the detached metadata as the source holds
+                // it: a source's `.commitmeta` where one holds it, and this
+                // repository's own where none does. A filter narrows what the
+                // pull then stores, so a later verify of the stored commit
+                // reads what the filter left.
                 let detached = match detached_bytes_from(&sources, commit).await? {
                     Some(bytes) => crate::summary::parse_signature_dict(&bytes)?,
                     None => self.read_commit_detached_metadata(commit).await?,
@@ -470,7 +573,8 @@ impl Repo {
                     self.import_object(&txn, &sources, name, flags, &mut verify_buf)
                         .await?;
                 }
-                self.import_detached_metadata(&sources, commit).await?;
+                self.import_detached_metadata(&sources, commit, &opts.detached_metadata_filter)
+                    .await?;
             }
             for (ref_name, tip) in &targets {
                 txn.set_ref(&refspec(opts.remote.as_deref(), ref_name), Some(tip));
@@ -625,11 +729,19 @@ impl Repo {
         Ok(())
     }
 
-    /// Copy a commit's detached metadata from the first source holding it. The
-    /// stored bytes are copied verbatim; a source with no `.commitmeta` leaves
-    /// the destination's alone.
-    async fn import_detached_metadata(&self, sources: &[&Repo], commit: &Checksum) -> Result<()> {
-        if let Some(bytes) = detached_bytes_from(sources, commit).await? {
+    /// Copy a commit's detached metadata from the first source holding it,
+    /// through `filter`. The stored bytes are the source's verbatim where the
+    /// filter keeps every property. A source with no `.commitmeta`, and a
+    /// filter that allows no property, each leave the destination's alone.
+    async fn import_detached_metadata(
+        &self,
+        sources: &[&Repo],
+        commit: &Checksum,
+        filter: &DetachedMetadataFilter,
+    ) -> Result<()> {
+        if let Some(bytes) = detached_bytes_from(sources, commit).await?
+            && let Some(bytes) = filter.apply(commit, bytes)?
+        {
             self.write_commit_detached_bytes(commit, bytes).await?;
         }
         Ok(())

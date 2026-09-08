@@ -7134,3 +7134,25 @@ spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: the two reach different exit statuses, so no oracle reads the pair. The
  three `export` options that take a value each take the last occurrence in both
  implementations, which `export/prefix-given-twice` above records.
+
+# ---------------------------------------------------------------------------
+# prune -- the option pair both implementations refuse.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: prune
+cell: prune/no-prune-with-delete-commit
+setup: repo-with-commit
+run: prune --repo=$REPO --no-prune --delete-commit=$REV
+expect-exit: 1
+expect-stderr: contains "error: Cannot specify both --delete-commit and --no-prune"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Cannot specify both --delete-commit and --no-prune"
+oracle: exit-status
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: both implementations refuse the pair in that line and remove no object.
+ The tool prints its usage block to standard error ahead of the line and the
+ port prints the line alone, so the assertions read the line each side writes
+ and no oracle compares the two streams whole.

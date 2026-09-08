@@ -77,7 +77,6 @@ type BodyReader = Pin<Box<dyn AsyncRead + Send>>;
 
 /// Options for [`Repo::export_tar`].
 #[derive(Debug, Default, Clone)]
-#[non_exhaustive]
 pub struct TarExportOptions {
     /// A path within the commit tree whose directory becomes the archive root,
     /// in place of the commit root. A path with no component names the whole
@@ -111,7 +110,6 @@ pub type TarRename = Box<dyn FnMut(&str) -> Result<String> + Send>;
 
 /// Options for [`Repo::import_tar`].
 #[derive(Default)]
-#[non_exhaustive]
 pub struct TarImportOptions {
     /// Rewrite a top-level `etc` component to `usr/etc`, matching the ostree
     /// convention that composes configuration into `/usr`. Off by default.

@@ -207,6 +207,19 @@ pub enum Error {
         /// The cap the caller set on the request.
         limit: u64,
     },
+    /// A metadata property named in
+    /// [`gc_root_properties`](crate::PruneOptions::gc_root_properties) holds a
+    /// value that is not a list of commit checksums: its variant type is not
+    /// `aay`, or one element is not a 32-byte checksum.
+    #[error("gc-root property {property} on commit {commit}: {reason}")]
+    InvalidGcRoot {
+        /// The commit the property was read from.
+        commit: Checksum,
+        /// The property name, as configured.
+        property: String,
+        /// What the value holds instead.
+        reason: String,
+    },
 }
 
 impl From<rustix::io::Errno> for Error {

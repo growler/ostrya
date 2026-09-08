@@ -15,8 +15,8 @@ use std::process::Command;
 use common::{TmpDir, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState, CreateOptions,
-    Ed25519Signer, Error, MutableTree, PullFlags, PullOptions, PullVerify, Repo, RepoMode, Type,
-    Value,
+    DetachedMetadataFilter, DetachedMetadataFilterFn, Ed25519Signer, Error, FilterResult,
+    MutableTree, PullFlags, PullOptions, PullVerify, Repo, RepoMode, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -187,6 +187,15 @@ async fn owned_source_repo(base: &Path, mode: RepoMode) -> (PathBuf, Repo, Check
     let c1 = commit_tree_with(&repo, base, "v1", "main", None, flags, owner).await;
     let c2 = commit_tree_with(&repo, base, "v2", "main", Some(c1), flags, owner).await;
     (path, repo, c1, c2)
+}
+
+/// The path of a commit's `.commitmeta` file inside a repository directory.
+fn commitmeta_path(repo_dir: &Path, commit: &Checksum) -> PathBuf {
+    let hex = commit.to_hex();
+    repo_dir
+        .join("objects")
+        .join(&hex[..2])
+        .join(format!("{}.commitmeta", &hex[2..]))
 }
 
 /// The `(device, inode)` of a loose object in a repository, or `None` when the
@@ -2036,6 +2045,252 @@ fn detached_metadata_travels_with_the_commit() {
     });
 }
 
+/// An `a{sv}` of two properties: one a signature stands in for, one the
+/// repository keeps to itself.
+fn two_property_metadata() -> Value {
+    let entry = |key: &str, value: &str| {
+        Value::Tuple(vec![
+            Value::Str(key.to_owned()),
+            Value::Variant(Box::new((
+                Type::parse("s").unwrap(),
+                Value::Str(value.to_owned()),
+            ))),
+        ])
+    };
+    Value::Array(vec![
+        entry("ostree.gpgsigs", "a signature"),
+        entry("build.gc-roots", "repository-local"),
+    ])
+}
+
+/// The value of one property of a stored commit's detached metadata.
+async fn detached_property(repo: &Repo, commit: &Checksum, key: &str) -> Option<Value> {
+    repo.read_commit_detached_metadata(commit)
+        .await
+        .unwrap()
+        .and_then(|dict| dict.dict_get(key).cloned())
+}
+
+#[test]
+fn a_filter_drops_the_properties_it_skips_and_keeps_the_rest() {
+    let tmp = TmpDir::new("pull-detached-filter");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                detached_metadata_filter: DetachedMetadataFilter::new(|_, key, _| {
+                    if key == "build.gc-roots" {
+                        FilterResult::Skip
+                    } else {
+                        FilterResult::Allow
+                    }
+                }),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            detached_property(&dst, &c2, "ostree.gpgsigs").await,
+            Some(Value::Variant(Box::new((
+                Type::parse("s").unwrap(),
+                Value::Str("a signature".to_owned()),
+            )))),
+            "an allowed property is stored"
+        );
+        assert_eq!(
+            detached_property(&dst, &c2, "build.gc-roots").await,
+            None,
+            "a skipped property is not"
+        );
+        // The source keeps what it had: the filter shapes what is stored here.
+        assert_eq!(
+            src.read_commit_detached_metadata(&c2).await.unwrap(),
+            Some(two_property_metadata())
+        );
+    });
+}
+
+#[test]
+fn a_filter_that_allows_everything_stores_the_source_bytes() {
+    let tmp = TmpDir::new("pull-detached-filter-allow");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                detached_metadata_filter: DetachedMetadataFilter::new(|_, _, _| {
+                    FilterResult::Allow
+                }),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
+            std::fs::read(commitmeta_path(&src_dir, &c2)).unwrap(),
+            "the stored bytes are the source's, byte for byte"
+        );
+    });
+}
+
+#[test]
+fn a_filter_that_skips_everything_stores_nothing() {
+    let tmp = TmpDir::new("pull-detached-filter-skip");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                detached_metadata_filter: DetachedMetadataFilter::new(|_, _, _| FilterResult::Skip),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !commitmeta_path(&dst_dir, &c2).exists(),
+            "no detached metadata is written"
+        );
+        assert_eq!(
+            dst.read_commit_detached_metadata(&c2).await.unwrap(),
+            None,
+            "which reads back as no metadata at all"
+        );
+    });
+}
+
+/// A filter allowing no property leaves the destination's own `.commitmeta`
+/// where it stands, which is what a source holding none does.
+#[test]
+fn a_filter_that_skips_everything_keeps_the_destinations_own_metadata() {
+    let tmp = TmpDir::new("pull-detached-filter-skip-keep");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+
+        // The destination holds the commit and detached metadata of its own.
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let local = dict_of("local.signature", "the destination's own");
+        dst.write_commit_detached_metadata(&c2, Some(&local))
+            .await
+            .unwrap();
+        let before = std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap();
+
+        // A callback the caller holds, which is what `from_fn` takes.
+        let skip: DetachedMetadataFilterFn =
+            std::sync::Arc::new(|_: &Checksum, _: &str, _: &Value| FilterResult::Skip);
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                detached_metadata_filter: DetachedMetadataFilter::from_fn(skip),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
+            before,
+            "the destination's own detached metadata stands"
+        );
+    });
+}
+
+/// An `a{sv}` of one string property.
+fn dict_of(key: &str, value: &str) -> Value {
+    Value::Array(vec![Value::Tuple(vec![
+        Value::Str(key.to_owned()),
+        Value::Variant(Box::new((
+            Type::parse("s").unwrap(),
+            Value::Str(value.to_owned()),
+        ))),
+    ])])
+}
+
+#[test]
+fn the_filter_sees_the_commit_it_is_filtering_for() {
+    let tmp = TmpDir::new("pull-detached-filter-commit");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        for commit in [&c1, &c2] {
+            src.write_commit_detached_metadata(commit, Some(&two_property_metadata()))
+                .await
+                .unwrap();
+        }
+
+        // Only the tip's private property is dropped; the parent keeps its own.
+        let tip = c2;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                depth: -1,
+                detached_metadata_filter: DetachedMetadataFilter::new(move |commit, key, _| {
+                    if *commit == tip && key == "build.gc-roots" {
+                        FilterResult::Skip
+                    } else {
+                        FilterResult::Allow
+                    }
+                }),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(detached_property(&dst, &c2, "build.gc-roots").await, None);
+        assert!(
+            detached_property(&dst, &c1, "build.gc-roots")
+                .await
+                .is_some(),
+            "the parent commit is filtered on its own terms"
+        );
+    });
+}
+
 #[test]
 fn a_localcache_repo_supplies_an_object_the_source_lacks() {
     let tmp = TmpDir::new("pull-localcache");
@@ -2384,6 +2639,45 @@ fn a_local_pull_checks_the_commits_when_asked() {
             !dst.has_object(ostrya::ObjectType::Commit, &c2)
                 .await
                 .unwrap()
+        );
+    });
+}
+
+/// The filter runs after the signature check, over the metadata the source
+/// holds, so a filter that drops the signature does not defeat the verification
+/// the pull was asked for. The commit that is stored then carries none.
+#[test]
+fn the_filter_runs_after_the_signature_check() {
+    let tmp = TmpDir::new("pull-local-filter-after-verify");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        src.sign_commit(&c1, &signer).await.unwrap();
+        src.sign_commit(&c2, &signer).await.unwrap();
+
+        let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+        let opts = PullOptions {
+            remote: Some("origin".to_owned()),
+            verify: PullVerify {
+                sign: Some(true),
+                ..PullVerify::default()
+            },
+            depth: -1,
+            detached_metadata_filter: DetachedMetadataFilter::new(|_, _, _| FilterResult::Skip),
+            ..PullOptions::default()
+        };
+        pull_main_with(&dst, &src, opts).await.unwrap();
+
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2),
+            "the pull verified the signature and published the ref"
+        );
+        assert_eq!(
+            dst.read_commit_detached_metadata(&c2).await.unwrap(),
+            None,
+            "and stored none of the metadata the filter skipped"
         );
     });
 }

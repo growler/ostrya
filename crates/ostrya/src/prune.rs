@@ -17,8 +17,20 @@
 //! - [`no_prune`](PruneOptions::no_prune) computes the statistics without
 //!   deleting anything.
 //! - [`delete_commit`](PruneOptions::delete_commit) removes a specific,
-//!   unreferenced commit object first, then sweeps what it orphaned. The
-//!   reported counts cover the swept objects, matching the tool.
+//!   unreferenced commit object, then sweeps what it orphaned. The walk treats
+//!   that commit as already absent, so what only it reached is swept, and the
+//!   object itself is unlinked once the walk has succeeded. The reported counts
+//!   cover the swept objects, matching the tool. Under
+//!   [`no_prune`](PruneOptions::no_prune) the commit stays and the counts
+//!   report the sweep its removal would cause. The `ostree` tool refuses the
+//!   two options together, and so does the `ostrya` CLI.
+//!
+//! Two options carry reachability the tool has no counterpart for, so a prune
+//! that leaves them at their defaults is the tool's:
+//! [`gc_root_properties`](PruneOptions::gc_root_properties) names metadata
+//! properties whose value names further commits to keep, and
+//! [`traverse_parent`](PruneOptions::traverse_parent) decides whether a commit's
+//! `parent` is reachable from it at all.
 
 use std::os::fd::BorrowedFd;
 
@@ -39,11 +51,36 @@ pub struct PruneOptions {
     /// How many parent commits of each ref to keep: `-1` for the whole
     /// ancestry, `0` for only the head, `N` for `N` parents.
     pub depth: i32,
-    /// Compute the statistics without deleting anything.
+    /// Compute the statistics without deleting anything, including the commit
+    /// [`delete_commit`](PruneOptions::delete_commit) names.
     pub no_prune: bool,
     /// Remove this specific commit object before sweeping. It must not be the
-    /// target of any ref.
+    /// target of any ref. Under [`no_prune`](PruneOptions::no_prune) it stays,
+    /// and the statistics cover the sweep its removal would cause.
     pub delete_commit: Option<Checksum>,
+    /// Metadata property names that name further reachable commits.
+    ///
+    /// Each name is looked up in every reached commit's own metadata and in its
+    /// detached metadata. A property that is present holds an `aay` whose
+    /// elements are commit checksums, and each of those commits is walked as a
+    /// root of its own, so what it reaches is kept too. A property that holds
+    /// anything else fails the prune with [`Error::InvalidGcRoot`].
+    ///
+    /// The list is empty by default, which reads no metadata at all. A
+    /// non-empty list adds no reachability under
+    /// [`refs_only`](PruneOptions::refs_only) unset, since a prune that is not
+    /// restricted to refs already roots every commit in the store. It is still
+    /// read there: every commit's metadata and detached metadata is looked up,
+    /// and a property of the wrong type fails the prune under either setting.
+    pub gc_root_properties: Vec<String>,
+    /// Whether a commit's `parent` is reachable from it.
+    ///
+    /// True by default, which is what the tool does and what
+    /// [`depth`](PruneOptions::depth) bounds. False keeps a commit's ancestry
+    /// only where something else names it, which is the setting an application
+    /// tracking its own roots through
+    /// [`gc_root_properties`](PruneOptions::gc_root_properties) uses.
+    pub traverse_parent: bool,
 }
 
 impl Default for PruneOptions {
@@ -53,6 +90,8 @@ impl Default for PruneOptions {
             depth: -1,
             no_prune: false,
             delete_commit: None,
+            gc_root_properties: Vec::new(),
+            traverse_parent: true,
         }
     }
 }
@@ -62,6 +101,26 @@ impl PruneOptions {
     /// store (nothing is pruned in a healthy repository).
     pub fn new() -> PruneOptions {
         PruneOptions::default()
+    }
+
+    /// Prune against the named properties as the extra roots, over refs alone
+    /// and without the `parent` edge: an application that records its own
+    /// reachability in commit metadata says what is kept, and a commit's
+    /// ancestry is not kept for being an ancestry.
+    ///
+    /// The caller sets [`traverse_parent`](PruneOptions::traverse_parent) back
+    /// to true on the result to have both edge kinds.
+    pub fn gc_roots<I, S>(properties: I) -> PruneOptions
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        PruneOptions {
+            refs_only: true,
+            gc_root_properties: properties.into_iter().map(Into::into).collect(),
+            traverse_parent: false,
+            ..PruneOptions::default()
+        }
     }
 }
 
@@ -82,16 +141,25 @@ impl Repo {
     pub async fn prune(&self, opts: &PruneOptions) -> Result<PruneStats> {
         let mode = self.mode();
 
-        // Remove an explicitly named commit first, so its objects fall out of
-        // the reachable set and are swept below.
+        // A commit a ref points at is not deletable. Refuse it here, so a prune
+        // that cannot succeed fails before the traversal. The unlink checks
+        // again, because a ref naming the commit can appear while the walk
+        // runs.
         if let Some(commit) = opts.delete_commit {
-            self.delete_commit_object(&commit).await?;
+            self.refuse_referenced_commit(&commit).await?;
         }
 
         // Assemble the roots: every ref's target, plus every commit in the
-        // store unless the caller restricted to refs.
+        // store unless the caller restricted to refs. A commit named for
+        // deletion is dropped from the store's view here and unlinked once the
+        // walk has succeeded, so it roots nothing and the sweep, which runs
+        // over this same view, does not name it a second time.
         let mut roots: Vec<Checksum> = self.list_all_ref_targets().await?;
-        let all_objects = self.list_objects().await?;
+        let mut all_objects = self.list_objects().await?;
+        if let Some(commit) = opts.delete_commit {
+            all_objects.remove(&ObjectName::new(commit, ObjectType::Commit));
+            all_objects.remove(&ObjectName::new(commit, ObjectType::CommitMeta));
+        }
         if !opts.refs_only {
             roots.extend(
                 all_objects
@@ -101,7 +169,13 @@ impl Repo {
             );
         }
 
-        let mut keep = self.traverse_reachable(roots, opts.depth).await?;
+        let gc = crate::traverse::GcRoots {
+            properties: opts.gc_root_properties.clone(),
+            traverse_parent: opts.traverse_parent,
+        };
+        let mut keep = self
+            .traverse_reachable_gc(roots, opts.depth, &gc, opts.delete_commit)
+            .await?;
         // A kept commit keeps its detached metadata.
         for name in keep.clone() {
             if name.ty == ObjectType::Commit {
@@ -118,6 +192,16 @@ impl Repo {
             .collect();
 
         let total_objects = all_objects.len();
+
+        // The walk succeeded, so no data the prune reads can refuse it now:
+        // remove the named commit, then sweep what it orphaned. A dry run keeps
+        // the commit and reports the sweep its removal would cause.
+        if !opts.no_prune
+            && let Some(commit) = opts.delete_commit
+        {
+            self.delete_commit_object(&commit).await?;
+        }
+
         let no_prune = opts.no_prune;
         let repo = self.clone();
         let (pruned_objects, freed_bytes) =
@@ -130,16 +214,25 @@ impl Repo {
         })
     }
 
-    /// Remove a named commit's object, its detached metadata, and its partial
-    /// marker. Refuses a commit any ref points at, so pruning cannot leave a
-    /// dangling ref.
-    async fn delete_commit_object(&self, commit: &Checksum) -> Result<()> {
+    /// Refuse a commit any ref points at, so pruning cannot leave a dangling
+    /// ref.
+    async fn refuse_referenced_commit(&self, commit: &Checksum) -> Result<()> {
         let referenced = self.list_all_ref_targets().await?;
         if referenced.contains(commit) {
             return Err(Error::InvalidFormat(format!(
                 "cannot delete commit {commit}: it is the target of a ref"
             )));
         }
+        Ok(())
+    }
+
+    /// Remove a named commit's object, its detached metadata, and its partial
+    /// marker.
+    ///
+    /// The ref check runs again next to the unlink, so a ref published while
+    /// the prune walked the store still refuses the deletion.
+    async fn delete_commit_object(&self, commit: &Checksum) -> Result<()> {
+        self.refuse_referenced_commit(commit).await?;
         let mode = self.mode();
         let commit = *commit;
         let repo = self.clone();

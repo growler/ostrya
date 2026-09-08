@@ -70,7 +70,9 @@
 //! [`Repo::traverse_commit`]/[`Repo::traverse_reachable`], [`Repo::prune`]
 //! ([`PruneOptions`]/[`PruneStats`]) which deletes objects unreachable from the
 //! chosen roots (refs, optionally every commit, to a depth, with an optional
-//! `delete_commit`), [`Repo::fsck`] ([`FsckOptions`]/[`FsckReport`]) which
+//! `delete_commit`, and with the extra roots
+//! [`PruneOptions::gc_root_properties`] names under an optional
+//! [`PruneOptions::traverse_parent`]), [`Repo::fsck`] ([`FsckOptions`]/[`FsckReport`]) which
 //! verifies object integrity and completeness and marks incomplete commits
 //! partial, and [`Repo::diff_commits`] ([`DiffEntry`]/[`DiffChange`]) which
 //! reports the paths that changed between two commits. It also covers
@@ -250,7 +252,10 @@ pub use ostrya_core::{
     to_text_unannotated,
 };
 pub use prune::{PruneOptions, PruneStats};
-pub use pull::{PullFlags, PullOptions, PullStats, PullVerify, TimestampCheck};
+pub use pull::{
+    DetachedMetadataFilter, DetachedMetadataFilterFn, PullFlags, PullOptions, PullStats,
+    PullVerify, TimestampCheck,
+};
 pub use read::{CommitSizes, CommitState};
 pub use refs::{CollectionRef, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};

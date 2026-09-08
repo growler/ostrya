@@ -1414,7 +1414,10 @@ stand:
 
 `prune` accepts `--repo`, `--refs-only`, `--depth`, `--no-prune`, and
 `--delete-commit`. Missing: `--keep-younger-than=DATE`, `--static-deltas-only`,
-`--retain-branch-depth=BRANCH`, `--only-branch=BRANCH`, `--commit-only`.
+`--retain-branch-depth=BRANCH`, `--only-branch=BRANCH`, `--commit-only`. The
+tool refuses `--delete-commit` together with `--no-prune`
+(`error: Cannot specify both --delete-commit and --no-prune`, exit 1, no object
+removed), and the port refuses the same pair in the same words.
 
 `fsck` accepts `--repo` and the port extension `--no-mark-partial`. Missing:
 `--add-tombstones`, `-q/--quiet`, `-a/--all`, `--delete`, `--verify-bindings`,

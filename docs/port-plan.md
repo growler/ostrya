@@ -5264,6 +5264,53 @@ Five properties hold over the two keys:
   copy, and setting the key and pulling again does not remove it. The list is a
   rule over what arrives, and it is not a sweep over what is already there.
 
+### Phase 23 -- Fetcher as a general HTTP client
+
+The fetcher serves absolute URLs with per-request headers and credentials,
+follows redirects, reaches an origin through a proxy, and offers a
+verification bypass, so one TLS stack serves both an ostree remote and an
+unrelated HTTP mirror.
+
+Two behaviors of the reference tool were recorded by black-box observation
+against libostree 2026.1 before the proxy and the bypass landed. Both records
+are reproducible by running the tool against a local origin server and a
+local forward proxy that logs every request line.
+
+Proxy from the environment:
+
+- `http_proxy` reaches an `http` origin. The request carries the absolute-form
+  target and the origin's own `Host` header.
+- `HTTP_PROXY` in uppercase is not read. Every other variable is read in
+  uppercase as well: `ALL_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` all take
+  effect.
+- `all_proxy` reaches either scheme. `https_proxy` is not applied to an `http`
+  origin, and `http_proxy` is not applied to an `https` origin.
+- An `https` origin behind `https_proxy` is reached with a `CONNECT` tunnel,
+  and TLS terminates at the origin.
+- `no_proxy` matches the host text of the URL and not the address the host
+  resolves to, so `no_proxy=localhost` leaves a `127.0.0.1` origin proxied. A
+  comma list, an entry equal to the host, and `*` each exempt an origin. An
+  empty value exempts nothing.
+- The remote `proxy` config key takes effect where no variable is set, and a
+  `no_proxy` that matches the origin host overrides that key.
+
+`tls-permissive` on a remote:
+
+- `tls-permissive=true` ignores `tls-ca-path`. A CA that signed nothing in the
+  chain serves, and so does a path naming a file that is absent. Without
+  `tls-permissive` that same absent path fails with `[77] Problem with the SSL
+  CA cert`.
+- `tls-permissive=true` keeps the host name check. A leaf carrying
+  `SAN DNS:localhost` alone serves `https://localhost:PORT` and fails
+  `https://127.0.0.1:PORT`. The chain failure and the name failure carry the
+  same `[60] SSL peer certificate or SSH remote key was not OK` text, so the
+  tool's own diagnostic does not tell them apart.
+- `tls-permissive` reads as a keyfile boolean. `true` and `1` are accepted;
+  `yes` and `TRUE` fail before any network work.
+
+Both records are the rule the port's own proxy and verification behavior
+follows.
+
 ## Risk register
 
 - composefs/EROFS byte-exactness (Phase 9): the EROFS and composefs on-disk

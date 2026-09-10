@@ -2186,6 +2186,79 @@ fn a_filter_that_skips_everything_stores_nothing() {
     });
 }
 
+/// `DetachedMetadataFilter::excluding` is the constructor the `ostrya` CLI
+/// builds from `[ex-ostrya] detached-metadata-exclude`. It drops the properties
+/// the list names and keeps every other one.
+#[test]
+fn an_exclude_list_drops_the_named_properties_and_keeps_the_rest() {
+    let tmp = TmpDir::new("pull-detached-exclude");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                detached_metadata_filter: DetachedMetadataFilter::excluding(["build.gc-roots"]),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            detached_property(&dst, &c2, "build.gc-roots").await,
+            None,
+            "a property the list names is not stored"
+        );
+        assert_eq!(
+            detached_property(&dst, &c2, "ostree.gpgsigs").await,
+            Some(Value::Variant(Box::new((
+                Type::parse("s").unwrap(),
+                Value::Str("a signature".to_owned()),
+            )))),
+            "a property it does not name is stored"
+        );
+    });
+}
+
+/// An empty exclude list is the absent-key case the CLI turns into the default
+/// filter. Built directly it keeps every property all the same.
+#[test]
+fn an_empty_exclude_list_keeps_every_property() {
+    let tmp = TmpDir::new("pull-detached-exclude-empty");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                detached_metadata_filter: DetachedMetadataFilter::excluding(Vec::<String>::new()),
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
+            std::fs::read(commitmeta_path(&src_dir, &c2)).unwrap(),
+            "the stored bytes are the source's, byte for byte"
+        );
+    });
+}
+
 /// A filter allowing no property leaves the destination's own `.commitmeta`
 /// where it stands, which is what a source holding none does.
 #[test]

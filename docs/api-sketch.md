@@ -370,20 +370,21 @@ pub struct PruneOptions {
     pub no_prune: bool,                   // count, delete nothing, keep the
                                           // commit delete_commit names
     pub delete_commit: Option<Checksum>,  // remove this commit, walk it as gone
-    /// Metadata property names naming further commits to keep. Each is read
-    /// from a reached commit's own metadata and from its detached metadata;
-    /// the value is an `aay` of commit checksums, and each commit it names is
-    /// walked as a root of its own. A property holding anything else fails the
-    /// prune with `Error::InvalidGcRoot`. Empty by default.
-    pub gc_root_properties: Vec<String>,
+    /// Metadata keys naming further commits to keep. Each is read from a
+    /// reached commit's own metadata and from its detached metadata; the
+    /// value is an `aay` of commit checksums, and each commit it names is
+    /// walked as a root of its own. A key holding anything else fails the
+    /// prune with `Error::InvalidGcRoot`. Empty by default. The `ostrya` CLI
+    /// fills this from `[ex-ostrya] gc-root-metadata-keys`.
+    pub gc_root_metadata_keys: Vec<String>,
     /// Whether a commit's `parent` is reachable from it. True by default,
     /// which is the edge `depth` bounds.
     pub traverse_parent: bool,
 }
 impl PruneOptions {
-    /// Refs alone, no `parent` edge, and the named properties as the extra
+    /// Refs alone, no `parent` edge, and the named metadata keys as the extra
     /// roots: what an application recording its own reachability prunes with.
-    pub fn gc_roots<I: IntoIterator<Item = S>, S: Into<String>>(properties: I)
+    pub fn gc_roots<I: IntoIterator<Item = S>, S: Into<String>>(keys: I)
         -> PruneOptions;
 }
 ```
@@ -1397,9 +1398,18 @@ the dict holds, and stores the properties it allows. It runs after every
 signature check and over the metadata the source holds, so a filter that drops a
 signature leaves the pull's own verification intact and stores a commit that
 carries none. A filter that allows everything stores the source's bytes
-verbatim; one that drops every property stores the zero-length "no metadata"
-marker. The callback is shared rather than exclusive, because an HTTP pull
-carries several commits at once and calls it from each.
+verbatim. One that drops every property writes nothing, which leaves the
+detached metadata the destination already holds where it stands, so a re-pull
+into a destination holding an earlier copy does not remove it. The callback is
+shared rather than exclusive, because an HTTP pull carries several commits at
+once and calls it from each.
+
+`DetachedMetadataFilter::excluding` builds the deny-list form: the names are
+matched whole against the key of each detached-metadata property, and every
+other property is kept. This is the constructor the `ostrya` CLI builds from
+`[ex-ostrya] detached-metadata-exclude`. Those names live in the same key space
+as `[ex-ostrya] gc-root-metadata-keys`, and neither list is derived from the
+other.
 
 Still remote-only and unimplemented: `subdirs`, `override_commit_ids`, and a
 progress callback.
@@ -1462,6 +1472,9 @@ impl DetachedMetadataFilter {
         -> DetachedMetadataFilter;
     // Over a callback the caller holds, for one shared with another PullOptions.
     pub fn from_fn(f: DetachedMetadataFilterFn) -> DetachedMetadataFilter;
+    // Drop the named keys, keep every other property. An empty list keeps all.
+    pub fn excluding<I: IntoIterator<Item = S>, S: Into<String>>(names: I)
+        -> DetachedMetadataFilter;
 }
 
 /// The signature checks a pull makes. `None` reads the remote's configuration

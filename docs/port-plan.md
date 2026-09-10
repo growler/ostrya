@@ -5081,35 +5081,38 @@ Deliverables, one line each:
 ### Phase 22 -- Extended prune and detached-metadata filtering (DONE)
 
 Two library capabilities an application that keeps its own reachability
-information in commit metadata needs. Neither has a counterpart in the `ostree`
-tool, so neither has a black-box oracle and neither changes the CLI: the tool
-prunes what a port prune with default options prunes, and the port's own tests
-carry the extensions. The default of every new field is the behavior that stood
-before it.
+information in commit metadata needs, and the two repository config keys that
+put them under repository policy. Neither capability has a counterpart in the
+`ostree` tool, so neither has a black-box oracle, and the port's own tests carry
+them. The default of every new field is the behavior that stood before it, so a
+prune with default options is the tool's prune. The CLI reads the two config
+keys, and a repository that sets one takes a prune or a pull the tool does not
+reproduce; `cli-surface.md`, "P2", records that divergence.
 
 `E1` -- the traversal core (DONE). `GcRoots` carries two edges into the walk in
 `traverse.rs`: the commit `parent` edge, which becomes optional, and any number
-of metadata properties. For each configured property the walk reads the value in
-a reached commit's own metadata and then in its detached metadata, and each
-element of the `aay` it holds is a commit checksum the walk seeds as a root of
-its own. Depth counts parent hops, so a commit a property names is given the
-walk's full depth rather than the remaining depth of the commit that named it. A
-property that is present and holds anything but an `aay` of 32-byte checksums
-fails the walk with `Error::InvalidGcRoot`, because objects are deleted for what
-the walk does not find, and a value it cannot read is an edge it cannot follow. A
-property naming a commit that is absent stays tolerated, which is what a dangling
-ref target already is. The detached metadata is read once per expansion of a
-commit and only for a walk with properties configured, so a commit reached again
-at a depth that follows more parents is read again. Prune passes the commit its
-`delete_commit` names into the walk as absent and unlinks it once the walk has
-succeeded, so a walk that refuses the prune leaves the store as it found it.
+of metadata keys. For each configured key the walk reads the value in a reached
+commit's own metadata and then in its detached metadata, and each element of the
+`aay` it holds is a commit checksum the walk seeds as a root of its own. Depth
+counts parent hops, so a commit a metadata key names is given the walk's full
+depth rather than the remaining depth of the commit that named it. A key that is
+present and holds anything but an `aay` of 32-byte checksums fails the walk with
+`Error::InvalidGcRoot`, because objects are deleted for what the walk does not
+find, and a value it cannot read is an edge it cannot follow. A key naming a
+commit that is absent stays tolerated, which is what a dangling ref target
+already is. A key no commit holds contributes no edge. The detached metadata is
+read once per expansion of a commit and only for a walk with metadata keys
+configured, so a commit reached again at a depth that follows more parents is
+read again. Prune passes the commit its `delete_commit` names into the walk as
+absent and unlinks it once the walk has succeeded, so a walk that refuses the
+prune leaves the store as it found it.
 
-`E2` -- the prune options (DONE). `PruneOptions` gains `gc_root_properties` and
-`traverse_parent`, and `PruneOptions::gc_roots` is the constructor for the
-extended use: refs alone, no `parent` edge, and the named properties as the extra
-roots. The property list adds no reachability with `refs_only` unset, since a
-prune that is not restricted to refs already roots every commit in the store. The
-properties are read under either setting, so a property of the wrong type fails
+`E2` -- the prune options (DONE). `PruneOptions` gains `gc_root_metadata_keys`
+and `traverse_parent`, and `PruneOptions::gc_roots` is the constructor for the
+extended use: refs alone, no `parent` edge, and the named metadata keys as the
+extra roots. The metadata-key list adds no reachability with `refs_only` unset,
+since a prune that is not restricted to refs already roots every commit in the
+store. The keys are read under either setting, so a key of the wrong type fails
 the prune either way.
 
 `E3` -- the detached-metadata filter (DONE). `PullOptions` gains
@@ -5129,6 +5132,52 @@ carries several commits at once and no exclusive borrow exists there; a filter
 holding state carries its own interior mutability. It is wrapped in a newtype
 with a hand-written `Debug`, so `PullOptions` keeps its `Debug`, `Clone`, and
 `Default`.
+
+`E4` -- the repository config keys (DONE). The `[ex-ostrya]` group carries the
+two keys that put E2 and E3 under repository policy. `gc-root-metadata-keys`
+holds the metadata keys a prune reads for further reachable commits.
+`detached-metadata-exclude` holds the detached-metadata keys the repository does
+not store when it receives a commit, and does not send when it serves one. Each
+is a `;`-separated list, empty when the key is absent, read on demand through
+`RepoConfig::gc_root_metadata_keys` and `RepoConfig::detached_metadata_exclude`.
+A value the key-file syntax cannot split is reported when the accessor runs, not
+when the repository opens, which is the style of every other tunable.
+`DetachedMetadataFilter::excluding` builds the filter the second key describes.
+
+The library reads neither key. `Repo::prune` and the pull drivers act on the
+options they are given, and every default is what it was:
+`PruneOptions::default` is still the tool's prune. `ostrya-cli` is the one
+reader, at its `prune`, `pull`, and `pull-local` sites.
+
+Five properties hold over the two keys:
+
+- Roots only. `gc-root-metadata-keys` carries no counterpart for
+  `traverse_parent` and does not touch `refs_only`, so a configured CLI prune
+  keeps the tool's parent traversal and adds roots to it. The divergence is
+  conservative: a configured prune keeps at least what the tool keeps, and never
+  less.
+- No implicit derivation. `detached-metadata-exclude` is never derived from
+  `gc-root-metadata-keys`, and the reverse also holds, even where the two lists
+  are identical, which is the common case. A repository that roots on a key and
+  does not list that key in the exclude list keeps transferring it.
+- Deployment consistency, unenforced. A repository must not root on a metadata
+  key that its upstream strips. The port applies no check, because the dangerous
+  combination spans two configurations -- a receiver that roots on a key, fed by
+  a sender that drops it -- and neither configuration alone can see it. A key
+  the sender strips is a key no commit holds, and a key no commit holds
+  contributes no edge, so the receiver prunes wider and reports nothing.
+- Receive half only, for now. Push is not implemented, so
+  `detached-metadata-exclude` acts today where a repository receives: the
+  archive and production repositories that pull. The outbound half, a build
+  repository that strips a key as it serves, arrives with push. The key needs no
+  new name then, because its meaning is already stated over the repository and
+  not over one direction.
+- What a pull stores, not what the repository holds. E3 writes nothing for a
+  commit whose every property the filter drops, which leaves the copy the
+  destination already holds where it stands. So a repository that stored a
+  commit's detached metadata before the list named its keys still holds that
+  copy, and setting the key and pulling again does not remove it. The list is a
+  rule over what arrives, and it is not a sweep over what is already there.
 
 ## Risk register
 

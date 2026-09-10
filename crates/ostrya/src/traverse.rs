@@ -22,12 +22,12 @@
 //!
 //! A walk follows two further edges under `GcRoots`, which
 //! [`PruneOptions`](crate::PruneOptions) exposes. The commit `parent` edge is
-//! optional, and any number of metadata properties name further commits: the
-//! value of each configured property, in a commit's own metadata and in its
-//! detached metadata, is an `aay` whose elements are commit checksums. Each
-//! such commit is walked in turn, so a property edge reaches everything the
-//! commit it names reaches. A commit arrived at this way is a root in its own
-//! right and is given the walk's full depth, since depth counts parent hops.
+//! optional, and any number of metadata keys name further commits: the value of
+//! each configured key, in a commit's own metadata and in its detached
+//! metadata, is an `aay` whose elements are commit checksums. Each such commit
+//! is walked in turn, so a metadata-key edge reaches everything the commit it
+//! names reaches. A commit arrived at this way is a root in its own right and
+//! is given the walk's full depth, since depth counts parent hops.
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -40,7 +40,7 @@ use crate::error::{Error, Result};
 use crate::refs::walk_ref_dir;
 use crate::repo::Repo;
 
-/// The GVariant type a garbage-collection root property holds: an array of
+/// The GVariant type a garbage-collection root metadata key holds: an array of
 /// commit checksums in their 32-byte binary form.
 const GC_ROOT_SIGNATURE: &str = "aay";
 
@@ -48,18 +48,18 @@ const GC_ROOT_SIGNATURE: &str = "aay";
 /// tree names.
 #[derive(Debug, Clone)]
 pub(crate) struct GcRoots {
-    /// Metadata property names whose value names further reachable commits.
-    /// Empty configures the walk to read no metadata at all.
-    pub properties: Vec<String>,
+    /// Metadata keys whose value names further reachable commits. Empty
+    /// configures the walk to read no metadata at all.
+    pub metadata_keys: Vec<String>,
     /// Whether the commit `parent` edge is followed.
     pub traverse_parent: bool,
 }
 
 impl GcRoots {
-    /// The plain ostree walk: the `parent` edge and no property edges.
+    /// The plain ostree walk: the `parent` edge and no metadata-key edges.
     fn parents_only() -> GcRoots {
         GcRoots {
-            properties: Vec::new(),
+            metadata_keys: Vec::new(),
             traverse_parent: true,
         }
     }
@@ -117,7 +117,7 @@ impl Repo {
 
     /// Collect every object reachable from any of `roots` under the edges `gc`
     /// names. This is [`traverse_reachable`](Repo::traverse_reachable) with the
-    /// `parent` edge made optional and the property edges added.
+    /// `parent` edge made optional and the metadata-key edges added.
     ///
     /// `pending_delete` names a commit the walk reads as absent. Prune unlinks
     /// the commit it deletes only once the walk has succeeded, and this keeps
@@ -149,9 +149,9 @@ impl Repo {
     /// follows at least as many parents is skipped, otherwise it is expanded
     /// again to push its parent further back.
     ///
-    /// `root_depth` is the walk's configured depth, which every commit a property
-    /// edge names is seeded at. `pending_delete` names a commit that is read as
-    /// absent.
+    /// `root_depth` is the walk's configured depth, which every commit a
+    /// metadata-key edge names is seeded at. `pending_delete` names a commit
+    /// that is read as absent.
     async fn collect_reachable(
         &self,
         seeds: Vec<(Checksum, i32)>,
@@ -184,8 +184,8 @@ impl Repo {
             self.walk_tree(commit.root_dirtree, &mut seen_dirtrees, reachable)
                 .await?;
 
-            if !gc.properties.is_empty() {
-                self.push_property_edges(
+            if !gc.metadata_keys.is_empty() {
+                self.push_metadata_key_edges(
                     &commit_checksum,
                     &commit.metadata,
                     gc,
@@ -236,20 +236,20 @@ impl Repo {
         Ok(())
     }
 
-    /// Push every commit the configured properties name onto the walk.
+    /// Push every commit the configured metadata keys name onto the walk.
     ///
-    /// Each property is read from `metadata`, the commit's own, and then from
-    /// its detached metadata, so one property name carries edges from both. A
-    /// property no dict holds contributes nothing. A property that is present
-    /// and does not hold an `aay` of 32-byte checksums fails the walk with
+    /// Each key is read from `metadata`, the commit's own, and then from its
+    /// detached metadata, so one key name carries edges from both. A key no
+    /// dict holds contributes nothing. A key that is present and does not hold
+    /// an `aay` of 32-byte checksums fails the walk with
     /// [`Error::InvalidGcRoot`], because a value the walk cannot read is an
     /// edge it cannot follow, and objects would be deleted for it.
     ///
     /// The detached metadata is read once per expansion of a commit, and only
-    /// for a walk that has properties configured. A commit reached again at a
-    /// depth that follows more parents is expanded a second time and read
+    /// for a walk that has metadata keys configured. A commit reached again at
+    /// a depth that follows more parents is expanded a second time and read
     /// again.
-    async fn push_property_edges(
+    async fn push_metadata_key_edges(
         &self,
         commit: &Checksum,
         metadata: &Value,
@@ -258,12 +258,12 @@ impl Repo {
         stack: &mut Vec<(Checksum, i32)>,
     ) -> Result<()> {
         let detached = self.read_commit_detached_metadata(commit).await?;
-        for property in &gc.properties {
+        for key in &gc.metadata_keys {
             for source in [Some(metadata), detached.as_ref()].into_iter().flatten() {
-                let Some(value) = source.dict_get(property) else {
+                let Some(value) = source.dict_get(key) else {
                     continue;
                 };
-                for target in property_targets(commit, property, value)? {
+                for target in metadata_key_targets(commit, key, value)? {
                     stack.push((target, root_depth));
                 }
             }
@@ -306,15 +306,15 @@ impl Repo {
     }
 }
 
-/// Read one property's value as the list of commits it names.
+/// Read one metadata key's value as the list of commits it names.
 ///
 /// The value is the variant an `a{sv}` entry holds. It has to carry an `aay`
 /// whose every element is a 32-byte commit checksum; anything else is an
 /// [`Error::InvalidGcRoot`] naming the commit the value came from.
-fn property_targets(commit: &Checksum, property: &str, value: &Value) -> Result<Vec<Checksum>> {
+fn metadata_key_targets(commit: &Checksum, key: &str, value: &Value) -> Result<Vec<Checksum>> {
     let invalid = |reason: String| Error::InvalidGcRoot {
         commit: *commit,
-        property: property.to_owned(),
+        metadata_key: key.to_owned(),
         reason,
     };
     let Some((ty, elements)) = value.as_variant() else {

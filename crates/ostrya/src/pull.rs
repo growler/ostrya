@@ -334,6 +334,40 @@ impl DetachedMetadataFilter {
         DetachedMetadataFilter(Some(f))
     }
 
+    /// A filter that drops the named metadata keys and keeps every other
+    /// property.
+    ///
+    /// The names are matched whole against the key of each property. An empty
+    /// list keeps every property, which stores the source bytes verbatim. A
+    /// name no commit holds drops nothing, and the list takes a repeated name.
+    ///
+    /// A commit whose every property the list names writes nothing, which
+    /// leaves the detached metadata the destination already holds where it
+    /// stands. A destination that stored such a commit before the list named
+    /// its keys still holds that copy.
+    ///
+    /// This is the constructor the `ostrya` CLI builds from the repository
+    /// config key `[ex-ostrya] detached-metadata-exclude`
+    /// ([`RepoConfig::detached_metadata_exclude`](crate::RepoConfig::detached_metadata_exclude)).
+    /// Those names live in the same key space as
+    /// [`PruneOptions::gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys)
+    /// reads, and neither list is derived from the other. The library reads no
+    /// config: a pull filters what its options say.
+    pub fn excluding<I, S>(names: I) -> DetachedMetadataFilter
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let names: Vec<String> = names.into_iter().map(Into::into).collect();
+        DetachedMetadataFilter::new(move |_, key, _| {
+            if names.iter().any(|name| name == key) {
+                FilterResult::Skip
+            } else {
+                FilterResult::Allow
+            }
+        })
+    }
+
     /// The properties of `bytes` this filter allows, serialized, and `None`
     /// where the caller writes nothing.
     ///

@@ -3,7 +3,8 @@
 //! [`RepoConfig`] wraps the [`KeyFile`] parsed from `<repo>/config` and applies
 //! the value-level conventions the `ostree` tool uses: the `[core]` group with
 //! `repo_version` and `mode`, the documented `[core]` tunables with their
-//! defaults, the `[archive]` group, and `[remote "<name>"]` sections.
+//! defaults, the `[archive]` group, and `[remote "<name>"]` sections. The
+//! `[ex-ostrya]` group carries the two keys that are ostrya extensions.
 //!
 //! The `repo_version` and `mode` keys are validated when the config is loaded,
 //! matching the tool, which refuses to open a repository whose version is not
@@ -26,6 +27,7 @@ use crate::repo::Repo;
 const CORE: &str = "core";
 const ARCHIVE: &str = "archive";
 const EX_INTEGRITY: &str = "ex-integrity";
+const EX_OSTRYA: &str = "ex-ostrya";
 /// The name of the repository file holding `config`.
 const CONFIG_FILE: &str = "config";
 
@@ -314,6 +316,55 @@ impl RepoConfig {
             .keyfile
             .get_integer(ARCHIVE, "zlib-level")?
             .unwrap_or(6))
+    }
+
+    /// The `[ex-ostrya] gc-root-metadata-keys` setting: the metadata keys a
+    /// prune reads for further reachable commits. Empty by default.
+    ///
+    /// The `ostrya prune` command puts this list into
+    /// [`PruneOptions::gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys).
+    /// The list adds roots and removes none, and it carries no counterpart for
+    /// [`traverse_parent`](crate::PruneOptions::traverse_parent), so a
+    /// configured prune keeps at least what a prune with the tool's own
+    /// reachability keeps.
+    ///
+    /// The library reads this key nowhere: [`Repo::prune`](crate::Repo::prune)
+    /// acts on the options its caller supplies.
+    pub fn gc_root_metadata_keys(&self) -> Result<Vec<String>> {
+        self.string_list(EX_OSTRYA, "gc-root-metadata-keys")
+    }
+
+    /// The `[ex-ostrya] detached-metadata-exclude` setting: the detached
+    /// metadata keys this repository does not store when it receives a commit,
+    /// and does not send when it serves one. Empty by default.
+    ///
+    /// The `ostrya pull` and `ostrya pull-local` commands put this list into
+    /// [`PullOptions::detached_metadata_filter`](crate::PullOptions::detached_metadata_filter)
+    /// through
+    /// [`DetachedMetadataFilter::excluding`](crate::DetachedMetadataFilter::excluding).
+    /// Push is not implemented, so today the key acts on the receiving side
+    /// alone.
+    ///
+    /// This list is never derived from
+    /// [`gc_root_metadata_keys`](RepoConfig::gc_root_metadata_keys), even when
+    /// the two lists are identical. A repository that roots on a key and does
+    /// not list it in the exclude list keeps transferring it.
+    ///
+    /// The list governs what a pull stores, not what the repository already
+    /// holds. A commit whose every detached-metadata key the list names leaves
+    /// the copy the destination already holds where it stands, so setting this
+    /// key and pulling again does not remove a copy an earlier pull stored.
+    pub fn detached_metadata_exclude(&self) -> Result<Vec<String>> {
+        self.string_list(EX_OSTRYA, "detached-metadata-exclude")
+    }
+
+    /// Read a `;`-separated list key, empty when the key is absent. A value the
+    /// key-file syntax cannot split is reported as an error.
+    fn string_list(&self, group: &str, key: &str) -> Result<Vec<String>> {
+        Ok(self
+            .keyfile
+            .get_string_list(group, key)?
+            .unwrap_or_default())
     }
 
     /// The `[ex-integrity] composefs` setting. Default `No`.
@@ -754,6 +805,52 @@ mod tests {
                     [ex-integrity]\ncomposefs=perhaps\nfsverity=no\n";
         let cfg = RepoConfig::parse(text).unwrap();
         assert_eq!(cfg.fsverity().unwrap(), Tristate::No);
+    }
+
+    #[test]
+    fn ex_ostrya_lists_are_empty_when_absent() {
+        let cfg = RepoConfig::parse(ARCHIVE_CONFIG).unwrap();
+        assert!(cfg.gc_root_metadata_keys().unwrap().is_empty());
+        assert!(cfg.detached_metadata_exclude().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ex_ostrya_lists_parse_their_values() {
+        let text = "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
+                    gc-root-metadata-keys=app.roots;app.caches\n\
+                    detached-metadata-exclude=app.roots\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        assert_eq!(
+            cfg.gc_root_metadata_keys().unwrap(),
+            vec!["app.roots".to_owned(), "app.caches".to_owned()]
+        );
+        assert_eq!(
+            cfg.detached_metadata_exclude().unwrap(),
+            vec!["app.roots".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_ex_ostrya_list_takes_a_trailing_separator() {
+        // The key-file list convention writes a trailing `;`, which adds no
+        // empty element.
+        let text = "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
+                    gc-root-metadata-keys=app.roots;app.caches;\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        assert_eq!(
+            cfg.gc_root_metadata_keys().unwrap(),
+            vec!["app.roots".to_owned(), "app.caches".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_malformed_ex_ostrya_list_is_an_error() {
+        // A value ending in a lone backslash is not a list the key-file syntax
+        // can split.
+        let text = "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
+                    detached-metadata-exclude=app.roots\\\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        assert!(cfg.detached_metadata_exclude().is_err());
     }
 
     #[test]

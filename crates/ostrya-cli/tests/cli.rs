@@ -12,13 +12,17 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ostrya::{ComposefsOptions, CreateOptions, LockKind, Repo, RepoMode, base64};
+use ostrya::{
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions,
+    LockKind, MutableTree, ObjectType, Repo, RepoMode, Type, Value, base64,
+};
 use ostrya_rt::block_on;
 
 /// The fixture commit id, branch, and timestamp from `generate.sh`/MANIFEST.
@@ -18572,4 +18576,293 @@ fn encode_test_base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+// --- [ex-ostrya] repository config keys ---------------------------------------
+
+/// A one-file tree at `base/<name>`, its content naming it.
+fn ex_ostrya_tree(base: &Path, name: &str) -> PathBuf {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload.txt"), format!("{name}\n")).unwrap();
+    dir
+}
+
+/// Commit `base/<name>` into the repository at `repo`, with the given metadata
+/// and, where `branch` names one, a ref pointing at the result.
+fn ex_ostrya_commit(
+    repo: &Path,
+    base: &Path,
+    name: &str,
+    metadata: Option<Value>,
+    branch: Option<&str>,
+) -> Checksum {
+    let dir = ex_ostrya_tree(base, name);
+    block_on(async {
+        let repo = Repo::open(repo).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let mut mtree = MutableTree::new();
+        let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+        let dfd = std::fs::File::open(&dir).unwrap();
+        txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), &mut mtree, Some(&mut modifier))
+            .await
+            .unwrap();
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let commit = txn
+            .write_commit(
+                CommitOptions {
+                    subject: Some(name.to_owned()),
+                    timestamp: Some(1_700_000_000),
+                    metadata,
+                    ..CommitOptions::default()
+                },
+                &root,
+            )
+            .await
+            .unwrap();
+        if let Some(branch) = branch {
+            txn.set_ref(branch, Some(&commit));
+        }
+        txn.commit().await.unwrap();
+        commit
+    })
+}
+
+/// An `a{sv}` holding one key whose value is an `aay` of commit checksums.
+fn ex_ostrya_checksum_list(key: &str, commits: &[Checksum]) -> Value {
+    let elements = commits
+        .iter()
+        .map(|c| Value::Bytes(c.as_bytes().to_vec()))
+        .collect();
+    Value::Array(vec![Value::Tuple(vec![
+        Value::Str(key.to_owned()),
+        Value::Variant(Box::new((
+            Type::parse("aay").unwrap(),
+            Value::Array(elements),
+        ))),
+    ])])
+}
+
+/// Whether the repository still holds `commit` as an object.
+fn ex_ostrya_holds(repo: &Path, commit: &Checksum) -> bool {
+    block_on(async {
+        Repo::open(repo)
+            .await
+            .unwrap()
+            .has_object(ObjectType::Commit, commit)
+            .await
+            .unwrap()
+    })
+}
+
+/// `prune` reads `[ex-ostrya] gc-root-metadata-keys` and keeps the commits the
+/// named metadata key holds. Without the key the same prune sweeps them, which
+/// is what the tool's own prune does.
+#[test]
+fn prune_honours_the_configured_gc_root_metadata_keys() {
+    const GC_KEY: &str = "app.gc-roots";
+
+    for configured in [false, true] {
+        let tag = if configured { "set" } else { "unset" };
+        let tmp = TmpDir::new(&format!("prune-gc-roots-{tag}"));
+        let base = tmp.path();
+        let repo = create_repo(base, RepoMode::Archive);
+        let repo_arg = format!("--repo={}", repo.display());
+
+        // `kept` is named by no ref. The branch head names it through the
+        // metadata key.
+        let kept = ex_ostrya_commit(&repo, base, "kept", None, None);
+        let head = ex_ostrya_commit(
+            &repo,
+            base,
+            "head",
+            Some(ex_ostrya_checksum_list(GC_KEY, &[kept])),
+            Some("main"),
+        );
+
+        if configured {
+            let mut config = std::fs::read_to_string(repo.join("config")).unwrap();
+            config.push_str(&format!("\n[ex-ostrya]\ngc-root-metadata-keys={GC_KEY};\n"));
+            std::fs::write(repo.join("config"), config).unwrap();
+        }
+
+        ostrya(&[&repo_arg, "prune", "--refs-only"], None, &[]).ok();
+
+        assert!(
+            ex_ostrya_holds(&repo, &head),
+            "{tag}: the ref's own commit survives"
+        );
+        assert_eq!(
+            ex_ostrya_holds(&repo, &kept),
+            configured,
+            "{tag}: the commit the configured metadata key names survives only \
+             where the key is configured"
+        );
+    }
+}
+
+/// A malformed `[ex-ostrya] gc-root-metadata-keys` value fails the prune, and
+/// the prune deletes nothing.
+#[test]
+fn prune_refuses_a_malformed_gc_root_metadata_keys_value() {
+    let tmp = TmpDir::new("prune-gc-roots-malformed");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let orphan = ex_ostrya_commit(&repo, base, "orphan", None, None);
+    ex_ostrya_commit(&repo, base, "head", None, Some("main"));
+
+    let mut config = std::fs::read_to_string(repo.join("config")).unwrap();
+    config.push_str("\n[ex-ostrya]\ngc-root-metadata-keys=app.roots\\\n");
+    std::fs::write(repo.join("config"), config).unwrap();
+
+    let run = ostrya(&[&repo_arg, "prune", "--refs-only"], None, &[]);
+    assert!(!run.status.success(), "a malformed list fails the prune");
+    assert!(
+        ex_ostrya_holds(&repo, &orphan),
+        "and the prune deletes nothing"
+    );
+}
+
+/// `pull-local` reads `[ex-ostrya] detached-metadata-exclude` from the
+/// destination and stores no detached-metadata key the list names.
+#[test]
+fn pull_local_honours_the_configured_detached_metadata_exclude() {
+    let tmp = TmpDir::new("pull-local-detached-exclude");
+    let base = tmp.path();
+    let src = base.join("src-repo");
+    block_on(async {
+        Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+    });
+    let commit = ex_ostrya_commit(&src, base, "payload", None, Some("main"));
+    let detached = Value::Array(vec![
+        Value::Tuple(vec![
+            Value::Str("app.gc-roots".to_owned()),
+            Value::Variant(Box::new((
+                Type::parse("s").unwrap(),
+                Value::Str("repository-local".to_owned()),
+            ))),
+        ]),
+        Value::Tuple(vec![
+            Value::Str("app.keep".to_owned()),
+            Value::Variant(Box::new((
+                Type::parse("s").unwrap(),
+                Value::Str("carried".to_owned()),
+            ))),
+        ]),
+    ]);
+    block_on(async {
+        Repo::open(&src)
+            .await
+            .unwrap()
+            .write_commit_detached_metadata(&commit, Some(&detached))
+            .await
+            .unwrap();
+    });
+
+    let dst = create_repo(base, RepoMode::Archive);
+    let mut config = std::fs::read_to_string(dst.join("config")).unwrap();
+    config.push_str("\n[ex-ostrya]\ndetached-metadata-exclude=app.gc-roots;\n");
+    std::fs::write(dst.join("config"), config).unwrap();
+
+    let repo_arg = format!("--repo={}", dst.display());
+    ostrya(
+        &[&repo_arg, "pull-local", &src.display().to_string(), "main"],
+        None,
+        &[],
+    )
+    .ok();
+
+    let stored = block_on(async {
+        Repo::open(&dst)
+            .await
+            .unwrap()
+            .read_commit_detached_metadata(&commit)
+            .await
+            .unwrap()
+    })
+    .expect("the destination stores detached metadata");
+    assert_eq!(
+        stored.dict_get("app.gc-roots"),
+        None,
+        "a key the exclude list names is not stored"
+    );
+    assert!(
+        stored.dict_get("app.keep").is_some(),
+        "a key it does not name is stored"
+    );
+}
+
+/// An `a{sv}` holding two string properties, one of them the key an exclude
+/// list names.
+fn ex_ostrya_two_key_detached() -> Value {
+    let entry = |key: &str, text: &str| {
+        Value::Tuple(vec![
+            Value::Str(key.to_owned()),
+            Value::Variant(Box::new((
+                Type::parse("s").unwrap(),
+                Value::Str(text.to_owned()),
+            ))),
+        ])
+    };
+    Value::Array(vec![
+        entry("app.gc-roots", "repository-local"),
+        entry("app.keep", "carried"),
+    ])
+}
+
+/// `pull` over HTTP reads `[ex-ostrya] detached-metadata-exclude` from the
+/// destination too, so the key covers the fetcher's own `.commitmeta` write and
+/// not the local-pull path alone.
+#[test]
+fn pull_over_http_honours_the_configured_detached_metadata_exclude() {
+    let tmp = TmpDir::new("pull-http-detached-exclude");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let commit = Checksum::from_hex(COMMIT).unwrap();
+    // The remote serves the pair, so the destination's filter is what decides
+    // which of the two keys it keeps.
+    block_on(async {
+        Repo::open(&remote)
+            .await
+            .unwrap()
+            .write_commit_detached_metadata(&commit, Some(&ex_ostrya_two_key_detached()))
+            .await
+            .unwrap();
+    });
+    let server = FileServer::start(&remote);
+
+    let dest = build_dest(base, "dest");
+    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+    let mut config = std::fs::read_to_string(dest.join("config")).unwrap();
+    config.push_str("\n[ex-ostrya]\ndetached-metadata-exclude=app.gc-roots;\n");
+    std::fs::write(dest.join("config"), config).unwrap();
+
+    ostrya(
+        &["pull", "--repo", dest.to_str().unwrap(), "origin", BRANCH],
+        None,
+        &[],
+    )
+    .ok();
+
+    let stored = block_on(async {
+        Repo::open(&dest)
+            .await
+            .unwrap()
+            .read_commit_detached_metadata(&commit)
+            .await
+            .unwrap()
+    })
+    .expect("the destination stores detached metadata");
+    assert_eq!(
+        stored.dict_get("app.gc-roots"),
+        None,
+        "a key the exclude list names is not stored"
+    );
+    assert!(
+        stored.dict_get("app.keep").is_some(),
+        "a key it does not name is stored"
+    );
 }

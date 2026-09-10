@@ -1244,6 +1244,40 @@ The `FS_IOC_ENABLE_VERITY` and `FS_IOC_MEASURE_VERITY` ioctls are the only
 syscalls in the write path that require `unsafe`; they live in the audited
 `ostrya-sys` crate.
 
+## Port extension: the ex-ostrya config group
+
+The `[ex-ostrya]` group is an ostrya extension. The `ostree` tool defines no key
+in it and reads none. The group holds two keys, each a `;`-separated list that
+is empty when the key is absent:
+
+- `gc-root-metadata-keys` -- the metadata keys a prune reads for further
+  reachable commits. The value of each key, in a commit's own metadata and in
+  its detached metadata, is an `aay` of 32-byte commit checksums, and each
+  checksum is a root of the walk. See `port-plan.md`, Phase 22.
+- `detached-metadata-exclude` -- the detached-metadata keys the repository does
+  not store when it receives a commit, and does not send when it serves one. A
+  pull drops each key the list names from the `.commitmeta` it stores.
+
+The group carries no repository fact. Detached metadata sits outside the commit
+checksum, so a repository that sets either key holds the same object bytes and
+the same checksums as one that sets neither. The `ostrya` CLI is the one reader:
+the library acts on the options its caller supplies.
+
+The tool tolerates the group. Observed with `ostree` 2026.1 against an archive
+repository whose `config` holds these two lines:
+
+```
+[ex-ostrya]
+gc-root-metadata-keys=app.roots;app.other;
+```
+
+- `ostree commit` and `ostree prune --refs-only` both exit 0 and behave as they
+  do without the group;
+- `ostree config get ex-ostrya.gc-root-metadata-keys` prints the raw value
+  `app.roots;app.other;` and exits 0;
+- `ostree config set core.mode archive-z2` rewrites `config` and preserves the
+  group and its key verbatim.
+
 ## Commit modifier: canonical permissions, consume, and devino
 
 A filesystem tree is ingested into a repository under a set of options the

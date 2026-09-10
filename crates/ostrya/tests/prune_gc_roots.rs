@@ -18,7 +18,7 @@ use ostrya_rt::block_on;
 /// A fixed timestamp, so the commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// The property name these tests configure as a GC root.
+/// The metadata key these tests configure as a GC root.
 const GC_ROOTS: &str = "test.gc-roots";
 
 /// Write a one-file tree at `dir`, its content naming it.
@@ -28,7 +28,7 @@ fn write_tree(base: &Path, name: &str) {
     std::fs::write(dir.join("payload.txt"), format!("{name}\n")).unwrap();
 }
 
-/// An `a{sv}` holding one property whose value is an `aay` of commit checksums.
+/// An `a{sv}` holding one key whose value is an `aay` of commit checksums.
 fn checksum_list(key: &str, commits: &[Checksum]) -> Value {
     let elements = commits
         .iter()
@@ -37,7 +37,7 @@ fn checksum_list(key: &str, commits: &[Checksum]) -> Value {
     dict(key, Type::parse("aay").unwrap(), Value::Array(elements))
 }
 
-/// An `a{sv}` holding one property of the caller's type and value.
+/// An `a{sv}` holding one key of the caller's type and value.
 fn dict(key: &str, ty: Type, value: Value) -> Value {
     Value::Array(vec![Value::Tuple(vec![
         Value::Str(key.to_owned()),
@@ -100,7 +100,7 @@ async fn repo_with_trees(base: &Path, names: &[&str]) -> Repo {
 }
 
 /// The options these tests prune with: refs alone, no parent edge, and the one
-/// property configured.
+/// metadata key configured.
 fn gc_root_options() -> PruneOptions {
     PruneOptions::gc_roots([GC_ROOTS])
 }
@@ -111,11 +111,11 @@ async fn holds(repo: &Repo, commit: &Checksum) -> bool {
 }
 
 #[test]
-fn a_property_in_commit_metadata_keeps_its_target() {
+fn a_metadata_key_in_commit_metadata_keeps_its_target() {
     let tmp = TmpDir::new("gc-roots-commit-meta");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["kept", "head"]).await;
-        // `kept` is named by no ref. The ref head names it through the property.
+        // `kept` is named by no ref. The ref head names it through the metadata key.
         let kept = commit(&repo, tmp.path(), "kept", None, None, None).await;
         let head = commit(
             &repo,
@@ -131,7 +131,7 @@ fn a_property_in_commit_metadata_keeps_its_target() {
         assert!(holds(&repo, &head).await, "the ref's own commit survives");
         assert!(
             holds(&repo, &kept).await,
-            "the commit the property names survives"
+            "the commit the metadata key names survives"
         );
         assert!(
             repo.has_object(ObjectType::DirTree, &commit_root(&repo, &kept).await)
@@ -143,7 +143,7 @@ fn a_property_in_commit_metadata_keeps_its_target() {
 }
 
 #[test]
-fn a_commit_no_property_names_is_pruned() {
+fn a_commit_no_metadata_key_names_is_pruned() {
     let tmp = TmpDir::new("gc-roots-control");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["orphan", "head"]).await;
@@ -155,13 +155,13 @@ fn a_commit_no_property_names_is_pruned() {
         assert!(holds(&repo, &head).await, "the ref's own commit survives");
         assert!(
             !holds(&repo, &orphan).await,
-            "a commit no ref and no property names is pruned"
+            "a commit no ref and no metadata key names is pruned"
         );
     });
 }
 
 #[test]
-fn a_property_in_detached_metadata_keeps_its_target() {
+fn a_metadata_key_in_detached_metadata_keeps_its_target() {
     let tmp = TmpDir::new("gc-roots-detached");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["kept", "head"]).await;
@@ -174,13 +174,13 @@ fn a_property_in_detached_metadata_keeps_its_target() {
         repo.prune(&gc_root_options()).await.unwrap();
         assert!(
             holds(&repo, &kept).await,
-            "the commit the detached property names survives"
+            "the commit the detached metadata key names survives"
         );
     });
 }
 
 #[test]
-fn property_edges_are_followed_recursively() {
+fn metadata_key_edges_are_followed_recursively() {
     let tmp = TmpDir::new("gc-roots-recursive");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["deep", "middle", "head"]).await;
@@ -240,7 +240,7 @@ fn a_kept_commit_keeps_its_detached_metadata() {
                 .await
                 .unwrap()
                 .is_some(),
-            "the detached metadata of a property-kept commit survives with it"
+            "the detached metadata of a metadata-key-kept commit survives with it"
         );
     });
 }
@@ -286,11 +286,11 @@ fn the_parent_edge_is_followed_by_default() {
 }
 
 #[test]
-fn a_property_edge_seeds_the_full_depth() {
+fn a_metadata_key_edge_seeds_the_full_depth() {
     let tmp = TmpDir::new("gc-roots-depth");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["base", "tip", "head"]).await;
-        // A two-commit chain the ref does not name, reached by one property edge
+        // A two-commit chain the ref does not name, reached by one metadata-key edge
         // at its tip. Depth counts parent hops, and the edge seeds the walk's
         // own depth, so the chain is kept whole.
         let base = commit(&repo, tmp.path(), "base", None, None, None).await;
@@ -312,7 +312,7 @@ fn a_property_edge_seeds_the_full_depth() {
         repo.prune(&opts).await.unwrap();
         assert!(
             holds(&repo, &tip).await,
-            "the commit the property names survives"
+            "the commit the metadata key names survives"
         );
         assert!(
             holds(&repo, &base).await,
@@ -322,7 +322,7 @@ fn a_property_edge_seeds_the_full_depth() {
 }
 
 #[test]
-fn a_property_of_the_wrong_type_fails_the_prune() {
+fn a_metadata_key_of_the_wrong_type_fails_the_prune() {
     let tmp = TmpDir::new("gc-roots-bad-type");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head"]).await;
@@ -344,11 +344,11 @@ fn a_property_of_the_wrong_type_fails_the_prune() {
         match err {
             Error::InvalidGcRoot {
                 commit,
-                property,
+                metadata_key,
                 reason,
             } => {
                 assert_eq!(commit, head);
-                assert_eq!(property, GC_ROOTS);
+                assert_eq!(metadata_key, GC_ROOTS);
                 assert!(
                     reason.contains("`as`"),
                     "the reason names the type: {reason}"
@@ -391,7 +391,7 @@ fn an_element_of_the_wrong_length_fails_the_prune() {
 }
 
 #[test]
-fn a_property_naming_an_absent_commit_is_tolerated() {
+fn a_metadata_key_naming_an_absent_commit_is_tolerated() {
     let tmp = TmpDir::new("gc-roots-absent");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head"]).await;
@@ -406,7 +406,7 @@ fn a_property_naming_an_absent_commit_is_tolerated() {
         )
         .await;
 
-        // A dangling property edge is a dangling reference like any other: the
+        // A dangling metadata-key edge is a dangling reference like any other: the
         // walk keeps its name and descends into nothing.
         repo.prune(&gc_root_options()).await.unwrap();
         assert!(holds(&repo, &head).await, "the ref's commit survives");
@@ -422,7 +422,7 @@ fn a_refused_prune_keeps_the_commit_it_was_told_to_delete() {
     let tmp = TmpDir::new("gc-roots-refused-delete");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "spare"]).await;
-        // The ref's commit holds a property the walk cannot read, so the prune
+        // The ref's commit holds a metadata key the walk cannot read, so the prune
         // is refused. The spare commit is unreferenced, so it is deletable.
         commit(
             &repo,

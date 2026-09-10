@@ -27,10 +27,16 @@
 //!
 //! Two options carry reachability the tool has no counterpart for, so a prune
 //! that leaves them at their defaults is the tool's:
-//! [`gc_root_properties`](PruneOptions::gc_root_properties) names metadata
-//! properties whose value names further commits to keep, and
+//! [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) names metadata
+//! keys whose value names further commits to keep, and
 //! [`traverse_parent`](PruneOptions::traverse_parent) decides whether a commit's
 //! `parent` is reachable from it at all.
+//!
+//! The `ostrya` CLI fills the first of the two from the repository config key
+//! `[ex-ostrya] gc-root-metadata-keys`
+//! ([`RepoConfig::gc_root_metadata_keys`](crate::RepoConfig::gc_root_metadata_keys)).
+//! The library reads no config: [`Repo::prune`] acts on the options it is
+//! given.
 
 use std::os::fd::BorrowedFd;
 
@@ -58,28 +64,33 @@ pub struct PruneOptions {
     /// target of any ref. Under [`no_prune`](PruneOptions::no_prune) it stays,
     /// and the statistics cover the sweep its removal would cause.
     pub delete_commit: Option<Checksum>,
-    /// Metadata property names that name further reachable commits.
+    /// Metadata keys that name further reachable commits.
     ///
     /// Each name is looked up in every reached commit's own metadata and in its
-    /// detached metadata. A property that is present holds an `aay` whose
-    /// elements are commit checksums, and each of those commits is walked as a
-    /// root of its own, so what it reaches is kept too. A property that holds
-    /// anything else fails the prune with [`Error::InvalidGcRoot`].
+    /// detached metadata. A key that is present holds an `aay` whose elements
+    /// are commit checksums, and each of those commits is walked as a root of
+    /// its own, so what it reaches is kept too. A key that holds anything else
+    /// fails the prune with [`Error::InvalidGcRoot`].
     ///
     /// The list is empty by default, which reads no metadata at all. A
     /// non-empty list adds no reachability under
     /// [`refs_only`](PruneOptions::refs_only) unset, since a prune that is not
     /// restricted to refs already roots every commit in the store. It is still
     /// read there: every commit's metadata and detached metadata is looked up,
-    /// and a property of the wrong type fails the prune under either setting.
-    pub gc_root_properties: Vec<String>,
+    /// and a key of the wrong type fails the prune under either setting.
+    pub gc_root_metadata_keys: Vec<String>,
     /// Whether a commit's `parent` is reachable from it.
     ///
     /// True by default, which is what the tool does and what
     /// [`depth`](PruneOptions::depth) bounds. False keeps a commit's ancestry
     /// only where something else names it, which is the setting an application
     /// tracking its own roots through
-    /// [`gc_root_properties`](PruneOptions::gc_root_properties) uses.
+    /// [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) uses.
+    ///
+    /// The repository config carries no counterpart for this field, so a prune
+    /// the `ostrya` CLI runs always follows the `parent` edge. A configured
+    /// CLI prune adds roots and takes none away, so it keeps at least what the
+    /// tool keeps.
     pub traverse_parent: bool,
 }
 
@@ -90,7 +101,7 @@ impl Default for PruneOptions {
             depth: -1,
             no_prune: false,
             delete_commit: None,
-            gc_root_properties: Vec::new(),
+            gc_root_metadata_keys: Vec::new(),
             traverse_parent: true,
         }
     }
@@ -103,21 +114,21 @@ impl PruneOptions {
         PruneOptions::default()
     }
 
-    /// Prune against the named properties as the extra roots, over refs alone
-    /// and without the `parent` edge: an application that records its own
+    /// Prune against the named metadata keys as the extra roots, over refs
+    /// alone and without the `parent` edge: an application that records its own
     /// reachability in commit metadata says what is kept, and a commit's
     /// ancestry is not kept for being an ancestry.
     ///
     /// The caller sets [`traverse_parent`](PruneOptions::traverse_parent) back
     /// to true on the result to have both edge kinds.
-    pub fn gc_roots<I, S>(properties: I) -> PruneOptions
+    pub fn gc_roots<I, S>(keys: I) -> PruneOptions
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         PruneOptions {
             refs_only: true,
-            gc_root_properties: properties.into_iter().map(Into::into).collect(),
+            gc_root_metadata_keys: keys.into_iter().map(Into::into).collect(),
             traverse_parent: false,
             ..PruneOptions::default()
         }
@@ -170,7 +181,7 @@ impl Repo {
         }
 
         let gc = crate::traverse::GcRoots {
-            properties: opts.gc_root_properties.clone(),
+            metadata_keys: opts.gc_root_metadata_keys.clone(),
             traverse_parent: opts.traverse_parent,
         };
         let mut keep = self

@@ -1419,6 +1419,31 @@ tool refuses `--delete-commit` together with `--no-prune`
 (`error: Cannot specify both --delete-commit and --no-prune`, exit 1, no object
 removed), and the port refuses the same pair in the same words.
 
+Two repository config keys in the `[ex-ostrya]` group are port extensions with
+no option and no counterpart in the tool. They part `ostrya` from `ostree` on a
+repository that sets one, and the divergence is by intent
+(`format-reference.md`, "Port extension: the ex-ostrya config group";
+`port-plan.md`, Phase 22):
+
+- `gc-root-metadata-keys` names metadata keys a prune reads for further
+  reachable commits. `ostrya prune` roots on them; `ostree prune` does not, and
+  sweeps what only they reach. The key carries roots alone -- it holds no
+  counterpart for the parent edge and does not touch `--refs-only` -- so a
+  configured `ostrya prune` keeps at least what `ostree prune` keeps, and never
+  less. A value the key-file syntax cannot split fails the prune, which then
+  deletes nothing.
+- `detached-metadata-exclude` names detached-metadata keys the repository does
+  not store on receive. `ostrya pull` and `ostrya pull-local` drop them from the
+  `.commitmeta` they write; the tool's pull writes what the source holds. The
+  commit checksum does not cover detached metadata, so the objects both write
+  stay identical. A commit whose every key the list names leaves the
+  `.commitmeta` the destination already holds where it stands. Push is not
+  implemented, so the sending half of the key does no work yet.
+
+Neither key is derived from the other, and no harness repository sets either
+(`harness.md`, "Constraints"), so every matrix cell reads the tool's own
+behavior.
+
 `fsck` accepts `--repo` and the port extension `--no-mark-partial`. Missing:
 `--add-tombstones`, `-q/--quiet`, `-a/--all`, `--delete`, `--verify-bindings`,
 `--verify-back-refs`.

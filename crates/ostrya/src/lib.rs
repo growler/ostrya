@@ -71,7 +71,7 @@
 //! ([`PruneOptions`]/[`PruneStats`]) which deletes objects unreachable from the
 //! chosen roots (refs, optionally every commit, to a depth, with an optional
 //! `delete_commit`, and with the extra roots
-//! [`PruneOptions::gc_root_properties`] names under an optional
+//! [`PruneOptions::gc_root_metadata_keys`] names under an optional
 //! [`PruneOptions::traverse_parent`]), [`Repo::fsck`] ([`FsckOptions`]/[`FsckReport`]) which
 //! verifies object integrity and completeness and marks incomplete commits
 //! partial, and [`Repo::diff_commits`] ([`DiffEntry`]/[`DiffChange`]) which

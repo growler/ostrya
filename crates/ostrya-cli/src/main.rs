@@ -59,13 +59,13 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutMode, CheckoutOptions, Checksum, CollectionRef,
     CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions,
-    DeltaOptions, DevInoCache, DictBuilder, DiffChange, Ed25519Signer, Ed25519Verifier, Error,
-    FileKind, FileObject, FilterResult, FsckOptions, MutableTree, ObjectType, PruneOptions,
-    PullFlags, PullOptions, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result,
-    SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef, TarExportOptions, TarImportOptions,
-    TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome,
-    VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text,
-    to_text_unannotated, validate_refspec,
+    DeltaOptions, DetachedMetadataFilter, DevInoCache, DictBuilder, DiffChange, Ed25519Signer,
+    Ed25519Verifier, Error, FileKind, FileObject, FilterResult, FsckOptions, MutableTree,
+    ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias, Repo,
+    RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef,
+    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
+    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
+    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -1429,6 +1429,7 @@ async fn pull(repo: Repo, name: &str, args: PullArgs) -> Result<()> {
                     sign: args.sign_verify,
                     sign_summary: args.sign_verify_summary,
                 },
+                detached_metadata_filter: detached_metadata_filter(&repo)?,
                 ..PullOptions::default()
             },
         )
@@ -1443,6 +1444,19 @@ fn parse_http_header(arg: &str) -> std::result::Result<(String, String), String>
         Some((name, value)) if !name.is_empty() => Ok((name.to_owned(), value.to_owned())),
         _ => Err("expected NAME=VALUE".to_owned()),
     }
+}
+
+/// The detached-metadata filter a pull into `repo` applies, from the
+/// repository config key `[ex-ostrya] detached-metadata-exclude`.
+///
+/// An absent or empty key gives the default filter, which keeps every property
+/// and stores the source bytes verbatim.
+fn detached_metadata_filter(repo: &Repo) -> Result<DetachedMetadataFilter> {
+    let excluded = repo.config().detached_metadata_exclude()?;
+    if excluded.is_empty() {
+        return Ok(DetachedMetadataFilter::default());
+    }
+    Ok(DetachedMetadataFilter::excluding(excluded))
 }
 
 /// Print what a pull imported.
@@ -1492,6 +1506,7 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
                 flags,
                 depth: args.depth,
                 localcache_repos,
+                detached_metadata_filter: detached_metadata_filter(&repo)?,
                 ..PullOptions::default()
             },
         )
@@ -5798,6 +5813,7 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         depth: args.depth,
         no_prune: args.no_prune,
         delete_commit,
+        gc_root_metadata_keys: repo.config().gc_root_metadata_keys()?,
         ..PruneOptions::default()
     };
     let stats = repo.prune(&opts).await?;

@@ -110,13 +110,16 @@ impl From<Error> for std::io::Error;
 The `io::ErrorKind` an error converts to:
 
 - `NotFound`: `PathNotFound`, `DanglingSymlink`, `ObjectNotFound`,
-  `RefNotFound`.
+  `RefNotFound`, `HttpStatus` with status 404.
 - `NotADirectory`: `NotADirectory`, `ReplaceFileWithDir`.
 - `AlreadyExists`: `EntryExists`, `MergeConflict`, `ReplaceDirWithFile`.
 - `InvalidInput`: `MutableTree`.
+- `PermissionDenied`: `HttpStatus` with status 401 or 403.
+- `FileTooLarge`: `FetchTooLarge`, the same kind a body that outgrows the cap
+  while streaming fails its read with.
 - The inner error itself: `Io`.
-- `Other`: everything else, `SymlinkLoop` included, since
-  `ErrorKind::FilesystemLoop` is unstable.
+- `Other`: everything else, `SymlinkLoop` and every other `HttpStatus` status
+  included, since `ErrorKind::FilesystemLoop` is unstable.
 
 ## GVariant types and values (`ostrya-gvariant`)
 

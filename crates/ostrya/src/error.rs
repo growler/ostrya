@@ -209,8 +209,9 @@ pub enum Error {
         url: String,
     },
     /// A response declared more bytes than the caller's cap allows. A body that
-    /// outgrows the cap while streaming fails the read with
-    /// [`FileTooLarge`](std::io::ErrorKind::FileTooLarge) instead.
+    /// outgrows the cap while streaming fails the read with the same
+    /// [`FileTooLarge`](std::io::ErrorKind::FileTooLarge) kind, under a
+    /// message payload that downcasts to no library error.
     #[error("fetched object exceeds the {limit}-byte cap")]
     FetchTooLarge {
         /// The cap the caller set on the request.
@@ -255,6 +256,18 @@ impl From<Error> for std::io::Error {
     /// A kind is given only where the standard set names the condition. A
     /// symlink loop falls to [`Other`](std::io::ErrorKind::Other), since
     /// `ErrorKind::FilesystemLoop` is unstable.
+    ///
+    /// Three fetch failures the standard set names carry their own kind. An
+    /// [`Error::HttpStatus`] of 404 maps to
+    /// [`NotFound`](std::io::ErrorKind::NotFound), which is how a remote
+    /// states an object is absent; a 401 and a 403 map to
+    /// [`PermissionDenied`](std::io::ErrorKind::PermissionDenied); every other
+    /// status falls to [`Other`](std::io::ErrorKind::Other). An
+    /// [`Error::FetchTooLarge`] maps to
+    /// [`FileTooLarge`](std::io::ErrorKind::FileTooLarge). A body that
+    /// outgrows the cap while streaming fails its read with that same kind,
+    /// and its payload is a message, so only the converted error downcasts
+    /// back to a library error.
     fn from(err: Error) -> std::io::Error {
         use std::io::ErrorKind;
 
@@ -266,7 +279,12 @@ impl From<Error> for std::io::Error {
             Error::PathNotFound { .. }
             | Error::DanglingSymlink { .. }
             | Error::ObjectNotFound { .. }
-            | Error::RefNotFound(_) => ErrorKind::NotFound,
+            | Error::RefNotFound(_)
+            | Error::HttpStatus { status: 404, .. } => ErrorKind::NotFound,
+            Error::HttpStatus {
+                status: 401 | 403, ..
+            } => ErrorKind::PermissionDenied,
+            Error::FetchTooLarge { .. } => ErrorKind::FileTooLarge,
             Error::NotADirectory { .. } | Error::ReplaceFileWithDir(_) => ErrorKind::NotADirectory,
             Error::EntryExists { .. } | Error::MergeConflict(_) | Error::ReplaceDirWithFile(_) => {
                 ErrorKind::AlreadyExists
@@ -296,6 +314,7 @@ mod tests {
         use std::io::ErrorKind;
 
         let path = || "usr/lib/modules".to_owned();
+        let url = || "https://example.invalid/objects/ab.commit".to_owned();
         let cases: Vec<(Error, ErrorKind)> = vec![
             (Error::PathNotFound { path: path() }, ErrorKind::NotFound),
             (
@@ -339,6 +358,66 @@ mod tests {
             ),
             (Error::SymlinkLoop { path: path() }, ErrorKind::Other),
             (Error::Staging("directory is gone".into()), ErrorKind::Other),
+            (
+                Error::HttpStatus {
+                    status: 404,
+                    url: url(),
+                },
+                ErrorKind::NotFound,
+            ),
+            (
+                Error::HttpStatus {
+                    status: 401,
+                    url: url(),
+                },
+                ErrorKind::PermissionDenied,
+            ),
+            (
+                Error::HttpStatus {
+                    status: 403,
+                    url: url(),
+                },
+                ErrorKind::PermissionDenied,
+            ),
+            (
+                Error::HttpStatus {
+                    status: 400,
+                    url: url(),
+                },
+                ErrorKind::Other,
+            ),
+            (
+                Error::HttpStatus {
+                    status: 429,
+                    url: url(),
+                },
+                ErrorKind::Other,
+            ),
+            (
+                Error::HttpStatus {
+                    status: 500,
+                    url: url(),
+                },
+                ErrorKind::Other,
+            ),
+            (
+                Error::HttpStatus {
+                    status: 502,
+                    url: url(),
+                },
+                ErrorKind::Other,
+            ),
+            (
+                Error::FetchTooLarge { limit: 4096 },
+                ErrorKind::FileTooLarge,
+            ),
+            (
+                Error::ContentEncoded {
+                    url: url(),
+                    encoding: "gzip".into(),
+                },
+                ErrorKind::Other,
+            ),
         ];
 
         for (err, expected) in cases {

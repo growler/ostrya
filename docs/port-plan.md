@@ -4586,7 +4586,8 @@ Verify: each option's `m10` record and the option's owning `m0`/`m1` cells
 move from `unimplemented-cli`/`unobserved` to `full` (or a named, justified
 `lossy`/`needs-priv`) as it lands.
 
-Landed so far: `F10` (`commit --fsync`, `commit --table-output`) and `F1`, `F2`,
+Landed so far: `F10` (`commit --fsync`, `commit --table-output`), `F11` and
+`F12` (`checkout`'s union family and its two whiteout switches), and `F1`, `F2`,
 and `F3`, which together give `commit` its message, its metadata dict, and its
 ref bindings. The three carry one library change between them, in
 `ostrya-gvariant`: the crate gained the reading half of the GVariant text form
@@ -4976,6 +4977,53 @@ semantics, which stay with `F14`; the one difference there is what a refusal
 leaves behind, the tool's `-H` gate standing after the destination directory is
 made and the port's guard standing before it, which the `-H` divergence text
 records. The conformance run reported 704 cells and 281 passes after the item.
+
+`F12` gives `checkout` its two whiteout switches, `--whiteouts` and
+`--process-passthrough-whiteouts`. The library carried the Docker-style form
+already, and the item type-gated it: the per-name rule and the opaque-marker
+skip applied by name ahead of the file object's load, so they acted on a symlink
+entry too, where the tool acts on a regular-file entry alone. `checkout_dir`
+now loads the object once and hands it to the marker decision and to
+`checkout_file` alike, and the decision reads the entry's kind. The same path
+gained the two refusals a marker naming nothing carries, which the port reached
+as a silent no-op before: `.wh.` stripped to an empty target and
+`remove_dir_entry` over an empty name returned `ENOENT` and succeeded.
+
+The passthrough form is new. `CheckoutOptions` gained
+`process_passthrough_whiteouts`, and `place_whiteout_device` writes the
+character device 0:0 through `rustix::fs::mknodat` and `rustix::fs::makedev`,
+both already in the crate's `rustix` feature set, so the item adds no
+dependency and no `unsafe`. Creating a device with number 0:0 needs no
+capability, which `mknod c 0 0` proves against `mknod c 1 1` as its negative
+control, so the item needed no privileged host. The device's permission bits
+reach `mknod` and the process umask reduces them, and a checkout outside `-U`
+applies the recorded mode in full together with the marker's ownership and
+extended attributes, which is the tool's own sequence. One disposition parts
+from the union family: `--union-identical` keeps an existing entry of any type
+at a passthrough marker's target with no comparison, so the identity rule the
+mode applies everywhere else does not run there.
+
+Either switch alongside `--composefs` or `--composefs-noverity` is refused,
+under the tool's own words, so the composefs divergence the union family
+carries does not grow. `--whiteouts` widens the union-files disposition over a
+type conflict, for every entry and not only for a marker, and the port carries
+it: a destination entry whose type is not the type the tree carries is removed
+and the entry is written, at the destination root and at every depth below it,
+whatever the entry's type. `widens_type_conflict` in `checkout.rs` gates the
+two sites, `pre_check` and `create_dest_dir`, on the switch together with
+union-files, so the whiteout device keeps its refusal over a destination
+directory and the destination directory a file subpath needs keeps the
+symlink-following rule. The removal reuses the iterative subtree removal the
+file already carries. Two divergences stand, both in `cli-surface.md`,
+"checkout": the wording of the three refusals a marker reaches; and either
+switch given twice, which the tool takes and the port refuses as it refuses
+every repeated boolean flag. The `--allow-noent` reach divergence already
+named both switches and the item measured them, adding two arms to its citing
+test. `format-reference.md`, "Checkout" states the marker set, the two
+orderings, the type test per marker, the device's metadata and the order it is
+applied in, the disposition table, the widening, and the two refusals, and its
+`CAP_MKNOD` claim is struck. The conformance run reported 725 cells and 289
+passes after the item.
 
 #### Phase 17g -- P3 commands with no matrix weight
 

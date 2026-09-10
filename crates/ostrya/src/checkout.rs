@@ -5,8 +5,9 @@
 //! [`CheckoutOptions`] shapes it: the checkout mode ([`None`](CheckoutMode::None)
 //! or [`User`](CheckoutMode::User)), the overwrite policy over an existing
 //! destination, an optional subpath, whether to fsync, whether to force a copy
-//! over a hardlink, whether to process Docker-style whiteouts, an optional
-//! [`DevInoCache`] to populate, and an optional filter.
+//! over a hardlink, whether to process Docker-style whiteouts, whether to
+//! process overlayfs passthrough whiteouts, an optional [`DevInoCache`] to
+//! populate, and an optional filter.
 //!
 //! For each regular file the checkout hardlinks the loose object into place when
 //! the object's stored inode carries the metadata the destination needs, and
@@ -68,6 +69,9 @@ const OPAQUE_MARKER: &str = ".wh..wh..opq";
 /// The Docker-style whiteout name prefix; `.wh.<name>` removes `<name>` from the
 /// destination directory.
 const WHITEOUT_PREFIX: &str = ".wh.";
+/// The overlayfs passthrough whiteout name prefix; `.ostree-wh.<name>` becomes a
+/// character device 0:0 at `<name>`.
+const PASSTHROUGH_PREFIX: &str = ".ostree-wh.";
 
 /// How checkout applies ownership, permissions, and xattrs to materialized
 /// files.
@@ -136,6 +140,10 @@ pub struct CheckoutOptions {
     /// Process Docker-style whiteouts (`.wh.<name>` and `.wh..wh..opq`) instead
     /// of materializing them as ordinary files.
     pub process_whiteouts: bool,
+    /// Process overlayfs passthrough whiteouts: a regular-file entry named
+    /// `.ostree-wh.<name>` becomes a character device 0:0 at `<name>` instead of
+    /// an ordinary file under its own name.
+    pub process_passthrough_whiteouts: bool,
     /// A devino cache to populate: each regular file's destination
     /// `(st_dev, st_ino)` is recorded against its checksum as it is written or
     /// linked.
@@ -153,6 +161,7 @@ impl Default for CheckoutOptions {
             enable_fsync: false,
             force_copy: false,
             process_whiteouts: false,
+            process_passthrough_whiteouts: false,
             devino_cache: None,
             filter: None,
         }
@@ -216,7 +225,12 @@ impl Repo {
             Target::Dir { dirtree, dirmeta } => {
                 let dm = self.load_dirmeta(&dirmeta).await?;
                 let (dir_fd, fresh) = match &name {
-                    Some(n) => create_dest_dir(parent_fd.as_fd(), n, policy.overwrite)?,
+                    Some(n) => create_dest_dir(
+                        parent_fd.as_fd(),
+                        n,
+                        policy.overwrite,
+                        widens_type_conflict(policy),
+                    )?,
                     None => (parent_fd.as_fd().try_clone_to_owned()?, false),
                 };
                 checkout_dir(
@@ -240,18 +254,12 @@ impl Repo {
                 let dir_name = name.ok_or_else(|| {
                     Error::Checkout("a file subpath needs a named destination directory".into())
                 })?;
+                // The destination directory a file target needs is outside the
+                // reach of the whiteout switch's widening.
                 let (dir_fd, _fresh) =
-                    create_dest_dir(parent_fd.as_fd(), &dir_name, policy.overwrite)?;
-                checkout_file(
-                    self,
-                    opts,
-                    policy,
-                    dir_fd.as_fd(),
-                    &entry_name,
-                    &checksum,
-                    "/",
-                )
-                .await?;
+                    create_dest_dir(parent_fd.as_fd(), &dir_name, policy.overwrite, false)?;
+                let obj = self.load_file(&checksum).await?;
+                checkout_entry(self, opts, policy, dir_fd.as_fd(), &entry_name, &obj, "/").await?;
                 if policy.enable_fsync {
                     fsync_dir(dir_fd).await?;
                 }
@@ -405,31 +413,25 @@ fn checkout_dir<'a>(
         let dirtree = repo.load_dirtree(&dirtree_csum).await?;
 
         // An opaque marker clears the destination directory before the committed
-        // entries are written. Over a fresh (empty) destination this is a no-op.
-        if policy.process_whiteouts && dirtree.files.iter().any(|(n, _)| n == OPAQUE_MARKER) {
+        // entries are written. A fresh directory was just created and holds
+        // nothing, so the clear has nothing to do there.
+        if !fresh
+            && policy.process_whiteouts
+            && dirtree.files.iter().any(|(n, _)| n == OPAQUE_MARKER)
+        {
             let d = dir_fd.as_fd().try_clone_to_owned()?;
             ostrya_rt::unblock(move || clear_dir(d.as_fd())).await?;
         }
 
         for (name, checksum) in &dirtree.files {
-            if policy.process_whiteouts {
-                if name == OPAQUE_MARKER {
-                    continue;
-                }
-                if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) {
-                    let d = dir_fd.as_fd().try_clone_to_owned()?;
-                    let target = target.to_owned();
-                    ostrya_rt::unblock(move || remove_dir_entry(d.as_fd(), &target)).await?;
-                    continue;
-                }
-            }
-            checkout_file(
+            let obj = repo.load_file(checksum).await?;
+            checkout_entry(
                 repo,
                 &mut *opts,
                 policy,
                 dir_fd.as_fd(),
                 name,
-                checksum,
+                &obj,
                 &base_path,
             )
             .await?;
@@ -449,7 +451,12 @@ fn checkout_dir<'a>(
                     continue;
                 }
             }
-            let (child_fd, child_fresh) = create_dest_dir(dir_fd.as_fd(), name, policy.overwrite)?;
+            let (child_fd, child_fresh) = create_dest_dir(
+                dir_fd.as_fd(),
+                name,
+                policy.overwrite,
+                widens_type_conflict(policy),
+            )?;
             checkout_dir(
                 repo,
                 &mut *opts,
@@ -480,6 +487,34 @@ fn checkout_dir<'a>(
     })
 }
 
+/// Act on one file entry of a tree: the whiteout verdict where a switch claims
+/// the name, and the plain materialization otherwise.
+///
+/// A `--subpath` naming a marker file reaches the same decision, so a marker is
+/// never materialized under its own name because a subpath selected it. The
+/// opaque marker's clear is the directory walk's own pre-pass, so a subpath
+/// naming `.wh..wh..opq` drops the entry and clears nothing, which is the tool's
+/// own outcome (`format-reference.md`, "Checkout").
+async fn checkout_entry(
+    repo: &Repo,
+    opts: &mut CheckoutOptions,
+    policy: Policy,
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+    obj: &FileObject,
+    base_path: &str,
+) -> Result<()> {
+    match whiteout_verdict(policy, name, obj)? {
+        Some(Whiteout::Drop) => Ok(()),
+        Some(Whiteout::Remove(target)) => {
+            let d = dir_fd.try_clone_to_owned()?;
+            ostrya_rt::unblock(move || remove_dir_entry(d.as_fd(), &target)).await
+        }
+        Some(Whiteout::Device(target)) => place_whiteout_device(policy, dir_fd, &target, obj).await,
+        None => checkout_file(repo, opts, policy, dir_fd, name, obj, base_path).await,
+    }
+}
+
 /// Materialize one file or symlink entry, after the filter.
 async fn checkout_file(
     repo: &Repo,
@@ -487,10 +522,9 @@ async fn checkout_file(
     policy: Policy,
     dir_fd: BorrowedFd<'_>,
     name: &str,
-    checksum: &Checksum,
+    obj: &FileObject,
     base_path: &str,
 ) -> Result<()> {
-    let obj = repo.load_file(checksum).await?;
     if let Some(filter) = &mut opts.filter {
         let cb_path = join_path(base_path, name);
         let fm = FileMeta {
@@ -505,9 +539,184 @@ async fn checkout_file(
     }
     match &obj.kind {
         FileKind::Symlink { target } => {
-            place_symlink(repo, policy, dir_fd, name, &obj, target).await
+            place_symlink(repo, policy, dir_fd, name, obj, target).await
         }
-        FileKind::Regular { .. } => place_regular(repo, opts, policy, dir_fd, name, &obj).await,
+        FileKind::Regular { .. } => place_regular(repo, opts, policy, dir_fd, name, obj).await,
+    }
+}
+
+/// What the whiteout options make of one file entry.
+///
+/// Both marker sets act on a regular-file entry alone: an entry of any other
+/// type carrying a marker name is materialized verbatim, which is the tool's
+/// own outcome (`format-reference.md`, "Checkout"). The opaque marker's clear
+/// is decided separately, by name over the whole file-entry list, so a symlink
+/// so named clears the directory and is then materialized.
+enum Whiteout {
+    /// The opaque marker, whose clear has already run: suppress it.
+    Drop,
+    /// A per-name marker: remove this name from the destination directory and
+    /// materialize nothing.
+    Remove(String),
+    /// A passthrough marker: write a character device 0:0 under this name.
+    Device(String),
+}
+
+/// The whiteout verdict for one file entry, or `None` where the entry is
+/// materialized as it stands. A marker naming nothing is refused.
+fn whiteout_verdict(policy: Policy, name: &str, obj: &FileObject) -> Result<Option<Whiteout>> {
+    if !matches!(obj.kind, FileKind::Regular { .. }) {
+        return Ok(None);
+    }
+    if policy.process_whiteouts {
+        if name == OPAQUE_MARKER {
+            return Ok(Some(Whiteout::Drop));
+        }
+        if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) {
+            if target.is_empty() {
+                return Err(Error::Checkout(format!(
+                    "{WHITEOUT_PREFIX}: the whiteout names no entry"
+                )));
+            }
+            return Ok(Some(Whiteout::Remove(target.to_owned())));
+        }
+    }
+    if policy.process_passthrough_whiteouts
+        && let Some(target) = name.strip_prefix(PASSTHROUGH_PREFIX)
+    {
+        if target.is_empty() {
+            return Err(Error::Checkout(format!(
+                "{PASSTHROUGH_PREFIX}: the overlayfs whiteout names no entry"
+            )));
+        }
+        return Ok(Some(Whiteout::Device(target.to_owned())));
+    }
+    Ok(None)
+}
+
+/// Materialize an overlayfs passthrough whiteout: a character device 0:0 under
+/// the marker's target name.
+///
+/// The device takes the marker's permission bits, and under
+/// [`None`](CheckoutMode::None) its ownership and its extended attributes as
+/// well. The bits reach `mknodat`, so the process umask reduces them exactly as
+/// it reduces the tool's; [`None`](CheckoutMode::None) then applies the recorded
+/// mode in full, so the umask stands under [`User`](CheckoutMode::User) alone.
+///
+/// [`UnionIdentical`](OverwriteMode::UnionIdentical) keeps an existing entry of
+/// any type here, with no comparison, which is the one place the identity rule
+/// does not run. Recovered by checking a passthrough marker out over a
+/// destination holding a regular file, a symlink, a directory, and a device
+/// (`format-reference.md`, "Checkout").
+async fn place_whiteout_device(
+    policy: Policy,
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+    obj: &FileObject,
+) -> Result<()> {
+    // The whiteout device keeps its refusal over a destination directory under
+    // either switch, so the widening does not reach it.
+    let remove_existing = match pre_check(dir_fd, name, policy.overwrite, false)? {
+        Disposition::Skip | Disposition::Check(_) => return Ok(()),
+        Disposition::Error => return Err(collision(name)),
+        Disposition::Place => false,
+        Disposition::Overwrite => true,
+    };
+
+    let plan = PlaceWhiteoutDevice {
+        dir: dir_fd.try_clone_to_owned()?,
+        name: name.to_owned(),
+        effective: policy.effective,
+        uid: obj.uid,
+        gid: obj.gid,
+        mode: obj.mode & PERM_MASK,
+        xattrs: obj.xattrs.clone(),
+        remove_existing,
+    };
+    ostrya_rt::unblock(move || place_whiteout_device_blocking(plan)).await
+}
+
+/// The blocking half of [`place_whiteout_device`].
+struct PlaceWhiteoutDevice {
+    dir: OwnedFd,
+    name: String,
+    effective: CheckoutMode,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    xattrs: Xattrs,
+    remove_existing: bool,
+}
+
+/// Create the whiteout device and apply its checkout-mode metadata.
+fn place_whiteout_device_blocking(plan: PlaceWhiteoutDevice) -> Result<()> {
+    if plan.remove_existing {
+        remove_dir_entry(plan.dir.as_fd(), &plan.name)?;
+    }
+    match rustix::fs::mknodat(
+        plan.dir.as_fd(),
+        plan.name.as_str(),
+        FileType::CharacterDevice,
+        Mode::from_raw_mode(plan.mode),
+        rustix::fs::makedev(0, 0),
+    ) {
+        Ok(()) => {}
+        Err(Errno::EXIST) => return Err(collision(&plan.name)),
+        Err(e) => return Err(e.into()),
+    }
+    if plan.effective == CheckoutMode::None {
+        // The order is the one `apply_regular_metadata` takes, and the tool's:
+        // the attributes, then the ownership, then the mode. `chown` on a device
+        // node clears the setuid and setgid bits for an unprivileged caller even
+        // where the ids do not change, so the recorded mode is applied after the
+        // ownership. The attributes come first, so a marker whose attribute the
+        // kernel refuses leaves the device at the mode `mknod` gave it, which is
+        // the tool's own outcome (`format-reference.md`, "Checkout").
+        for (name, value) in plan.xattrs.iter() {
+            crate::write::set_link_xattr(plan.dir.as_fd(), &plan.name, name, value).map_err(
+                |err| {
+                    Error::Checkout(format!(
+                        "{}: setting the extended attribute {}: {}",
+                        plan.name,
+                        xattr_name(name),
+                        reason(err),
+                    ))
+                },
+            )?;
+        }
+        rustix::fs::chownat(
+            plan.dir.as_fd(),
+            plan.name.as_str(),
+            Some(Uid::from_raw(plan.uid)),
+            Some(Gid::from_raw(plan.gid)),
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        rustix::fs::chmodat(
+            plan.dir.as_fd(),
+            plan.name.as_str(),
+            Mode::from_raw_mode(plan.mode),
+            AtFlags::empty(),
+        )?;
+    }
+    Ok(())
+}
+
+/// An extended attribute's name for a message: the stored name without its
+/// terminating NUL, and lossily where it is not UTF-8.
+fn xattr_name(name: &[u8]) -> String {
+    String::from_utf8_lossy(name.strip_suffix(&[0]).unwrap_or(name)).into_owned()
+}
+
+/// An error's own words for a message a caller wraps, with the numeric tail an
+/// I/O error carries left off.
+fn reason(err: Error) -> String {
+    let text = match &err {
+        Error::Io(io) => io.to_string(),
+        other => other.to_string(),
+    };
+    match text.find(" (os error ") {
+        Some(cut) => text[..cut].to_owned(),
+        None => text,
     }
 }
 
@@ -522,18 +731,19 @@ async fn place_regular(
     obj: &FileObject,
 ) -> Result<()> {
     let checksum = obj.checksum();
-    let remove_existing = match pre_check(dir_fd, name, policy.overwrite)? {
-        Disposition::Skip => return Ok(()),
-        Disposition::Error => return Err(collision(name)),
-        Disposition::Place => false,
-        Disposition::Overwrite => true,
-        Disposition::Check(st) => {
-            if destination_is_identical(repo, policy, dir_fd, name, &st, obj).await? {
-                return Ok(());
+    let remove_existing =
+        match pre_check(dir_fd, name, policy.overwrite, widens_type_conflict(policy))? {
+            Disposition::Skip => return Ok(()),
+            Disposition::Error => return Err(collision(name)),
+            Disposition::Place => false,
+            Disposition::Overwrite => true,
+            Disposition::Check(st) => {
+                if destination_is_identical(repo, policy, dir_fd, name, &st, obj).await? {
+                    return Ok(());
+                }
+                return Err(collision(name));
             }
-            return Err(collision(name));
-        }
-    };
+        };
 
     // A cross-filesystem link (EXDEV) yields None and falls back to the copy
     // path below.
@@ -576,18 +786,19 @@ async fn place_symlink(
     target: &str,
 ) -> Result<()> {
     let checksum = obj.checksum();
-    let remove_existing = match pre_check(dir_fd, name, policy.overwrite)? {
-        Disposition::Skip => return Ok(()),
-        Disposition::Error => return Err(collision(name)),
-        Disposition::Place => false,
-        Disposition::Overwrite => true,
-        Disposition::Check(st) => {
-            if destination_is_identical(repo, policy, dir_fd, name, &st, obj).await? {
-                return Ok(());
+    let remove_existing =
+        match pre_check(dir_fd, name, policy.overwrite, widens_type_conflict(policy))? {
+            Disposition::Skip => return Ok(()),
+            Disposition::Error => return Err(collision(name)),
+            Disposition::Place => false,
+            Disposition::Overwrite => true,
+            Disposition::Check(st) => {
+                if destination_is_identical(repo, policy, dir_fd, name, &st, obj).await? {
+                    return Ok(());
+                }
+                return Err(collision(name));
             }
-            return Err(collision(name));
-        }
-    };
+        };
 
     if hardlink_symlink(policy)
         && try_link_object(repo, policy, dir_fd, name, checksum, remove_existing)
@@ -636,7 +847,16 @@ enum Disposition {
 /// Decide how to treat a destination entry given the overwrite mode.
 /// [`UnionIdentical`](OverwriteMode::UnionIdentical) defers to
 /// [`destination_is_identical`], which the caller runs over the returned stat.
-fn pre_check(dir_fd: BorrowedFd<'_>, name: &str, overwrite: OverwriteMode) -> Result<Disposition> {
+///
+/// `widen_type_conflict` carries [`widens_type_conflict`] for the entry sites
+/// the switch reaches. The whiteout device is not one of them, so it passes
+/// `false` and keeps its refusal over a destination directory.
+fn pre_check(
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+    overwrite: OverwriteMode,
+    widen_type_conflict: bool,
+) -> Result<Disposition> {
     let st = match rustix::fs::statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) => st,
         Err(Errno::NOENT) => return Ok(Disposition::Place),
@@ -649,8 +869,9 @@ fn pre_check(dir_fd: BorrowedFd<'_>, name: &str, overwrite: OverwriteMode) -> Re
             // over the name) but cannot rename a file or symlink over a
             // directory: a directory where the commit carries a non-directory is
             // a conflict it errors on (`renameat(...): Is a directory`), not a
-            // subtree to remove.
-            if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
+            // subtree to remove. `--whiteouts` widens the disposition, and the
+            // directory and its whole subtree are then removed.
+            if FileType::from_raw_mode(st.st_mode) == FileType::Directory && !widen_type_conflict {
                 Disposition::Error
             } else {
                 Disposition::Overwrite
@@ -787,18 +1008,22 @@ async fn hash_destination_file(
 /// there, which is the tool's outcome. A link resolving to nothing, to a
 /// non-directory, or to itself carries the open's own error. See
 /// `format-reference.md`, "Checkout".
+///
+/// `widen_type_conflict` carries [`widens_type_conflict`] for the directory
+/// sites the switch reaches: the destination root of a directory target and
+/// every directory of the walk below it. The entry standing there is removed
+/// and a directory is created in its place, so a symlink loses the link alone
+/// and the directory it resolved to stays as it stands. The destination
+/// directory a file target needs is not one of the sites, so it passes `false`
+/// and keeps the symlink-following rule above.
 fn create_dest_dir(
     parent: BorrowedFd<'_>,
     name: &str,
     overwrite: OverwriteMode,
+    widen_type_conflict: bool,
 ) -> Result<(OwnedFd, bool)> {
     match rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(TRANSIENT_DIR_MODE)) {
-        Ok(()) => {
-            let fd = open_dir(parent, name)?;
-            // Override the umask so the directory is writable while populated.
-            rustix::fs::fchmod(&fd, Mode::from_raw_mode(TRANSIENT_DIR_MODE))?;
-            Ok((fd, true))
-        }
+        Ok(()) => Ok((open_fresh_dir(parent, name)?, true)),
         Err(Errno::EXIST) => {
             // The name is taken. The tool reuses a like-typed directory,
             // merging its subtree, but never changes an entry's type: a name
@@ -807,6 +1032,11 @@ fn create_dest_dir(
             // error rather than letting the directory open below surface a raw
             // ENOTDIR (or ELOOP for a symlink).
             let st = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if FileType::from_raw_mode(st.st_mode) != FileType::Directory && widen_type_conflict {
+                unlink_entry(parent, name, false)?;
+                rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(TRANSIENT_DIR_MODE))?;
+                return Ok((open_fresh_dir(parent, name)?, true));
+            }
             if overwrite != OverwriteMode::None && is_symlink(st.st_mode) {
                 return Ok((open_dir_following(parent, name)?, false));
             }
@@ -824,6 +1054,14 @@ fn create_dest_dir(
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Open a directory just created under `parent`, overriding the umask so it is
+/// writable while its children are materialized.
+fn open_fresh_dir(parent: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
+    let fd = open_dir(parent, name)?;
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(TRANSIENT_DIR_MODE))?;
+    Ok(fd)
 }
 
 /// Whether an `st_mode` names a symlink.
@@ -1104,27 +1342,102 @@ fn recreate_symlink_blocking(plan: RecreateSymlink) -> Result<()> {
 /// Remove a destination entry, recursing into a directory. A missing entry is
 /// not an error.
 fn remove_dir_entry(dir: BorrowedFd<'_>, name: &str) -> Result<()> {
-    let st = match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(st) => st,
-        Err(Errno::NOENT) => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
-        let child = open_dir(dir, name)?;
-        clear_dir(child.as_fd())?;
-        drop(child);
-        rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR)?;
+    match entry_is_dir(dir, name)? {
+        None => Ok(()),
+        Some(false) => unlink_entry(dir, name, false),
+        Some(true) => remove_subtree(dir, name),
+    }
+}
+
+/// Whether `name` under `dir` is a directory, or `None` where the name is not
+/// taken.
+fn entry_is_dir(dir: BorrowedFd<'_>, name: &str) -> Result<Option<bool>> {
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => Ok(Some(
+            FileType::from_raw_mode(st.st_mode) == FileType::Directory,
+        )),
+        Err(Errno::NOENT) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Unlink `name` under `dir`. A name that is already gone is not an error.
+fn unlink_entry(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
+    let flags = if is_dir {
+        AtFlags::REMOVEDIR
     } else {
-        rustix::fs::unlinkat(dir, name, AtFlags::empty())?;
+        AtFlags::empty()
+    };
+    match rustix::fs::unlinkat(dir, name, flags) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Remove `name` under `dir` and everything below it.
+///
+/// The removal is a loop over an explicit stack of levels, and one directory
+/// descriptor stands open at a time: descending replaces the level's descriptor
+/// with the child's, and ascending replaces it with the one `..` opens, which
+/// names the parent while the emptied level is still linked where it was
+/// opened. Depth costs a name and an entry list on the heap, so a destination
+/// subtree deeper than the process descriptor limit or than the thread stack
+/// holds is removed whole.
+fn remove_subtree(dir: BorrowedFd<'_>, name: &str) -> Result<()> {
+    let mut level = open_dir(dir, name)?;
+    // One entry per level on the path from `name` down to the level in hand:
+    // the level's own name, and what is left to remove within it.
+    let mut levels = vec![(name.to_owned(), read_level(level.as_fd())?)];
+
+    while let Some((_, entries)) = levels.last_mut() {
+        match entries.pop() {
+            Some((child, false)) => unlink_entry(level.as_fd(), &child, false)?,
+            Some((child, true)) => {
+                let child_fd = match open_dir(level.as_fd(), &child) {
+                    Ok(fd) => fd,
+                    // The child is gone, which the removal wanted anyway.
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                let child_entries = read_level(child_fd.as_fd())?;
+                level = child_fd;
+                levels.push((child, child_entries));
+            }
+            None => {
+                let (cleared, _) = levels.pop().expect("a level is in hand within the loop");
+                if levels.is_empty() {
+                    drop(level);
+                    return unlink_entry(dir, &cleared, true);
+                }
+                level = open_dir(level.as_fd(), "..")?;
+                unlink_entry(level.as_fd(), &cleared, true)?;
+            }
+        }
     }
     Ok(())
 }
 
-/// Remove every entry of a directory, recursing into subdirectories. Names are
-/// collected before removal so the iteration is not disturbed by the unlinks.
+/// Remove every entry of a directory, recursing into subdirectories. The names
+/// are collected before the removal so the iteration is not disturbed by the
+/// unlinks.
 fn clear_dir(dir: BorrowedFd<'_>) -> Result<()> {
-    let mut names = Vec::new();
-    for entry in Dir::read_from(dir)? {
+    for (name, is_dir) in read_level(dir)? {
+        if is_dir {
+            remove_subtree(dir, &name)?;
+        } else {
+            unlink_entry(dir, &name, false)?;
+        }
+    }
+    Ok(())
+}
+
+/// The entries of one directory, each with whether it is a directory.
+///
+/// The type comes from one `statat` per name, and a name that is gone by the
+/// time that call runs is left out.
+fn read_level(level: BorrowedFd<'_>) -> Result<Vec<(String, bool)>> {
+    let mut entries = Vec::new();
+    for entry in Dir::read_from(level)? {
         let entry = entry?;
         let name = entry.file_name();
         if name == c"." || name == c".." {
@@ -1134,12 +1447,13 @@ fn clear_dir(dir: BorrowedFd<'_>) -> Result<()> {
             .to_str()
             .map_err(|_| Error::InvalidFormat("directory entry name is not valid UTF-8".into()))?
             .to_owned();
-        names.push(name);
+        let is_dir = match entry_is_dir(level, &name)? {
+            Some(is_dir) => is_dir,
+            None => continue,
+        };
+        entries.push((name, is_dir));
     }
-    for name in &names {
-        remove_dir_entry(dir, name)?;
-    }
-    Ok(())
+    Ok(entries)
 }
 
 /// Fsync a directory on the blocking pool.
@@ -1168,6 +1482,7 @@ struct Policy {
     overwrite: OverwriteMode,
     enable_fsync: bool,
     process_whiteouts: bool,
+    process_passthrough_whiteouts: bool,
 }
 
 impl Policy {
@@ -1185,6 +1500,7 @@ impl Policy {
             overwrite: opts.overwrite,
             enable_fsync: opts.enable_fsync,
             process_whiteouts: opts.process_whiteouts,
+            process_passthrough_whiteouts: opts.process_passthrough_whiteouts,
         }
     }
 }
@@ -1211,6 +1527,16 @@ fn hardlink_symlink(policy: Policy) -> bool {
     !policy.force_copy
         && policy.repo_mode == RepoMode::Bare
         && policy.requested == CheckoutMode::None
+}
+
+/// Whether the whiteout switch widens the union-files disposition over a type
+/// conflict, so a destination entry whose type is not the type the tree carries
+/// is removed rather than refused. `process_whiteouts` widens
+/// [`UnionFiles`](OverwriteMode::UnionFiles) alone, and
+/// `process_passthrough_whiteouts` widens nothing. See `format-reference.md`,
+/// "Checkout".
+fn widens_type_conflict(policy: Policy) -> bool {
+    policy.process_whiteouts && policy.overwrite == OverwriteMode::UnionFiles
 }
 
 /// `CheckoutOptions` moves freely across tasks and threads, so the recursive

@@ -2782,7 +2782,8 @@ loss: a repeated boolean flag. The tool takes a second occurrence of `--union`
  and checks out as it does for one. The port refuses it at exit 1 and creates
  no destination, as it refuses every repeated boolean flag in its CLI
  (`cli-surface.md`, "P2"). The same holds for `--union-add`,
- `--union-identical`, and `--allow-noent`.
+ `--union-identical`, `--allow-noent`, `--whiteouts`, and
+ `--process-passthrough-whiteouts`.
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: the two reach different exit statuses, so no oracle reads the pair. The
  absolute claims state each side.
@@ -2939,6 +2940,352 @@ note: the two facts an exit status does not hold. With `--allow-noent` and a
  subpath that names nothing, neither implementation creates the destination,
  and a destination that already existed is left byte for byte and at the mode
  it carried. The cited test states both over a destination it pre-populates.
+
+# ---------------------------------------------------------------------------
+# checkout -- the two whiteout switches (Phase 17f). The corpus the setup
+# commits holds no marker name, so the acceptance and the refusals run and the
+# cells that state a marker outcome cite the test that walks both
+# implementations' destinations.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-accepted
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --whiteouts $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: the switch is taken and writes no line. The corpus carries no marker name,
+ so the tree the two write is the tree the switch-free checkout writes; the
+ marker rules themselves are the cells below.
+
+family: M10
+subcommand: checkout
+cell: checkout/passthrough-whiteouts-accepted
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --process-passthrough-whiteouts $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: the second switch, on the same terms as the cell above. The two switches
+ are independent: each reads its own marker names and no others.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-with-composefs
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO --composefs --whiteouts $REV $SCRATCH/img
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Specified options are incompatible with --composefs"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Specified options are incompatible with --composefs"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: a whiteout switch describes a transformation of the tree a checkout
+ writes, and a composefs export writes an image of the commit tree. Both
+ implementations refuse the pair at exit 1 under the same words and write no
+ image. `--composefs-noverity` refuses the same way.
+
+family: M10
+subcommand: checkout
+cell: checkout/passthrough-whiteouts-with-composefs
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO --composefs --process-passthrough-whiteouts $REV $SCRATCH/img
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Specified options are incompatible with --composefs"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Specified options are incompatible with --composefs"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: the second switch, on the same terms as the cell above.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-given-twice
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --whiteouts --whiteouts $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag. The tool takes a second occurrence of
+ `--whiteouts` and checks out as it does for one. The port refuses it at exit 1
+ and creates no destination, as it refuses every repeated boolean flag in its
+ CLI (`cli-surface.md`, "P2"). `--process-passthrough-whiteouts` behaves the
+ same way, which the cited test states for both.
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+evidence: ostrya_cli::cli::checkout_union_options_are_mutually_exclusive
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ absolute claims state each side.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-remove-and-drop-the-marker
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteouts_match_the_tool
+spec: format-reference.md#checkout
+note: a regular-file entry named `.wh.<name>` removes `<name>` from the
+ destination directory and is not materialized. The removal is in order among
+ the directory's file entries, so a marker sorting after its target removes the
+ entry this same checkout wrote, and a marker sorting before it leaves the
+ target the checkout writes afterwards. The cited test states both against the
+ tool's own destination.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-marker-naming-an-absent-entry
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteouts_match_the_tool
+spec: format-reference.md#checkout
+note: a marker whose target the destination does not hold exits 0, removes
+ nothing, and materializes nothing.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-remove-a-directory-subtree
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteouts_match_the_tool
+spec: format-reference.md#checkout
+note: the removal reaches an entry of any type and recurses into a directory,
+ taking the whole subtree. File entries are materialized before directory
+ entries, so a marker never removes a directory the same tree writes at the
+ marker's target name.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-opaque-marker-clears-the-directory
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteouts_match_the_tool
+spec: format-reference.md#checkout
+note: an entry named `.wh..wh..opq` clears the destination directory before any
+ of the directory's entries is written, so an entry the commit also carries
+ arrives fresh whatever the union mode keeps.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-are-union-mode-independent
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_passthrough_whiteout_dispositions_match_the_tool,
+ ostrya_cli::cli::checkout_whiteouts_match_the_tool
+spec: format-reference.md#checkout
+note: the per-name removal and the opaque clear ignore the union mode, and each
+ removes an entry of any type. The first cited test states the per-name removal
+ over six destination pre-states under no union option, `--union`,
+ `--union-add`, and `--union-identical`. The second states the removal and the
+ opaque clear over eight pre-states in three repository modes under no union
+ option, `--union`, and `--union-add`; `--union-identical` needs a destination
+ the pre-states do not differ from, so the sweep leaves it out.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteout-markers-are-regular-files-only
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteout_markers_act_on_regular_files_only
+spec: format-reference.md#checkout
+note: the per-name and passthrough marker names act on a regular-file entry
+ alone. A symlink or a directory carrying such a name is materialized verbatim
+ and acts on nothing. The opaque clear is decided by the name across the whole
+ file-entry list, so a symlink named `.wh..wh..opq` clears the directory and is
+ then materialized while a directory so named clears nothing.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-off-materialize-the-markers
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteouts_off_materialize_the_markers
+spec: format-reference.md#checkout
+note: with neither switch every marker is an ordinary entry under its own name
+ and nothing is removed, which is the default both implementations take.
+
+family: M10
+subcommand: checkout
+cell: checkout/passthrough-whiteouts-write-a-char-0-0-device
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_passthrough_whiteouts_match_the_tool
+spec: format-reference.md#checkout
+note: a regular-file entry named `.ostree-wh.<name>` becomes a character device
+ with device number 0:0 at `<name>` and is not materialized under its own name.
+ The marker's content is ignored and the rule holds at any depth. Device number
+ 0:0 needs no capability, so the cell runs unprivileged.
+
+family: M10
+subcommand: checkout
+cell: checkout/passthrough-whiteouts-keep-the-marker-mode
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_passthrough_whiteouts_match_the_tool
+spec: format-reference.md#checkout
+note: the device takes the marker's permission bits, and outside `-U` the
+ marker's ownership as well. The bits reach `mknod`, so the process umask
+ reduces them in both implementations, and a checkout outside `-U` then applies
+ the recorded mode in full, after the ownership: a chown on a device node clears
+ the setuid and setgid bits, which the cited test states with a 04755 and a
+ 02755 marker. The marker's extended attributes are applied ahead of both, which
+ a `user.` attribute turns into a refusal on both sides;
+ `format-reference.md`, "Checkout" states that rule and the library test
+ `ostrya::checkout::passthrough_whiteout_xattrs_reach_the_device` holds it,
+ since a CLI-level case would need a tool the suite does not carry to write the
+ attribute.
+
+family: M10
+subcommand: checkout
+cell: checkout/passthrough-whiteouts-over-an-existing-entry
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_passthrough_whiteout_dispositions_match_the_tool
+spec: format-reference.md#checkout
+note: the destination disposition per union mode. `--union` unlinks an existing
+ regular file, symlink, or device and creates the device; `--union-add` and
+ `--union-identical` keep an existing entry of any type. `--union-identical`
+ applies no identity comparison to a passthrough whiteout, which is the one
+ place its identity rule does not run.
+
+family: M10
+subcommand: checkout
+cell: checkout/passthrough-whiteouts-over-a-directory
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_passthrough_whiteout_dispositions_match_the_tool
+spec: format-reference.md#checkout
+note: a passthrough marker whose target the destination holds as a directory is
+ refused under `--union` at exit 1, and the destination keeps the directory and
+ everything the walk had already written. The words part: the tool reports
+ `unlink(<name>): Is a directory` and the port its own `<name>: destination
+ entry already exists`, which cli-surface.md, "P2" records, so each side states
+ its own text.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteout-empty-name-refused
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteout_empty_names_are_refused
+spec: format-reference.md#checkout
+note: a regular file named exactly `.wh.` names no entry and is refused at exit
+ 1 under `--whiteouts`. The refusal comes mid-walk, so the destination
+ directory stands and holds what the walk had already written. Without the
+ switch the entry is an ordinary file, and a symlink so named is materialized
+ under every switch. The words part: the tool reports `Invalid empty whiteout
+ ''` and the port its own `.wh.: the whiteout names no entry`.
+
+family: M10
+subcommand: checkout
+cell: checkout/passthrough-whiteout-empty-name-refused
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteout_empty_names_are_refused
+spec: format-reference.md#checkout
+note: a regular file named exactly `.ostree-wh.` is refused at exit 1 under
+ `--process-passthrough-whiteouts`, on the same terms as the cell above. Each
+ refusal answers to its own switch alone. The words part: the tool reports
+ `Invalid empty overlayfs whiteout ''` and the port its own `.ostree-wh.: the
+ overlayfs whiteout names no entry`.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-and-passthrough-together
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_passthrough_whiteouts_match_the_tool
+spec: format-reference.md#checkout
+note: the two switches given together read their own marker names and no
+ others, and the outcome is the outcome of each applied to its own names. The
+ marker set is independent of the repository mode, of `-U`, and of `-C`, and of
+ `-H` wherever the repository mode can hardlink into the checkout mode. The
+ cited test states the pair in `archive`, `bare-user`, and `bare`, under `-U`
+ and outside it, with and without `-C`, and with `-H` in the two modes that
+ take it.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-under-a-subpath-naming-a-marker
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteouts_under_a_subpath_match_the_tool
+spec: format-reference.md#checkout
+note: a `--subpath` naming a marker file reaches the marker rules, so the marker
+ is not materialized under its own name: `.wh.<name>` removes `<name>` from the
+ destination the subpath writes into, `.ostree-wh.<name>` writes the device, and
+ `.wh.` and `.ostree-wh.` keep their refusals at exit 1. The opaque marker's
+ clear is the directory walk's own pre-pass, so a subpath naming `.wh..wh..opq`
+ drops the entry and clears nothing. The cited test states the five values
+ against the tool's own destination.
+
+family: M10
+subcommand: checkout
+cell: checkout/whiteouts-widen-a-union-type-conflict
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_whiteouts_widen_a_union_type_conflict
+spec: format-reference.md#checkout
+note: `--whiteouts` widens the union-files disposition over a type conflict, for
+ every entry and not only for a marker. Under `--union` with the switch a
+ destination entry whose type is not the type the tree carries at that name is
+ removed and the entry is written, at exit 0: a directory and its whole
+ subtree, empty or populated, where the tree carries a regular file or a
+ symlink, and a regular file, a symlink of any kind, a fifo, a device, or a
+ socket where the tree carries a directory. A symlink loses the link alone, so
+ the directory a link to a directory resolved to stays as it stands and
+ receives nothing. The rule reaches the destination root and every depth below
+ it, and the checkout mode, the repository mode, and `--subpath` make no
+ difference. The destination directory a file subpath needs stands outside it,
+ refusing a destination that is not a directory under either switch. The switch
+ widens union-files alone: `--union-add` and `--union-identical` keep their own
+ disposition, `--process-passthrough-whiteouts` widens nothing, and the
+ whiteout device refuses a destination directory under either switch. The tree
+ the cited test checks out holds no marker name, so the widening answers to the
+ switch and not to a marker.
 
 # ---------------------------------------------------------------------------
 # show -- the commit report, the raw variant, the metadata modes, and the

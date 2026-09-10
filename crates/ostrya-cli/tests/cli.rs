@@ -18900,6 +18900,10 @@ fn set_user_xattr(path: &Path, name: &str, value: &str) -> bool {
 /// `bare-user` object hardlinked under `-U` carries `user.ostreemeta` in both,
 /// which no `-U` checkout applies itself.
 ///
+/// An entry that is a device, a fifo, or a socket renders its type, its
+/// permission bits, and its device number, so a whiteout character device and
+/// an empty regular file of the same name do not compare equal.
+///
 /// A root that does not exist renders one line saying so, so a case whose
 /// claim is that neither implementation created the destination compares.
 fn describe_tree_with_content(root: &Path) -> Vec<String> {
@@ -18931,7 +18935,7 @@ fn describe_tree_with_content(root: &Path) -> Vec<String> {
             } else if ty.is_dir() {
                 out.push(format!("{rel} dir {perm:o}"));
                 walk(&entry.path(), &format!("{rel}/"), out);
-            } else {
+            } else if ty.is_file() {
                 assert!(
                     meta.len() <= 4096,
                     "{rel} is {} bytes; this walker renders content in full",
@@ -18939,6 +18943,23 @@ fn describe_tree_with_content(root: &Path) -> Vec<String> {
                 );
                 let content = std::fs::read(entry.path()).unwrap();
                 out.push(format!("{rel} file {perm:o} {}", hex(&content)));
+            } else {
+                use std::os::unix::fs::FileTypeExt as _;
+
+                // A device, a fifo, or a socket reads as zero bytes, so the
+                // regular-file arm would render it as an empty file and a
+                // destination where one implementation wrote a whiteout device
+                // and the other an empty file would compare equal. The device
+                // number is rendered whole, and 0 is device 0:0.
+                if ty.is_char_device() {
+                    out.push(format!("{rel} chardev {perm:o} rdev {}", meta.rdev()));
+                } else if ty.is_block_device() {
+                    out.push(format!("{rel} blockdev {perm:o} rdev {}", meta.rdev()));
+                } else if ty.is_fifo() {
+                    out.push(format!("{rel} fifo {perm:o}"));
+                } else {
+                    out.push(format!("{rel} socket {perm:o}"));
+                }
             }
         }
     }
@@ -19215,8 +19236,8 @@ fn checkout_union_modes_match_the_tool() {
 /// needs `-H`.
 ///
 /// Carries `checkout/union-add-with-union-identical` and the ordering claim
-/// behind the other two pair cells, and the divergence
-/// `checkout/union-given-twice` records.
+/// behind the other two pair cells, and the divergences
+/// `checkout/union-given-twice` and `checkout/whiteouts-given-twice` record.
 #[test]
 fn checkout_union_options_are_mutually_exclusive() {
     if !ostree_available() {
@@ -19287,6 +19308,8 @@ fn checkout_union_options_are_mutually_exclusive() {
         "--union-add",
         "--union-identical",
         "--allow-noent",
+        "--whiteouts",
+        "--process-passthrough-whiteouts",
     ]
     .into_iter()
     .enumerate()
@@ -19537,6 +19560,1074 @@ fn checkout_allow_noent_matches_the_tool() {
     }
 }
 
+/// Create a character device 0:0 at `path`. Device number 0:0 is the overlayfs
+/// whiteout and its creation needs no capability, so this runs unprivileged.
+/// `mknod` is used because the test crate links no syscall wrapper.
+fn mknod_whiteout(path: &Path) {
+    let status = Command::new("mknod")
+        .arg(path)
+        .args(["c", "0", "0"])
+        .status()
+        .expect("run mknod");
+    assert!(status.success(), "mknod {} failed", path.display());
+}
+
+/// A fifo at `path`, for a destination entry of a type neither implementation
+/// writes.
+fn mkfifo_at(path: &Path) {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo {} failed", path.display());
+}
+
+/// The tree the whiteout tests check out. It carries a target for every marker
+/// and a marker of every type:
+///
+/// - regular-file per-name markers `.wh.present`, `.wh.absent`, `.wh.targetdir`,
+///   `.wh..a`, and `sub/.wh.present`;
+/// - a regular-file opaque marker `opqdir/.wh..wh..opq`;
+/// - regular-file passthrough markers `.ostree-wh.ptA` at 0644,
+///   `.ostree-wh.pt755` at 0755, `.ostree-wh.ptsuid` at 04755,
+///   `.ostree-wh.ptsgid` at 02755, and `sub/.ostree-wh.nested`;
+/// - a directory named `.wh.dirmarker` and a directory named
+///   `.ostree-wh.adir`, neither of which is a marker;
+/// - a symlink named `.wh.slink` and a symlink named `.ostree-wh.alink`,
+///   neither of which is a marker.
+///
+/// The removal order is stated by two pairs. `.wh.present` sorts before
+/// `present`, so the marker removes the destination's entry and the commit's
+/// own `present` is written afterwards; `.wh..a` sorts after `.a`, so the
+/// marker removes the `.a` this same checkout wrote and the destination holds
+/// neither. `.wh.targetdir` names a directory the same commit writes, and files
+/// are iterated before directories, so the removal is of the destination's
+/// `targetdir` alone.
+///
+/// The setuid and setgid passthrough markers state the mode a checkout outside
+/// `-U` gives the device: a chown on a device node clears both bits, so the
+/// recorded mode has to be applied after the ownership.
+fn build_whiteout_tree(dir: &Path) {
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::create_dir_all(dir.join("targetdir")).unwrap();
+    std::fs::create_dir_all(dir.join("opqdir")).unwrap();
+    std::fs::create_dir_all(dir.join(".wh.dirmarker")).unwrap();
+    std::fs::create_dir_all(dir.join(".ostree-wh.adir")).unwrap();
+    for (name, content, mode) in [
+        ("present", &b"present\n"[..], 0o644),
+        ("sub/present", b"subpres\n", 0o644),
+        ("targetdir/inner", b"inner\n", 0o644),
+        ("opqdir/keep", b"keep\n", 0o644),
+        (".a", b"dot-a\n", 0o644),
+        (".wh.present", b"", 0o644),
+        (".wh.absent", b"", 0o644),
+        (".wh.targetdir", b"", 0o644),
+        (".wh..a", b"", 0o644),
+        ("sub/.wh.present", b"", 0o644),
+        ("opqdir/.wh..wh..opq", b"", 0o644),
+        (".ostree-wh.ptA", b"p\n", 0o644),
+        (".ostree-wh.pt755", b"p\n", 0o755),
+        (".ostree-wh.ptsuid", b"p\n", 0o4755),
+        (".ostree-wh.ptsgid", b"p\n", 0o2755),
+        ("sub/.ostree-wh.nested", b"p\n", 0o644),
+        (".wh.dirmarker/child", b"c\n", 0o644),
+        (".ostree-wh.adir/c", b"c\n", 0o644),
+    ] {
+        std::fs::write(dir.join(name), content).unwrap();
+        chmod_to(&dir.join(name), mode);
+    }
+    std::os::unix::fs::symlink("t", dir.join(".wh.slink")).unwrap();
+    std::os::unix::fs::symlink("t", dir.join(".ostree-wh.alink")).unwrap();
+    for name in [
+        "sub",
+        "targetdir",
+        "opqdir",
+        ".wh.dirmarker",
+        ".ostree-wh.adir",
+    ] {
+        chmod_to(&dir.join(name), 0o755);
+    }
+    chmod_to(dir, 0o755);
+}
+
+/// The names [`build_whiteout_tree`]'s per-name and passthrough markers act on.
+const WHITEOUT_TARGETS: &[&str] = &[
+    "present",
+    "absent",
+    "targetdir",
+    ".a",
+    "dirmarker",
+    "slink",
+    "ptA",
+    "pt755",
+    "ptsuid",
+    "ptsgid",
+    "alink",
+    "adir",
+];
+
+/// The destination pre-states the whiteout sweeps run over.
+///
+/// One type conflict is left out: a directory at a passthrough marker's target
+/// is the refusal `checkout_passthrough_whiteout_dispositions_match_the_tool`
+/// states.
+const WHITEOUT_PRESTATES: &[UnionPrestate] = &[
+    ("absent", None),
+    (
+        "empty",
+        Some(|dest| {
+            std::fs::create_dir_all(dest).unwrap();
+        }),
+    ),
+    (
+        "regular-at-every-target",
+        Some(|dest| {
+            std::fs::create_dir_all(dest.join("sub")).unwrap();
+            for name in WHITEOUT_TARGETS {
+                std::fs::write(dest.join(name), b"OLDFILE\n").unwrap();
+                chmod_to(&dest.join(name), 0o644);
+            }
+            std::fs::write(dest.join("sub/present"), b"OLDSUB\n").unwrap();
+            chmod_to(&dest.join("sub/present"), 0o644);
+            chmod_to(&dest.join("sub"), 0o755);
+        }),
+    ),
+    (
+        "symlink-at-every-target",
+        Some(|dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            for name in WHITEOUT_TARGETS {
+                std::os::unix::fs::symlink("nowhere", dest.join(name)).unwrap();
+            }
+        }),
+    ),
+    (
+        "chardev-at-the-passthrough-targets",
+        Some(|dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            for name in ["ptA", "pt755", "ptsuid", "ptsgid"] {
+                mknod_whiteout(&dest.join(name));
+            }
+        }),
+    ),
+    (
+        "dir-at-the-whiteout-targets",
+        Some(|dest| {
+            for name in ["present", "absent", "targetdir", ".a", "dirmarker", "slink"] {
+                std::fs::create_dir_all(dest.join(name)).unwrap();
+                std::fs::write(dest.join(name).join("inner"), b"inner\n").unwrap();
+                chmod_to(&dest.join(name).join("inner"), 0o644);
+                chmod_to(&dest.join(name), 0o755);
+            }
+        }),
+    ),
+    (
+        "stale-entries-in-opqdir",
+        Some(|dest| {
+            std::fs::create_dir_all(dest.join("opqdir/deep")).unwrap();
+            std::fs::write(dest.join("opqdir/keep"), b"OLDKEEP\n").unwrap();
+            std::fs::write(dest.join("opqdir/stale"), b"stale\n").unwrap();
+            std::fs::write(dest.join("opqdir/deep/deeper"), b"deeper\n").unwrap();
+            for name in ["opqdir/keep", "opqdir/stale", "opqdir/deep/deeper"] {
+                chmod_to(&dest.join(name), 0o644);
+            }
+            chmod_to(&dest.join("opqdir"), 0o755);
+            chmod_to(&dest.join("opqdir/deep"), 0o755);
+        }),
+    ),
+    (
+        "unrelated-entries",
+        Some(|dest| {
+            std::fs::create_dir_all(dest.join("extradir")).unwrap();
+            std::fs::write(dest.join("extra.txt"), b"extra\n").unwrap();
+            std::fs::write(dest.join("extradir/x"), b"x\n").unwrap();
+            chmod_to(&dest.join("extra.txt"), 0o644);
+            chmod_to(&dest.join("extradir/x"), 0o644);
+        }),
+    ),
+];
+
+/// The union arms a whiteout sweep runs. `--union-identical` is left out: its
+/// identity rule over a destination entry the sweep's pre-states differ from is
+/// `checkout_union_modes_match_the_tool`'s claim, and the two implementations
+/// refuse such an entry at their own point of the walk, which leaves the
+/// partial destinations no basis for comparison.
+/// `checkout_passthrough_whiteout_dispositions_match_the_tool` states the
+/// switch's own disposition under `--union-identical` over a one-marker tree.
+const WHITEOUT_ARMS: &[(&str, &[&str])] = &[
+    ("plain", &["-U"]),
+    ("union", &["-U", "--union"]),
+    ("union-add", &["-U", "--union-add"]),
+    ("faithful", &[]),
+    ("union-faithful", &["--union"]),
+];
+
+/// Run one whiteout sweep: every repository mode, every union arm, every
+/// destination pre-state, with `switches` added to each arm.
+fn whiteout_sweep(label: &str, switches: &[&str]) {
+    let tmp = TmpDir::new(label);
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_whiteout_tree(&tree);
+
+    for (mode_name, mode) in [
+        ("archive", RepoMode::Archive),
+        ("bare-user", RepoMode::BareUser),
+        ("bare", RepoMode::Bare),
+    ] {
+        let (repo, rev) = union_repo(base, mode, &format!("repo-{mode_name}"), &tree);
+        for (arm, options) in WHITEOUT_ARMS {
+            for (state, build) in WHITEOUT_PRESTATES {
+                let case = format!("{mode_name}/{arm}/{state}");
+                let port_dest = base.join(format!("port-{mode_name}-{arm}-{state}"));
+                let tool_dest = base.join(format!("tool-{mode_name}-{arm}-{state}"));
+                if let Some(build) = build {
+                    build(&port_dest);
+                    build(&tool_dest);
+                }
+                let mut all = options.to_vec();
+                all.extend(switches.iter().copied());
+                let (port, tool) = checkout_pair(&repo, &all, &rev, &port_dest, &tool_dest);
+                assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &case);
+            }
+        }
+    }
+}
+
+/// `--whiteouts` over every repository mode, every union arm, and every
+/// destination pre-state.
+///
+/// Carries `checkout/whiteouts-remove-and-drop-the-marker`,
+/// `checkout/whiteouts-marker-naming-an-absent-entry`,
+/// `checkout/whiteouts-remove-a-directory-subtree`,
+/// `checkout/whiteouts-opaque-marker-clears-the-directory`, and
+/// `checkout/whiteouts-are-union-mode-independent`.
+#[test]
+fn checkout_whiteouts_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    whiteout_sweep("checkout-whiteouts", &["--whiteouts"]);
+}
+
+/// `--process-passthrough-whiteouts` over the same sweep, the device's own
+/// claims, and the two switches together.
+///
+/// Carries `checkout/passthrough-whiteouts-write-a-char-0-0-device`,
+/// `checkout/passthrough-whiteouts-keep-the-marker-mode`,
+/// `checkout/passthrough-whiteouts-over-an-existing-entry`, and
+/// `checkout/whiteouts-and-passthrough-together`.
+#[test]
+fn checkout_passthrough_whiteouts_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    whiteout_sweep(
+        "checkout-passthrough-whiteouts",
+        &["--process-passthrough-whiteouts"],
+    );
+
+    // The two marker sets are disjoint, so each single-switch sweep above
+    // already states that the other switch's names stay materialized. What the
+    // pair adds is that they do not interfere, which one destination per
+    // repository mode states, and that neither marker set answers to `-H` or
+    // `-C`.
+    let tmp = TmpDir::new("checkout-both-whiteouts");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_whiteout_tree(&tree);
+    let prestate = |dest: &Path| {
+        std::fs::create_dir_all(dest.join("opqdir")).unwrap();
+        for name in WHITEOUT_TARGETS {
+            std::fs::write(dest.join(name), b"OLDFILE\n").unwrap();
+            chmod_to(&dest.join(name), 0o644);
+        }
+        std::fs::write(dest.join("opqdir/stale"), b"stale\n").unwrap();
+        chmod_to(&dest.join("opqdir/stale"), 0o644);
+        chmod_to(&dest.join("opqdir"), 0o755);
+    };
+
+    let mut bare_user_repo = None;
+    for (mode_name, mode) in [
+        ("archive", RepoMode::Archive),
+        ("bare-user", RepoMode::BareUser),
+        ("bare", RepoMode::Bare),
+    ] {
+        let (repo, rev) = union_repo(base, mode, &format!("repo-{mode_name}"), &tree);
+        let mut arms: Vec<(&str, Vec<&str>)> = vec![
+            ("user", vec!["-U", "--union"]),
+            ("user-force-copy", vec!["-U", "-C", "--union"]),
+            ("faithful", vec!["--union"]),
+            ("faithful-force-copy", vec!["-C", "--union"]),
+        ];
+        // `-H` is taken only where the repository mode can hardlink into the
+        // checkout mode; the arms it refuses are the `-H` divergence's claim
+        // and not this test's.
+        match mode_name {
+            "bare-user" => arms.push(("require-hardlinks", vec!["-U", "-H", "--union"])),
+            "bare" => arms.push(("require-hardlinks", vec!["-H", "--union"])),
+            _ => {}
+        }
+        for (arm, options) in &arms {
+            let case = format!("{mode_name}/{arm}");
+            let port_dest = base.join(format!("port-{mode_name}-{arm}"));
+            let tool_dest = base.join(format!("tool-{mode_name}-{arm}"));
+            prestate(&port_dest);
+            prestate(&tool_dest);
+            let mut all = options.clone();
+            all.extend(["--whiteouts", "--process-passthrough-whiteouts"]);
+            let (port, tool) = checkout_pair(&repo, &all, &rev, &port_dest, &tool_dest);
+            assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &case);
+        }
+        if mode_name == "bare-user" {
+            bare_user_repo = Some((repo, rev));
+        }
+    }
+
+    // The device's own claims, which the sweeps compare but do not name: the
+    // marker's permission bits, the device number, the depth, and the
+    // ownership a checkout outside `-U` applies. The bits reach `mknod`, where
+    // the process umask reduces them, so the absolute mode claim is made on the
+    // arm outside `-U`, which applies the recorded mode after the ownership.
+    let (repo, rev) = bare_user_repo.expect("the bare-user fixture is built above");
+    for (case, options) in [
+        ("user", vec!["-U", "--process-passthrough-whiteouts"]),
+        ("faithful", vec!["--process-passthrough-whiteouts"]),
+    ] {
+        let port_dest = base.join(format!("port-device-{case}"));
+        let tool_dest = base.join(format!("tool-device-{case}"));
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, case);
+        for (name, recorded) in [
+            ("ptA", 0o644),
+            ("pt755", 0o755),
+            ("ptsuid", 0o4755),
+            ("ptsgid", 0o2755),
+            ("sub/nested", 0o644),
+        ] {
+            let meta = std::fs::symlink_metadata(port_dest.join(name)).unwrap();
+            assert_eq!(
+                meta.mode() & 0o170000,
+                0o020000,
+                "{case}: {name} is a character device",
+            );
+            assert_eq!(meta.rdev(), 0, "{case}: {name} carries device number 0:0");
+            let bits = meta.mode() & 0o7777;
+            if case == "faithful" {
+                assert_eq!(
+                    bits, recorded,
+                    "{case}: {name} keeps the marker's permission bits",
+                );
+            } else {
+                assert_eq!(
+                    bits & !recorded,
+                    0,
+                    "{case}: {name} carries no bit the marker does not record",
+                );
+            }
+            let tool_meta = std::fs::symlink_metadata(tool_dest.join(name)).unwrap();
+            assert_eq!(
+                (meta.uid(), meta.gid()),
+                (tool_meta.uid(), tool_meta.gid()),
+                "{case}: {name} takes the tool's ownership",
+            );
+        }
+        assert!(!port_dest.join(".ostree-wh.ptA").exists());
+    }
+}
+
+/// The markers act on a regular-file entry alone, and the opaque marker's
+/// clear is decided by the name alone.
+///
+/// Carries `checkout/whiteout-markers-are-regular-files-only`.
+#[test]
+fn checkout_whiteout_markers_act_on_regular_files_only() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-whiteout-types");
+    let base = tmp.path();
+    let both: &[&str] = &["--whiteouts", "--process-passthrough-whiteouts"];
+
+    // The sweep tree already holds a directory and a symlink under each
+    // marker prefix; this states their outcome against a destination that
+    // holds an entry at each of their target names.
+    let tree = base.join("tree");
+    build_whiteout_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+    let port_dest = base.join("port-types");
+    let tool_dest = base.join("tool-types");
+    for dest in [&port_dest, &tool_dest] {
+        std::fs::create_dir_all(dest).unwrap();
+        for name in ["dirmarker", "slink", "alink", "adir"] {
+            std::fs::write(dest.join(name), b"KEPT\n").unwrap();
+            chmod_to(&dest.join(name), 0o644);
+        }
+    }
+    let mut options = vec!["-U", "--union"];
+    options.extend(both.iter().copied());
+    let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "non-regular-markers");
+    for name in ["dirmarker", "slink", "alink", "adir"] {
+        assert_eq!(
+            std::fs::read(port_dest.join(name)).unwrap(),
+            b"KEPT\n",
+            "a non-regular marker removed {name}",
+        );
+    }
+
+    // The opaque marker as a symlink and as a directory, each needing a tree
+    // of its own.
+    for (case, build) in [
+        (
+            "opaque-symlink",
+            (|dir: &Path| {
+                std::fs::create_dir_all(dir).unwrap();
+                std::os::unix::fs::symlink("nowhere", dir.join(".wh..wh..opq")).unwrap();
+                std::fs::write(dir.join("keep"), b"k\n").unwrap();
+                chmod_to(&dir.join("keep"), 0o644);
+                chmod_to(dir, 0o755);
+            }) as fn(&Path),
+        ),
+        ("opaque-directory", |dir: &Path| {
+            std::fs::create_dir_all(dir.join(".wh..wh..opq")).unwrap();
+            std::fs::write(dir.join(".wh..wh..opq/z"), b"z\n").unwrap();
+            std::fs::write(dir.join("keep"), b"k\n").unwrap();
+            chmod_to(&dir.join(".wh..wh..opq/z"), 0o644);
+            chmod_to(&dir.join(".wh..wh..opq"), 0o755);
+            chmod_to(&dir.join("keep"), 0o644);
+            chmod_to(dir, 0o755);
+        }),
+    ] {
+        let tree = base.join(format!("tree-{case}"));
+        build(&tree);
+        let (repo, rev) = union_repo(base, RepoMode::BareUser, &format!("repo-{case}"), &tree);
+        let port_dest = base.join(format!("port-{case}"));
+        let tool_dest = base.join(format!("tool-{case}"));
+        for dest in [&port_dest, &tool_dest] {
+            std::fs::create_dir_all(dest.join("subdir")).unwrap();
+            std::fs::write(dest.join("alpha"), b"alpha\n").unwrap();
+            std::fs::write(dest.join("subdir/beta"), b"beta\n").unwrap();
+            chmod_to(&dest.join("alpha"), 0o644);
+            chmod_to(&dest.join("subdir/beta"), 0o644);
+            chmod_to(&dest.join("subdir"), 0o755);
+        }
+        let (port, tool) = checkout_pair(
+            &repo,
+            &["-U", "--union", "--whiteouts"],
+            &rev,
+            &port_dest,
+            &tool_dest,
+        );
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, case);
+        assert_eq!(
+            port_dest.join("alpha").exists(),
+            case == "opaque-directory",
+            "{case}: the clear is decided by the name over the file entries",
+        );
+    }
+}
+
+/// With neither switch every marker is an ordinary entry and nothing is
+/// removed.
+///
+/// Carries `checkout/whiteouts-off-materialize-the-markers`.
+#[test]
+fn checkout_whiteouts_off_materialize_the_markers() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-whiteouts-off");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_whiteout_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+
+    let port_dest = base.join("port");
+    let tool_dest = base.join("tool");
+    for dest in [&port_dest, &tool_dest] {
+        std::fs::create_dir_all(dest.join("opqdir")).unwrap();
+        for name in WHITEOUT_TARGETS {
+            std::fs::write(dest.join(name), b"KEPT\n").unwrap();
+            chmod_to(&dest.join(name), 0o644);
+        }
+        std::fs::write(dest.join("opqdir/stale"), b"stale\n").unwrap();
+        chmod_to(&dest.join("opqdir/stale"), 0o644);
+        chmod_to(&dest.join("opqdir"), 0o755);
+    }
+    let (port, tool) = checkout_pair(&repo, &["-U", "--union"], &rev, &port_dest, &tool_dest);
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "markers-off");
+
+    for marker in [
+        ".wh.present",
+        ".wh.absent",
+        ".wh.targetdir",
+        "sub/.wh.present",
+        "opqdir/.wh..wh..opq",
+        ".ostree-wh.ptA",
+        ".ostree-wh.pt755",
+        "sub/.ostree-wh.nested",
+    ] {
+        assert!(
+            std::fs::symlink_metadata(port_dest.join(marker))
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "{marker} is an ordinary file with the switches off",
+        );
+    }
+    assert_eq!(std::fs::read(port_dest.join("absent")).unwrap(), b"KEPT\n");
+    assert_eq!(
+        std::fs::read(port_dest.join("opqdir/stale")).unwrap(),
+        b"stale\n",
+    );
+}
+
+/// A marker naming no entry is refused, each refusal gated by its own switch
+/// and by the entry's type. The refusal comes mid-walk, so the destination
+/// directory stands and holds what the walk had already written.
+///
+/// Carries `checkout/whiteout-empty-name-refused` and
+/// `checkout/passthrough-whiteout-empty-name-refused`. The words part, so each
+/// side is asserted against its own message.
+#[test]
+fn checkout_whiteout_empty_names_are_refused() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-whiteout-empty");
+    let base = tmp.path();
+
+    // One tree per marker, so the entry the walk reaches first is settled, and
+    // one tree holding both as symlinks.
+    let build_regular = |dir: &Path, marker: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        for name in [marker, "keep"] {
+            std::fs::write(dir.join(name), b"a\n").unwrap();
+            chmod_to(&dir.join(name), 0o644);
+        }
+        chmod_to(dir, 0o755);
+    };
+    let wh = base.join("tree-wh");
+    build_regular(&wh, ".wh.");
+    let pt = base.join("tree-pt");
+    build_regular(&pt, ".ostree-wh.");
+    let links = base.join("tree-links");
+    std::fs::create_dir_all(&links).unwrap();
+    for name in [".wh.", ".ostree-wh."] {
+        std::os::unix::fs::symlink("t", links.join(name)).unwrap();
+    }
+    std::fs::write(links.join("keep"), b"a\n").unwrap();
+    chmod_to(&links.join("keep"), 0o644);
+    chmod_to(&links, 0o755);
+
+    let (wh_repo, wh_rev) = union_repo(base, RepoMode::BareUser, "repo-wh", &wh);
+    let (pt_repo, pt_rev) = union_repo(base, RepoMode::BareUser, "repo-pt", &pt);
+    let (links_repo, links_rev) = union_repo(base, RepoMode::BareUser, "repo-links", &links);
+
+    // The port's words and the tool's, per marker.
+    const WH_WORDS: (&str, &str) = (
+        ".wh.: the whiteout names no entry",
+        "Invalid empty whiteout",
+    );
+    const PT_WORDS: (&str, &str) = (
+        ".ostree-wh.: the overlayfs whiteout names no entry",
+        "Invalid empty overlayfs whiteout",
+    );
+
+    // The gating table: each refusal answers to its own switch alone.
+    let arms: [(&str, &[&str], bool, bool); 4] = [
+        ("neither", &[], false, false),
+        ("whiteouts", &["--whiteouts"], true, false),
+        (
+            "passthrough",
+            &["--process-passthrough-whiteouts"],
+            false,
+            true,
+        ),
+        (
+            "both",
+            &["--whiteouts", "--process-passthrough-whiteouts"],
+            true,
+            true,
+        ),
+    ];
+
+    for (case, switches, wh_refused, pt_refused) in arms {
+        let mut options = vec!["-U"];
+        options.extend(switches.iter().copied());
+
+        for (marker, repo, rev, refused, words) in [
+            ("wh", &wh_repo, &wh_rev, wh_refused, WH_WORDS),
+            ("pt", &pt_repo, &pt_rev, pt_refused, PT_WORDS),
+        ] {
+            let label = format!("{marker}/{case}");
+            let port_dest = base.join(format!("port-{marker}-{case}"));
+            let tool_dest = base.join(format!("tool-{marker}-{case}"));
+            let (port, tool) = checkout_pair(repo, &options, rev, &port_dest, &tool_dest);
+            assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+            assert_eq!(
+                port.status.code(),
+                Some(i32::from(refused)),
+                "{label}: the port's status: {}",
+                String::from_utf8_lossy(&port.stderr),
+            );
+            if refused {
+                assert!(
+                    String::from_utf8_lossy(&port.stderr).contains(words.0),
+                    "{label}: the port's words: {}",
+                    String::from_utf8_lossy(&port.stderr),
+                );
+                assert!(
+                    String::from_utf8_lossy(&tool.stderr).contains(words.1),
+                    "{label}: the tool's words: {}",
+                    String::from_utf8_lossy(&tool.stderr),
+                );
+                // The marker sorts ahead of `keep`, so the walk had written
+                // nothing when the refusal fired, and the destination
+                // directory stands empty.
+                assert!(
+                    port_dest.is_dir() && tool_dest.is_dir(),
+                    "{label}: the destination directory was removed",
+                );
+                assert!(!port_dest.join("keep").exists());
+            } else {
+                let dest = port_dest.join(if marker == "wh" {
+                    ".wh."
+                } else {
+                    ".ostree-wh."
+                });
+                assert_eq!(std::fs::read(dest).unwrap(), b"a\n");
+            }
+        }
+
+        // A symlink so named is materialized and no refusal fires.
+        let label = format!("links/{case}");
+        let port_dest = base.join(format!("port-links-{case}"));
+        let tool_dest = base.join(format!("tool-links-{case}"));
+        let (port, tool) = checkout_pair(&links_repo, &options, &links_rev, &port_dest, &tool_dest);
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+        assert_eq!(port.status.code(), Some(0), "{label}: the port refused");
+        for marker in [".wh.", ".ostree-wh."] {
+            assert!(
+                std::fs::symlink_metadata(port_dest.join(marker))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{label}: {marker} is materialized",
+            );
+        }
+    }
+}
+
+/// A `--subpath` naming a marker file reaches the marker rules, so the marker
+/// is not materialized under its own name and the empty names keep their
+/// refusals. The opaque marker's clear is the directory walk's own pre-pass, so
+/// a subpath naming `.wh..wh..opq` drops the entry and clears nothing.
+///
+/// Carries `checkout/whiteouts-under-a-subpath-naming-a-marker`.
+#[test]
+fn checkout_whiteouts_under_a_subpath_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-whiteout-subpath");
+    let base = tmp.path();
+
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for name in [
+        ".wh.gone",
+        ".wh.",
+        ".wh..wh..opq",
+        ".ostree-wh.",
+        ".ostree-wh.dev",
+        "keep",
+    ] {
+        std::fs::write(tree.join(name), b"x\n").unwrap();
+        chmod_to(&tree.join(name), 0o644);
+    }
+    chmod_to(&tree, 0o755);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+
+    for subpath in [
+        "/.wh.gone",
+        "/.wh.",
+        "/.ostree-wh.",
+        "/.ostree-wh.dev",
+        "/.wh..wh..opq",
+    ] {
+        let label = subpath.trim_start_matches('/');
+        let port_dest = base.join(format!("port-{label}"));
+        let tool_dest = base.join(format!("tool-{label}"));
+        for dest in [&port_dest, &tool_dest] {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("gone"), b"OLD\n").unwrap();
+            std::fs::write(dest.join("other"), b"OLD\n").unwrap();
+            chmod_to(&dest.join("gone"), 0o644);
+            chmod_to(&dest.join("other"), 0o644);
+        }
+        let subpath_option = format!("--subpath={subpath}");
+        let options = vec![
+            "-U",
+            "--union",
+            "--whiteouts",
+            "--process-passthrough-whiteouts",
+            &subpath_option,
+        ];
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, label);
+        assert!(
+            !port_dest.join(label).exists(),
+            "{label}: the marker was materialized under its own name",
+        );
+    }
+}
+
+/// `--whiteouts` widens the union-files disposition over a type conflict: a
+/// destination entry whose type is not the type the tree carries at that name is
+/// removed and the entry is written. The tree the case checks out holds no
+/// marker at all, so the widening answers to the switch and not to a marker.
+///
+/// The destination stands inside a parent directory of its own and the parent is
+/// what the two sides are compared over, so a case whose destination is itself a
+/// regular file, a symlink, or a fifo is rendered whole.
+///
+/// Carries `checkout/whiteouts-widen-a-union-type-conflict`.
+#[test]
+fn checkout_whiteouts_widen_a_union_type_conflict() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-whiteouts-widen");
+    let base = tmp.path();
+
+    // A regular file, a symlink, a directory, a nested directory, and no marker
+    // name.
+    let tree = base.join("tree");
+    std::fs::create_dir_all(tree.join("dd")).unwrap();
+    std::fs::create_dir_all(tree.join("deep/mid")).unwrap();
+    std::fs::write(tree.join("dd/in"), b"in\n").unwrap();
+    std::fs::write(tree.join("deep/mid/leaf"), b"leaf\n").unwrap();
+    std::fs::write(tree.join("rf"), b"rf\n").unwrap();
+    std::os::unix::fs::symlink("t", tree.join("sl")).unwrap();
+    std::fs::write(tree.join("keep"), b"k\n").unwrap();
+    for name in ["dd/in", "deep/mid/leaf", "rf", "keep"] {
+        chmod_to(&tree.join(name), 0o644);
+    }
+    for name in ["dd", "deep", "deep/mid"] {
+        chmod_to(&tree.join(name), 0o755);
+    }
+    chmod_to(&tree, 0o755);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+
+    // The pre-states that put the wrong type at a name the tree carries. Each
+    // builder receives the destination path and creates its own parent.
+    type Conflict = (&'static str, fn(&Path));
+    let conflicts: [Conflict; 17] = [
+        ("dir-at-a-file", |dest| {
+            std::fs::create_dir_all(dest.join("rf")).unwrap();
+            std::fs::write(dest.join("rf/inner"), b"inner\n").unwrap();
+            chmod_to(&dest.join("rf/inner"), 0o644);
+            chmod_to(&dest.join("rf"), 0o755);
+        }),
+        ("empty-dir-at-a-file", |dest| {
+            std::fs::create_dir_all(dest.join("rf")).unwrap();
+            chmod_to(&dest.join("rf"), 0o755);
+        }),
+        ("deep-dir-at-a-file", |dest| {
+            std::fs::create_dir_all(dest.join("rf/a/b")).unwrap();
+            std::fs::write(dest.join("rf/a/b/z"), b"z\n").unwrap();
+            std::os::unix::fs::symlink("q", dest.join("rf/a/l")).unwrap();
+            chmod_to(&dest.join("rf/a/b/z"), 0o644);
+            for name in ["rf", "rf/a", "rf/a/b"] {
+                chmod_to(&dest.join(name), 0o755);
+            }
+        }),
+        ("dir-at-a-symlink", |dest| {
+            std::fs::create_dir_all(dest.join("sl")).unwrap();
+            std::fs::write(dest.join("sl/inner"), b"inner\n").unwrap();
+            chmod_to(&dest.join("sl/inner"), 0o644);
+            chmod_to(&dest.join("sl"), 0o755);
+        }),
+        ("file-at-a-directory", |dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("dd"), b"inner\n").unwrap();
+            chmod_to(&dest.join("dd"), 0o644);
+        }),
+        ("symlink-to-a-directory-at-a-directory", |dest| {
+            std::fs::create_dir_all(dest.join("realdir")).unwrap();
+            std::fs::write(dest.join("realdir/r"), b"r\n").unwrap();
+            std::os::unix::fs::symlink("realdir", dest.join("dd")).unwrap();
+            chmod_to(&dest.join("realdir/r"), 0o644);
+            chmod_to(&dest.join("realdir"), 0o755);
+        }),
+        ("symlink-to-a-file-at-a-directory", |dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("real"), b"real\n").unwrap();
+            std::os::unix::fs::symlink("real", dest.join("dd")).unwrap();
+            chmod_to(&dest.join("real"), 0o644);
+        }),
+        ("dangling-symlink-at-a-directory", |dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::os::unix::fs::symlink("nowhere", dest.join("dd")).unwrap();
+        }),
+        ("fifo-at-a-directory", |dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            mkfifo_at(&dest.join("dd"));
+        }),
+        ("chardev-at-a-directory", |dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            mknod_whiteout(&dest.join("dd"));
+        }),
+        ("nested-file-at-a-directory", |dest| {
+            std::fs::create_dir_all(dest.join("deep")).unwrap();
+            std::fs::write(dest.join("deep/mid"), b"mid\n").unwrap();
+            chmod_to(&dest.join("deep/mid"), 0o644);
+            chmod_to(&dest.join("deep"), 0o755);
+        }),
+        ("nested-dir-at-a-file", |dest| {
+            std::fs::create_dir_all(dest.join("deep/mid/leaf")).unwrap();
+            std::fs::write(dest.join("deep/mid/leaf/inner"), b"inner\n").unwrap();
+            chmod_to(&dest.join("deep/mid/leaf/inner"), 0o644);
+            for name in ["deep", "deep/mid", "deep/mid/leaf"] {
+                chmod_to(&dest.join(name), 0o755);
+            }
+        }),
+        ("a-file-as-the-destination", |dest| {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, b"dest\n").unwrap();
+            chmod_to(dest, 0o644);
+        }),
+        ("a-symlink-to-a-file-as-the-destination", |dest| {
+            let parent = dest.parent().unwrap();
+            std::fs::create_dir_all(parent).unwrap();
+            std::fs::write(parent.join("real"), b"real\n").unwrap();
+            chmod_to(&parent.join("real"), 0o644);
+            std::os::unix::fs::symlink("real", dest).unwrap();
+        }),
+        ("a-symlink-to-a-directory-as-the-destination", |dest| {
+            let parent = dest.parent().unwrap();
+            std::fs::create_dir_all(parent.join("realdir")).unwrap();
+            std::fs::write(parent.join("realdir/r"), b"r\n").unwrap();
+            chmod_to(&parent.join("realdir/r"), 0o644);
+            chmod_to(&parent.join("realdir"), 0o755);
+            std::os::unix::fs::symlink("realdir", dest).unwrap();
+        }),
+        ("a-dangling-symlink-as-the-destination", |dest| {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("nowhere", dest).unwrap();
+        }),
+        ("a-fifo-as-the-destination", |dest| {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            mkfifo_at(dest);
+        }),
+    ];
+
+    // The arms the widening answers to and the arms it does not. `--whiteouts`
+    // widens union-files alone, so `--union-add` and `--union-identical` keep
+    // their own disposition, `--process-passthrough-whiteouts` widens nothing,
+    // and the checkout mode makes no difference.
+    let arms: [(&str, &[&str]); 7] = [
+        ("whiteouts", &["-U", "--union", "--whiteouts"]),
+        ("neither", &["-U", "--union"]),
+        (
+            "passthrough",
+            &["-U", "--union", "--process-passthrough-whiteouts"],
+        ),
+        (
+            "both-switches",
+            &[
+                "-U",
+                "--union",
+                "--whiteouts",
+                "--process-passthrough-whiteouts",
+            ],
+        ),
+        ("union-add", &["-U", "--union-add", "--whiteouts"]),
+        (
+            "union-identical",
+            &["-U", "-H", "--union-identical", "--whiteouts"],
+        ),
+        ("faithful", &["--union", "--whiteouts"]),
+    ];
+
+    let run = |case: &str, arm: &str, build: fn(&Path), options: &[&str]| {
+        let label = format!("{case}/{arm}");
+        let port_parent = base.join(format!("port-{case}-{arm}"));
+        let tool_parent = base.join(format!("tool-{case}-{arm}"));
+        let port_dest = port_parent.join("dest");
+        let tool_dest = tool_parent.join("dest");
+        build(&port_dest);
+        build(&tool_dest);
+        let (port, tool) = checkout_pair(&repo, options, &rev, &port_dest, &tool_dest);
+        assert_checkout_pair(&port, &tool, &port_parent, &tool_parent, &label);
+    };
+
+    for (case, build) in conflicts {
+        for (arm, options) in arms {
+            run(case, arm, build, options);
+        }
+    }
+
+    // A `--subpath` narrows what the walk reaches, and the widening follows it.
+    // The destination directory a file subpath needs stands outside the reach:
+    // a destination that is not a directory is refused there under either
+    // switch.
+    let reached = |name: &str| {
+        *conflicts
+            .iter()
+            .find(|(case, _)| *case == name)
+            .expect("the pre-state is one of the seventeen above")
+    };
+    for (case, build) in [
+        reached("dir-at-a-file"),
+        reached("nested-file-at-a-directory"),
+        reached("nested-dir-at-a-file"),
+        reached("a-file-as-the-destination"),
+        reached("a-symlink-to-a-directory-as-the-destination"),
+        reached("a-dangling-symlink-as-the-destination"),
+    ] {
+        for (arm, options) in [
+            (
+                "subpath-dir-whiteouts",
+                &["-U", "--union", "--whiteouts", "--subpath=/deep"][..],
+            ),
+            ("subpath-dir-neither", &["-U", "--union", "--subpath=/deep"]),
+            (
+                "subpath-file-whiteouts",
+                &["-U", "--union", "--whiteouts", "--subpath=/rf"],
+            ),
+            ("subpath-file-neither", &["-U", "--union", "--subpath=/rf"]),
+        ] {
+            run(case, arm, build, options);
+        }
+    }
+}
+
+/// The destination disposition each overwrite mode gives a passthrough
+/// whiteout, over a one-marker tree so the walk order around a refusal is
+/// settled, and the per-name whiteout's own disposition beside it.
+///
+/// Carries `checkout/passthrough-whiteouts-over-an-existing-entry`,
+/// `checkout/passthrough-whiteouts-over-a-directory`, and
+/// `checkout/whiteouts-are-union-mode-independent`. The refusal's words part,
+/// so each side is asserted against its own message.
+#[test]
+fn checkout_passthrough_whiteout_dispositions_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-whiteout-dispositions");
+    let base = tmp.path();
+
+    let build = |dir: &Path, marker: &str| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(marker), b"x\n").unwrap();
+        std::fs::write(dir.join("keep"), b"k\n").unwrap();
+        chmod_to(&dir.join(marker), 0o644);
+        chmod_to(&dir.join("keep"), 0o644);
+        chmod_to(dir, 0o755);
+    };
+    let pt = base.join("tree-pt");
+    build(&pt, ".ostree-wh.dev");
+    let wh = base.join("tree-wh");
+    build(&wh, ".wh.dev");
+    let (pt_repo, pt_rev) = union_repo(base, RepoMode::BareUser, "repo-pt", &pt);
+    let (wh_repo, wh_rev) = union_repo(base, RepoMode::BareUser, "repo-wh", &wh);
+
+    // The six destination pre-states at the marker's target name. `absent`
+    // leaves the destination itself absent, which the modes with no union
+    // option need.
+    let prestates: [UnionPrestate; 6] = [
+        ("absent", None),
+        (
+            "empty",
+            Some(|dest: &Path| {
+                std::fs::create_dir_all(dest).unwrap();
+            }),
+        ),
+        (
+            "file-at-dev",
+            Some(|dest: &Path| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::write(dest.join("dev"), b"OLDFILE\n").unwrap();
+                chmod_to(&dest.join("dev"), 0o644);
+            }),
+        ),
+        (
+            "dir-at-dev",
+            Some(|dest: &Path| {
+                std::fs::create_dir_all(dest.join("dev")).unwrap();
+                std::fs::write(dest.join("dev/inner"), b"inner\n").unwrap();
+                chmod_to(&dest.join("dev/inner"), 0o644);
+                chmod_to(&dest.join("dev"), 0o755);
+            }),
+        ),
+        (
+            "symlink-at-dev",
+            Some(|dest: &Path| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::os::unix::fs::symlink("nowhere", dest.join("dev")).unwrap();
+            }),
+        ),
+        (
+            "chardev-at-dev",
+            Some(|dest: &Path| {
+                std::fs::create_dir_all(dest).unwrap();
+                mknod_whiteout(&dest.join("dev"));
+            }),
+        ),
+    ];
+
+    let arms: [(&str, &[&str]); 4] = [
+        ("plain", &["-U"]),
+        ("union", &["-U", "--union"]),
+        ("union-add", &["-U", "--union-add"]),
+        ("union-identical", &["-U", "-H", "--union-identical"]),
+    ];
+
+    for (marker, repo, rev, switch) in [
+        ("pt", &pt_repo, &pt_rev, "--process-passthrough-whiteouts"),
+        ("wh", &wh_repo, &wh_rev, "--whiteouts"),
+    ] {
+        for (arm, options) in arms {
+            for (state, prestate) in prestates {
+                let label = format!("{marker}/{arm}/{state}");
+                let port_dest = base.join(format!("port-{marker}-{arm}-{state}"));
+                let tool_dest = base.join(format!("tool-{marker}-{arm}-{state}"));
+                if let Some(prestate) = prestate {
+                    prestate(&port_dest);
+                    prestate(&tool_dest);
+                }
+                let mut all = options.to_vec();
+                all.push(switch);
+                let (port, tool) = checkout_pair(repo, &all, rev, &port_dest, &tool_dest);
+                assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+
+                // The one refusal the switches themselves reach: a passthrough
+                // marker over a destination directory, under `--union`.
+                if marker == "pt" && arm == "union" && state == "dir-at-dev" {
+                    assert_eq!(port.status.code(), Some(1), "{label}: the port accepted");
+                    assert!(
+                        String::from_utf8_lossy(&port.stderr)
+                            .contains("dev: destination entry already exists"),
+                        "{label}: the port's words: {}",
+                        String::from_utf8_lossy(&port.stderr),
+                    );
+                    assert!(
+                        String::from_utf8_lossy(&tool.stderr)
+                            .contains("unlink(dev): Is a directory"),
+                        "{label}: the tool's words: {}",
+                        String::from_utf8_lossy(&tool.stderr),
+                    );
+                    assert!(port_dest.join("dev/inner").exists());
+                }
+            }
+        }
+    }
+}
+
 /// The reach of `--allow-noent`, which is the one divergence the switch
 /// carries: the tool honors it on some command lines and the port on every
 /// one, and neither side writes anything either way.
@@ -19554,11 +20645,10 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
     let (repo, rev) = union_repo(base, RepoMode::Bare, "repo", &tree);
 
     // The tool's own table, measured. `-M/--bareuseronly-dirs`,
-    // `--disable-cache`, `--whiteouts`, `--process-passthrough-whiteouts`, and
-    // `--skip-list` also make the tool drop the switch, and they are outside
-    // the port's `checkout` surface today, so they join this table with the
-    // items that add them.
-    let arms: [(&str, &[&str], i32); 7] = [
+    // `--disable-cache`, and `--skip-list` also make the tool drop the switch,
+    // and they are outside the port's `checkout` surface today, so they join
+    // this table with the items that add them.
+    let arms: [(&str, &[&str], i32); 9] = [
         ("bare", &[], 0),
         ("require-hardlinks", &["-H"], 1),
         ("force-copy", &["-C"], 1),
@@ -19566,6 +20656,12 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
         ("user-mode", &["-U"], 0),
         ("union", &["--union"], 0),
         ("verbose", &["-v"], 0),
+        ("whiteouts", &["--whiteouts"], 1),
+        (
+            "passthrough-whiteouts",
+            &["--process-passthrough-whiteouts"],
+            1,
+        ),
     ];
 
     for (case, switches, tool_status) in arms {

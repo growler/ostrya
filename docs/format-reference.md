@@ -1521,7 +1521,9 @@ Overwrite policy over an existing destination:
   `opendir(d): Not a directory`, and
   `opendir(d): Too many levels of symbolic links`). Under the default mode a
   symlink at the destination is an error (`mkdirat: File exists`) like any
-  other existing destination.
+  other existing destination. Under union files with `--whiteouts` the link is
+  removed and a directory is created in its place, which the "Whiteouts."
+  paragraphs below state.
 - Union files (`ostree checkout --union`): an existing directory is reused
   without re-applying its metadata, an existing file or symlink is overwritten
   whatever its content, mode, or target, new entries are added, and existing
@@ -1566,7 +1568,8 @@ Overwrite policy over an existing destination:
   destination of the same mode and of `0755`.
 
 A type conflict between the destination and the commit stops the checkout, and
-no mode changes an entry's type:
+no mode changes an entry's type. `--whiteouts` is the one exception, and the
+"Whiteouts." paragraphs below state what it widens. The conflicts:
 
 - A destination name held by a regular file when the commit carries a directory
   of that name is a conflict in every mode. The tool errors
@@ -1579,15 +1582,114 @@ no mode changes an entry's type:
   errors (`renameat(...): Is a directory` under union-files). Under add-files the
   existing directory is kept and nothing is written for that name.
 
-Whiteouts. With whiteout processing enabled (`ostree checkout --whiteouts`),
-within each directory an entry named `.wh..wh..opq` marks the directory opaque, so
-the destination directory's pre-existing entries are removed before the committed
-entries are written, and the marker itself is not materialized; an entry named
-`.wh.<name>` removes `<name>` from the destination directory and is not
-materialized; all other entries check out normally. With whiteout processing off,
-`.wh.`-prefixed entries check out as ordinary files. The
-`--process-passthrough-whiteouts` option (extracting overlayfs char 0:0 devices,
-which needs `CAP_MKNOD`) is a distinct mechanism and is out of scope here.
+Whiteouts. Three marker names are read, by two independent options. Each option
+reads its own names and no others, and with both options off every marker checks
+out as an ordinary entry under its own name and nothing is removed.
+
+`ostree checkout --whiteouts` reads two Docker-style names:
+
+- `.wh.<name>` removes `<name>` from the destination directory and is not
+  materialized. The removal reaches an entry of any type and recurses into a
+  directory, taking the whole subtree. A target the destination does not hold is
+  a no-op at exit 0.
+- `.wh..wh..opq` clears the destination directory before any of the directory's
+  entries is written, and is not materialized.
+
+`ostree checkout --process-passthrough-whiteouts` reads one overlayfs name,
+`.ostree-wh.<name>`, which becomes a character device with device number 0:0 at
+`<name>` and is not materialized under its own name. The marker's content is
+ignored. `.ovl.wh.`, `.overlay.wh.`, and `.ostree.wh.` are ordinary name
+prefixes and carry no meaning.
+
+The removal order and the clear order differ. The clear is a pre-pass over the
+destination directory, decided by the name across the whole file-entry list, so
+an entry the commit also carries at a cleared name arrives fresh whatever the
+union mode would otherwise keep. The per-name removal runs in order among the
+directory's file entries, so a marker sorting after its target removes the entry
+the same checkout wrote, and a marker sorting before it leaves the target the
+checkout writes afterwards. File entries are materialized before directory
+entries, so a marker never removes a directory the same tree writes at the
+marker's target name.
+
+The type test differs per marker. The per-name marker and the passthrough marker
+act on a regular-file entry alone: a symlink or a directory carrying such a name
+is materialized verbatim and acts on nothing. The opaque clear is decided by the
+name alone, and the marker's own materialization by its type: a symlink named
+`.wh..wh..opq` clears the directory and is then materialized, a regular file
+clears it and is not materialized, and a directory clears nothing and is
+materialized.
+
+The whiteout device takes the marker's permission bits. The bits reach `mknod`,
+so the process umask reduces them; a checkout outside `-U` then applies the
+recorded mode in full, together with the marker's ownership and its extended
+attributes. The order is the attributes, then the ownership, then the mode. A
+`chown` on a device node clears the setuid and setgid bits for an unprivileged
+caller even where the ids do not change, so a marker recorded at 04755 or 02755
+carries its bits only where the mode is applied after the ownership. Creating a
+character device with device number 0:0 needs no capability, so the whole
+mechanism runs unprivileged. A `user.*` extended attribute on a marker is a
+refusal on every kernel outside `-U`, since the `user.` namespace is not
+permitted on a device node. The device then stands where it was created at the
+mode `mknod` gave it, the umask included and the recorded mode not yet applied,
+which places the attributes ahead of the mode. The tool reports its own `GError`
+misuse on `stderr` ahead of that refusal, which no reader should treat as part
+of the message.
+
+The destination disposition the device takes per union mode: union-files unlinks
+an existing regular file, symlink, or device and creates the device, and refuses
+an existing directory (`unlink(<name>): Is a directory`); add-files keeps an
+existing entry of any type; union-identical keeps an existing entry of any type
+with no comparison, which is the one place its identity rule does not run. With
+no union option a destination directory that already exists is refused before
+any entry is reached, so the default mode's disposition at a marker's target
+name is not observable. The per-name removal and the opaque clear ignore the
+union mode altogether.
+
+`--whiteouts` widens the union-files disposition over a type conflict, for every
+entry and not only for a marker. Under `--union` with the switch, a destination
+entry whose type is not the type the tree carries at that name is removed and
+the entry is written: a directory and its whole subtree, empty or populated,
+where the tree carries a regular file or a symlink, and a regular file, a
+symlink of any kind, a fifo, a device, or a socket where the tree carries a
+directory. A symlink loses the link alone, so a link to a directory the
+checkout would otherwise follow is unlinked and the directory it resolved to
+stays as it stands and receives nothing. A directory the widening creates takes
+the tree's own dirmeta, as a directory the checkout creates in an empty
+destination does. With the switch absent the same conflict ends the checkout,
+apart from the link to a directory the checkout follows.
+
+The widening reaches the destination root and every depth below it, so a
+destination path holding a regular file, a symlink of any kind, or a fifo
+becomes the checkout's own directory. It is independent of the checkout mode,
+the repository mode, and `--subpath`. The destination directory a `--subpath`
+naming a file or a symlink needs stands outside it: a destination that is not a
+directory is refused there under either switch.
+
+`--process-passthrough-whiteouts` widens nothing, the whiteout device refusing a
+destination directory under either switch, and `--union-add` and
+`--union-identical` are not widened. With no union option a destination that
+already exists is refused before any entry is reached, so no type conflict is
+reachable there.
+
+A `--subpath` naming a marker file reaches the same rules, so the marker is not
+materialized under its own name because a subpath selected it: `.wh.<name>`
+removes `<name>` from the destination the subpath writes into, and
+`.ostree-wh.<name>` writes the device there. The opaque marker's clear is the
+directory's own pre-pass, so a subpath naming `.wh..wh..opq` drops the entry and
+clears nothing.
+
+Two names are refused at exit 1. A regular file named exactly `.wh.` under
+`--whiteouts` refuses (`Invalid empty whiteout ''`), and a regular file named
+exactly `.ostree-wh.` under `--process-passthrough-whiteouts` refuses (`Invalid
+empty overlayfs whiteout ''`). Each refusal answers to its own switch alone, and
+a symlink so named is materialized under either switch. The refusal comes
+mid-walk, after the directory's opaque clear, so the destination directory stands
+and holds what the walk had already written.
+
+Both options are independent of the repository mode, of `-U`, of `-H`, and of
+`-C`. Neither option is taken alongside `--composefs` or `--composefs-noverity`:
+the pair is refused at exit 1 (`Specified options are incompatible with
+--composefs`) and no image is written.
 
 Subpath. A subpath resolves a node within the commit tree and checks that node
 out as the destination root. A subpath to a directory makes its dirmeta the

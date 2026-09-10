@@ -394,6 +394,15 @@ struct CheckoutArgs {
     /// `-H/--require-hardlinks`.
     #[arg(long)]
     union_identical: bool,
+    /// Process Docker-style whiteout entries: `.wh.<name>` removes <name> from
+    /// the destination and `.wh..wh..opq` clears the destination directory,
+    /// and neither marker is materialized.
+    #[arg(long)]
+    whiteouts: bool,
+    /// Turn a `.ostree-wh.<name>` entry into an overlayfs whiteout: a
+    /// character device 0:0 at <name>.
+    #[arg(long)]
+    process_passthrough_whiteouts: bool,
     /// Exit 0 without writing anything when `--subpath` names nothing.
     #[arg(long)]
     allow_noent: bool,
@@ -3524,6 +3533,13 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     }
 
     if args.composefs || args.composefs_noverity {
+        // A whiteout switch describes a transformation of the tree a checkout
+        // writes, and a composefs export writes an image of the commit tree
+        // instead. The tool refuses the combination and writes no image, and
+        // the port refuses it under the same words.
+        if args.whiteouts || args.process_passthrough_whiteouts {
+            exit_error("Specified options are incompatible with --composefs");
+        }
         let opts = ComposefsOptions {
             verity: if args.composefs_noverity {
                 VerityPolicy::Disabled
@@ -3580,6 +3596,8 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     let mut opts = CheckoutOptions::new(mode);
     opts.subpath = args.subpath;
     opts.force_copy = args.force_copy;
+    opts.process_whiteouts = args.whiteouts;
+    opts.process_passthrough_whiteouts = args.process_passthrough_whiteouts;
     opts.overwrite = if args.union {
         OverwriteMode::UnionFiles
     } else if args.union_add {

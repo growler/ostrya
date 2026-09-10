@@ -1266,8 +1266,8 @@ stand.
 `checkout` accepts `--repo`, `-H/--require-hardlinks`, `-C/--force-copy`,
 `--composefs`, `--composefs-noverity`, and, since Phase 17c, `-U/--user-mode`
 and `--subpath=PATH`, and, since Phase 17f, `--union`, `--union-add`,
-`--union-identical`, and `--allow-noent`. Missing: `--disable-cache`,
-`--whiteouts`, `--process-passthrough-whiteouts`, `--from-stdin`,
+`--union-identical`, `--allow-noent`, `--whiteouts`, and
+`--process-passthrough-whiteouts`. Missing: `--disable-cache`, `--from-stdin`,
 `--from-file=FILE`, `--fsync=POLICY`, `-M/--bareuseronly-dirs`,
 `--skip-list=FILE`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
 
@@ -1292,8 +1292,36 @@ calls identical is stated in `../format-reference.md`, "Checkout", and held
 against the tool case by case in
 `ostrya_cli::cli::checkout_union_identical_identity_matches_the_tool`.
 
-Three divergences stand at the values `--subpath` takes, one at `-H`, three at
-the composefs switches, and three at the union family:
+`--whiteouts` reads two marker names and `--process-passthrough-whiteouts`
+reads a third. Each switch reads its own names and no others, and the marker
+rules, the type gate per marker, and the destination disposition per union mode
+are stated in `../format-reference.md`, "Checkout". The two switches agree with
+the tool over every repository mode, every union mode, and a destination the
+test pre-populates
+(`ostrya_cli::cli::checkout_whiteouts_match_the_tool`,
+`ostrya_cli::cli::checkout_passthrough_whiteouts_match_the_tool`,
+`ostrya_cli::cli::checkout_passthrough_whiteout_dispositions_match_the_tool`,
+`ostrya_cli::cli::checkout_whiteout_markers_act_on_regular_files_only`,
+`ostrya_cli::cli::checkout_whiteouts_off_materialize_the_markers`). Three
+refusals agree at the exit status and part at the words, which the wording rule
+covers: a marker named exactly `.wh.` or exactly `.ostree-wh.` under its own
+switch (`ostrya_cli::cli::checkout_whiteout_empty_names_are_refused`), and a
+passthrough marker whose target the destination holds as a directory under
+`--union`
+(`ostrya_cli::cli::checkout_passthrough_whiteout_dispositions_match_the_tool`).
+`--whiteouts` also widens the union-files disposition over a type conflict, for
+every entry and not only for a marker, and the two agree over the destination
+root, a nested path, and a destination entry of every type, under both switches
+and every union mode
+(`ostrya_cli::cli::checkout_whiteouts_widen_a_union_type_conflict`). The rule
+is stated in `../format-reference.md`, "Checkout".
+Either switch alongside `--composefs` or `--composefs-noverity` is refused at
+exit 1 with no image written, under the tool's own words, `Specified options
+are incompatible with --composefs`.
+
+Two divergences stand at the values `--subpath` takes, one at `-H`, three at
+the composefs switches, two at `--allow-noent`, and one at a repeated boolean
+flag:
 
 - a subpath naming nothing ends the checkout at exit 1 in both, leaving no
   destination, and the words part: the tool reports `error: No such file or
@@ -1394,8 +1422,9 @@ the composefs switches, and three at the union family:
   sides. Only an out-of-band deletion reaches this pair, so it is recorded and
   no gate is added: a repository the port writes and prunes holds every object
   its commits name;
-- a union option given twice is taken by the tool and refused by the port, as
-  the port refuses every repeated boolean flag
+- a union option, `--allow-noent`, `--whiteouts`, or
+  `--process-passthrough-whiteouts` given twice is taken by the tool and
+  refused by the port, as the port refuses every repeated boolean flag
   (`ostrya_cli::cli::checkout_union_options_are_mutually_exclusive`).
 
 `export` accepts `--repo`, `--no-xattrs`, `--subpath=PATH`, `--prefix=PATH`,

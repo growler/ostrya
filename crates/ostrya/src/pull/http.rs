@@ -811,10 +811,8 @@ impl Repo {
         let body = match ctx
             .fetcher
             .fetch(FetchRequest {
-                path: &path,
                 priority: Priority::Low,
-                validators: None,
-                max_size: None,
+                ..FetchRequest::path(&path)
             })
             .await
         {
@@ -1399,10 +1397,9 @@ async fn fetch_whole(
 ) -> Result<Vec<u8>> {
     let fetched = fetcher
         .fetch(FetchRequest {
-            path,
             priority,
-            validators: None,
             max_size: Some(max_size),
+            ..FetchRequest::path(path)
         })
         .await?;
     let Fetched::Body(mut body) = fetched else {

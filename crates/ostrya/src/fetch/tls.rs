@@ -54,12 +54,18 @@ pub struct TlsOptions {
 /// Build the shared client configuration. `http2` decides whether `h2` is
 /// offered in ALPN. `https` says whether any mirror is reached over TLS, which
 /// decides whether an empty system trust store is fatal.
+///
+/// The second half of the pair says whether the trust store holds an anchor. A
+/// store with none reaches here for a fetcher whose mirrors are all cleartext,
+/// which opens no handshake to consult them; the caller refuses the one fetch
+/// that would, a request naming an `https` URL of its own.
 pub(crate) async fn client_config(
     options: &TlsOptions,
     http2: bool,
     https: bool,
-) -> Result<Arc<ClientConfig>> {
+) -> Result<(Arc<ClientConfig>, bool)> {
     let store = root_store(&options.roots, https).await?;
+    let has_trust_anchors = !store.is_empty();
     let provider = Arc::new(rustls_graviola::default_provider());
     let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
@@ -85,7 +91,7 @@ pub(crate) async fn client_config(
     } else {
         vec![b"http/1.1".to_vec()]
     };
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), has_trust_anchors))
 }
 
 /// Assemble the trust anchors. `https` says whether a handshake will consult
@@ -161,13 +167,27 @@ mod tests {
             roots: TrustRoots::Pem(CA_PEM.to_vec()),
             client_identity: None,
         };
-        let with_h2 = block_on(client_config(&options, true, true)).unwrap();
+        let (with_h2, _) = block_on(client_config(&options, true, true)).unwrap();
         assert_eq!(
             with_h2.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
-        let without = block_on(client_config(&options, false, true)).unwrap();
+        let (without, _) = block_on(client_config(&options, false, true)).unwrap();
         assert_eq!(without.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    /// A configuration built from anchors of its own reports that it holds
+    /// them, whichever scheme the mirrors carry.
+    #[test]
+    fn pem_anchors_are_reported_as_held() {
+        let options = TlsOptions {
+            roots: TrustRoots::Pem(CA_PEM.to_vec()),
+            client_identity: None,
+        };
+        for https in [true, false] {
+            let (_, has_trust_anchors) = block_on(client_config(&options, true, https)).unwrap();
+            assert!(has_trust_anchors, "https={https}");
+        }
     }
 
     #[test]

@@ -1242,7 +1242,11 @@ carries no field of its own.
 
 The HTTP client pull is built on. One `Fetcher` serves one remote: it holds the
 mirrors, headers, credentials, and TLS configuration, pools connections per
-origin, and admits a bounded number of requests at a time in priority order.
+origin, and admits a bounded number of requests at a time in priority order. A
+request names a `Target`: a path under every mirror's base URL, or an absolute
+`http` or `https` URL of its own, which is served from that URL's origin and
+consults no mirror. A request carries headers and credentials of its own as
+well, merged over the fetcher's, one of a name replacing the fetcher's.
 Protocol selection is the TLS handshake's -- ALPN offers `h2` and `http/1.1`.
 Two deadlines bound one attempt's cost: `connect_timeout` over opening a
 connection, and `progress_timeout` over a response delivering bytes, restarted
@@ -1252,14 +1256,25 @@ retries together, from admission to the response head, which is what caps how
 long one fetch holds an admission permit. A credential is sent to every mirror,
 so `basic_auth` and an `Authorization`, `Proxy-Authorization`, or `Cookie` entry
 in `headers` require every mirror to be `https`; a cleartext mirror alongside one
-fails `Fetcher::new`.
+fails `Fetcher::new`. A request whose merged headers carry a credential is
+refused before admission when a destination it may reach is cleartext, which
+`allow_cleartext_credentials` admits. A `Host` header, and a header the
+connection layer sets -- `Content-Length`, `Transfer-Encoding`, `Connection`,
+`Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`, `Expect` -- is
+refused at both layers. A URL whose authority names a port the URL parser
+cannot read is refused, and a host is one origin whichever case it is written
+in.
 
 ```rust
 pub struct FetcherOptions {
     pub mirrors: Vec<String>,             // base URLs, tried in order; a query
-                                          // string or userinfo is rejected
+                                          // string, userinfo, or an unreadable
+                                          // port is rejected; empty serves
+                                          // Target::Url requests alone
     pub headers: Vec<(String, String)>,   // an Authorization, Proxy-Authorization,
-                                          // or Cookie entry needs https mirrors
+                                          // or Cookie entry needs https mirrors;
+                                          // a Host or connection-layer name is
+                                          // rejected
     pub basic_auth: Option<BasicAuth>,    // needs https mirrors
     pub tls: TlsOptions,                  // trust roots, client identity
     pub http2: bool,                      // default true
@@ -1281,12 +1296,36 @@ pub enum Protocol { Http11, Http2 }
 /// The server's own validator strings, replayed to make a fetch conditional.
 pub struct Validators { pub etag: Option<String>, pub last_modified: Option<String> }
 
+/// What a request names. A path is served under every mirror; a URL is served
+/// from its own origin, and the mirror list is not consulted.
+pub enum Target<'a> { Path(&'a str), Url(&'a str) }
+
 pub struct FetchRequest<'a> {
-    pub path: &'a str,                    // relative to each mirror, appended
-                                          // as written; no query, no fragment
+    pub target: Target<'a>,               // a path is appended to each mirror's
+                                          // base path as written and holds no
+                                          // query and no fragment; a URL sends
+                                          // its query as written and holds
+                                          // neither a fragment nor userinfo
     pub priority: Priority,
     pub validators: Option<&'a Validators>,
     pub max_size: Option<u64>,
+    pub headers: &'a [(String, String)],  // merged over the fetcher's; one of
+                                          // the same name replaces it
+    pub basic_auth: Option<&'a BasicAuth>, // replaces the fetcher's for this
+                                          // one request
+    pub allow_cleartext_credentials: bool, // default false: a credential bound
+                                          // for an http origin is refused
+}
+
+/// Credentials for HTTP basic authentication. The `Debug` rendering holds the
+/// user name and a fixed word in place of the password.
+pub struct BasicAuth { pub user: String, pub password: String }
+
+impl<'a> FetchRequest<'a> {
+    // A normal-priority, unconditional, uncapped request carrying the
+    // fetcher's headers and credentials.
+    pub fn path(path: &'a str) -> FetchRequest<'a>;
+    pub fn url(url: &'a str) -> FetchRequest<'a>;
 }
 
 pub enum Fetched { Body(Body), NotModified }
@@ -1309,7 +1348,11 @@ impl Body {
 impl Fetcher {
     // Async: TrustRoots::System, the default, reads the host trust store on
     // the blocking pool, whatever the mirrors' scheme. A store holding no
-    // certificate fails only when a mirror is https. Clone, Send + Sync.
+    // certificate fails the constructor when a mirror is https, and when the
+    // mirror list is empty, since a request may then name an https URL; a
+    // fetcher whose mirrors are all cleartext builds without anchors, and a
+    // fetch of a TLS destination over it is refused before admission.
+    // Clone, Send + Sync.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher>;
     pub async fn fetch(&self, request: FetchRequest<'_>) -> Result<Fetched>;
 }

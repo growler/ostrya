@@ -2392,19 +2392,46 @@ blocking pool through `rt::unblock`, keeping that the only door to it. The TLS
 configuration is built whatever the mirrors' scheme is, so a cleartext-only
 fetcher reads the store as well; under `TrustRoots::Pem` the constructor stays in
 memory and never yields. A system store holding no certificate fails the
-constructor only when at least one mirror is `https`, whose handshake needs the
-anchors, so a host without a CA bundle -- a container without ca-certificates --
-still builds a fetcher for a cleartext remote. Credentials are the one thing a
-cleartext mirror is refused for: `basic_auth`, and an `Authorization`,
+constructor when at least one mirror is `https`, whose handshake needs the
+anchors, and when the mirror list is empty, since a request may then name an
+`https` URL of its own; a host without a CA bundle -- a container without
+ca-certificates -- still builds a fetcher for a cleartext remote. That fetcher
+holds no anchors, so the one fetch over it that would consult them, a request
+naming an `https` URL, is refused before admission with `Error::Fetch` naming
+the origin. The handshake reports that case as an unknown issuer, a retryable
+failure that spends every round and every backoff before it names anything.
+Credentials are the one thing a cleartext mirror is refused for:
+`basic_auth`, and an `Authorization`,
 `Proxy-Authorization`, or `Cookie` entry in `headers`, are sent with every
 request to every mirror, so one `http` entry in the list fails the constructor
 with `Error::Fetch` naming that mirror. Withholding the credential from that one
 mirror instead would answer 401 and name nothing, and those three are the header
-names whose value is a secret whatever it holds -- any other header is sent as
-written.
-`Fetcher::fetch` takes a `FetchRequest` -- a path relative to each mirror, a
-`Priority`, optional `Validators`, an optional size cap -- and resolves to
-`Fetched::Body` or `Fetched::NotModified`.
+names whose value is a secret whatever it holds. A `Host` header is refused as
+well, since it states the authority of the destination the request goes to,
+which the fetcher reads from the URL, and so is a header the connection layer
+sets: `Content-Length`, `Transfer-Encoding`, `Connection`, `Keep-Alive`,
+`Proxy-Connection`, `TE`, `Trailer`, `Upgrade`, and `Expect`. The framing of a
+request and the fate of its connection belong to the connection, and a value of
+a caller's own puts the wire and the connection pool out of step with each
+other -- a `Content-Length` of a caller's own ends the HTTP/1.1 connection under
+a pooled sender, and the next fetch over that fetcher fails on a channel the
+connection task has dropped. Every other header is sent as written.
+`Fetcher::fetch` takes a `FetchRequest` -- a `Target`, a `Priority`, optional
+`Validators`, an optional size cap, headers of the request's own, credentials of
+the request's own, and the switch that admits a credential to a cleartext
+origin -- and resolves to `Fetched::Body` or `Fetched::NotModified`. A `Target`
+is a path relative to each mirror, or an absolute `http`/`https` URL served from
+its own origin, which consults no mirror; a fetcher whose mirror list is empty
+serves URL targets alone, and the pool is keyed by origin, so a URL target
+shares a connection with a mirror at the same origin. The request's headers
+merge over the fetcher's, one of a name replacing the fetcher's, and the
+request's credentials replace the fetcher's `Authorization`. Within one layer,
+credentials beside an `Authorization` header are refused, both of them setting
+one header. Everything one fetch settles for every destination -- the
+destination a URL target names, the merged headers, the credentials they carry,
+the cleartext-credential rule, and the anchors a TLS destination verifies
+against -- is settled before admission, so a refusal takes no permit and opens
+no socket.
 
 - Protocol selection is the TLS handshake's: ALPN offers `h2` then `http/1.1`,
   and the connection speaks what the server chose. A cleartext origin speaks
@@ -2414,17 +2441,23 @@ written.
   multiplexes concurrent requests; an HTTP/1.1 connection returns to the pool
   when its body reaches the end, and a body dropped early closes its connection
   instead, because the rest of the response is still in flight.
-- An HTTP/1.1 request carries the origin-form target (the path alone) and a
-  `Host` header built from the mirror's authority; the absolute form belongs to
-  proxy requests, and a plain static-file server -- how an ostree repository is
-  usually published -- answers 404 to it. An HTTP/2 request carries the absolute
-  URL, from which the `:scheme` and `:authority` pseudo-headers are filled. A
-  caller-supplied `host` header is rejected at construction, since it would
-  collide.
+- An HTTP/1.1 request carries the origin-form target -- the path, and the query
+  string a URL target carries -- and a `Host` header built from the
+  destination's authority; the absolute form belongs to proxy requests, and a
+  plain static-file server -- how an ostree repository is usually published --
+  answers 404 to it. An HTTP/2 request carries the absolute URL, from which the
+  `:scheme` and `:authority` pseudo-headers are filled. One string holds both
+  forms: the whole of it is the absolute URL, and its tail from the length of
+  the `scheme://authority` prefix is the origin-form target. A caller-supplied
+  `host` header is refused at both layers, since it would collide.
 - Conditional GET replays `ETag` as `If-None-Match` and `Last-Modified` as
   `If-Modified-Since`; the stored values are the server's own strings, so no
   date parsing enters the fetcher. A 304 resolves to `NotModified` and its
   connection is reusable at once.
+- A path target's destination is built for the mirror the attempt is about to
+  use, so a fetch the first mirror answers builds one destination whatever the
+  length of the mirror list; a URL target's destination is parsed once per fetch
+  and serves every attempt and every retry round.
 - Every mirror is tried in order before anything is retried. Transport failures
   and the statuses 408, 429, and 5xx are retryable, and a round holding one
   repeats after a delay doubling from 250ms to a two-second cap; any other
@@ -2490,7 +2523,16 @@ written.
   given as an IPv6 literal keeps its brackets in the `Host` header and in the
   absolute URLs, and is held bare in the origin, which is what the connect
   resolves and the TLS server name is built from; both reject the bracketed
-  form.
+  form. An ASCII host is held in the origin in lower case, so one origin written
+  in two cases is one pool key and one connection, which is what a `Location`
+  header echoing the origin server's own case would otherwise split.
+- `hyper::Uri` accepts an authority whose port it cannot read -- `h:99999`,
+  `h:65536`, `h:abc`, `h:` -- and reports no port for it. Taking the scheme
+  default there serves the request from a port the caller did not name, and the
+  rebuilt authority drops the port as well, so such an authority is refused with
+  `Error::Fetch` naming the URL and the port text. A URL with no port at all
+  takes the scheme default. This holds for a mirror URL and a request URL alike,
+  both being read by one parse.
 - A request path is appended to the base path as written, carrying the escaping
   the server is meant to see, and holds no query and no fragment: a `?` or a `#`
   in it fails the fetch with `Error::Fetch` naming the character. Either one

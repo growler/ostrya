@@ -170,7 +170,10 @@ impl hyper::body::Body for TestBody {
 /// What the client asked for, as the server saw it.
 #[derive(Clone, Debug)]
 struct Seen {
+    /// The request target's path alone.
     path: String,
+    /// The whole request target, the query string included.
+    target: String,
     headers: HeaderMap,
 }
 
@@ -292,6 +295,7 @@ where
         async move {
             let record = Seen {
                 path: request.uri().path().to_string(),
+                target: request.uri().to_string(),
                 headers: request.headers().clone(),
             };
             let count = {
@@ -429,7 +433,7 @@ async fn queued(fetcher: Fetcher, path: &'static str, priority: Priority) {
     let fetched = fetcher
         .fetch(FetchRequest {
             priority,
-            ..FetchRequest::new(path)
+            ..FetchRequest::path(path)
         })
         .await
         .unwrap();
@@ -442,7 +446,7 @@ async fn queued(fetcher: Fetcher, path: &'static str, priority: Priority) {
 
 /// Fetch `path` and return the body's bytes with the protocol that carried it.
 async fn fetch_bytes(fetcher: &Fetcher, path: &str) -> (Vec<u8>, Protocol) {
-    match fetcher.fetch(FetchRequest::new(path)).await.unwrap() {
+    match fetcher.fetch(FetchRequest::path(path)).await.unwrap() {
         Fetched::Body(mut body) => {
             let protocol = body.protocol();
             let mut out = Vec::new();
@@ -450,6 +454,48 @@ async fn fetch_bytes(fetcher: &Fetcher, path: &str) -> (Vec<u8>, Protocol) {
             (out, protocol)
         }
         Fetched::NotModified => panic!("unexpected 304 for {path}"),
+    }
+}
+
+/// Fetch the absolute URL `url` and return the body's bytes with the protocol
+/// that carried it.
+async fn fetch_url_bytes(fetcher: &Fetcher, url: &str) -> (Vec<u8>, Protocol) {
+    match fetcher.fetch(FetchRequest::url(url)).await.unwrap() {
+        Fetched::Body(mut body) => {
+            let protocol = body.protocol();
+            let mut out = Vec::new();
+            body.read_to_end(&mut out).await.unwrap();
+            (out, protocol)
+        }
+        Fetched::NotModified => panic!("unexpected 304 for {url}"),
+    }
+}
+
+/// Read a fetched body to the end, which releases the admission permit.
+async fn read_body(fetched: Fetched) -> Vec<u8> {
+    let Fetched::Body(mut body) = fetched else {
+        panic!("unexpected 304");
+    };
+    let mut out = Vec::new();
+    body.read_to_end(&mut out).await.unwrap();
+    out
+}
+
+/// Options for a fetcher with no mirror, which serves the URLs its requests
+/// name. The fixture anchors stand in for the host trust store, which an empty
+/// mirror list otherwise demands.
+fn mirrorless_options() -> FetcherOptions {
+    FetcherOptions {
+        tls: tls_options(None),
+        ..FetcherOptions::default()
+    }
+}
+
+/// Credentials a test sends.
+fn basic_auth(user: &str, password: &str) -> BasicAuth {
+    BasicAuth {
+        user: user.to_owned(),
+        password: password.to_owned(),
     }
 }
 
@@ -611,7 +657,7 @@ fn a_conditional_fetch_resolves_to_not_modified() {
             .await
             .unwrap();
 
-        let validators = match fetcher.fetch(FetchRequest::new("summary")).await.unwrap() {
+        let validators = match fetcher.fetch(FetchRequest::path("summary")).await.unwrap() {
             Fetched::Body(mut body) => {
                 let validators = body.validators().clone();
                 let mut out = Vec::new();
@@ -627,7 +673,7 @@ fn a_conditional_fetch_resolves_to_not_modified() {
             Some("Wed, 21 Oct 2015 07:28:00 GMT")
         );
 
-        let mut request = FetchRequest::new("summary");
+        let mut request = FetchRequest::path("summary");
         request.validators = Some(&validators);
         assert!(matches!(
             fetcher.fetch(request).await.unwrap(),
@@ -652,7 +698,7 @@ fn a_missing_object_reports_its_status_without_retrying() {
             .unwrap();
 
         let err = fetcher
-            .fetch(FetchRequest::new("objects/ab/cd.filez"))
+            .fetch(FetchRequest::path("objects/ab/cd.filez"))
             .await
             .unwrap_err();
         match err {
@@ -702,7 +748,7 @@ fn retries_stop_at_the_configured_count() {
         let fetcher = Fetcher::new(options).await.unwrap();
 
         let err = fetcher
-            .fetch(FetchRequest::new("config"))
+            .fetch(FetchRequest::path("config"))
             .await
             .unwrap_err();
         assert!(
@@ -732,7 +778,7 @@ fn a_mirror_that_answered_definitively_is_not_asked_again() {
         let fetcher = Fetcher::new(options).await.unwrap();
 
         let err = fetcher
-            .fetch(FetchRequest::new("objects/ab/cd.dirtree"))
+            .fetch(FetchRequest::path("objects/ab/cd.dirtree"))
             .await
             .unwrap_err();
         // The first mirror in the list is the first that had something to say.
@@ -770,7 +816,7 @@ fn a_definitive_answer_from_an_earlier_round_is_reported() {
         let fetcher = Fetcher::new(options).await.unwrap();
 
         let err = fetcher
-            .fetch(FetchRequest::new("summary"))
+            .fetch(FetchRequest::path("summary"))
             .await
             .unwrap_err();
         // The 404 came first, in the round before the 410 that ended the fetch.
@@ -804,7 +850,7 @@ fn a_definitive_answer_after_a_retryable_failure_is_reported() {
         let fetcher = Fetcher::new(options).await.unwrap();
 
         let err = fetcher
-            .fetch(FetchRequest::new("summary"))
+            .fetch(FetchRequest::path("summary"))
             .await
             .unwrap_err();
         // The 503 of the first round does not hide the answer of the second.
@@ -850,7 +896,7 @@ fn an_invalid_path_connects_to_no_mirror() {
         let fetcher = Fetcher::new(options).await.unwrap();
 
         let err = fetcher
-            .fetch(FetchRequest::new("summary?sig=1"))
+            .fetch(FetchRequest::path("summary?sig=1"))
             .await
             .unwrap_err();
         assert!(
@@ -864,6 +910,357 @@ fn an_invalid_path_connects_to_no_mirror() {
         // permit or connection behind.
         let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
         assert_eq!(bytes, b"unreachable");
+    });
+}
+
+// --- url targets, request headers, and request credentials ----------------
+
+/// A URL target names the whole request target, so its query string reaches
+/// the handler as it was written, escapes included.
+#[test]
+fn a_url_target_sends_its_query_string_verbatim() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"signed bytes")).await;
+        let fetcher = Fetcher::new(mirrorless_options()).await.unwrap();
+
+        let url = format!("{}/repo/summary?sig=a%2Fb&x=1", server.url(false));
+        let (bytes, _) = fetch_url_bytes(&fetcher, &url).await;
+        assert_eq!(bytes, b"signed bytes");
+        assert_eq!(server.seen()[0].target, "/repo/summary?sig=a%2Fb&x=1");
+        assert_eq!(server.seen()[0].path, "/repo/summary");
+    });
+}
+
+/// Neither userinfo nor a fragment is ever sent, so a URL target carrying one
+/// asks for something other than what the caller named. Both are refused
+/// before the fetch is admitted: no connection is opened, and the fetcher
+/// serves the next request.
+#[test]
+fn a_url_target_with_userinfo_or_a_fragment_connects_to_nothing() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"unreachable")).await;
+        let fetcher = Fetcher::new(mirrorless_options()).await.unwrap();
+        let port = server.addr.port();
+
+        for (url, expected) in [
+            (
+                format!("http://user:pass@localhost:{port}/summary"),
+                "userinfo",
+            ),
+            (format!("http://localhost:{port}/summary#frag"), "fragment"),
+        ] {
+            let err = fetcher.fetch(FetchRequest::url(&url)).await.unwrap_err();
+            assert!(err.to_string().contains(expected), "{url}: {err}");
+        }
+        assert_eq!(server.requests(), 0);
+        assert_eq!(server.connections(), 0);
+
+        let url = format!("http://localhost:{port}/summary");
+        let (bytes, _) = fetch_url_bytes(&fetcher, &url).await;
+        assert_eq!(bytes, b"unreachable");
+    });
+}
+
+/// A fetcher with no mirror serves the URLs its requests name, and pools their
+/// connections by origin: two URL fetches of one origin travel over one
+/// HTTP/2 connection.
+#[test]
+fn a_mirrorless_fetcher_pools_one_connection_per_origin() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Tls {
+                alpn: vec!["h2"],
+                client_auth: false,
+            },
+            always(b"over h2"),
+        )
+        .await;
+        let fetcher = Fetcher::new(mirrorless_options()).await.unwrap();
+
+        let base = server.url(true);
+        for name in ["a", "b"] {
+            let url = format!("{base}/{name}");
+            let (bytes, protocol) = fetch_url_bytes(&fetcher, &url).await;
+            assert_eq!(bytes, b"over h2");
+            assert_eq!(protocol, Protocol::Http2);
+        }
+        assert_eq!(server.requests(), 2);
+        assert_eq!(server.connections(), 1);
+    });
+}
+
+/// A request's headers are merged over the fetcher's: one of the same name
+/// replaces the fetcher's and is seen once, and one of another name is sent
+/// beside the fetcher's own.
+#[test]
+fn a_request_header_replaces_the_fetchers_header_of_the_same_name() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
+        let mut options = FetcherOptions::new(server.url(false));
+        options.headers = vec![
+            ("x-trace".to_owned(), "fetcher".to_owned()),
+            ("x-fetcher-only".to_owned(), "yes".to_owned()),
+        ];
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        // The name is written in another case, which a header name compares
+        // the same as.
+        let headers = vec![
+            ("X-Trace".to_owned(), "request".to_owned()),
+            ("x-request-only".to_owned(), "yes".to_owned()),
+        ];
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                headers: &headers,
+                ..FetchRequest::path("summary")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"bytes");
+
+        let seen = &server.seen()[0];
+        assert_eq!(seen.header("x-trace"), Some("request"));
+        assert_eq!(seen.headers.get_all("x-trace").iter().count(), 1);
+        assert_eq!(seen.header("x-fetcher-only"), Some("yes"));
+        assert_eq!(seen.header("x-request-only"), Some("yes"));
+    });
+}
+
+/// The connection layer frames a request and holds the connection carrying it,
+/// so a request header of one of those names is refused before the fetch is
+/// admitted: no request reaches the server, and the connection pool is left as
+/// it was, so the next fetch over the same fetcher is served.
+#[test]
+fn a_request_framing_header_reaches_no_server() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+
+        let headers = vec![("content-length".to_owned(), "10".to_owned())];
+        let err = fetcher
+            .fetch(FetchRequest {
+                headers: &headers,
+                ..FetchRequest::path("summary")
+            })
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("content-length"), "{message}");
+        assert!(message.contains("connection layer"), "{message}");
+        assert_eq!(server.requests(), 0);
+        assert_eq!(server.connections(), 0);
+
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"bytes");
+        assert_eq!(server.requests(), 1);
+    });
+}
+
+/// A fetcher header of a connection-layer name fails the constructor, which is
+/// where the fetcher's own headers are read.
+#[test]
+fn a_fetcher_framing_header_fails_the_constructor() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"unreachable")).await;
+        let mut options = FetcherOptions::new(server.url(false));
+        options.headers = vec![("transfer-encoding".to_owned(), "chunked".to_owned())];
+        let err = Fetcher::new(options).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("transfer-encoding"), "{message}");
+        assert!(message.contains("connection layer"), "{message}");
+        assert_eq!(server.connections(), 0);
+    });
+}
+
+/// A host is one origin whichever case it is written in, so two URL targets
+/// that differ only in the case of the host travel over one connection.
+#[test]
+fn a_host_written_in_two_cases_shares_one_connection() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
+        let fetcher = Fetcher::new(mirrorless_options()).await.unwrap();
+        let port = server.addr.port();
+
+        for host in ["localhost", "LOCALHOST"] {
+            let url = format!("http://{host}:{port}/summary");
+            let (bytes, _) = fetch_url_bytes(&fetcher, &url).await;
+            assert_eq!(bytes, b"bytes");
+        }
+        assert_eq!(server.requests(), 2);
+        assert_eq!(server.connections(), 1);
+    });
+}
+
+/// A request's credentials replace the fetcher's, whether the fetcher holds
+/// them as credentials or as an `Authorization` header. Both layers reach an
+/// https destination, which is where a credential may go.
+#[test]
+fn a_request_basic_auth_overrides_the_fetchers_authorization() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Tls {
+                alpn: vec!["http/1.1"],
+                client_auth: false,
+            },
+            always(b"bytes"),
+        )
+        .await;
+        let auth = basic_auth("u", "p");
+
+        let mut options = FetcherOptions::new(server.url(true));
+        options.tls = tls_options(None);
+        options.basic_auth = Some(basic_auth("fetcher", "secret"));
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                basic_auth: Some(&auth),
+                ..FetchRequest::path("one")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"bytes");
+
+        let mut options = FetcherOptions::new(server.url(true));
+        options.tls = tls_options(None);
+        options.headers = vec![("authorization".to_owned(), "Basic ZmV0Y2hlcg==".to_owned())];
+        let header_fetcher = Fetcher::new(options).await.unwrap();
+        let fetched = header_fetcher
+            .fetch(FetchRequest {
+                basic_auth: Some(&auth),
+                ..FetchRequest::path("two")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"bytes");
+
+        // base64("u:p"), sent once by each fetcher.
+        assert_eq!(server.requests(), 2);
+        for seen in server.seen() {
+            assert_eq!(seen.header("authorization"), Some("Basic dTpw"));
+            assert_eq!(seen.headers.get_all("authorization").iter().count(), 1);
+        }
+    });
+}
+
+/// A credential is withheld from no destination, so a cleartext destination
+/// refuses the fetch and is named. A request that means it says so, and the
+/// credential goes over cleartext.
+#[test]
+fn a_request_credential_to_a_cleartext_origin_is_refused() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let auth = basic_auth("u", "p");
+
+        let err = fetcher
+            .fetch(FetchRequest {
+                basic_auth: Some(&auth),
+                ..FetchRequest::path("summary")
+            })
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("carries credentials"), "{message}");
+        assert!(
+            message.contains(&format!("http://localhost:{}", server.addr.port())),
+            "{message}"
+        );
+        assert_eq!(server.requests(), 0);
+        assert_eq!(server.connections(), 0);
+
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                basic_auth: Some(&auth),
+                allow_cleartext_credentials: true,
+                ..FetchRequest::path("summary")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"bytes");
+        assert_eq!(server.seen()[0].header("authorization"), Some("Basic dTpw"));
+    });
+}
+
+/// Credentials beside an `Authorization` header give two answers to one
+/// question. The fetcher refuses them at construction, and a request refuses
+/// them before it is admitted.
+#[test]
+fn basic_auth_beside_an_authorization_header_is_refused() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"unreachable")).await;
+        let auth = basic_auth("u", "p");
+
+        // An https mirror, so the refusal is the ambiguity and not the
+        // cleartext one. The mirror is never contacted.
+        let mut options = FetcherOptions {
+            tls: tls_options(None),
+            ..FetcherOptions::new("https://secure.example/repo")
+        };
+        options.headers = vec![("authorization".to_owned(), "Basic aaa".to_owned())];
+        options.basic_auth = Some(auth.clone());
+        let err = Fetcher::new(options).await.unwrap_err();
+        assert!(err.to_string().contains("pass one of them"), "{err}");
+
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let headers = vec![("authorization".to_owned(), "Basic aaa".to_owned())];
+        let err = fetcher
+            .fetch(FetchRequest {
+                headers: &headers,
+                basic_auth: Some(&auth),
+                allow_cleartext_credentials: true,
+                ..FetchRequest::path("summary")
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("pass one of them"), "{err}");
+        assert_eq!(server.requests(), 0);
+    });
+}
+
+/// A path target is served under the mirrors, so a fetcher with none has
+/// nowhere to send it and says so before the fetch is admitted.
+#[test]
+fn a_path_target_without_a_mirror_reaches_no_server() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"unreachable")).await;
+        let fetcher = Fetcher::new(mirrorless_options()).await.unwrap();
+
+        let err = fetcher
+            .fetch(FetchRequest::path("summary"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Fetch(_)), "{err}");
+        assert!(err.to_string().contains("no mirror is configured"), "{err}");
+        assert_eq!(server.requests(), 0);
+        assert_eq!(server.connections(), 0);
+    });
+}
+
+/// The pool is keyed by origin, so a URL target and a path target for one
+/// origin travel over one connection.
+#[test]
+fn a_url_target_shares_the_pooled_connection_with_a_path_target() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
+        let base = server.url(false);
+        let fetcher = Fetcher::new(FetcherOptions::new(base.clone()))
+            .await
+            .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"bytes");
+        let url = format!("{base}/objects/ab/cd.filez");
+        let (bytes, _) = fetch_url_bytes(&fetcher, &url).await;
+        assert_eq!(bytes, b"bytes");
+
+        assert_eq!(server.requests(), 2);
+        assert_eq!(server.connections(), 1);
     });
 }
 
@@ -882,7 +1279,7 @@ fn a_declared_length_over_the_cap_fails_before_streaming() {
             .await
             .unwrap();
 
-        let mut request = FetchRequest::new("summary");
+        let mut request = FetchRequest::path("summary");
         request.max_size = Some(1024);
         let err = fetcher.fetch(request).await.unwrap_err();
         assert!(matches!(err, Error::FetchTooLarge { limit: 1024 }), "{err}");
@@ -905,7 +1302,7 @@ fn a_body_that_outgrows_the_cap_fails_the_read() {
             .await
             .unwrap();
 
-        let mut request = FetchRequest::new("summary");
+        let mut request = FetchRequest::path("summary");
         request.max_size = Some(1024);
         let Fetched::Body(mut body) = fetcher.fetch(request).await.unwrap() else {
             panic!("unexpected 304");
@@ -1022,7 +1419,7 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
         without_cert.max_retries = 0;
         let fetcher = Fetcher::new(without_cert).await.unwrap();
         let err = fetcher
-            .fetch(FetchRequest::new("config"))
+            .fetch(FetchRequest::path("config"))
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Fetch(_)), "{err}");
@@ -1096,7 +1493,7 @@ fn a_fetched_body_verifies_against_its_expected_digest() {
             .unwrap();
 
         let Fetched::Body(body) = fetcher
-            .fetch(FetchRequest::new("objects/ab/cd.filez"))
+            .fetch(FetchRequest::path("objects/ab/cd.filez"))
             .await
             .unwrap()
         else {
@@ -1109,7 +1506,7 @@ fn a_fetched_body_verifies_against_its_expected_digest() {
 
         // The same stream against a different digest fails at the end.
         let Fetched::Body(body) = fetcher
-            .fetch(FetchRequest::new("objects/ab/cd.filez"))
+            .fetch(FetchRequest::path("objects/ab/cd.filez"))
             .await
             .unwrap()
         else {
@@ -1140,7 +1537,8 @@ fn an_abandoned_body_is_not_pooled() {
             .await
             .unwrap();
 
-        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::new("big")).await.unwrap() else {
+        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::path("big")).await.unwrap()
+        else {
             panic!("unexpected 304");
         };
         let mut head = [0u8; 16];
@@ -1176,7 +1574,7 @@ fn an_unsuccessful_status_with_a_short_body_keeps_its_connection() {
 
         for _ in 0..4 {
             let err = fetcher
-                .fetch(FetchRequest::new("objects/ab/cd.filez"))
+                .fetch(FetchRequest::path("objects/ab/cd.filez"))
                 .await
                 .unwrap_err();
             assert!(
@@ -1203,7 +1601,7 @@ fn an_over_cap_response_with_a_short_body_keeps_its_connection() {
             let err = fetcher
                 .fetch(FetchRequest {
                     max_size: Some(4),
-                    ..FetchRequest::new("summary")
+                    ..FetchRequest::path("summary")
                 })
                 .await
                 .unwrap_err();
@@ -1233,7 +1631,7 @@ fn an_unsuccessful_status_with_an_undeclared_body_closes_its_connection() {
         for _ in 0..3 {
             assert!(
                 fetcher
-                    .fetch(FetchRequest::new("objects/ab/cd.filez"))
+                    .fetch(FetchRequest::path("objects/ab/cd.filez"))
                     .await
                     .is_err()
             );
@@ -1254,7 +1652,7 @@ fn a_queued_high_priority_fetch_is_served_before_a_low_priority_one() {
         let fetcher = Fetcher::new(options).await.unwrap();
 
         // The one permit is held by a body that has not been read to the end.
-        let Fetched::Body(held) = fetcher.fetch(FetchRequest::new("held")).await.unwrap() else {
+        let Fetched::Body(held) = fetcher.fetch(FetchRequest::path("held")).await.unwrap() else {
             panic!("unexpected 304");
         };
 
@@ -1296,7 +1694,7 @@ fn a_stalled_handshake_times_out() {
         let fetcher = Fetcher::new(options).await.unwrap();
 
         let err = fetcher
-            .fetch(FetchRequest::new("summary"))
+            .fetch(FetchRequest::path("summary"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
@@ -1315,7 +1713,7 @@ fn a_stalled_response_times_out() {
         let fetcher = Fetcher::new(options).await.unwrap();
 
         let err = fetcher
-            .fetch(FetchRequest::new("summary"))
+            .fetch(FetchRequest::path("summary"))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no response after"), "{err}");
@@ -1341,7 +1739,7 @@ fn a_fetch_gives_up_when_its_own_deadline_passes() {
         let fetcher = Fetcher::new(options).await.unwrap();
 
         let err = fetcher
-            .fetch(FetchRequest::new("summary"))
+            .fetch(FetchRequest::path("summary"))
             .await
             .unwrap_err();
         assert!(
@@ -1350,7 +1748,7 @@ fn a_fetch_gives_up_when_its_own_deadline_passes() {
         );
 
         let second = or(
-            async { Some(fetcher.fetch(FetchRequest::new("summary")).await) },
+            async { Some(fetcher.fetch(FetchRequest::path("summary")).await) },
             async {
                 Timer::after(Duration::from_secs(5)).await;
                 None
@@ -1392,7 +1790,8 @@ fn a_stalled_body_fails_the_read() {
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
 
-        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::new("big")).await.unwrap() else {
+        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::path("big")).await.unwrap()
+        else {
             panic!("unexpected 304");
         };
         assert_eq!(body.content_length(), Some(64));
@@ -1441,7 +1840,8 @@ fn a_body_that_resumes_after_the_window_stays_failed() {
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
 
-        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::new("big")).await.unwrap() else {
+        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::path("big")).await.unwrap()
+        else {
             panic!("unexpected 304");
         };
         let mut head = [0u8; 8];
@@ -1481,7 +1881,8 @@ fn a_truncated_body_fails_the_read() {
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
 
-        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::new("big")).await.unwrap() else {
+        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::path("big")).await.unwrap()
+        else {
             panic!("unexpected 304");
         };
         assert_eq!(body.content_length(), Some(64));
@@ -1535,7 +1936,7 @@ fn an_unread_body_is_not_on_the_progress_clock() {
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
 
-        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::new("late")).await.unwrap()
+        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::path("late")).await.unwrap()
         else {
             panic!("unexpected 304");
         };
@@ -1561,7 +1962,8 @@ fn an_abandoned_read_leaves_the_progress_window_running() {
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
 
-        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::new("big")).await.unwrap() else {
+        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::path("big")).await.unwrap()
+        else {
             panic!("unexpected 304");
         };
         let mut head = [0u8; 8];

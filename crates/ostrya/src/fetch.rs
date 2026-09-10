@@ -1,36 +1,69 @@
 //! The async HTTP fetcher pull is built on.
 //!
 //! A [`Fetcher`] holds the mirrors, headers, credentials, and TLS
-//! configuration of one remote, and serves [`FetchRequest`]s for paths
-//! relative to those mirrors. Every fetch is streaming: the response arrives as
-//! a [`Body`] that yields bounded chunks, so an object of any size passes
-//! through without being buffered whole.
+//! configuration of one remote, and serves [`FetchRequest`]s. A request names
+//! a [`Target`]: a path under every mirror's base URL, or an absolute `http`
+//! or `https` URL of its own, which is served from that URL's origin and
+//! consults no mirror. A fetcher whose mirror list is empty serves URL targets
+//! alone. Every fetch is streaming: the response arrives as a [`Body`] that
+//! yields bounded chunks, so an object of any size passes through without
+//! being buffered whole.
 //!
 //! Protocol selection is the TLS handshake's: ALPN offers `h2` and
 //! `http/1.1`, and the fetcher speaks whichever the server chose. Over
 //! cleartext it speaks HTTP/1.1. HTTP/2 connections are pooled per origin and
 //! carry concurrent requests on one connection; HTTP/1.1 connections are pooled
-//! and reused once the previous body has been read to the end.
+//! and reused once the previous body has been read to the end. The pool is
+//! keyed by origin, so a URL target shares a connection with a mirror at the
+//! same origin.
 //!
-//! A credential goes to every mirror, so credentials and cleartext are refused
-//! together: [`basic_auth`](FetcherOptions::basic_auth), or an `Authorization`,
-//! `Proxy-Authorization`, or `Cookie` entry in
+//! A request sends the fetcher's headers with its own merged over them: a
+//! request header replaces the fetcher header of the same name, and two
+//! headers of one name both reach the wire. The `Authorization` header a
+//! request carries is the first of these that is set --
+//! [`FetchRequest::basic_auth`], an `Authorization` entry in
+//! [`FetchRequest::headers`], [`FetcherOptions::basic_auth`], an
+//! `Authorization` entry in [`FetcherOptions::headers`]. Within one layer,
+//! credentials beside an `Authorization` header give two answers to one
+//! question, so they are refused: on the fetcher by [`Fetcher::new`], and on a
+//! request by the fetch. A header the connection layer sets -- `Host`, the
+//! framing headers, and the hop-by-hop ones -- is refused at both layers as
+//! well: the framing of a request and the fate of its connection belong to the
+//! connection, and a value of the caller's own puts the wire and the connection
+//! pool out of step with each other.
+//!
+//! A credential is withheld from no destination, so credentials and cleartext
+//! are refused together. [`basic_auth`](FetcherOptions::basic_auth), or an
+//! `Authorization`, `Proxy-Authorization`, or `Cookie` entry in
 //! [`headers`](FetcherOptions::headers), fails [`Fetcher::new`] when any mirror
-//! is `http`. The alternative is to withhold the credential from that one
-//! mirror, which turns a configuration mistake into a 401 that names nothing.
+//! is `http`. A fetch whose merged headers carry a credential fails before
+//! admission when a destination it may reach is `http`, and names that origin;
+//! [`FetchRequest::allow_cleartext_credentials`] admits such a fetch, and the
+//! construction check has no such switch. The alternative is to withhold the
+//! credential from that one destination, which turns a configuration mistake
+//! into a 401 that names nothing.
 //!
-//! What a fetch does when something goes wrong:
+//! A TLS destination needs a trust anchor to verify the server certificate
+//! against. A fetcher whose mirrors are all cleartext holds none where the host
+//! trust store is empty, and the one fetch that would consult them there -- a
+//! request naming an `https` URL of its own -- is refused before admission with
+//! the origin named.
 //!
-//! - Every mirror is tried in order before anything is retried.
+//! What a fetch does when something goes wrong. A path target is served under
+//! every mirror, in the mirror order, and its destination is resolved at the
+//! attempt that uses it; a URL target has the one destination the URL names.
+//!
+//! - Every destination is tried in order before anything is retried.
 //! - Transport failures and the statuses 408, 429, and 5xx are retryable; a
-//!   round in which at least one mirror failed that way is repeated, up to
+//!   round in which at least one destination failed that way is repeated, up to
 //!   [`max_retries`](FetcherOptions::max_retries) times, with a doubling delay
 //!   starting at 250ms and capped at two seconds. A repeated round asks only the
-//!   mirrors whose failure was retryable.
-//! - Every other unsuccessful status is definitive: the mirror that answered it
-//!   is not asked again, its answer being the same whichever round asks.
-//! - A fetch runs out either of mirrors to ask or of rounds to repeat, and both
-//!   report a definitive answer when the fetch received one, and the first
+//!   destinations whose failure was retryable.
+//! - Every other unsuccessful status is definitive: the destination that
+//!   answered it is not asked again, its answer being the same whichever round
+//!   asks.
+//! - A fetch runs out either of destinations to ask or of rounds to repeat, and
+//!   both report a definitive answer when the fetch received one, and the first
 //!   retryable failure otherwise. A definitive answer is what a caller can act
 //!   on -- a 404 is how absence reads -- so it is reported whichever round it
 //!   came from, and a retryable failure seen before it does not hide it. Among
@@ -46,7 +79,7 @@
 //! remote does not hold, so without this a scan would pay a connection setup per
 //! absent object.
 //!
-//! Two deadlines bound one attempt against one mirror:
+//! Two deadlines bound one attempt against one destination:
 //!
 //! - [`connect_timeout`](FetcherOptions::connect_timeout) covers opening a
 //!   connection -- the TCP connect, the TLS handshake, and the HTTP handshake
@@ -62,16 +95,16 @@
 //!   [`io::ErrorKind::TimedOut`](std::io::ErrorKind::TimedOut), and keeps failing
 //!   it.
 //!
-//! Both expire as transport failures, so they are retryable and the next mirror
-//! is tried.
+//! Both expire as transport failures, so they are retryable and the next
+//! destination is tried.
 //!
 //! [`fetch_timeout`](FetcherOptions::fetch_timeout) bounds the fetch as a whole:
-//! every mirror round, every retry, and the delays between them, from admission
-//! to the response head. It expires as [`Error::Fetch`](crate::Error::Fetch)
+//! every round, every retry, and the delays between them, from admission to the
+//! response head. It expires as [`Error::Fetch`](crate::Error::Fetch)
 //! with nothing left to try, and the attempt it cancels takes the admission
 //! permit with it. This is what keeps an unresponsive peer from stalling a pull
-//! for the product of the mirror count, the retry count, and the two per-attempt
-//! deadlines.
+//! for the product of the destination count, the retry count, and the two
+//! per-attempt deadlines.
 //!
 //! Requests carry a [`Priority`]. The fetcher admits
 //! [`max_outstanding`](FetcherOptions::max_outstanding) requests at a time and
@@ -83,6 +116,7 @@
 //! Range requests are not used: an interrupted body is refetched from the
 //! start.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -110,8 +144,38 @@ use io::{FuturesIo, RtExecutor, RtTimer, WriteVectored};
 use tls::client_config;
 pub use tls::{ClientIdentity, TlsOptions, TrustRoots};
 
-/// The user agent every request carries.
+/// The user agent a request carries, which a `User-Agent` header the fetcher or
+/// the request sets replaces.
 const USER_AGENT: &str = concat!("ostrya/", env!("CARGO_PKG_VERSION"));
+
+/// What a layer that sets both credentials and an `Authorization` header is
+/// told. Which of the two the request should carry is not stated, and picking
+/// one would send a credential the caller did not choose.
+const AMBIGUOUS_AUTHORIZATION: &str =
+    "basic-auth credentials and an authorization header both set Authorization: pass one of them";
+
+/// What a layer that sets a `Host` header is told. The header states the
+/// authority of the destination the request goes to, which the fetcher reads
+/// from the URL.
+const HOST_COMES_FROM_THE_URL: &str = "the host header is set from the url the request is sent to";
+
+/// The header names the connection layer sets: the ones that frame a request
+/// and the ones that state what becomes of the connection carrying it. A value
+/// of a caller's own puts the wire and the connection pool out of step with
+/// each other -- a `Content-Length` of a caller's own ends the HTTP/1.1
+/// connection under a pooled sender, and the next fetch over that fetcher
+/// fails on a channel the connection task has dropped.
+const CONNECTION_HEADERS: [&str; 9] = [
+    "connection",
+    "content-length",
+    "expect",
+    "keep-alive",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 /// The largest declared response body a failed attempt reads to the end so its
 /// HTTP/1.1 connection can go back to the pool. Above this, and with no declared
@@ -155,7 +219,10 @@ pub enum Protocol {
 }
 
 /// Credentials for a remote behind HTTP basic authentication.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// The [`Debug`] rendering holds the user name and a fixed word in place of the
+/// password, so a struct that carries credentials is logged without them.
+#[derive(Clone, Eq, PartialEq)]
 pub struct BasicAuth {
     /// The user name.
     pub user: String,
@@ -163,8 +230,17 @@ pub struct BasicAuth {
     pub password: String,
 }
 
+impl std::fmt::Debug for BasicAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicAuth")
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
 /// The validators a response carried, replayed to make the next fetch of the
-/// same path conditional.
+/// same target conditional.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Validators {
     /// The response's `ETag`, sent back as `If-None-Match`.
@@ -183,27 +259,35 @@ impl Validators {
 /// How a [`Fetcher`] reaches its remote.
 #[derive(Clone, Debug)]
 pub struct FetcherOptions {
-    /// Base URLs, tried in order for every request. A remote with a mirrorlist
-    /// contributes one entry per mirror. A base URL is a scheme, an authority,
-    /// and a path; a query string or userinfo is rejected at construction, since
-    /// a request target is the base path with the object path appended and
-    /// neither part would be sent.
+    /// Base URLs, tried in order for every request naming a [`Target::Path`]. A
+    /// remote with a mirrorlist contributes one entry per mirror. A base URL is
+    /// a scheme, an authority, and a path; a query string or userinfo is
+    /// rejected at construction, since a request target is the base path with
+    /// the object path appended and neither part would be sent. An empty list
+    /// serves [`Target::Url`] requests alone.
     pub mirrors: Vec<String>,
-    /// Extra headers sent with every request, to every mirror. An
-    /// `Authorization`, `Proxy-Authorization`, or `Cookie` header is refused at
-    /// construction when any mirror is cleartext `http`, since its value is a
-    /// secret whatever it holds. Any other header is sent as written.
+    /// Extra headers sent with every request, to every destination. A request
+    /// header of the same name replaces one of these. An `Authorization`,
+    /// `Proxy-Authorization`, or `Cookie` header is refused at construction
+    /// when any mirror is cleartext `http`, since its value is a secret
+    /// whatever it holds. A `Host` header, and a header the connection layer
+    /// sets -- the framing and hop-by-hop names -- is refused at construction
+    /// as well. Any other header is sent as written.
     pub headers: Vec<(String, String)>,
     /// Credentials for `Authorization: Basic`, sent with every request to every
-    /// mirror. Every mirror must be `https`: a cleartext one is refused at
-    /// construction rather than sent the credentials in the clear.
+    /// destination, and replaced for one request by
+    /// [`FetchRequest::basic_auth`]. Every mirror must be `https`: a cleartext
+    /// one is refused at construction rather than sent the credentials in the
+    /// clear. An `Authorization` entry in
+    /// [`headers`](FetcherOptions::headers) alongside these is refused at
+    /// construction, both of them setting the same header.
     pub basic_auth: Option<BasicAuth>,
     /// Trust anchors and the client certificate, for `https` mirrors.
     pub tls: TlsOptions,
     /// Whether to offer HTTP/2 in ALPN. With this false the fetcher speaks
     /// HTTP/1.1 even against a server that supports HTTP/2.
     pub http2: bool,
-    /// How many times a round of mirrors is repeated after a retryable
+    /// How many times a round of destinations is repeated after a retryable
     /// failure.
     pub max_retries: u32,
     /// How many requests are in flight at once.
@@ -216,8 +300,8 @@ pub struct FetcherOptions {
     /// silence since a read wanted bytes, so it caps silence and leaves transfer
     /// time unbounded.
     pub progress_timeout: Duration,
-    /// How long one fetch may spend reaching a response: every mirror round,
-    /// every retry, and the delays between them, from the moment the fetch is
+    /// How long one fetch may spend reaching a response: every round, every
+    /// retry, and the delays between them, from the moment the fetch is
     /// admitted until the response head arrives. The body that follows is
     /// bounded by [`progress_timeout`](FetcherOptions::progress_timeout) alone.
     /// This caps how long a fetch that reaches no response holds an admission
@@ -254,17 +338,38 @@ impl FetcherOptions {
     }
 }
 
-/// One thing to fetch: a path relative to each mirror's base URL.
+/// What a request names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Target<'a> {
+    /// A path under each mirror's base URL.
+    Path(&'a str),
+    /// An absolute `http` or `https` URL. The mirror list is not consulted.
+    Url(&'a str),
+}
+
+impl Target<'_> {
+    /// The string the target holds, which every diagnostic names it by.
+    fn as_str(&self) -> &str {
+        match self {
+            Target::Path(path) => path,
+            Target::Url(url) => url,
+        }
+    }
+}
+
+/// One thing to fetch.
 #[derive(Clone, Debug)]
 pub struct FetchRequest<'a> {
-    /// The path under the mirror's base URL, without a leading slash --
-    /// `objects/ab/cdef.filez`, `summary`, `refs/heads/main`.
+    /// What is fetched: a path under every mirror's base URL, or an absolute
+    /// URL of the request's own.
     ///
-    /// It is appended to the base path as written, so it carries the escaping
-    /// the server is meant to see. A `?` or a `#` fails the fetch before it is
-    /// admitted, neither being part of a path, and a character no request target
-    /// may hold fails it where the URL is assembled.
-    pub path: &'a str,
+    /// A path is appended to the base path as written, so it carries the
+    /// escaping the server is meant to see, and it holds neither a `?` nor a
+    /// `#`: both fail the fetch before it is admitted, neither being part of a
+    /// path. A URL's query string is sent as written, and a URL holds no
+    /// fragment, which is never sent either. A character no request target may
+    /// hold fails the fetch where the URL is assembled.
+    pub target: Target<'a>,
     /// Where the request sits in the queue when the fetcher is at its limit.
     pub priority: Priority,
     /// Validators from a previous fetch. When the server reports the copy is
@@ -275,16 +380,51 @@ pub struct FetchRequest<'a> {
     /// cap mid-stream fails the read with
     /// [`io::ErrorKind::FileTooLarge`](std::io::ErrorKind::FileTooLarge).
     pub max_size: Option<u64>,
+    /// Headers merged over the fetcher's, replacing a fetcher header of the
+    /// same name.
+    ///
+    /// Names compare as `HeaderName`, so the comparison is case-insensitive.
+    /// Two entries of one name both reach the wire. A `Host` entry is refused,
+    /// the header coming from the URL the request is sent to, and so is a
+    /// header the connection layer sets -- the framing and hop-by-hop names.
+    /// An invalid name or value fails the fetch before it is admitted.
+    pub headers: &'a [(String, String)],
+    /// Credentials that replace the fetcher's for this request.
+    ///
+    /// These set the `Authorization` header, so an `Authorization` entry in
+    /// [`headers`](FetchRequest::headers) alongside them fails the fetch.
+    pub basic_auth: Option<&'a BasicAuth>,
+    /// Whether a credential may reach a cleartext origin.
+    ///
+    /// With this false, a fetch whose merged headers carry a credential fails
+    /// when a destination it may reach is `http`. The check
+    /// [`Fetcher::new`] makes over the mirror list stands whatever this holds.
+    pub allow_cleartext_credentials: bool,
 }
 
 impl<'a> FetchRequest<'a> {
-    /// A normal-priority, unconditional, uncapped request for `path`.
-    pub fn new(path: &'a str) -> FetchRequest<'a> {
+    /// A normal-priority, unconditional, uncapped request for `path` under
+    /// every mirror, carrying the fetcher's headers and credentials.
+    pub fn path(path: &'a str) -> FetchRequest<'a> {
+        FetchRequest::for_target(Target::Path(path))
+    }
+
+    /// A normal-priority, unconditional, uncapped request for the absolute URL
+    /// `url`, carrying the fetcher's headers and credentials.
+    pub fn url(url: &'a str) -> FetchRequest<'a> {
+        FetchRequest::for_target(Target::Url(url))
+    }
+
+    /// A request for `target` with every other field at its default.
+    fn for_target(target: Target<'a>) -> FetchRequest<'a> {
         FetchRequest {
-            path,
+            target,
             priority: Priority::default(),
             validators: None,
             max_size: None,
+            headers: &[],
+            basic_auth: None,
+            allow_cleartext_credentials: false,
         }
     }
 }
@@ -309,28 +449,91 @@ struct Mirror {
     /// The origin's scheme, host, and port.
     origin: Origin,
     /// The `host[:port]` this mirror is addressed by, the value of the `Host`
-    /// header on HTTP/1.1 requests. The default port for the scheme is left
-    /// out, and an IPv6 literal keeps its brackets.
+    /// header on HTTP/1.1 requests. It holds the authority as the base URL
+    /// wrote it, the default port for the scheme left out, and an IPv6 literal
+    /// keeps its brackets.
     authority: HeaderValue,
     /// The `scheme://authority` prefix of every absolute URL built for this
-    /// mirror.
+    /// mirror, which is also the origin a diagnostic names it by.
     prefix: String,
     /// The base path, without a trailing slash. Empty for a mirror at the root.
     base: String,
 }
 
 impl Mirror {
-    /// The absolute URL of `path` under this mirror, used for HTTP/2 requests,
-    /// where the scheme and authority are pseudo-headers, and in messages.
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.prefix, self.target(path))
+    /// Where a request for `path` under this mirror is sent. The one string the
+    /// destination holds is built here: the mirror's prefix and base path, then
+    /// the request path.
+    fn destination(&self, path: &str) -> Destination {
+        Destination {
+            origin: self.origin.clone(),
+            authority: self.authority.clone(),
+            url: format!(
+                "{}{}/{}",
+                self.prefix,
+                self.base,
+                path.trim_start_matches('/')
+            ),
+            path_at: self.prefix.len(),
+        }
+    }
+}
+
+/// Where one attempt sends its request. A URL target resolves its one
+/// destination once per fetch, and every attempt and every retry round uses
+/// that one; a path target resolves the destination of the mirror an attempt is
+/// about to use, at that attempt.
+#[derive(Clone, Debug)]
+struct Destination {
+    /// The origin's scheme, host, and port, which the connection pool is keyed
+    /// by.
+    origin: Origin,
+    /// The `host[:port]` the request is addressed by, the value of the `Host`
+    /// header on HTTP/1.1 requests. It holds the authority as the caller wrote
+    /// it, the default port for the scheme left out, and an IPv6 literal keeps
+    /// its brackets.
+    authority: HeaderValue,
+    /// The absolute URL, which holds both forms one request needs: the whole
+    /// string, and the tail from `path_at`.
+    url: String,
+    /// Where the request path begins in `url`, which is the length of the
+    /// `scheme://authority` prefix.
+    path_at: usize,
+}
+
+impl Destination {
+    /// The absolute URL, which an HTTP/2 request carries and every diagnostic
+    /// names.
+    fn url(&self) -> &str {
+        &self.url
     }
 
-    /// The origin-form request target of `path`: the path alone, which is what
-    /// an HTTP/1.1 request to an origin server carries.
-    fn target(&self, path: &str) -> String {
-        format!("{}/{}", self.base, path.trim_start_matches('/'))
+    /// The origin-form request target -- the path, and the query string a URL
+    /// target carries -- which is what an HTTP/1.1 request to an origin server
+    /// carries.
+    fn target(&self) -> &str {
+        &self.url[self.path_at..]
     }
+
+    /// The `scheme://authority` this destination is reached at, which a
+    /// diagnostic about the origin names it by.
+    fn origin_url(&self) -> &str {
+        &self.url[..self.path_at]
+    }
+}
+
+/// Where a fetch sends its requests, in the order it asks.
+///
+/// A path target is served under every mirror, so a round walks the mirror list
+/// and builds the destination of the mirror it is about to ask: a fetch the
+/// first mirror answers builds one destination whatever the length of the list.
+/// A URL target names one destination, which is parsed once per fetch.
+#[derive(Debug)]
+enum Route<'a> {
+    /// Every mirror in order, serving this request path.
+    Mirrors(&'a str),
+    /// The one destination a URL target names.
+    One(Destination),
 }
 
 /// A connection endpoint: connections are pooled per origin.
@@ -338,7 +541,9 @@ impl Mirror {
 struct Origin {
     tls: bool,
     /// What the connect resolves and the TLS server name is built from, so an
-    /// IPv6 literal is held without the brackets the authority carries.
+    /// IPv6 literal is held without the brackets the authority carries. An
+    /// ASCII host is held in lower case, so one origin written in two cases is
+    /// one pool key and one connection.
     host: String,
     port: u16,
 }
@@ -392,6 +597,10 @@ struct Inner {
     mirrors: Vec<Mirror>,
     headers: Vec<(HeaderName, HeaderValue)>,
     tls: Arc<rustls::ClientConfig>,
+    /// Whether the TLS configuration holds a trust anchor. A fetcher whose
+    /// mirrors are all cleartext builds without one where the host trust store
+    /// is empty, and a TLS destination is refused there.
+    has_trust_anchors: bool,
     max_retries: u32,
     connect_timeout: Duration,
     progress_timeout: Duration,
@@ -449,10 +658,15 @@ impl std::fmt::Debug for Fetcher {
 impl Fetcher {
     /// Build a fetcher from `options`.
     ///
-    /// Fails when no mirror is configured, when a mirror URL is not an absolute
-    /// `http`/`https` URL or carries a query string or userinfo, when a header
-    /// name or value is not valid, when credentials are configured alongside a
-    /// cleartext mirror, or when the TLS material does not parse.
+    /// The mirror list may be empty, in which case the fetcher serves
+    /// [`Target::Url`] requests alone.
+    ///
+    /// Fails when a mirror URL is not an absolute `http`/`https` URL, carries a
+    /// query string or userinfo, or names a port the URL parser cannot read;
+    /// when a header name or value is not valid; when a header the connection
+    /// layer sets is configured; when credentials are configured alongside a
+    /// cleartext mirror; when credentials are configured alongside an
+    /// `Authorization` header; or when the TLS material does not parse.
     ///
     /// This is async because [`TrustRoots::System`](crate::TrustRoots::System),
     /// the default, reads the host trust store, which goes to the blocking
@@ -460,12 +674,10 @@ impl Fetcher {
     /// a cleartext-only fetcher reads it too; under
     /// [`TrustRoots::Pem`](crate::TrustRoots::Pem) the work is all in memory and
     /// the constructor never yields. A system store holding no certificate
-    /// fails the constructor only when at least one mirror is `https`, so a
+    /// fails the constructor when at least one mirror is `https`, and when the
+    /// mirror list is empty, since a request may then name an `https` URL; a
     /// host without a CA bundle still reaches a cleartext remote.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher> {
-        if options.mirrors.is_empty() {
-            return Err(Error::Fetch("no mirror url configured".into()));
-        }
         let mirrors = options
             .mirrors
             .iter()
@@ -497,9 +709,13 @@ impl Fetcher {
             let name = HeaderName::try_from(name.as_str())
                 .map_err(|_| Error::Fetch(format!("invalid header name: {name}")))?;
             if name == hyper::header::HOST {
-                return Err(Error::Fetch(
-                    "the host header is set from the mirror url".into(),
-                ));
+                return Err(Error::Fetch(HOST_COMES_FROM_THE_URL.into()));
+            }
+            if is_connection_header(&name) {
+                return Err(connection_header_refused(&name));
+            }
+            if name == hyper::header::AUTHORIZATION && options.basic_auth.is_some() {
+                return Err(Error::Fetch(AMBIGUOUS_AUTHORIZATION.into()));
             }
             if is_credential(&name)
                 && let Some(url) = cleartext
@@ -514,19 +730,20 @@ impl Fetcher {
             headers.push((name, value));
         }
         if let Some(auth) = &options.basic_auth {
-            let encoded =
-                ostrya_core::base64::encode(format!("{}:{}", auth.user, auth.password).as_bytes());
-            let value = HeaderValue::try_from(format!("Basic {encoded}"))
-                .map_err(|_| Error::Fetch("invalid basic-auth credentials".into()))?;
-            headers.push((hyper::header::AUTHORIZATION, value));
+            headers.push((hyper::header::AUTHORIZATION, basic_auth_value(auth)?));
         }
         let max_outstanding = options.max_outstanding.max(1);
-        let https = mirrors.iter().any(|mirror| mirror.origin.tls);
+        // A fetcher with no mirror serves the URLs its requests name, any of
+        // which may be `https`, so it has to hold trust anchors: an empty
+        // system store is as fatal there as it is for an `https` mirror.
+        let https = mirrors.is_empty() || mirrors.iter().any(|mirror| mirror.origin.tls);
+        let (tls, has_trust_anchors) = client_config(&options.tls, options.http2, https).await?;
         Ok(Fetcher {
             inner: Arc::new(Inner {
                 mirrors,
                 headers,
-                tls: client_config(&options.tls, options.http2, https).await?,
+                tls,
+                has_trust_anchors,
                 max_retries: options.max_retries,
                 connect_timeout: options.connect_timeout,
                 progress_timeout: options.progress_timeout,
@@ -538,51 +755,167 @@ impl Fetcher {
         })
     }
 
-    /// Fetch `request`, trying every mirror and retrying as configured.
+    /// Fetch `request`, trying every destination and retrying as configured.
     pub async fn fetch(&self, request: FetchRequest<'_>) -> Result<Fetched> {
-        // The path is what it is whichever mirror serves it, so it is checked
-        // before admission: the failure is reported once rather than once per
-        // mirror, and no permit is taken and no socket opened for it.
-        check_path(request.path)?;
+        // What the request names, the headers it sends, the credentials they
+        // carry, and the anchors a TLS destination verifies against are the
+        // same whichever destination serves the request, so all of them are
+        // settled before admission: a failure is reported once rather than once
+        // per destination and once per round, and no permit is taken and no
+        // socket opened for it.
+        let route = self.route(request.target)?;
+        let headers = merge_headers(&self.inner.headers, request.headers, request.basic_auth)?;
+        if !request.allow_cleartext_credentials {
+            self.check_cleartext(&route, &headers)?;
+        }
+        self.check_trust_anchors(&route)?;
         let permit = self.inner.gate.acquire(request.priority).await;
+        let rounds = self.rounds(&request, &route, &headers, permit);
         let Some(limit) = self.inner.fetch_timeout else {
-            return self.rounds(&request, permit).await;
+            return rounds.await;
         };
         // Expiry drops the rounds, and with them the attempt in flight and the
         // permit, so the slot is free before the failure is reported.
-        let fetched = within(limit, self.rounds(&request, permit)).await;
-        match fetched {
+        match within(limit, rounds).await {
             Some(result) => result,
             None => Err(Error::Fetch(format!(
                 "fetch of {} timed out after {limit:?}",
-                request.path
+                request.target.as_str()
             ))),
         }
     }
 
-    /// Try every mirror in turn, repeating the round while a mirror failed in a
-    /// way another attempt may not. The permit moves into the body a successful
-    /// round produces, and is dropped with this future otherwise.
-    async fn rounds(&self, request: &FetchRequest<'_>, permit: Permit) -> Result<Fetched> {
-        // A mirror that answered definitively answers the same in every round,
-        // so it is asked once: a repeated round asks only the mirrors whose
-        // failure another attempt may not repeat.
-        let mut settled = vec![false; self.inner.mirrors.len()];
+    /// Where a fetch of `target` sends its requests, in the order it asks.
+    ///
+    /// A URL target names its one destination itself, which is parsed here. A
+    /// path target is served under the mirrors, so a fetcher with no mirror has
+    /// nowhere to send it.
+    fn route<'a>(&self, target: Target<'a>) -> Result<Route<'a>> {
+        match target {
+            Target::Url(url) => Ok(Route::One(parse_url(url)?)),
+            Target::Path(path) => {
+                check_path(path)?;
+                if self.inner.mirrors.is_empty() {
+                    return Err(Error::Fetch(format!(
+                        "fetch of the path {path} has nowhere to go: no mirror is configured"
+                    )));
+                }
+                Ok(Route::Mirrors(path))
+            }
+        }
+    }
+
+    /// Refuse a fetch whose headers carry a credential a cleartext destination
+    /// would receive in the clear.
+    ///
+    /// A credential is withheld from no destination, so one cleartext
+    /// destination among the ones the fetch may reach is enough to refuse it.
+    /// The alternative is to send the request without the credential, which
+    /// answers 401 and names nothing.
+    fn check_cleartext(
+        &self,
+        route: &Route<'_>,
+        headers: &[(HeaderName, HeaderValue)],
+    ) -> Result<()> {
+        if !headers.iter().any(|(name, _)| is_credential(name)) {
+            return Ok(());
+        }
+        let Some(origin) = self.matching_origin(route, |origin| !origin.tls) else {
+            return Ok(());
+        };
+        Err(Error::Fetch(format!(
+            "the request carries credentials, which the cleartext origin {origin} would receive \
+             in the clear: fetch over https, drop the credentials, or set \
+             FetchRequest::allow_cleartext_credentials"
+        )))
+    }
+
+    /// Refuse a fetch of a TLS destination on a fetcher that holds no trust
+    /// anchors.
+    ///
+    /// A handshake verifies the server certificate against an anchor, so a
+    /// fetcher with none reaches no TLS origin. What arrives here is a request
+    /// naming an `https` URL of its own on a fetcher whose mirrors are all
+    /// cleartext, since every other combination fails [`Fetcher::new`]. The
+    /// handshake reports it as an unknown issuer, a retryable failure that
+    /// spends every round and every backoff before it names anything, so the
+    /// refusal is made here instead, before admission.
+    fn check_trust_anchors(&self, route: &Route<'_>) -> Result<()> {
+        if self.inner.has_trust_anchors {
+            return Ok(());
+        }
+        let Some(origin) = self.matching_origin(route, |origin| origin.tls) else {
+            return Ok(());
+        };
+        Err(Error::Fetch(format!(
+            "the certificate of the tls origin {origin} has nothing to verify against: the \
+             fetcher holds no trust anchors, so set TlsOptions::roots"
+        )))
+    }
+
+    /// The `scheme://authority` of the first destination on `route` whose
+    /// origin `wanted` accepts.
+    fn matching_origin<'a>(
+        &'a self,
+        route: &'a Route<'_>,
+        wanted: fn(&Origin) -> bool,
+    ) -> Option<&'a str> {
+        match route {
+            Route::Mirrors(_) => self
+                .inner
+                .mirrors
+                .iter()
+                .find(|mirror| wanted(&mirror.origin))
+                .map(|mirror| mirror.prefix.as_str()),
+            Route::One(destination) => {
+                wanted(&destination.origin).then(|| destination.origin_url())
+            }
+        }
+    }
+
+    /// Try every destination in turn, repeating the round while a destination
+    /// failed in a way another attempt may not. The permit moves into the body
+    /// a successful round produces, and is dropped with this future otherwise.
+    async fn rounds(
+        &self,
+        request: &FetchRequest<'_>,
+        route: &Route<'_>,
+        headers: &[(HeaderName, HeaderValue)],
+        permit: Permit,
+    ) -> Result<Fetched> {
+        let destination_count = match route {
+            Route::Mirrors(_) => self.inner.mirrors.len(),
+            Route::One(_) => 1,
+        };
+        // A destination that answered definitively answers the same in every
+        // round, so it is asked once: a repeated round asks only the
+        // destinations whose failure another attempt may not repeat.
+        let mut settled = vec![false; destination_count];
         // The failure both exhaustion paths report. A definitive answer is what
         // a caller can act on, so it outranks a retryable failure whichever
-        // round each came from: a mirror that fails transiently and then answers
-        // 404 reports the 404. Among failures of one kind the earliest is kept,
-        // which is the mirror order the fetcher honors everywhere else.
+        // round each came from: a destination that fails transiently and then
+        // answers 404 reports the 404. Among failures of one kind the earliest
+        // is kept, which is the mirror order the fetcher honors everywhere
+        // else.
         let mut reported: Option<Error> = None;
         let mut definitive = false;
         let mut round = 0;
         loop {
             let mut retryable = false;
-            for (mirror, settled) in self.inner.mirrors.iter().zip(&mut settled) {
+            for (position, settled) in settled.iter_mut().enumerate() {
                 if *settled {
                     continue;
                 }
-                let failure = match self.attempt(mirror, request).await {
+                // The destination of a mirror is built for the attempt that
+                // uses it, so a fetch the first mirror answers builds one
+                // whatever the length of the list.
+                let destination = match route {
+                    Route::Mirrors(path) => {
+                        Cow::Owned(self.inner.mirrors[position].destination(path))
+                    }
+                    Route::One(destination) => Cow::Borrowed(destination),
+                };
+                let failure = match self.attempt(&destination, request, headers).await {
                     Ok(Attempted::Body(mut body)) => {
                         body.permit = Some(permit);
                         return Ok(Fetched::Body(body));
@@ -606,8 +939,8 @@ impl Fetcher {
                     }
                 }
             }
-            // At least one mirror failed in a way a later attempt may not;
-            // otherwise every mirror has answered definitively.
+            // At least one destination failed in a way a later attempt may not;
+            // otherwise every destination has answered definitively.
             if !retryable || round >= self.inner.max_retries {
                 return Err(reported.expect("a failed round holds a failure"));
             }
@@ -616,16 +949,18 @@ impl Fetcher {
         }
     }
 
-    /// One request against one mirror.
+    /// One request against one destination.
     async fn attempt(
         &self,
-        mirror: &Mirror,
+        destination: &Destination,
         request: &FetchRequest<'_>,
+        headers: &[(HeaderName, HeaderValue)],
     ) -> std::result::Result<Attempted, Failure> {
-        let url = mirror.url(request.path);
+        let origin = &destination.origin;
+        let url = destination.url();
         let connect_timeout = self.inner.connect_timeout;
         let progress_timeout = self.inner.progress_timeout;
-        let sender = match self.inner.take_conn(&mirror.origin) {
+        let sender = match self.inner.take_conn(origin) {
             Some(sender) => sender,
             None => {
                 // Opening a connection is by far the largest state a fetch
@@ -635,13 +970,13 @@ impl Fetcher {
                 // caller nests inside its own: a fetch is ten times smaller
                 // this way, and a pull that wraps several helpers around one
                 // multiplies what it saves.
-                let opened = within(connect_timeout, Box::pin(self.connect(&mirror.origin))).await;
+                let opened = within(connect_timeout, Box::pin(self.connect(origin))).await;
                 match opened {
                     Some(result) => result.map_err(Failure::Retry)?,
                     None => {
                         return Err(Failure::Retry(Error::Fetch(format!(
                             "connect to {}:{} timed out after {connect_timeout:?}",
-                            mirror.origin.host, mirror.origin.port
+                            origin.host, origin.port
                         ))));
                     }
                 }
@@ -650,7 +985,7 @@ impl Fetcher {
         let (response, protocol, reuse) = match sender {
             Sender::H1(mut sender) => {
                 let http_request = self
-                    .build_request(mirror, request, Protocol::Http11)
+                    .build_request(destination, request, headers, Protocol::Http11)
                     .map_err(Failure::Fatal)?;
                 // The request and the wait for the response head share the
                 // progress window: the head is the first bytes the response
@@ -661,14 +996,14 @@ impl Fetcher {
                 })
                 .await;
                 let response = match sent {
-                    Some(result) => result.map_err(|e| Failure::Retry(transport(&url, e)))?,
-                    None => return Err(Failure::Retry(stalled(&url, progress_timeout))),
+                    Some(result) => result.map_err(|e| Failure::Retry(transport(url, e)))?,
+                    None => return Err(Failure::Retry(stalled(url, progress_timeout))),
                 };
                 (response, Protocol::Http11, Some(sender))
             }
             Sender::H2(mut sender) => {
                 let http_request = self
-                    .build_request(mirror, request, Protocol::Http2)
+                    .build_request(destination, request, headers, Protocol::Http2)
                     .map_err(Failure::Fatal)?;
                 let sent = within(progress_timeout, async {
                     sender.ready().await?;
@@ -676,8 +1011,8 @@ impl Fetcher {
                 })
                 .await;
                 let response = match sent {
-                    Some(result) => result.map_err(|e| Failure::Retry(transport(&url, e)))?,
-                    None => return Err(Failure::Retry(stalled(&url, progress_timeout))),
+                    Some(result) => result.map_err(|e| Failure::Retry(transport(url, e)))?,
+                    None => return Err(Failure::Retry(stalled(url, progress_timeout))),
                 };
                 (response, Protocol::Http2, None)
             }
@@ -686,13 +1021,13 @@ impl Fetcher {
         if status == StatusCode::NOT_MODIFIED {
             // A 304 carries no body, so the connection is immediately reusable.
             if let Some(sender) = reuse {
-                self.inner.put_h1(&mirror.origin, sender);
+                self.inner.put_h1(origin, sender);
             }
             return Ok(Attempted::NotModified);
         }
         if status != StatusCode::OK {
-            let failure = classify(status, &url);
-            self.discard(&mirror.origin, response, reuse).await;
+            let failure = classify(status, url);
+            self.discard(origin, response, reuse).await;
             return Err(failure);
         }
         let validators = read_validators(response.headers());
@@ -700,7 +1035,7 @@ impl Fetcher {
         if let (Some(limit), Some(length)) = (request.max_size, content_length)
             && length > limit
         {
-            self.discard(&mirror.origin, response, reuse).await;
+            self.discard(origin, response, reuse).await;
             return Err(Failure::Fatal(Error::FetchTooLarge { limit }));
         }
         let protocol = match response.version() {
@@ -716,7 +1051,7 @@ impl Fetcher {
             content_length,
             protocol,
             inner: self.inner.clone(),
-            origin: mirror.origin.clone(),
+            origin: origin.clone(),
             reuse,
             permit: None,
             done: false,
@@ -764,7 +1099,7 @@ impl Fetcher {
         }
     }
 
-    /// Assemble the GET for `request` against `mirror`.
+    /// Assemble the GET for `request` against `destination`, sending `headers`.
     ///
     /// An HTTP/1.1 request carries the origin-form target and a `Host` header,
     /// which is what an origin server expects; the absolute form belongs to
@@ -773,21 +1108,22 @@ impl Fetcher {
     /// `:scheme` and `:authority` pseudo-headers.
     fn build_request(
         &self,
-        mirror: &Mirror,
+        destination: &Destination,
         request: &FetchRequest<'_>,
+        headers: &[(HeaderName, HeaderValue)],
         protocol: Protocol,
     ) -> Result<Request<NoBody>> {
         let url = match protocol {
-            Protocol::Http11 => mirror.target(request.path),
-            Protocol::Http2 => mirror.url(request.path),
+            Protocol::Http11 => destination.target(),
+            Protocol::Http2 => destination.url(),
         };
         let uri =
-            Uri::try_from(&url).map_err(|e| Error::Fetch(format!("invalid url {url}: {e}")))?;
+            Uri::try_from(url).map_err(|e| Error::Fetch(format!("invalid url {url}: {e}")))?;
         let mut builder = Request::builder().method(Method::GET).uri(uri);
         if protocol == Protocol::Http11 {
-            builder = builder.header(hyper::header::HOST, &mirror.authority);
+            builder = builder.header(hyper::header::HOST, &destination.authority);
         }
-        for (name, value) in &self.inner.headers {
+        for (name, value) in headers {
             builder = builder.header(name, value);
         }
         if let Some(validators) = request.validators {
@@ -1003,7 +1339,7 @@ impl std::fmt::Debug for Body {
 }
 
 impl Body {
-    /// The validators to replay on the next fetch of this path.
+    /// The validators to replay on the next fetch of this target.
     pub fn validators(&self) -> &Validators {
         &self.validators
     }
@@ -1142,15 +1478,32 @@ impl rt::tokio_io::AsyncRead for Body {
     }
 }
 
-/// Whether a header name carries credentials, which no cleartext mirror is sent.
+/// Whether a header name carries credentials, which no cleartext destination is
+/// sent.
 ///
 /// These three are the header names whose value is a secret whatever it holds.
-/// Any other header is sent as the caller wrote it: a secret can be spelled into
-/// one, and the fetcher has no way to tell.
+/// A header outside this list, and outside the `Host` and connection-layer
+/// names both layers refuse, is sent as the caller wrote it: a secret can be
+/// spelled into one, and the fetcher has no way to tell.
 fn is_credential(name: &HeaderName) -> bool {
     *name == hyper::header::AUTHORIZATION
         || *name == hyper::header::PROXY_AUTHORIZATION
         || *name == hyper::header::COOKIE
+}
+
+/// Whether the connection layer sets a header of this name, which is what makes
+/// it one no caller may set. A `HeaderName` holds its name in lower case, which
+/// is the case [`CONNECTION_HEADERS`] is written in.
+fn is_connection_header(name: &HeaderName) -> bool {
+    CONNECTION_HEADERS.contains(&name.as_str())
+}
+
+/// What a layer that sets a header of the connection layer's is told.
+fn connection_header_refused(name: &HeaderName) -> Error {
+    Error::Fetch(format!(
+        "the {name} header is set by the connection layer, which frames the request and \
+         holds its connection: drop the header"
+    ))
 }
 
 /// Check that a request path can be appended to a mirror's base path.
@@ -1169,15 +1522,82 @@ fn check_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Parse one base URL into a [`Mirror`].
-fn parse_mirror(url: &str) -> Result<Mirror> {
-    // The scheme is checked before the URL is parsed, because a URL the fetcher
-    // cannot serve at all -- a `file://` one, say -- is worth saying so about
-    // even when it is not a well-formed HTTP URL.
+/// The headers one request sends: the fetcher's, with the request's own merged
+/// over them.
+///
+/// A request header replaces the fetcher header of the same name, and the
+/// request's credentials replace the fetcher's `Authorization`, whichever of
+/// the two layers set it. Two request headers of one name both reach the wire,
+/// as two fetcher headers do. A request that adds neither a header nor
+/// credentials sends the fetcher's list as it stands, which is the path every
+/// object fetch takes.
+fn merge_headers<'a>(
+    fetcher: &'a [(HeaderName, HeaderValue)],
+    extra: &[(String, String)],
+    basic_auth: Option<&BasicAuth>,
+) -> Result<Cow<'a, [(HeaderName, HeaderValue)]>> {
+    if extra.is_empty() && basic_auth.is_none() {
+        return Ok(Cow::Borrowed(fetcher));
+    }
+    let mut added = Vec::with_capacity(extra.len() + usize::from(basic_auth.is_some()));
+    for (name, value) in extra {
+        let name = HeaderName::try_from(name.as_str())
+            .map_err(|_| Error::Fetch(format!("invalid header name: {name}")))?;
+        if name == hyper::header::HOST {
+            return Err(Error::Fetch(HOST_COMES_FROM_THE_URL.into()));
+        }
+        if is_connection_header(&name) {
+            return Err(connection_header_refused(&name));
+        }
+        if name == hyper::header::AUTHORIZATION && basic_auth.is_some() {
+            return Err(Error::Fetch(AMBIGUOUS_AUTHORIZATION.into()));
+        }
+        let value = HeaderValue::try_from(value.as_str())
+            .map_err(|_| Error::Fetch(format!("invalid value for header {name}")))?;
+        added.push((name, value));
+    }
+    if let Some(auth) = basic_auth {
+        added.push((hyper::header::AUTHORIZATION, basic_auth_value(auth)?));
+    }
+    let mut headers = Vec::with_capacity(fetcher.len() + added.len());
+    headers.extend(
+        fetcher
+            .iter()
+            .filter(|(name, _)| !added.iter().any(|(replaced, _)| replaced == name))
+            .cloned(),
+    );
+    headers.extend(added);
+    Ok(Cow::Owned(headers))
+}
+
+/// The `Authorization` value basic credentials are sent as.
+fn basic_auth_value(auth: &BasicAuth) -> Result<HeaderValue> {
+    let encoded =
+        ostrya_core::base64::encode(format!("{}:{}", auth.user, auth.password).as_bytes());
+    HeaderValue::try_from(format!("Basic {encoded}"))
+        .map_err(|_| Error::Fetch("invalid basic-auth credentials".into()))
+}
+
+/// The origin, and the authority it is addressed by, of one absolute URL.
+///
+/// The scheme is checked before the URL is parsed, because a URL the fetcher
+/// cannot serve at all -- a `file://` one, say -- is worth saying so about even
+/// when it is not a well-formed HTTP URL. Userinfo is refused rather than
+/// dropped, since credentials that never reach the wire answer 401, which
+/// points at nothing; `credentials` names the field that carries them instead.
+/// A userinfo holds a password, so what the refusal names is the scheme and the
+/// host, and a message about a URL whose authority the parse has not reached
+/// names the URL with any userinfo left out.
+fn parse_authority(url: &str, credentials: &str) -> Result<(Uri, Origin, String)> {
     let scheme = url
         .split_once("://")
         .map(|(scheme, _)| scheme)
-        .ok_or_else(|| Error::Fetch(format!("url {url} is not an absolute http or https url")))?;
+        .ok_or_else(|| {
+            Error::Fetch(format!(
+                "url {} is not an absolute http or https url",
+                without_userinfo(url)
+            ))
+        })?;
     let tls = match scheme {
         _ if scheme.eq_ignore_ascii_case(Scheme::HTTPS.as_str()) => true,
         _ if scheme.eq_ignore_ascii_case(Scheme::HTTP.as_str()) => false,
@@ -1187,52 +1607,135 @@ fn parse_mirror(url: &str) -> Result<Mirror> {
             )));
         }
     };
-    let uri = Uri::try_from(url).map_err(|e| Error::Fetch(format!("invalid url {url}: {e}")))?;
-    // A request target is the mirror's base path with the object path appended,
-    // so anything else the URL carries would be dropped without a word. Both
-    // parts are rejected rather than ignored: a presigned URL that lost its
-    // signature answers 403, and credentials that never reach the wire answer
-    // 401, neither of which points at the URL that caused it.
-    if let Some(query) = uri.query() {
-        return Err(Error::Fetch(format!(
-            "mirror url {url} carries the query string ?{query}, which the fetcher does not send"
-        )));
-    }
-    if uri
-        .authority()
-        .is_some_and(|authority| authority.as_str().contains('@'))
-    {
-        return Err(Error::Fetch(format!(
-            "mirror url {url} carries userinfo, which the fetcher does not send: \
-             pass credentials as FetcherOptions::basic_auth"
-        )));
-    }
+    let scheme = if tls { "https" } else { "http" };
+    let uri = Uri::try_from(url)
+        .map_err(|e| Error::Fetch(format!("invalid url {}: {e}", without_userinfo(url))))?;
     // `Uri::host` wraps an IPv6 literal in brackets. The brackets belong to the
     // authority -- the `Host` header and the absolute URL carry them -- and not
     // to the address itself: a connect resolves the bracketed form to nothing,
     // and a TLS server name is not built from it either.
     let literal = uri
         .host()
-        .ok_or_else(|| Error::Fetch(format!("url {url} has no host")))?;
+        .ok_or_else(|| Error::Fetch(format!("url {} has no host", without_userinfo(url))))?;
+    if uri
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'))
+    {
+        return Err(Error::Fetch(format!(
+            "the {scheme} url for {literal} carries userinfo, which the fetcher does not send: \
+             pass credentials as {credentials}"
+        )));
+    }
+    // A host compares as one origin whichever case it is written in, so the
+    // pool key holds it in lower case: a `Location` header echoes the case the
+    // origin server wrote, and two cases of one host would otherwise open two
+    // connections and two HTTP/2 sessions to it.
     let host = literal
         .strip_prefix('[')
         .and_then(|inner| inner.strip_suffix(']'))
         .unwrap_or(literal)
-        .to_string();
+        .to_ascii_lowercase();
+    // `Uri` accepts an authority whose port it cannot read -- `h:99999`, `h:`,
+    // `h:abc` -- and reports no port for it. Taking the scheme default there
+    // serves the request from a port the caller did not name, and the rebuilt
+    // authority drops the port as well, so the port text is read from the
+    // authority and refused.
+    let port_text = uri
+        .authority()
+        .and_then(|authority| authority.as_str().strip_prefix(literal))
+        .and_then(|rest| rest.strip_prefix(':'));
     let default_port = if tls { 443 } else { 80 };
-    let port = uri.port_u16().unwrap_or(default_port);
-    let scheme = if tls { "https" } else { "http" };
+    let port = match (uri.port_u16(), port_text) {
+        (Some(port), _) => port,
+        (None, None) => default_port,
+        (None, Some(text)) => {
+            return Err(Error::Fetch(format!(
+                "url {url} names the port {text:?}, which is not a number from 0 to 65535"
+            )));
+        }
+    };
     let authority = if port == default_port {
         literal.to_string()
     } else {
         format!("{literal}:{port}")
     };
+    Ok((uri, Origin { tls, host, port }, authority))
+}
+
+/// How a message names a URL whose authority the parse has not reached, which
+/// is a URL whose userinfo has not been refused yet. Userinfo holds a password,
+/// so the part of the authority before the `@` is left out.
+fn without_userinfo(url: &str) -> Cow<'_, str> {
+    let start = url.find("://").map_or(0, |at| at + 3);
+    let end = url[start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |at| start + at);
+    match url[start..end].rfind('@') {
+        Some(at) => Cow::Owned(format!("{}{}", &url[..start], &url[start + at + 1..])),
+        None => Cow::Borrowed(url),
+    }
+}
+
+/// The `Host` header value of one authority.
+fn host_header(url: &str, authority: &str) -> Result<HeaderValue> {
+    HeaderValue::try_from(authority)
+        .map_err(|_| Error::Fetch(format!("url {url} has an unusable host")))
+}
+
+/// Parse one base URL into a [`Mirror`].
+fn parse_mirror(url: &str) -> Result<Mirror> {
+    let (uri, origin, authority) = parse_authority(url, "FetcherOptions::basic_auth")?;
+    // A request target is the mirror's base path with the object path appended,
+    // so a query string the base URL carries would be dropped without a word.
+    // It is rejected rather than ignored: a presigned URL that lost its
+    // signature answers 403, which does not point at the URL that caused it.
+    if let Some(query) = uri.query() {
+        return Err(Error::Fetch(format!(
+            "mirror url {url} carries the query string ?{query}, which the fetcher does not send"
+        )));
+    }
+    let scheme = if origin.tls { "https" } else { "http" };
     Ok(Mirror {
-        origin: Origin { tls, host, port },
-        authority: HeaderValue::try_from(&authority)
-            .map_err(|_| Error::Fetch(format!("url {url} has an unusable host")))?,
+        authority: host_header(url, &authority)?,
         prefix: format!("{scheme}://{authority}"),
         base: uri.path().trim_end_matches('/').to_string(),
+        origin,
+    })
+}
+
+/// Parse the absolute URL a request names into its [`Destination`].
+///
+/// The query string is part of what the request names, so it reaches the wire
+/// as written. A fragment is refused: it is never sent, so a URL carrying one
+/// asks for a resource other than the one the caller named.
+fn parse_url(url: &str) -> Result<Destination> {
+    if url.contains('#') {
+        return Err(Error::Fetch(format!(
+            "fetch url {} carries a fragment, which no request sends",
+            without_userinfo(url)
+        )));
+    }
+    let (uri, origin, authority) = parse_authority(url, "FetchRequest::basic_auth")?;
+    let scheme = if origin.tls { "https" } else { "http" };
+    let path_and_query = uri.path_and_query().map_or("/", |pq| pq.as_str());
+    // The one string the destination holds is assembled from the parts the
+    // parse produced: the whole of it is the absolute URL, and its tail from
+    // the prefix length is the origin-form target.
+    let mut text =
+        String::with_capacity(scheme.len() + 3 + authority.len() + 1 + path_and_query.len());
+    text.push_str(scheme);
+    text.push_str("://");
+    text.push_str(&authority);
+    let path_at = text.len();
+    if !path_and_query.starts_with('/') {
+        text.push('/');
+    }
+    text.push_str(path_and_query);
+    Ok(Destination {
+        authority: host_header(url, &authority)?,
+        url: text,
+        path_at,
+        origin,
     })
 }
 
@@ -1327,22 +1830,26 @@ mod tests {
     fn mirror_urls_join_base_and_path() {
         let mirror = parse_mirror("https://example.com/repo/").unwrap();
         assert_eq!(
-            mirror.url("objects/ab/cd.filez"),
+            mirror.destination("objects/ab/cd.filez").url(),
             "https://example.com/repo/objects/ab/cd.filez"
         );
         assert_eq!(mirror.origin.port, 443);
         assert!(mirror.origin.tls);
 
         let root = parse_mirror("http://example.com").unwrap();
-        assert_eq!(root.url("summary"), "http://example.com/summary");
+        assert_eq!(
+            root.destination("summary").url(),
+            "http://example.com/summary"
+        );
         assert_eq!(root.origin.port, 80);
         assert!(!root.origin.tls);
 
         // A non-default port stays in the URL and in the host header; a leading
         // slash on the path is not doubled.
         let ported = parse_mirror("http://127.0.0.1:8080/r").unwrap();
-        assert_eq!(ported.url("/config"), "http://127.0.0.1:8080/r/config");
-        assert_eq!(ported.target("/config"), "/r/config");
+        let config = ported.destination("/config");
+        assert_eq!(config.url(), "http://127.0.0.1:8080/r/config");
+        assert_eq!(config.target(), "/r/config");
         assert_eq!(ported.authority, "127.0.0.1:8080");
         assert_eq!(root.authority, "example.com");
     }
@@ -1356,13 +1863,19 @@ mod tests {
         assert_eq!(ported.origin.host, "::1");
         assert_eq!(ported.origin.port, 8080);
         assert_eq!(ported.authority, "[::1]:8080");
-        assert_eq!(ported.url("summary"), "http://[::1]:8080/r/summary");
+        assert_eq!(
+            ported.destination("summary").url(),
+            "http://[::1]:8080/r/summary"
+        );
 
         let tls = parse_mirror("https://[2001:db8::1]/repo").unwrap();
         assert_eq!(tls.origin.host, "2001:db8::1");
         assert_eq!(tls.origin.port, 443);
         assert_eq!(tls.authority, "[2001:db8::1]");
-        assert_eq!(tls.url("summary"), "https://[2001:db8::1]/repo/summary");
+        assert_eq!(
+            tls.destination("summary").url(),
+            "https://[2001:db8::1]/repo/summary"
+        );
         // The server name the TLS handshake is opened with comes from the same
         // field, and rejects the bracketed form.
         rustls::pki_types::ServerName::try_from(tls.origin.host.clone()).unwrap();
@@ -1391,20 +1904,46 @@ mod tests {
     #[test]
     fn options_are_validated_at_construction() {
         rt::block_on(async {
-            let err = Fetcher::new(FetcherOptions::default()).await.unwrap_err();
-            assert!(err.to_string().contains("no mirror"), "{err}");
-
             let mut options = FetcherOptions::new("http://example.com");
             options.headers = vec![("not a header".into(), "v".into())];
             let err = Fetcher::new(options).await.unwrap_err();
             assert!(err.to_string().contains("invalid header name"), "{err}");
 
-            // The host header comes from the mirror URL, so a caller-supplied
-            // one would collide with it.
+            // The host header comes from the url the request is sent to, so a
+            // caller-supplied one would collide with it.
             let mut options = FetcherOptions::new("http://example.com");
             options.headers = vec![("host".into(), "elsewhere".into())];
             let err = Fetcher::new(options).await.unwrap_err();
             assert!(err.to_string().contains("host header"), "{err}");
+
+            // Credentials and an authorization header both set the same
+            // header, and which of the two to send is not stated.
+            let mut options = tls_options("https://example.com");
+            options.headers = vec![("authorization".into(), "Basic aaa".into())];
+            options.basic_auth = Some(BasicAuth {
+                user: "u".into(),
+                password: "p".into(),
+            });
+            let err = Fetcher::new(options).await.unwrap_err();
+            assert!(err.to_string().contains("pass one of them"), "{err}");
+        });
+    }
+
+    /// A fetcher with no mirror serves the URLs its requests name. A path
+    /// target has nowhere to go there, and is refused before admission.
+    #[test]
+    fn a_path_target_needs_a_mirror() {
+        rt::block_on(async {
+            let fetcher = Fetcher::new(mirrorless_options()).await.unwrap();
+            let err = fetcher.route(Target::Path("summary")).unwrap_err();
+            assert!(err.to_string().contains("no mirror is configured"), "{err}");
+            let route = fetcher
+                .route(Target::Url("https://example.com/summary"))
+                .unwrap();
+            let Route::One(destination) = route else {
+                panic!("a url target names one destination");
+            };
+            assert_eq!(destination.url(), "https://example.com/summary");
         });
     }
 
@@ -1434,8 +1973,14 @@ mod tests {
                 .await
                 .unwrap();
             let mirror = &fetcher.inner.mirrors[0];
+            let destination = mirror.destination("refs/heads/a");
             let request = fetcher
-                .build_request(mirror, &FetchRequest::new("refs/heads/a"), Protocol::Http11)
+                .build_request(
+                    &destination,
+                    &FetchRequest::path("refs/heads/a"),
+                    &fetcher.inner.headers,
+                    Protocol::Http11,
+                )
                 .unwrap();
             assert_eq!(request.uri(), "/r/refs/heads/a");
         });
@@ -1491,6 +2036,17 @@ mod tests {
             value(hyper::header::AUTHORIZATION).as_deref(),
             Some("Basic dTpw")
         );
+    }
+
+    /// Options for a fetcher with no mirror, which serves the URLs its
+    /// requests name. The anchors come from the fixture authority, so the
+    /// constructor reads no host trust store, which an empty mirror list
+    /// otherwise demands.
+    fn mirrorless_options() -> FetcherOptions {
+        FetcherOptions {
+            mirrors: Vec::new(),
+            ..tls_options("unused")
+        }
     }
 
     /// Options for an `https` mirror whose anchors come from the fixture
@@ -1572,5 +2128,369 @@ mod tests {
             ..tls_options("unused")
         };
         rt::block_on(Fetcher::new(options)).unwrap();
+    }
+
+    /// A request URL is served as it is written: the query string is part of
+    /// what the request names and reaches the wire, while userinfo and a
+    /// fragment are refused, neither of them being sent. The absolute URL, the
+    /// origin-form target, the authority, and the origin are all read off the
+    /// one string the destination holds.
+    #[test]
+    fn url_targets_are_parsed_and_validated() {
+        // Every row states the URL, then the absolute URL, the origin-form
+        // target, the authority, and the origin the parse produces.
+        let rows = [
+            (
+                "https://example.com/repo/summary?sig=a%2Fb&x=1",
+                "https://example.com/repo/summary?sig=a%2Fb&x=1",
+                "/repo/summary?sig=a%2Fb&x=1",
+                "example.com",
+                "https://example.com",
+            ),
+            // A URL with no path of its own asks for the root, whether it
+            // writes the trailing slash or not.
+            ("http://h", "http://h/", "/", "h", "http://h"),
+            ("http://h/", "http://h/", "/", "h", "http://h"),
+            // An empty query is part of what the request names.
+            ("http://h/p?", "http://h/p?", "/p?", "h", "http://h"),
+            (
+                "http://h/p?a=%2F&b=1",
+                "http://h/p?a=%2F&b=1",
+                "/p?a=%2F&b=1",
+                "h",
+                "http://h",
+            ),
+            // The default port for the scheme is left out of the authority
+            // whether the URL wrote it or not, and the scheme is held in lower
+            // case.
+            ("https://h:443/p", "https://h/p", "/p", "h", "https://h"),
+            ("HTTP://h/p", "http://h/p", "/p", "h", "http://h"),
+            // An IPv6 literal keeps its brackets in the authority, and a
+            // non-default port stays with it.
+            (
+                "http://[2001:db8::1]:8080/r/config",
+                "http://[2001:db8::1]:8080/r/config",
+                "/r/config",
+                "[2001:db8::1]:8080",
+                "http://[2001:db8::1]:8080",
+            ),
+        ];
+        for (url, absolute, target, authority, origin) in rows {
+            let dest = parse_url(url).unwrap();
+            assert_eq!(dest.url(), absolute, "{url}");
+            assert_eq!(dest.target(), target, "{url}");
+            assert_eq!(dest.authority, authority, "{url}");
+            assert_eq!(dest.origin_url(), origin, "{url}");
+        }
+
+        let dest = parse_url("https://example.com/repo/summary?sig=a%2Fb&x=1").unwrap();
+        assert_eq!(dest.origin.port, 443);
+        assert!(dest.origin.tls);
+        let root = parse_url("http://example.com").unwrap();
+        assert_eq!(root.origin.port, 80);
+        assert!(!root.origin.tls);
+        // The address itself is held without the brackets the authority carries.
+        let ported = parse_url("http://[::1]:8080/r/config").unwrap();
+        assert_eq!(ported.origin.host, "::1");
+        assert_eq!(ported.origin.port, 8080);
+
+        // The refusal names the scheme and the host, and leaves the password
+        // out of a message a caller logs.
+        let err = parse_url("https://alice:sup3rs3cret@example.com/p").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("userinfo"), "{message}");
+        assert!(message.contains("https url for example.com"), "{message}");
+        assert!(message.contains("FetchRequest::basic_auth"), "{message}");
+        assert!(!message.contains("sup3rs3cret"), "{message}");
+
+        let err = parse_url("https://example.com/p#frag").unwrap_err();
+        assert!(err.to_string().contains("fragment"), "{err}");
+        let err = parse_url("file:///srv/repo").unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+        let err = parse_url("/srv/repo").unwrap_err();
+        assert!(err.to_string().contains("not an absolute"), "{err}");
+    }
+
+    /// A message about a URL the parse has not read the authority of leaves the
+    /// userinfo out, whichever of those messages it is.
+    #[test]
+    fn a_password_reaches_no_message() {
+        for url in [
+            "https://alice:sup3rs3cret@example.com/p",
+            "https://alice:sup3rs3cret@example.com/p#frag",
+            "http://alice:sup3rs3cret@example.com/ p",
+            "http://alice:sup3rs3cret@",
+            "alice:sup3rs3cret@example.com/p",
+        ] {
+            let err = parse_url(url).unwrap_err();
+            let message = err.to_string();
+            assert!(!message.contains("sup3rs3cret"), "{url}: {message}");
+        }
+    }
+
+    /// `Uri` accepts an authority whose port it cannot read and reports no port
+    /// for it, so a URL naming such a port is refused rather than served from
+    /// the scheme default.
+    #[test]
+    fn a_port_the_url_parser_cannot_read_is_refused() {
+        for (url, text) in [
+            ("http://h:99999/x", "99999"),
+            ("http://h:65536/x", "65536"),
+            ("http://h:abc/x", "abc"),
+            ("http://h:/x", ""),
+        ] {
+            let err = parse_url(url).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains(url), "{url}: {message}");
+            assert!(message.contains(text), "{url}: {message}");
+            assert!(message.contains("not a number"), "{url}: {message}");
+            // A mirror URL is read by the same parse.
+            assert!(parse_mirror(url).is_err(), "{url}");
+        }
+
+        // A URL with no port at all takes the scheme default, and a port the
+        // parser reads is kept.
+        let default = parse_url("http://h/x").unwrap();
+        assert_eq!(default.origin.port, 80);
+        assert_eq!(default.url(), "http://h/x");
+        let ported = parse_url("http://h:8080/x").unwrap();
+        assert_eq!(ported.origin.port, 8080);
+        assert_eq!(ported.url(), "http://h:8080/x");
+    }
+
+    /// A host compares as one origin whichever case it is written in, so two
+    /// spellings of one origin are one pool key.
+    #[test]
+    fn a_host_in_another_case_is_one_origin() {
+        let upper = parse_url("http://LOCALHOST:8080/x").unwrap();
+        let lower = parse_url("http://localhost:8080/x").unwrap();
+        assert_eq!(upper.origin, lower.origin);
+        assert_eq!(upper.origin.host, "localhost");
+        // The authority reaches the wire as the caller wrote it.
+        assert_eq!(upper.authority, "LOCALHOST:8080");
+        assert_eq!(upper.url(), "http://LOCALHOST:8080/x");
+    }
+
+    /// The password is left out of what a struct carrying credentials renders.
+    #[test]
+    fn basic_auth_debug_holds_no_password() {
+        let auth = BasicAuth {
+            user: "alice".into(),
+            password: "sup3rs3cret".into(),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(rendered.contains("alice"), "{rendered}");
+        assert!(!rendered.contains("sup3rs3cret"), "{rendered}");
+
+        let request = FetchRequest {
+            basic_auth: Some(&auth),
+            ..FetchRequest::path("summary")
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("sup3rs3cret"), "{rendered}");
+
+        let options = FetcherOptions {
+            basic_auth: Some(auth),
+            ..FetcherOptions::new("https://example.com")
+        };
+        let rendered = format!("{options:?}");
+        assert!(!rendered.contains("sup3rs3cret"), "{rendered}");
+    }
+
+    /// The connection layer frames a request and holds its connection, so a
+    /// header of one of those names is refused: by the constructor for a
+    /// fetcher header, and before admission for a request header.
+    #[test]
+    fn a_connection_header_is_refused_at_both_layers() {
+        let fetcher_headers = vec![(
+            HeaderName::from_static("x-trace"),
+            HeaderValue::from_static("abc"),
+        )];
+        for name in CONNECTION_HEADERS {
+            let options = FetcherOptions {
+                headers: vec![(name.to_owned(), "10".to_owned())],
+                ..FetcherOptions::new("http://example.com")
+            };
+            let err = rt::block_on(Fetcher::new(options)).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains(name), "{name}: {message}");
+            assert!(message.contains("connection layer"), "{name}: {message}");
+
+            let request = vec![(name.to_owned(), "10".to_owned())];
+            let err = merge_headers(&fetcher_headers, &request, None).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains(name), "{name}: {message}");
+            assert!(message.contains("connection layer"), "{name}: {message}");
+        }
+
+        // A name written in another case is the same header name.
+        let request = vec![("Content-Length".to_owned(), "10".to_owned())];
+        let err = merge_headers(&fetcher_headers, &request, None).unwrap_err();
+        assert!(err.to_string().contains("content-length"), "{err}");
+    }
+
+    /// A request that adds neither a header nor credentials sends the
+    /// fetcher's list by reference. A request header replaces the fetcher
+    /// header of the same name, and the request's credentials replace the
+    /// fetcher's `Authorization`.
+    #[test]
+    fn request_headers_merge_over_the_fetchers() {
+        let header = |name: &'static str, value: &'static str| {
+            (
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            )
+        };
+        let fetcher = vec![
+            header("x-trace", "fetcher"),
+            header("x-only", "yes"),
+            header("authorization", "Basic ZmV0Y2hlcg=="),
+        ];
+        let sent = |headers: &[(HeaderName, HeaderValue)]| {
+            headers
+                .iter()
+                .map(|(name, value)| (name.as_str().to_owned(), value.to_str().unwrap().to_owned()))
+                .collect::<Vec<_>>()
+        };
+
+        let borrowed = merge_headers(&fetcher, &[], None).unwrap();
+        assert!(matches!(borrowed, Cow::Borrowed(_)));
+        assert_eq!(sent(&borrowed), sent(&fetcher));
+
+        // The replacement compares names as header names, so it holds whatever
+        // case the request wrote, and it leaves every other fetcher header in
+        // place. Two request headers of one name both reach the wire.
+        let extra = vec![
+            ("X-Trace".to_owned(), "request".to_owned()),
+            ("x-trace".to_owned(), "second".to_owned()),
+        ];
+        let merged = merge_headers(&fetcher, &extra, None).unwrap();
+        assert_eq!(
+            sent(&merged),
+            [
+                ("x-only".to_owned(), "yes".to_owned()),
+                ("authorization".to_owned(), "Basic ZmV0Y2hlcg==".to_owned()),
+                ("x-trace".to_owned(), "request".to_owned()),
+                ("x-trace".to_owned(), "second".to_owned()),
+            ]
+        );
+
+        // base64("u:p")
+        let auth = BasicAuth {
+            user: "u".into(),
+            password: "p".into(),
+        };
+        let merged = merge_headers(&fetcher, &[], Some(&auth)).unwrap();
+        assert_eq!(
+            sent(&merged),
+            [
+                ("x-trace".to_owned(), "fetcher".to_owned()),
+                ("x-only".to_owned(), "yes".to_owned()),
+                ("authorization".to_owned(), "Basic dTpw".to_owned()),
+            ]
+        );
+
+        let both = vec![("authorization".to_owned(), "Basic aaa".to_owned())];
+        let err = merge_headers(&fetcher, &both, Some(&auth)).unwrap_err();
+        assert!(err.to_string().contains("pass one of them"), "{err}");
+        let host = vec![("host".to_owned(), "elsewhere".to_owned())];
+        let err = merge_headers(&fetcher, &host, None).unwrap_err();
+        assert!(err.to_string().contains("host header"), "{err}");
+        let invalid = vec![("not a header".to_owned(), "v".to_owned())];
+        let err = merge_headers(&fetcher, &invalid, None).unwrap_err();
+        assert!(err.to_string().contains("invalid header name"), "{err}");
+    }
+
+    /// A credential is withheld from no destination, so one cleartext
+    /// destination among those a fetch may reach refuses it, and the origin is
+    /// named. A header that is not a credential reaches a cleartext
+    /// destination.
+    #[test]
+    fn a_credential_refuses_a_cleartext_destination() {
+        let credential = vec![(hyper::header::COOKIE, HeaderValue::from_static("session=1"))];
+        let plain = vec![(
+            HeaderName::from_static("x-trace"),
+            HeaderValue::from_static("abc"),
+        )];
+        // A fetcher whose mirror list holds one cleartext entry among https
+        // ones. The credential is the request's, so the construction check
+        // over the list has nothing to say about it.
+        let options = FetcherOptions {
+            mirrors: vec![
+                "https://secure.example/repo".to_owned(),
+                "http://cleartext.example/repo".to_owned(),
+            ],
+            ..tls_options("unused")
+        };
+        let fetcher = rt::block_on(Fetcher::new(options)).unwrap();
+
+        let mirrors = fetcher.route(Target::Path("summary")).unwrap();
+        let err = fetcher.check_cleartext(&mirrors, &credential).unwrap_err();
+        assert!(
+            err.to_string().contains("http://cleartext.example"),
+            "{err}"
+        );
+        fetcher.check_cleartext(&mirrors, &plain).unwrap();
+
+        let cleartext = fetcher
+            .route(Target::Url("http://cleartext.example/p"))
+            .unwrap();
+        let err = fetcher
+            .check_cleartext(&cleartext, &credential)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("http://cleartext.example"),
+            "{err}"
+        );
+        fetcher.check_cleartext(&cleartext, &plain).unwrap();
+
+        let secure = fetcher
+            .route(Target::Url("https://secure.example/p"))
+            .unwrap();
+        fetcher.check_cleartext(&secure, &credential).unwrap();
+    }
+
+    /// A handshake verifies the server certificate against a trust anchor, so
+    /// a fetch of a TLS origin is refused before admission when the fetcher
+    /// holds none, and the origin is named. The fetcher that carries the flag
+    /// clear is one built on a host whose trust store holds nothing, which is
+    /// what the flag is set by hand to stand for here: this host has a CA
+    /// bundle, and `TrustRoots::Pem` fails the constructor over a blob that
+    /// holds no certificate.
+    #[test]
+    fn a_tls_destination_needs_a_trust_anchor() {
+        rt::block_on(async {
+            let mut fetcher = Fetcher::new(FetcherOptions::new("http://cleartext.example/repo"))
+                .await
+                .unwrap();
+            Arc::get_mut(&mut fetcher.inner)
+                .expect("the one handle on this fetcher")
+                .has_trust_anchors = false;
+
+            // Nothing listens on port 1 of the loopback, so an attempt would
+            // fail its connect and be retried through every round and every
+            // backoff. The refusal is definitive and takes no attempt, so it
+            // resolves at once.
+            let refused = within(
+                Duration::from_secs(1),
+                fetcher.fetch(FetchRequest::url("https://127.0.0.1:1/summary")),
+            )
+            .await;
+            let err = refused
+                .expect("the refusal takes no attempt")
+                .expect_err("a tls url is refused without anchors");
+            let message = err.to_string();
+            assert!(message.contains("https://127.0.0.1:1"), "{message}");
+            assert!(message.contains("no trust anchors"), "{message}");
+
+            // A cleartext destination opens no handshake, so it is served by
+            // the same fetcher.
+            let cleartext = fetcher
+                .route(Target::Url("http://cleartext.example/summary"))
+                .unwrap();
+            fetcher.check_trust_anchors(&cleartext).unwrap();
+            let mirrors = fetcher.route(Target::Path("summary")).unwrap();
+            fetcher.check_trust_anchors(&mirrors).unwrap();
+        });
     }
 }

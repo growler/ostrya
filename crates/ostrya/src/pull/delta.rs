@@ -403,10 +403,9 @@ pub(crate) async fn fetch_part(
     // `Content-Length` above it before the body arrives and stops a body that
     // passes it as the bytes land.
     let request = FetchRequest {
-        path: &path,
         priority: Priority::High,
-        validators: None,
         max_size: Some(entry.size),
+        ..FetchRequest::path(&path)
     };
     let body = match fetcher.fetch(request).await? {
         Fetched::Body(body) => body,

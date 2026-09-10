@@ -114,12 +114,14 @@
 //! the signing engines over the raw superblock bytes, and
 //! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache. It also
 //! covers the fetcher pull is built on (Phase 16a): [`Fetcher`] serves
-//! [`FetchRequest`]s for paths under a remote's mirrors over HTTP/1.1 and
-//! HTTP/2 -- ALPN picks the version, connections are pooled per origin,
-//! requests carry a [`Priority`] the fetcher's admission queue honors,
-//! conditional requests resolve to [`Fetched::NotModified`], retryable
-//! failures are repeated across mirrors, and a response arrives as a streaming
-//! [`Body`] under an optional size cap -- and [`VerifyingReader`], the stream
+//! [`FetchRequest`]s naming a [`Target`] -- a path under a remote's mirrors, or
+//! an absolute URL of the request's own -- over HTTP/1.1 and HTTP/2 -- ALPN
+//! picks the version, connections are pooled per origin, requests carry a
+//! [`Priority`] the fetcher's admission queue honors, a request's headers and
+//! credentials replace the fetcher's for that one request, conditional requests
+//! resolve to [`Fetched::NotModified`], retryable failures are repeated across
+//! destinations, and a response arrives as a streaming [`Body`] under an
+//! optional size cap -- and [`VerifyingReader`], the stream
 //! that checks a payload against its expected digest at EOF. It also covers
 //! local pull (Phase 16b): [`Repo::pull_local`] imports refs, their commit
 //! chains, and every object those commits reach out of another local
@@ -229,7 +231,7 @@ pub use diff::{DiffChange, DiffEntry};
 pub use error::{Error, Result};
 pub use fetch::{
     BasicAuth, Body, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, Priority,
-    Protocol, TlsOptions, TrustRoots, Validators,
+    Protocol, Target, TlsOptions, TrustRoots, Validators,
 };
 pub use file::{ContentReader, FileKind, FileObject};
 pub use fsck::{FsckError, FsckErrorKind, FsckOptions, FsckReport};

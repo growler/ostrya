@@ -32,6 +32,21 @@
 //! connection, and a value of the caller's own puts the wire and the connection
 //! pool out of step with each other.
 //!
+//! A fetch delivers the bytes the remote stores, so every request carries
+//! `Accept-Encoding: identity` and asks for no content coding. A server that
+//! compresses a response where the header is absent stays within the HTTP
+//! specification, and its body would then hold bytes other than the ones the
+//! object's checksum names. An `Accept-Encoding` entry in
+//! [`FetcherOptions::headers`] or [`FetchRequest::headers`] replaces the value
+//! the fetcher asks with, and what it changes is the question the request puts
+//! to the server. A 200 whose `Content-Encoding` names a coding other than
+//! `identity`, or whose `Transfer-Encoding` names a coding other than
+//! `chunked`, fails the attempt definitively with [`Error::ContentEncoded`],
+//! whichever layer asked for the coding. The fetcher delivers stored bytes
+//! alone, so a caller that wants a coded body decodes it outside the fetcher.
+//! `chunked` frames a message and the connection undoes the framing, so a
+//! response carrying it alone delivers the body as the remote wrote it.
+//!
 //! A credential is withheld from no destination, so credentials and cleartext
 //! are refused together. [`basic_auth`](FetcherOptions::basic_auth), or an
 //! `Authorization`, `Proxy-Authorization`, or `Cookie` entry in
@@ -147,6 +162,18 @@ pub use tls::{ClientIdentity, TlsOptions, TrustRoots};
 /// The user agent a request carries, which a `User-Agent` header the fetcher or
 /// the request sets replaces.
 const USER_AGENT: &str = concat!("ostrya/", env!("CARGO_PKG_VERSION"));
+
+/// The one content coding a fetch accepts, which is the absence of a coding.
+/// Every request asks for it, and a response declaring anything else fails the
+/// attempt. An `Accept-Encoding` header the fetcher or the request sets replaces
+/// the one the fetcher asks with.
+const IDENTITY: &str = "identity";
+
+/// The one transfer coding a response may declare. It frames a message, and the
+/// connection undoes the framing, so the body reaches the caller as the remote
+/// wrote it. The port advertises no `TE`, so any other transfer coding is a
+/// server fault, and a response declaring one fails the attempt.
+const CHUNKED: &str = "chunked";
 
 /// What a layer that sets both credentials and an `Authorization` header is
 /// told. Which of the two the request should carry is not stated, and picking
@@ -267,7 +294,9 @@ pub struct FetcherOptions {
     /// serves [`Target::Url`] requests alone.
     pub mirrors: Vec<String>,
     /// Extra headers sent with every request, to every destination. A request
-    /// header of the same name replaces one of these. An `Authorization`,
+    /// header of the same name replaces one of these. The fetcher itself sets
+    /// `User-Agent` and `Accept-Encoding: identity`, and an entry of one of
+    /// those names replaces the value the fetcher sets. An `Authorization`,
     /// `Proxy-Authorization`, or `Cookie` header is refused at construction
     /// when any mirror is cleartext `http`, since its value is a secret
     /// whatever it holds. A `Host` header, and a header the connection layer
@@ -382,6 +411,11 @@ pub struct FetchRequest<'a> {
     pub max_size: Option<u64>,
     /// Headers merged over the fetcher's, replacing a fetcher header of the
     /// same name.
+    ///
+    /// The fetcher sets `User-Agent` and `Accept-Encoding: identity`, and an
+    /// entry of one of those names replaces it. An entry that asks for a
+    /// content coding changes what the request asks the server for, and a
+    /// response that carries a coding is refused whichever layer asked for it.
     ///
     /// Names compare as `HeaderName`, so the comparison is case-insensitive.
     /// Two entries of one name both reach the wire. A `Host` entry is refused,
@@ -701,10 +735,23 @@ impl Fetcher {
                  use https mirrors or drop the credentials"
             )));
         }
-        let mut headers = vec![(
-            hyper::header::USER_AGENT,
-            HeaderValue::from_static(USER_AGENT),
-        )];
+        let mut headers = vec![
+            (
+                hyper::header::USER_AGENT,
+                HeaderValue::from_static(USER_AGENT),
+            ),
+            (
+                hyper::header::ACCEPT_ENCODING,
+                HeaderValue::from_static(IDENTITY),
+            ),
+        ];
+        // How much of the list the fetcher itself sets. A configured header of
+        // one of those names replaces that entry, the way a request header
+        // replaces a fetcher header of the same name: the two would otherwise
+        // both reach the wire and give one question two answers. A name outside
+        // this region is a configured header, which two entries of one name
+        // both reach the wire under.
+        let mut base = headers.len();
         for (name, value) in &options.headers {
             let name = HeaderName::try_from(name.as_str())
                 .map_err(|_| Error::Fetch(format!("invalid header name: {name}")))?;
@@ -727,6 +774,10 @@ impl Fetcher {
             }
             let value = HeaderValue::try_from(value.as_str())
                 .map_err(|_| Error::Fetch(format!("invalid value for header {name}")))?;
+            if let Some(at) = headers[..base].iter().position(|(held, _)| *held == name) {
+                headers.remove(at);
+                base -= 1;
+            }
             headers.push((name, value));
         }
         if let Some(auth) = &options.basic_auth {
@@ -1029,6 +1080,19 @@ impl Fetcher {
             let failure = classify(status, url);
             self.discard(origin, response, reuse).await;
             return Err(failure);
+        }
+        // A coded body holds bytes other than the ones the remote stores, so
+        // the declared length says nothing about the object either: the coding
+        // is refused before the cap is compared. A refusal that names the
+        // coding is what a checksum mismatch cannot say. The refusal is
+        // definitive, another attempt against the same destination being
+        // answered the same way.
+        if let Some(encoding) = declared_coding(response.headers()) {
+            self.discard(origin, response, reuse).await;
+            return Err(Failure::Fatal(Error::ContentEncoded {
+                url: url.to_string(),
+                encoding,
+            }));
         }
         let validators = read_validators(response.headers());
         let content_length = content_length(response.headers());
@@ -1749,6 +1813,55 @@ fn content_length(headers: &hyper::HeaderMap) -> Option<u64> {
         .ok()
 }
 
+/// The coding a response declared, when it declared one a body would have to
+/// be decoded from.
+///
+/// `Content-Encoding` codes the content, and `Transfer-Encoding` codes the
+/// message the content travels in; a body under either holds bytes other than
+/// the ones the remote stores, so both headers are read. A response that
+/// declares both is named by its content coding.
+fn declared_coding(headers: &hyper::HeaderMap) -> Option<String> {
+    coding(headers, hyper::header::CONTENT_ENCODING, &[IDENTITY]).or_else(|| {
+        coding(
+            headers,
+            hyper::header::TRANSFER_ENCODING,
+            &[IDENTITY, CHUNKED],
+        )
+    })
+}
+
+/// The coding a response declared under `name`, when it declared one outside
+/// `undone` -- the codings that leave the body as the remote wrote it.
+///
+/// A value is a comma-separated list of codings, and several headers of one
+/// name state one list together, so every token of every value is read. A value
+/// whose tokens are all empty names no coding, and it joins nothing to what
+/// comes back either, so a stray separator reaches no message. What comes back
+/// is the text the response carried, in the order it carried it, so the refusal
+/// names the server's own value; a response with nothing to refuse builds no
+/// string.
+fn coding(headers: &hyper::HeaderMap, name: HeaderName, undone: &[&str]) -> Option<String> {
+    let declared = || {
+        headers
+            .get_all(&name)
+            .iter()
+            .map(|value| String::from_utf8_lossy(value.as_bytes()))
+            .filter(|value| value.split(',').any(|token| !token.trim().is_empty()))
+    };
+    if !declared().any(|value| value.split(',').any(|token| names_a_coding(token, undone))) {
+        return None;
+    }
+    Some(declared().collect::<Vec<_>>().join(", "))
+}
+
+/// Whether one token of a coding list names a coding outside `undone`. The
+/// comparison ignores case and the space around the token, and an empty token
+/// names nothing.
+fn names_a_coding(token: &str, undone: &[&str]) -> bool {
+    let token = token.trim();
+    !token.is_empty() && !undone.iter().any(|name| token.eq_ignore_ascii_case(name))
+}
+
 /// Read the cache validators out of a response.
 fn read_validators(headers: &hyper::HeaderMap) -> Validators {
     let text = |name: HeaderName| {
@@ -2399,6 +2512,123 @@ mod tests {
         let invalid = vec![("not a header".to_owned(), "v".to_owned())];
         let err = merge_headers(&fetcher, &invalid, None).unwrap_err();
         assert!(err.to_string().contains("invalid header name"), "{err}");
+    }
+
+    /// A fetch delivers the bytes the remote stores, so a response is served
+    /// only where it declares no coding, or declares `identity`. A value is a
+    /// comma-separated list, several headers state one list together, and a
+    /// token compares without case and without the space around it.
+    #[test]
+    fn a_declared_content_coding_is_read_off_the_response() {
+        let map = |values: &[&str]| {
+            let mut headers = hyper::HeaderMap::new();
+            for value in values {
+                headers.append(
+                    hyper::header::CONTENT_ENCODING,
+                    HeaderValue::try_from(*value).unwrap(),
+                );
+            }
+            headers
+        };
+
+        // Nothing to undo: no header at all, an empty value, a value of
+        // separators alone, and every spelling of the one coding that is served.
+        for values in [
+            vec![],
+            vec![""],
+            vec![","],
+            vec!["identity"],
+            vec!["IDENTITY"],
+            vec![" identity "],
+            vec!["identity", "identity"],
+        ] {
+            assert_eq!(declared_coding(&map(&values)), None, "{values:?}");
+        }
+
+        // A coding the body would have to be decoded from, named as the
+        // response wrote it. A list holding one refuses the whole response,
+        // whichever position the coding sits in, and several headers are read
+        // together in the order they arrived. A value whose tokens are all
+        // empty names nothing, so it joins no separator to the message either.
+        for (values, named) in [
+            (vec!["gzip"], "gzip"),
+            (vec!["GZip"], "GZip"),
+            (vec!["identity, gzip"], "identity, gzip"),
+            (vec!["gzip, identity"], "gzip, identity"),
+            (vec!["identity", "gzip"], "identity, gzip"),
+            (vec!["gzip", "br"], "gzip, br"),
+            (vec!["", "gzip"], "gzip"),
+            (vec!["gzip", ""], "gzip"),
+            (vec!["gzip", "", "br"], "gzip, br"),
+            (vec!["gzip", ",", "br"], "gzip, br"),
+        ] {
+            assert_eq!(
+                declared_coding(&map(&values)).as_deref(),
+                Some(named),
+                "{values:?}"
+            );
+        }
+    }
+
+    /// Every request asks for no content coding, and a configured header of one
+    /// of the names the fetcher sets replaces that entry rather than joining it
+    /// on the wire.
+    #[test]
+    fn a_fetcher_header_replaces_the_entry_the_fetcher_sets() {
+        let sent = |fetcher: &Fetcher, name: HeaderName| {
+            fetcher
+                .inner
+                .headers
+                .iter()
+                .filter(|(held, _)| *held == name)
+                .map(|(_, value)| value.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let fetcher =
+            rt::block_on(Fetcher::new(FetcherOptions::new("http://example.com"))).unwrap();
+        assert_eq!(
+            sent(&fetcher, hyper::header::ACCEPT_ENCODING),
+            [IDENTITY.to_owned()]
+        );
+
+        for name in ["accept-encoding", "user-agent"] {
+            let options = FetcherOptions {
+                headers: vec![(name.to_owned(), "caller".to_owned())],
+                ..FetcherOptions::new("http://example.com")
+            };
+            let fetcher = rt::block_on(Fetcher::new(options)).unwrap();
+            let header = HeaderName::from_static(name);
+            assert_eq!(sent(&fetcher, header), ["caller".to_owned()], "{name}");
+        }
+
+        // Two entries of one name both reach the wire, the entry the fetcher
+        // sets having been replaced by the first of them.
+        let options = FetcherOptions {
+            headers: vec![
+                ("accept-encoding".to_owned(), "one".to_owned()),
+                ("Accept-Encoding".to_owned(), "two".to_owned()),
+            ],
+            ..FetcherOptions::new("http://example.com")
+        };
+        let fetcher = rt::block_on(Fetcher::new(options)).unwrap();
+        assert_eq!(
+            sent(&fetcher, hyper::header::ACCEPT_ENCODING),
+            ["one".to_owned(), "two".to_owned()]
+        );
+        // A name the fetcher sets nothing under keeps both entries as well.
+        let options = FetcherOptions {
+            headers: vec![
+                ("x-trace".to_owned(), "one".to_owned()),
+                ("x-trace".to_owned(), "two".to_owned()),
+            ],
+            ..FetcherOptions::new("http://example.com")
+        };
+        let fetcher = rt::block_on(Fetcher::new(options)).unwrap();
+        assert_eq!(
+            sent(&fetcher, HeaderName::from_static("x-trace")),
+            ["one".to_owned(), "two".to_owned()]
+        );
     }
 
     /// A credential is withheld from no destination, so one cleartext

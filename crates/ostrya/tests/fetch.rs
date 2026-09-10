@@ -1074,6 +1074,203 @@ fn a_fetcher_framing_header_fails_the_constructor() {
     });
 }
 
+/// A fetch delivers the bytes the remote stores, so every request states that
+/// it accepts no content coding, and it states it once.
+#[test]
+fn every_request_asks_for_no_content_coding() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"object bytes")).await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "objects/ab/cd.filez").await;
+        assert_eq!(bytes, b"object bytes");
+        let seen = &server.seen()[0];
+        assert_eq!(seen.header("accept-encoding"), Some("identity"));
+        assert_eq!(seen.headers.get_all("accept-encoding").iter().count(), 1);
+    });
+}
+
+/// A coded body holds bytes other than the ones the remote stores, so a
+/// response declaring a coding is refused and the coding is named. The refusal
+/// drains the short body the response declared, so the next fetch is served over
+/// the same connection.
+#[test]
+fn a_coded_response_is_refused_and_keeps_its_connection() {
+    block_on(async {
+        let handler: Handler = Arc::new(|_seen, count| {
+            let mut response = Response::builder().status(StatusCode::OK);
+            if count == 1 {
+                response = response.header("content-encoding", "gzip");
+            }
+            response.body(TestBody::measured(b"squeezed")).unwrap()
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+
+        let err = fetcher
+            .fetch(FetchRequest::path("objects/ab/cd.filez"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::ContentEncoded { encoding, .. } if encoding == "gzip"),
+            "{err}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("gzip"), "{message}");
+        assert!(
+            message.contains(&format!("{}/objects/ab/cd.filez", server.url(false))),
+            "{message}"
+        );
+
+        let (bytes, _) = fetch_bytes(&fetcher, "objects/ab/cd.filez").await;
+        assert_eq!(bytes, b"squeezed");
+        assert_eq!(server.requests(), 2);
+        assert_eq!(server.connections(), 1);
+    });
+}
+
+/// `identity` names no coding, so a response declaring it carries the bytes the
+/// remote stores and is served whole.
+#[test]
+fn a_response_declaring_identity_is_served() {
+    block_on(async {
+        let handler: Handler = Arc::new(|_seen, _count| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-encoding", "identity")
+                .body(TestBody::measured(b"object bytes"))
+                .unwrap()
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "objects/ab/cd.filez").await;
+        assert_eq!(bytes, b"object bytes");
+    });
+}
+
+/// A caller that asks for a content coding of its own replaces what the fetcher
+/// asks for, at either layer, and the server sees the caller's value once. The
+/// coding the caller asked for is refused all the same, so a caller that wants
+/// a coded body decodes it outside the fetcher.
+#[test]
+fn a_caller_supplied_accept_encoding_replaces_the_fetchers() {
+    block_on(async {
+        // A server that honors the request: it codes the response where the
+        // request asked for gzip, and leaves it alone otherwise.
+        let handler: Handler = Arc::new(|seen, _count| {
+            let mut response = Response::builder().status(StatusCode::OK);
+            if seen.header("accept-encoding") == Some("gzip") {
+                response = response.header("content-encoding", "gzip");
+            }
+            response.body(TestBody::measured(b"bytes")).unwrap()
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+
+        // A request header, with the name written in another case.
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let headers = vec![("Accept-Encoding".to_owned(), "gzip".to_owned())];
+        let err = fetcher
+            .fetch(FetchRequest {
+                headers: &headers,
+                ..FetchRequest::path("summary")
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::ContentEncoded { encoding, .. } if encoding == "gzip"),
+            "{err}"
+        );
+        let seen = &server.seen()[0];
+        assert_eq!(seen.header("accept-encoding"), Some("gzip"));
+        assert_eq!(seen.headers.get_all("accept-encoding").iter().count(), 1);
+
+        // A fetcher header, and the `User-Agent` the fetcher sets beside it.
+        // The coded answer to the first is refused, and the second asks for no
+        // coding, so it is served.
+        for (name, value, coded) in [
+            ("accept-encoding", "gzip", true),
+            ("user-agent", "caller/1", false),
+        ] {
+            let mut options = FetcherOptions::new(server.url(false));
+            options.headers = vec![(name.to_owned(), value.to_owned())];
+            let fetcher = Fetcher::new(options).await.unwrap();
+            let before = server.requests();
+            let outcome = fetcher.fetch(FetchRequest::path("summary")).await;
+            if coded {
+                let err = outcome.unwrap_err();
+                assert!(
+                    matches!(&err, Error::ContentEncoded { encoding, .. } if encoding == "gzip"),
+                    "{name}: {err}"
+                );
+            } else {
+                assert_eq!(read_body(outcome.unwrap()).await, b"bytes", "{name}");
+            }
+            let seen = &server.seen()[before];
+            assert_eq!(seen.header(name), Some(value), "{name}");
+            assert_eq!(seen.headers.get_all(name).iter().count(), 1, "{name}");
+        }
+    });
+}
+
+/// A transfer coding other than `chunked` leaves the body coded, so a response
+/// declaring one is refused and the coding is named. `chunked` frames a message
+/// and the connection undoes the framing, so a response carrying it alone
+/// delivers the body as the remote wrote it. The peer is raw, since the
+/// transfer coding of a response is the connection layer's to write.
+#[test]
+fn a_transfer_coded_response_is_refused() {
+    block_on(async {
+        // Each row states the whole answer the peer writes, then the coding the
+        // refusal names, or nothing where the response is served.
+        for (answer, refused) in [
+            // A final coding other than `chunked`, under a body that runs to
+            // the close.
+            (
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nsqueezed"[..],
+                Some("gzip"),
+            ),
+            // Chunked framing over a coded body: the connection undoes the
+            // framing and the coding stays.
+            (
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n8\r\nsqueezed\r\n0\r\n\r\n"[..],
+                Some("gzip, chunked"),
+            ),
+            // Chunked framing alone.
+            (
+                &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nsqueezed\r\n0\r\n\r\n"[..],
+                None,
+            ),
+        ] {
+            let addr = truncating_server(answer).await;
+            let base = format!("http://127.0.0.1:{}", addr.port());
+            let fetcher = Fetcher::new(FetcherOptions::new(base)).await.unwrap();
+            let outcome = fetcher
+                .fetch(FetchRequest::path("objects/ab/cd.filez"))
+                .await;
+            match refused {
+                Some(coding) => {
+                    let err = outcome.unwrap_err();
+                    assert!(
+                        matches!(&err, Error::ContentEncoded { encoding, .. } if encoding == coding),
+                        "{coding}: {err}"
+                    );
+                    assert!(err.to_string().contains(coding), "{err}");
+                }
+                None => assert_eq!(read_body(outcome.unwrap()).await, b"squeezed"),
+            }
+        }
+    });
+}
+
 /// A host is one origin whichever case it is written in, so two URL targets
 /// that differ only in the case of the host travel over one connection.
 #[test]

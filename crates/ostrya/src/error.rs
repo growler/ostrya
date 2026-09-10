@@ -216,6 +216,16 @@ pub enum Error {
         /// The cap the caller set on the request.
         limit: u64,
     },
+    /// A response declared a coding, in `Content-Encoding` or in
+    /// `Transfer-Encoding`, so its body holds bytes other than the ones the
+    /// remote stores.
+    #[error("response for {url} carries the coding {encoding}")]
+    ContentEncoded {
+        /// The URL that answered.
+        url: String,
+        /// The coding the response declared.
+        encoding: String,
+    },
     /// A metadata key named in
     /// [`gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys)
     /// holds a value that is not a list of commit checksums: its variant type

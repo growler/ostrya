@@ -2415,7 +2415,10 @@ request and the fate of its connection belong to the connection, and a value of
 a caller's own puts the wire and the connection pool out of step with each
 other -- a `Content-Length` of a caller's own ends the HTTP/1.1 connection under
 a pooled sender, and the next fetch over that fetcher fails on a channel the
-connection task has dropped. Every other header is sent as written.
+connection task has dropped. Every other header is sent as written. The fetcher
+itself sets two headers, `User-Agent` and `Accept-Encoding: identity`, and a
+configured header of one of those names replaces the entry rather than joining
+it on the wire.
 `Fetcher::fetch` takes a `FetchRequest` -- a `Target`, a `Priority`, optional
 `Validators`, an optional size cap, headers of the request's own, credentials of
 the request's own, and the switch that admits a credential to a cleartext
@@ -2490,9 +2493,28 @@ no socket.
   limit; no mirror is tried afterwards. The body that follows a response is
   bounded by `progress_timeout` alone, so a large object's transfer time stays
   unbounded. `None` applies no cap. 16c sizes this against `max_outstanding`.
+- A fetch delivers the bytes the remote stores, so every request carries
+  `Accept-Encoding: identity`. A server that compresses a response where the
+  header is absent stays within the HTTP specification, and its body would then
+  hold bytes other than the ones the object's checksum names. An
+  `Accept-Encoding` entry in `FetcherOptions::headers` or
+  `FetchRequest::headers` replaces the value the fetcher asks with, and what it
+  changes is the question the request puts to the server. A 200 whose
+  `Content-Encoding` names a coding other than `identity`, or whose
+  `Transfer-Encoding` names a coding other than `chunked`, fails the attempt
+  definitively with `Error::ContentEncoded`, whichever layer asked for the
+  coding, and the response goes through the same drain as any other refused
+  answer. A caller that wants a coded body decodes it outside the fetcher. Each
+  value is read as a comma-separated list, and several headers of one name state
+  one list together. `chunked` frames a message and the connection undoes the
+  framing, so a response carrying it alone delivers the body as the remote wrote
+  it; the port advertises no `TE`, so any other transfer coding is a server
+  fault.
 - The size cap is enforced twice: a declared `Content-Length` over the cap fails
   the fetch with `Error::FetchTooLarge` before any body is read, and a body that
   outgrows the cap mid-stream fails the read with `io::ErrorKind::FileTooLarge`.
+  A coded response is refused before the cap is compared: the declared length of
+  a coded body says nothing about the object.
 - A failure ends the body. The size cap, the progress deadline, and a transport
   failure mid-body are each latched and replayed on every later read, so a
   consumer reading past a failure never observes a clean end of stream and cannot

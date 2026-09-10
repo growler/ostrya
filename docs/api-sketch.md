@@ -1263,7 +1263,14 @@ connection layer sets -- `Content-Length`, `Transfer-Encoding`, `Connection`,
 `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Upgrade`, `Expect` -- is
 refused at both layers. A URL whose authority names a port the URL parser
 cannot read is refused, and a host is one origin whichever case it is written
-in.
+in. Every request carries `Accept-Encoding: identity` and asks for no content
+coding, the bytes a fetch delivers being the ones the remote stores; an
+`Accept-Encoding` entry at either layer replaces it and changes what the
+request asks the server for. A 200 whose `Content-Encoding` names a coding
+other than `identity`, or whose `Transfer-Encoding` names a coding other than
+`chunked`, fails the attempt with `Error::ContentEncoded`, whichever layer
+asked for the coding. A caller that wants a coded body decodes it outside the
+fetcher.
 
 ```rust
 pub struct FetcherOptions {
@@ -1274,7 +1281,9 @@ pub struct FetcherOptions {
     pub headers: Vec<(String, String)>,   // an Authorization, Proxy-Authorization,
                                           // or Cookie entry needs https mirrors;
                                           // a Host or connection-layer name is
-                                          // rejected
+                                          // rejected; a User-Agent or
+                                          // Accept-Encoding entry replaces the
+                                          // one the fetcher sets
     pub basic_auth: Option<BasicAuth>,    // needs https mirrors
     pub tls: TlsOptions,                  // trust roots, client identity
     pub http2: bool,                      // default true
@@ -1310,7 +1319,9 @@ pub struct FetchRequest<'a> {
     pub validators: Option<&'a Validators>,
     pub max_size: Option<u64>,
     pub headers: &'a [(String, String)],  // merged over the fetcher's; one of
-                                          // the same name replaces it
+                                          // the same name replaces it, the
+                                          // User-Agent and Accept-Encoding the
+                                          // fetcher sets included
     pub basic_auth: Option<&'a BasicAuth>, // replaces the fetcher's for this
                                           // one request
     pub allow_cleartext_credentials: bool, // default false: a credential bound

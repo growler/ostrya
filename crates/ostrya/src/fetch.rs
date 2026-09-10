@@ -14,8 +14,10 @@
 //! cleartext it speaks HTTP/1.1. HTTP/2 connections are pooled per origin and
 //! carry concurrent requests on one connection; HTTP/1.1 connections are pooled
 //! and reused once the previous body has been read to the end. The pool is
-//! keyed by origin, so a URL target shares a connection with a mirror at the
-//! same origin.
+//! keyed by the origin together with whether the connection presents the
+//! configured client certificate, so a URL target shares a connection with a
+//! mirror at the same origin; with no certificate configured that key is the
+//! origin alone.
 //!
 //! A request sends the fetcher's headers with its own merged over them: a
 //! request header replaces the fetcher header of the same name, and two
@@ -47,8 +49,10 @@
 //! `chunked` frames a message and the connection undoes the framing, so a
 //! response carrying it alone delivers the body as the remote wrote it.
 //!
-//! A credential is withheld from no destination, so credentials and cleartext
-//! are refused together. [`basic_auth`](FetcherOptions::basic_auth), or an
+//! A credential is withheld from no destination a route names, so credentials
+//! and cleartext are refused together. A redirect hop names an origin of the
+//! server's choosing, and the redirect paragraph below states what a credential
+//! does there. [`basic_auth`](FetcherOptions::basic_auth), or an
 //! `Authorization`, `Proxy-Authorization`, or `Cookie` entry in
 //! [`headers`](FetcherOptions::headers), fails [`Fetcher::new`] when any mirror
 //! is `http`. A fetch whose merged headers carry a credential fails before
@@ -60,13 +64,68 @@
 //!
 //! A TLS destination needs a trust anchor to verify the server certificate
 //! against. A fetcher whose mirrors are all cleartext holds none where the host
-//! trust store is empty, and the one fetch that would consult them there -- a
-//! request naming an `https` URL of its own -- is refused before admission with
-//! the origin named.
+//! trust store is empty, and a fetch that would consult them there is refused
+//! with the origin named: a request naming an `https` URL of its own is refused
+//! before admission, and a redirect hop onto a TLS origin ends the attempt
+//! definitively.
+//!
+//! A redirect is followed. A 301, 302, 303, 307, or 308 sends the attempt on
+//! to the URL its `Location` header names, up to
+//! [`max_redirects`](FetcherOptions::max_redirects) times; every request the
+//! fetcher makes is a GET, so no status among the five changes the method of
+//! the hop that follows it. A limit of zero follows nothing, and each of those
+//! statuses is then a definitive answer of its own. An attempt that has
+//! followed the limit and is sent on to another URL fails definitively with
+//! [`Error::RedirectLimit`](crate::Error::RedirectLimit).
+//!
+//! `Location` is resolved against the URL of the response that carried it, so
+//! it reads as an absolute URL, a relative one (`/other/path`, `sibling`), or
+//! a scheme-relative one (`//host/path`). The resolution normalizes what it
+//! produces: a dot segment is resolved away, a backslash reads as a path
+//! separator, a tab and a newline are removed, a character a path or a query
+//! may not carry is percent-encoded, an IPv4 or an IPv6 host is canonicalized,
+//! and a fragment is dropped, which is what the HTTP specification prescribes
+//! for a redirect. A [`Target::Url`] reaches the wire as the caller wrote it,
+//! so one string named as a URL target and named as a `Location` reaches the
+//! server as two different request targets. Two hops are refused definitively
+//! with [`Error::Fetch`](crate::Error::Fetch) naming both the URL that
+//! redirected and the URL it named: a scheme other than `http` or `https`, and
+//! a hop from `https` to `http`. A hop onto a TLS origin is refused the same
+//! way on a fetcher that holds no trust anchors. A hop from `http` to `https`
+//! is followed. A response carrying one of the five statuses and no `Location`
+//! the resolution reads a URL out of -- no header at all, an empty value, a
+//! value that is not text, or a value the resolution cannot read -- is reported
+//! as the status it answered, whatever the hop count.
+//!
+//! `Authorization`, `Proxy-Authorization`, and `Cookie`, from either layer,
+//! reach the origin the route named and a hop at that same origin -- the same
+//! scheme, host, and port -- and are dropped for a hop at any other origin. A
+//! credential dropped once stays dropped for the rest of that attempt, a
+//! redirect back to the named origin included: the other origin's operator has
+//! the request by then. Every other header reaches every hop, the `User-Agent`
+//! and the `Accept-Encoding` the fetcher sets included. A configured client
+//! certificate is presented to the origin the route named and to no other, so
+//! the connection pool holds the connections opened with it apart from the ones
+//! opened without.
+//!
+//! The body of an intermediate response is discarded the way the body of an
+//! unsuccessful one is, so one whose declared length is at or below 64 KiB
+//! returns its HTTP/1.1 connection to the pool and a chain that stays on one
+//! origin travels over one connection; a chain whose intermediate responses
+//! declare more than that, or declare nothing, opens a connection per hop.
+//! [`max_size`](FetchRequest::max_size) is compared against the final
+//! response's `Content-Length` and enforced while the final body streams; an
+//! intermediate response is not measured against it. The validators reach every
+//! hop, since they describe the resource, and a 304 from any hop is the caller's
+//! answer. Every diagnostic names the URL of the response that answered, which
+//! after a redirect is the last hop's.
 //!
 //! What a fetch does when something goes wrong. A path target is served under
 //! every mirror, in the mirror order, and its destination is resolved at the
 //! attempt that uses it; a URL target has the one destination the URL names.
+//! The hop count belongs to one attempt, so a retryable status on a hop makes
+//! the whole attempt retryable, and the round that repeats it starts again from
+//! the destination the route named.
 //!
 //! - Every destination is tried in order before anything is retried.
 //! - Transport failures and the statuses 408, 429, and 5xx are retryable; a
@@ -92,7 +151,11 @@
 //! connection returns to the pool; a larger declared length, or none at all,
 //! closes the connection instead. A 404 is the ordinary answer for an object a
 //! remote does not hold, so without this a scan would pay a connection setup per
-//! absent object.
+//! absent object. Every such read one attempt makes shares one
+//! [`progress_timeout`](FetcherOptions::progress_timeout) window, whatever the
+//! number of hops: a peer that declares a short body on every hop and sends
+//! fewer bytes than it declared spends that window once, and the reads after it
+//! close their connections without waiting.
 //!
 //! Two deadlines bound one attempt against one destination:
 //!
@@ -135,7 +198,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_io::{AsyncRead, AsyncWrite};
 use hyper::body::{Body as _, Bytes, Frame, Incoming, SizeHint};
@@ -156,7 +219,7 @@ mod tls;
 
 use gate::{Gate, Permit};
 use io::{FuturesIo, RtExecutor, RtTimer, WriteVectored};
-use tls::client_config;
+use tls::{ClientConfigs, client_config};
 pub use tls::{ClientIdentity, TlsOptions, TrustRoots};
 
 /// The user agent a request carries, which a `User-Agent` header the fetcher or
@@ -174,6 +237,17 @@ const IDENTITY: &str = "identity";
 /// wrote it. The port advertises no `TE`, so any other transfer coding is a
 /// server fault, and a response declaring one fails the attempt.
 const CHUNKED: &str = "chunked";
+
+/// The statuses a redirect is followed at. Every request the fetcher makes is
+/// a GET, so none of the five changes the method of the hop that follows it,
+/// and the ones that part over the method are one case here.
+const REDIRECTS: [StatusCode; 5] = [
+    StatusCode::MOVED_PERMANENTLY,
+    StatusCode::FOUND,
+    StatusCode::SEE_OTHER,
+    StatusCode::TEMPORARY_REDIRECT,
+    StatusCode::PERMANENT_REDIRECT,
+];
 
 /// What a layer that sets both credentials and an `Authorization` header is
 /// told. Which of the two the request should carry is not stated, and picking
@@ -293,18 +367,21 @@ pub struct FetcherOptions {
     /// the object path appended and neither part would be sent. An empty list
     /// serves [`Target::Url`] requests alone.
     pub mirrors: Vec<String>,
-    /// Extra headers sent with every request, to every destination. A request
-    /// header of the same name replaces one of these. The fetcher itself sets
-    /// `User-Agent` and `Accept-Encoding: identity`, and an entry of one of
-    /// those names replaces the value the fetcher sets. An `Authorization`,
+    /// Extra headers sent with every request, to every destination and on to
+    /// every redirect hop. A request header of the same name replaces one of
+    /// these. The fetcher itself sets `User-Agent` and
+    /// `Accept-Encoding: identity`, and an entry of one of those names
+    /// replaces the value the fetcher sets. An `Authorization`,
     /// `Proxy-Authorization`, or `Cookie` header is refused at construction
     /// when any mirror is cleartext `http`, since its value is a secret
-    /// whatever it holds. A `Host` header, and a header the connection layer
-    /// sets -- the framing and hop-by-hop names -- is refused at construction
-    /// as well. Any other header is sent as written.
+    /// whatever it holds, and it reaches the origin a route named and a
+    /// redirect hop at that same origin alone. A `Host` header, and a header
+    /// the connection layer sets -- the framing and hop-by-hop names -- is
+    /// refused at construction as well. Any other header is sent as written.
     pub headers: Vec<(String, String)>,
-    /// Credentials for `Authorization: Basic`, sent with every request to every
-    /// destination, and replaced for one request by
+    /// Credentials for `Authorization: Basic`, sent with every request to
+    /// every destination and to a redirect hop at the origin the route named,
+    /// and replaced for one request by
     /// [`FetchRequest::basic_auth`]. Every mirror must be `https`: a cleartext
     /// one is refused at construction rather than sent the credentials in the
     /// clear. An `Authorization` entry in
@@ -319,6 +396,14 @@ pub struct FetcherOptions {
     /// How many times a round of destinations is repeated after a retryable
     /// failure.
     pub max_retries: u32,
+    /// How many redirects one attempt against one destination follows. A 301,
+    /// 302, 303, 307, or 308 is followed while the attempt has followed fewer
+    /// than this many; the next one that names a URL fails the attempt
+    /// definitively with [`Error::RedirectLimit`], and one that names none
+    /// reports its own status. Zero follows nothing, and each of those statuses
+    /// is then a definitive answer of its own. The count belongs to one attempt,
+    /// so a repeated round counts again from the destination the route named.
+    pub max_redirects: u32,
     /// How many requests are in flight at once.
     pub max_outstanding: usize,
     /// How long opening a connection may take: the TCP connect, the TLS
@@ -349,6 +434,7 @@ impl Default for FetcherOptions {
             tls: TlsOptions::default(),
             http2: true,
             max_retries: 5,
+            max_redirects: 10,
             max_outstanding: 8,
             connect_timeout: Duration::from_secs(30),
             progress_timeout: Duration::from_secs(60),
@@ -407,7 +493,9 @@ pub struct FetchRequest<'a> {
     /// The most bytes the response body may hold. A larger `Content-Length`
     /// fails the fetch with [`Error::FetchTooLarge`]; a body that outgrows the
     /// cap mid-stream fails the read with
-    /// [`io::ErrorKind::FileTooLarge`](std::io::ErrorKind::FileTooLarge).
+    /// [`io::ErrorKind::FileTooLarge`](std::io::ErrorKind::FileTooLarge). The
+    /// cap is compared against the response that answers, so an intermediate
+    /// redirect response is not measured against it.
     pub max_size: Option<u64>,
     /// Headers merged over the fetcher's, replacing a fetcher header of the
     /// same name.
@@ -433,6 +521,10 @@ pub struct FetchRequest<'a> {
     /// With this false, a fetch whose merged headers carry a credential fails
     /// when a destination it may reach is `http`. The check
     /// [`Fetcher::new`] makes over the mirror list stands whatever this holds.
+    ///
+    /// A redirect hop carries a credential to no cleartext origin of its own:
+    /// the credential is dropped for a hop at another origin, and a hop from
+    /// `https` to `http` is refused.
     pub allow_cleartext_credentials: bool,
 }
 
@@ -520,7 +612,7 @@ impl Mirror {
 #[derive(Clone, Debug)]
 struct Destination {
     /// The origin's scheme, host, and port, which the connection pool is keyed
-    /// by.
+    /// by together with the client identity the connection presents.
     origin: Origin,
     /// The `host[:port]` the request is addressed by, the value of the `Host`
     /// header on HTTP/1.1 requests. It holds the authority as the caller wrote
@@ -570,7 +662,7 @@ enum Route<'a> {
     One(Destination),
 }
 
-/// A connection endpoint: connections are pooled per origin.
+/// A connection endpoint.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Origin {
     tls: bool,
@@ -580,6 +672,22 @@ struct Origin {
     /// one pool key and one connection.
     host: String,
     port: u16,
+}
+
+/// What the connection pool is keyed by: an endpoint, and which of the two
+/// client configurations opened the connection.
+///
+/// A connection presents the client certificate for every request it carries,
+/// so one opened with the certificate is never handed to a hop that must not
+/// present it, and one opened without it is never handed to the origin the
+/// route named. The flag sits here rather than in [`Origin`], which states the
+/// identity of a network endpoint and is what the cleartext and trust-anchor
+/// checks read.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PoolKey {
+    origin: Origin,
+    /// Whether the connection presents the configured client certificate.
+    identity: bool,
 }
 
 /// The request body: every request is a GET, so there is nothing to send.
@@ -617,7 +725,7 @@ enum Sender {
     H2(H2Sender),
 }
 
-/// The connections pooled for one origin.
+/// The connections pooled under one [`PoolKey`].
 #[derive(Default)]
 struct PoolEntry {
     /// The origin's HTTP/2 connection, if one is open.
@@ -630,18 +738,23 @@ struct PoolEntry {
 struct Inner {
     mirrors: Vec<Mirror>,
     headers: Vec<(HeaderName, HeaderValue)>,
-    tls: Arc<rustls::ClientConfig>,
+    tls: ClientConfigs,
     /// Whether the TLS configuration holds a trust anchor. A fetcher whose
     /// mirrors are all cleartext builds without one where the host trust store
     /// is empty, and a TLS destination is refused there.
     has_trust_anchors: bool,
+    /// Whether a client certificate is configured, which is what makes the two
+    /// client configurations differ. With none configured every connection is
+    /// opened over one configuration and the pool holds one entry per origin.
+    client_identity: bool,
     max_retries: u32,
+    max_redirects: u32,
     connect_timeout: Duration,
     progress_timeout: Duration,
     fetch_timeout: Option<Duration>,
     gate: Arc<Gate>,
     h2_connection_window: u32,
-    pool: Mutex<HashMap<Origin, PoolEntry>>,
+    pool: Mutex<HashMap<PoolKey, PoolEntry>>,
 }
 
 /// The HTTP/2 connection flow-control window for a fetcher admitting
@@ -788,14 +901,16 @@ impl Fetcher {
         // which may be `https`, so it has to hold trust anchors: an empty
         // system store is as fatal there as it is for an `https` mirror.
         let https = mirrors.is_empty() || mirrors.iter().any(|mirror| mirror.origin.tls);
-        let (tls, has_trust_anchors) = client_config(&options.tls, options.http2, https).await?;
+        let tls = client_config(&options.tls, options.http2, https).await?;
         Ok(Fetcher {
             inner: Arc::new(Inner {
                 mirrors,
                 headers,
+                has_trust_anchors: tls.has_trust_anchors,
+                client_identity: options.tls.client_identity.is_some(),
                 tls,
-                has_trust_anchors,
                 max_retries: options.max_retries,
+                max_redirects: options.max_redirects,
                 connect_timeout: options.connect_timeout,
                 progress_timeout: options.progress_timeout,
                 fetch_timeout: options.fetch_timeout,
@@ -881,16 +996,20 @@ impl Fetcher {
         )))
     }
 
-    /// Refuse a fetch of a TLS destination on a fetcher that holds no trust
-    /// anchors.
+    /// Refuse a fetch whose route names a TLS destination on a fetcher that
+    /// holds no trust anchors.
     ///
     /// A handshake verifies the server certificate against an anchor, so a
     /// fetcher with none reaches no TLS origin. What arrives here is a request
     /// naming an `https` URL of its own on a fetcher whose mirrors are all
-    /// cleartext, since every other combination fails [`Fetcher::new`]. The
-    /// handshake reports it as an unknown issuer, a retryable failure that
-    /// spends every round and every backoff before it names anything, so the
-    /// refusal is made here instead, before admission.
+    /// cleartext, since every other combination of route and anchors fails
+    /// [`Fetcher::new`]. The handshake reports it as an unknown issuer, a
+    /// retryable failure that spends every round and every backoff before it
+    /// names anything, so the refusal is made here instead, before admission.
+    ///
+    /// This reads the destinations of the route. A redirect hop names an origin
+    /// of the server's choosing, which the attempt refuses where it is TLS,
+    /// under the message [`no_trust_anchors`] writes for both.
     fn check_trust_anchors(&self, route: &Route<'_>) -> Result<()> {
         if self.inner.has_trust_anchors {
             return Ok(());
@@ -898,10 +1017,7 @@ impl Fetcher {
         let Some(origin) = self.matching_origin(route, |origin| origin.tls) else {
             return Ok(());
         };
-        Err(Error::Fetch(format!(
-            "the certificate of the tls origin {origin} has nothing to verify against: the \
-             fetcher holds no trust anchors, so set TlsOptions::roots"
-        )))
+        Err(no_trust_anchors(origin))
     }
 
     /// The `scheme://authority` of the first destination on `route` whose
@@ -1000,18 +1116,177 @@ impl Fetcher {
         }
     }
 
-    /// One request against one destination.
+    /// One request against one destination, following the redirects it meets.
+    ///
+    /// The hop state of an attempt is three locals: the destination, borrowed
+    /// from the route until a redirect names another one; the header list,
+    /// which is the caller's slice until a hop crosses an origin and a
+    /// credential has to come out of it; and the count of redirects followed.
+    /// A first response that answers the request leaves all three as they
+    /// start, so it builds no URL, copies no header list, and allocates no
+    /// bookkeeping.
     async fn attempt(
         &self,
         destination: &Destination,
         request: &FetchRequest<'_>,
         headers: &[(HeaderName, HeaderValue)],
     ) -> std::result::Result<Attempted, Failure> {
-        let origin = &destination.origin;
-        let url = destination.url();
+        // The origin the route named, which is the one a credential and the
+        // client certificate are scoped to.
+        let named = &destination.origin;
+        let mut hop = Cow::Borrowed(destination);
+        let mut headers = Cow::Borrowed(headers);
+        let mut followed = 0u32;
+        let progress_timeout = self.inner.progress_timeout;
+        // One progress window covers every drain this attempt makes, however
+        // many hops it follows. A peer that answers each hop with a short
+        // declared body and then stops sending spends the window on the first
+        // drain, and every drain after it drops its connection rather than
+        // waiting again. An attempt that follows no redirect drains once and
+        // has the whole window for it.
+        let drain_until = Instant::now() + progress_timeout;
+        loop {
+            let key = PoolKey {
+                origin: hop.origin.clone(),
+                identity: self.presents_identity(&hop.origin, named),
+            };
+            let url = hop.url();
+            let (response, protocol, reuse) = self.send(&hop, &key, request, &headers).await?;
+            let status = response.status();
+            if status == StatusCode::NOT_MODIFIED {
+                // A 304 carries no body, so the connection is immediately
+                // reusable. The validators describe the resource, so a 304 a
+                // hop answers is the caller's answer as much as one the
+                // destination the route named answers.
+                if let Some(sender) = reuse {
+                    self.inner.put_h1(&key, sender);
+                }
+                return Ok(Attempted::NotModified);
+            }
+            // A limit of zero follows nothing, which leaves every redirect
+            // status a definitive answer of its own.
+            if is_redirect(status) && self.inner.max_redirects > 0 {
+                let location = response
+                    .headers()
+                    .get(hyper::header::LOCATION)
+                    .and_then(|value| resolve_location(url, value));
+                let Some(location) = location else {
+                    // There is nothing to follow, so the status the hop
+                    // answered is the answer the attempt reports, whatever the
+                    // hop count is by then.
+                    let failure = classify(status, url);
+                    self.discard(&key, response, reuse, drain_until).await;
+                    return Err(failure);
+                };
+                // The limit stops the attempt at a URL it would otherwise
+                // follow, so it is read once the `Location` names one.
+                if followed >= self.inner.max_redirects {
+                    self.discard(&key, response, reuse, drain_until).await;
+                    return Err(Failure::Fatal(Error::RedirectLimit {
+                        url: url.to_string(),
+                        hops: followed,
+                    }));
+                }
+                let next = redirect_destination(&hop, &location);
+                // The intermediate body is discarded the way an unsuccessful
+                // one is, so a short one returns its HTTP/1.1 connection to the
+                // pool and the next hop at this origin travels over it.
+                self.discard(&key, response, reuse, drain_until).await;
+                let next = next.map_err(Failure::Fatal)?;
+                // A handshake verifies the server certificate against an
+                // anchor, so a hop onto a TLS origin is refused where the
+                // fetcher holds none. The handshake would otherwise fail
+                // retryably, spending every round and every backoff on a
+                // message about the peer.
+                if next.origin.tls && !self.inner.has_trust_anchors {
+                    return Err(Failure::Fatal(no_trust_anchors(next.origin_url())));
+                }
+                // A credential is in the hands of the operator of the origin
+                // the request reaches, so it is left out for a hop at any
+                // origin other than the one the route named. Once left out it
+                // stays out for the rest of the attempt, a redirect back to the
+                // named origin included: by the time that request is made the
+                // other operator holds the credential already.
+                if next.origin != *named && headers.iter().any(|(name, _)| is_credential(name)) {
+                    let scoped = headers
+                        .iter()
+                        .filter(|(name, _)| !is_credential(name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    headers = Cow::Owned(scoped);
+                }
+                hop = Cow::Owned(next);
+                followed += 1;
+                continue;
+            }
+            if status != StatusCode::OK {
+                let failure = classify(status, url);
+                self.discard(&key, response, reuse, drain_until).await;
+                return Err(failure);
+            }
+            // A coded body holds bytes other than the ones the remote stores,
+            // so the declared length says nothing about the object either: the
+            // coding is refused before the cap is compared. A refusal that
+            // names the coding is what a checksum mismatch cannot say. The
+            // refusal is definitive, another attempt against the same
+            // destination being answered the same way.
+            if let Some(encoding) = declared_coding(response.headers()) {
+                let url = url.to_string();
+                self.discard(&key, response, reuse, drain_until).await;
+                return Err(Failure::Fatal(Error::ContentEncoded { url, encoding }));
+            }
+            let validators = read_validators(response.headers());
+            let content_length = content_length(response.headers());
+            // The cap is the caller's bound on the object, so it is compared
+            // against the response that carries it and against no redirect on
+            // the way there.
+            if let (Some(limit), Some(length)) = (request.max_size, content_length)
+                && length > limit
+            {
+                self.discard(&key, response, reuse, drain_until).await;
+                return Err(Failure::Fatal(Error::FetchTooLarge { limit }));
+            }
+            let protocol = match response.version() {
+                Version::HTTP_2 => Protocol::Http2,
+                _ => protocol,
+            };
+            return Ok(Attempted::Body(Body {
+                incoming: response.into_body(),
+                chunk: Bytes::new(),
+                received: 0,
+                max_size: request.max_size,
+                validators,
+                content_length,
+                protocol,
+                inner: self.inner.clone(),
+                key,
+                reuse,
+                permit: None,
+                done: false,
+                failed: None,
+                deadline: rt::Deadline::new(progress_timeout),
+                waiting: false,
+            }));
+        }
+    }
+
+    /// Take or open a connection for one hop and send the request over it.
+    ///
+    /// What comes back is the response, the protocol that carried it, and the
+    /// HTTP/1.1 connection the response holds, which returns to the pool once
+    /// the response has been read to its end.
+    async fn send(
+        &self,
+        hop: &Destination,
+        key: &PoolKey,
+        request: &FetchRequest<'_>,
+        headers: &[(HeaderName, HeaderValue)],
+    ) -> std::result::Result<(Response<Incoming>, Protocol, Option<H1Sender>), Failure> {
+        let url = hop.url();
+        let origin = &key.origin;
         let connect_timeout = self.inner.connect_timeout;
         let progress_timeout = self.inner.progress_timeout;
-        let sender = match self.inner.take_conn(origin) {
+        let sender = match self.inner.take_conn(key) {
             Some(sender) => sender,
             None => {
                 // Opening a connection is by far the largest state a fetch
@@ -1021,7 +1296,7 @@ impl Fetcher {
                 // caller nests inside its own: a fetch is ten times smaller
                 // this way, and a pull that wraps several helpers around one
                 // multiplies what it saves.
-                let opened = within(connect_timeout, Box::pin(self.connect(origin))).await;
+                let opened = within(connect_timeout, Box::pin(self.connect(key))).await;
                 match opened {
                     Some(result) => result.map_err(Failure::Retry)?,
                     None => {
@@ -1033,10 +1308,10 @@ impl Fetcher {
                 }
             }
         };
-        let (response, protocol, reuse) = match sender {
+        match sender {
             Sender::H1(mut sender) => {
                 let http_request = self
-                    .build_request(destination, request, headers, Protocol::Http11)
+                    .build_request(hop, request, headers, Protocol::Http11)
                     .map_err(Failure::Fatal)?;
                 // The request and the wait for the response head share the
                 // progress window: the head is the first bytes the response
@@ -1050,11 +1325,11 @@ impl Fetcher {
                     Some(result) => result.map_err(|e| Failure::Retry(transport(url, e)))?,
                     None => return Err(Failure::Retry(stalled(url, progress_timeout))),
                 };
-                (response, Protocol::Http11, Some(sender))
+                Ok((response, Protocol::Http11, Some(sender)))
             }
             Sender::H2(mut sender) => {
                 let http_request = self
-                    .build_request(destination, request, headers, Protocol::Http2)
+                    .build_request(hop, request, headers, Protocol::Http2)
                     .map_err(Failure::Fatal)?;
                 let sent = within(progress_timeout, async {
                     sender.ready().await?;
@@ -1065,64 +1340,18 @@ impl Fetcher {
                     Some(result) => result.map_err(|e| Failure::Retry(transport(url, e)))?,
                     None => return Err(Failure::Retry(stalled(url, progress_timeout))),
                 };
-                (response, Protocol::Http2, None)
+                Ok((response, Protocol::Http2, None))
             }
-        };
-        let status = response.status();
-        if status == StatusCode::NOT_MODIFIED {
-            // A 304 carries no body, so the connection is immediately reusable.
-            if let Some(sender) = reuse {
-                self.inner.put_h1(origin, sender);
-            }
-            return Ok(Attempted::NotModified);
         }
-        if status != StatusCode::OK {
-            let failure = classify(status, url);
-            self.discard(origin, response, reuse).await;
-            return Err(failure);
-        }
-        // A coded body holds bytes other than the ones the remote stores, so
-        // the declared length says nothing about the object either: the coding
-        // is refused before the cap is compared. A refusal that names the
-        // coding is what a checksum mismatch cannot say. The refusal is
-        // definitive, another attempt against the same destination being
-        // answered the same way.
-        if let Some(encoding) = declared_coding(response.headers()) {
-            self.discard(origin, response, reuse).await;
-            return Err(Failure::Fatal(Error::ContentEncoded {
-                url: url.to_string(),
-                encoding,
-            }));
-        }
-        let validators = read_validators(response.headers());
-        let content_length = content_length(response.headers());
-        if let (Some(limit), Some(length)) = (request.max_size, content_length)
-            && length > limit
-        {
-            self.discard(origin, response, reuse).await;
-            return Err(Failure::Fatal(Error::FetchTooLarge { limit }));
-        }
-        let protocol = match response.version() {
-            Version::HTTP_2 => Protocol::Http2,
-            _ => protocol,
-        };
-        Ok(Attempted::Body(Body {
-            incoming: response.into_body(),
-            chunk: Bytes::new(),
-            received: 0,
-            max_size: request.max_size,
-            validators,
-            content_length,
-            protocol,
-            inner: self.inner.clone(),
-            origin: origin.clone(),
-            reuse,
-            permit: None,
-            done: false,
-            failed: None,
-            deadline: rt::Deadline::new(progress_timeout),
-            waiting: false,
-        }))
+    }
+
+    /// Whether a connection to `hop` presents the configured client
+    /// certificate: one is configured, the hop is the origin the route named,
+    /// and that origin is TLS, a cleartext connection presenting no
+    /// certificate at all. With none configured this is false everywhere, so
+    /// the pool holds one entry per origin.
+    fn presents_identity(&self, hop: &Origin, named: &Origin) -> bool {
+        self.inner.client_identity && hop.tls && hop == named
     }
 
     /// End an attempt whose response is not the one the caller asked for.
@@ -1133,21 +1362,32 @@ impl Fetcher {
     /// the connection, since the rest of the response is still in flight. An
     /// HTTP/2 stream carries no such cost -- its connection stays pooled
     /// whatever the stream did -- so there is nothing to drain.
+    ///
+    /// `drain_until` bounds every read one attempt makes here: it is one
+    /// progress window from the moment the attempt began, and they share it. A
+    /// read that reaches the end of that window drops what is left of the
+    /// response, and one that finds the budget spent drops the connection
+    /// without reading.
     async fn discard(
         &self,
-        origin: &Origin,
+        key: &PoolKey,
         response: Response<Incoming>,
         reuse: Option<H1Sender>,
+        drain_until: Instant,
     ) {
         let Some(sender) = reuse else { return };
         if content_length(response.headers()).is_none_or(|length| length > DRAIN_LIMIT) {
             return;
         }
+        let budget = drain_until.saturating_duration_since(Instant::now());
+        if budget.is_zero() {
+            return;
+        }
         let mut body = response.into_body();
-        // The drain runs under the progress window, so a peer that declares a
-        // short body and then stops sending costs the attempt no more than a
-        // stalled body would.
-        let drained = within(self.inner.progress_timeout, async {
+        // The drain runs under what is left of the attempt's window, so a peer
+        // that declares a short body and then stops sending costs the attempt
+        // no more than a stalled body would, whatever the hop count.
+        let drained = within(budget, async {
             loop {
                 let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
                 match frame {
@@ -1159,7 +1399,7 @@ impl Fetcher {
         })
         .await;
         if drained == Some(true) {
-            self.inner.put_h1(origin, sender);
+            self.inner.put_h1(key, sender);
         }
     }
 
@@ -1203,9 +1443,14 @@ impl Fetcher {
             .map_err(|e| Error::Fetch(format!("invalid request for {url}: {e}")))
     }
 
-    /// Open a connection to `origin`, negotiating the protocol over ALPN when
+    /// Open a connection for `key`, negotiating the protocol over ALPN when
     /// the origin is TLS.
-    async fn connect(&self, origin: &Origin) -> Result<Sender> {
+    ///
+    /// The key states which client configuration the handshake runs under, so a
+    /// connection that presents the client certificate and one that presents
+    /// none are two pool entries and neither is handed to the other's hop.
+    async fn connect(&self, key: &PoolKey) -> Result<Sender> {
+        let origin = &key.origin;
         let tcp = rt::TcpStream::connect(&origin.host, origin.port)
             .await
             .map_err(|e| {
@@ -1217,25 +1462,30 @@ impl Fetcher {
         if !origin.tls {
             // Cleartext HTTP/2 needs prior knowledge or an upgrade; neither is
             // used, so a cleartext origin speaks HTTP/1.1.
-            return self.handshake_h1(origin, FuturesIo::new(tcp)).await;
+            return self.handshake_h1(key, FuturesIo::new(tcp)).await;
         }
         let server_name = rustls::pki_types::ServerName::try_from(origin.host.clone())
             .map_err(|e| Error::Fetch(format!("invalid server name {}: {e}", origin.host)))?;
-        let stream = futures_rustls::TlsConnector::from(self.inner.tls.clone())
+        let config = if key.identity {
+            &self.inner.tls.with_identity
+        } else {
+            &self.inner.tls.without_identity
+        };
+        let stream = futures_rustls::TlsConnector::from(config.clone())
             .connect(server_name, tcp)
             .await
             .map_err(|e| Error::Fetch(format!("tls handshake with {} failed: {e}", origin.host)))?;
         let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
         let io = FuturesIo::new(stream);
         if h2 {
-            self.handshake_h2(origin, io).await
+            self.handshake_h2(key, io).await
         } else {
-            self.handshake_h1(origin, io).await
+            self.handshake_h1(key, io).await
         }
     }
 
     /// Complete an HTTP/1.1 handshake and drive the connection in its own task.
-    async fn handshake_h1<S>(&self, origin: &Origin, io: FuturesIo<S>) -> Result<Sender>
+    async fn handshake_h1<S>(&self, key: &PoolKey, io: FuturesIo<S>) -> Result<Sender>
     where
         S: AsyncRead + AsyncWrite + WriteVectored + Send + Unpin + 'static,
     {
@@ -1245,7 +1495,7 @@ impl Fetcher {
                 .map_err(|e| {
                     Error::Fetch(format!(
                         "http/1.1 handshake with {} failed: {e}",
-                        origin.host
+                        key.origin.host
                     ))
                 })?;
         drop(rt::spawn(async move {
@@ -1262,7 +1512,7 @@ impl Fetcher {
     /// The connection is built rather than handshaken free-standing, since the
     /// flow-control windows and the keep-alive ping are settings only the
     /// builder reaches.
-    async fn handshake_h2<S>(&self, origin: &Origin, io: FuturesIo<S>) -> Result<Sender>
+    async fn handshake_h2<S>(&self, key: &PoolKey, io: FuturesIo<S>) -> Result<Sender>
     where
         S: AsyncRead + AsyncWrite + WriteVectored + Send + Unpin + 'static,
     {
@@ -1275,21 +1525,24 @@ impl Fetcher {
             .handshake(io)
             .await
             .map_err(|e| {
-                Error::Fetch(format!("http/2 handshake with {} failed: {e}", origin.host))
+                Error::Fetch(format!(
+                    "http/2 handshake with {} failed: {e}",
+                    key.origin.host
+                ))
             })?;
         drop(rt::spawn(async move {
             let _ = connection.await;
         }));
-        self.inner.put_h2(origin, sender.clone());
+        self.inner.put_h2(key, sender.clone());
         Ok(Sender::H2(sender))
     }
 }
 
 impl Inner {
-    /// A pooled connection for `origin`, if one is still usable.
-    fn take_conn(&self, origin: &Origin) -> Option<Sender> {
+    /// A pooled connection for `key`, if one is still usable.
+    fn take_conn(&self, key: &PoolKey) -> Option<Sender> {
         let mut pool = self.pool.lock().expect("fetcher pool mutex");
-        let entry = pool.get_mut(origin)?;
+        let entry = pool.get_mut(key)?;
         if let Some(h2) = &entry.h2 {
             if h2.is_closed() {
                 entry.h2 = None;
@@ -1306,12 +1559,20 @@ impl Inner {
     }
 
     /// Return an idle HTTP/1.1 connection to the pool.
-    fn put_h1(&self, origin: &Origin, sender: H1Sender) {
+    ///
+    /// The entry an origin already has is reached by reference. Building one
+    /// takes a key of the pool's own, and the host string it holds is an
+    /// allocation the warm path of every object fetch would otherwise pay.
+    fn put_h1(&self, key: &PoolKey, sender: H1Sender) {
         if sender.is_closed() {
             return;
         }
         let mut pool = self.pool.lock().expect("fetcher pool mutex");
-        pool.entry(origin.clone()).or_default().h1.push(sender);
+        if let Some(entry) = pool.get_mut(key) {
+            entry.h1.push(sender);
+            return;
+        }
+        pool.entry(key.clone()).or_default().h1.push(sender);
     }
 
     /// Record the origin's HTTP/2 connection, keeping a usable one already
@@ -1322,13 +1583,19 @@ impl Inner {
     /// other requests are already multiplexing over, and stay alive unreferenced
     /// until its own senders drop; instead it serves only the request that
     /// opened it and closes with that request.
-    fn put_h2(&self, origin: &Origin, sender: H2Sender) {
+    ///
+    /// The entry an origin already has is reached by reference, the way
+    /// [`Inner::put_h1`] reaches it.
+    fn put_h2(&self, key: &PoolKey, sender: H2Sender) {
         let mut pool = self.pool.lock().expect("fetcher pool mutex");
-        let entry = pool.entry(origin.clone()).or_default();
-        match &entry.h2 {
-            Some(pooled) if !pooled.is_closed() => {}
-            _ => entry.h2 = Some(sender),
+        if let Some(entry) = pool.get_mut(key) {
+            match &entry.h2 {
+                Some(pooled) if !pooled.is_closed() => {}
+                _ => entry.h2 = Some(sender),
+            }
+            return;
         }
+        pool.entry(key.clone()).or_default().h2 = Some(sender);
     }
 }
 
@@ -1374,7 +1641,9 @@ pub struct Body {
     content_length: Option<u64>,
     protocol: Protocol,
     inner: Arc<Inner>,
-    origin: Origin,
+    /// The pool entry the connection carrying this body came from, which is
+    /// where it goes back.
+    key: PoolKey,
     /// The HTTP/1.1 connection to return to the pool at the end of the body.
     reuse: Option<H1Sender>,
     /// The concurrency permit, held for as long as the body is in flight.
@@ -1518,7 +1787,7 @@ impl AsyncRead for Body {
                     // The whole response has arrived, so the connection can
                     // serve the next request.
                     if let Some(sender) = me.reuse.take() {
-                        me.inner.put_h1(&me.origin, sender);
+                        me.inner.put_h1(&me.key, sender);
                     }
                     me.permit = None;
                     return Poll::Ready(Ok(0));
@@ -1876,6 +2145,91 @@ fn read_validators(headers: &hyper::HeaderMap) -> Validators {
     }
 }
 
+/// Whether a response at this status sends the attempt on to another URL.
+fn is_redirect(status: StatusCode) -> bool {
+    REDIRECTS.contains(&status)
+}
+
+/// The URL a `Location` header names, resolved against `from`, the URL of the
+/// response that carried it.
+///
+/// A `Location` reads as an absolute URL, as one relative to the response's
+/// own URL, or as a scheme-relative one, and the resolution is the one the URL
+/// specification states. A fragment the result carries is dropped: a fragment
+/// names a part of a representation and reaches no request, and the HTTP
+/// specification has a redirect drop it rather than refuse it.
+///
+/// The resolution normalizes what it produces, where a [`Target::Url`] reaches
+/// the wire as the caller wrote it:
+/// a dot segment is resolved away (`/deep/../root` becomes `/root`, `/./p`
+/// becomes `/p`), a backslash reads as a path separator (`/a\b` becomes
+/// `/a/b`), a tab and a newline are removed, a character a path or a query may
+/// not carry is percent-encoded (`?q='x'` becomes `?q=%27x%27`), and an IPv4 or
+/// an IPv6 host is canonicalized (`2130706433` and `0177.0.0.1` both become
+/// `127.0.0.1`). A request target the caller signed reaches the server
+/// re-encoded where its signature covers one of those characters, which the
+/// server reads as a target of its own and answers 403 to.
+///
+/// `None` says the header holds no URL a request can be sent to, which covers
+/// a value that is not text, an empty value, and one the resolution cannot
+/// read. A value the resolution reads as the URL of the response itself -- a
+/// fragment alone, `#frag` -- is a hop of its own and spends one of the hops
+/// the attempt is allowed.
+fn resolve_location(from: &str, location: &HeaderValue) -> Option<String> {
+    let location = location.to_str().ok()?;
+    // An empty value resolves to the URL of the response that carried it, so
+    // the attempt would follow the hop it just made.
+    if location.is_empty() {
+        return None;
+    }
+    let mut resolved = url::Url::parse(from).ok()?.join(location).ok()?;
+    resolved.set_fragment(None);
+    Some(resolved.into())
+}
+
+/// Read the URL a redirect named into the destination of the next hop.
+///
+/// Two hops are refused, and both refusals name the URL that redirected and
+/// the URL it named: a scheme other than `http` or `https`, which the fetcher
+/// serves nothing under, and a hop from `https` to `http`, which would put a
+/// request the caller made over TLS on the wire in the clear. A hop from
+/// `http` to `https` is followed.
+///
+/// What arrives is the resolved URL, normalized by [`resolve_location`]. This
+/// parse reads it the way it reads a [`Target::Url`], so userinfo and a port
+/// the URL parser cannot read are refused by that parse, under the message it
+/// writes. A userinfo holds a password, so the two refusals made here name the
+/// URL with the userinfo left out.
+fn redirect_destination(from: &Destination, to: &str) -> Result<Destination> {
+    let refused = |what: &str| {
+        Error::Fetch(format!(
+            "{} redirects to {}, {what}",
+            from.url(),
+            without_userinfo(to)
+        ))
+    };
+    let tls = match to.split_once("://").map(|(scheme, _)| scheme) {
+        Some(scheme) if scheme.eq_ignore_ascii_case(Scheme::HTTPS.as_str()) => true,
+        Some(scheme) if scheme.eq_ignore_ascii_case(Scheme::HTTP.as_str()) => false,
+        _ => return Err(refused("which is not an absolute http or https url")),
+    };
+    if from.origin.tls && !tls {
+        return Err(refused(
+            "which is cleartext: a request made over tls is not followed onto http",
+        ));
+    }
+    parse_url(to)
+}
+
+/// What a fetch of a TLS origin is told on a fetcher that holds no trust
+/// anchors, whether the route named that origin or a redirect hop did.
+fn no_trust_anchors(origin: &str) -> Error {
+    Error::Fetch(format!(
+        "the certificate of the tls origin {origin} has nothing to verify against: the \
+         fetcher holds no trust anchors, so set TlsOptions::roots"
+    ))
+}
+
 /// Decide whether an unsuccessful status is worth another attempt.
 fn classify(status: StatusCode, url: &str) -> Failure {
     let error = Error::HttpStatus {
@@ -2097,6 +2451,140 @@ mod tests {
                 .unwrap();
             assert_eq!(request.uri(), "/r/refs/heads/a");
         });
+    }
+
+    /// A `Location` is resolved against the URL of the response that carried
+    /// it, so it reads as an absolute URL, a relative one, or a
+    /// scheme-relative one. A fragment names a part of a representation and
+    /// reaches no request, so a redirect drops it.
+    #[test]
+    fn a_location_resolves_against_the_response_that_carried_it() {
+        let resolved = |value: &str| {
+            resolve_location(
+                "https://example.com/repo/objects/summary?x=1",
+                &HeaderValue::try_from(value).unwrap(),
+            )
+        };
+        for (value, hop) in [
+            // Absolute, at another origin and at another port.
+            ("http://other.example/p", "http://other.example/p"),
+            (
+                "https://other.example:8443/p?q=2",
+                "https://other.example:8443/p?q=2",
+            ),
+            // Relative: rooted at the origin, and a sibling of the path the
+            // response was answered at.
+            ("/other/path", "https://example.com/other/path"),
+            ("sibling", "https://example.com/repo/objects/sibling"),
+            // Scheme-relative, which takes the scheme of the response that
+            // redirected.
+            ("//host.example/path", "https://host.example/path"),
+            // A fragment is dropped rather than refused.
+            ("/other/path#frag", "https://example.com/other/path"),
+            ("http://other.example/p#frag", "http://other.example/p"),
+            // A scheme the fetcher serves nothing under resolves here; the hop
+            // check is what refuses it.
+            ("file:///srv/repo", "file:///srv/repo"),
+        ] {
+            assert_eq!(resolved(value).as_deref(), Some(hop), "{value}");
+        }
+
+        // A value the resolution cannot read holds no URL a request can be
+        // sent to, and neither does an empty one, which resolves to the URL of
+        // the response itself.
+        assert_eq!(resolved("http://"), None);
+        assert_eq!(resolved(""), None);
+
+        // A fragment alone resolves to the URL of the response itself, which is
+        // a hop of its own.
+        assert_eq!(
+            resolved("#frag").as_deref(),
+            Some("https://example.com/repo/objects/summary?x=1")
+        );
+
+        // The resolution normalizes what it produces: a dot segment is resolved
+        // away, a backslash reads as a path separator, a tab is removed, a
+        // character a query may not carry is percent-encoded, and an IPv4 host
+        // is canonicalized.
+        for (value, hop) in [
+            ("/deep/../root", "https://example.com/root"),
+            ("/./p", "https://example.com/p"),
+            ("/a\\b", "https://example.com/a/b"),
+            ("/pa\tth", "https://example.com/path"),
+            ("/p?q='x'", "https://example.com/p?q=%27x%27"),
+            ("http://2130706433/p", "http://127.0.0.1/p"),
+        ] {
+            assert_eq!(resolved(value).as_deref(), Some(hop), "{value}");
+        }
+    }
+
+    /// A hop is read the way a URL target is, and two hops are refused with
+    /// both URLs named: a scheme the fetcher serves nothing under, and a hop
+    /// from `https` to `http`. A hop from `http` to `https` is followed.
+    #[test]
+    fn a_redirect_hop_is_validated_against_the_url_that_redirected() {
+        let secure = parse_url("https://example.com/repo/summary").unwrap();
+        let cleartext = parse_url("http://example.com/repo/summary").unwrap();
+
+        // A hop at another origin, and one at the origin that redirected.
+        let hop = redirect_destination(&secure, "https://other.example/p?q=1").unwrap();
+        assert_eq!(hop.url(), "https://other.example/p?q=1");
+        assert_eq!(hop.origin.host, "other.example");
+        let hop = redirect_destination(&secure, "https://example.com/elsewhere").unwrap();
+        assert_eq!(hop.origin, secure.origin);
+        // A hop from cleartext to tls is followed, and so is one that stays
+        // cleartext.
+        let hop = redirect_destination(&cleartext, "https://example.com/elsewhere").unwrap();
+        assert!(hop.origin.tls);
+        redirect_destination(&cleartext, "http://other.example/p").unwrap();
+
+        // A hop from tls to cleartext is refused, and both URLs are named.
+        let err = redirect_destination(&secure, "http://other.example/p").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("https://example.com/repo/summary"),
+            "{message}"
+        );
+        assert!(message.contains("http://other.example/p"), "{message}");
+        assert!(message.contains("cleartext"), "{message}");
+
+        // A scheme the fetcher serves nothing under, named the same way.
+        let err = redirect_destination(&secure, "file:///srv/repo").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("https://example.com/repo/summary"),
+            "{message}"
+        );
+        assert!(message.contains("file:///srv/repo"), "{message}");
+        assert!(
+            message.contains("not an absolute http or https url"),
+            "{message}"
+        );
+
+        // Userinfo is refused, and the password reaches no message.
+        let err =
+            redirect_destination(&secure, "https://alice:sup3rs3cret@other.example/p").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("userinfo"), "{message}");
+        assert!(!message.contains("sup3rs3cret"), "{message}");
+    }
+
+    /// Which statuses send an attempt on to another URL. Every request is a
+    /// GET, so the ones that part over the method are one case.
+    #[test]
+    fn the_followed_statuses_are_the_five_redirects() {
+        for status in [301u16, 302, 303, 307, 308] {
+            assert!(
+                is_redirect(StatusCode::from_u16(status).unwrap()),
+                "{status}"
+            );
+        }
+        for status in [200u16, 300, 304, 305, 306, 400, 404, 500] {
+            assert!(
+                !is_redirect(StatusCode::from_u16(status).unwrap()),
+                "{status}"
+            );
+        }
     }
 
     #[test]
@@ -2721,6 +3209,87 @@ mod tests {
             fetcher.check_trust_anchors(&cleartext).unwrap();
             let mirrors = fetcher.route(Target::Path("summary")).unwrap();
             fetcher.check_trust_anchors(&mirrors).unwrap();
+        });
+    }
+
+    /// A redirect names an origin of the server's choosing, so a hop onto a TLS
+    /// origin meets the refusal a route naming one meets: the fetcher holds
+    /// nothing to verify the certificate against, and the handshake would fail
+    /// retryably under a message about the peer, spending every round and every
+    /// backoff on it. The flag is set by hand here for the reason the check
+    /// above states.
+    ///
+    /// The two peers are raw sockets: one answers a redirect to the other, and
+    /// the other reports how many connections reached it.
+    #[test]
+    fn a_redirect_to_a_tls_origin_needs_a_trust_anchor() {
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        rt::block_on(async {
+            // The origin the redirect names. Nothing connects to it, which is
+            // what the count reports.
+            let tls_peer = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let tls_port = tls_peer.local_addr().unwrap().port();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let counted = connections.clone();
+            drop(rt::spawn(async move {
+                while let Ok((stream, _peer)) = tls_peer.accept().await {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            }));
+
+            let cleartext_peer = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let cleartext_port = cleartext_peer.local_addr().unwrap().port();
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counted = requests.clone();
+            drop(rt::spawn(async move {
+                while let Ok((mut stream, _peer)) = cleartext_peer.accept().await {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    let answer = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:{tls_port}/hopped\r\n\
+                         Content-Length: 0\r\n\r\n"
+                    );
+                    let _ = stream.write_all(answer.as_bytes()).await;
+                    let _ = stream.flush().await;
+                }
+            }));
+
+            let mut fetcher = Fetcher::new(FetcherOptions::new(format!(
+                "http://127.0.0.1:{cleartext_port}"
+            )))
+            .await
+            .unwrap();
+            Arc::get_mut(&mut fetcher.inner)
+                .expect("the one handle on this fetcher")
+                .has_trust_anchors = false;
+
+            // Six rounds of a retryable handshake failure and their backoffs
+            // run for over five seconds, so a refusal that ends the attempt is
+            // what resolves inside this window.
+            let refused = within(
+                Duration::from_secs(2),
+                fetcher.fetch(FetchRequest::path("summary")),
+            )
+            .await;
+            let err = refused
+                .expect("the refusal ends the attempt")
+                .expect_err("a tls hop is refused without anchors");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("https://127.0.0.1:{tls_port}")),
+                "{message}"
+            );
+            assert!(message.contains("no trust anchors"), "{message}");
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            assert_eq!(connections.load(Ordering::SeqCst), 0);
         });
     }
 }

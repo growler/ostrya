@@ -2425,8 +2425,10 @@ the request's own, and the switch that admits a credential to a cleartext
 origin -- and resolves to `Fetched::Body` or `Fetched::NotModified`. A `Target`
 is a path relative to each mirror, or an absolute `http`/`https` URL served from
 its own origin, which consults no mirror; a fetcher whose mirror list is empty
-serves URL targets alone, and the pool is keyed by origin, so a URL target
-shares a connection with a mirror at the same origin. The request's headers
+serves URL targets alone, and the pool is keyed by the origin together with
+whether the connection presents the configured client certificate, so a URL
+target shares a connection with a mirror at the same origin; with no certificate
+configured that key is the origin alone. The request's headers
 merge over the fetcher's, one of a name replacing the fetcher's, and the
 request's credentials replace the fetcher's `Authorization`. Within one layer,
 credentials beside an `Authorization` header are refused, both of them setting
@@ -2440,7 +2442,9 @@ no socket.
   and the connection speaks what the server chose. A cleartext origin speaks
   HTTP/1.1, since cleartext HTTP/2 needs prior knowledge or an upgrade.
   `FetcherOptions::http2 = false` drops `h2` from the offer.
-- Connections are pooled per origin (scheme, host, port). An HTTP/2 connection
+- Connections are pooled per origin (scheme, host, port) and per client
+  identity presented, which the redirect items below state in full. An HTTP/2
+  connection
   multiplexes concurrent requests; an HTTP/1.1 connection returns to the pool
   when its body reaches the end, and a body dropped early closes its connection
   instead, because the rest of the response is still in flight.
@@ -2535,7 +2539,81 @@ no socket.
   arrival of higher-priority waiters keeps a lower-priority one queued, and what
   bounds that is the caller's mix of priorities. 16c's state machine sets the
   limit and assigns the priorities.
-- Range requests are not used, and redirects are not followed.
+- Range requests are not used: an interrupted body is refetched from the start.
+- A redirect is followed. A 301, 302, 303, 307, or 308 sends one attempt on to
+  the URL its `Location` names, up to `max_redirects` hops, 10 by default. A
+  limit of zero follows nothing, which leaves each of those statuses a
+  definitive answer of its own, and an attempt that has followed the limit and
+  is sent on to another URL fails definitively with `Error::RedirectLimit`.
+  Every
+  request the fetcher makes is a GET, so none of the five changes the method of
+  the hop that follows it. `Location` is resolved against the URL of the
+  response that carried it, over the `url` crate, so it reads as an absolute
+  URL, a relative one, or a scheme-relative one. The resolution normalizes what
+  it produces, where a request URL reaches the wire as the caller wrote it: a
+  dot segment is resolved away (`/deep/../root` becomes `/root`), a backslash
+  reads as a path separator (`/a\b` becomes `/a/b`), a tab and a newline are
+  removed, a character a path or a query may not carry is percent-encoded
+  (`?q='x'` becomes `?q=%27x%27`), an IPv4 or an IPv6 host is canonicalized
+  (`2130706433` and `0177.0.0.1` both become `127.0.0.1`), and a fragment is
+  dropped, which is what the HTTP specification prescribes for a redirect. One
+  string named as a request URL and named as a `Location` therefore reaches the
+  server as two different request targets. Two hops are refused with `Error::Fetch`
+  naming the URL that redirected and the URL it named: a scheme other than
+  `http` or `https`, and a hop from `https` to `http`. A hop onto a TLS origin
+  is refused the same way on a fetcher that holds no trust anchors, which the
+  handshake would otherwise report as an unknown issuer after every round and
+  every backoff. A hop from `http` to `https` is followed. A response carrying
+  one of the five statuses and no `Location` the resolution reads a URL out of
+  -- no header at all, an empty value, a value that is not text, or a value the
+  resolution cannot read -- is reported as the status it answered, whatever the
+  hop count.
+- The resolution re-encodes a query the caller signed. `'`, `"`, `<`, `>`, a
+  space, and the C0 controls are percent-encoded in a query string, so a
+  `Location` of `/p?q='x'` reaches the server as `/p?q=%27x%27`. A redirect to a
+  presigned URL whose signature covers one of those characters therefore reaches
+  the server with a query the redirect did not name, and the server answers 403.
+  That is a divergence from a client that sends the `Location` byte for byte.
+  Resolving a relative `Location` against the response demands a URL parser, and
+  the parser that resolves is the one that normalizes; object-storage redirects
+  are a main reason to follow a redirect at all, so the divergence is recorded
+  here.
+- Resolving a `Location` carries the whole binary cost of the URL parser. The
+  one `url::Url::parse().join()` call is the only use of the `url` crate in
+  `ostrya`, and `url` depends on `idna`, whose compiled Unicode tables are
+  hundreds of kilobytes; the crate offers no feature that drops them. That
+  weight is an order of magnitude above the rest of the redirect work. The
+  release build records the figure for both the library and the shipped
+  binary.
+- A credential and the client certificate are scoped to the origin the route
+  named. `Authorization`, `Proxy-Authorization`, and `Cookie` reach that origin
+  and a hop at it -- the same scheme, host, and port -- and are dropped for a
+  hop at any other origin; a credential dropped once stays dropped for the rest
+  of the attempt, the other origin's operator holding it by then. Every other
+  header reaches every hop, the `User-Agent` and the `Accept-Encoding` the
+  fetcher sets included. The client certificate is presented at the origin the
+  route named alone, which the fetcher holds two client configurations for, one
+  with client auth and one without, sharing the provider, the protocol
+  versions, the anchors, and the ALPN offer. The connection pool is keyed by the
+  origin together with which of the two opened the connection, since a
+  connection presents the certificate for every request it carries; with no
+  certificate configured the two configurations are one `Arc` and the pool holds
+  one entry per origin.
+- The body of an intermediate response is discarded the way the body of an
+  unsuccessful one is, so one whose declared length is at or below 64 KiB
+  returns its HTTP/1.1 connection to the pool and a chain that stays on one
+  origin travels over one connection; a chain whose intermediate responses
+  declare more than that, or declare nothing, opens a connection per hop. Every
+  such read one attempt makes shares one `progress_timeout` window, whatever the
+  number of hops, so a peer that declares a short body on every hop and then
+  sends fewer bytes than it declared spends that window once and the reads after
+  it close their connections without waiting. The
+  size cap is compared against the response that answers and against no
+  redirect on the way there. The validators reach every hop, since they describe
+  the resource, and a 304 any hop answers is the caller's answer. The hop count
+  belongs to one attempt, so a retryable status on a hop makes the whole attempt
+  retryable and the round that repeats it starts again from the destination the
+  route named.
 - A mirror URL is a scheme, an authority, and a base path. A request target is
   that base path with the object path appended, so a URL carrying a query string
   or userinfo is rejected at construction with `Error::Fetch` naming the part:

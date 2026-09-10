@@ -1275,6 +1275,34 @@ other than `identity`, or whose `Transfer-Encoding` names a coding other than
 asked for the coding. A caller that wants a coded body decodes it outside the
 fetcher.
 
+A redirect is followed. A 301, 302, 303, 307, or 308 sends one attempt on to
+the URL its `Location` names, up to `max_redirects` hops; a limit of zero
+follows nothing, and each of those statuses is then a definitive answer of its
+own. An attempt that has followed the limit and is sent on to another URL fails
+with `Error::RedirectLimit`, and one that meets a redirect status naming no URL
+reports that status whatever the hop count. Every request is a GET, so none of
+the five changes the
+method of the hop that follows it. `Location` is resolved against the URL of
+the response that carried it, so it reads as an absolute URL, a relative one, or
+a scheme-relative one. The resolution normalizes what it produces, where a
+`Target::Url` reaches the wire as the caller wrote it: a dot segment is resolved
+away, a backslash reads as a path separator, a tab and a newline are removed, a
+character a path or a query may not carry is percent-encoded, an IPv4 or an IPv6
+host is canonicalized, and a fragment is dropped. A scheme other than `http` or
+`https`, and a hop from `https` to `http`, are refused with `Error::Fetch`
+naming both URLs; a hop onto a TLS origin is refused the same way on a fetcher
+that holds no trust anchors, and a hop from `http` to `https` is followed. A
+credential -- `basic_auth`, or an `Authorization`, `Proxy-Authorization`, or
+`Cookie` header at either layer -- and a configured client certificate reach
+the origin the route named and a hop at that same origin, and no other; a
+credential dropped for a hop stays dropped for the rest of the attempt. Every
+other header reaches every hop. An intermediate body is discarded the way an
+unsuccessful one is, `max_size` is compared against the response that answers
+alone, the validators reach every hop, and every diagnostic names the URL of the
+response that answered. The hop count belongs to one attempt, so a retryable
+status on a hop makes the whole attempt retryable and the round that repeats it
+starts again from the destination the route named.
+
 ```rust
 pub struct FetcherOptions {
     pub mirrors: Vec<String>,             // base URLs, tried in order; a query
@@ -1291,6 +1319,7 @@ pub struct FetcherOptions {
     pub tls: TlsOptions,                  // trust roots, client identity
     pub http2: bool,                      // default true
     pub max_retries: u32,                 // default 5
+    pub max_redirects: u32,               // default 10; 0 follows nothing
     pub max_outstanding: usize,           // default 8
     pub connect_timeout: Duration,        // default 30s: connect + TLS + handshake
     pub progress_timeout: Duration,       // default 60s: silence, not transfer time

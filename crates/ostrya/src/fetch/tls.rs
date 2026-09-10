@@ -1,9 +1,14 @@
 //! The fetcher's TLS configuration.
 //!
-//! One rustls [`ClientConfig`] is built per [`Fetcher`](crate::Fetcher) and
-//! shared by every connection it opens. The crypto provider is `graviola`:
-//! Rust plus formally-verified assembly, so the provider adds no C to the
-//! build and carries no `cc` build dependency.
+//! Two rustls [`ClientConfig`]s are built per [`Fetcher`](crate::Fetcher) and
+//! shared by the connections it opens: one presents the configured client
+//! certificate and one presents none, so the certificate reaches the origin a
+//! route named and no redirect hop elsewhere. Everything else -- the crypto
+//! provider, the protocol versions, the trust anchors, and the ALPN offer --
+//! is one configuration both hold. With no client certificate configured the
+//! two are one `Arc`, so nothing is built twice. The crypto provider is
+//! `graviola`: Rust plus formally-verified assembly, so the provider adds no C
+//! to the build and carries no `cc` build dependency.
 //!
 //! ALPN advertises `h2` before `http/1.1` unless HTTP/2 is switched off, which
 //! is what selects the protocol version -- the server picks from the offer
@@ -51,27 +56,45 @@ pub struct TlsOptions {
     pub client_identity: Option<ClientIdentity>,
 }
 
-/// Build the shared client configuration. `http2` decides whether `h2` is
+/// The client configurations one fetcher opens its connections with.
+#[derive(Debug)]
+pub(crate) struct ClientConfigs {
+    /// What a connection to the origin a route named is opened with. It
+    /// presents the configured client certificate.
+    pub(crate) with_identity: Arc<ClientConfig>,
+    /// What a connection to a redirect hop at any other origin is opened with.
+    /// It presents no client certificate. With none configured this is the
+    /// other field's own `Arc`.
+    pub(crate) without_identity: Arc<ClientConfig>,
+    /// Whether the trust store holds an anchor. A store with none reaches here
+    /// for a fetcher whose mirrors are all cleartext, which opens no handshake
+    /// to consult them; the caller refuses a fetch that would, whether the
+    /// route named the TLS origin or a redirect hop did.
+    pub(crate) has_trust_anchors: bool,
+}
+
+/// Build the shared client configurations. `http2` decides whether `h2` is
 /// offered in ALPN. `https` says whether any mirror is reached over TLS, which
 /// decides whether an empty system trust store is fatal.
-///
-/// The second half of the pair says whether the trust store holds an anchor. A
-/// store with none reaches here for a fetcher whose mirrors are all cleartext,
-/// which opens no handshake to consult them; the caller refuses the one fetch
-/// that would, a request naming an `https` URL of its own.
 pub(crate) async fn client_config(
     options: &TlsOptions,
     http2: bool,
     https: bool,
-) -> Result<(Arc<ClientConfig>, bool)> {
-    let store = root_store(&options.roots, https).await?;
+) -> Result<ClientConfigs> {
+    let store = Arc::new(root_store(&options.roots, https).await?);
     let has_trust_anchors = !store.is_empty();
     let provider = Arc::new(rustls_graviola::default_provider());
-    let builder = ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| Error::Fetch(format!("tls setup: {e}")))?
-        .with_root_certificates(store);
-    let mut config = match &options.client_identity {
+    let alpn = if http2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
+    let mut plain = shared(&provider, &store)?.with_no_client_auth();
+    plain.alpn_protocols = alpn.clone();
+    let without_identity = Arc::new(plain);
+    // The certificate half is built only where a certificate is configured, so
+    // a fetcher without one holds one configuration under two names.
+    let with_identity = match &options.client_identity {
         Some(identity) => {
             let chain = parse_certs(&identity.cert_chain_pem)?;
             if chain.is_empty() {
@@ -80,18 +103,32 @@ pub(crate) async fn client_config(
                 ));
             }
             let key = parse_key(&identity.key_pem)?;
-            builder
+            let mut config = shared(&provider, &store)?
                 .with_client_auth_cert(chain, key)
-                .map_err(|e| Error::Fetch(format!("client certificate rejected: {e}")))?
+                .map_err(|e| Error::Fetch(format!("client certificate rejected: {e}")))?;
+            config.alpn_protocols = alpn;
+            Arc::new(config)
         }
-        None => builder.with_no_client_auth(),
+        None => without_identity.clone(),
     };
-    config.alpn_protocols = if http2 {
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-    } else {
-        vec![b"http/1.1".to_vec()]
-    };
-    Ok((Arc::new(config), has_trust_anchors))
+    Ok(ClientConfigs {
+        with_identity,
+        without_identity,
+        has_trust_anchors,
+    })
+}
+
+/// What both client configurations hold: the crypto provider, the protocol
+/// versions, and the trust anchors. The anchors are shared by `Arc`, so the
+/// store is parsed once and held once.
+fn shared(
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+    store: &Arc<rustls::RootCertStore>,
+) -> Result<rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert>> {
+    Ok(ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Fetch(format!("tls setup: {e}")))?
+        .with_root_certificates(store.clone()))
 }
 
 /// Assemble the trust anchors. `https` says whether a handshake will consult
@@ -167,13 +204,16 @@ mod tests {
             roots: TrustRoots::Pem(CA_PEM.to_vec()),
             client_identity: None,
         };
-        let (with_h2, _) = block_on(client_config(&options, true, true)).unwrap();
+        let with_h2 = block_on(client_config(&options, true, true)).unwrap();
         assert_eq!(
-            with_h2.alpn_protocols,
+            with_h2.without_identity.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
-        let (without, _) = block_on(client_config(&options, false, true)).unwrap();
-        assert_eq!(without.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        let without = block_on(client_config(&options, false, true)).unwrap();
+        assert_eq!(
+            without.without_identity.alpn_protocols,
+            vec![b"http/1.1".to_vec()]
+        );
     }
 
     /// A configuration built from anchors of its own reports that it holds
@@ -185,11 +225,14 @@ mod tests {
             client_identity: None,
         };
         for https in [true, false] {
-            let (_, has_trust_anchors) = block_on(client_config(&options, true, https)).unwrap();
-            assert!(has_trust_anchors, "https={https}");
+            let configs = block_on(client_config(&options, true, https)).unwrap();
+            assert!(configs.has_trust_anchors, "https={https}");
         }
     }
 
+    /// A configured client certificate makes the two configurations two, and
+    /// the ALPN offer of both is the one offer. With none configured the two
+    /// are one `Arc`.
     #[test]
     fn a_client_identity_is_accepted() {
         let options = TlsOptions {
@@ -199,7 +242,25 @@ mod tests {
                 key_pem: CLIENT_KEY_PEM.to_vec(),
             }),
         };
-        assert!(block_on(client_config(&options, true, true)).is_ok());
+        let configs = block_on(client_config(&options, true, true)).unwrap();
+        assert!(!Arc::ptr_eq(
+            &configs.with_identity,
+            &configs.without_identity
+        ));
+        assert_eq!(
+            configs.with_identity.alpn_protocols,
+            configs.without_identity.alpn_protocols
+        );
+
+        let options = TlsOptions {
+            roots: TrustRoots::Pem(CA_PEM.to_vec()),
+            client_identity: None,
+        };
+        let configs = block_on(client_config(&options, true, true)).unwrap();
+        assert!(Arc::ptr_eq(
+            &configs.with_identity,
+            &configs.without_identity
+        ));
     }
 
     #[test]

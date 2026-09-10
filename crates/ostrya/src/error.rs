@@ -208,6 +208,20 @@ pub enum Error {
         /// The URL requested of it.
         url: String,
     },
+    /// A redirect chain reached the limit
+    /// [`max_redirects`](crate::FetcherOptions::max_redirects) sets, and the
+    /// response at the end of it named another URL to follow. One attempt
+    /// against one destination counts its own hops, so a repeated round counts
+    /// again from the destination the route named.
+    #[error("redirect from {url} exceeds the {hops}-redirect limit")]
+    RedirectLimit {
+        /// The last hop the attempt reached, which is the URL whose `Location`
+        /// the limit stopped it from following.
+        url: String,
+        /// How many redirects the attempt followed, which is the limit it was
+        /// given.
+        hops: u32,
+    },
     /// A response declared more bytes than the caller's cap allows. A body that
     /// outgrows the cap while streaming fails the read with the same
     /// [`FileTooLarge`](std::io::ErrorKind::FileTooLarge) kind, under a

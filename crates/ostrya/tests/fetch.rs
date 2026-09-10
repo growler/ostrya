@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::future::or;
@@ -190,12 +190,26 @@ impl Seen {
 enum Transport {
     /// Cleartext HTTP/1.1.
     Cleartext,
-    /// TLS, offering these ALPN protocols, optionally demanding a client
-    /// certificate signed by the fixture authority.
+    /// TLS, offering these ALPN protocols and asking of its clients what
+    /// `client_auth` states.
     Tls {
         alpn: Vec<&'static str>,
-        client_auth: bool,
+        client_auth: ClientAuth,
     },
+}
+
+/// What a TLS server asks of its clients.
+#[derive(Clone, Copy)]
+enum ClientAuth {
+    /// No certificate is asked for.
+    None,
+    /// A certificate signed by the fixture authority is demanded, and a client
+    /// that presents none is refused.
+    Required,
+    /// A certificate signed by the fixture authority is asked for, and a client
+    /// that presents none is served. The server records what each connection
+    /// presented.
+    Optional,
 }
 
 /// The handler a test installs: it sees the request and the 1-based count of
@@ -210,6 +224,9 @@ struct TestServer {
     addr: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
     connections: Arc<AtomicUsize>,
+    /// Whether each accepted TLS connection presented a client certificate, in
+    /// the order the connections arrived.
+    client_certificates: Arc<Mutex<Vec<bool>>>,
 }
 
 impl TestServer {
@@ -222,6 +239,7 @@ impl TestServer {
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(AtomicUsize::new(0));
+        let client_certificates: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
         let acceptor = match &transport {
             Transport::Cleartext => None,
             Transport::Tls { alpn, client_auth } => Some(futures_rustls::TlsAcceptor::from(
@@ -230,6 +248,7 @@ impl TestServer {
         };
         let task_seen = seen.clone();
         let task_connections = connections.clone();
+        let task_certificates = client_certificates.clone();
         drop(spawn(async move {
             loop {
                 let Ok((stream, _peer)) = listener.accept().await else {
@@ -238,6 +257,7 @@ impl TestServer {
                 task_connections.fetch_add(1, Ordering::SeqCst);
                 let handler = handler.clone();
                 let seen = task_seen.clone();
+                let certificates = task_certificates.clone();
                 let acceptor = acceptor.clone();
                 drop(spawn(async move {
                     match acceptor {
@@ -245,6 +265,10 @@ impl TestServer {
                             let Ok(tls) = acceptor.accept(stream).await else {
                                 return;
                             };
+                            // The handshake is complete, so the client's
+                            // certificate has arrived if it sent one.
+                            let presented = tls.get_ref().1.peer_certificates().is_some();
+                            certificates.lock().unwrap().push(presented);
                             let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
                             serve(tls, h2, handler, seen).await;
                         }
@@ -257,6 +281,7 @@ impl TestServer {
             addr,
             seen,
             connections,
+            client_certificates,
         }
     }
 
@@ -277,6 +302,11 @@ impl TestServer {
 
     fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    /// Whether each accepted TLS connection presented a client certificate.
+    fn client_certificates(&self) -> Vec<bool> {
+        self.client_certificates.lock().unwrap().clone()
     }
 }
 
@@ -318,7 +348,7 @@ where
 }
 
 /// The fixture server's rustls configuration.
-fn server_config(alpn: &[&str], client_auth: bool) -> rustls::ServerConfig {
+fn server_config(alpn: &[&str], client_auth: ClientAuth) -> rustls::ServerConfig {
     let provider = Arc::new(rustls_graviola::default_provider());
     let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(SERVER_CERT_PEM))
         .collect::<Result<_, _>>()
@@ -329,24 +359,33 @@ fn server_config(alpn: &[&str], client_auth: bool) -> rustls::ServerConfig {
     let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .unwrap();
-    let mut config = if client_auth {
+    let verifier = |optional: bool| {
         let mut roots = rustls::RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut io::BufReader::new(CA_PEM)) {
             roots.add(cert.unwrap()).unwrap();
         }
-        let verifier =
-            rustls::server::WebPkiClientVerifier::builder_with_provider(roots.into(), provider)
-                .build()
-                .unwrap();
-        builder
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)
-            .unwrap()
-    } else {
-        builder
+        let builder =
+            rustls::server::WebPkiClientVerifier::builder_with_provider(roots.into(), provider);
+        let builder = if optional {
+            builder.allow_unauthenticated()
+        } else {
+            builder
+        };
+        builder.build().unwrap()
+    };
+    let mut config = match client_auth {
+        ClientAuth::None => builder
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .unwrap()
+            .unwrap(),
+        ClientAuth::Required => builder
+            .with_client_cert_verifier(verifier(false))
+            .with_single_cert(certs, key)
+            .unwrap(),
+        ClientAuth::Optional => builder
+            .with_client_cert_verifier(verifier(true))
+            .with_single_cert(certs, key)
+            .unwrap(),
     };
     config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
     config
@@ -372,6 +411,38 @@ fn always_status(status: u16) -> Handler {
             .body(TestBody::empty())
             .unwrap()
     })
+}
+
+/// A response that redirects to `location` with `status` and an empty body.
+fn redirect(status: u16, location: &str) -> Response<TestBody> {
+    Response::builder()
+        .status(status)
+        .header("location", location)
+        .body(TestBody::empty())
+        .unwrap()
+}
+
+/// A handler that redirects the first request to `location` and answers every
+/// one after it with `body` and a 200.
+fn redirect_once(location: String, body: &'static [u8]) -> Handler {
+    Arc::new(move |_seen, count| {
+        if count == 1 {
+            redirect(302, &location)
+        } else {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(TestBody::measured(body))
+                .unwrap()
+        }
+    })
+}
+
+/// Fetch `path` and return the error the fetch failed with.
+async fn fetch_error(fetcher: &Fetcher, path: &str) -> Error {
+    match fetcher.fetch(FetchRequest::path(path)).await {
+        Ok(_) => panic!("the fetch of {path} was expected to fail"),
+        Err(err) => err,
+    }
 }
 
 /// A peer that accepts a connection, reads what the client sent, answers with
@@ -417,6 +488,36 @@ async fn truncating_server(answer: &'static [u8]) -> SocketAddr {
         }
     }));
     addr
+}
+
+/// A peer that answers every request with a redirect declaring a body it does
+/// not finish sending, and then holds the connection open without another byte.
+/// Every hop leaves a body short of its declared length, which is what an
+/// attempt drains. The counter reports how many requests the peer read.
+async fn short_redirecting_server() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    drop(spawn(async move {
+        // The accepted connections are kept so the peer stays silent instead of
+        // closing, which is what leaves the declared body unfinished.
+        let mut held = Vec::new();
+        while let Ok((mut stream, _peer)) = listener.accept().await {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let hop = counter.fetch_add(1, Ordering::SeqCst) + 1;
+            let answer = format!(
+                "HTTP/1.1 302 Found\r\nLocation: /hop{hop}\r\nContent-Length: 64\r\n\r\nshort"
+            );
+            stream.write_all(answer.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            held.push(stream);
+        }
+    }));
+    (addr, requests)
 }
 
 /// Options for a client that trusts the fixture authority.
@@ -597,7 +698,7 @@ fn alpn_selects_http2_over_tls() {
         let server = TestServer::start(
             Transport::Tls {
                 alpn: vec!["h2", "http/1.1"],
-                client_auth: false,
+                client_auth: ClientAuth::None,
             },
             always(b"over h2"),
         )
@@ -619,7 +720,7 @@ fn disabling_http2_negotiates_http1_over_tls() {
         let server = TestServer::start(
             Transport::Tls {
                 alpn: vec!["h2", "http/1.1"],
-                client_auth: false,
+                client_auth: ClientAuth::None,
             },
             always(b"over h1"),
         )
@@ -970,7 +1071,7 @@ fn a_mirrorless_fetcher_pools_one_connection_per_origin() {
         let server = TestServer::start(
             Transport::Tls {
                 alpn: vec!["h2"],
-                client_auth: false,
+                client_auth: ClientAuth::None,
             },
             always(b"over h2"),
         )
@@ -1299,7 +1400,7 @@ fn a_request_basic_auth_overrides_the_fetchers_authorization() {
         let server = TestServer::start(
             Transport::Tls {
                 alpn: vec!["http/1.1"],
-                client_auth: false,
+                client_auth: ClientAuth::None,
             },
             always(b"bytes"),
         )
@@ -1531,7 +1632,7 @@ fn credentials_and_extra_headers_reach_the_server() {
         let server = TestServer::start(
             Transport::Tls {
                 alpn: vec!["http/1.1"],
-                client_auth: false,
+                client_auth: ClientAuth::None,
             },
             always(b"authorized"),
         )
@@ -1563,7 +1664,7 @@ fn credentials_with_a_cleartext_mirror_fail_the_constructor() {
         let secure = TestServer::start(
             Transport::Tls {
                 alpn: vec!["http/1.1"],
-                client_auth: false,
+                client_auth: ClientAuth::None,
             },
             always(b"unreachable"),
         )
@@ -1594,7 +1695,7 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
         let server = TestServer::start(
             Transport::Tls {
                 alpn: vec!["h2", "http/1.1"],
-                client_auth: true,
+                client_auth: ClientAuth::Required,
             },
             always(b"mutual"),
         )
@@ -1623,6 +1724,496 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
     });
 }
 
+/// A redirect to another origin carries every header but the credentials: the
+/// server the route named receives them, and the server the hop reaches
+/// receives none of the three. A header that is not a credential reaches both.
+#[test]
+fn a_redirect_to_another_origin_leaves_the_credentials_behind() {
+    block_on(async {
+        let hop = TestServer::start(Transport::Cleartext, always(b"hopped")).await;
+        let named = TestServer::start(
+            Transport::Cleartext,
+            redirect_once(format!("{}/hopped", hop.url(false)), b"unreachable"),
+        )
+        .await;
+
+        let fetcher = Fetcher::new(FetcherOptions::new(named.url(false)))
+            .await
+            .unwrap();
+        let headers = vec![
+            ("authorization".to_owned(), "Basic aaa".to_owned()),
+            ("proxy-authorization".to_owned(), "Basic bbb".to_owned()),
+            ("cookie".to_owned(), "session=1".to_owned()),
+            ("x-trace".to_owned(), "abc".to_owned()),
+        ];
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                headers: &headers,
+                allow_cleartext_credentials: true,
+                ..FetchRequest::path("config")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"hopped");
+
+        let first = &named.seen()[0];
+        assert_eq!(first.header("authorization"), Some("Basic aaa"));
+        assert_eq!(first.header("proxy-authorization"), Some("Basic bbb"));
+        assert_eq!(first.header("cookie"), Some("session=1"));
+        assert_eq!(first.header("x-trace"), Some("abc"));
+
+        let second = &hop.seen()[0];
+        assert_eq!(second.path, "/hopped");
+        assert_eq!(second.header("authorization"), None);
+        assert_eq!(second.header("proxy-authorization"), None);
+        assert_eq!(second.header("cookie"), None);
+        assert_eq!(second.header("x-trace"), Some("abc"));
+        // The fetcher's own headers reach the hop as well.
+        assert_eq!(second.header("accept-encoding"), Some("identity"));
+        assert!(second.header("user-agent").is_some());
+    });
+}
+
+/// A hop at the origin the route named is the origin the credentials were
+/// meant for, so they go with it.
+#[test]
+fn a_same_origin_redirect_keeps_the_credentials() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            redirect_once("/elsewhere".to_owned(), b"arrived"),
+        )
+        .await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let headers = vec![("cookie".to_owned(), "session=1".to_owned())];
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                headers: &headers,
+                basic_auth: Some(&basic_auth("u", "p")),
+                allow_cleartext_credentials: true,
+                ..FetchRequest::path("config")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"arrived");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].path, "/elsewhere");
+        for request in &seen {
+            // base64("u:p")
+            assert_eq!(request.header("authorization"), Some("Basic dTpw"));
+            assert_eq!(request.header("cookie"), Some("session=1"));
+        }
+    });
+}
+
+/// A `Location` is resolved against the URL of the response that carried it, so
+/// a rooted one names a path at that origin and a bare one names a sibling of
+/// the path the response was answered at.
+#[test]
+fn a_relative_location_resolves_against_the_response() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, count: usize| match count {
+                1 => redirect(302, "/deep/path?q=1"),
+                2 => redirect(302, "sibling"),
+                _ => Response::builder()
+                    .status(StatusCode::OK)
+                    .body(TestBody::measured(b"arrived"))
+                    .unwrap(),
+            }),
+        )
+        .await;
+        let fetcher = Fetcher::new(FetcherOptions::new(format!("{}/base", server.url(false))))
+            .await
+            .unwrap();
+        let (bytes, _) = fetch_bytes(&fetcher, "config").await;
+        assert_eq!(bytes, b"arrived");
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].target, "/base/config");
+        assert_eq!(seen[1].target, "/deep/path?q=1");
+        assert_eq!(seen[2].target, "/deep/sibling");
+    });
+}
+
+/// A scheme-relative `Location` names another authority and takes the scheme of
+/// the response that carried it.
+#[test]
+fn a_scheme_relative_location_keeps_the_scheme() {
+    block_on(async {
+        let hop = TestServer::start(Transport::Cleartext, always(b"hopped")).await;
+        let named = TestServer::start(
+            Transport::Cleartext,
+            redirect_once(
+                format!("//localhost:{}/hopped", hop.addr.port()),
+                b"unreachable",
+            ),
+        )
+        .await;
+        let fetcher = Fetcher::new(FetcherOptions::new(named.url(false)))
+            .await
+            .unwrap();
+        let (bytes, _) = fetch_bytes(&fetcher, "config").await;
+        assert_eq!(bytes, b"hopped");
+        assert_eq!(hop.seen()[0].path, "/hopped");
+    });
+}
+
+/// A fragment names a part of a representation and reaches no request, so a
+/// redirect drops the one its `Location` carries.
+#[test]
+fn a_fragment_in_a_location_reaches_no_server() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            redirect_once("/other/path#frag".to_owned(), b"arrived"),
+        )
+        .await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let (bytes, _) = fetch_bytes(&fetcher, "config").await;
+        assert_eq!(bytes, b"arrived");
+
+        let seen = server.seen();
+        assert_eq!(seen[1].target, "/other/path");
+        for request in &seen {
+            assert!(!request.target.contains('#'), "{}", request.target);
+        }
+    });
+}
+
+/// A request the caller made over tls is not followed onto cleartext: the hop
+/// is refused, both URLs are named, and the cleartext server is never asked.
+#[test]
+fn a_redirect_from_tls_to_cleartext_is_refused() {
+    block_on(async {
+        let cleartext = TestServer::start(Transport::Cleartext, always(b"unreachable")).await;
+        let secure = TestServer::start(
+            Transport::Tls {
+                alpn: vec!["http/1.1"],
+                client_auth: ClientAuth::None,
+            },
+            redirect_once(format!("{}/hopped", cleartext.url(false)), b"unreachable"),
+        )
+        .await;
+
+        let mut options = FetcherOptions::new(secure.url(true));
+        options.tls = tls_options(None);
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let err = fetch_error(&fetcher, "config").await;
+        let message = err.to_string();
+        assert!(matches!(err, Error::Fetch(_)), "{message}");
+        assert!(
+            message.contains(&format!("{}/config", secure.url(true))),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("{}/hopped", cleartext.url(false))),
+            "{message}"
+        );
+        assert!(message.contains("cleartext"), "{message}");
+        assert_eq!(cleartext.requests(), 0);
+        assert_eq!(cleartext.connections(), 0);
+    });
+}
+
+/// A chain longer than the limit fails the attempt, and the failure names the
+/// hop the limit stopped it at.
+#[test]
+fn a_chain_longer_than_the_limit_is_refused() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, count: usize| redirect(302, &format!("/hop{count}"))),
+        )
+        .await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let err = fetch_error(&fetcher, "config").await;
+        let Error::RedirectLimit { url, hops } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(*hops, 10);
+        assert_eq!(url, &format!("{}/hop10", server.url(false)));
+        // Eleven requests: the first, and one for each of the ten hops.
+        assert_eq!(server.requests(), 11);
+    });
+}
+
+/// A limit of zero follows nothing, which leaves a redirect a definitive answer
+/// of its own.
+#[test]
+fn a_limit_of_zero_follows_nothing() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            redirect_once("/elsewhere".to_owned(), b"unreachable"),
+        )
+        .await;
+        let mut options = FetcherOptions::new(server.url(false));
+        options.max_redirects = 0;
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let err = fetch_error(&fetcher, "config").await;
+        let Error::HttpStatus { status, url } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(*status, 302);
+        assert_eq!(url, &format!("{}/config", server.url(false)));
+        assert_eq!(server.requests(), 1);
+    });
+}
+
+/// A redirect with nothing to follow is reported as the status it answered.
+#[test]
+fn a_redirect_without_a_location_reports_its_status() {
+    block_on(async {
+        let server = TestServer::start(Transport::Cleartext, always_status(302)).await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let err = fetch_error(&fetcher, "config").await;
+        let Error::HttpStatus { status, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(*status, 302);
+        assert_eq!(server.requests(), 1);
+    });
+}
+
+/// The cap is the caller's bound on the object, so it is compared against the
+/// response that answers and against no redirect on the way there: an
+/// intermediate response declaring more than the cap leaves the fetch standing.
+#[test]
+fn the_size_cap_measures_the_final_response_alone() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, count: usize| {
+                if count == 1 {
+                    // A redirect whose own body declares far more than the cap.
+                    Response::builder()
+                        .status(302)
+                        .header("location", "/small")
+                        .body(TestBody::measured(&[b'x'; 4096]))
+                        .unwrap()
+                } else {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(TestBody::measured(b"tiny"))
+                        .unwrap()
+                }
+            }),
+        )
+        .await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                max_size: Some(16),
+                ..FetchRequest::path("config")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"tiny");
+
+        // The response that answers is measured: a final body over the cap
+        // fails the fetch.
+        let err = fetcher
+            .fetch(FetchRequest {
+                max_size: Some(2),
+                ..FetchRequest::path("config")
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::FetchTooLarge { limit: 2 }), "{err}");
+    });
+}
+
+/// A configured client certificate identifies the fetcher to the origin its
+/// route named and to no other, so a hop at another origin presents none.
+///
+/// Both servers ask for a certificate and serve a client that presents none, so
+/// each records what its connection presented and the chain runs to its end.
+/// TLS 1.3 sends the client certificate after the server has finished, and the
+/// server's accept resolves once the client's whole flight has arrived, so a
+/// certificate the client sent is on the connection by then.
+#[test]
+fn a_client_certificate_reaches_the_named_origin_alone() {
+    block_on(async {
+        let hop = TestServer::start(
+            Transport::Tls {
+                alpn: vec!["http/1.1"],
+                client_auth: ClientAuth::Optional,
+            },
+            always(b"hopped"),
+        )
+        .await;
+        let named = TestServer::start(
+            Transport::Tls {
+                alpn: vec!["http/1.1"],
+                client_auth: ClientAuth::Optional,
+            },
+            redirect_once(format!("{}/hopped", hop.url(true)), b"unreachable"),
+        )
+        .await;
+
+        let mut options = FetcherOptions::new(named.url(true));
+        options.tls = tls_options(Some(ClientIdentity {
+            cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
+            key_pem: CLIENT_KEY_PEM.to_vec(),
+        }));
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let (bytes, _) = fetch_bytes(&fetcher, "config").await;
+        assert_eq!(bytes, b"hopped");
+
+        // The origin the route named received the certificate, and the hop
+        // received none.
+        assert_eq!(named.client_certificates(), [true]);
+        assert_eq!(hop.client_certificates(), [false]);
+        // One request each: the redirect, and the response that answered.
+        assert_eq!(named.requests(), 1);
+        assert_eq!(hop.requests(), 1);
+    });
+}
+
+/// An intermediate body is discarded the way an unsuccessful one is, so a chain
+/// of short redirects on one origin travels over the connection the first hop
+/// opened.
+#[test]
+fn a_redirect_chain_on_one_origin_travels_over_one_connection() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, count: usize| {
+                if count <= 3 {
+                    redirect(302, &format!("/hop{count}"))
+                } else {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(TestBody::measured(b"arrived"))
+                        .unwrap()
+                }
+            }),
+        )
+        .await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let (bytes, protocol) = fetch_bytes(&fetcher, "config").await;
+        assert_eq!(bytes, b"arrived");
+        assert_eq!(protocol, Protocol::Http11);
+        assert_eq!(server.requests(), 4);
+        assert_eq!(server.connections(), 1);
+    });
+}
+
+/// Every drain one attempt makes shares one progress window, however many hops
+/// the attempt follows: a peer that answers each hop with a short declared body
+/// and then sends fewer bytes than it declared spends that window once.
+#[test]
+fn one_progress_window_covers_every_drain_of_an_attempt() {
+    block_on(async {
+        let (addr, requests) = short_redirecting_server().await;
+        let mut options = FetcherOptions::new(format!("http://127.0.0.1:{}", addr.port()));
+        options.progress_timeout = Duration::from_millis(200);
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        let started = Instant::now();
+        let err = fetch_error(&fetcher, "config").await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, Error::RedirectLimit { hops: 10, .. }),
+            "{err}"
+        );
+        // Eleven requests: the first, and one for each of the ten hops.
+        assert_eq!(requests.load(Ordering::SeqCst), 11);
+        // One window is 200ms, and eleven of them are 2.2s.
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    });
+}
+
+/// A `Location` with no value resolves to the URL of the response that carried
+/// it, so it names no URL a request can be sent to and the status the response
+/// answered is the answer the attempt reports.
+#[test]
+fn an_empty_location_names_no_url() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, _count: usize| redirect(302, "")),
+        )
+        .await;
+        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+            .await
+            .unwrap();
+        let err = fetch_error(&fetcher, "config").await;
+        let Error::HttpStatus { status, url } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(*status, 302);
+        assert_eq!(url, &format!("{}/config", server.url(false)));
+        assert_eq!(server.requests(), 1);
+    });
+}
+
+/// The limit stops an attempt at a URL it would otherwise follow, so a redirect
+/// with nothing to follow reports the status it answered whatever the hop count,
+/// and one that does name a URL reports the limit.
+#[test]
+fn at_the_limit_a_redirect_reports_what_it_carried() {
+    block_on(async {
+        let nothing_to_follow = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, count: usize| {
+                if count <= 2 {
+                    redirect(302, &format!("/hop{count}"))
+                } else {
+                    Response::builder()
+                        .status(302)
+                        .body(TestBody::empty())
+                        .unwrap()
+                }
+            }),
+        )
+        .await;
+        let mut options = FetcherOptions::new(nothing_to_follow.url(false));
+        options.max_redirects = 2;
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let err = fetch_error(&fetcher, "config").await;
+        let Error::HttpStatus { status, url } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(*status, 302);
+        assert_eq!(url, &format!("{}/hop2", nothing_to_follow.url(false)));
+        assert_eq!(nothing_to_follow.requests(), 3);
+
+        let another_hop = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, count: usize| redirect(302, &format!("/hop{count}"))),
+        )
+        .await;
+        let mut options = FetcherOptions::new(another_hop.url(false));
+        options.max_redirects = 2;
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let err = fetch_error(&fetcher, "config").await;
+        let Error::RedirectLimit { url, hops } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(*hops, 2);
+        assert_eq!(url, &format!("{}/hop2", another_hop.url(false)));
+        assert_eq!(another_hop.requests(), 3);
+    });
+}
+
 #[test]
 fn http1_connections_are_reused_between_fetches() {
     block_on(async {
@@ -1647,7 +2238,7 @@ fn http2_multiplexes_concurrent_fetches_over_one_connection() {
         let server = TestServer::start(
             Transport::Tls {
                 alpn: vec!["h2"],
-                client_auth: false,
+                client_auth: ClientAuth::None,
             },
             always(b"multiplexed"),
         )

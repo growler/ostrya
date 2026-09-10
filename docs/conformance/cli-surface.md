@@ -1386,8 +1386,8 @@ flag:
   own directory and renames it over the destination, so the rename stays inside
   one filesystem and every destination is taken. The two agree on what the
   temporary file buys: an export that finishes replaces the destination rather
-  than writes into it, so the image carries the process umask and not the mode
-  the destination held
+  than writes into it, and the image lands at mode 0644 whatever the process
+  umask and whatever mode the destination held
   (`ostrya_cli::cli::checkout_composefs_switches_match_the_tool`), and an
   export that does not finish leaves a destination that already existed as it
   was, byte for byte and at its own mode

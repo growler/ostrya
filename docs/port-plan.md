@@ -4976,7 +4976,7 @@ combinations of repository mode, `-U`, `-H`, and `-C` without touching `-H`
 semantics, which stay with `F14`; the one difference there is what a refusal
 leaves behind, the tool's `-H` gate standing after the destination directory is
 made and the port's guard standing before it, which the `-H` divergence text
-records. The conformance run reported 704 cells and 281 passes after the item.
+records. The conformance run reported 704 cells and 284 passes after the item.
 
 `F12` gives `checkout` its two whiteout switches, `--whiteouts` and
 `--process-passthrough-whiteouts`. The library carried the Docker-style form

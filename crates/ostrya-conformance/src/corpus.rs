@@ -55,7 +55,9 @@ pub fn tier(name: &str) -> Option<Tier> {
 
 /// Build the corpus tree at `root`, which must not exist yet.
 pub fn materialize(name: &str, root: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(root).map_err(|err| fail(root, err))?;
+    // The root's own mode reaches the committed root dirmeta, so it is pinned
+    // like every other entry rather than left to the process umask.
+    directory(root, 0o755)?;
     match name {
         "C0" | "C3" => basic(root),
         "C1" => modes(root),
@@ -195,8 +197,8 @@ fn names(root: &Path) -> Result<(), String> {
     let mut deep = root.to_path_buf();
     for _ in 0..40 {
         deep.push("d");
+        directory(&deep, 0o755)?;
     }
-    std::fs::create_dir_all(&deep).map_err(|err| fail(&deep, err))?;
     write(&deep.join("leaf.txt"), b"corpus C10 deep path\n", 0o644)
 }
 

@@ -2112,7 +2112,8 @@ tree and reaches another.
 The tool builds the image in an anonymous temporary file (`O_TMPFILE`) opened
 relative to the current directory and links it into place next to the
 destination, so the export runs with a working directory on the destination's
-filesystem.
+filesystem. The image at the destination has mode 0644, whatever the process
+umask and whatever mode a destination that already existed held.
 
 ### fs-verity digest
 

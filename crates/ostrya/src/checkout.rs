@@ -1384,7 +1384,14 @@ fn unlink_entry(dir: BorrowedFd<'_>, name: &str, is_dir: bool) -> Result<()> {
 /// subtree deeper than the process descriptor limit or than the thread stack
 /// holds is removed whole.
 fn remove_subtree(dir: BorrowedFd<'_>, name: &str) -> Result<()> {
-    let mut level = open_dir(dir, name)?;
+    let mut level = match open_dir(dir, name) {
+        Ok(fd) => fd,
+        // The subtree is gone, which the removal wanted anyway. The type comes
+        // from `getdents64` or from a caller's own `statat`, so the name can be
+        // unlinked between the two calls.
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
     // One entry per level on the path from `name` down to the level in hand:
     // the level's own name, and what is left to remove within it.
     let mut levels = vec![(name.to_owned(), read_level(level.as_fd())?)];
@@ -1433,8 +1440,10 @@ fn clear_dir(dir: BorrowedFd<'_>) -> Result<()> {
 
 /// The entries of one directory, each with whether it is a directory.
 ///
-/// The type comes from one `statat` per name, and a name that is gone by the
-/// time that call runs is left out.
+/// `getdents64` already carries the type, so the type is read off the entry and
+/// no call per name is made. A filesystem that reports [`FileType::Unknown`]
+/// leaves the type to one `statat` for that name alone; a name that is gone by
+/// the time that call runs is left out.
 fn read_level(level: BorrowedFd<'_>) -> Result<Vec<(String, bool)>> {
     let mut entries = Vec::new();
     for entry in Dir::read_from(level)? {
@@ -1447,9 +1456,13 @@ fn read_level(level: BorrowedFd<'_>) -> Result<Vec<(String, bool)>> {
             .to_str()
             .map_err(|_| Error::InvalidFormat("directory entry name is not valid UTF-8".into()))?
             .to_owned();
-        let is_dir = match entry_is_dir(level, &name)? {
-            Some(is_dir) => is_dir,
-            None => continue,
+        let is_dir = match entry.file_type() {
+            FileType::Directory => true,
+            FileType::Unknown => match entry_is_dir(level, &name)? {
+                Some(is_dir) => is_dir,
+                None => continue,
+            },
+            _ => false,
         };
         entries.push((name, is_dir));
     }

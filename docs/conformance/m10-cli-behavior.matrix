@@ -2494,7 +2494,8 @@ note: `--composefs` writes the EROFS image whose metacopy xattr carries the
  36-byte fs-verity record of each backed object. This is the image the
  no-verity cells below contrast against. No oracle reads a cell's own checkout
  destination, so the cited test reads the image both implementations wrote for
- one commit and states the bytes equal.
+ one commit and states the bytes equal, and that both replaced a destination
+ pre-created at 0600 with an image at 0644.
 
 family: M10
 subcommand: checkout

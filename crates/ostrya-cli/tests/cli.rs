@@ -3368,7 +3368,11 @@ fn composefs_checkout_matches_library() {
 ///
 /// Every destination is created at mode 0600 first, so each form also states
 /// that both implementations replace a destination that already exists rather
-/// than write into it: the image lands at the process umask on both sides.
+/// than write into it: the image lands at mode 0644 on both sides at the umask
+/// the run carries. That the tool's image mode is 0644 whatever the umask is
+/// the observation recorded in `docs/format-reference.md`, "composefs"; the
+/// port reaches the same mode by `fchmod` on the open descriptor, which takes
+/// no umask.
 #[test]
 fn checkout_composefs_switches_match_the_tool() {
     if !ostree_available() {
@@ -3463,6 +3467,18 @@ fn checkout_composefs_switches_match_the_tool() {
             0o600,
             "`checkout {label}` wrote into the destination instead of \
              replacing it",
+        );
+        assert_eq!(
+            mode(&port_image),
+            0o644,
+            "`checkout {label}` left the replaced destination at a mode \
+             other than 0644",
+        );
+        assert_eq!(
+            mode(&tool_image),
+            0o644,
+            "the tool left the replaced destination of `checkout {label}` at \
+             a mode other than 0644",
         );
         written.push(port_bytes);
     }
@@ -9115,6 +9131,14 @@ fn ls_recursive_visits_each_subtree_before_its_next_sibling() {
     std::fs::create_dir_all(src.join("db")).unwrap();
     std::fs::write(src.join("da/f1.txt"), b"one\n").unwrap();
     std::fs::write(src.join("db/f2.txt"), b"two\n").unwrap();
+    // `create_dir_all` and `fs::write` reduce 0777 and 0666 by the process
+    // umask, and the mode reaches the recorded dirmeta and file mode the
+    // listing below states, so every mode is pinned.
+    for rel in ["", "da", "db"] {
+        chmod_to(&src.join(rel), 0o755);
+    }
+    chmod_to(&src.join("da/f1.txt"), 0o644);
+    chmod_to(&src.join("db/f2.txt"), 0o644);
     let repo = create_repo(base, RepoMode::Archive);
     let repo_s = repo.to_str().unwrap();
     ostrya(
@@ -14314,8 +14338,14 @@ fn commit_generate_sizes_matches_the_tool() {
     let sources = build_overlay_sources(base);
     let t1 = sources.join("t1").to_str().unwrap().to_owned();
     let t2 = sources.join("t2").to_str().unwrap().to_owned();
+    // The empty source's root mode is pinned to the mode `build_overlay_sources`
+    // gives `t1`'s root. The two implementations part over `ostree.sizes` where
+    // an earlier source's root dirmeta is a different object from the last
+    // source's, so the arm below states the composition rule and not that
+    // divergence.
     let empty = sources.join("nothing");
     std::fs::create_dir_all(&empty).unwrap();
+    chmod_to(&empty, 0o755);
     let overlay_tar = base.join("overlay.tar");
     pack_tar(&sources.join("t2"), &overlay_tar);
     assert_agrees(
@@ -15105,6 +15135,12 @@ fn commit_derived_metadata_key_order() {
 /// not. Returns the parent holding both.
 fn build_overlay_sources(base: &Path) -> PathBuf {
     let root = base.join("sources");
+    // `create_dir_all` and `fs::write` reduce 0777 and 0666 by the process
+    // umask, and the mode reaches the recorded dirmeta and file mode, so every
+    // mode this helper creates is pinned. The `m1`/`m2` pair below already
+    // states its directory modes, which is what these calls do for the rest.
+    std::fs::create_dir_all(&root).unwrap();
+    chmod_to(&root, 0o755);
     for (name, own) in [("t1", "onlyA"), ("t2", "onlyB")] {
         let dir = root.join(name);
         std::fs::create_dir_all(dir.join("common")).unwrap();
@@ -15113,6 +15149,12 @@ fn build_overlay_sources(base: &Path) -> PathBuf {
         std::fs::write(dir.join("common").join(format!("{name}.txt")), "shared\n").unwrap();
         std::fs::write(dir.join(own).join("own.txt"), "own\n").unwrap();
         std::os::unix::fs::symlink("f.txt", dir.join("link")).unwrap();
+        for rel in ["", "common", own] {
+            chmod_to(&dir.join(rel), 0o755);
+        }
+        chmod_to(&dir.join("f.txt"), 0o644);
+        chmod_to(&dir.join("common").join(format!("{name}.txt")), 0o644);
+        chmod_to(&dir.join(own).join("own.txt"), 0o644);
     }
     // A symlink naming a directory, for the `dir=` source that resolves to a
     // tree through a link.
@@ -15123,11 +15165,17 @@ fn build_overlay_sources(base: &Path) -> PathBuf {
     std::fs::write(root.join("n1/a/b/p/i"), "inner\n").unwrap();
     std::fs::create_dir_all(root.join("n2/a/b")).unwrap();
     std::fs::write(root.join("n2/a/b/p"), "leaf\n").unwrap();
+    for rel in ["n1", "n1/a", "n1/a/b", "n1/a/b/p", "n2", "n2/a", "n2/a/b"] {
+        chmod_to(&root.join(rel), 0o755);
+    }
+    chmod_to(&root.join("n1/a/b/p/i"), 0o644);
+    chmod_to(&root.join("n2/a/b/p"), 0o644);
     // Two trees whose shared directories differ in mode alone.
     for (name, mode) in [("m1", 0o700u32), ("m2", 0o751)] {
         let dir = root.join(name);
         std::fs::create_dir_all(dir.join("d")).unwrap();
         std::fs::write(dir.join("d").join(name), "x\n").unwrap();
+        chmod_to(&dir.join("d").join(name), 0o644);
         for rel in ["d", ""] {
             std::fs::set_permissions(dir.join(rel), std::fs::Permissions::from_mode(mode)).unwrap();
         }
@@ -19414,6 +19462,7 @@ fn checkout_union_identical_requires_require_hardlinks() {
         for dest in [&port_dest, &tool_dest] {
             std::fs::create_dir_all(dest).unwrap();
             std::fs::write(dest.join("keep.txt"), b"keep\n").unwrap();
+            chmod_to(&dest.join("keep.txt"), 0o644);
             chmod_to(dest, 0o700);
         }
         let (port, tool) =
@@ -20700,6 +20749,7 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
         for dest in [&port_dest, &tool_dest] {
             std::fs::create_dir_all(dest).unwrap();
             std::fs::write(dest.join("kept.txt"), b"kept\n").unwrap();
+            chmod_to(&dest.join("kept.txt"), 0o644);
         }
         let mut options = vec!["--allow-noent", "--subpath=/nope"];
         options.extend(switches.iter().copied());

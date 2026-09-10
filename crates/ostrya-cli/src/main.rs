@@ -51,6 +51,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3562,6 +3563,14 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         let temp = dir.join(format!(".ostrya-composefs-{}.tmp", std::process::id()));
         let out = std::fs::File::create(&temp).map_err(Error::Io)?;
+        // The tool's image mode is 0644 whatever the umask, and `File::create`
+        // opens with 0666 reduced by the umask, so the mode is set on the open
+        // descriptor: `fchmod` takes no umask, and the rename carries the mode
+        // to the destination.
+        if let Err(err) = out.set_permissions(std::fs::Permissions::from_mode(0o644)) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(Error::Io(err));
+        }
         let written = repo
             .export_composefs_to(&commit, &opts, out.as_fd())
             .await

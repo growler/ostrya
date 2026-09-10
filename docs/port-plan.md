@@ -4940,6 +4940,43 @@ cannot be opened is refused in. The three options that take a value each take
 the last occurrence, which is what the tool does. The conformance run reported
 681 cells and 270 passes after the item.
 
+`F11` gives `checkout` its union family. The CLI gained `--union`,
+`--union-add`, `--union-identical`, and `--allow-noent`. The pair exclusion and
+the `--union-identical` requirement for `-H` sit in the handler after the
+revision resolves, which is where the tool makes them, so a bad revision is
+reported ahead of a bad option pair in both.
+`OverwriteMode::UnionIdentical` changed: it compared the destination's inode
+against the loose object's, and the tool compares the file-object checksum
+computed from the destination with a permission-bit check against the loose
+object inode and an inode short-circuit ahead of it, so a byte-identical file
+with its own inode is kept where the port refused it. `Error::Checkout`'s
+subpath string became `Error::SubpathNotFound` and
+`Error::SubpathNotADirectory`, which is what `--allow-noent` acts on: it
+suppresses the first and not the second, as the tool does. `canonical_header` in
+`write.rs` widened to `pub(crate)` so the comparison reduces the destination the
+way the repository mode reduces an ingested entry, and the hashing goes through
+`ostrya_core::ContentHasher` in bounded chunks. A union mode follows a symlink
+standing at any directory name, the destination root and every directory name
+inside the tree, and writes into the directory the link resolves to, wherever
+that is; the default mode refuses it. No new dependency.
+
+Four divergences stand, all four in `cli-surface.md`, "checkout": the reach of
+`--allow-noent`, which the tool honors only on command lines holding none of
+`-H`, `-C`, `-M`, `--union-add`, `--disable-cache`, `--whiteouts`,
+`--process-passthrough-whiteouts`, and `--skip-list`, and which the port honors
+uniformly, neither side writing anything either way; a `--subpath` naming a file
+whose loose content object was deleted out of band, which the tool suppresses
+under `--allow-noent` and the port refuses; `--composefs` alongside a single
+`--union-add` or `--union-identical`, which the tool refuses and the port
+exports; and a union option given twice, which the tool takes and the port
+refuses as it refuses every repeated boolean flag. The `--union-identical` gate
+agrees with the tool for all sixteen
+combinations of repository mode, `-U`, `-H`, and `-C` without touching `-H`
+semantics, which stay with `F14`; the one difference there is what a refusal
+leaves behind, the tool's `-H` gate standing after the destination directory is
+made and the port's guard standing before it, which the `-H` divergence text
+records. The conformance run reported 704 cells and 281 passes after the item.
+
 #### Phase 17g -- P3 commands with no matrix weight
 
 `reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and

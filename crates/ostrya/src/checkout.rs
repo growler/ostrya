@@ -32,6 +32,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 
+use futures_lite::AsyncReadExt;
 use ostrya_core::{Checksum, Commit, DirMeta, ObjectType, RepoMode, Xattrs, loose_path};
 use ostrya_rt::File as RtFile;
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Gid, Mode, OFlags, RenameFlags, Uid};
@@ -55,6 +56,9 @@ const PERM_MASK: u32 = 0o7777;
 /// with `ostree checkout -U --force-copy` in each mode
 /// (`format-reference.md`, "Checkout").
 const USER_PERM_MASK: u32 = 0o1777;
+/// The chunk size the identity comparison streams a destination file in, so no
+/// whole file is buffered.
+const HASH_CHUNK: usize = 64 * 1024;
 /// The transient mode a directory is created with so its children can be
 /// written; the final logical mode is applied after they are materialized.
 const TRANSIENT_DIR_MODE: u32 = 0o700;
@@ -94,9 +98,14 @@ pub enum OverwriteMode {
     /// Keep existing files and directories, only add entries that do not already
     /// exist (`ostree checkout --union-add`).
     AddFiles,
-    /// Add new entries; an existing entry identical (by inode) to the object it
-    /// would receive is left in place, and a differing existing entry is an
-    /// error (`ostree checkout --union-identical`).
+    /// Add new entries; an existing entry that is what this checkout would put
+    /// there is left in place, and a differing existing entry is an error
+    /// (`ostree checkout --union-identical`). A regular file is what the
+    /// checkout would put there when it is already the loose object's inode, or
+    /// when its file-object checksum equals the object's and its permission bits
+    /// equal the loose object inode's. A symlink is compared by its target. A
+    /// directory is reused with no comparison, as under the other union modes.
+    /// See `format-reference.md`, "Checkout".
     UnionIdentical,
 }
 
@@ -181,11 +190,11 @@ impl Repo {
         commit: &Checksum,
     ) -> Result<()> {
         let policy = Policy::new(self.mode(), opts);
-        // union-identical establishes identity by the object inode, so it is
-        // meaningful only for a hardlink checkout. Reject it before any I/O when
-        // the repository mode and checkout mode (or force_copy) produce copies,
-        // matching the tool's refusal to run `--union-identical` without
-        // `--require-hardlinks`.
+        // The tool takes `--union-identical` only together with
+        // `--require-hardlinks`, so the checkout that runs under it is a
+        // hardlinking one. Reject the mode before any I/O where the repository
+        // mode and checkout mode (or force_copy) produce copies, which is the
+        // same set the tool's `-H` gate refuses.
         if policy.overwrite == OverwriteMode::UnionIdentical && !hardlink_regular(policy) {
             return Err(Error::Checkout(
                 "union-identical requires a hardlink checkout, but this repository \
@@ -265,7 +274,11 @@ enum Target {
 
 /// Resolve the checkout target within a commit tree, honoring an optional
 /// subpath. An absent or root subpath selects the whole tree; a subpath is
-/// resolved through the tree and a missing one is an error.
+/// resolved through the tree and one that does not resolve is an error. The two
+/// refusals are told apart: a value naming no entry is
+/// [`Error::SubpathNotFound`] and one running through an entry that is not a
+/// directory is [`Error::SubpathNotADirectory`], the split the tool also makes
+/// and the split `ostrya checkout --allow-noent` acts on.
 async fn resolve_target(repo: &Repo, commit: &Commit, subpath: Option<&Path>) -> Result<Target> {
     let root = Target::Dir {
         dirtree: commit.root_dirtree,
@@ -284,11 +297,43 @@ async fn resolve_target(repo: &Repo, commit: &Commit, subpath: Option<&Path>) ->
             dirmeta: *tree.dirmeta_checksum(),
         }),
         Some(TreeEntry::File { name, checksum }) => Ok(Target::File { name, checksum }),
-        None => Err(Error::Checkout(format!(
-            "subpath not found: {}",
-            sub.display()
-        ))),
+        None => Err(unresolved_subpath(&tree, sub).await),
     }
+}
+
+/// Which refusal a subpath that resolved to nothing carries. The walk descends
+/// the value's leading components one at a time: a component naming an entry
+/// that is not a directory makes the value run through a non-directory, and
+/// every other outcome makes the value name nothing.
+async fn unresolved_subpath(tree: &RepoTree, sub: &Path) -> Error {
+    use std::path::Component;
+
+    let not_found = || Error::SubpathNotFound(sub.to_path_buf());
+    let components: Vec<&std::ffi::OsStr> = sub
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => Some(part),
+            _ => None,
+        })
+        .collect();
+    let Some(leading) = components.len().checked_sub(1) else {
+        return not_found();
+    };
+    let mut current = tree.clone();
+    for component in &components[..leading] {
+        match current.lookup(Path::new(component)).await {
+            Ok(Some(TreeEntry::Dir { tree, .. })) => current = tree,
+            Ok(Some(TreeEntry::File { .. })) => {
+                return Error::SubpathNotADirectory(sub.to_path_buf());
+            }
+            Ok(None) => return not_found(),
+            // A failed lookup keeps its own error. Reporting it as an absent
+            // subpath would let `ostrya checkout --allow-noent` turn a read or
+            // decode failure into exit 0.
+            Err(e) => return e,
+        }
+    }
+    not_found()
 }
 
 /// Whether a path has no meaningful component, so it names the tree root.
@@ -477,16 +522,17 @@ async fn place_regular(
     obj: &FileObject,
 ) -> Result<()> {
     let checksum = obj.checksum();
-    let obj_devino = if policy.overwrite == OverwriteMode::UnionIdentical {
-        Some(loose_object_devino(repo, policy.repo_mode, checksum)?)
-    } else {
-        None
-    };
-    let remove_existing = match pre_check(dir_fd, name, policy.overwrite, obj_devino)? {
+    let remove_existing = match pre_check(dir_fd, name, policy.overwrite)? {
         Disposition::Skip => return Ok(()),
         Disposition::Error => return Err(collision(name)),
         Disposition::Place => false,
         Disposition::Overwrite => true,
+        Disposition::Check(st) => {
+            if destination_is_identical(repo, policy, dir_fd, name, &st, obj).await? {
+                return Ok(());
+            }
+            return Err(collision(name));
+        }
     };
 
     // A cross-filesystem link (EXDEV) yields None and falls back to the copy
@@ -530,16 +576,17 @@ async fn place_symlink(
     target: &str,
 ) -> Result<()> {
     let checksum = obj.checksum();
-    let obj_devino = if policy.overwrite == OverwriteMode::UnionIdentical {
-        Some(loose_object_devino(repo, policy.repo_mode, checksum)?)
-    } else {
-        None
-    };
-    let remove_existing = match pre_check(dir_fd, name, policy.overwrite, obj_devino)? {
+    let remove_existing = match pre_check(dir_fd, name, policy.overwrite)? {
         Disposition::Skip => return Ok(()),
         Disposition::Error => return Err(collision(name)),
         Disposition::Place => false,
         Disposition::Overwrite => true,
+        Disposition::Check(st) => {
+            if destination_is_identical(repo, policy, dir_fd, name, &st, obj).await? {
+                return Ok(());
+            }
+            return Err(collision(name));
+        }
     };
 
     if hardlink_symlink(policy)
@@ -579,20 +626,17 @@ enum Disposition {
     Overwrite,
     /// The entry exists and is left in place.
     Skip,
+    /// The entry exists and must be compared against the object it would
+    /// receive, carrying the stat the comparison reads.
+    Check(rustix::fs::Stat),
     /// The entry exists and its presence is a conflict.
     Error,
 }
 
-/// Decide how to treat a destination entry given the overwrite mode. For
-/// [`UnionIdentical`](OverwriteMode::UnionIdentical), `obj_devino` is the
-/// `(dev, ino)` of the loose object the entry would receive; an existing entry
-/// that already shares it is identical.
-fn pre_check(
-    dir_fd: BorrowedFd<'_>,
-    name: &str,
-    overwrite: OverwriteMode,
-    obj_devino: Option<(u64, u64)>,
-) -> Result<Disposition> {
+/// Decide how to treat a destination entry given the overwrite mode.
+/// [`UnionIdentical`](OverwriteMode::UnionIdentical) defers to
+/// [`destination_is_identical`], which the caller runs over the returned stat.
+fn pre_check(dir_fd: BorrowedFd<'_>, name: &str, overwrite: OverwriteMode) -> Result<Disposition> {
     let st = match rustix::fs::statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(st) => st,
         Err(Errno::NOENT) => return Ok(Disposition::Place),
@@ -613,15 +657,13 @@ fn pre_check(
             }
         }
         OverwriteMode::AddFiles => Disposition::Skip,
-        OverwriteMode::UnionIdentical => match obj_devino {
-            Some((dev, ino)) if st.st_dev == dev && st.st_ino == ino => Disposition::Skip,
-            _ => Disposition::Error,
-        },
+        OverwriteMode::UnionIdentical => Disposition::Check(st),
     })
 }
 
-/// The `(st_dev, st_ino)` of a loose content object, for identity comparison.
-fn loose_object_devino(repo: &Repo, mode: RepoMode, checksum: &Checksum) -> Result<(u64, u64)> {
+/// The `(st_dev, st_ino)` and the permission bits of a loose content object's
+/// own inode, for identity comparison.
+fn loose_object_stat(repo: &Repo, mode: RepoMode, checksum: &Checksum) -> Result<(u64, u64, u32)> {
     let path = loose_path(checksum, ObjectType::File, mode);
     let st =
         rustix::fs::statat(repo.objects_fd(), &path, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| {
@@ -634,13 +676,117 @@ fn loose_object_devino(repo: &Repo, mode: RepoMode, checksum: &Checksum) -> Resu
                 e.into()
             }
         })?;
-    Ok((st.st_dev, st.st_ino))
+    Ok((st.st_dev, st.st_ino, st.st_mode & PERM_MASK))
+}
+
+/// Whether an existing destination entry is what this checkout would put there,
+/// deciding [`OverwriteMode::UnionIdentical`].
+///
+/// The rule is the tool's, recovered by black-box observation and recorded in
+/// `format-reference.md`, "Checkout". A regular file matches when it is already
+/// the loose object's inode, or when the file-object checksum computed from it
+/// equals the object's and its permission bits equal the loose object inode's.
+/// The checksum reduces the destination's metadata the way the repository mode
+/// reduces an ingested entry, so `bare-user-only` drops ownership and extended
+/// attributes and masks the permission bits. A symlink matches on its target
+/// alone. Neither the modification time nor the link count is read. An entry
+/// whose type differs from the object's matches nothing.
+///
+/// The checksum covers the framed header followed by the payload, so a
+/// destination of a different size, or one whose canonical header differs,
+/// carries a different checksum whatever its bytes hold. Both are decided from
+/// the stat and the extended attributes alone, so the payload is read only
+/// where a match is still possible.
+async fn destination_is_identical(
+    repo: &Repo,
+    policy: Policy,
+    dir_fd: BorrowedFd<'_>,
+    name: &str,
+    st: &rustix::fs::Stat,
+    obj: &FileObject,
+) -> Result<bool> {
+    match &obj.kind {
+        FileKind::Symlink { target } => {
+            if FileType::from_raw_mode(st.st_mode) != FileType::Symlink {
+                return Ok(false);
+            }
+            let link = rustix::fs::readlinkat(dir_fd, name, Vec::new())?;
+            Ok(link.as_bytes() == target.as_bytes())
+        }
+        FileKind::Regular { size } => {
+            if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+                return Ok(false);
+            }
+            let (dev, ino, obj_perm) = loose_object_stat(repo, policy.repo_mode, obj.checksum())?;
+            if st.st_dev == dev && st.st_ino == ino {
+                return Ok(true);
+            }
+            if u64::try_from(st.st_size).ok() != Some(*size) {
+                return Ok(false);
+            }
+            if st.st_mode & PERM_MASK != obj_perm {
+                return Ok(false);
+            }
+            let fd = rustix::fs::openat(
+                dir_fd,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            let meta = FileMeta {
+                uid: st.st_uid,
+                gid: st.st_gid,
+                mode: st.st_mode,
+                xattrs: crate::object::read_all_xattrs(fd.as_fd())?,
+            };
+            let header = crate::write::canonical_header(policy.repo_mode, meta.regular_header());
+            if header != crate::write::canonical_header(policy.repo_mode, obj.header()) {
+                return Ok(false);
+            }
+            let checksum = hash_destination_file(fd, &header, *size).await?;
+            Ok(checksum == *obj.checksum())
+        }
+    }
+}
+
+/// The file-object checksum a destination regular file of `size` bytes, opened
+/// as `fd` and carrying `header`, would ingest as. The payload streams in
+/// bounded chunks, so no whole file is buffered.
+async fn hash_destination_file(
+    fd: OwnedFd,
+    header: &ostrya_core::FileHeader,
+    size: u64,
+) -> Result<Checksum> {
+    let mut hasher = ostrya_core::ContentHasher::new(header)?;
+    let mut file = RtFile::from(fd);
+    let mut buf = vec![
+        0u8;
+        usize::try_from(size)
+            .unwrap_or(HASH_CHUNK)
+            .clamp(1, HASH_CHUNK)
+    ];
+    loop {
+        let n = file.read(&mut buf).await.map_err(Error::Io)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finish())
 }
 
 /// Create the destination directory `name` under `parent`, returning its fd and
 /// whether it was freshly created. A fresh directory is opened writable so its
 /// children can be materialized. An existing directory is an error under
 /// [`OverwriteMode::None`] and reused otherwise.
+///
+/// A union mode follows a symlink standing at any directory name, the
+/// checkout's own destination included, and writes into the directory the link
+/// resolves to. The link is followed wherever it points, so a checkout writes
+/// outside the destination tree where the destination's own symlinks lead
+/// there, which is the tool's outcome. A link resolving to nothing, to a
+/// non-directory, or to itself carries the open's own error. See
+/// `format-reference.md`, "Checkout".
 fn create_dest_dir(
     parent: BorrowedFd<'_>,
     name: &str,
@@ -661,6 +807,9 @@ fn create_dest_dir(
             // error rather than letting the directory open below surface a raw
             // ENOTDIR (or ELOOP for a symlink).
             let st = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if overwrite != OverwriteMode::None && is_symlink(st.st_mode) {
+                return Ok((open_dir_following(parent, name)?, false));
+            }
             if FileType::from_raw_mode(st.st_mode) != FileType::Directory {
                 return Err(Error::Checkout(format!(
                     "{name}: destination entry exists and is not a directory"
@@ -675,6 +824,22 @@ fn create_dest_dir(
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Whether an `st_mode` names a symlink.
+fn is_symlink(mode: u32) -> bool {
+    FileType::from_raw_mode(mode) == FileType::Symlink
+}
+
+/// Open the directory `name` under `parent` resolves to, following a symlink at
+/// the final component.
+fn open_dir_following(parent: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
+    Ok(rustix::fs::openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)
 }
 
 /// Open an existing directory `name` under `parent`, no-follow.

@@ -135,10 +135,19 @@ pub enum Error {
     MergeConflict(String),
     /// A checkout could not proceed: a collision under
     /// [`OverwriteMode::None`](crate::OverwriteMode::None), a
-    /// [`UnionIdentical`](crate::OverwriteMode::UnionIdentical) mismatch, a
-    /// missing subpath, or an unsupported combination of options.
+    /// [`UnionIdentical`](crate::OverwriteMode::UnionIdentical) mismatch, or an
+    /// unsupported combination of options.
     #[error("checkout: {0}")]
     Checkout(String),
+    /// A checkout's [`subpath`](crate::CheckoutOptions::subpath) names no entry
+    /// in the commit tree. The payload is the value as the caller spelled it.
+    #[error("checkout: subpath not found: {}", .0.display())]
+    SubpathNotFound(std::path::PathBuf),
+    /// A checkout's [`subpath`](crate::CheckoutOptions::subpath) runs through an
+    /// entry that is not a directory. The payload is the value as the caller
+    /// spelled it.
+    #[error("checkout: subpath is not a directory: {}", .0.display())]
+    SubpathNotADirectory(std::path::PathBuf),
     /// A tar import or export could not proceed: an entry type ostree cannot
     /// store (a device node or FIFO), a path with a `..` component, a hardlink
     /// with no target in the archive, or a non-UTF-8 xattr name.

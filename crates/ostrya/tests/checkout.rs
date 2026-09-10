@@ -1033,6 +1033,324 @@ fn union_identical_requires_hardlink_mode() {
     });
 }
 
+// --- union-identical: what the option calls identical ---------------------
+
+/// A source tree holding one regular file `f` of `content` at `perm`.
+fn build_one_file(dir: &Path, content: &[u8], perm: u32) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("f"), content).unwrap();
+    set_mode(&dir.join("f"), perm);
+    set_mode(dir, 0o755);
+}
+
+/// The permission bits of the one loose content object a fixture repository
+/// holds.
+fn only_loose_object_perm(repo_dir: &Path) -> u32 {
+    let mut found = Vec::new();
+    for shard in std::fs::read_dir(repo_dir.join("objects")).unwrap() {
+        let shard = shard.unwrap().path();
+        if !shard.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&shard).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("file") {
+                found.push(path);
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "the fixture holds one content object");
+    std::fs::symlink_metadata(&found[0])
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+/// Check `commit` out over `dest` under [`OverwriteMode::UnionIdentical`].
+async fn union_identical_checkout(
+    repo: &Repo,
+    mode: CheckoutMode,
+    base_fd: std::os::fd::BorrowedFd<'_>,
+    dest: &str,
+    commit: &Checksum,
+) -> Result<(), ostrya::Error> {
+    let mut opts = CheckoutOptions::new(mode);
+    opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
+    repo.checkout_at(&mut opts, base_fd, Path::new(dest), commit)
+        .await
+}
+
+/// A destination file the checkout would put there, built by hand so it carries
+/// its own inode, is kept: the file-object checksum computed from it equals the
+/// object's and its permission bits equal the loose object inode's, which is the
+/// rule `format-reference.md`, "Checkout" records.
+#[test]
+fn union_identical_keeps_a_byte_identical_copy() {
+    let tmp = TmpDir::new("co-ui-identical");
+    let base = tmp.path();
+    build_one_file(&base.join("src"), b"payload\n", 0o644);
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, base, "src").await;
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        let dest = base.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("f"), b"payload\n").unwrap();
+        set_mode(&dest.join("f"), 0o644);
+        let before = std::fs::symlink_metadata(dest.join("f")).unwrap().ino();
+
+        union_identical_checkout(&repo, CheckoutMode::None, base_fd.as_fd(), "dest", &commit)
+            .await
+            .expect("a byte-identical destination file is kept");
+        assert_eq!(
+            std::fs::symlink_metadata(dest.join("f")).unwrap().ino(),
+            before,
+            "the kept file is left in place rather than relinked",
+        );
+    });
+}
+
+/// The permission bits are part of the comparison: the same content at another
+/// mode is not what the checkout would put there.
+#[test]
+fn union_identical_refuses_a_differing_mode() {
+    let tmp = TmpDir::new("co-ui-mode");
+    let base = tmp.path();
+    build_one_file(&base.join("src"), b"payload\n", 0o644);
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, base, "src").await;
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        let dest = base.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("f"), b"payload\n").unwrap();
+        set_mode(&dest.join("f"), 0o755);
+
+        let err =
+            union_identical_checkout(&repo, CheckoutMode::None, base_fd.as_fd(), "dest", &commit)
+                .await;
+        assert!(
+            matches!(err, Err(ostrya::Error::Checkout(_))),
+            "a differing mode is a conflict, got {err:?}",
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(dest.join("f"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755,
+            "the colliding entry is left as it was",
+        );
+    });
+}
+
+/// The extended-attribute set is part of the comparison: one attribute the
+/// object does not carry makes the entry differ.
+#[test]
+fn union_identical_refuses_an_extra_xattr() {
+    let tmp = TmpDir::new("co-ui-xattr");
+    let base = tmp.path();
+    build_one_file(&base.join("src"), b"payload\n", 0o644);
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, base, "src").await;
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        let dest = base.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("f"), b"payload\n").unwrap();
+        set_mode(&dest.join("f"), 0o644);
+        let set = rustix::fs::setxattr(
+            dest.join("f"),
+            "user.k",
+            b"v",
+            rustix::fs::XattrFlags::empty(),
+        );
+        if set.is_err() {
+            // The filesystem under the temporary directory carries no user
+            // extended attributes, so the case has nothing to state here.
+            eprintln!("skipped: the temporary filesystem takes no user xattr");
+            return;
+        }
+
+        let err =
+            union_identical_checkout(&repo, CheckoutMode::None, base_fd.as_fd(), "dest", &commit)
+                .await;
+        assert!(
+            matches!(err, Err(ostrya::Error::Checkout(_))),
+            "an extra extended attribute is a conflict, got {err:?}",
+        );
+    });
+}
+
+/// The modification time is outside the comparison: a destination stamped in the
+/// past is still what the checkout would put there.
+#[test]
+fn union_identical_ignores_the_modification_time() {
+    let tmp = TmpDir::new("co-ui-mtime");
+    let base = tmp.path();
+    build_one_file(&base.join("src"), b"payload\n", 0o644);
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, base, "src").await;
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        let dest = base.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("f"), b"payload\n").unwrap();
+        set_mode(&dest.join("f"), 0o644);
+        // 2001-01-01T00:00:00Z.
+        let stamp = rustix::fs::Timespec {
+            tv_sec: 978_307_200,
+            tv_nsec: 0,
+        };
+        rustix::fs::utimensat(
+            rustix::fs::CWD,
+            dest.join("f"),
+            &rustix::fs::Timestamps {
+                last_access: stamp,
+                last_modification: stamp,
+            },
+            rustix::fs::AtFlags::empty(),
+        )
+        .unwrap();
+
+        union_identical_checkout(&repo, CheckoutMode::None, base_fd.as_fd(), "dest", &commit)
+            .await
+            .expect("the modification time is outside the comparison");
+    });
+}
+
+/// A symlink is compared by its target alone.
+#[test]
+fn union_identical_compares_a_symlink_by_target() {
+    let tmp = TmpDir::new("co-ui-symlink");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("hello.txt"), b"hello\n").unwrap();
+    set_mode(&src.join("hello.txt"), 0o644);
+    symlink("hello.txt", src.join("l")).unwrap();
+    set_mode(&src, 0o755);
+
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, base, "src").await;
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        let same = base.join("same");
+        std::fs::create_dir(&same).unwrap();
+        symlink("hello.txt", same.join("l")).unwrap();
+        union_identical_checkout(&repo, CheckoutMode::None, base_fd.as_fd(), "same", &commit)
+            .await
+            .expect("a symlink carrying the committed target is kept");
+
+        let other = base.join("other");
+        std::fs::create_dir(&other).unwrap();
+        symlink("elsewhere", other.join("l")).unwrap();
+        let err =
+            union_identical_checkout(&repo, CheckoutMode::None, base_fd.as_fd(), "other", &commit)
+                .await;
+        assert!(
+            matches!(err, Err(ostrya::Error::Checkout(_))),
+            "a differing target is a conflict, got {err:?}",
+        );
+        assert_eq!(
+            std::fs::read_link(other.join("l")).unwrap(),
+            Path::new("elsewhere"),
+            "the colliding link is left as it was",
+        );
+    });
+}
+
+/// The second conjunct of the identity rule: the destination's permission bits
+/// are compared against the loose object inode's, not against the object's
+/// logical mode. A `bare-user` object whose logical mode carries a bit the inode
+/// rule `(logical_perm & 0o775) | 0o400` drops is identical to no destination at
+/// all, where the same object in `bare` is identical to a destination of its own
+/// mode.
+#[test]
+fn union_identical_refuses_a_mode_the_loose_inode_cannot_carry() {
+    let tmp = TmpDir::new("co-ui-inode-mode");
+    let base = tmp.path();
+    build_one_file(&base.join("src"), b"payload\n", 0o777);
+
+    block_on(async {
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        // `bare-user` stores the object inode at 0775 for a logical 0777, so no
+        // destination mode satisfies both conjuncts.
+        let repo = Repo::create(
+            &base.join("repo-bare-user"),
+            CreateOptions::new(RepoMode::BareUser),
+        )
+        .await
+        .unwrap();
+        let commit = commit_tree(&repo, base, "src").await;
+        assert_eq!(
+            only_loose_object_perm(&base.join("repo-bare-user")),
+            0o775,
+            "the `bare-user` inode rule drops the group- and other-write bits",
+        );
+
+        let dest = base.join("dest-bare-user");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("f"), b"payload\n").unwrap();
+        set_mode(&dest.join("f"), 0o777);
+        let err = union_identical_checkout(
+            &repo,
+            CheckoutMode::User,
+            base_fd.as_fd(),
+            "dest-bare-user",
+            &commit,
+        )
+        .await;
+        assert!(
+            matches!(err, Err(ostrya::Error::Checkout(_))),
+            "a destination at the object's logical mode is refused where the \
+             loose inode cannot carry it, got {err:?}",
+        );
+
+        // `bare` puts the full logical mode on the inode, so the same
+        // destination is identical there.
+        let bare = Repo::create(&base.join("repo-bare"), CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&bare, base, "src").await;
+        let dest = base.join("dest-bare");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::write(dest.join("f"), b"payload\n").unwrap();
+        set_mode(&dest.join("f"), 0o777);
+        union_identical_checkout(
+            &bare,
+            CheckoutMode::None,
+            base_fd.as_fd(),
+            "dest-bare",
+            &commit,
+        )
+        .await
+        .expect("`bare` carries the full logical mode on the inode");
+    });
+}
+
 // --- type conflict -------------------------------------------------------
 
 /// A destination name held by a file when the commit carries a directory of
@@ -1237,7 +1555,16 @@ fn subpath_directory_and_file() {
         let err = repo
             .checkout_at(&mut opts, base_fd.as_fd(), Path::new("missing"), &commit)
             .await;
-        assert!(matches!(err, Err(ostrya::Error::Checkout(_))));
+        assert!(matches!(err, Err(ostrya::Error::SubpathNotFound(_))));
+
+        // A subpath running through an entry that is not a directory carries
+        // the other refusal, which is the split `--allow-noent` acts on.
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.subpath = Some(PathBuf::from("hello.txt/deeper"));
+        let err = repo
+            .checkout_at(&mut opts, base_fd.as_fd(), Path::new("through"), &commit)
+            .await;
+        assert!(matches!(err, Err(ostrya::Error::SubpathNotADirectory(_))));
     });
 }
 

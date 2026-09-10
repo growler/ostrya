@@ -1265,9 +1265,9 @@ stand.
 
 `checkout` accepts `--repo`, `-H/--require-hardlinks`, `-C/--force-copy`,
 `--composefs`, `--composefs-noverity`, and, since Phase 17c, `-U/--user-mode`
-and `--subpath=PATH`. Missing: `--disable-cache`,
-`--union`, `--union-add`, `--union-identical`, `--whiteouts`,
-`--process-passthrough-whiteouts`, `--allow-noent`, `--from-stdin`,
+and `--subpath=PATH`, and, since Phase 17f, `--union`, `--union-add`,
+`--union-identical`, and `--allow-noent`. Missing: `--disable-cache`,
+`--whiteouts`, `--process-passthrough-whiteouts`, `--from-stdin`,
 `--from-file=FILE`, `--fsync=POLICY`, `-M/--bareuseronly-dirs`,
 `--skip-list=FILE`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
 
@@ -1277,21 +1277,48 @@ file, in `archive`, `bare-user`, and `bare` (`../format-reference.md`,
 decides whatever the command-line order: `--composefs`, `--composefs-noverity`,
 and the two orders of the pair each write the tool's image bytes over a
 `bare-user` repository
-(`ostrya_cli::cli::checkout_composefs_switches_match_the_tool`). Three
-divergences stand at the values `--subpath` takes, one at `-H`, and two at the
-composefs switches:
+(`ostrya_cli::cli::checkout_composefs_switches_match_the_tool`).
+
+The three union modes and `--allow-noent` agree with the tool over a
+destination the test pre-populates, in `archive`, `bare-user`, and `bare`
+(`ostrya_cli::cli::checkout_union_modes_match_the_tool`). Two union options on
+one command line are refused as a pair, and `--union-identical` is refused
+without `-H`, both after the repository opens and the revision resolves, which
+is the tool's own order; the port reproduces the tool's four wordings there --
+`Cannot specify both --union and --union-add`, `Cannot specify both --union and
+--union-identical`, `Cannot specify both --union-add and --union-identical`,
+and `--union-identical requires --require-hardlinks`. What `--union-identical`
+calls identical is stated in `../format-reference.md`, "Checkout", and held
+against the tool case by case in
+`ostrya_cli::cli::checkout_union_identical_identity_matches_the_tool`.
+
+Three divergences stand at the values `--subpath` takes, one at `-H`, three at
+the composefs switches, and three at the union family:
 
 - a subpath naming nothing ends the checkout at exit 1 in both, leaving no
   destination, and the words part: the tool reports `error: No such file or
   directory: <path>`, naming the path with a leading slash it adds, and a path
   running through a regular file reports `error: Not a directory`. The port
-  reports its own `error: checkout: subpath not found: <path>` for both;
+  reports its own `error: checkout: subpath not found: <path>` where the value
+  names nothing and `error: checkout: subpath is not a directory: <path>` where
+  it runs through an entry that is not a directory, which is the split
+  `--allow-noent` acts on;
 - `--subpath=.` and a trailing-slash form such as `--subpath=/sub/` are refused
   by the tool, which reads the whole value as a name to look up (`No such file or
-  directory: /.`). The port reads a path, so `.` names the tree root and the
-  trailing slash names the same directory as the form without it. Both accept a
-  leading-slash and a relative spelling of a name that exists, and `/` names the
-  whole tree in both;
+  directory: /.`). A leading `.` component (`/./d`), a doubled slash (`//d` and
+  `/d//g`), and an embedded `.` component (`/d/./g`) are refused the same way,
+  each naming in the message the prefix the tool looked up. The port reads a
+  path, so `.` names the tree root, the trailing slash names the same directory
+  as the form without it, and a `.` component and a doubled slash resolve to the
+  node behind them. Both accept a leading-slash and a relative spelling of a
+  name that exists, and `/` names the whole tree in both. Under `--allow-noent`
+  every one of these spellings reaches exit 0 on both sides, the tool having
+  written nothing and the port having written the tree the value names. An empty
+  `--subpath=` is refused by the port at exit 1 whatever else the command line
+  carries, since `clap` requires a value for the option (`error: a value is
+  required for '--subpath <PATH>' but none was supplied`); the tool refuses it
+  at exit 1 on its own (`No such file or directory: /`) and exits 0 under
+  `--allow-noent`;
 - the tool takes `-H` only where the repository mode can hardlink under the
   checkout mode in force, and refuses it at exit 1 elsewhere. Measured over the
   four modes, `-H` alone is taken by `bare` and `bare-user-only` and refused by
@@ -1307,7 +1334,11 @@ composefs switches:
   `bare` repository out with `-H` on both sides and reads 14 devino-cache hits
   out of each side's own `--table-output` block, against 13 for a `bare-user`
   repository checked out with `-U` and 0 for the two forms that hardlink
-  nothing;
+  nothing. The tool's `-H` gate stands after the destination directory is made,
+  so a refusal leaves an empty destination behind; the port's own refusal of
+  `--union-identical` in a mode that cannot hardlink stands before any
+  destination is made and leaves none
+  (`ostrya_cli::cli::checkout_union_identical_requires_require_hardlinks`);
 - the tool exports a composefs image from any repository mode, and from an
   `archive` repository it writes `trusted.overlay.redirect` values naming
   `.file` loose paths that repository does not hold, whose objects are
@@ -1332,7 +1363,40 @@ composefs switches:
   (`ostrya_cli::cli::checkout_composefs_switches_match_the_tool`), and an
   export that does not finish leaves a destination that already existed as it
   was, byte for byte and at its own mode
-  (`ostrya_cli::cli::checkout_composefs_refuses_an_archive_repository`).
+  (`ostrya_cli::cli::checkout_composefs_refuses_an_archive_repository`);
+- the tool takes `--composefs` alongside `--union` and `--allow-noent` and
+  refuses it alongside `--union-add`, `--union-identical`, or `-H` at exit 1
+  (`error: Specified options are incompatible with --composefs`), writing no
+  image. The port takes a single union option alongside `--composefs` and
+  writes the image, since a composefs export reads the commit tree and takes no
+  destination entry for any of them to decide. Two union options on one line
+  are refused by the port ahead of the export, so the pair the port calls
+  mutually exclusive is refused whatever else the line carries;
+- `--allow-noent` reaches every command line in the port and only some in the
+  tool. The tool honors it when the line holds none of `-H`, `-C`, `-M`,
+  `--union-add`, `--disable-cache`, `--whiteouts`,
+  `--process-passthrough-whiteouts`, and `--skip-list`, and ignores it when the
+  line holds any of them, refusing an absent `--subpath` at exit 1 as though
+  the switch were absent; `-U`, `--union`, `--fsync`, `-v`, and `--from-file`
+  keep it. `--union-identical` needs `-H`, so the switch never reaches it in
+  the tool. Neither side writes anything or creates the destination in either
+  case, so the exit status is the whole of the difference. The port honors the
+  switch uniformly, the split carrying no semantic rule the port could adopt
+  without reinterpreting it
+  (`ostrya_cli::cli::checkout_allow_noent_reach_diverges_from_the_tool`);
+- the switch reaches a second refusal in the tool that it does not reach in the
+  port: a `--subpath` naming a regular file whose loose content object has been
+  deleted out of band. The tool exits 0 and creates no destination, where
+  without the switch it exits 1 (`Opening content object <checksum>: Couldn't
+  find file object '<checksum>'`); the port exits 1 either way (`error: object
+  not found: File <checksum>`) and leaves behind the destination directory it
+  created, empty. The same commit checked out whole keeps the refusal on both
+  sides. Only an out-of-band deletion reaches this pair, so it is recorded and
+  no gate is added: a repository the port writes and prunes holds every object
+  its commits name;
+- a union option given twice is taken by the tool and refused by the port, as
+  the port refuses every repeated boolean flag
+  (`ostrya_cli::cli::checkout_union_options_are_mutually_exclusive`).
 
 `export` accepts `--repo`, `--no-xattrs`, `--subpath=PATH`, `--prefix=PATH`,
 and `-o/--output=PATH`, and nothing is missing.

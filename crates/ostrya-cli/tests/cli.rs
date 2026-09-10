@@ -18866,3 +18866,1195 @@ fn pull_over_http_honours_the_configured_detached_metadata_exclude() {
         "a key it does not name is stored"
     );
 }
+
+// --- checkout: the union family and --allow-noent -------------------------
+
+/// Set `path`'s permission bits.
+fn chmod_to(path: &Path, mode: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Give `path` one extended attribute through `setfattr`, reporting whether it
+/// landed. A host without the tool, or a filesystem that takes no user
+/// attribute, reports false and the caller states nothing about attributes.
+fn set_user_xattr(path: &Path, name: &str, value: &str) -> bool {
+    Command::new("setfattr")
+        .args(["-n", name, "-v", value])
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// `describe_tree` with each regular file's content bytes in place of its
+/// length, for the checkout tests whose claim is what a file holds. The
+/// content is rendered in lowercase hexadecimal, and the trees these tests
+/// build hold small files.
+///
+/// The link count and the extended attributes are deliberately outside the
+/// comparison. The tool hardlinks an `archive` object out of an
+/// `uncompressed-objects-cache/` it maintains outside the on-disk format and
+/// the port copies, so the two agree on every byte of the destination and part
+/// on `st_nlink` alone (`docs/format-reference.md`, "Checkout"); and a
+/// `bare-user` object hardlinked under `-U` carries `user.ostreemeta` in both,
+/// which no `-U` checkout applies itself.
+///
+/// A root that does not exist renders one line saying so, so a case whose
+/// claim is that neither implementation created the destination compares.
+fn describe_tree_with_content(root: &Path) -> Vec<String> {
+    use std::fmt::Write as _;
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(out, "{byte:02x}").unwrap();
+        }
+        out
+    }
+
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = format!("{prefix}{name}");
+            let meta = entry.path().symlink_metadata().unwrap();
+            let ty = meta.file_type();
+            let perm = meta.permissions().mode() & 0o7777;
+            if ty.is_symlink() {
+                let target = std::fs::read_link(entry.path()).unwrap();
+                out.push(format!("{rel} symlink -> {}", target.display()));
+            } else if ty.is_dir() {
+                out.push(format!("{rel} dir {perm:o}"));
+                walk(&entry.path(), &format!("{rel}/"), out);
+            } else {
+                assert!(
+                    meta.len() <= 4096,
+                    "{rel} is {} bytes; this walker renders content in full",
+                    meta.len(),
+                );
+                let content = std::fs::read(entry.path()).unwrap();
+                out.push(format!("{rel} file {perm:o} {}", hex(&content)));
+            }
+        }
+    }
+
+    if !root.exists() {
+        return vec!["<no destination>".to_owned()];
+    }
+    let mut out = Vec::new();
+    walk(root, "", &mut out);
+    out
+}
+
+/// The tree the union-family tests check out: a regular file `f`, a symlink `l`
+/// naming it, a directory `d` holding one file, and a directory `xd` at mode
+/// 0750 carrying one `user.*` extended attribute where the host takes one.
+fn build_union_tree(dir: &Path) {
+    std::fs::create_dir_all(dir.join("d")).unwrap();
+    std::fs::create_dir_all(dir.join("xd")).unwrap();
+    std::fs::write(dir.join("f"), b"f-content\n").unwrap();
+    chmod_to(&dir.join("f"), 0o644);
+    std::os::unix::fs::symlink("f", dir.join("l")).unwrap();
+    std::fs::write(dir.join("d/inner.txt"), b"inner\n").unwrap();
+    chmod_to(&dir.join("d/inner.txt"), 0o644);
+    chmod_to(&dir.join("d"), 0o755);
+    set_user_xattr(&dir.join("xd"), "user.dirattr", "v");
+    chmod_to(&dir.join("xd"), 0o750);
+    chmod_to(dir, 0o755);
+}
+
+/// A repository of `mode` under `base/name` holding one commit of `tree`, and
+/// that commit's checksum. The timestamp is fixed so both implementations read
+/// one checksum.
+fn union_repo(base: &Path, mode: RepoMode, name: &str, tree: &Path) -> (PathBuf, String) {
+    let repo = base.join(name);
+    block_on(async {
+        Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+    });
+    let run = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    );
+    let rev = run.ok().stdout_trimmed();
+    (repo, rev)
+}
+
+/// Run `checkout` with the same options in both implementations, over one
+/// repository, into a destination of each one's own.
+fn checkout_pair(
+    repo: &Path,
+    options: &[&str],
+    rev: &str,
+    port_dest: &Path,
+    tool_dest: &Path,
+) -> (Run, Run) {
+    let repo_arg = format!("--repo={}", repo.display());
+    let port_path = port_dest.display().to_string();
+    let tool_path = tool_dest.display().to_string();
+
+    let mut port_args = vec!["checkout", repo_arg.as_str()];
+    port_args.extend(options.iter().copied());
+    port_args.push(rev);
+    port_args.push(port_path.as_str());
+    let port = ostrya(&port_args, None, &[]);
+
+    let mut tool_args = vec!["checkout", repo_arg.as_str()];
+    tool_args.extend(options.iter().copied());
+    tool_args.push(rev);
+    tool_args.push(tool_path.as_str());
+    let tool = ostree(&tool_args);
+
+    (port, tool)
+}
+
+/// Assert two checkout runs reached the same exit status and left the same
+/// destination tree.
+fn assert_checkout_pair(port: &Run, tool: &Run, port_dest: &Path, tool_dest: &Path, label: &str) {
+    assert_eq!(
+        port.status.code(),
+        tool.status.code(),
+        "{label}: the exit statuses part\nport: {}\ntool: {}",
+        String::from_utf8_lossy(&port.stderr),
+        String::from_utf8_lossy(&tool.stderr),
+    );
+    assert_eq!(
+        describe_tree_with_content(port_dest),
+        describe_tree_with_content(tool_dest),
+        "{label}: the destinations part",
+    );
+}
+
+/// The destination pre-states the union modes are run over. A `None` builder
+/// leaves the destination absent.
+type UnionPrestate = (&'static str, Option<fn(&Path)>);
+
+/// One named destination the caller builds before a checkout runs over it.
+type DestBuilder = (&'static str, fn(&Path));
+
+/// The twelve destination pre-states of the union sweep.
+const UNION_PRESTATES: &[UnionPrestate] = &[
+    ("absent", None),
+    (
+        "empty",
+        Some(|dest| {
+            std::fs::create_dir_all(dest).unwrap();
+        }),
+    ),
+    (
+        "same-file-at-f",
+        Some(|dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("f"), b"f-content\n").unwrap();
+            chmod_to(&dest.join("f"), 0o644);
+        }),
+    ),
+    (
+        "other-file-at-f",
+        Some(|dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("f"), b"g-content\n").unwrap();
+            chmod_to(&dest.join("f"), 0o644);
+        }),
+    ),
+    (
+        "same-file-at-f-other-mode",
+        Some(|dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("f"), b"f-content\n").unwrap();
+            chmod_to(&dest.join("f"), 0o755);
+        }),
+    ),
+    (
+        "dir-at-f",
+        Some(|dest| {
+            std::fs::create_dir_all(dest.join("f")).unwrap();
+            std::fs::write(dest.join("f/pre.txt"), b"pre\n").unwrap();
+        }),
+    ),
+    (
+        "same-symlink-at-f",
+        Some(|dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::os::unix::fs::symlink("f", dest.join("f")).unwrap();
+        }),
+    ),
+    (
+        "other-symlink-at-f",
+        Some(|dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::os::unix::fs::symlink("elsewhere", dest.join("f")).unwrap();
+        }),
+    ),
+    (
+        "dir-at-d-with-extra",
+        Some(|dest| {
+            std::fs::create_dir_all(dest.join("d")).unwrap();
+            std::fs::write(dest.join("d/pre.txt"), b"pre\n").unwrap();
+        }),
+    ),
+    (
+        "dir-at-d-0700",
+        Some(|dest| {
+            std::fs::create_dir_all(dest.join("d")).unwrap();
+            chmod_to(&dest.join("d"), 0o700);
+        }),
+    ),
+    (
+        "dir-at-xd-0700",
+        Some(|dest| {
+            std::fs::create_dir_all(dest.join("xd")).unwrap();
+            chmod_to(&dest.join("xd"), 0o700);
+        }),
+    ),
+    (
+        "unrelated-entries",
+        Some(|dest| {
+            std::fs::create_dir_all(dest.join("extradir")).unwrap();
+            std::fs::write(dest.join("extra.txt"), b"extra\n").unwrap();
+            std::fs::write(dest.join("extradir/x"), b"x\n").unwrap();
+        }),
+    ),
+];
+
+/// The three union modes over a destination the test pre-populates, in
+/// `archive`, `bare-user`, and `bare`.
+///
+/// Carries `checkout/union-over-a-populated-destination`,
+/// `checkout/union-add-over-a-populated-destination`,
+/// `checkout/union-identical-over-a-populated-destination`, and
+/// `checkout/union-identical-directories-are-reused`.
+///
+/// `--union-identical` needs a hardlinking checkout, so it runs `-U -H` in
+/// `bare-user` and `-H` in `bare`, and it is left out of `archive`, where
+/// `checkout/union-identical-in-archive` states the refusal instead.
+#[test]
+fn checkout_union_modes_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-union-modes");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_union_tree(&tree);
+
+    for (mode_name, mode) in [
+        ("archive", RepoMode::Archive),
+        ("bare-user", RepoMode::BareUser),
+        ("bare", RepoMode::Bare),
+    ] {
+        let (repo, rev) = union_repo(base, mode, &format!("repo-{mode_name}"), &tree);
+
+        let mut arms: Vec<(&str, Vec<&str>)> = vec![
+            ("union", vec!["-U", "--union"]),
+            ("union-add", vec!["-U", "--union-add"]),
+        ];
+        match mode {
+            RepoMode::BareUser => {
+                arms.push(("union-identical", vec!["-U", "-H", "--union-identical"]));
+            }
+            RepoMode::Bare => arms.push(("union-identical", vec!["-H", "--union-identical"])),
+            _ => {}
+        }
+
+        for (arm, options) in &arms {
+            for (state, build) in UNION_PRESTATES {
+                let label = format!("{mode_name}/{arm}/{state}");
+                let port_dest = base.join(format!("port-{mode_name}-{arm}-{state}"));
+                let tool_dest = base.join(format!("tool-{mode_name}-{arm}-{state}"));
+                if let Some(build) = build {
+                    build(&port_dest);
+                    build(&tool_dest);
+                }
+                let (port, tool) = checkout_pair(&repo, options, &rev, &port_dest, &tool_dest);
+                assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+            }
+        }
+
+        // The directory claim: a pre-existing directory keeps its own mode and
+        // a fresh one takes the commit's dirmeta.
+        let reused = base.join(format!("port-{mode_name}-union-dir-at-xd-0700"));
+        assert_eq!(
+            std::fs::symlink_metadata(reused.join("xd"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700,
+            "{mode_name}: a reused directory keeps its own mode",
+        );
+        let fresh = base.join(format!("port-{mode_name}-union-empty"));
+        assert_eq!(
+            std::fs::symlink_metadata(fresh.join("xd"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o750,
+            "{mode_name}: a fresh directory takes the commit's dirmeta mode",
+        );
+    }
+}
+
+/// The three union options are mutually exclusive, and `--union-identical`
+/// needs `-H`.
+///
+/// Carries `checkout/union-add-with-union-identical` and the ordering claim
+/// behind the other two pair cells, and the divergence
+/// `checkout/union-given-twice` records.
+#[test]
+fn checkout_union_options_are_mutually_exclusive() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-union-exclusive");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_union_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::Bare, "repo", &tree);
+
+    let pairs: [(&str, [&str; 2]); 3] = [
+        (
+            "Cannot specify both --union and --union-add",
+            ["--union", "--union-add"],
+        ),
+        (
+            "Cannot specify both --union and --union-identical",
+            ["--union", "--union-identical"],
+        ),
+        (
+            "Cannot specify both --union-add and --union-identical",
+            ["--union-add", "--union-identical"],
+        ),
+    ];
+
+    let mut case = 0;
+    for (message, [first, second]) in pairs {
+        for options in [vec![first, second], vec![second, first]] {
+            case += 1;
+            let port_dest = base.join(format!("port-pair-{case}"));
+            let tool_dest = base.join(format!("tool-pair-{case}"));
+            let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+            for (who, run) in [("port", &port), ("tool", &tool)] {
+                assert_eq!(run.status.code(), Some(1), "the {who} accepted {options:?}",);
+                assert!(
+                    String::from_utf8_lossy(&run.stderr).contains(message),
+                    "the {who} did not name the pair for {options:?}: {}",
+                    String::from_utf8_lossy(&run.stderr),
+                );
+            }
+            assert!(!port_dest.exists(), "the port created a destination");
+            assert!(!tool_dest.exists(), "the tool created a destination");
+        }
+    }
+
+    // All three together report the first pair, which fixes the check order.
+    let all = ["--union", "--union-add", "--union-identical"];
+    let port_dest = base.join("port-all-three");
+    let tool_dest = base.join("tool-all-three");
+    let (port, tool) = checkout_pair(&repo, &all, &rev, &port_dest, &tool_dest);
+    for (who, run) in [("port", &port), ("tool", &tool)] {
+        assert_eq!(run.status.code(), Some(1), "the {who} accepted all three");
+        assert!(
+            String::from_utf8_lossy(&run.stderr)
+                .contains("Cannot specify both --union and --union-add"),
+            "the {who} did not report the first pair: {}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+    }
+    assert!(!port_dest.exists() && !tool_dest.exists());
+
+    // A repeated boolean flag: the tool takes a second occurrence and checks
+    // out, and the port refuses it as it refuses every repeated boolean flag
+    // (`docs/conformance/cli-surface.md`, "P2").
+    for (index, option) in [
+        "--union",
+        "--union-add",
+        "--union-identical",
+        "--allow-noent",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let port_dest = base.join(format!("port-twice-{index}"));
+        let tool_dest = base.join(format!("tool-twice-{index}"));
+        let options = if option == "--union-identical" {
+            vec!["-H", option, option]
+        } else {
+            vec![option, option]
+        };
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_eq!(
+            port.status.code(),
+            Some(1),
+            "the port took `{option}` twice: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert!(
+            !port_dest.exists(),
+            "the port created a destination for `{option}` twice",
+        );
+        assert_eq!(
+            tool.status.code(),
+            Some(0),
+            "the tool refused `{option}` twice: {}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
+    }
+}
+
+/// The `-H` requirement `--union-identical` carries, over every repository
+/// mode, with and without `-U`, and with `-C`.
+///
+/// Carries `checkout/union-identical-without-require-hardlinks` and
+/// `checkout/union-identical-in-archive`.
+#[test]
+fn checkout_union_identical_requires_require_hardlinks() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-union-identical-gate");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_union_tree(&tree);
+
+    for (mode_name, mode) in [
+        ("archive", RepoMode::Archive),
+        ("bare-user", RepoMode::BareUser),
+        ("bare", RepoMode::Bare),
+        ("bare-user-only", RepoMode::BareUserOnly),
+    ] {
+        let (repo, rev) = union_repo(base, mode, &format!("repo-{mode_name}"), &tree);
+
+        for user_mode in [false, true] {
+            for switches in [vec![], vec!["-H"], vec!["-C"], vec!["-H", "-C"]] {
+                let mut options = vec!["--union-identical"];
+                if user_mode {
+                    options.push("-U");
+                }
+                options.extend(switches.iter().copied());
+                let label = format!("{mode_name}/{options:?}");
+                let tag = format!(
+                    "{mode_name}-{}-{}",
+                    u8::from(user_mode),
+                    switches.join("").replace('-', "")
+                );
+                let port_dest = base.join(format!("port-gate-{tag}"));
+                let tool_dest = base.join(format!("tool-gate-{tag}"));
+                let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+                assert_eq!(
+                    port.status.code(),
+                    tool.status.code(),
+                    "{label}: the exit statuses part\nport: {}\ntool: {}",
+                    String::from_utf8_lossy(&port.stderr),
+                    String::from_utf8_lossy(&tool.stderr),
+                );
+                if port.status.code() != Some(0) {
+                    assert!(
+                        !port_dest.exists(),
+                        "{label}: the port's refusal created a destination",
+                    );
+                    // The tool's own `-H` gate stands after the destination
+                    // directory is made, so an `archive` or `bare` repository
+                    // that cannot hardlink leaves an empty destination behind
+                    // where the port leaves none. `-H` semantics are `F14`'s,
+                    // and `cli-surface.md`, "checkout" records the difference;
+                    // what both refusals hold in common is that neither writes
+                    // an entry.
+                    let listing = describe_tree_with_content(&tool_dest);
+                    assert!(
+                        listing.is_empty() || listing == ["<no destination>"],
+                        "{label}: the tool's refusal wrote an entry: {listing:?}",
+                    );
+                }
+            }
+        }
+
+        // A refusal leaves a destination that already existed as it was.
+        let port_dest = base.join(format!("port-gate-existing-{mode_name}"));
+        let tool_dest = base.join(format!("tool-gate-existing-{mode_name}"));
+        for dest in [&port_dest, &tool_dest] {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("keep.txt"), b"keep\n").unwrap();
+            chmod_to(dest, 0o700);
+        }
+        let (port, tool) =
+            checkout_pair(&repo, &["--union-identical"], &rev, &port_dest, &tool_dest);
+        assert_eq!(port.status.code(), Some(1), "{mode_name}: the port took it");
+        assert_eq!(tool.status.code(), Some(1), "{mode_name}: the tool took it");
+        assert_checkout_pair(
+            &port,
+            &tool,
+            &port_dest,
+            &tool_dest,
+            &format!("{mode_name}/existing-destination"),
+        );
+        assert_eq!(
+            describe_tree_with_content(&port_dest),
+            vec!["keep.txt file 644 6b6565700a".to_owned()],
+            "{mode_name}: the refusal left the destination as it was",
+        );
+    }
+}
+
+/// `--allow-noent` against the tool: what it suppresses, and what it does not.
+///
+/// Carries `checkout/allow-noent-leaves-the-destination-alone`.
+#[test]
+fn checkout_allow_noent_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-allow-noent");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_union_tree(&tree);
+
+    for (mode_name, mode) in [
+        ("bare", RepoMode::Bare),
+        ("archive", RepoMode::Archive),
+        ("bare-user", RepoMode::BareUser),
+    ] {
+        let (repo, rev) = union_repo(base, mode, &format!("repo-{mode_name}"), &tree);
+
+        // An absent subpath with the switch: exit 0 in both, no destination.
+        for (case, subpath) in [("shallow", "/nope"), ("deep", "/d/nope")] {
+            let port_dest = base.join(format!("port-{mode_name}-{case}"));
+            let tool_dest = base.join(format!("tool-{mode_name}-{case}"));
+            let (port, tool) = checkout_pair(
+                &repo,
+                &["-U", "--allow-noent", &format!("--subpath={subpath}")],
+                &rev,
+                &port_dest,
+                &tool_dest,
+            );
+            assert_eq!(port.status.code(), Some(0), "the port refused {subpath}");
+            assert_eq!(tool.status.code(), Some(0), "the tool refused {subpath}");
+            assert_checkout_pair(
+                &port,
+                &tool,
+                &port_dest,
+                &tool_dest,
+                &format!("{mode_name}/allow-noent-{case}"),
+            );
+            assert!(!port_dest.exists(), "the port created a destination");
+            assert!(!tool_dest.exists(), "the tool created a destination");
+        }
+
+        // The switch over a destination that already exists leaves it alone.
+        let port_dest = base.join(format!("port-{mode_name}-existing"));
+        let tool_dest = base.join(format!("tool-{mode_name}-existing"));
+        for dest in [&port_dest, &tool_dest] {
+            std::fs::create_dir_all(dest.join("sub")).unwrap();
+            std::fs::write(dest.join("kept.txt"), b"kept\n").unwrap();
+            std::fs::write(dest.join("sub/deep.txt"), b"deep\n").unwrap();
+            chmod_to(dest, 0o700);
+        }
+        let before = describe_tree_with_content(&port_dest);
+        let (port, tool) = checkout_pair(
+            &repo,
+            &["-U", "--allow-noent", "--subpath=/nope"],
+            &rev,
+            &port_dest,
+            &tool_dest,
+        );
+        assert_eq!(port.status.code(), Some(0));
+        assert_eq!(tool.status.code(), Some(0));
+        assert_eq!(
+            describe_tree_with_content(&port_dest),
+            before,
+            "{mode_name}: the port changed the destination",
+        );
+        assert_eq!(
+            describe_tree_with_content(&tool_dest),
+            before,
+            "{mode_name}: the tool changed the destination",
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&port_dest)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700,
+            "{mode_name}: the destination keeps its own mode",
+        );
+
+        // The refusals the switch does not reach, and the ordinary checkout it
+        // leaves alone.
+        let cases: [(&str, Vec<&str>, Option<i32>); 4] = [
+            ("no-switch", vec!["-U", "--subpath=/nope"], Some(1)),
+            (
+                "through-a-file",
+                vec!["-U", "--allow-noent", "--subpath=/f/nope"],
+                Some(1),
+            ),
+            ("absent-commit", vec!["-U", "--allow-noent"], Some(1)),
+            (
+                "subpath-that-resolves",
+                vec!["-U", "--allow-noent", "--subpath=/d"],
+                Some(0),
+            ),
+        ];
+        for (case, options, expected) in cases {
+            let port_dest = base.join(format!("port-{mode_name}-{case}"));
+            let tool_dest = base.join(format!("tool-{mode_name}-{case}"));
+            let revision = if case == "absent-commit" {
+                "no-such-ref"
+            } else {
+                rev.as_str()
+            };
+            let (port, tool) = checkout_pair(&repo, &options, revision, &port_dest, &tool_dest);
+            assert_eq!(
+                port.status.code(),
+                expected,
+                "{mode_name}/{case}: the port's status\n{}",
+                String::from_utf8_lossy(&port.stderr),
+            );
+            assert_checkout_pair(
+                &port,
+                &tool,
+                &port_dest,
+                &tool_dest,
+                &format!("{mode_name}/{case}"),
+            );
+        }
+    }
+}
+
+/// The reach of `--allow-noent`, which is the one divergence the switch
+/// carries: the tool honors it on some command lines and the port on every
+/// one, and neither side writes anything either way.
+///
+/// Carries `checkout/allow-noent-under-require-hardlinks`.
+#[test]
+fn checkout_allow_noent_reach_diverges_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-allow-noent-reach");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_union_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::Bare, "repo", &tree);
+
+    // The tool's own table, measured. `-M/--bareuseronly-dirs`,
+    // `--disable-cache`, `--whiteouts`, `--process-passthrough-whiteouts`, and
+    // `--skip-list` also make the tool drop the switch, and they are outside
+    // the port's `checkout` surface today, so they join this table with the
+    // items that add them.
+    let arms: [(&str, &[&str], i32); 7] = [
+        ("bare", &[], 0),
+        ("require-hardlinks", &["-H"], 1),
+        ("force-copy", &["-C"], 1),
+        ("union-add", &["--union-add"], 1),
+        ("user-mode", &["-U"], 0),
+        ("union", &["--union"], 0),
+        ("verbose", &["-v"], 0),
+    ];
+
+    for (case, switches, tool_status) in arms {
+        let port_dest = base.join(format!("port-{case}"));
+        let tool_dest = base.join(format!("tool-{case}"));
+        let mut options = vec!["--allow-noent", "--subpath=/nope"];
+        options.extend(switches.iter().copied());
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_eq!(
+            tool.status.code(),
+            Some(tool_status),
+            "{case}: the tool's status moved: {}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
+        assert_eq!(
+            port.status.code(),
+            Some(0),
+            "{case}: the port honors the switch on every command line: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert!(
+            !port_dest.exists(),
+            "{case}: the port created a destination"
+        );
+        assert!(
+            !tool_dest.exists(),
+            "{case}: the tool created a destination"
+        );
+    }
+
+    // Neither side touches a destination that already exists, whichever status
+    // it reaches. That is the fact the divergence's `loss:` field points at.
+    for (case, switches) in [("keeps", ["-U"]), ("loses", ["-H"])] {
+        let port_dest = base.join(format!("port-existing-{case}"));
+        let tool_dest = base.join(format!("tool-existing-{case}"));
+        for dest in [&port_dest, &tool_dest] {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("kept.txt"), b"kept\n").unwrap();
+        }
+        let mut options = vec!["--allow-noent", "--subpath=/nope"];
+        options.extend(switches.iter().copied());
+        let (_port, _tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        for (who, dest) in [("port", &port_dest), ("tool", &tool_dest)] {
+            assert_eq!(
+                describe_tree_with_content(dest),
+                vec!["kept.txt file 644 6b6570740a".to_owned()],
+                "{case}: the {who} changed the destination",
+            );
+        }
+    }
+}
+
+/// The type conflicts no union mode resolves, the write order a refusal makes
+/// visible, and the symlink a union mode follows at a directory name inside the
+/// tree.
+///
+/// Carries `checkout/union-type-conflicts`.
+#[test]
+fn checkout_union_type_conflicts_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-union-conflicts");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_union_tree(&tree);
+
+    let conflicts: [DestBuilder; 5] = [
+        ("dir-at-f", |dest| {
+            std::fs::create_dir_all(dest.join("f")).unwrap();
+        }),
+        // A symlink to a directory at a directory name inside the tree is
+        // followed, and the subtree lands in the link's target. The
+        // `symlink-at-d` case below is the dangling form of the same shape,
+        // where following the link is what raises the error.
+        ("symlink-to-dir-at-d", |dest| {
+            std::fs::create_dir_all(dest.join("real")).unwrap();
+            std::os::unix::fs::symlink("real", dest.join("d")).unwrap();
+        }),
+        ("dir-at-l", |dest| {
+            std::fs::create_dir_all(dest.join("l")).unwrap();
+        }),
+        ("file-at-d", |dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("d"), b"i am a file\n").unwrap();
+        }),
+        ("symlink-at-d", |dest| {
+            std::fs::create_dir_all(dest).unwrap();
+            std::os::unix::fs::symlink("elsewhere", dest.join("d")).unwrap();
+        }),
+    ];
+
+    for (mode_name, mode) in [("bare", RepoMode::Bare), ("bare-user", RepoMode::BareUser)] {
+        let (repo, rev) = union_repo(base, mode, &format!("repo-{mode_name}"), &tree);
+        let identical: Vec<&str> = if mode == RepoMode::Bare {
+            vec!["-H", "--union-identical"]
+        } else {
+            vec!["-U", "-H", "--union-identical"]
+        };
+        let arms: [(&str, Vec<&str>); 3] = [
+            ("union", vec!["-U", "--union"]),
+            ("union-add", vec!["-U", "--union-add"]),
+            ("union-identical", identical),
+        ];
+
+        for (arm, options) in &arms {
+            for (case, build) in conflicts {
+                let label = format!("{mode_name}/{arm}/{case}");
+                let port_dest = base.join(format!("port-{mode_name}-{arm}-{case}"));
+                let tool_dest = base.join(format!("tool-{mode_name}-{arm}-{case}"));
+                build(&port_dest);
+                build(&tool_dest);
+                let (port, tool) = checkout_pair(&repo, options, &rev, &port_dest, &tool_dest);
+                assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+            }
+        }
+    }
+}
+
+/// The destination forms the three union modes take, against the tool.
+///
+/// Carries `checkout/union-creates-or-reuses-the-destination`.
+#[test]
+fn checkout_union_destination_forms_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-union-destinations");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_union_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::Bare, "repo", &tree);
+
+    for (arm, options) in [
+        ("union", vec!["-U", "--union"]),
+        ("union-add", vec!["-U", "--union-add"]),
+        ("union-identical", vec!["-H", "--union-identical"]),
+    ] {
+        // Absent: both create it at the tree root's dirmeta mode.
+        let port_dest = base.join(format!("port-{arm}-fresh"));
+        let tool_dest = base.join(format!("tool-{arm}-fresh"));
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_checkout_pair(
+            &port,
+            &tool,
+            &port_dest,
+            &tool_dest,
+            &format!("{arm}/fresh"),
+        );
+        assert_eq!(port.status.code(), Some(0));
+        assert_eq!(
+            std::fs::symlink_metadata(&port_dest)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            std::fs::symlink_metadata(&tool_dest)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            "{arm}: the created destination's own mode parts",
+        );
+
+        // Pre-created at 0700: both keep 0700.
+        let port_dest = base.join(format!("port-{arm}-0700"));
+        let tool_dest = base.join(format!("tool-{arm}-0700"));
+        for dest in [&port_dest, &tool_dest] {
+            std::fs::create_dir_all(dest).unwrap();
+            chmod_to(dest, 0o700);
+        }
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &format!("{arm}/0700"));
+        for (who, dest) in [("port", &port_dest), ("tool", &tool_dest)] {
+            assert_eq!(
+                std::fs::symlink_metadata(dest)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o700,
+                "{arm}: the {who} restamped an existing destination",
+            );
+        }
+
+        // A parent that does not exist: both refuse, nothing created.
+        let port_dest = base.join(format!("port-{arm}-nodir/dest"));
+        let tool_dest = base.join(format!("tool-{arm}-nodir/dest"));
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_eq!(port.status.code(), Some(1), "{arm}: the port took it");
+        assert_eq!(tool.status.code(), Some(1), "{arm}: the tool took it");
+        assert!(!port_dest.exists() && !tool_dest.exists());
+
+        // A destination that is a regular file: both refuse, the file untouched.
+        let port_dest = base.join(format!("port-{arm}-file"));
+        let tool_dest = base.join(format!("tool-{arm}-file"));
+        for dest in [&port_dest, &tool_dest] {
+            std::fs::write(dest, b"not a directory\n").unwrap();
+        }
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_eq!(port.status.code(), Some(1), "{arm}: the port took a file");
+        assert_eq!(tool.status.code(), Some(1), "{arm}: the tool took a file");
+        for (who, dest) in [("port", &port_dest), ("tool", &tool_dest)] {
+            assert_eq!(
+                std::fs::read(dest).unwrap(),
+                b"not a directory\n",
+                "{arm}: the {who} changed the file",
+            );
+        }
+
+        // A destination that is a symlink to a directory is followed.
+        let port_dest = base.join(format!("port-{arm}-link"));
+        let tool_dest = base.join(format!("tool-{arm}-link"));
+        for (dest, target) in [
+            (&port_dest, base.join(format!("port-{arm}-target"))),
+            (&tool_dest, base.join(format!("tool-{arm}-target"))),
+        ] {
+            std::fs::create_dir_all(&target).unwrap();
+            std::os::unix::fs::symlink(&target, dest).unwrap();
+        }
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_eq!(
+            port.status.code(),
+            Some(0),
+            "{arm}: the port refused a link: {}",
+            String::from_utf8_lossy(&port.stderr)
+        );
+        assert_eq!(
+            tool.status.code(),
+            Some(0),
+            "{arm}: the tool refused a link: {}",
+            String::from_utf8_lossy(&tool.stderr)
+        );
+        assert!(
+            std::fs::symlink_metadata(&port_dest)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "{arm}: the port replaced the link",
+        );
+        assert_eq!(
+            describe_tree_with_content(&base.join(format!("port-{arm}-target"))),
+            describe_tree_with_content(&base.join(format!("tool-{arm}-target"))),
+            "{arm}: the two link targets part",
+        );
+    }
+
+    // The plain-checkout contrast: an existing destination is refused.
+    let port_dest = base.join("port-plain");
+    let tool_dest = base.join("tool-plain");
+    for dest in [&port_dest, &tool_dest] {
+        std::fs::create_dir_all(dest).unwrap();
+    }
+    let (port, tool) = checkout_pair(&repo, &["-U"], &rev, &port_dest, &tool_dest);
+    assert_eq!(
+        port.status.code(),
+        Some(1),
+        "the port took an existing destination"
+    );
+    assert_eq!(
+        tool.status.code(),
+        Some(1),
+        "the tool took an existing destination"
+    );
+}
+
+/// What `--union-identical` calls identical, held against the tool case by
+/// case over destinations the test builds by hand.
+///
+/// Carries `checkout/union-identical-identity-rule`.
+///
+/// One arm of the rule is out of reach without privilege: an object in a `bare`
+/// repository whose uid or gid differs from the invoking user's, which a `bare`
+/// commit cannot record unprivileged. The ownership clause is stated through
+/// `bare-user`, which records the ids in the metadata attribute, and through
+/// `bare-user-only`, which discards them.
+#[test]
+fn checkout_union_identical_identity_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-identity");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("f"), b"payload\n").unwrap();
+    chmod_to(&tree.join("f"), 0o644);
+    std::os::unix::fs::symlink("f", tree.join("l")).unwrap();
+    chmod_to(&tree, 0o755);
+
+    // Whether the host takes a user extended attribute at all, which the
+    // attribute case needs.
+    std::fs::write(base.join("probe"), b"").unwrap();
+    let xattrs_work = set_user_xattr(&base.join("probe"), "user.probe", "v");
+    if !xattrs_work {
+        eprintln!("skipped one case: the host takes no user extended attribute");
+    }
+
+    let arms: [(&str, RepoMode, &[&str]); 3] = [
+        ("bare", RepoMode::Bare, &["-H"]),
+        ("bare-user", RepoMode::BareUser, &["-U", "-H"]),
+        ("bare-user-only", RepoMode::BareUserOnly, &["-H"]),
+    ];
+
+    for (arm, mode, switches) in arms {
+        let (repo, rev) = union_repo(base, mode, &format!("repo-{arm}"), &tree);
+        let mut options = switches.to_vec();
+        options.push("--union-identical");
+
+        let mut cases: Vec<DestBuilder> = vec![
+            ("identical", |dest| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::write(dest.join("f"), b"payload\n").unwrap();
+                chmod_to(&dest.join("f"), 0o644);
+            }),
+            ("other-bytes", |dest| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::write(dest.join("f"), b"payloaD\n").unwrap();
+                chmod_to(&dest.join("f"), 0o644);
+            }),
+            ("other-mode", |dest| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::write(dest.join("f"), b"payload\n").unwrap();
+                chmod_to(&dest.join("f"), 0o600);
+            }),
+            ("old-mtime", |dest| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::write(dest.join("f"), b"payload\n").unwrap();
+                chmod_to(&dest.join("f"), 0o644);
+                let touched = Command::new("touch")
+                    .args(["-d", "2001-01-01T00:00:00Z"])
+                    .arg(dest.join("f"))
+                    .status()
+                    .unwrap();
+                assert!(touched.success(), "touch could not stamp the destination");
+            }),
+            ("hardlinked", |dest| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::write(dest.join("twin"), b"payload\n").unwrap();
+                chmod_to(&dest.join("twin"), 0o644);
+                std::fs::hard_link(dest.join("twin"), dest.join("f")).unwrap();
+            }),
+            ("same-symlink", |dest| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::os::unix::fs::symlink("f", dest.join("l")).unwrap();
+            }),
+            ("other-symlink", |dest| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::os::unix::fs::symlink("elsewhere", dest.join("l")).unwrap();
+            }),
+        ];
+        if xattrs_work {
+            cases.push(("extra-xattr", |dest| {
+                std::fs::create_dir_all(dest).unwrap();
+                std::fs::write(dest.join("f"), b"payload\n").unwrap();
+                chmod_to(&dest.join("f"), 0o644);
+                set_user_xattr(&dest.join("f"), "user.k", "v");
+            }));
+        }
+
+        for (case, build) in &cases {
+            let label = format!("{arm}/{case}");
+            let port_dest = base.join(format!("port-{arm}-{case}"));
+            let tool_dest = base.join(format!("tool-{arm}-{case}"));
+            build(&port_dest);
+            build(&tool_dest);
+            let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+            assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+        }
+
+        // A destination an earlier hardlinking checkout of the same commit
+        // produced is already the loose object's inode, which the rule
+        // short-circuits on. Each implementation runs over a destination of its
+        // own making.
+        let port_dest = base.join(format!("port-{arm}-relinked"));
+        let tool_dest = base.join(format!("tool-{arm}-relinked"));
+        let (port, tool) = checkout_pair(&repo, switches, &rev, &port_dest, &tool_dest);
+        assert_eq!(
+            port.status.code(),
+            Some(0),
+            "{arm}: the port's first checkout"
+        );
+        assert_eq!(
+            tool.status.code(),
+            Some(0),
+            "{arm}: the tool's first checkout"
+        );
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_eq!(
+            port.status.code(),
+            Some(0),
+            "{arm}: the port refused its own hardlinked checkout: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert_checkout_pair(
+            &port,
+            &tool,
+            &port_dest,
+            &tool_dest,
+            &format!("{arm}/relinked"),
+        );
+    }
+
+    // The ownership clause. A `bare-user` object records the committed ids and
+    // a `bare-user-only` object discards them, so one destination owned by the
+    // invoking user is refused in the first and kept in the second.
+    let owned_tree = base.join("owned-tree");
+    std::fs::create_dir_all(&owned_tree).unwrap();
+    std::fs::write(owned_tree.join("f"), b"payload\n").unwrap();
+    chmod_to(&owned_tree.join("f"), 0o644);
+    chmod_to(&owned_tree, 0o755);
+    for (arm, mode, switches) in [
+        ("bare-user", RepoMode::BareUser, vec!["-U", "-H"]),
+        ("bare-user-only", RepoMode::BareUserOnly, vec!["-H"]),
+    ] {
+        let repo = base.join(format!("repo-owned-{arm}"));
+        block_on(async {
+            Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+        });
+        let rev = ostrya(
+            &[
+                "commit",
+                "--repo",
+                repo.to_str().unwrap(),
+                "-b",
+                BRANCH,
+                "-s",
+                SUBJECT,
+                "--timestamp=@1700000000",
+                "--owner-uid=4242",
+                "--owner-gid=4243",
+                owned_tree.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        );
+        let rev = rev.ok().stdout_trimmed();
+        let mut options = switches.clone();
+        options.push("--union-identical");
+
+        let port_dest = base.join(format!("port-owned-{arm}"));
+        let tool_dest = base.join(format!("tool-owned-{arm}"));
+        for dest in [&port_dest, &tool_dest] {
+            std::fs::create_dir_all(dest).unwrap();
+            std::fs::write(dest.join("f"), b"payload\n").unwrap();
+            chmod_to(&dest.join("f"), 0o644);
+        }
+        let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+        assert_checkout_pair(
+            &port,
+            &tool,
+            &port_dest,
+            &tool_dest,
+            &format!("{arm}/owner-ids"),
+        );
+    }
+
+    // The second conjunct: the destination's permission bits are compared
+    // against the loose object inode's. A `bare-user` inode carries
+    // `(logical_perm & 0o775) | 0o400`, so an object whose logical mode holds a
+    // bit that rule drops is identical to no destination at all, where the same
+    // object in `bare` is identical to a destination of its own mode.
+    for perm in [0o666u32, 0o777, 0o1755, 0o2755, 0o4755] {
+        let mode_tree = base.join(format!("tree-{perm:o}"));
+        std::fs::create_dir_all(&mode_tree).unwrap();
+        std::fs::write(mode_tree.join("f"), b"payload\n").unwrap();
+        chmod_to(&mode_tree.join("f"), perm);
+        chmod_to(&mode_tree, 0o755);
+
+        for (arm, mode, switches) in [
+            ("bare", RepoMode::Bare, vec!["-H"]),
+            ("bare-user", RepoMode::BareUser, vec!["-U", "-H"]),
+        ] {
+            let (repo, rev) =
+                union_repo(base, mode, &format!("repo-mode-{arm}-{perm:o}"), &mode_tree);
+            let mut options = switches.clone();
+            options.push("--union-identical");
+            for dest_perm in [perm, 0o755] {
+                let label = format!("{arm}/{perm:o}/dest-{dest_perm:o}");
+                let port_dest = base.join(format!("port-mode-{arm}-{perm:o}-{dest_perm:o}"));
+                let tool_dest = base.join(format!("tool-mode-{arm}-{perm:o}-{dest_perm:o}"));
+                for dest in [&port_dest, &tool_dest] {
+                    std::fs::create_dir_all(dest).unwrap();
+                    std::fs::write(dest.join("f"), b"payload\n").unwrap();
+                    chmod_to(&dest.join("f"), dest_perm);
+                }
+                let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+                assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+            }
+        }
+    }
+}

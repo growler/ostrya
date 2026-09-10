@@ -61,11 +61,11 @@ use ostrya::{
     CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions,
     DeltaOptions, DetachedMetadataFilter, DevInoCache, DictBuilder, DiffChange, Ed25519Signer,
     Ed25519Verifier, Error, FileKind, FileObject, FilterResult, FsckOptions, MutableTree,
-    ObjectType, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias, Repo,
-    RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef,
-    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
-    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
-    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
+    ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify,
+    RefAlias, Repo, RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions,
+    SummaryRef, TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats,
+    TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes,
+    load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -382,6 +382,21 @@ struct CheckoutArgs {
     /// Check out this path within the commit instead of the whole tree.
     #[arg(long, value_name = "PATH")]
     subpath: Option<PathBuf>,
+    /// Keep existing directories, overwrite existing files, and add new
+    /// entries.
+    #[arg(long)]
+    union: bool,
+    /// Keep every existing entry and add only the entries that do not exist.
+    #[arg(long)]
+    union_add: bool,
+    /// Add new entries and keep an existing entry identical to the object it
+    /// would receive; a differing entry is an error. Requires
+    /// `-H/--require-hardlinks`.
+    #[arg(long)]
+    union_identical: bool,
+    /// Exit 0 without writing anything when `--subpath` names nothing.
+    #[arg(long)]
+    allow_noent: bool,
     /// Write the commit's composefs EROFS image to the destination instead of a
     /// tree (requires a bare-user or bare-user-shared repository).
     #[arg(long)]
@@ -3491,6 +3506,23 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     let commit = resolve(&repo, &args.commit).await?;
 
+    // The three union options are mutually exclusive, and the first pair the
+    // command line holds is the one reported, in this order. The check sits
+    // here rather than on the `clap` definition because the tool makes it after
+    // the repository opens and the revision resolves
+    // (`docs/conformance/cli-surface.md`, "P2"). It stands ahead of the
+    // composefs export as well, so a pair the port refuses is refused whatever
+    // else the command line carries.
+    if args.union && args.union_add {
+        exit_error("Cannot specify both --union and --union-add");
+    }
+    if args.union && args.union_identical {
+        exit_error("Cannot specify both --union and --union-identical");
+    }
+    if args.union_add && args.union_identical {
+        exit_error("Cannot specify both --union-add and --union-identical");
+    }
+
     if args.composefs || args.composefs_noverity {
         let opts = ComposefsOptions {
             verity: if args.composefs_noverity {
@@ -3525,6 +3557,17 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
         return Ok(());
     }
 
+    // The `-H` requirement stands after the composefs export, which takes no
+    // hardlink and so has no use for the switch.
+    //
+    // The hardlink is what establishes identity, so the tool takes
+    // `--union-identical` only together with `-H`, whatever the repository
+    // mode. The library's own guard then refuses the modes that cannot
+    // hardlink, which is the same set the tool's `-H` refuses.
+    if args.union_identical && !args.require_hardlinks {
+        exit_error("--union-identical requires --require-hardlinks");
+    }
+
     // `-U` applies no ownership and no xattrs and reduces a regular file's mode
     // to `perm & 0777`; a `--subpath` directory's own metadata becomes the
     // destination root's, and a `--subpath` file or symlink is placed inside a
@@ -3537,14 +3580,34 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     let mut opts = CheckoutOptions::new(mode);
     opts.subpath = args.subpath;
     opts.force_copy = args.force_copy;
+    opts.overwrite = if args.union {
+        OverwriteMode::UnionFiles
+    } else if args.union_add {
+        OverwriteMode::AddFiles
+    } else if args.union_identical {
+        OverwriteMode::UnionIdentical
+    } else {
+        OverwriteMode::None
+    };
     // -H and -C are mutually exclusive (enforced by clap); -C forces copies and
     // -H requests hardlinks, which is the default path when copies are not
-    // forced. The minimal library surface exposes only force_copy.
+    // forced. The minimal library surface exposes only force_copy, so the
+    // `--union-identical` check above is the one place `-H` is read.
     let _ = args.require_hardlinks;
 
     let dest_dir = std::fs::File::open(".").map_err(Error::Io)?;
-    repo.checkout_at(&mut opts, dest_dir.as_fd(), &args.destination, &commit)
+    match repo
+        .checkout_at(&mut opts, dest_dir.as_fd(), &args.destination, &commit)
         .await
+    {
+        // `--allow-noent` suppresses one refusal and one only: a `--subpath`
+        // that names nothing. An unresolvable COMMIT is refused ahead of this
+        // call, and a subpath running through an entry that is not a directory
+        // keeps its refusal, both of which is what the tool does
+        // (`docs/conformance/cli-surface.md`, "P2").
+        Err(Error::SubpathNotFound(_)) if args.allow_noent => Ok(()),
+        other => other,
+    }
 }
 
 /// Write a commit's tree to standard output, or to `--output`, as a tar stream.

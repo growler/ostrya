@@ -1501,31 +1501,79 @@ destination root at `0755`.
 
 Overwrite policy over an existing destination:
 
-- Default (`ostree checkout`): the destination is created fresh, and any
-  pre-existing destination directory is an error (`mkdirat: File exists`). Each
-  subdirectory is created with `mkdirat`, and an existing one is an error.
+- Default (`ostree checkout`): the destination itself must not exist, and an
+  existing destination directory is an error (`mkdirat: File exists`) whether or
+  not it is empty. Each subdirectory is created with `mkdirat`, and an existing
+  one is an error. The three union modes take an existing destination and create
+  an absent one; a destination created by any mode takes the checked-out tree
+  root's dirmeta, and one that already existed keeps its own metadata. A
+  destination whose parent does not exist is an error in every mode
+  (`mkdirat: No such file or directory`). A symlink to a directory is followed
+  by the three union modes at every directory name, the destination itself and
+  every directory name inside the tree, which write into the target and leave
+  the link in place. The link is followed wherever it points, so a union
+  checkout writes outside the destination tree where a symlink inside the
+  destination leads there: over a commit carrying `d/g`, a destination holding
+  an absolute symlink `d` to a directory elsewhere on the filesystem exits 0 and
+  creates `g` in that directory. A symlink resolving to nothing, to a
+  non-directory, or to itself ends the checkout at exit 1 with the open's own
+  error (`opendir(d): No such file or directory`,
+  `opendir(d): Not a directory`, and
+  `opendir(d): Too many levels of symbolic links`). Under the default mode a
+  symlink at the destination is an error (`mkdirat: File exists`) like any
+  other existing destination.
 - Union files (`ostree checkout --union`): an existing directory is reused
-  without re-applying its metadata, an existing file is overwritten, new entries
-  are added, and existing entries not in the commit are left in place.
+  without re-applying its metadata, an existing file or symlink is overwritten
+  whatever its content, mode, or target, new entries are added, and existing
+  entries not in the commit are left in place. An existing directory where the
+  commit carries a regular file or a symlink is an error.
 - Add files (`ostree checkout --union-add`): only entries that do not already
-  exist are written; an existing file or directory is kept.
-- Union identical (`ostree checkout --union-identical`): new entries are added
-  and an existing entry identical to the object it would receive is left in
-  place, while a differing existing entry is an error. The tool establishes
-  identity by hardlink; identity is equivalently an existing entry whose
-  `(st_dev, st_ino)` equals the repository object it would link. The tool
-  accepts `--union-identical` only together with `--require-hardlinks`, since the
-  hardlink is what establishes identity. Checkout therefore requires a
-  hardlink-eligible repository mode and checkout mode with no forced copy for
-  this policy, and rejects it up front otherwise.
+  exist are written. An existing entry of any type is kept, including a
+  directory where the commit carries a regular file, and including an entry the
+  commit does not carry. An existing regular file or symlink where the commit
+  carries a directory is still an error, since the walk descends into the name.
+- Union identical (`ostree checkout --union-identical`): new entries are added,
+  an existing entry that is what the checkout would put there is left in place,
+  and a differing existing entry is an error. The tool takes the option only
+  together with `--require-hardlinks`, whatever the repository mode, so the
+  checkout that runs under it is a hardlinking one; without the switch it exits
+  1 having written nothing. A regular file is what the checkout would put there
+  when its `(st_dev, st_ino)` equals the loose object's, or when both its
+  file-object checksum -- computed over content bytes, uid, gid, permission
+  bits, and extended attributes, reduced the way the repository mode reduces an
+  ingested entry -- equals the object's checksum and its permission bits equal
+  the loose object inode's permission bits. Neither the modification time nor
+  the link count is read. The second conjunct is what makes an object identical
+  to nothing in `bare-user` when its logical mode carries a bit the inode rule
+  `(logical_perm & 0o775) | 0o400` drops: `0666`, `0777`, and every mode
+  carrying a setuid, setgid, or sticky bit. In `bare` the inode carries the full
+  logical mode, so the second conjunct is implied by the first and a setuid
+  object is identical to a setuid destination. In `bare-user-only` the reduction
+  drops ownership and extended attributes and masks the permission bits, so a
+  destination owned by the invoking user and carrying an unrelated extended
+  attribute is identical while one whose raw permission bits differ from the
+  object inode's is not. A symlink is compared by its target alone, whatever the
+  object's ownership. A directory is reused with no comparison, as under the
+  other union modes. Checkout requires a hardlink-eligible repository mode and
+  checkout mode with no forced copy for this policy, and rejects it up front
+  otherwise.
+
+  Recovered by checking out against destinations built by hand, one variable at
+  a time, in `bare`, `bare-user`, and `bare-user-only`: the content bytes, the
+  permission bits, the uid, the gid, and the extended-attribute set each make
+  the entry differ; the modification time, the inode, and the link count do not;
+  and each logical mode from `0400` through `04755` was checked against a
+  destination of the same mode and of `0755`.
 
 A type conflict between the destination and the commit stops the checkout, and
 no mode changes an entry's type:
 
-- A destination name held by a non-directory (a file or symlink) when the commit
-  carries a directory of that name is a conflict in every mode. The tool errors
+- A destination name held by a regular file when the commit carries a directory
+  of that name is a conflict in every mode. The tool errors
   (`opendir(<name>): Not a directory`), since it descends into the existing name
-  to merge the committed directory's children.
+  to merge the committed directory's children. A name held by a symlink is
+  followed by the three union modes, and the outcome is the one the destination
+  bullet above states.
 - A destination directory when the commit carries a non-directory of that name is
   a conflict under the default, union-files, and union-identical modes; the tool
   errors (`renameat(...): Is a directory` under union-files). Under add-files the
@@ -1557,6 +1605,17 @@ leading slash the tool adds, and `error: Not a directory` where the path runs
 through a regular file. The tool looks the value up as given, so `.` is refused
 (`No such file or directory: /.`) and a trailing slash is refused
 (`No such file or directory: /sub/`).
+
+`--allow-noent` turns the absent-subpath refusal into exit 0 with nothing
+written: no destination is created, and a destination that already existed is
+left as it was. Over a well-formed repository that is the one refusal it
+reaches: an unresolvable COMMIT and a subpath running through an entry that is
+not a directory keep their refusals and their exit status. Where the loose
+content object a `--subpath` names has been deleted out of band, the tool
+suppresses that refusal as well and exits 0 creating no destination, while the
+same commit checked out whole keeps the refusal.
+`conformance/cli-surface.md`, "P2", records the command lines on which the tool
+does not honor the switch, and the port's own reach beside them.
 
 ## Extended attributes
 

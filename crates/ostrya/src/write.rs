@@ -155,7 +155,7 @@ impl FileMeta {
 /// and is left alone; its ownership and xattrs are discarded like a regular
 /// file's. See `format-reference.md`, "Write path: loose-object inode modes and
 /// durability".
-fn canonical_header(mode: RepoMode, mut header: FileHeader) -> FileHeader {
+pub(crate) fn canonical_header(mode: RepoMode, mut header: FileHeader) -> FileHeader {
     if mode == RepoMode::BareUserOnly {
         header.uid = 0;
         header.gid = 0;

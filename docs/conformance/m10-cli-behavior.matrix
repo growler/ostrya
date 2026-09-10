@@ -2567,6 +2567,380 @@ note: the two reach different exit statuses, so no oracle reads the pair. Both
  at the mode it carried.
 
 # ---------------------------------------------------------------------------
+# checkout -- the union family and --allow-noent. The refusals run; the cells
+# that state a destination tree cite the test that walks both implementations'
+# destinations, since no oracle reads a cell's own checkout destination.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: checkout
+cell: checkout/union-with-union-add
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --union --union-add $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Cannot specify both --union and --union-add"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Cannot specify both --union and --union-add"
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: two union options on one line are refused in both, in that line, with no
+ destination created. The port reproduces the tool's wording here, which
+ cli-surface.md, "P2" names.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-with-union-identical
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --union --union-identical $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Cannot specify both --union and --union-identical"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Cannot specify both --union and --union-identical"
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: the pair is refused ahead of the `-H` requirement `--union-identical`
+ carries, so the line names the pair and not the missing switch.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-add-with-union-identical
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --union-add --union-identical $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Cannot specify both --union-add and --union-identical"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Cannot specify both --union-add and --union-identical"
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_union_options_are_mutually_exclusive
+spec: format-reference.md#checkout
+note: the third pair. The three checks run in the order union/union-add,
+ union/union-identical, union-add/union-identical, so all three options
+ together report the first pair, which the cited test states.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-identical-without-require-hardlinks
+setup: repo-with-commit
+run: checkout --repo=$REPO --union-identical $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: --union-identical requires --require-hardlinks"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: --union-identical requires --require-hardlinks"
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: the hardlink is what establishes identity, so both refuse the option
+ without `-H` whatever the repository mode, and neither creates the
+ destination. This cell runs in `bare`, whose mode does hardlink, so the
+ refusal is the switch and not the mode.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-identical-in-archive
+modes: archive
+setup: repo-with-commit
+run: checkout --repo=$REPO -U -H --union-identical $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_union_identical_requires_require_hardlinks
+spec: format-reference.md#checkout
+note: an `archive` repository cannot hardlink under any checkout mode, so both
+ refuse `--union-identical -H` and neither writes an entry. The words part:
+ the tool refuses the `-H` (`Bare repository mode cannot hardlink in user
+ checkout mode`) and the port refuses the policy (`checkout: union-identical
+ requires a hardlink checkout...`), so `stderr-text` is no oracle here. The
+ tool's `-H` gate stands after the destination directory is made, so it leaves
+ an empty destination where the port leaves none; that difference belongs to
+ `-H` and is recorded with the other `-H` divergence (`cli-surface.md`,
+ "checkout"). The cited test states it.
+
+family: M10
+subcommand: checkout
+cell: checkout/allow-noent-absent-subpath
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --allow-noent --subpath=/nope $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: `--allow-noent` turns the absent-subpath refusal into exit 0 with nothing
+ written and no destination created, in both. The cell contrasts with
+ `checkout/subpath-absent` above, which is the same subpath without the switch.
+
+family: M10
+subcommand: checkout
+cell: checkout/allow-noent-absent-ref
+setup: repo-with-commit
+run: checkout --repo=$REPO --allow-noent no-such-ref $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: the switch names a path, not a revision. An unresolvable COMMIT is
+ refused in both with the switch given, at the same status the invocation
+ without it reaches, and no destination is created.
+
+family: M10
+subcommand: checkout
+cell: checkout/allow-noent-subpath-through-a-file
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --allow-noent --subpath=/file.txt/nope $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: the switch suppresses a subpath that names nothing and not one that runs
+ through an entry that is not a directory, which is what the tool does. The
+ words part: the tool reports `Not a directory` and the port `checkout: subpath
+ is not a directory: <path>`.
+
+family: M10
+subcommand: checkout
+cell: checkout/plain-refuses-an-existing-destination
+setup: repo-with-commit
+run: checkout --repo=$REPO -U $REV $SCRATCH
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: with no union option the destination must not exist, and an existing
+ directory is refused whether or not it is empty. `$SCRATCH` is the one
+ directory a cell has that already exists. The words part: `mkdirat: File
+ exists` from the tool and `checkout: <name>: destination directory already
+ exists` from the port.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-takes-an-existing-destination
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --union $REV $SCRATCH
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: `--union` takes the destination the cell above refuses, writing the tree
+ into it beside the repository the setup built. The tree the two write is the
+ claim of `checkout/union-over-a-populated-destination` below, which cites the
+ test that walks it; this cell states that the invocation is taken.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-given-twice
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --union --union $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag. The tool takes a second occurrence of `--union`
+ and checks out as it does for one. The port refuses it at exit 1 and creates
+ no destination, as it refuses every repeated boolean flag in its CLI
+ (`cli-surface.md`, "P2"). The same holds for `--union-add`,
+ `--union-identical`, and `--allow-noent`.
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ absolute claims state each side.
+
+family: M10
+subcommand: checkout
+cell: checkout/allow-noent-under-require-hardlinks
+setup: repo-with-commit
+run: checkout --repo=$REPO -H --allow-noent --subpath=/nope $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+outcome: lossy
+severity: interop
+loss: the reach of `--allow-noent`. The tool honors the switch only when the
+ command line holds none of `-H`, `-C`, `-M`, `--union-add`,
+ `--disable-cache`, `--whiteouts`, `--process-passthrough-whiteouts`, and
+ `--skip-list`; with any of them the absent subpath is refused at exit 1 as
+ though the switch were absent, while `-U`, `--union`, `--fsync`, `-v`, and
+ `--from-file` keep it. `--union-identical` needs `-H`, so the switch never
+ reaches it in the tool. The port honors the switch on every command line
+ (`cli-surface.md`, "P2").
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+ Neither side writes anything and neither creates the destination, which the
+ cited test states for both.
+evidence: ostrya_cli::cli::checkout_allow_noent_reach_diverges_from_the_tool
+
+family: M10
+subcommand: checkout
+cell: checkout/union-over-a-populated-destination
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_union_modes_match_the_tool
+spec: format-reference.md#checkout
+note: `--union` reuses an existing directory without restamping it, replaces an
+ existing regular file or symlink whatever its content, mode, or target, adds
+ the entries that are absent, and leaves alone the entries the commit does not
+ carry. The cited test walks both implementations' destinations file for file
+ over a destination it pre-populates, in `archive`, `bare-user`, and `bare`.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-add-over-a-populated-destination
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_union_modes_match_the_tool
+spec: format-reference.md#checkout
+note: `--union-add` keeps every existing entry whatever its type -- regular
+ file, symlink, or directory -- and writes only the entries that are absent,
+ descending into an existing directory to add its absent children. The cited
+ test walks both destinations in the three modes.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-identical-over-a-populated-destination
+modes: bare-user
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_union_modes_match_the_tool,
+ ostrya_cli::cli::checkout_union_identical_identity_matches_the_tool
+spec: format-reference.md#checkout
+note: `--union-identical -U -H` over a populated destination leaves every entry
+ it calls identical in place, adds the entries that are absent, and exits 0.
+ The first cited test walks both destinations over a destination it
+ pre-populates by hand; the second runs the option over a destination an
+ earlier hardlinking checkout of the same commit produced, which the identity
+ rule short-circuits on. Between them the two cover the three places the option
+ is reachable: `bare-user` under `-U`, and `bare` and `bare-user-only` without
+ it. `archive` is `checkout/union-identical-in-archive` above.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-identical-identity-rule
+modes: bare-user
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_union_identical_identity_matches_the_tool
+spec: format-reference.md#checkout
+note: what the option calls identical. The cited test builds each destination
+ entry by hand and states the tool's own verdict against the port's: content
+ bytes, permission bits, uid, gid, and the extended-attribute set are compared
+ and the modification time, the inode, and the link count are not; a symlink is
+ compared by its target alone; and an object whose loose inode mode differs
+ from its logical mode is identical to no destination at all, which is the
+ `bare-user` rule `(logical_perm & 0o775) | 0o400` produces for `0666`, `0777`,
+ and every mode carrying a bit outside `0777`.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-identical-directories-are-reused
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_union_modes_match_the_tool
+spec: format-reference.md#checkout
+note: `--union-identical` compares no directory. An existing destination
+ directory of a mode the commit does not carry is reused at its own mode and
+ the checkout exits 0, the same as under `--union` and `--union-add`. A
+ directory created fresh takes the commit's dirmeta, which is what parts the
+ two cases.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-type-conflicts
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_union_type_conflicts_match_the_tool
+spec: format-reference.md#checkout
+note: the conflicts no union mode resolves, each refused at exit 1 in both with
+ the colliding entry untouched: an existing directory where the commit carries
+ a regular file or a symlink, under `--union` and `--union-identical`; and an
+ existing regular file where the commit carries a directory, under all three.
+ `--union-add` is the one exception, keeping an existing directory where the
+ commit carries a file and exiting 0. An existing symlink where the commit
+ carries a directory is no conflict: all three modes follow it, so a link to a
+ directory takes the subtree into the link's target at exit 0 and a dangling
+ link is refused by the open the follow makes. The cited test states the
+ destination each refusal leaves, which pins the write order: a directory's
+ regular files and symlinks first in name order, then its subdirectories in
+ name order.
+
+family: M10
+subcommand: checkout
+cell: checkout/union-creates-or-reuses-the-destination
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_union_destination_forms_match_the_tool
+spec: format-reference.md#checkout
+note: the destination forms the three union modes take. A destination that does
+ not exist is created and takes the checked-out tree root's dirmeta mode; one
+ that exists keeps its own mode and is not restamped; one whose parent does not
+ exist is refused at exit 1 in both; one that is a regular file is refused at
+ exit 1 in both with the file untouched; and one that is a symlink to a
+ directory is followed, both writing into the target.
+
+family: M10
+subcommand: checkout
+cell: checkout/allow-noent-leaves-the-destination-alone
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_allow_noent_matches_the_tool
+spec: format-reference.md#checkout
+note: the two facts an exit status does not hold. With `--allow-noent` and a
+ subpath that names nothing, neither implementation creates the destination,
+ and a destination that already existed is left byte for byte and at the mode
+ it carried. The cited test states both over a destination it pre-populates.
+
+# ---------------------------------------------------------------------------
 # show -- the commit report, the raw variant, the metadata modes, and the
 # refusals (Phase 17d).
 # ---------------------------------------------------------------------------

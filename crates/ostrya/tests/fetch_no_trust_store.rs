@@ -8,10 +8,14 @@
 //! a child process, which keeps the process that reads it free of an in-process
 //! `set_var`, and keeps the store the child runs with -- one that trusts nothing
 //! -- away from every other test.
+//!
+//! The same child covers the verification bypass (Phase 23): a bypass variant
+//! of `TrustRoots` reads no store, so it builds an `https` fetcher where
+//! `TrustRoots::System` fails.
 
 use std::process::Command;
 
-use ostrya::{Fetcher, FetcherOptions};
+use ostrya::{Fetcher, FetcherOptions, TlsOptions, TrustRoots};
 use ostrya_rt::block_on;
 
 const NO_CERT_FILE: &str = "/nonexistent/ca-bundle.pem";
@@ -74,5 +78,26 @@ fn an_absent_trust_store_subprocess() {
             .await
             .expect_err("an https mirror needs anchors the handshake can use");
         assert!(err.to_string().contains("no trusted certificates"), "{err}");
+
+        // A verification bypass reads no store, so the same https mirror that
+        // fails above builds here. `TrustRoots::System` failing in the same
+        // process is what shows the store this child runs with is empty, so
+        // the bypass is what carried the constructor and not a store that
+        // happened to hold something.
+        for roots in [
+            TrustRoots::DangerousAcceptAnyChain,
+            TrustRoots::DangerousAcceptAny,
+        ] {
+            let options = FetcherOptions {
+                tls: TlsOptions {
+                    roots: roots.clone(),
+                    client_identity: None,
+                },
+                ..FetcherOptions::new("https://example.invalid/repo")
+            };
+            Fetcher::new(options)
+                .await
+                .unwrap_or_else(|e| panic!("{roots:?} reads no trust store: {e}"));
+        }
     });
 }

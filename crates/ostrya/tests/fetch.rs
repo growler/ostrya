@@ -36,6 +36,16 @@ const SERVER_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/serve
 const SERVER_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.key.pem");
 const CLIENT_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.pem");
 const CLIENT_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.key.pem");
+const OTHERNAME_CERT_PEM: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/server-othername.pem");
+const OTHERNAME_KEY_PEM: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/server-othername.key.pem");
+const UNTRUSTED_CERT_PEM: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/server-untrusted.pem");
+const UNTRUSTED_KEY_PEM: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/server-untrusted.key.pem");
+const EXPIRED_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server-expired.pem");
+const EXPIRED_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server-expired.key.pem");
 
 // --- server plumbing -------------------------------------------------------
 
@@ -212,6 +222,41 @@ enum ClientAuth {
     Optional,
 }
 
+/// Which server leaf a TLS test server presents. Each one beyond the fixture
+/// leaf fails exactly one of the checks the full verification makes, so a test
+/// states which check a bypass dropped.
+#[derive(Clone, Copy)]
+enum Leaf {
+    /// Signed by the fixture authority, valid, and covering both `localhost`
+    /// and `127.0.0.1`.
+    Fixture,
+    /// Signed by the fixture authority and valid, covering neither name.
+    OtherName,
+    /// Covering both names and valid, signed by an authority nothing trusts.
+    Untrusted,
+    /// Signed by the fixture authority and covering both names, out of
+    /// validity since 2020.
+    Expired,
+    /// The `server-untrusted` certificate with the `server` private key, which
+    /// belongs to a different certificate: every server certificate check the
+    /// bypass drops passes for it under `DangerousAcceptAnyChain`, and the
+    /// handshake signature the bypass still checks is made with the wrong key.
+    MismatchedKey,
+}
+
+impl Leaf {
+    /// The certificate and the private key, both PEM-encoded.
+    fn pem(self) -> (&'static [u8], &'static [u8]) {
+        match self {
+            Leaf::Fixture => (SERVER_CERT_PEM, SERVER_KEY_PEM),
+            Leaf::OtherName => (OTHERNAME_CERT_PEM, OTHERNAME_KEY_PEM),
+            Leaf::Untrusted => (UNTRUSTED_CERT_PEM, UNTRUSTED_KEY_PEM),
+            Leaf::Expired => (EXPIRED_CERT_PEM, EXPIRED_KEY_PEM),
+            Leaf::MismatchedKey => (UNTRUSTED_CERT_PEM, SERVER_KEY_PEM),
+        }
+    }
+}
+
 /// The handler a test installs: it sees the request and the 1-based count of
 /// requests this server has answered.
 type Handler = Arc<dyn Fn(&Seen, usize) -> Response<TestBody> + Send + Sync>;
@@ -231,10 +276,26 @@ struct TestServer {
 
 impl TestServer {
     async fn start(transport: Transport, handler: Handler) -> TestServer {
-        TestServer::start_on("127.0.0.1:0".parse().unwrap(), transport, handler).await
+        TestServer::start_on(
+            "127.0.0.1:0".parse().unwrap(),
+            Leaf::Fixture,
+            transport,
+            handler,
+        )
+        .await
     }
 
-    async fn start_on(bind: SocketAddr, transport: Transport, handler: Handler) -> TestServer {
+    /// A server on an ephemeral port presenting `leaf`.
+    async fn start_with_leaf(leaf: Leaf, transport: Transport, handler: Handler) -> TestServer {
+        TestServer::start_on("127.0.0.1:0".parse().unwrap(), leaf, transport, handler).await
+    }
+
+    async fn start_on(
+        bind: SocketAddr,
+        leaf: Leaf,
+        transport: Transport,
+        handler: Handler,
+    ) -> TestServer {
         let listener = TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
@@ -243,7 +304,7 @@ impl TestServer {
         let acceptor = match &transport {
             Transport::Cleartext => None,
             Transport::Tls { alpn, client_auth } => Some(futures_rustls::TlsAcceptor::from(
-                Arc::new(server_config(alpn, *client_auth)),
+                Arc::new(server_config(alpn, *client_auth, leaf)),
             )),
         };
         let task_seen = seen.clone();
@@ -348,14 +409,22 @@ where
 }
 
 /// The fixture server's rustls configuration.
-fn server_config(alpn: &[&str], client_auth: ClientAuth) -> rustls::ServerConfig {
+fn server_config(alpn: &[&str], client_auth: ClientAuth, leaf: Leaf) -> rustls::ServerConfig {
     let provider = Arc::new(rustls_graviola::default_provider());
-    let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(SERVER_CERT_PEM))
+    let (cert_pem, key_pem) = leaf.pem();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(cert_pem))
         .collect::<Result<_, _>>()
         .unwrap();
-    let key = rustls_pemfile::private_key(&mut io::BufReader::new(SERVER_KEY_PEM))
+    let key = rustls_pemfile::private_key(&mut io::BufReader::new(key_pem))
         .unwrap()
         .unwrap();
+    // The certificate and the key are paired here rather than through
+    // `with_single_cert`, which refuses a key that does not belong to the
+    // certificate. `Leaf::MismatchedKey` is exactly that pair.
+    let signing_key = provider.key_provider.load_private_key(key).unwrap();
+    let resolver: Arc<dyn rustls::server::ResolvesServerCert> = Arc::new(
+        rustls::sign::SingleCertAndKey::from(rustls::sign::CertifiedKey::new(certs, signing_key)),
+    );
     let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .unwrap();
@@ -374,18 +443,13 @@ fn server_config(alpn: &[&str], client_auth: ClientAuth) -> rustls::ServerConfig
         builder.build().unwrap()
     };
     let mut config = match client_auth {
-        ClientAuth::None => builder
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .unwrap(),
+        ClientAuth::None => builder.with_no_client_auth().with_cert_resolver(resolver),
         ClientAuth::Required => builder
             .with_client_cert_verifier(verifier(false))
-            .with_single_cert(certs, key)
-            .unwrap(),
+            .with_cert_resolver(resolver),
         ClientAuth::Optional => builder
             .with_client_cert_verifier(verifier(true))
-            .with_single_cert(certs, key)
-            .unwrap(),
+            .with_cert_resolver(resolver),
     };
     config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
     config
@@ -629,6 +693,7 @@ fn fetches_from_an_ipv6_literal_mirror() {
     block_on(async {
         let server = TestServer::start_on(
             "[::1]:0".parse().unwrap(),
+            Leaf::Fixture,
             Transport::Cleartext,
             always(b"object bytes"),
         )
@@ -1721,6 +1786,127 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Fetch(_)), "{err}");
+    });
+}
+
+/// Fetch one path over TLS from a server presenting `leaf`, verifying it under
+/// `roots`. Retries are off, so a refused handshake reports at once rather
+/// than spending every round and every backoff first.
+async fn tls_fetch(leaf: Leaf, roots: TrustRoots) -> Result<Vec<u8>, Error> {
+    let server = TestServer::start_with_leaf(
+        leaf,
+        Transport::Tls {
+            alpn: vec!["h2", "http/1.1"],
+            client_auth: ClientAuth::None,
+        },
+        always(b"served"),
+    )
+    .await;
+    let mut options = FetcherOptions::new(server.url(true));
+    options.tls = TlsOptions {
+        roots,
+        client_identity: None,
+    };
+    options.max_retries = 0;
+    let fetcher = Fetcher::new(options).await?;
+    match fetcher.fetch(FetchRequest::path("config")).await? {
+        Fetched::Body(mut body) => {
+            let mut out = Vec::new();
+            body.read_to_end(&mut out).await.unwrap();
+            Ok(out)
+        }
+        Fetched::NotModified => panic!("unexpected 304"),
+    }
+}
+
+/// A leaf covering neither name the tests reach fails the host name check
+/// alone: the fixture authority signed it and it is in validity. Only the
+/// bypass that drops the name check serves it.
+#[test]
+fn a_name_mismatch_is_served_only_where_the_name_check_is_dropped() {
+    block_on(async {
+        let bytes = tls_fetch(Leaf::OtherName, TrustRoots::DangerousAcceptAny)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"served");
+
+        for roots in [
+            TrustRoots::Pem(CA_PEM.to_vec()),
+            TrustRoots::DangerousAcceptAnyChain,
+        ] {
+            let err = tls_fetch(Leaf::OtherName, roots.clone()).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(r#"certificate not valid for name "localhost""#),
+                "{roots:?}: {err}"
+            );
+        }
+    });
+}
+
+/// A leaf carrying the right name that no trusted authority signed fails the
+/// chain check alone. Both bypasses serve it, and the anchors refuse it.
+#[test]
+fn an_untrusted_chain_is_served_by_either_bypass() {
+    block_on(async {
+        for roots in [
+            TrustRoots::DangerousAcceptAnyChain,
+            TrustRoots::DangerousAcceptAny,
+        ] {
+            let bytes = tls_fetch(Leaf::Untrusted, roots.clone()).await.unwrap();
+            assert_eq!(bytes, b"served", "{roots:?}");
+        }
+
+        let err = tls_fetch(Leaf::Untrusted, TrustRoots::Pem(CA_PEM.to_vec()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("UnknownIssuer"), "{err}");
+    });
+}
+
+/// A leaf carrying the right name that the fixture authority signed, whose
+/// validity ended in 2020, fails the expiry check alone. Both bypasses serve
+/// it, and the anchors refuse it.
+#[test]
+fn an_expired_leaf_is_served_by_either_bypass() {
+    block_on(async {
+        for roots in [
+            TrustRoots::DangerousAcceptAnyChain,
+            TrustRoots::DangerousAcceptAny,
+        ] {
+            let bytes = tls_fetch(Leaf::Expired, roots.clone()).await.unwrap();
+            assert_eq!(bytes, b"served", "{roots:?}");
+        }
+
+        let err = tls_fetch(Leaf::Expired, TrustRoots::Pem(CA_PEM.to_vec()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("certificate expired"), "{err}");
+    });
+}
+
+/// The one check a bypass keeps is the handshake signature. A server that
+/// presents the `server-untrusted` certificate and signs with the `server`
+/// private key passes every check either bypass drops -- the name check finds
+/// the right name in that certificate -- and fails that one, so both bypasses
+/// refuse it. The harness pairs the certificate and the key directly, since
+/// `with_single_cert` refuses a pair that does not match.
+#[test]
+fn a_signature_made_with_another_key_is_refused_by_either_bypass() {
+    block_on(async {
+        for roots in [
+            TrustRoots::DangerousAcceptAnyChain,
+            TrustRoots::DangerousAcceptAny,
+        ] {
+            let err = tls_fetch(Leaf::MismatchedKey, roots.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("invalid peer certificate: BadSignature"),
+                "{roots:?}: {err}"
+            );
+        }
     });
 }
 

@@ -739,9 +739,11 @@ struct Inner {
     mirrors: Vec<Mirror>,
     headers: Vec<(HeaderName, HeaderValue)>,
     tls: ClientConfigs,
-    /// Whether the TLS configuration holds a trust anchor. A fetcher whose
-    /// mirrors are all cleartext builds without one where the host trust store
-    /// is empty, and a TLS destination is refused there.
+    /// Whether a handshake has what it needs to verify the peer. A store with
+    /// no anchor reaches here for a fetcher whose mirrors are all cleartext,
+    /// which opens no handshake to consult them, and a TLS destination is
+    /// refused there. A bypass variant of [`TrustRoots`] reads no store and
+    /// reports true, because its handshake consults no anchor and completes.
     has_trust_anchors: bool,
     /// Whether a client certificate is configured, which is what makes the two
     /// client configurations differ. With none configured every connection is
@@ -823,7 +825,10 @@ impl Fetcher {
     /// the constructor never yields. A system store holding no certificate
     /// fails the constructor when at least one mirror is `https`, and when the
     /// mirror list is empty, since a request may then name an `https` URL; a
-    /// host without a CA bundle still reaches a cleartext remote.
+    /// host without a CA bundle still reaches a cleartext remote. Under either
+    /// bypass variant of [`TrustRoots`](crate::TrustRoots) no store is read at
+    /// all, so the constructor never yields and an empty host store is fatal
+    /// for no mirror scheme.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher> {
         let mirrors = options
             .mirrors

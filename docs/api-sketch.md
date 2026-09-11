@@ -1327,7 +1327,16 @@ pub struct FetcherOptions {
                                           // together, up to the response head
 }
 
-pub enum TrustRoots { System, Pem(Vec<u8>) }
+#[non_exhaustive]
+pub enum TrustRoots {
+    System,                           // the certificates the host trusts
+    Pem(Vec<u8>),                     // exactly this PEM blob
+    DangerousAcceptAnyChain,          // the chain as presented: no trust
+                                      // anchor, no expiry check, no key-usage
+                                      // check, and no trust store read; the
+                                      // host name check is kept
+    DangerousAcceptAny,               // the name check dropped as well
+}
 pub struct ClientIdentity { pub cert_chain_pem: Vec<u8>, pub key_pem: Vec<u8> }
 pub struct TlsOptions { pub roots: TrustRoots, pub client_identity: Option<ClientIdentity> }
 
@@ -1394,7 +1403,10 @@ impl Fetcher {
     // certificate fails the constructor when a mirror is https, and when the
     // mirror list is empty, since a request may then name an https URL; a
     // fetcher whose mirrors are all cleartext builds without anchors, and a
-    // fetch of a TLS destination over it is refused before admission.
+    // fetch of a TLS destination over it is refused before admission. Either
+    // bypass variant reads no store, so the constructor reaches no file and no
+    // blocking pool and an https mirror needs no anchors. Both keep the
+    // handshake signature check.
     // Clone, Send + Sync.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher>;
     pub async fn fetch(&self, request: FetchRequest<'_>) -> Result<Fetched>;

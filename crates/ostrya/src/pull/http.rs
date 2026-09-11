@@ -1616,16 +1616,24 @@ async fn check_stream_end<R: AsyncRead + Unpin>(
 
 /// Read the trust anchors and the client identity a remote's TLS keys name.
 async fn remote_tls(remote: &str, section: &crate::config::Remote<'_>) -> Result<TlsOptions> {
-    if section.tls_permissive()? {
-        return Err(Error::Unsupported(format!(
-            "remote '{remote}' sets tls-permissive: the fetcher has no way to skip \
-             certificate verification, and verifying anyway would misreport the \
-             configuration"
-        )));
-    }
-    let roots = match section.tls_ca_path()? {
-        Some(path) => TrustRoots::Pem(read_pem(&path).await?),
-        None => TrustRoots::System,
+    // `tls-permissive` keeps the host name check and ignores `tls-ca-path`.
+    // Both are measured of the reference tool (`docs/port-plan.md`, Phase 23,
+    // "tls-permissive on a remote"): a CA that signed nothing in the chain
+    // serves, and so does a path naming a file that is absent. The path is
+    // therefore left unread here rather than read and discarded, so an absent
+    // one is no failure. `DangerousAcceptAnyChain` holds the name check and
+    // takes the chain as presented, so it is the setting that mapping asks
+    // for. It drops the expiry check as well, which is the port's own reading
+    // and not a measurement: a peer verification that ignores the CA path is
+    // libcurl peer verification switched off, and that setting takes the
+    // validity dates with it.
+    let roots = if section.tls_permissive()? {
+        TrustRoots::DangerousAcceptAnyChain
+    } else {
+        match section.tls_ca_path()? {
+            Some(path) => TrustRoots::Pem(read_pem(&path).await?),
+            None => TrustRoots::System,
+        }
     };
     let client_identity = match (
         section.tls_client_cert_path()?,
@@ -2218,6 +2226,23 @@ mod tests {
         }
         assert_eq!(high_water, PART_CAP);
         assert_eq!(applied, 5);
+    }
+
+    /// A remote setting `tls-permissive` maps onto the bypass that holds the
+    /// host name check, and the `tls-ca-path` alongside it is never opened:
+    /// the path here names no file, so reading it would fail the call.
+    #[test]
+    fn tls_permissive_leaves_the_ca_path_unread() {
+        let cfg = RepoConfig::parse(
+            "[core]\nrepo_version=1\nmode=archive-z2\n\
+             [remote \"origin\"]\nurl=https://example.invalid/repo\n\
+             tls-permissive=true\ntls-ca-path=/nonexistent/ca.pem\n",
+        )
+        .unwrap();
+        let section = cfg.remote("origin").unwrap();
+        let tls = block_on(remote_tls("origin", &section)).unwrap();
+        assert_eq!(tls.roots, TrustRoots::DangerousAcceptAnyChain);
+        assert!(tls.client_identity.is_none());
     }
 
     /// A delta whose objects all went to fallbacks has no part to wait for, so

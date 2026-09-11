@@ -43,6 +43,14 @@ use ostrya_rt::{TcpListener, block_on, spawn};
 const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
 const SERVER_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.pem");
 const SERVER_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.key.pem");
+const OTHERNAME_CERT_PEM: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/server-othername.pem");
+const OTHERNAME_KEY_PEM: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/server-othername.key.pem");
+const UNTRUSTED_CERT_PEM: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/server-untrusted.pem");
+const UNTRUSTED_KEY_PEM: &[u8] =
+    include_bytes!("../../../tests/fixtures/tls/server-untrusted.key.pem");
 
 /// A fixed timestamp, so a source repository's commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
@@ -161,6 +169,29 @@ struct Policy {
     truncated: HashSet<String>,
 }
 
+/// Which server leaf a TLS [`RepoServer`] presents.
+#[derive(Clone, Copy)]
+enum Leaf {
+    /// Signed by the fixture authority, valid, covering `localhost` and
+    /// `127.0.0.1`.
+    Fixture,
+    /// Signed by the fixture authority and valid, covering neither name.
+    OtherName,
+    /// Covering both names and valid, signed by an authority nothing trusts.
+    Untrusted,
+}
+
+impl Leaf {
+    /// The certificate and the private key, both PEM-encoded.
+    fn pem(self) -> (&'static [u8], &'static [u8]) {
+        match self {
+            Leaf::Fixture => (SERVER_CERT_PEM, SERVER_KEY_PEM),
+            Leaf::OtherName => (OTHERNAME_CERT_PEM, OTHERNAME_KEY_PEM),
+            Leaf::Untrusted => (UNTRUSTED_CERT_PEM, UNTRUSTED_KEY_PEM),
+        }
+    }
+}
+
 /// An in-process static file server over a repository directory.
 struct RepoServer {
     addr: SocketAddr,
@@ -175,6 +206,12 @@ struct RepoServer {
 
 impl RepoServer {
     async fn start(root: &Path, tls: bool) -> RepoServer {
+        RepoServer::start_with_leaf(root, tls, Leaf::Fixture).await
+    }
+
+    /// A server presenting `leaf`, which decides which of the server
+    /// certificate checks a TLS client can complete.
+    async fn start_with_leaf(root: &Path, tls: bool, leaf: Leaf) -> RepoServer {
         let root = root.to_path_buf();
         let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
             .await
@@ -186,7 +223,7 @@ impl RepoServer {
         let inflight = Arc::new(AtomicUsize::new(0));
         let connections = Arc::new(AtomicUsize::new(0));
         let acceptor = tls.then(|| {
-            futures_rustls::TlsAcceptor::from(Arc::new(server_config(&["h2", "http/1.1"])))
+            futures_rustls::TlsAcceptor::from(Arc::new(server_config(&["h2", "http/1.1"], leaf)))
         });
 
         let task = (
@@ -379,12 +416,13 @@ fn not_found() -> Response<FileBody> {
 }
 
 /// The fixture server's rustls configuration.
-fn server_config(alpn: &[&str]) -> rustls::ServerConfig {
+fn server_config(alpn: &[&str], leaf: Leaf) -> rustls::ServerConfig {
     let provider = Arc::new(rustls_graviola::default_provider());
-    let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(SERVER_CERT_PEM))
+    let (cert_pem, key_pem) = leaf.pem();
+    let certs: Vec<_> = rustls_pemfile::certs(&mut io::BufReader::new(cert_pem))
         .collect::<Result<_, _>>()
         .unwrap();
-    let key = rustls_pemfile::private_key(&mut io::BufReader::new(SERVER_KEY_PEM))
+    let key = rustls_pemfile::private_key(&mut io::BufReader::new(key_pem))
         .unwrap()
         .unwrap();
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
@@ -2735,14 +2773,50 @@ fn a_connection_cut_mid_pull_fails_and_publishes_nothing() {
     });
 }
 
-/// A remote setting `tls-permissive` is refused rather than verified anyway,
-/// which would misreport the configuration.
+/// A remote setting `tls-permissive` pulls from a server whose chain no
+/// authority the destination holds signed. That the key also leaves
+/// `tls-ca-path` unread is held by `remote_tls`'s own unit test, which needs
+/// no server.
 #[test]
-fn a_tls_permissive_remote_is_refused() {
+fn a_tls_permissive_remote_accepts_an_untrusted_chain() {
     block_on(async {
         let dir = TmpDir::new("pull-http-permissive");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server =
+            RepoServer::start_with_leaf(&dir.path().join("remote"), true, Leaf::Untrusted).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            "tls-permissive=true\n",
+        )
+        .await;
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+    });
+}
+
+/// `tls-permissive` keeps the host name check, so a leaf covering neither name
+/// the harness reaches is refused. The pull writes no ref.
+#[test]
+fn a_tls_permissive_remote_keeps_the_name_check() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-permissive-name");
         build_remote(dir.path()).await;
-        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let server =
+            RepoServer::start_with_leaf(&dir.path().join("remote"), true, Leaf::OtherName).await;
         let dest = build_dest(
             dir.path(),
             RepoMode::Archive,
@@ -2756,13 +2830,23 @@ fn a_tls_permissive_remote_is_refused() {
                 "origin",
                 PullOptions {
                     refs: vec!["test/main".to_owned()],
+                    // A failed handshake is retryable, so the rounds are
+                    // turned off and the refusal is reported at once.
+                    n_network_retries: Some(0),
                     ..PullOptions::default()
                 },
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "{err}");
-        assert!(err.to_string().contains("tls-permissive"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(r#"certificate not valid for name "localhost""#),
+            "{err}"
+        );
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            None
+        );
     });
 }
 

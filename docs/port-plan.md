@@ -3216,7 +3216,8 @@ two refs at one commit are both checked while the commit is fetched once.
 `timestamp_check`; `config.rs` grows `Remote::branches` and the TLS keys
 `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path`, with
 `tls-permissive=true` refused as `Unsupported` -- the fetcher has no way to skip
-verification, and verifying anyway would misreport the configuration.
+verification, and verifying anyway would misreport the configuration. Phase 23
+replaced that refusal: the key maps onto `TrustRoots::DangerousAcceptAnyChain`.
 `summary.rs` grows `Summary::parse`/`Summary::lookup`, the read side ref
 resolution needs.
 
@@ -3297,7 +3298,9 @@ supplying an object the remote answers 404 for, where the same pull without it
 fails; `max_outstanding_fetches = Some(1)` pinning the request order to the
 plan's drain order, and the default limit reaching the same request set with more
 than one fetch in flight; a connection cut mid-object failing the pull with
-nothing published; a `tls-permissive` remote refused; and
+nothing published; a `tls-permissive` remote refused, which Phase 23 replaced
+with a pull over `TrustRoots::DangerousAcceptAnyChain` from a server whose
+chain no anchor the destination holds signed; and
 `remote_fetch_summary` reporting both files. Unit tests cover `Summary::parse`,
 the `.filez` stream parser, and the driver (slot refill from the plan, the first
 ready slot returned, and an error dropping every slot still in flight). The
@@ -5453,6 +5456,41 @@ Proxy from the environment:
 Both records are the rule the port's own proxy and verification behavior
 follows.
 
+The verification bypass:
+
+- `TrustRoots::DangerousAcceptAnyChain` takes the server certificate chain as
+  presented: no trust anchor, no expiry check, and no key-usage check. A
+  client certificate or a CA certificate is therefore taken as a server leaf.
+  The host name check is kept.
+- `TrustRoots::DangerousAcceptAny` drops the host name check as well, so any
+  certificate the server presents is taken.
+- Revocation is checked by neither setting. The anchored verification
+  configures no CRL, so revocation is no difference between a bypass and the
+  full check.
+- Both keep the handshake signature check, so the peer proves it holds the
+  private key of the certificate it presented. Nobody vouches for that
+  certificate, so the peer is not authenticated: an active attacker on the
+  path presents a certificate of its own and the handshake completes.
+- Under either one the constructor reads no trust store: it touches no file
+  and reaches no blocking pool, and an `https` mirror needs no anchors.
+- A remote setting `tls-permissive=true` maps onto
+  `TrustRoots::DangerousAcceptAnyChain`. The record above measured two terms
+  of that mapping: the host name check is kept, and `tls-ca-path` is ignored.
+  The path is therefore left unread, so one naming a file that is absent is no
+  failure. The expiry check going with the chain is the port's own reading and
+  not a measurement: a peer verification that ignores the CA path is libcurl
+  peer verification switched off, and that setting takes the validity dates
+  with it.
+- A bypass origin counts as authenticated for the fetcher's cleartext
+  credential guards, which read the scheme alone, so a credential does reach
+  such an origin. The tool sends one there as well, and the operator who asks
+  for the bypass carries the risk.
+- `remote_fetcher` applies the named remote's TLS options to a
+  `PullOptions::url` override, so a `tls-permissive` remote's bypass follows
+  that URL to an unrelated host. The tool applies a remote's options under
+  `--url` the same way. The refusal the key drew before this phase left this
+  consequence unreachable.
+
 ## Risk register
 
 - composefs/EROFS byte-exactness (Phase 9): the EROFS and composefs on-disk
@@ -5684,6 +5722,10 @@ Resolved:
     `ostrya::Error` carries it: its variants are the port's own error
     vocabulary, a phase that adds a failure mode adds a variant, and a caller
     reads the enum rather than constructing it.
+
+    `TrustRoots` carries it (Phase 23): the port owns the set of trust
+    settings, a caller matches over it rather than exhausting it, and the
+    verification bypass added two members to it.
 
     No option struct carries it -- `PruneOptions`, `PullOptions`,
     `TarExportOptions`, `TarImportOptions`, and the rest. The attribute blocks

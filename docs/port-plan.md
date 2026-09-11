@@ -5541,6 +5541,28 @@ The verification bypass:
   `--url` the same way. The refusal the key drew before this phase left this
   consequence unreachable.
 
+Opening the connection:
+
+- A host that parses as an IP address is the one address the connect reaches.
+  Every other host goes to the system resolver on the blocking pool, so the
+  lookup holds no async task.
+- The resolver's order is kept, except that the first address whose family
+  differs from the family of the first address moves to second place. The
+  first two attempts therefore reach both families where the answer holds
+  both.
+- The first attempt starts at once. Each later attempt starts 250 ms after the
+  attempt before it, and an attempt that fails starts the next attempt at
+  once. Every started attempt stays in flight until one attempt completes, and
+  that attempt wins. Every address in the answer can hold an attempt at the
+  same time, so the descriptor count one connect reaches is the size of the
+  answer.
+- Where every attempt fails, the failure reported is the one from the address
+  the answer names first. Its message names that address, and the failure the
+  operating system gave stays reachable as the error's source, with its error
+  number.
+- `connect_timeout` bounds the whole open: the resolution and every attempt
+  together.
+
 ## Risk register
 
 - composefs/EROFS byte-exactness (Phase 9): the EROFS and composefs on-disk

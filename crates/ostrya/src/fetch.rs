@@ -3008,7 +3008,11 @@ fn stalled(url: &str, limit: Duration) -> Error {
 /// Run `future` under a deadline, resolving to `None` when `limit` expires
 /// first. The future is dropped on expiry, which cancels the work it holds.
 async fn within<F: Future>(limit: Duration, future: F) -> Option<F::Output> {
-    futures_lite::future::or(async { Some(future.await) }, async {
+    // The future is pinned before the race, so the block that awaits it holds
+    // a pointer and not a second copy of it. A future this wraps sits on the
+    // pull path once per object in flight, and its size is stack cost there.
+    let mut future = core::pin::pin!(future);
+    futures_lite::future::or(async { Some(future.as_mut().await) }, async {
         rt::Timer::after(limit).await;
         None
     })

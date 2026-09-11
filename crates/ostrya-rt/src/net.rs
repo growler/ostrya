@@ -518,9 +518,9 @@ mod tests {
     /// short enough to keep the suite quick.
     const TEST_STAGGER: Duration = Duration::from_millis(10);
 
-    /// The upper bound a timing test holds the whole open to. A race that runs
-    /// one attempt at a time, and a race that runs the shipped 250 ms window in
-    /// place of [`TEST_STAGGER`], both take longer than this.
+    /// The upper bound a timing test holds a completed open to. A race that
+    /// runs the shipped 250 ms window in place of [`TEST_STAGGER`] takes
+    /// longer than this.
     const TIMING_CEILING: Duration = Duration::from_millis(200);
 
     /// Whether a connect attempt to `addr` is still pending after a short
@@ -530,8 +530,8 @@ mod tests {
     /// packet leaves the attempt pending for as long as the operating system
     /// retries. A network that answers with an ICMP refusal instead fails the
     /// attempt at once. The failure starts the next attempt, so the stagger
-    /// window never runs and a measured window has no lower bound to hold. A
-    /// timing test reads this first and states which case it ran in.
+    /// window never runs and a measured window has no lower bound to hold.
+    /// [`answers_now`] reads this to tell the two networks apart.
     async fn stays_pending(addr: SocketAddr) -> bool {
         let mut attempt = Box::pin(backend::TcpStream::connect(addr));
         for _ in 0..5 {
@@ -542,6 +542,26 @@ mod tests {
             crate::Timer::after(Duration::from_millis(4)).await;
         }
         true
+    }
+
+    /// Whether any address in `addrs` answers a connect attempt now.
+    ///
+    /// The addresses are read in the order given, and the read stops at the
+    /// first address that answers. The name of that address goes to the
+    /// standard error stream.
+    ///
+    /// A test reads this only after the race, and only once the race has
+    /// already missed the timing it states. An address that answered during
+    /// the race and holds the attempt pending again afterwards reads the same
+    /// as a race that ran at the wrong time.
+    async fn answers_now(addrs: &[SocketAddr]) -> bool {
+        for addr in addrs {
+            if !stays_pending(*addr).await {
+                eprintln!("{addr} answers a connect attempt here");
+                return true;
+            }
+        }
+        false
     }
 
     /// Two loopback addresses that refuse a connection. Both ports are held at
@@ -610,57 +630,64 @@ mod tests {
     /// An address that black-holes the attempt holds the race for one stagger
     /// window alone. The next address takes the connection, and the open ends
     /// one window in.
+    ///
+    /// A network that answers the TEST-NET-1 address with an ICMP refusal
+    /// fails the first attempt at once, and that failure starts the second
+    /// attempt inside the window. The lower bound is left out on such a
+    /// network, which [`answers_now`] identifies.
     #[test]
     fn a_black_holed_address_gives_way_to_the_next_one() {
         block_on(async {
-            let dark = at("192.0.2.1:80");
-            let black_holed = stays_pending(dark).await;
+            let dark = [at("192.0.2.1:80")];
             let listener = TcpListener::bind(at("127.0.0.1:0")).await.unwrap();
             let live = listener.local_addr().unwrap();
             let server = spawn(async move { listener.accept().await.unwrap().1 });
             let start = Instant::now();
-            let client = connect_addrs(vec![dark, live], TEST_STAGGER).await.unwrap();
+            let client = connect_addrs(vec![dark[0], live], TEST_STAGGER)
+                .await
+                .unwrap();
             let elapsed = start.elapsed();
             assert_eq!(client.peer_addr().unwrap(), live);
-            if black_holed {
-                assert!(elapsed >= TEST_STAGGER, "the open took {elapsed:?}");
-            } else {
+            assert!(elapsed < TIMING_CEILING, "the open took {elapsed:?}");
+            if elapsed < TEST_STAGGER {
+                assert!(answers_now(&dark).await, "the open took {elapsed:?}");
                 eprintln!(
-                    "{dark} is refused here, so the second attempt starts on that \
-                     failure and the lower bound is left out"
+                    "the attempt behind it starts on that failure and the \
+                     timing bound is left out"
                 );
             }
-            assert!(elapsed < TIMING_CEILING, "the open took {elapsed:?}");
             assert_eq!(server.await, client.local_addr().unwrap());
         });
     }
 
     /// Two black-holed addresses hold the race for two stagger windows, so the
     /// third attempt starts two windows in and takes the connection.
+    ///
+    /// A network that answers a TEST-NET-1 address with an ICMP refusal fails
+    /// the attempt at once, and that failure starts the attempt behind it
+    /// inside the window. The lower bound is left out on such a network, which
+    /// [`answers_now`] identifies.
     #[test]
     fn a_second_window_starts_the_third_attempt() {
         block_on(async {
-            let first = at("192.0.2.1:80");
-            let second = at("192.0.2.2:80");
-            let black_holed = stays_pending(first).await && stays_pending(second).await;
+            let dark = [at("192.0.2.1:80"), at("192.0.2.2:80")];
             let listener = TcpListener::bind(at("127.0.0.1:0")).await.unwrap();
             let live = listener.local_addr().unwrap();
             let server = spawn(async move { listener.accept().await.unwrap().1 });
             let start = Instant::now();
-            let client = connect_addrs(vec![first, second, live], TEST_STAGGER)
+            let client = connect_addrs(vec![dark[0], dark[1], live], TEST_STAGGER)
                 .await
                 .unwrap();
             let elapsed = start.elapsed();
             assert_eq!(client.peer_addr().unwrap(), live);
-            if black_holed {
-                assert!(elapsed >= 2 * TEST_STAGGER, "the open took {elapsed:?}");
-            } else {
+            assert!(elapsed < TIMING_CEILING, "the open took {elapsed:?}");
+            if elapsed < 2 * TEST_STAGGER {
+                assert!(answers_now(&dark).await, "the open took {elapsed:?}");
                 eprintln!(
-                    "{first} and {second} are refused here, so the later attempts \
-                     start on those failures and the lower bound is left out"
+                    "the attempt behind it starts on that failure and the \
+                     timing bound is left out"
                 );
             }
-            assert!(elapsed < TIMING_CEILING, "the open took {elapsed:?}");
             assert_eq!(server.await, client.local_addr().unwrap());
         });
     }
@@ -701,31 +728,69 @@ mod tests {
         });
     }
 
+    /// An attempt that fails starts the next attempt at once. Two addresses
+    /// that refuse the attempt therefore hand the connection to the third
+    /// address inside the first stagger window.
+    ///
+    /// A port the pair names is free, so a test running beside this one in the
+    /// same process can bind it between the pair coming back and the race
+    /// starting. A race that lands on such a port is dropped and a fresh pair
+    /// takes its place.
+    #[test]
+    fn a_failed_attempt_starts_the_next_one_at_once() {
+        block_on(async {
+            for remaining in (0..8).rev() {
+                let listener = TcpListener::bind(at("127.0.0.1:0")).await.unwrap();
+                let live = listener.local_addr().unwrap();
+                let (first, second) = two_closed_ports().await;
+                let start = Instant::now();
+                let client = connect_addrs(vec![first, second, live], TEST_STAGGER)
+                    .await
+                    .unwrap();
+                let elapsed = start.elapsed();
+                if client.peer_addr().unwrap() != live {
+                    assert!(remaining > 0, "a closed port answered on every try");
+                    continue;
+                }
+                assert!(
+                    elapsed < TEST_STAGGER,
+                    "two refusals waited for a window: {elapsed:?}"
+                );
+                let peer = listener.accept().await.unwrap().1;
+                assert_eq!(peer, client.local_addr().unwrap());
+                return;
+            }
+        });
+    }
+
     /// Dropping the race while attempts are in flight cancels them, and the
     /// runtime opens the next connection afterwards.
+    ///
+    /// A network that answers a TEST-NET-1 address ends the race before the
+    /// drop. The race then carries no attempt to cancel, and the cancellation
+    /// half of the test is left out, which [`answers_now`] identifies.
     #[test]
     fn dropping_the_race_mid_flight_leaves_the_runtime_working() {
         block_on(async {
-            let first = at("192.0.2.1:80");
-            let second = at("192.0.2.2:80");
-            let black_holed = stays_pending(first).await && stays_pending(second).await;
-            let mut race = Box::pin(connect_addrs(vec![first, second], TEST_STAGGER));
+            let dark = [at("192.0.2.1:80"), at("192.0.2.2:80")];
+            let mut race = Box::pin(connect_addrs(dark.to_vec(), TEST_STAGGER));
+            let mut ended_early = false;
             for _ in 0..4 {
                 let polled = std::future::poll_fn(|cx| Poll::Ready(race.as_mut().poll(cx))).await;
                 if polled.is_ready() {
-                    assert!(
-                        !black_holed,
-                        "an attempt to a black-holed address completed"
-                    );
-                    eprintln!(
-                        "{first} and {second} are refused here, so the race ended \
-                         before the drop"
-                    );
+                    ended_early = true;
                     break;
                 }
                 crate::Timer::after(TEST_STAGGER).await;
             }
             drop(race);
+            if ended_early {
+                assert!(
+                    answers_now(&dark).await,
+                    "an attempt to a black-holed address completed"
+                );
+                eprintln!("the race ended before the drop");
+            }
 
             let listener = TcpListener::bind(at("127.0.0.1:0")).await.unwrap();
             let live = listener.local_addr().unwrap();

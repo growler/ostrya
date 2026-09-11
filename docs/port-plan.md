@@ -5419,9 +5419,11 @@ addresses a host resolves to, so one TLS stack serves both an ostree remote
 and an unrelated HTTP mirror. The connect belongs to `ostrya-rt` and the rest
 to `ostrya`. Phase 16a above records the fetcher's whole behavior, which this
 phase extended in place; what follows states what the phase added, what it
-measured, and where it parts from the reference tool. The release is 0.3.0.
+measured, and where it parts from the reference tool. The release is 0.2.2.
 The option structs stay exhaustive by decision 14, so a field added to one is
-a breaking change, and a breaking change takes a minor version before 1.0.
+a breaking change. Decision 14 gives a breaking change a minor version before
+1.0. This release carries its breaking changes under a patch version. The
+release parts from decision 14 on this point, and decision 14 stays unchanged.
 
 The request surface:
 

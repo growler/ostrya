@@ -5502,6 +5502,9 @@ Proxy from the environment:
 - `HTTP_PROXY` in uppercase is not read. Every other variable is read in
   uppercase as well: `ALL_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` all take
   effect.
+- A variable set in both cases is read in lower case. `all_proxy` naming a
+  proxy that answers, beside `ALL_PROXY` naming a dead port, pulls through the
+  proxy. With the two values exchanged, the pull fails.
 - `all_proxy` reaches either scheme. `https_proxy` is not applied to an `http`
   origin, and `http_proxy` is not applied to an `https` origin.
 - An `https` origin behind `https_proxy` is reached with a `CONNECT` tunnel,
@@ -5510,20 +5513,33 @@ Proxy from the environment:
   resolves to, so `no_proxy=localhost` leaves a `127.0.0.1` origin proxied. A
   comma list, an entry equal to the host, and `*` each exempt an origin. An
   empty value exempts nothing.
-- The remote `proxy` config key takes effect where no variable is set, and a
-  `no_proxy` that matches the origin host overrides that key.
+- The remote `proxy` config key wins over the environment in both directions.
+  The key naming a proxy that answers, beside `http_proxy` naming a dead port,
+  pulls through the proxy the key names. The key naming a dead port, beside
+  `http_proxy` naming a proxy that answers, fails the pull with `[7] Could not
+  connect to server`, and the proxy the variable names logs no request. A
+  `no_proxy` that matches the origin host overrides the key.
 
 `tls-permissive` on a remote:
 
 - `tls-permissive=true` ignores `tls-ca-path`. A CA that signed nothing in the
   chain serves, and so does a path naming a file that is absent. Without
   `tls-permissive` that same absent path fails with `[77] Problem with the SSL
-  CA cert`.
+  CA cert (path? access rights?)`.
 - `tls-permissive=true` keeps the host name check. A leaf carrying
   `SAN DNS:localhost` alone serves `https://localhost:PORT` and fails
   `https://127.0.0.1:PORT`. The chain failure and the name failure carry the
   same `[60] SSL peer certificate or SSH remote key was not OK` text, so the
   tool's own diagnostic does not tell them apart.
+- The installed page `ostree.repo-config(5)` states a wider rule than the
+  observation. Of `tls-permissive` it says: "A boolean value, defaults to
+  false. By default, server TLS certificates will be checked against the
+  system certificate store. If this variable is set, any certificate will be
+  accepted." The measurement above is narrower than "any certificate": the
+  host name check stays. The measurement governs the port, which is why
+  `TrustRoots::DangerousAcceptAnyChain` keeps the name check. A rule taken
+  from the page alone drops that check, and the port would then take a
+  certificate carrying a name the request did not ask for.
 - `tls-permissive` reads as a keyfile boolean. `true` and `1` are accepted;
   `yes` and `TRUE` fail before any network work.
 
@@ -5576,7 +5592,12 @@ The proxy the port implements:
   another origin is served the way a route naming that origin would be, and a
   proxied hop may redirect onto an exempt origin reached directly.
 - The remote `proxy` config key is not carried, so an HTTP pull reads the
-  environment alone.
+  environment alone. A later phase that carries it maps it onto
+  `Proxy::Variables`, which states the variables in the options: the key's
+  value goes into `http_proxy` and `https_proxy`, and `no_proxy` keeps the
+  value the environment holds, which is the exemption the record above
+  measured over the key. `Proxy::Url` reads no exemptions, so it cannot
+  express that exemption. The mapping needs no new variant.
 
 The verification bypass:
 
@@ -5655,6 +5676,25 @@ The binary cost of the redirect resolver:
 - The first binary measures 13,491,736 bytes and the second 13,251,224, so the
   call costs 240,512 bytes, which is about 235 KiB. Rebuilds of one tree land
   a few hundred bytes apart, so the figure holds to the kilobyte.
+
+The size of a fetch in flight:
+
+- `Fetcher::fetch` measures 4,912 bytes of future state with the `Box::pin`
+  on `connect` in `fetch.rs`, and 36,048 bytes without it, so the box holds
+  31,136 bytes off every fetch in flight. Each caller nests the fetch future
+  inside its own, so a pull that wraps several helpers around one fetch
+  multiplies the amount the box keeps off the stack.
+- The 31,136 bytes are 86% of the 36,048 an unboxed fetch holds, so the box
+  keeps the larger part of that state off the stack.
+- The 31 KiB is the TLS handshake and the HTTP handshake. The `CONNECT`
+  exchange contributes nothing measurable of its own: boxing `tunnel` alone,
+  with `connect` left unboxed, measures the same 36,048 bytes.
+- `Proxies::via` runs once per hop, which is once per object on a pull that
+  takes no redirect and no retry, and it allocates nothing. Against a
+  257-entry `no_proxy` list whose matching entry is the last one, the
+  power-of-two allocation histogram of a pull is bucket for bucket the one
+  `Proxy::None` gives, and that run was not the slowest of five
+  configurations.
 
 The suite's proxy exemption:
 

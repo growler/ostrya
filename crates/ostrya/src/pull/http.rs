@@ -108,7 +108,7 @@
 //! destination rejects one whose header is not the canonical form it stores.
 //!
 //! Signatures are a policy of their own, described in
-//! [`verify`](super::verify): the remote's configuration states it and
+//! `verify`: the remote's configuration states it and
 //! [`PullVerify`](super::PullVerify) overrides it. The summary is checked as
 //! soon as it and its signature are here, before the refs it resolves or the
 //! deltas it advertises are read; a commit is checked in the step that fetched

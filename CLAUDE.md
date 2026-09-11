@@ -180,15 +180,84 @@ measured on the resolved dependency graph.
   compressed packet, so the verification path has no use for the feature.
 - The `asm` feature stays off. It pulls `sha1-asm` and turns on the assembly
   paths in `sha2`.
-- With `default-features = false` the graph holds 152 packages under 150
-  distinct names, of which 91 are new to `Cargo.lock`. Two names appear at two
-  versions: `serdect` 0.2.0 and 0.3.0, `syn` 2.0.119 and 3.0.4. No package in
-  the graph declares a `links` key, and no package name in it ends in `-sys`.
+- With `default-features = false` the graph holds 156 packages under 155
+  distinct names, measured with `cargo tree -p pgp -e normal,build`, of which
+  91 were new to `Cargo.lock` when the crate was authorized. One name appears
+  at two versions, `serdect` 0.2.0 and 0.3.0. No package in the graph declares
+  a `links` key, and no package name in it ends in `-sys`.
 - Every license in the graph is permissive by the rule in "Requirement:
   permissive licenses only". Nine packages state a permissive choice in the
   legacy slash form, `A/B` or `A / B`. The CI license guard must normalize
   both forms to `A OR B` before it matches, so these nine pass and a copyleft
   license still fails.
+
+### Authorized: the `url` crate
+
+`url` 2.5.8 is authorized for `crates/ostrya` alone. It supplies the one
+`Url::parse().join()` call in `fetch.rs`, which resolves the `Location` of a
+redirect against the URL of the response that carried it. That is the only call
+the library makes into the crate: a mirror URL, a request URL, and a proxy URL
+are read by the `hyper::Uri` parse. Each term below is measured on the resolved
+dependency graph.
+
+- License `MIT OR Apache-2.0`.
+- The default feature set is taken. `idna` is a mandatory dependency, so
+  `default-features = false` drops neither `idna` nor the Unicode tables it
+  carries.
+- The graph holds 33 packages under 32 distinct names, measured with
+  `cargo tree -p url -e normal,build`, which reads the features the workspace
+  resolves. `syn` appears at two versions, 2.0.118 and 3.0.3. No package in
+  the graph declares a `links` key, and no package name in it ends in `-sys`.
+  `cargo metadata --format-version 1 --all-features`, which the license rule
+  below prescribes, counts 36 packages under 35 distinct names for the same
+  closure. Its resolve graph carries the optional `serde` dependency of `url`
+  and the two packages behind it, which no feature set in this workspace turns
+  on.
+- Four packages carry a build script: `icu_normalizer_data`,
+  `icu_properties_data`, `proc-macro2`, and `quote`. The first two compile
+  Unicode data tables in Rust, and the last two were already in the graph.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only": 18 packages state `Unicode-3.0`, which is the
+  ICU4X set, 11 state `MIT OR Apache-2.0`, 2 state `Apache-2.0 OR MIT`,
+  `synstructure` states `MIT`, and `unicode-ident` states
+  `(MIT OR Apache-2.0) AND Unicode-3.0`.
+- The highest minimum supported Rust version in the graph is 1.88, stated by
+  the ICU4X packages. The workspace pins 1.92, so the requirement holds.
+- The call costs about 235 KiB of the stripped `target/release/ostrya`, the
+  binary `cargo build --release -p ostrya-cli` writes with its default feature
+  set. `docs/port-plan.md`, Phase 23, states the counterfactual the figure is
+  measured against and the two byte counts.
+
+### Authorized: the `pkcs8` crate
+
+`pkcs8` 0.10.2 is authorized for `crates/ostrya` alone. It decrypts an
+encrypted PKCS#8 client key in `fetch/tls.rs` alone. Each term below is
+measured on the resolved dependency graph.
+
+- License `Apache-2.0 OR MIT`.
+- `default-features = false` is mandatory, with the features `encryption`,
+  `pem`, and `std`. `pem` reads the PEM armor, `encryption` supplies the PBES2
+  decryption path, and `std` supplies the standard error trait.
+- The `3des` and `des-insecure` features stay off. `pkcs5` resolves with
+  `alloc` and `pbes2` alone, so no DES or 3DES decryption path is compiled.
+  `des` 0.8.1 is in `Cargo.lock` through `pgp`, and no path from `pkcs8`
+  reaches it.
+- Five packages enter the graph with it: `pkcs5` 0.7.1, `cbc` 0.1.2, `pbkdf2`
+  0.12.2, `salsa20` 0.10.2, and `scrypt` 0.11.0. No other crate in the
+  workspace reaches any of the five. `sign-spki` and `verify-gpg` already
+  reached `pkcs8` itself through `p256` and `pgp`.
+- The graph holds 35 packages under 35 distinct names. No package in it
+  declares a `links` key, and no package name in it ends in `-sys`. Four carry
+  a build script -- `generic-array`, `libc`, `proc-macro2`, and `quote` -- and
+  all four were already in the graph.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only": 22 packages state `MIT OR Apache-2.0`, 9 state
+  `Apache-2.0 OR MIT`, `generic-array` states `MIT`, `subtle` states
+  `BSD-3-Clause`, `unicode-ident` states `(MIT OR Apache-2.0) AND Unicode-3.0`,
+  and `version_check` states the legacy `MIT/Apache-2.0` form the CI license
+  guard normalizes.
+- The highest minimum supported Rust version in the graph is 1.85. The
+  workspace pins 1.92, so the requirement holds.
 
 ## Requirement: permissive licenses only
 

@@ -610,8 +610,8 @@ pub fn load_sign_keys(sign_type: &str) -> Result<SignKeys> {
 /// lines are skipped and any other line must decode. A missing file or
 /// directory is not an error. Directory entries are read in sorted name order.
 ///
-/// Every file is read under the rule [`read_key_source`] states: only a regular
-/// file, and only up to [`MAX_KEY_FILE`]. A path of another kind and a file over
+/// Every file is read under the rule `read_key_source` states: only a regular
+/// file, and only up to `MAX_KEY_FILE`. A path of another kind and a file over
 /// the ceiling are each refused by that file's own name.
 pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> Result<SignKeys> {
     let mut keys = SignKeys::default();

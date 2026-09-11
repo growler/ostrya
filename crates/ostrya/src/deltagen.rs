@@ -194,7 +194,7 @@ impl Repo {
     /// describe files this run has replaced; once the new superblock is in place,
     /// part files left by a longer previous delta are removed, along with temp
     /// files a generation that was killed mid-write left behind once they are an
-    /// hour old (see [`TEMP_STALE_SECS`]). That pass covers the repository's own
+    /// hour old (see `TEMP_STALE_SECS`). That pass covers the repository's own
     /// `deltas/` tree; a directory named through [`DeltaOptions::output_dir`]
     /// belongs to the caller and nothing in it is removed.
     ///

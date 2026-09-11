@@ -38,7 +38,7 @@ use crate::tree::RepoTree;
 /// A directory being assembled in memory.
 ///
 /// Files map a name to a content checksum; subdirectories map a name to a
-/// [`Child`], which is either a lazy reference to a committed dirtree or a
+/// `Child`, which is either a lazy reference to a committed dirtree or a
 /// materialized nested tree. `clean` holds the committed dirtree checksum while
 /// this directory exactly matches a committed dirtree and has not been mutated;
 /// it is cleared on mutation and set again once the directory is written.
@@ -504,7 +504,7 @@ impl Transaction {
     /// constraint [`Transaction::read_dir`](Transaction::read_dir) states:
     /// passing it to [`RepoTree::read_dir`](crate::RepoTree::read_dir) before
     /// the transaction commits reaches
-    /// [`Error::ObjectNotFound`](crate::Error::ObjectNotFound) for the staged
+    /// [`Error::ObjectNotFound`] for the staged
     /// dirtree.
     pub async fn write_mtree(&self, mtree: &mut MutableTree) -> Result<RepoTree> {
         let emitted = write_node(self, mtree, "/".to_owned()).await?;

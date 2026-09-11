@@ -2584,9 +2584,8 @@ no socket.
   one `url::Url::parse().join()` call is the only use of the `url` crate in
   `ostrya`, and `url` depends on `idna`, whose compiled Unicode tables are
   hundreds of kilobytes; the crate offers no feature that drops them. That
-  weight is an order of magnitude above the rest of the redirect work. The
-  release build records the figure for both the library and the shipped
-  binary.
+  weight is an order of magnitude above the rest of the redirect work. Phase 23
+  states the figure measured on the shipped binary.
 - A credential and the client certificate are scoped to the origin the route
   named. `Authorization`, `Proxy-Authorization`, and `Cookie` reach that origin
   and a hop at it -- the same scheme, host, and port -- and are dropped for a
@@ -5411,12 +5410,85 @@ Five properties hold over the two keys:
   copy, and setting the key and pulling again does not remove it. The list is a
   rule over what arrives, and it is not a sweep over what is already there.
 
-### Phase 23 -- Fetcher as a general HTTP client
+### Phase 23 -- Fetcher as a general HTTP client (DONE)
 
 The fetcher serves absolute URLs with per-request headers and credentials,
-follows redirects, reaches an origin through a proxy, and offers a
-verification bypass, so one TLS stack serves both an ostree remote and an
-unrelated HTTP mirror.
+follows redirects, reaches an origin through a proxy, offers a verification
+bypass, reads an encrypted client key, and races a connect across the
+addresses a host resolves to, so one TLS stack serves both an ostree remote
+and an unrelated HTTP mirror. The connect belongs to `ostrya-rt` and the rest
+to `ostrya`. Phase 16a above records the fetcher's whole behavior, which this
+phase extended in place; what follows states what the phase added, what it
+measured, and where it parts from the reference tool. The release is 0.3.0.
+The option structs stay exhaustive by decision 14, so a field added to one is
+a breaking change, and a breaking change takes a minor version before 1.0.
+
+The request surface:
+
+- A `FetchRequest` names a `Target`: a path under every mirror's base URL, or
+  an absolute `http` or `https` URL served from its own origin, which consults
+  no mirror. `FetchRequest::path` and `FetchRequest::url` build the two forms,
+  and the field they set is `target`.
+- A URL target is read by the parse that reads a mirror URL, so userinfo and a
+  port the URL parser cannot read are refused, and a fragment is refused as
+  well: a fragment reaches no request, so accepting one would ask for a
+  resource the caller did not name. The query string reaches the wire as the
+  caller wrote it.
+- A fetcher whose mirror list is empty serves URL targets alone. It is built
+  the way a fetcher with an `https` mirror is built, since any request over it
+  may name an `https` URL.
+- A request carries headers of its own, merged over the fetcher's, and
+  credentials of its own, which replace the fetcher's for that request. Within
+  one layer, `basic_auth` beside an `Authorization` header is refused, both of
+  them setting one header.
+- The cleartext-credential rule is checked per request as well as at
+  construction. A fetch whose merged headers carry a credential is refused
+  before admission when a destination it may reach is `http`, and
+  `FetchRequest::allow_cleartext_credentials` admits such a fetch. The
+  construction check over the mirror list holds whatever that flag is set to.
+- The client identity stays per fetcher. A caller that needs a second identity
+  builds a second fetcher.
+- `Error::ContentEncoded` and `Error::RedirectLimit` are the two error variants
+  the phase adds. `Error::HttpStatus` names the URL of the response that
+  answered, so after a redirect it names the last hop.
+- `From<Error> for std::io::Error` gives three fetch failures a kind of their
+  own: `HttpStatus` of 404 maps to `NotFound`, 401 and 403 map to
+  `PermissionDenied`, and `FetchTooLarge` maps to `FileTooLarge`, the kind a
+  body that outgrows the cap mid-stream already fails its read with. Every
+  other status stays `Other`.
+
+Encrypted client keys:
+
+- `ClientIdentity::key_passphrase` decrypts a PKCS#8 key under PBES2. The
+  ciphers are AES-128-CBC, AES-192-CBC, and AES-256-CBC, and the key derivation
+  functions are PBKDF2 with an HMAC-SHA-2 pseudorandom function, and scrypt.
+- The key blob is read section by section, and the first section whose armor
+  label names a private key decides the path. A certificate and key bundle, a
+  trailing newline, and two plain key sections each read the way
+  `rustls_pemfile` reads one. An `ENCRYPTED PRIVATE KEY` section in front of a
+  plain key parts from that reader: the label is one `rustls_pemfile` holds
+  unknown, so it steps over the section and reads the plain key behind it,
+  while the port spends the passphrase on the encrypted section and refuses
+  where no passphrase is set. `the_first_key_section_decides_the_path` in
+  `fetch/tls.rs` states the divergence.
+- Six cases are refused, each with a message of its own: an encrypted key where
+  no passphrase is set, a passphrase set for a key section that carries no
+  encryption, a passphrase that does not decrypt the key, a PBES2 cipher or key
+  derivation function this build carries no implementation for, a key under
+  PKCS#5 PBES1, and the legacy OpenSSL traditional PEM. The fourth message
+  names the OID, and DES, 3DES, and PBKDF2 with an HMAC-SHA-1 pseudorandom
+  function all reach it. The sixth names the `openssl pkcs8 -topk8` conversion.
+- `pkcs5` recognizes six PBES1 OIDs, and an OID outside that set gives the DER
+  decoding failure a corrupted document gives, so the two are not told apart.
+- The legacy header is matched at the start of a line inside the selected
+  section, which stops free text around a plain key from reading as legacy and
+  reads the header with no space after the colon.
+- The key derivation runs on the blocking pool: the key file sets its cost, and
+  PBKDF2 and scrypt are deliberately slow. No bound is applied to either
+  parameter, the key file being operator-supplied.
+- The `Debug` rendering of `ClientIdentity` holds the key and the passphrase
+  out of the formatted text. The key is stated by its length and the passphrase
+  by whether it is set.
 
 Two behaviors of the reference tool were recorded by black-box observation
 against libostree 2026.1 before the proxy and the bypass landed. Both records
@@ -5562,6 +5634,55 @@ Opening the connection:
   number.
 - `connect_timeout` bounds the whole open: the resolution and every attempt
   together.
+
+The binary cost of the redirect resolver:
+
+- Resolving a `Location` against the URL of the response needs a URL parser,
+  and `url` carries `idna` and the compiled Unicode tables `idna` holds. What
+  the cost buys is WHATWG URL Standard resolution. The reference tool resolves
+  a redirect through libcurl, so the two readings part; the doc comment on
+  `resolve_location` in `fetch.rs` enumerates the divergence, from a dot
+  segment resolved away to a signed request target that answers 403.
+- The figure is measured on `target/release/ostrya`, the binary
+  `cargo build --release -p ostrya-cli` writes with its default feature set,
+  stripped after the build. Two builds of one tree under one toolchain are
+  compared. The first is the tree as it stands. The second holds the
+  counterfactual, which has two parts: the `url::Url::parse().join()` call is
+  stubbed to hand the `Location` value back unresolved, and the `url` entry is
+  dropped from `crates/ostrya/Cargo.toml`. Both parts are needed, because the
+  stub alone leaves the crate in the link. `cargo tree -p ostrya-cli -i url`
+  confirms the second build reaches no such package.
+- The first binary measures 13,491,736 bytes and the second 13,251,224, so the
+  call costs 240,512 bytes, which is about 235 KiB. Rebuilds of one tree land
+  a few hundred bytes apart, so the figure holds to the kilobyte.
+
+The suite's proxy exemption:
+
+- `Proxy::Environment` is the default, so a pull the port's own tests run reads
+  the environment of the host that runs them. Every test server the suite
+  starts listens on the loopback, and a host that names a proxy would send
+  those fetches to it, so the suite would depend on the environment the
+  developer or the runner holds.
+- `.cargo/config.toml` sets `no_proxy = "*"` with `force`. `*` exempts every
+  origin, which is the fetcher's own rule for the list, and the setting reaches
+  every binary cargo runs, a test binary that builds its fetcher deep inside a
+  pull included. `force` stops a host value from narrowing it.
+- The setting exempts a proxy a `cargo run` would use as well. An installed
+  binary reads the environment it is given.
+
+Dependency set for the phase, both in `crates/ostrya` and both pure Rust with
+no C in the graph. `CLAUDE.md` states the measured graph of each.
+
+- `url` 2.5.8, default features, for the one `Url::parse().join()` call that
+  resolves a `Location`. `idna` is a mandatory dependency of it, so
+  `default-features = false` drops neither `idna` nor its Unicode tables. The
+  proxy URL is read by the `hyper::Uri` parse that reads a mirror URL.
+- `pkcs8` 0.10.2, `default-features = false` with `encryption`, `pem`, and
+  `std`, for the encrypted client key. `sign-spki` and `verify-gpg` already
+  reached it through `p256` and `pgp`, and it becomes a dependency the build
+  always carries. `pkcs5`, `cbc`, `pbkdf2`, `salsa20`, and `scrypt` enter the
+  graph with it, and no other crate in the workspace reaches them. The `3des`
+  and `des-insecure` features stay off.
 
 ## Risk register
 

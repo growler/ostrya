@@ -69,10 +69,11 @@ hyper = { version = "1.11", default-features = false, features = [
     "http2",
 ] }
 # URL parsing for the fetcher. `Url::join` resolves the `Location` of a
-# redirect against the URL of the response, and the same parser reads a
-# proxy URL. The default feature set is taken because `idna` is a
-# mandatory dependency: `default-features = false` drops neither it nor
-# the Unicode tables it carries.
+# redirect against the URL of the response, which is the one call the
+# library makes into this crate; a mirror URL, a request URL, and a proxy
+# URL are read by the `hyper::Uri` parse. The default feature set is taken
+# because `idna` is a mandatory dependency: `default-features = false`
+# drops neither it nor the Unicode tables it carries.
 url = "2.5.8"
 # TLS for the fetcher. `rustls-graviola` supplies the crypto provider: Rust
 # plus formally-verified assembly, so the provider adds no C to the build and

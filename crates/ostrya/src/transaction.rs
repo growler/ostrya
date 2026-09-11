@@ -1,13 +1,13 @@
 //! Owned transaction handles.
 //!
-//! A [`Transaction`] is created from a [`Repo`](crate::Repo) and owns the
+//! A [`Transaction`] is created from a [`Repo`] and owns the
 //! repository lock hold and a staging directory for its duration. Multiple
 //! transactions may exist at once in one process, each with its own staging
 //! directory; the shared repository lock coordinates them and excludes other
 //! processes, and the `ostree` tool, per the configured lock kind.
 //!
 //! A transaction ingests objects into its staging directory through the write
-//! methods (in [`crate::write`]) and publishes them into `objects/` at
+//! methods (in `crate::write`) and publishes them into `objects/` at
 //! [`commit`](Transaction::commit). Object identity, dedup, free-space
 //! accounting, and the archive size map live in the shared staged state behind
 //! a mutex, so concurrent writers may share a `&Transaction`. Dropping a
@@ -432,7 +432,7 @@ impl Transaction {
     /// deriving commit metadata from the tree it is about to commit needs. Each
     /// [`TreeEntry::Dir`](crate::TreeEntry::Dir) it returns is read back the
     /// same way: passing one to `RepoTree::read_dir` before the transaction
-    /// commits reaches [`Error::ObjectNotFound`](crate::Error::ObjectNotFound)
+    /// commits reaches [`Error::ObjectNotFound`]
     /// for the subtree's dirtree.
     pub async fn read_dir(&self, tree: &crate::RepoTree) -> Result<Vec<crate::TreeEntry>> {
         let dirtree = self

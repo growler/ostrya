@@ -146,7 +146,7 @@
 //!
 //! Signatures: [`PullVerify`] states which of the four checks a pull makes over
 //! the commits it carries and the source's summary, described in
-//! [`verify`](self::verify). A local pull makes none unless one is asked for,
+//! `verify`. A local pull makes none unless one is asked for,
 //! and every check reads its keys from the configuration of the remote
 //! [`PullOptions::remote`] names, so a check asked for without one is refused.
 //! The commits and the summary are checked before the transaction opens, so a
@@ -298,7 +298,7 @@ pub struct PullVerify {
 ///
 /// The arguments are the commit the metadata belongs to, the property's key, and
 /// the value the dict holds for it, which is the `v` member of the `a{sv}` entry
-/// and so a [`Value::Variant`](ostrya_core::Value::Variant).
+/// and so a [`Value::Variant`].
 /// [`Allow`](FilterResult::Allow) stores the property,
 /// [`Skip`](FilterResult::Skip) leaves it out.
 pub type DetachedMetadataFilterFn =

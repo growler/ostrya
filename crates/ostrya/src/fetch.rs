@@ -90,7 +90,7 @@
 //! than `/`, no query, and no fragment. Userinfo is percent-decoded and sent to
 //! the proxy as `Proxy-Authorization: Basic`. Anything else -- an `https://` or
 //! a `socks5://` proxy among them -- fails [`Fetcher::new`] with
-//! [`Error::Unsupported`](crate::Error::Unsupported), whether the options or the
+//! [`Error::Unsupported`], whether the options or the
 //! environment named it, and the message names the value with any userinfo left
 //! out.
 //!
@@ -132,7 +132,7 @@
 //! entry are the ones a direct connection to that origin gets. A byte that
 //! arrives before the client has spoken fails the connect: nothing follows a
 //! `CONNECT` response. A non-2xx answer is a retryable failure and a 407 is a
-//! definitive one, both [`Error::Fetch`](crate::Error::Fetch) naming the proxy.
+//! definitive one, both [`Error::Fetch`] naming the proxy.
 //! [`connect_timeout`](FetcherOptions::connect_timeout) bounds the whole of it:
 //! the connect to the proxy, the `CONNECT` exchange, the TLS handshake, and the
 //! HTTP handshake together.
@@ -160,7 +160,7 @@
 //! the hop that follows it. A limit of zero follows nothing, and each of those
 //! statuses is then a definitive answer of its own. An attempt that has
 //! followed the limit and is sent on to another URL fails definitively with
-//! [`Error::RedirectLimit`](crate::Error::RedirectLimit).
+//! [`Error::RedirectLimit`].
 //!
 //! `Location` is resolved against the URL of the response that carried it, so
 //! it reads as an absolute URL, a relative one (`/other/path`, `sibling`), or
@@ -172,7 +172,7 @@
 //! for a redirect. A [`Target::Url`] reaches the wire as the caller wrote it,
 //! so one string named as a URL target and named as a `Location` reaches the
 //! server as two different request targets. Two hops are refused definitively
-//! with [`Error::Fetch`](crate::Error::Fetch) naming both the URL that
+//! with [`Error::Fetch`] naming both the URL that
 //! redirected and the URL it named: a scheme other than `http` or `https`, and
 //! a hop from `https` to `http`. A hop onto a TLS origin is refused the same
 //! way on a fetcher that holds no trust anchors. A hop from `http` to `https`
@@ -245,7 +245,10 @@
 //!
 //! - [`connect_timeout`](FetcherOptions::connect_timeout) covers opening a
 //!   connection -- the TCP connect, the TLS handshake, and the HTTP handshake
-//!   together.
+//!   together. The TCP connect resolves the host name and then races the
+//!   addresses the resolver gave, a further attempt starting every 250ms and
+//!   an attempt that fails starting the next one at once, so this window
+//!   covers the resolution and every attempt together.
 //! - [`progress_timeout`](FetcherOptions::progress_timeout) covers a response
 //!   making progress: the wait for the response head, and then each stall while
 //!   the body streams. The window runs from the read that finds nothing until
@@ -262,7 +265,7 @@
 //!
 //! [`fetch_timeout`](FetcherOptions::fetch_timeout) bounds the fetch as a whole:
 //! every round, every retry, and the delays between them, from admission to the
-//! response head. It expires as [`Error::Fetch`](crate::Error::Fetch)
+//! response head. It expires as [`Error::Fetch`]
 //! with nothing left to try, and the attempt it cancels takes the admission
 //! permit with it. This is what keeps an unresponsive peer from stalling a pull
 //! for the product of the destination count, the retry count, and the two
@@ -670,6 +673,11 @@ pub struct FetchRequest<'a> {
     ///
     /// These set the `Authorization` header, so an `Authorization` entry in
     /// [`headers`](FetchRequest::headers) alongside them fails the fetch.
+    ///
+    /// The header value is encoded here for each request. A caller that sends
+    /// one credential over many requests can encode the `Authorization` value
+    /// once and set it in [`headers`](FetchRequest::headers) instead, which
+    /// replaces the fetcher's credential for that request the same way.
     pub basic_auth: Option<&'a BasicAuth>,
     /// Whether a credential may reach a cleartext origin.
     ///
@@ -1078,16 +1086,16 @@ impl Fetcher {
     /// environment, is not `http://host[:port]`; or when the TLS material does
     /// not parse.
     ///
-    /// This is async because [`TrustRoots::System`](crate::TrustRoots::System),
+    /// This is async because [`TrustRoots::System`],
     /// the default, reads the host trust store, which goes to the blocking
     /// pool. The TLS configuration is built whatever the mirrors' scheme is, so
     /// a cleartext-only fetcher reads it too; under
-    /// [`TrustRoots::Pem`](crate::TrustRoots::Pem) the work is all in memory and
+    /// [`TrustRoots::Pem`] the work is all in memory and
     /// the constructor never yields. A system store holding no certificate
     /// fails the constructor when at least one mirror is `https`, and when the
     /// mirror list is empty, since a request may then name an `https` URL; a
     /// host without a CA bundle still reaches a cleartext remote. Under either
-    /// bypass variant of [`TrustRoots`](crate::TrustRoots) no store is read at
+    /// bypass variant of [`TrustRoots`] no store is read at
     /// all, so the constructor never yields and an empty host store is fatal
     /// for no mirror scheme.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher> {

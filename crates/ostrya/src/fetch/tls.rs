@@ -426,8 +426,10 @@ enum KeySection<'a> {
 
 /// Decode the private key a PEM blob holds. The first section whose armor
 /// label names a private key decides the path. A blob that carries a
-/// certificate and a key, or two keys, therefore reads the way
-/// `rustls_pemfile` reads one. `passphrase` decrypts an
+/// certificate and a key, or two plain keys, therefore reads the way
+/// `rustls_pemfile` reads one. An `ENCRYPTED PRIVATE KEY` section in front of
+/// a plain key parts from that reader, which holds the label unknown and steps
+/// over the section to the plain key behind it. `passphrase` decrypts an
 /// `ENCRYPTED PRIVATE KEY` section. It is refused on a section that carries no
 /// encryption, because a passphrase that decrypts nothing hides a
 /// configuration mistake.

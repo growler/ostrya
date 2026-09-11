@@ -395,13 +395,13 @@ struct CheckoutArgs {
     /// `-H/--require-hardlinks`.
     #[arg(long)]
     union_identical: bool,
-    /// Process Docker-style whiteout entries: `.wh.<name>` removes <name> from
+    /// Process Docker-style whiteout entries: `.wh.<name>` removes `<name>` from
     /// the destination and `.wh..wh..opq` clears the destination directory,
     /// and neither marker is materialized.
     #[arg(long)]
     whiteouts: bool,
     /// Turn a `.ostree-wh.<name>` entry into an overlayfs whiteout: a
-    /// character device 0:0 at <name>.
+    /// character device 0:0 at `<name>`.
     #[arg(long)]
     process_passthrough_whiteouts: bool,
     /// Exit 0 without writing anything when `--subpath` names nothing.

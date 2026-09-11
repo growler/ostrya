@@ -1,7 +1,7 @@
 //! Path-addressed tree construction over a transaction (Phase 7f).
 //!
 //! A [`StagingTree`] builds a directory tree by path rather than by hand-walking
-//! a [`MutableTree`](crate::MutableTree). It borrows the transaction it stages
+//! a [`MutableTree`]. It borrows the transaction it stages
 //! into, so `close`, [`write_mtree`](crate::Transaction::write_mtree), commit is
 //! the only ordering that compiles. It is a port extension with no `ostree` tool
 //! counterpart and no on-disk format impact: every file, symlink, and directory
@@ -16,7 +16,7 @@
 //! parts -- hydrating a lazily-loaded committed subdirectory, loading a symlink
 //! object during resolution, streaming payloads -- run between lock acquisitions,
 //! never across one. [`close`](StagingTree::close) hands back the assembled
-//! [`MutableTree`](crate::MutableTree) and fails while any file writer is still
+//! [`MutableTree`] and fails while any file writer is still
 //! outstanding, counted on the tree. A [`merge_at`](StagingTree::merge_at) that
 //! drops a directory, a [`remove`](StagingTree::remove) that takes an entry out,
 //! a [`clear_dir`](StagingTree::clear_dir) that reaches a directory, and a

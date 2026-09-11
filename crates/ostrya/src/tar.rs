@@ -35,7 +35,7 @@
 //! stores only regular files, symlinks, and directories.
 //! [`Repo::import_tar_into`] reads into a tree an earlier source already
 //! filled, and shapes each member with a
-//! [`CommitModifier`](crate::CommitModifier). The tree is serialized and
+//! [`CommitModifier`]. The tree is serialized and
 //! committed by the caller through
 //! [`Transaction::write_mtree`](crate::Transaction::write_mtree) and
 //! [`Transaction::write_commit`](crate::Transaction::write_commit).

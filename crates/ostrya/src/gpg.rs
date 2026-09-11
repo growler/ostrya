@@ -621,7 +621,7 @@ impl Repo {
     /// The keyring is replaced atomically at the repository root. It keeps the
     /// packet stream it already held and carries the packets of each added
     /// certificate as `keys` wrote them, with the Trust packets dropped (see
-    /// [`merge_keyring`]). It is written in the binary form, so an armored
+    /// `merge_keyring`). It is written in the binary form, so an armored
     /// keyring keeps its packets and loses its armor.
     ///
     /// A certificate for a key the keyring already holds is left as the keyring
@@ -638,7 +638,7 @@ impl Repo {
     /// the held one states, an absent expiry counting as later than any instant,
     /// replaces it as well, so a key whose owner has extended its life speaks
     /// again. Each replacement rewrites the keyring and drops the Trust packets
-    /// it carried (see [`merge_keyring`]), and the key is still counted as one
+    /// it carried (see `merge_keyring`), and the key is still counted as one
     /// the keyring already held. The offered stream and the keyring the remote
     /// already holds reach one keyring reader, so a keyring carrying bytes past
     /// its last framed packet is refused by the name of the keyring, which

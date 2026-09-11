@@ -2425,10 +2425,10 @@ the request's own, and the switch that admits a credential to a cleartext
 origin -- and resolves to `Fetched::Body` or `Fetched::NotModified`. A `Target`
 is a path relative to each mirror, or an absolute `http`/`https` URL served from
 its own origin, which consults no mirror; a fetcher whose mirror list is empty
-serves URL targets alone, and the pool is keyed by the origin together with
-whether the connection presents the configured client certificate, so a URL
-target shares a connection with a mirror at the same origin; with no certificate
-configured that key is the origin alone. The request's headers
+serves URL targets alone, and the pool is keyed by the endpoint the connection
+is open to, whether the connection presents the configured client certificate,
+and whether it is a proxy connection carrying absolute-form requests, so a URL
+target shares a connection with a mirror at the same origin. The request's headers
 merge over the fetcher's, one of a name replacing the fetcher's, and the
 request's credentials replace the fetcher's `Authorization`. Within one layer,
 credentials beside an `Authorization` header are refused, both of them setting
@@ -2442,9 +2442,11 @@ no socket.
   and the connection speaks what the server chose. A cleartext origin speaks
   HTTP/1.1, since cleartext HTTP/2 needs prior knowledge or an upgrade.
   `FetcherOptions::http2 = false` drops `h2` from the offer.
-- Connections are pooled per origin (scheme, host, port) and per client
-  identity presented, which the redirect items below state in full. An HTTP/2
-  connection
+- Connections are pooled per endpoint (scheme, host, port), per client
+  identity presented, and per proxied flag, which the redirect and proxy items
+  below state in full. The endpoint is the origin for a direct connection and
+  for a `CONNECT` tunnel, and the proxy for a proxied cleartext connection. An
+  HTTP/2 connection
   multiplexes concurrent requests; an HTTP/1.1 connection returns to the pool
   when its body reaches the end, and a body dropped early closes its connection
   instead, because the rest of the response is still in flight.
@@ -5455,6 +5457,54 @@ Proxy from the environment:
 
 Both records are the rule the port's own proxy and verification behavior
 follows.
+
+The proxy the port implements:
+
+- `FetcherOptions::proxy` names the form. `Proxy::None` reaches every origin
+  directly. `Proxy::Environment`, the default, reads `http_proxy`,
+  `https_proxy`, `all_proxy`, and `no_proxy` out of the process once, at
+  construction. `Proxy::Variables` states those same variables in the options.
+  `Proxy::Url` names one proxy for every origin and reads no exemptions.
+  Nothing re-reads the environment per request.
+- Each variable is read in upper case as well, `HTTP_PROXY` excepted, which is
+  the trap the tool's own record names: a CGI gateway hands a request header
+  called `Proxy` on under that name. Lower case wins over upper case, and an
+  empty value counts as unset.
+- A proxy URL is `http://host[:port]`, port 80 by default, with no path other
+  than `/`, no query, and no fragment. Anything else fails `Fetcher::new` with
+  `Error::Unsupported`, and the message names the value with any userinfo left
+  out. Every variable holding a value is parsed, including one the selection
+  passes over, so an unreadable `all_proxy` beside both scheme-specific
+  variables fails the constructor too.
+- Userinfo is the proxy's credential. It is percent-decoded and sent as
+  `Proxy-Authorization: Basic`, it belongs to the connection layer, and it is
+  no part of the merged header list: the cleartext-credential check and the
+  redirect scoping read neither it nor a tunnel.
+- A cleartext origin behind a proxy is reached over a connection to the proxy
+  carrying the absolute-form target and the origin's own `Host` header. Such a
+  connection speaks HTTP/1.1 and pools under the proxy, one connection
+  carrying requests for any cleartext origin.
+- A TLS origin behind a proxy is reached over a `CONNECT` tunnel naming
+  `host:port`, the port always written and an IPv6 literal keeping its
+  brackets. On a 2xx the tunneled socket comes back and the TLS handshake, the
+  ALPN selection, and the pool entry are the ones a direct connection gets. A
+  byte arriving behind the `CONNECT` response fails the connect. A non-2xx is
+  retryable and a 407 is definitive, both `Error::Fetch` naming the proxy.
+  `connect_timeout` bounds the connect, the `CONNECT` exchange, the TLS
+  handshake, and the HTTP handshake together, and a window that ends on a
+  proxied hop names the proxy.
+- `no_proxy` entries hold a host text, one leading `.`, and `:port`. `*` as a
+  whole entry exempts every host and is the one wildcard read, so
+  `*.example.com` is a host text no origin holds. An entry left naming no host
+  exempts nothing. The match reads the host text of the URL, ASCII case
+  ignored, and no address it resolves to, which is the tool's rule; CIDR
+  notation names no network, which is where this parts from curl 7.86 and
+  later.
+- The decision is made per hop from that hop's origin, so a redirect onto
+  another origin is served the way a route naming that origin would be, and a
+  proxied hop may redirect onto an exempt origin reached directly.
+- The remote `proxy` config key is not carried, so an HTTP pull reads the
+  environment alone.
 
 The verification bypass:
 

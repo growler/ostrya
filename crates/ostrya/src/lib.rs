@@ -231,7 +231,7 @@ pub use diff::{DiffChange, DiffEntry};
 pub use error::{Error, Result};
 pub use fetch::{
     BasicAuth, Body, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, Priority,
-    Protocol, Target, TlsOptions, TrustRoots, Validators,
+    Protocol, Proxy, Target, TlsOptions, TrustRoots, Validators,
 };
 pub use file::{ContentReader, FileKind, FileObject};
 pub use fsck::{FsckError, FsckErrorKind, FsckOptions, FsckReport};

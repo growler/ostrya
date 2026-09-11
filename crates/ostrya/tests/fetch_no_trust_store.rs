@@ -15,11 +15,21 @@
 
 use std::process::Command;
 
-use ostrya::{Fetcher, FetcherOptions, TlsOptions, TrustRoots};
+use ostrya::{Fetcher, FetcherOptions, Proxy, TlsOptions, TrustRoots};
 use ostrya_rt::block_on;
 
 const NO_CERT_FILE: &str = "/nonexistent/ca-bundle.pem";
 const NO_CERT_DIR: &str = "/nonexistent/certs";
+
+/// Options for a fetcher whose mirror is `url` and which reaches every origin
+/// directly, so the proxy variables the host running the suite holds decide
+/// nothing here.
+fn direct_options(url: impl Into<String>) -> FetcherOptions {
+    FetcherOptions {
+        proxy: Proxy::None,
+        ..FetcherOptions::new(url)
+    }
+}
 
 #[test]
 fn a_cleartext_fetcher_needs_no_trust_store() {
@@ -57,11 +67,11 @@ fn an_absent_trust_store_subprocess() {
     }
 
     block_on(async {
-        Fetcher::new(FetcherOptions::new("http://example.invalid/repo"))
+        Fetcher::new(direct_options("http://example.invalid/repo"))
             .await
             .expect("a cleartext mirror opens no handshake, so it needs no anchors");
 
-        let err = Fetcher::new(FetcherOptions::new("https://example.invalid/repo"))
+        let err = Fetcher::new(direct_options("https://example.invalid/repo"))
             .await
             .expect_err("an https mirror needs anchors the handshake can use");
         assert!(err.to_string().contains("no trusted certificates"), "{err}");
@@ -72,6 +82,7 @@ fn an_absent_trust_store_subprocess() {
                 "http://example.invalid/repo".to_owned(),
                 "https://example.invalid/mirror".to_owned(),
             ],
+            proxy: Proxy::None,
             ..FetcherOptions::default()
         };
         let err = Fetcher::new(mixed)
@@ -93,7 +104,7 @@ fn an_absent_trust_store_subprocess() {
                     roots: roots.clone(),
                     client_identity: None,
                 },
-                ..FetcherOptions::new("https://example.invalid/repo")
+                ..direct_options("https://example.invalid/repo")
             };
             Fetcher::new(options)
                 .await

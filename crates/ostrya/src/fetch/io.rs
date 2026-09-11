@@ -65,6 +65,13 @@ impl<S> FuturesIo<S> {
             scratch: Vec::new(),
         }
     }
+
+    /// The stream the adapter holds, taken back once hyper is done with it.
+    /// A `CONNECT` tunnel recovers its socket this way: hyper hands the
+    /// upgraded I/O back as the type the handshake was opened over.
+    pub(crate) fn into_inner(self) -> S {
+        self.inner
+    }
 }
 
 impl<S: AsyncRead + Unpin> hyper::rt::Read for FuturesIo<S> {

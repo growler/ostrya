@@ -5,5 +5,15 @@
 # `commit --tar-pathname-filter` compiles would follow it. This pins the
 # vendored static build everywhere, `force` so a host environment cannot
 # unset it.
+# The fetcher reads `http_proxy`, `https_proxy`, `all_proxy`, and `no_proxy`
+# out of the process environment, and every test server the suite starts
+# listens on the loopback. A host that names a proxy would send those fetches
+# to it, so the whole suite would depend on the environment the developer or
+# the runner holds. `*` exempts every origin, which is the fetcher's own rule
+# for the list, and it reaches every binary cargo runs, a test binary that
+# builds its fetcher deep inside a pull included. `force` so a host value
+# cannot narrow it. A proxy a `cargo run` would use is exempted the same way;
+# an installed binary reads the environment it is given.
 [env]
 PCRE2_SYS_STATIC = { value = "1", force = true }
+no_proxy = { value = "*", force = true }

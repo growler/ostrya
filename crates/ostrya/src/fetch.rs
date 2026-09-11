@@ -13,11 +13,14 @@
 //! `http/1.1`, and the fetcher speaks whichever the server chose. Over
 //! cleartext it speaks HTTP/1.1. HTTP/2 connections are pooled per origin and
 //! carry concurrent requests on one connection; HTTP/1.1 connections are pooled
-//! and reused once the previous body has been read to the end. The pool is
-//! keyed by the origin together with whether the connection presents the
-//! configured client certificate, so a URL target shares a connection with a
-//! mirror at the same origin; with no certificate configured that key is the
-//! origin alone.
+//! and reused once the previous body has been read to the end. The pool key
+//! holds three terms: the endpoint the connection is open to, whether the
+//! connection presents the configured client certificate, and whether it is a
+//! proxy connection carrying absolute-form requests. The endpoint is the origin
+//! for a direct connection and for a tunnel, whose TLS reaches the origin
+//! itself, and it is the proxy for a proxied cleartext connection. So a URL
+//! target shares a connection with a mirror at the same origin, and one proxy
+//! connection carries requests for any cleartext origin.
 //!
 //! A request sends the fetcher's headers with its own merged over them: a
 //! request header replaces the fetcher header of the same name, and two
@@ -68,6 +71,87 @@
 //! with the origin named: a request naming an `https` URL of its own is refused
 //! before admission, and a redirect hop onto a TLS origin ends the attempt
 //! definitively.
+//!
+//! A proxy carries the request where one applies to the origin.
+//! [`proxy`](FetcherOptions::proxy) states which one:
+//! [`Proxy::None`] reaches every origin directly, [`Proxy::Environment`] reads
+//! `http_proxy`, `https_proxy`, `all_proxy`, and `no_proxy` out of the process
+//! environment once, at construction, [`Proxy::Variables`] states those same
+//! variables in the options instead of in the process, and [`Proxy::Url`] names
+//! one proxy for every origin. `http_proxy` serves `http` origins, `https_proxy`
+//! serves `https` ones, and `all_proxy` serves either where the scheme-specific
+//! variable is unset. Each name is read in upper case as well, `HTTP_PROXY`
+//! excepted: a CGI gateway hands a request header called `Proxy` on under that
+//! name, so a request of a client's own would otherwise pick the proxy the
+//! fetcher connects through. Lower case wins over upper case, and an empty
+//! value counts as unset. Nothing re-reads the environment per request.
+//!
+//! A proxy URL is `http://host[:port]`, port 80 by default, with no path other
+//! than `/`, no query, and no fragment. Userinfo is percent-decoded and sent to
+//! the proxy as `Proxy-Authorization: Basic`. Anything else -- an `https://` or
+//! a `socks5://` proxy among them -- fails [`Fetcher::new`] with
+//! [`Error::Unsupported`](crate::Error::Unsupported), whether the options or the
+//! environment named it, and the message names the value with any userinfo left
+//! out.
+//!
+//! `no_proxy` states the origins the two environment forms exempt, as a
+//! comma-separated list. An entry holds a host text, one leading `.` where it
+//! is written with one, and `:port` where it names a port; space around an
+//! entry is ignored, and an entry left naming no host -- an empty one, `.`, and
+//! `:8080` among them -- exempts nothing. `*` as a whole entry exempts every
+//! host, and it is the one wildcard the list reads: `*.example.com` is a host
+//! text, which no origin holds. An entry matches an origin when it equals the
+//! host or the host ends with a `.` and the entry; one leading `.` on the entry
+//! is stripped first, so `.example.com` and `example.com` both exempt
+//! `a.example.com`, and a second `.` belongs to the host text the entry names.
+//! An entry carrying `:port` matches that port alone. The match is made against
+//! the host text of the URL, ASCII case ignored, and never against the address
+//! the host resolves to: `localhost` exempts no origin written as `127.0.0.1`,
+//! and an entry that is an IP literal matches that text alone. An entry in CIDR
+//! notation names no network here, which is where this parts from curl 7.86 and
+//! later; it is read as a host text, which no origin holds. An empty `no_proxy`
+//! value exempts nothing, and [`Proxy::Url`] reads no exemptions at all, naming
+//! the one proxy every origin is reached through.
+//!
+//! A cleartext origin behind a proxy is reached over a connection to the proxy,
+//! and the request carries the absolute-form target -- the whole
+//! `http://host/path` URL -- together with the origin's own `Host` header. Such
+//! a connection speaks HTTP/1.1, cleartext HTTP/2 needing prior knowledge or an
+//! upgrade, and it pools under the proxy rather than under the origin, one
+//! proxy connection carrying requests for any cleartext origin. The pool key
+//! states that a connection is a proxy's, so a direct connection to an endpoint
+//! that happens to be the proxy's own is never handed to a proxied request, nor
+//! the other way about: the two request forms differ, and a server answers the
+//! form it was not expecting with a 404.
+//!
+//! A TLS origin behind a proxy is reached over a `CONNECT` tunnel. The request
+//! names the target as `host:port`, with the port always written and an IPv6
+//! literal keeping its brackets, and carries the same `Proxy-Authorization`
+//! where the proxy URL held userinfo. On a 2xx the tunneled socket comes back
+//! and the TLS handshake, the ALPN protocol selection, and the connection pool
+//! entry are the ones a direct connection to that origin gets. A byte that
+//! arrives before the client has spoken fails the connect: nothing follows a
+//! `CONNECT` response. A non-2xx answer is a retryable failure and a 407 is a
+//! definitive one, both [`Error::Fetch`](crate::Error::Fetch) naming the proxy.
+//! [`connect_timeout`](FetcherOptions::connect_timeout) bounds the whole of it:
+//! the connect to the proxy, the `CONNECT` exchange, the TLS handshake, and the
+//! HTTP handshake together.
+//!
+//! The proxy credential belongs to the connection layer. It reaches the proxy
+//! on a proxied cleartext request and on a `CONNECT`, and it reaches no origin:
+//! it is no part of the merged header list, so neither the cleartext credential
+//! check nor the redirect scoping reads it, and a tunnel carries nothing of it.
+//! A `Proxy-Authorization` header a caller sets keeps the meaning it has
+//! without a proxy: it is a credential in the merged list, refused for a
+//! cleartext destination the way the other two are. On a proxied cleartext
+//! request it replaces the fetcher's own proxy credential, two values for one
+//! header being two answers to one question; over a tunnel the two never meet,
+//! the caller's reaching the origin and the fetcher's the proxy.
+//!
+//! The proxy decision is made per hop, from that hop's origin, so a redirect
+//! onto another origin is served the way a route naming that origin would be.
+//! A proxy changes nothing about the cleartext rule: a cleartext origin is
+//! cleartext however it is reached.
 //!
 //! A redirect is followed. A 301, 302, 303, 307, or 308 sends the attempt on
 //! to the URL its `Location` header names, up to
@@ -238,6 +322,25 @@ const IDENTITY: &str = "identity";
 /// server fault, and a response declaring one fails the attempt.
 const CHUNKED: &str = "chunked";
 
+/// The variables [`Proxy::Environment`] reads, in the order a lookup prefers
+/// them: the lower-case name of each, and the upper-case name where one is
+/// read. `HTTP_PROXY` is read by nothing. A CGI gateway hands a request header
+/// called `Proxy` on to the program under that name, so a request of a client's
+/// own would otherwise name the proxy the fetcher connects through.
+const PROXY_VARIABLES: [&str; 7] = [
+    "http_proxy",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
+
+/// The scheme a proxy URL is named under, which is the one scheme a proxy
+/// connection is opened with.
+const PROXY_SCHEME: &str = "http://";
+
 /// The statuses a redirect is followed at. Every request the fetcher makes is
 /// a GET, so none of the five changes the method of the hop that follows it,
 /// and the ones that part over the method are one case here.
@@ -357,6 +460,52 @@ impl Validators {
     }
 }
 
+/// Which proxy a [`Fetcher`] reaches an origin through.
+///
+/// The module documentation states the variables the two environment forms
+/// read, the shape of a proxy URL, and the exemptions `no_proxy` lists. Every
+/// form is resolved once, by [`Fetcher::new`], which is what refuses a proxy
+/// URL the fetcher cannot connect through.
+///
+/// The [`Debug`] rendering leaves the userinfo of a proxy URL out, so a struct
+/// that carries proxy credentials is logged without them.
+#[derive(Clone, Default)]
+pub enum Proxy {
+    /// Connect directly, whatever the environment says.
+    None,
+    /// Read `http_proxy`, `https_proxy`, `all_proxy`, and `no_proxy` from the
+    /// process environment, once, at construction.
+    #[default]
+    Environment,
+    /// The same variables, stated as name and value pairs rather than read from
+    /// the process. A name the environment forms do not read is ignored here as
+    /// well, and among two entries of one name the first with a value is the one
+    /// read.
+    Variables(Vec<(String, String)>),
+    /// One `http://` proxy URL for every origin, whose userinfo is sent as
+    /// `Proxy-Authorization: Basic`. No origin is exempt: the environment is
+    /// read for neither the proxy nor the exemptions.
+    Url(String),
+}
+
+impl std::fmt::Debug for Proxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Proxy::None => f.write_str("None"),
+            Proxy::Environment => f.write_str("Environment"),
+            Proxy::Variables(variables) => {
+                let held = variables
+                    .iter()
+                    .map(|(name, value)| (name, without_userinfo(value)));
+                f.debug_tuple("Variables")
+                    .field(&held.collect::<Vec<_>>())
+                    .finish()
+            }
+            Proxy::Url(url) => f.debug_tuple("Url").field(&without_userinfo(url)).finish(),
+        }
+    }
+}
+
 /// How a [`Fetcher`] reaches its remote.
 #[derive(Clone, Debug)]
 pub struct FetcherOptions {
@@ -390,6 +539,11 @@ pub struct FetcherOptions {
     pub basic_auth: Option<BasicAuth>,
     /// Trust anchors and the client certificate, for `https` mirrors.
     pub tls: TlsOptions,
+    /// Which proxy an origin is reached through, which defaults to the one the
+    /// process environment names. The value is resolved by [`Fetcher::new`],
+    /// which refuses a proxy URL that is not `http://host[:port]`; nothing
+    /// re-reads it per request.
+    pub proxy: Proxy,
     /// Whether to offer HTTP/2 in ALPN. With this false the fetcher speaks
     /// HTTP/1.1 even against a server that supports HTTP/2.
     pub http2: bool,
@@ -432,6 +586,7 @@ impl Default for FetcherOptions {
             headers: Vec::new(),
             basic_auth: None,
             tls: TlsOptions::default(),
+            proxy: Proxy::default(),
             http2: true,
             max_retries: 5,
             max_redirects: 10,
@@ -674,8 +829,8 @@ struct Origin {
     port: u16,
 }
 
-/// What the connection pool is keyed by: an endpoint, and which of the two
-/// client configurations opened the connection.
+/// What the connection pool is keyed by: an endpoint, which of the two client
+/// configurations opened the connection, and whether it is a proxy's.
 ///
 /// A connection presents the client certificate for every request it carries,
 /// so one opened with the certificate is never handed to a hop that must not
@@ -688,6 +843,108 @@ struct PoolKey {
     origin: Origin,
     /// Whether the connection presents the configured client certificate.
     identity: bool,
+    /// Whether the connection goes to a proxy and carries absolute-form
+    /// requests. Such a connection is pooled under the proxy endpoint, which a
+    /// cleartext origin of the same host and port is pooled under as well, and
+    /// the two carry different request forms: the flag is what keeps one from
+    /// being handed to the other's request.
+    proxied: bool,
+}
+
+/// One proxy the fetcher connects through, resolved from a proxy URL.
+#[derive(Debug)]
+struct ProxyEndpoint {
+    /// Where the connection goes. A proxy is reached over cleartext, so this
+    /// origin is never TLS.
+    endpoint: Origin,
+    /// The `Proxy-Authorization` value the proxy URL's userinfo builds, where
+    /// it carried any.
+    credential: Option<HeaderValue>,
+    /// How a diagnostic names this proxy, which is its URL with the userinfo
+    /// left out.
+    named: String,
+}
+
+/// One `no_proxy` entry: a host text, and the port it is qualified by where it
+/// named one.
+#[derive(Debug)]
+struct Exemption {
+    /// The host the entry names, in ASCII lower case, with one leading `.`
+    /// stripped. This is never empty: an entry naming no host exempts nothing
+    /// and reaches no list.
+    host: String,
+    /// The port the entry matches, where it named a readable one.
+    port: Option<u16>,
+}
+
+impl Exemption {
+    /// Whether this entry exempts `origin`.
+    ///
+    /// The comparison is made byte by byte, ASCII case ignored, so a host that
+    /// is not ASCII is compared without the slicing a character boundary would
+    /// fault on.
+    fn matches(&self, origin: &Origin) -> bool {
+        if self.port.is_some_and(|port| port != origin.port) {
+            return false;
+        }
+        let host = origin.host.as_bytes();
+        let entry = self.host.as_bytes();
+        if host.eq_ignore_ascii_case(entry) {
+            return true;
+        }
+        // The host is a name under the entry, which the `.` before the entry is
+        // what states: `notexample.com` is no part of `example.com`.
+        host.len() > entry.len()
+            && host[host.len() - entry.len() - 1] == b'.'
+            && host[host.len() - entry.len()..].eq_ignore_ascii_case(entry)
+    }
+}
+
+/// Which proxy each scheme is reached through, and what is exempt from both.
+#[derive(Debug, Default)]
+struct Proxies {
+    /// The proxy a cleartext origin is reached through.
+    http: Option<Arc<ProxyEndpoint>>,
+    /// The proxy a TLS origin is reached through. One proxy URL serving both
+    /// schemes is held here and in `http` as one endpoint.
+    https: Option<Arc<ProxyEndpoint>>,
+    /// Whether `no_proxy` listed `*`, which exempts every host.
+    exempt_all: bool,
+    /// The hosts `no_proxy` listed.
+    exempt: Vec<Exemption>,
+}
+
+impl Proxies {
+    /// How a hop at `origin` is reached. This reads the resolved state and
+    /// allocates nothing, so the decision costs a fetch one walk of the
+    /// exemption list.
+    fn via(&self, origin: &Origin) -> Via<'_> {
+        let proxy = if origin.tls { &self.https } else { &self.http };
+        let Some(proxy) = proxy.as_deref() else {
+            return Via::Direct;
+        };
+        if self.exempt_all || self.exempt.iter().any(|entry| entry.matches(origin)) {
+            return Via::Direct;
+        }
+        if origin.tls {
+            Via::Tunnel(proxy)
+        } else {
+            Via::Absolute(proxy)
+        }
+    }
+}
+
+/// How one hop reaches its origin.
+#[derive(Clone, Copy, Debug)]
+enum Via<'a> {
+    /// Straight to the origin.
+    Direct,
+    /// Over a connection to the proxy carrying absolute-form requests, which is
+    /// how a cleartext origin behind a proxy is reached.
+    Absolute(&'a ProxyEndpoint),
+    /// Over a `CONNECT` tunnel through the proxy, which is how a TLS origin
+    /// behind a proxy is reached.
+    Tunnel(&'a ProxyEndpoint),
 }
 
 /// The request body: every request is a GET, so there is nothing to send.
@@ -749,6 +1006,8 @@ struct Inner {
     /// client configurations differ. With none configured every connection is
     /// opened over one configuration and the pool holds one entry per origin.
     client_identity: bool,
+    /// Which proxy each scheme is reached through, resolved at construction.
+    proxies: Proxies,
     max_retries: u32,
     max_redirects: u32,
     connect_timeout: Duration,
@@ -815,7 +1074,9 @@ impl Fetcher {
     /// when a header name or value is not valid; when a header the connection
     /// layer sets is configured; when credentials are configured alongside a
     /// cleartext mirror; when credentials are configured alongside an
-    /// `Authorization` header; or when the TLS material does not parse.
+    /// `Authorization` header; when a proxy URL, from the options or from the
+    /// environment, is not `http://host[:port]`; or when the TLS material does
+    /// not parse.
     ///
     /// This is async because [`TrustRoots::System`](crate::TrustRoots::System),
     /// the default, reads the host trust store, which goes to the blocking
@@ -901,6 +1162,7 @@ impl Fetcher {
         if let Some(auth) = &options.basic_auth {
             headers.push((hyper::header::AUTHORIZATION, basic_auth_value(auth)?));
         }
+        let proxies = resolve_proxy(&options.proxy)?;
         let max_outstanding = options.max_outstanding.max(1);
         // A fetcher with no mirror serves the URLs its requests name, any of
         // which may be `https`, so it has to hold trust anchors: an empty
@@ -913,6 +1175,7 @@ impl Fetcher {
                 headers,
                 has_trust_anchors: tls.has_trust_anchors,
                 client_identity: options.tls.client_identity.is_some(),
+                proxies,
                 tls,
                 max_retries: options.max_retries,
                 max_redirects: options.max_redirects,
@@ -1151,12 +1414,21 @@ impl Fetcher {
         // has the whole window for it.
         let drain_until = Instant::now() + progress_timeout;
         loop {
+            // The proxy decision is this hop's own, and a cleartext hop behind
+            // a proxy is pooled under the proxy endpoint rather than under the
+            // origin: one such connection carries requests for any cleartext
+            // origin.
+            let via = self.inner.proxies.via(&hop.origin);
             let key = PoolKey {
-                origin: hop.origin.clone(),
+                origin: match via {
+                    Via::Absolute(proxy) => proxy.endpoint.clone(),
+                    Via::Direct | Via::Tunnel(_) => hop.origin.clone(),
+                },
                 identity: self.presents_identity(&hop.origin, named),
+                proxied: matches!(via, Via::Absolute(_)),
             };
             let url = hop.url();
-            let (response, protocol, reuse) = self.send(&hop, &key, request, &headers).await?;
+            let (response, protocol, reuse) = self.send(&hop, &key, via, request, &headers).await?;
             let status = response.status();
             if status == StatusCode::NOT_MODIFIED {
                 // A 304 carries no body, so the connection is immediately
@@ -1284,6 +1556,7 @@ impl Fetcher {
         &self,
         hop: &Destination,
         key: &PoolKey,
+        via: Via<'_>,
         request: &FetchRequest<'_>,
         headers: &[(HeaderName, HeaderValue)],
     ) -> std::result::Result<(Response<Incoming>, Protocol, Option<H1Sender>), Failure> {
@@ -1301,14 +1574,25 @@ impl Fetcher {
                 // caller nests inside its own: a fetch is ten times smaller
                 // this way, and a pull that wraps several helpers around one
                 // multiplies what it saves.
-                let opened = within(connect_timeout, Box::pin(self.connect(key))).await;
+                let opened = within(connect_timeout, Box::pin(self.connect(key, via))).await;
                 match opened {
-                    Some(result) => result.map_err(Failure::Retry)?,
+                    Some(result) => result?,
                     None => {
-                        return Err(Failure::Retry(Error::Fetch(format!(
-                            "connect to {}:{} timed out after {connect_timeout:?}",
-                            origin.host, origin.port
-                        ))));
+                        // The window covers the connect to whichever endpoint
+                        // the hop is opened to, so a proxied hop names the
+                        // proxy: the origin behind it is reached over that
+                        // connection and is contacted by nothing until it is
+                        // open.
+                        return Err(Failure::Retry(Error::Fetch(match via {
+                            Via::Direct => format!(
+                                "connect to {}:{} timed out after {connect_timeout:?}",
+                                origin.host, origin.port
+                            ),
+                            Via::Absolute(proxy) | Via::Tunnel(proxy) => format!(
+                                "connect to the proxy {} timed out after {connect_timeout:?}",
+                                proxy.named
+                            ),
+                        })));
                     }
                 }
             }
@@ -1316,7 +1600,7 @@ impl Fetcher {
         match sender {
             Sender::H1(mut sender) => {
                 let http_request = self
-                    .build_request(hop, request, headers, Protocol::Http11)
+                    .build_request(hop, request, headers, Protocol::Http11, via)
                     .map_err(Failure::Fatal)?;
                 // The request and the wait for the response head share the
                 // progress window: the head is the first bytes the response
@@ -1334,7 +1618,7 @@ impl Fetcher {
             }
             Sender::H2(mut sender) => {
                 let http_request = self
-                    .build_request(hop, request, headers, Protocol::Http2)
+                    .build_request(hop, request, headers, Protocol::Http2, via)
                     .map_err(Failure::Fatal)?;
                 let sent = within(progress_timeout, async {
                     sender.ready().await?;
@@ -1415,16 +1699,29 @@ impl Fetcher {
     /// proxy requests, and a plain static-file server answers 404 to it. An
     /// HTTP/2 request carries the absolute URL, from which hyper fills the
     /// `:scheme` and `:authority` pseudo-headers.
+    ///
+    /// A request that travels to a cleartext origin over a proxy connection
+    /// carries the absolute form, which is what tells the proxy where to send
+    /// it, and the `Host` header of the origin rather than of the proxy. It
+    /// carries the proxy's own credential as well, where the merged headers
+    /// hold none of that name: a `Proxy-Authorization` header the caller set
+    /// states what the proxy is to be sent, and two values of one name would
+    /// give the proxy two answers to one question. A `CONNECT` tunnel carries
+    /// the fetcher's proxy credential on the `CONNECT` alone, so the request
+    /// that travels over the tunnel is the one a direct connection sends.
     fn build_request(
         &self,
         destination: &Destination,
         request: &FetchRequest<'_>,
         headers: &[(HeaderName, HeaderValue)],
         protocol: Protocol,
+        via: Via<'_>,
     ) -> Result<Request<NoBody>> {
-        let url = match protocol {
-            Protocol::Http11 => destination.target(),
-            Protocol::Http2 => destination.url(),
+        let absolute = protocol == Protocol::Http2 || matches!(via, Via::Absolute(_));
+        let url = if absolute {
+            destination.url()
+        } else {
+            destination.target()
         };
         let uri =
             Uri::try_from(url).map_err(|e| Error::Fetch(format!("invalid url {url}: {e}")))?;
@@ -1434,6 +1731,14 @@ impl Fetcher {
         }
         for (name, value) in headers {
             builder = builder.header(name, value);
+        }
+        if let Via::Absolute(proxy) = via
+            && let Some(credential) = &proxy.credential
+            && !headers
+                .iter()
+                .any(|(name, _)| *name == hyper::header::PROXY_AUTHORIZATION)
+        {
+            builder = builder.header(hyper::header::PROXY_AUTHORIZATION, credential);
         }
         if let Some(validators) = request.validators {
             if let Some(etag) = &validators.etag {
@@ -1454,23 +1759,55 @@ impl Fetcher {
     /// The key states which client configuration the handshake runs under, so a
     /// connection that presents the client certificate and one that presents
     /// none are two pool entries and neither is handed to the other's hop.
-    async fn connect(&self, key: &PoolKey) -> Result<Sender> {
+    ///
+    /// `via` states what the connection reaches. A proxied cleartext origin is
+    /// keyed by the proxy endpoint already, so the socket goes where the key
+    /// names it and the requests that travel over it carry the absolute form. A
+    /// tunneled TLS origin is keyed by the origin, so the socket goes to the
+    /// proxy and the `CONNECT` exchange is what the handshake then runs over.
+    ///
+    /// A failure here says whether another attempt may find something else. A
+    /// proxy that refuses the tunnel with 407 refuses the credential the
+    /// fetcher holds, which no round of retries changes; every other failure is
+    /// retryable.
+    async fn connect(&self, key: &PoolKey, via: Via<'_>) -> std::result::Result<Sender, Failure> {
         let origin = &key.origin;
-        let tcp = rt::TcpStream::connect(&origin.host, origin.port)
+        let endpoint = match via {
+            Via::Tunnel(proxy) => &proxy.endpoint,
+            Via::Direct | Via::Absolute(_) => origin,
+        };
+        let tcp = rt::TcpStream::connect(&endpoint.host, endpoint.port)
             .await
             .map_err(|e| {
-                Error::Fetch(format!(
-                    "connect to {}:{} failed: {e}",
-                    origin.host, origin.port
-                ))
+                Failure::Retry(Error::Fetch(match via {
+                    Via::Direct => {
+                        format!("connect to {}:{} failed: {e}", endpoint.host, endpoint.port)
+                    }
+                    Via::Absolute(proxy) | Via::Tunnel(proxy) => {
+                        format!("connect to the proxy {} failed: {e}", proxy.named)
+                    }
+                }))
             })?;
         if !origin.tls {
             // Cleartext HTTP/2 needs prior knowledge or an upgrade; neither is
-            // used, so a cleartext origin speaks HTTP/1.1.
-            return self.handshake_h1(key, FuturesIo::new(tcp)).await;
+            // used, so a cleartext origin speaks HTTP/1.1, over a proxy as
+            // over a direct connection.
+            return self
+                .handshake_h1(key, FuturesIo::new(tcp))
+                .await
+                .map_err(Failure::Retry);
         }
-        let server_name = rustls::pki_types::ServerName::try_from(origin.host.clone())
-            .map_err(|e| Error::Fetch(format!("invalid server name {}: {e}", origin.host)))?;
+        let tcp = match via {
+            Via::Tunnel(proxy) => self.tunnel(proxy, origin, tcp).await?,
+            Via::Direct | Via::Absolute(_) => tcp,
+        };
+        let server_name =
+            rustls::pki_types::ServerName::try_from(origin.host.clone()).map_err(|e| {
+                Failure::Retry(Error::Fetch(format!(
+                    "invalid server name {}: {e}",
+                    origin.host
+                )))
+            })?;
         let config = if key.identity {
             &self.inner.tls.with_identity
         } else {
@@ -1479,14 +1816,123 @@ impl Fetcher {
         let stream = futures_rustls::TlsConnector::from(config.clone())
             .connect(server_name, tcp)
             .await
-            .map_err(|e| Error::Fetch(format!("tls handshake with {} failed: {e}", origin.host)))?;
+            .map_err(|e| {
+                Failure::Retry(Error::Fetch(format!(
+                    "tls handshake with {} failed: {e}",
+                    origin.host
+                )))
+            })?;
         let h2 = stream.get_ref().1.alpn_protocol() == Some(b"h2");
         let io = FuturesIo::new(stream);
         if h2 {
-            self.handshake_h2(key, io).await
+            self.handshake_h2(key, io).await.map_err(Failure::Retry)
         } else {
-            self.handshake_h1(key, io).await
+            self.handshake_h1(key, io).await.map_err(Failure::Retry)
         }
+    }
+
+    /// Ask `proxy` to tunnel to `origin` and hand back the socket the tunnel
+    /// runs over.
+    ///
+    /// The `CONNECT` goes over hyper's HTTP/1.1 client, which is what reads the
+    /// answer and hands the socket back: a 2xx to a `CONNECT` is an upgrade,
+    /// and the upgraded I/O is the stream the handshake was opened with. The
+    /// connection future is what delivers it, so it is driven in its own task
+    /// and ends with the upgrade.
+    ///
+    /// Bytes buffered behind the response fail the connect. Nothing follows a
+    /// `CONNECT` response before the client speaks, so a proxy that sent
+    /// something is not speaking the protocol the tunnel needs, and the TLS
+    /// handshake would read the stream from after those bytes.
+    async fn tunnel(
+        &self,
+        proxy: &ProxyEndpoint,
+        origin: &Origin,
+        tcp: rt::TcpStream,
+    ) -> std::result::Result<rt::TcpStream, Failure> {
+        let refused = |what: String| Failure::Retry(Error::Fetch(what));
+        let authority = connect_authority(origin);
+        let host = HeaderValue::try_from(&authority).map_err(|_| {
+            Failure::Fatal(Error::Fetch(format!(
+                "the proxy {} cannot be asked to reach {authority}, which is not a usable host",
+                proxy.named
+            )))
+        })?;
+        let mut builder = Request::builder()
+            .method(Method::CONNECT)
+            .uri(&authority)
+            .header(hyper::header::HOST, host);
+        if let Some(credential) = &proxy.credential {
+            builder = builder.header(hyper::header::PROXY_AUTHORIZATION, credential);
+        }
+        let request = builder.body(NoBody).map_err(|e| {
+            refused(format!(
+                "the connect request to the proxy {} for {authority} is invalid: {e}",
+                proxy.named
+            ))
+        })?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(FuturesIo::new(tcp))
+            .await
+            .map_err(|e| {
+                refused(format!(
+                    "http/1.1 handshake with the proxy {} failed: {e}",
+                    proxy.named
+                ))
+            })?;
+        // The upgrade is delivered by the connection future, so it runs beside
+        // the request. It ends with the upgrade, and the task with it.
+        drop(rt::spawn(async move {
+            let _ = connection.with_upgrades().await;
+        }));
+        let response = async {
+            sender.ready().await?;
+            sender.send_request(request).await
+        }
+        .await
+        .map_err(|e| {
+            refused(format!(
+                "connect to {authority} through the proxy {} failed: {e}",
+                proxy.named
+            ))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = format!(
+                "the proxy {} answered the connect to {authority} with {}",
+                proxy.named,
+                status.as_u16()
+            );
+            // A 407 refuses the credential the fetcher holds, or the absence of
+            // one, which every round of retries would offer again.
+            return Err(match status {
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED => Failure::Fatal(Error::Fetch(message)),
+                _ => Failure::Retry(Error::Fetch(message)),
+            });
+        }
+        let upgraded = hyper::upgrade::on(response).await.map_err(|e| {
+            refused(format!(
+                "the proxy {} accepted the connect to {authority} without tunneling it: {e}",
+                proxy.named
+            ))
+        })?;
+        let parts = upgraded
+            .downcast::<FuturesIo<rt::TcpStream>>()
+            .map_err(|_| {
+                refused(format!(
+                    "the tunnel through the proxy {} to {authority} is not the socket it was \
+                     opened over",
+                    proxy.named
+                ))
+            })?;
+        if !parts.read_buf.is_empty() {
+            return Err(refused(format!(
+                "the proxy {} sent {} bytes after the connect to {authority}, which nothing may \
+                 follow",
+                proxy.named,
+                parts.read_buf.len()
+            )));
+        }
+        Ok(parts.io.into_inner())
     }
 
     /// Complete an HTTP/1.1 handshake and drive the connection in its own task.
@@ -1908,6 +2354,294 @@ fn merge_headers<'a>(
     Ok(Cow::Owned(headers))
 }
 
+/// Resolve the proxy configuration into the state a fetch reads.
+///
+/// Every form is resolved once, here, so a fetch reads no environment and
+/// parses no URL. A proxy URL the fetcher cannot connect through fails the
+/// constructor, whether the options named it or the environment did: a value
+/// read under a meaning of the port's own would send the request somewhere the
+/// caller did not name.
+fn resolve_proxy(proxy: &Proxy) -> Result<Proxies> {
+    match proxy {
+        Proxy::None => Ok(Proxies::default()),
+        Proxy::Environment => resolve_variables(&environment()),
+        Proxy::Variables(variables) => resolve_variables(variables),
+        Proxy::Url(url) => {
+            let endpoint = Arc::new(parse_proxy(url)?);
+            Ok(Proxies {
+                http: Some(endpoint.clone()),
+                https: Some(endpoint),
+                exempt_all: false,
+                exempt: Vec::new(),
+            })
+        }
+    }
+}
+
+/// The proxy variables the process environment holds.
+///
+/// An empty value counts as unset, so it is left out here and the lookup below
+/// has one rule to apply.
+fn environment() -> Vec<(String, String)> {
+    PROXY_VARIABLES
+        .iter()
+        .filter_map(|name| {
+            let value = std::env::var(name).ok()?;
+            (!value.is_empty()).then(|| ((*name).to_owned(), value))
+        })
+        .collect()
+}
+
+/// Resolve the variable forms of [`Proxy`] into the state a fetch reads.
+fn resolve_variables(variables: &[(String, String)]) -> Result<Proxies> {
+    let all = variable(variables, "all_proxy", Some("ALL_PROXY"));
+    let http = variable(variables, "http_proxy", None);
+    let https = variable(variables, "https_proxy", Some("HTTPS_PROXY"));
+    // Every variable holding a value is parsed, and the selection below is made
+    // from what parsed: a proxy url the fetcher cannot connect through is
+    // refused where the caller named it, and `all_proxy` beside both
+    // scheme-specific variables is named and read by no fetch. One URL serving
+    // both schemes is parsed once and held as one endpoint, so the pool key of
+    // a proxy connection is the same whichever variable named it.
+    let mut endpoints: Vec<(&str, Arc<ProxyEndpoint>)> = Vec::new();
+    for url in [all, http, https].into_iter().flatten() {
+        if !endpoints.iter().any(|(named, _)| *named == url) {
+            endpoints.push((url, Arc::new(parse_proxy(url)?)));
+        }
+    }
+    let parsed = |url: Option<&str>| {
+        url.and_then(|url| endpoints.iter().find(|(named, _)| *named == url))
+            .map(|(_, endpoint)| endpoint.clone())
+    };
+    let (http, https) = (parsed(http.or(all)), parsed(https.or(all)));
+    let mut exempt_all = false;
+    let mut exempt = Vec::new();
+    for entry in variable(variables, "no_proxy", Some("NO_PROXY"))
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        if entry == "*" {
+            exempt_all = true;
+            continue;
+        }
+        exempt.extend(parse_exemption(entry));
+    }
+    Ok(Proxies {
+        http,
+        https,
+        exempt_all,
+        exempt,
+    })
+}
+
+/// The value of one proxy variable: the lower-case name first, then the
+/// upper-case name where one is read.
+///
+/// An empty value counts as unset, and among two entries of one name the first
+/// with a value is the one read.
+fn variable<'a>(
+    variables: &'a [(String, String)],
+    lower: &str,
+    upper: Option<&str>,
+) -> Option<&'a str> {
+    let held = |name: &str| {
+        variables
+            .iter()
+            .find(|(held, value)| held == name && !value.is_empty())
+            .map(|(_, value)| value.as_str())
+    };
+    held(lower).or_else(|| upper.and_then(held))
+}
+
+/// Read one `no_proxy` entry, or `None` where it names no host.
+///
+/// An IPv6 literal carries colons of its own, so a port is read off the
+/// bracketed form and off an entry holding one colon; an unbracketed entry with
+/// more colons than that is an address rather than a host and a port. A port
+/// text that is not a number from 0 to 65535 leaves the whole entry as one host
+/// text, which no origin host holds, so such an entry exempts nothing.
+///
+/// An entry left with no host once its leading `.` and its port are taken off
+/// -- `.` and `:8080` are the two spellings of it -- exempts nothing and is
+/// dropped here: an empty host text is the suffix of every host, and keeping it
+/// would exempt every origin.
+fn parse_exemption(entry: &str) -> Option<Exemption> {
+    let (host, port) = match entry
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+    {
+        Some((inside, rest)) => (inside, rest.strip_prefix(':')),
+        None => match entry.split_once(':') {
+            Some((host, port)) if !port.contains(':') => (host, Some(port)),
+            _ => (entry, None),
+        },
+    };
+    // One leading `.` states the suffix match the comparison makes anyway, so
+    // it is stripped and the two spellings of one entry are one entry. A second
+    // `.` is part of the host text the entry names, which no origin host holds.
+    let named = |host: &str| host.strip_prefix('.').unwrap_or(host).to_ascii_lowercase();
+    let (host, port) = match port.map(str::parse::<u16>) {
+        Some(Ok(port)) => (named(host), Some(port)),
+        Some(Err(_)) => (named(entry), None),
+        None => (named(host), None),
+    };
+    (!host.is_empty()).then_some(Exemption { host, port })
+}
+
+/// Read a proxy URL into the endpoint a connection is opened to.
+///
+/// A proxy is asked for an origin by the request that travels to it, so the URL
+/// names an endpoint and nothing else: a path other than `/`, a query, or a
+/// fragment states something the request has no place to carry, and it is
+/// refused rather than dropped. The scheme is `http`, which is the one scheme a
+/// proxy connection is opened with here.
+///
+/// Userinfo is the proxy's credential. It is percent-decoded and sent as
+/// `Proxy-Authorization: Basic`, which is what a proxy that works under another
+/// client expects. Every refusal names the URL with the userinfo left out, a
+/// userinfo holding a password.
+fn parse_proxy(url: &str) -> Result<ProxyEndpoint> {
+    let refused = |what: &str| {
+        Error::Unsupported(format!(
+            "proxy url {}: {what}",
+            without_userinfo(url.trim())
+        ))
+    };
+    let url = url.trim();
+    if !url
+        .get(..PROXY_SCHEME.len())
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(PROXY_SCHEME))
+    {
+        return Err(refused("a proxy is reached over http://host[:port] alone"));
+    }
+    if url.contains('#') {
+        return Err(refused("a proxy url carries no fragment"));
+    }
+    let uri = Uri::try_from(url).map_err(|e| refused(&format!("invalid url: {e}")))?;
+    if let Some(query) = uri.query() {
+        return Err(refused(&format!(
+            "a proxy url carries no query string, and this one carries ?{query}"
+        )));
+    }
+    if !matches!(uri.path(), "" | "/") {
+        return Err(refused(&format!(
+            "a proxy url carries no path, and this one carries {}",
+            uri.path()
+        )));
+    }
+    // `Uri::host` holds an IPv6 literal in brackets, which belong to the
+    // authority and not to the address: a connect resolves the bracketed form
+    // to nothing.
+    let literal = uri.host().ok_or_else(|| refused("the url has no host"))?;
+    let authority = uri
+        .authority()
+        .expect("a url holding a host holds an authority")
+        .as_str();
+    let credential = match authority.rsplit_once('@') {
+        Some((userinfo, _)) => Some(proxy_credential(userinfo).ok_or_else(|| {
+            refused(
+                "the userinfo is not a percent-encoded user name and password the proxy can be \
+                 sent",
+            )
+        })?),
+        None => None,
+    };
+    let host = literal
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(literal)
+        .to_ascii_lowercase();
+    // `Uri` accepts an authority whose port it cannot read and reports no port
+    // for it, so the port text is read from the authority and refused rather
+    // than served from the default.
+    let port_text = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
+        .strip_prefix(literal)
+        .and_then(|rest| rest.strip_prefix(':'));
+    let port = match (uri.port_u16(), port_text) {
+        (Some(port), _) => port,
+        (None, None) => 80,
+        (None, Some(text)) => {
+            return Err(refused(&format!(
+                "the port {text:?} is not a number from 0 to 65535"
+            )));
+        }
+    };
+    let named = if port == 80 {
+        format!("{PROXY_SCHEME}{literal}")
+    } else {
+        format!("{PROXY_SCHEME}{literal}:{port}")
+    };
+    Ok(ProxyEndpoint {
+        endpoint: Origin {
+            tls: false,
+            host,
+            port,
+        },
+        credential,
+        named,
+    })
+}
+
+/// The `Proxy-Authorization` value one proxy URL's userinfo builds.
+///
+/// The two fields are percent-decoded, since that is the encoding a URL states
+/// a `:` or an `@` in a credential under. `None` says the userinfo holds
+/// something else: an escape that is not two hexadecimal digits, or a field
+/// whose bytes are not text.
+fn proxy_credential(userinfo: &str) -> Option<HeaderValue> {
+    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    let field = |text: &str| String::from_utf8(percent_decode(text)?).ok();
+    basic_auth_value(&BasicAuth {
+        user: field(user)?,
+        password: field(password)?,
+    })
+    .ok()
+}
+
+/// Percent-decode one field of a proxy URL's userinfo.
+///
+/// `%` starts an escape of exactly two hexadecimal digits. `None` says the
+/// field holds one that is not, which is refused rather than sent as the bytes
+/// the caller wrote: a credential the proxy reads differently from the one the
+/// caller meant answers 407 and names nothing.
+fn percent_decode(field: &str) -> Option<Vec<u8>> {
+    let bytes = field.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'%' {
+            decoded.push(bytes[at]);
+            at += 1;
+            continue;
+        }
+        let escape = bytes.get(at + 1..at + 3)?;
+        if !escape.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        let text = std::str::from_utf8(escape).ok()?;
+        decoded.push(u8::from_str_radix(text, 16).ok()?);
+        at += 3;
+    }
+    Some(decoded)
+}
+
+/// The `host:port` a `CONNECT` names its target by.
+///
+/// The port is always written, whatever the scheme's default is: what the proxy
+/// opens is a TCP connection, which names a port and reads no scheme. An IPv6
+/// literal keeps the brackets that separate the address from the port.
+fn connect_authority(origin: &Origin) -> String {
+    if origin.host.contains(':') {
+        format!("[{}]:{}", origin.host, origin.port)
+    } else {
+        format!("{}:{}", origin.host, origin.port)
+    }
+}
+
 /// The `Authorization` value basic credentials are sent as.
 fn basic_auth_value(auth: &BasicAuth) -> Result<HeaderValue> {
     let encoded =
@@ -1987,8 +2721,12 @@ fn parse_authority(url: &str, credentials: &str) -> Result<(Uri, Origin, String)
         (Some(port), _) => port,
         (None, None) => default_port,
         (None, Some(text)) => {
+            // A password holding a `?` or a `#` ends the authority before the
+            // `@`, so the userinfo check above passes and this message is one a
+            // URL carrying userinfo still reaches.
             return Err(Error::Fetch(format!(
-                "url {url} names the port {text:?}, which is not a number from 0 to 65535"
+                "url {} names the port {text:?}, which is not a number from 0 to 65535",
+                without_userinfo(url)
             )));
         }
     };
@@ -2003,12 +2741,18 @@ fn parse_authority(url: &str, credentials: &str) -> Result<(Uri, Origin, String)
 /// How a message names a URL whose authority the parse has not reached, which
 /// is a URL whose userinfo has not been refused yet. Userinfo holds a password,
 /// so the part of the authority before the `@` is left out.
+///
+/// The password arrives as the caller wrote it, and one holding a `/`, a `?`,
+/// or a `#` puts the end of the authority after the `@` rather than before it:
+/// where the authority ends is readable once the userinfo is found and not
+/// before. So an `@` anywhere past the scheme states that there is a userinfo,
+/// and everything up to the last one is left out, which keeps a password of
+/// any spelling out of the message. A URL carrying an `@` in its path and no
+/// userinfo costs the message its host that way, which is what a redaction
+/// that reads no well-formed authority costs.
 fn without_userinfo(url: &str) -> Cow<'_, str> {
     let start = url.find("://").map_or(0, |at| at + 3);
-    let end = url[start..]
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |at| start + at);
-    match url[start..end].rfind('@') {
+    match url[start..].rfind('@') {
         Some(at) => Cow::Owned(format!("{}{}", &url[..start], &url[start + at + 1..])),
         None => Cow::Borrowed(url),
     }
@@ -2376,14 +3120,14 @@ mod tests {
     #[test]
     fn options_are_validated_at_construction() {
         rt::block_on(async {
-            let mut options = FetcherOptions::new("http://example.com");
+            let mut options = direct_options("http://example.com");
             options.headers = vec![("not a header".into(), "v".into())];
             let err = Fetcher::new(options).await.unwrap_err();
             assert!(err.to_string().contains("invalid header name"), "{err}");
 
             // The host header comes from the url the request is sent to, so a
             // caller-supplied one would collide with it.
-            let mut options = FetcherOptions::new("http://example.com");
+            let mut options = direct_options("http://example.com");
             options.headers = vec![("host".into(), "elsewhere".into())];
             let err = Fetcher::new(options).await.unwrap_err();
             assert!(err.to_string().contains("host header"), "{err}");
@@ -2441,7 +3185,7 @@ mod tests {
     #[test]
     fn a_request_target_appends_the_path_to_the_base() {
         rt::block_on(async {
-            let fetcher = Fetcher::new(FetcherOptions::new("http://example.com/r"))
+            let fetcher = Fetcher::new(direct_options("http://example.com/r"))
                 .await
                 .unwrap();
             let mirror = &fetcher.inner.mirrors[0];
@@ -2452,6 +3196,7 @@ mod tests {
                     &FetchRequest::path("refs/heads/a"),
                     &fetcher.inner.headers,
                     Protocol::Http11,
+                    Via::Direct,
                 )
                 .unwrap();
             assert_eq!(request.uri(), "/r/refs/heads/a");
@@ -2655,6 +3400,19 @@ mod tests {
         }
     }
 
+    /// Options for a fetcher at `url` that reaches every origin directly.
+    ///
+    /// A test that is not about the proxy states this, so the proxy variables
+    /// the host running the suite holds decide nothing: the default form reads
+    /// them, and a fetcher built under one would travel to a proxy no test
+    /// started.
+    fn direct_options(url: impl Into<String>) -> FetcherOptions {
+        FetcherOptions {
+            proxy: Proxy::None,
+            ..FetcherOptions::new(url)
+        }
+    }
+
     /// Options for an `https` mirror whose anchors come from the fixture
     /// authority, so the constructor reads no host trust store.
     fn tls_options(url: &str) -> FetcherOptions {
@@ -2665,7 +3423,7 @@ mod tests {
                 ),
                 ..TlsOptions::default()
             },
-            ..FetcherOptions::new(url)
+            ..direct_options(url)
         }
     }
 
@@ -2708,7 +3466,7 @@ mod tests {
         for name in ["authorization", "proxy-authorization", "cookie"] {
             let options = FetcherOptions {
                 headers: vec![(name.to_owned(), "secret".to_owned())],
-                ..FetcherOptions::new("http://cleartext.example/repo")
+                ..direct_options("http://cleartext.example/repo")
             };
             let err = rt::block_on(Fetcher::new(options)).unwrap_err();
             let message = err.to_string();
@@ -2719,7 +3477,7 @@ mod tests {
         // A header that is not a credential reaches a cleartext mirror.
         let options = FetcherOptions {
             headers: vec![("x-trace".to_owned(), "abc".to_owned())],
-            ..FetcherOptions::new("http://cleartext.example/repo")
+            ..direct_options("http://cleartext.example/repo")
         };
         rt::block_on(Fetcher::new(options)).unwrap();
 
@@ -2832,6 +3590,14 @@ mod tests {
             let message = err.to_string();
             assert!(!message.contains("sup3rs3cret"), "{url}: {message}");
         }
+
+        // A password holding a `/`, a `?`, or a `#` puts the end of the
+        // authority behind the `@`, and the userinfo is left out all the same.
+        for password in ["pa#ss", "pa?ss", "p/ss"] {
+            let url = format!("https://alice:{password}@example.com/p");
+            let message = parse_url(&url).unwrap_err().to_string();
+            assert!(!message.contains(password), "{password}: {message}");
+        }
     }
 
     /// `Uri` accepts an authority whose port it cannot read and reports no port
@@ -2897,10 +3663,500 @@ mod tests {
 
         let options = FetcherOptions {
             basic_auth: Some(auth),
-            ..FetcherOptions::new("https://example.com")
+            ..direct_options("https://example.com")
         };
         let rendered = format!("{options:?}");
         assert!(!rendered.contains("sup3rs3cret"), "{rendered}");
+    }
+
+    /// The origin of one absolute URL, which is what a proxy decision reads.
+    fn origin_of(url: &str) -> Origin {
+        parse_url(url).unwrap().origin
+    }
+
+    /// How a hop at `url` is reached: the proxy it names, and whether the
+    /// request travels in absolute form or through a tunnel.
+    fn via_of(proxies: &Proxies, url: &str) -> Option<(String, bool)> {
+        match proxies.via(&origin_of(url)) {
+            Via::Direct => None,
+            Via::Absolute(proxy) => Some((proxy.named.clone(), false)),
+            Via::Tunnel(proxy) => Some((proxy.named.clone(), true)),
+        }
+    }
+
+    /// The variable list one test states, as the options carry it.
+    fn variables(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    /// A proxy is named by an endpoint and nothing else: a path, a query, a
+    /// fragment, or a scheme other than `http` states something a proxy
+    /// connection has no place to carry, and every one of them is refused at
+    /// construction.
+    #[test]
+    fn a_proxy_url_names_an_http_endpoint() {
+        // Every row states the URL, then the endpoint host, the port, and how a
+        // diagnostic names the proxy.
+        for (url, host, port, named) in [
+            (
+                "http://proxy.example",
+                "proxy.example",
+                80,
+                "http://proxy.example",
+            ),
+            (
+                "http://proxy.example:3128",
+                "proxy.example",
+                3128,
+                "http://proxy.example:3128",
+            ),
+            // A path of `/` alone is the root, which is no path at all.
+            (
+                "http://proxy.example/",
+                "proxy.example",
+                80,
+                "http://proxy.example",
+            ),
+            (
+                "HTTP://Proxy.Example:3128",
+                "proxy.example",
+                3128,
+                "http://Proxy.Example:3128",
+            ),
+            // Surrounding space is what an environment variable carries; the
+            // endpoint is read without it.
+            (
+                " http://proxy.example:3128 ",
+                "proxy.example",
+                3128,
+                "http://proxy.example:3128",
+            ),
+            // An IPv6 literal keeps its brackets in the authority and is held
+            // without them, the connect resolving the bracketed form to nothing.
+            ("http://[::1]:3128", "::1", 3128, "http://[::1]:3128"),
+            (
+                "http://alice:s3cret@proxy.example:3128",
+                "proxy.example",
+                3128,
+                "http://proxy.example:3128",
+            ),
+        ] {
+            let proxy = parse_proxy(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(proxy.endpoint.host, host, "{url}");
+            assert_eq!(proxy.endpoint.port, port, "{url}");
+            assert!(!proxy.endpoint.tls, "{url}");
+            assert_eq!(proxy.named, named, "{url}");
+        }
+
+        // Userinfo is the proxy's credential, percent-decoding included:
+        // base64("alice:s3cret") and base64("al:ce:p@ss").
+        let credential = |url: &str| {
+            parse_proxy(url)
+                .unwrap()
+                .credential
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        assert_eq!(credential("http://proxy.example"), None);
+        assert_eq!(
+            credential("http://alice:s3cret@proxy.example").as_deref(),
+            Some("Basic YWxpY2U6czNjcmV0")
+        );
+        assert_eq!(
+            credential("http://al%3Ace:p%40ss@proxy.example").as_deref(),
+            Some("Basic YWw6Y2U6cEBzcw==")
+        );
+        // A user with no password is userinfo too, and it is sent with the
+        // empty password an `Authorization` value holds: base64("alice:").
+        assert_eq!(
+            credential("http://alice@proxy.example").as_deref(),
+            Some("Basic YWxpY2U6")
+        );
+
+        // Every row states a URL the fetcher cannot connect through and a word
+        // its refusal carries.
+        for (url, says) in [
+            ("socks5://proxy.example:1080", "http://host[:port] alone"),
+            ("https://proxy.example:3128", "http://host[:port] alone"),
+            ("proxy.example:3128", "http://host[:port] alone"),
+            ("http://proxy.example/squid", "carries no path"),
+            ("http://proxy.example/?upstream=1", "carries no query"),
+            ("http://proxy.example/#frag", "carries no fragment"),
+            ("http://", "invalid url"),
+            ("http://proxy.example:99999", "not a number"),
+            ("http://proxy.example:abc", "not a number"),
+            ("http://alice:p%zz@proxy.example", "percent-encoded"),
+            ("http://alice:p%4@proxy.example", "percent-encoded"),
+        ] {
+            let err = parse_proxy(url).unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{url}: {err}");
+            let message = err.to_string();
+            assert!(message.contains(says), "{url}: {message}");
+        }
+    }
+
+    /// `http_proxy` serves cleartext origins and `https_proxy` serves TLS ones,
+    /// `all_proxy` serves either where the scheme-specific variable is unset,
+    /// lower case wins over upper case, an empty value counts as unset, and
+    /// `HTTP_PROXY` is read by nothing.
+    #[test]
+    fn the_proxy_variables_are_read_per_scheme() {
+        let cleartext = "http://origin.example/summary";
+        let tls = "https://origin.example/summary";
+        let absolute = |named: &str| Some((named.to_owned(), false));
+        let tunnel = |named: &str| Some((named.to_owned(), true));
+
+        // Each scheme is served by its own variable, and the request form
+        // follows the origin: absolute over a proxy connection for cleartext, a
+        // tunnel for TLS.
+        let proxies = resolve_variables(&variables(&[
+            ("http_proxy", "http://plain.example:3128"),
+            ("https_proxy", "http://secure.example:3128"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            via_of(&proxies, cleartext),
+            absolute("http://plain.example:3128")
+        );
+        assert_eq!(via_of(&proxies, tls), tunnel("http://secure.example:3128"));
+
+        // One variable serves its own scheme alone.
+        let proxies =
+            resolve_variables(&variables(&[("http_proxy", "http://plain.example:3128")])).unwrap();
+        assert_eq!(
+            via_of(&proxies, cleartext),
+            absolute("http://plain.example:3128")
+        );
+        assert_eq!(via_of(&proxies, tls), None);
+        let proxies =
+            resolve_variables(&variables(&[("https_proxy", "http://secure.example:3128")]))
+                .unwrap();
+        assert_eq!(via_of(&proxies, cleartext), None);
+        assert_eq!(via_of(&proxies, tls), tunnel("http://secure.example:3128"));
+
+        // `all_proxy` serves either scheme, and the scheme-specific variable
+        // takes the scheme it names.
+        let proxies =
+            resolve_variables(&variables(&[("all_proxy", "http://any.example:3128")])).unwrap();
+        assert_eq!(
+            via_of(&proxies, cleartext),
+            absolute("http://any.example:3128")
+        );
+        assert_eq!(via_of(&proxies, tls), tunnel("http://any.example:3128"));
+        let proxies = resolve_variables(&variables(&[
+            ("all_proxy", "http://any.example:3128"),
+            ("https_proxy", "http://secure.example:3128"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            via_of(&proxies, cleartext),
+            absolute("http://any.example:3128")
+        );
+        assert_eq!(via_of(&proxies, tls), tunnel("http://secure.example:3128"));
+
+        // The upper-case name is read for every variable but `http_proxy`: a
+        // CGI gateway hands a request header called `Proxy` on under that name.
+        let proxies = resolve_variables(&variables(&[
+            ("HTTP_PROXY", "http://cgi.example:3128"),
+            ("HTTPS_PROXY", "http://secure.example:3128"),
+        ]))
+        .unwrap();
+        assert_eq!(via_of(&proxies, cleartext), None);
+        assert_eq!(via_of(&proxies, tls), tunnel("http://secure.example:3128"));
+        let proxies =
+            resolve_variables(&variables(&[("ALL_PROXY", "http://any.example:3128")])).unwrap();
+        assert_eq!(
+            via_of(&proxies, cleartext),
+            absolute("http://any.example:3128")
+        );
+
+        // Lower case wins over upper case, and an empty value counts as unset,
+        // which leaves the upper-case name the one that is read.
+        let proxies = resolve_variables(&variables(&[
+            ("https_proxy", "http://lower.example:3128"),
+            ("HTTPS_PROXY", "http://upper.example:3128"),
+        ]))
+        .unwrap();
+        assert_eq!(via_of(&proxies, tls), tunnel("http://lower.example:3128"));
+        let proxies = resolve_variables(&variables(&[
+            ("https_proxy", ""),
+            ("HTTPS_PROXY", "http://upper.example:3128"),
+        ]))
+        .unwrap();
+        assert_eq!(via_of(&proxies, tls), tunnel("http://upper.example:3128"));
+        let proxies = resolve_variables(&variables(&[("http_proxy", "")])).unwrap();
+        assert_eq!(via_of(&proxies, cleartext), None);
+
+        // A value the fetcher cannot connect through fails the resolution
+        // whichever variable held it.
+        for name in ["http_proxy", "https_proxy", "all_proxy"] {
+            let err = resolve_variables(&variables(&[(name, "socks5://proxy.example:1080")]))
+                .unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{name}: {err}");
+        }
+        // A variable the selection passes over is parsed too: an `all_proxy`
+        // beside both scheme-specific variables is read by no fetch, and one
+        // holding a value the fetcher cannot connect through fails the
+        // resolution where the caller named it.
+        let err = resolve_variables(&variables(&[
+            ("all_proxy", "socks5://proxy.example:1080"),
+            ("http_proxy", "http://plain.example:3128"),
+            ("https_proxy", "http://secure.example:3128"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+
+        // No variable at all, and the explicit forms of the option.
+        let proxies = resolve_variables(&[]).unwrap();
+        assert_eq!(via_of(&proxies, cleartext), None);
+        assert_eq!(via_of(&proxies, tls), None);
+        let proxies = resolve_proxy(&Proxy::None).unwrap();
+        assert_eq!(via_of(&proxies, cleartext), None);
+        // One URL serves every origin, and it reads no exemption.
+        let proxies = resolve_proxy(&Proxy::Url("http://any.example:3128".into())).unwrap();
+        assert_eq!(
+            via_of(&proxies, cleartext),
+            absolute("http://any.example:3128")
+        );
+        assert_eq!(via_of(&proxies, tls), tunnel("http://any.example:3128"));
+    }
+
+    /// What `no_proxy` exempts: an exact host, a host under a listed domain, a
+    /// port-qualified entry, and every host under `*`. The match is made
+    /// against the host text and never against the address it resolves to.
+    #[test]
+    fn no_proxy_exempts_by_host_text_and_port() {
+        let proxied = |no_proxy: &str, url: &str| {
+            let proxies = resolve_variables(&variables(&[
+                ("all_proxy", "http://any.example:3128"),
+                ("no_proxy", no_proxy),
+            ]))
+            .unwrap();
+            via_of(&proxies, url).is_some()
+        };
+
+        // An exact host, and a host of another name at the same domain.
+        assert!(!proxied("origin.example", "http://origin.example/p"));
+        assert!(proxied("origin.example", "http://other.example/p"));
+        // A host under a listed domain, whichever of the two spellings the
+        // entry uses, and a name that merely ends with the same letters.
+        for entry in ["example.com", ".example.com"] {
+            assert!(!proxied(entry, "http://a.example.com/p"));
+            assert!(!proxied(entry, "http://deep.a.example.com/p"));
+            assert!(!proxied(entry, "http://example.com/p"));
+            assert!(proxied(entry, "http://notexample.com/p"));
+        }
+        // The list is comma-separated, space around an entry is ignored, and an
+        // empty entry names nothing.
+        assert!(!proxied(" a.example , b.example ", "http://b.example/p"));
+        assert!(!proxied("a.example,,b.example", "http://a.example/p"));
+        assert!(proxied(",", "http://a.example/p"));
+        assert!(proxied("", "http://a.example/p"));
+        // ASCII case is ignored on both sides.
+        assert!(!proxied("ORIGIN.example", "http://origin.EXAMPLE/p"));
+        // A port-qualified entry matches that port alone.
+        assert!(!proxied(
+            "origin.example:8080",
+            "http://origin.example:8080/p"
+        ));
+        assert!(proxied(
+            "origin.example:8080",
+            "http://origin.example:8081/p"
+        ));
+        assert!(proxied("origin.example:8080", "http://origin.example/p"));
+        assert!(!proxied("origin.example:443", "https://origin.example/p"));
+        // An entry with no port matches whatever port the origin names.
+        assert!(!proxied("origin.example", "http://origin.example:8080/p"));
+        // `*` exempts every host, whatever else the list holds.
+        for url in ["http://a.example/p", "https://b.example:8443/p"] {
+            assert!(!proxied("*", url));
+            assert!(!proxied("a.example,*", url));
+        }
+        // An IP literal matches that text and nothing else, so a name is not
+        // exempted by the address it resolves to and an address is not exempted
+        // by a name.
+        assert!(!proxied("127.0.0.1", "http://127.0.0.1:8080/p"));
+        assert!(proxied("localhost", "http://127.0.0.1:8080/p"));
+        assert!(proxied("127.0.0.1", "http://localhost:8080/p"));
+        // An IPv6 literal is exempted by the address alone, written with or
+        // without the brackets the authority carries.
+        for entry in ["::1", "[::1]", "[::1]:8080"] {
+            assert!(!proxied(entry, "http://[::1]:8080/p"), "{entry}");
+        }
+        assert!(proxied("[::1]:8081", "http://[::1]:8080/p"));
+        // A network in CIDR notation names no network here: it is read as a
+        // host text, which no origin holds.
+        assert!(proxied("127.0.0.0/8", "http://127.0.0.1:8080/p"));
+        // A port text that is no port leaves the entry as one host text, which
+        // no origin host holds.
+        assert!(proxied("origin.example:abc", "http://origin.example/p"));
+        // An entry left naming no host exempts nothing, a host written with a
+        // trailing `.` included.
+        for entry in [".", ":8080", ".:8080"] {
+            assert!(proxied(entry, "http://a.example./p"), "{entry}");
+            assert!(proxied(entry, "http://a.example:8080/p"), "{entry}");
+        }
+        // One leading `.` is stripped, so a second belongs to the host text the
+        // entry names.
+        assert!(proxied("..example.com", "http://a.example.com/p"));
+        // `*` as a whole entry is the one wildcard the list reads: every other
+        // form holding one is a host text.
+        assert!(proxied("*.example.com", "http://a.example.com/p"));
+        assert!(proxied("*.example.com", "http://example.com/p"));
+    }
+
+    /// A proxy URL's userinfo holds a password, so it reaches neither a
+    /// rendering of the options nor a refusal the constructor writes.
+    #[test]
+    fn a_proxy_password_reaches_no_message() {
+        let url = |tail: &str| format!("http://alice:sup3rs3cret@proxy.example:3128{tail}");
+
+        // The rendering of every form that carries a URL.
+        for proxy in [
+            Proxy::Url(url("")),
+            Proxy::Variables(vec![("https_proxy".to_owned(), url(""))]),
+        ] {
+            let rendered = format!("{proxy:?}");
+            assert!(!rendered.contains("sup3rs3cret"), "{rendered}");
+            assert!(rendered.contains("proxy.example:3128"), "{rendered}");
+
+            let options = FetcherOptions {
+                proxy,
+                ..direct_options("https://example.com")
+            };
+            let rendered = format!("{options:?}");
+            assert!(!rendered.contains("sup3rs3cret"), "{rendered}");
+        }
+
+        // Every refusal, whichever part of the URL the parse was reading.
+        for tail in ["/squid", "/?upstream=1", "/#frag", ":99999"] {
+            let err = parse_proxy(&url(tail)).unwrap_err();
+            let message = err.to_string();
+            assert!(!message.contains("sup3rs3cret"), "{tail}: {message}");
+        }
+        let err = parse_proxy("socks5://alice:sup3rs3cret@proxy.example:1080").unwrap_err();
+        assert!(!err.to_string().contains("sup3rs3cret"), "{err}");
+
+        // A password holding a `/`, a `?`, or a `#` puts the end of the
+        // authority behind the `@`, and the userinfo is left out all the same.
+        for password in ["pa#ss", "pa?ss", "p/ss"] {
+            let url = format!("http://alice:{password}@proxy.example:3128/squid");
+            let rendered = format!("{:?}", Proxy::Url(url.clone()));
+            assert!(!rendered.contains(password), "{password}: {rendered}");
+            assert!(
+                rendered.contains("proxy.example:3128"),
+                "{password}: {rendered}"
+            );
+            let message = parse_proxy(&url).unwrap_err().to_string();
+            assert!(!message.contains(password), "{password}: {message}");
+            assert!(
+                message.contains("proxy.example:3128"),
+                "{password}: {message}"
+            );
+        }
+
+        // The refusal the constructor writes is the one a caller logs.
+        rt::block_on(async {
+            let err = Fetcher::new(FetcherOptions {
+                proxy: Proxy::Url(url("/squid")),
+                ..direct_options("http://origin.example/repo")
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{err}");
+            let message = err.to_string();
+            assert!(!message.contains("sup3rs3cret"), "{message}");
+            assert!(message.contains("proxy.example:3128"), "{message}");
+        });
+    }
+
+    /// A `CONNECT` names its target by host and port, the port always written:
+    /// what the proxy opens is a TCP connection, which reads no scheme.
+    #[test]
+    fn a_connect_names_the_target_with_its_port() {
+        for (url, authority) in [
+            ("https://origin.example/p", "origin.example:443"),
+            ("https://origin.example:8443/p", "origin.example:8443"),
+            ("http://origin.example/p", "origin.example:80"),
+            ("https://[2001:db8::1]/p", "[2001:db8::1]:443"),
+            ("https://[::1]:8443/p", "[::1]:8443"),
+        ] {
+            assert_eq!(connect_authority(&origin_of(url)), authority, "{url}");
+        }
+    }
+
+    /// A proxied cleartext request carries the absolute-form target and the
+    /// origin's own `Host` header, and the proxy's credential where the merged
+    /// headers hold none of that name. A direct request and the request that
+    /// travels over a tunnel carry the origin form and nothing of the proxy's.
+    #[test]
+    fn a_proxied_cleartext_request_carries_the_absolute_form() {
+        rt::block_on(async {
+            let fetcher = Fetcher::new(FetcherOptions {
+                proxy: Proxy::Url("http://alice:s3cret@proxy.example:3128".into()),
+                ..tls_options("http://origin.example/r")
+            })
+            .await
+            .unwrap();
+            let destination = fetcher.inner.mirrors[0].destination("refs/heads/a");
+            let request = FetchRequest::path("refs/heads/a");
+            let built = |via: Via<'_>, headers: &[(HeaderName, HeaderValue)]| {
+                fetcher
+                    .build_request(&destination, &request, headers, Protocol::Http11, via)
+                    .unwrap()
+            };
+            let proxy_credential = |request: &Request<NoBody>| {
+                request
+                    .headers()
+                    .get(hyper::header::PROXY_AUTHORIZATION)
+                    .map(|value| value.to_str().unwrap().to_owned())
+            };
+            let Via::Absolute(proxy) = fetcher.inner.proxies.via(&destination.origin) else {
+                panic!("a cleartext origin behind a proxy travels in absolute form");
+            };
+            let via = Via::Absolute(proxy);
+
+            let absolute = built(via, &fetcher.inner.headers);
+            assert_eq!(absolute.uri(), "http://origin.example/r/refs/heads/a");
+            assert_eq!(
+                absolute.headers().get(hyper::header::HOST).unwrap(),
+                "origin.example"
+            );
+            // base64("alice:s3cret")
+            assert_eq!(
+                proxy_credential(&absolute).as_deref(),
+                Some("Basic YWxpY2U6czNjcmV0")
+            );
+
+            // A `Proxy-Authorization` header the caller set states what the
+            // proxy is to be sent, so the fetcher's own credential is left out
+            // rather than joined to it.
+            let mut headers = fetcher.inner.headers.clone();
+            headers.push((
+                hyper::header::PROXY_AUTHORIZATION,
+                HeaderValue::from_static("Basic Y2FsbGVy"),
+            ));
+            let caller = built(via, &headers);
+            assert_eq!(
+                caller
+                    .headers()
+                    .get_all(hyper::header::PROXY_AUTHORIZATION)
+                    .iter()
+                    .count(),
+                1
+            );
+            assert_eq!(proxy_credential(&caller).as_deref(), Some("Basic Y2FsbGVy"));
+
+            // A direct hop, and the request that travels over a tunnel, carry
+            // the origin form and nothing of the proxy's.
+            for via in [Via::Direct, Via::Tunnel(proxy)] {
+                let direct = built(via, &fetcher.inner.headers);
+                assert_eq!(direct.uri(), "/r/refs/heads/a");
+                assert_eq!(proxy_credential(&direct), None);
+            }
+        });
     }
 
     /// The connection layer frames a request and holds its connection, so a
@@ -2915,7 +4171,7 @@ mod tests {
         for name in CONNECTION_HEADERS {
             let options = FetcherOptions {
                 headers: vec![(name.to_owned(), "10".to_owned())],
-                ..FetcherOptions::new("http://example.com")
+                ..direct_options("http://example.com")
             };
             let err = rt::block_on(Fetcher::new(options)).unwrap_err();
             let message = err.to_string();
@@ -3078,8 +4334,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let fetcher =
-            rt::block_on(Fetcher::new(FetcherOptions::new("http://example.com"))).unwrap();
+        let fetcher = rt::block_on(Fetcher::new(direct_options("http://example.com"))).unwrap();
         assert_eq!(
             sent(&fetcher, hyper::header::ACCEPT_ENCODING),
             [IDENTITY.to_owned()]
@@ -3088,7 +4343,7 @@ mod tests {
         for name in ["accept-encoding", "user-agent"] {
             let options = FetcherOptions {
                 headers: vec![(name.to_owned(), "caller".to_owned())],
-                ..FetcherOptions::new("http://example.com")
+                ..direct_options("http://example.com")
             };
             let fetcher = rt::block_on(Fetcher::new(options)).unwrap();
             let header = HeaderName::from_static(name);
@@ -3102,7 +4357,7 @@ mod tests {
                 ("accept-encoding".to_owned(), "one".to_owned()),
                 ("Accept-Encoding".to_owned(), "two".to_owned()),
             ],
-            ..FetcherOptions::new("http://example.com")
+            ..direct_options("http://example.com")
         };
         let fetcher = rt::block_on(Fetcher::new(options)).unwrap();
         assert_eq!(
@@ -3115,7 +4370,7 @@ mod tests {
                 ("x-trace".to_owned(), "one".to_owned()),
                 ("x-trace".to_owned(), "two".to_owned()),
             ],
-            ..FetcherOptions::new("http://example.com")
+            ..direct_options("http://example.com")
         };
         let fetcher = rt::block_on(Fetcher::new(options)).unwrap();
         assert_eq!(
@@ -3183,7 +4438,7 @@ mod tests {
     #[test]
     fn a_tls_destination_needs_a_trust_anchor() {
         rt::block_on(async {
-            let mut fetcher = Fetcher::new(FetcherOptions::new("http://cleartext.example/repo"))
+            let mut fetcher = Fetcher::new(direct_options("http://cleartext.example/repo"))
                 .await
                 .unwrap();
             Arc::get_mut(&mut fetcher.inner)
@@ -3267,11 +4522,10 @@ mod tests {
                 }
             }));
 
-            let mut fetcher = Fetcher::new(FetcherOptions::new(format!(
-                "http://127.0.0.1:{cleartext_port}"
-            )))
-            .await
-            .unwrap();
+            let mut fetcher =
+                Fetcher::new(direct_options(format!("http://127.0.0.1:{cleartext_port}")))
+                    .await
+                    .unwrap();
             Arc::get_mut(&mut fetcher.inner)
                 .expect("the one handle on this fetcher")
                 .has_trust_anchors = false;

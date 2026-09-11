@@ -20,15 +20,15 @@ use std::time::{Duration, Instant};
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::future::or;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use hyper::body::{Bytes, Frame, SizeHint};
+use hyper::body::{Body as _, Bytes, Frame, SizeHint};
 use hyper::header::{HeaderMap, HeaderName};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::{
     BasicAuth, Checksum, ClientIdentity, Error, FetchRequest, Fetched, Fetcher, FetcherOptions,
-    Priority, Protocol, TlsOptions, TrustRoots, VerifyingReader,
+    Priority, Protocol, Proxy, TlsOptions, TrustRoots, VerifyingReader,
 };
-use ostrya_rt::{TcpListener, Timer, block_on, spawn};
+use ostrya_rt::{TcpListener, TcpStream, Timer, block_on, spawn};
 use sha2::{Digest, Sha256};
 
 const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
@@ -458,6 +458,254 @@ fn server_config(alpn: &[&str], client_auth: ClientAuth, leaf: Leaf) -> rustls::
     config
 }
 
+// --- proxy plumbing --------------------------------------------------------
+
+/// What the proxy saw of one request.
+#[derive(Clone, Debug)]
+struct ProxySeen {
+    method: String,
+    /// The request target as the proxy read it: the absolute form of a
+    /// forwarded request, and `host:port` for a `CONNECT`.
+    target: String,
+    headers: HeaderMap,
+}
+
+impl ProxySeen {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(HeaderName::from_bytes(name.as_bytes()).unwrap())?
+            .to_str()
+            .ok()
+    }
+}
+
+/// How the proxy answers a `CONNECT`.
+#[derive(Clone, Copy)]
+enum Tunnel {
+    /// Open a connection to the target and carry the bytes both ways.
+    Open,
+    /// Answer with this status and tunnel nothing.
+    Refuse(u16),
+}
+
+/// An in-process HTTP/1.1 proxy.
+///
+/// A forwarded request is sent on to the origin the absolute-form target names,
+/// and a `CONNECT` is answered by splicing a connection to the target. Every
+/// request line and every header is recorded, so a test states what reached the
+/// proxy and what reached the origin.
+///
+/// The headers of a forwarded request are sent on as the client wrote them, the
+/// hop-by-hop ones excepted: `Proxy-Authorization` names the proxy and travels
+/// no further, which is what a proxy does with it.
+struct TestProxy {
+    addr: SocketAddr,
+    seen: Arc<Mutex<Vec<ProxySeen>>>,
+    connections: Arc<AtomicUsize>,
+}
+
+impl TestProxy {
+    async fn start(tunnel: Tunnel) -> TestProxy {
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<ProxySeen>>> = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let task_seen = seen.clone();
+        let task_connections = connections.clone();
+        drop(spawn(async move {
+            while let Ok((stream, _peer)) = listener.accept().await {
+                task_connections.fetch_add(1, Ordering::SeqCst);
+                let seen = task_seen.clone();
+                drop(spawn(async move {
+                    let io = TestIo {
+                        inner: stream,
+                        scratch: Vec::new(),
+                    };
+                    let service = service_fn(move |request| {
+                        let seen = seen.clone();
+                        proxied(request, tunnel, seen)
+                    });
+                    // The upgrades are what carries a `CONNECT`: the tunneled
+                    // socket comes back through one.
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(io, service)
+                        .with_upgrades()
+                        .await;
+                }));
+            }
+        }));
+        TestProxy {
+            addr,
+            seen,
+            connections,
+        }
+    }
+
+    /// The URL a fetcher names this proxy by.
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.addr.port())
+    }
+
+    /// The URL with `userinfo` in it, which the proxy is sent as a credential.
+    fn url_with(&self, userinfo: &str) -> String {
+        format!("http://{userinfo}@127.0.0.1:{}", self.addr.port())
+    }
+
+    fn seen(&self) -> Vec<ProxySeen> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn requests(&self) -> usize {
+        self.seen.lock().unwrap().len()
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+}
+
+/// Serve one request the proxy received.
+async fn proxied(
+    mut request: Request<hyper::body::Incoming>,
+    tunnel: Tunnel,
+    seen: Arc<Mutex<Vec<ProxySeen>>>,
+) -> Result<Response<TestBody>, Infallible> {
+    seen.lock().unwrap().push(ProxySeen {
+        method: request.method().to_string(),
+        target: request.uri().to_string(),
+        headers: request.headers().clone(),
+    });
+    if request.method() == hyper::Method::CONNECT {
+        let status = match tunnel {
+            Tunnel::Refuse(status) => status,
+            Tunnel::Open => {
+                let target = request.uri().authority().unwrap().clone();
+                let upgrade = hyper::upgrade::on(&mut request);
+                // The splice runs once the 200 below has reached the client,
+                // which is when the upgrade is delivered.
+                drop(spawn(splice(upgrade, target)));
+                200
+            }
+        };
+        return Ok(Response::builder()
+            .status(status)
+            .body(TestBody::empty())
+            .unwrap());
+    }
+    Ok(forwarded(request).await)
+}
+
+/// Carry the bytes of one tunnel both ways.
+async fn splice(upgrade: hyper::upgrade::OnUpgrade, target: hyper::http::uri::Authority) {
+    let port = target.port_u16().unwrap_or(80);
+    let host = target.host().trim_start_matches('[').trim_end_matches(']');
+    let Ok(target) = TcpStream::connect(host, port).await else {
+        return;
+    };
+    let Ok(upgraded) = upgrade.await else {
+        return;
+    };
+    let Ok(parts) = upgraded.downcast::<TestIo<TcpStream>>() else {
+        return;
+    };
+    let (client_reader, mut client_writer) = futures_lite::io::split(parts.io.inner);
+    let (target_reader, mut target_writer) = futures_lite::io::split(target);
+    // Whatever arrived behind the request head belongs to the tunnel.
+    if !parts.read_buf.is_empty() && target_writer.write_all(&parts.read_buf).await.is_err() {
+        return;
+    }
+    let mut client_reader = client_reader;
+    let mut target_reader = target_reader;
+    // The first direction to end ends the tunnel, and dropping the other half
+    // closes what is left of it.
+    or(
+        async {
+            let _ = futures_lite::io::copy(&mut client_reader, &mut target_writer).await;
+        },
+        async {
+            let _ = futures_lite::io::copy(&mut target_reader, &mut client_writer).await;
+        },
+    )
+    .await;
+}
+
+/// Send one absolute-form request on to the origin it names and answer with
+/// what came back.
+async fn forwarded(request: Request<hyper::body::Incoming>) -> Response<TestBody> {
+    let refused = || {
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(TestBody::empty())
+            .unwrap()
+    };
+    let Some(authority) = request.uri().authority().cloned() else {
+        return refused();
+    };
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let Ok(stream) = TcpStream::connect(host, authority.port_u16().unwrap_or(80)).await else {
+        return refused();
+    };
+    let io = TestIo {
+        inner: stream,
+        scratch: Vec::new(),
+    };
+    let Ok((mut sender, connection)) = hyper::client::conn::http1::handshake(io).await else {
+        return refused();
+    };
+    drop(spawn(async move {
+        let _ = connection.await;
+    }));
+    let target = request
+        .uri()
+        .path_and_query()
+        .map_or("/", |path| path.as_str())
+        .to_owned();
+    let mut upstream = Request::builder()
+        .method(request.method())
+        .uri(&target)
+        .body(TestBody::empty())
+        .unwrap();
+    for (name, value) in request.headers() {
+        // A hop-by-hop header names this proxy and travels no further.
+        if name == hyper::header::PROXY_AUTHORIZATION || name == "proxy-connection" {
+            continue;
+        }
+        upstream.headers_mut().append(name.clone(), value.clone());
+    }
+    let Ok(response) = sender.send_request(upstream).await else {
+        return refused();
+    };
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut body = response.into_body();
+    let mut bytes = Vec::new();
+    while let Some(Ok(frame)) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+    {
+        if let Ok(data) = frame.into_data() {
+            bytes.extend_from_slice(&data);
+        }
+    }
+    let mut answer = Response::builder()
+        .status(status)
+        .body(TestBody::measured(&bytes))
+        .unwrap();
+    for (name, value) in &headers {
+        // The framing headers belong to the connection this answer travels
+        // over, and the body is re-measured here. Every other header is what
+        // the origin said, a `Location` a redirect names among them.
+        if name == hyper::header::CONTENT_LENGTH || name == hyper::header::TRANSFER_ENCODING {
+            continue;
+        }
+        answer.headers_mut().append(name.clone(), value.clone());
+    }
+    answer
+}
+
 // --- client helpers --------------------------------------------------------
 
 /// A handler that answers every request with `body` and a 200.
@@ -552,6 +800,30 @@ async fn truncating_server(answer: &'static [u8]) -> SocketAddr {
             stream.write_all(answer).await.unwrap();
             stream.flush().await.unwrap();
             stream.close().await.unwrap();
+        }
+    }));
+    addr
+}
+
+/// A peer that answers every `CONNECT` with a 200 carrying bytes behind it, and
+/// then holds the connection open. Nothing follows a `CONNECT` response before
+/// the client has spoken, so those bytes are what the tunnel refuses.
+async fn talkative_connect_proxy() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(spawn(async move {
+        // The accepted connections are kept, so the client reads the answer and
+        // not a close.
+        let mut held = Vec::new();
+        while let Ok((mut stream, _peer)) = listener.accept().await {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let answer = b"HTTP/1.1 200 Connection established\r\n\r\nsurprise";
+            stream.write_all(answer).await.unwrap();
+            stream.flush().await.unwrap();
+            held.push(stream);
         }
     }));
     addr
@@ -655,7 +927,21 @@ async fn read_body(fetched: Fetched) -> Vec<u8> {
 fn mirrorless_options() -> FetcherOptions {
     FetcherOptions {
         tls: tls_options(None),
+        proxy: Proxy::None,
         ..FetcherOptions::default()
+    }
+}
+
+/// Options for a fetcher whose mirror is `url` and which reaches every origin
+/// directly.
+///
+/// A test that is not about the proxy states this, so the proxy variables the
+/// host running the suite holds decide nothing: the default form reads them,
+/// and a fetcher built under one would travel to a proxy no test started.
+fn direct_options(url: impl Into<String>) -> FetcherOptions {
+    FetcherOptions {
+        proxy: Proxy::None,
+        ..FetcherOptions::new(url)
     }
 }
 
@@ -673,7 +959,7 @@ fn basic_auth(user: &str, password: &str) -> BasicAuth {
 fn fetches_a_body_over_cleartext_http1() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"object bytes")).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -702,7 +988,7 @@ fn fetches_from_an_ipv6_literal_mirror() {
         )
         .await;
         let port = server.addr.port();
-        let fetcher = Fetcher::new(FetcherOptions::new(format!("http://[::1]:{port}/repo")))
+        let fetcher = Fetcher::new(direct_options(format!("http://[::1]:{port}/repo")))
             .await
             .unwrap();
 
@@ -745,7 +1031,7 @@ fn http1_requests_use_origin_form_with_a_host_header() {
         });
 
         let base = format!("http://127.0.0.1:{}/repo", addr.port());
-        let fetcher = Fetcher::new(FetcherOptions::new(base)).await.unwrap();
+        let fetcher = Fetcher::new(direct_options(base)).await.unwrap();
         let (bytes, _) = fetch_bytes(&fetcher, "objects/ab/cd.filez").await;
         assert_eq!(bytes, b"ok");
 
@@ -771,7 +1057,7 @@ fn alpn_selects_http2_over_tls() {
             always(b"over h2"),
         )
         .await;
-        let mut options = FetcherOptions::new(server.url(true));
+        let mut options = direct_options(server.url(true));
         options.tls = tls_options(None);
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -793,7 +1079,7 @@ fn disabling_http2_negotiates_http1_over_tls() {
             always(b"over h1"),
         )
         .await;
-        let mut options = FetcherOptions::new(server.url(true));
+        let mut options = direct_options(server.url(true));
         options.tls = tls_options(None);
         options.http2 = false;
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -822,7 +1108,7 @@ fn a_conditional_fetch_resolves_to_not_modified() {
                 .unwrap()
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -862,7 +1148,7 @@ fn a_conditional_fetch_resolves_to_not_modified() {
 fn a_missing_object_reports_its_status_without_retrying() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always_status(404)).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -898,7 +1184,7 @@ fn a_server_error_is_retried_and_then_succeeds() {
                 .unwrap()
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
-        let mut options = FetcherOptions::new(server.url(false));
+        let mut options = direct_options(server.url(false));
         options.max_retries = 3;
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -912,7 +1198,7 @@ fn a_server_error_is_retried_and_then_succeeds() {
 fn retries_stop_at_the_configured_count() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always_status(503)).await;
-        let mut options = FetcherOptions::new(server.url(false));
+        let mut options = direct_options(server.url(false));
         options.max_retries = 1;
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -939,7 +1225,7 @@ fn a_mirror_that_answered_definitively_is_not_asked_again() {
         let absent = TestServer::start(Transport::Cleartext, always_status(404)).await;
         let flapping = TestServer::start(Transport::Cleartext, always_status(503)).await;
         let gone = TestServer::start(Transport::Cleartext, always_status(410)).await;
-        let mut options = FetcherOptions::new(absent.url(false));
+        let mut options = direct_options(absent.url(false));
         options
             .mirrors
             .extend([flapping.url(false), gone.url(false)]);
@@ -979,7 +1265,7 @@ fn a_definitive_answer_from_an_earlier_round_is_reported() {
                 .unwrap()
         });
         let turning = TestServer::start(Transport::Cleartext, handler).await;
-        let mut options = FetcherOptions::new(absent.url(false));
+        let mut options = direct_options(absent.url(false));
         options.mirrors.push(turning.url(false));
         options.max_retries = 3;
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -1014,7 +1300,7 @@ fn a_definitive_answer_after_a_retryable_failure_is_reported() {
                 .unwrap()
         });
         let turning = TestServer::start(Transport::Cleartext, handler).await;
-        let mut options = FetcherOptions::new(turning.url(false));
+        let mut options = direct_options(turning.url(false));
         options.max_retries = 3;
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -1038,7 +1324,7 @@ fn mirrors_are_tried_in_order_until_one_answers() {
         let broken = TestServer::start(Transport::Cleartext, always_status(500)).await;
         let absent = TestServer::start(Transport::Cleartext, always_status(404)).await;
         let good = TestServer::start(Transport::Cleartext, always(b"from the third")).await;
-        let mut options = FetcherOptions::new(broken.url(false));
+        let mut options = direct_options(broken.url(false));
         options.mirrors.extend([absent.url(false), good.url(false)]);
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -1060,7 +1346,7 @@ fn an_invalid_path_connects_to_no_mirror() {
     block_on(async {
         let first = TestServer::start(Transport::Cleartext, always(b"unreachable")).await;
         let second = TestServer::start(Transport::Cleartext, always(b"unreachable")).await;
-        let mut options = FetcherOptions::new(first.url(false));
+        let mut options = direct_options(first.url(false));
         options.mirrors.push(second.url(false));
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -1165,7 +1451,7 @@ fn a_mirrorless_fetcher_pools_one_connection_per_origin() {
 fn a_request_header_replaces_the_fetchers_header_of_the_same_name() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
-        let mut options = FetcherOptions::new(server.url(false));
+        let mut options = direct_options(server.url(false));
         options.headers = vec![
             ("x-trace".to_owned(), "fetcher".to_owned()),
             ("x-fetcher-only".to_owned(), "yes".to_owned()),
@@ -1203,7 +1489,7 @@ fn a_request_header_replaces_the_fetchers_header_of_the_same_name() {
 fn a_request_framing_header_reaches_no_server() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -1233,7 +1519,7 @@ fn a_request_framing_header_reaches_no_server() {
 fn a_fetcher_framing_header_fails_the_constructor() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"unreachable")).await;
-        let mut options = FetcherOptions::new(server.url(false));
+        let mut options = direct_options(server.url(false));
         options.headers = vec![("transfer-encoding".to_owned(), "chunked".to_owned())];
         let err = Fetcher::new(options).await.unwrap_err();
         let message = err.to_string();
@@ -1249,7 +1535,7 @@ fn a_fetcher_framing_header_fails_the_constructor() {
 fn every_request_asks_for_no_content_coding() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"object bytes")).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -1276,7 +1562,7 @@ fn a_coded_response_is_refused_and_keeps_its_connection() {
             response.body(TestBody::measured(b"squeezed")).unwrap()
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -1315,7 +1601,7 @@ fn a_response_declaring_identity_is_served() {
                 .unwrap()
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -1343,7 +1629,7 @@ fn a_caller_supplied_accept_encoding_replaces_the_fetchers() {
         let server = TestServer::start(Transport::Cleartext, handler).await;
 
         // A request header, with the name written in another case.
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let headers = vec![("Accept-Encoding".to_owned(), "gzip".to_owned())];
@@ -1369,7 +1655,7 @@ fn a_caller_supplied_accept_encoding_replaces_the_fetchers() {
             ("accept-encoding", "gzip", true),
             ("user-agent", "caller/1", false),
         ] {
-            let mut options = FetcherOptions::new(server.url(false));
+            let mut options = direct_options(server.url(false));
             options.headers = vec![(name.to_owned(), value.to_owned())];
             let fetcher = Fetcher::new(options).await.unwrap();
             let before = server.requests();
@@ -1421,7 +1707,7 @@ fn a_transfer_coded_response_is_refused() {
         ] {
             let addr = truncating_server(answer).await;
             let base = format!("http://127.0.0.1:{}", addr.port());
-            let fetcher = Fetcher::new(FetcherOptions::new(base)).await.unwrap();
+            let fetcher = Fetcher::new(direct_options(base)).await.unwrap();
             let outcome = fetcher
                 .fetch(FetchRequest::path("objects/ab/cd.filez"))
                 .await;
@@ -1475,7 +1761,7 @@ fn a_request_basic_auth_overrides_the_fetchers_authorization() {
         .await;
         let auth = basic_auth("u", "p");
 
-        let mut options = FetcherOptions::new(server.url(true));
+        let mut options = direct_options(server.url(true));
         options.tls = tls_options(None);
         options.basic_auth = Some(basic_auth("fetcher", "secret"));
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -1488,7 +1774,7 @@ fn a_request_basic_auth_overrides_the_fetchers_authorization() {
             .unwrap();
         assert_eq!(read_body(fetched).await, b"bytes");
 
-        let mut options = FetcherOptions::new(server.url(true));
+        let mut options = direct_options(server.url(true));
         options.tls = tls_options(None);
         options.headers = vec![("authorization".to_owned(), "Basic ZmV0Y2hlcg==".to_owned())];
         let header_fetcher = Fetcher::new(options).await.unwrap();
@@ -1517,7 +1803,7 @@ fn a_request_basic_auth_overrides_the_fetchers_authorization() {
 fn a_request_credential_to_a_cleartext_origin_is_refused() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let auth = basic_auth("u", "p");
@@ -1564,14 +1850,14 @@ fn basic_auth_beside_an_authorization_header_is_refused() {
         // cleartext one. The mirror is never contacted.
         let mut options = FetcherOptions {
             tls: tls_options(None),
-            ..FetcherOptions::new("https://secure.example/repo")
+            ..direct_options("https://secure.example/repo")
         };
         options.headers = vec![("authorization".to_owned(), "Basic aaa".to_owned())];
         options.basic_auth = Some(auth.clone());
         let err = Fetcher::new(options).await.unwrap_err();
         assert!(err.to_string().contains("pass one of them"), "{err}");
 
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let headers = vec![("authorization".to_owned(), "Basic aaa".to_owned())];
@@ -1615,9 +1901,7 @@ fn a_url_target_shares_the_pooled_connection_with_a_path_target() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"bytes")).await;
         let base = server.url(false);
-        let fetcher = Fetcher::new(FetcherOptions::new(base.clone()))
-            .await
-            .unwrap();
+        let fetcher = Fetcher::new(direct_options(base.clone())).await.unwrap();
 
         let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
         assert_eq!(bytes, b"bytes");
@@ -1641,7 +1925,7 @@ fn a_declared_length_over_the_cap_fails_before_streaming() {
                 .unwrap()
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -1664,7 +1948,7 @@ fn a_body_that_outgrows_the_cap_fails_the_read() {
                 .unwrap()
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -1705,7 +1989,7 @@ fn credentials_and_extra_headers_reach_the_server() {
             always(b"authorized"),
         )
         .await;
-        let mut options = FetcherOptions::new(server.url(true));
+        let mut options = direct_options(server.url(true));
         options.tls = tls_options(None);
         options.basic_auth = Some(BasicAuth {
             user: "alice".into(),
@@ -1738,7 +2022,7 @@ fn credentials_with_a_cleartext_mirror_fail_the_constructor() {
         )
         .await;
 
-        let mut options = FetcherOptions::new(secure.url(true));
+        let mut options = direct_options(secure.url(true));
         options.mirrors.push(cleartext.url(false));
         options.tls = tls_options(None);
         options.basic_auth = Some(BasicAuth {
@@ -1769,7 +2053,7 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
         )
         .await;
 
-        let mut with_cert = FetcherOptions::new(server.url(true));
+        let mut with_cert = direct_options(server.url(true));
         with_cert.tls = tls_options(Some(ClientIdentity {
             cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
             key_pem: CLIENT_KEY_PEM.to_vec(),
@@ -1781,7 +2065,7 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
 
         // Without the certificate the handshake fails, and a failed handshake
         // is retryable, so the attempt is repeated before it is reported.
-        let mut without_cert = FetcherOptions::new(server.url(true));
+        let mut without_cert = direct_options(server.url(true));
         without_cert.tls = tls_options(None);
         without_cert.max_retries = 0;
         let fetcher = Fetcher::new(without_cert).await.unwrap();
@@ -1808,7 +2092,7 @@ fn an_encrypted_client_key_is_presented_when_the_server_demands_one() {
         )
         .await;
 
-        let mut options = FetcherOptions::new(server.url(true));
+        let mut options = direct_options(server.url(true));
         options.tls = tls_options(Some(ClientIdentity {
             cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
             key_pem: CLIENT_KEY_ENC_PEM.to_vec(),
@@ -1834,7 +2118,7 @@ async fn tls_fetch(leaf: Leaf, roots: TrustRoots) -> Result<Vec<u8>, Error> {
         always(b"served"),
     )
     .await;
-    let mut options = FetcherOptions::new(server.url(true));
+    let mut options = direct_options(server.url(true));
     options.tls = TlsOptions {
         roots,
         client_identity: None,
@@ -1955,7 +2239,7 @@ fn a_redirect_to_another_origin_leaves_the_credentials_behind() {
         )
         .await;
 
-        let fetcher = Fetcher::new(FetcherOptions::new(named.url(false)))
+        let fetcher = Fetcher::new(direct_options(named.url(false)))
             .await
             .unwrap();
         let headers = vec![
@@ -2002,7 +2286,7 @@ fn a_same_origin_redirect_keeps_the_credentials() {
             redirect_once("/elsewhere".to_owned(), b"arrived"),
         )
         .await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let headers = vec![("cookie".to_owned(), "session=1".to_owned())];
@@ -2046,7 +2330,7 @@ fn a_relative_location_resolves_against_the_response() {
             }),
         )
         .await;
-        let fetcher = Fetcher::new(FetcherOptions::new(format!("{}/base", server.url(false))))
+        let fetcher = Fetcher::new(direct_options(format!("{}/base", server.url(false))))
             .await
             .unwrap();
         let (bytes, _) = fetch_bytes(&fetcher, "config").await;
@@ -2074,7 +2358,7 @@ fn a_scheme_relative_location_keeps_the_scheme() {
             ),
         )
         .await;
-        let fetcher = Fetcher::new(FetcherOptions::new(named.url(false)))
+        let fetcher = Fetcher::new(direct_options(named.url(false)))
             .await
             .unwrap();
         let (bytes, _) = fetch_bytes(&fetcher, "config").await;
@@ -2093,7 +2377,7 @@ fn a_fragment_in_a_location_reaches_no_server() {
             redirect_once("/other/path#frag".to_owned(), b"arrived"),
         )
         .await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let (bytes, _) = fetch_bytes(&fetcher, "config").await;
@@ -2122,7 +2406,7 @@ fn a_redirect_from_tls_to_cleartext_is_refused() {
         )
         .await;
 
-        let mut options = FetcherOptions::new(secure.url(true));
+        let mut options = direct_options(secure.url(true));
         options.tls = tls_options(None);
         let fetcher = Fetcher::new(options).await.unwrap();
         let err = fetch_error(&fetcher, "config").await;
@@ -2152,7 +2436,7 @@ fn a_chain_longer_than_the_limit_is_refused() {
             Arc::new(|_seen: &Seen, count: usize| redirect(302, &format!("/hop{count}"))),
         )
         .await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let err = fetch_error(&fetcher, "config").await;
@@ -2176,7 +2460,7 @@ fn a_limit_of_zero_follows_nothing() {
             redirect_once("/elsewhere".to_owned(), b"unreachable"),
         )
         .await;
-        let mut options = FetcherOptions::new(server.url(false));
+        let mut options = direct_options(server.url(false));
         options.max_redirects = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
         let err = fetch_error(&fetcher, "config").await;
@@ -2194,7 +2478,7 @@ fn a_limit_of_zero_follows_nothing() {
 fn a_redirect_without_a_location_reports_its_status() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always_status(302)).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let err = fetch_error(&fetcher, "config").await;
@@ -2231,7 +2515,7 @@ fn the_size_cap_measures_the_final_response_alone() {
             }),
         )
         .await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let fetched = fetcher
@@ -2284,7 +2568,7 @@ fn a_client_certificate_reaches_the_named_origin_alone() {
         )
         .await;
 
-        let mut options = FetcherOptions::new(named.url(true));
+        let mut options = direct_options(named.url(true));
         options.tls = tls_options(Some(ClientIdentity {
             cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
             key_pem: CLIENT_KEY_PEM.to_vec(),
@@ -2324,7 +2608,7 @@ fn a_redirect_chain_on_one_origin_travels_over_one_connection() {
             }),
         )
         .await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let (bytes, protocol) = fetch_bytes(&fetcher, "config").await;
@@ -2342,7 +2626,7 @@ fn a_redirect_chain_on_one_origin_travels_over_one_connection() {
 fn one_progress_window_covers_every_drain_of_an_attempt() {
     block_on(async {
         let (addr, requests) = short_redirecting_server().await;
-        let mut options = FetcherOptions::new(format!("http://127.0.0.1:{}", addr.port()));
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.progress_timeout = Duration::from_millis(200);
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -2371,7 +2655,7 @@ fn an_empty_location_names_no_url() {
             Arc::new(|_seen: &Seen, _count: usize| redirect(302, "")),
         )
         .await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
         let err = fetch_error(&fetcher, "config").await;
@@ -2404,7 +2688,7 @@ fn at_the_limit_a_redirect_reports_what_it_carried() {
             }),
         )
         .await;
-        let mut options = FetcherOptions::new(nothing_to_follow.url(false));
+        let mut options = direct_options(nothing_to_follow.url(false));
         options.max_redirects = 2;
         let fetcher = Fetcher::new(options).await.unwrap();
         let err = fetch_error(&fetcher, "config").await;
@@ -2420,7 +2704,7 @@ fn at_the_limit_a_redirect_reports_what_it_carried() {
             Arc::new(|_seen: &Seen, count: usize| redirect(302, &format!("/hop{count}"))),
         )
         .await;
-        let mut options = FetcherOptions::new(another_hop.url(false));
+        let mut options = direct_options(another_hop.url(false));
         options.max_redirects = 2;
         let fetcher = Fetcher::new(options).await.unwrap();
         let err = fetch_error(&fetcher, "config").await;
@@ -2437,7 +2721,7 @@ fn at_the_limit_a_redirect_reports_what_it_carried() {
 fn http1_connections_are_reused_between_fetches() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"pooled")).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -2462,7 +2746,7 @@ fn http2_multiplexes_concurrent_fetches_over_one_connection() {
             always(b"multiplexed"),
         )
         .await;
-        let mut options = FetcherOptions::new(server.url(true));
+        let mut options = direct_options(server.url(true));
         options.tls = tls_options(None);
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -2495,7 +2779,7 @@ fn a_fetched_body_verifies_against_its_expected_digest() {
     block_on(async {
         let payload = b"content object payload";
         let server = TestServer::start(Transport::Cleartext, always(payload)).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -2540,7 +2824,7 @@ fn an_abandoned_body_is_not_pooled() {
                 .unwrap()
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -2575,7 +2859,7 @@ fn an_unsuccessful_status_with_a_short_body_keeps_its_connection() {
                 .unwrap()
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -2600,7 +2884,7 @@ fn an_unsuccessful_status_with_a_short_body_keeps_its_connection() {
 fn an_over_cap_response_with_a_short_body_keeps_its_connection() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"more than asked for")).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -2631,7 +2915,7 @@ fn an_unsuccessful_status_with_an_undeclared_body_closes_its_connection() {
                 .unwrap()
         });
         let server = TestServer::start(Transport::Cleartext, handler).await;
-        let fetcher = Fetcher::new(FetcherOptions::new(server.url(false)))
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
             .await
             .unwrap();
 
@@ -2654,7 +2938,7 @@ fn an_unsuccessful_status_with_an_undeclared_body_closes_its_connection() {
 fn a_queued_high_priority_fetch_is_served_before_a_low_priority_one() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"served")).await;
-        let mut options = FetcherOptions::new(server.url(false));
+        let mut options = direct_options(server.url(false));
         options.max_outstanding = 1;
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -2694,7 +2978,7 @@ fn a_queued_high_priority_fetch_is_served_before_a_low_priority_one() {
 fn a_stalled_handshake_times_out() {
     block_on(async {
         let addr = stalling_server(b"").await;
-        let mut options = FetcherOptions::new(format!("https://localhost:{}", addr.port()));
+        let mut options = direct_options(format!("https://localhost:{}", addr.port()));
         options.tls = tls_options(None);
         options.connect_timeout = Duration::from_millis(150);
         options.max_retries = 0;
@@ -2714,7 +2998,7 @@ fn a_stalled_handshake_times_out() {
 fn a_stalled_response_times_out() {
     block_on(async {
         let addr = stalling_server(b"").await;
-        let mut options = FetcherOptions::new(format!("http://127.0.0.1:{}", addr.port()));
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.progress_timeout = Duration::from_millis(150);
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -2734,7 +3018,7 @@ fn a_stalled_response_times_out() {
 fn a_fetch_gives_up_when_its_own_deadline_passes() {
     block_on(async {
         let addr = stalling_server(b"").await;
-        let mut options = FetcherOptions::new(format!("http://127.0.0.1:{}", addr.port()));
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.progress_timeout = Duration::from_millis(100);
         // Rounds enough that the per-attempt deadline and the backoff alone
         // would keep this fetch going for minutes.
@@ -2776,7 +3060,7 @@ fn a_fetch_gives_up_when_its_own_deadline_passes() {
 fn a_fetch_without_a_deadline_still_completes() {
     block_on(async {
         let server = TestServer::start(Transport::Cleartext, always(b"object bytes")).await;
-        let mut options = FetcherOptions::new(server.url(false));
+        let mut options = direct_options(server.url(false));
         options.fetch_timeout = None;
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -2792,7 +3076,7 @@ fn a_stalled_body_fails_the_read() {
     block_on(async {
         // A head promising 64 bytes, eight of them, and then silence.
         let addr = stalling_server(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nfirst   ").await;
-        let mut options = FetcherOptions::new(format!("http://127.0.0.1:{}", addr.port()));
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.progress_timeout = Duration::from_millis(150);
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -2842,7 +3126,7 @@ fn a_body_that_resumes_after_the_window_stays_failed() {
             stream.flush().await.unwrap();
         });
 
-        let mut options = FetcherOptions::new(format!("http://127.0.0.1:{}", addr.port()));
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.progress_timeout = Duration::from_millis(150);
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -2884,7 +3168,7 @@ fn a_truncated_body_fails_the_read() {
         // A head promising 64 bytes, eight of them, and then a close.
         let addr =
             truncating_server(b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nfirst   ").await;
-        let mut options = FetcherOptions::new(format!("http://127.0.0.1:{}", addr.port()));
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
 
@@ -2938,7 +3222,7 @@ fn an_unread_body_is_not_on_the_progress_clock() {
             stream.flush().await.unwrap();
         }));
 
-        let mut options = FetcherOptions::new(format!("http://127.0.0.1:{}", addr.port()));
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.progress_timeout = Duration::from_millis(300);
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -2964,7 +3248,7 @@ fn an_abandoned_read_leaves_the_progress_window_running() {
     block_on(async {
         // A head promising 16 bytes, eight of them, and then silence.
         let addr = stalling_server(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\nfirst   ").await;
-        let mut options = FetcherOptions::new(format!("http://127.0.0.1:{}", addr.port()));
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
         options.progress_timeout = Duration::from_millis(200);
         options.max_retries = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
@@ -3002,5 +3286,549 @@ fn an_abandoned_read_leaves_the_progress_window_running() {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
         assert!(err.to_string().contains("delivered nothing"), "{err}");
+    });
+}
+
+/// A cleartext origin behind a proxy is reached over a connection to the proxy,
+/// and the request carries the absolute-form target with the origin's own
+/// `Host` header. What the origin answers is what the fetch delivers.
+#[test]
+fn a_cleartext_fetch_travels_through_the_proxy() {
+    block_on(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"object bytes")).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(proxy.url()),
+            ..direct_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+
+        let (bytes, protocol) = fetch_bytes(&fetcher, "objects/ab/cd.filez").await;
+        assert_eq!(bytes, b"object bytes");
+        // A proxy connection is cleartext, so it speaks HTTP/1.1.
+        assert_eq!(protocol, Protocol::Http11);
+
+        let authority = format!("localhost:{}", origin.addr.port());
+        let seen = proxy.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "GET");
+        assert_eq!(
+            seen[0].target,
+            format!("http://{authority}/objects/ab/cd.filez")
+        );
+        assert_eq!(seen[0].header("host"), Some(authority.as_str()));
+        // The origin was asked for the object, in the origin form a server
+        // answers.
+        assert_eq!(origin.seen()[0].path, "/objects/ab/cd.filez");
+        assert_eq!(origin.seen()[0].target, "/objects/ab/cd.filez");
+
+        // One proxy connection carries requests for any cleartext origin: a
+        // fetch of another origin's URL travels over the connection the first
+        // fetch returned to the pool.
+        let other = TestServer::start(Transport::Cleartext, always(b"other bytes")).await;
+        let url = format!("{}/summary", other.url(false));
+        let (bytes, _) = fetch_url_bytes(&fetcher, &url).await;
+        assert_eq!(bytes, b"other bytes");
+        assert_eq!(proxy.requests(), 2);
+        assert_eq!(proxy.seen()[1].target, url);
+        assert_eq!(proxy.connections(), 1);
+        assert_eq!(other.seen()[0].path, "/summary");
+    });
+}
+
+/// A TLS origin behind a proxy is reached over a `CONNECT` tunnel, and the
+/// handshake that follows is the one a direct connection makes: ALPN selects
+/// HTTP/2 end to end, and the proxy carries the bytes without reading them.
+#[test]
+fn a_tls_fetch_tunnels_through_the_proxy() {
+    block_on(async {
+        let origin = TestServer::start(
+            Transport::Tls {
+                alpn: vec!["h2", "http/1.1"],
+                client_auth: ClientAuth::None,
+            },
+            always(b"over h2"),
+        )
+        .await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(proxy.url()),
+            ..direct_options(origin.url(true))
+        })
+        .await
+        .unwrap();
+
+        let (bytes, protocol) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"over h2");
+        assert_eq!(protocol, Protocol::Http2);
+
+        // The proxy saw the tunnel and nothing of the request inside it. The
+        // target is named with its port, and the `Host` header holds the same.
+        let authority = format!("localhost:{}", origin.addr.port());
+        let seen = proxy.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "CONNECT");
+        assert_eq!(seen[0].target, authority);
+        assert_eq!(seen[0].header("host"), Some(authority.as_str()));
+        assert_eq!(origin.seen()[0].path, "/summary");
+    });
+}
+
+/// `no_proxy` exempts an origin from the proxy: an exact host, the same host
+/// written with the leading `.`, an entry qualified by the port the origin
+/// names, and `*`. An exempt fetch reaches the origin directly, and the proxy
+/// records nothing.
+#[test]
+fn no_proxy_exempts_the_origin_from_the_proxy() {
+    block_on(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"direct")).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let port = origin.addr.port();
+        let fetcher = |no_proxy: String| {
+            let variables = vec![
+                ("http_proxy".to_owned(), proxy.url()),
+                ("no_proxy".to_owned(), no_proxy),
+            ];
+            Fetcher::new(FetcherOptions {
+                tls: tls_options(None),
+                proxy: Proxy::Variables(variables),
+                ..direct_options(origin.url(false))
+            })
+        };
+
+        for no_proxy in [
+            "localhost".to_owned(),
+            ".localhost".to_owned(),
+            format!("localhost:{port}"),
+            "*".to_owned(),
+            format!("other.example,localhost:{port}"),
+        ] {
+            let fetcher = fetcher(no_proxy.clone()).await.unwrap();
+            let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+            assert_eq!(bytes, b"direct", "{no_proxy}");
+            assert_eq!(proxy.requests(), 0, "{no_proxy}");
+        }
+
+        // An entry that exempts something else leaves the origin behind the
+        // proxy: an unrelated host, and the same host at another port.
+        for (asked, no_proxy) in [
+            (1, "other.example".to_owned()),
+            // The listener holds a port of its own, so the wrap names one it
+            // does not.
+            (2, format!("localhost:{}", port.wrapping_add(1))),
+        ] {
+            let fetcher = fetcher(no_proxy.clone()).await.unwrap();
+            let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+            assert_eq!(bytes, b"direct", "{no_proxy}");
+            assert_eq!(proxy.requests(), asked, "{no_proxy}");
+        }
+    });
+}
+
+/// An entry exempts every host under the domain it names.
+///
+/// The origin here is a name that resolves to nothing, so what the exemption
+/// decides is which endpoint the connect names: a request that is not exempt
+/// reaches the proxy, which records it and then answers 502, having nothing to
+/// forward it to, while an exempt one is a connect the fetch makes itself and
+/// the proxy sees no more of it.
+#[test]
+fn no_proxy_exempts_a_host_under_a_listed_domain() {
+    block_on(async {
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        // Port 9 of a `.invalid` name, which the DNS answers for nothing.
+        let mirror = "http://deep.host.example.invalid:9/repo";
+        let fetcher = |no_proxy: &str| {
+            let variables = vec![
+                ("http_proxy".to_owned(), proxy.url()),
+                ("no_proxy".to_owned(), no_proxy.to_owned()),
+            ];
+            Fetcher::new(FetcherOptions {
+                tls: tls_options(None),
+                proxy: Proxy::Variables(variables),
+                max_retries: 0,
+                // The assertions read what reached the proxy, and both arms
+                // discard what the fetch resolved to, so the window is the one
+                // that keeps a name nothing answers for off the test clock.
+                fetch_timeout: Some(Duration::from_secs(1)),
+                ..direct_options(mirror)
+            })
+        };
+
+        let not_exempt = fetcher("other.example").await.unwrap();
+        let _ = not_exempt.fetch(FetchRequest::path("summary")).await;
+        let seen = proxy.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].target,
+            "http://deep.host.example.invalid:9/repo/summary"
+        );
+
+        for entry in ["host.example.invalid", ".host.example.invalid"] {
+            let exempt = fetcher(entry).await.unwrap();
+            let _ = exempt.fetch(FetchRequest::path("summary")).await;
+            assert_eq!(proxy.requests(), 1, "{entry}");
+        }
+    });
+}
+
+/// [`Proxy::None`] reaches every origin directly. The variables that would name
+/// the proxy are stated in the other form, so what the two fetchers part over
+/// is which of them reads them at all.
+#[test]
+fn proxy_none_reaches_the_origin_directly() {
+    block_on(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"answered")).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let variables = vec![("http_proxy".to_owned(), proxy.url())];
+
+        let through = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Variables(variables),
+            ..direct_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+        let (bytes, _) = fetch_bytes(&through, "summary").await;
+        assert_eq!(bytes, b"answered");
+        assert_eq!(proxy.requests(), 1);
+
+        let direct = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::None,
+            ..direct_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+        let (bytes, _) = fetch_bytes(&direct, "summary").await;
+        assert_eq!(bytes, b"answered");
+        assert_eq!(proxy.requests(), 1);
+        assert_eq!(origin.requests(), 2);
+    });
+}
+
+/// The userinfo of a proxy URL is the proxy's credential: it reaches the proxy
+/// as `Proxy-Authorization`, and it is no part of the merged header list, which
+/// carries the caller's own credential beside it.
+///
+/// A proxied cleartext request is one request, so what the proxy recorded is
+/// the header list the fetcher built, and the two credentials arrive there
+/// under their own names. On the tunnel path nothing between the fetcher and
+/// the origin reads the bytes at all, so what the origin recorded is the
+/// fetcher's own doing, and the credential it holds is the caller's alone.
+#[test]
+fn the_proxy_credential_reaches_the_proxy_and_no_origin() {
+    block_on(async {
+        // base64("alice:s3cret")
+        let expected = Some("Basic YWxpY2U6czNjcmV0");
+
+        let origin = TestServer::start(Transport::Cleartext, always(b"through")).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(proxy.url_with("alice:s3cret")),
+            ..direct_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+        let caller = basic_auth("bob", "origin");
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                basic_auth: Some(&caller),
+                allow_cleartext_credentials: true,
+                ..FetchRequest::path("summary")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"through");
+        let seen = proxy.seen();
+        assert_eq!(seen[0].header("proxy-authorization"), expected);
+        // base64("bob:origin")
+        assert_eq!(
+            seen[0].header("authorization"),
+            Some("Basic Ym9iOm9yaWdpbg==")
+        );
+
+        let tls_origin = TestServer::start(
+            Transport::Tls {
+                alpn: vec!["h2", "http/1.1"],
+                client_auth: ClientAuth::None,
+            },
+            always(b"tunneled"),
+        )
+        .await;
+        let tls_proxy = TestProxy::start(Tunnel::Open).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            basic_auth: Some(basic_auth("bob", "origin")),
+            proxy: Proxy::Url(tls_proxy.url_with("alice:s3cret")),
+            ..direct_options(tls_origin.url(true))
+        })
+        .await
+        .unwrap();
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"tunneled");
+        let seen = tls_proxy.seen();
+        assert_eq!(seen[0].method, "CONNECT");
+        assert_eq!(seen[0].header("proxy-authorization"), expected);
+        assert_eq!(tls_origin.seen()[0].header("proxy-authorization"), None);
+        // The credential the origin is asked for is the caller's, which the
+        // tunnel carried past a proxy that read none of it.
+        assert_eq!(
+            tls_origin.seen()[0].header("authorization"),
+            Some("Basic Ym9iOm9yaWdpbg==")
+        );
+    });
+}
+
+/// A proxy that refuses the tunnel names the proxy and the status in the
+/// failure. A 407 refuses the credential the fetcher holds, which no retry
+/// changes, so the proxy is asked once; every other status is retryable and the
+/// round that repeats asks again.
+#[test]
+fn a_refused_connect_is_definitive_at_407_and_retried_at_502() {
+    block_on(async {
+        let refusing = |status: u16, max_retries: u32| async move {
+            let proxy = TestProxy::start(Tunnel::Refuse(status)).await;
+            let fetcher = Fetcher::new(FetcherOptions {
+                tls: tls_options(None),
+                proxy: Proxy::Url(proxy.url()),
+                max_retries,
+                // Nothing listens on port 1 of the loopback, so a fetch that
+                // reached past the proxy would fail on the connect instead.
+                ..direct_options("https://localhost:1/repo")
+            })
+            .await
+            .unwrap();
+            let err = fetch_error(&fetcher, "summary").await;
+            (proxy, err)
+        };
+
+        let (proxy, err) = refusing(407, 3).await;
+        let message = err.to_string();
+        assert!(message.contains("407"), "{message}");
+        assert!(message.contains(&proxy.url()), "{message}");
+        assert!(message.contains("localhost:1"), "{message}");
+        assert_eq!(proxy.requests(), 1);
+        assert!(
+            proxy.seen().iter().all(|seen| seen.method == "CONNECT"),
+            "{:?}",
+            proxy.seen()
+        );
+
+        let (proxy, err) = refusing(502, 1).await;
+        let message = err.to_string();
+        assert!(message.contains("502"), "{message}");
+        assert!(message.contains(&proxy.url()), "{message}");
+        // One round, then the round the retry repeats.
+        assert_eq!(proxy.requests(), 2);
+    });
+}
+
+/// A proxy URL the fetcher cannot connect through fails the constructor, and
+/// the value is named. The environment forms are read the same way, so a
+/// variable holding one fails it too.
+#[test]
+fn a_proxy_the_fetcher_cannot_reach_is_refused_at_construction() {
+    block_on(async {
+        for url in ["socks5://127.0.0.1:1080", "https://127.0.0.1:3128"] {
+            let err = Fetcher::new(FetcherOptions {
+                proxy: Proxy::Url(url.to_owned()),
+                ..direct_options("http://origin.example/repo")
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{url}: {err}");
+            let message = err.to_string();
+            assert!(message.contains(url), "{url}: {message}");
+
+            let variables = vec![("all_proxy".to_owned(), url.to_owned())];
+            let err = Fetcher::new(FetcherOptions {
+                proxy: Proxy::Variables(variables),
+                ..direct_options("http://origin.example/repo")
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{url}: {err}");
+        }
+    });
+}
+
+/// A redirect under a proxy is served the way a route naming the hop's origin
+/// would be: the hop that follows carries the absolute form to the same proxy,
+/// and one proxy connection carries both.
+#[test]
+fn a_redirect_under_the_proxy_travels_over_one_proxy_connection() {
+    block_on(async {
+        let second = TestServer::start(Transport::Cleartext, always(b"second hop")).await;
+        let first = TestServer::start(
+            Transport::Cleartext,
+            redirect_once(format!("{}/moved", second.url(false)), b"first hop"),
+        )
+        .await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(proxy.url()),
+            ..direct_options(first.url(false))
+        })
+        .await
+        .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"second hop");
+        let seen = proxy.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].target, format!("{}/summary", first.url(false)));
+        assert_eq!(seen[1].target, format!("{}/moved", second.url(false)));
+        // Both hops are cleartext origins behind one proxy, and the redirect
+        // carried an empty body, so its connection was back in the pool for the
+        // hop that followed it.
+        assert_eq!(proxy.connections(), 1);
+        assert_eq!(second.seen()[0].target, "/moved");
+    });
+}
+
+/// The proxy decision is made per hop, so a proxied origin that redirects onto
+/// an exempt one is followed to that origin itself: the hop opens its own
+/// connection and carries the origin form a server answers.
+#[test]
+fn a_redirect_onto_an_exempt_origin_is_followed_directly() {
+    block_on(async {
+        let exempt = TestServer::start(Transport::Cleartext, always(b"direct hop")).await;
+        let proxied = TestServer::start(
+            Transport::Cleartext,
+            redirect_once(format!("{}/moved", exempt.url(false)), b"first hop"),
+        )
+        .await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        // The two origins are one host at two ports, which a port-qualified
+        // entry tells apart.
+        let variables = vec![
+            ("http_proxy".to_owned(), proxy.url()),
+            (
+                "no_proxy".to_owned(),
+                format!("localhost:{}", exempt.addr.port()),
+            ),
+        ];
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Variables(variables),
+            ..direct_options(proxied.url(false))
+        })
+        .await
+        .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"direct hop");
+        let seen = proxy.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].target, format!("{}/summary", proxied.url(false)));
+        assert_eq!(exempt.seen()[0].target, "/moved");
+        assert_eq!(exempt.connections(), 1);
+    });
+}
+
+/// A direct connection and a proxied connection to one endpoint are two
+/// connections, and each carries its own request form. The endpoint is the
+/// proxy's own here, exempted by `no_proxy` so a URL target naming it is
+/// reached directly: the proxy reads the absolute form of the proxied request
+/// and the origin form of the direct one.
+#[test]
+fn a_proxied_connection_is_not_handed_to_a_direct_request() {
+    block_on(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"proxied")).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let variables = vec![
+            ("http_proxy".to_owned(), proxy.url()),
+            (
+                "no_proxy".to_owned(),
+                format!("127.0.0.1:{}", proxy.addr.port()),
+            ),
+        ];
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Variables(variables),
+            max_retries: 0,
+            ..direct_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"proxied");
+        assert_eq!(proxy.connections(), 1);
+
+        // The same endpoint asked for a path of its own: the proxy has no
+        // absolute-form target to forward and answers 502, which is the answer
+        // a server gives the form it was not expecting.
+        let url = format!("{}/direct", proxy.url());
+        let err = fetcher
+            .fetch(FetchRequest::url(&url))
+            .await
+            .expect_err("the proxy forwards nothing for an origin-form target");
+        assert!(err.to_string().contains("502"), "{err}");
+        let seen = proxy.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].target, format!("{}/summary", origin.url(false)));
+        assert_eq!(seen[1].target, "/direct");
+        assert_eq!(proxy.connections(), 2);
+    });
+}
+
+/// A byte behind a `CONNECT` response fails the connect: nothing follows that
+/// response before the client has spoken, so the TLS handshake would read the
+/// stream from after those bytes.
+#[test]
+fn a_connect_answered_with_trailing_bytes_fails_the_connect() {
+    block_on(async {
+        let addr = talkative_connect_proxy().await;
+        let proxy = format!("http://127.0.0.1:{}", addr.port());
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(proxy.clone()),
+            max_retries: 0,
+            // Nothing listens on port 1 of the loopback, so a tunnel the
+            // fetcher took up would fail on the handshake instead.
+            ..direct_options("https://localhost:1/repo")
+        })
+        .await
+        .unwrap();
+
+        let err = fetch_error(&fetcher, "summary").await;
+        let message = err.to_string();
+        assert!(message.contains(&proxy), "{message}");
+        assert!(message.contains("after the connect"), "{message}");
+        assert!(message.contains("localhost:1"), "{message}");
+    });
+}
+
+/// A connect window that ends on a proxied hop names the proxy: the connection
+/// the window covers is the one to the proxy, and the origin behind it is
+/// contacted by nothing until that connection is open.
+#[test]
+fn a_connect_timeout_on_a_proxied_hop_names_the_proxy() {
+    block_on(async {
+        // A peer that accepts the connection, reads the `CONNECT`, and answers
+        // nothing.
+        let addr = stalling_server(b"").await;
+        let proxy = format!("http://127.0.0.1:{}", addr.port());
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(proxy.clone()),
+            connect_timeout: Duration::from_millis(300),
+            max_retries: 0,
+            ..direct_options("https://localhost:1/repo")
+        })
+        .await
+        .unwrap();
+
+        let message = fetch_error(&fetcher, "summary").await.to_string();
+        assert!(message.contains(&proxy), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(!message.contains("localhost:1"), "{message}");
     });
 }

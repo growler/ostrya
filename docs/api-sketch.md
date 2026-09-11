@@ -1245,7 +1245,7 @@ carries no field of its own.
 
 The HTTP client pull is built on. One `Fetcher` serves one remote: it holds the
 mirrors, headers, credentials, and TLS configuration, pools connections per
-origin, and admits a bounded number of requests at a time in priority order. A
+endpoint, and admits a bounded number of requests at a time in priority order. A
 request names a `Target`: a path under every mirror's base URL, or an absolute
 `http` or `https` URL of its own, which is served from that URL's origin and
 consults no mirror. A request carries headers and credentials of its own as
@@ -1303,6 +1303,44 @@ response that answered. The hop count belongs to one attempt, so a retryable
 status on a hop makes the whole attempt retryable and the round that repeats it
 starts again from the destination the route named.
 
+`proxy` states which proxy an origin is reached through, and it defaults to the
+one the process environment names. `Proxy::Environment` reads `http_proxy` for
+an `http` origin, `https_proxy` for an `https` one, `all_proxy` for either
+where the scheme-specific variable is unset, and `no_proxy` for the exemptions;
+`Proxy::Variables` states those same variables in the options, and
+`Proxy::Url` names one proxy for every origin and reads no exemption.
+Every name is read in upper case as well, `HTTP_PROXY` excepted, a CGI gateway
+handing a request header called `Proxy` on under that name. Lower case wins
+over upper case and an empty value counts as unset. A proxy URL is
+`http://host[:port]`, port 80 by default, with no path other than `/`, no
+query, and no fragment; userinfo is percent-decoded and sent as
+`Proxy-Authorization: Basic`, and anything else fails `Fetcher::new` with
+`Error::Unsupported` naming the value without its userinfo. A `no_proxy` entry
+matches the host text of the URL, ASCII case ignored, and never the address the
+host resolves to: it matches a host it equals or a host that ends with a `.`
+and the entry, one leading `.` on the entry stripped first, and it may carry
+`:port` to match that port alone. An entry left naming no host exempts nothing.
+`*` as a whole entry exempts every host and is the one wildcard the list reads,
+so `*.example.com` is a host text no origin holds, and an entry in CIDR
+notation names no network, which is where this parts from curl 7.86 and later.
+Every form is resolved once, by `Fetcher::new`.
+
+A cleartext origin behind a proxy is reached over a connection to the proxy,
+carrying the absolute-form target and the origin's own `Host` header; such a
+connection speaks HTTP/1.1 and pools under the proxy. A TLS origin behind a
+proxy is reached over a `CONNECT` tunnel naming `host:port`, after which the
+handshake, the ALPN selection, and the pool entry are a direct connection's; a
+byte arriving before the client speaks fails the connect. A non-2xx answer to
+`CONNECT` is retryable and a 407 is definitive, both `Error::Fetch` naming the
+proxy, and `connect_timeout` bounds the proxy connect, the `CONNECT` exchange,
+the TLS handshake, and the HTTP handshake together. The proxy credential
+belongs to the connection layer: it reaches the proxy alone, it is no part of
+the merged header list, and a tunnel carries nothing of it. A
+`Proxy-Authorization` header a caller sets keeps its own meaning, and on a
+proxied cleartext request it replaces the fetcher's proxy credential. The proxy
+decision is made per hop from that hop's origin, and a cleartext origin is
+cleartext however it is reached.
+
 ```rust
 pub struct FetcherOptions {
     pub mirrors: Vec<String>,             // base URLs, tried in order; a query
@@ -1317,6 +1355,7 @@ pub struct FetcherOptions {
                                           // one the fetcher sets
     pub basic_auth: Option<BasicAuth>,    // needs https mirrors
     pub tls: TlsOptions,                  // trust roots, client identity
+    pub proxy: Proxy,                     // default Proxy::Environment
     pub http2: bool,                      // default true
     pub max_retries: u32,                 // default 5
     pub max_redirects: u32,               // default 10; 0 follows nothing
@@ -1352,6 +1391,20 @@ pub struct ClientIdentity {
     pub key_passphrase: Option<String>,
 }
 pub struct TlsOptions { pub roots: TrustRoots, pub client_identity: Option<ClientIdentity> }
+
+/// Which proxy an origin is reached through. The `Debug` rendering leaves the
+/// userinfo of a proxy URL out.
+pub enum Proxy {
+    None,                             // connect directly, whatever the
+                                      // environment says
+    Environment,                      // the default: http_proxy, https_proxy,
+                                      // all_proxy, no_proxy, read once at
+                                      // construction
+    Variables(Vec<(String, String)>), // the same variables, stated here
+    Url(String),                      // one http:// proxy for every origin,
+                                      // userinfo sent as
+                                      // Proxy-Authorization: Basic
+}
 
 pub enum Priority { Low, Normal, High }
 pub enum Protocol { Http11, Http2 }

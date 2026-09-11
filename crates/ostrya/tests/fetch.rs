@@ -36,6 +36,9 @@ const SERVER_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/serve
 const SERVER_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.key.pem");
 const CLIENT_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.pem");
 const CLIENT_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.key.pem");
+const CLIENT_KEY_ENC_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.key.enc.pem");
+/// The passphrase `tests/fixtures/tls/generate.sh` encrypted that key with.
+const CLIENT_KEY_PASSPHRASE: &str = "ostrya test passphrase";
 const OTHERNAME_CERT_PEM: &[u8] =
     include_bytes!("../../../tests/fixtures/tls/server-othername.pem");
 const OTHERNAME_KEY_PEM: &[u8] =
@@ -1770,6 +1773,7 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
         with_cert.tls = tls_options(Some(ClientIdentity {
             cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
             key_pem: CLIENT_KEY_PEM.to_vec(),
+            key_passphrase: None,
         }));
         let fetcher = Fetcher::new(with_cert).await.unwrap();
         let (bytes, _) = fetch_bytes(&fetcher, "config").await;
@@ -1786,6 +1790,34 @@ fn a_client_certificate_is_presented_when_the_server_demands_one() {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Fetch(_)), "{err}");
+    });
+}
+
+/// The same client certificate under an encrypted PKCS#8 key completes client
+/// authentication: the fetcher decrypts the key with the passphrase and
+/// presents the certificate the server demands.
+#[test]
+fn an_encrypted_client_key_is_presented_when_the_server_demands_one() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Tls {
+                alpn: vec!["h2", "http/1.1"],
+                client_auth: ClientAuth::Required,
+            },
+            always(b"mutual"),
+        )
+        .await;
+
+        let mut options = FetcherOptions::new(server.url(true));
+        options.tls = tls_options(Some(ClientIdentity {
+            cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
+            key_pem: CLIENT_KEY_ENC_PEM.to_vec(),
+            key_passphrase: Some(CLIENT_KEY_PASSPHRASE.to_string()),
+        }));
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let (bytes, _) = fetch_bytes(&fetcher, "config").await;
+        assert_eq!(bytes, b"mutual");
+        assert_eq!(server.client_certificates(), [true]);
     });
 }
 
@@ -2256,6 +2288,7 @@ fn a_client_certificate_reaches_the_named_origin_alone() {
         options.tls = tls_options(Some(ClientIdentity {
             cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
             key_pem: CLIENT_KEY_PEM.to_vec(),
+            key_passphrase: None,
         }));
         let fetcher = Fetcher::new(options).await.unwrap();
         let (bytes, _) = fetch_bytes(&fetcher, "config").await;

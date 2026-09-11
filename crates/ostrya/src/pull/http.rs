@@ -1642,6 +1642,9 @@ async fn remote_tls(remote: &str, section: &crate::config::Remote<'_>) -> Result
         (Some(cert), Some(key)) => Some(ClientIdentity {
             cert_chain_pem: read_pem(&cert).await?,
             key_pem: read_pem(&key).await?,
+            // A remote carries no config key for a passphrase, so a remote
+            // client key has to be one that needs none.
+            key_passphrase: None,
         }),
         (None, None) => None,
         _ => {

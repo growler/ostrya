@@ -1337,7 +1337,20 @@ pub enum TrustRoots {
                                       // host name check is kept
     DangerousAcceptAny,               // the name check dropped as well
 }
-pub struct ClientIdentity { pub cert_chain_pem: Vec<u8>, pub key_pem: Vec<u8> }
+/// A client certificate and its key. The key is PEM, and the first section
+/// whose armor label names a private key is the one read. A `PRIVATE KEY`,
+/// `RSA PRIVATE KEY`, or `EC PRIVATE KEY` section is read as it is, and an
+/// `ENCRYPTED PRIVATE KEY` section is PKCS#8 under PBES2 that
+/// `key_passphrase` decrypts on the blocking pool. A passphrase set for a key
+/// section that carries no encryption is refused, as are the legacy OpenSSL
+/// traditional encrypted PEM and a key under PKCS#5 PBES1. The `Debug`
+/// rendering states the key by its length and the passphrase by whether it is
+/// set.
+pub struct ClientIdentity {
+    pub cert_chain_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    pub key_passphrase: Option<String>,
+}
 pub struct TlsOptions { pub roots: TrustRoots, pub client_identity: Option<ClientIdentity> }
 
 pub enum Priority { Low, Normal, High }

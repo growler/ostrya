@@ -14,9 +14,44 @@
 //! is what selects the protocol version -- the server picks from the offer
 //! during the handshake, and the fetcher speaks whichever came back.
 //!
-//! Building the configuration is async because [`TrustRoots::System`] reads the
-//! host trust store off the filesystem, which belongs on the blocking pool.
-//! Everything else here is decoding already-loaded bytes.
+//! A client private key comes in as PEM. The blob holds one section or more.
+//! The fetcher takes the first section whose armor label names a private key,
+//! and that section decides the path. The labels it reads are
+//! `ENCRYPTED PRIVATE KEY`, `PRIVATE KEY`, `RSA PRIVATE KEY`, and
+//! `EC PRIVATE KEY`.
+//!
+//! A section under one of the last three labels is read as it is. An
+//! `ENCRYPTED PRIVATE KEY` section is PKCS#8 under PBES2, and
+//! [`ClientIdentity::key_passphrase`] decrypts it. The supported ciphers are
+//! AES-128-CBC, AES-192-CBC, and AES-256-CBC. The supported key derivation
+//! functions are PBKDF2 with an HMAC-SHA-2 pseudorandom function, and scrypt.
+//!
+//! Each of these cases is refused with a message of its own:
+//!
+//! - a key that is encrypted, where no passphrase is set;
+//! - a passphrase set for a key section that carries no encryption;
+//! - a passphrase that does not decrypt the key;
+//! - a PBES2 cipher or key derivation function this build carries no
+//!   implementation for. The message names the OID. DES, 3DES, and PBKDF2
+//!   with an HMAC-SHA-1 pseudorandom function all reach it;
+//! - a key under PKCS#5 PBES1, which `pkcs5` parses and does not decrypt. The
+//!   message names PBES1. `pkcs5` recognizes six PBES1 OIDs, and an OID
+//!   outside that set gives a DER decoding failure. A corrupted document
+//!   gives the same failure, so the two cases are not told apart;
+//! - the legacy OpenSSL traditional PEM, which carries a
+//!   `Proc-Type: 4,ENCRYPTED` header line in the section. The message names
+//!   the `openssl pkcs8 -topk8` conversion that gives a PKCS#8 key.
+//!
+//! The key file sets the cost of the key derivation. The iteration count of
+//! PBKDF2 and the cost parameter of scrypt both come out of the document. A
+//! file that names an extreme parameter spends that much processor time or
+//! that much memory. The key file is operator-supplied, so no bound is applied
+//! to either parameter.
+//!
+//! Building the configuration is async for two reasons.
+//! [`TrustRoots::System`] reads the host trust store off the filesystem, and
+//! an encrypted client key runs a key derivation function. Both belong on the
+//! blocking pool. Everything else here is decoding already-loaded bytes.
 //!
 //! Two trust settings bypass verification, for an origin whose certificate the
 //! operator has decided not to check.
@@ -82,12 +117,39 @@ pub enum TrustRoots {
 
 /// A client certificate and its private key, both PEM-encoded, for a remote
 /// that authenticates its clients with TLS.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ClientIdentity {
     /// The client certificate, followed by any intermediates.
     pub cert_chain_pem: Vec<u8>,
-    /// The matching private key.
+    /// The matching private key. The first section whose armor label names a
+    /// private key is the one read. A `PRIVATE KEY`, `RSA PRIVATE KEY`, or
+    /// `EC PRIVATE KEY` section is read as it is, and an
+    /// `ENCRYPTED PRIVATE KEY` section is decrypted with `key_passphrase`.
     pub key_pem: Vec<u8>,
+    /// Decrypts an encrypted PKCS#8 key. A key section that carries no
+    /// encryption is refused where this is set, because a passphrase that
+    /// decrypts nothing hides a configuration mistake.
+    pub key_passphrase: Option<String>,
+}
+
+/// The private key and the passphrase are both held out of the formatted
+/// text, so a logged fetcher configuration carries neither. The key is stated
+/// by its length, and the passphrase by whether it is set. The certificate
+/// chain is public material and is formatted in full.
+impl std::fmt::Debug for ClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientIdentity")
+            .field("cert_chain_pem", &self.cert_chain_pem)
+            .field(
+                "key_pem",
+                &format!("<{} bytes redacted>", self.key_pem.len()),
+            )
+            .field(
+                "key_passphrase",
+                &self.key_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// How the fetcher negotiates TLS.
@@ -151,7 +213,7 @@ pub(crate) async fn client_config(
                     "client certificate holds no certificate".into(),
                 ));
             }
-            let key = parse_key(&identity.key_pem)?;
+            let key = parse_key(&identity.key_pem, identity.key_passphrase.as_deref()).await?;
             let mut config = shared(&provider, &verification)?
                 .with_client_auth_cert(chain, key)
                 .map_err(|e| Error::Fetch(format!("client certificate rejected: {e}")))?;
@@ -337,11 +399,206 @@ fn parse_certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
         .map_err(|e| Error::Fetch(format!("certificate pem: {e}")))
 }
 
-/// Decode the first private key in a PEM blob.
-fn parse_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
+/// The armor label of an encrypted PKCS#8 section, which this module decrypts
+/// itself.
+const ENCRYPTED_KEY_LABEL: &[u8] = b"ENCRYPTED PRIVATE KEY";
+
+/// The armor labels `rustls_pemfile` reads a private key out of.
+const PLAIN_KEY_LABELS: [&[u8]; 3] = [b"PRIVATE KEY", b"RSA PRIVATE KEY", b"EC PRIVATE KEY"];
+
+/// The header a legacy OpenSSL traditional encrypted PEM carries on a line of
+/// its own inside the section. RFC 7468 allows no header, so the PEM readers
+/// here stop on such a section; the fetcher finds the line first and names the
+/// conversion. RFC 1421 leaves the space after the colon optional.
+const LEGACY_ENCRYPTED_HEADER: &[u8] = b"Proc-Type:";
+
+/// The value that header carries where the section is encrypted.
+const LEGACY_ENCRYPTED_VALUE: &[u8] = b"4,ENCRYPTED";
+
+/// The first section of a PEM blob whose armor label names a private key.
+enum KeySection<'a> {
+    /// An `ENCRYPTED PRIVATE KEY` section, sliced out of the blob so the
+    /// decoder sees that section and nothing around it.
+    Encrypted(&'a [u8]),
+    /// A section under a label `rustls_pemfile` reads a key out of.
+    Plain(&'a [u8]),
+}
+
+/// Decode the private key a PEM blob holds. The first section whose armor
+/// label names a private key decides the path. A blob that carries a
+/// certificate and a key, or two keys, therefore reads the way
+/// `rustls_pemfile` reads one. `passphrase` decrypts an
+/// `ENCRYPTED PRIVATE KEY` section. It is refused on a section that carries no
+/// encryption, because a passphrase that decrypts nothing hides a
+/// configuration mistake.
+async fn parse_key(pem: &[u8], passphrase: Option<&str>) -> Result<PrivateKeyDer<'static>> {
+    match first_key_section(pem) {
+        Some(KeySection::Encrypted(section)) => decrypt_key(section, passphrase).await,
+        Some(KeySection::Plain(section)) => {
+            if is_legacy_encrypted(section) {
+                return Err(Error::Fetch(
+                    "private key pem is in the legacy openssl encrypted format. \
+                     convert the key to pkcs#8 with `openssl pkcs8 -topk8`"
+                        .into(),
+                ));
+            }
+            if passphrase.is_some() {
+                return Err(Error::Fetch(
+                    "a passphrase is set for a private key pem that carries no encryption".into(),
+                ));
+            }
+            read_plain_key(pem)
+        }
+        // A blob that carries no private-key section holds no key, whatever
+        // else it carries. `rustls_pemfile` states that.
+        None => read_plain_key(pem),
+    }
+}
+
+/// Read the key `rustls_pemfile` finds first. The section scan has already
+/// settled which section that is.
+fn read_plain_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut BufReader::new(pem))
         .map_err(|e| Error::Fetch(format!("private key pem: {e}")))?
         .ok_or_else(|| Error::Fetch("private key pem holds no key".into()))
+}
+
+/// Find the first section whose armor label names a private key. A key blob is
+/// a configuration-sized buffer, so this walks its lines; a certificate
+/// section, or a section under any other label, is stepped over.
+fn first_key_section(pem: &[u8]) -> Option<KeySection<'_>> {
+    for (start, end) in line_ranges(pem, 0) {
+        let Some(label) = armor_label(pem[start..end].trim_ascii(), b"BEGIN") else {
+            continue;
+        };
+        if label == ENCRYPTED_KEY_LABEL {
+            return Some(KeySection::Encrypted(section_at(pem, start, label)));
+        }
+        if PLAIN_KEY_LABELS.contains(&label) {
+            return Some(KeySection::Plain(section_at(pem, start, label)));
+        }
+    }
+    None
+}
+
+/// The bytes of the section that opens at `begin`, from that line through the
+/// end of the matching end line. A section with no end line runs to the end of
+/// the blob, and the decoder that reads it reports it as no key.
+fn section_at<'a>(pem: &'a [u8], begin: usize, label: &[u8]) -> &'a [u8] {
+    for (start, end) in line_ranges(pem, begin) {
+        if armor_label(pem[start..end].trim_ascii(), b"END") == Some(label) {
+            return &pem[begin..end];
+        }
+    }
+    &pem[begin..]
+}
+
+/// The label of a PEM armor line, `-----BEGIN <label>-----` for the keyword
+/// `BEGIN` and `-----END <label>-----` for `END`. A line that is neither gives
+/// `None`.
+fn armor_label<'a>(line: &'a [u8], keyword: &[u8]) -> Option<&'a [u8]> {
+    line.strip_prefix(b"-----".as_slice())?
+        .strip_prefix(keyword)?
+        .strip_prefix(b" ".as_slice())?
+        .strip_suffix(b"-----".as_slice())
+}
+
+/// Whether a section carries the header of the legacy OpenSSL traditional
+/// encrypted PEM. The header opens a line of its own, so the same text in the
+/// free space around a section reads as free text.
+fn is_legacy_encrypted(section: &[u8]) -> bool {
+    line_ranges(section, 0).any(|(start, end)| {
+        section[start..end]
+            .trim_ascii()
+            .strip_prefix(LEGACY_ENCRYPTED_HEADER)
+            .is_some_and(|value| value.trim_ascii_start() == LEGACY_ENCRYPTED_VALUE)
+    })
+}
+
+/// The byte range of each line of `pem` from `from`, the terminating newline
+/// counted in the range it ends.
+fn line_ranges(pem: &[u8], from: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let mut offset = from;
+    std::iter::from_fn(move || {
+        let start = offset;
+        if start >= pem.len() {
+            return None;
+        }
+        offset = pem[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(pem.len(), |index| start + index + 1);
+        Some((start, offset))
+    })
+}
+
+/// Decrypt an encrypted PKCS#8 section with `passphrase`.
+///
+/// PBKDF2 and scrypt are deliberately slow, and the key file sets how slow.
+/// The work therefore runs on the blocking pool, away from the caller's
+/// executor thread. The closure owns its inputs. That costs one copy of the
+/// section and one of the passphrase, once per fetcher.
+async fn decrypt_key(section: &[u8], passphrase: Option<&str>) -> Result<PrivateKeyDer<'static>> {
+    let Some(passphrase) = passphrase else {
+        return Err(Error::Fetch(
+            "private key pem is encrypted, and no passphrase is set".into(),
+        ));
+    };
+    let section = section.to_vec();
+    let passphrase = passphrase.to_string();
+    rt::unblock(move || decrypt_pkcs8(&section, &passphrase)).await
+}
+
+/// Decode an encrypted PKCS#8 section and decrypt it. A section the decoder
+/// reads no document out of reports the failure an empty blob reports, because
+/// it holds no key either way.
+fn decrypt_pkcs8(section: &[u8], passphrase: &str) -> Result<PrivateKeyDer<'static>> {
+    let no_key = || Error::Fetch("private key pem holds no key".into());
+    let text = std::str::from_utf8(section).map_err(|_| no_key())?;
+    let (_, document) = pkcs8::SecretDocument::from_pem(text).map_err(|_| no_key())?;
+    // The cipher and the key derivation function are named by OID in the
+    // document, and the decoder rejects an OID it carries no implementation
+    // for. DES and 3DES are compiled out, so a PBES2 key under either stops
+    // here.
+    let info = document
+        .decode_msg::<pkcs8::EncryptedPrivateKeyInfo<'_>>()
+        .map_err(|e| match e.kind() {
+            pkcs8::der::ErrorKind::OidUnknown { oid } => unsupported_algorithm(&oid),
+            _ => Error::Fetch(format!("encrypted private key pem: {e}")),
+        })?;
+    let key = info.decrypt(passphrase).map_err(|e| match e {
+        // A wrong passphrase derives a wrong key, and the plaintext that key
+        // gives carries invalid padding. `pkcs5` reports a padding failure as
+        // `EncryptFailed` on the decryption path as well as the encryption
+        // path, and constructs `DecryptFailed` nowhere.
+        pkcs8::Error::EncryptedPrivateKey(pkcs8::pkcs5::Error::EncryptFailed) => {
+            Error::Fetch("the passphrase does not decrypt the private key".into())
+        }
+        // A PBES2 pseudorandom function that is compiled out lands here, where
+        // an unknown cipher OID lands in the decoder above.
+        pkcs8::Error::EncryptedPrivateKey(pkcs8::pkcs5::Error::UnsupportedAlgorithm { oid }) => {
+            unsupported_algorithm(&oid)
+        }
+        // `pkcs5` parses PBES1 and decrypts none of it.
+        pkcs8::Error::EncryptedPrivateKey(pkcs8::pkcs5::Error::NoPbes1CryptSupport) => {
+            Error::Fetch(
+                "private key pem is encrypted under pkcs#5 pbes1, \
+                 which this build does not decrypt"
+                    .into(),
+            )
+        }
+        other => Error::Fetch(format!("encrypted private key: {other}")),
+    })?;
+    Ok(PrivateKeyDer::Pkcs8(key.as_bytes().to_vec().into()))
+}
+
+/// The refusal an algorithm this build carries no implementation for gets. The
+/// document names the algorithm by OID, and so does the message.
+fn unsupported_algorithm(oid: &pkcs8::ObjectIdentifier) -> Error {
+    Error::Fetch(format!(
+        "private key pem is encrypted with algorithm {oid}, \
+         which this build does not decrypt"
+    ))
 }
 
 #[cfg(test)]
@@ -352,6 +609,35 @@ mod tests {
     const CA_PEM: &[u8] = include_bytes!("../../../../tests/fixtures/tls/ca.pem");
     const CLIENT_CERT_PEM: &[u8] = include_bytes!("../../../../tests/fixtures/tls/client.pem");
     const CLIENT_KEY_PEM: &[u8] = include_bytes!("../../../../tests/fixtures/tls/client.key.pem");
+    /// The same key, in PKCS#8 under PBES2 with AES-256-CBC.
+    const CLIENT_KEY_ENC_PEM: &[u8] =
+        include_bytes!("../../../../tests/fixtures/tls/client.key.enc.pem");
+    /// The same key, in the legacy OpenSSL traditional encrypted PEM.
+    const CLIENT_KEY_LEGACY_PEM: &[u8] =
+        include_bytes!("../../../../tests/fixtures/tls/client.key.legacy.pem");
+    /// The same key, in PKCS#8 under PBES1 with pbeWithMD5AndDES-CBC.
+    const CLIENT_KEY_PBES1_PEM: &[u8] =
+        include_bytes!("../../../../tests/fixtures/tls/client.key.pbes1.pem");
+    /// The passphrase `tests/fixtures/tls/generate.sh` encrypted all three
+    /// with.
+    const KEY_PASSPHRASE: &str = "ostrya test passphrase";
+
+    /// Build the configurations from a client key and whatever passphrase goes
+    /// with it, so a test states the one pair it is about.
+    fn configs_for_key(key_pem: &[u8], passphrase: Option<&str>) -> Result<ClientConfigs> {
+        block_on(client_config(
+            &TlsOptions {
+                roots: TrustRoots::Pem(CA_PEM.to_vec()),
+                client_identity: Some(ClientIdentity {
+                    cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
+                    key_pem: key_pem.to_vec(),
+                    key_passphrase: passphrase.map(str::to_string),
+                }),
+            },
+            true,
+            true,
+        ))
+    }
 
     #[test]
     fn alpn_offers_h2_first_unless_disabled() {
@@ -395,6 +681,7 @@ mod tests {
             client_identity: Some(ClientIdentity {
                 cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
                 key_pem: CLIENT_KEY_PEM.to_vec(),
+                key_passphrase: None,
             }),
         };
         let configs = block_on(client_config(&options, true, true)).unwrap();
@@ -457,6 +744,7 @@ mod tests {
                 client_identity: Some(ClientIdentity {
                     cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
                     key_pem: CLIENT_KEY_PEM.to_vec(),
+                    key_passphrase: None,
                 }),
             };
             let configs = block_on(client_config(&options, true, true)).unwrap();
@@ -483,6 +771,7 @@ mod tests {
             client_identity: Some(ClientIdentity {
                 cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
                 key_pem: CA_PEM.to_vec(),
+                key_passphrase: None,
             }),
         };
         let err = block_on(client_config(&no_key, true, true)).unwrap_err();
@@ -493,9 +782,188 @@ mod tests {
             client_identity: Some(ClientIdentity {
                 cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
                 key_pem: b"-----BEGIN PRIVATE KEY-----\n".to_vec(),
+                key_passphrase: None,
             }),
         };
         let err = block_on(client_config(&unparsable_key, true, true)).unwrap_err();
         assert!(err.to_string().contains("private key pem"), "{err}");
+    }
+
+    /// An encrypted PKCS#8 key with its passphrase builds the two
+    /// configurations, the same as the key that carries no encryption.
+    #[test]
+    fn an_encrypted_client_key_is_decrypted() {
+        let configs = configs_for_key(CLIENT_KEY_ENC_PEM, Some(KEY_PASSPHRASE)).unwrap();
+        assert!(!Arc::ptr_eq(
+            &configs.with_identity,
+            &configs.without_identity
+        ));
+    }
+
+    /// Each refusal the encrypted-key path carries names its own case: a wrong
+    /// passphrase, an encrypted key with no passphrase, a passphrase on a key
+    /// that carries no encryption, and the legacy OpenSSL format.
+    #[test]
+    fn the_encrypted_key_refusals_name_their_case() {
+        let err = configs_for_key(CLIENT_KEY_ENC_PEM, Some("not the passphrase")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fetch: the passphrase does not decrypt the private key"
+        );
+
+        let err = configs_for_key(CLIENT_KEY_ENC_PEM, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fetch: private key pem is encrypted, and no passphrase is set"
+        );
+
+        let err = configs_for_key(CLIENT_KEY_PEM, Some(KEY_PASSPHRASE)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fetch: a passphrase is set for a private key pem that carries no \
+             encryption"
+        );
+
+        // The legacy form is refused whether a passphrase is set or not, and
+        // the message names the conversion that gives a readable key.
+        for passphrase in [Some(KEY_PASSPHRASE), None] {
+            let err = configs_for_key(CLIENT_KEY_LEGACY_PEM, passphrase).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "fetch: private key pem is in the legacy openssl encrypted \
+                 format. convert the key to pkcs#8 with `openssl pkcs8 -topk8`"
+            );
+        }
+    }
+
+    /// The formatted identity carries neither the private key nor the
+    /// passphrase, so a logged fetcher configuration carries neither. The key
+    /// is stated by its length. The certificate chain is public material and
+    /// is formatted in full.
+    #[test]
+    fn debug_redacts_the_key_and_the_passphrase() {
+        // A key that carries no encryption is the case a `Debug` leak costs
+        // most, and it is the case a pull configures.
+        let identity = ClientIdentity {
+            cert_chain_pem: CLIENT_CERT_PEM.to_vec(),
+            key_pem: CLIENT_KEY_PEM.to_vec(),
+            key_passphrase: Some(KEY_PASSPHRASE.to_string()),
+        };
+        let text = format!("{identity:?}");
+        assert!(!text.contains(KEY_PASSPHRASE), "{text}");
+        assert!(
+            text.contains("key_passphrase: Some(\"<redacted>\")"),
+            "{text}"
+        );
+        for line in std::str::from_utf8(CLIENT_KEY_PEM)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+        {
+            assert!(!text.contains(line), "{line} in {text}");
+        }
+        assert!(
+            text.contains(&format!("<{} bytes redacted>", CLIENT_KEY_PEM.len())),
+            "{text}"
+        );
+        assert!(text.contains("cert_chain_pem: ["), "{text}");
+
+        let without = ClientIdentity {
+            key_passphrase: None,
+            ..identity
+        };
+        let text = format!("{without:?}");
+        assert!(text.contains("key_passphrase: None"), "{text}");
+        assert!(!text.contains(KEY_PASSPHRASE), "{text}");
+    }
+
+    /// The encrypted section is read whatever follows it: a trailing blank
+    /// line, or the certificate the usual bundle carries in front of the key.
+    /// The decoder sees that one section, sliced out of the blob.
+    #[test]
+    fn an_encrypted_key_is_read_out_of_a_longer_blob() {
+        let blobs = [
+            [CLIENT_KEY_ENC_PEM, b"\n"].concat(),
+            [CLIENT_CERT_PEM, CLIENT_KEY_ENC_PEM].concat(),
+            [CLIENT_KEY_ENC_PEM, CLIENT_CERT_PEM].concat(),
+        ];
+        for blob in blobs {
+            let configs = configs_for_key(&blob, Some(KEY_PASSPHRASE)).unwrap();
+            assert!(!Arc::ptr_eq(
+                &configs.with_identity,
+                &configs.without_identity
+            ));
+        }
+    }
+
+    /// The first section whose label names a private key decides the path, so
+    /// a blob that holds an encrypted key and a plain one is read as whichever
+    /// comes first.
+    #[test]
+    fn the_first_key_section_decides_the_path() {
+        // Encrypted first: the passphrase is spent on it, and leaving the
+        // passphrase out refuses rather than falling through to the plain key
+        // behind it.
+        let encrypted_first = [CLIENT_KEY_ENC_PEM, CLIENT_KEY_PEM].concat();
+        configs_for_key(&encrypted_first, Some(KEY_PASSPHRASE)).unwrap();
+        let err = configs_for_key(&encrypted_first, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fetch: private key pem is encrypted, and no passphrase is set"
+        );
+
+        // Plain first: it is read as it is, and a passphrase is refused
+        // although an encrypted section stands behind it.
+        let plain_first = [CLIENT_KEY_PEM, CLIENT_KEY_ENC_PEM].concat();
+        configs_for_key(&plain_first, None).unwrap();
+        let err = configs_for_key(&plain_first, Some(KEY_PASSPHRASE)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fetch: a passphrase is set for a private key pem that carries no \
+             encryption"
+        );
+    }
+
+    /// The legacy header is read inside the section that carries it. A plain
+    /// key in front of a legacy one is served, and the same text in the free
+    /// space around a plain key reads as free text.
+    #[test]
+    fn the_legacy_header_is_read_inside_its_own_section() {
+        let plain_first = [CLIENT_KEY_PEM, CLIENT_KEY_LEGACY_PEM].concat();
+        configs_for_key(&plain_first, None).unwrap();
+
+        let with_note = [
+            b"Proc-Type: 4,ENCRYPTED\n".as_slice(),
+            b"# Proc-Type: 4,ENCRYPTED\n".as_slice(),
+            CLIENT_KEY_PEM,
+        ]
+        .concat();
+        configs_for_key(&with_note, None).unwrap();
+    }
+
+    /// RFC 1421 leaves the space after the colon optional, and the header is
+    /// named under either spelling.
+    #[test]
+    fn the_legacy_header_is_named_without_the_space() {
+        let text = std::str::from_utf8(CLIENT_KEY_LEGACY_PEM)
+            .unwrap()
+            .replace("Proc-Type: 4,ENCRYPTED", "Proc-Type:4,ENCRYPTED");
+        let err = configs_for_key(text.as_bytes(), Some(KEY_PASSPHRASE)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fetch: private key pem is in the legacy openssl encrypted \
+             format. convert the key to pkcs#8 with `openssl pkcs8 -topk8`"
+        );
+    }
+
+    /// A key under PKCS#5 PBES1 is refused, and the message names PBES1.
+    #[test]
+    fn a_pbes1_key_is_refused_by_name() {
+        let err = configs_for_key(CLIENT_KEY_PBES1_PEM, Some(KEY_PASSPHRASE)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fetch: private key pem is encrypted under pkcs#5 pbes1, \
+             which this build does not decrypt"
+        );
     }
 }

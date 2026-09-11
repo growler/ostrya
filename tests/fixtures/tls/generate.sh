@@ -33,6 +33,20 @@
 #                     through `openssl ca`, which takes an explicit
 #                     `-startdate` and `-enddate`.
 #
+# Three more copies of the client key carry the same key under an encryption
+# the fetcher has to read or refuse:
+#
+#   client.key.enc.pem     PKCS#8 under PBES2 with AES-256-CBC. The fetcher
+#                          decrypts this one with the passphrase below.
+#   client.key.legacy.pem  The legacy OpenSSL traditional PEM, which carries a
+#                          `Proc-Type: 4,ENCRYPTED` header. The fetcher refuses
+#                          this form and names the conversion.
+#   client.key.pbes1.pem   PKCS#8 under PBES1 with pbeWithMD5AndDES-CBC. The
+#                          fetcher refuses this form and names PBES1.
+#
+# All three take the passphrase `ostrya test passphrase`, which the tests
+# supply.
+#
 # `ca.pem`, `server.pem`, and `client.pem` were committed before the subject
 # handling below was written, so all three carry the common name `ostrya test`.
 # A full re-run gives each certificate a subject of its own. No test asserts a
@@ -44,6 +58,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 days=36500
+
+# The passphrase of the three encrypted copies of the client key. The tests
+# hold the same text.
+passphrase='ostrya test passphrase'
 
 # The configuration every invocation reads. LibreSSL's `req` takes the subject
 # from the `[dn]` section and ignores `-subj`, while GNU OpenSSL lets `-subj`
@@ -180,8 +198,30 @@ for leaf in ca server client server-othername server-untrusted server-expired; d
     mv "$leaf.key.pk8.pem" "$leaf.key.pem"
 done
 
+# The encrypted copies of the client key. The first is PKCS#8 under PBES2 with
+# AES-256-CBC, which the fetcher decrypts. The second is the legacy OpenSSL
+# traditional PEM, which the fetcher refuses: `openssl ec` writes that form,
+# and it carries the `Proc-Type: 4,ENCRYPTED` header the refusal reads.
+openssl pkcs8 -topk8 -v2 aes-256-cbc -in client.key.pem \
+    -out client.key.enc.pem -passout "pass:$passphrase"
+openssl ec -in client.key.pem -aes256 -out client.key.legacy.pem \
+    -passout "pass:$passphrase"
+
+# The third copy is PKCS#8 under PBES1, which the fetcher refuses as well.
+# PBES1 derives its key with PBKDF1, which GNU OpenSSL 3 holds in the legacy
+# provider. LibreSSL carries no `-provider` option and reaches PBKDF1 without
+# one. Both openssls write the same algorithm, pbeWithMD5AndDES-CBC.
+pbes1_provider=()
+if ! openssl version | grep -q LibreSSL; then
+    pbes1_provider=(-provider legacy -provider default)
+fi
+openssl pkcs8 -topk8 -v1 PBE-MD5-DES -in client.key.pem \
+    -out client.key.pbes1.pem -passout "pass:$passphrase" \
+    "${pbes1_provider[@]}"
+
 rm -f openssl.cnf backdate.cnf
 echo "wrote ca.pem server.pem server.key.pem client.pem client.key.pem" \
+    "client.key.enc.pem client.key.legacy.pem client.key.pbes1.pem" \
     "server-othername.pem server-othername.key.pem" \
     "server-untrusted.pem server-untrusted.key.pem" \
     "server-expired.pem server-expired.key.pem"

@@ -106,6 +106,18 @@ cargo build
 cargo test
 ```
 
+A Nix flake builds the `ostrya` binary and supplies the development
+shell:
+
+```sh
+nix build .#ostrya        # ./result/bin/ostrya
+nix develop               # Rust 1.92, the `ostree` tool, gnupg, and the
+                          # other binaries the test suite runs
+```
+
+The flake exposes the package as an overlay under `overlays.default`, so
+another flake can take `pkgs.ostrya`.
+
 The test suite runs under both runtime backends:
 
 ```sh

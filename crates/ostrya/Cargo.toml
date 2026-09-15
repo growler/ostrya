@@ -20,6 +20,13 @@ sign-gpg = ["verify-gpg"]
 # takes the system liblzma.
 lzma-static = ["liblzma/static"]
 
+# The crate documentation links items of the signing and verification
+# engines, and a feature gates each item. docs.rs adds these three features
+# to the default set, and the links then resolve. The `tokio` and
+# `lzma-static` features change no documented item, so the list omits them.
+[package.metadata.docs.rs]
+features = ["sign-spki", "verify-gpg", "sign-gpg"]
+
 [dependencies]
 ostrya-core = { workspace = true }
 ostrya-composefs = { workspace = true }

@@ -279,6 +279,11 @@ impl Repo {
 
     pub fn mode(&self) -> RepoMode;
     pub fn config(&self) -> &RepoConfig;                   // parsed, read-only view
+    /// The path this handle was opened or created with, exactly as given.
+    /// There is no canonicalization and no `/proc/self/fd` resolution, so a
+    /// relative path stays relative. For `open_at` and `create_at` the value
+    /// is relative to the `dir` fd of that call and needs that fd to resolve.
+    pub fn path(&self) -> &Path;
 
     /// Replace `config` with the document a caller edited through `KeyFile`'s
     /// setters and removers: a temporary file at mode 0644, `fdatasync`ed when
@@ -568,8 +573,28 @@ impl Repo {
     /// Serialized bytes of a metadata object; views borrow this buffer.
     pub async fn load_object_bytes(&self, ty: ObjectType, c: &Checksum)
         -> Result<Vec<u8>>;
+    /// A streaming reader over a metadata object's raw bytes. The bound is
+    /// `MAX_METADATA_SIZE`, the bound `load_object_bytes` holds, and the
+    /// reader holds it without buffering the object whole. It carries no
+    /// checksum verification, which matches `load_object_bytes`.
+    pub async fn metadata_reader(&self, ty: ObjectType, c: &Checksum)
+        -> Result<MetadataReader>;
 }
+
+/// The size bound both metadata readers hold, 128 MiB.
+pub const MAX_METADATA_SIZE: u64;
+
+/// An async reader over a metadata object's raw bytes. It implements
+/// `futures_io::AsyncRead` unconditionally and `tokio::io::AsyncRead` under
+/// the `tokio` feature.
+pub struct MetadataReader { /* rt::File + the running total */ }
 ```
+
+`metadata_reader` holds the bound at two points, the two points
+`load_object_bytes` holds it at: an `fstat` at the open refuses an object
+already above the bound, and a running total refuses an object that grows
+under the reader. The reader hands the caller at most `MAX_METADATA_SIZE`
+bytes, and the refusal is terminal, so every later read repeats the error.
 
 The owned `DirTree` and `DirMeta` values returned by `load_dirtree` and
 `load_dirmeta` are built through `to_owned`. Callers that only traverse --
@@ -582,6 +607,10 @@ read a handful at a time and their fields are retained.
 ```rust
 pub struct RepoTree { /* repo handle + dirtree/dirmeta checksums, lazy */ }
 impl RepoTree {
+    /// A leading `/` and every `.` component are ignored. A `..` component
+    /// names an entry that no directory holds, so the walk resolves the
+    /// components ahead of it and then yields `Ok(None)`, which is the
+    /// answer the tool gives such a path.
     pub async fn lookup(&self, path: &Path) -> Result<Option<TreeEntry>>;
     pub async fn read_dir(&self) -> Result<Vec<TreeEntry>>;  // files then dirs, name-sorted
     pub fn dirtree_checksum(&self) -> &Checksum;
@@ -757,6 +786,13 @@ impl MutableTree {
     // async: descending into a lazily-loaded committed subdirectory reads its
     // dirtree, so the hydrating descent is offloaded through the blocking pool.
     pub async fn ensure_dir(&mut self, name: &str) -> Result<&mut MutableTree>;
+    /// The existing subdirectory named `name`, hydrating a lazy committed
+    /// child in place. It creates nothing. An absent name is `PathNotFound`
+    /// and a file of that name is `NotADirectory`, and both carry the bare
+    /// entry name, since this layer holds no path. A symlink is a file entry
+    /// in this model, so a symlink to a directory takes `NotADirectory` and
+    /// the target is never read.
+    pub async fn subtree(&mut self, name: &str) -> Result<&mut MutableTree>;
     pub fn replace_file(&mut self, name: &str, checksum: Checksum) -> Result<()>;
     pub fn set_metadata_checksum(&mut self, c: Checksum);
     /// This directory's dirmeta checksum, if set. A root with none cannot be
@@ -872,6 +908,13 @@ impl StagingTree<'_> {
     pub async fn write_file_content(&self, path: &Path, meta: &FileMeta,
         content: &[u8]) -> Result<()>;
     pub async fn make_dir(&self, path: &Path, meta: &DirMeta) -> Result<()>;
+    /// Create `path` and any missing ancestor. A symlink at the last
+    /// component is `EntryExists`, whatever it points at, since the check
+    /// precedes the walk of its target; a regular file there is
+    /// `NotADirectory`. A symlink at an earlier component resolves to its
+    /// target directory, and a `..` hop after a symlink makes that symlink
+    /// an earlier component. `mkdir -p` accepts a symlink to a directory at
+    /// the last component.
     pub async fn make_dir_all(&self, path: &Path, meta: &DirMeta) -> Result<()>;
     /// Create the directory, or reuse an existing one and stamp `meta`
     /// onto it. Stages the dirmeta only when it creates the directory or
@@ -938,11 +981,14 @@ pub enum StagingLookup {
     Dir,
 }
 
-/// How the merge treats the merge root's own dirmeta. Reconcile is the
-/// default and treats the root like any other directory; KeepLeft ignores
-/// the right root's dirmeta, so a left root that carries none keeps none
-/// and the tree cannot be written. Every directory below the root
-/// reconciles either way.
+/// The dirmeta policy for one directory in a merge: the merge root
+/// (`root_dirmeta`) or a directory a followed left-side symlink lands in
+/// (`symlink_target_dirmeta`). Reconcile is the default and treats the
+/// directory like any other directory in the merge; KeepLeft ignores the
+/// dirmeta the right side carries for it, so a left directory that carries
+/// none keeps none, and a tree that holds a directory with no dirmeta
+/// cannot be written. Every other directory the merge reaches reconciles
+/// under either setting.
 #[derive(Default)]
 pub enum RootDirmeta { #[default] Reconcile, KeepLeft }
 
@@ -951,6 +997,12 @@ pub struct MergeOptions {
     pub allow_overwrite: bool,
     pub follow_symlinks: bool,
     pub root_dirmeta: RootDirmeta,
+    /// How the merge treats the dirmeta of a directory reached by following
+    /// a left-side symlink (`follow_symlinks`). It applies at every such
+    /// landing the recursive merge reaches, independent of `root_dirmeta`,
+    /// which governs the merge root alone, a `merge_at` base that is itself
+    /// a symlink included. `allow_overwrite` does not override KeepLeft.
+    pub symlink_target_dirmeta: RootDirmeta,
 }
 ```
 
@@ -972,8 +1024,15 @@ the symlink and the missing target. The flag governs the left-side entry
 names the merge reaches; a `merge_at` base's own final component follows
 either way. `root_dirmeta` governs the merge
 root alone: the directory at `base` reconciles its own dirmeta under
-`Reconcile` and keeps the dirmeta it has under `KeepLeft`, and every
-directory below the root reconciles either way. A merge that drops a
+`Reconcile` and keeps the dirmeta it has under `KeepLeft`. `base` resolves
+through symlinks before the merge starts, so a `base` that is itself a
+symlink is the merge root and takes `root_dirmeta`. A directory a followed
+left-side symlink lands in takes `symlink_target_dirmeta`, at every such
+landing the recursion reaches, however deep the symlink sits; a chain of
+symlinks resolves to a real directory first, so the landing is never itself
+a symlink. Every other directory the merge reaches reconciles under either
+setting. A landing that carries no dirmeta keeps none under `KeepLeft`, and
+the tree that holds it cannot be written. A merge that drops a
 directory is refused with `Staging` while any `write_file`
 writer is outstanding, wherever in the tree it sits, and leaves that
 directory and its subtree in place: a writer records its entry at
@@ -1022,7 +1081,10 @@ replace an existing file or symlink entry and fail on a directory with
 on a file or symlink, and takes a path with no components -- `.`, `/`,
 and the empty path -- as the tree root, which it stamps under the same
 comparison; `make_dir_all` applies its `DirMeta` to the
-directories it creates and leaves existing ones untouched; `clear_dir`
+directories it creates, leaves existing ones untouched, and refuses a
+symlink at the last component with `EntryExists`, since that component is
+the directory it creates, and the directories the walk created before the
+refusal stay in the tree; `clear_dir`
 fails with `NotADirectory` on a file, and on a symlink even where it
 points at a directory, and names a directory below the root, so the
 root itself cannot be cleared. A `remove` that takes an entry out and a

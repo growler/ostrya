@@ -16,7 +16,9 @@ use common::{
     fixture_repo,
 };
 use futures_lite::io::Cursor;
-use ostrya::{Checksum, CreateOptions, Error, FileMeta, MutableTree, Repo, RepoMode};
+use ostrya::{
+    Checksum, CommitOptions, CreateOptions, Error, FileMeta, MutableTree, Repo, RepoMode,
+};
 use ostrya_core::{DirMeta, ObjectType, Xattrs, loose_path};
 use ostrya_rt::block_on;
 
@@ -227,6 +229,217 @@ fn write_mtree_requires_a_dirmeta_checksum() {
     });
 }
 
+/// Create a repository at `root` holding one commit whose tree is `a/b/leaf.txt`
+/// beside a top-level `top.txt` and a top-level symlink `to_a -> a`, resolvable
+/// as `test/main`. Every directory carries the fixture dirmeta, so a hydrated
+/// level is recognized by `ROOT_DIRMETA`. Returns the handle and the commit's
+/// root dirtree checksum.
+async fn two_level_repo(root: &Path) -> (Repo, Checksum) {
+    let repo = Repo::create(root, CreateOptions::new(RepoMode::BareUser))
+        .await
+        .unwrap();
+    let txn = repo.transaction().await.unwrap();
+    let dirmeta_bytes = fixture_dirmeta().serialize().unwrap();
+    let dirmeta = txn
+        .write_metadata(ObjectType::DirMeta, None, &dirmeta_bytes)
+        .await
+        .unwrap();
+    let content = txn
+        .write_content(
+            None,
+            &FileMeta::regular(0, 0, 0o644),
+            Cursor::new(b"leaf\n".to_vec()),
+        )
+        .await
+        .unwrap();
+
+    // A symlink is stored as a file entry naming a content object, so `to_a` is
+    // a file of the tree even though its target is the directory `a`.
+    let to_a = txn
+        .write_symlink("a", &FileMeta::regular(0, 0, 0), None)
+        .await
+        .unwrap();
+
+    let mut mtree = MutableTree::new();
+    mtree.set_metadata_checksum(dirmeta);
+    mtree.replace_file("top.txt", content).unwrap();
+    mtree.replace_file("to_a", to_a).unwrap();
+    {
+        let a = mtree.ensure_dir("a").await.unwrap();
+        a.set_metadata_checksum(dirmeta);
+        let b = a.ensure_dir("b").await.unwrap();
+        b.set_metadata_checksum(dirmeta);
+        b.replace_file("leaf.txt", content).unwrap();
+    }
+
+    let rt = txn.write_mtree(&mut mtree).await.unwrap();
+    let root_dirtree = *rt.dirtree_checksum();
+    let commit = txn
+        .write_commit(CommitOptions::default(), &rt)
+        .await
+        .unwrap();
+    txn.set_ref("test/main", Some(&commit));
+    txn.commit().await.unwrap();
+    (repo, root_dirtree)
+}
+
+/// Assert that `mtree` still holds exactly the committed tree: it writes back
+/// the commit's root dirtree checksum, and a tree hydrated fresh from the same
+/// commit writes the same checksum. A directory materialized by a refusal fails
+/// this: one carrying no dirmeta fails the write, and one carrying a dirmeta
+/// changes the root dirtree. Each refusal test also probes the entry itself,
+/// which is the direct observation; this is the whole-tree check.
+async fn assert_matches_commit(repo: &Repo, mtree: &mut MutableTree, root_dirtree: Checksum) {
+    let txn = repo.transaction().await.unwrap();
+    let rt = txn.write_mtree(mtree).await.unwrap();
+    assert_eq!(
+        *rt.dirtree_checksum(),
+        root_dirtree,
+        "the tree still writes the committed root dirtree"
+    );
+    let mut fresh = MutableTree::from_commit(repo, "test/main").await.unwrap();
+    let fresh_rt = txn.write_mtree(&mut fresh).await.unwrap();
+    assert_eq!(
+        fresh_rt.dirtree_checksum(),
+        rt.dirtree_checksum(),
+        "a fresh hydration of the same commit agrees"
+    );
+    txn.abort().await.unwrap();
+}
+
+#[test]
+fn subtree_resolves_both_levels_of_a_hydrated_tree() {
+    let tmp = TmpDir::new("mtree-subtree");
+    block_on(async {
+        let (repo, _) = two_level_repo(&tmp.path().join("repo")).await;
+
+        let mut mtree = MutableTree::from_commit(&repo, "test/main").await.unwrap();
+        let a = mtree.subtree("a").await.unwrap();
+        assert_eq!(
+            a.metadata_checksum(),
+            Some(csum(ROOT_DIRMETA)),
+            "the first level hydrated with its committed dirmeta"
+        );
+        let b = a.subtree("b").await.unwrap();
+        assert_eq!(
+            b.metadata_checksum(),
+            Some(csum(ROOT_DIRMETA)),
+            "the second level hydrated with its committed dirmeta"
+        );
+        // The leaf file came with the directory, so removing it succeeds.
+        b.remove("leaf.txt", false).unwrap();
+
+        // A second descent takes the already-loaded child and answers the same.
+        let a = mtree.subtree("a").await.unwrap();
+        assert_eq!(a.metadata_checksum(), Some(csum(ROOT_DIRMETA)));
+        let b = a.subtree("b").await.unwrap();
+        assert!(
+            b.remove("leaf.txt", false).is_err(),
+            "the loaded child is the one the first descent mutated"
+        );
+    });
+}
+
+#[test]
+fn subtree_refuses_an_absent_name_at_either_level() {
+    let tmp = TmpDir::new("mtree-subtree-absent");
+    block_on(async {
+        let (repo, root_dirtree) = two_level_repo(&tmp.path().join("repo")).await;
+
+        let mut mtree = MutableTree::from_commit(&repo, "test/main").await.unwrap();
+        match mtree.subtree("nope").await {
+            Err(Error::PathNotFound { path }) => assert_eq!(path, "nope"),
+            other => panic!("expected PathNotFound at the root, got {other:?}"),
+        }
+        {
+            let a = mtree.subtree("a").await.unwrap();
+            match a.subtree("nope").await {
+                Err(Error::PathNotFound { path }) => assert_eq!(path, "nope"),
+                other => panic!("expected PathNotFound one level down, got {other:?}"),
+            }
+            // Neither directory holds an entry of that name, so there is
+            // nothing to remove. This reads the entry the refusal names.
+            assert!(
+                matches!(a.remove("nope", false), Err(Error::MutableTree(_))),
+                "the refusal one level down created no entry"
+            );
+        }
+        assert!(
+            matches!(mtree.remove("nope", false), Err(Error::MutableTree(_))),
+            "the refusal at the root created no entry"
+        );
+
+        // Neither refusal changed the tree as a whole.
+        assert_matches_commit(&repo, &mut mtree, root_dirtree).await;
+    });
+}
+
+#[test]
+fn subtree_refuses_a_file_name() {
+    let tmp = TmpDir::new("mtree-subtree-file");
+    block_on(async {
+        let (repo, root_dirtree) = two_level_repo(&tmp.path().join("repo")).await;
+
+        let mut mtree = MutableTree::from_commit(&repo, "test/main").await.unwrap();
+        match mtree.subtree("top.txt").await {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "top.txt"),
+            other => panic!("expected NotADirectory at the root, got {other:?}"),
+        }
+        {
+            let a = mtree.subtree("a").await.unwrap();
+            let b = a.subtree("b").await.unwrap();
+            match b.subtree("leaf.txt").await {
+                Err(Error::NotADirectory { path }) => assert_eq!(path, "leaf.txt"),
+                other => panic!("expected NotADirectory two levels down, got {other:?}"),
+            }
+            // The entry is still a file, which is what `ensure_dir` reports on
+            // a name the tree holds as one.
+            assert!(
+                matches!(
+                    b.ensure_dir("leaf.txt").await,
+                    Err(Error::ReplaceFileWithDir(name)) if name == "leaf.txt"
+                ),
+                "the refusal two levels down left the file in place"
+            );
+        }
+        assert!(
+            matches!(
+                mtree.ensure_dir("top.txt").await,
+                Err(Error::ReplaceFileWithDir(name)) if name == "top.txt"
+            ),
+            "the refusal at the root left the file in place"
+        );
+
+        // Neither refusal replaced a file with a directory.
+        assert_matches_commit(&repo, &mut mtree, root_dirtree).await;
+    });
+}
+
+#[test]
+fn subtree_refuses_a_symlink_to_a_directory() {
+    let tmp = TmpDir::new("mtree-subtree-symlink");
+    block_on(async {
+        let (repo, root_dirtree) = two_level_repo(&tmp.path().join("repo")).await;
+
+        // `to_a` names the directory `a`. The mutable tree holds a symlink as a
+        // file entry and reads no target, so the descent refuses the name.
+        let mut mtree = MutableTree::from_commit(&repo, "test/main").await.unwrap();
+        match mtree.subtree("to_a").await {
+            Err(Error::NotADirectory { path }) => assert_eq!(path, "to_a"),
+            other => panic!("expected NotADirectory for the symlink, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                mtree.ensure_dir("to_a").await,
+                Err(Error::ReplaceFileWithDir(name)) if name == "to_a"
+            ),
+            "the symlink is still a file entry"
+        );
+
+        assert_matches_commit(&repo, &mut mtree, root_dirtree).await;
+    });
+}
+
 #[test]
 fn rejects_invalid_names_and_collisions() {
     block_on(async {
@@ -242,6 +455,10 @@ fn rejects_invalid_names_and_collisions() {
             assert!(
                 matches!(mtree.ensure_dir(name).await, Err(Error::MutableTree(_))),
                 "ensure_dir rejects {name:?}"
+            );
+            assert!(
+                matches!(mtree.subtree(name).await, Err(Error::MutableTree(_))),
+                "subtree rejects {name:?}"
             );
         }
 

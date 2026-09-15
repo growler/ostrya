@@ -2085,6 +2085,19 @@ fn subpath_directory_and_file() {
             .checkout_at(&mut opts, base_fd.as_fd(), Path::new("through"), &commit)
             .await;
         assert!(matches!(err, Err(ostrya::Error::SubpathNotADirectory(_))));
+
+        // A `..` followed by a name the directory before the `..` holds as a
+        // file. No directory holds an entry named `..`, so the walk stops at
+        // the `..` and the value carries the absent-subpath refusal.
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.subpath = Some(PathBuf::from("subdir/../nested.txt/x"));
+        let err = repo
+            .checkout_at(&mut opts, base_fd.as_fd(), Path::new("parent"), &commit)
+            .await;
+        assert!(
+            matches!(err, Err(ostrya::Error::SubpathNotFound(_))),
+            "a `..` carries the absent-subpath refusal, got {err:?}"
+        );
     });
 }
 

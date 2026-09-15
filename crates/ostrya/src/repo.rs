@@ -20,7 +20,7 @@
 
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -99,6 +99,10 @@ struct RepoInner {
     repo_fd: OwnedFd,
     objects_fd: OwnedFd,
     config: RepoConfig,
+    // The path the handle was opened or created with, stored exactly as the
+    // caller gave it. It is a record of the caller's argument and is never
+    // used for I/O; every access goes through `repo_fd` and `objects_fd`.
+    path: PathBuf,
     // The repository lock, created on the first transaction and held for the
     // handle's lifetime so every clone of this handle shares one `.lock`
     // descriptor and one in-process hold count.
@@ -132,25 +136,28 @@ impl Repo {
     /// working directory.
     pub async fn open(path: &Path) -> Result<Repo> {
         let path = path.to_owned();
+        let stored = path.clone();
         let materials = ostrya_rt::unblock(move || open_materials(rustix::fs::CWD, &path)).await?;
-        Repo::assemble(materials)
+        Repo::assemble(materials, stored)
     }
 
     /// Open an existing repository at `path`, resolved against `dir`.
     pub async fn open_at(dir: BorrowedFd<'_>, path: &Path) -> Result<Repo> {
         let dir = dir.try_clone_to_owned()?;
         let path = path.to_owned();
+        let stored = path.clone();
         let materials = ostrya_rt::unblock(move || open_materials(&dir, &path)).await?;
-        Repo::assemble(materials)
+        Repo::assemble(materials, stored)
     }
 
     /// Create a repository at `path`, resolved against the current working
     /// directory, then open it. Creation is idempotent.
     pub async fn create(path: &Path, opts: CreateOptions) -> Result<Repo> {
         let path = path.to_owned();
+        let stored = path.clone();
         let materials =
             ostrya_rt::unblock(move || create_materials(rustix::fs::CWD, &path, &opts)).await?;
-        Repo::assemble(materials)
+        Repo::assemble(materials, stored)
     }
 
     /// Create a repository at `path`, resolved against `dir`, then open it.
@@ -158,8 +165,9 @@ impl Repo {
     pub async fn create_at(dir: BorrowedFd<'_>, path: &Path, opts: CreateOptions) -> Result<Repo> {
         let dir = dir.try_clone_to_owned()?;
         let path = path.to_owned();
+        let stored = path.clone();
         let materials = ostrya_rt::unblock(move || create_materials(&dir, &path, &opts)).await?;
-        Repo::assemble(materials)
+        Repo::assemble(materials, stored)
     }
 
     /// The repository storage mode.
@@ -170,6 +178,21 @@ impl Repo {
     /// The parsed repository configuration.
     pub fn config(&self) -> &RepoConfig {
         &self.inner.config
+    }
+
+    /// The path this handle was opened or created with, exactly as given. The
+    /// constructor applies no canonicalization and no
+    /// `readlink("/proc/self/fd/N")` resolution, so a relative path stays
+    /// relative.
+    ///
+    /// For [`Repo::open_at`] and [`Repo::create_at`] the value is relative to
+    /// the `dir` fd of that call. It does not resolve without that fd.
+    ///
+    /// A relative path has its meaning in the process and the working
+    /// directory that opened the handle. Make such a path absolute before you
+    /// give it to another process.
+    pub fn path(&self) -> &Path {
+        &self.inner.path
     }
 
     /// Begin a transaction that holds the repository lock shared.
@@ -227,7 +250,9 @@ impl Repo {
     }
 
     /// Parse the config bytes and assemble the handle. This step is CPU-only.
-    fn assemble(materials: Materials) -> Result<Repo> {
+    /// `path` is the argument the caller gave the constructor, stored as is for
+    /// [`Repo::path`].
+    fn assemble(materials: Materials, path: PathBuf) -> Result<Repo> {
         let text = std::str::from_utf8(&materials.config)
             .map_err(|_| Error::InvalidFormat("config is not valid UTF-8".into()))?;
         let config = RepoConfig::parse(text)?;
@@ -236,6 +261,7 @@ impl Repo {
                 repo_fd: materials.repo_fd,
                 objects_fd: materials.objects_fd,
                 config,
+                path,
                 lock: Mutex::new(None),
             }),
         })

@@ -246,6 +246,7 @@ pub use modifier::{
     XattrFn,
 };
 pub use mtree::MutableTree;
+pub use object::MAX_METADATA_SIZE;
 pub use ostrya_composefs::Image;
 pub use ostrya_core::base64;
 pub use ostrya_core::{
@@ -258,7 +259,7 @@ pub use pull::{
     DetachedMetadataFilter, DetachedMetadataFilterFn, PullFlags, PullOptions, PullStats,
     PullVerify, TimestampCheck,
 };
-pub use read::{CommitSizes, CommitState};
+pub use read::{CommitSizes, CommitState, MetadataReader};
 pub use refs::{CollectionRef, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};
 pub use sign::{

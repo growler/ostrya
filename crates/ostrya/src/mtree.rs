@@ -9,10 +9,11 @@
 //!
 //! Lazy hydration. [`MutableTree::from_commit`] reads only the root dirtree and
 //! records the checksums of each subdirectory. A subdirectory's contents are
-//! read when [`ensure_dir`](MutableTree::ensure_dir) first descends into it,
-//! so editing one path in a large commit reads only the directories along that
-//! path. Descending is `async` because it may read a dirtree; the other
-//! mutators operate on already-hydrated contents and stay synchronous.
+//! read when [`ensure_dir`](MutableTree::ensure_dir) or
+//! [`subtree`](MutableTree::subtree) first descends into it, so reaching one
+//! path in a large commit reads only the directories along that path.
+//! Descending is `async` because it may read a dirtree; the other mutators
+//! operate on already-hydrated contents and stay synchronous.
 //!
 //! Dirty tracking. A subtree that matches a committed dirtree and has not been
 //! mutated keeps that dirtree checksum, and [`write_mtree`](Transaction::write_mtree)
@@ -119,6 +120,17 @@ enum TakenInner {
     Dir(Child),
 }
 
+/// Which mode a descent runs in. It selects what a name the directory does not
+/// hold does, and with it the variant a file of that name raises.
+enum Absent {
+    /// Insert an empty subdirectory of that name and return it. A file of that
+    /// name is [`Error::ReplaceFileWithDir`].
+    Create,
+    /// Refuse that name with [`Error::PathNotFound`]. A file of that name is
+    /// [`Error::NotADirectory`].
+    Refuse,
+}
+
 /// The checksums a written directory contributes to its parent's dirtree entry.
 struct Emitted {
     dirtree: Checksum,
@@ -208,12 +220,41 @@ impl MutableTree {
     /// empty one if absent or hydrating a lazy committed one. Fails if a file
     /// with that name exists.
     pub async fn ensure_dir(&mut self, name: &str) -> Result<&mut MutableTree> {
+        self.descend(name, Absent::Create).await
+    }
+
+    /// The existing subdirectory named `name`, hydrating a lazy committed child
+    /// in place. Creates nothing: an absent name is [`Error::PathNotFound`] and
+    /// a file of that name is [`Error::NotADirectory`]. A symlink is a file
+    /// entry in this model, so a symlink whose target is a directory is
+    /// [`Error::NotADirectory`] as well: the accessor resolves one name in one
+    /// directory and reads no symlink target. Both payloads are the entry name,
+    /// because this layer holds no path, the same carve-out
+    /// [`Error::ReplaceDirWithFile`] records for the staging tree.
+    pub async fn subtree(&mut self, name: &str) -> Result<&mut MutableTree> {
+        self.descend(name, Absent::Refuse).await
+    }
+
+    /// Return the subdirectory named `name`, hydrating a lazy committed child in
+    /// place. `absent` selects what an absent name does, and with it the variant
+    /// a file of that name raises.
+    async fn descend(&mut self, name: &str, absent: Absent) -> Result<&mut MutableTree> {
         validate_name(name)?;
         if self.files.contains_key(name) {
-            return Err(Error::ReplaceFileWithDir(name.to_owned()));
+            return Err(match absent {
+                Absent::Create => Error::ReplaceFileWithDir(name.to_owned()),
+                Absent::Refuse => Error::NotADirectory {
+                    path: name.to_owned(),
+                },
+            });
         }
         match self.dirs.get(name) {
             None => {
+                if matches!(absent, Absent::Refuse) {
+                    return Err(Error::PathNotFound {
+                        path: name.to_owned(),
+                    });
+                }
                 let child = MutableTree {
                     metadata_checksum: None,
                     files: BTreeMap::new(),

@@ -104,8 +104,12 @@ impl RepoTree {
     }
 
     /// Resolve a relative path within this tree, or `None` if any component is
-    /// missing. Leading `/` and `.` components are ignored. A trailing
+    /// missing. A leading `/` and every `.` component are ignored. A trailing
     /// component may name either a file or a directory.
+    ///
+    /// A path names entries in the committed tree, and a `..` component names
+    /// an entry that no directory holds. Such a path resolves to `None` at the
+    /// `..`, once the components before it resolved.
     pub async fn lookup(&self, path: &Path) -> Result<Option<TreeEntry>> {
         let components = normalize(path);
         if components.is_empty() {
@@ -113,6 +117,10 @@ impl RepoTree {
         }
         let mut current = self.clone();
         for (index, component) in components.iter().enumerate() {
+            let Comp::Normal(component) = component else {
+                // A `..` component. No directory holds an entry of this name.
+                return Ok(None);
+            };
             let is_last = index + 1 == components.len();
             let dirtree = current.repo.load_dirtree(&current.dirtree).await?;
 
@@ -155,13 +163,26 @@ impl RepoTree {
     }
 }
 
-/// Split a path into its meaningful components, dropping the root and `.`.
-fn normalize(path: &Path) -> Vec<String> {
+/// One meaningful component of a lookup path.
+pub(crate) enum Comp {
+    /// An entry name to resolve in the directory the walk stands in.
+    Normal(String),
+    /// A `..` component. It is a marker: no directory holds an entry of this
+    /// name, so the walk stops at it and the lookup resolves to nothing.
+    Parent,
+}
+
+/// Split a path into its meaningful components, dropping the root and `.` and
+/// keeping `..` as [`Comp::Parent`]. Every walk over a commit-tree path reads
+/// its components through this function, so one path splits the same way at
+/// every call site.
+pub(crate) fn normalize(path: &Path) -> Vec<Comp> {
     use std::path::Component;
     path.components()
         .filter_map(|c| match c {
-            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
+            Component::Normal(part) => Some(Comp::Normal(part.to_string_lossy().into_owned())),
+            Component::ParentDir => Some(Comp::Parent),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => None,
         })
         .collect()
 }

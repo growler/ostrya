@@ -17,7 +17,12 @@ use crate::error::{Error, Result};
 
 /// The maximum size of a metadata object the reader will load, matching the
 /// format's 128 MiB metadata cap.
-pub(crate) const MAX_METADATA_SIZE: u64 = 128 * 1024 * 1024;
+///
+/// Both metadata reading paths hold the bound: [`crate::Repo::load_object_bytes`]
+/// refuses an object above it, and [`crate::MetadataReader`] refuses one at the
+/// open and again once it has handed over this many bytes and the object still
+/// holds a further one.
+pub const MAX_METADATA_SIZE: u64 = 128 * 1024 * 1024;
 
 /// The maximum size of a content object's framed file header the reader will
 /// load, for the archive form on disk and for the same framing received over
@@ -33,13 +38,23 @@ pub(crate) const MAX_METADATA_SIZE: u64 = 128 * 1024 * 1024;
 pub(crate) const MAX_FILE_HEADER_SIZE: u64 = 1024 * 1024;
 
 /// Open a loose object for reading, relative to a directory fd.
-fn open_object(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<OwnedFd> {
+pub(crate) fn open_object(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<OwnedFd> {
     Ok(rustix::fs::openat(
         dir,
         path,
         OFlags::RDONLY | OFlags::CLOEXEC,
         Mode::empty(),
     )?)
+}
+
+/// The error every metadata read reports for an object above the size cap. The
+/// buffered loader and the streaming reader both raise this one error, so the
+/// two paths refuse an oversized object alike.
+pub(crate) fn metadata_cap_exceeded() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "object exceeds the metadata size cap",
+    )
 }
 
 /// Read a whole metadata object into memory, rejecting anything larger than
@@ -54,20 +69,14 @@ pub(crate) fn read_meta_object(
     let stat = rustix::fs::fstat(&fd)?;
     let size = stat.st_size.max(0) as u64;
     if size > cap {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "object exceeds the metadata size cap",
-        ));
+        return Err(metadata_cap_exceeded());
     }
     let file = std::fs::File::from(fd);
     let mut buf = Vec::with_capacity(size as usize);
     // `take` guards against a file that grows between stat and read.
     file.take(cap + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > cap {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "object exceeds the metadata size cap",
-        ));
+        return Err(metadata_cap_exceeded());
     }
     Ok(buf)
 }

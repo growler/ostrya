@@ -1499,6 +1499,24 @@ note: the reported path is the prefix that failed, made absolute.
 
 family: M10
 subcommand: cat
+cell: cat/path-parent-component
+setup: repo-with-commit
+run: cat --repo=$REPO $BRANCH dir/../file.txt
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#cat
+note: a `..` component is an entry name that no directory of a commit tree
+ holds, so the path names nothing and no content is written. Both report
+ `error: No such file or directory: /dir/..`, and the standing wording rule
+ leaves that text unasserted, so `stderr-text` is not an oracle here.
+
+family: M10
+subcommand: cat
 cell: cat/unresolvable-commit
 setup: repo-with-commit
 run: cat --repo=$REPO nosuch /file.txt
@@ -3864,6 +3882,69 @@ severity: interop
 spec: format-reference.md#ls
 note: an empty argument resolves to the root and is refused all the same, so the
  message names `/` as the path while quoting the empty argument.
+
+family: M10
+subcommand: ls
+cell: ls/path-parent-component
+setup: repo-with-commit
+run: ls --repo=$REPO $BRANCH dir/../nested.txt
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ls
+note: a `..` component is an entry name that no directory of a commit tree
+ holds, so the path names nothing and the listing is refused. A `PATH` names
+ entries and does not climb out of the directory it stands in. `nested.txt`
+ is a name `dir` holds, so a walk that drops the `..` reaches `dir/nested.txt`
+ and lists it at exit 0. This cell fails such a walk. The port names the whole
+ path, and the tool names the prefix that failed:
+ `Inspecting path 'dir/../nested.txt': No such file or directory: /dir/..`.
+ `stderr-text` is not an oracle here.
+
+family: M10
+subcommand: ls
+cell: ls/path-leading-parent
+setup: repo-with-commit
+run: ls --repo=$REPO $BRANCH ../file.txt
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ls
+note: a leading `..` stands in the commit root, so it names an entry of the root
+ and the root holds none, which refuses the path the same way. `file.txt` is a
+ name the commit root holds, so a walk that drops the `..` reaches `file.txt`
+ and lists it at exit 0. This cell fails such a walk. The tool reports
+ `No such file or directory: /..` after the quoted argument and the port names
+ the whole path, so `stderr-text` is not an oracle here.
+
+family: M10
+subcommand: ls
+cell: ls/path-trailing-parent
+setup: repo-with-commit
+run: ls --repo=$REPO $BRANCH dir/..
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#ls
+note: a `..` in the final position names an entry of the directory before it,
+ and `dir` holds none of that name, so the listing is refused and no entry of
+ `dir` is printed. `dir` is a name the commit root holds, so a walk that drops
+ the `..` reaches `dir` and lists it at exit 0. This cell fails such a walk.
+ Both report `Inspecting path 'dir/..': No such file or directory: /dir/..`,
+ and the standing wording rule leaves that text unasserted, so `stderr-text` is
+ not an oracle here.
 
 family: M10
 subcommand: ls

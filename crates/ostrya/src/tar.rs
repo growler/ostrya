@@ -79,9 +79,11 @@ type BodyReader = Pin<Box<dyn AsyncRead + Send>>;
 #[derive(Debug, Default, Clone)]
 pub struct TarExportOptions {
     /// A path within the commit tree whose directory becomes the archive root,
-    /// in place of the commit root. A path with no component names the whole
-    /// tree. A path naming a file or a symlink, and a path naming nothing, are
-    /// both refused with [`Error::Tar`].
+    /// in place of the commit root. A path with no name component names the
+    /// whole tree. A path that carries a name component and a `..` component
+    /// names nothing, since no directory holds a `..` entry. A path naming a
+    /// file or a symlink, and a path naming nothing, are both refused with
+    /// [`Error::Tar`].
     pub subpath: Option<PathBuf>,
     /// A prefix over every member pathname. The root member's name is the
     /// prefix with one `/` appended where it does not end in one; every other
@@ -751,7 +753,7 @@ fn join(comps: &[String]) -> String {
 }
 
 /// The dirtree and dirmeta the archive's root member stands for: the commit
-/// root, or the directory a subpath names inside it. A subpath with no path
+/// root, or the directory a subpath names inside it. A subpath with no name
 /// component names the whole tree, matching
 /// [`CheckoutOptions::subpath`](crate::CheckoutOptions::subpath). A subpath
 /// naming a file or a symlink has no tree to walk, and one naming nothing at

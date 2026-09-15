@@ -88,14 +88,18 @@ pub enum Error {
     /// A path names a component that is not present.
     #[error("path not found: {path}")]
     PathNotFound {
-        /// The path of the component that is absent.
+        /// The path of the component that is absent. A caller that holds one
+        /// name and no path, `MutableTree::subtree` among them, puts the bare
+        /// entry name here.
         path: String,
     },
     /// A path component that had to be a directory is a file, or a symlink
     /// resolved to one.
     #[error("not a directory: {path}")]
     NotADirectory {
-        /// The path of the component that is not a directory.
+        /// The path of the component that is not a directory. A caller that
+        /// holds one name and no path, `MutableTree::subtree` among them, puts
+        /// the bare entry name here.
         path: String,
     },
     /// A symlink's target does not resolve.

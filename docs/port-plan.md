@@ -1058,8 +1058,11 @@ Definition:
   final component never follows: `write_file` and `write_file_content`
   replace an existing file or symlink and fail on a directory;
   `make_dir`, `symlink`, and `hardlink` fail on any existing entry;
-  `make_dir_all` applies its `DirMeta` to directories it creates and
-  leaves existing ones untouched.
+  `make_dir_all` applies its `DirMeta` to directories it creates, leaves
+  existing ones untouched, and refuses a symlink at the last component
+  with `EntryExists`, since that component is the directory it creates,
+  and the directories the walk created ahead of the refusal stay in the
+  tree.
 - Staged-first reads: `StagingTree::read_file` and `read_dir` resolve
   paths against the staged tree and load objects through the
   transaction's staged-first object lookup, which reads the
@@ -5725,6 +5728,182 @@ no C in the graph. `CLAUDE.md` states the measured graph of each.
   always carries. `pkcs5`, `cbc`, `pbkdf2`, `salsa20`, and `scrypt` enter the
   graph with it, and no other crate in the workspace reaches them. The `3des`
   and `des-insecure` features stay off.
+
+### Phase 24 -- API follow-ups for the debles migration (DONE)
+
+Six library items the debles migration asked for after Phase 21. debles is an
+out-of-tree consumer that builds Debian OSTree images; its demand side is
+`ostrya-followup-req.md` in that project, items A1 through A7, and the
+ostrya-side plan is `debles-api-update.md` at this repo's root, untracked the
+way `phase-17-cli-conformance-plan.md` is. Both are cited by name, and the
+decisions themselves are carried here. Every item had a working debles-side
+workaround already, so none of the six was blocking. The phase adds no crate
+to any manifest and touches neither `format-reference.md` nor the on-disk byte
+layout, so the six items are independent of one another. A7 is informational
+and asked for no change: debles closed the ref-walk and prune disagreement on
+its own side, and `PruneOptions::traverse_parent` is the knob that would have
+closed it from this side.
+
+The release is 0.2.3. A2 adds a field to an existing option struct, which
+decision 14 calls a breaking change taking a minor version before 1.0, and A5
+and A6 change the behavior of existing functions. Per the maintainer, this
+project is pre-1.0 and carries no compatibility burden yet, so the release
+takes a patch version, the point Phase 23 already made an exception on.
+Decision 14 stays unchanged.
+
+`A1` -- `Repo::path()` (DONE). `RepoInner` carries a `PathBuf` and each of the
+four constructors clones the path it already owns before the `unblock` closure
+moves the original. The accessor returns exactly the caller's argument: there
+is no canonicalization and no `readlink("/proc/self/fd/N")` resolution, so a
+relative path stays relative. For `open_at` and `create_at` the value is
+relative to the `dir` fd of that call and does not resolve without it, so a
+caller that hands the path to another process makes it absolute first. The
+stored value is a record and never an I/O input; every access still goes
+through `repo_fd` or `objects_fd`. The tests gate all four constructors, and a
+`canonicalize()` added to any one of them fails them.
+
+`A2` -- `MergeOptions::symlink_target_dirmeta` (DONE). The recursive merge
+reconciled the dirmeta of a directory it reached by following a left-side
+symlink against the dirmeta the right side carried for the symlink's name, so
+a scaffolded `/run/lock` reached through `/var/lock -> /run/lock` conflicted
+with a package's own `./var/lock/` whenever the two modes differed. The new
+field reuses the `RootDirmeta` enum, since the choice is the same one, and
+defaults to `Reconcile`, so no existing caller changes. The suppression applies
+at every such landing the recursion reaches and not at the merge root alone:
+the alias sits one level below the root, so a root-only knob would never reach
+it. A `merge_at` base resolves through symlinks before the merge starts, so a
+base that is itself a symlink is the merge root and takes `root_dirmeta`. A
+chain of symlinks resolves to a real directory first, so a landing is never
+itself a symlink. `allow_overwrite` does not override `KeepLeft`. One hazard
+the root case already carried now reaches a landing too: a left directory that
+carries no dirmeta keeps none under `KeepLeft`, and a tree that holds a
+directory with no dirmeta cannot be written. The debles demand doc also credits
+this knob with closing the parent-resolution parity gap of its migration step
+3.1. That gap is about tree shape, which directory `./lib/foo` lands in when
+`./lib` is a symlink, and a dirmeta policy moves no file, so the phase does not
+claim it.
+
+`A3` -- `MutableTree::subtree` (DONE). `ensure_dir` creates an empty directory
+for a name the tree does not hold, so a caller that only descends an existing
+committed tree got a silent empty directory where a path component was wrong.
+`ensure_dir`'s body became a private descent parameterized by what an absent
+name does, so the creating and the read-only paths share the lazy-hydration
+logic, and `ensure_dir` keeps its behavior exactly. The refusals are typed: an
+absent name is `Error::PathNotFound` and a file of that name is
+`Error::NotADirectory`, which map to `NotFound` and `NotADirectory`, where the
+untyped `Error::MutableTree` maps to `InvalidInput` and `ReplaceFileWithDir`
+names a write a read-only accessor never makes. Both carry the bare entry name,
+because the mutable-tree layer holds no path context; this is the carve-out the
+staging tree already records for `ReplaceDirWithFile`, and `error.rs` now
+records it on both variants. A symlink is a file entry in this model, so a
+symlink to a directory takes `NotADirectory` and the target is never read.
+Neither refusal puts a directory in the tree.
+
+`A4` -- `Repo::metadata_reader` and `MetadataReader` (DONE). A streaming reader
+over a metadata object's raw bytes beside the buffered `load_object_bytes`.
+Metadata objects carry no compression and no framed header in any repository
+mode, so the reader is the plain file at offset 0 and needs none of
+`ContentReader`'s variants. It implements `futures_io::AsyncRead`
+unconditionally and `tokio::io::AsyncRead` under the `tokio` feature. It
+carries no checksum verification, which is `load_object_bytes`'s contract, and
+it holds that loader's two size checks at the same boundary through one shared
+error constructor: an `fstat` at the open refuses an object already above
+`MAX_METADATA_SIZE`, and a running total refuses one that grows under the
+reader. The bound is now public, since the doc names it. Two properties the
+plan left unstated and the tests now pin: the reader hands the caller at most
+`MAX_METADATA_SIZE` bytes, the byte that carries the object past the bound
+being read into a private probe and never delivered; and the refusal is
+terminal, so every later read repeats the error. Without the second, the read
+after a refusal reported a clean end of file and a caller that logged the error
+and continued ended with a truncated object it believed was whole. An object of
+exactly the bound reads through and ends at `Ok(0)`, on both the buffered and
+the streaming path.
+
+`A5` -- `RepoTree::lookup` refuses a `..` component (DONE). The path normalizer
+dropped every component that was not a name, `..` included, so `a/../b`
+resolved as `a/b` and `../c` as `c`, and the lookup answered for an entry the
+caller did not name. The tool was observed on this host, `ostree` 2026.1, with
+a commit holding `a/b/f` beside `c`: every command that takes a tree path
+treats `..` as an entry name that no directory holds and exits 1 with
+`No such file or directory: /a/..`. Measured, tool then port before the fix:
+`ls a/../c` exits 1 and 1; `ls ../c` exits 1 and 0, listing `c`; `ls a/..`
+exits 1 and 0, listing `a`; `cat a/../c` exits 1 and 1; `checkout --subpath
+a/../c` exits 1 and 1. The normalizer now keeps `..` as a marker and the walk
+yields `Ok(None)` at it, after the components ahead of it resolve, which
+reaches the CLI as the existing refusal. `.`, a leading `/`, and a prefix are
+dropped as before. `lookup` backs `ls`, `cat`, `checkout --subpath`, and the
+tar export subpath, so resolving `..` would have moved all four away from the
+tool. The demand doc allowed either answer; refusal is the one the tool gives,
+and debles normalizes before the call, so refusal costs it nothing. Four `m10`
+cells hold the rule, three of them guards on the changed path.
+
+A fifth site the plan's caller list missed: `checkout.rs` classified a failed
+subpath through a component filter of its own, which also dropped `..`, so a
+`..` path whose surviving components ran through a regular file came back as
+`SubpathNotADirectory` where the tool reports not-found. That is the split
+`--allow-noent` acts on, so `checkout --allow-noent --subpath=a/../b/x` over a
+file `a/b` exited 1 where the tool exits 0. Both sites now read their
+components through the one normalizer, and the not-a-directory classification
+is kept where the file stands ahead of the `..`, which is the tool's
+`Not a directory`.
+
+Two divergences stay open and are recorded rather than closed, both because a
+path carrying no name component at all never reaches `lookup`. `checkout` and
+the tar export short-circuit such a path to the commit root, so
+`--subpath=..` and `--subpath=.` write the whole tree where the tool exits 1;
+`ls` and `cat` refuse both and agree. And `.` is dropped at any position, so
+`ls dir/.`, `ls ./dir`, and `checkout --subpath=dir/.` succeed where the tool
+exits 1, `cat` agreeing with the tool on every `.` shape. The plan freezes `.`
+handling, and the whole group is one decision -- that only `/` names the root
+-- which is left to the maintainer. `cli-surface.md` carries both.
+
+`A6` -- `make_dir_all` refuses a symlink at the final component (DONE).
+`walk_creating` had no notion of a final component, so a last component that
+resolved to a symlink was followed like any other. A base root filesystem that
+ships `/var` or `/usr/etc` as a symlink therefore sealed with the content placed
+under the symlink's target, and the call reported no error. The refusal is
+scoped to `make_dir_all`, which is the one caller that wants it:
+`walk_creating` took a parameter, and the parent resolution of a write under an
+implied dirmeta and the base resolution of `merge_at` clear it, because for
+both of those the last component walked is a parent directory that must keep
+following a symlink. `make_dir_all`'s own signature is unchanged, so decision
+D4's "no new parameter on `make_dir_all`" and the `walk_creating` parameter
+agree. Intermediate components follow a symlink to a directory, so the refusal
+reaches the field defect only where the alias is the last component. A call
+under the alias, `make_dir_all` on `/usr/etc/tmpfiles.d` among them, creates
+under the directory the alias resolves to. An alias that resolves to nothing
+reports `DanglingSymlink`, and an alias onto a regular file reports
+`NotADirectory`. A caller that wants the alias reported calls `make_dir_all`
+on `/usr/etc` itself first, and that call is `EntryExists`. `mkdir -p` accepts
+a symlink to a directory at the final component, and `make_dir_all` parts from
+it there. The doc comment says so.
+
+Three consequences the plan text left implicit, each now documented and pinned
+by a test. The refusal is scoped to the last element of the walked component
+list, so a path that ends in `..` leaves no element for the flag to apply to:
+`make_dir_all("var/lock/..")` follows the symlink, pops, and creates nothing,
+and `make_dir_all("var/lock/../new")` creates `run/new`. That is the recorded
+pop-and-clamp decision left in place, and no `..` form can produce the field
+defect the refusal exists to catch, because the symlink arm creates no
+directory at all. A `..` ahead of the final name does not disarm the refusal.
+Second, the check precedes the walk of the symlink's target, so a dangling
+symlink and a symlink onto a regular file both report `EntryExists` at that
+component, where they reported `DanglingSymlink` and `NotADirectory`; a regular
+file at the same component is still `NotADirectory`. Third, the refusal names
+the resolved component path, which is the path form every typed staging refusal
+already takes, and the refused component's own name is never resolved through,
+so the path always names the symlink where it sits. The directories the walk
+created ahead of the refusal stay in the tree, the rule the implied-ancestor
+writes already follow.
+
+A6 asserts no tool parity. The demand doc attributes the refusal to libostree's
+own recursive directory creation, and `make_dir_all` is an ostrya-internal
+writer primitive for implied-ancestor creation with no single `ostree`
+invocation that exercises it end to end: the CLI's path arguments are read
+paths, and `commit --tree=dir=` ingests from disk, where the kernel and not
+ostrya resolves the symlink. The clean-room rule forbids confirming the
+comparison in the reference source, and no black-box angle to confirm it was
+found. The fix is justified on the debles field defect alone.
 
 ## Risk register
 

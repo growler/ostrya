@@ -33,7 +33,10 @@
 //! ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)), in which case
 //! the write creates its missing ancestors as directories carrying that
 //! dirmeta, and a [`merge_at`](StagingTree::merge_at) creates its whole base
-//! the same way; resolution for a read never creates a directory. Reads
+//! the same way; resolution for a read never creates a directory.
+//! [`make_dir_all`](StagingTree::make_dir_all) refuses a symlink at the last
+//! component of its path, since that component is the directory the call
+//! creates, and follows one at every component it crosses before that. Reads
 //! ([`read_file`](StagingTree::read_file), [`read_dir`](StagingTree::read_dir),
 //! [`lookup`](StagingTree::lookup)) take a `follow_symlinks` flag governing the
 //! final component. The [`merge_at`](StagingTree::merge_at) flag of that name
@@ -114,18 +117,24 @@ enum WalkEnd {
     },
 }
 
-/// How a merge treats the merge root's own directory metadata. Every
-/// directory below the root reconciles either way.
+/// The dirmeta policy for one directory in a merge: the merge root
+/// ([`root_dirmeta`](MergeOptions::root_dirmeta)) or a directory a followed
+/// left-side symlink lands in
+/// ([`symlink_target_dirmeta`](MergeOptions::symlink_target_dirmeta)). Every
+/// other directory the merge reaches reconciles under either setting.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum RootDirmeta {
-    /// Reconcile the merge root like any other directory: an equal dirmeta is
-    /// silent, and a differing one is a conflict without `allow_overwrite`
-    /// and is taken from the right side with it.
+    /// Reconcile the directory like any other directory in the merge: an equal
+    /// dirmeta is silent, and a differing one is a conflict without
+    /// `allow_overwrite` and is taken from the right side with it.
     #[default]
     Reconcile,
-    /// Keep the left side's root dirmeta, whatever the right root carries. A
-    /// left root that carries none keeps none, and a tree whose root has no
-    /// dirmeta cannot be written.
+    /// Keep the left side's dirmeta for the directory, whatever the right side
+    /// carries for it. A left directory that carries none keeps none, and a
+    /// tree that holds a directory with no dirmeta cannot be written. Under
+    /// [`Reconcile`](RootDirmeta::Reconcile) such a directory takes the
+    /// dirmeta the right side carries for it, when the right side carries
+    /// one.
     KeepLeft,
 }
 
@@ -140,6 +149,12 @@ pub struct MergeOptions {
     /// How the merge treats the merge root's own dirmeta. Governs the root
     /// alone.
     pub root_dirmeta: RootDirmeta,
+    /// How the merge treats the dirmeta of a directory reached by following a
+    /// left-side symlink (`follow_symlinks`). Applies at every such landing
+    /// the recursive merge reaches, independent of `root_dirmeta`, which
+    /// governs the merge root alone, a [`merge_at`](StagingTree::merge_at)
+    /// base that is itself a symlink included.
+    pub symlink_target_dirmeta: RootDirmeta,
 }
 
 /// One entry in a [`read_dir`](StagingTree::read_dir) listing. A directory under
@@ -359,21 +374,65 @@ impl<'txn> StagingTree<'txn> {
 
     /// Create `path` and any missing ancestors, applying `meta` to the
     /// directories it creates and leaving existing ones untouched.
+    ///
+    /// A symlink at the last component of `path` is refused with
+    /// [`EntryExists`](Error::EntryExists), because that component is the
+    /// directory the call creates. A base root filesystem can ship `/var` or
+    /// `/usr/etc` as a symlink onto another directory. The refusal reports that
+    /// alias to the caller, which then decides where the content belongs. The
+    /// refusal holds whatever the symlink points at, and it comes before the
+    /// target resolves, so a dangling symlink at that component is
+    /// [`EntryExists`](Error::EntryExists) as well. A regular file at the same
+    /// component is [`NotADirectory`](Error::NotADirectory). `mkdir -p` accepts
+    /// a symlink to a directory there and exits zero.
+    ///
+    /// A symlink at an earlier component resolves to its target directory, and
+    /// the components after it are created under that target. A `..` hop after
+    /// a symlink makes that symlink an earlier component, so
+    /// `make_dir_all("var/lock/..")` follows a `var/lock` alias, pops to the
+    /// target's parent, and creates nothing at the alias.
+    ///
+    /// The directories the walk creates before a refusal stay in the tree. A
+    /// directory a later `..` steps back out of is created like any other
+    /// ancestor. The implied-dirmeta policy follows the same rule
+    /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)).
     pub async fn make_dir_all(&self, path: &Path, meta: &DirMeta) -> Result<()> {
-        self.walk_creating(components_of(path)?, meta).await?;
+        self.walk_creating(components_of(path)?, meta, true).await?;
         Ok(())
     }
 
     /// Walk `comps` from the tree root, creating each absent component as a
     /// directory carrying `meta` and following symlinks to directories.
     /// Returns the literal component path the walk reached.
-    async fn walk_creating(&self, comps: Vec<Comp>, meta: &DirMeta) -> Result<Vec<String>> {
+    ///
+    /// With `refuse_final_symlink`, a symlink at the last element of `comps` is
+    /// [`EntryExists`](Error::EntryExists). Without it, the walk follows that
+    /// symlink to its target directory. Every earlier element follows such a
+    /// symlink under either setting, and a last element that is a `Comp::Parent`
+    /// hop pops the resolved path and ends the walk, so a `comps` ending in
+    /// `..` has no element the flag applies to.
+    /// [`make_dir_all`](StagingTree::make_dir_all) sets it, because that
+    /// element is the directory the call creates. The two resolution walks
+    /// clear it, because for them the last element of `comps` is a parent
+    /// directory that must follow a symlink: the parent of
+    /// a write under an implied dirmeta
+    /// ([`resolve_write_parent`](StagingTree::resolve_write_parent)) and the
+    /// base of a [`merge_at`](StagingTree::merge_at)
+    /// ([`resolve_merge_base`](StagingTree::resolve_merge_base)).
+    async fn walk_creating(
+        &self,
+        comps: Vec<Comp>,
+        meta: &DirMeta,
+        refuse_final_symlink: bool,
+    ) -> Result<Vec<String>> {
         // Stage `meta` at most once, and only when a directory is actually
         // created. A walk whose every component already exists creates
         // nothing and must not materialize an orphan dirmeta into `objects/`.
         let mut dirmeta: Option<Checksum> = None;
         let mut cur: Vec<String> = Vec::new();
-        for comp in comps {
+        let total = comps.len();
+        for (idx, comp) in comps.into_iter().enumerate() {
+            let is_final = idx + 1 == total;
             let name = match comp {
                 Comp::Parent => {
                     cur.pop();
@@ -417,6 +476,13 @@ impl<'txn> StagingTree<'txn> {
                     let obj = self.txn.load_file_staged_first(&checksum).await?;
                     match obj.kind {
                         FileKind::Symlink { target } => {
+                            // The caller that creates the last component takes
+                            // a symlink there as an entry already present. The
+                            // check precedes the target walk, so what the
+                            // symlink points at leaves the refusal the same.
+                            if refuse_final_symlink && is_final {
+                                return Err(entry_exists(&cur, &name));
+                            }
                             // An absent component the target walk reaches
                             // belongs to this symlink: the walk consumes the
                             // target alone, so its `PathNotFound` is never one
@@ -827,8 +893,18 @@ impl<'txn> StagingTree<'txn> {
     /// `root_dirmeta` governs the merge root alone: under
     /// [`Reconcile`](RootDirmeta::Reconcile) the directory at `base`
     /// reconciles its own dirmeta against the right root's, and under
-    /// [`KeepLeft`](RootDirmeta::KeepLeft) it keeps the dirmeta it has. Every
-    /// directory below the root reconciles either way.
+    /// [`KeepLeft`](RootDirmeta::KeepLeft) it keeps the dirmeta it has.
+    /// `symlink_target_dirmeta` governs the directory a followed left-side
+    /// symlink lands in, at every such landing the merge reaches: under
+    /// [`KeepLeft`](RootDirmeta::KeepLeft) the target keeps its own dirmeta,
+    /// and under [`Reconcile`](RootDirmeta::Reconcile) it reconciles against
+    /// the dirmeta the right side carries for the symlink's name. `base`
+    /// resolves through symlinks before the merge starts, so a `base` that is
+    /// itself a symlink is the merge root and takes `root_dirmeta`. Every
+    /// other directory reconciles under either setting. Under
+    /// [`KeepLeft`](RootDirmeta::KeepLeft) a landing that carries no dirmeta
+    /// keeps none, and a tree that holds a directory with no dirmeta cannot be
+    /// written.
     ///
     /// A missing `base` is created under an implied dirmeta
     /// ([`with_implied_dirmeta`](StagingTree::with_implied_dirmeta)) and is
@@ -931,7 +1007,7 @@ impl<'txn> StagingTree<'txn> {
                 }),
             };
         };
-        self.walk_creating(comps, meta).await
+        self.walk_creating(comps, meta, false).await
     }
 
     /// Put a fresh empty directory carrying `dirmeta` at `parent/name` for a
@@ -980,7 +1056,7 @@ impl<'txn> StagingTree<'txn> {
             return self.resolve_parent(path).await;
         };
         let (init, name) = split_final(path)?;
-        let parent = self.walk_creating(init, meta).await?;
+        let parent = self.walk_creating(init, meta, false).await?;
         Ok((parent, name))
     }
 
@@ -1274,9 +1350,11 @@ impl<'a> RightDir<'a> {
 type MergeFuture<'a> = Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>>;
 
 /// Merge the right-side directory `right` into the left staging tree at
-/// `left_path`. `root_dirmeta` is the policy for `left_path`'s own metadata,
-/// which the caller takes from the options; each descendant reconciles, so the
-/// recursion passes [`RootDirmeta::Reconcile`].
+/// `left_path`. `root_dirmeta` is the policy for `left_path`'s own metadata.
+/// The merge root takes [`MergeOptions::root_dirmeta`], the directory a
+/// followed left-side symlink lands in takes
+/// [`MergeOptions::symlink_target_dirmeta`], and every other descendant
+/// reconciles, so the recursion passes [`RootDirmeta::Reconcile`] for it.
 fn merge_into<'a>(
     st: &'a StagingTree<'_>,
     left_path: Vec<String>,
@@ -1288,7 +1366,8 @@ fn merge_into<'a>(
         // Reconcile this directory's own metadata. A right dirmeta that is unset
         // makes no change; one that equals the left is silent; a differing one is
         // a conflict without `allow_overwrite`, and is taken with it. Under
-        // `KeepLeft` the merge root skips this and keeps the dirmeta it has.
+        // `KeepLeft` this directory skips the step and keeps the dirmeta it
+        // has.
         if matches!(root_dirmeta, RootDirmeta::Reconcile)
             && let Some(right_dm) = right.dirmeta()
         {
@@ -1376,8 +1455,14 @@ fn merge_into<'a>(
                         let obj = st.txn.load_file_staged_first(&left_csum).await?;
                         if let FileKind::Symlink { target } = obj.kind {
                             let target_dir = st.resolve_symlink_dir(&left_path, &target).await?;
-                            merge_into(st, target_dir, right_child, opts, RootDirmeta::Reconcile)
-                                .await?;
+                            merge_into(
+                                st,
+                                target_dir,
+                                right_child,
+                                opts,
+                                opts.symlink_target_dirmeta,
+                            )
+                            .await?;
                             continue;
                         }
                     }

@@ -158,6 +158,95 @@ fn open_at_and_create_at_use_the_dir_fd() {
     assert_eq!(repo.mode(), RepoMode::Archive);
 }
 
+/// A path that names `target` relative to the current working directory. Each
+/// component of the working directory becomes one `..`, and the components of
+/// `target` follow. The result resolves to `target` with no change of the
+/// process working directory, which every test in this binary shares.
+///
+/// Both paths must be absolute, so the first component of each is the root
+/// directory and `skip(1)` drops it. A working directory that is the root
+/// itself contributes no `..`, and the result is still relative.
+fn relative_to_cwd(target: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().expect("current dir");
+    assert!(cwd.is_absolute(), "the working directory is absolute");
+    assert!(target.is_absolute(), "the target is absolute: {target:?}");
+    let mut rel = PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        rel.push("..");
+    }
+    for part in target.components().skip(1) {
+        rel.push(part);
+    }
+    rel
+}
+
+/// `Repo::path` reports the argument `create` and `open` were given, with no
+/// resolution: a relative path stays relative, `..` components included. The
+/// `config` file under the absolute path shows that the relative path named
+/// the directory the test intended.
+#[test]
+fn path_reports_the_relative_argument_create_and_open_were_given() {
+    let tmp = TmpDir::new("relpath");
+    let absolute = tmp.path().join("repo");
+    let relative = relative_to_cwd(&absolute);
+    assert!(relative.is_relative(), "the test path is relative");
+
+    let created = block_on(Repo::create(
+        &relative,
+        CreateOptions::new(RepoMode::Archive),
+    ))
+    .expect("create through the relative path");
+    assert_eq!(
+        created.path(),
+        relative.as_path(),
+        "create stores the relative argument unchanged"
+    );
+    assert!(
+        absolute.join("config").is_file(),
+        "the relative path named the intended directory"
+    );
+
+    let opened = block_on(Repo::open(&relative)).expect("open through the relative path");
+    assert_eq!(opened.mode(), RepoMode::Archive, "the repository opened");
+    assert_eq!(
+        opened.path(),
+        relative.as_path(),
+        "open stores the relative argument unchanged"
+    );
+}
+
+/// `Repo::path` reports the `dir`-relative argument `create_at` and `open_at`
+/// were given, which needs that fd to resolve.
+#[test]
+fn path_reports_the_dir_relative_argument_the_at_constructors_were_given() {
+    let tmp = TmpDir::new("atpath");
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let parent_fd = std::os::fd::AsFd::as_fd(&parent);
+
+    let created = block_on(Repo::create_at(
+        parent_fd,
+        Path::new("repo"),
+        CreateOptions::new(RepoMode::Bare),
+    ))
+    .expect("create_at");
+    assert_eq!(
+        created.path(),
+        Path::new("repo"),
+        "create_at stores the dir-relative argument unchanged"
+    );
+    assert!(
+        tmp.path().join("repo").join("config").is_file(),
+        "the dir-relative path named the intended directory"
+    );
+
+    let opened = block_on(Repo::open_at(parent_fd, Path::new("repo"))).expect("open_at");
+    assert_eq!(
+        opened.path(),
+        Path::new("repo"),
+        "open_at stores the dir-relative argument unchanged"
+    );
+}
+
 #[test]
 fn open_rejects_unsupported_repo_version() {
     let tmp = TmpDir::new("badver");

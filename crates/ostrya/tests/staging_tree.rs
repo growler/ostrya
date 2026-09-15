@@ -18,8 +18,8 @@ use common::TmpDir;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DirMeta, Error,
-    FileMeta, FileObject, MergeOptions, MutableTree, Repo, RepoMode, RootDirmeta, StagingEntry,
-    StagingLookup, Transaction, TreeEntry,
+    FileKind, FileMeta, FileObject, MergeOptions, MutableTree, Repo, RepoMode, RootDirmeta,
+    StagingEntry, StagingLookup, Transaction, TreeEntry,
 };
 use ostrya_core::{ObjectType, Xattrs};
 use ostrya_rt::block_on;
@@ -3608,6 +3608,341 @@ fn merge_at_root_dirmeta_governs_the_base_alone() {
     });
 }
 
+/// Stage the `/var/lock -> ../run/lock` alias under `prefix`: a 0755
+/// `<prefix>/run/lock` directory and a `<prefix>/var/lock` symlink that reaches
+/// it, one level below the `<prefix>/var` merge base. Each arm of the test
+/// below takes its own prefix, so one tree carries them all.
+async fn stage_lock_alias(st: &ostrya::StagingTree<'_>, prefix: &str) {
+    for dir in ["", "/run", "/run/lock", "/var"] {
+        st.make_dir(Path::new(&format!("{prefix}{dir}")), &dir_meta())
+            .await
+            .unwrap();
+    }
+    st.symlink(
+        Path::new(&format!("{prefix}/var/lock")),
+        Path::new("../run/lock"),
+        &symlink_meta(),
+    )
+    .await
+    .unwrap();
+}
+
+/// `symlink_target_dirmeta` governs the dirmeta of the directory a followed
+/// left-side symlink lands in. Every arm merges the same 0700 `lock` directory
+/// over the `/var/lock -> /run/lock` alias, whose 0755 target disagrees with
+/// it. Under the default `Reconcile` the landing reconciles, so the merge
+/// conflicts, and takes the right side's dirmeta with `allow_overwrite`; under
+/// `KeepLeft` the landing keeps its own dirmeta whatever `allow_overwrite`
+/// says, and the merge lands the entries. A directory below the landing
+/// reconciles under either value.
+#[test]
+fn merge_can_keep_the_dirmeta_of_a_followed_symlink_target() {
+    let tmp = TmpDir::new("staging-merge-symlink-target-dirmeta");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        // `dir_meta()` is the 0755 meta the alias directories take, so
+        // `run/lock` carries the same checksum the tree root does.
+        let root_dm = stage_dir_meta(&txn).await;
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &novel.serialize().unwrap())
+            .await
+            .unwrap();
+
+        // The right side: a 0700 `lock` directory holding a file and a 0700
+        // subdirectory. Its root carries no dirmeta, so the merge root itself
+        // reconciles nothing and the symlink's landing is the first dirmeta
+        // question the merge asks.
+        let pkg_st = txn.staging_tree(None).await.unwrap();
+        pkg_st.make_dir(Path::new("lock"), &novel).await.unwrap();
+        pkg_st
+            .write_file_content(Path::new("lock/f"), &reg(), b"pkg")
+            .await
+            .unwrap();
+        pkg_st
+            .make_dir(Path::new("lock/sub"), &novel)
+            .await
+            .unwrap();
+        let package = pkg_st.close().unwrap();
+
+        let follow = MergeOptions {
+            follow_symlinks: true,
+            ..MergeOptions::default()
+        };
+        let follow_overwrite = MergeOptions {
+            allow_overwrite: true,
+            ..follow
+        };
+        let keep = MergeOptions {
+            symlink_target_dirmeta: RootDirmeta::KeepLeft,
+            ..follow
+        };
+        let keep_overwrite = MergeOptions {
+            allow_overwrite: true,
+            ..keep
+        };
+
+        let st = txn.staging_tree(None).await.unwrap();
+        for prefix in ["reconcile", "overwrite", "keep", "keep_overwrite", "below"] {
+            stage_lock_alias(&st, prefix).await;
+        }
+
+        // The default reconciles the landing directory, and the two modes
+        // differ, so the merge conflicts and names the landing directory.
+        match st
+            .merge_at(Path::new("reconcile/var"), &package, follow)
+            .await
+        {
+            Err(Error::MergeConflict(msg)) => assert_eq!(
+                msg, "directory metadata differs at reconcile/run/lock",
+                "the conflict names the symlink's landing directory"
+            ),
+            other => panic!("the default reconciles the landing dirmeta: {other:?}"),
+        }
+        assert_eq!(
+            st.lookup(Path::new("reconcile/run/lock/f"), false)
+                .await
+                .unwrap(),
+            StagingLookup::Absent,
+            "the conflict was raised before the entries were applied"
+        );
+
+        // `Reconcile` with `allow_overwrite` takes the right side's dirmeta for
+        // the landing, the answer a differing dirmeta gets anywhere else in the
+        // merge.
+        st.merge_at(Path::new("overwrite/var"), &package, follow_overwrite)
+            .await
+            .unwrap();
+
+        // `KeepLeft` suppresses that reconciliation alone, and suppresses it
+        // whatever `allow_overwrite` says.
+        st.merge_at(Path::new("keep/var"), &package, keep)
+            .await
+            .unwrap();
+        st.merge_at(Path::new("keep_overwrite/var"), &package, keep_overwrite)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(
+                &st.read_file(Path::new("keep/run/lock/f"), false)
+                    .await
+                    .unwrap()
+            )
+            .await,
+            b"pkg",
+            "the right side landed in the symlink's target"
+        );
+
+        // A directory below the landing reconciles under `KeepLeft` too. This
+        // arm's left side already holds a 0755 `run/lock/sub`, so the right
+        // side's 0700 `lock/sub` conflicts with it one level below the landing.
+        st.make_dir(Path::new("below/run/lock/sub"), &dir_meta())
+            .await
+            .unwrap();
+        match st.merge_at(Path::new("below/var"), &package, keep).await {
+            Err(Error::MergeConflict(msg)) => assert_eq!(
+                msg, "directory metadata differs at below/run/lock/sub",
+                "the conflict names the directory below the landing"
+            ),
+            other => panic!("a directory below the landing reconciles under KeepLeft: {other:?}"),
+        }
+
+        let mut built = st.close().unwrap();
+        built.set_metadata_checksum(root_dm);
+        let built_root = txn.write_mtree(&mut built).await.unwrap();
+        let root_dirtree = *built_root.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&root).await.unwrap();
+        for (prefix, want) in [
+            ("overwrite", novel_csum),
+            ("keep", root_dm),
+            ("keep_overwrite", root_dm),
+        ] {
+            let (prefix_dt, _) = dirtree_subdir(&repo, &root_dirtree, prefix).await;
+            let (run_dt, _) = dirtree_subdir(&repo, &prefix_dt, "run").await;
+            let (lock_dt, lock_dm) = dirtree_subdir(&repo, &run_dt, "lock").await;
+            assert_eq!(lock_dm, want, "{prefix}: the landing's dirmeta");
+            let (_, sub_dm) = dirtree_subdir(&repo, &lock_dt, "sub").await;
+            assert_eq!(
+                sub_dm, novel_csum,
+                "{prefix}: the subdirectory the merge created below the landing \
+                 takes the right side's dirmeta"
+            );
+        }
+    });
+}
+
+/// `KeepLeft` can leave a landing directory with no dirmeta, and a tree that
+/// holds such a directory cannot be written. An `l -> ..` symlink at the top
+/// level lands the merge on the tree root, which a staging tree opened without
+/// a commit carries no dirmeta for: under `Reconcile` the landing takes the
+/// right side's dirmeta and the tree writes, and under `KeepLeft` the landing
+/// keeps none and `write_mtree` refuses the tree.
+#[test]
+fn keep_left_can_leave_a_symlink_landing_without_a_dirmeta() {
+    let tmp = TmpDir::new("staging-merge-symlink-target-no-dirmeta");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &novel.serialize().unwrap())
+            .await
+            .unwrap();
+
+        // The right side: a 0700 `l` directory holding a file.
+        let pkg_st = txn.staging_tree(None).await.unwrap();
+        pkg_st.make_dir(Path::new("l"), &novel).await.unwrap();
+        pkg_st
+            .write_file_content(Path::new("l/f"), &reg(), b"pkg")
+            .await
+            .unwrap();
+        let package = pkg_st.close().unwrap();
+
+        let follow = MergeOptions {
+            follow_symlinks: true,
+            ..MergeOptions::default()
+        };
+        let keep = MergeOptions {
+            symlink_target_dirmeta: RootDirmeta::KeepLeft,
+            ..follow
+        };
+
+        let reconciled = txn.staging_tree(None).await.unwrap();
+        reconciled
+            .symlink(Path::new("l"), Path::new(".."), &symlink_meta())
+            .await
+            .unwrap();
+        reconciled.merge(&package, follow).await.unwrap();
+        let mut built = reconciled.close().unwrap();
+        assert_eq!(
+            built.metadata_checksum(),
+            Some(novel_csum),
+            "Reconcile gave the landing the right side's dirmeta"
+        );
+        txn.write_mtree(&mut built).await.unwrap();
+
+        let kept = txn.staging_tree(None).await.unwrap();
+        kept.symlink(Path::new("l"), Path::new(".."), &symlink_meta())
+            .await
+            .unwrap();
+        kept.merge(&package, keep).await.unwrap();
+        let mut built = kept.close().unwrap();
+        assert_eq!(
+            built.metadata_checksum(),
+            None,
+            "KeepLeft left the landing with no dirmeta"
+        );
+        match txn.write_mtree(&mut built).await {
+            Err(Error::MutableTree(msg)) => assert_eq!(
+                msg, "directory / has no dirmeta checksum set",
+                "the write names the directory that carries no dirmeta"
+            ),
+            other => {
+                panic!("a tree holding a directory with no dirmeta cannot be written: {other:?}")
+            }
+        }
+    });
+}
+
+/// Stage the nested alias the test below merges over: a 0755 `c` directory and
+/// an `a/b` symlink that reaches it, two levels below the tree root.
+async fn stage_nested_alias(st: &ostrya::StagingTree<'_>) {
+    st.make_dir(Path::new("c"), &dir_meta()).await.unwrap();
+    st.make_dir(Path::new("a"), &dir_meta()).await.unwrap();
+    st.symlink(Path::new("a/b"), Path::new("../c"), &symlink_meta())
+        .await
+        .unwrap();
+}
+
+/// The suppression is not scoped to the merge root: it holds at every symlink
+/// landing the recursion reaches. The symlink sits two levels below the merge
+/// root here -- `a/b -> ../c`, with the right side carrying `a/b/d` -- and the
+/// default still conflicts on `c` while `KeepLeft` still lands the entries.
+#[test]
+fn symlink_target_dirmeta_holds_below_the_merge_root() {
+    let tmp = TmpDir::new("staging-merge-symlink-target-nested");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root_dm = stage_dir_meta(&txn).await;
+        let novel = dir_meta_mode(0o040700);
+        let novel_csum = txn
+            .write_metadata(ObjectType::DirMeta, None, &novel.serialize().unwrap())
+            .await
+            .unwrap();
+
+        // The right side: `a` at 0755, so the ordinary recursion through it is
+        // silent, and a 0700 `a/b` holding `d` and a file.
+        let pkg_st = txn.staging_tree(None).await.unwrap();
+        pkg_st.make_dir(Path::new("a"), &dir_meta()).await.unwrap();
+        pkg_st.make_dir(Path::new("a/b"), &novel).await.unwrap();
+        pkg_st.make_dir(Path::new("a/b/d"), &novel).await.unwrap();
+        pkg_st
+            .write_file_content(Path::new("a/b/f"), &reg(), b"pkg")
+            .await
+            .unwrap();
+        let package = pkg_st.close().unwrap();
+
+        let follow = MergeOptions {
+            follow_symlinks: true,
+            ..MergeOptions::default()
+        };
+        let keep = MergeOptions {
+            follow_symlinks: true,
+            symlink_target_dirmeta: RootDirmeta::KeepLeft,
+            ..MergeOptions::default()
+        };
+
+        let conflicting = txn.staging_tree(None).await.unwrap();
+        stage_nested_alias(&conflicting).await;
+        match conflicting.merge(&package, follow).await {
+            Err(Error::MergeConflict(msg)) => assert_eq!(
+                msg, "directory metadata differs at c",
+                "the conflict names the landing the nested symlink reaches"
+            ),
+            other => panic!("the default reconciles the landing dirmeta: {other:?}"),
+        }
+        drop(conflicting);
+
+        let st = txn.staging_tree(None).await.unwrap();
+        stage_nested_alias(&st).await;
+        st.merge(&package, keep).await.unwrap();
+        assert_eq!(
+            read_all(&st.read_file(Path::new("c/f"), false).await.unwrap()).await,
+            b"pkg",
+            "the right side landed in the symlink's target"
+        );
+
+        let mut built = st.close().unwrap();
+        built.set_metadata_checksum(root_dm);
+        let built_root = txn.write_mtree(&mut built).await.unwrap();
+        let root_dirtree = *built_root.dirtree_checksum();
+        txn.commit().await.unwrap();
+
+        let repo = Repo::open(&root).await.unwrap();
+        let (c_dt, c_dm) = dirtree_subdir(&repo, &root_dirtree, "c").await;
+        assert_eq!(c_dm, root_dm, "the landing kept its own dirmeta");
+        let (_, d_dm) = dirtree_subdir(&repo, &c_dt, "d").await;
+        assert_eq!(
+            d_dm, novel_csum,
+            "the subdirectory the merge created below the landing takes the \
+             right side's dirmeta"
+        );
+    });
+}
+
 /// A missing `merge_at` base is created under the implied dirmeta and stays in
 /// the tree when the merge then conflicts on it. `KeepLeft` keeps the policy
 /// dirmeta and lands the right side under it. Without a policy, an absent base
@@ -3872,6 +4207,394 @@ fn merge_at_guards_only_the_arms_that_drop_a_directory() {
             ),
             "once the writer finished, the file replaces the directory"
         );
+        st.close().unwrap();
+        txn.abort().await.unwrap();
+    });
+}
+
+/// Stage the `/var/lock -> ../run/lock` alias at the tree root: a 0755
+/// `run/lock` directory, a 0755 `var` directory, and a `var/lock` symlink that
+/// reaches the directory. This is the shape a base rootfs ships when it aliases
+/// `/var/lock` onto `/run/lock`.
+async fn stage_root_lock_alias(st: &ostrya::StagingTree<'_>) {
+    for dir in ["run", "run/lock", "var"] {
+        st.make_dir(Path::new(dir), &dir_meta()).await.unwrap();
+    }
+    st.symlink(
+        Path::new("var/lock"),
+        Path::new("../run/lock"),
+        &symlink_meta(),
+    )
+    .await
+    .unwrap();
+}
+
+/// `make_dir_all` refuses a symlink at the last path component and writes
+/// nothing, so a caller that asks for `/var/lock` on a base root filesystem
+/// that ships the name as an alias hears about the alias and places no content
+/// under the symlink's target. The refusal holds whatever the symlink points
+/// at, and comes before the target resolves, so a symlink onto a regular file
+/// and a dangling symlink take it too. An absent last component still creates
+/// the directory, and a regular file there keeps the condition the walk types
+/// for a file in the way.
+#[test]
+fn make_dir_all_refuses_a_symlink_at_the_final_component() {
+    let tmp = TmpDir::new("staging-make-dir-all-final-symlink");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+        stage_root_lock_alias(&st).await;
+
+        match st.make_dir_all(Path::new("var/lock"), &dir_meta()).await {
+            Err(Error::EntryExists { path }) => assert_eq!(
+                path, "var/lock",
+                "the refusal names the symlink at the final component"
+            ),
+            other => panic!("a final symlink is refused: {other:?}"),
+        }
+
+        // The refusal wrote nothing: the entry is still the symlink, it still
+        // holds its target, and the target directory is still empty.
+        assert!(
+            matches!(
+                st.lookup(Path::new("var/lock"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "var/lock is still the symlink"
+        );
+        assert_eq!(
+            st.read_file(Path::new("var/lock"), false)
+                .await
+                .unwrap()
+                .kind,
+            FileKind::Symlink {
+                target: "../run/lock".to_owned()
+            },
+            "the symlink still holds its target"
+        );
+        assert!(
+            st.read_dir(Path::new("run/lock"), false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the refusal created nothing under the symlink target"
+        );
+
+        // An absent final component still creates the directory.
+        st.make_dir_all(Path::new("var/other"), &dir_meta())
+            .await
+            .unwrap();
+        assert_eq!(
+            st.lookup(Path::new("var/other"), false).await.unwrap(),
+            StagingLookup::Dir,
+            "an absent final component is created"
+        );
+
+        // A regular file at the same component keeps the condition the walk
+        // types for a file in the way of a directory.
+        st.write_file_content(Path::new("var/f"), &reg(), b"f")
+            .await
+            .unwrap();
+        match st.make_dir_all(Path::new("var/f"), &dir_meta()).await {
+            Err(Error::NotADirectory { path }) => assert_eq!(
+                path, "var/f",
+                "a regular file at the final component is NotADirectory"
+            ),
+            other => panic!("a final regular file is NotADirectory: {other:?}"),
+        }
+
+        // What the symlink points at leaves the refusal the same: one onto the
+        // regular file just written, and one that resolves to nothing, are
+        // both refused, and the dangling one is refused before its target is
+        // walked, so it is not reported as dangling.
+        st.symlink(Path::new("var/tofile"), Path::new("f"), &symlink_meta())
+            .await
+            .unwrap();
+        st.symlink(
+            Path::new("var/dangling"),
+            Path::new("nowhere"),
+            &symlink_meta(),
+        )
+        .await
+        .unwrap();
+        for name in ["var/tofile", "var/dangling"] {
+            match st.make_dir_all(Path::new(name), &dir_meta()).await {
+                Err(Error::EntryExists { path }) => assert_eq!(
+                    path, name,
+                    "the refusal names the symlink whatever it points at"
+                ),
+                other => panic!("{name}: a final symlink is refused: {other:?}"),
+            }
+        }
+
+        st.close().unwrap();
+        txn.abort().await.unwrap();
+    });
+}
+
+/// The refusal belongs to the last component of the walked list. A `..` hop
+/// after a symlink makes the symlink an earlier component, which the walk
+/// follows, and the hop then pops the target's own components: the walk of
+/// `var/lock/..` ends at `run`, so a name after the hop is created there.
+/// `..` pops and clamps at the root everywhere in the staging tree, and this
+/// test holds that rule in place for `make_dir_all`.
+#[test]
+fn make_dir_all_follows_a_symlink_before_a_parent_hop() {
+    let tmp = TmpDir::new("staging-make-dir-all-parent-hop");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+        stage_root_lock_alias(&st).await;
+
+        // A path ending in the hop. The walk follows `var/lock`, pops to
+        // `run`, and creates nothing.
+        st.make_dir_all(Path::new("var/lock/.."), &dir_meta())
+            .await
+            .unwrap();
+        // The same, with the alias name repeated after the hop: the walk ends
+        // at the existing `run/lock` directory and creates nothing there.
+        st.make_dir_all(Path::new("var/lock/../lock"), &dir_meta())
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                st.lookup(Path::new("var/lock"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "var/lock is still the symlink"
+        );
+        assert!(
+            st.read_dir(Path::new("run/lock"), false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "neither call created anything under the symlink target"
+        );
+
+        // A fresh name after the hop lands in the target's parent, `run`,
+        // because the hop pops the path the symlink resolved to.
+        st.make_dir_all(Path::new("var/lock/../new"), &dir_meta())
+            .await
+            .unwrap();
+        assert_eq!(
+            st.lookup(Path::new("run/new"), false).await.unwrap(),
+            StagingLookup::Dir,
+            "the name after the hop was created under the symlink target's parent"
+        );
+        assert_eq!(
+            st.lookup(Path::new("var/new"), false).await.unwrap(),
+            StagingLookup::Absent,
+            "the hop popped the resolved path and not the path as given"
+        );
+
+        // A hop before the final name leaves that name final, so the refusal
+        // still holds for it.
+        match st
+            .make_dir_all(Path::new("run/../var/lock"), &dir_meta())
+            .await
+        {
+            Err(Error::EntryExists { path }) => assert_eq!(
+                path, "var/lock",
+                "a hop before the final name leaves the refusal in place"
+            ),
+            other => panic!("a final symlink is refused: {other:?}"),
+        }
+
+        st.close().unwrap();
+        txn.abort().await.unwrap();
+    });
+}
+
+/// The refusal keeps the directories the same walk created before it. The walk
+/// of `new1/new2/../../var/lock` creates `new1` and `new1/new2`, pops back to
+/// the root, and then refuses the alias, and the two directories stay in the
+/// tree. This matches every other staging operation that creates implied
+/// ancestors and then refuses the entry it walked to.
+#[test]
+fn a_refused_make_dir_all_keeps_the_directories_it_created() {
+    let tmp = TmpDir::new("staging-make-dir-all-kept-ancestors");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+        stage_root_lock_alias(&st).await;
+
+        match st
+            .make_dir_all(Path::new("new1/new2/../../var/lock"), &dir_meta())
+            .await
+        {
+            Err(Error::EntryExists { path }) => assert_eq!(path, "var/lock"),
+            other => panic!("a final symlink is refused: {other:?}"),
+        }
+        assert_eq!(
+            st.lookup(Path::new("new1/new2"), false).await.unwrap(),
+            StagingLookup::Dir,
+            "the directories the walk created before the refusal stay"
+        );
+
+        st.close().unwrap();
+        txn.abort().await.unwrap();
+    });
+}
+
+/// The refusal names the resolved literal component path, the path form every
+/// typed staging refusal reports. The alias sits at `x/y/var/lock` and the
+/// walk reaches its parent through the `a/b -> ../x/y` symlink, so the refusal
+/// names `x/y/var/lock` and not the `a/b/var/lock` the caller gave. The name
+/// of the refused component itself is never resolved through, so the path
+/// names the symlink where it sits.
+#[test]
+fn a_refused_make_dir_all_names_the_resolved_path() {
+    let tmp = TmpDir::new("staging-make-dir-all-resolved-path");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+
+        st.make_dir_all(Path::new("x/y/run/lock"), &dir_meta())
+            .await
+            .unwrap();
+        st.make_dir_all(Path::new("x/y/var"), &dir_meta())
+            .await
+            .unwrap();
+        st.symlink(
+            Path::new("x/y/var/lock"),
+            Path::new("../run/lock"),
+            &symlink_meta(),
+        )
+        .await
+        .unwrap();
+        st.make_dir(Path::new("a"), &dir_meta()).await.unwrap();
+        st.symlink(Path::new("a/b"), Path::new("../x/y"), &symlink_meta())
+            .await
+            .unwrap();
+
+        match st
+            .make_dir_all(Path::new("a/b/var/lock"), &dir_meta())
+            .await
+        {
+            Err(Error::EntryExists { path }) => assert_eq!(
+                path, "x/y/var/lock",
+                "the refusal names the resolved path of the symlink it stopped at"
+            ),
+            other => panic!("a final symlink is refused: {other:?}"),
+        }
+
+        st.close().unwrap();
+        txn.abort().await.unwrap();
+    });
+}
+
+/// A symlink at a component before the last resolves to its target directory,
+/// so `make_dir_all("var/lock/sub")` creates `run/lock/sub`. The refusal
+/// belongs to the last component alone.
+#[test]
+fn make_dir_all_follows_a_symlink_at_an_intermediate_component() {
+    let tmp = TmpDir::new("staging-make-dir-all-inner-symlink");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let st = txn.staging_tree(None).await.unwrap();
+        stage_root_lock_alias(&st).await;
+
+        st.make_dir_all(Path::new("var/lock/sub"), &dir_meta())
+            .await
+            .unwrap();
+        assert_eq!(
+            st.lookup(Path::new("run/lock/sub"), false).await.unwrap(),
+            StagingLookup::Dir,
+            "the walk created the directory under the symlink target"
+        );
+        assert!(
+            matches!(
+                st.lookup(Path::new("var/lock"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "var/lock is still the symlink"
+        );
+
+        st.close().unwrap();
+        txn.abort().await.unwrap();
+    });
+}
+
+/// The two other walks that create implied ancestors keep following a symlink
+/// at the last component they walk, because that component is a parent
+/// directory: a write under an implied dirmeta lands its file under the
+/// symlink's target, and a merge base that is a symlink merges into the target.
+#[test]
+fn implied_writes_and_a_merge_base_follow_a_final_symlink() {
+    let tmp = TmpDir::new("staging-implied-final-symlink");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        // `run/lock` carries `dir_meta()`, so a right root stamped with the
+        // same checksum reconciles silently.
+        let root_dm = stage_dir_meta(&txn).await;
+
+        let right_st = txn.staging_tree(None).await.unwrap();
+        right_st
+            .write_file_content(Path::new("g"), &reg(), b"g")
+            .await
+            .unwrap();
+        let mut right = right_st.close().unwrap();
+        right.set_metadata_checksum(root_dm);
+
+        let st = txn
+            .staging_tree(None)
+            .await
+            .unwrap()
+            .with_implied_dirmeta(dir_meta());
+        stage_root_lock_alias(&st).await;
+
+        // `resolve_write_parent` walks `var/lock` as the parent of `f`.
+        st.write_file_content(Path::new("var/lock/f"), &reg(), b"f")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(&st.read_file(Path::new("run/lock/f"), false).await.unwrap()).await,
+            b"f",
+            "the write landed under the symlink target"
+        );
+
+        // `resolve_merge_base` walks `var/lock` as the merge base.
+        st.merge_at(Path::new("var/lock"), &right, MergeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_all(&st.read_file(Path::new("run/lock/g"), false).await.unwrap()).await,
+            b"g",
+            "the merge landed under the symlink target"
+        );
+
+        assert!(
+            matches!(
+                st.lookup(Path::new("var/lock"), false).await.unwrap(),
+                StagingLookup::File { .. }
+            ),
+            "var/lock is still the symlink"
+        );
+
         st.close().unwrap();
         txn.abort().await.unwrap();
     });

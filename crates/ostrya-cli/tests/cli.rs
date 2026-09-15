@@ -2773,7 +2773,8 @@ fn export_output_switch_matches_the_tool() {
 
 /// The `--subpath` values the two implementations part on: a trailing slash the
 /// tool reads as part of a name, and a subpath naming a file or a symlink,
-/// which the reference build dies on.
+/// which the reference build dies on. A `..` component inside a value is the
+/// case they agree on, and this test states both.
 #[test]
 fn export_subpath_refusals_match_the_tool() {
     if !ostree_available() {
@@ -2859,14 +2860,16 @@ fn export_subpath_refusals_match_the_tool() {
 
     // The tool reads each `/`-separated span of the value as a child name, so a
     // trailing slash and the spans `.` and `..` all name nothing. The port
-    // reads a path, where the trailing slash names the same directory and a `.`
-    // or a `..` component falls away.
-    for (subpath, named) in [
-        ("--subpath=/dir/", "/dir/"),
-        ("--subpath=.", "/."),
-        ("--subpath=..", "/.."),
-        ("--subpath=/./dir", "/."),
-        ("--subpath=/dir/..", "/dir/.."),
+    // reads a path: a `..` component names nothing there either, and the two
+    // agree, while a trailing slash names the same directory and a `.`
+    // component falls away, which the port takes and the tool refuses.
+    for (subpath, named, port_status) in [
+        ("--subpath=/dir/", "/dir/", 0),
+        ("--subpath=.", "/.", 0),
+        ("--subpath=..", "/..", 0),
+        ("--subpath=/./dir", "/.", 0),
+        ("--subpath=/dir/..", "/dir/..", 1),
+        ("--subpath=/dir/../file.txt", "/dir/..", 1),
     ] {
         let args = ["export", "--repo", repo_arg, subpath, &rev];
         let tool = ostree(&args);
@@ -2880,14 +2883,27 @@ fn export_subpath_refusals_match_the_tool() {
         let port = ostrya(&args, None, &[]);
         assert_eq!(
             port.status.code(),
-            Some(0),
-            "the port takes {subpath}: {}",
+            Some(port_status),
+            "the port's status for {subpath}: {}",
             String::from_utf8_lossy(&port.stderr),
         );
+        if port_status == 1 {
+            assert!(
+                String::from_utf8_lossy(&port.stderr).contains("subpath not found"),
+                "the port names the cause: {}",
+                String::from_utf8_lossy(&port.stderr),
+            );
+            assert!(
+                tar_members(&port.stdout).is_empty(),
+                "the port writes no archive for {subpath}",
+            );
+        }
     }
 
     // The port's archive under the trailing-slash form is the one it writes
-    // without it, and `.` and `..` name the whole tree.
+    // without it, and `.` and `..` name the whole tree. The `..` value reaches
+    // the whole tree through the no-component test the subpath takes first,
+    // ahead of the path walk that refuses a `..` inside a value.
     let dir_args = ["export", "--repo", repo_arg, "--subpath=/dir", &rev];
     let plain_dir = ostrya(&dir_args, None, &[]).ok().stdout.clone();
     let plain_root = ostrya(&["export", "--repo", repo_arg, &rev], None, &[])
@@ -19569,7 +19585,7 @@ fn checkout_allow_noent_matches_the_tool() {
 
         // The refusals the switch does not reach, and the ordinary checkout it
         // leaves alone.
-        let cases: [(&str, Vec<&str>, Option<i32>); 4] = [
+        let cases: [(&str, Vec<&str>, Option<i32>); 7] = [
             ("no-switch", vec!["-U", "--subpath=/nope"], Some(1)),
             (
                 "through-a-file",
@@ -19581,6 +19597,29 @@ fn checkout_allow_noent_matches_the_tool() {
                 "subpath-that-resolves",
                 vec!["-U", "--allow-noent", "--subpath=/d"],
                 Some(0),
+            ),
+            // A `..` component names an entry no directory holds, so the
+            // switch reaches the refusal it carries.
+            (
+                "parent-component",
+                vec!["-U", "--allow-noent", "--subpath=/d/../f"],
+                Some(0),
+            ),
+            // A `..` followed by a name the directory before the `..` holds as
+            // a file. The value stops at the `..`, so the refusal it carries
+            // is an absent subpath and the switch reaches it.
+            (
+                "parent-then-a-file",
+                vec!["-U", "--allow-noent", "--subpath=/d/../inner.txt/nope"],
+                Some(0),
+            ),
+            // A file in a non-final position ahead of the `..`. The value
+            // stops at the file, so it runs through a non-directory and the
+            // switch does not reach that refusal.
+            (
+                "a-file-then-a-parent",
+                vec!["-U", "--allow-noent", "--subpath=/f/../d"],
+                Some(1),
             ),
         ];
         for (case, options, expected) in cases {

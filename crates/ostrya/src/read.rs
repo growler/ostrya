@@ -3,14 +3,20 @@
 //!
 //! Metadata objects (commit, dirtree, dirmeta, detached commit metadata) are
 //! small and bounded, so they load whole into memory and parse through the
-//! `ostrya-core` object model. File content objects have their own path in
-//! [`crate::file`], which streams the payload. Every entry point is `async fn`
-//! and offloads its syscalls to the blocking pool; a missing object surfaces as
-//! [`Error::ObjectNotFound`].
+//! `ostrya-core` object model. [`MetadataReader`] streams the same bytes for a
+//! caller that hands them to a sink instead of parsing them. File content
+//! objects have their own path in [`crate::file`], which streams the payload.
+//! Every entry point is `async fn` and offloads its syscalls to the blocking
+//! pool; a missing object surfaces as [`Error::ObjectNotFound`].
+
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectType, Type, Value, from_bytes, loose_path,
 };
+use ostrya_rt::File as RtFile;
 
 use crate::error::{Error, Result};
 use crate::object::{self, MAX_METADATA_SIZE};
@@ -65,6 +71,44 @@ impl Repo {
         .await;
         match res {
             Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(Error::ObjectNotFound { checksum: key, ty })
+            }
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
+    /// Open a streaming reader over a metadata object's raw bytes.
+    ///
+    /// The reader holds the same [`MAX_METADATA_SIZE`] cap
+    /// [`load_object_bytes`](Repo::load_object_bytes) holds, and it buffers no
+    /// whole object: the caller takes the bytes in chunks of its own size. Use
+    /// it to copy a metadata object into a sink; use
+    /// [`load_object_bytes`](Repo::load_object_bytes) where a parse needs the
+    /// whole buffer.
+    ///
+    /// The reader carries no checksum verification, matching
+    /// [`load_object_bytes`](Repo::load_object_bytes). A caller that needs the
+    /// identity checked hashes the streamed bytes itself.
+    ///
+    /// A missing object surfaces as [`Error::ObjectNotFound`]. An object the
+    /// open already measures above the cap fails here, so an oversized object
+    /// costs no streaming.
+    pub async fn metadata_reader(
+        &self,
+        ty: ObjectType,
+        checksum: &Checksum,
+    ) -> Result<MetadataReader> {
+        let path = loose_path(checksum, ty, self.mode());
+        let repo = self.clone();
+        let key = *checksum;
+        let res = ostrya_rt::unblock(move || open_meta_file(repo.objects_fd(), &path)).await;
+        match res {
+            Ok(file) => Ok(MetadataReader {
+                file: RtFile::from(file),
+                taken: 0,
+                refused: false,
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(Error::ObjectNotFound { checksum: key, ty })
             }
@@ -196,3 +240,135 @@ impl Repo {
         })
     }
 }
+
+/// Open a metadata object for streaming. The function refuses an object that
+/// the `fstat` already measures above [`MAX_METADATA_SIZE`]. This check matches
+/// the open-time check of `object::read_meta_object`, so the streaming path and
+/// the buffered path refuse the same object with the same error.
+///
+/// This check and the running total in `MetadataReader` both read
+/// [`MAX_METADATA_SIZE`], so the open and the read hold one bound.
+fn open_meta_file(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<std::fs::File> {
+    let fd = object::open_object(dir, path)?;
+    let stat = rustix::fs::fstat(&fd)?;
+    let size = stat.st_size.max(0) as u64;
+    if size > MAX_METADATA_SIZE {
+        return Err(object::metadata_cap_exceeded());
+    }
+    Ok(std::fs::File::from(fd))
+}
+
+/// An async reader over a metadata object's raw bytes.
+///
+/// A metadata object carries no compression and no framed header in any
+/// repository mode, so the reader streams the object file itself from offset 0
+/// in chunks of the caller's size and buffers nothing whole.
+///
+/// The reader holds the [`MAX_METADATA_SIZE`] cap twice, the way
+/// [`Repo::load_object_bytes`] holds it. The `fstat` at the open refuses an
+/// object already above the cap. A running total of the bytes handed to the
+/// caller then guards an object that grows while the read is in flight: once the
+/// total stands at the cap and the object still holds a further byte, the read
+/// fails with the same error, and the reader has handed over no more than
+/// [`MAX_METADATA_SIZE`] bytes when it does. That refusal is terminal -- every
+/// later read repeats it -- so an oversized object never reads back as one that
+/// ended at the cap.
+///
+/// A read into an empty buffer makes no progress and yields `Ok(0)`.
+///
+/// The reader implements `futures_io::AsyncRead` unconditionally and
+/// `tokio::io::AsyncRead` under the `tokio` feature, so neither backend needs a
+/// caller-side adapter. It carries no checksum verification.
+pub struct MetadataReader {
+    file: RtFile,
+    /// How many bytes the caller has taken so far.
+    taken: u64,
+    /// Whether the running total has already refused the object. The probe read
+    /// that raises the refusal takes the byte that carried the object over the
+    /// cap out of the stream, so a reader that carried on from there would
+    /// report the end of an object one byte short of the truth.
+    refused: bool,
+}
+
+impl MetadataReader {
+    /// The shared read step both trait families drive. `rt::File` presents
+    /// `futures_io::AsyncRead` under either backend.
+    fn poll_read_bytes(&mut self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<io::Result<usize>> {
+        use futures_io::AsyncRead;
+        if self.refused {
+            return Poll::Ready(Err(object::metadata_cap_exceeded()));
+        }
+        if out.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let room = MAX_METADATA_SIZE.saturating_sub(self.taken);
+        if room == 0 {
+            // With the cap reached, one further byte in the object puts it above
+            // the cap. This probe settles cap-versus-end-of-file. It reads into
+            // a byte of its own, so the byte that fails the cap never lands in
+            // the caller's buffer, and `taken` never counts it.
+            let mut probe = [0u8; 1];
+            let n = match Pin::new(&mut self.file).poll_read(cx, &mut probe) {
+                Poll::Ready(Ok(n)) => n,
+                other => return other,
+            };
+            if n == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            self.refused = true;
+            return Poll::Ready(Err(object::metadata_cap_exceeded()));
+        }
+        // Clamped to the bytes left under the cap, so a short read and a full
+        // read alike leave `taken` equal to the bytes the caller has.
+        let limit = room.min(out.len() as u64) as usize;
+        let n = match Pin::new(&mut self.file).poll_read(cx, &mut out[..limit]) {
+            Poll::Ready(Ok(n)) => n,
+            other => return other,
+        };
+        self.taken += n as u64;
+        Poll::Ready(Ok(n))
+    }
+}
+
+impl futures_io::AsyncRead for MetadataReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        self.get_mut().poll_read_bytes(cx, buf)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl ostrya_rt::tokio_io::AsyncRead for MetadataReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ostrya_rt::tokio_io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let out = buf.initialize_unfilled();
+        match self.get_mut().poll_read_bytes(cx, out) {
+            Poll::Ready(Ok(n)) => {
+                buf.advance(n);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// The metadata reader moves freely across tasks and threads.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MetadataReader>();
+};
+
+/// Under the `tokio` feature the metadata reader also speaks the tokio I/O
+/// traits, so a tokio-native caller needs no adapter.
+#[cfg(feature = "tokio")]
+const _: fn() = || {
+    fn assert_tokio_read<T: ostrya_rt::tokio_io::AsyncRead>() {}
+    assert_tokio_read::<MetadataReader>();
+};

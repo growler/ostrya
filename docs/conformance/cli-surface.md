@@ -1338,8 +1338,13 @@ flag:
   each naming in the message the prefix the tool looked up. The port reads a
   path, so `.` names the tree root, the trailing slash names the same directory
   as the form without it, and a `.` component and a doubled slash resolve to the
-  node behind them. Both accept a leading-slash and a relative spelling of a
-  name that exists, and `/` names the whole tree in both. Under `--allow-noent`
+  node behind them. A `..` component parts from the `.` forms: the port refuses
+  a value that carries one after a name, `--subpath=/dir/..` and
+  `--subpath=/dir/../f` among them, at exit 1 with `subpath not found`, which is
+  the tool's answer, and Phase 24 records the rule. A value carrying no name
+  component at all, `--subpath=..` among them, names the whole tree in the port
+  and exits 1 in the tool. Both accept a leading-slash and a relative spelling
+  of a name that exists, and `/` names the whole tree in both. Under `--allow-noent`
   every one of these spellings reaches exit 0 on both sides, the tool having
   written nothing and the port having written the tree the value names. An empty
   `--subpath=` is refused by the port at exit 1 whatever else the command line
@@ -1469,11 +1474,15 @@ stand:
   and `--subpath=/dir/..` all name nothing and end the export at exit 1 (`error:
   No such file or directory:` and the value, with a leading slash the tool
   adds). The port reads a path, so a trailing slash names the same directory as
-  the form without it, and a `.` or a `..` component falls away, which leaves
-  `.` and `..` naming the whole tree. The two agree on the empty value, which
-  both refuse at exit 1: the tool looks up `/` and the port refuses the value
-  before the export starts. Both accept a leading-slash and a relative spelling
-  of a name that exists, and `/` names the whole tree in both;
+  the form without it. The two agree on `--subpath=/dir/..`, which the port
+  refuses at exit 1. A `..` component that follows a name component names an
+  entry no directory holds, which Phase 24 recorded. A `.` component falls
+  away, and a value that carries no name component names the whole tree. Of
+  those values the tool takes `/` alone, so `--subpath=.`, `--subpath=..`, and
+  `--subpath=/..` write a tree in the port where the tool exits 1. The two
+  agree on the empty value, which both refuse at exit 1: the tool looks up `/`
+  and the port refuses the value before the export starts. Both accept a
+  leading-slash and a relative spelling of a name that exists;
 - a `--subpath` naming a regular file or a symlink, which has no tree to walk.
   The port refuses it at exit 1 with `error: tar: subpath is not a directory:
   <path>` and writes nothing. The reference build ends on SIGABRT: it prints

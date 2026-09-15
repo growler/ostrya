@@ -2447,7 +2447,7 @@ directory's own dirmeta becomes the `./` member's metadata, and every member
 below it takes a name relative to it. A leading `/` is optional, and `/` names
 the whole tree. Each `/`-separated span of the value is read as a child name to
 look up, so a span that no directory holds as a name refuses the export at exit
-1 with `error: No such file or directory: <path>`, naming the value with the
+1 with `error: No such file or directory: <path>`, where `<path>` carries a
 leading slash the tool adds. This covers a trailing `/` (`--subpath=/dir/`
 reports `/dir/`), the empty value (which reports `/`), and the spans `.` and
 `..` wherever they stand: `--subpath=.` reports `/.`, `--subpath=..` reports
@@ -2592,11 +2592,16 @@ own stream part from the tool's, and `conformance/cli-surface.md`, "export"
 records them with the rest: every entry of a directory is emitted in one name
 order, so a content-sharing group spanning two directories coalesces in the
 opposite direction and a hardlink member's header carries zeros; `subpath` is a
-path, so its `.` and `..` components and a trailing slash fall away and a
-subpath naming a file or a symlink is refused at exit 1 with `tar: subpath is
-not a directory: <path>`; and standard output carries the two trailing zero
-blocks alone, the way a `-o` destination does, with no padding up to a
-10240-byte record.
+path, where the tool reads a list of child names, and a subpath naming a file
+or a symlink is refused at exit 1 with
+`tar: subpath is not a directory: <path>`; and standard output carries the two
+trailing zero blocks alone, the way a `-o` destination does, with no padding up
+to a 10240-byte record. The port reads `subpath` as a path. A `.` component
+falls away, a trailing slash falls away, and a value that carries no name
+component names the whole tree. The tool refuses a `.` component and a trailing
+slash. Of the values that carry no name component, the tool takes `/` alone.
+The two agree on a `..` component in a value that carries a name component:
+both refuse it at exit 1.
 
 ## bare-split-xattrs mode
 

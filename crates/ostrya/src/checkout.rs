@@ -45,7 +45,7 @@ use crate::ingest::join_path;
 use crate::modifier::{DevInoCache, FilterResult};
 use crate::read::CommitState;
 use crate::repo::Repo;
-use crate::tree::{RepoTree, TreeEntry};
+use crate::tree::{Comp, RepoTree, TreeEntry};
 use crate::write::{FileMeta, TempKind};
 
 /// The permission-and-special-bit mask of an `st_mode` (`perm & 0o7777`).
@@ -129,7 +129,12 @@ pub struct CheckoutOptions {
     /// The overwrite policy over an existing destination.
     pub overwrite: OverwriteMode,
     /// A path within the commit tree to check out as the destination root,
-    /// instead of the whole tree.
+    /// instead of the whole tree. A path with no name component names the
+    /// whole tree. A path that carries a name component and a `..` component
+    /// names nothing, since no directory holds a `..` entry. Such a path is
+    /// refused with [`Error::SubpathNotFound`]. Where a component before the
+    /// first `..` names a file or a symlink, the refusal is
+    /// [`Error::SubpathNotADirectory`].
     pub subpath: Option<PathBuf>,
     /// Whether to fsync written files and directories. Defaults false, matching
     /// the tool.
@@ -312,23 +317,22 @@ async fn resolve_target(repo: &Repo, commit: &Commit, subpath: Option<&Path>) ->
 /// Which refusal a subpath that resolved to nothing carries. The walk descends
 /// the value's leading components one at a time: a component naming an entry
 /// that is not a directory makes the value run through a non-directory, and
-/// every other outcome makes the value name nothing.
+/// every other outcome makes the value name nothing. The components are read
+/// through the same split [`RepoTree::lookup`](crate::RepoTree::lookup) reads,
+/// so the walk stops where the lookup stopped.
 async fn unresolved_subpath(tree: &RepoTree, sub: &Path) -> Error {
-    use std::path::Component;
-
     let not_found = || Error::SubpathNotFound(sub.to_path_buf());
-    let components: Vec<&std::ffi::OsStr> = sub
-        .components()
-        .filter_map(|c| match c {
-            Component::Normal(part) => Some(part),
-            _ => None,
-        })
-        .collect();
+    let components = crate::tree::normalize(sub);
     let Some(leading) = components.len().checked_sub(1) else {
         return not_found();
     };
     let mut current = tree.clone();
     for component in &components[..leading] {
+        let Comp::Normal(component) = component else {
+            // A `..` component. No directory holds an entry of this name, so
+            // the value names nothing, whatever follows it.
+            return not_found();
+        };
         match current.lookup(Path::new(component)).await {
             Ok(Some(TreeEntry::Dir { tree, .. })) => current = tree,
             Ok(Some(TreeEntry::File { .. })) => {

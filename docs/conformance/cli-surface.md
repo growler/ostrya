@@ -1266,10 +1266,10 @@ stand.
 `checkout` accepts `--repo`, `-H/--require-hardlinks`, `-C/--force-copy`,
 `--composefs`, `--composefs-noverity`, and, since Phase 17c, `-U/--user-mode`
 and `--subpath=PATH`, and, since Phase 17f, `--union`, `--union-add`,
-`--union-identical`, `--allow-noent`, `--whiteouts`, and
-`--process-passthrough-whiteouts`. Missing: `--disable-cache`, `--from-stdin`,
-`--from-file=FILE`, `--fsync=POLICY`, `-M/--bareuseronly-dirs`,
-`--skip-list=FILE`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
+`--union-identical`, `--allow-noent`, `--whiteouts`,
+`--process-passthrough-whiteouts`, `--from-stdin`, `--from-file=FILE`, and
+`--skip-list=FILE`. Missing: `--disable-cache`, `--fsync=POLICY`,
+`-M/--bareuseronly-dirs`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
 
 The destination trees `-U` and `--subpath` produce agree with the tool's file for
 file, in `archive`, `bare-user`, and `bare` (`../format-reference.md`,
@@ -1319,9 +1319,91 @@ Either switch alongside `--composefs` or `--composefs-noverity` is refused at
 exit 1 with no image written, under the tool's own words, `Specified options
 are incompatible with --composefs`.
 
+The three path-selection options split into two families. `--skip-list=FILE`
+names tree paths to prune. `--from-stdin` and `--from-file=FILE` read a batch of
+checkouts: the input is a stream of NUL-separated records read as
+`(REFSPEC, SUBPATH)` pairs, and each pair checks its own revision out into one
+destination, which the invocation's first positional names.
+`../format-reference.md`, "Checkout", states the list's match rule and the
+stream's record format.
+
+The list's path forms agree with the tool over `archive`, `bare-user`, and
+`bare`: a file and a symlink match under their own path, a directory matches
+under its trailing-slash spelling alone, the root is `/` and prunes everything,
+and no other spelling matches -- a missing leading slash, a doubled slash, a
+leading `.`, a surrounding space, and a trailing slash on a file each name
+nothing (`ostrya_cli::cli::checkout_skip_list_matches_the_tool`). A trailing
+`\r` names nothing either, under the line syntax, which agrees too: blank lines
+are ignored, a final line needs no newline, a duplicate changes nothing, a path
+that matches nothing is not reported, and there is no comment syntax
+(`ostrya_cli::cli::checkout_skip_list_line_syntax_matches_the_tool`). A pruned
+root reads nothing of the destination path, so a destination under a directory
+that does not exist is accepted at exit 0 in both and that directory is not
+created (`ostrya_cli::cli::checkout_skip_list_root_needs_no_destination_parent`).
+The list is rooted at the `--subpath` root where one is given, and no spelling
+reaches the single object a file subpath names
+(`ostrya_cli::cli::checkout_skip_list_under_a_subpath_matches_the_tool`). It
+decides a whiteout marker on the marker's own tree path and ahead of the
+whiteout decision, and it does not decide the opaque clear
+(`ostrya_cli::cli::checkout_skip_list_precedes_the_whiteout_decision`). Four
+refusals -- a file that is absent, one that is a directory, one that cannot be
+read, and one holding a NUL byte or a byte sequence that is not UTF-8 -- agree
+at the exit status and at the words, the port reproducing the tool's
+`openat(<path as spelled>): <reason>`, `Is a directory`, and `Invalid UTF-8`
+(`ostrya_cli::cli::checkout_skip_list_refusals_match_the_tool`). A composefs
+switch alongside `--skip-list` is refused in both under the tool's own words,
+`Specified options are incompatible with --composefs`
+(`ostrya_cli::cli::checkout_batch_ignores_subpath_and_takes_composefs`).
+
+An agreement worth stating: `checkout --skip-list` matches a directory under its
+trailing-slash spelling alone, where `commit --skip-list` matches it under both
+spellings. Each command follows its own rule in both implementations.
+
+The batch record format agrees as well: the records are NUL-separated, a final
+record with no terminator counts, an empty record in the refspec position ends
+the stream, a trailing refspec with no record after it names the whole tree, one
+trailing `\n` and then one trailing `\r` are dropped from a refspec record and
+nothing is dropped from a subpath record, and a subpath record that is not UTF-8
+reaches the lookup as the bytes it holds
+(`ostrya_cli::cli::checkout_batch_pairs_match_the_tool`). Every pair writes into
+the destination the first positional names, under the invocation's own overwrite
+mode, so pairs layer under `--union` and a second pair is a collision without one
+(`ostrya_cli::cli::checkout_batch_destination_matches_the_tool`). `--from-stdin`
+wins over `--from-file` whatever the command-line order, a repeated `--from-file`
+takes the last value, and standard input is left unread where neither switch is
+given (`ostrya_cli::cli::checkout_batch_sources_and_precedence_match_the_tool`).
+A refspec record that does not resolve ends the run at exit 1 with nothing
+written, under the tool's own `Refspec '<value>' not found`; `--allow-noent` acts
+per pair and the stream continues, and without it the run stops at the first
+failing pair with the earlier pairs' output left in place
+(`ostrya_cli::cli::checkout_batch_refusals_match_the_tool`). `--subpath` is
+dropped under a batch option, the pair's second record carrying the subpath
+instead, and both composefs switches are taken with a batch option, each pair
+writing the image of its own revision
+(`ostrya_cli::cli::checkout_batch_ignores_subpath_and_takes_composefs`).
+
+A stream that carries no pair reaches none of the refusals the command line
+carries into one checkout. The union-option pair, the composefs
+incompatibility, the `--union-identical` requirement, and a destination value of
+no bytes all stand inside the scope of one checkout in the tool, which the
+`Processing tree <checksum>: ` prefix on each of them shows, so an empty stream
+exits 0 in both whatever the rest of the line holds and a populated stream is
+refused at exit 1 in both, with no destination created either way
+(`ostrya_cli::cli::checkout_batch_refusals_stand_inside_the_pair_scope`). The
+tool resolves the first pair's refspec ahead of those refusals and the port
+makes them ahead of the resolution, so a line holding both a refusal and an
+unresolvable first refspec draws one message in the tool and the other in the
+port. Both exit 1 with no destination, which the standing wording rule covers.
+
+A pair's subpath record is a `--subpath` value, so the two `--subpath` value
+divergences below reach it unchanged. An explicitly empty subpath record is one
+of them: the tool looks the empty value up and exits 1 (`No such file or
+directory: /`), and the port reads a value carrying no name component as the
+whole tree and exits 0.
+
 Two divergences stand at the values `--subpath` takes, one at `-H`, three at
-the composefs switches, two at `--allow-noent`, and one at a repeated boolean
-flag:
+the composefs switches, two at `--allow-noent`, one at a repeated boolean
+flag, and four at the path-selection options:
 
 - a subpath naming nothing ends the checkout at exit 1 in both, leaving no
   destination, and the words part: the tool reports `error: No such file or
@@ -1410,13 +1492,14 @@ flag:
   `--union-add`, `--disable-cache`, `--whiteouts`,
   `--process-passthrough-whiteouts`, and `--skip-list`, and ignores it when the
   line holds any of them, refusing an absent `--subpath` at exit 1 as though
-  the switch were absent; `-U`, `--union`, `--fsync`, `-v`, and `--from-file`
-  keep it. `--union-identical` needs `-H`, so the switch never reaches it in
-  the tool. Neither side writes anything or creates the destination in either
-  case, so the exit status is the whole of the difference. The port honors the
-  switch uniformly, the split carrying no semantic rule the port could adopt
-  without reinterpreting it
-  (`ostrya_cli::cli::checkout_allow_noent_reach_diverges_from_the_tool`);
+  the switch were absent; `-U`, `--union`, `--fsync`, `-v`, `--from-file`, and
+  `--from-stdin` keep it. `--union-identical` needs `-H`, so the switch never
+  reaches it in the tool. Neither side writes anything or creates the
+  destination in either case, so the exit status is the whole of the
+  difference. The port honors the switch uniformly, the split carrying no
+  semantic rule the port could adopt without reinterpreting it
+  (`ostrya_cli::cli::checkout_allow_noent_reach_diverges_from_the_tool`,
+  `ostrya_cli::cli::checkout_skip_list_drops_allow_noent_in_the_tool`);
 - the switch reaches a second refusal in the tool that it does not reach in the
   port: a `--subpath` naming a regular file whose loose content object has been
   deleted out of band. The tool exits 0 and creates no destination, where
@@ -1427,10 +1510,33 @@ flag:
   sides. Only an out-of-band deletion reaches this pair, so it is recorded and
   no gate is added: a repository the port writes and prunes holds every object
   its commits name;
-- a union option, `--allow-noent`, `--whiteouts`, or
-  `--process-passthrough-whiteouts` given twice is taken by the tool and
-  refused by the port, as the port refuses every repeated boolean flag
-  (`ostrya_cli::cli::checkout_union_options_are_mutually_exclusive`).
+- a union option, `--allow-noent`, `--whiteouts`,
+  `--process-passthrough-whiteouts`, or `--from-stdin` given twice is taken by
+  the tool and refused by the port, as the port refuses every repeated boolean
+  flag (`ostrya_cli::cli::checkout_union_options_are_mutually_exclusive`).
+  `--from-file` and `--skip-list` take the last value in both;
+- the `Processing tree <checksum>: ` prefix. The tool puts it in front of every
+  refusal a batch pair reaches, `<checksum>` being the pair's resolved commit.
+  The port reports its own message with no prefix. Both exit 1 and both leave
+  the same destination state, so the wording is the whole of the difference,
+  which the standing wording rule covers. The refspec refusal carries no prefix
+  in either, the commit not having resolved yet;
+- the path a `--from-file` open failure names. The tool writes `Error opening
+  file <path>: <reason>`, where `<path>` is the value made absolute against the
+  working directory and lexically normalized. The port writes `openat(<value as
+  spelled>): <reason>`, which is the wording it already gives a `--skip-list`
+  open failure. Both exit 1 and neither creates the destination
+  (`ostrya_cli::cli::checkout_batch_refusals_match_the_tool`);
+- the bound. The port reads at most 128 mebibytes of the batch stream, the
+  batch file, and the skip-list file, and refuses a larger one with `Control
+  file larger than 134217728 bytes`; the tool reads the whole of each. This is
+  the cap `-F/--body-file` and the two `commit` control files already take;
+- a third and later positional. The tool ignores every positional past the
+  first two, with a batch option and without one, so `checkout REV DEST extra`
+  writes `DEST` and nothing else. The port refuses a third with clap's own
+  `error: unexpected argument '<value>' found` at exit 1. The difference stands
+  on the plain path as well and becomes visible under a batch option, where the
+  second positional is itself ignored.
 
 `export` accepts `--repo`, `--no-xattrs`, `--subpath=PATH`, `--prefix=PATH`,
 and `-o/--output=PATH`, and nothing is missing.

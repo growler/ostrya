@@ -15,6 +15,7 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use common::{TmpDir, ostree_available};
 use ostrya::{
@@ -2134,6 +2135,253 @@ fn filter_prunes_a_subtree() {
         assert!(filtered.join("hello.txt").exists());
         assert!(!filtered.join("subdir").exists(), "the subtree was pruned");
         assert!(!filtered.join("secret").exists(), "the file was skipped");
+    });
+}
+
+/// A filter that records every `(path, mode)` it is offered and answers the
+/// verdict `skip` gives for the path.
+fn recording_filter(
+    calls: &Arc<Mutex<Vec<(String, u32)>>>,
+    skip: fn(&str) -> bool,
+) -> ostrya::CheckoutFilterFn {
+    let calls = Arc::clone(calls);
+    Box::new(move |path: &Path, meta: &FileMeta| {
+        let path = path.to_string_lossy().into_owned();
+        let skipped = skip(&path);
+        calls.lock().unwrap().push((path, meta.mode));
+        if skipped {
+            FilterResult::Skip
+        } else {
+            FilterResult::Allow
+        }
+    })
+}
+
+/// The checkout root is offered to the filter as `/`, carrying the root
+/// dirmeta's own mode, and every entry below it is offered under its own path.
+#[test]
+fn checkout_filter_sees_the_destination_root() {
+    let tmp = TmpDir::new("co-filter-root");
+    let base = tmp.path();
+    let src = base.join("src");
+    build_source(&src);
+    let repo_dir = base.join("repo");
+
+    block_on(async {
+        let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, base, "src").await;
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.filter = Some(recording_filter(&calls, |_| false));
+        repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("co"), &commit)
+            .await
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        let roots: Vec<&(String, u32)> = calls.iter().filter(|(path, _)| path == "/").collect();
+        assert_eq!(roots.len(), 1, "the root is offered once, got {calls:?}");
+        assert_eq!(roots[0].1 & S_IFDIR, S_IFDIR, "the root carries its type");
+        assert_eq!(roots[0].1 & 0o7777, 0o755, "the root carries its own mode");
+
+        let mode_of = |name: &str| {
+            calls
+                .iter()
+                .find(|(path, _)| path == name)
+                .unwrap_or_else(|| panic!("{name} was never offered, got {calls:?}"))
+                .1
+        };
+        assert_eq!(mode_of("/subdir") & S_IFDIR, S_IFDIR);
+        assert_eq!(mode_of("/hello.txt") & S_IFREG, S_IFREG);
+        assert!(calls.iter().any(|(path, _)| path == "/link"));
+        assert!(calls.iter().any(|(path, _)| path == "/subdir/nested.txt"));
+    });
+}
+
+/// A `Skip` on the root writes nothing and creates no destination, and over an
+/// existing destination under a union mode it leaves that destination as it
+/// stands.
+#[test]
+fn checkout_filter_skipping_the_root_creates_no_destination() {
+    let tmp = TmpDir::new("co-filter-root-skip");
+    let base = tmp.path();
+    let src = base.join("src");
+    build_source(&src);
+    let repo_dir = base.join("repo");
+
+    block_on(async {
+        let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, base, "src").await;
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.filter = Some(recording_filter(&calls, |path| path == "/"));
+        repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("absent"), &commit)
+            .await
+            .unwrap();
+        assert!(
+            !base.join("absent").exists(),
+            "a pruned root creates no destination"
+        );
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the walk stops at the pruned root"
+        );
+
+        let existing = base.join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("pre.txt"), b"pre\n").unwrap();
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.overwrite = ostrya::OverwriteMode::UnionFiles;
+        opts.filter = Some(recording_filter(&calls, |path| path == "/"));
+        repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("existing"), &commit)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_dir(&existing).unwrap().count(),
+            1,
+            "a pruned root adds nothing to an existing destination"
+        );
+        assert_eq!(std::fs::read(existing.join("pre.txt")).unwrap(), b"pre\n");
+    });
+}
+
+/// The filter decides a file entry ahead of the whiteout verdict, so a `Skip`
+/// on a marker's own path performs no removal and writes no device. The opaque
+/// marker's clear is the directory walk's own pre-pass and is not filtered.
+#[test]
+fn checkout_filter_runs_ahead_of_the_whiteout_decision() {
+    let tmp = TmpDir::new("co-filter-whiteout");
+    let base = tmp.path();
+    let layer = base.join("layer");
+    std::fs::create_dir_all(layer.join("sub")).unwrap();
+    std::fs::write(layer.join("keep.txt"), b"new\n").unwrap();
+    std::fs::write(layer.join(".wh.gone.txt"), b"").unwrap();
+    std::fs::write(layer.join(".ostree-wh.dev"), b"").unwrap();
+    std::fs::write(layer.join("sub/.wh..wh..opq"), b"").unwrap();
+    std::fs::write(layer.join("sub/child.txt"), b"child\n").unwrap();
+    let repo_dir = base.join("repo");
+
+    /// Build the destination each arm runs over.
+    fn prestate(dest: &Path) {
+        std::fs::create_dir_all(dest.join("sub")).unwrap();
+        std::fs::write(dest.join("gone.txt"), b"old\n").unwrap();
+        std::fs::write(dest.join("dev"), b"olddev\n").unwrap();
+        std::fs::write(dest.join("sub/stale.txt"), b"stale\n").unwrap();
+    }
+
+    block_on(async {
+        let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, base, "layer").await;
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        // The control arm, with no filter: the markers act.
+        let plain = base.join("plain");
+        prestate(&plain);
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.overwrite = ostrya::OverwriteMode::UnionFiles;
+        opts.process_whiteouts = true;
+        opts.process_passthrough_whiteouts = true;
+        repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("plain"), &commit)
+            .await
+            .unwrap();
+        assert!(!plain.join("gone.txt").exists(), "the marker removed it");
+        assert!(
+            !plain.join("sub/stale.txt").exists(),
+            "the opaque marker cleared it"
+        );
+        let dev = std::fs::symlink_metadata(plain.join("dev")).unwrap();
+        assert_eq!(
+            dev.mode() & 0o170000,
+            0o020000,
+            "the passthrough marker wrote a character device"
+        );
+
+        // The filtered arm: each marker's own path is pruned.
+        let filtered = base.join("filtered");
+        prestate(&filtered);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.overwrite = ostrya::OverwriteMode::UnionFiles;
+        opts.process_whiteouts = true;
+        opts.process_passthrough_whiteouts = true;
+        opts.filter = Some(recording_filter(&calls, |path| {
+            matches!(
+                path,
+                "/.wh.gone.txt" | "/.ostree-wh.dev" | "/sub/.wh..wh..opq"
+            )
+        }));
+        repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("filtered"), &commit)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(filtered.join("gone.txt")).unwrap(),
+            b"old\n",
+            "a pruned marker removes nothing"
+        );
+        assert_eq!(
+            std::fs::read(filtered.join("dev")).unwrap(),
+            b"olddev\n",
+            "a pruned passthrough marker writes no device"
+        );
+        assert!(
+            !filtered.join("sub/stale.txt").exists(),
+            "the opaque clear is not filtered"
+        );
+        assert_eq!(
+            std::fs::read(filtered.join("sub/child.txt")).unwrap(),
+            b"child\n"
+        );
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|(path, _)| path == "/.wh.gone.txt"),
+            "the marker's own path is offered, got {calls:?}"
+        );
+    });
+}
+
+/// The single object a file subpath names is written without a filter call.
+#[test]
+fn checkout_filter_does_not_reach_a_file_subpath_target() {
+    let tmp = TmpDir::new("co-filter-file-subpath");
+    let base = tmp.path();
+    let src = base.join("src");
+    build_source(&src);
+    let repo_dir = base.join("repo");
+
+    block_on(async {
+        let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::Bare))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, base, "src").await;
+        let base_fd = std::fs::File::open(base).unwrap();
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.subpath = Some(PathBuf::from("/hello.txt"));
+        opts.filter = Some(recording_filter(&calls, |_| true));
+        repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("one"), &commit)
+            .await
+            .unwrap();
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the filter is not called for a file subpath target"
+        );
+        assert_eq!(
+            std::fs::read(base.join("one/hello.txt")).unwrap(),
+            b"hello ostree\n"
+        );
     });
 }
 

@@ -5174,6 +5174,72 @@ applied in, the disposition table, the widening, and the two refusals, and its
 `CAP_MKNOD` claim is struck. The conformance run reported 725 cells and 289
 passes after the item.
 
+`F13` gives `checkout` its three path-selection options. They form two
+families. `--skip-list=FILE` names tree paths to prune, one per line, a
+directory spelled with a trailing slash and the root spelled `/`.
+`--from-stdin` and `--from-file=FILE` read a batch of checkouts: a stream of
+NUL-separated records taken two at a time as `(refspec, subpath)` pairs, each
+pair checking its own revision out into the one destination the invocation's
+first positional names.
+
+The library's filter contract changed in three ways, none of which the CLI
+could reach on its own. The checkout root is now offered to the filter under
+the path `/` and before the destination directory is created, so a pruned root
+writes nothing and creates no destination. The per-entry consult moved out of
+`checkout_file` and into `checkout_dir`'s file loop, so it stands ahead of the
+whiteout verdict and a pruned marker performs no removal and writes no device;
+the opaque marker's clear stays outside it, being the walk's own pre-pass. The
+single object a file or symlink `subpath` names is written with no filter call,
+which follows from the move. This is a behaviour change to a field of the
+published 0.2.x surface, taken without a compatibility shim; the crate carries
+no changelog file, so the whole contract is stated on `CheckoutFilterFn` and
+held by four tests in `crates/ostrya/tests/checkout.rs`. No new dependency and
+no `unsafe`.
+
+On the CLI side the skip list reuses the control-file reader `commit` already
+carries, and the filter builds the tool's key from the library's path: a
+directory below the root takes the trailing slash, and the root, a file, and a
+symlink match under the path itself. The batch stream needs its own reader, the
+records being NUL-separated and not UTF-8. The three reads are bounded by
+`CONTROL_FILE_LIMIT`, the 128-mebibyte cap `-F/--body-file` and the two
+`commit` control files already take. `DESTINATION` became conditional, a batch
+option making the first positional the destination. The plain path's
+missing-argument error is unchanged byte for byte, which `cli-surface.md`,
+"Global conventions" requires; the `--help` usage line spells the positional
+`[DESTINATION]`, which the conditional form carries. A composefs switch is
+taken alongside a batch option, so the export moved into a helper the plain
+path calls once and the batch loop calls per pair.
+
+The refusals the command line carries into one checkout -- the union-option
+pair, the composefs incompatibility, the `--union-identical` requirement, and a
+destination value of no bytes -- stand inside the scope of one checkout in the
+tool, which the prefix on each of them shows. A batch stream that carries no
+pair reaches none of them and exits 0, so the port makes them only where the
+stream carries a pair. Each reads the command line alone, which no pair
+changes, so one pass over them stands for the stream's own.
+
+The batch stream is read once into one buffer and its records are scanned as
+they are needed, stopping at the record that ends the stream, so the memory one
+costs is the bytes it carries and a constant. A 128-mebibyte stream of NUL
+bytes, the largest input the bound accepts and one record per byte, runs under
+an address-space limit of one gibibyte, which
+`ostrya_cli::cli::checkout_batch_stream_holds_no_more_than_the_stream` pins.
+
+Four divergences stand, all in `cli-surface.md`, "checkout": the `Processing
+tree <checksum>: ` prefix the tool puts in front of every refusal a batch pair
+reaches, where the port reports its own message and both leave the same
+destination state; the path a `--from-file` open failure names, where the tool
+gives the lexically absolute path and the port the value as the command line
+spelled it; the 128-mebibyte bound; and a third and later positional, which the
+tool ignores and the port refuses. Two standing divergences widened: a repeated
+`--from-stdin`, which joins the repeated-boolean-flag sentence, and the reach of
+`--allow-noent`, whose keeping set gains `--from-stdin` while `--skip-list` was
+already in the dropping set. A pair's subpath record is a `--subpath` value, so
+the two `--subpath` value divergences reach it unchanged, an explicitly empty
+record among them. `format-reference.md`, "Checkout" states the list's match
+rule, the filter's reach, and the stream's record format. The conformance run
+reports 769 cells and 303 passes.
+
 #### Phase 17g -- P3 commands with no matrix weight
 
 `reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and

@@ -1719,6 +1719,76 @@ same commit checked out whole keeps the refusal.
 `conformance/cli-surface.md`, "P2", records the command lines on which the tool
 does not honor the switch, and the port's own reach beside them.
 
+Path selection. A per-path filter decides which entries a checkout writes.
+`ostree checkout --skip-list=FILE` supplies one from a file: the file holds one
+path per line, blank lines are ignored, a final line needs no newline, and
+nothing else is stripped or normalized. The file must hold UTF-8
+with no NUL byte, and a byte that is not refuses the command at exit 1 with
+`Invalid UTF-8` and creates no destination. Nothing is reported for a line that
+matches no entry.
+
+The filter's key is the entry's path rooted at the checkout root, which is the
+`--subpath` root where one is given, with a leading slash. A directory carries a
+trailing slash, the root is `/`, and a file and a symlink carry none. The match
+is an exact string comparison, so `/a/` prunes the directory `a` and its whole
+subtree while `/a`, `//a/`, `/a//`, ` /a/ `, and `./a/` match nothing, and `/f1`
+prunes the file `f1` while `f1` and `/f1/` match nothing. Recovered by checking
+one commit out under each spelling and walking the destination.
+
+The filter decides the checkout root before the destination path is touched, so
+a pruned root writes nothing and creates no destination, and under a union mode
+it leaves an existing destination as it stands. The destination's own parent
+directory is not read either, so a pruned root exits 0 where that parent does
+not exist. It decides a whiteout
+marker on the marker's own tree path and before either whiteout switch reads it,
+so a pruned `.wh.<name>` performs no removal and a pruned `.ostree-wh.<name>`
+writes no device. It does not decide the opaque clear, which is the directory
+walk's own pre-pass over the destination's names, and it does not decide the
+single object a file or symlink subpath names. Recovered by checking a commit
+holding the three markers out over a populated destination, once per marker
+path, by checking a file subpath out under each spelling of its path, and by
+checking a pruned root out into a destination under a directory that does not
+exist.
+
+The two commands that take a `--skip-list` read a directory entry under
+different conventions. `ostree commit --skip-list` prunes a directory under
+`/a` and under `/a/` alike. `ostree checkout --skip-list` takes the
+trailing-slash spelling alone.
+
+Batch checkouts. `ostree checkout --from-stdin` and
+`ostree checkout --from-file=FILE` read a stream of NUL-separated records, taken
+two at a time as `(REFSPEC, SUBPATH)` pairs. A final record with no terminator
+is a record, so a stream ending in NUL carries no trailing empty record. An
+empty record in the refspec position ends the stream. A refspec record with no
+record after it carries no subpath and names the whole tree, and an empty record
+in the subpath position is an empty subpath value.
+
+One trailing `\n` is dropped from a refspec record, and then one trailing `\r`.
+Nothing is dropped from a subpath record, and no whitespace is stripped from
+either. Neither record is validated as UTF-8: a subpath record reaches the tree
+lookup as the bytes it holds.
+
+The refspec takes every form the `COMMIT` positional takes: a branch name, a
+full checksum, an abbreviated checksum, and a `^` ancestry suffix. The subpath
+record is a `--subpath` value and follows the rules above.
+
+Every pair checks out into one destination, which the invocation's first
+positional names, under the invocation's own overwrite mode. So pairs layer
+under `--union` and a second pair over the same name is a collision without one.
+A `--subpath` on the command line decides nothing under a batch option, and a
+`--skip-list` applies to each pair, rooted at that pair's subpath. The skip list
+is opened inside the per-pair scope, so a stream that carries no pair leaves the
+file unread. The refusals the command line carries into one checkout stand
+inside that scope as well -- the union-option pair, the composefs
+incompatibility, and the `--union-identical` requirement -- so a stream that
+carries no pair reaches none of them and exits 0. A destination value of no
+bytes takes the same rule: a pair creates a path, so a pair refuses the empty
+value and an empty stream exits 0. `--allow-noent` acts per pair and
+the stream continues; without it the run stops at the first failing pair and the
+pairs already written stay. A composefs switch is taken with a batch option, and
+each pair writes the image of its own revision, the pair's subpath deciding
+nothing.
+
 ## Extended attributes
 
 Storage form is GVariant `a(ayay)`: array of (name-bytes, value-bytes). A

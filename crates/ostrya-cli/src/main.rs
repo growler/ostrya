@@ -58,15 +58,16 @@ use std::sync::{Arc, Mutex};
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
-    BootableMetadata, BootableRefusal, CheckoutMode, CheckoutOptions, Checksum, CollectionRef,
-    CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions,
-    DeltaOptions, DetachedMetadataFilter, DevInoCache, DictBuilder, DiffChange, Ed25519Signer,
-    Ed25519Verifier, Error, FileKind, FileObject, FilterResult, FsckOptions, MutableTree,
-    ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify,
-    RefAlias, Repo, RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions,
-    SummaryRef, TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats,
-    TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes,
-    load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
+    BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
+    CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions,
+    CreateOptions, DeltaOptions, DetachedMetadataFilter, DevInoCache, DictBuilder, DiffChange,
+    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
+    FsckOptions, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
+    PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, SignatureInfo, Signer,
+    Summary, SummaryOptions, SummaryRef, TarExportOptions, TarImportOptions, TimestampCheck,
+    Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy,
+    Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
+    validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -416,10 +417,28 @@ struct CheckoutArgs {
     /// switches are independent, and this one decides in any order.
     #[arg(long)]
     composefs_noverity: bool,
-    /// The commit to check out (a checksum or a ref).
+    /// Read NUL-separated (REFSPEC, SUBPATH) records from standard input and
+    /// check each pair out into the destination the first positional names.
+    #[arg(long)]
+    from_stdin: bool,
+    /// Read the same records from FILE. Given more than once, the last value
+    /// wins; --from-stdin wins over this option whatever the command-line
+    /// order.
+    #[arg(long, value_name = "FILE", overrides_with = "from_file")]
+    from_file: Option<PathBuf>,
+    /// Prune every tree path FILE names, one per line, a directory spelled
+    /// with a trailing slash. Given more than once, the last value wins.
+    #[arg(long, value_name = "FILE", overrides_with = "skip_list")]
+    skip_list: Option<PathBuf>,
+    /// The commit to check out (a checksum or a ref). Under --from-stdin or
+    /// --from-file this positional is the destination and every revision comes
+    /// from the record stream.
     commit: String,
-    /// The destination path.
-    destination: PathBuf,
+    /// The destination path. Under --from-stdin or --from-file the first
+    /// positional is the destination and this one is ignored, which is the
+    /// tool's own arity.
+    #[arg(required_unless_present_any = ["from_stdin", "from_file"])]
+    destination: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -2646,17 +2665,11 @@ fn report_unmatched(kind: &str, unmatched: &[String]) -> std::result::Result<(),
 /// bars an unbounded read).
 const CONTROL_FILE_LIMIT: u64 = 128 * 1024 * 1024;
 
-/// Read a control file as text. A path that does not open is reported the way
+/// Read a control file as bytes. A path that does not open is reported the way
 /// the tool reports it, naming the path as the command line spelled it; a
-/// directory is reported without one.
-///
-/// The bytes must be UTF-8 whole, and a NUL byte counts as invalid. A single
-/// invalid byte anywhere in the file refuses the command with `Invalid UTF-8`,
-/// which is what the tool does. An accepted file therefore holds text alone,
-/// and the walk compares each entry's own bytes against the walk path's bytes,
-/// so a spelled replacement character names that character and nothing else.
-/// The read stops at [`CONTROL_FILE_LIMIT`].
-fn read_control_file(path: &Path) -> std::result::Result<String, String> {
+/// directory is reported without one. The read stops at
+/// [`CONTROL_FILE_LIMIT`].
+fn read_control_bytes(path: &Path) -> std::result::Result<Vec<u8>, String> {
     let file = std::fs::File::open(path)
         .map_err(|err| format!("openat({}): {}", path.display(), io_reason(&err)))?;
     let mut bytes = Vec::new();
@@ -2670,6 +2683,18 @@ fn read_control_file(path: &Path) -> std::result::Result<String, String> {
             "Control file larger than {CONTROL_FILE_LIMIT} bytes"
         ));
     }
+    Ok(bytes)
+}
+
+/// Read a control file as text.
+///
+/// The bytes must be UTF-8 whole, and a NUL byte counts as invalid. A single
+/// invalid byte anywhere in the file refuses the command with `Invalid UTF-8`,
+/// which is what the tool does. An accepted file therefore holds text alone,
+/// and the walk compares each entry's own bytes against the walk path's bytes,
+/// so a spelled replacement character names that character and nothing else.
+fn read_control_file(path: &Path) -> std::result::Result<String, String> {
+    let bytes = read_control_bytes(path)?;
     if bytes.contains(&0) {
         return Err("Invalid UTF-8".to_owned());
     }
@@ -3513,97 +3538,154 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + day_of_era - 719_468
 }
 
-async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
-    let commit = resolve(&repo, &args.commit).await?;
+/// A refspec record without its line terminator: one trailing `\n` is dropped,
+/// then one trailing `\r`. A subpath record keeps every byte it carries.
+fn batch_refspec(record: &[u8]) -> &[u8] {
+    let record = record.strip_suffix(b"\n").unwrap_or(record);
+    record.strip_suffix(b"\r").unwrap_or(record)
+}
 
-    // The three union options are mutually exclusive, and the first pair the
-    // command line holds is the one reported, in this order. The check sits
-    // here rather than on the `clap` definition because the tool makes it after
-    // the repository opens and the revision resolves
-    // (`docs/conformance/cli-surface.md`, "P2"). It stands ahead of the
-    // composefs export as well, so a pair the port refuses is refused whatever
-    // else the command line carries.
-    if args.union && args.union_add {
-        exit_error("Cannot specify both --union and --union-add");
-    }
-    if args.union && args.union_identical {
-        exit_error("Cannot specify both --union and --union-identical");
-    }
-    if args.union_add && args.union_identical {
-        exit_error("Cannot specify both --union-add and --union-identical");
-    }
-
-    if args.composefs || args.composefs_noverity {
-        // A whiteout switch describes a transformation of the tree a checkout
-        // writes, and a composefs export writes an image of the commit tree
-        // instead. The tool refuses the combination and writes no image, and
-        // the port refuses it under the same words.
-        if args.whiteouts || args.process_passthrough_whiteouts {
-            exit_error("Specified options are incompatible with --composefs");
+/// The `(refspec, subpath)` pairs a batch stream carries.
+///
+/// The records are NUL-separated and are read two at a time. An empty record in
+/// the refspec position ends the stream, and a trailing refspec with no record
+/// after it carries no subpath, which names the whole tree. An empty record in
+/// the subpath position is a subpath value of its own.
+///
+/// A final record with no terminator counts, so an empty segment with nothing
+/// after it is the terminator of the record before it and a stream ending in
+/// NUL carries no trailing empty record. The scan stops at the record that ends
+/// the stream, so the segments past it cost nothing and the walk holds the
+/// pairs the stream carries and no more.
+fn batch_pairs(bytes: &[u8]) -> Vec<(&[u8], Option<&[u8]>)> {
+    let mut records = bytes.split(|byte| *byte == 0).peekable();
+    let mut pairs = Vec::new();
+    while let Some(refspec) = records.next() {
+        if refspec.is_empty() {
+            break;
         }
-        let opts = ComposefsOptions {
-            verity: if args.composefs_noverity {
-                VerityPolicy::Disabled
-            } else {
-                VerityPolicy::Computed
-            },
+        let subpath = match records.next() {
+            Some(record) if !(record.is_empty() && records.peek().is_none()) => Some(record),
+            _ => None,
         };
-        // The image is serialized as it is built, so a refusal and a failed
-        // write both come after part of the file is on disk. The export goes to
-        // a temporary file beside the destination and is renamed over it once
-        // the image is whole: an export that does not finish leaves no
-        // destination behind and leaves a destination that already existed as
-        // it was, and one that finishes replaces it in a single step. The
-        // temporary file shares the destination's directory, so the rename
-        // stays inside one filesystem whatever destination is named.
-        let dir = args
-            .destination
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        let temp = dir.join(format!(".ostrya-composefs-{}.tmp", std::process::id()));
-        let out = std::fs::File::create(&temp).map_err(Error::Io)?;
-        // The tool's image mode is 0644 whatever the umask, and `File::create`
-        // opens with 0666 reduced by the umask, so the mode is set on the open
-        // descriptor: `fchmod` takes no umask, and the rename carries the mode
-        // to the destination.
-        if let Err(err) = out.set_permissions(std::fs::Permissions::from_mode(0o644)) {
-            let _ = std::fs::remove_file(&temp);
-            return Err(Error::Io(err));
-        }
-        let written = repo
-            .export_composefs_to(&commit, &opts, out.as_fd())
-            .await
-            .and_then(|_| std::fs::rename(&temp, &args.destination).map_err(Error::Io));
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        written?;
-        return Ok(());
+        pairs.push((batch_refspec(refspec), subpath));
     }
+    pairs
+}
 
-    // The `-H` requirement stands after the composefs export, which takes no
-    // hardlink and so has no use for the switch.
-    //
-    // The hardlink is what establishes identity, so the tool takes
-    // `--union-identical` only together with `-H`, whatever the repository
-    // mode. The library's own guard then refuses the modes that cannot
-    // hardlink, which is the same set the tool's `-H` refuses.
-    if args.union_identical && !args.require_hardlinks {
-        exit_error("--union-identical requires --require-hardlinks");
+/// One batch refspec record as text. A record that is not UTF-8 names no
+/// revision the port resolves, so it is refused rather than read under a
+/// replacement character.
+fn batch_refspec_str(record: &[u8]) -> &str {
+    match std::str::from_utf8(record) {
+        Ok(refspec) => refspec,
+        Err(_) => exit_error(&format!(
+            "Invalid refspec {}",
+            String::from_utf8_lossy(record)
+        )),
     }
+}
 
-    // `-U` applies no ownership and no xattrs and reduces a regular file's mode
-    // to `perm & 0777`; a `--subpath` directory's own metadata becomes the
-    // destination root's, and a `--subpath` file or symlink is placed inside a
-    // fresh destination directory (`docs/format-reference.md`, "Checkout").
+/// The batch stream a `checkout` invocation reads, or `None` where the command
+/// line names neither source. Standard input wins over a file whatever the
+/// command-line order.
+fn read_batch(args: &CheckoutArgs) -> std::result::Result<Option<Vec<u8>>, String> {
+    if args.from_stdin {
+        return read_batch_stdin().map(Some);
+    }
+    match args.from_file.as_deref() {
+        Some(path) => read_control_bytes(path).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Read the batch stream from standard input. A batch of checkouts is control
+/// input, so the read is bounded by [`CONTROL_FILE_LIMIT`] as every other
+/// control input is.
+fn read_batch_stdin() -> std::result::Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    let mut bounded = std::io::Read::take(std::io::stdin().lock(), CONTROL_FILE_LIMIT + 1);
+    std::io::Read::read_to_end(&mut bounded, &mut bytes).map_err(|err| io_reason(&err))?;
+    if bytes.len() as u64 > CONTROL_FILE_LIMIT {
+        return Err(format!(
+            "Control file larger than {CONTROL_FILE_LIMIT} bytes"
+        ));
+    }
+    Ok(bytes)
+}
+
+/// The `--skip-list` paths, split by the shape the file spells them in.
+///
+/// The library calls the filter with the entry's path rooted at the checkout
+/// root and carrying no trailing slash, and with the root as `/`. The file
+/// spells a directory below the root with a trailing slash, so a line carrying
+/// one is held under the name without it and every other line is held as the
+/// file spells it. Both sets are then looked up under the path the library
+/// hands the filter, which allocates nothing per entry.
+struct SkipPaths {
+    /// The lines naming a directory below the root, each without its trailing
+    /// slash.
+    dirs: HashSet<String>,
+    /// Every other line, the root's own `/` among them.
+    files: HashSet<String>,
+}
+
+/// Read the `--skip-list` paths, shared by every checkout of the invocation. A
+/// command line naming no list reads nothing. `checkout` reports no unmatched
+/// entry, so the sets carry no order and a duplicate line changes nothing.
+fn read_skip_paths(path: Option<&Path>) -> Option<Arc<SkipPaths>> {
+    let path = path?;
+    let lines = match read_skip_list(path) {
+        Ok(lines) => lines,
+        Err(message) => exit_error(&message),
+    };
+    let mut paths = SkipPaths {
+        dirs: HashSet::new(),
+        files: HashSet::new(),
+    };
+    for line in lines {
+        // The root is spelled `/`, and stripping its slash leaves nothing, so
+        // it stays with the lines the path itself matches.
+        match line.strip_suffix('/') {
+            Some(dir) if !dir.is_empty() => paths.dirs.insert(dir.to_owned()),
+            _ => paths.files.insert(line),
+        };
+    }
+    Some(Arc::new(paths))
+}
+
+/// The checkout filter a `--skip-list` installs.
+fn skip_list_filter(paths: Arc<SkipPaths>) -> CheckoutFilterFn {
+    Box::new(move |path: &Path, meta: &FileMeta| {
+        let path = path.to_string_lossy();
+        let skipped = if meta.mode & S_IFMT == S_IFDIR && path != "/" {
+            paths.dirs.contains(path.as_ref())
+        } else {
+            paths.files.contains(path.as_ref())
+        };
+        if skipped {
+            FilterResult::Skip
+        } else {
+            FilterResult::Allow
+        }
+    })
+}
+
+/// The library options one checkout of a `checkout` invocation runs under.
+/// Each checkout of a batch takes its own, the filter being a callback the
+/// options own.
+///
+/// `-U` applies no ownership and no xattrs and reduces a regular file's mode to
+/// `perm & 0777`; a `--subpath` directory's own metadata becomes the destination
+/// root's, and a `--subpath` file or symlink is placed inside a fresh
+/// destination directory (`docs/format-reference.md`, "Checkout").
+fn checkout_options(args: &CheckoutArgs, filter: Option<CheckoutFilterFn>) -> CheckoutOptions {
     let mode = if args.user_mode {
         CheckoutMode::User
     } else {
         CheckoutMode::None
     };
     let mut opts = CheckoutOptions::new(mode);
-    opts.subpath = args.subpath;
     opts.force_copy = args.force_copy;
     opts.process_whiteouts = args.whiteouts;
     opts.process_passthrough_whiteouts = args.process_passthrough_whiteouts;
@@ -3616,6 +3698,157 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     } else {
         OverwriteMode::None
     };
+    opts.filter = filter;
+    opts
+}
+
+/// Write one commit's composefs image to `destination`.
+///
+/// The image is serialized as it is built, so a refusal and a failed write both
+/// come after part of the file is on disk. The export goes to a temporary file
+/// beside the destination and is renamed over it once the image is whole: an
+/// export that does not finish leaves no destination behind and leaves a
+/// destination that already existed as it was, and one that finishes replaces
+/// it in a single step. The temporary file shares the destination's directory,
+/// so the rename stays inside one filesystem whatever destination is named.
+async fn export_composefs(
+    repo: &Repo,
+    opts: &ComposefsOptions,
+    commit: &Checksum,
+    destination: &Path,
+) -> Result<()> {
+    let dir = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let temp = dir.join(format!(".ostrya-composefs-{}.tmp", std::process::id()));
+    let out = std::fs::File::create(&temp).map_err(Error::Io)?;
+    // The tool's image mode is 0644 whatever the umask, and `File::create`
+    // opens with 0666 reduced by the umask, so the mode is set on the open
+    // descriptor: `fchmod` takes no umask, and the rename carries the mode
+    // to the destination.
+    if let Err(err) = out.set_permissions(std::fs::Permissions::from_mode(0o644)) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(Error::Io(err));
+    }
+    let written = repo
+        .export_composefs_to(commit, opts, out.as_fd())
+        .await
+        .and_then(|_| std::fs::rename(&temp, destination).map_err(Error::Io));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
+async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
+    // The tool opens a `--from-file` ahead of every other check the subcommand
+    // makes, so a file that does not open is reported before the union pair,
+    // the composefs incompatibility, and the revision.
+    let batch = match read_batch(&args) {
+        Ok(batch) => batch,
+        Err(message) => exit_error(&message),
+    };
+
+    let pairs = batch.as_deref().map(batch_pairs);
+
+    // The tool makes every command-line refusal below inside the scope of one
+    // checkout, which the prefix each of them carries under a batch option
+    // shows. A stream that carries no pair enters no such scope and reaches
+    // none of them, so it exits 0 whatever the rest of the command line holds.
+    // Each of the refusals reads the command line alone, which no pair
+    // changes, so one pass over them stands for the stream's own.
+    let in_scope = pairs.as_ref().is_none_or(|pairs| !pairs.is_empty());
+
+    // The plain path resolves its own COMMIT. Under a batch option the first
+    // positional is the destination and every revision comes from the record
+    // stream, so nothing is resolved here.
+    let commit = if batch.is_some() {
+        None
+    } else {
+        Some(resolve(&repo, &args.commit).await?)
+    };
+
+    // The three union options are mutually exclusive, and the first pair the
+    // command line holds is the one reported, in this order. The check sits
+    // here rather than on the `clap` definition because the tool makes it after
+    // the repository opens and the revision resolves
+    // (`docs/conformance/cli-surface.md`, "P2"). It stands ahead of the
+    // composefs export as well, so a pair the port refuses is refused whatever
+    // else the command line carries.
+    if in_scope {
+        if args.union && args.union_add {
+            exit_error("Cannot specify both --union and --union-add");
+        }
+        if args.union && args.union_identical {
+            exit_error("Cannot specify both --union and --union-identical");
+        }
+        if args.union_add && args.union_identical {
+            exit_error("Cannot specify both --union-add and --union-identical");
+        }
+    }
+
+    // Under a batch option the destination is the first positional and the
+    // second is ignored, which is the tool's own arity. A destination value of
+    // no bytes names no path, so it is refused rather than read as the working
+    // directory; `clap` refuses the same value on the plain path.
+    let destination = match &batch {
+        Some(_) => {
+            if in_scope && args.commit.is_empty() {
+                exit_error("DESTINATION must be specified");
+            }
+            PathBuf::from(&args.commit)
+        }
+        None => args
+            .destination
+            .clone()
+            .expect("clap requires DESTINATION where no batch option is given"),
+    };
+
+    if args.composefs || args.composefs_noverity {
+        // A whiteout switch describes a transformation of the tree a checkout
+        // writes, a skip list prunes paths out of it, and a composefs export
+        // writes an image of the commit tree instead. The tool refuses each
+        // combination and writes no image, and the port refuses it under the
+        // same words. The two batch options are not refused: the tool exports
+        // one image per pair, from the pair's own revision.
+        if in_scope
+            && (args.whiteouts || args.process_passthrough_whiteouts || args.skip_list.is_some())
+        {
+            exit_error("Specified options are incompatible with --composefs");
+        }
+        let opts = ComposefsOptions {
+            verity: if args.composefs_noverity {
+                VerityPolicy::Disabled
+            } else {
+                VerityPolicy::Computed
+            },
+        };
+        let Some(pairs) = pairs else {
+            let commit = commit.expect("the plain path resolved its own COMMIT");
+            return export_composefs(&repo, &opts, &commit, &destination).await;
+        };
+        // A pair's subpath decides nothing here, as `--subpath` decides nothing
+        // on the plain path: a composefs export writes the image of the whole
+        // commit tree.
+        for (refspec, _) in pairs {
+            let commit = resolve(&repo, batch_refspec_str(refspec)).await?;
+            export_composefs(&repo, &opts, &commit, &destination).await?;
+        }
+        return Ok(());
+    }
+
+    // The `-H` requirement stands after the composefs export, which takes no
+    // hardlink and so has no use for the switch.
+    //
+    // The hardlink is what establishes identity, so the tool takes
+    // `--union-identical` only together with `-H`, whatever the repository
+    // mode. The library's own guard then refuses the modes that cannot
+    // hardlink, which is the same set the tool's `-H` refuses.
+    if in_scope && args.union_identical && !args.require_hardlinks {
+        exit_error("--union-identical requires --require-hardlinks");
+    }
+
     // -H and -C are mutually exclusive (enforced by clap); -C forces copies and
     // -H requests hardlinks, which is the default path when copies are not
     // forced. The minimal library surface exposes only force_copy, so the
@@ -3623,18 +3856,53 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     let _ = args.require_hardlinks;
 
     let dest_dir = std::fs::File::open(".").map_err(Error::Io)?;
-    match repo
-        .checkout_at(&mut opts, dest_dir.as_fd(), &args.destination, &commit)
-        .await
-    {
-        // `--allow-noent` suppresses one refusal and one only: a `--subpath`
-        // that names nothing. An unresolvable COMMIT is refused ahead of this
-        // call, and a subpath running through an entry that is not a directory
-        // keeps its refusal, both of which is what the tool does
-        // (`docs/conformance/cli-surface.md`, "P2").
-        Err(Error::SubpathNotFound(_)) if args.allow_noent => Ok(()),
-        other => other,
+    let Some(pairs) = pairs else {
+        let commit = commit.expect("the plain path resolved its own COMMIT");
+        let mut opts = checkout_options(
+            &args,
+            read_skip_paths(args.skip_list.as_deref()).map(skip_list_filter),
+        );
+        opts.subpath = args.subpath.clone();
+        return match repo
+            .checkout_at(&mut opts, dest_dir.as_fd(), &destination, &commit)
+            .await
+        {
+            // `--allow-noent` suppresses one refusal and one only: a `--subpath`
+            // that names nothing. An unresolvable COMMIT is refused ahead of this
+            // call, and a subpath running through an entry that is not a directory
+            // keeps its refusal, both of which is what the tool does
+            // (`docs/conformance/cli-surface.md`, "P2").
+            Err(Error::SubpathNotFound(_)) if args.allow_noent => Ok(()),
+            other => other,
+        };
+    };
+
+    // Every pair writes into the one destination under the invocation's own
+    // overwrite mode, and `--subpath` is dropped, the pair's second record
+    // carrying the subpath instead. The tool opens the skip list inside the
+    // per-pair scope, so a stream carrying no pair never reads the file.
+    let skip = if pairs.is_empty() {
+        None
+    } else {
+        read_skip_paths(args.skip_list.as_deref())
+    };
+    for (refspec, subpath) in pairs {
+        let commit = resolve(&repo, batch_refspec_str(refspec)).await?;
+        let mut opts = checkout_options(&args, skip.clone().map(skip_list_filter));
+        opts.subpath = subpath.map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
+        match repo
+            .checkout_at(&mut opts, dest_dir.as_fd(), &destination, &commit)
+            .await
+        {
+            // `--allow-noent` acts per pair and the stream continues. Every
+            // other refusal ends the run, leaving the pairs already written in
+            // place.
+            Err(Error::SubpathNotFound(_)) if args.allow_noent => {}
+            Err(err) => return Err(err),
+            Ok(()) => {}
+        }
     }
+    Ok(())
 }
 
 /// Write a commit's tree to standard output, or to `--output`, as a tar stream.

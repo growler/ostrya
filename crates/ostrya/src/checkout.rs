@@ -113,8 +113,26 @@ pub enum OverwriteMode {
     UnionIdentical,
 }
 
-/// A synchronous filter over checked-out paths. A [`Skip`](FilterResult::Skip)
-/// on a directory prunes its whole subtree.
+/// A synchronous filter over checked-out paths.
+///
+/// The path is rooted at the checkout root, carries a leading slash, and
+/// carries no trailing slash; the root itself is `/`. The [`FileMeta`] carries
+/// the entry's own recorded metadata: a directory's dirmeta, and a file's or a
+/// symlink's file object, so `mode` names the entry's type. That metadata
+/// object is loaded before the filter is called, so a pruned entry still costs
+/// the load of its own metadata.
+///
+/// The filter decides the checkout root, every directory entry, and every file
+/// and symlink entry of a walked tree. A [`Skip`](FilterResult::Skip) on the
+/// root writes nothing and creates no destination, and a
+/// [`Skip`](FilterResult::Skip) on a directory prunes its whole subtree.
+///
+/// Two sites stand outside it: the single object a file or symlink
+/// [`subpath`](CheckoutOptions::subpath) names, which is written without a
+/// filter call; and the opaque whiteout marker's clear, which is the directory
+/// walk's own pre-pass over the destination's names. A file entry is decided
+/// ahead of the whiteout verdict, so a [`Skip`](FilterResult::Skip) on a marker
+/// entry's own path performs no removal and writes no device.
 pub type CheckoutFilterFn = Box<dyn FnMut(&Path, &FileMeta) -> FilterResult + Send>;
 
 /// Options for [`Repo::checkout_at`].
@@ -153,7 +171,8 @@ pub struct CheckoutOptions {
     /// `(st_dev, st_ino)` is recorded against its checksum as it is written or
     /// linked.
     pub devino_cache: Option<DevInoCache>,
-    /// A filter called per path to include or prune entries.
+    /// A filter called per path to include or prune entries. The paths it sees
+    /// and the sites it does not reach are stated on [`CheckoutFilterFn`].
     pub filter: Option<CheckoutFilterFn>,
 }
 
@@ -224,11 +243,25 @@ impl Repo {
             )));
         }
         let target = resolve_target(self, &commit_obj, opts.subpath.as_deref()).await?;
-        let (parent_fd, name) = open_dest_parent(dest_dir, dest_path)?;
 
         match target {
             Target::Dir { dirtree, dirmeta } => {
                 let dm = self.load_dirmeta(&dirmeta).await?;
+                // The root is decided before the destination path is touched,
+                // so a pruned root writes nothing, creates no destination, and
+                // reads nothing of the destination's own parent.
+                if let Some(filter) = &mut opts.filter {
+                    let fm = FileMeta {
+                        uid: dm.uid,
+                        gid: dm.gid,
+                        mode: dm.mode,
+                        xattrs: dm.xattrs.clone(),
+                    };
+                    if filter(Path::new("/"), &fm) == FilterResult::Skip {
+                        return Ok(());
+                    }
+                }
+                let (parent_fd, name) = open_dest_parent(dest_dir, dest_path)?;
                 let (dir_fd, fresh) = match &name {
                     Some(n) => create_dest_dir(
                         parent_fd.as_fd(),
@@ -256,6 +289,7 @@ impl Repo {
                 name: entry_name,
                 checksum,
             } => {
+                let (parent_fd, name) = open_dest_parent(dest_dir, dest_path)?;
                 let dir_name = name.ok_or_else(|| {
                     Error::Checkout("a file subpath needs a named destination directory".into())
                 })?;
@@ -264,7 +298,7 @@ impl Repo {
                 let (dir_fd, _fresh) =
                     create_dest_dir(parent_fd.as_fd(), &dir_name, policy.overwrite, false)?;
                 let obj = self.load_file(&checksum).await?;
-                checkout_entry(self, opts, policy, dir_fd.as_fd(), &entry_name, &obj, "/").await?;
+                checkout_entry(self, opts, policy, dir_fd.as_fd(), &entry_name, &obj).await?;
                 if policy.enable_fsync {
                     fsync_dir(dir_fd).await?;
                 }
@@ -429,16 +463,21 @@ fn checkout_dir<'a>(
 
         for (name, checksum) in &dirtree.files {
             let obj = repo.load_file(checksum).await?;
-            checkout_entry(
-                repo,
-                &mut *opts,
-                policy,
-                dir_fd.as_fd(),
-                name,
-                &obj,
-                &base_path,
-            )
-            .await?;
+            // The filter decides the entry ahead of the whiteout verdict, so a
+            // pruned marker removes nothing and writes no device.
+            if let Some(filter) = &mut opts.filter {
+                let cb_path = join_path(&base_path, name);
+                let fm = FileMeta {
+                    uid: obj.uid,
+                    gid: obj.gid,
+                    mode: obj.mode,
+                    xattrs: obj.xattrs.clone(),
+                };
+                if filter(Path::new(&cb_path), &fm) == FilterResult::Skip {
+                    continue;
+                }
+            }
+            checkout_entry(repo, &mut *opts, policy, dir_fd.as_fd(), name, &obj).await?;
         }
 
         for (name, sub_dirtree, sub_dirmeta) in &dirtree.dirs {
@@ -506,7 +545,6 @@ async fn checkout_entry(
     dir_fd: BorrowedFd<'_>,
     name: &str,
     obj: &FileObject,
-    base_path: &str,
 ) -> Result<()> {
     match whiteout_verdict(policy, name, obj)? {
         Some(Whiteout::Drop) => Ok(()),
@@ -515,11 +553,11 @@ async fn checkout_entry(
             ostrya_rt::unblock(move || remove_dir_entry(d.as_fd(), &target)).await
         }
         Some(Whiteout::Device(target)) => place_whiteout_device(policy, dir_fd, &target, obj).await,
-        None => checkout_file(repo, opts, policy, dir_fd, name, obj, base_path).await,
+        None => checkout_file(repo, opts, policy, dir_fd, name, obj).await,
     }
 }
 
-/// Materialize one file or symlink entry, after the filter.
+/// Materialize one file or symlink entry.
 async fn checkout_file(
     repo: &Repo,
     opts: &mut CheckoutOptions,
@@ -527,20 +565,7 @@ async fn checkout_file(
     dir_fd: BorrowedFd<'_>,
     name: &str,
     obj: &FileObject,
-    base_path: &str,
 ) -> Result<()> {
-    if let Some(filter) = &mut opts.filter {
-        let cb_path = join_path(base_path, name);
-        let fm = FileMeta {
-            uid: obj.uid,
-            gid: obj.gid,
-            mode: obj.mode,
-            xattrs: obj.xattrs.clone(),
-        };
-        if filter(Path::new(&cb_path), &fm) == FilterResult::Skip {
-            return Ok(());
-        }
-    }
     match &obj.kind {
         FileKind::Symlink { target } => {
             place_symlink(repo, policy, dir_fd, name, obj, target).await

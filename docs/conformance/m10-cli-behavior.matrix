@@ -2823,10 +2823,10 @@ loss: the reach of `--allow-noent`. The tool honors the switch only when the
  command line holds none of `-H`, `-C`, `-M`, `--union-add`,
  `--disable-cache`, `--whiteouts`, `--process-passthrough-whiteouts`, and
  `--skip-list`; with any of them the absent subpath is refused at exit 1 as
- though the switch were absent, while `-U`, `--union`, `--fsync`, `-v`, and
- `--from-file` keep it. `--union-identical` needs `-H`, so the switch never
- reaches it in the tool. The port honors the switch on every command line
- (`cli-surface.md`, "P2").
+ though the switch were absent, while `-U`, `--union`, `--fsync`, `-v`,
+ `--from-file`, and `--from-stdin` keep it. `--union-identical` needs `-H`, so
+ the switch never reaches it in the tool. The port honors the switch on every
+ command line (`cli-surface.md`, "P2").
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: the two reach different exit statuses, so no oracle reads the pair.
  Neither side writes anything and neither creates the destination, which the
@@ -3305,6 +3305,637 @@ note: `--whiteouts` widens the union-files disposition over a type conflict, for
  whiteout device refuses a destination directory under either switch. The tree
  the cited test checks out holds no marker name, so the widening answers to the
  switch and not to a marker.
+
+# ---------------------------------------------------------------------------
+# checkout -- path selection: the skip list and the two batch sources. The
+# refusals and the empty-stream forms run; every cell needing a populated skip
+# list or a populated batch stream cites a test, the harness writing no
+# auxiliary file and pinning standard input to /dev/null.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: checkout
+cell: checkout/from-stdin-empty-stream
+setup: repo-with-commit
+run: checkout --repo=$REPO --from-stdin $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: standard input is /dev/null here, so the stream carries no record. The
+ stream ends before the first pair, both implementations exit 0, neither writes
+ a line, and neither creates the destination. The positional is the destination
+ under a batch option, which this cell states by naming one positional alone.
+
+family: M10
+subcommand: checkout
+cell: checkout/from-stdin-given-twice
+setup: repo-with-commit
+run: checkout --repo=$REPO --from-stdin --from-stdin $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "cannot be used multiple times"
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag. The tool takes a second `--from-stdin` and makes
+ one pass over standard input; the port refuses it at exit 1, as it refuses
+ every repeated boolean flag (`cli-surface.md`, "checkout"). Neither side
+ creates the destination.
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+ `--from-file` and `--skip-list` take the last value in both, so neither joins
+ this divergence.
+
+family: M10
+subcommand: checkout
+cell: checkout/from-file-absent
+setup: repo-with-commit
+run: checkout --repo=$REPO --from-file=$SCRATCH/nosuch $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No such file or directory"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: a batch file that does not open ends the command at exit 1 with no
+ destination created, in both. The words part: the tool reports `Error opening
+ file <absolute path>: <reason>` and the port `openat(<value as spelled>):
+ <reason>`, which cli-surface.md, "checkout" records, so `stderr-text` is no
+ oracle here. The open stands ahead of every other check the subcommand makes.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-absent
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --skip-list=$SCRATCH/nosuch $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No such file or directory"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: a skip-list file that does not open ends the checkout at exit 1 with no
+ destination created. The port reproduces the tool's wording,
+ `openat(<path as the command line spelled it>): <reason>`, so `stderr-text` is
+ an oracle. The read stands after the revision resolves and before the subpath
+ resolution.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-is-a-directory
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --skip-list=$SCRATCH $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Is a directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Is a directory"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: a skip-list value naming a directory ends the checkout at exit 1 with no
+ destination created. Both report `Is a directory` with no path, so
+ `stderr-text` is an oracle.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-with-composefs
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO --composefs --skip-list=$SCRATCH/nosuch $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Specified options are incompatible with --composefs"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Specified options are incompatible with --composefs"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: a skip list prunes paths out of a tree and a composefs export writes an
+ image of the commit tree instead, so the pair is refused at exit 1 with no
+ image written, in both and under the tool's own words. The refusal stands
+ ahead of the skip-list read, so a file that does not exist reaches it too.
+ `--composefs-noverity` carries the same refusal.
+
+family: M10
+subcommand: checkout
+cell: checkout/from-stdin-with-composefs
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO --composefs --from-stdin $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: a composefs switch is taken alongside a batch option, where it refuses a
+ skip list. Standard input is /dev/null here, so the stream carries no pair and
+ neither implementation writes an image. The populated form, where each pair
+ writes the image of its own revision, is
+ `checkout/batch-takes-a-composefs-switch` below.
+
+family: M10
+subcommand: checkout
+cell: checkout/from-stdin-empty-stream-takes-a-union-pair
+setup: repo-with-commit
+run: checkout --repo=$REPO --from-stdin --union --union-add $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: the union-option pair stands inside the scope of one checkout, so a stream
+ carrying no pair never reaches it. Standard input is /dev/null here, so both
+ implementations exit 0, neither writes a line, and neither creates the
+ destination. The same line over a populated stream is refused at exit 1 in
+ both, which `checkout/batch-refusals-stand-inside-the-pair-scope` below
+ carries.
+
+family: M10
+subcommand: checkout
+cell: checkout/from-stdin-empty-stream-takes-union-identical
+setup: repo-with-commit
+run: checkout --repo=$REPO --from-stdin --union-identical $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: the `--union-identical requires --require-hardlinks` refusal stands inside
+ the scope of one checkout too, so a stream carrying no pair reaches it no more
+ than it reaches the union pair above.
+
+family: M10
+subcommand: checkout
+cell: checkout/from-stdin-empty-stream-takes-a-composefs-refusal
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO --from-stdin --composefs --whiteouts $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: the composefs incompatibility stands inside the scope of one checkout, so
+ a stream carrying no pair reaches it no more than it reaches the two refusals
+ above. Standard input is /dev/null here, and neither implementation writes an
+ image.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-refusals-stand-inside-the-pair-scope
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_refusals_stand_inside_the_pair_scope
+spec: format-reference.md#checkout
+note: seven command lines, each carrying one of the refusals a checkout makes
+ with a revision in hand -- the three union-option pairs, the
+ `--union-identical` requirement, and the composefs incompatibility against a
+ skip list and against each whiteout switch. Over an empty stream all seven
+ exit 0 in both; over a stream carrying one pair all seven exit 1 in both, with
+ no destination created. The harness feeds no populated standard input, so the
+ cell cites the test.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-empty-destination
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_refusals_stand_inside_the_pair_scope
+spec: format-reference.md#checkout
+note: a destination value of no bytes names no path. It is refused at exit 1 in
+ both over a stream carrying a pair, and reached by neither over an empty
+ stream, which exits 0. The words part, which cli-surface.md, "checkout"
+ records. Both implementations run from a directory of their own in the cited
+ test, which then states that neither wrote into it.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-prunes-a-file
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_matches_the_tool
+spec: format-reference.md#checkout
+note: an entry spelling a file's own path, leading slash included, prunes that
+ file and leaves every other entry written. The same holds for a symlink. The
+ harness writes no auxiliary file, so the cited test writes the list and walks
+ both implementations' destinations, in `archive`, `bare-user`, and `bare`.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-prunes-a-directory-under-a-trailing-slash
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_matches_the_tool
+spec: format-reference.md#checkout
+note: an entry spelling a directory's path with a trailing slash prunes that
+ directory and its whole subtree, and the destination holds no directory of
+ that name. The cited test states the rule at three depths.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-ignores-a-directory-without-a-trailing-slash
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_matches_the_tool,
+ ostrya_cli::cli::checkout_skip_list_line_syntax_matches_the_tool
+spec: format-reference.md#checkout
+note: the match is an exact string comparison, so a directory spelled without
+ its trailing slash matches nothing and the whole subtree is written. A missing
+ leading slash, a doubled slash, a leading `.`, a surrounding space, and a
+ trailing slash on a file all match nothing for the same reason; the first
+ cited test states those. A trailing `\r` matches nothing too, which the second
+ cited test states under its `crlf` case.
+ `commit --skip-list` prunes a directory under both spellings, and each command
+ follows its own rule in both implementations.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-prunes-the-root
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_matches_the_tool
+spec: format-reference.md#checkout
+note: an entry of `/` names the checkout root, which is decided before the
+ destination path is touched: nothing is written and no destination is created,
+ at exit 0. Under a union mode an existing destination is left as it stands.
+ The cited test states the form in three repository modes, compares the absent
+ destinations, and runs the union form over a destination holding a file of its
+ own.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-root-needs-no-destination-parent
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_root_needs_no_destination_parent
+spec: format-reference.md#checkout
+note: a pruned root reads nothing of the destination path, so a destination
+ under a directory that does not exist is accepted at exit 0 and that directory
+ is not created. The cited test states the plain path and the batch path, and
+ carries the control where the same destination without a list is refused at
+ exit 1 in both.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-line-syntax
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_line_syntax_matches_the_tool
+spec: format-reference.md#checkout
+note: blank lines are ignored, a final line needs no newline, a duplicate
+ changes nothing, and there is no comment syntax, so a `#` line is a path that
+ matches nothing. A path matching no entry is not reported, which is where
+ `checkout --skip-list` parts from `commit --skip-list` and its `Unmatched
+ skip-list path:` lines. Neither implementation writes a line of its own.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-invalid-utf8
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_refusals_match_the_tool
+spec: format-reference.md#checkout
+note: a skip-list file holding a NUL byte or a byte sequence that is not UTF-8
+ ends the checkout at exit 1 with `Invalid UTF-8` and no destination created,
+ in both and under the tool's own wording. The harness writes no auxiliary
+ file, so the cited test writes each file and compares the two refusals.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-unreadable
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_refusals_match_the_tool
+spec: format-reference.md#checkout
+note: a skip-list file the caller cannot read ends the checkout at exit 1 with
+ `openat(<path as spelled>): Permission denied` and no destination created, in
+ both. The harness creates no file at mode 000, so the cited test does.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-last-value-wins
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_refusals_match_the_tool
+spec: format-reference.md#checkout
+note: `--skip-list` given more than once takes the last value, in both. The
+ cited test gives two files naming different entries and states that the second
+ is the one that decides.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-under-a-subpath
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_under_a_subpath_matches_the_tool
+spec: format-reference.md#checkout
+note: the list is matched against paths rooted at the `--subpath` root, so a
+ subpath of `/a` prunes `a/b` under the entry `/b/` and prunes nothing under
+ `/a/b/`. An entry of `/` under a subpath writes nothing and creates no
+ destination.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-does-not-reach-a-file-subpath
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_under_a_subpath_matches_the_tool
+spec: format-reference.md#checkout
+note: a `--subpath` naming a regular file or a symlink places one object, which
+ no filter decides. The cited test states that none of the five spellings of
+ that object's path, `/` included, prevents the destination from holding it.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-precedes-a-whiteout-marker
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_precedes_the_whiteout_decision
+spec: format-reference.md#checkout
+note: the list is matched against a marker's own tree path and ahead of the
+ whiteout decision, so an entry of `/.wh.<name>` performs no removal and an
+ entry of `/.ostree-wh.<name>` writes no device. An entry naming the marker's
+ target instead changes nothing. The cited test runs the five cases in
+ `bare-user` and `bare` over a populated destination.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-does-not-reach-the-opaque-clear
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_skip_list_precedes_the_whiteout_decision
+spec: format-reference.md#checkout
+note: the opaque marker's clear is the directory walk's own pre-pass over the
+ destination's names, so an entry naming `.wh..wh..opq` suppresses the marker's
+ own materialization and the clear still runs.
+
+family: M10
+subcommand: checkout
+cell: checkout/skip-list-drops-allow-noent
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the reach of `--allow-noent`. The tool ignores the switch while the
+ command line holds a `--skip-list`, so an absent `--subpath` ends the checkout
+ at exit 1; the port honors the switch uniformly and exits 0. Neither side
+ writes anything or creates the destination, so the exit status is the whole of
+ the difference (`cli-surface.md`, "checkout"). `--from-file` and
+ `--from-stdin` keep the switch in both.
+evidence: ostrya_cli::cli::checkout_skip_list_drops_allow_noent_in_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ cited test states the `--skip-list` arm and the two batch arms, and states
+ that neither side created a destination in any of them. The list must be
+ readable for the arm to mean anything, and the harness writes no auxiliary
+ file, so the cell cites the test.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-pair-format
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_pairs_match_the_tool
+spec: format-reference.md#checkout
+note: the stream holds NUL-separated records read two at a time as
+ `(REFSPEC, SUBPATH)` pairs. The subpath record is a `--subpath` value, is not
+ validated as UTF-8, and keeps every byte it carries. The harness feeds no
+ standard input, so the cited test feeds each stream and walks both
+ implementations' destinations.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-odd-trailing-refspec
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_pairs_match_the_tool
+spec: format-reference.md#checkout
+note: a refspec record with no record after it carries no subpath and checks the
+ whole tree out. A final record with no NUL terminator is a record, so a stream
+ ending in NUL carries no trailing empty record.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-empty-record-ends-the-stream
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_pairs_match_the_tool
+spec: format-reference.md#checkout
+note: an empty record in the refspec position ends the stream at exit 0, so the
+ pairs before it run and the records after it are not read. The cited test
+ states the rule with the empty record first, between two pairs, and as the
+ whole stream. The subpath position takes an empty record under a rule of its
+ own, which `checkout/batch-empty-subpath-record` below carries.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-empty-subpath-record
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: an empty record in the subpath position. It is an empty subpath value,
+ which the tool looks up and refuses at exit 1 with no destination created,
+ and which the port reads as the whole tree and writes at exit 0. This is the
+ recorded `--subpath` value divergence reaching the record stream: the port
+ reads a value carrying no name component as the whole tree
+ (`cli-surface.md`, "checkout").
+evidence: ostrya_cli::cli::checkout_batch_empty_subpath_record_diverges_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ harness feeds no standard input, so the cell cites the test, which states the
+ tool's refusal and the whole tree the port writes.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-refspec-newline-strip
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_pairs_match_the_tool
+spec: format-reference.md#checkout
+note: one trailing `\n` is dropped from a refspec record, then one trailing
+ `\r`, so a record written by a line-oriented producer resolves. Nothing is
+ dropped from a subpath record and no whitespace is stripped from either, so a
+ spaced record names nothing and ends the run at exit 1.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-destination-is-the-first-positional
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_destination_matches_the_tool
+spec: format-reference.md#checkout
+note: under a batch option the first positional is the destination, which is the
+ COMMIT slot of the usage line, and the tool ignores the second. The cited test
+ gives two positionals to each implementation and states that only the first is
+ written to.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-pairs-share-one-destination
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_pairs_match_the_tool,
+ ostrya_cli::cli::checkout_batch_destination_matches_the_tool
+spec: format-reference.md#checkout
+note: every pair checks out into the one destination under the invocation's own
+ overwrite mode, so pairs layer under `--union` and a second pair over the same
+ name is a collision without one.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-stops-at-the-first-failing-pair
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_destination_matches_the_tool,
+ ostrya_cli::cli::checkout_batch_refusals_match_the_tool
+spec: format-reference.md#checkout
+note: a pair that is refused ends the run at exit 1, and the pairs already
+ written stay in the destination. The words part: the tool puts a `Processing
+ tree <checksum>: ` prefix in front of every refusal a pair reaches and the
+ port reports its own message with no prefix, which cli-surface.md, "checkout"
+ records. A refspec record that does not resolve carries no prefix in either.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-allow-noent-skips-a-pair
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_refusals_match_the_tool
+spec: format-reference.md#checkout
+note: `--allow-noent` acts per pair, so a pair whose subpath names nothing is
+ passed over and the stream continues at exit 0. The cited test states the
+ failing pair first and last, and states the exit 1 the same streams reach
+ without the switch.
+
+family: M10
+subcommand: checkout
+cell: checkout/from-stdin-wins-over-from-file
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_sources_and_precedence_match_the_tool
+spec: format-reference.md#checkout
+note: a command line holding both sources reads standard input, whatever the
+ command-line order. Standard input is left unread where neither switch is
+ given. The harness feeds no standard input, so the cell cites the test.
+
+family: M10
+subcommand: checkout
+cell: checkout/from-file-last-value-wins
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_sources_and_precedence_match_the_tool
+spec: format-reference.md#checkout
+note: `--from-file` given more than once takes the last value, in both. The
+ cited test gives two files naming different subpaths and states that the
+ second is the one that decides.
+
+family: M10
+subcommand: checkout
+cell: checkout/from-file-open-failures
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_refusals_match_the_tool
+spec: format-reference.md#checkout
+note: a batch file that is absent, that is a directory, or that cannot be read
+ ends the command at exit 1 with no destination created, in both. The words
+ part, which cli-surface.md, "checkout" records. `checkout/from-file-absent`
+ above runs the absent case; the other two need a file the harness does not
+ create, so the cell cites the test.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-ignores-subpath
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_ignores_subpath_and_takes_composefs
+spec: format-reference.md#checkout
+note: `--subpath` on the command line decides nothing under a batch option, the
+ pair's second record carrying the subpath instead. The cited test gives a
+ `--subpath` naming one directory and a pair naming another, and states that
+ the destination holds the pair's.
+
+family: M10
+subcommand: checkout
+cell: checkout/batch-takes-a-composefs-switch
+modes: bare-user
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_batch_ignores_subpath_and_takes_composefs
+spec: format-reference.md#composefs
+note: `--composefs` and `--composefs-noverity` are each taken alongside a batch
+ option, and every pair writes the image of its own revision into the one
+ destination, the pair's subpath deciding nothing. No oracle reads a cell's own
+ checkout destination, so the cited test reads the image both implementations
+ wrote and states the bytes equal.
 
 # ---------------------------------------------------------------------------
 # show -- the commit report, the raw variant, the metadata modes, and the

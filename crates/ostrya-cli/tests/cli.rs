@@ -20732,10 +20732,12 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
     build_union_tree(&tree);
     let (repo, rev) = union_repo(base, RepoMode::Bare, "repo", &tree);
 
-    // The tool's own table, measured. `-M/--bareuseronly-dirs`,
-    // `--disable-cache`, and `--skip-list` also make the tool drop the switch,
-    // and they are outside the port's `checkout` surface today, so they join
-    // this table with the items that add them.
+    // The tool's own table, measured. `-M/--bareuseronly-dirs` and
+    // `--disable-cache` also make the tool drop the switch, and they are
+    // outside the port's `checkout` surface today, so they join this table
+    // with the items that add them. `--skip-list` is in
+    // `checkout_skip_list_drops_allow_noent_in_the_tool`, together with the
+    // two batch options that keep the switch.
     let arms: [(&str, &[&str], i32); 9] = [
         ("bare", &[], 0),
         ("require-hardlinks", &["-H"], 1),
@@ -21242,4 +21244,1154 @@ fn checkout_union_identical_identity_matches_the_tool() {
             }
         }
     }
+}
+
+// --- checkout: path selection ------------------------------------------------
+//
+// `--skip-list=FILE` prunes tree paths; `--from-stdin` and `--from-file=FILE`
+// read a batch of checkouts. Each test builds its own repository and runs both
+// implementations over it, into a destination of each one's own.
+
+/// Run the `ostree` tool from `cwd` with `args` and `stdin`, which `ostree()`
+/// pins to `/dev/null`. The streams the batch tests feed are a few bytes each,
+/// so the write completes before the tool's output can fill a pipe.
+fn ostree_stdin(cwd: Option<&Path>, args: &[&str], stdin: &[u8]) -> Run {
+    let mut command = Command::new("ostree");
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    let mut child = command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ostree");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin)
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait ostree");
+    Run {
+        status: out.status,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    }
+}
+
+/// Run one batch `checkout` in both implementations over one repository, into a
+/// destination of each one's own. A batch invocation names its destination in
+/// the COMMIT slot, so the destination is the one positional given.
+fn checkout_batch_pair(
+    repo: &Path,
+    options: &[&str],
+    stdin: &[u8],
+    port_dest: &Path,
+    tool_dest: &Path,
+) -> (Run, Run) {
+    let repo_arg = format!("--repo={}", repo.display());
+    let port_path = port_dest.display().to_string();
+    let tool_path = tool_dest.display().to_string();
+
+    let mut port_args = vec!["checkout", repo_arg.as_str()];
+    port_args.extend(options.iter().copied());
+    port_args.push(port_path.as_str());
+    let port = ostrya(&port_args, Some(stdin), &[]);
+
+    let mut tool_args = vec!["checkout", repo_arg.as_str()];
+    tool_args.extend(options.iter().copied());
+    tool_args.push(tool_path.as_str());
+    let tool = ostree_stdin(None, &tool_args, stdin);
+
+    (port, tool)
+}
+
+/// The tree the path-selection tests check out: a regular file `f1`, a symlink
+/// `link` naming it, a three-level directory chain `a/b/c`, and a second
+/// directory `d`, so a list entry can name a file, a symlink, a directory at
+/// each depth, and a path that matches nothing.
+fn build_skip_tree(dir: &Path) {
+    std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+    std::fs::create_dir_all(dir.join("d")).unwrap();
+    for (name, content) in [
+        ("f1", &b"f1\n"[..]),
+        ("a/f2", b"f2\n"),
+        ("a/b/f3", b"f3\n"),
+        ("a/b/c/f4", b"f4\n"),
+        ("d/f5", b"f5\n"),
+    ] {
+        std::fs::write(dir.join(name), content).unwrap();
+        chmod_to(&dir.join(name), 0o644);
+    }
+    std::os::unix::fs::symlink("f1", dir.join("link")).unwrap();
+    for name in ["a", "a/b", "a/b/c", "d"] {
+        chmod_to(&dir.join(name), 0o755);
+    }
+    chmod_to(dir, 0o755);
+}
+
+/// Write `content` to `base/name` and return the `--skip-list=` option naming
+/// it.
+fn skip_list_option(base: &Path, name: &str, content: &[u8]) -> String {
+    let path = base.join(name);
+    std::fs::write(&path, content).unwrap();
+    format!("--skip-list={}", path.display())
+}
+
+/// The path forms a `--skip-list` entry takes, over every repository mode whose
+/// checkout path differs.
+///
+/// Carries `checkout/skip-list-prunes-a-file`,
+/// `checkout/skip-list-prunes-a-directory-under-a-trailing-slash`,
+/// `checkout/skip-list-ignores-a-directory-without-a-trailing-slash`, and
+/// `checkout/skip-list-prunes-the-root`.
+#[test]
+fn checkout_skip_list_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-skip-list");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+
+    // Each entry is one skip-list file content. The root form asserts that
+    // neither implementation created a destination, which the tree walker
+    // renders as one `<no destination>` line.
+    let forms: &[(&str, &str)] = &[
+        ("file", "/f1\n"),
+        ("file-no-leading-slash", "f1\n"),
+        ("file-doubled-slash", "//f1\n"),
+        ("file-spaced", " /f1 \n"),
+        ("file-dot-prefix", "./f1\n"),
+        ("symlink", "/link\n"),
+        ("symlink-trailing-slash", "/link/\n"),
+        ("file-trailing-slash", "/f1/\n"),
+        ("dir-no-trailing-slash", "/a\n"),
+        ("dir", "/a/\n"),
+        ("nested-dir-no-trailing-slash", "/a/b\n"),
+        ("nested-dir", "/a/b/\n"),
+        ("deep-dir", "/a/b/c/\n"),
+        ("nested-file", "/a/f2\n"),
+        ("deeper-file", "/a/b/f3\n"),
+        ("deepest-file", "/a/b/c/f4\n"),
+        ("dir-doubled-trailing-slash", "/a//\n"),
+        ("dir-doubled-leading-slash", "//a/\n"),
+        ("root", "/\n"),
+        ("absent", "/nope\n"),
+        ("empty-file", ""),
+    ];
+
+    for (mode_name, mode) in [
+        ("archive", RepoMode::Archive),
+        ("bare-user", RepoMode::BareUser),
+        ("bare", RepoMode::Bare),
+    ] {
+        let (repo, rev) = union_repo(base, mode, &format!("repo-{mode_name}"), &tree);
+        for (form, content) in forms {
+            let option = skip_list_option(base, &format!("skip-{form}.txt"), content.as_bytes());
+            let case = format!("{mode_name}/{form}");
+            let port_dest = base.join(format!("port-{mode_name}-{form}"));
+            let tool_dest = base.join(format!("tool-{mode_name}-{form}"));
+            let (port, tool) = checkout_pair(&repo, &["-U", &option], &rev, &port_dest, &tool_dest);
+            assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &case);
+        }
+    }
+
+    // The root form under a union mode over a destination that already holds a
+    // file: the pruned root writes nothing and the destination stands.
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo-root-union", &tree);
+    let option = skip_list_option(base, "skip-root.txt", b"/\n");
+    let port_dest = base.join("port-root-union");
+    let tool_dest = base.join("tool-root-union");
+    for dest in [&port_dest, &tool_dest] {
+        std::fs::create_dir_all(dest).unwrap();
+        std::fs::write(dest.join("pre"), b"keep\n").unwrap();
+        chmod_to(&dest.join("pre"), 0o644);
+        chmod_to(dest, 0o755);
+    }
+    let (port, tool) = checkout_pair(
+        &repo,
+        &["-U", "--union", &option],
+        &rev,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "root-under-union");
+    assert_eq!(
+        std::fs::read(port_dest.join("pre")).unwrap(),
+        b"keep\n",
+        "the destination is left as it stands",
+    );
+    assert!(
+        !port_dest.join("f1").exists(),
+        "the pruned root wrote nothing",
+    );
+}
+
+/// The line syntax of a `--skip-list` file: blank lines, a final line with no
+/// newline, duplicates, a line that matches nothing, and the absence of a
+/// comment syntax.
+///
+/// Carries `checkout/skip-list-line-syntax`.
+#[test]
+fn checkout_skip_list_line_syntax_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-skip-syntax");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+
+    let cases: &[(&str, &str)] = &[
+        ("blank-line-first", "\n/f1\n"),
+        ("blank-line-between", "/f1\n\n/link\n"),
+        ("no-final-newline", "/f1"),
+        ("no-final-newline-two", "/f1\n/link"),
+        ("crlf", "/f1\r\n"),
+        ("duplicate", "/f1\n/f1\n"),
+        ("two-paths", "/f1\n/d/f5\n"),
+        ("hash-is-a-path", "# /f1\n/f1\n"),
+        ("unmatched-path", "/nope\n/f1\n"),
+        ("trailing-blank-lines", "/f1\n\n\n"),
+    ];
+
+    for (case, content) in cases {
+        let option = skip_list_option(base, &format!("skip-{case}.txt"), content.as_bytes());
+        let port_dest = base.join(format!("port-{case}"));
+        let tool_dest = base.join(format!("tool-{case}"));
+        let (port, tool) = checkout_pair(&repo, &["-U", &option], &rev, &port_dest, &tool_dest);
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, case);
+        assert!(
+            port.stdout.is_empty() && tool.stdout.is_empty(),
+            "{case}: neither implementation writes a line of its own",
+        );
+    }
+}
+
+/// The refusals a `--skip-list` file carries, and the last-value-wins rule a
+/// repeated option takes. The port reproduces the tool's four wordings, so the
+/// message compares as well as the status.
+///
+/// Carries `checkout/skip-list-invalid-utf8`, `checkout/skip-list-unreadable`,
+/// and `checkout/skip-list-last-value-wins`.
+#[test]
+fn checkout_skip_list_refusals_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-skip-refusals");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+
+    let absent = format!("--skip-list={}", base.join("nosuch").display());
+    let directory = format!("--skip-list={}", base.join("adir").display());
+    std::fs::create_dir_all(base.join("adir")).unwrap();
+    let unreadable = skip_list_option(base, "mode000.txt", b"/f1\n");
+    chmod_to(&base.join("mode000.txt"), 0o000);
+    let nul = skip_list_option(base, "nul.txt", b"/f1\0");
+    let invalid = skip_list_option(base, "invalid.txt", b"/f\xff1\n");
+
+    for (case, option) in [
+        ("absent", &absent),
+        ("directory", &directory),
+        ("unreadable", &unreadable),
+        ("nul-byte", &nul),
+        ("invalid-utf8", &invalid),
+    ] {
+        let port_dest = base.join(format!("port-{case}"));
+        let tool_dest = base.join(format!("tool-{case}"));
+        let (port, tool) = checkout_pair(&repo, &["-U", option], &rev, &port_dest, &tool_dest);
+        assert_eq!(port.status.code(), Some(1), "{case}: the port exits 1");
+        assert_eq!(tool.status.code(), Some(1), "{case}: the tool exits 1");
+        assert_eq!(
+            String::from_utf8_lossy(&port.stderr),
+            String::from_utf8_lossy(&tool.stderr),
+            "{case}: the port reproduces the tool's wording",
+        );
+        assert!(
+            !port_dest.exists(),
+            "{case}: the port created a destination"
+        );
+        assert!(
+            !tool_dest.exists(),
+            "{case}: the tool created a destination"
+        );
+    }
+
+    // A repeated option takes the last value in both.
+    let first = skip_list_option(base, "first.txt", b"/f1\n");
+    let second = skip_list_option(base, "second.txt", b"/link\n");
+    let port_dest = base.join("port-last-wins");
+    let tool_dest = base.join("tool-last-wins");
+    let (port, tool) = checkout_pair(
+        &repo,
+        &["-U", &first, &second],
+        &rev,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "last-wins");
+    assert!(
+        port_dest.join("f1").exists() && !port_dest.join("link").exists(),
+        "the second file is the one that decides",
+    );
+}
+
+/// A `--skip-list` under a `--subpath`: the list is rooted at the subpath, and
+/// no spelling reaches the single object a file subpath names.
+///
+/// Carries `checkout/skip-list-under-a-subpath` and
+/// `checkout/skip-list-does-not-reach-a-file-subpath`.
+#[test]
+fn checkout_skip_list_under_a_subpath_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-skip-subpath");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+
+    let cases: &[(&str, &str, &str)] = &[
+        ("dir-rooted-at-the-subpath", "--subpath=/a", "/b/\n"),
+        ("dir-under-its-tree-path", "--subpath=/a", "/a/b/\n"),
+        ("file-rooted-at-the-subpath", "--subpath=/a", "/f2\n"),
+        ("root-under-a-subpath", "--subpath=/a", "/\n"),
+        ("file-subpath-own-path", "--subpath=/f1", "/f1\n"),
+        ("file-subpath-bare-name", "--subpath=/f1", "f1\n"),
+        ("file-subpath-root", "--subpath=/f1", "/\n"),
+        ("file-subpath-doubled", "--subpath=/f1", "//f1\n"),
+        ("file-subpath-trailing", "--subpath=/f1", "/f1/\n"),
+    ];
+
+    for (case, subpath, content) in cases {
+        let option = skip_list_option(base, &format!("skip-{case}.txt"), content.as_bytes());
+        let port_dest = base.join(format!("port-{case}"));
+        let tool_dest = base.join(format!("tool-{case}"));
+        let (port, tool) = checkout_pair(
+            &repo,
+            &["-U", subpath, &option],
+            &rev,
+            &port_dest,
+            &tool_dest,
+        );
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, case);
+    }
+}
+
+/// The filter decides a marker's own tree path ahead of the whiteout decision,
+/// and it does not decide the opaque clear.
+///
+/// Carries `checkout/skip-list-precedes-a-whiteout-marker` and
+/// `checkout/skip-list-does-not-reach-the-opaque-clear`.
+#[test]
+fn checkout_skip_list_precedes_the_whiteout_decision() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-skip-whiteouts");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(tree.join("keepdir")).unwrap();
+    for name in [".wh.gone", "keepdir/.wh..wh..opq", ".ostree-wh.dev"] {
+        std::fs::write(tree.join(name), b"").unwrap();
+        chmod_to(&tree.join(name), 0o644);
+    }
+    chmod_to(&tree.join("keepdir"), 0o755);
+    chmod_to(&tree, 0o755);
+
+    let prestate = |dest: &Path| {
+        std::fs::create_dir_all(dest.join("keepdir")).unwrap();
+        std::fs::write(dest.join("gone"), b"old\n").unwrap();
+        std::fs::write(dest.join("dev"), b"olddev\n").unwrap();
+        std::fs::write(dest.join("keepdir/old"), b"oldk\n").unwrap();
+        for name in ["gone", "dev", "keepdir/old"] {
+            chmod_to(&dest.join(name), 0o644);
+        }
+        chmod_to(&dest.join("keepdir"), 0o755);
+    };
+
+    let cases: &[(&str, &str)] = &[
+        ("no-list", ""),
+        ("marker-path", "/.wh.gone\n"),
+        ("opaque-marker-path", "/keepdir/.wh..wh..opq\n"),
+        ("passthrough-marker-path", "/.ostree-wh.dev\n"),
+        ("passthrough-target-path", "/dev\n"),
+    ];
+
+    for (mode_name, mode) in [("bare-user", RepoMode::BareUser), ("bare", RepoMode::Bare)] {
+        let (repo, rev) = union_repo(base, mode, &format!("repo-{mode_name}"), &tree);
+        for (case, content) in cases {
+            let label = format!("{mode_name}/{case}");
+            let port_dest = base.join(format!("port-{mode_name}-{case}"));
+            let tool_dest = base.join(format!("tool-{mode_name}-{case}"));
+            prestate(&port_dest);
+            prestate(&tool_dest);
+            let mut options = vec![
+                "-U",
+                "--union",
+                "--whiteouts",
+                "--process-passthrough-whiteouts",
+            ];
+            let option;
+            if !content.is_empty() {
+                option = skip_list_option(base, &format!("skip-{case}.txt"), content.as_bytes());
+                options.push(&option);
+            }
+            let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+            assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+        }
+    }
+}
+
+/// `--skip-list` joins the set of options that make the tool drop
+/// `--allow-noent`, and the two batch options join the set that keeps it.
+///
+/// Carries `checkout/skip-list-drops-allow-noent`.
+#[test]
+fn checkout_skip_list_drops_allow_noent_in_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-skip-allow-noent");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+    let option = skip_list_option(base, "skip.txt", b"/f1\n");
+
+    // The divergence: the tool ignores the switch while the line holds a
+    // readable `--skip-list`, and the port honors it.
+    let port_dest = base.join("port-skip");
+    let tool_dest = base.join("tool-skip");
+    let (port, tool) = checkout_pair(
+        &repo,
+        &["-U", "--allow-noent", "--subpath=/nope", &option],
+        &rev,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_eq!(tool.status.code(), Some(1), "the tool drops the switch");
+    assert_eq!(port.status.code(), Some(0), "the port honors the switch");
+    assert!(!port_dest.exists(), "the port created a destination");
+    assert!(!tool_dest.exists(), "the tool created a destination");
+
+    // `--from-file` keeps the switch on both sides.
+    let empty = base.join("empty.batch");
+    std::fs::write(&empty, b"").unwrap();
+    let from_file = format!("--from-file={}", empty.display());
+    let port_dest = base.join("port-from-file");
+    let tool_dest = base.join("tool-from-file");
+    let (port, tool) = checkout_pair(
+        &repo,
+        &["-U", "--allow-noent", "--subpath=/nope", &from_file],
+        &rev,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_eq!(port.status.code(), Some(0), "the port exits 0");
+    assert_eq!(tool.status.code(), Some(0), "the tool exits 0");
+
+    // `--from-stdin` keeps it too, the pair's own subpath naming nothing.
+    let record = format!("{rev}\0/nope\0").into_bytes();
+    let port_dest = base.join("port-from-stdin");
+    let tool_dest = base.join("tool-from-stdin");
+    let (port, tool) = checkout_batch_pair(
+        &repo,
+        &["-U", "--from-stdin", "--allow-noent"],
+        &record,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_eq!(port.status.code(), Some(0), "the port exits 0");
+    assert_eq!(tool.status.code(), Some(0), "the tool exits 0");
+    assert!(!port_dest.exists() && !tool_dest.exists());
+}
+
+/// The record format of a batch stream: NUL separation, an unterminated final
+/// record, an empty record ending the stream, the refspec's line-terminator
+/// strip, and the subpath record's lack of one.
+///
+/// Carries `checkout/batch-pair-format`,
+/// `checkout/batch-odd-trailing-refspec`,
+/// `checkout/batch-empty-record-ends-the-stream`, and
+/// `checkout/batch-refspec-newline-strip`.
+#[test]
+fn checkout_batch_pairs_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-batch-pairs");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+
+    // Each stream is built from the branch name, so the records the test feeds
+    // are the ones a caller would write.
+    let plain: &[&str] = &["-U", "--from-stdin"];
+    let union: &[&str] = &["-U", "--from-stdin", "--union"];
+    let cases: &[(&str, &[u8], &[&str])] = &[
+        ("one-pair", b"@\0/a\0", plain),
+        ("two-pairs-union", b"@\0/a\0@\0/d\0", union),
+        ("three-pairs-union", b"@\0/a\0@\0/d\0@\0/f1\0", union),
+        ("odd-trailing-refspec", b"@\0", plain),
+        ("unterminated-refspec", b"@", plain),
+        ("unterminated-subpath", b"@\0/a", plain),
+        ("empty-stream", b"", plain),
+        ("one-nul", b"\0", plain),
+        ("two-nuls", b"\0\0", plain),
+        ("empty-record-ends-the-stream", b"@\0/a\0\0@\0/d\0", plain),
+        ("leading-empty-record", b"\0@\0/a\0", plain),
+        ("refspec-newline", b"@\n\0/a\0", plain),
+        ("refspec-crlf", b"@\r\n\0/a\0", plain),
+        ("refspec-cr", b"@\r\0/a\0", plain),
+        ("refspec-two-newlines", b"@\n\n\0/a\0", plain),
+        ("refspec-two-crs", b"@\r\r\0/a\0", plain),
+        ("subpath-newline", b"@\0/a\n\0", plain),
+        ("subpath-cr", b"@\0/a\r\0", plain),
+        ("subpath-spaces", b"@\0  /a  \0", plain),
+        ("subpath-not-utf8", b"@\0/\xff\0", plain),
+        ("odd-record-count", b"@\0/a\0/d\0", plain),
+        ("root-subpath", b"@\0/\0", plain),
+        ("relative-subpath", b"@\0a\0", plain),
+    ];
+
+    for (case, template, options) in cases {
+        let stream: Vec<u8> = template
+            .iter()
+            .flat_map(|byte| {
+                if *byte == b'@' {
+                    rev.as_bytes().to_vec()
+                } else {
+                    vec![*byte]
+                }
+            })
+            .collect();
+        let port_dest = base.join(format!("port-{case}"));
+        let tool_dest = base.join(format!("tool-{case}"));
+        let (port, tool) = checkout_batch_pair(&repo, options, &stream, &port_dest, &tool_dest);
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, case);
+    }
+}
+
+/// The destination a batch invocation writes into: the first positional, with
+/// every later one ignored by the tool, and every pair writing into that one
+/// destination.
+///
+/// Carries `checkout/batch-destination-is-the-first-positional`,
+/// `checkout/batch-pairs-share-one-destination`, and
+/// `checkout/batch-stops-at-the-first-failing-pair`.
+#[test]
+fn checkout_batch_destination_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-batch-dest");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+    let stream = format!("{rev}\0/a\0").into_bytes();
+
+    // The first positional is the destination, and the tool ignores the second.
+    let repo_arg = format!("--repo={}", repo.display());
+    let port_dest = base.join("port-first");
+    let tool_dest = base.join("tool-first");
+    let port_second = base.join("port-second");
+    let tool_second = base.join("tool-second");
+    let port = ostrya(
+        &[
+            "checkout",
+            &repo_arg,
+            "-U",
+            "--from-stdin",
+            port_dest.to_str().unwrap(),
+            port_second.to_str().unwrap(),
+        ],
+        Some(&stream),
+        &[],
+    );
+    let tool = ostree_stdin(
+        None,
+        &[
+            "checkout",
+            &repo_arg,
+            "-U",
+            "--from-stdin",
+            tool_dest.to_str().unwrap(),
+            tool_second.to_str().unwrap(),
+        ],
+        &stream,
+    );
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "first-positional");
+    assert!(
+        !port_second.exists() && !tool_second.exists(),
+        "the second positional is not written to",
+    );
+
+    // Two pairs over one destination without a union option: the second is a
+    // collision, and the first pair's output stays.
+    let stream = format!("{rev}\0/a\0{rev}\0/d\0").into_bytes();
+    let port_dest = base.join("port-collide");
+    let tool_dest = base.join("tool-collide");
+    let (port, tool) = checkout_batch_pair(
+        &repo,
+        &["-U", "--from-stdin"],
+        &stream,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_eq!(port.status.code(), Some(1), "the port refuses the second");
+    assert_eq!(tool.status.code(), Some(1), "the tool refuses the second");
+    assert_eq!(
+        describe_tree_with_content(&port_dest),
+        describe_tree_with_content(&tool_dest),
+        "the first pair's output stays on both sides",
+    );
+    assert!(port_dest.join("f2").exists(), "the first pair ran");
+}
+
+/// The two batch sources, their precedence, and the repeated forms.
+///
+/// Carries `checkout/from-stdin-wins-over-from-file` and
+/// `checkout/from-file-last-value-wins`.
+#[test]
+fn checkout_batch_sources_and_precedence_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-batch-sources");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+
+    let first = base.join("first.batch");
+    std::fs::write(&first, format!("{rev}\0/a\0")).unwrap();
+    let second = base.join("second.batch");
+    std::fs::write(&second, format!("{rev}\0/d\0")).unwrap();
+    let from_first = format!("--from-file={}", first.display());
+    let from_second = format!("--from-file={}", second.display());
+    let stdin_stream = format!("{rev}\0/d\0").into_bytes();
+
+    // `--from-file` alone, read with no stdin content behind it.
+    let port_dest = base.join("port-file");
+    let tool_dest = base.join("tool-file");
+    let (port, tool) =
+        checkout_batch_pair(&repo, &["-U", &from_first], b"", &port_dest, &tool_dest);
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "from-file");
+    assert!(port_dest.join("f2").exists(), "the file's pair ran");
+
+    // Standard input wins over a file whatever the command-line order.
+    for (case, options) in [
+        ("file-then-stdin", vec!["-U", &from_first, "--from-stdin"]),
+        ("stdin-then-file", vec!["-U", "--from-stdin", &from_first]),
+    ] {
+        let port_dest = base.join(format!("port-{case}"));
+        let tool_dest = base.join(format!("tool-{case}"));
+        let (port, tool) =
+            checkout_batch_pair(&repo, &options, &stdin_stream, &port_dest, &tool_dest);
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, case);
+        assert!(port_dest.join("f5").exists(), "{case}: stdin decided");
+    }
+
+    // A repeated `--from-file` takes the last value.
+    let port_dest = base.join("port-file-twice");
+    let tool_dest = base.join("tool-file-twice");
+    let (port, tool) = checkout_batch_pair(
+        &repo,
+        &["-U", &from_first, &from_second],
+        b"",
+        &port_dest,
+        &tool_dest,
+    );
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "from-file-twice");
+    assert!(port_dest.join("f5").exists(), "the second file decided");
+
+    // Standard input is left unread where neither switch is given.
+    let port_dest = base.join("port-unread");
+    let tool_dest = base.join("tool-unread");
+    let repo_arg = format!("--repo={}", repo.display());
+    let port = ostrya(
+        &[
+            "checkout",
+            &repo_arg,
+            "-U",
+            &rev,
+            port_dest.to_str().unwrap(),
+        ],
+        Some(b"garbage\0"),
+        &[],
+    );
+    let tool = ostree_stdin(
+        None,
+        &[
+            "checkout",
+            &repo_arg,
+            "-U",
+            &rev,
+            tool_dest.to_str().unwrap(),
+        ],
+        b"garbage\0",
+    );
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "stdin-unread");
+    assert!(port_dest.join("f1").exists(), "the whole tree was written");
+}
+
+/// The refusals a batch invocation carries: a `--from-file` that does not open,
+/// an unresolvable refspec record, and the stream's own stopping rule.
+///
+/// Carries `checkout/from-file-open-failures` and
+/// `checkout/batch-allow-noent-skips-a-pair`.
+#[test]
+fn checkout_batch_refusals_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-batch-refusals");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+
+    std::fs::create_dir_all(base.join("adir")).unwrap();
+    let unreadable = base.join("mode000.batch");
+    std::fs::write(&unreadable, b"").unwrap();
+    chmod_to(&unreadable, 0o000);
+
+    // The three open failures. Both exit 1 and neither creates a destination;
+    // the words part, which `cli-surface.md` records.
+    for (case, path) in [
+        ("absent", base.join("nosuch")),
+        ("directory", base.join("adir")),
+        ("unreadable", unreadable.clone()),
+    ] {
+        let option = format!("--from-file={}", path.display());
+        let port_dest = base.join(format!("port-{case}"));
+        let tool_dest = base.join(format!("tool-{case}"));
+        let (port, tool) =
+            checkout_batch_pair(&repo, &["-U", &option], b"", &port_dest, &tool_dest);
+        assert_eq!(port.status.code(), Some(1), "{case}: the port exits 1");
+        assert_eq!(tool.status.code(), Some(1), "{case}: the tool exits 1");
+        assert!(
+            !port_dest.exists(),
+            "{case}: the port created a destination"
+        );
+        assert!(
+            !tool_dest.exists(),
+            "{case}: the tool created a destination"
+        );
+    }
+
+    // A refspec record that does not resolve ends the run before anything is
+    // written, and the port reproduces the tool's wording there.
+    let port_dest = base.join("port-badref");
+    let tool_dest = base.join("tool-badref");
+    let (port, tool) = checkout_batch_pair(
+        &repo,
+        &["-U", "--from-stdin"],
+        b"nosuchref\0/a\0",
+        &port_dest,
+        &tool_dest,
+    );
+    assert_eq!(port.status.code(), Some(1));
+    assert_eq!(tool.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&port.stderr),
+        String::from_utf8_lossy(&tool.stderr),
+    );
+    assert!(!port_dest.exists() && !tool_dest.exists());
+
+    // `--allow-noent` skips one pair and the stream continues; without it the
+    // run stops at the first failing pair.
+    for (case, options, expected) in [
+        (
+            "allow-noent-first",
+            vec!["-U", "--from-stdin", "--allow-noent"],
+            0,
+        ),
+        ("plain-first", vec!["-U", "--from-stdin"], 1),
+    ] {
+        let stream = format!("{rev}\0/nope\0{rev}\0/d\0").into_bytes();
+        let port_dest = base.join(format!("port-{case}"));
+        let tool_dest = base.join(format!("tool-{case}"));
+        let (port, tool) = checkout_batch_pair(&repo, &options, &stream, &port_dest, &tool_dest);
+        assert_eq!(port.status.code(), Some(expected), "{case}: the port");
+        assert_eq!(tool.status.code(), Some(expected), "{case}: the tool");
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, case);
+    }
+
+    // The same with the failing pair last.
+    let stream = format!("{rev}\0/d\0{rev}\0/nope\0").into_bytes();
+    let port_dest = base.join("port-allow-noent-last");
+    let tool_dest = base.join("tool-allow-noent-last");
+    let (port, tool) = checkout_batch_pair(
+        &repo,
+        &["-U", "--from-stdin", "--allow-noent", "--union"],
+        &stream,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "allow-noent-last");
+    assert!(port_dest.join("f5").exists(), "the good pair ran");
+}
+
+/// `--subpath` is dropped under a batch option, and the two composefs switches
+/// are taken with one, each pair writing the image of its own revision.
+///
+/// Carries `checkout/batch-ignores-subpath`.
+#[test]
+fn checkout_batch_ignores_subpath_and_takes_composefs() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-batch-composefs");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+    let stream = format!("{rev}\0/a\0").into_bytes();
+
+    // The pair's own subpath decides, and `--subpath` decides nothing.
+    let port_dest = base.join("port-subpath");
+    let tool_dest = base.join("tool-subpath");
+    let (port, tool) = checkout_batch_pair(
+        &repo,
+        &["-U", "--from-stdin", "--subpath=/d"],
+        &stream,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "subpath-ignored");
+    assert!(
+        port_dest.join("f2").exists() && !port_dest.join("f5").exists(),
+        "the pair's subpath is the one that decided",
+    );
+
+    // Both composefs switches take a batch option, and the image is the one
+    // the pair's revision produces. The tool writes the image through a
+    // temporary file it creates in the working directory and links to the
+    // destination, so both implementations run from the directory the
+    // destinations sit in.
+    let repo_arg = format!("--repo={}", repo.display());
+    for (case, switch) in [
+        ("composefs", "--composefs"),
+        ("composefs-noverity", "--composefs-noverity"),
+    ] {
+        let port_name = format!("port-{case}");
+        let tool_name = format!("tool-{case}");
+        let port_dest = base.join(&port_name);
+        let tool_dest = base.join(&tool_name);
+        let port = ostrya_in(
+            Some(base),
+            &["checkout", &repo_arg, "--from-stdin", switch, &port_name],
+            Some(&stream),
+            &[],
+        );
+        let tool = ostree_stdin(
+            Some(base),
+            &["checkout", &repo_arg, "--from-stdin", switch, &tool_name],
+            &stream,
+        );
+        assert_eq!(
+            port.status.code(),
+            Some(0),
+            "{case}: the port exits 0: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert_eq!(
+            tool.status.code(),
+            Some(0),
+            "{case}: the tool exits 0: {}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
+        assert_eq!(
+            std::fs::read(&port_dest).unwrap(),
+            std::fs::read(&tool_dest).unwrap(),
+            "{case}: the image bytes part",
+        );
+    }
+
+    // A `--skip-list` alongside a composefs switch is refused in both, under
+    // the tool's own words, with no destination written.
+    let option = skip_list_option(base, "skip.txt", b"/f1\n");
+    let port_dest = base.join("port-composefs-skip");
+    let tool_dest = base.join("tool-composefs-skip");
+    let (port, tool) = checkout_pair(
+        &repo,
+        &["--composefs", &option],
+        &rev,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_eq!(port.status.code(), Some(1));
+    assert_eq!(tool.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&port.stderr),
+        String::from_utf8_lossy(&tool.stderr),
+    );
+    assert!(!port_dest.exists() && !tool_dest.exists());
+}
+
+/// A batch stream costs the bytes it carries and a constant.
+///
+/// The stream is read once into one buffer, and the record scan stops at the
+/// record that ends the stream, so the records past that one cost nothing. The
+/// bound is pinned by running the largest stream the port accepts -- 128
+/// mebibytes, every byte a NUL, so every byte is a record boundary and the
+/// first record ends the stream -- under an address-space limit of one
+/// gibibyte. A run holding a slice of every record needs 16 bytes per input
+/// byte, which is two gibibytes of slices on top of the buffer, so it cannot
+/// finish under that limit.
+#[test]
+fn checkout_batch_stream_holds_no_more_than_the_stream() {
+    let tmp = TmpDir::new("checkout-batch-bound");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::BareUser);
+    let dest = base.join("dest");
+    let stream = vec![0u8; 128 * 1024 * 1024];
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -v 1048576; exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_ostrya"))
+        .arg(format!("--repo={}", repo.display()))
+        .arg("checkout")
+        .arg("--from-stdin")
+        .arg(&dest)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn ostrya under an address-space limit");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&stream)
+        .expect("write the stream");
+    let out = child.wait_with_output().expect("wait ostrya");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the stream is accepted under the limit: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "no line is written: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(!dest.exists(), "a stream carrying no pair creates nothing");
+}
+
+/// The refusals the command line carries into one checkout stand inside the
+/// scope of one checkout, so a batch stream carrying no pair reaches none of
+/// them and a populated stream reaches every one of them.
+///
+/// Carries `checkout/batch-refusals-stand-inside-the-pair-scope` and
+/// `checkout/batch-empty-destination`.
+#[test]
+fn checkout_batch_refusals_stand_inside_the_pair_scope() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-batch-scope");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+    let absent = format!("--skip-list={}", base.join("nosuch").display());
+
+    // Seven command lines, each carrying one refusal. The first three are the
+    // union-option pairs, the fourth the `--union-identical` requirement, and
+    // the last three the composefs incompatibility.
+    let lines: &[(&str, &[&str])] = &[
+        ("union-and-union-add", &["--union", "--union-add"]),
+        (
+            "union-and-union-identical",
+            &["--union", "--union-identical"],
+        ),
+        (
+            "union-add-and-union-identical",
+            &["--union-add", "--union-identical"],
+        ),
+        ("union-identical-without-h", &["--union-identical"]),
+        ("composefs-and-skip-list", &["--composefs", &absent]),
+        ("composefs-and-whiteouts", &["--composefs", "--whiteouts"]),
+        (
+            "composefs-and-passthrough-whiteouts",
+            &["--composefs", "--process-passthrough-whiteouts"],
+        ),
+    ];
+    let populated = format!("{rev}\0/a\0").into_bytes();
+
+    for (case, refusal) in lines {
+        // An empty stream carries no pair, so neither implementation makes the
+        // refusal and neither creates a destination.
+        let mut options = vec!["--from-stdin"];
+        options.extend(refusal.iter().copied());
+        let port_dest = base.join(format!("port-empty-{case}"));
+        let tool_dest = base.join(format!("tool-empty-{case}"));
+        let (port, tool) = checkout_batch_pair(&repo, &options, b"", &port_dest, &tool_dest);
+        assert_eq!(port.status.code(), Some(0), "{case}: the port exits 0");
+        assert_eq!(tool.status.code(), Some(0), "{case}: the tool exits 0");
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, case);
+
+        // A stream carrying one pair reaches the refusal in both, at exit 1
+        // with no destination created.
+        let port_dest = base.join(format!("port-pair-{case}"));
+        let tool_dest = base.join(format!("tool-pair-{case}"));
+        let (port, tool) = checkout_batch_pair(&repo, &options, &populated, &port_dest, &tool_dest);
+        assert_eq!(port.status.code(), Some(1), "{case}: the port refuses");
+        assert_eq!(tool.status.code(), Some(1), "{case}: the tool refuses");
+        assert!(
+            !port_dest.exists() && !tool_dest.exists(),
+            "{case}: a refusal creates no destination",
+        );
+    }
+
+    // A destination value of no bytes takes the same rule: an empty stream
+    // exits 0 and a populated one is refused, with nothing written either way.
+    // Both implementations run from a directory of their own, which the walk
+    // then compares, since an accepted empty value would write the tree into
+    // the working directory.
+    for (case, stream, expected) in [("empty-stream", &b""[..], 0), ("one-pair", &populated, 1)] {
+        let port_cwd = base.join(format!("port-cwd-{case}"));
+        let tool_cwd = base.join(format!("tool-cwd-{case}"));
+        std::fs::create_dir_all(&port_cwd).unwrap();
+        std::fs::create_dir_all(&tool_cwd).unwrap();
+        let repo_arg = format!("--repo={}", repo.display());
+        let port = ostrya_in(
+            Some(&port_cwd),
+            &["checkout", &repo_arg, "--from-stdin", ""],
+            Some(stream),
+            &[],
+        );
+        let tool = ostree_stdin(
+            Some(&tool_cwd),
+            &["checkout", &repo_arg, "--from-stdin", ""],
+            stream,
+        );
+        assert_eq!(port.status.code(), Some(expected), "{case}: the port");
+        assert_eq!(tool.status.code(), Some(expected), "{case}: the tool");
+        assert_eq!(
+            describe_tree_with_content(&port_cwd),
+            describe_tree_with_content(&tool_cwd),
+            "{case}: neither implementation wrote into the working directory",
+        );
+        assert!(
+            describe_tree_with_content(&port_cwd).is_empty(),
+            "{case}: the working directory is still empty",
+        );
+    }
+}
+
+/// A pruned root reads nothing of the destination path, so a destination under
+/// a directory that does not exist is checked out at exit 0.
+///
+/// Carries `checkout/skip-list-root-needs-no-destination-parent`.
+#[test]
+fn checkout_skip_list_root_needs_no_destination_parent() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-skip-no-parent");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+    let option = skip_list_option(base, "skip-root.txt", b"/\n");
+
+    // The plain path.
+    let port_dest = base.join("port-nodir").join("dest");
+    let tool_dest = base.join("tool-nodir").join("dest");
+    let (port, tool) = checkout_pair(&repo, &["-U", &option], &rev, &port_dest, &tool_dest);
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "plain-absent-parent");
+    assert_eq!(port.status.code(), Some(0), "the port exits 0");
+    assert!(
+        !base.join("port-nodir").exists() && !base.join("tool-nodir").exists(),
+        "neither implementation created the destination's parent",
+    );
+
+    // The batch path, the pair's own subpath rooting the list.
+    let stream = format!("{rev}\0/a\0").into_bytes();
+    let port_dest = base.join("port-batch-nodir").join("dest");
+    let tool_dest = base.join("tool-batch-nodir").join("dest");
+    let (port, tool) = checkout_batch_pair(
+        &repo,
+        &["-U", "--from-stdin", &option],
+        &stream,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "batch-absent-parent");
+    assert_eq!(port.status.code(), Some(0), "the port exits 0");
+    assert!(
+        !base.join("port-batch-nodir").exists() && !base.join("tool-batch-nodir").exists(),
+        "neither implementation created the destination's parent",
+    );
+
+    // The control: with no list the same destination is refused in both.
+    let port_dest = base.join("port-control").join("dest");
+    let tool_dest = base.join("tool-control").join("dest");
+    let (port, tool) = checkout_pair(&repo, &["-U"], &rev, &port_dest, &tool_dest);
+    assert_eq!(port.status.code(), Some(1), "the port refuses the control");
+    assert_eq!(tool.status.code(), Some(1), "the tool refuses the control");
+}
+
+/// An empty record in the subpath position is an empty subpath value, which the
+/// two implementations read differently.
+///
+/// Carries `checkout/batch-empty-subpath-record`.
+#[test]
+fn checkout_batch_empty_subpath_record_diverges_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-batch-empty-subpath");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_skip_tree(&tree);
+    let (repo, rev) = union_repo(base, RepoMode::BareUser, "repo", &tree);
+    let stream = format!("{rev}\0\0").into_bytes();
+
+    let port_dest = base.join("port-empty-subpath");
+    let tool_dest = base.join("tool-empty-subpath");
+    let (port, tool) = checkout_batch_pair(
+        &repo,
+        &["-U", "--from-stdin"],
+        &stream,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_eq!(
+        tool.status.code(),
+        Some(1),
+        "the tool looks the empty value up and refuses it",
+    );
+    assert_eq!(
+        port.status.code(),
+        Some(0),
+        "the port reads a value carrying no name component as the whole tree: {}",
+        String::from_utf8_lossy(&port.stderr),
+    );
+    assert!(
+        !tool_dest.exists(),
+        "the tool created no destination for the refused value",
+    );
+    assert!(
+        port_dest.join("f1").exists() && port_dest.join("a/b/c/f4").exists(),
+        "the port wrote the whole tree",
+    );
 }

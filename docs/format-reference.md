@@ -1129,11 +1129,9 @@ Archive `.filez` layout (extends "File content object header"):
 
 Object store fanout directories `objects/<xx>/` are created with request mode
 0777 (reduced by the umask); `objects/` itself is 0775. This is the same in
-every mode. Group sharing of a `bare-user-shared` repository is arranged at the
-filesystem level (see the bare-user-shared section): with the repository
-directory setgid and carrying a default group ACL, the OS propagates the group,
-the setgid bit, and the group-write permission to each fanout directory as it is
-created.
+every mode the tool writes. In `bare-user-shared`, the port extension, each
+directory the port creates is forced to 02770 with an `fchmod` after the
+create, independent of the umask (see the bare-user-shared section).
 
 Durability and staging (traced): the tool ingests each object into an unnamed
 temp file (`O_TMPFILE` in the staging directory) and materializes it with
@@ -2848,15 +2846,35 @@ Storage. Identical to `bare-user` in every byte that carries identity:
 
 The single behavioral difference from `bare-user`: the logical mode is never
 applied to the inode. Objects are written with a fixed mode 0644 via explicit
-`fchmod` (never trusting umask). Repository directories -- `objects/xx/`,
-`tmp/`, staging directories -- are created with request mode 0777 reduced by
-the umask. Group sharing of these directories is arranged at the filesystem
-level: the operator sets the repository directory setgid 2775 with a default
-group ACL (`setfacl -d -m g::rwx`) before `init`, and the OS propagates the
-group, the setgid bit, and the group-write permission to every directory
-created underneath, so every group member can read, deduplicate, and write
-objects. `.lock` is written 0664, so every group member can open it for writing
-and take the exclusive lock.
+`fchmod` (never trusting umask).
+
+The port forces the permission bits of every directory and every lock file it
+creates inside the repository, with an `fchmod` after the create, so the
+process file-creation mask does not reach them:
+
+- Directories take 02770: the repository root and each layout directory at
+  `init`, the `objects/<xx>` fanout directories, the `refs/` parent
+  directories, `tmp/`, and each per-transaction staging directory. Every
+  member of the repository group can therefore read, deduplicate, and write
+  objects, and can publish a ref. The setgid bit is part of the forced mode,
+  so the group descends to each directory created below. The sticky bit stays
+  off, because the stale-staging reaper removes staging trees that other
+  members own.
+- `.lock` and each per-transaction staging sibling lock take 0660, so every
+  group member opens them `O_RDWR`, takes the repository lock, and reaps a
+  staging tree whose owner has died.
+- The `state/<commit>.commitpartial` marker takes 0644.
+
+Forcing applies on the arm of a create where the port made the entry. An entry
+that already stands keeps the mode and the group it has, the repository root
+included: the group and the mode of a root the port did not create are the
+caller's responsibility. The port sets no group ownership.
+
+02770 gives no bits to others. A repository whose objects are world-readable at
+0644 relies on the directory to hold the boundary.
+
+The directories and the files under `deltas/` and `delta-indexes/` are outside
+this rule. They keep the umask-reduced modes they take in every other mode.
 
 Mode string. `[core] mode=bare-user-shared`. The distinct string is a safety
 fence: under a literal `bare-user` string the upstream tool would accept the

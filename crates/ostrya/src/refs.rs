@@ -31,11 +31,12 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use ostrya_core::Checksum;
+use ostrya_core::{Checksum, RepoMode};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
+use crate::perm;
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::traverse::read_dir_names;
@@ -148,11 +149,12 @@ impl Transaction {
             return Ok(());
         }
         let (fsync, _) = self.fsync_flags()?;
+        let repo_mode = self.repo().mode();
         let repo_fd = self.repo().repo_fd().try_clone_to_owned()?;
         let refs = refs.to_vec();
         ostrya_rt::unblock(move || {
             for (relpath, checksum) in &refs {
-                write_ref_blocking(repo_fd.as_fd(), relpath, *checksum, fsync)?;
+                write_ref_blocking(repo_fd.as_fd(), relpath, *checksum, fsync, repo_mode)?;
             }
             Ok(())
         })
@@ -328,10 +330,13 @@ impl Repo {
 
     async fn write_ref_relpath(&self, relpath: String, checksum: Option<&Checksum>) -> Result<()> {
         let fsync = self.config().fsync()?;
+        let repo_mode = self.mode();
         let checksum = checksum.copied();
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || write_ref_blocking(repo_fd.as_fd(), &relpath, checksum, fsync))
-            .await
+        ostrya_rt::unblock(move || {
+            write_ref_blocking(repo_fd.as_fd(), &relpath, checksum, fsync, repo_mode)
+        })
+        .await
     }
 
     /// Write one ref as an alias of another: a relative symlink from
@@ -341,11 +346,14 @@ impl Repo {
     /// `[core] fsync`, which for a symlink reaches the directory holding it.
     pub async fn set_ref_alias_immediate(&self, refspec: &str, target: &str) -> Result<()> {
         let fsync = self.config().fsync()?;
+        let repo_mode = self.mode();
         let relpath = refspec_to_relpath(refspec)?;
         let link = relative_link(&relpath, &refspec_to_relpath(target)?);
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || write_alias_blocking(repo_fd.as_fd(), &relpath, &link, fsync))
-            .await
+        ostrya_rt::unblock(move || {
+            write_alias_blocking(repo_fd.as_fd(), &relpath, &link, fsync, repo_mode)
+        })
+        .await
     }
 }
 
@@ -762,11 +770,10 @@ fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> {
 /// the tool's `0644` ref files.
 const REF_FILE_MODE: u32 = 0o644;
 /// The request mode for a created ref parent directory, reduced by the umask
-/// (the tool's ref subdirectories are `0755` under a `022` umask). A
-/// group-shared repository is arranged at the filesystem level, not here: an
-/// operator sets the repository directory `2775` with a default group ACL
-/// (`setfacl -d -m g::rwx`) before `init`, and the OS propagates the setgid bit
-/// and group permissions to every directory created underneath, refs included.
+/// (the tool's ref subdirectories are `0755` under a `022` umask). In a
+/// `bare-user-shared` repository a parent directory the write creates is then
+/// forced to [`perm::SHARED_DIR_MODE`], so every member of the repository group
+/// publishes a ref under it.
 const REF_DIR_MODE: u32 = 0o777;
 
 /// Write or remove one ref file relative to `repo_fd`, atomically.
@@ -784,6 +791,7 @@ fn write_ref_blocking(
     relpath: &str,
     checksum: Option<Checksum>,
     fsync: bool,
+    repo_mode: RepoMode,
 ) -> Result<()> {
     let Some(checksum) = checksum else {
         return match rustix::fs::unlinkat(repo_fd, relpath, AtFlags::empty()) {
@@ -798,7 +806,7 @@ fn write_ref_blocking(
         };
     };
 
-    let created = create_ref_parents(repo_fd, relpath)?;
+    let created = create_ref_parents(repo_fd, relpath, repo_mode)?;
     let content = format!("{}\n", checksum.to_hex());
     let tmp = format!(
         "{relpath}.tmp-{}-{}",
@@ -844,8 +852,9 @@ fn write_alias_blocking(
     relpath: &str,
     link: &str,
     fsync: bool,
+    repo_mode: RepoMode,
 ) -> Result<()> {
-    let created = create_ref_parents(repo_fd, relpath)?;
+    let created = create_ref_parents(repo_fd, relpath, repo_mode)?;
     let tmp = format!(
         "{relpath}.tmp-{}-{}",
         std::process::id(),
@@ -881,7 +890,15 @@ fn sync_ref_parent(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<()> {
 /// but the last is created; existing directories are left in place. Returns the
 /// paths this call created, shallowest first, for
 /// [`sync_created_ref_parents`] to make durable.
-fn create_ref_parents(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<Vec<String>> {
+///
+/// In a `bare-user-shared` repository each directory this call creates is
+/// forced to [`perm::SHARED_DIR_MODE`]. A directory that already stands keeps
+/// the mode and the group it has.
+fn create_ref_parents(
+    repo_fd: BorrowedFd<'_>,
+    relpath: &str,
+    repo_mode: RepoMode,
+) -> Result<Vec<String>> {
     let mut created = Vec::new();
     let mut acc = String::new();
     let mut components: Vec<&str> = relpath.split('/').collect();
@@ -892,7 +909,10 @@ fn create_ref_parents(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<Vec<Stri
         }
         acc.push_str(component);
         match rustix::fs::mkdirat(repo_fd, acc.as_str(), Mode::from_raw_mode(REF_DIR_MODE)) {
-            Ok(()) => created.push(acc.clone()),
+            Ok(()) => {
+                perm::force_created_dir(repo_fd, acc.as_str(), repo_mode)?;
+                created.push(acc.clone());
+            }
             Err(Errno::EXIST) => {}
             Err(e) => return Err(e.into()),
         }

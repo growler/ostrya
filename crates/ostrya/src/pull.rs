@@ -165,6 +165,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::modifier::FilterResult;
+use crate::perm;
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
@@ -177,6 +178,11 @@ mod verify;
 
 /// The chunk size for streaming a content object's payload.
 const READ_CHUNK: usize = 128 * 1024;
+
+/// The mode a `state/<commit>.commitpartial` marker is requested with, reduced
+/// by the process umask. In a `bare-user-shared` repository an `fchmod` after
+/// the create restores [`perm::SHARED_FILE_MODE`].
+pub(crate) const PARTIAL_MARKER_MODE: u32 = 0o644;
 
 /// Flags controlling a pull.
 ///
@@ -796,6 +802,10 @@ impl Repo {
     /// reachable before the marker guarding it is durable. A local pull writes all
     /// of its markers before the first import, and an HTTP pull writes each
     /// commit's marker in the step that fetched that commit.
+    ///
+    /// A marker this call creates in a `bare-user-shared` repository is forced to
+    /// [`perm::SHARED_FILE_MODE`]; a marker that already stands keeps the mode it
+    /// has.
     async fn write_partial_marker(&self, commit: &Checksum) -> Result<()> {
         let path = partial_path(commit);
         let repo = self.clone();
@@ -804,9 +814,13 @@ impl Repo {
                 repo.repo_fd(),
                 path.as_str(),
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o644),
+                Mode::from_raw_mode(PARTIAL_MARKER_MODE),
             ) {
-                Ok(_) | Err(rustix::io::Errno::EXIST) => Ok(()),
+                Ok(fd) => {
+                    perm::force_created_mode(&fd, repo.mode(), perm::SHARED_FILE_MODE)?;
+                    Ok(())
+                }
+                Err(rustix::io::Errno::EXIST) => Ok(()),
                 Err(e) => Err(Error::from(e)),
             }
         })

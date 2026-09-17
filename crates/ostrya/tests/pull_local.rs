@@ -137,8 +137,9 @@ async fn make_repo(base: &Path, name: &str, mode: RepoMode) -> (PathBuf, Repo) {
 }
 
 /// Create a repository of the given mode inside a setgid `2775` directory owned
-/// by group `gid`, which is the arrangement `format-reference.md` prescribes for a
-/// group-shared repository. Every object written there takes `gid`.
+/// by group `gid`. The setgid bit carries `gid` to the repository root and, from
+/// there, to every directory below it, so every object written there takes
+/// `gid`.
 async fn make_repo_in_group(base: &Path, name: &str, mode: RepoMode, gid: u32) -> (PathBuf, Repo) {
     let parent = base.join(format!("{name}-group"));
     std::fs::create_dir(&parent).unwrap();

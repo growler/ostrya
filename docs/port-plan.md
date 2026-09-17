@@ -268,11 +268,13 @@ serving as a composefs backing store. The full format is in
 Summary. Storage is `bare-user` -- raw payload on disk, logical
 uid/gid/mode/xattrs in the `user.ostreemeta` xattr, symlinks as regular
 files -- with one behavioral difference: the logical mode is never applied to
-the inode. Objects carry a fixed mode 0644, and `.lock` is group-writable;
-group sharing of the repository directories is arranged at the filesystem
-level, with the repository directory made setgid 2775 and given a default group
-ACL before `init` so the OS propagates the group to everything created
-underneath. This resolves the
+the inode. Objects carry a fixed mode 0644. The port forces the permission
+bits of every directory and every lock file it creates inside the repository
+with an `fchmod` after the create, so the process file-creation mask does not
+reach them: 02770 for a directory, setgid bit included, and 0660 for `.lock`
+and for a per-transaction staging sibling lock. Every member of the repository
+group therefore writes objects, publishes refs, takes the repository lock, and
+reaps a staging tree whose owner has died. This resolves the
 `bare-user` lockout on restrictively-permissioned files in a shared
 repository (an `/etc/shadow` object stored 0600 by one user is unreadable to
 the next). Object identity, and therefore dirtree and commit hashes, are
@@ -292,11 +294,16 @@ Design thread across phases:
   `[core] mode` on create; reading is served by the `bare-user` loader, which
   never consults inode permissions.
 - Phase 7: the `bare-user` writer with the inode mode application skipped:
-  objects `fchmod` 0644 (never trusting umask), repository directories
-  created 0777 reduced by the umask (a group-shared repository relies on a
-  setgid parent and default group ACL set by the operator before `init`),
-  `.lock` written 0664; size generation is archive-only, so a request in this
-  mode is a no-op.
+  objects `fchmod` 0644 (never trusting umask), each directory the port
+  creates `fchmod` 02770 -- the repository root and the layout directories,
+  the `objects/<xx>` fanout directories, the `refs/` parent directories,
+  `tmp/`, and each staging directory -- `.lock` and each staging sibling lock
+  `fchmod` 0660, and the `state/<commit>.commitpartial` marker `fchmod` 0644.
+  Forcing runs on the arm of a create where the port made the entry, so an
+  entry another member of the group owns keeps the mode it has, and the group
+  and the mode of a repository root the port did not create are the caller's
+  responsibility. `deltas/` and `delta-indexes/` are outside the rule. Size
+  generation is archive-only, so a request in this mode is a no-op.
 - Phase 8: copy-based checkout (reflink where the filesystem supports it)
   applying the `user.ostreemeta` mode; hardlink checkout refused.
 - Phase 9: composefs export builds the EROFS metadata from `user.ostreemeta`
@@ -762,9 +769,8 @@ Definition:
 - Object publication in `Transaction::commit()`, the object half of the
   durability contract: `syncfs` on the repo fd, rename staged objects
   into `objects/xx/` (fanout directories created on demand at 0777 reduced by
-  the umask; in a group-shared repository the group and setgid bit are
-  inherited from the operator-configured parent), fsync each
-  touched `objects/xx/` and `objects/`. `fsync=false` turns every sync
+  the umask, and forced to 02770 in a `bare-user-shared` repository), fsync
+  each touched `objects/xx/` and `objects/`. `fsync=false` turns every sync
   into a no-op; `per-object-fsync` follows the tool's recovered pattern.
   `commit(self)` returns `TransactionStats` (the devino counter stays 0
   until 7c).
@@ -6147,10 +6153,11 @@ Resolved:
 5. Development mode `bare-user-shared` (Phase 6a; supersedes the
    `bare-user-split-attrs` object split, removed before its write path was
    built): `bare-user` storage with the logical mode never applied to the
-   inode -- fixed 0644 objects and a group-writable lock, with directory group
-   sharing arranged at the filesystem level (an operator-set setgid parent and
-   default group ACL) -- so a group-shared repository on a multi-user build
-   host has no lockout on restrictively-permissioned files. Object identity
+   inode -- fixed 0644 objects, directories forced to 02770 with the setgid
+   bit, and lock files forced to 0660, each with an `fchmod` after the create
+   so the process file-creation mask does not reach them -- so a group-shared
+   repository on a multi-user build host has no lockout on
+   restrictively-permissioned files. Object identity
    is preserved for development-to-production portability, `ostree.sizes`
    never appears (size generation is archive-only in the tool, a no-op
    elsewhere), and the mode serves as the intended composefs backing store.

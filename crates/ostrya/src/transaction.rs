@@ -915,6 +915,7 @@ impl Transaction {
             return Ok(());
         }
         let (fsync, _) = self.fsync_flags()?;
+        let repo_mode = self.repo.mode();
         let repo_fd = self.repo.repo_fd().try_clone_to_owned()?;
         let objects_fd = self.repo.objects_fd().try_clone_to_owned()?;
         let staging_fd = self.staging_fd().try_clone_to_owned()?;
@@ -925,6 +926,7 @@ impl Transaction {
                 staging_fd.as_fd(),
                 &objects,
                 fsync,
+                repo_mode,
             )
         })
         .await

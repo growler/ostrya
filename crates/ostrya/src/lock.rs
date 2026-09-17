@@ -26,15 +26,19 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
+use ostrya_core::RepoMode;
 use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
+use crate::perm;
 
 /// The repository lock file, relative to the repository root.
 const LOCK_FILE: &str = ".lock";
 
-/// The mode a created `.lock` file is given, matching the tool.
+/// The mode a created `.lock` file is requested with, matching the tool. The
+/// process umask reduces it. In a `bare-user-shared` repository an `fchmod`
+/// after the create restores [`perm::SHARED_LOCK_MODE`].
 const LOCK_MODE: u32 = 0o660;
 
 /// The delay between lock-acquisition attempts while contended.
@@ -97,7 +101,16 @@ impl RepoLock {
     /// Return the [`RepoLock`] for the repository rooted at `repo_fd`, creating
     /// `<repo>/.lock` and registering it on first use. Runs synchronous
     /// filesystem calls and is meant to be offloaded to the blocking pool.
-    pub(crate) fn get_or_create(repo_fd: BorrowedFd<'_>) -> std::io::Result<Arc<RepoLock>> {
+    ///
+    /// A `.lock` this call creates in a `bare-user-shared` repository is forced
+    /// to [`perm::SHARED_LOCK_MODE`], so every member of the repository group
+    /// opens it `O_RDWR` and takes the lock. The create attempt therefore
+    /// carries `O_EXCL`, which separates the arm that made the file from the
+    /// arm that found one: a `.lock` another member owns keeps the mode it has.
+    pub(crate) fn get_or_create(
+        repo_fd: BorrowedFd<'_>,
+        repo_mode: RepoMode,
+    ) -> std::io::Result<Arc<RepoLock>> {
         let mut reg = registry().lock().unwrap();
 
         // Probe an existing entry without opening a second descriptor: opening
@@ -109,12 +122,24 @@ impl RepoLock {
             }
         }
 
-        let fd = rustix::fs::openat(
+        let fd = match rustix::fs::openat(
             repo_fd,
             LOCK_FILE,
-            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC,
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
             Mode::from_raw_mode(LOCK_MODE),
-        )?;
+        ) {
+            Ok(fd) => {
+                perm::force_created_mode(&fd, repo_mode, perm::SHARED_LOCK_MODE)?;
+                fd
+            }
+            Err(Errno::EXIST) => rustix::fs::openat(
+                repo_fd,
+                LOCK_FILE,
+                OFlags::RDWR | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?,
+            Err(e) => return Err(e.into()),
+        };
         let stat = rustix::fs::fstat(&fd)?;
         let key = (stat.st_dev, stat.st_ino);
 
@@ -317,7 +342,7 @@ mod tests {
     #[test]
     fn shared_holders_share_one_descriptor_lock() {
         let scratch = Scratch::new("shared");
-        let lock = RepoLock::get_or_create(scratch.repo_fd()).unwrap();
+        let lock = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
 
         assert!(matches!(
             lock.try_acquire(LockKind::Shared).unwrap(),
@@ -338,7 +363,7 @@ mod tests {
     #[test]
     fn exclusive_upgrades_and_downgrades_around_a_shared_holder() {
         let scratch = Scratch::new("upgrade");
-        let lock = RepoLock::get_or_create(scratch.repo_fd()).unwrap();
+        let lock = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
 
         lock.try_acquire(LockKind::Shared).unwrap();
         assert_eq!(os_lock(&lock), OsLock::Shared);
@@ -360,8 +385,8 @@ mod tests {
     #[test]
     fn one_repo_lock_is_shared_across_handles_and_reclaimed() {
         let scratch = Scratch::new("registry");
-        let a = RepoLock::get_or_create(scratch.repo_fd()).unwrap();
-        let b = RepoLock::get_or_create(scratch.repo_fd()).unwrap();
+        let a = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+        let b = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
         assert!(Arc::ptr_eq(&a, &b), "same repo yields one shared lock");
         let key = a.key;
 

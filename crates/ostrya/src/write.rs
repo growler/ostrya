@@ -41,6 +41,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Tristate;
 use crate::error::{Error, Result};
+use crate::perm;
 use crate::transaction::Transaction;
 
 /// The regular-file mode bit.
@@ -1170,6 +1171,7 @@ pub(crate) fn publish_blocking(
     staging_fd: BorrowedFd<'_>,
     objects: &[(String, String)],
     fsync: bool,
+    repo_mode: RepoMode,
 ) -> Result<()> {
     if fsync {
         rustix::fs::syncfs(repo_fd)?;
@@ -1177,7 +1179,7 @@ pub(crate) fn publish_blocking(
     let mut fanouts: Vec<String> = Vec::new();
     for (staging_name, dest) in objects {
         let fanout = &dest[..2];
-        ensure_fanout(objects_fd, fanout)?;
+        ensure_fanout(objects_fd, fanout, repo_mode)?;
         rustix::fs::renameat(staging_fd, staging_name.as_str(), objects_fd, dest.as_str())?;
         if !fanouts.iter().any(|f| f == fanout) {
             fanouts.push(fanout.to_owned());
@@ -1199,14 +1201,15 @@ pub(crate) fn publish_blocking(
 }
 
 /// Create a fanout directory `objects/<xx>/` on demand, ignoring a race that
-/// already created it. The request mode is `0777` reduced by the umask. A
-/// group-shared repository is arranged at the filesystem level, not here: an
-/// operator sets the repository directory setgid `2775` with a default group
-/// ACL (`setfacl -d -m g::rwx`) before `init`, and the OS propagates the group,
-/// setgid bit, and permissions to every directory created underneath.
-fn ensure_fanout(objects_fd: BorrowedFd<'_>, fanout: &str) -> Result<()> {
+/// already created it. The request mode is `0777` reduced by the umask. In a
+/// `bare-user-shared` repository a fanout this call creates is then forced to
+/// [`perm::SHARED_DIR_MODE`], so every member of the repository group adds an
+/// object under it. A fanout that already stands keeps the mode and the group
+/// it has.
+fn ensure_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, repo_mode: RepoMode) -> Result<()> {
     match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(0o777)) {
-        Ok(()) | Err(rustix::io::Errno::EXIST) => Ok(()),
+        Ok(()) => Ok(perm::force_created_dir(objects_fd, fanout, repo_mode)?),
+        Err(rustix::io::Errno::EXIST) => Ok(()),
         Err(e) => Err(e.into()),
     }
 }

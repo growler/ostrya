@@ -17,6 +17,12 @@
 //! `extensions` directories (mode `0775`, reduced by the process umask, the
 //! same as the tool). Creation is idempotent: an existing `config` is left
 //! untouched, matching the tool's `init`.
+//!
+//! In a `bare-user-shared` repository each directory this module creates is
+//! forced to `02770` after the create, independent of the umask (see
+//! [`crate::perm`]). A directory that already stands keeps the mode and the
+//! group it has, the repository root included: the group and the mode of a root
+//! ostrya did not create are the caller's responsibility.
 
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -31,6 +37,7 @@ use rustix::io::Errno;
 use crate::config::{MinFreeSpace, RepoConfig};
 use crate::error::{Error, Result};
 use crate::lock::{self, LockGuard, LockKind, RepoLock};
+use crate::perm;
 use crate::staging::StagingDir;
 use crate::transaction::Transaction;
 
@@ -117,7 +124,7 @@ impl RepoInner {
         if let Some(existing) = slot.as_ref() {
             return Ok(existing.clone());
         }
-        let lock = RepoLock::get_or_create(self.repo_fd.as_fd())?;
+        let lock = RepoLock::get_or_create(self.repo_fd.as_fd(), self.config.mode())?;
         *slot = Some(lock.clone());
         Ok(lock)
     }
@@ -226,9 +233,11 @@ impl Repo {
         };
 
         let repo = self.clone();
-        let staging =
-            ostrya_rt::unblock(move || StagingDir::create(repo.inner.repo_fd.as_fd(), expiry_secs))
-                .await?;
+        let staging = ostrya_rt::unblock(move || {
+            let mode = repo.inner.config.mode();
+            StagingDir::create(repo.inner.repo_fd.as_fd(), expiry_secs, mode)
+        })
+        .await?;
 
         // The initial free-space budget: the bytes available above the
         // configured reserve. Each staged object debits it.
@@ -294,10 +303,10 @@ fn create_materials<Fd: AsFd>(
     path: &Path,
     opts: &CreateOptions,
 ) -> std::io::Result<Materials> {
-    mkdir_idempotent(&dir, path)?;
+    mkdir_idempotent(&dir, path, opts.mode)?;
     let repo_fd = open_dir(&dir, path)?;
     for sub in LAYOUT_DIRS {
-        mkdir_idempotent(&repo_fd, Path::new(sub))?;
+        mkdir_idempotent(&repo_fd, Path::new(sub), opts.mode)?;
     }
     write_initial_config(&repo_fd, opts)?;
     materials_from_repo(repo_fd)
@@ -333,10 +342,14 @@ fn read_file<Fd: AsFd>(dir: Fd, path: &str) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Create a directory, treating an existing entry as success.
-fn mkdir_idempotent<Fd: AsFd>(dir: Fd, path: &Path) -> std::io::Result<()> {
-    match rustix::fs::mkdirat(dir, path, Mode::from_raw_mode(DIR_MODE)) {
-        Ok(()) | Err(Errno::EXIST) => Ok(()),
+/// Create a directory, treating an existing entry as success. A directory this
+/// call creates in a `bare-user-shared` repository is forced to
+/// [`perm::SHARED_DIR_MODE`]. An entry that already stands keeps the mode and
+/// the group it has.
+fn mkdir_idempotent<Fd: AsFd>(dir: Fd, path: &Path, mode: RepoMode) -> std::io::Result<()> {
+    match rustix::fs::mkdirat(&dir, path, Mode::from_raw_mode(DIR_MODE)) {
+        Ok(()) => perm::force_created_dir(&dir, path, mode),
+        Err(Errno::EXIST) => Ok(()),
         Err(e) => Err(e.into()),
     }
 }

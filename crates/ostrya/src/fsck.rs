@@ -23,10 +23,12 @@ use std::os::fd::BorrowedFd;
 use std::pin::Pin;
 
 use futures_lite::AsyncReadExt;
-use ostrya_core::{Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType};
+use ostrya_core::{Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType, RepoMode};
 use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::error::{Error, Result};
+use crate::perm;
 use crate::repo::Repo;
 
 /// The single byte the tool writes into a `.commitpartial` marker when fsck
@@ -333,7 +335,7 @@ impl Repo {
     async fn mark_commit_partial(&self, commit: &Checksum) -> Result<()> {
         let path = crate::pull::partial_path(commit);
         let repo = self.clone();
-        ostrya_rt::unblock(move || write_partial_marker(repo.repo_fd(), &path)).await
+        ostrya_rt::unblock(move || write_partial_marker(repo.repo_fd(), &path, repo.mode())).await
     }
 }
 
@@ -387,13 +389,34 @@ fn fsck_walk_subtree<'a>(repo: &'a Repo, dt: Checksum, ctx: &'a mut Ctx) -> Subt
 
 /// Create or truncate a `.commitpartial` marker holding the single state byte
 /// the tool writes.
-fn write_partial_marker(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
-    let fd = rustix::fs::openat(
+///
+/// A marker this call creates in a `bare-user-shared` repository is forced to
+/// [`perm::SHARED_FILE_MODE`]. The create attempt therefore carries `O_EXCL`,
+/// which separates the arm that made the file from the arm that found one: a
+/// marker another member of the repository group owns keeps the mode it has and
+/// is truncated in place. The second open carries `O_CREAT` as well, because a
+/// concurrent pull or prune removes the marker of a commit it completes or
+/// deletes, and the name is free again by the time this call reaches it.
+fn write_partial_marker(repo_fd: BorrowedFd<'_>, path: &str, repo_mode: RepoMode) -> Result<()> {
+    let mode = Mode::from_raw_mode(crate::pull::PARTIAL_MARKER_MODE);
+    let fd = match rustix::fs::openat(
         repo_fd,
         path,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC,
-        Mode::from_raw_mode(0o644),
-    )?;
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        mode,
+    ) {
+        Ok(fd) => {
+            perm::force_created_mode(&fd, repo_mode, perm::SHARED_FILE_MODE)?;
+            fd
+        }
+        Err(Errno::EXIST) => rustix::fs::openat(
+            repo_fd,
+            path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC,
+            mode,
+        )?,
+        Err(e) => return Err(e.into()),
+    };
     std::fs::File::from(fd)
         .write_all(&[PARTIAL_STATE_BYTE])
         .map_err(Error::Io)

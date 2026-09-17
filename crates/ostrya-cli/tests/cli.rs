@@ -23394,3 +23394,194 @@ fn checkout_materialization_switches_refuse_composefs_in_both() {
         );
     }
 }
+
+// --- bare-user-shared permission bits ----------------------------------------
+
+/// The layout entries whose modes a `bare-user-shared` repository forces, with
+/// `.lock` last. `refs/heads/test` is the ref parent the `test/umask` branch
+/// creates, which the ref write path makes and not `init`.
+const SHARED_LAYOUT: &[&str] = &[
+    "",
+    "objects",
+    "tmp",
+    "tmp/cache",
+    "refs",
+    "refs/heads",
+    "refs/heads/test",
+    "refs/remotes",
+    "refs/mirrors",
+    "state",
+    "extensions",
+    ".lock",
+];
+
+/// Run the `ostrya` binary under an explicit file-creation mask.
+///
+/// `umask` is global to a process, and the library tests run on parallel
+/// threads, so the mask is set in the child alone: a shell sets it and then
+/// replaces itself with the binary. `Command::pre_exec` would do the same in
+/// one process, and this crate forbids unsafe code.
+fn ostrya_with_umask(mask: &str, args: &[&str]) -> Run {
+    let mut script = format!("umask {mask}; exec '{}'", env!("CARGO_BIN_EXE_ostrya"));
+    for arg in args {
+        assert!(
+            !arg.contains('\''),
+            "the shell wrapper takes no quoted argument: {arg}"
+        );
+        script.push_str(" '");
+        script.push_str(arg);
+        script.push('\'');
+    }
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn sh");
+    Run {
+        status: out.status,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    }
+}
+
+/// The permission bits of each [`SHARED_LAYOUT`] entry of `repo`, the setgid
+/// bit included.
+fn layout_modes(repo: &Path) -> Vec<(&'static str, u32)> {
+    SHARED_LAYOUT
+        .iter()
+        .map(|name| {
+            let path = if name.is_empty() {
+                repo.to_owned()
+            } else {
+                repo.join(name)
+            };
+            let mode = std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o7777;
+            (*name, mode)
+        })
+        .collect()
+}
+
+/// Initialize a repository of `mode` at `base/tag` under the mask `mask`, then
+/// commit the fixture tree into it so the repository lock file is created.
+fn init_and_commit_with_umask(base: &Path, tag: &str, repo_mode: &str, mask: &str) -> PathBuf {
+    let repo = base.join(tag);
+    let src = base.join("src");
+    ostrya_with_umask(
+        mask,
+        &[
+            "init",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--mode",
+            repo_mode,
+        ],
+    )
+    .ok();
+    ostrya_with_umask(
+        mask,
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            "test/umask",
+            "-s",
+            "umask",
+            "--canonical-permissions",
+            src.to_str().unwrap(),
+        ],
+    )
+    .ok();
+    repo
+}
+
+/// A `bare-user-shared` repository takes the same layout and lock modes under
+/// any process file-creation mask, and a `bare-user` repository under the same
+/// mask keeps the masked result.
+#[test]
+fn shared_repo_modes_do_not_follow_the_umask() {
+    let tmp = TmpDir::new("umask");
+    let base = tmp.path();
+    build_fixture_source(base);
+
+    let strict = init_and_commit_with_umask(base, "shared-077", "bare-user-shared", "077");
+    let lax = init_and_commit_with_umask(base, "shared-022", "bare-user-shared", "022");
+    let strict_modes = layout_modes(&strict);
+    assert_eq!(
+        strict_modes,
+        layout_modes(&lax),
+        "the same modes under either mask"
+    );
+    for (name, mode) in &strict_modes {
+        let want = if *name == ".lock" { 0o660 } else { 0o2770 };
+        assert_eq!(*mode, want, "the {name} entry");
+    }
+
+    // The control: the same mask over a bare-user repository reaches every
+    // entry, which is what scopes the forcing to the one repository mode.
+    let control = init_and_commit_with_umask(base, "bare-user-077", "bare-user", "077");
+    for (name, mode) in layout_modes(&control) {
+        let want = if name == ".lock" { 0o600 } else { 0o700 };
+        assert_eq!(mode, want, "the {name} entry of the bare-user control");
+    }
+}
+
+/// The sole `state/<commit>.commitpartial` marker of `repo`.
+fn partial_marker(repo: &Path) -> PathBuf {
+    let state = repo.join("state");
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&state)
+        .expect("read state/")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "commitpartial")
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one marker in {}", state.display());
+    found.pop().expect("the marker")
+}
+
+/// The `state/<commit>.commitpartial` marker a `bare-user-shared` repository
+/// writes takes 0644 under any process file-creation mask. The control is the
+/// same pull into a `bare-user` repository, where the mask reaches the marker.
+#[test]
+fn shared_repo_partial_marker_mode_does_not_follow_the_umask() {
+    let tmp = TmpDir::new("umask-marker");
+    let base = tmp.path();
+    build_fixture_source(base);
+
+    for (repo_mode, want) in [("bare-user-shared", 0o644_u32), ("bare-user", 0o600)] {
+        let src = init_and_commit_with_umask(base, &format!("{repo_mode}-src"), repo_mode, "022");
+        let dst = base.join(format!("{repo_mode}-dst"));
+        let dst_arg = dst.to_str().unwrap();
+        ostrya_with_umask("077", &["init", "--repo", dst_arg, "--mode", repo_mode]).ok();
+        ostrya_with_umask(
+            "077",
+            &[
+                "pull-local",
+                "--repo",
+                dst_arg,
+                "--commit-metadata-only",
+                src.to_str().unwrap(),
+                "test/umask",
+            ],
+        )
+        .ok();
+
+        let marker = partial_marker(&dst);
+        let mode = std::fs::metadata(&marker)
+            .expect("stat the marker")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, want, "the {repo_mode} marker");
+    }
+}

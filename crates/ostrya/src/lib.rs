@@ -203,6 +203,7 @@ pub mod modifier;
 pub mod mtree;
 mod object;
 mod overlay;
+mod perm;
 pub mod prune;
 pub mod pull;
 pub mod read;

@@ -31,13 +31,21 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Mutex, OnceLock};
 
+use ostrya_core::RepoMode;
 use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
-/// The mode staging directories are created with, matching the tool.
+use crate::perm;
+
+/// The mode staging directories are requested with, matching the tool. The
+/// process umask reduces it. In a `bare-user-shared` repository an `fchmod`
+/// after the create restores [`perm::SHARED_DIR_MODE`].
 const STAGING_DIR_MODE: u32 = 0o775;
 
-/// The mode a staging lock file is created with, matching the tool.
+/// The mode a staging lock file is requested with, matching the tool. In a
+/// `bare-user-shared` repository an `fchmod` after the create raises it to
+/// [`perm::SHARED_LOCK_MODE`], so the reaper of another member of the
+/// repository group opens the file `O_RDWR` and tests the owner.
 const STAGING_LOCK_MODE: u32 = 0o600;
 
 /// The character set of the random staging-name suffix (mkdtemp's alphabet).
@@ -100,9 +108,14 @@ impl StagingDir {
     /// Create a fresh staging directory under the repository rooted at
     /// `repo_fd`, reaping stale leftovers first. Runs synchronous filesystem
     /// calls and is meant to be offloaded to the blocking pool.
-    pub(crate) fn create(repo_fd: BorrowedFd<'_>, expiry_secs: i64) -> io::Result<StagingDir> {
+    pub(crate) fn create(
+        repo_fd: BorrowedFd<'_>,
+        expiry_secs: i64,
+        repo_mode: RepoMode,
+    ) -> io::Result<StagingDir> {
         match rustix::fs::mkdirat(repo_fd, "tmp", Mode::from_raw_mode(STAGING_DIR_MODE)) {
-            Ok(()) | Err(Errno::EXIST) => {}
+            Ok(()) => perm::force_created_dir(repo_fd, "tmp", repo_mode)?,
+            Err(Errno::EXIST) => {}
             Err(e) => return Err(e.into()),
         }
         let tmp_fd = rustix::fs::openat(
@@ -117,10 +130,10 @@ impl StagingDir {
         let prefix = format!("staging-{}-", boot_id()?);
         // `mkdtemp` claims the name in `active` before the directory exists, so
         // a concurrent same-process reaper never sees it unclaimed.
-        let (name, dir_fd) = mkdtemp(tmp_fd.as_fd(), &prefix)?;
+        let (name, dir_fd) = mkdtemp(tmp_fd.as_fd(), &prefix, repo_mode)?;
 
         let lock_name = format!("{name}-lock");
-        let lock_fd = match acquire_staging_lock(tmp_fd.as_fd(), &lock_name) {
+        let lock_fd = match acquire_staging_lock(tmp_fd.as_fd(), &lock_name, repo_mode) {
             Ok(fd) => fd,
             Err(e) => {
                 active().lock().unwrap().remove(&name);
@@ -158,16 +171,53 @@ impl Drop for StagingDir {
 
 /// Create the sibling lock file and hold it exclusively. A fresh lock file is
 /// uncontended, so the attempt does not block.
-fn acquire_staging_lock(tmp_fd: BorrowedFd<'_>, lock_name: &str) -> io::Result<OwnedFd> {
-    let lock_fd = rustix::fs::openat(
+///
+/// The name is the sibling of the directory [`mkdtemp`] has just created, so
+/// this open normally makes the file. A removal unlinks a staging directory
+/// before its sibling lock, so a process that ends between the two leaves a
+/// lock file whose directory is gone, and a later staging directory that draws
+/// the same name finds that file. `O_EXCL` separates the two cases: a lock file
+/// this call makes is forced to [`perm::SHARED_LOCK_MODE`] in a
+/// `bare-user-shared` repository, and a file that already stands keeps the mode
+/// and the group it has, which another member of the group may own. The second
+/// open carries `O_CREAT`, because a reaper in another process removes such a
+/// leftover and the name is free again by the time this call reaches it.
+///
+/// The second open never reaches a lock file this process holds: [`mkdtemp`]
+/// skips a name in `active` and its `mkdirat` fails on a directory that stands,
+/// so the name belongs to no live [`StagingDir`] of this process.
+fn acquire_staging_lock(
+    tmp_fd: BorrowedFd<'_>,
+    lock_name: &str,
+    repo_mode: RepoMode,
+) -> io::Result<OwnedFd> {
+    let lock_fd = match rustix::fs::openat(
         tmp_fd,
         lock_name,
-        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::from_raw_mode(STAGING_LOCK_MODE),
-    )?;
+    ) {
+        Ok(fd) => {
+            if let Err(e) = perm::force_created_mode(&fd, repo_mode, perm::SHARED_LOCK_MODE) {
+                // The open created the lock file; remove it so a failed force
+                // leaves no orphaned sibling behind.
+                drop(fd);
+                let _ = rustix::fs::unlinkat(tmp_fd, lock_name, AtFlags::empty());
+                return Err(e);
+            }
+            fd
+        }
+        Err(Errno::EXIST) => rustix::fs::openat(
+            tmp_fd,
+            lock_name,
+            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::from_raw_mode(STAGING_LOCK_MODE),
+        )?,
+        Err(e) => return Err(e.into()),
+    };
     if let Err(e) = rustix::fs::fcntl_lock(&lock_fd, FlockOperation::NonBlockingLockExclusive) {
-        // The open created the lock file; remove it so a failed acquire leaves
-        // no orphaned sibling behind.
+        // The caller removes the staging directory; remove its sibling lock too
+        // so a failed acquire leaves no orphan behind.
         let _ = rustix::fs::unlinkat(tmp_fd, lock_name, AtFlags::empty());
         return Err(e.into());
     }
@@ -199,7 +249,11 @@ fn boot_id() -> io::Result<&'static str> {
 /// takes it without conflict and removes the directory. The claim carries its
 /// own duplicate of `tmp_fd`, which is what [`reap_owned`] removes the
 /// directory through.
-fn mkdtemp(tmp_fd: BorrowedFd<'_>, prefix: &str) -> io::Result<(String, OwnedFd)> {
+fn mkdtemp(
+    tmp_fd: BorrowedFd<'_>,
+    prefix: &str,
+    repo_mode: RepoMode,
+) -> io::Result<(String, OwnedFd)> {
     for _ in 0..MKDTEMP_ATTEMPTS {
         let name = format!("{prefix}{}", random_suffix());
         let claim = tmp_fd.try_clone_to_owned()?;
@@ -220,7 +274,15 @@ fn mkdtemp(tmp_fd: BorrowedFd<'_>, prefix: &str) -> io::Result<(String, OwnedFd)
                     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                     Mode::empty(),
                 ) {
-                    Ok(dir_fd) => return Ok((name, dir_fd)),
+                    Ok(dir_fd) => {
+                        if let Err(e) =
+                            perm::force_created_mode(&dir_fd, repo_mode, perm::SHARED_DIR_MODE)
+                        {
+                            active().lock().unwrap().remove(&name);
+                            return Err(e);
+                        }
+                        return Ok((name, dir_fd));
+                    }
                     Err(e) => {
                         active().lock().unwrap().remove(&name);
                         return Err(e.into());

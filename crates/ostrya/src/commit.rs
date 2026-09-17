@@ -40,6 +40,7 @@ use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::file::FileKind;
+use crate::perm;
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
@@ -305,10 +306,11 @@ impl Repo {
         appends: Vec<(String, Vec<u8>)>,
         fsync: bool,
     ) -> Result<()> {
-        let dest = loose_path(checksum, ObjectType::CommitMeta, self.mode());
+        let repo_mode = self.mode();
+        let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
         let objects_fd = self.objects_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || {
-            edit_detached_blocking(objects_fd.as_fd(), &dest, fsync, |read| {
+            edit_detached_blocking(objects_fd.as_fd(), &dest, fsync, repo_mode, |read| {
                 let mut dict = match replace {
                     Some(dict) => dict,
                     None => read()?.unwrap_or_else(|| Value::Array(Vec::new())),
@@ -340,10 +342,11 @@ impl Repo {
         mut remove: impl FnMut(&[u8], &[u8]) -> bool + Send + 'static,
         fsync: bool,
     ) -> Result<usize> {
-        let dest = loose_path(checksum, ObjectType::CommitMeta, self.mode());
+        let repo_mode = self.mode();
+        let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
         let objects_fd = self.objects_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || {
-            edit_detached_blocking(objects_fd.as_fd(), &dest, fsync, |read| {
+            edit_detached_blocking(objects_fd.as_fd(), &dest, fsync, repo_mode, |read| {
                 let Some(mut dict) = read()? else {
                     return Ok((DetachedWrite::Keep, 0));
                 };
@@ -376,11 +379,12 @@ impl Repo {
         checksum: &Checksum,
         bytes: Vec<u8>,
     ) -> Result<()> {
-        let dest = loose_path(checksum, ObjectType::CommitMeta, self.mode());
+        let repo_mode = self.mode();
+        let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
         let fsync = self.config().fsync()?;
         let objects_fd = self.objects_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || {
-            write_detached_blocking(objects_fd.as_fd(), &dest, &bytes, fsync)
+            write_detached_blocking(objects_fd.as_fd(), &dest, &bytes, fsync, repo_mode)
         })
         .await
     }
@@ -449,6 +453,7 @@ fn edit_detached_blocking<T>(
     objects_fd: BorrowedFd<'_>,
     dest: &str,
     fsync: bool,
+    repo_mode: RepoMode,
     edit: impl FnOnce(&dyn Fn() -> Result<Option<Value>>) -> Result<(DetachedWrite, T)>,
 ) -> Result<T> {
     let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
@@ -457,9 +462,9 @@ fn edit_detached_blocking<T>(
     match write {
         DetachedWrite::Dict(dict) => {
             let bytes = to_bytes(&ty, &dict).map_err(ostrya_core::Error::from)?;
-            write_detached_blocking(objects_fd, dest, &bytes, fsync)?;
+            write_detached_blocking(objects_fd, dest, &bytes, fsync, repo_mode)?;
         }
-        DetachedWrite::Marker => write_detached_blocking(objects_fd, dest, &[], fsync)?,
+        DetachedWrite::Marker => write_detached_blocking(objects_fd, dest, &[], fsync, repo_mode)?,
         DetachedWrite::Keep => {}
     }
     Ok(value)
@@ -487,23 +492,28 @@ fn read_detached_blocking(
 }
 
 /// Write detached-metadata bytes to the `.commitmeta` loose path atomically:
-/// the fanout directory is created on demand (`0777` reduced by the umask), the
-/// bytes go to a temp file (`fchmod` 0644, `fdatasync` when fsync is on), and
-/// the temp is renamed over the target. When fsync is on, the fanout directory
-/// is fsynced after the rename so the new name survives a crash, and `objects/`
-/// is fsynced too when the fanout directory was newly created, matching the
-/// durability the object publication path honors.
+/// the fanout directory is created on demand (`0777` reduced by the umask, and
+/// forced to [`perm::SHARED_DIR_MODE`] where this call creates it in a
+/// `bare-user-shared` repository), the bytes go to a temp file (`fchmod` 0644,
+/// `fdatasync` when fsync is on), and the temp is renamed over the target. When
+/// fsync is on, the fanout directory is fsynced after the rename so the new name
+/// survives a crash, and `objects/` is fsynced too when the fanout directory was
+/// newly created, matching the durability the object publication path honors.
 fn write_detached_blocking(
     objects_fd: BorrowedFd<'_>,
     dest: &str,
     bytes: &[u8],
     fsync: bool,
+    repo_mode: RepoMode,
 ) -> Result<()> {
     use std::io::Write;
 
     let fanout = &dest[..2];
     let fanout_created = match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(0o777)) {
-        Ok(()) => true,
+        Ok(()) => {
+            perm::force_created_dir(objects_fd, fanout, repo_mode)?;
+            true
+        }
         Err(Errno::EXIST) => false,
         Err(e) => return Err(e.into()),
     };

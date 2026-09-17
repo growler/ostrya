@@ -1010,10 +1010,10 @@ file and commits it. There the plain commit is the outlier and the flagged one i
 the faithful result; `--no-xattrs` on the plain walk reaches the flagged
 checksum. The two implementations agree on all four commits over that variant, so
 what parts is the flagged commit from the unflagged one and not one
-implementation from the other. Three of the fourteen variants are checkouts the
-tool refuses and the port performs, which is a `checkout` difference and not one
-of these options'; the eleven both perform were compared, and the two
-implementations agree on every one.
+implementation from the other. Three of the fourteen variants are checkouts
+both implementations refuse under `-H`, which the "checkout" paragraph below
+states; the eleven both perform were compared, and the two implementations
+agree on every one.
 
 Two wordings the port reproduces are the tool's own and read as defects. The
 first is the editor-failure line, which carries no separator between the closing
@@ -1267,9 +1267,9 @@ stand.
 `--composefs`, `--composefs-noverity`, and, since Phase 17c, `-U/--user-mode`
 and `--subpath=PATH`, and, since Phase 17f, `--union`, `--union-add`,
 `--union-identical`, `--allow-noent`, `--whiteouts`,
-`--process-passthrough-whiteouts`, `--from-stdin`, `--from-file=FILE`, and
-`--skip-list=FILE`. Missing: `--disable-cache`, `--fsync=POLICY`,
-`-M/--bareuseronly-dirs`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
+`--process-passthrough-whiteouts`, `--from-stdin`, `--from-file=FILE`,
+`--skip-list=FILE`, `-M/--bareuseronly-dirs`, and `--disable-cache`. Missing:
+`--fsync=POLICY`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
 
 The destination trees `-U` and `--subpath` produce agree with the tool's file for
 file, in `archive`, `bare-user`, and `bare` (`../format-reference.md`,
@@ -1291,6 +1291,63 @@ and `--union-identical requires --require-hardlinks`. What `--union-identical`
 calls identical is stated in `../format-reference.md`, "Checkout", and held
 against the tool case by case in
 `ostrya_cli::cli::checkout_union_identical_identity_matches_the_tool`.
+
+`-H/--require-hardlinks` refuses rather than falling back to a copy, and the
+refusal is raised at the entry the checkout would have to copy. The two
+implementations agree on the whole table: a directory never refuses, a
+zero-length regular file never refuses, a regular file of non-zero length
+refuses wherever the repository mode and the checkout mode in force give a copy
+-- `archive` under either mode, `bare` under `-U`, and `bare-user` without `-U`
+-- and a symlink refuses in `archive` under either mode and in `bare` under
+`-U`. A commit holding none of the refusing shapes is written whole at exit 0 in
+every mode, an empty commit and a directory-only commit among them. The refusal
+stands ahead of the destination disposition, so an entry `--union-add` would
+keep and an entry `--union-identical` would call identical are refused all the
+same; it stands behind the whiteout verdict, so a marker that removes a name and
+a marker that writes a character device are both taken. A destination directory
+on another filesystem than the repository is refused before any entry of it is
+written, whatever the subtree holds; the destination root reaches the refusal
+and so does every directory below it, fresh or reused. The tables are stated in
+`../format-reference.md`,
+"Checkout", and held against the tool in
+`ostrya_cli::cli::checkout_require_hardlinks_refusals_match_the_tool`,
+`ostrya_cli::cli::checkout_require_hardlinks_refuses_at_the_entry`,
+`ostrya_cli::cli::checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool`,
+and `ostrya_cli::cli::checkout_require_hardlinks_refuses_across_devices`. Where
+both take `-H`, the two hardlink the same objects and leave the same entries on
+inodes of their own, the zero-length file among the second set
+(`ostrya_cli::cli::checkout_require_hardlinks_hardlinks_the_same_objects`);
+`ostrya_cli::cli::commit_checkout_speedup_matches_the_tool` checks a `bare`
+repository out with `-H` on both sides and reads 14 devino-cache hits out of
+each side's own `--table-output` block, against 13 for a `bare-user` repository
+checked out with `-U` and 0 for the two forms that hardlink nothing. A
+destination directory below the root is reached by a destination symlink into a
+second filesystem, which a union mode follows, and the two implementations agree
+there on the exit status and on the destination. A `--subpath` naming a file or
+a symlink reaches no directory walk and takes no such check: the two agree that
+a zero-length regular file is written at exit 0 and that a shape the mode pair
+hardlinks is refused at the link.
+
+`-M/--bareuseronly-dirs` reduces every directory the checkout creates to
+`mode & 0775`, at the destination root and at every depth below it. A directory
+the checkout reuses under a union mode keeps its own mode, a regular file and a
+symlink are unaffected, and the process umask reduces nothing further. The
+switch is accepted in every repository mode and under both checkout modes, and
+it is a no-op in `bare-user-only`, whose directory modes are already below the
+mask at commit time. The two implementations produce the same destination tree
+in every combination
+(`ostrya_cli::cli::checkout_bareuseronly_dirs_matches_the_tool`), and the mask
+is stated in `../format-reference.md`, "Checkout".
+
+`--disable-cache` changes no byte and no metadata of the destination. The tool
+keeps an uncompressed-object cache at `<repo>/uncompressed-objects-cache/` and
+writes it for an `archive` repository checked out with `-U` and for no other
+combination, hardlinking that destination's regular files out of it; the switch
+stops it writing one and stops it reading one, so each destination file gets its
+own inode. The port keeps no such cache, so its destination already carries the
+inode identity the switch asks for and the switch decides nothing. The
+destinations compare equal with the switch and without it, on both sides
+(`ostrya_cli::cli::checkout_disable_cache_matches_the_tool`).
 
 `--whiteouts` reads two marker names and `--process-passthrough-whiteouts`
 reads a third. Each switch reads its own names and no others, and the marker
@@ -1401,9 +1458,9 @@ of them: the tool looks the empty value up and exits 1 (`No such file or
 directory: /`), and the port reads a value carrying no name component as the
 whole tree and exits 0.
 
-Two divergences stand at the values `--subpath` takes, one at `-H`, three at
-the composefs switches, two at `--allow-noent`, one at a repeated boolean
-flag, and four at the path-selection options:
+Two divergences stand at the values `--subpath` takes, one at the wording of
+the `-H` refusals, three at the composefs switches, two at `--allow-noent`, one
+at a repeated boolean flag, and four at the path-selection options:
 
 - a subpath naming nothing ends the checkout at exit 1 in both, leaving no
   destination, and the words part: the tool reports `error: No such file or
@@ -1434,26 +1491,19 @@ flag, and four at the path-selection options:
   required for '--subpath <PATH>' but none was supplied`); the tool refuses it
   at exit 1 on its own (`No such file or directory: /`) and exits 0 under
   `--allow-noent`;
-- the tool takes `-H` only where the repository mode can hardlink under the
-  checkout mode in force, and refuses it at exit 1 elsewhere. Measured over the
-  four modes, `-H` alone is taken by `bare` and `bare-user-only` and refused by
-  `archive` (`error: Bare repository mode cannot hardlink in user checkout
-  mode`) and by `bare-user` (`error: User repository mode requires user checkout
-  mode to hardlink`); `-U -H` together is taken by `bare-user` and
-  `bare-user-only` and refused by `archive` and `bare` (`error: Bare repository
-  mode cannot hardlink in user checkout mode`). The port's `-H` is a no-op, so
-  it accepts every combination and hardlinks wherever a copy is not forced.
-  Giving `-H` its refusal is `-H` semantics, which belongs with the remaining
-  `checkout` options. Where the tool takes `-H`, the two hardlink the same
-  objects: `ostrya_cli::cli::commit_checkout_speedup_matches_the_tool` checks a
-  `bare` repository out with `-H` on both sides and reads 14 devino-cache hits
-  out of each side's own `--table-output` block, against 13 for a `bare-user`
-  repository checked out with `-U` and 0 for the two forms that hardlink
-  nothing. The tool's `-H` gate stands after the destination directory is made,
-  so a refusal leaves an empty destination behind; the port's own refusal of
-  `--union-identical` in a mode that cannot hardlink stands before any
-  destination is made and leaves none
-  (`ostrya_cli::cli::checkout_union_identical_requires_require_hardlinks`);
+- the wording of each `-H` refusal. The tool writes `error: Bare repository
+  mode cannot hardlink in user checkout mode` for `archive` under either
+  checkout mode and for `bare` under `-U`, `error: User repository mode
+  requires user checkout mode to hardlink` for `bare-user` without `-U`, and
+  `error: Unable to do hardlink checkout across devices (src=<dev>
+  destination=<dev>)` for a destination on another filesystem. The first text
+  fires for `archive` under a faithful checkout, where it names neither `bare`
+  nor a user checkout, so the port writes its own words naming the entry and
+  the reason instead. Both exit 1, and both leave the same destination state:
+  the destination directory created and empty for the cross-device refusal and
+  for a tree whose first entry refuses, and the entries already written for one
+  that refuses part-way through
+  (`ostrya_cli::cli::checkout_require_hardlinks_leaves_the_same_destination_on_a_refusal`);
 - the tool exports a composefs image from any repository mode, and from an
   `archive` repository it writes `trusted.overlay.redirect` values naming
   `.file` loose paths that repository does not hold, whose objects are
@@ -1480,13 +1530,18 @@ flag, and four at the path-selection options:
   was, byte for byte and at its own mode
   (`ostrya_cli::cli::checkout_composefs_refuses_an_archive_repository`);
 - the tool takes `--composefs` alongside `--union` and `--allow-noent` and
-  refuses it alongside `--union-add`, `--union-identical`, or `-H` at exit 1
+  refuses it alongside `--union-add` or `--union-identical` at exit 1
   (`error: Specified options are incompatible with --composefs`), writing no
   image. The port takes a single union option alongside `--composefs` and
   writes the image, since a composefs export reads the commit tree and takes no
   destination entry for any of them to decide. Two union options on one line
   are refused by the port ahead of the export, so the pair the port calls
-  mutually exclusive is refused whatever else the line carries;
+  mutually exclusive is refused whatever else the line carries. The tool
+  refuses `-H`, `-C`, `-M`, and `--disable-cache` there under the same words,
+  and the port refuses all four with it: each decides how a checkout
+  materializes an entry, which an export performs none of, so the refusal
+  reinterprets no value
+  (`ostrya_cli::cli::checkout_materialization_switches_refuse_composefs_in_both`);
 - `--allow-noent` reaches every command line in the port and only some in the
   tool. The tool honors it when the line holds none of `-H`, `-C`, `-M`,
   `--union-add`, `--disable-cache`, `--whiteouts`,
@@ -1511,9 +1566,10 @@ flag, and four at the path-selection options:
   no gate is added: a repository the port writes and prunes holds every object
   its commits name;
 - a union option, `--allow-noent`, `--whiteouts`,
-  `--process-passthrough-whiteouts`, or `--from-stdin` given twice is taken by
-  the tool and refused by the port, as the port refuses every repeated boolean
-  flag (`ostrya_cli::cli::checkout_union_options_are_mutually_exclusive`).
+  `--process-passthrough-whiteouts`, `--from-stdin`, `-H`, `-M`, or
+  `--disable-cache` given twice is taken by the tool and refused by the port,
+  as the port refuses every repeated boolean flag
+  (`ostrya_cli::cli::checkout_union_options_are_mutually_exclusive`).
   `--from-file` and `--skip-list` take the last value in both;
 - the `Processing tree <checksum>: ` prefix. The tool puts it in front of every
   refusal a batch pair reaches, `<checksum>` being the pair's resolved commit.

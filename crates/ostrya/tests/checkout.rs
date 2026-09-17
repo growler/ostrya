@@ -1387,6 +1387,7 @@ fn passthrough_whiteouts_write_char_devices() {
             symlink("nowhere", over.join("m600")).unwrap();
             let mut opts = CheckoutOptions::new(CheckoutMode::User);
             opts.overwrite = overwrite;
+            opts.require_hardlinks = overwrite == ostrya::OverwriteMode::UnionIdentical;
             opts.process_passthrough_whiteouts = true;
             let result = repo
                 .checkout_at(&mut opts, base_fd.as_fd(), Path::new(&name), &commit)
@@ -1475,6 +1476,7 @@ fn overwrite_modes() {
         checkout_none(&repo, base_fd.as_fd(), "ident", &commit_a).await;
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
+        opts.require_hardlinks = true;
         let err = repo
             .checkout_at(&mut opts, base_fd.as_fd(), Path::new("ident"), &commit_b)
             .await;
@@ -1487,56 +1489,89 @@ fn overwrite_modes() {
         // same inodes the base checkout hardlinked).
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
+        opts.require_hardlinks = true;
         repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new("ident"), &commit_a)
             .await
             .expect("union-identical over an identical tree is a no-op");
     });
 }
 
-/// union-identical establishes identity by the object inode, so it is
-/// meaningful only for a hardlink checkout. A copy-mode repository (archive) or
-/// a forced copy cannot hardlink, so the checkout is rejected before the
-/// destination is created, matching the tool's refusal to run
-/// `--union-identical` without `--require-hardlinks`.
+/// union-identical establishes identity by the object inode, so the tool takes
+/// it only together with `--require-hardlinks`. The library reads that as a
+/// requirement over the options alone: the pair is refused before any I/O, and
+/// which repository mode and checkout mode can hardlink is carried by the
+/// per-entry `require_hardlinks` refusal. A tree holding no entry that needs a
+/// copy is therefore written whole in a mode that copies, which is the tool's
+/// own outcome.
 #[test]
-fn union_identical_requires_hardlink_mode() {
+fn union_identical_requires_require_hardlinks() {
     let tmp = TmpDir::new("co-ui-guard");
     let base = tmp.path();
     let src = base.join("src");
     build_source(&src);
+    let dirs = base.join("dirs");
+    std::fs::create_dir_all(dirs.join("inner")).unwrap();
 
     block_on(async {
-        // archive checks out by copy under both modes, so union-identical is
-        // rejected up front.
         let archive_dir = base.join("archive");
         let repo = Repo::create(&archive_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
         let commit = commit_tree(&repo, base, "src").await;
+        let dir_commit = commit_tree(&repo, base, "dirs").await;
         let base_fd = std::fs::File::open(base).unwrap();
+
+        // Without `require_hardlinks` the option is refused before any I/O.
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
         opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
         let err = repo
-            .checkout_at(&mut opts, base_fd.as_fd(), Path::new("co_archive"), &commit)
+            .checkout_at(&mut opts, base_fd.as_fd(), Path::new("co_alone"), &commit)
             .await;
         assert!(
             matches!(err, Err(ostrya::Error::Checkout(_))),
-            "union-identical on a copy-mode repo is rejected, got {err:?}"
+            "union-identical without require_hardlinks is refused, got {err:?}"
         );
         assert!(
-            !base.join("co_archive").exists(),
-            "the destination is not created when union-identical is rejected"
+            !base.join("co_alone").exists(),
+            "the destination is not created when union-identical is refused"
         );
 
-        // force_copy suppresses the hardlink a bare + faithful checkout would
-        // otherwise use, so union-identical is rejected there too.
+        // With it, a tree carrying a regular file is refused at that entry,
+        // `archive` giving a copy of it.
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
+        opts.require_hardlinks = true;
+        let err = repo
+            .checkout_at(&mut opts, base_fd.as_fd(), Path::new("co_entry"), &commit)
+            .await;
+        assert!(
+            matches!(err, Err(ostrya::Error::RequireHardlinks(_))),
+            "an `archive` regular file is refused at the entry, got {err:?}"
+        );
+
+        // A tree of directories alone reaches no such entry, so the same
+        // options write it whole.
+        let mut opts = CheckoutOptions::new(CheckoutMode::None);
+        opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
+        opts.require_hardlinks = true;
+        repo.checkout_at(
+            &mut opts,
+            base_fd.as_fd(),
+            Path::new("co_dirs"),
+            &dir_commit,
+        )
+        .await
+        .expect("a directory-only tree needs no copy");
+        assert!(base.join("co_dirs").join("inner").is_dir());
+
+        // `require_hardlinks` and `force_copy` are mutually exclusive.
         let bare_dir = base.join("bare");
         let repo = Repo::create(&bare_dir, CreateOptions::new(RepoMode::Bare))
             .await
             .unwrap();
         let commit = commit_tree(&repo, base, "src").await;
         let mut opts = CheckoutOptions::new(CheckoutMode::None);
-        opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
+        opts.require_hardlinks = true;
         opts.force_copy = true;
         let err = repo
             .checkout_at(
@@ -1548,9 +1583,121 @@ fn union_identical_requires_hardlink_mode() {
             .await;
         assert!(
             matches!(err, Err(ostrya::Error::Checkout(_))),
-            "union-identical under force_copy is rejected, got {err:?}"
+            "require_hardlinks with force_copy is refused, got {err:?}"
         );
         assert!(!base.join("co_forcecopy").exists());
+    });
+}
+
+/// The per-entry `require_hardlinks` refusal, over the shapes the tool's own
+/// table separates: a directory and a zero-length regular file are written in
+/// every mode, a regular file of non-zero length is refused wherever the
+/// repository mode and the checkout mode give a copy, and a symlink follows a
+/// table of its own (`format-reference.md`, "Checkout"). A refusal part-way
+/// through a walk leaves the entries already written.
+#[test]
+fn require_hardlinks_refuses_at_the_entry() {
+    let tmp = TmpDir::new("co-require-entry");
+    let base = tmp.path();
+    std::fs::create_dir_all(base.join("t_dir").join("d")).unwrap();
+    std::fs::create_dir_all(base.join("t_empty")).unwrap();
+    std::fs::write(base.join("t_empty").join("e"), b"").unwrap();
+    std::fs::create_dir_all(base.join("t_one")).unwrap();
+    std::fs::write(base.join("t_one").join("o"), b"x").unwrap();
+    std::fs::create_dir_all(base.join("t_sym")).unwrap();
+    symlink("target", base.join("t_sym").join("l")).unwrap();
+    std::fs::create_dir_all(base.join("t_order").join("a")).unwrap();
+    std::fs::write(base.join("t_order").join("a").join("empty"), b"").unwrap();
+    symlink("x", base.join("t_order").join("a").join("link")).unwrap();
+
+    block_on(async {
+        let base_fd = std::fs::File::open(base).unwrap();
+        for (mode_name, mode) in [
+            ("archive", RepoMode::Archive),
+            ("bare", RepoMode::Bare),
+            ("bare-user", RepoMode::BareUser),
+            ("bare-user-only", RepoMode::BareUserOnly),
+        ] {
+            let repo = Repo::create(
+                &base.join(format!("repo-{mode_name}")),
+                CreateOptions::new(mode),
+            )
+            .await
+            .unwrap();
+            // Each shape is committed once per repository mode; the two
+            // checkout modes read the same four commits.
+            let shapes: [(&str, Checksum); 4] = [
+                ("t_dir", commit_tree(&repo, base, "t_dir").await),
+                ("t_empty", commit_tree(&repo, base, "t_empty").await),
+                ("t_one", commit_tree(&repo, base, "t_one").await),
+                ("t_sym", commit_tree(&repo, base, "t_sym").await),
+            ];
+            for checkout_mode in [CheckoutMode::None, CheckoutMode::User] {
+                let user = checkout_mode == CheckoutMode::User;
+                let refuses_regular = !matches!(
+                    (mode, user),
+                    (RepoMode::Bare, false)
+                        | (RepoMode::BareUser, true)
+                        | (RepoMode::BareUserOnly, _)
+                );
+                let refuses_symlink = matches!(
+                    (mode, user),
+                    (RepoMode::Archive, _) | (RepoMode::Bare, true)
+                );
+                for ((tree, commit), refuses) in
+                    shapes
+                        .iter()
+                        .zip([false, false, refuses_regular, refuses_symlink])
+                {
+                    let dest = format!("out-{mode_name}-{}-{tree}", u8::from(user));
+                    let mut opts = CheckoutOptions::new(checkout_mode);
+                    opts.require_hardlinks = true;
+                    let result = repo
+                        .checkout_at(&mut opts, base_fd.as_fd(), Path::new(&dest), commit)
+                        .await;
+                    if refuses {
+                        assert!(
+                            matches!(result, Err(ostrya::Error::RequireHardlinks(_))),
+                            "{mode_name}/user={user}/{tree}: got {result:?}",
+                        );
+                    } else {
+                        result.unwrap_or_else(|e| {
+                            panic!("{mode_name}/user={user}/{tree} is written: {e}")
+                        });
+                    }
+                }
+
+                // The switch off refuses nothing: the same shapes are written
+                // in the same cells with `require_hardlinks` clear.
+                for (tree, commit) in &shapes {
+                    let dest = format!("free-{mode_name}-{}-{tree}", u8::from(user));
+                    let mut opts = CheckoutOptions::new(checkout_mode);
+                    let result = repo
+                        .checkout_at(&mut opts, base_fd.as_fd(), Path::new(&dest), commit)
+                        .await;
+                    result.unwrap_or_else(|e| {
+                        panic!("{mode_name}/user={user}/{tree} without the switch: {e}")
+                    });
+                }
+            }
+        }
+
+        // The refusal is raised where the entry is materialized, so the entries
+        // the walk already wrote stay. `bare` under a user checkout takes the
+        // zero-length file and refuses the symlink beside it.
+        let repo = Repo::open(&base.join("repo-bare")).await.unwrap();
+        let commit = commit_tree(&repo, base, "t_order").await;
+        let mut opts = CheckoutOptions::new(CheckoutMode::User);
+        opts.require_hardlinks = true;
+        let result = repo
+            .checkout_at(&mut opts, base_fd.as_fd(), Path::new("partial"), &commit)
+            .await;
+        assert!(
+            matches!(result, Err(ostrya::Error::RequireHardlinks(_))),
+            "the symlink is refused, got {result:?}",
+        );
+        assert!(base.join("partial").join("a").join("empty").is_file());
+        assert!(!base.join("partial").join("a").join("link").exists());
     });
 }
 
@@ -1598,6 +1745,7 @@ async fn union_identical_checkout(
 ) -> Result<(), ostrya::Error> {
     let mut opts = CheckoutOptions::new(mode);
     opts.overwrite = ostrya::OverwriteMode::UnionIdentical;
+    opts.require_hardlinks = true;
     repo.checkout_at(&mut opts, base_fd, Path::new(dest), commit)
         .await
 }
@@ -1914,6 +2062,7 @@ fn file_where_commit_has_directory_is_a_conflict() {
             checkout_none(&repo, base_fd.as_fd(), &dest_name, &commit_file).await;
             let mut opts = CheckoutOptions::new(CheckoutMode::None);
             opts.overwrite = mode;
+            opts.require_hardlinks = mode == ostrya::OverwriteMode::UnionIdentical;
             let err = repo
                 .checkout_at(
                     &mut opts,
@@ -1993,6 +2142,7 @@ fn directory_where_commit_has_file_follows_the_tool() {
             checkout_none(&repo, base_fd.as_fd(), &dest_name, &commit_dir).await;
             let mut opts = CheckoutOptions::new(CheckoutMode::None);
             opts.overwrite = mode;
+            opts.require_hardlinks = mode == ostrya::OverwriteMode::UnionIdentical;
             let err = repo
                 .checkout_at(
                     &mut opts,

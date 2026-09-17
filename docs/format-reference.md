@@ -1470,7 +1470,14 @@ write; otherwise it copies. Regular files, by storage mode and checkout mode:
   hardlinks from an `uncompressed-objects-cache/` it maintains outside the
   on-disk format; a checkout that does not maintain that cache copies instead and
   differs from the tool only in the object's link count, never in content or
-  metadata.
+  metadata. The cache is a directory at the top level of the repository, laid
+  out in the loose fanout and holding one uncompressed `.file` per content
+  object. The tool creates it for an `archive` repository checked out with `-U`
+  and for no other repository mode and no other checkout mode.
+  `ostree checkout --disable-cache` stops it writing one and stops it reading
+  one, so each destination file gets an inode of its own; the destination's
+  bytes and metadata are the same either way. The port keeps no such cache, so
+  its default is what the switch asks for.
 
 Symlinks are hardlinked only under `bare` + faithful (destination link count 2
 observed). Everywhere else the symlink is recreated fresh (link count 1),
@@ -1482,6 +1489,88 @@ The unifying rule is: hardlink iff the object inode is already exactly the targe
 inode. Forcing a copy (`ostree checkout -C`) suppresses every hardlink; the copy
 path still attempts a reflink. A hardlink that would cross a filesystem (`EXDEV`)
 falls back to a copy.
+
+A zero-length regular file is the one exception. The tool writes it fresh in
+every repository mode and under both checkout modes, so its destination carries
+its own inode at link count 1. Recovered by checking a tree holding a
+zero-length file at 0644, a zero-length file at 0600, a one-byte file, a
+100-byte file, and a 100-kibibyte file out of a `bare` repository with
+`ostree checkout -H`: the two zero-length destinations came out at link count 1
+on inodes of their own, and the other three at link count 2 on the loose
+objects' inodes. Nothing of the destination's content or metadata turns on it.
+
+Requiring a hardlink. `ostree checkout -H/--require-hardlinks` refuses an entry
+the checkout would materialize by a copy, rather than falling back to one. The
+refusal is raised at the entry, so a commit holding no such entry is written
+whole at exit 0 in every repository mode, an empty commit and a commit of
+directories alone among them. The refusal stands ahead of the destination
+disposition, so an entry `--union-add` would keep and an entry
+`--union-identical` would call identical are refused all the same; it stands
+behind the whiteout verdict, so a marker that removes a name and a marker that
+writes a character device are both taken; and a `--skip-list` entry that prunes
+an entry, or a `--subpath` that does not select it, keeps the walk clear of it.
+The shapes:
+
+- a directory never refuses, in any mode;
+- a zero-length regular file never refuses, in any mode, the rule above writing
+  it fresh rather than copying an inode;
+- a regular file of non-zero length refuses wherever the hardlink table above
+  gives a copy: `archive` under both checkout modes, `bare` under the
+  unprivileged checkout, `bare-user` under the faithful checkout, and
+  `bare-user-shared` and `bare-split-xattrs` under both. The last two have no
+  observation, the tool carrying neither mode; each stores a regular file the
+  hardlink table gives a copy of, so each refuses;
+- a symlink refuses in `archive` under both checkout modes and in `bare` under
+  the unprivileged checkout, and refuses nowhere else. This is not the symlink
+  hardlink rule above: `bare-user` recreates a symlink fresh under both checkout
+  modes and refuses neither, and so does `bare-user-only`. `bare-user-shared`
+  and `bare-split-xattrs` have no observation, the tool carrying neither mode;
+  each stores a symlink the way `bare-user` does, so each follows `bare-user`
+  here.
+
+Recovered by checking four single-shape commits -- one directory, one
+zero-length file, one one-byte file, and one symlink -- out of an `archive`, a
+`bare`, a `bare-user`, and a `bare-user-only` repository, under both checkout
+modes, and reading the exit status of each of the thirty-two invocations.
+
+A destination directory on another filesystem than the repository is refused
+before any entry of it is written, whatever the subtree holds, and the check
+stands after the directory is created. Recovered by checking a directory-only
+commit out of a repository on one filesystem into a destination on another: the
+tool exits 1 with `Unable to do hardlink checkout across devices (src=<dev>
+destination=<dev>)` and leaves the destination directory created and empty. The
+check stands ahead of the per-entry refusal, an `archive` repository checked out
+across devices reporting the device refusal.
+
+The check is repeated at every destination directory the walk enters, the
+destination root and every directory below it, fresh or reused. Recovered by
+putting a subtree behind a destination symlink to a second filesystem and
+checking it out under a union mode, which follows the symlink: the tool refuses
+whatever the subtree holds -- one empty directory, one zero-length file, one
+symlink, one regular file, and a mixture of a zero-length and a regular file all
+give the device refusal -- and writes nothing into the directory on the second
+filesystem. The refusal is raised where the directory is entered, so it stands
+behind a per-entry refusal in a directory the walk reads first and ahead of one
+in a directory it reads later: a commit holding `aa/real` and `zz/sub` with the
+destination's `zz` on the second filesystem reports the per-entry refusal, and
+the same commit with `aa` on the second filesystem reports the device refusal.
+The refusal does not read the repository mode: `archive`, `bare`, `bare-user`,
+and `bare-user-only` each give it.
+
+A `--subpath` naming a file or a symlink reaches no directory walk and takes no
+such check. The tool creates the destination directory, attempts the link, and
+reports `Hardlinking <object> to <name>: Invalid cross-device link` at exit 1
+where the mode pair hardlinks the shape. A zero-length regular file, which no
+mode hardlinks, is written into the destination at exit 0. Recovered in a `bare`
+repository under the faithful checkout, which hardlinks both a regular file and
+a symlink, with the destination directory on a second filesystem: the
+zero-length file gave exit 0 and the file it names, and the regular file and the
+symlink each gave exit 1 and an empty destination directory.
+
+A refusal reached part-way through a walk leaves the entries the walk already
+wrote. Recovered by checking a commit holding `a/empty`, `a/link`, and `b/real`
+out of a `bare` repository with `-U -H`: the destination held `a` and `a/empty`
+and the walk stopped at the symlink.
 
 The copy path writes into a temp file in the destination directory, applies the
 checkout-mode metadata, and materializes it under the destination name. For a
@@ -1498,6 +1587,21 @@ does not block writing them. The destination root receives the checked-out
 (sub)tree root's dirmeta: committing a root at mode `0750` and checking it out
 yields a destination root at `0750`; a subpath to a directory at `0755` yields a
 destination root at `0755`.
+
+Directory mode mask. `ostree checkout -M/--bareuseronly-dirs` reduces the mode
+of every directory the checkout creates to `mode & 0o775`. The mask reaches the
+destination root and every directory below it, in every repository mode and
+under both checkout modes. A directory the checkout reuses under a union mode
+keeps its own mode, with the switch and without it. A regular file and a symlink
+are unaffected, and the process umask reduces nothing further, the mode being
+applied explicitly. The switch is a no-op in `bare-user-only`, whose directory
+modes are already below the mask at commit time. Recovered by checking a tree of
+thirteen directory modes out under the switch and reading the destination modes
+back: `0666` gave `0664`, `0700` gave `0700`, `0705` gave `0705`, `0774` gave
+`0774`, `0775` gave `0775`, `0776` gave `0774`, `0777` gave `0775`, `1755` gave
+`0755`, `2755` gave `0755`, `3775` gave `0775`, `4755` gave `0755`, `6755` gave
+`0755`, and `7777` gave `0775`. Every result equals `mode & 0o775`. The switch
+changes nothing in the repository, and `commit` carries no equivalent.
 
 Overwrite policy over an existing destination:
 

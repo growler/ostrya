@@ -11,10 +11,16 @@
 //!
 //! For each regular file the checkout hardlinks the loose object into place when
 //! the object's stored inode carries the metadata the destination needs, and
-//! copies otherwise. A hardlink adopts the object inode's mode as it stands, so
+//! copies otherwise. A zero-length object is written fresh in every mode, which
+//! is the tool's own outcome. A hardlink adopts the object inode's mode as it stands, so
 //! a `bare-user` object under [`User`](CheckoutMode::User) arrives without the
 //! sticky bit a copy would keep; that is the tool's own outcome for the same
-//! commit. The copy path streams the
+//! commit.
+//! [`require_hardlinks`](CheckoutOptions::require_hardlinks) refuses such an
+//! entry instead of copying it, at the entry itself, and refuses a destination
+//! on another filesystem than the repository before any entry is written.
+//! [`bareuseronly_dirs`](CheckoutOptions::bareuseronly_dirs) reduces every
+//! directory the checkout creates to `mode & 0o775`. The copy path streams the
 //! payload through [`FileObject::reader`], attempting a `FICLONE` reflink on a
 //! non-archive object before falling back to a byte copy. Directories are always
 //! created fresh and receive their full logical mode after their children are
@@ -57,6 +63,11 @@ const PERM_MASK: u32 = 0o7777;
 /// with `ostree checkout -U --force-copy` in each mode
 /// (`format-reference.md`, "Checkout").
 const USER_PERM_MASK: u32 = 0o1777;
+/// The mask [`bareuseronly_dirs`](CheckoutOptions::bareuseronly_dirs) reduces a
+/// created directory's mode to. Recovered by checking a tree of thirteen
+/// directory modes out under `ostree checkout -M`: every result equals
+/// `mode & 0o775` (`format-reference.md`, "Checkout").
+const BAREUSERONLY_DIR_MASK: u32 = 0o775;
 /// The chunk size the identity comparison streams a destination file in, so no
 /// whole file is buffered.
 const HASH_CHUNK: usize = 64 * 1024;
@@ -110,6 +121,12 @@ pub enum OverwriteMode {
     /// equal the loose object inode's. A symlink is compared by its target. A
     /// directory is reused with no comparison, as under the other union modes.
     /// See `format-reference.md`, "Checkout".
+    ///
+    /// This mode needs
+    /// [`require_hardlinks`](CheckoutOptions::require_hardlinks). A checkout
+    /// that sets it with the flag clear is refused up front with
+    /// [`Error::Checkout`], before the destination is touched, which is the
+    /// pairing the tool also demands.
     UnionIdentical,
 }
 
@@ -160,6 +177,24 @@ pub struct CheckoutOptions {
     /// Force a copy for every object, suppressing every hardlink. The copy path
     /// still attempts a reflink.
     pub force_copy: bool,
+    /// Refuse an entry the checkout would materialize by a copy, instead of
+    /// falling back to one (`ostree checkout -H`). The refusal is raised at the
+    /// entry, so a tree holding no such entry is written whole: a directory
+    /// never needs a copy, and neither does a zero-length regular file, which
+    /// every mode writes fresh. A destination on another filesystem than the
+    /// repository is refused before any entry is written. The two refusals are
+    /// [`Error::RequireHardlinks`] and [`Error::HardlinkAcrossDevices`], and
+    /// the table each follows is recorded in `format-reference.md`, "Checkout".
+    ///
+    /// This flag and [`force_copy`](CheckoutOptions::force_copy) are mutually
+    /// exclusive, and setting both is refused up front with
+    /// [`Error::Checkout`]. [`OverwriteMode::UnionIdentical`] needs this flag
+    /// set.
+    pub require_hardlinks: bool,
+    /// Reduce every directory the checkout creates to `mode & 0o775`
+    /// (`ostree checkout -M`). A directory the checkout reuses keeps its own
+    /// mode, and a regular file and a symlink are unaffected.
+    pub bareuseronly_dirs: bool,
     /// Process Docker-style whiteouts (`.wh.<name>` and `.wh..wh..opq`) instead
     /// of materializing them as ordinary files.
     pub process_whiteouts: bool,
@@ -184,6 +219,8 @@ impl Default for CheckoutOptions {
             subpath: None,
             enable_fsync: false,
             force_copy: false,
+            require_hardlinks: false,
+            bareuseronly_dirs: false,
             process_whiteouts: false,
             process_passthrough_whiteouts: false,
             devino_cache: None,
@@ -215,6 +252,14 @@ impl Repo {
     /// `dest_path` names the destination root relative to `dest_dir`; its parent
     /// components must already exist. A `.` or empty `dest_path` checks out into
     /// `dest_dir` itself without creating or re-stamping a root directory.
+    ///
+    /// Two option pairings are refused before the destination is touched, each
+    /// with [`Error::Checkout`]: [`OverwriteMode::UnionIdentical`] with
+    /// [`require_hardlinks`](CheckoutOptions::require_hardlinks) clear, and
+    /// [`require_hardlinks`](CheckoutOptions::require_hardlinks) together with
+    /// [`force_copy`](CheckoutOptions::force_copy). Which repository mode and
+    /// checkout mode can hardlink is decided at the entry instead, so a tree
+    /// holding no entry that needs a copy is written whole under either flag.
     pub async fn checkout_at(
         &self,
         opts: &mut CheckoutOptions,
@@ -225,14 +270,19 @@ impl Repo {
         let policy = Policy::new(self.mode(), opts);
         // The tool takes `--union-identical` only together with
         // `--require-hardlinks`, so the checkout that runs under it is a
-        // hardlinking one. Reject the mode before any I/O where the repository
-        // mode and checkout mode (or force_copy) produce copies, which is the
-        // same set the tool's `-H` gate refuses.
-        if policy.overwrite == OverwriteMode::UnionIdentical && !hardlink_regular(policy) {
+        // hardlinking one. The two refusals below read the options alone and
+        // perform no I/O. Which repository mode and checkout mode can hardlink
+        // is carried by the per-entry `require_hardlinks` refusal, where the
+        // tool also carries it: a tree holding no entry that needs a copy is
+        // written whole under `UnionIdentical`.
+        if policy.overwrite == OverwriteMode::UnionIdentical && !policy.require_hardlinks {
             return Err(Error::Checkout(
-                "union-identical requires a hardlink checkout, but this repository \
-                 mode and checkout mode (or force_copy) produce copies"
-                    .into(),
+                "union-identical requires require_hardlinks".into(),
+            ));
+        }
+        if policy.require_hardlinks && policy.force_copy {
+            return Err(Error::Checkout(
+                "require_hardlinks and force_copy are mutually exclusive".into(),
             ));
         }
         let (commit_obj, state) = self.load_commit(commit).await?;
@@ -297,6 +347,12 @@ impl Repo {
                 // reach of the whiteout switch's widening.
                 let (dir_fd, _fresh) =
                     create_dest_dir(parent_fd.as_fd(), &dir_name, policy.overwrite, false)?;
+                // A single file or symlink target reaches no directory walk, so
+                // it takes no up-front device check: the tool writes a
+                // zero-length file at exit 0 into a destination on another
+                // filesystem and refuses the other shapes at the link itself.
+                // The `EXDEV` arms of `place_regular` and `place_symlink` carry
+                // that refusal (`format-reference.md`, "Checkout").
                 let obj = self.load_file(&checksum).await?;
                 checkout_entry(self, opts, policy, dir_fd.as_fd(), &entry_name, &obj).await?;
                 if policy.enable_fsync {
@@ -448,6 +504,11 @@ fn checkout_dir<'a>(
             fresh,
             base_path,
         } = node;
+        // Every destination directory the walk enters is checked, fresh or
+        // reused, before anything in it is read or written. A directory holding
+        // nothing refuses all the same, which is the tool's own outcome
+        // (`format-reference.md`, "Checkout").
+        check_hardlink_device(repo, policy, dir_fd.as_fd())?;
         let dirtree = repo.load_dirtree(&dirtree_csum).await?;
 
         // An opaque marker clears the destination directory before the committed
@@ -521,7 +582,9 @@ fn checkout_dir<'a>(
         if fresh {
             let d = dir_fd.as_fd().try_clone_to_owned()?;
             let effective = policy.effective;
-            ostrya_rt::unblock(move || apply_dir_metadata(d.as_fd(), effective, &dirmeta)).await?;
+            let masked = policy.bareuseronly_dirs;
+            ostrya_rt::unblock(move || apply_dir_metadata(d.as_fd(), effective, masked, &dirmeta))
+                .await?;
         }
         if policy.enable_fsync {
             fsync_dir(dir_fd).await?;
@@ -558,6 +621,13 @@ async fn checkout_entry(
 }
 
 /// Materialize one file or symlink entry.
+///
+/// Under [`require_hardlinks`](CheckoutOptions::require_hardlinks) the entry is
+/// refused here, ahead of the destination disposition, so an entry a union mode
+/// would keep or skip is refused all the same. The whiteout verdict stands
+/// ahead of this call, so a marker that removes a name and a marker that writes
+/// a device are both taken. Both are the tool's own order
+/// (`format-reference.md`, "Checkout").
 async fn checkout_file(
     repo: &Repo,
     opts: &mut CheckoutOptions,
@@ -566,6 +636,9 @@ async fn checkout_file(
     name: &str,
     obj: &FileObject,
 ) -> Result<()> {
+    if require_hardlinks_refuses(policy, obj) {
+        return Err(Error::RequireHardlinks(name.to_owned()));
+    }
     match &obj.kind {
         FileKind::Symlink { target } => {
             place_symlink(repo, policy, dir_fd, name, obj, target).await
@@ -775,17 +848,32 @@ async fn place_regular(
         };
 
     // A cross-filesystem link (EXDEV) yields None and falls back to the copy
-    // path below.
-    if hardlink_regular(policy)
-        && let Some((dev, ino)) =
-            try_link_object(repo, policy, dir_fd, name, checksum, remove_existing).await?
-    {
-        record_devino(opts, dev, ino, checksum);
-        return Ok(());
+    // path below. Under `require_hardlinks` the copy is what the switch
+    // refuses, so the entry is refused instead. The directory walk's own device
+    // check does not reach a single file or symlink target, and this does.
+    if hardlink_regular_object(policy, obj) {
+        match try_link_object(repo, policy, dir_fd, name, checksum, remove_existing).await? {
+            Some((dev, ino)) => {
+                record_devino(opts, dev, ino, checksum);
+                return Ok(());
+            }
+            None if policy.require_hardlinks => {
+                return hardlink_across_devices(repo, dir_fd);
+            }
+            None => {}
+        }
     }
 
     let (temp, kind) = crate::write::open_temp(dir_fd)?;
-    copy_object(repo, obj, &temp, policy).await?;
+    // A loose object of a bare-family mode holds the raw payload, so a recorded
+    // size of zero is the object's own `st_size` and the temp file already
+    // carries every byte the destination needs. An `archive` object records the
+    // declared uncompressed size of its header, which is no such ground truth,
+    // so that mode always copies.
+    if !(policy.repo_mode != RepoMode::Archive && matches!(obj.kind, FileKind::Regular { size: 0 }))
+    {
+        copy_object(repo, obj, &temp, policy).await?;
+    }
     let plan = FinishCopy {
         dir: dir_fd.try_clone_to_owned()?,
         name: name.to_owned(),
@@ -829,12 +917,17 @@ async fn place_symlink(
             }
         };
 
-    if hardlink_symlink(policy)
-        && try_link_object(repo, policy, dir_fd, name, checksum, remove_existing)
-            .await?
-            .is_some()
-    {
-        return Ok(());
+    // The `EXDEV` arm takes the same refusal `place_regular` takes: under
+    // `require_hardlinks` a copy is what the switch refuses, and recreating the
+    // link is a copy.
+    if hardlink_symlink(policy) {
+        match try_link_object(repo, policy, dir_fd, name, checksum, remove_existing).await? {
+            Some(_) => return Ok(()),
+            None if policy.require_hardlinks => {
+                return hardlink_across_devices(repo, dir_fd);
+            }
+            None => {}
+        }
     }
 
     let plan = RecreateSymlink {
@@ -1320,14 +1413,29 @@ fn apply_regular_metadata(
 /// (`mode & 0o7777`, special bits kept) is applied under both checkout modes;
 /// only the chown and xattrs differ. The mode is applied last, since a `user.*`
 /// xattr needs write permission on the inode.
-fn apply_dir_metadata(fd: BorrowedFd<'_>, effective: CheckoutMode, dm: &DirMeta) -> Result<()> {
+///
+/// `bareuseronly_dirs` reduces the mode to [`BAREUSERONLY_DIR_MASK`] instead.
+/// This function has one call site, the fresh arm of the directory walk, so the
+/// mask reaches the destination root and every directory the checkout creates
+/// and no directory it reuses.
+fn apply_dir_metadata(
+    fd: BorrowedFd<'_>,
+    effective: CheckoutMode,
+    bareuseronly_dirs: bool,
+    dm: &DirMeta,
+) -> Result<()> {
     if effective == CheckoutMode::None {
         for (name, value) in dm.xattrs.iter() {
             crate::write::set_inode_xattr(fd, name, value)?;
         }
         rustix::fs::fchown(fd, Some(Uid::from_raw(dm.uid)), Some(Gid::from_raw(dm.gid)))?;
     }
-    rustix::fs::fchmod(fd, Mode::from_raw_mode(dm.mode & PERM_MASK))?;
+    let mask = if bareuseronly_dirs {
+        BAREUSERONLY_DIR_MASK
+    } else {
+        PERM_MASK
+    };
+    rustix::fs::fchmod(fd, Mode::from_raw_mode(dm.mode & mask))?;
     Ok(())
 }
 
@@ -1521,6 +1629,8 @@ struct Policy {
     /// inode.
     effective: CheckoutMode,
     force_copy: bool,
+    require_hardlinks: bool,
+    bareuseronly_dirs: bool,
     overwrite: OverwriteMode,
     enable_fsync: bool,
     process_whiteouts: bool,
@@ -1539,6 +1649,8 @@ impl Policy {
             requested: opts.mode,
             effective,
             force_copy: opts.force_copy,
+            require_hardlinks: opts.require_hardlinks,
+            bareuseronly_dirs: opts.bareuseronly_dirs,
             overwrite: opts.overwrite,
             enable_fsync: opts.enable_fsync,
             process_whiteouts: opts.process_whiteouts,
@@ -1571,6 +1683,93 @@ fn hardlink_symlink(policy: Policy) -> bool {
         && policy.requested == CheckoutMode::None
 }
 
+/// Whether this regular file's loose object may be hardlinked into place.
+/// A zero-length object is written fresh in every mode, so its destination
+/// carries its own inode at link count 1. That is the tool's own outcome, so
+/// the two agree on the destination's link counts entry for entry
+/// (`format-reference.md`, "Checkout").
+fn hardlink_regular_object(policy: Policy, obj: &FileObject) -> bool {
+    hardlink_regular(policy) && !matches!(obj.kind, FileKind::Regular { size: 0 })
+}
+
+/// Whether [`require_hardlinks`](CheckoutOptions::require_hardlinks) refuses
+/// this entry. A directory reaches no file site, so it never refuses; a
+/// zero-length regular file is written fresh in every mode, so it is not a copy
+/// the switch refuses; and a regular file of non-zero length and a symlink each
+/// follow a table of their own.
+fn require_hardlinks_refuses(policy: Policy, obj: &FileObject) -> bool {
+    if !policy.require_hardlinks {
+        return false;
+    }
+    match obj.kind {
+        FileKind::Regular { size } => size != 0 && require_hardlinks_refuses_regular(policy),
+        FileKind::Symlink { .. } => require_hardlinks_refuses_symlink(policy),
+    }
+}
+
+/// Whether [`require_hardlinks`](CheckoutOptions::require_hardlinks) refuses a
+/// regular file of non-zero length: the complement of [`hardlink_regular`],
+/// which is the table `format-reference.md`, "Checkout" records. Recovered by
+/// checking a one-byte-file commit out of each mode under both checkout modes.
+/// The switch itself is read by [`require_hardlinks_refuses`], the one caller.
+fn require_hardlinks_refuses_regular(policy: Policy) -> bool {
+    !hardlink_regular(policy)
+}
+
+/// Whether [`require_hardlinks`](CheckoutOptions::require_hardlinks) refuses a
+/// symlink. Recovered by checking a symlink-only commit out of each mode under
+/// both checkout modes: the refusing set is `archive` under either checkout
+/// mode and `bare` under [`User`](CheckoutMode::User). It is not the table
+/// [`hardlink_symlink`] follows: `bare-user` under
+/// [`None`](CheckoutMode::None) recreates the link and does not refuse.
+///
+/// `bare-user-shared` and `bare-split-xattrs` are the port's own modes, which
+/// the tool does not carry, so no observation decides them. Each stores a
+/// symlink the way `bare-user` does and recreates it, so each follows
+/// `bare-user` here and refuses nothing.
+///
+/// The switch itself is read by [`require_hardlinks_refuses`], the one caller.
+fn require_hardlinks_refuses_symlink(policy: Policy) -> bool {
+    matches!(
+        (policy.repo_mode, policy.requested),
+        (RepoMode::Archive, _) | (RepoMode::Bare, CheckoutMode::User)
+    )
+}
+
+/// Refuse a [`require_hardlinks`](CheckoutOptions::require_hardlinks) checkout
+/// at a destination directory on another filesystem than the repository, where
+/// no entry of it can be hardlinked. Every directory the walk enters reaches
+/// this, the destination root and every directory below it, fresh or reused,
+/// and each is refused before anything in it is read or written. The check
+/// stands after the directory is created, which is the tool's own order, so
+/// both leave the same destination behind. The two `fstat` calls are cheap and
+/// synchronous.
+///
+/// Recovered by checking a commit whose subtree sits behind a destination
+/// symlink to a second filesystem out under `-H`: the tool refuses whatever the
+/// subtree holds, a subtree of one empty directory among them, and refuses in
+/// every repository mode (`format-reference.md`, "Checkout").
+fn check_hardlink_device(repo: &Repo, policy: Policy, dest: BorrowedFd<'_>) -> Result<()> {
+    if !policy.require_hardlinks {
+        return Ok(());
+    }
+    let src = rustix::fs::fstat(repo.objects_fd())?.st_dev;
+    let dst = rustix::fs::fstat(dest)?.st_dev;
+    if src == dst {
+        return Ok(());
+    }
+    Err(Error::HardlinkAcrossDevices { src, dst })
+}
+
+/// The cross-device refusal for a `linkat` that returned `EXDEV`, naming each
+/// side's device. The caller has already established that the link crossed a
+/// filesystem, so this always returns the error.
+fn hardlink_across_devices(repo: &Repo, dest: BorrowedFd<'_>) -> Result<()> {
+    let src = rustix::fs::fstat(repo.objects_fd())?.st_dev;
+    let dst = rustix::fs::fstat(dest)?.st_dev;
+    Err(Error::HardlinkAcrossDevices { src, dst })
+}
+
 /// Whether the whiteout switch widens the union-files disposition over a type
 /// conflict, so a destination entry whose type is not the type the tree carries
 /// is removed rather than refused. `process_whiteouts` widens
@@ -1598,6 +1797,18 @@ mod tests {
             &CheckoutOptions {
                 mode,
                 force_copy,
+                ..CheckoutOptions::default()
+            },
+        )
+    }
+
+    /// The same with `require_hardlinks` set.
+    fn require_policy(repo_mode: RepoMode, mode: CheckoutMode) -> Policy {
+        Policy::new(
+            repo_mode,
+            &CheckoutOptions {
+                mode,
+                require_hardlinks: true,
                 ..CheckoutOptions::default()
             },
         )
@@ -1640,6 +1851,114 @@ mod tests {
         assert!(!hardlink_symlink(policy(BareUser, None, false)));
         assert!(!hardlink_symlink(policy(BareUserOnly, None, false)));
         assert!(!hardlink_symlink(policy(Archive, None, false)));
+    }
+
+    /// The regular-file refusal table of `format-reference.md`, "Checkout": a
+    /// regular file of non-zero length is refused wherever the repository mode
+    /// and the checkout mode in force give a copy. The switch itself is read by
+    /// `require_hardlinks_refuses`, whose clear arm
+    /// `tests/checkout.rs::require_hardlinks_refuses_at_the_entry` states.
+    #[test]
+    fn require_hardlinks_regular_matrix() {
+        use CheckoutMode::{None, User};
+        use RepoMode::{Archive, Bare, BareSplitXattrs, BareUser, BareUserOnly, BareUserShared};
+
+        assert!(!require_hardlinks_refuses_regular(require_policy(
+            Bare, None
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            Bare, User
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            BareUser, None
+        )));
+        assert!(!require_hardlinks_refuses_regular(require_policy(
+            BareUser, User
+        )));
+        assert!(!require_hardlinks_refuses_regular(require_policy(
+            BareUserOnly,
+            None
+        )));
+        assert!(!require_hardlinks_refuses_regular(require_policy(
+            BareUserOnly,
+            User
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            BareUserShared,
+            None
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            BareUserShared,
+            User
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            Archive, None
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            Archive, User
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            BareSplitXattrs,
+            None
+        )));
+        assert!(require_hardlinks_refuses_regular(require_policy(
+            BareSplitXattrs,
+            User
+        )));
+    }
+
+    /// The symlink refusal table of `format-reference.md`, "Checkout", which is
+    /// not the regular-file table: `bare-user` under `None` refuses a regular
+    /// file and takes a symlink. The switch itself is read by
+    /// `require_hardlinks_refuses`, whose clear arm
+    /// `tests/checkout.rs::require_hardlinks_refuses_at_the_entry` states.
+    #[test]
+    fn require_hardlinks_symlink_matrix() {
+        use CheckoutMode::{None, User};
+        use RepoMode::{Archive, Bare, BareSplitXattrs, BareUser, BareUserOnly, BareUserShared};
+
+        assert!(require_hardlinks_refuses_symlink(require_policy(
+            Archive, None
+        )));
+        assert!(require_hardlinks_refuses_symlink(require_policy(
+            Archive, User
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            Bare, None
+        )));
+        assert!(require_hardlinks_refuses_symlink(require_policy(
+            Bare, User
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareUser, None
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareUser, User
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareUserOnly,
+            None
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareUserOnly,
+            User
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareUserShared,
+            None
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareUserShared,
+            User
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareSplitXattrs,
+            None
+        )));
+        assert!(!require_hardlinks_refuses_symlink(require_policy(
+            BareSplitXattrs,
+            User
+        )));
     }
 
     /// `bare-user-only` forces `User` semantics regardless of the requested

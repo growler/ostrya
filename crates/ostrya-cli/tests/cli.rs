@@ -19301,7 +19301,10 @@ fn checkout_union_modes_match_the_tool() {
 ///
 /// Carries `checkout/union-add-with-union-identical` and the ordering claim
 /// behind the other two pair cells, and the divergences
-/// `checkout/union-given-twice` and `checkout/whiteouts-given-twice` record.
+/// `checkout/union-given-twice`, `checkout/whiteouts-given-twice`,
+/// `checkout/require-hardlinks-given-twice`,
+/// `checkout/bareuseronly-dirs-given-twice`, and
+/// `checkout/disable-cache-given-twice` record.
 #[test]
 fn checkout_union_options_are_mutually_exclusive() {
     if !ostree_available() {
@@ -19374,6 +19377,9 @@ fn checkout_union_options_are_mutually_exclusive() {
         "--allow-noent",
         "--whiteouts",
         "--process-passthrough-whiteouts",
+        "-H",
+        "-M",
+        "--disable-cache",
     ]
     .into_iter()
     .enumerate()
@@ -19452,22 +19458,19 @@ fn checkout_union_identical_requires_require_hardlinks() {
                     String::from_utf8_lossy(&tool.stderr),
                 );
                 if port.status.code() != Some(0) {
-                    assert!(
-                        !port_dest.exists(),
-                        "{label}: the port's refusal created a destination",
-                    );
-                    // The tool's own `-H` gate stands after the destination
-                    // directory is made, so an `archive` or `bare` repository
-                    // that cannot hardlink leaves an empty destination behind
-                    // where the port leaves none. `-H` semantics are `F14`'s,
-                    // and `cli-surface.md`, "checkout" records the difference;
-                    // what both refusals hold in common is that neither writes
-                    // an entry.
-                    let listing = describe_tree_with_content(&tool_dest);
-                    assert!(
-                        listing.is_empty() || listing == ["<no destination>"],
-                        "{label}: the tool's refusal wrote an entry: {listing:?}",
-                    );
+                    // Both refusals leave the destination with no entry in
+                    // it. The option-consistency refusals the port makes
+                    // through `clap` create no destination at all, and the
+                    // per-entry `-H` refusal both sides make over this tree
+                    // reaches the tree's first regular file, so the
+                    // destination directory stands and holds nothing.
+                    for (who, dest) in [("port", &port_dest), ("tool", &tool_dest)] {
+                        let listing = describe_tree_with_content(dest);
+                        assert!(
+                            listing.is_empty() || listing == ["<no destination>"],
+                            "{label}: the {who}'s refusal wrote an entry: {listing:?}",
+                        );
+                    }
                 }
             }
         }
@@ -20732,13 +20735,10 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
     build_union_tree(&tree);
     let (repo, rev) = union_repo(base, RepoMode::Bare, "repo", &tree);
 
-    // The tool's own table, measured. `-M/--bareuseronly-dirs` and
-    // `--disable-cache` also make the tool drop the switch, and they are
-    // outside the port's `checkout` surface today, so they join this table
-    // with the items that add them. `--skip-list` is in
+    // The tool's own table, measured. `--skip-list` is in
     // `checkout_skip_list_drops_allow_noent_in_the_tool`, together with the
     // two batch options that keep the switch.
-    let arms: [(&str, &[&str], i32); 9] = [
+    let arms: [(&str, &[&str], i32); 11] = [
         ("bare", &[], 0),
         ("require-hardlinks", &["-H"], 1),
         ("force-copy", &["-C"], 1),
@@ -20752,6 +20752,8 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
             &["--process-passthrough-whiteouts"],
             1,
         ),
+        ("bareuseronly-dirs", &["-M"], 1),
+        ("disable-cache", &["--disable-cache"], 1),
     ];
 
     for (case, switches, tool_status) in arms {
@@ -22394,4 +22396,1001 @@ fn checkout_batch_empty_subpath_record_diverges_from_the_tool() {
         port_dest.join("f1").exists() && port_dest.join("a/b/c/f4").exists(),
         "the port wrote the whole tree",
     );
+}
+
+// --- checkout: the hardlink requirement and the directory-mode mask ----------
+//
+// `-H/--require-hardlinks` refuses an entry the checkout would materialize by a
+// copy, `-M/--bareuseronly-dirs` reduces every directory the checkout creates
+// to `mode & 0775`, and `--disable-cache` suppresses the uncompressed-object
+// cache the tool keeps. The facts are recorded in `../docs/format-reference.md`,
+// "Checkout", and the cells these tests carry are in
+// `../docs/conformance/m10-cli-behavior.matrix`.
+
+/// The four repository modes the tool carries, in the order the sweeps take
+/// them.
+const HARDLINK_MODES: [(&str, RepoMode); 4] = [
+    ("archive", RepoMode::Archive),
+    ("bare", RepoMode::Bare),
+    ("bare-user", RepoMode::BareUser),
+    ("bare-user-only", RepoMode::BareUserOnly),
+];
+
+/// Whether `-H` refuses a regular file of non-zero length in this repository
+/// mode under this checkout mode, as the tool was measured to.
+fn refuses_regular(mode: RepoMode, user_mode: bool) -> bool {
+    !matches!(
+        (mode, user_mode),
+        (RepoMode::Bare, false) | (RepoMode::BareUser, true) | (RepoMode::BareUserOnly, _)
+    )
+}
+
+/// Whether `-H` refuses a symlink in this repository mode under this checkout
+/// mode, as the tool was measured to. The set is not the regular-file set.
+fn refuses_symlink(mode: RepoMode, user_mode: bool) -> bool {
+    matches!(
+        (mode, user_mode),
+        (RepoMode::Archive, _) | (RepoMode::Bare, true)
+    )
+}
+
+/// Create a repository of `mode` at `base/name`, with no commit.
+fn hardlink_repo(base: &Path, mode: RepoMode, name: &str) -> PathBuf {
+    let repo = base.join(name);
+    block_on(async {
+        Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+    });
+    repo
+}
+
+/// Commit `tree` into `repo` under `branch` at a fixed timestamp, keeping the
+/// tree's own modes, and return the commit checksum.
+fn commit_verbatim(repo: &Path, branch: &str, tree: &Path) -> String {
+    ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            "-b",
+            branch,
+            "-s",
+            SUBJECT,
+            "--timestamp=@1700000000",
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed()
+}
+
+/// The corpus the `-H` sweeps check out: a regular file, a zero-length regular
+/// file, a symlink, and a directory holding one more regular file. It reaches
+/// every refusal the tool makes.
+fn build_hardlink_tree(dir: &Path) {
+    std::fs::create_dir_all(dir.join("d")).unwrap();
+    std::fs::write(dir.join("f"), b"f-content\n").unwrap();
+    chmod_to(&dir.join("f"), 0o644);
+    std::fs::write(dir.join("empty"), b"").unwrap();
+    chmod_to(&dir.join("empty"), 0o644);
+    std::os::unix::fs::symlink("f", dir.join("l")).unwrap();
+    std::fs::write(dir.join("d/nested"), b"nested\n").unwrap();
+    chmod_to(&dir.join("d/nested"), 0o644);
+    chmod_to(&dir.join("d"), 0o755);
+    chmod_to(dir, 0o755);
+}
+
+/// The four single-shape trees the per-entry sweep needs, each holding one
+/// entry of one shape, under `base/shape-<name>`.
+fn build_shape_trees(base: &Path) {
+    std::fs::create_dir_all(base.join("shape-dir/d")).unwrap();
+    chmod_to(&base.join("shape-dir/d"), 0o755);
+    std::fs::create_dir_all(base.join("shape-empty")).unwrap();
+    std::fs::write(base.join("shape-empty/e"), b"").unwrap();
+    chmod_to(&base.join("shape-empty/e"), 0o644);
+    std::fs::create_dir_all(base.join("shape-one")).unwrap();
+    std::fs::write(base.join("shape-one/o"), b"x").unwrap();
+    chmod_to(&base.join("shape-one/o"), 0o644);
+    std::fs::create_dir_all(base.join("shape-sym")).unwrap();
+    std::os::unix::fs::symlink("target", base.join("shape-sym/l")).unwrap();
+    for name in ["shape-dir", "shape-empty", "shape-one", "shape-sym"] {
+        chmod_to(&base.join(name), 0o755);
+    }
+}
+
+/// The inode numbers of every loose object of `repo`, so a destination entry
+/// can be told to be the object's own inode without naming a checksum.
+fn object_inodes(repo: &Path) -> std::collections::HashSet<u64> {
+    let mut out = std::collections::HashSet::new();
+    let objects = repo.join("objects");
+    let Ok(fanouts) = std::fs::read_dir(&objects) else {
+        return out;
+    };
+    for fanout in fanouts.map(Result::unwrap) {
+        let Ok(entries) = std::fs::read_dir(fanout.path()) else {
+            continue;
+        };
+        for entry in entries.map(Result::unwrap) {
+            out.insert(entry.path().symlink_metadata().unwrap().ino());
+        }
+    }
+    out
+}
+
+/// Each non-directory of a checked-out tree, rendered as its path, its link
+/// count, and whether its inode is one of `repo`'s loose objects. This is what
+/// states a hardlink without naming a checksum. Each implementation is given
+/// its own copy of the repository, so the counts are its own.
+fn describe_tree_with_links(root: &Path, repo: &Path) -> Vec<String> {
+    fn walk(
+        dir: &Path,
+        prefix: &str,
+        inodes: &std::collections::HashSet<u64>,
+        out: &mut Vec<String>,
+    ) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = format!("{prefix}{name}");
+            let meta = entry.path().symlink_metadata().unwrap();
+            if meta.file_type().is_dir() {
+                out.push(format!("{rel} dir"));
+                walk(&entry.path(), &format!("{rel}/"), inodes, out);
+                continue;
+            }
+            let shares = if inodes.contains(&meta.ino()) {
+                "yes"
+            } else {
+                "no"
+            };
+            out.push(format!(
+                "{rel} links={} shares-object={shares}",
+                meta.nlink(),
+            ));
+        }
+    }
+
+    if !root.exists() {
+        return vec!["<no destination>".to_owned()];
+    }
+    let inodes = object_inodes(repo);
+    let mut out = Vec::new();
+    walk(root, "", &inodes, &mut out);
+    out
+}
+
+/// Run `checkout` in the port alone, for the cases where each implementation
+/// reads a repository of its own.
+fn checkout_port(repo: &Path, options: &[&str], rev: &str, dest: &Path) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let dest_path = dest.display().to_string();
+    let mut args = vec!["checkout", repo_arg.as_str()];
+    args.extend(options.iter().copied());
+    args.push(rev);
+    args.push(dest_path.as_str());
+    ostrya(&args, None, &[])
+}
+
+/// The same in the tool alone.
+fn checkout_tool(repo: &Path, options: &[&str], rev: &str, dest: &Path) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let dest_path = dest.display().to_string();
+    let mut args = vec!["checkout", repo_arg.as_str()];
+    args.extend(options.iter().copied());
+    args.push(rev);
+    args.push(dest_path.as_str());
+    ostree(&args)
+}
+
+/// `-H` over the whole corpus, in every repository mode and under both checkout
+/// modes: the two implementations reach the same exit status and, where both
+/// take it, the same destination tree. The refusal stands ahead of the
+/// destination disposition, so an entry a union mode would keep or skip is
+/// refused all the same.
+///
+/// Carries `checkout/require-hardlinks-in-archive`,
+/// `checkout/require-hardlinks-in-bare`,
+/// `checkout/require-hardlinks-in-bare-under-user-mode`,
+/// `checkout/require-hardlinks-in-bare-user-without-user-mode`,
+/// `checkout/require-hardlinks-in-bare-user-under-user-mode`,
+/// `checkout/require-hardlinks-in-bare-user-only`, and
+/// `checkout/require-hardlinks-in-bare-user-only-under-user-mode`.
+#[test]
+fn checkout_require_hardlinks_refusals_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-require-hardlinks");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_hardlink_tree(&tree);
+
+    for (mode_name, mode) in HARDLINK_MODES {
+        let repo = hardlink_repo(base, mode, &format!("repo-{mode_name}"));
+        let rev = commit_verbatim(&repo, BRANCH, &tree);
+
+        for user_mode in [false, true] {
+            let mut options = vec!["-H"];
+            if user_mode {
+                options.push("-U");
+            }
+            let tag = format!("{mode_name}-{}", u8::from(user_mode));
+            let label = format!("{mode_name}/user={user_mode}");
+            let port_dest = base.join(format!("port-{tag}"));
+            let tool_dest = base.join(format!("tool-{tag}"));
+            let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+            assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+            assert_eq!(
+                port.status.code() == Some(0),
+                !refuses_regular(mode, user_mode) && !refuses_symlink(mode, user_mode),
+                "{label}: the measured table says otherwise: {}",
+                String::from_utf8_lossy(&port.stderr),
+            );
+
+            // The refusal stands ahead of the destination disposition: an
+            // entry `--union-add` would keep and an entry `--union-identical`
+            // would call identical are refused all the same.
+            for union in ["--union-add", "--union-identical"] {
+                let mut options = vec!["-H", union];
+                if user_mode {
+                    options.push("-U");
+                }
+                let label = format!("{mode_name}/user={user_mode}/{union}");
+                let port_dest = base.join(format!("port-{tag}-{union}"));
+                let tool_dest = base.join(format!("tool-{tag}-{union}"));
+                for dest in [&port_dest, &tool_dest] {
+                    std::fs::create_dir_all(dest).unwrap();
+                    std::fs::write(dest.join("f"), b"f-content\n").unwrap();
+                    chmod_to(&dest.join("f"), 0o644);
+                    std::fs::write(dest.join("empty"), b"").unwrap();
+                    chmod_to(&dest.join("empty"), 0o644);
+                }
+                let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+                assert_eq!(
+                    port.status.code(),
+                    tool.status.code(),
+                    "{label}: the exit statuses part\nport: {}\ntool: {}",
+                    String::from_utf8_lossy(&port.stderr),
+                    String::from_utf8_lossy(&tool.stderr),
+                );
+            }
+        }
+    }
+}
+
+/// `-H` decides per entry, not per repository mode. A directory and a
+/// zero-length regular file never refuse, a regular file of non-zero length
+/// refuses wherever the mode pair gives a copy, and a symlink follows a table
+/// of its own. Thirty-two cells, four shapes over four repository modes under
+/// both checkout modes.
+///
+/// Carries `checkout/require-hardlinks-refuses-at-the-entry`.
+#[test]
+fn checkout_require_hardlinks_refuses_at_the_entry() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-require-hardlinks-entry");
+    let base = tmp.path();
+    build_shape_trees(base);
+
+    for (mode_name, mode) in HARDLINK_MODES {
+        let repo = hardlink_repo(base, mode, &format!("repo-{mode_name}"));
+        // Each shape is committed once per repository mode; the two checkout
+        // modes read the same four commits.
+        let shapes: [(&str, String); 4] = ["dir", "empty", "one", "sym"].map(|shape| {
+            (
+                shape,
+                commit_verbatim(&repo, shape, &base.join(format!("shape-{shape}"))),
+            )
+        });
+        for user_mode in [false, true] {
+            for (shape, rev) in &shapes {
+                let shape = *shape;
+                let refuses = match shape {
+                    "one" => refuses_regular(mode, user_mode),
+                    "sym" => refuses_symlink(mode, user_mode),
+                    _ => false,
+                };
+                let mut options = vec!["-H"];
+                if user_mode {
+                    options.push("-U");
+                }
+                let tag = format!("{mode_name}-{}-{shape}", u8::from(user_mode));
+                let label = format!("{mode_name}/user={user_mode}/{shape}");
+                let port_dest = base.join(format!("port-{tag}"));
+                let tool_dest = base.join(format!("tool-{tag}"));
+                let (port, tool) = checkout_pair(&repo, &options, rev, &port_dest, &tool_dest);
+                assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+                assert_eq!(
+                    port.status.code() == Some(1),
+                    refuses,
+                    "{label}: the measured table says otherwise: {}",
+                    String::from_utf8_lossy(&port.stderr),
+                );
+            }
+        }
+    }
+}
+
+/// The refusal is raised where the entry is materialized, so a walk that
+/// refuses part-way through leaves the entries it already wrote. Both
+/// implementations leave the same partial destination.
+///
+/// Carries `checkout/require-hardlinks-leaves-a-partial-destination`.
+#[test]
+fn checkout_require_hardlinks_leaves_the_same_destination_on_a_refusal() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-require-hardlinks-partial");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(tree.join("a")).unwrap();
+    std::fs::create_dir_all(tree.join("b")).unwrap();
+    std::fs::write(tree.join("a/empty"), b"").unwrap();
+    chmod_to(&tree.join("a/empty"), 0o644);
+    std::os::unix::fs::symlink("x", tree.join("a/link")).unwrap();
+    std::fs::write(tree.join("b/real"), b"r").unwrap();
+    chmod_to(&tree.join("b/real"), 0o644);
+    chmod_to(&tree.join("a"), 0o755);
+    chmod_to(&tree.join("b"), 0o755);
+    chmod_to(&tree, 0o755);
+
+    let repo = hardlink_repo(base, RepoMode::Bare, "repo");
+    let rev = commit_verbatim(&repo, BRANCH, &tree);
+    let port_dest = base.join("port-partial");
+    let tool_dest = base.join("tool-partial");
+    let (port, tool) = checkout_pair(&repo, &["-U", "-H"], &rev, &port_dest, &tool_dest);
+    assert_eq!(port.status.code(), Some(1), "the port took it");
+    assert_eq!(tool.status.code(), Some(1), "the tool took it");
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "partial");
+    assert_eq!(
+        describe_tree_with_content(&port_dest),
+        vec!["a dir 700".to_owned(), "a/empty file 644 ".to_owned()],
+        "the walk stopped at the symlink and kept what it wrote; the directory \
+         keeps the transient mode, its own being applied after its children",
+    );
+}
+
+/// Where both implementations take `-H`, both hardlink the same entries out of
+/// their own repository and leave the same entries on inodes of their own. A
+/// zero-length regular file is on neither side's object inode.
+///
+/// Carries `checkout/require-hardlinks-in-bare`,
+/// `checkout/require-hardlinks-in-bare-user-under-user-mode`, and
+/// `checkout/require-hardlinks-in-bare-user-only`.
+#[test]
+fn checkout_require_hardlinks_hardlinks_the_same_objects() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-require-hardlinks-identity");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_hardlink_tree(&tree);
+
+    for (mode_name, mode, user_mode) in [
+        ("bare", RepoMode::Bare, false),
+        ("bare-user", RepoMode::BareUser, true),
+        ("bare-user-only", RepoMode::BareUserOnly, false),
+        ("bare-user-only-u", RepoMode::BareUserOnly, true),
+    ] {
+        let repo = hardlink_repo(base, mode, &format!("repo-{mode_name}"));
+        let rev = commit_verbatim(&repo, BRANCH, &tree);
+        let tool_repo = clone_repo(base, &repo, &format!("tool-repo-{mode_name}"));
+
+        let mut options = vec!["-H"];
+        if user_mode {
+            options.push("-U");
+        }
+        let port_dest = base.join(format!("port-id-{mode_name}"));
+        let tool_dest = base.join(format!("tool-id-{mode_name}"));
+        checkout_port(&repo, &options, &rev, &port_dest).ok();
+        checkout_tool(&tool_repo, &options, &rev, &tool_dest).ok();
+
+        let port_links = describe_tree_with_links(&port_dest, &repo);
+        assert_eq!(
+            port_links,
+            describe_tree_with_links(&tool_dest, &tool_repo),
+            "{mode_name}: the link counts part",
+        );
+        assert!(
+            port_links.contains(&"empty links=1 shares-object=no".to_owned()),
+            "{mode_name}: a zero-length file is written fresh: {port_links:?}",
+        );
+        assert!(
+            port_links.contains(&"f links=2 shares-object=yes".to_owned()),
+            "{mode_name}: a regular file is hardlinked: {port_links:?}",
+        );
+    }
+}
+
+/// A destination directory on another filesystem than the repository is
+/// refused before any entry of it is written, whatever the subtree holds. The
+/// destination root reaches the refusal and so does every directory below it,
+/// which a destination symlink into the second filesystem puts under a union
+/// mode. A single file or symlink target takes no such check and refuses at
+/// the link itself, so a zero-length file is written there at exit 0.
+///
+/// Carries `checkout/require-hardlinks-across-devices`.
+#[test]
+fn checkout_require_hardlinks_refuses_across_devices() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-require-hardlinks-xdev");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(tree.join("d")).unwrap();
+    chmod_to(&tree.join("d"), 0o755);
+    chmod_to(&tree, 0o755);
+    let repo = hardlink_repo(base, RepoMode::Bare, "repo");
+    let rev = commit_verbatim(&repo, BRANCH, &tree);
+
+    // A second filesystem is needed, and `/dev/shm` is one where the host
+    // gives it. A destination is needed to run anything at all, so an
+    // unwritable `/dev/shm` skips here; whether it is a second filesystem is
+    // read after the first assertion fails, so a host that has one cannot
+    // pass by skipping.
+    let other = Path::new("/dev/shm").join(format!("ostrya-cli-xdev-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&other);
+    if std::fs::create_dir_all(&other).is_err() {
+        eprintln!("skipped: /dev/shm is not writable, so no second filesystem is reachable");
+        return;
+    }
+
+    let port_dest = other.join("port");
+    let tool_dest = other.join("tool");
+    let (port, tool) = checkout_pair(&repo, &["-H"], &rev, &port_dest, &tool_dest);
+    if port.status.code() != Some(1) || tool.status.code() != Some(1) {
+        let same_device =
+            std::fs::metadata(&other).unwrap().dev() == std::fs::metadata(base).unwrap().dev();
+        assert!(
+            same_device,
+            "a cross-device hardlink checkout was taken\nport: {}\ntool: {}",
+            String::from_utf8_lossy(&port.stderr),
+            String::from_utf8_lossy(&tool.stderr),
+        );
+        let _ = std::fs::remove_dir_all(&other);
+        eprintln!("skipped: /dev/shm is the scratch directory's own filesystem");
+        return;
+    }
+    for (who, dest) in [("port", &port_dest), ("tool", &tool_dest)] {
+        assert_eq!(
+            describe_tree_with_content(dest),
+            Vec::<String>::new(),
+            "the {who} left the destination directory with an entry in it",
+        );
+    }
+    // Without `-H` the same destination is written whole, so the refusal is
+    // the switch's and not the filesystem's.
+    let plain = other.join("plain");
+    let (port, tool) = checkout_pair(&repo, &[], &rev, &plain, &other.join("plain-tool"));
+    port.ok();
+    tool.ok();
+    assert!(plain.join("d").is_dir());
+
+    // A destination directory below the root: the tree's `a` is a directory,
+    // the destination's `a` is a symlink into the second filesystem, and a
+    // union mode follows it. Every subtree shape refuses, a subtree of one
+    // empty directory among them, and nothing of it is written.
+    let shapes: [DestBuilder; 5] = [
+        ("dir", |d| {
+            std::fs::create_dir_all(d.join("a/sub")).unwrap();
+        }),
+        ("empty", |d| {
+            std::fs::create_dir_all(d.join("a")).unwrap();
+            std::fs::write(d.join("a/e"), b"").unwrap();
+        }),
+        ("symlink", |d| {
+            std::fs::create_dir_all(d.join("a")).unwrap();
+            std::os::unix::fs::symlink("x", d.join("a/l")).unwrap();
+        }),
+        ("regular", |d| {
+            std::fs::create_dir_all(d.join("a")).unwrap();
+            std::fs::write(d.join("a/r"), b"r\n").unwrap();
+        }),
+        ("mixed", |d| {
+            std::fs::create_dir_all(d.join("a")).unwrap();
+            std::fs::write(d.join("a/aempty"), b"").unwrap();
+            std::fs::write(d.join("a/zreal"), b"r\n").unwrap();
+        }),
+    ];
+    for (shape, build) in shapes {
+        let sub_tree = base.join(format!("tree-{shape}"));
+        build(&sub_tree);
+        chmod_to(&sub_tree.join("a"), 0o755);
+        chmod_to(&sub_tree, 0o755);
+        let sub_rev = commit_verbatim(&repo, &format!("below-{shape}"), &sub_tree);
+
+        let port_root = base.join(format!("below-port-{shape}"));
+        let tool_root = base.join(format!("below-tool-{shape}"));
+        let port_target = other.join(format!("port-{shape}"));
+        let tool_target = other.join(format!("tool-{shape}"));
+        for (root, target) in [(&port_root, &port_target), (&tool_root, &tool_target)] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::create_dir_all(target).unwrap();
+            std::os::unix::fs::symlink(target, root.join("a")).unwrap();
+        }
+
+        let (port, tool) =
+            checkout_pair(&repo, &["-H", "--union"], &sub_rev, &port_root, &tool_root);
+        for (who, run, target) in [("port", &port, &port_target), ("tool", &tool, &tool_target)] {
+            assert_eq!(
+                run.status.code(),
+                Some(1),
+                "{shape}: the {who} took a checkout onto another filesystem: {}",
+                String::from_utf8_lossy(&run.stderr),
+            );
+            assert_eq!(
+                describe_tree_with_content(target),
+                Vec::<String>::new(),
+                "{shape}: the {who} wrote into the directory on another filesystem",
+            );
+        }
+    }
+
+    // A single file or symlink target reaches no directory walk, so it takes
+    // no up-front check: the zero-length file is written and the other two
+    // shapes are refused where the link fails.
+    for (shape, subpath, expected) in [
+        ("empty", "--subpath=/a/e", 0),
+        ("regular", "--subpath=/a/r", 1),
+        ("symlink", "--subpath=/a/l", 1),
+    ] {
+        let branch = format!("below-{shape}");
+        let port_dest = other.join(format!("file-port-{shape}"));
+        let tool_dest = other.join(format!("file-tool-{shape}"));
+        let (port, tool) = checkout_pair(&repo, &["-H", subpath], &branch, &port_dest, &tool_dest);
+        assert_eq!(
+            port.status.code(),
+            Some(expected),
+            "{shape}: the port's status moved: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, shape);
+    }
+    let _ = std::fs::remove_dir_all(&other);
+}
+
+/// A pruned entry is never materialized, so it never refuses; and the gate
+/// follows a `--subpath` into the subtree it selects.
+///
+/// Carries `checkout/require-hardlinks-refuses-at-the-entry`.
+#[test]
+fn checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-require-hardlinks-selection");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_hardlink_tree(&tree);
+    let repo = hardlink_repo(base, RepoMode::Archive, "repo");
+    let rev = commit_verbatim(&repo, BRANCH, &tree);
+
+    // A skip list that prunes every entry that would refuse leaves a tree of
+    // directories and one zero-length file, which both take.
+    let skip = base.join("skip.txt");
+    std::fs::write(&skip, b"/f\n/l\n/d/nested\n").unwrap();
+    let skip_option = format!("--skip-list={}", skip.display());
+    let port_dest = base.join("port-skip");
+    let tool_dest = base.join("tool-skip");
+    let (port, tool) = checkout_pair(
+        &repo,
+        &["-H", skip_option.as_str()],
+        &rev,
+        &port_dest,
+        &tool_dest,
+    );
+    assert_eq!(
+        port.status.code(),
+        Some(0),
+        "the port refused a tree holding nothing that needs a copy: {}",
+        String::from_utf8_lossy(&port.stderr),
+    );
+    assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, "skip-list");
+
+    // A subpath naming the zero-length file is taken and one naming the
+    // symlink is refused, in both.
+    for (name, subpath, expected) in [("empty", "--subpath=/empty", 0), ("sym", "--subpath=/l", 1)]
+    {
+        let port_dest = base.join(format!("port-sub-{name}"));
+        let tool_dest = base.join(format!("tool-sub-{name}"));
+        let (port, tool) = checkout_pair(&repo, &["-H", subpath], &rev, &port_dest, &tool_dest);
+        assert_eq!(
+            port.status.code(),
+            Some(expected),
+            "{name}: the port's status moved: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, name);
+    }
+
+    // A batch stream carrying no pair reaches no checkout and no refusal; one
+    // carrying a pair reaches both.
+    for (name, stream, expected) in [
+        ("empty-stream", String::new(), 0),
+        ("one-pair", format!("{rev}\0/\0"), 1),
+    ] {
+        let port_dest = base.join(format!("port-batch-{name}"));
+        let tool_dest = base.join(format!("tool-batch-{name}"));
+        let (port, tool) = checkout_batch_pair(
+            &repo,
+            &["-H", "--from-stdin"],
+            stream.as_bytes(),
+            &port_dest,
+            &tool_dest,
+        );
+        assert_eq!(
+            port.status.code(),
+            Some(expected),
+            "{name}: the port's status moved: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert_eq!(
+            tool.status.code(),
+            Some(expected),
+            "{name}: the tool's status moved: {}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
+    }
+}
+
+/// The tree the `-M` sweep checks out: twelve directory modes, one regular
+/// file above the mask, and one symlink.
+fn build_dir_mode_tree(dir: &Path) {
+    // Every mode carries the owner-execute bit, which the walk of a source
+    // tree needs to descend a directory.
+    const MODES: [u32; 12] = [
+        0o700, 0o705, 0o774, 0o775, 0o776, 0o777, 0o1755, 0o1777, 0o2755, 0o3775, 0o4755, 0o7777,
+    ];
+    std::fs::create_dir_all(dir).unwrap();
+    for mode in MODES {
+        let child = dir.join(format!("D{mode:o}"));
+        std::fs::create_dir_all(child.join("inner")).unwrap();
+        chmod_to(&child.join("inner"), mode);
+        chmod_to(&child, mode);
+    }
+    std::fs::write(dir.join("f"), b"payload\n").unwrap();
+    chmod_to(&dir.join("f"), 0o666);
+    std::os::unix::fs::symlink("f", dir.join("l")).unwrap();
+    chmod_to(dir, 0o777);
+}
+
+/// `-M` reduces every directory the checkout creates to `mode & 0775`, at the
+/// destination root and at every depth below it, in every repository mode and
+/// under both checkout modes. A directory the checkout reuses keeps its own
+/// mode, and a regular file and a symlink are unaffected.
+///
+/// Carries `checkout/bareuseronly-dirs-accepted` and
+/// `checkout/bareuseronly-dirs-masks-created-directories-only`.
+#[test]
+fn checkout_bareuseronly_dirs_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-bareuseronly-dirs");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_dir_mode_tree(&tree);
+
+    for (mode_name, mode) in HARDLINK_MODES {
+        let repo = hardlink_repo(base, mode, &format!("repo-{mode_name}"));
+        let rev = commit_verbatim(&repo, BRANCH, &tree);
+
+        for user_mode in [false, true] {
+            let mut masked = vec!["-M"];
+            let mut plain = vec![];
+            if user_mode {
+                masked.push("-U");
+                plain.push("-U");
+            }
+            let tag = format!("{mode_name}-{}", u8::from(user_mode));
+            let label = format!("{mode_name}/user={user_mode}");
+
+            let port_masked = base.join(format!("port-m-{tag}"));
+            let tool_masked = base.join(format!("tool-m-{tag}"));
+            let (port, tool) = checkout_pair(&repo, &masked, &rev, &port_masked, &tool_masked);
+            port.ok();
+            assert_checkout_pair(&port, &tool, &port_masked, &tool_masked, &label);
+
+            let port_plain = base.join(format!("port-p-{tag}"));
+            let tool_plain = base.join(format!("tool-p-{tag}"));
+            let (port, tool) = checkout_pair(&repo, &plain, &rev, &port_plain, &tool_plain);
+            port.ok();
+            assert_checkout_pair(
+                &port,
+                &tool,
+                &port_plain,
+                &tool_plain,
+                &format!("{label}/no-switch"),
+            );
+
+            // The walked tree the comparison above reads starts below the
+            // destination root, so the root's own mode is read here. The tree
+            // root is committed at 0777, which the mask reduces, so this
+            // states the root is masked in every repository mode and under
+            // both checkout modes.
+            let root_mode =
+                |dest: &Path| std::fs::metadata(dest).unwrap().permissions().mode() & 0o7777;
+            for (name, port_dest, tool_dest) in [
+                ("masked", &port_masked, &tool_masked),
+                ("plain", &port_plain, &tool_plain),
+            ] {
+                assert_eq!(
+                    root_mode(port_dest),
+                    root_mode(tool_dest),
+                    "{label}/{name}: the destination root's mode parts",
+                );
+            }
+            assert_eq!(
+                root_mode(&port_masked),
+                root_mode(&port_plain) & 0o775,
+                "{label}: the mask did not reach the destination root",
+            );
+
+            // `bare-user-only` canonicalizes a directory's mode at commit
+            // time, so every directory is already below the mask there and the
+            // switch is a no-op. Everywhere else it changes the tree, so a
+            // no-op implementation cannot pass.
+            let differs =
+                describe_tree_with_content(&port_masked) != describe_tree_with_content(&port_plain);
+            assert_eq!(
+                differs,
+                mode != RepoMode::BareUserOnly,
+                "{label}: the switch's reach moved",
+            );
+
+            // Four more directory modes at the destination root, which a
+            // `--subpath` states. The mask is read at one site, the fresh arm
+            // of the directory walk, and the root-mode assertion above already
+            // runs that site in every repository mode and under both checkout
+            // modes, so this sweep takes one cell of each.
+            if mode != RepoMode::Bare || user_mode {
+                continue;
+            }
+            for dir_mode in ["D777", "D2755", "D1777", "D776"] {
+                let subpath = format!("--subpath=/{dir_mode}");
+                let mut options = vec!["-M", subpath.as_str()];
+                if user_mode {
+                    options.push("-U");
+                }
+                let port_dest = base.join(format!("port-sub-{tag}-{dir_mode}"));
+                let tool_dest = base.join(format!("tool-sub-{tag}-{dir_mode}"));
+                let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+                port.ok();
+                assert_eq!(
+                    std::fs::metadata(&port_dest).unwrap().permissions().mode() & 0o7777,
+                    std::fs::metadata(&tool_dest).unwrap().permissions().mode() & 0o7777,
+                    "{label}/{dir_mode}: the destination root's mode parts",
+                );
+                assert_checkout_pair(
+                    &port,
+                    &tool,
+                    &port_dest,
+                    &tool_dest,
+                    &format!("{label}/{dir_mode}"),
+                );
+            }
+        }
+
+        // A directory the checkout reuses keeps its own mode, with the switch
+        // and without it.
+        for (name, switches) in [
+            ("reuse-m", vec!["-M", "--union"]),
+            ("reuse", vec!["--union"]),
+        ] {
+            let port_dest = base.join(format!("port-{name}-{mode_name}"));
+            let tool_dest = base.join(format!("tool-{name}-{mode_name}"));
+            for dest in [&port_dest, &tool_dest] {
+                std::fs::create_dir_all(dest.join("D777")).unwrap();
+                chmod_to(&dest.join("D777"), 0o700);
+                chmod_to(dest, 0o711);
+            }
+            let (port, tool) = checkout_pair(&repo, &switches, &rev, &port_dest, &tool_dest);
+            port.ok();
+            assert_checkout_pair(
+                &port,
+                &tool,
+                &port_dest,
+                &tool_dest,
+                &format!("{mode_name}/{name}"),
+            );
+            assert_eq!(
+                std::fs::metadata(&port_dest).unwrap().permissions().mode() & 0o7777,
+                0o711,
+                "{mode_name}/{name}: a reused destination root was re-stamped",
+            );
+        }
+    }
+}
+
+/// `--disable-cache` changes no byte and no metadata of the destination. The
+/// tool writes an uncompressed-object cache for an `archive` repository checked
+/// out with `-U` and for no other combination, and writes none under the
+/// switch. The port keeps no such cache in any combination.
+///
+/// Carries `checkout/disable-cache-accepted` and
+/// `checkout/disable-cache-writes-no-cache-directory`.
+#[test]
+fn checkout_disable_cache_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-disable-cache");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_hardlink_tree(&tree);
+
+    const CACHE: &str = "uncompressed-objects-cache";
+
+    let repo = hardlink_repo(base, RepoMode::Archive, "repo");
+    let rev = commit_verbatim(&repo, BRANCH, &tree);
+
+    // Each arm takes its own repository copy, so one arm's cache does not
+    // decide the next one's.
+    let mut trees = Vec::new();
+    for (name, switches) in [
+        ("plain", vec!["-U"]),
+        ("disabled", vec!["-U", "--disable-cache"]),
+    ] {
+        let port_repo = clone_repo(base, &repo, &format!("port-repo-{name}"));
+        let tool_repo = clone_repo(base, &repo, &format!("tool-repo-{name}"));
+        let port_dest = base.join(format!("port-{name}"));
+        let tool_dest = base.join(format!("tool-{name}"));
+        let port = checkout_port(&port_repo, &switches, &rev, &port_dest);
+        port.ok();
+        let tool = checkout_tool(&tool_repo, &switches, &rev, &tool_dest);
+        tool.ok();
+        assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, name);
+        assert_eq!(
+            tool_repo.join(CACHE).exists(),
+            name == "plain",
+            "{name}: the tool's cache directory moved",
+        );
+        assert!(
+            !port_repo.join(CACHE).exists(),
+            "{name}: the port wrote a cache directory",
+        );
+        trees.push(describe_tree_with_content(&port_dest));
+    }
+
+    // A cache the tool already populated is not read under the switch, and the
+    // destination is the same tree either way.
+    let tool_repo = clone_repo(base, &repo, "tool-repo-populated");
+    let warm = base.join("tool-warm");
+    ostree(&[
+        &format!("--repo={}", tool_repo.display()),
+        "checkout",
+        "-U",
+        &rev,
+        warm.to_str().unwrap(),
+    ])
+    .ok();
+    assert!(
+        tool_repo.join(CACHE).exists(),
+        "the cache was not populated"
+    );
+    let after = base.join("tool-after");
+    ostree(&[
+        &format!("--repo={}", tool_repo.display()),
+        "checkout",
+        "-U",
+        "--disable-cache",
+        &rev,
+        after.to_str().unwrap(),
+    ])
+    .ok();
+    assert_eq!(
+        describe_tree_with_content(&after),
+        trees[0],
+        "the switch changed the destination over a populated cache",
+    );
+    assert_eq!(trees[0], trees[1], "the switch changed the destination");
+
+    // The switch is accepted in every repository mode, with and without `-U`,
+    // and neither side writes a cache directory under it. The `archive` arms
+    // read the repository built above, which no checkout has written to.
+    for (mode_name, mode) in HARDLINK_MODES {
+        let (repo, rev) = if mode == RepoMode::Archive {
+            (repo.clone(), rev.clone())
+        } else {
+            let repo = hardlink_repo(base, mode, &format!("repo-{mode_name}"));
+            let rev = commit_verbatim(&repo, BRANCH, &tree);
+            (repo, rev)
+        };
+        for user_mode in [false, true] {
+            let mut options = vec!["--disable-cache"];
+            if user_mode {
+                options.push("-U");
+            }
+            let tag = format!("{mode_name}-{}", u8::from(user_mode));
+            let port_dest = base.join(format!("port-dc-{tag}"));
+            let tool_dest = base.join(format!("tool-dc-{tag}"));
+            let (port, tool) = checkout_pair(&repo, &options, &rev, &port_dest, &tool_dest);
+            port.ok();
+            assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &tag);
+            assert!(
+                !repo.join(CACHE).exists(),
+                "{tag}: the port wrote a cache directory",
+            );
+        }
+    }
+}
+
+/// Each of the four switches that decide how a checkout materializes an entry
+/// is refused alongside a composefs switch: both implementations exit 1 and
+/// neither writes a destination.
+///
+/// Carries `checkout/require-hardlinks-with-composefs`,
+/// `checkout/force-copy-with-composefs`,
+/// `checkout/bareuseronly-dirs-with-composefs`, and
+/// `checkout/disable-cache-with-composefs`.
+#[test]
+fn checkout_materialization_switches_refuse_composefs_in_both() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-materialization-composefs");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_hardlink_tree(&tree);
+    let repo = hardlink_repo(base, RepoMode::BareUser, "repo");
+    let rev = commit_verbatim(&repo, BRANCH, &tree);
+
+    for switch in ["-H", "-C", "-M", "--disable-cache"] {
+        for composefs in ["--composefs", "--composefs-noverity"] {
+            let tag = format!("{}-{}", switch.trim_start_matches('-'), &composefs[2..]);
+            let port_dest = base.join(format!("port-{tag}"));
+            let tool_dest = base.join(format!("tool-{tag}"));
+            let (port, tool) =
+                checkout_pair(&repo, &[switch, composefs], &rev, &port_dest, &tool_dest);
+            assert_eq!(
+                port.status.code(),
+                Some(1),
+                "{tag}: the port took the pair: {}",
+                String::from_utf8_lossy(&port.stderr),
+            );
+            assert_eq!(
+                tool.status.code(),
+                Some(1),
+                "{tag}: the tool took the pair: {}",
+                String::from_utf8_lossy(&tool.stderr),
+            );
+            assert!(
+                String::from_utf8_lossy(&port.stderr)
+                    .contains("Specified options are incompatible with --composefs"),
+                "{tag}: the port's words: {}",
+                String::from_utf8_lossy(&port.stderr),
+            );
+            for (who, dest) in [("port", &port_dest), ("tool", &tool_dest)] {
+                assert!(!dest.exists(), "{tag}: the {who} wrote a destination");
+            }
+        }
+    }
+
+    // A destination that already exists is left as it was.
+    let port_dest = base.join("port-existing");
+    let tool_dest = base.join("tool-existing");
+    for dest in [&port_dest, &tool_dest] {
+        std::fs::write(dest, b"keep\n").unwrap();
+        chmod_to(dest, 0o644);
+    }
+    let (port, tool) = checkout_pair(&repo, &["-M", "--composefs"], &rev, &port_dest, &tool_dest);
+    assert_eq!(port.status.code(), Some(1));
+    assert_eq!(tool.status.code(), Some(1));
+    for (who, dest) in [("port", &port_dest), ("tool", &tool_dest)] {
+        assert_eq!(
+            std::fs::read(dest).unwrap(),
+            b"keep\n",
+            "the {who} replaced an existing destination",
+        );
+    }
 }

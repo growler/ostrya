@@ -372,12 +372,20 @@ struct CommitArgs {
 
 #[derive(Args)]
 struct CheckoutArgs {
-    /// Prefer hardlinks where the repository mode allows (the default path).
+    /// Refuse an entry the checkout would materialize by a copy, instead of
+    /// falling back to one.
     #[arg(short = 'H', long)]
     require_hardlinks: bool,
     /// Copy every object instead of hardlinking (the copy path still reflinks).
     #[arg(short = 'C', long, conflicts_with = "require_hardlinks")]
     force_copy: bool,
+    /// Reduce every directory the checkout creates to `mode & 0775`.
+    #[arg(short = 'M', long)]
+    bareuseronly_dirs: bool,
+    /// Do not update or use the repository's uncompressed object cache. The
+    /// port keeps no such cache, so the switch decides nothing.
+    #[arg(long)]
+    disable_cache: bool,
     /// Do not change file ownership or initialize extended attributes.
     #[arg(short = 'U', long)]
     user_mode: bool,
@@ -3687,6 +3695,8 @@ fn checkout_options(args: &CheckoutArgs, filter: Option<CheckoutFilterFn>) -> Ch
     };
     let mut opts = CheckoutOptions::new(mode);
     opts.force_copy = args.force_copy;
+    opts.require_hardlinks = args.require_hardlinks;
+    opts.bareuseronly_dirs = args.bareuseronly_dirs;
     opts.process_whiteouts = args.whiteouts;
     opts.process_passthrough_whiteouts = args.process_passthrough_whiteouts;
     opts.overwrite = if args.union {
@@ -3807,13 +3817,21 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
 
     if args.composefs || args.composefs_noverity {
         // A whiteout switch describes a transformation of the tree a checkout
-        // writes, a skip list prunes paths out of it, and a composefs export
-        // writes an image of the commit tree instead. The tool refuses each
-        // combination and writes no image, and the port refuses it under the
-        // same words. The two batch options are not refused: the tool exports
-        // one image per pair, from the pair's own revision.
+        // writes, a skip list prunes paths out of it, and the four switches
+        // below decide how a checkout materializes an entry. A composefs export
+        // writes an image of the commit tree instead, so none of them reaches
+        // it. The tool refuses each combination and writes no image, and the
+        // port refuses it under the same words. The two batch options are not
+        // refused: the tool exports one image per pair, from the pair's own
+        // revision.
         if in_scope
-            && (args.whiteouts || args.process_passthrough_whiteouts || args.skip_list.is_some())
+            && (args.whiteouts
+                || args.process_passthrough_whiteouts
+                || args.skip_list.is_some()
+                || args.require_hardlinks
+                || args.force_copy
+                || args.bareuseronly_dirs
+                || args.disable_cache)
         {
             exit_error("Specified options are incompatible with --composefs");
         }
@@ -3843,17 +3861,17 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     //
     // The hardlink is what establishes identity, so the tool takes
     // `--union-identical` only together with `-H`, whatever the repository
-    // mode. The library's own guard then refuses the modes that cannot
-    // hardlink, which is the same set the tool's `-H` refuses.
+    // mode. The library holds the same pairing as its own guard, and decides
+    // which mode pair can hardlink at the entry instead.
     if in_scope && args.union_identical && !args.require_hardlinks {
         exit_error("--union-identical requires --require-hardlinks");
     }
 
-    // -H and -C are mutually exclusive (enforced by clap); -C forces copies and
-    // -H requests hardlinks, which is the default path when copies are not
-    // forced. The minimal library surface exposes only force_copy, so the
-    // `--union-identical` check above is the one place `-H` is read.
-    let _ = args.require_hardlinks;
+    // The port keeps no uncompressed object cache, so a checkout writes none
+    // and reads none. The switch asks for the behaviour the port already has,
+    // so it is accepted and decides nothing
+    // (`docs/conformance/cli-surface.md`, "checkout").
+    let _ = args.disable_cache;
 
     let dest_dir = std::fs::File::open(".").map_err(Error::Io)?;
     let Some(pairs) = pairs else {

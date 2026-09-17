@@ -152,6 +152,32 @@ pub enum Error {
     /// spelled it.
     #[error("checkout: subpath is not a directory: {}", .0.display())]
     SubpathNotADirectory(std::path::PathBuf),
+    /// A checkout under
+    /// [`require_hardlinks`](crate::CheckoutOptions::require_hardlinks) reached
+    /// an entry the repository mode and the checkout mode in force give a copy.
+    /// The payload is the entry's own name.
+    #[error(
+        "checkout: {0}: require-hardlinks is set and this repository mode and \
+         checkout mode give a copy of this entry"
+    )]
+    RequireHardlinks(String),
+    /// A checkout under
+    /// [`require_hardlinks`](crate::CheckoutOptions::require_hardlinks) reached
+    /// a destination directory on another filesystem than the repository, where
+    /// no entry can be hardlinked. The destination root reaches this and so
+    /// does every directory below it. A single file or symlink target takes no
+    /// such check and reaches this where its own link crosses a filesystem. The
+    /// payload is each side's device number.
+    #[error(
+        "checkout: require-hardlinks: the destination is on another filesystem \
+         than the repository (repository={src} destination={dst})"
+    )]
+    HardlinkAcrossDevices {
+        /// The device number of the repository's object store.
+        src: u64,
+        /// The device number of the destination.
+        dst: u64,
+    },
     /// A tar import or export could not proceed: an entry type ostree cannot
     /// store (a device node or FIFO), a path with a `..` component, a hardlink
     /// with no target in the archive, or a non-UTF-8 xattr name.

@@ -1278,7 +1278,7 @@ Phase 17. Subcommands:
 - `ostrya checkout [--repo <repo>] [-H|--require-hardlinks]
   [-C|--force-copy] [--composefs] [--composefs-noverity] <commit>
   <destination>` -- Phase 8 faithful checkout; `-C` forces copies, `-H` (its
-  conflicting opposite) requests the hardlink-preferring default path;
+  conflicting opposite) refuses an entry that would be copied;
   `--composefs` writes the Phase 9 EROFS image to `destination` instead of a
   tree, and `--composefs-noverity` writes that image with no fs-verity digest
   in it, deciding whatever the order the two switches take.
@@ -5120,12 +5120,11 @@ under `--allow-noent` and the port refuses; `--composefs` alongside a single
 `--union-add` or `--union-identical`, which the tool refuses and the port
 exports; and a union option given twice, which the tool takes and the port
 refuses as it refuses every repeated boolean flag. The `--union-identical` gate
-agrees with the tool for all sixteen
-combinations of repository mode, `-U`, `-H`, and `-C` without touching `-H`
-semantics, which stay with `F14`; the one difference there is what a refusal
-leaves behind, the tool's `-H` gate standing after the destination directory is
-made and the port's guard standing before it, which the `-H` divergence text
-records. The conformance run reported 704 cells and 284 passes after the item.
+agreed with the tool over all sixteen combinations of repository mode, `-U`,
+`-H`, and `-C` for a corpus carrying a regular file, which is the corpus the
+citing test builds. The `-H` paragraph below widens the claim to a corpus that
+carries none. The conformance run reported 704 cells and 284 passes after the
+item.
 
 `F12` gives `checkout` its two whiteout switches, `--whiteouts` and
 `--process-passthrough-whiteouts`. The library carried the Docker-style form
@@ -5239,6 +5238,89 @@ the two `--subpath` value divergences reach it unchanged, an explicitly empty
 record among them. `format-reference.md`, "Checkout" states the list's match
 rule, the filter's reach, and the stream's record format. The conformance run
 reports 769 cells and 303 passes.
+
+Three more `checkout` options land next: `-H/--require-hardlinks`, which the
+CLI accepted and read nowhere, `-M/--bareuseronly-dirs`, and
+`--disable-cache`.
+
+`-H` refuses an entry the checkout would materialize by a copy, rather than
+falling back to one, and the refusal is raised at the entry. A commit holding no
+such entry is written whole at exit 0 in every repository mode, an empty commit
+and a commit of directories alone among them. Two shapes are exempt: a
+directory, which is always created fresh, and a zero-length regular file, which
+every mode writes fresh. A regular file of non-zero length refuses wherever the
+mode pair gives a copy, and a symlink refuses under a table of its own --
+`archive` under both checkout modes and `bare` under `-U` -- which is not the
+symlink hardlink rule. A destination directory on another filesystem than the
+repository is refused before any entry of it is written, after the directory is
+made, and every directory the walk enters reaches the check -- the destination
+root and every directory below it, fresh or reused. A `--subpath` naming a file
+or a symlink reaches no directory walk and takes no such check, so a zero-length
+regular file is written there at exit 0 and a shape the mode pair hardlinks is
+refused at the link. `format-reference.md`, "Checkout" states the tables, the
+two exemptions, and the device refusal, and records what each was recovered
+from.
+
+The port stopped hardlinking a zero-length regular file, in every repository
+mode and with the switch and without it, which is what the tool does. The
+destination's link counts then agree with the tool's entry for entry, and no
+byte and no metadata of a destination moved.
+
+The library surface: `CheckoutOptions.require_hardlinks` and
+`CheckoutOptions.bareuseronly_dirs`; `Error::RequireHardlinks` and
+`Error::HardlinkAcrossDevices`; the predicates
+`require_hardlinks_refuses_regular` and `require_hardlinks_refuses_symlink`,
+each with a unit test over all six repository modes and both checkout modes;
+`hardlink_regular_object`, which carries the zero-length exemption; the
+`BAREUSERONLY_DIR_MASK` constant and the one masked `fchmod` in
+`apply_dir_metadata`, whose single call site is the fresh arm of the directory
+walk; and `check_hardlink_device`, which stands at the top of the directory walk
+and so runs once for the destination root and once for each directory below it.
+The per-entry decision reads the file object's recorded size and the policy, so
+the checkout stays streaming and no payload is read for it. A loose object of a
+bare-family mode holds the raw payload, so a recorded size of zero is the
+object's own `st_size` and the fresh write copies nothing; an `archive` object
+records the declared uncompressed size of its header, so that mode always
+copies.
+
+The up-front mode half of the `--union-identical` guard was replaced. The guard
+now reads the options alone -- `UnionIdentical` needs `require_hardlinks`, and
+`require_hardlinks` and `force_copy` are mutually exclusive -- and which mode
+pair can hardlink is carried by the per-entry `-H` refusal, where the tool
+carries it. The two now agree over a tree holding no regular file of non-zero
+length, where the old guard refused and the tool exited 0. That widens the
+sixteen-combination claim the union-family paragraph above makes, which held
+over a corpus carrying such a file.
+
+`--disable-cache` needs no library surface. The tool keeps an uncompressed-object
+cache under the repository and writes it for an `archive` repository checked out
+with `-U` and for no other combination; the switch stops it writing one and
+stops it reading one. The port keeps no such cache, so the switch changes no
+destination byte and decides nothing. `-M` is checkout-only, `commit` carrying
+no equivalent.
+
+Two divergences stand, both in `cli-surface.md`, "checkout": the wording of the
+three `-H` refusals, which the standing wording rule covers and each refusal
+cell states per side; and `-H`, `-M`, or `--disable-cache` given twice, which
+the tool takes and the port refuses as it refuses every repeated boolean flag.
+One divergence shrank: the tool refuses `-H`, `-C`, `-M`, and `--disable-cache`
+alongside a composefs switch, and the port now refuses all four there, so the
+composefs incompatibility divergence names the two union options alone. The
+`--allow-noent` reach divergence already named `-H`, `-M`, and
+`--disable-cache`; observation confirmed all three and its citing test grew two
+arms.
+
+A destination directory below the root is reached without privilege: a
+destination symlink into a second filesystem, which a union mode follows. The
+tool refuses there whatever the subtree holds, a subtree of one empty directory
+among them, and the port now agrees on the exit status and on the destination in
+every shape measured.
+
+`checkout` writes no line of its own, so the item adds no "CLI output formats"
+subsection; the shared gate's `format-reference.md` clause is met by that file's
+"Checkout" section, which gained a "Requiring a hardlink." block, a "Directory
+mode mask." block, the zero-length exception, and the cache correction on the
+`archive` hardlink bullet. The conformance run reports 794 cells and 321 passes.
 
 #### Phase 17g -- P3 commands with no matrix weight
 

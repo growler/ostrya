@@ -2683,15 +2683,13 @@ outcome: refused-both
 severity: interop
 evidence: ostrya_cli::cli::checkout_union_identical_requires_require_hardlinks
 spec: format-reference.md#checkout
-note: an `archive` repository cannot hardlink under any checkout mode, so both
- refuse `--union-identical -H` and neither writes an entry. The words part:
- the tool refuses the `-H` (`Bare repository mode cannot hardlink in user
- checkout mode`) and the port refuses the policy (`checkout: union-identical
- requires a hardlink checkout...`), so `stderr-text` is no oracle here. The
- tool's `-H` gate stands after the destination directory is made, so it leaves
- an empty destination where the port leaves none; that difference belongs to
- `-H` and is recorded with the other `-H` divergence (`cli-surface.md`,
- "checkout"). The cited test states it.
+note: an `archive` repository gives a copy of every regular file and every
+ symlink, so `-H` refuses at the first of `C0`'s, in both, and neither writes an
+ entry. The refusal is `-H`'s and not the option pair's: `--union-identical`
+ needs `-H`, and what the mode pair can hardlink is decided at the entry
+ (`cli-surface.md`, "checkout"). A corpus of directories alone reaches no such
+ entry and is written whole under the same command line, in both. The words
+ part, so `stderr-text` is no oracle here.
 
 family: M10
 subcommand: checkout
@@ -3936,6 +3934,476 @@ note: `--composefs` and `--composefs-noverity` are each taken alongside a batch
  destination, the pair's subpath deciding nothing. No oracle reads a cell's own
  checkout destination, so the cited test reads the image both implementations
  wrote and states the bytes equal.
+
+# ---------------------------------------------------------------------------
+# checkout -- the hardlink requirement, the directory-mode mask, and the
+# uncompressed-object cache (Phase 17f).
+#
+# `-H/--require-hardlinks` refuses at the entry the checkout would materialize
+# by a copy, so a cell that states a refusal names a corpus that reaches one and
+# a cell that states an acceptance names one that does not. Corpus `C0` carries
+# a regular file of non-zero length and a symlink, so it reaches every refusal;
+# its directories and its empty file reach none. No oracle reads a cell's own
+# checkout destination or the cache directory, so every destination claim and
+# every link-count claim cites the test that walks both implementations'
+# destinations. The words of each refusal part, which cli-surface.md,
+# "checkout" records, so a refusal cell names `exit-status stdout-text` and
+# states the tool's words with `ref-expect-stderr`.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-in-archive
+modes: archive
+setup: repo-with-commit
+run: checkout --repo=$REPO -H $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "cannot hardlink in user checkout mode"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: `archive` stores content compressed, so no object of `C0` is the inode a
+ destination entry needs and the checkout copies. `-H` refuses at the first such
+ entry, in both. The refusal leaves the destination directory created and
+ holding what the walk wrote before it.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-in-bare-user-without-user-mode
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO -H $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "requires user checkout mode to hardlink"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: a `bare-user` object inode carries the ownership and the mode a user
+ checkout writes, so a faithful checkout copies every regular file and `-H`
+ refuses at the first of them. The same command line takes the corpus's symlink,
+ which `bare-user` recreates in either checkout mode.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-in-bare-under-user-mode
+modes: bare
+setup: repo-with-commit
+run: checkout --repo=$REPO -U -H $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "cannot hardlink in user checkout mode"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: a `bare` object inode carries the committed ownership, which a user
+ checkout does not write, so the checkout copies and `-H` refuses. The same
+ repository takes `-H` under a faithful checkout.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-in-bare
+modes: bare
+setup: repo-with-commit
+run: checkout --repo=$REPO -H $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_require_hardlinks_hardlinks_the_same_objects
+spec: format-reference.md#checkout
+note: `bare` under a faithful checkout hardlinks every regular file of non-zero
+ length and every symlink, so `-H` is taken. No oracle reads a cell's own
+ checkout destination, so the cited test states that the two sides put the same
+ entries on their own loose-object inodes and that the corpus's empty file is on
+ neither side's.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-in-bare-user-under-user-mode
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO -U -H $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_require_hardlinks_hardlinks_the_same_objects
+spec: format-reference.md#checkout
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-in-bare-user-only
+modes: bare-user-only
+setup: repo-with-commit
+run: checkout --repo=$REPO -H $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_require_hardlinks_hardlinks_the_same_objects
+spec: format-reference.md#checkout
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-in-bare-user-only-under-user-mode
+modes: bare-user-only
+setup: repo-with-commit
+run: checkout --repo=$REPO -U -H $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: `bare-user-only` applies user semantics whatever the request, so the two
+ checkout modes reach one destination and one hardlink decision.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-refuses-at-the-entry
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_require_hardlinks_refuses_at_the_entry,
+ ostrya_cli::cli::checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool
+spec: format-reference.md#checkout
+note: `-H` decides per entry. A directory never refuses, a zero-length regular
+ file never refuses, a regular file of non-zero length refuses wherever the
+ repository mode and the checkout mode in force give a copy, and a symlink
+ refuses in `archive` under either checkout mode and in `bare` under `-U`. A
+ commit holding none of the refusing shapes is written whole at exit 0 in every
+ mode. The first cited test states all thirty-two cells against the tool, one
+ single-shape commit per cell; no single invocation can. The second states that
+ a `--skip-list` pruning every refusing entry gives exit 0 and that a
+ `--subpath` naming the empty file gives exit 0 where one naming the symlink
+ gives exit 1, in both.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-leaves-a-partial-destination
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_require_hardlinks_leaves_the_same_destination_on_a_refusal
+spec: format-reference.md#checkout
+note: the refusal is raised where the entry is materialized, so the entries the
+ walk already wrote stay. Both implementations leave the same partial
+ destination. The cited test uses a tree whose first directory holds an empty
+ file and a symlink, so the walk writes the file and refuses at the link.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-stands-ahead-of-the-destination-disposition
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_require_hardlinks_refusals_match_the_tool
+spec: format-reference.md#checkout
+note: the refusal is made before the destination entry is read, so an entry
+ `--union-add` would keep and an entry `--union-identical` would call identical
+ are refused all the same. The cited test runs both union modes over a
+ destination already holding the corpus's regular file, in every repository mode
+ and under both checkout modes.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-across-devices
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_require_hardlinks_refuses_across_devices
+spec: format-reference.md#checkout
+note: a destination directory on another filesystem than the repository is
+ refused before any entry of it is written, whatever the subtree holds, and both
+ leave the destination directory created and empty. The check is repeated at
+ every destination directory the walk enters, the destination root and every
+ directory below it, fresh or reused; a directory below the root is reached by a
+ destination symlink into a second filesystem, which a union mode follows. A
+ `--subpath` naming a file or a symlink reaches no directory walk and takes no
+ such check, so a zero-length regular file is written there at exit 0 and a
+ shape the mode pair hardlinks is refused at the link. The harness binds one
+ scratch subtree per side and cannot name a second filesystem, so the claim is
+ stated by the cited test, which runs where one is reachable and states nothing
+ where none is. The words part: the tool writes `Unable to do hardlink checkout
+ across devices (src=<dev> destination=<dev>)` for a destination directory and
+ `Hardlinking <object> to <name>: Invalid cross-device link` for a file or
+ symlink target.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-with-force-copy
+modes: bare
+setup: repo-with-commit
+run: checkout --repo=$REPO -H -C $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Cannot specify both --require-hardlinks and --force-copy"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port refuses the pair through `clap` and the tool through a check of
+ its own, both at exit 1 with no destination created. The words part, which the
+ standing wording rule covers.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-given-twice
+modes: bare
+setup: repo-with-commit
+run: checkout --repo=$REPO -H -H $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag. The tool takes `-H -H` and checks the tree out;
+ the port refuses it, as it refuses every repeated boolean flag
+ (`cli-surface.md`, "P2").
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-empty-stream
+modes: archive
+setup: repo-with-commit
+run: checkout --repo=$REPO -H --from-stdin $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#checkout
+note: an empty stream carries no pair, so no checkout runs and the refusal the
+ repository mode would reach is never made, in both.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-in-a-batch-pair
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool
+spec: format-reference.md#checkout
+note: the refusal stands inside the scope of one checkout, so a stream carrying
+ a pair reaches it at exit 1 in both. The harness feeds no populated standard
+ input, so the cell cites the test. The tool prefixes the refusal with
+ `Processing tree <checksum>: `, which cli-surface.md, "checkout" records.
+
+family: M10
+subcommand: checkout
+cell: checkout/require-hardlinks-with-composefs
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO -H --composefs $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Specified options are incompatible with --composefs"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Specified options are incompatible with --composefs"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_materialization_switches_refuse_composefs_in_both
+spec: format-reference.md#composefs
+note: a composefs export writes an image of the commit tree and takes no
+ hardlink, so the switch decides nothing there. Both implementations refuse the
+ pair under the same words, write no image, and leave a destination that already
+ existed as it was. The cited test states the same for
+ `--composefs-noverity`.
+
+family: M10
+subcommand: checkout
+cell: checkout/force-copy-with-composefs
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO -C --composefs $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Specified options are incompatible with --composefs"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Specified options are incompatible with --composefs"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_materialization_switches_refuse_composefs_in_both
+spec: format-reference.md#composefs
+
+family: M10
+subcommand: checkout
+cell: checkout/bareuseronly-dirs-accepted
+corpus: C2
+modes: bare
+setup: repo-with-commit
+run: checkout --repo=$REPO -M $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_bareuseronly_dirs_matches_the_tool
+spec: format-reference.md#checkout
+note: `-M` reduces every directory the checkout creates to `mode & 0775`, so
+ `C2`'s setgid directory at 02775 and its sticky directory at 01777 both arrive
+ at 0775. No oracle reads a cell's own checkout destination, so the cited test
+ walks both implementations' destinations over twelve directory modes.
+
+family: M10
+subcommand: checkout
+cell: checkout/bareuseronly-dirs-masks-created-directories-only
+corpus: C2
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_bareuseronly_dirs_matches_the_tool
+spec: format-reference.md#checkout
+note: the mask reaches the destination root and every directory the checkout
+ creates below it, in every repository mode and under both checkout modes, and
+ the process umask reduces nothing further. A directory the checkout reuses
+ under a union mode keeps its own mode, with the switch and without it. A
+ regular file and a symlink are unaffected. The switch is a no-op in
+ `bare-user-only`, whose directory modes are already below the mask at commit
+ time, and the cited test states that it changes the tree in every other mode.
+
+family: M10
+subcommand: checkout
+cell: checkout/bareuseronly-dirs-with-composefs
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO -M --composefs $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Specified options are incompatible with --composefs"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Specified options are incompatible with --composefs"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_materialization_switches_refuse_composefs_in_both
+spec: format-reference.md#composefs
+
+family: M10
+subcommand: checkout
+cell: checkout/bareuseronly-dirs-given-twice
+corpus: C2
+modes: bare
+setup: repo-with-commit
+run: checkout --repo=$REPO -M -M $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag. The tool takes `-M -M` and applies the mask once;
+ the port refuses it (`cli-surface.md`, "P2").
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+
+family: M10
+subcommand: checkout
+cell: checkout/disable-cache-accepted
+modes: archive
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --disable-cache $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_disable_cache_matches_the_tool
+spec: format-reference.md#checkout
+note: the switch changes no byte and no metadata of the destination. It decides
+ the destination's inode identity alone: the tool hardlinks an `archive`
+ unprivileged checkout's regular files out of an uncompressed-object cache it
+ keeps under the repository, and the switch stops it writing one and stops it
+ reading one. The port keeps no such cache, so the switch decides nothing there.
+ The cited test states the destinations equal across the arms with the switch,
+ without it, and with it over a cache the tool already populated.
+
+family: M10
+subcommand: checkout
+cell: checkout/disable-cache-writes-no-cache-directory
+modes: archive
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_disable_cache_matches_the_tool
+spec: format-reference.md#checkout
+note: the cache lives at `<repo>/uncompressed-objects-cache/`, outside the
+ object store, so no oracle reads it. The tool creates it for an `archive`
+ repository checked out with `-U` and for no other combination, and creates none
+ under the switch. The port creates none in any combination.
+
+family: M10
+subcommand: checkout
+cell: checkout/disable-cache-with-composefs
+modes: bare-user
+setup: repo-with-commit
+run: checkout --repo=$REPO --disable-cache --composefs $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Specified options are incompatible with --composefs"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Specified options are incompatible with --composefs"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_materialization_switches_refuse_composefs_in_both
+spec: format-reference.md#composefs
+
+family: M10
+subcommand: checkout
+cell: checkout/disable-cache-given-twice
+modes: archive
+setup: repo-with-commit
+run: checkout --repo=$REPO --disable-cache --disable-cache $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag. The tool takes it and checks the tree out; the
+ port refuses it (`cli-surface.md`, "P2").
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 
 # ---------------------------------------------------------------------------
 # show -- the commit report, the raw variant, the metadata modes, and the

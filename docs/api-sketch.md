@@ -1143,7 +1143,10 @@ pub struct CheckoutOptions {
     pub subpath: Option<PathBuf>,
     pub enable_fsync: bool,          // default false, matching the tool
     pub force_copy: bool,
+    pub require_hardlinks: bool,     // refuse an entry a copy would materialize
+    pub bareuseronly_dirs: bool,     // a created directory takes `mode & 0o775`
     pub process_whiteouts: bool,
+    pub process_passthrough_whiteouts: bool,
     pub devino_cache: Option<DevInoCache>,
     pub filter: Option<CheckoutFilterFn>,
 }

@@ -491,15 +491,17 @@ fn read_detached_blocking(
     ))
 }
 
-/// Write detached-metadata bytes to the `.commitmeta` loose path atomically:
-/// the fanout directory is created on demand (`0777` reduced by the umask, and
+/// Write metadata bytes to a loose path atomically. The detached-metadata
+/// writers reach it for a `.commitmeta`, and the prune sweep reaches it for a
+/// `.tombstone-commit`; both objects carry the `0644` every metadata object
+/// carries. The fanout directory is created on demand (`0777` reduced by the umask, and
 /// forced to [`perm::SHARED_DIR_MODE`] where this call creates it in a
 /// `bare-user-shared` repository), the bytes go to a temp file (`fchmod` 0644,
 /// `fdatasync` when fsync is on), and the temp is renamed over the target. When
 /// fsync is on, the fanout directory is fsynced after the rename so the new name
 /// survives a crash, and `objects/` is fsynced too when the fanout directory was
 /// newly created, matching the durability the object publication path honors.
-fn write_detached_blocking(
+pub(crate) fn write_detached_blocking(
     objects_fd: BorrowedFd<'_>,
     dest: &str,
     bytes: &[u8],

@@ -280,6 +280,63 @@ pub(crate) fn list_delta_targets(
     scan_deltas(repo_fd, parse_delta_dir)
 }
 
+/// One delta's `deltas/<fanout>/<leaf>` directory names and the target commit
+/// it carries, for the prune sweep.
+pub(crate) struct DeltaDir {
+    /// The `deltas/` fanout directory name.
+    pub(crate) fanout: String,
+    /// The delta directory name below the fanout.
+    pub(crate) leaf: String,
+    /// The commit the delta produces.
+    pub(crate) to: Checksum,
+}
+
+/// Scan `deltas/<fanout>/<leaf>` and collect each delta's directory names
+/// alongside the commit it produces.
+pub(crate) fn list_delta_dirs(repo_fd: BorrowedFd<'_>) -> Result<Vec<DeltaDir>> {
+    scan_deltas(repo_fd, |fanout, leaf| {
+        let (_, to) = parse_delta_dir(fanout, leaf)?;
+        Ok(DeltaDir {
+            fanout: fanout.to_owned(),
+            leaf: leaf.to_owned(),
+            to,
+        })
+    })
+}
+
+/// Remove one `deltas/<fanout>/<leaf>` directory and every file in it.
+///
+/// A delta directory holds a `superblock` and its numbered part files and no
+/// subdirectory. The fanout directory above it is left in place, empty where
+/// this was its last entry, which is what a prune by the `ostree` tool leaves.
+/// A directory that is already gone is success.
+pub(crate) fn remove_delta_dir(repo_fd: BorrowedFd<'_>, dir: &DeltaDir) -> Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
+
+    let path = format!("deltas/{}/{}", dir.fanout, dir.leaf);
+    let fd = match openat(
+        repo_fd,
+        path.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    for name in dir_child_names(&fd)? {
+        match unlinkat(&fd, name.as_str(), AtFlags::empty()) {
+            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
+            Err(e) => return Err(Error::Io(e.into())),
+        }
+    }
+    drop(fd);
+    match unlinkat(repo_fd, path.as_str(), AtFlags::REMOVEDIR) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(e) => Err(Error::Io(e.into())),
+    }
+}
+
 /// Walk the two-level `deltas/` tree, applying `parse` to each delta's fanout
 /// and leaf directory names. A repository with no `deltas/` yields nothing.
 fn scan_deltas<T>(

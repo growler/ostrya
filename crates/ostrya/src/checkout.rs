@@ -171,8 +171,10 @@ pub struct CheckoutOptions {
     /// first `..` names a file or a symlink, the refusal is
     /// [`Error::SubpathNotADirectory`].
     pub subpath: Option<PathBuf>,
-    /// Whether to fsync written files and directories. Defaults false, matching
-    /// the tool.
+    /// Whether to fsync written files and directories. Defaults false.
+    /// `ostrya checkout` resolves the value from the repository's `[core]
+    /// fsync` narrowed by `--fsync` (`docs/format-reference.md`, "The fsync
+    /// vocabulary").
     pub enable_fsync: bool,
     /// Force a copy for every object, suppressing every hardlink. The copy path
     /// still attempts a reflink.

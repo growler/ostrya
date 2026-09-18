@@ -328,10 +328,13 @@ One resolution behavior the tool has and the port does not, recorded in
   unreachable and deletes it, so after `ostrya commit -b 'odd~1'` and `ostree
   prune --refs-only` the ref file stands over an absent commit object and
   `ostrya cat 'odd~1' PATH` reports `error: object not found`. The port
-  enumerates the name everywhere. A branch name ending in `^` carries the same
-  consequence and is recorded under "P2", where the write-side guard that keeps
-  it out of a port-written repository stands; the two are one class. `prune`
-  belongs to a later sub-phase, which is where that pair is compared. And the tool holds such a name to name no ref as
+  enumerates the name everywhere, so its own `prune --refs-only` over the same
+  repository keeps the commit and leaves the ref file standing over it, which is
+  the pair `ostrya_cli::cli::prune_refs_only_parts_on_a_shadowed_ref_name`
+  states over the names `odd~1` and `main^`. A branch name ending in `^` carries
+  the same consequence and is recorded under "P2", where the write-side guard
+  that keeps it out of a port-written repository stands; the two are one class.
+  And the tool holds such a name to name no ref as
   an `-A --create` target, so over the ref `tes~t` written by
   `ostrya commit -b 'tes~t'` the port writes `refs -A --create=al 'tes~t'` and the
   tool reports `error: Cannot create alias to non-existent ref: tes~t` at exit 1,
@@ -1098,7 +1101,9 @@ Where one stands, the tool's ref enumeration skips it without a word and its
 it, leaving the ref file over an absent object, where the port enumerates the
 name and keeps the commit. That is the destructive class the `odd~1` item of
 "P1" records for the ref-name character class, and the two read as one class:
-an out-of-band write is the only arrival for either name. The character class
+an out-of-band write is the only arrival for either name.
+`ostrya_cli::cli::prune_refs_only_parts_on_a_shadowed_ref_name` states the pair
+over both names. The character class
 itself stays deferred, so a `^` inside the name parts the two -- the port writes
 `a^b` and the tool refuses it with `Invalid refspec a^b`.
 
@@ -1268,8 +1273,8 @@ stand.
 and `--subpath=PATH`, and, since Phase 17f, `--union`, `--union-add`,
 `--union-identical`, `--allow-noent`, `--whiteouts`,
 `--process-passthrough-whiteouts`, `--from-stdin`, `--from-file=FILE`,
-`--skip-list=FILE`, `-M/--bareuseronly-dirs`, and `--disable-cache`. Missing:
-`--fsync=POLICY`, `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
+`--skip-list=FILE`, `-M/--bareuseronly-dirs`, `--disable-cache`, and
+`--fsync=POLICY`. Missing: `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
 
 The destination trees `-U` and `--subpath` produce agree with the tool's file for
 file, in `archive`, `bare-user`, and `bare` (`../format-reference.md`,
@@ -1460,7 +1465,8 @@ whole tree and exits 0.
 
 Two divergences stand at the values `--subpath` takes, one at the wording of
 the `-H` refusals, three at the composefs switches, two at `--allow-noent`, one
-at a repeated boolean flag, and four at the path-selection options:
+at a repeated boolean flag, four at the path-selection options, and three at
+the durability policy:
 
 - a subpath naming nothing ends the checkout at exit 1 in both, leaving no
   destination, and the words part: the tool reports `error: No such file or
@@ -1592,7 +1598,54 @@ at a repeated boolean flag, and four at the path-selection options:
   writes `DEST` and nothing else. The port refuses a third with clap's own
   `error: unexpected argument '<value>' found` at exit 1. The difference stands
   on the plain path as well and becomes visible under a batch option, where the
-  second positional is itself ignored.
+  second positional is itself ignored;
+- `--disable-fsync`. Both refuse it at exit 1 and neither creates the
+  destination, and the words part: the tool writes `error: Unknown option
+  --disable-fsync`, and the port writes clap's `error: unexpected argument
+  '--disable-fsync' found`. The standing wording rule covers it, and the
+  valueless spelling stays with `pull` and `pull-local`, which document it
+  (`ostrya_cli::cli::checkout_fsync_policy_matches_the_tool`);
+- `--fsync` given twice. The tool takes the line and reads the last
+  occurrence, so `--fsync=false --fsync=true` syncs and
+  `--fsync=true --fsync=false` does not; the two orders reach one exit status,
+  so the syscall count is what states the rule
+  (`ostrya_cli::cli::checkout_fsync_policy_controls_the_syscalls`). The port
+  refuses the repeat with `error: the argument '--fsync <POLICY>' cannot be
+  used multiple times` at exit 1 and creates no destination, whichever values
+  the two occurrences carry. The port takes `commit --fsync` once as well, so
+  the two commands hold one rule. The tool validates each occurrence, so a
+  value it does not hold exits 1 from either position
+  (`ostrya_cli::cli::checkout_fsync_policy_matches_the_tool`);
+- a `[core] fsync` value the reader refuses, under `--composefs`. The port
+  reads the key where the checkout path uses it, which is after the composefs
+  export decision, so a composefs export never reaches the read: the port
+  writes the image and exits 0 where the tool refuses the repository at exit 1,
+  naming the key on standard error and writing nothing. The quotation marks the
+  tool sets around the key name follow the locale, so the line is held to the
+  key name and the exit status. Every other `checkout` line reaches the read
+  and refuses such a repository in both
+  (`ostrya_cli::cli::checkout_refuses_a_bad_configured_fsync_under_every_override`).
+
+The sync calls a policy-on checkout makes stand outside the list above. The two
+resolve the same policy from the same inputs -- the configured `[core] fsync`
+narrowed by the option value, so a repository configured off syncs nothing
+under `--fsync=true` -- and the calls each then makes follow from what each
+writes. The tool syncs the temporary files of the uncompressed object
+cache it keeps in the repository, and syncs no part of the destination. The
+port keeps no such cache and syncs the files and the directories of the
+destination (`../format-reference.md`, "The fsync vocabulary").
+
+The step the value reader stands at also sits outside the list. In both the
+reader runs ahead of the repository and ahead of the revision, so a value
+neither holds is reported where a bad repository path or a bad revision would
+otherwise answer. The argument-count check `clap` makes stands ahead of the
+port's reader, so a plain-path line that omits DESTINATION names a different
+fault in each: `ostree checkout --fsync=on REV` reports the value and
+`ostrya checkout --fsync=on REV` reports the missing positional. Both exit 1
+and create nothing, so the standing wording rule covers it. Under a batch
+option the port's reader stands ahead of its own `error: DESTINATION must be
+specified`, and both report the value
+(`ostrya_cli::cli::checkout_fsync_policy_matches_the_tool`).
 
 `export` accepts `--repo`, `--no-xattrs`, `--subpath=PATH`, `--prefix=PATH`,
 and `-o/--output=PATH`, and nothing is missing.
@@ -1676,12 +1729,86 @@ stand:
   and for a path naming a directory; the port reports the system's own reason
   for each. Both exit 1 and neither creates the parent.
 
-`prune` accepts `--repo`, `--refs-only`, `--depth`, `--no-prune`, and
-`--delete-commit`. Missing: `--keep-younger-than=DATE`, `--static-deltas-only`,
-`--retain-branch-depth=BRANCH`, `--only-branch=BRANCH`, `--commit-only`. The
-tool refuses `--delete-commit` together with `--no-prune`
+`prune` accepts `--repo`, `--refs-only`, `--depth`, `--no-prune`,
+`--delete-commit`, `--keep-younger-than=DATE`, `--static-deltas-only`,
+`--retain-branch-depth=BRANCH=DEPTH`, `--only-branch=BRANCH`, and
+`--commit-only`. Nothing is missing. The tool refuses `--delete-commit`
+together with `--no-prune`
 (`error: Cannot specify both --delete-commit and --no-prune`, exit 1, no object
-removed), and the port refuses the same pair in the same words.
+removed), and the port refuses the same pair in the same words. The totals text
+the command writes is in `../format-reference.md`, "CLI output formats",
+`prune`.
+
+Six divergences stand at `prune`:
+
+- the `--keep-younger-than` value dialect. The port takes `@SECONDS` and an
+  absolute date and time carrying a UTC offset, and refuses the tool's
+  local-time, relative, and empty forms with the tool's own
+  `Could not parse '<value>'` text at exit 1, removing nothing. That is the same
+  subset and the same words `commit --timestamp` carries, one date reader
+  serving both sites, and the reason is the one stated there: reading the
+  refused forms needs a time-zone database or a natural-language date reader,
+  and both are the dialect of a C library the port does not link. The value
+  `2023-11-15`, the value `1 hour ago`, and an empty value each exit 0 in the
+  tool and 1 in the port;
+- the `--retain-branch-depth` depth dialect. The value splits at its first `=`
+  in both, and both refuse a value carrying no `=`
+  (`Invalid value <value>, must specify BRANCH=DEPTH`) and a depth holding no
+  digits (`Invalid depth <text>`), in the same words at exit 1. The tool reads
+  the depth with the leading-digit-run reader "Global conventions" records for
+  its key-file values, so `main=0x1` and `main=0=1` read as depth 0, `main=+1`,
+  `main= 1`, and `main=1 ` read as depth 1, and `main=99999999999999999999`
+  reads as a very large depth. The port reads a decimal integer with an optional
+  leading `-` and refuses each of those five at exit 1 with
+  `Invalid depth <text>`, removing nothing;
+- the words `--static-deltas-only` is refused in without `--delete-commit`. Both
+  exit 1 and remove nothing; the tool's line ends with a URL naming its own
+  issue tracker and the port's line ends at the sentence the two share,
+  `--static-deltas-only requires --delete-commit`;
+- the words `--delete-commit` refuses a commit a ref names in. The tool reports
+  `Commit '<checksum>' is referenced by '<ref>'` and the port
+  `invalid format: cannot delete commit <checksum>: it is the target of a ref`.
+  Both exit 1 and remove nothing. `--static-deltas-only` reaches no such refusal
+  in either: it keys its deltas on the commit and deletes no object, so a branch
+  head is a value both accept there;
+- a repeated `--refs-only`, `--commit-only`, `--no-prune`, or
+  `--static-deltas-only`, which the tool takes and the port refuses. This is the
+  repeated-boolean-flag class already recorded for `export --no-xattrs`. A
+  repeated `--depth` and a repeated `--keep-younger-than` take the last
+  occurrence in both, and `--only-branch` and `--retain-branch-depth` are
+  repeatable options in both;
+- the values `--delete-commit` takes. The tool reads the value as a
+  64-character checksum and uses it as the object path, so `--delete-commit=
+  main^` reports `error: Deleting object main^.commit: unlinkat(ma/in^.commit):
+  No such file or directory` at exit 1 and an abbreviated checksum reports the
+  same line over its own text. Neither run removes an object. The port resolves
+  the value as a revision, so both spellings name a commit, the run removes it
+  and sweeps what it orphaned, and the run exits 0. This is the revision
+  superset the port carries at every site that takes a revision, and `prune` is
+  the one site where the superset removes objects: a value the tool refuses
+  deletes here.
+
+Two corners at `prune` are not settled by an observation this host can make:
+
+- two refs naming one commit, where the two carry different bounds. The tool
+  applies one of the two and drops the other, and which one it applies follows
+  the enumeration and not a rule a black-box run states: over one local ref
+  `alpha` and one local ref `beta` at one commit, `--only-branch=alpha
+  --depth=0` cuts the shared history and `--only-branch=beta --depth=0` keeps
+  it, and over one local ref and one remote ref at one commit the remote ref's
+  bound decides both directions. The port applies both bounds and keeps what
+  either of them reaches, which is deterministic, independent of the ref names,
+  and never removes an object a ref's own bound retains. No matrix cell states
+  the corner;
+- the decimal separator the size in the totals line renders with. The port
+  always writes `.`. Only the `C`, `C.utf8`, `en_GB.utf8`, `en_US.utf8`, and
+  `POSIX` locales are installed on the conformance host, so every run of the
+  tool falls back to the C separator and the two agree. Whether the tool follows
+  a locale that renders a different separator is unverified here.
+
+A ref name the tool's ref enumeration skips is read by the tool's
+`prune --refs-only` as unreachable, so the tool deletes a commit the port keeps.
+That is the ref-name character class of "P1", and the pair is stated there.
 
 Two repository config keys in the `[ex-ostrya]` group are port extensions with
 no option and no counterpart in the tool. They part `ostrya` from `ostree` on a
@@ -2204,8 +2331,14 @@ Observed by running the tool (2026.1).
   direction. The tool reads these keys when it opens the repository, so its
   refusal precedes every check a subcommand makes and reaches every subcommand:
   `ostree refs` over a repository holding `fsync=bogus` exits 1. The port reads
-  each key where it is used, so a read-only subcommand that never reads it runs
-  to completion: `ostrya refs` over that repository lists the refs at exit 0.
+  each key where it is used, so a subcommand that never reads a key runs to
+  completion whatever that key holds, whether the subcommand writes or not:
+  `ostrya refs` over that repository lists the refs at exit 0, and `ostrya
+  checkout` over a repository holding `locking=bogus`, `per-object-fsync=bogus`,
+  or a `min-free-space-size` the size grammar does not hold checks the tree out
+  at exit 0, where the tool refuses each of those three at exit 1. The reach of
+  the port's refusal is therefore per key and per subcommand, and the list of
+  the keys a subcommand reads is the list of the values it can refuse.
   Within `commit` the port reads the whole `[core]` set the transaction needs
   in one place, after the `--statoverride` and `--skip-list` files and after
   the missing-branch check, and before `--parent`, the metadata options, the
@@ -2213,7 +2346,13 @@ Observed by running the tool (2026.1).
   nowhere, since both refuse it and exit 1. Two faults report the tool's config
   refusal and the port's earlier check, so `commit --statoverride=no-such-file`
   against a repository holding `fsync=bogus` names the config from the tool and
-  the file from the port. Both exit 1 with no object and no ref written.
+  the file from the port. Both exit 1 with no object and no ref written. Within
+  `checkout` the port reads `[core] fsync` alone, and it reads it after the
+  composefs export decision, which applies no durability policy, and ahead of
+  the first checkout. A record stream carrying no pair reaches the read and
+  refuses such a value too. A `--composefs` line reaches it nowhere, so the port
+  exports the image at exit 0 where the tool refuses the repository, which
+  "checkout" above records as a divergence.
 - `init --mode=<mode>` rejects a mode it does not recognize with `error:
   Invalid mode '<mode>' in repository configuration` and exits 1, before
   writing anything to the target directory. Confirmed for an unknown string
@@ -2266,15 +2405,14 @@ Observed by running the tool (2026.1).
 
 A script reads standard output, so the format is part of the surface. The
 formats of `commit`, including its `--table-output` block, `refs`, `rev-parse`,
-`cat`, `show`, `log`, `ls`, and
-`config get`, together with the GVariant text form the reading commands share,
+`cat`, `show`, `log`, `ls`, `config get`, and `prune`, together with the
+GVariant text form the reading commands share,
 are recovered and recorded in `../format-reference.md`, "CLI output formats" and
 "The GVariant text form". Each format below still needs a black-box observation
 pass, and the results belong in that same section.
 
 - `diff`, including the per-path change prefixes and `--stats`.
 - `fsck` progress output and its `-q` form.
-- `prune` totals.
 - `summary -v`, `--raw`, and `--list-metadata-keys`, whose formats are the ones
   `remote summary` reports and whose flags the local command still lacks.
 - `static-delta list`, `show`, and `indexes`.

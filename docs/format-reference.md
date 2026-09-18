@@ -54,6 +54,33 @@ serialization and in `ostree.sizes`).
 - 9 `FILE_XATTRS_LINK` -- `.file-xattrs-link` -- hardlink to a `.file-xattrs`,
   keyed by the `.file` checksum.
 
+A `.tombstone-commit` object marks a commit a prune removed. It holds an
+`a{sv}` carrying one entry, whose key is `commit` and whose value is a variant
+of type `ay` holding the commit checksum in 64 lowercase hex characters
+followed by one NUL. The object is 78 bytes for every commit, and its
+permission bits are `0644`, the bits every metadata object carries. The bytes
+of the marker for commit
+`5a7db91c4984baa542cb29238cd86a54497303c82cbed2f0af3c44606c0d482f`:
+
+```
+00000000: 636f 6d6d 6974 0000 3561 3764 6239 3163  commit..5a7db91c
+00000010: 3439 3834 6261 6135 3432 6362 3239 3233  4984baa542cb2923
+00000020: 3863 6438 3661 3534 3439 3733 3033 6338  8cd86a54497303c8
+00000030: 3263 6265 6432 6630 6166 3363 3434 3630  2cbed2f0af3c4460
+00000040: 3663 3064 3438 3266 0000 6179 074d       6c0d482f..ay.M
+```
+
+The framing reads: the dict entry's key ends at offset 7, which the `0x07`
+offset byte at 76 states; the variant's separator NUL sits at 73 with the type
+string `ay` at 74; and the array's one element ends at offset 77, which the
+`0x4d` offset byte at 77 states. `fsck` over a repository holding these reports
+no error, and `log` does not read them.
+
+A prune writes the marker for every commit it removes where the command line
+carries `--delete-commit` or the repository config sets
+`[core] tombstone-commits`. A marker is never pruned itself and is counted in
+neither number a prune reports.
+
 The is-meta predicate is `t` in 2..=6. Types 7/8/9 are not "meta" despite being
 auxiliary. The checksum rules key off the is-meta predicate. The `z` loose-path
 suffix applies only to a `FILE` object (type 1) in archive mode, stored
@@ -2976,6 +3003,55 @@ creates `deep` and `nest`, which makes three directory syncs and a count of 14
 (12 fsync, 1 fdatasync, 1 syncfs). The three rows that sync nothing are the
 rule, and the port matches them exactly.
 
+The same measurement over `checkout -U main DEST` of that commit into a fresh
+destination, out of an `archive` repository holding it, gives these counts. The
+`tool` column holds the tool's calls and the `port` column holds the port's:
+
+```
+[core] fsync   option           tool   port
+unset (on)     --fsync=true      2      5
+unset (on)     (none)            2      5
+true           --fsync=false     0      0
+false          --fsync=true      0      0
+```
+
+The tool's two calls are `fsync` of the temporary files its uncompressed object
+cache writes under `tmp/` in the repository, one per regular file carrying
+content. `--disable-cache` takes the count to 0, and a `bare-user` repository,
+which keeps no such cache, gives 0 on every row. The tool syncs no file and no
+directory of the destination.
+
+The port keeps no uncompressed object cache, and it syncs the destination. It
+issues one `fsync` of the temporary inode of each file it copies, taken before
+the inode is linked into place, and one `fsync` of each directory it writes,
+taken after that directory's entries. Over corpus `C0` that is the 5 calls the
+table records for `archive` mode, where every regular file is copied, and 3 in
+`bare-user` mode under `-U`, where the two files carrying content are
+hardlinked and the zero-length file is written fresh. The three rows that sync
+nothing are the rule, and the port matches them exactly.
+
+The two counts on the syncing rows are alike at the scale of corpus `C0` and
+part at the scale of a tree. The target and the lifetime of a call are the
+reason:
+
+- the tool's calls target the uncompressed object cache under the repository,
+  and that cache persists. The first `archive` checkout of a commit pays one
+  call per regular file carrying content, and a second checkout of the same
+  commit out of the same repository pays none. A `bare-user` checkout pays none
+  on any run, since that mode keeps no such cache;
+- the port's calls target the destination, which each checkout writes afresh,
+  so every checkout pays the full count. The count is one per file the copy
+  path writes plus one per directory the checkout writes.
+
+Measured on one host with `strace -f -e trace=fsync,fdatasync,syncfs`, over a
+tree of 5000 regular files in one directory (2 directories in all) out of an
+`archive` repository: the port issues 5002 calls on every run, and the tool
+issues 5000 on the first run and 0 on the second. Over a tree of 520 regular
+files in 22 directories out of a `bare-user` repository, where the checkout
+hardlinks every file: the port issues 22 calls on every run, one per directory,
+and the tool issues 0 on every run. `port-plan.md`, Phase 17f, carries the
+wall-clock figures and holds the item open.
+
 The valueless spelling is `--disable-fsync`, which equals `--fsync=false`. It
 takes no argument, so an `=VALUE` suffix is read and discarded:
 `--disable-fsync=false` disables fsync.
@@ -3012,6 +3088,28 @@ reads it while the other `[core]` keys are read, ahead of the editor and ahead
 of the repository lock. It declines the undocumented `commit --disable-fsync`
 (`conformance/cli-surface.md`, "P2").
 
+The port accepts `--fsync=POLICY` on `checkout` with that same value set, that
+same refusal text, and that same narrowing rule, and the value is read while
+the options are read, ahead of the repository, ahead of the revision, and ahead
+of the port's own `error: DESTINATION must be specified`, which a batch option
+raises on an empty destination value. The argument-count check `clap` makes
+stands ahead of the value reader, so a plain-path line that omits DESTINATION
+altogether names a different fault in each: the tool reports the value and the
+port reports the missing positional. Both exit 1 and create nothing
+(`conformance/cli-surface.md`, "checkout"). The resolved policy reaches the
+file syncs of the copy path and the directory syncs alike, and every checkout
+of a `--from-stdin` or `--from-file` batch runs under the one value. The port
+reads the configured `[core] fsync` under every state of the option, and it
+reads it where it is used: after the composefs export decision, which applies
+no such policy, and ahead of the first checkout. A `--composefs` export
+therefore reaches no such read, and a repository holding a `[core] fsync` value
+the reader refuses exports the image at exit 0 in the port where the tool
+refuses the repository at exit 1
+(`conformance/cli-surface.md`, "checkout"). It refuses `--disable-fsync` on
+`checkout`, which the tool refuses too, and takes the option once, where the
+tool takes the last of a repeat. Neither policy changes a byte of the
+destination.
+
 The syscall counts a policy produces are the whole observable difference, and
 the conformance matrix reads standard output, standard error, the exit status,
 and the repository bytes alone, so no `run:` line can state them. Cell
@@ -3021,6 +3119,21 @@ binaries over the four rows above with `strace -y`. It holds the three quiet
 rows to zero calls and the syncing row to the target of every call and to the
 total this table records, 11 for the tool and 12 for the port, so the table and
 the test stay one record. It asserts where `strace` is installed.
+
+Cell `checkout/fsync-syscalls` states the same claim for `checkout`, citing
+`checkout_fsync_policy_controls_the_syscalls` in the same file. It measures the
+four `checkout` rows above for both binaries, holds the three quiet rows to
+zero calls, and holds the syncing row to the totals this table records, 2 for
+the tool and 5 for the port, with every one of the port's targets under the
+destination and every one of the tool's under the repository.
+
+The same test states which occurrence of a repeated `--fsync` the tool reads,
+which no exit status shows, since both orders exit 0. It is the last one:
+`--fsync=false --fsync=true` gives the syncing row's 2 calls and
+`--fsync=true --fsync=false` gives 0. Each order is measured over a repository
+the run creates for itself, because the uncompressed object cache a first
+`archive` checkout fills would take a second measurement in the same repository
+to 0 whatever the policy resolves to.
 
 ### `commit`
 
@@ -4874,3 +4987,68 @@ The command writes the tar stream and no line of its own. The stream's member
 naming, its metadata conventions, its member order, and the four options that
 shape it are stated under "tar" above, together with what `-o` does to its
 destination.
+
+### `prune`
+
+The command writes two lines to standard output and nothing to standard error.
+`-v` adds `OT: ` trace lines on standard error and leaves standard output
+unchanged.
+
+The first line states how many objects the run considered.
+
+```
+Total objects: <count>
+```
+
+Under `--commit-only` the first line names the restriction and counts commit
+objects alone.
+
+```
+Total (commit only) objects: <count>
+```
+
+The count covers the loose objects the run read. Detached commit metadata
+(`.commitmeta`), tombstone markers (`.tombstone-commit`), and static deltas are
+outside it. The count is taken after `--delete-commit` has removed its target,
+so deleting one commit lowers it by one.
+
+The second line states the outcome.
+
+```
+No unreachable objects
+Deleted <count> objects, <size> freed
+Would delete: <count> objects, freeing <size>
+```
+
+The first form is written where the run deletes nothing, whether or not
+`--no-prune` was given. The third is written under `--no-prune`, and the second
+otherwise. `<count>` is never pluralized: a run deleting one object writes
+`Deleted 1 objects`.
+
+`<size>` is a decimal (SI) rendering of the bytes the deleted objects occupied
+on disk. Below 1000 bytes it is the byte count, a space, and the word `byte` or
+`bytes`, singular at exactly 1. At 1000 bytes and above it is the count divided
+by the largest power of 1000 that leaves it at or above 1, printed with one
+fractional digit, then U+00A0 NO-BREAK SPACE, then the unit `kB`, `MB`, `GB`,
+`TB`, `PB`, or `EB`. The unit is chosen from the byte count and not from the
+rounded value, so 999999 bytes render as `1000.0 kB` and 1000000 as `1.0 MB`.
+
+```
+0          -> 0 bytes
+1          -> 1 byte
+673        -> 673 bytes
+999        -> 999 bytes
+1000       -> 1.0 kB
+1073       -> 1.1 kB
+1172       -> 1.2 kB
+100172     -> 100.2 kB
+999999     -> 1000.0 kB
+1000000    -> 1.0 MB
+1500173    -> 1.5 MB
+1000000173 -> 1.0 GB
+```
+
+The bytes a deleted `.commitmeta` freed are not in the sum, the object not
+being in the count. Every measurement here was taken under `LC_ALL=C.UTF-8`,
+which renders the decimal separator as `.`
+(`conformance/cli-surface.md`, "prune").

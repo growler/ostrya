@@ -369,15 +369,46 @@ pub struct SummaryOptions {
     pub metadata_commit_timestamp: Option<u64>,
 }
 
-/// What a prune keeps. The first four fields are the tool's; the last two are
+/// What a prune keeps. The first nine fields are the tool's; the last two are
 /// port extensions the tool has no counterpart for, and their defaults are what
 /// the tool does.
 pub struct PruneOptions {
     pub refs_only: bool,                  // roots are the refs alone
-    pub depth: i32,                       // parents kept: -1 all, 0 the head
+    pub depth: i32,                       // parents kept: -1 all, 0 the head,
+                                          // every other negative the head
     pub no_prune: bool,                   // count, delete nothing, keep the
                                           // commit delete_commit names
     pub delete_commit: Option<Checksum>,  // remove this commit, walk it as gone
+    /// Keep no commit older than this count of seconds since the Unix epoch.
+    /// `Some` roots the walk on the refs alone and bounds the `parent` edge by
+    /// time in place of by `depth`. A ref's own target is kept whatever its
+    /// timestamp.
+    pub keep_younger_than: Option<u64>,
+    /// The branches the run prunes, each named as `Repo::list_refs` and
+    /// `Repo::list_remote_refs` name one. Empty prunes every branch. A
+    /// non-empty list roots the walk on the refs alone and retains in full
+    /// every branch it does not name and `retain_branch_depth` does not name
+    /// either. Every value is resolved as a revision, so one naming nothing
+    /// fails the prune before any object is removed.
+    pub only_branch: Vec<String>,
+    /// A depth for one branch, in place of `depth` for it. A non-empty list
+    /// roots the walk on the refs alone. The last entry naming a branch decides
+    /// it, and an entry of depth 0 leaves the branch at the global `depth`
+    /// while still counting as naming it.
+    ///
+    /// A branch's bound belongs to the commit its ref names: a walk that
+    /// reaches that commit over the `parent` edge continues under the ref's own
+    /// bound, so a branch cut short cuts every history running through its
+    /// head. Where two refs name one commit, the commit is walked under each of
+    /// the two bounds and keeps what either of them reaches.
+    pub retain_branch_depth: Vec<(String, i32)>,
+    /// Delete commit objects alone, leaving the trees they reached where they
+    /// stand. The statistics then count commit objects alone.
+    pub commit_only: bool,
+    /// Delete the static deltas `delete_commit` targets and nothing else.
+    /// Requires `delete_commit`; without it the prune fails with
+    /// `Error::InvalidFormat`.
+    pub static_deltas_only: bool,
     /// Metadata keys naming further commits to keep. Each is read from a
     /// reached commit's own metadata and from its detached metadata; the
     /// value is an `aay` of commit checksums, and each commit it names is
@@ -1141,7 +1172,9 @@ pub struct CheckoutOptions {
     pub mode: CheckoutMode,
     pub overwrite: OverwriteMode,
     pub subpath: Option<PathBuf>,
-    pub enable_fsync: bool,          // default false, matching the tool
+    pub enable_fsync: bool,          // default false; `ostrya checkout`
+                                     // resolves it from `[core] fsync` and
+                                     // `--fsync`
     pub force_copy: bool,
     pub require_hardlinks: bool,     // refuse an entry a copy would materialize
     pub bareuseronly_dirs: bool,     // a created directory takes `mode & 0o775`

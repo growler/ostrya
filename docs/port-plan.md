@@ -5328,6 +5328,170 @@ subsection; the shared gate's `format-reference.md` clause is met by that file's
 mode mask." block, the zero-length exception, and the cache correction on the
 `archive` hardlink bullet. The conformance run reports 794 cells and 321 passes.
 
+`checkout --fsync=POLICY` is one CLI option and no library code. The library
+already carried `CheckoutOptions.enable_fsync`, honored at three write sites --
+the parent directory of a single-entry checkout, a directory whose metadata has
+been applied, and the temporary inode of a copy before it is linked into place
+-- and the CLI left the field unset. The option now sets it.
+
+The resolution rule sits in the CLI, where `commit` gets it from the library.
+`Transaction::fsync_flags` reads the configured `[core] fsync` and narrows it by
+the transaction's override, so `commit` passes `false` alone and leaves the
+config in charge otherwise. The checkout path reads no config; the field is a
+plain value the caller supplies. `checkout` therefore reads `repo.config()
+.fsync()?` itself and ANDs the two, at one place that covers the plain path and
+every pair of a `--from-stdin` or `--from-file` batch. The read stands after the
+composefs export decision, which applies no durability policy, and ahead of the
+first checkout, so the port reads the key where it is used
+(`cli-surface.md`, "P2").
+
+The default changes: `ostrya checkout` now resolves an absent `--fsync` to the
+configured `[core] fsync`, which defaults on, so the default checkout syncs the
+files and the directories it writes. No destination byte moves. A repository
+holding a `[core] fsync` value the reader refuses now refuses every
+`ostrya checkout` line that reaches the read, a record stream carrying no pair
+included, which moves the port toward the tool. A `--composefs` line reaches no
+such read, since the export decision stands ahead of it, so that one line takes
+such a repository and exports the image at exit 0 where the tool refuses it at
+exit 1. `cli-surface.md`, "checkout", records that as a divergence, and
+`checkout_refuses_a_bad_configured_fsync_under_every_override` holds both
+halves.
+
+The counts part, and `format-reference.md`, "The fsync vocabulary" records both:
+the tool syncs the temporary files of the uncompressed object cache it keeps
+under the repository and syncs no part of the destination, and the port, which
+keeps no such cache, syncs the destination. Over corpus `C0` in `archive` mode
+that is 2 calls for the tool and 5 for the port, and the three rows whose
+resolved policy is off issue none in either.
+
+Three divergences stand, all three in `cli-surface.md`, "checkout":
+`--disable-fsync`, which both refuse and whose words part; `--fsync` given
+twice, which the tool takes, reading the last value, and the port refuses, as it
+refuses a repeated `commit --fsync`; and a `[core] fsync` value the reader
+refuses under `--composefs`, which the port takes and the tool refuses. The
+conformance run reports 805 cells and 329 passes.
+
+Open item for the maintainer, and the standing behavior until it is decided.
+The two implementations pay their sync calls on different schedules, and the
+counts in `format-reference.md` are stated at the scale of corpus `C0`, where
+the schedules look alike. At the scale of a tree they part. The tool's calls
+target the uncompressed object cache under the repository, which persists, so a
+second `archive` checkout of the same commit pays none and a `bare-user`
+checkout pays none on any run. The port's calls target the destination, which
+each checkout writes afresh, so every checkout pays one call per file the copy
+path writes plus one per directory it writes, and the barriers are serialized:
+the walk awaits each entry in turn. Measured on one host: a tree of 5000 regular
+files in one directory, checked out of an `archive` repository, gives the port
+5002 calls and 14.3 s against 0.39 s with the policy off, and gives the tool
+5000 calls on the first run, 0 on the second, and 0.10 s warm. A tree of 520
+regular files in 22 directories, checked out of a `bare-user` repository where
+every file is hardlinked, gives the port 22 calls and 0.110 s against 0.037 s
+with the policy off, and gives the tool 0 calls on every run. The port places
+every destination file and every destination directory on stable storage before
+it exits, at a cost proportional to the tree. The call schedule sits in
+`crates/ostrya/src/checkout.rs`, which the option reads and does not change, so
+a different schedule -- one barrier for the whole destination, or a barrier a
+reused directory does not pay -- is a decision about the library's durability
+model.
+
+`F18` completes `prune`. The CLI gained `--keep-younger-than=DATE`,
+`--static-deltas-only`, `--retain-branch-depth=BRANCH=DEPTH`,
+`--only-branch=BRANCH`, and `--commit-only`, and the command's totals text is
+recovered and recorded in `format-reference.md`, "CLI output formats", `prune`:
+two lines, the count of the loose objects the run read and the outcome, with the
+freed bytes rendered as a decimal (SI) quantity above 1000 bytes, the unit
+chosen from the byte count and not from the rounded value and separated from it
+by a no-break space.
+
+`PruneOptions` gained the five fields the options set -- `keep_younger_than`,
+`only_branch`, `retain_branch_depth`, `commit_only`, and `static_deltas_only`
+-- which is a breaking change to the struct and takes a minor version, the
+struct carrying no `#[non_exhaustive]` by decision 14. The reachability walk
+took the work. `traverse.rs` gained `ParentBound`, which is either a depth or a
+timestamp, and `traverse_reachable_gc` now takes one bound per root, so a branch
+cut to a depth and a branch kept in full walk together in one pass. The
+timestamp bound acts on the `parent` edge alone: a root's own commit is kept
+whatever its timestamp, and a commit the bound rules out contributes nothing and
+is not recorded, so a ref naming that same commit still reaches it. A commit is
+expanded again only under a bound that follows further than every bound it was
+expanded under, which is what bounds the walk with two kinds of bound in play.
+The branch a depth applies to is matched by name, so `refs.rs`'s walk gained
+`Repo::list_all_refs`, which names a local ref by its path under `refs/heads`, a
+remote ref by its `<remote>:<name>` refspec, and a mirror ref by its path under
+`refs/mirrors`; `list_all_ref_targets` reads it.
+
+Three behavior changes reach options the port already carried. `PruneStats`
+counts neither detached commit metadata nor tombstone markers in
+`total_objects`, `pruned_objects`, or `freed_bytes`, and under `commit_only`
+counts commit objects alone, which is what the tool reports: a pruned commit's
+`.commitmeta` is removed with it and the bytes it freed are outside the sum.
+`--depth` reads `-1` as the whole ancestry and every other negative value as the
+head alone, where the port read every negative as the whole ancestry, so
+`--depth=-2` stops meaning "all history" and starts meaning "the head alone";
+the rule sits in `ParentBound::depth` and reaches `Repo::traverse_commit` and
+`Repo::traverse_reachable` with it. And `Repo::prune` now removes the static
+delta of every commit it deleted, the delta directory whole and its fanout
+parent in place, which is what keeps a pruned repository from offering a delta
+whose target commit is gone; a delta whose source commit the run deleted is
+kept, and the `delta-indexes/` cache is left alone, as the tool leaves it.
+`delta.rs` carries the two helpers that reach it, `list_delta_dirs` and
+`remove_delta_dir`.
+
+The `.tombstone-commit` write path lands with the item. A run writes the marker
+for every commit it removes where the command line carries `--delete-commit` or
+the repository config sets `[core] tombstone-commits`; a run that removes
+nothing writes none, and a marker is never pruned itself.
+`format-reference.md`, "Object types" states the object's bytes -- an `a{sv}`
+holding one `commit` key whose `ay` value is the checksum in 64 lowercase hex
+characters followed by one NUL, 78 bytes at `0644` -- so `fsck --add-tombstones`
+reads a recorded format rather than recovering one.
+
+`--only-branch` resolves every value as a revision, so one naming nothing fails
+the prune before any object is removed, and it then selects a branch by matching
+the value the caller gave against the ref names: the commit the value resolves
+to is not read, so a value that resolves and names no ref assigns the depth to
+no branch, which leaves every branch retained in full. A
+`--retain-branch-depth` entry replaces `--depth` for the branch it names, an
+entry whose depth is 0 leaves the branch at `--depth` while still counting as
+naming it, and the last entry for a branch decides it. A non-empty entry list
+roots the walk on the refs alone, as `--only-branch` and `--keep-younger-than`
+each do.
+
+The bound a branch takes belongs to the commit its ref names and not to the
+path a walk took to reach that commit. `Repo::prune` hands the walk the set of
+ref targets, and the walk drops every `parent`-edge arrival at one of them:
+the seed the ref placed holds the branch's own bound, so that bound stands
+there in place of the bound the arrival carried. The ref's bound stands whole:
+a ref at the global depth 3, reached with one parent hop left, keeps three more
+parents. So a branch cut short cuts every history running through its head. Where two refs name one commit, both seeds
+stand and the commit is walked under each of the two bounds, so it keeps what
+either of them reaches; `cli-surface.md`, "prune" records that corner as one no
+black-box observation settles, and no matrix cell states it.
+
+`--keep-younger-than` settles item `X7`: the port reads the one date reader its
+CLI carries, the reader `commit --timestamp` takes, so the accepted set, the
+refused set, and the refusal text are the same at both sites. Six divergences
+stand, all in `cli-surface.md`, "prune": the `--keep-younger-than` value
+dialect, where the port refuses the tool's local-time, relative, and empty forms
+in the tool's own `Could not parse '<value>'` words; the `--retain-branch-depth`
+depth dialect, where the tool reads a leading run of digits and drops the rest of
+the string and the port refuses the five spellings that reach it; the words
+`--static-deltas-only` is refused in without `--delete-commit`, the tool's line
+ending with a URL; the words `--delete-commit` refuses a commit a ref names in;
+a repeated `--refs-only`, `--commit-only`, `--no-prune`, or
+`--static-deltas-only`, which the tool takes and the port refuses, as it refuses
+every repeated boolean flag; and the values `--delete-commit` takes, where the
+tool reads a 64-character checksum and uses it as the object path and the port
+resolves a revision, which is the one site the port's revision superset removes
+an object at. `--depth` and `--keep-younger-than` each take the last occurrence
+in both. One standing divergence is now stated as a pair rather
+than as the tool's half alone: a ref name outside the character class the tool
+validates against is skipped by the tool's enumeration, so its
+`prune --refs-only` deletes the commit that ref holds and the port keeps it
+(`cli-surface.md`, "P1"). The item adds 51 `m10` cells, of which 21 are
+executable and all 21 pass; the conformance run reports 856 cells and 350
+passes.
+
 #### Phase 17g -- P3 commands with no matrix weight
 
 `reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and

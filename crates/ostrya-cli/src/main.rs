@@ -434,6 +434,10 @@ struct CheckoutArgs {
     /// order.
     #[arg(long, value_name = "FILE", overrides_with = "from_file")]
     from_file: Option<PathBuf>,
+    /// Specify how to invoke fsync(): a boolean word from `true`, `yes`, `1`,
+    /// `false`, `no`, or `0`, read without regard to case.
+    #[arg(long, value_name = "POLICY", allow_hyphen_values = true)]
+    fsync: Option<String>,
     /// Prune every tree path FILE names, one per line, a directory spelled
     /// with a trailing slash. Given more than once, the last value wins.
     #[arg(long, value_name = "FILE", overrides_with = "skip_list")]
@@ -786,7 +790,7 @@ struct PruneArgs {
     #[arg(long)]
     refs_only: bool,
     /// Parents of each ref to keep: -1 for all history, 0 for only the head.
-    #[arg(long, default_value_t = -1, allow_negative_numbers = true)]
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true, overrides_with = "depth")]
     depth: i32,
     /// Compute and print the statistics without deleting anything.
     #[arg(long)]
@@ -794,6 +798,23 @@ struct PruneArgs {
     /// Delete this specific, unreferenced commit before sweeping.
     #[arg(long)]
     delete_commit: Option<String>,
+    /// Keep no commit older than DATE: `@SECONDS` since the Unix epoch, or a
+    /// date and time carrying a UTC offset.
+    #[arg(long, value_name = "DATE", overrides_with = "keep_younger_than")]
+    keep_younger_than: Option<String>,
+    /// Delete the static deltas the named commit targets and nothing else.
+    /// Requires --delete-commit.
+    #[arg(long)]
+    static_deltas_only: bool,
+    /// Retain DEPTH parents of BRANCH, in place of --depth for that branch.
+    #[arg(long, value_name = "BRANCH=DEPTH")]
+    retain_branch_depth: Vec<String>,
+    /// Prune BRANCH alone; every other branch keeps its whole ancestry.
+    #[arg(long, value_name = "BRANCH")]
+    only_branch: Vec<String>,
+    /// Delete commit objects alone.
+    #[arg(long)]
+    commit_only: bool,
 }
 
 #[derive(Args)]
@@ -1172,8 +1193,17 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             commit(repo, args, owner, fsync).await
         }
         Command::Checkout(args) => {
+            // `--fsync` is read while the options are read on `checkout` too,
+            // so a value the reader refuses stands ahead of the repository,
+            // ahead of the revision, and ahead of the `DESTINATION must be
+            // specified` refusal a batch option makes below. `clap` has already
+            // counted the positionals by this point, so a plain-path line that
+            // omits DESTINATION reports the missing positional instead, where
+            // the tool reports the value (`docs/format-reference.md`, "The
+            // fsync vocabulary").
+            let fsync = fsync_policy(args.fsync.as_deref());
             let (repo, _) = resolve_repo(repo, verbose, name).await;
-            checkout(repo, args).await
+            checkout(repo, args, fsync).await
         }
         Command::Export(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
@@ -3687,7 +3717,15 @@ fn skip_list_filter(paths: Arc<SkipPaths>) -> CheckoutFilterFn {
 /// `perm & 0777`; a `--subpath` directory's own metadata becomes the destination
 /// root's, and a `--subpath` file or symlink is placed inside a fresh
 /// destination directory (`docs/format-reference.md`, "Checkout").
-fn checkout_options(args: &CheckoutArgs, filter: Option<CheckoutFilterFn>) -> CheckoutOptions {
+///
+/// `enable_fsync` is the policy the caller resolved from the repository's
+/// `[core] fsync` and `--fsync` together, and every checkout of a batch runs
+/// under the one value (`docs/format-reference.md`, "The fsync vocabulary").
+fn checkout_options(
+    args: &CheckoutArgs,
+    filter: Option<CheckoutFilterFn>,
+    enable_fsync: bool,
+) -> CheckoutOptions {
     let mode = if args.user_mode {
         CheckoutMode::User
     } else {
@@ -3699,6 +3737,7 @@ fn checkout_options(args: &CheckoutArgs, filter: Option<CheckoutFilterFn>) -> Ch
     opts.bareuseronly_dirs = args.bareuseronly_dirs;
     opts.process_whiteouts = args.whiteouts;
     opts.process_passthrough_whiteouts = args.process_passthrough_whiteouts;
+    opts.enable_fsync = enable_fsync;
     opts.overwrite = if args.union {
         OverwriteMode::UnionFiles
     } else if args.union_add {
@@ -3751,7 +3790,7 @@ async fn export_composefs(
     written
 }
 
-async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
+async fn checkout(repo: Repo, args: CheckoutArgs, fsync: Option<bool>) -> Result<()> {
     // The tool opens a `--from-file` ahead of every other check the subcommand
     // makes, so a file that does not open is reported before the union pair,
     // the composefs incompatibility, and the revision.
@@ -3873,12 +3912,22 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     // (`docs/conformance/cli-surface.md`, "checkout").
     let _ = args.disable_cache;
 
+    // The checkout path takes the policy as a plain value, so the configured
+    // `[core] fsync` is read here, where it is used. The option narrows that
+    // policy and never widens it: a repository holding `[core] fsync=false`
+    // syncs nothing under `--fsync=true` (`docs/format-reference.md`, "CLI
+    // output formats", "The fsync vocabulary"). The read stands after the
+    // composefs export, which applies no such policy, and ahead of every
+    // checkout, so one read covers the plain path and every pair of a batch.
+    let enable_fsync = repo.config().fsync()? && fsync != Some(false);
+
     let dest_dir = std::fs::File::open(".").map_err(Error::Io)?;
     let Some(pairs) = pairs else {
         let commit = commit.expect("the plain path resolved its own COMMIT");
         let mut opts = checkout_options(
             &args,
             read_skip_paths(args.skip_list.as_deref()).map(skip_list_filter),
+            enable_fsync,
         );
         opts.subpath = args.subpath.clone();
         return match repo
@@ -3906,7 +3955,7 @@ async fn checkout(repo: Repo, args: CheckoutArgs) -> Result<()> {
     };
     for (refspec, subpath) in pairs {
         let commit = resolve(&repo, batch_refspec_str(refspec)).await?;
-        let mut opts = checkout_options(&args, skip.clone().map(skip_list_filter));
+        let mut opts = checkout_options(&args, skip.clone().map(skip_list_filter), enable_fsync);
         opts.subpath = subpath.map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(bytes)));
         match repo
             .checkout_at(&mut opts, dest_dir.as_fd(), &destination, &commit)
@@ -6176,9 +6225,81 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+/// Read one `--retain-branch-depth` value: a branch name, `=`, and a depth.
+///
+/// The value splits at its first `=`, so a branch name holding one is not
+/// spellable, which is what the tool does. The depth is a decimal integer with
+/// an optional leading `-`; the tool reads a leading run of digits and drops
+/// the rest of the string, and the port refuses what its own reader does not
+/// hold (`docs/conformance/cli-surface.md`, "P2").
+fn parse_retain_branch_depth(value: &str) -> std::result::Result<(String, i32), String> {
+    let Some((branch, depth)) = value.split_once('=') else {
+        return Err(format!("Invalid value {value}, must specify BRANCH=DEPTH"));
+    };
+    let body = depth.strip_prefix('-').unwrap_or(depth);
+    let held = !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit());
+    match held.then(|| depth.parse::<i32>().ok()).flatten() {
+        Some(depth) => Ok((branch.to_owned(), depth)),
+        None => Err(format!("Invalid depth {depth}")),
+    }
+}
+
+/// The units a prune totals line renders a byte count in above 1000 bytes.
+const SIZE_UNITS: [&str; 6] = ["kB", "MB", "GB", "TB", "PB", "EB"];
+
+/// The character the totals line puts between a rendered quantity and its
+/// unit, U+00A0 NO-BREAK SPACE.
+const NO_BREAK_SPACE: char = '\u{a0}';
+
+/// Render a byte count the way the totals line does: the count, a space, and
+/// the word `byte` or `bytes` below 1000, and a decimal (SI) quantity with one
+/// fractional digit, a no-break space, and the unit at or above it. The unit
+/// follows the byte count and not the rounded value, so 999999 renders as
+/// `1000.0 kB` (`docs/format-reference.md`, "CLI output formats", `prune`).
+fn format_size(bytes: u64) -> String {
+    if bytes < 1000 {
+        let word = if bytes == 1 { "byte" } else { "bytes" };
+        return format!("{bytes} {word}");
+    }
+    let count = bytes as f64;
+    let mut value = count / 1000.0;
+    let mut unit = SIZE_UNITS[0];
+    for (index, name) in SIZE_UNITS.iter().enumerate() {
+        let divisor = 1000f64.powi(index as i32 + 1);
+        if count / divisor < 1.0 {
+            break;
+        }
+        value = count / divisor;
+        unit = name;
+    }
+    format!("{value:.1}{NO_BREAK_SPACE}{unit}")
+}
+
 async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
+    // The order of the refusals below is the tool's own: the option pair, the
+    // `--static-deltas-only` requirement, the date, each
+    // `--retain-branch-depth` value, and then the revisions, which
+    // `Repo::prune` resolves last. None of them writes, so a refusal leaves the
+    // repository untouched.
     if args.no_prune && args.delete_commit.is_some() {
         exit_error("Cannot specify both --delete-commit and --no-prune");
+    }
+    if args.static_deltas_only && args.delete_commit.is_none() {
+        exit_error("--static-deltas-only requires --delete-commit");
+    }
+    let keep_younger_than = match args.keep_younger_than.as_deref() {
+        Some(text) => match parse_timestamp(text) {
+            Some(seconds) => Some(seconds),
+            None => exit_error(&format!("Could not parse '{text}'")),
+        },
+        None => None,
+    };
+    let mut retain_branch_depth = Vec::new();
+    for value in &args.retain_branch_depth {
+        match parse_retain_branch_depth(value) {
+            Ok(entry) => retain_branch_depth.push(entry),
+            Err(message) => exit_error(&message),
+        }
     }
     let delete_commit = match args.delete_commit.as_deref() {
         Some(rev) => Some(resolve(&repo, rev).await?),
@@ -6189,22 +6310,33 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         depth: args.depth,
         no_prune: args.no_prune,
         delete_commit,
+        keep_younger_than,
+        only_branch: args.only_branch.clone(),
+        retain_branch_depth,
+        commit_only: args.commit_only,
+        static_deltas_only: args.static_deltas_only,
         gc_root_metadata_keys: repo.config().gc_root_metadata_keys()?,
         ..PruneOptions::default()
     };
-    let stats = repo.prune(&opts).await?;
-    println!("Total objects: {}", stats.total_objects);
+    let stats = repo.prune(&opts).await.map_err(report_resolution_failure)?;
+    if args.commit_only {
+        println!("Total (commit only) objects: {}", stats.total_objects);
+    } else {
+        println!("Total objects: {}", stats.total_objects);
+    }
     if stats.pruned_objects == 0 {
         println!("No unreachable objects");
     } else if args.no_prune {
         println!(
-            "Would delete: {} objects, freeing {} bytes",
-            stats.pruned_objects, stats.freed_bytes
+            "Would delete: {} objects, freeing {}",
+            stats.pruned_objects,
+            format_size(stats.freed_bytes)
         );
     } else {
         println!(
-            "Deleted {} objects, {} bytes freed",
-            stats.pruned_objects, stats.freed_bytes
+            "Deleted {} objects, {} freed",
+            stats.pruned_objects,
+            format_size(stats.freed_bytes)
         );
     }
     Ok(())
@@ -7751,5 +7883,82 @@ mod tests {
         assert_eq!(mode(named, &meta), meta.mode | 0o4000);
         assert!(walk.unmatched_skip_list().is_empty());
         assert!(walk.unmatched_statoverride().is_empty());
+    }
+
+    /// The totals line renders a byte count as a decimal (SI) quantity above
+    /// 1000 bytes, the unit chosen from the byte count and not from the rounded
+    /// value, with a no-break space before the unit. Each pair here was checked
+    /// against `ostree prune` under `LC_ALL=C.UTF-8`
+    /// (`docs/format-reference.md`, "CLI output formats", `prune`).
+    #[test]
+    fn a_freed_byte_count_renders_the_way_the_totals_line_does() {
+        for (bytes, rendered) in [
+            (0u64, "0 bytes"),
+            (1, "1 byte"),
+            (2, "2 bytes"),
+            (673, "673 bytes"),
+            (999, "999 bytes"),
+            (1000, "1.0\u{a0}kB"),
+            (1073, "1.1\u{a0}kB"),
+            (1172, "1.2\u{a0}kB"),
+            (10172, "10.2\u{a0}kB"),
+            (100172, "100.2\u{a0}kB"),
+            (999999, "1000.0\u{a0}kB"),
+            (1000000, "1.0\u{a0}MB"),
+            (1048749, "1.0\u{a0}MB"),
+            (1500173, "1.5\u{a0}MB"),
+            (1000000173, "1.0\u{a0}GB"),
+            (1100000172, "1.1\u{a0}GB"),
+        ] {
+            assert_eq!(format_size(bytes), rendered, "{bytes} rendered wrongly");
+        }
+        assert!(format_size(u64::MAX).ends_with("\u{a0}EB"));
+    }
+
+    /// A `--retain-branch-depth` value splits at its first `=` and its depth is
+    /// a decimal integer with an optional leading `-`. The tool reads a leading
+    /// run of digits and drops the rest of the string; the port refuses what its
+    /// own reader does not hold (`docs/conformance/cli-surface.md`, "P2").
+    #[test]
+    fn a_retain_branch_depth_value_reads_strictly() {
+        assert_eq!(
+            parse_retain_branch_depth("main=1"),
+            Ok(("main".to_owned(), 1))
+        );
+        assert_eq!(
+            parse_retain_branch_depth("main=-1"),
+            Ok(("main".to_owned(), -1))
+        );
+        assert_eq!(
+            parse_retain_branch_depth("main=0"),
+            Ok(("main".to_owned(), 0))
+        );
+        assert_eq!(parse_retain_branch_depth("=0"), Ok((String::new(), 0)));
+        assert_eq!(
+            parse_retain_branch_depth("a/b/c=2"),
+            Ok(("a/b/c".to_owned(), 2))
+        );
+        for value in ["main", ""] {
+            assert_eq!(
+                parse_retain_branch_depth(value),
+                Err(format!("Invalid value {value}, must specify BRANCH=DEPTH"))
+            );
+        }
+        for (value, depth) in [
+            ("main=", ""),
+            ("main=abc", "abc"),
+            ("main==0", "=0"),
+            ("main=0=1", "0=1"),
+            ("main=0x1", "0x1"),
+            ("main=+1", "+1"),
+            ("main= 1", " 1"),
+            ("main=1 ", "1 "),
+            ("main=99999999999999999999", "99999999999999999999"),
+        ] {
+            assert_eq!(
+                parse_retain_branch_depth(value),
+                Err(format!("Invalid depth {depth}"))
+            );
+        }
     }
 }

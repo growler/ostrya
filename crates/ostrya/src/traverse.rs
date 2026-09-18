@@ -12,6 +12,15 @@
 //! `ostree prune --refs-only --depth=N`): `depth` is the number of parent
 //! commits to follow. `depth = 0` keeps only the named commit; `depth = 1`
 //! keeps it and its immediate parent; `depth = -1` follows the whole ancestry.
+//! `-1` is the one negative value that follows the whole ancestry: every other
+//! negative depth keeps the named commit alone, which `ostree prune
+//! --refs-only --depth=-2` and `--depth=-3` show.
+//!
+//! A walk bounds the `parent` chain by depth or by time. [`ParentBound::Since`]
+//! follows the chain while each parent commit's own timestamp is at or after a
+//! chosen second count, which is what `ostree prune --keep-younger-than=DATE`
+//! does. A commit a root names is kept whatever its timestamp; the bound acts
+//! on the `parent` edge alone.
 //!
 //! Traversal is lenient about objects that are referenced but absent: a missing
 //! object's name is still collected (it is a reachable reference), but a missing
@@ -44,6 +53,112 @@ use crate::repo::Repo;
 /// commit checksums in their 32-byte binary form.
 const GC_ROOT_SIGNATURE: &str = "aay";
 
+/// The bound a walk puts on one root's `parent` chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParentBound {
+    /// Follow this many more `parent` hops. `-1` is the whole ancestry and is
+    /// the one negative value the bound carries.
+    Depth(i32),
+    /// Follow the `parent` chain while each parent commit's own timestamp is at
+    /// or after this count of seconds since the Unix epoch.
+    Since(u64),
+}
+
+impl ParentBound {
+    /// The depth bound `depth` names: `-1` is the whole ancestry, and every
+    /// other negative value is the named commit alone.
+    pub(crate) fn depth(depth: i32) -> ParentBound {
+        ParentBound::Depth(if depth == -1 { -1 } else { depth.max(0) })
+    }
+}
+
+/// How the walk arrived at a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arrival {
+    /// The commit is a root: a caller-supplied seed or a commit a metadata-key
+    /// edge names. The bound the arrival carries is the commit's own.
+    Root,
+    /// The commit was reached over a depth-bounded `parent` edge, so the bound
+    /// it carries is the one the child had left.
+    Parent,
+    /// The commit was reached over a [`ParentBound::Since`] `parent` edge, so
+    /// it is kept only while its own timestamp is at or after the bound.
+    TimedParent,
+}
+
+impl Arrival {
+    /// Whether the bound the arrival carries came down a `parent` edge.
+    fn inherited(self) -> bool {
+        self != Arrival::Root
+    }
+}
+
+/// What the expansions of one commit have reached so far.
+///
+/// A commit is expanded again only under a bound that follows further than
+/// every bound it was expanded under, so each expansion strictly improves one
+/// of the first two fields and the walk terminates.
+#[derive(Debug, Clone, Copy, Default)]
+struct Expanded {
+    /// The most reaching depth bound an expansion carried.
+    depth: Option<i32>,
+    /// The earliest timestamp bound an expansion carried.
+    since: Option<u64>,
+    /// The earliest timestamp bound a conditional arrival was rejected under.
+    /// The commit's own timestamp is below it, so every conditional arrival at
+    /// or above it is rejected too and needs no second read of the commit.
+    rejected_since: Option<u64>,
+}
+
+impl Expanded {
+    /// Whether an expansion already made follows at least as far as `bound`
+    /// would.
+    fn covers(&self, bound: ParentBound) -> bool {
+        if self.depth == Some(-1) {
+            return true;
+        }
+        match bound {
+            ParentBound::Depth(depth) => {
+                self.depth.is_some_and(|prev| reaches_at_least(prev, depth))
+            }
+            ParentBound::Since(since) => self.since.is_some_and(|prev| prev <= since),
+        }
+    }
+
+    /// Whether a conditional arrival under `bound` is already known to fall
+    /// below the commit's own timestamp.
+    fn rejects(&self, bound: ParentBound) -> bool {
+        match bound {
+            ParentBound::Since(since) => self.rejected_since.is_some_and(|prev| since >= prev),
+            ParentBound::Depth(_) => false,
+        }
+    }
+
+    /// Record an expansion under `bound`.
+    fn record(&mut self, bound: ParentBound) {
+        match bound {
+            ParentBound::Depth(depth) => {
+                if !self.depth.is_some_and(|prev| reaches_at_least(prev, depth)) {
+                    self.depth = Some(depth);
+                }
+            }
+            ParentBound::Since(since) => {
+                if self.since.is_none_or(|prev| prev > since) {
+                    self.since = Some(since);
+                }
+            }
+        }
+    }
+
+    /// Record that a conditional arrival under `since` fell below the commit's
+    /// own timestamp.
+    fn reject(&mut self, since: u64) {
+        if self.rejected_since.is_none_or(|prev| prev > since) {
+            self.rejected_since = Some(since);
+        }
+    }
+}
+
 /// The edges a reachability walk follows out of a commit, beyond the objects its
 /// tree names.
 #[derive(Debug, Clone)]
@@ -53,14 +168,20 @@ pub(crate) struct GcRoots {
     pub metadata_keys: Vec<String>,
     /// Whether the commit `parent` edge is followed.
     pub traverse_parent: bool,
+    /// Whether the objects a commit's tree names are reachable. False collects
+    /// commit names alone and reads no dirtree, which is the set
+    /// `prune --commit-only` consults.
+    pub traverse_tree: bool,
 }
 
 impl GcRoots {
-    /// The plain ostree walk: the `parent` edge and no metadata-key edges.
+    /// The plain ostree walk: the `parent` edge, the trees, and no
+    /// metadata-key edges.
     fn parents_only() -> GcRoots {
         GcRoots {
             metadata_keys: Vec::new(),
             traverse_parent: true,
+            traverse_tree: true,
         }
     }
 }
@@ -77,6 +198,18 @@ impl Repo {
         ostrya_rt::unblock(move || list_objects_blocking(repo.objects_fd())).await
     }
 
+    /// Count the loose objects under `objects/` whose type `keep` admits.
+    ///
+    /// The enumeration is the one [`list_objects`](Repo::list_objects) makes
+    /// and holds no name, so a caller that needs a total alone pays for no set.
+    pub(crate) async fn count_objects<F>(&self, keep: F) -> Result<usize>
+    where
+        F: Fn(ObjectType) -> bool + Send + 'static,
+    {
+        let repo = self.clone();
+        ostrya_rt::unblock(move || count_objects_blocking(repo.objects_fd(), keep)).await
+    }
+
     /// Collect every object reachable from `commit`, following parent commits up
     /// to `max_depth` (`-1` for the whole ancestry). The named commit must
     /// exist; a parent that is absent stops that chain without error.
@@ -91,11 +224,13 @@ impl Repo {
                 ty: ObjectType::Commit,
             });
         }
+        let bound = ParentBound::depth(max_depth);
         let mut reachable = HashSet::new();
         self.collect_reachable(
-            vec![(*commit, max_depth)],
-            max_depth,
+            vec![(*commit, bound, Arrival::Root)],
+            bound,
             &GcRoots::parents_only(),
+            &HashSet::new(),
             None,
             &mut reachable,
         )
@@ -111,13 +246,30 @@ impl Repo {
         roots: impl IntoIterator<Item = Checksum>,
         max_depth: i32,
     ) -> Result<HashSet<ObjectName>> {
-        self.traverse_reachable_gc(roots, max_depth, &GcRoots::parents_only(), None)
-            .await
+        let bound = ParentBound::depth(max_depth);
+        self.traverse_reachable_gc(
+            roots.into_iter().map(|c| (c, bound)),
+            bound,
+            &GcRoots::parents_only(),
+            &HashSet::new(),
+            None,
+        )
+        .await
     }
 
     /// Collect every object reachable from any of `roots` under the edges `gc`
     /// names. This is [`traverse_reachable`](Repo::traverse_reachable) with the
     /// `parent` edge made optional and the metadata-key edges added.
+    ///
+    /// Each root carries its own bound, so one walk holds a branch cut to a
+    /// depth beside a branch kept in full. `root_bound` is the bound every
+    /// commit a metadata-key edge names is seeded at.
+    ///
+    /// `bounded_roots` names the commits whose bound is a property of the
+    /// commit and not of the path that reached it: the walk drops every
+    /// `parent`-edge arrival at one of them and leaves the expansion to the
+    /// seed, so the bound the arrival inherited is replaced rather than
+    /// narrowed. Every checksum in it must also be a seed in `roots`.
     ///
     /// `pending_delete` names a commit the walk reads as absent. Prune unlinks
     /// the commit it deletes only once the walk has succeeded, and this keeps
@@ -125,82 +277,152 @@ impl Repo {
     /// leaves: the commit's own name is reachable, and nothing under it is.
     pub(crate) async fn traverse_reachable_gc(
         &self,
-        roots: impl IntoIterator<Item = Checksum>,
-        max_depth: i32,
+        roots: impl IntoIterator<Item = (Checksum, ParentBound)>,
+        root_bound: ParentBound,
         gc: &GcRoots,
+        bounded_roots: &HashSet<Checksum>,
         pending_delete: Option<Checksum>,
     ) -> Result<HashSet<ObjectName>> {
-        let seeds = roots.into_iter().map(|c| (c, max_depth)).collect();
+        let seeds = roots
+            .into_iter()
+            .map(|(c, bound)| (c, bound, Arrival::Root))
+            .collect();
         let mut reachable = HashSet::new();
-        self.collect_reachable(seeds, max_depth, gc, pending_delete, &mut reachable)
-            .await?;
+        self.collect_reachable(
+            seeds,
+            root_bound,
+            gc,
+            bounded_roots,
+            pending_delete,
+            &mut reachable,
+        )
+        .await?;
         Ok(reachable)
     }
 
     /// The shared reachability walk. `seeds` pairs each root commit with the
-    /// number of parents still to follow (`-1` for unbounded). Names are added
-    /// for every referenced object; recursion into a commit or dirtree needs the
-    /// object to load, so an absent or corrupt one contributes its own name but
-    /// none beneath it.
+    /// bound its `parent` chain follows and with the kind of arrival it is.
+    /// Names are added for every referenced object; recursion into a commit or
+    /// dirtree needs the object to load, so an absent or corrupt one
+    /// contributes its own name but none beneath it.
     ///
-    /// A commit reached from more than one root is expanded at the deepest
-    /// remaining depth any root gives it, so the reachable set does not depend on
-    /// the order roots are supplied in: a commit already expanded at a depth that
-    /// follows at least as many parents is skipped, otherwise it is expanded
-    /// again to push its parent further back.
+    /// A commit reached from more than one root is expanded under the furthest
+    /// reaching bound any root gives it, so the reachable set does not depend on
+    /// the order roots are supplied in: a commit already expanded under a bound
+    /// that follows at least as far is skipped, otherwise it is expanded again
+    /// to push its parent further back.
     ///
-    /// `root_depth` is the walk's configured depth, which every commit a
-    /// metadata-key edge names is seeded at. `pending_delete` names a commit
-    /// that is read as absent.
+    /// A commit `bounded_roots` names carries its own bound. Every
+    /// `parent`-edge arrival at one is dropped, so the seed's bound stands in
+    /// place of the bound the arrival inherited.
+    ///
+    /// A conditional arrival is one a [`ParentBound::Since`] parent edge made.
+    /// It contributes nothing at all where the commit's own timestamp is below
+    /// the bound, and no expansion is recorded for it, so a root naming that
+    /// same commit still keeps it. The rejection itself is memoized, so a
+    /// second child arriving under the same bound reads no commit.
+    ///
+    /// `root_bound` is the bound every commit a metadata-key edge names is
+    /// seeded at. `pending_delete` names a commit that is read as absent.
     async fn collect_reachable(
         &self,
-        seeds: Vec<(Checksum, i32)>,
-        root_depth: i32,
+        seeds: Vec<(Checksum, ParentBound, Arrival)>,
+        root_bound: ParentBound,
         gc: &GcRoots,
+        bounded_roots: &HashSet<Checksum>,
         pending_delete: Option<Checksum>,
         reachable: &mut HashSet<ObjectName>,
     ) -> Result<()> {
         let mut commit_stack = seeds;
-        let mut seen_commits: HashMap<Checksum, i32> = HashMap::new();
+        let mut seen_commits: HashMap<Checksum, Expanded> = HashMap::new();
         let mut seen_dirtrees: HashSet<Checksum> = HashSet::new();
 
-        while let Some((commit_checksum, depth)) = commit_stack.pop() {
-            if let Some(&prev) = seen_commits.get(&commit_checksum)
-                && reaches_at_least(prev, depth)
-            {
+        while let Some((commit_checksum, bound, arrival)) = commit_stack.pop() {
+            // A commit that carries its own bound takes it whatever the
+            // `parent` edge that reached it had left. The seed holds that
+            // bound, so the arrival is dropped here and the seed's expansion
+            // stands for it.
+            if arrival.inherited() && bounded_roots.contains(&commit_checksum) {
                 continue;
             }
-            seen_commits.insert(commit_checksum, depth);
+
+            let seen = seen_commits
+                .get(&commit_checksum)
+                .copied()
+                .unwrap_or_default();
+            if seen.covers(bound) {
+                continue;
+            }
+            if arrival == Arrival::TimedParent && seen.rejects(bound) {
+                continue;
+            }
+
+            let loaded = if pending_delete == Some(commit_checksum) {
+                None
+            } else {
+                self.try_load_commit(&commit_checksum).await?
+            };
+
+            // A commit the timestamp bound rules out is not kept and no
+            // expansion is recorded for it, so a ref naming it still reaches
+            // it. The rejection is recorded, so a second child under the same
+            // bound does not read the commit again.
+            if arrival == Arrival::TimedParent
+                && let ParentBound::Since(since) = bound
+                && let Some(commit) = &loaded
+                && commit.timestamp < since
+            {
+                seen_commits
+                    .entry(commit_checksum)
+                    .or_default()
+                    .reject(since);
+                continue;
+            }
+
+            seen_commits
+                .entry(commit_checksum)
+                .or_default()
+                .record(bound);
             reachable.insert(ObjectName::new(commit_checksum, ObjectType::Commit));
 
-            if pending_delete == Some(commit_checksum) {
-                continue;
-            }
-            let Some(commit) = self.try_load_commit(&commit_checksum).await? else {
+            let Some(commit) = loaded else {
                 continue;
             };
 
-            reachable.insert(ObjectName::new(commit.root_dirmeta, ObjectType::DirMeta));
-            self.walk_tree(commit.root_dirtree, &mut seen_dirtrees, reachable)
-                .await?;
+            if gc.traverse_tree {
+                reachable.insert(ObjectName::new(commit.root_dirmeta, ObjectType::DirMeta));
+                self.walk_tree(commit.root_dirtree, &mut seen_dirtrees, reachable)
+                    .await?;
+            }
 
             if !gc.metadata_keys.is_empty() {
                 self.push_metadata_key_edges(
                     &commit_checksum,
                     &commit.metadata,
                     gc,
-                    root_depth,
+                    root_bound,
                     &mut commit_stack,
                 )
                 .await?;
             }
 
             if gc.traverse_parent
-                && depth != 0
                 && let Some(parent) = commit.parent
             {
-                let next = if depth < 0 { -1 } else { depth - 1 };
-                commit_stack.push((parent, next));
+                match bound {
+                    ParentBound::Depth(0) => {}
+                    ParentBound::Depth(depth) => {
+                        let next = if depth < 0 { -1 } else { depth - 1 };
+                        commit_stack.push((parent, ParentBound::Depth(next), Arrival::Parent));
+                    }
+                    ParentBound::Since(since) => {
+                        commit_stack.push((
+                            parent,
+                            ParentBound::Since(since),
+                            Arrival::TimedParent,
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -254,8 +476,8 @@ impl Repo {
         commit: &Checksum,
         metadata: &Value,
         gc: &GcRoots,
-        root_depth: i32,
-        stack: &mut Vec<(Checksum, i32)>,
+        root_bound: ParentBound,
+        stack: &mut Vec<(Checksum, ParentBound, Arrival)>,
     ) -> Result<()> {
         let detached = self.read_commit_detached_metadata(commit).await?;
         for key in &gc.metadata_keys {
@@ -264,7 +486,7 @@ impl Repo {
                     continue;
                 };
                 for target in metadata_key_targets(commit, key, value)? {
-                    stack.push((target, root_depth));
+                    stack.push((target, root_bound, Arrival::Root));
                 }
             }
         }
@@ -294,11 +516,28 @@ impl Repo {
     /// `refs/heads`, `refs/remotes`, and `refs/mirrors`. Used to seed prune and
     /// fsck with the set of refs' targets.
     pub(crate) async fn list_all_ref_targets(&self) -> Result<Vec<Checksum>> {
+        Ok(self
+            .list_all_refs()
+            .await?
+            .into_iter()
+            .map(|(_, checksum)| checksum)
+            .collect())
+    }
+
+    /// Collect every ref as a `(name, commit)` pair, across `refs/heads`,
+    /// `refs/remotes`, and `refs/mirrors`.
+    ///
+    /// A local ref is named by its path under `refs/heads`, so a nested name
+    /// keeps its `/`. A remote ref is named by its `<remote>:<name>` refspec. A
+    /// mirror ref is named by its path under `refs/mirrors`, which is the
+    /// collection id and the ref name below it. Prune reads the names to decide
+    /// which branch a depth applies to.
+    pub(crate) async fn list_all_refs(&self) -> Result<Vec<(String, Checksum)>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
             let mut out = Vec::new();
             for top in ["refs/heads", "refs/remotes", "refs/mirrors"] {
-                collect_ref_targets(repo.repo_fd(), top, &mut out)?;
+                collect_named_refs(repo.repo_fd(), top, &mut out)?;
             }
             Ok(out)
         })
@@ -354,54 +593,81 @@ pub(crate) fn reaches_at_least(prev: i32, depth: i32) -> bool {
     }
 }
 
-/// Enumerate loose objects under an `objects/` directory fd.
-fn list_objects_blocking(objects_fd: BorrowedFd<'_>) -> Result<HashSet<ObjectName>> {
-    let mut out = HashSet::new();
-    for fanout in read_dir_names(objects_fd)? {
+/// Call `f` with the [`ObjectName`] of each loose object under an `objects/`
+/// directory fd.
+///
+/// The enumeration holds one directory open at a time and borrows each entry
+/// name from the reader, so it allocates nothing per object.
+fn for_each_object(objects_fd: BorrowedFd<'_>, mut f: impl FnMut(ObjectName)) -> Result<()> {
+    for_each_dir_name(objects_fd, |fanout| {
         // Object fanout directories are exactly two hex characters; anything
         // else under `objects/` (a stray file, a cache directory) is not a
         // loose-object fanout.
         if fanout.len() != 2 || !fanout.bytes().all(|b| b.is_ascii_hexdigit()) {
-            continue;
+            return Ok(());
         }
         let dir = match rustix::fs::openat(
             objects_fd,
-            fanout.as_str(),
+            fanout,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
             Ok(fd) => fd,
-            Err(Errno::NOENT) => continue,
+            Err(Errno::NOENT) => return Ok(()),
             Err(e) => return Err(Error::Io(e.into())),
         };
-        for entry in read_dir_names(dir.as_fd())? {
-            if let Some(name) = parse_object_entry(&fanout, &entry) {
-                out.insert(name);
+        for_each_dir_name(dir.as_fd(), |entry| {
+            if let Some(name) = parse_object_entry(fanout, entry) {
+                f(name);
             }
-        }
-    }
+            Ok(())
+        })
+    })
+}
+
+/// Enumerate loose objects under an `objects/` directory fd.
+fn list_objects_blocking(objects_fd: BorrowedFd<'_>) -> Result<HashSet<ObjectName>> {
+    let mut out = HashSet::new();
+    for_each_object(objects_fd, |name| {
+        out.insert(name);
+    })?;
     Ok(out)
+}
+
+/// Count the loose objects under an `objects/` directory fd whose type `keep`
+/// admits, holding no name.
+fn count_objects_blocking(
+    objects_fd: BorrowedFd<'_>,
+    keep: impl Fn(ObjectType) -> bool,
+) -> Result<usize> {
+    let mut count = 0usize;
+    for_each_object(objects_fd, |name| {
+        if keep(name.ty) {
+            count += 1;
+        }
+    })?;
+    Ok(count)
 }
 
 /// Parse one `objects/<fanout>/<rest>.<ext>` entry into an [`ObjectName`], or
 /// `None` when the name is not a valid loose object.
 fn parse_object_entry(fanout: &str, entry: &str) -> Option<ObjectName> {
     let (rest, ext) = entry.rsplit_once('.')?;
-    if rest.len() != 62 {
+    if fanout.len() != 2 || rest.len() != 62 {
         return None;
     }
     let ty = ObjectType::from_extension(ext)?;
-    let mut hex = String::with_capacity(64);
-    hex.push_str(fanout);
-    hex.push_str(rest);
-    let checksum = Checksum::from_hex(&hex).ok()?;
+    let mut hex = [0u8; 64];
+    hex[..2].copy_from_slice(fanout.as_bytes());
+    hex[2..].copy_from_slice(rest.as_bytes());
+    let checksum = Checksum::from_hex(std::str::from_utf8(&hex).ok()?).ok()?;
     Some(ObjectName::new(checksum, ty))
 }
 
-/// Read the entry names of an open directory, skipping `.` and `..`.
-pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
+/// Call `f` with the name of each entry of an open directory, skipping `.` and
+/// `..`. The name borrows the reader's own buffer.
+fn for_each_dir_name(dir: BorrowedFd<'_>, mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
     let reader = rustix::fs::Dir::read_from(dir).map_err(|e| Error::Io(e.into()))?;
-    let mut names = Vec::new();
     for entry in reader {
         let entry = entry.map_err(|e| Error::Io(e.into()))?;
         let bytes = entry.file_name().to_bytes();
@@ -411,16 +677,31 @@ pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
         // Object and fanout names are ASCII and a ref name is UTF-8; anything
         // else is neither a loose object nor a ref.
         if let Ok(name) = std::str::from_utf8(bytes) {
-            names.push(name.to_owned());
+            f(name)?;
         }
     }
+    Ok(())
+}
+
+/// Read the entry names of an open directory, skipping `.` and `..`.
+pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for_each_dir_name(dir, |name| {
+        names.push(name.to_owned());
+        Ok(())
+    })?;
     Ok(names)
 }
 
-/// Recursively collect the checksum each ref file under `top` resolves to,
+/// Recursively collect the name and the checksum of each ref file under `top`,
 /// following the `refs/` subtree. Alias symlinks are followed; a dangling one is
-/// skipped. Names are not retained -- only the target checksums.
-fn collect_ref_targets(repo_fd: BorrowedFd<'_>, top: &str, out: &mut Vec<Checksum>) -> Result<()> {
+/// skipped. A ref under `refs/remotes` takes its `<remote>:<name>` refspec, and
+/// a ref under either of the other two takes its path below `top`.
+fn collect_named_refs(
+    repo_fd: BorrowedFd<'_>,
+    top: &str,
+    out: &mut Vec<(String, Checksum)>,
+) -> Result<()> {
     let dir = match rustix::fs::openat(
         repo_fd,
         top,
@@ -431,9 +712,14 @@ fn collect_ref_targets(repo_fd: BorrowedFd<'_>, top: &str, out: &mut Vec<Checksu
         Err(Errno::NOENT) => return Ok(()),
         Err(e) => return Err(Error::Io(e.into())),
     };
+    let remotes = top == "refs/remotes";
     walk_ref_dir(dir.as_fd(), "", &mut |entry| {
         if let Some(checksum) = read_ref_target(entry.dir, entry.name)? {
-            out.push(checksum);
+            let name = match remotes {
+                true => entry.path.replacen('/', ":", 1),
+                false => entry.path.to_owned(),
+            };
+            out.push((name, checksum));
         }
         Ok(())
     })

@@ -18788,6 +18788,1170 @@ fn prune_refuses_a_malformed_gc_root_metadata_keys_value() {
     );
 }
 
+// --- prune -------------------------------------------------------------------
+//
+// Each test builds one repository, copies it per implementation, runs the same
+// line on each, and holds the two to the same exit status, the same two lines of
+// standard output, and the same loose-object and static-delta inventory. The two
+// copies hold the same commits, so no checksum needs masking.
+
+/// The base timestamp the prune fixtures commit at, and the step between two
+/// commits of one branch, so a timestamp cut between them is spellable.
+const PRUNE_BASE_TS: u64 = 1_700_000_000;
+const PRUNE_STEP: u64 = 86_400;
+
+/// The environment every prune comparison runs under, so the decimal separator
+/// and the size units the totals line renders are the same on any host.
+const PRUNE_ENV: [(&str, &str); 1] = [("LC_ALL", "C.UTF-8")];
+
+/// Commit `tree` onto `branch` at a fixed timestamp, returning the checksum.
+fn prune_commit(repo: &Path, branch: &str, tree: &Path, step: u64) -> String {
+    let timestamp = format!("--timestamp=@{}", PRUNE_BASE_TS + PRUNE_STEP * step);
+    ostrya(
+        &[
+            "commit",
+            &format!("--repo={}", repo.display()),
+            "-b",
+            branch,
+            "-s",
+            branch,
+            "--canonical-permissions",
+            &timestamp,
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed()
+}
+
+/// Every loose object and every static-delta directory of a repository, sorted:
+/// the oracle for what a prune removed.
+fn prune_inventory(repo: &Path) -> Vec<String> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = format!("{prefix}{name}");
+            if entry.path().symlink_metadata().unwrap().is_dir() {
+                out.push(format!("{rel}/"));
+                walk(&entry.path(), &format!("{rel}/"), out);
+            } else {
+                out.push(rel);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&repo.join("objects"), "objects/", &mut out);
+    walk(&repo.join("deltas"), "deltas/", &mut out);
+    out.sort();
+    out
+}
+
+/// A repository holding `main` with three commits and `other` with two, each
+/// branch one payload per commit and each commit one step older than the next.
+fn build_prune_repo(base: &Path, mode: RepoMode) -> PathBuf {
+    let repo = create_repo(base, mode);
+    let tree = base.join("prune-tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for (branch, count, first) in [("main", 3u64, 1u64), ("other", 2, 10)] {
+        for step in 0..count {
+            std::fs::write(tree.join("payload.txt"), format!("{branch}-{step}\n")).unwrap();
+            prune_commit(&repo, branch, &tree, first + step);
+        }
+    }
+    repo
+}
+
+/// A repository holding `main` with five commits and a second ref `mid` at the
+/// third of them, so the two branches share their history and a bound one of
+/// them carries stands on the other's walk.
+fn build_shared_history_prune_repo(base: &Path, mode: RepoMode) -> PathBuf {
+    let repo = create_repo(base, mode);
+    let tree = base.join("shared-tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for step in 1..=5u64 {
+        std::fs::write(tree.join("payload.txt"), format!("main-{step}\n")).unwrap();
+        prune_commit(&repo, "main", &tree, step);
+    }
+    let third = resolve(&repo, "main^^").unwrap();
+    ostrya(
+        &[
+            &format!("--repo={}", repo.display()),
+            "refs",
+            "--create=mid",
+            &third,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    repo
+}
+
+/// Run `prune` with `args` against a copy of `repo` under each implementation
+/// and hold the two to the same exit status, standard output, and inventory.
+/// Returns the port's standard output.
+fn assert_prune_agrees(base: &Path, repo: &Path, tag: &str, args: &[&str]) -> String {
+    let port_repo = clone_repo(base, repo, &format!("{tag}-port"));
+    let tool_repo = clone_repo(base, repo, &format!("{tag}-tool"));
+    let port_arg = format!("--repo={}", port_repo.display());
+    let tool_arg = format!("--repo={}", tool_repo.display());
+    let mut port_args = vec!["prune", port_arg.as_str()];
+    port_args.extend_from_slice(args);
+    let mut tool_args = vec!["prune", tool_arg.as_str()];
+    tool_args.extend_from_slice(args);
+    let port = ostrya(&port_args, None, &PRUNE_ENV);
+    let tool = ostree_env(&tool_args, &PRUNE_ENV);
+    assert_eq!(
+        port.status.code(),
+        tool.status.code(),
+        "{tag}: exit status parts for `{}`\nport: {}\ntool: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&port.stderr),
+        String::from_utf8_lossy(&tool.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&port.stdout),
+        String::from_utf8_lossy(&tool.stdout),
+        "{tag}: standard output parts for `{}`",
+        args.join(" "),
+    );
+    assert_eq!(
+        prune_inventory(&port_repo),
+        prune_inventory(&tool_repo),
+        "{tag}: the two left different repositories for `{}`",
+        args.join(" "),
+    );
+    String::from_utf8(port.stdout).unwrap()
+}
+
+/// The totals text: two lines, the count the run considered and the outcome,
+/// under `--no-prune` and without it. Carries `prune/totals-nothing-to-delete`,
+/// `prune/totals-deleted-line`, and `prune/totals-would-delete-line`.
+#[test]
+fn prune_totals_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-totals");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+
+    let nothing = assert_prune_agrees(base, &repo, "nothing", &[]);
+    assert!(
+        nothing.ends_with("No unreachable objects\n"),
+        "a run that deletes nothing states it: {nothing:?}",
+    );
+    assert_eq!(nothing.lines().count(), 2, "the totals are two lines");
+    assert!(nothing.starts_with("Total objects: "));
+
+    let deleted = assert_prune_agrees(base, &repo, "deleted", &["--refs-only", "--depth=0"]);
+    assert!(
+        deleted.contains("\nDeleted ") && deleted.ends_with(" freed\n"),
+        "the deleting form: {deleted:?}",
+    );
+    let dry = assert_prune_agrees(
+        base,
+        &repo,
+        "dry",
+        &["--refs-only", "--depth=0", "--no-prune"],
+    );
+    assert!(
+        dry.contains("\nWould delete: ") && dry.ends_with("\n"),
+        "the dry-run form: {dry:?}",
+    );
+
+    // The count is taken after `--delete-commit` has removed its target, so
+    // deleting one commit lowers it by one.
+    let root = resolve(&repo, "main^^").unwrap();
+    let delete = format!("--delete-commit={root}");
+    let after = assert_prune_agrees(base, &repo, "delete-commit", &[&delete]);
+    let total = |text: &str| {
+        text.lines()
+            .next()
+            .unwrap()
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+    };
+    assert_eq!(total(&after) + 1, total(&nothing));
+
+    // Detached commit metadata is outside both counts: a repository whose every
+    // commit carries a `.commitmeta` reports the same total as the same
+    // repository without one, and the bytes a removed `.commitmeta` freed are
+    // not in the sum.
+    let detached = create_repo(base, RepoMode::BareUser);
+    let tree = base.join("detached-tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for step in 0..2u64 {
+        std::fs::write(tree.join("payload.txt"), format!("detached-{step}\n")).unwrap();
+        ostrya(
+            &[
+                "commit",
+                &format!("--repo={}", detached.display()),
+                "-b",
+                "main",
+                "-s",
+                "detached",
+                "--canonical-permissions",
+                &format!("--timestamp=@{}", PRUNE_BASE_TS + PRUNE_STEP * step),
+                &format!("--add-detached-metadata-string=k=v{step}"),
+                tree.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        )
+        .ok();
+    }
+    let files = |repo: &Path| {
+        prune_inventory(repo)
+            .into_iter()
+            .filter(|entry| !entry.ends_with('/'))
+            .count()
+    };
+    let before = files(&detached);
+    let text = assert_prune_agrees(base, &detached, "detached", &["--refs-only", "--depth=0"]);
+    assert_eq!(
+        total(&text) + 2,
+        before,
+        "the two `.commitmeta` objects are outside the total",
+    );
+}
+
+/// The size a totals line renders: the byte count below 1000 and a decimal (SI)
+/// quantity above it. Carries `prune/totals-size-below-1000`,
+/// `prune/totals-size-si-rendering`, and `prune/totals-size-unit-boundary`.
+#[test]
+fn prune_totals_size_rendering_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-size");
+    let base = tmp.path();
+    for (index, payload) in [0usize, 1, 673, 829, 999_828, 999_829, 1_500_000]
+        .into_iter()
+        .enumerate()
+    {
+        // `bare-user` stores the payload uncompressed and needs no privilege,
+        // so the bytes a run frees are the bytes the tree holds.
+        let repo = create_repo(base, RepoMode::BareUser);
+        let tree = base.join(format!("size-tree-{index}"));
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("payload.bin"), vec![b'x'; payload]).unwrap();
+        prune_commit(&repo, "main", &tree, 0);
+        // Dropping the ref leaves the whole commit unreachable, so the freed
+        // sum is the four objects it wrote.
+        ostrya(
+            &[
+                "refs",
+                &format!("--repo={}", repo.display()),
+                "--delete",
+                "main",
+            ],
+            None,
+            &[],
+        )
+        .ok();
+        let tag = format!("size-{index}");
+        let text = assert_prune_agrees(base, &repo, &tag, &["--refs-only"]);
+        let freed = text.lines().nth(1).unwrap();
+        if payload < 700 {
+            assert!(freed.ends_with(" bytes freed"), "{freed:?}");
+        } else {
+            assert!(
+                freed.ends_with("B freed") && freed.contains('\u{a0}'),
+                "a rendered quantity carries a no-break space: {freed:?}",
+            );
+        }
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+}
+
+/// `--commit-only` names the restriction in the first line, counts commit
+/// objects alone, and leaves the trees a deleted commit reached. Carries
+/// `prune/totals-commit-only`, `prune/commit-only-count`, and
+/// `prune/commit-only-leaves-the-tree`.
+#[test]
+fn prune_commit_only_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-commit-only");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+
+    let idle = assert_prune_agrees(base, &repo, "co-idle", &["--commit-only"]);
+    assert_eq!(
+        idle.lines().next().unwrap(),
+        "Total (commit only) objects: 5",
+        "the first line names the restriction and counts the five commits",
+    );
+    let text = assert_prune_agrees(
+        base,
+        &repo,
+        "co-cut",
+        &["--commit-only", "--refs-only", "--depth=0"],
+    );
+    assert!(text.contains("\nDeleted 3 objects, "), "{text:?}");
+    assert_prune_agrees(
+        base,
+        &repo,
+        "co-dry",
+        &["--commit-only", "--refs-only", "--depth=0", "--no-prune"],
+    );
+}
+
+/// `--keep-younger-than` roots the walk on the refs alone, keeps every ref head
+/// whatever its timestamp, and replaces the `--depth` bound. Carries
+/// `prune/keep-younger-than-epoch`,
+/// `prune/keep-younger-than-offset-datetime`,
+/// `prune/keep-younger-than-implies-refs-only`,
+/// `prune/keep-younger-than-keeps-every-ref-head`, and
+/// `prune/keep-younger-than-replaces-depth`.
+#[test]
+fn prune_keep_younger_than_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-kyt");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+    // An orphan younger than every cut below, named by no ref.
+    let orphan_tree = base.join("orphan-tree");
+    std::fs::create_dir_all(&orphan_tree).unwrap();
+    std::fs::write(orphan_tree.join("payload.txt"), b"orphan\n").unwrap();
+    let orphan = prune_commit(&repo, "tmpbr", &orphan_tree, 100);
+    ostrya(
+        &[
+            "refs",
+            &format!("--repo={}", repo.display()),
+            "--delete",
+            "tmpbr",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+
+    let cut = format!("--keep-younger-than=@{}", PRUNE_BASE_TS + PRUNE_STEP * 50);
+    let text = assert_prune_agrees(base, &repo, "kyt-epoch", &[&cut]);
+    assert!(text.contains("\nDeleted "), "{text:?}");
+    // The orphan is younger than the cut and still goes: the option roots the
+    // walk on the refs alone.
+    let swept = clone_repo(base, &repo, "kyt-orphan");
+    let orphan_object = swept
+        .join("objects")
+        .join(&orphan[..2])
+        .join(format!("{}.commit", &orphan[2..]));
+    assert!(orphan_object.exists(), "the fixture holds no orphan commit");
+    ostrya(
+        &[
+            "prune",
+            &format!("--repo={}", swept.display()),
+            cut.as_str(),
+        ],
+        None,
+        &PRUNE_ENV,
+    )
+    .ok();
+    assert!(
+        !orphan_object.exists(),
+        "a timestamp cut sweeps an unreferenced commit younger than the cut",
+    );
+
+    // Every ref head is older than this cut and every one of them stays.
+    for args in [
+        vec![cut.as_str()],
+        vec!["--refs-only", cut.as_str()],
+        vec!["--depth=0", cut.as_str()],
+        vec!["--depth=1", cut.as_str()],
+        vec!["--depth=-1", cut.as_str()],
+        vec!["--only-branch=main", cut.as_str()],
+        vec!["--retain-branch-depth=main=-1", cut.as_str()],
+        vec!["--commit-only", cut.as_str()],
+        vec!["--keep-younger-than=2023-11-15T00:00:00Z"],
+        vec!["--keep-younger-than=@1", "--keep-younger-than=@2000000000"],
+    ] {
+        let tag = format!("kyt-{}", args.join("-").replace(['=', '@', ':'], "_"));
+        assert_prune_agrees(base, &repo, &tag, &args);
+    }
+
+    // A cut older than every commit leaves each branch whole, where the same
+    // `--depth=0` alone keeps each head alone. The orphan still goes, the cut
+    // rooting the walk on the refs.
+    let old = format!("--keep-younger-than=@{}", PRUNE_BASE_TS - 1);
+    assert_prune_agrees(base, &repo, "kyt-old", &["--depth=0", &old]);
+    let kept = clone_repo(base, &repo, "kyt-old-kept");
+    let root = resolve(&repo, "main^^").unwrap();
+    let root_object = kept
+        .join("objects")
+        .join(&root[..2])
+        .join(format!("{}.commit", &root[2..]));
+    ostrya(
+        &[
+            "prune",
+            &format!("--repo={}", kept.display()),
+            "--depth=0",
+            &old,
+        ],
+        None,
+        &PRUNE_ENV,
+    )
+    .ok();
+    assert!(
+        root_object.exists(),
+        "a cut older than every commit leaves the ancestry `--depth=0` alone \
+         would cut",
+    );
+}
+
+/// The `--keep-younger-than` value dialect: the port takes `@SECONDS` and an
+/// absolute date and time carrying a UTC offset, and refuses the tool's
+/// local-time, relative, and empty forms. Carries
+/// `prune/keep-younger-than-unparseable`,
+/// `prune/keep-younger-than-local-time`, `prune/keep-younger-than-relative`,
+/// and `prune/keep-younger-than-empty`.
+#[test]
+fn prune_keep_younger_than_dialect_parts_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-kyt-dialect");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+
+    // Both refuse the same words, so the pair compares whole.
+    for value in ["garbage", "@", "@abc", "1700000000", "2023-13-45T00:00:00Z"] {
+        let port_repo = clone_repo(base, &repo, "kyt-bad-port");
+        let tool_repo = clone_repo(base, &repo, "kyt-bad-tool");
+        let option = format!("--keep-younger-than={value}");
+        let port = ostrya(
+            &["prune", &format!("--repo={}", port_repo.display()), &option],
+            None,
+            &PRUNE_ENV,
+        );
+        let tool = ostree_env(
+            &["prune", &format!("--repo={}", tool_repo.display()), &option],
+            &PRUNE_ENV,
+        );
+        for (who, run) in [("port", &port), ("tool", &tool)] {
+            assert_eq!(run.status.code(), Some(1), "{who} took `{value}`");
+            assert!(
+                String::from_utf8_lossy(&run.stderr)
+                    .contains(&format!("Could not parse '{value}'")),
+                "{who} worded `{value}` as {:?}",
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        assert_eq!(prune_inventory(&port_repo), prune_inventory(&tool_repo));
+        std::fs::remove_dir_all(&port_repo).unwrap();
+        std::fs::remove_dir_all(&tool_repo).unwrap();
+    }
+
+    // The three forms the tool reads through a time-zone database or a
+    // natural-language date reader and the port refuses.
+    for value in ["2023-11-15", "2023-11-15 22:13:20", "1 hour ago", "now", ""] {
+        let port_repo = clone_repo(base, &repo, "kyt-lossy-port");
+        let tool_repo = clone_repo(base, &repo, "kyt-lossy-tool");
+        let option = format!("--keep-younger-than={value}");
+        let port = ostrya(
+            &["prune", &format!("--repo={}", port_repo.display()), &option],
+            None,
+            &PRUNE_ENV,
+        );
+        let tool = ostree_env(
+            &["prune", &format!("--repo={}", tool_repo.display()), &option],
+            &PRUNE_ENV,
+        );
+        assert_eq!(port.status.code(), Some(1), "the port took `{value}`");
+        assert!(
+            String::from_utf8_lossy(&port.stderr).contains(&format!("Could not parse '{value}'")),
+            "the port worded `{value}` as {:?}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert_eq!(tool.status.code(), Some(0), "the tool refused `{value}`");
+        std::fs::remove_dir_all(&port_repo).unwrap();
+        std::fs::remove_dir_all(&tool_repo).unwrap();
+    }
+}
+
+/// `--only-branch` prunes the branch it names and retains every other one in
+/// full, roots the walk on the refs alone, and resolves its value as a
+/// revision. Carries `prune/only-branch-names-the-branch`,
+/// `prune/only-branch-retains-the-others`, `prune/only-branch-repeated`,
+/// `prune/only-branch-implies-refs-only`,
+/// `prune/only-branch-abbreviated-checksum`, and `prune/only-branch-unknown`.
+#[test]
+fn prune_only_branch_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-only-branch");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+    let head = resolve(&repo, "main").unwrap();
+    let abbreviated = &head[..10];
+
+    for (tag, args) in [
+        ("ob-plain", vec!["--only-branch=main"]),
+        ("ob-cut", vec!["--only-branch=main", "--depth=0"]),
+        ("ob-other", vec!["--only-branch=other", "--depth=0"]),
+        (
+            "ob-both",
+            vec!["--only-branch=main", "--only-branch=other", "--depth=0"],
+        ),
+        (
+            "ob-repeat",
+            vec!["--only-branch=main", "--only-branch=main", "--depth=0"],
+        ),
+        ("ob-depth1", vec!["--only-branch=main", "--depth=1"]),
+        ("ob-infinite", vec!["--only-branch=main", "--depth=-1"]),
+        ("ob-unknown", vec!["--only-branch=nosuch", "--depth=0"]),
+        ("ob-parent", vec!["--only-branch=main^", "--depth=0"]),
+    ] {
+        assert_prune_agrees(base, &repo, tag, &args);
+    }
+    // A value that resolves and names no ref assigns the depth to no branch.
+    let value = format!("--only-branch={abbreviated}");
+    let text = assert_prune_agrees(base, &repo, "ob-abbrev", &[&value, "--depth=0"]);
+    assert!(text.ends_with("No unreachable objects\n"), "{text:?}");
+}
+
+/// `--retain-branch-depth` replaces the global depth for the branch it names,
+/// a depth of 0 leaves the branch at the global depth, the last entry for a
+/// branch decides it, and a named branch is not retained in full by
+/// `--only-branch`. Carries `prune/retain-branch-depth-value`,
+/// `prune/retain-branch-depth-replaces-the-global`,
+/// `prune/retain-branch-depth-zero-is-no-value`,
+/// `prune/retain-branch-depth-last-wins`,
+/// `prune/retain-branch-depth-unknown-branch`, and
+/// `prune/retain-branch-depth-suppresses-only-branch-retention`.
+#[test]
+fn prune_retain_branch_depth_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-rbd");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+
+    let mut index = 0usize;
+    for global in ["-1", "0", "1"] {
+        for depth in ["-1", "0", "1", "2", "-2", "-3"] {
+            for branch in ["main", "other", "nosuch"] {
+                index += 1;
+                let global = format!("--depth={global}");
+                let entry = format!("--retain-branch-depth={branch}={depth}");
+                assert_prune_agrees(
+                    base,
+                    &repo,
+                    &format!("rbd-{index}"),
+                    &["--refs-only", &global, &entry],
+                );
+            }
+        }
+    }
+    for (tag, args) in [
+        (
+            "rbd-last-a",
+            vec![
+                "--refs-only",
+                "--depth=0",
+                "--retain-branch-depth=main=1",
+                "--retain-branch-depth=main=-1",
+            ],
+        ),
+        (
+            "rbd-last-b",
+            vec![
+                "--refs-only",
+                "--depth=0",
+                "--retain-branch-depth=main=-1",
+                "--retain-branch-depth=main=1",
+            ],
+        ),
+        (
+            "rbd-two",
+            vec![
+                "--refs-only",
+                "--depth=0",
+                "--retain-branch-depth=main=1",
+                "--retain-branch-depth=other=1",
+            ],
+        ),
+        (
+            "rbd-empty-branch",
+            vec!["--refs-only", "--depth=0", "--retain-branch-depth==0"],
+        ),
+        (
+            "rbd-ob-zero",
+            vec![
+                "--only-branch=main",
+                "--depth=0",
+                "--retain-branch-depth=other=0",
+            ],
+        ),
+        (
+            "rbd-ob-infinite",
+            vec![
+                "--only-branch=main",
+                "--depth=0",
+                "--retain-branch-depth=other=-1",
+            ],
+        ),
+        (
+            "rbd-ob-self",
+            vec![
+                "--only-branch=main",
+                "--depth=0",
+                "--retain-branch-depth=main=1",
+            ],
+        ),
+    ] {
+        assert_prune_agrees(base, &repo, tag, &args);
+    }
+}
+
+/// A branch bound belongs to the commit the ref names, so it stands wherever a
+/// walk reaches that commit and replaces the bound the walk carried. Carries
+/// `prune/ref-target-bound-replaces-the-inherited-one`,
+/// `prune/ref-target-bound-is-not-narrowed`,
+/// `prune/only-branch-cuts-shared-history`,
+/// `prune/keep-younger-than-cuts-shared-history`, and
+/// `prune/retain-branch-depth-implies-refs-only`.
+#[test]
+fn prune_bounds_stand_at_every_ref_target_matching_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-shared-history");
+    let base = tmp.path();
+    let repo = build_shared_history_prune_repo(base, RepoMode::BareUser);
+    // The third commit's own timestamp, so a cut at it keeps it and drops its
+    // parents.
+    let cut = format!("--keep-younger-than=@{}", PRUNE_BASE_TS + PRUNE_STEP * 3);
+
+    for (tag, args) in [
+        // `mid` cuts the history `main` runs through it.
+        (
+            "shared-rbd",
+            vec!["--refs-only", "--retain-branch-depth=mid=1"],
+        ),
+        // `main` is kept whole and `mid` takes the global depth.
+        (
+            "shared-global",
+            vec!["--refs-only", "--depth=0", "--retain-branch-depth=main=-1"],
+        ),
+        // The bound at `mid` replaces the one the arrival carried rather than
+        // narrowing it: `mid` at the global depth 3 keeps the whole chain,
+        // where the two parent hops the arrival had left would cut it.
+        (
+            "shared-no-narrow",
+            vec!["--refs-only", "--depth=3", "--retain-branch-depth=mid=0"],
+        ),
+        // `--only-branch` cuts the same way.
+        (
+            "shared-only-branch",
+            vec!["--refs-only", "--only-branch=mid", "--depth=0"],
+        ),
+        (
+            "shared-only-branch-main",
+            vec!["--refs-only", "--only-branch=main", "--depth=0"],
+        ),
+    ] {
+        assert_prune_agrees(base, &repo, tag, &args);
+    }
+    // A timestamp cut at a ref target replaces the depth the arrival carried.
+    assert_prune_agrees(
+        base,
+        &repo,
+        "shared-cut",
+        &["--refs-only", &cut, "--retain-branch-depth=main=-1"],
+    );
+    // A per-branch depth roots the walk on the refs alone, the way
+    // `--only-branch` and `--keep-younger-than` do.
+    assert_prune_agrees(
+        base,
+        &repo,
+        "shared-rbd-refs-alone",
+        &["--retain-branch-depth=mid=1"],
+    );
+}
+
+/// The `--retain-branch-depth` value dialect: both refuse a value carrying no
+/// `=` and a depth with no digits, and the tool reads a leading run of digits
+/// where the port refuses the value whole. Carries
+/// `prune/retain-branch-depth-no-equals`,
+/// `prune/retain-branch-depth-nonnumeric`, and
+/// `prune/retain-branch-depth-trailing-text`.
+#[test]
+fn prune_retain_branch_depth_value_dialect_parts_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-rbd-dialect");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+
+    // Both refuse, in the same words.
+    for (value, message) in [
+        ("main", "Invalid value main, must specify BRANCH=DEPTH"),
+        ("", "Invalid value , must specify BRANCH=DEPTH"),
+        ("main=", "Invalid depth "),
+        ("main=abc", "Invalid depth abc"),
+        ("main==0", "Invalid depth =0"),
+    ] {
+        let port_repo = clone_repo(base, &repo, "rbd-bad-port");
+        let tool_repo = clone_repo(base, &repo, "rbd-bad-tool");
+        let option = format!("--retain-branch-depth={value}");
+        let port = ostrya(
+            &[
+                "prune",
+                &format!("--repo={}", port_repo.display()),
+                "--refs-only",
+                "--depth=0",
+                &option,
+            ],
+            None,
+            &PRUNE_ENV,
+        );
+        let tool = ostree_env(
+            &[
+                "prune",
+                &format!("--repo={}", tool_repo.display()),
+                "--refs-only",
+                "--depth=0",
+                &option,
+            ],
+            &PRUNE_ENV,
+        );
+        for (who, run) in [("port", &port), ("tool", &tool)] {
+            assert_eq!(run.status.code(), Some(1), "{who} took `{value}`");
+            assert!(
+                String::from_utf8_lossy(&run.stderr).contains(message),
+                "{who} worded `{value}` as {:?}",
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        assert_eq!(
+            prune_inventory(&port_repo),
+            prune_inventory(&tool_repo),
+            "a refused value removes nothing in either",
+        );
+        std::fs::remove_dir_all(&port_repo).unwrap();
+        std::fs::remove_dir_all(&tool_repo).unwrap();
+    }
+
+    // The five spellings the tool's leading-digit-run reader takes and the
+    // port's strict reader refuses.
+    for (value, depth) in [
+        ("main=0x1", "0x1"),
+        ("main=0=1", "0=1"),
+        ("main=1 ", "1 "),
+        ("main=+1", "+1"),
+        ("main=99999999999999999999", "99999999999999999999"),
+    ] {
+        let port_repo = clone_repo(base, &repo, "rbd-lossy-port");
+        let tool_repo = clone_repo(base, &repo, "rbd-lossy-tool");
+        let option = format!("--retain-branch-depth={value}");
+        let port = ostrya(
+            &[
+                "prune",
+                &format!("--repo={}", port_repo.display()),
+                "--refs-only",
+                "--depth=0",
+                &option,
+            ],
+            None,
+            &PRUNE_ENV,
+        );
+        let tool = ostree_env(
+            &[
+                "prune",
+                &format!("--repo={}", tool_repo.display()),
+                "--refs-only",
+                "--depth=0",
+                &option,
+            ],
+            &PRUNE_ENV,
+        );
+        assert_eq!(port.status.code(), Some(1), "the port took `{value}`");
+        assert!(
+            String::from_utf8_lossy(&port.stderr).contains(&format!("Invalid depth {depth}")),
+            "the port worded `{value}` as {:?}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert_eq!(tool.status.code(), Some(0), "the tool refused `{value}`");
+        std::fs::remove_dir_all(&port_repo).unwrap();
+        std::fs::remove_dir_all(&tool_repo).unwrap();
+    }
+}
+
+/// `--depth` outside `-1`: `-1` alone keeps the whole ancestry and every other
+/// negative value keeps the head alone. Carries `prune/depth-minus-two`.
+#[test]
+fn prune_depth_outside_minus_one_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-depth");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+    for depth in ["-3", "-2", "-1", "0", "1", "2", "3"] {
+        let option = format!("--depth={depth}");
+        let tag = format!("depth{}", depth.replace('-', "m"));
+        assert_prune_agrees(base, &repo, &tag, &["--refs-only", &option]);
+    }
+}
+
+/// A prune removes the static delta of every commit it deleted and keeps a
+/// delta whose source commit it deleted, the delta directory whole and its
+/// fanout parent in place. Carries `prune/static-delta-swept-with-its-target`
+/// and `prune/static-delta-source-is-kept`.
+#[test]
+fn prune_sweeps_the_static_delta_of_a_pruned_commit() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-deltas");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let c1 = resolve(&repo, "main^^").unwrap();
+    let c2 = resolve(&repo, "main^").unwrap();
+    let c3 = resolve(&repo, "main").unwrap();
+    for (from, to) in [(&c1, &c2), (&c2, &c3)] {
+        ostrya(
+            &[
+                "static-delta",
+                "generate",
+                &repo_arg,
+                &format!("--from={from}"),
+                &format!("--to={to}"),
+            ],
+            None,
+            &[],
+        )
+        .ok();
+    }
+
+    // `--depth=0` prunes `c1` and `c2`: the delta whose target is `c2` goes and
+    // the delta whose source is `c2` stays. `--depth=1` prunes `c1` alone,
+    // which is no delta's target, so neither goes.
+    for (tag, args) in [
+        ("delta-cut", vec!["--refs-only", "--depth=0"]),
+        ("delta-keep", vec!["--refs-only", "--depth=1"]),
+        ("delta-dry", vec!["--refs-only", "--depth=0", "--no-prune"]),
+        (
+            "delta-commit-only",
+            vec!["--commit-only", "--refs-only", "--depth=0"],
+        ),
+    ] {
+        assert_prune_agrees(base, &repo, tag, &args);
+    }
+    let swept = clone_repo(base, &repo, "delta-listed");
+    ostrya(
+        &[
+            "prune",
+            &format!("--repo={}", swept.display()),
+            "--refs-only",
+            "--depth=0",
+        ],
+        None,
+        &PRUNE_ENV,
+    )
+    .ok();
+    let listed = ostrya(
+        &[
+            "static-delta",
+            "list",
+            &format!("--repo={}", swept.display()),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+    assert_eq!(
+        listed,
+        format!("{c2}-{c3}"),
+        "the delta whose target the run deleted is gone",
+    );
+}
+
+/// `--static-deltas-only` requires `--delete-commit` and, with it, removes the
+/// static deltas the named commit targets and no loose object. Carries
+/// `prune/static-deltas-only-needs-delete-commit` and
+/// `prune/static-deltas-only-deletes-the-delta-alone`.
+#[test]
+fn prune_static_deltas_only_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-deltas-only");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let c1 = resolve(&repo, "main^^").unwrap();
+    let c2 = resolve(&repo, "main^").unwrap();
+    let c3 = resolve(&repo, "main").unwrap();
+    for (from, to) in [(&c1, &c2), (&c2, &c3)] {
+        ostrya(
+            &[
+                "static-delta",
+                "generate",
+                &repo_arg,
+                &format!("--from={from}"),
+                &format!("--to={to}"),
+            ],
+            None,
+            &[],
+        )
+        .ok();
+    }
+
+    // The requirement. Both refuse at exit 1 and remove nothing; the tool's
+    // line carries a URL the port does not write, so the two are held to the
+    // sentence they share.
+    for extra in [
+        vec![],
+        vec!["--refs-only", "--depth=0"],
+        vec!["--commit-only", "--refs-only", "--depth=0"],
+    ] {
+        let port_repo = clone_repo(base, &repo, "sdo-port");
+        let tool_repo = clone_repo(base, &repo, "sdo-tool");
+        let mut port_args = vec![
+            "prune".to_owned(),
+            format!("--repo={}", port_repo.display()),
+            "--static-deltas-only".to_owned(),
+        ];
+        let mut tool_args = vec![
+            "prune".to_owned(),
+            format!("--repo={}", tool_repo.display()),
+            "--static-deltas-only".to_owned(),
+        ];
+        for arg in &extra {
+            port_args.push((*arg).to_owned());
+            tool_args.push((*arg).to_owned());
+        }
+        let port_ref: Vec<&str> = port_args.iter().map(String::as_str).collect();
+        let tool_ref: Vec<&str> = tool_args.iter().map(String::as_str).collect();
+        let port = ostrya(&port_ref, None, &PRUNE_ENV);
+        let tool = ostree_env(&tool_ref, &PRUNE_ENV);
+        for (who, run) in [("port", &port), ("tool", &tool)] {
+            assert_eq!(run.status.code(), Some(1), "{who} took the option alone");
+            assert!(
+                String::from_utf8_lossy(&run.stderr)
+                    .contains("--static-deltas-only requires --delete-commit"),
+                "{who} worded the refusal as {:?}",
+                String::from_utf8_lossy(&run.stderr),
+            );
+        }
+        assert_eq!(
+            prune_inventory(&port_repo),
+            prune_inventory(&tool_repo),
+            "the refusal removes nothing in either",
+        );
+        std::fs::remove_dir_all(&port_repo).unwrap();
+        std::fs::remove_dir_all(&tool_repo).unwrap();
+    }
+
+    // Each of the three commits as the delta key. `c3` is the branch head,
+    // which a plain `--delete-commit` refuses and this option does not.
+    for (index, target) in [&c1, &c2, &c3].into_iter().enumerate() {
+        let option = format!("--delete-commit={target}");
+        let tag = format!("sdo-{index}");
+        let text = assert_prune_agrees(base, &repo, &tag, &["--static-deltas-only", &option]);
+        assert!(
+            text.ends_with("No unreachable objects\n"),
+            "no loose object is touched: {text:?}",
+        );
+    }
+}
+
+/// A prune writes a `.tombstone-commit` for every commit it removes where
+/// `--delete-commit` is given or `[core] tombstone-commits` is set, and counts
+/// the markers in neither total. Carries `prune/tombstone-on-delete-commit`
+/// and `prune/tombstone-on-config-key`.
+#[test]
+fn prune_writes_a_tombstone_for_every_commit_it_removes() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-tombstones");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+    let root = resolve(&repo, "main^^").unwrap();
+    let delete = format!("--delete-commit={root}");
+
+    assert_prune_agrees(base, &repo, "tomb-delete", &[&delete]);
+    let text = assert_prune_agrees(
+        base,
+        &repo,
+        "tomb-delete-cut",
+        &["--refs-only", "--depth=0", &delete],
+    );
+    assert!(text.contains("\nDeleted "), "{text:?}");
+
+    // The config key turns the same behavior on with no `--delete-commit`.
+    let configured = base.join("configured");
+    std::fs::create_dir_all(&configured).unwrap();
+    let configured = clone_repo(&configured, &repo, "repo");
+    ostrya(
+        &[
+            "config",
+            &format!("--repo={}", configured.display()),
+            "set",
+            "core.tombstone-commits",
+            "true",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_prune_agrees(base, &configured, "tomb-key", &["--refs-only", "--depth=0"]);
+    assert_prune_agrees(
+        base,
+        &configured,
+        "tomb-key-dry",
+        &["--refs-only", "--depth=0", "--no-prune"],
+    );
+    assert_prune_agrees(
+        base,
+        &configured,
+        "tomb-key-commit-only",
+        &["--refs-only", "--depth=0", "--commit-only"],
+    );
+    // The markers a run leaves are outside the count the next run reports.
+    let swept = clone_repo(base, &configured, "tomb-second");
+    let swept_arg = format!("--repo={}", swept.display());
+    ostrya(
+        &["prune", &swept_arg, "--refs-only", "--depth=0"],
+        None,
+        &PRUNE_ENV,
+    )
+    .ok();
+    assert_prune_agrees(base, &swept, "tomb-second-run", &[]);
+}
+
+/// The port and the tool part on a ref name the tool's ref enumeration skips:
+/// the tool's `prune --refs-only` reads the commit that ref holds as
+/// unreachable and deletes it, and the port enumerates the name and keeps the
+/// commit. Carries `prune/refs-only-deletes-a-shadowed-ref-commit`.
+#[test]
+fn prune_refs_only_parts_on_a_shadowed_ref_name() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-shadowed");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+    let head = resolve(&repo, "main").unwrap();
+
+    for name in ["odd~1", "main^"] {
+        let port_repo = clone_repo(base, &repo, "shadow-port");
+        let tool_repo = clone_repo(base, &repo, "shadow-tool");
+        for copy in [&port_repo, &tool_repo] {
+            std::fs::remove_file(copy.join("refs/heads/main")).unwrap();
+            std::fs::remove_file(copy.join("refs/heads/other")).unwrap();
+            write_ref_file(copy, &format!("heads/{name}"), &head);
+        }
+        let object = |repo: &Path| {
+            repo.join("objects")
+                .join(&head[..2])
+                .join(format!("{}.commit", &head[2..]))
+        };
+        assert!(object(&port_repo).exists(), "the fixture holds no commit");
+
+        ostrya(
+            &[
+                "prune",
+                &format!("--repo={}", port_repo.display()),
+                "--refs-only",
+            ],
+            None,
+            &PRUNE_ENV,
+        )
+        .ok();
+        ostree_env(
+            &[
+                "prune",
+                &format!("--repo={}", tool_repo.display()),
+                "--refs-only",
+            ],
+            &PRUNE_ENV,
+        )
+        .ok();
+        assert!(
+            object(&port_repo).exists(),
+            "the port enumerates `{name}` and keeps the commit it holds",
+        );
+        assert!(
+            !object(&tool_repo).exists(),
+            "the tool's enumeration skips `{name}` and deletes the commit",
+        );
+        assert!(
+            tool_repo.join("refs/heads").join(name).exists(),
+            "the tool leaves the ref file over the absent object",
+        );
+        std::fs::remove_dir_all(&port_repo).unwrap();
+        std::fs::remove_dir_all(&tool_repo).unwrap();
+    }
+}
+
+/// The three boolean flags `prune` gains are refused on a second occurrence by
+/// the port and taken by the tool, which is the repeated-boolean-flag class the
+/// port's CLI carries throughout. Carries `prune/commit-only-repeated` and
+/// `prune/refs-only-repeated`.
+#[test]
+fn prune_repeated_boolean_flags_part_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-repeated");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+
+    for flag in ["--refs-only", "--commit-only", "--no-prune"] {
+        let port_repo = clone_repo(base, &repo, "rep-port");
+        let tool_repo = clone_repo(base, &repo, "rep-tool");
+        let port = ostrya(
+            &[
+                "prune",
+                &format!("--repo={}", port_repo.display()),
+                flag,
+                flag,
+            ],
+            None,
+            &PRUNE_ENV,
+        );
+        let tool = ostree_env(
+            &[
+                "prune",
+                &format!("--repo={}", tool_repo.display()),
+                flag,
+                flag,
+            ],
+            &PRUNE_ENV,
+        );
+        assert_eq!(port.status.code(), Some(1), "the port took `{flag}` twice");
+        assert_eq!(
+            tool.status.code(),
+            Some(0),
+            "the tool refused `{flag}` twice"
+        );
+        std::fs::remove_dir_all(&port_repo).unwrap();
+        std::fs::remove_dir_all(&tool_repo).unwrap();
+    }
+}
+
 /// `pull-local` reads `[ex-ostrya] detached-metadata-exclude` from the
 /// destination and stores no detached-metadata key the list names.
 #[test]
@@ -20738,7 +21902,7 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
     // The tool's own table, measured. `--skip-list` is in
     // `checkout_skip_list_drops_allow_noent_in_the_tool`, together with the
     // two batch options that keep the switch.
-    let arms: [(&str, &[&str], i32); 11] = [
+    let arms: [(&str, &[&str], i32); 12] = [
         ("bare", &[], 0),
         ("require-hardlinks", &["-H"], 1),
         ("force-copy", &["-C"], 1),
@@ -20754,6 +21918,7 @@ fn checkout_allow_noent_reach_diverges_from_the_tool() {
         ),
         ("bareuseronly-dirs", &["-M"], 1),
         ("disable-cache", &["--disable-cache"], 1),
+        ("fsync", &["--fsync=true"], 0),
     ];
 
     for (case, switches, tool_status) in arms {
@@ -23391,6 +24556,583 @@ fn checkout_materialization_switches_refuse_composefs_in_both() {
             std::fs::read(dest).unwrap(),
             b"keep\n",
             "the {who} replaced an existing destination",
+        );
+    }
+}
+
+/// `checkout --fsync=POLICY` takes the tool's boolean words, refuses every
+/// other value in the tool's words and at the tool's own step, and changes no
+/// byte of the destination. `--disable-fsync` is refused by both.
+///
+/// The port's half of this runs on every host. The assertions that hold the
+/// port against the tool run where `ostree` is installed.
+///
+/// The value reader is a `&str` reader that runs before the repository is
+/// opened, so it cannot vary by repository mode. The whole accepted set is
+/// therefore swept in one mode, and the two policies that set resolves to are
+/// swept in every mode, which covers both axes.
+///
+/// Carries `checkout/fsync-true`, `checkout/fsync-false`,
+/// `checkout/fsync-case-and-numeral`,
+/// `checkout/fsync-changes-no-destination-byte`, and
+/// `checkout/disable-fsync-refused`.
+#[test]
+fn checkout_fsync_policy_matches_the_tool() {
+    let tool_present = ostree_available();
+    let tmp = TmpDir::new("checkout-fsync");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_hardlink_tree(&tree);
+
+    // Every accepted spelling, in both cases, the same set `commit` takes, and
+    // the two distinct policies that set resolves to.
+    let accepted: [&str; 11] = [
+        "true", "TRUE", "tRuE", "yes", "yEs", "1", "false", "False", "no", "NO", "0",
+    ];
+    let resolved: [&str; 2] = ["true", "false"];
+
+    for (index, (mode_name, mode)) in HARDLINK_MODES.into_iter().enumerate() {
+        let repo = hardlink_repo(base, mode, &format!("repo-{mode_name}"));
+        let rev = commit_verbatim(&repo, BRANCH, &tree);
+
+        // The destination the policy is held against: the same checkout with no
+        // `--fsync` at all.
+        let plain = base.join(format!("plain-{mode_name}"));
+        checkout_port(&repo, &["-U"], &rev, &plain).ok();
+        let expected = describe_tree_with_content(&plain);
+
+        let values: &[&str] = if index == 0 { &accepted } else { &resolved };
+        for value in values {
+            let option = format!("--fsync={value}");
+            let label = format!("{mode_name}/{value}");
+            let port_dest = base.join(format!("port-{mode_name}-{value}"));
+            let port = checkout_port(&repo, &["-U", option.as_str()], &rev, &port_dest);
+            assert_eq!(
+                port.status.code(),
+                Some(0),
+                "{label}: the port refused the value: {}",
+                String::from_utf8_lossy(&port.stderr),
+            );
+            assert!(port.stdout.is_empty(), "{label}: the port printed output");
+            assert!(port.stderr.is_empty(), "{label}: the port wrote a line");
+            assert_eq!(
+                describe_tree_with_content(&port_dest),
+                expected,
+                "{label}: the policy changed the destination",
+            );
+            if tool_present {
+                let tool_dest = base.join(format!("tool-{mode_name}-{value}"));
+                let tool = checkout_tool(&repo, &["-U", option.as_str()], &rev, &tool_dest);
+                assert_checkout_pair(&port, &tool, &port_dest, &tool_dest, &label);
+            }
+        }
+    }
+
+    // A value neither reader holds, and the step the refusal stands at: ahead
+    // of the repository and ahead of the revision. Each line here names a
+    // DESTINATION, so `clap`'s own argument count is satisfied and the value
+    // reader answers (`../docs/conformance/cli-surface.md`, "checkout"). The
+    // valueless form takes the next word as its value, which is what the last
+    // case names.
+    let repo = hardlink_repo(base, RepoMode::BareUser, "refusals");
+    let rev = commit_verbatim(&repo, BRANCH, &tree);
+    let absent = base.join("no-such-repo");
+    let refusals: [(&[&str], &str); 6] = [
+        (&["-U", "--fsync=on"], "on"),
+        (&["-U", "--fsync=garbage"], "garbage"),
+        (&["-U", "--fsync="], ""),
+        (&["-U", "--fsync=on", "--subpath=/nope"], "on"),
+        (&["--fsync=on", "--allow-noent"], "on"),
+        (&["-U", "--fsync", "--allow-noent"], "--allow-noent"),
+    ];
+    for (options, value) in refusals {
+        let port_dest = base.join("refused-dest");
+        let expected = format!("error: Invalid boolean argument '{value}'");
+        let run = checkout_port(&repo, options, &rev, &port_dest);
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "`{options:?}` was not refused:\n{}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+        assert!(run.stdout.is_empty(), "`{options:?}` printed output");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr).trim(),
+            expected,
+            "`{options:?}` was refused in other words",
+        );
+        assert!(!port_dest.exists(), "`{options:?}` created a destination",);
+
+        // The same value against a repository that does not exist: the read
+        // stands ahead of the repository.
+        let run = checkout_port(&absent, options, &rev, &port_dest);
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr).trim(),
+            expected,
+            "`{options:?}` reported the repository first in the port",
+        );
+
+        if !tool_present {
+            continue;
+        }
+        let tool_run = checkout_tool(&repo, options, &rev, &port_dest);
+        assert_eq!(
+            tool_run.status.code(),
+            Some(1),
+            "the tool took `{options:?}`",
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&tool_run.stderr).trim(),
+            expected,
+            "the tool refused `{options:?}` in other words",
+        );
+        assert!(!port_dest.exists(), "the tool created a destination");
+        let tool_run = checkout_tool(&absent, options, &rev, &port_dest);
+        assert_eq!(
+            String::from_utf8_lossy(&tool_run.stderr).trim(),
+            expected,
+            "`{options:?}` reported the repository first in the tool",
+        );
+    }
+
+    // `--disable-fsync` is refused by both and the words part
+    // (`../docs/conformance/cli-surface.md`, "checkout").
+    let port_dest = base.join("port-disable-fsync");
+    let port = checkout_port(&repo, &["-U", "--disable-fsync"], &rev, &port_dest);
+    assert_eq!(port.status.code(), Some(1), "the port took --disable-fsync");
+    assert!(
+        String::from_utf8_lossy(&port.stderr)
+            .contains("unexpected argument '--disable-fsync' found"),
+        "the port's words: {}",
+        String::from_utf8_lossy(&port.stderr),
+    );
+    assert!(!port_dest.exists(), "the port created a destination");
+    if tool_present {
+        let tool_dest = base.join("tool-disable-fsync");
+        let tool = checkout_tool(&repo, &["-U", "--disable-fsync"], &rev, &tool_dest);
+        assert_eq!(tool.status.code(), Some(1), "the tool took --disable-fsync");
+        assert!(
+            String::from_utf8_lossy(&tool.stderr).contains("Unknown option --disable-fsync"),
+            "the tool's words: {}",
+            String::from_utf8_lossy(&tool.stderr),
+        );
+        assert!(!tool_dest.exists(), "the tool created a destination");
+    }
+
+    // The option given twice, carrying two different values in each order. The
+    // port refuses the line whichever values the two occurrences carry, and the
+    // tool takes it and exits 0 in both orders. Which occurrence the tool reads
+    // shows in no artifact here, so the sync-call counts state it in
+    // `checkout_fsync_policy_controls_the_syscalls`.
+    for (first, last) in [("false", "true"), ("true", "false")] {
+        let label = format!("--fsync={first} --fsync={last}");
+        let first_option = format!("--fsync={first}");
+        let last_option = format!("--fsync={last}");
+        let options = ["-U", first_option.as_str(), last_option.as_str()];
+        let port_dest = base.join(format!("port-fsync-twice-{first}-{last}"));
+        let port = checkout_port(&repo, &options, &rev, &port_dest);
+        assert_eq!(port.status.code(), Some(1), "the port took `{label}`");
+        assert!(
+            String::from_utf8_lossy(&port.stderr).contains("cannot be used multiple times"),
+            "the port's words on `{label}`: {}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert!(!port_dest.exists(), "the port created a destination");
+        if tool_present {
+            let tool_dest = base.join(format!("tool-fsync-twice-{first}-{last}"));
+            let tool = checkout_tool(&repo, &options, &rev, &tool_dest);
+            assert_eq!(tool.status.code(), Some(0), "the tool refused `{label}`");
+            assert!(tool_dest.exists(), "the tool wrote no destination");
+        }
+    }
+
+    // A line that omits DESTINATION altogether. `clap` counts the positionals
+    // before the value reader runs, so the port names the missing positional
+    // where the tool names the value. Both exit 1 and create nothing, which the
+    // wording rule covers (`../docs/conformance/cli-surface.md`, "checkout").
+    // Each run takes the temporary directory as its working directory, since a
+    // line that took the value would name its destination after the revision
+    // and write it there.
+    let repo_arg = format!("--repo={}", repo.display());
+    let bare = [repo_arg.as_str(), "checkout", "-U", "--fsync=on", &rev];
+    let run = ostrya_in(Some(base), &bare, None, &[]);
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "the port took a line with no \
+         DESTINATION"
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("<DESTINATION>"),
+        "the port's words: {}",
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert!(
+        !base.join(&rev).exists(),
+        "the port wrote a destination named after the revision",
+    );
+    if tool_present {
+        let run = ostree_in(base, &bare);
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "the tool took a line with no \
+             DESTINATION"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr).trim(),
+            "error: Invalid boolean argument 'on'",
+            "the tool named another fault",
+        );
+        assert!(
+            !base.join(&rev).exists(),
+            "the tool wrote a destination named after the revision",
+        );
+    }
+
+    // Each occurrence of a repeat is validated by the tool, so a value it does
+    // not hold is reported from either position.
+    if tool_present {
+        for options in [
+            ["-U", "--fsync=on", "--fsync=true"],
+            ["-U", "--fsync=false", "--fsync=on"],
+        ] {
+            let tool_dest = base.join("tool-fsync-twice-bad");
+            let tool = checkout_tool(&repo, &options, &rev, &tool_dest);
+            assert_eq!(tool.status.code(), Some(1), "the tool took `{options:?}`");
+            assert_eq!(
+                String::from_utf8_lossy(&tool.stderr).trim(),
+                "error: Invalid boolean argument 'on'",
+                "the tool refused `{options:?}` in other words",
+            );
+            assert!(!tool_dest.exists(), "the tool created a destination");
+        }
+    }
+}
+
+/// A `[core] fsync` value the reader does not hold is refused under every state
+/// of `checkout --fsync`, the option's own value included, and the tool refuses
+/// the same repository. The option narrows the configured policy, so the
+/// configured value is read before the narrowing and `--fsync=false` conceals
+/// nothing (`../docs/format-reference.md`, "The fsync vocabulary").
+///
+/// A `--composefs` export reaches no such read, because the port reads the key
+/// where the checkout path uses it and the export decision stands ahead of that
+/// place. The port writes the image and exits 0 where the tool refuses the
+/// repository, which is the divergence
+/// `../docs/conformance/cli-surface.md`, "checkout", records. The quotation
+/// marks the tool sets around the key name follow the locale, so the tool's
+/// line is held to the key name.
+///
+/// The port's half runs on every host. The assertions about the tool run where
+/// `ostree` is installed.
+///
+/// Carries `checkout/composefs-keeps-a-bad-configured-fsync`.
+#[test]
+fn checkout_refuses_a_bad_configured_fsync_under_every_override() {
+    let tool_present = ostree_available();
+    let tmp = TmpDir::new("checkout-fsync-bad-config");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    build_hardlink_tree(&tree);
+    let repo = hardlink_repo(base, RepoMode::BareUser, "repo");
+    let rev = commit_verbatim(&repo, BRANCH, &tree);
+    let config = repo.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replacen("[core]\n", "[core]\nfsync=bogus\n", 1),
+    )
+    .unwrap();
+
+    for option in [None, Some("--fsync=true"), Some("--fsync=false")] {
+        let tag = option.unwrap_or("none");
+        let dest = base.join(format!("dest-{}", tag.trim_start_matches('-')));
+        let mut options = vec!["-U"];
+        options.extend(option);
+        let run = checkout_port(&repo, &options, &rev, &dest);
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "`{tag}` took the configured value: {}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+        assert!(
+            String::from_utf8_lossy(&run.stderr)
+                .contains("value 'bogus' for core.fsync is not a boolean"),
+            "`{tag}` was refused in other words: {}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+        assert!(!dest.exists(), "`{tag}` created a destination");
+
+        if !tool_present {
+            continue;
+        }
+        let tool_dest = base.join(format!("tool-dest-{}", tag.trim_start_matches('-')));
+        let tool = checkout_tool(&repo, &options, &rev, &tool_dest);
+        assert_eq!(
+            tool.status.code(),
+            Some(1),
+            "the tool took `{tag}` over the configured value",
+        );
+        let words = String::from_utf8_lossy(&tool.stderr);
+        assert!(
+            words.contains("fsync") && words.contains("cannot be interpreted"),
+            "the tool refused `{tag}` in other words: {words}",
+        );
+        assert!(!tool_dest.exists(), "the tool created a destination");
+    }
+
+    // The composefs export, which reaches no read of the key. The port takes
+    // the repository and the tool refuses it.
+    let port_image = base.join("port-composefs");
+    let run = checkout_port(&repo, &["-U", "--composefs"], &rev, &port_image);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "the port refused the composefs export: {}",
+        String::from_utf8_lossy(&run.stderr),
+    );
+    assert!(
+        port_image.is_file(),
+        "the port wrote no image at `{}`",
+        port_image.display(),
+    );
+    if tool_present {
+        let tool_image = base.join("tool-composefs");
+        let tool = checkout_tool(&repo, &["-U", "--composefs"], &rev, &tool_image);
+        assert_eq!(
+            tool.status.code(),
+            Some(1),
+            "the tool took the composefs export over the configured value",
+        );
+        let words = String::from_utf8_lossy(&tool.stderr);
+        assert!(
+            words.contains("fsync") && words.contains("cannot be interpreted"),
+            "the tool refused the composefs export in other words: {words}",
+        );
+        assert!(!tool_image.exists(), "the tool wrote an image");
+    }
+}
+
+/// The `--fsync=POLICY` policy is resolved from the repository config narrowed
+/// by the option, and the resolved value reaches every write the checkout
+/// makes. Neither half shows in a byte of the destination, so the claim is
+/// stated in syscalls: the four `checkout` rows of the table in
+/// `../docs/format-reference.md`, "The fsync vocabulary", measured for the port
+/// and for the tool over corpus `C0` in `archive` mode. Three of the four rows
+/// must issue no sync call at all, which is the narrowing rule.
+///
+/// The syncing row is held to the total the table records, 2 for the tool and 5
+/// for the port, so the table and this test stay one record. The targets part:
+/// the tool syncs the temporary files of the uncompressed object cache it keeps
+/// under the repository, and the port, which keeps no such cache, syncs the
+/// files and the directories of the destination.
+///
+/// It also states which occurrence of a repeated `--fsync` the tool reads,
+/// which is the last one, since both orders exit 0 and write one tree.
+///
+/// Every claim here is a count of syscalls, so the whole body needs `strace`
+/// and returns without an assertion where `strace` is absent. The rows that
+/// name the tool need `ostree` as well.
+///
+/// Carries `checkout/fsync-syscalls` and `checkout/fsync-given-twice`.
+#[test]
+fn checkout_fsync_policy_controls_the_syscalls() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("checkout-fsync-syscalls");
+    // `strace -y` prints the path a descriptor resolves to, so the paths the
+    // targets are named against must be resolved too.
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    let port = env!("CARGO_BIN_EXE_ostrya");
+
+    // (tag, configured `[core] fsync`, option, the calls the row expects). The
+    // tool is measured beside the port wherever it is installed.
+    let rows: [(&str, Option<&str>, Option<&str>, usize); 4] = [
+        ("unset-on", None, Some("--fsync=true"), 1),
+        ("unset-plain", None, None, 1),
+        ("on-off", Some("true"), Some("--fsync=false"), 0),
+        ("off-on", Some("false"), Some("--fsync=true"), 0),
+    ];
+
+    let mut binaries: Vec<(&str, String, usize)> = vec![("port", port.to_owned(), 5)];
+    if ostree_available() {
+        binaries.push(("tool", "ostree".to_owned(), 2));
+    }
+
+    // Every row of every binary is held against this one: the policy reaches
+    // the sync calls and leaves standard output, standard error, the exit
+    // status, and the destination where they stand.
+    let mut answer: Option<(String, String, Option<i32>, Vec<String>)> = None;
+    for (who, binary, total) in &binaries {
+        for (tag, configured, option, expect_sync) in rows {
+            let repo = base.join(format!("{who}-{tag}"));
+            let dest = base.join(format!("dest-{who}-{tag}"));
+            block_on(async {
+                Repo::create(&repo, CreateOptions::new(RepoMode::Archive))
+                    .await
+                    .unwrap();
+            });
+            if let Some(value) = configured {
+                let config = repo.join("config");
+                let text = std::fs::read_to_string(&config).unwrap();
+                std::fs::write(
+                    &config,
+                    text.replacen("[core]\n", &format!("[core]\nfsync={value}\n"), 1),
+                )
+                .unwrap();
+            }
+            let repo_arg = format!("--repo={}", repo.display());
+            ostrya(
+                &[
+                    repo_arg.as_str(),
+                    "commit",
+                    "-b",
+                    "main",
+                    "-s",
+                    "x",
+                    "--timestamp=@1700000000",
+                    "--fsync=false",
+                    tree.to_str().unwrap(),
+                ],
+                None,
+                &[],
+            )
+            .ok();
+            let dest_arg = dest.display().to_string();
+            let mut args = vec![repo_arg.as_str(), "checkout", "-U"];
+            if let Some(option) = option {
+                args.push(option);
+            }
+            args.push("main");
+            args.push(dest_arg.as_str());
+            let trace = base.join(format!("trace-{who}-{tag}"));
+            let (run, calls) = sync_calls(binary, &repo, &trace, &args);
+            assert!(
+                run.status.success(),
+                "`{who}` failed the `{tag}` row: {args:?}\n{}",
+                String::from_utf8_lossy(&run.stderr),
+            );
+            if expect_sync == 0 {
+                assert!(
+                    calls.is_empty(),
+                    "`{who}` issued {} sync calls in the `{tag}` row, \
+                     where the resolved policy is off: {calls:?}",
+                    calls.len(),
+                );
+            } else {
+                // The totals `../docs/format-reference.md`, "The fsync
+                // vocabulary", records for corpus `C0` in `archive` mode.
+                assert_eq!(
+                    calls.len(),
+                    *total,
+                    "`{who}` issued {} sync calls in the `{tag}` row, where the table in \
+                     `docs/format-reference.md`, \"The fsync vocabulary\", records {total}: \
+                     {calls:?}",
+                    calls.len(),
+                );
+                // `sync_calls` names a target under the repository relative to
+                // it and leaves every other path absolute, so the tool's
+                // targets are the relative ones and the port's are under the
+                // destination.
+                let dest_prefix = format!("{dest_arg}/");
+                for (kind, path) in &calls {
+                    let under_repo = !path.starts_with('/');
+                    let under_dest = path == &dest_arg || path.starts_with(&dest_prefix);
+                    let want_dest = *who == "port";
+                    assert_eq!(
+                        (under_dest, under_repo),
+                        (want_dest, !want_dest),
+                        "`{who}` issued `{kind}` on `{path}` in the `{tag}` row",
+                    );
+                }
+            }
+
+            // The sync calls are the whole difference. Every row says nothing
+            // on either stream, exits the same way, and leaves the same
+            // destination, across the four policies and across the two
+            // binaries.
+            let observed = (
+                String::from_utf8_lossy(&run.stdout).into_owned(),
+                String::from_utf8_lossy(&run.stderr).into_owned(),
+                run.status.code(),
+                describe_tree_with_content(&dest),
+            );
+            match &answer {
+                None => answer = Some(observed),
+                Some(first) => assert_eq!(
+                    &observed, first,
+                    "`{who}` parted from the first row in the `{tag}` row",
+                ),
+            }
+        }
+    }
+
+    if !ostree_available() {
+        return;
+    }
+
+    // Which occurrence of a repeated `--fsync` the tool reads. Both orders
+    // exit 0 and write one tree, so the count of sync calls is what states it.
+    // Each order takes a repository of its own: a first `archive` checkout
+    // fills the uncompressed object cache, and a second checkout out of the
+    // same repository issues no call whatever the policy resolves to, which
+    // would read as a syncing order that does not sync.
+    for (first, last, expect_sync) in [("false", "true", 2), ("true", "false", 0)] {
+        let tag = format!("repeat-{first}-{last}");
+        let repo = base.join(format!("tool-{tag}"));
+        let dest = base.join(format!("dest-tool-{tag}"));
+        block_on(async {
+            Repo::create(&repo, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+        });
+        let repo_arg = format!("--repo={}", repo.display());
+        ostrya(
+            &[
+                repo_arg.as_str(),
+                "commit",
+                "-b",
+                "main",
+                "-s",
+                "x",
+                "--timestamp=@1700000000",
+                "--fsync=false",
+                tree.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        )
+        .ok();
+        let dest_arg = dest.display().to_string();
+        let first_option = format!("--fsync={first}");
+        let last_option = format!("--fsync={last}");
+        let args = [
+            repo_arg.as_str(),
+            "checkout",
+            "-U",
+            first_option.as_str(),
+            last_option.as_str(),
+            "main",
+            dest_arg.as_str(),
+        ];
+        let trace = base.join(format!("trace-tool-{tag}"));
+        let (run, calls) = sync_calls("ostree", &repo, &trace, &args);
+        assert!(
+            run.status.success(),
+            "the tool failed `{tag}`: {args:?}\n{}",
+            String::from_utf8_lossy(&run.stderr),
+        );
+        assert_eq!(
+            calls.len(),
+            expect_sync,
+            "the tool issued {} sync calls under `{first_option} {last_option}`, \
+             where the last occurrence resolves to {expect_sync}: {calls:?}",
+            calls.len(),
         );
     }
 }

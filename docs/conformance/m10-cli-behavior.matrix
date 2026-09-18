@@ -4406,6 +4406,231 @@ loss: a repeated boolean flag. The tool takes it and checks the tree out; the
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 
 # ---------------------------------------------------------------------------
+# checkout -- durability (Phase 17f, F16).
+#
+# `--fsync=POLICY` carries the value set, the refusal text, and the narrowing
+# rule the vocabulary states, and it changes no byte of the destination. No
+# oracle reads a cell's own checkout destination, so the destination claim
+# cites the test that walks both implementations' destinations, and the cells
+# here run the acceptances and the refusals, which an exit status and a message
+# state. The count of sync calls a policy produces is outside every oracle this
+# harness reads, so it cites a test as well, and so does the reach of a
+# configured `[core] fsync` value the reader refuses, which needs a repository
+# config no setup here writes.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: checkout
+cell: checkout/fsync-true
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --fsync=true $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_fsync_policy_matches_the_tool
+spec: format-reference.md#the-fsync-vocabulary
+note: the policy that is also the default. Both take the value, write no line,
+ and exit 0. The cited test states the two destinations equal, which is the
+ claim `--fsync` carries on `checkout`: it changes the durability of the writes
+ and no byte of the tree they write.
+
+family: M10
+subcommand: checkout
+cell: checkout/fsync-false
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --fsync=false $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_fsync_policy_matches_the_tool
+spec: format-reference.md#the-fsync-vocabulary
+note: the other policy over the same commit and the same destination path. The
+ pair states that the policy leaves the destination alone.
+
+family: M10
+subcommand: checkout
+cell: checkout/fsync-case-and-numeral
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --fsync=YeS $REV $SCRATCH/dest
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_fsync_policy_matches_the_tool
+spec: format-reference.md#the-fsync-vocabulary
+note: the value words are matched without regard to case. The whole accepted set
+ -- `true`, `yes`, `1`, `false`, `no`, `0`, in every case -- is one invocation
+ per value, so the set stands in the cited test and this cell states one
+ spelling of it.
+
+family: M10
+subcommand: checkout
+cell: checkout/fsync-invalid-value
+setup: repo-with-commit
+run: checkout --repo=$REPO --fsync=on $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Invalid boolean argument 'on'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Invalid boolean argument 'on'"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#the-fsync-vocabulary
+note: `on` is a boolean word neither reader holds, the accepted set being
+ `true`, `yes`, `1`, `false`, `no`, and `0`. Both refuse in the same words at
+ exit 1, and neither creates the destination.
+
+family: M10
+subcommand: checkout
+cell: checkout/fsync-empty-value
+setup: repo-with-commit
+run: checkout --repo=$REPO --fsync= $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Invalid boolean argument ''"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Invalid boolean argument ''"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#the-fsync-vocabulary
+note: the empty value reaches the same reader and is quoted verbatim by both.
+
+family: M10
+subcommand: checkout
+cell: checkout/fsync-refusal-stands-first
+setup: repo-with-commit
+run: checkout --repo=$REPO --fsync=on nosuchrev $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Invalid boolean argument 'on'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Invalid boolean argument 'on'"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#checkout
+note: the revision names nothing, so the resolution line would answer the
+ invocation where the policy were read later. Both report the policy instead,
+ which places the read in the option step, ahead of the repository and ahead of
+ the revision.
+
+family: M10
+subcommand: checkout
+cell: checkout/fsync-changes-no-destination-byte
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_fsync_policy_matches_the_tool
+spec: format-reference.md#the-fsync-vocabulary
+note: no oracle reads a cell's own checkout destination, so the claim cites the
+ test that walks both. The destinations under `--fsync=true`, under
+ `--fsync=false`, and under no option at all are one tree in each repository
+ mode, and each equals the tool's.
+
+family: M10
+subcommand: checkout
+cell: checkout/disable-fsync-refused
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --disable-fsync $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --disable-fsync"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::checkout_fsync_policy_matches_the_tool
+spec: format-reference.md#the-fsync-vocabulary
+note: `checkout` takes the valued spelling alone. Both refuse the valueless one
+ at exit 1 and neither creates the destination; the words part, which
+ cli-surface.md, "checkout" records, so the cell states the tool's words with
+ `ref-expect-stderr` and the port's in the cited test.
+
+family: M10
+subcommand: checkout
+cell: checkout/fsync-given-twice
+setup: repo-with-commit
+run: checkout --repo=$REPO -U --fsync=false --fsync=true $REV $SCRATCH/dest
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+outcome: lossy
+severity: interop
+evidence: ostrya_cli::cli::checkout_fsync_policy_controls_the_syscalls
+loss: a repeated valued option carrying two different values. The tool takes
+ the line and reads the last occurrence; the port refuses the line whatever the
+ two occurrences carry (`cli-surface.md`, "checkout"). Which occurrence the
+ tool reads is outside every oracle here, since both orders exit 0 and write
+ one tree, so the cited test states it in sync-call counts: `--fsync=false
+ --fsync=true` syncs and `--fsync=true --fsync=false` does not.
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+
+family: M10
+subcommand: checkout
+cell: checkout/fsync-syscalls
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::checkout_fsync_policy_controls_the_syscalls
+spec: format-reference.md#the-fsync-vocabulary
+note: what the policy does, which no artifact this harness reads can show: the
+ policy changes the `fsync`, `fdatasync`, and `syncfs` calls alone, and leaves
+ standard output, standard error, the exit status, and the destination alike.
+ The cited test counts those calls for both binaries with `strace` over the
+ four rows of the configured-value and option-value table
+ (format-reference.md, "The fsync vocabulary"): the option narrows the
+ configured value and never widens it, so a repository holding `[core]
+ fsync=false` syncs nothing under `--fsync=true`. The syncing row is held to
+ the total the table records, 2 for the tool and 5 for the port over corpus
+ `C0` in `archive` mode, with every one of the port's targets under the
+ destination and every one of the tool's under the repository. The test asserts
+ on a host carrying `strace` and returns without an assertion on one that does
+ not, which is a gate beyond the tool's own presence.
+
+family: M10
+subcommand: checkout
+cell: checkout/composefs-keeps-a-bad-configured-fsync
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+evidence: ostrya_cli::cli::checkout_refuses_a_bad_configured_fsync_under_every_override
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+loss: the reach of a `[core] fsync` value the reader refuses. The tool reads
+ the key when it opens the repository, so every `checkout` line exits 1. The
+ port reads it where the checkout path uses it, which is after the composefs
+ export decision, so a `--composefs` line writes the image and exits 0. Every
+ other `checkout` line reaches the read and exits 1 in both.
+note: no setup here writes a repository config the reader refuses, so the cell
+ cites the test, which edits the config and runs both binaries. The test holds
+ the composefs arm to the port's exit 0 with the image present and to the tool's
+ exit 1 with nothing written, and the plain arm to exit 1 in both under every
+ state of `--fsync`. The quotation marks the tool sets around the key name
+ follow the locale, so the tool's line is held to the key name.
+
+# ---------------------------------------------------------------------------
 # show -- the commit report, the raw variant, the metadata modes, and the
 # refusals (Phase 17d).
 # ---------------------------------------------------------------------------
@@ -9038,7 +9263,7 @@ note: the two reach different exit statuses, so no oracle reads the pair. The
  implementations, which `export/prefix-given-twice` above records.
 
 # ---------------------------------------------------------------------------
-# prune -- the option pair both implementations refuse.
+# prune -- the option set and the totals format (Phase 17f, F18).
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -9058,3 +9283,796 @@ note: both implementations refuse the pair in that line and remove no object.
  The tool prints its usage block to standard error ahead of the line and the
  port prints the line alone, so the assertions read the line each side writes
  and no oracle compares the two streams whole.
+
+family: M10
+subcommand: prune
+cell: prune/totals-nothing-to-delete
+setup: repo-with-commit
+run: prune --repo=$REPO
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#prune
+note: the two-line form a run that deletes nothing writes: the count of the
+ loose objects it read, then `No unreachable objects`. The `stdout-text` oracle
+ states that the two lines agree whole, the count included, so it states the
+ count each side reads as well as the words each side writes.
+
+family: M10
+subcommand: prune
+cell: prune/totals-commit-only
+setup: repo-with-commit
+run: prune --repo=$REPO --commit-only
+expect-exit: 0
+expect-stdout: contains "Total (commit only) objects: 1"
+ref-expect-exit: 0
+ref-expect-stdout: contains "Total (commit only) objects: 1"
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#prune
+note: the first line names the restriction and counts commit objects alone, so
+ a repository holding one commit and its tree reports 1 where
+ `prune/totals-nothing-to-delete` above reports the whole store.
+
+family: M10
+subcommand: prune
+cell: prune/totals-no-prune
+setup: repo-with-commit
+run: prune --repo=$REPO --no-prune
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#prune
+note: `No unreachable objects` is written where the run deletes nothing,
+ whether or not `--no-prune` was given, so this cell and
+ `prune/totals-nothing-to-delete` state the same two lines. The `Would delete:`
+ form needs a repository holding something to delete, which
+ `prune/totals-would-delete-line` below cites.
+
+family: M10
+subcommand: prune
+cell: prune/totals-deleted-line
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_totals_match_the_tool
+spec: format-reference.md#prune
+note: item `F18`. The `Deleted <count> objects, <size> freed` line, which needs
+ a repository holding something to delete; the setup binds one branch holding
+ one commit. The cited test builds a repository of two branches and five
+ commits, copies it per implementation, and holds the two to the same two lines
+ and the same loose-object inventory. It also states that the count is taken
+ after `--delete-commit` has removed its target, the total falling by one.
+
+family: M10
+subcommand: prune
+cell: prune/totals-would-delete-line
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_totals_match_the_tool
+spec: format-reference.md#prune
+note: the `Would delete: <count> objects, freeing <size>` line, written under
+ `--no-prune` alone and only where the run would delete something. Needs the
+ same repository `prune/totals-deleted-line` above names.
+
+family: M10
+subcommand: prune
+cell: prune/totals-size-below-1000
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_totals_size_rendering_matches_the_tool
+spec: format-reference.md#prune
+note: a freed sum below 1000 renders as the byte count, a space, and the word
+ `byte` or `bytes`, singular at exactly 1. The cited test commits one file of a
+ chosen size, drops the ref, and prunes, so the freed sum is the four objects
+ the commit wrote; it runs the case over seven sizes and holds the two
+ implementations to one line each time.
+
+family: M10
+subcommand: prune
+cell: prune/totals-size-si-rendering
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_totals_size_rendering_matches_the_tool,
+ ostrya::main::a_freed_byte_count_renders_the_way_the_totals_line_does
+spec: format-reference.md#prune
+note: a freed sum at 1000 bytes and above renders as a decimal (SI) quantity
+ with one fractional digit, a no-break space, and the unit. The second cited
+ test holds the port's renderer to the sixteen pairs measured against the tool,
+ the no-break space included; the first states that the two implementations
+ write one line for a repository whose freed sum crosses 1000.
+
+family: M10
+subcommand: prune
+cell: prune/totals-size-unit-boundary
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_totals_size_rendering_matches_the_tool,
+ ostrya::main::a_freed_byte_count_renders_the_way_the_totals_line_does
+spec: format-reference.md#prune
+note: the unit follows the byte count and not the rounded value, so 999999
+ renders as `1000.0 kB` and 1000000 as `1.0 MB`. The cited test's payload sizes
+ place the freed sum on both sides of each boundary.
+
+family: M10
+subcommand: prune
+cell: prune/totals-commitmeta-not-counted
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_totals_match_the_tool,
+ ostrya::prune_options::commitmeta_is_outside_both_counts
+spec: format-reference.md#prune
+note: detached commit metadata is outside both numbers a run reports. A pruned
+ commit's `.commitmeta` is removed with it and the bytes it freed are not in the
+ sum. The setup commits no detached metadata, so the cited tests build a
+ repository whose every commit carries some.
+
+family: M10
+subcommand: prune
+cell: prune/commit-only-count
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_commit_only_matches_the_tool
+spec: format-reference.md#prune
+note: the deleted count under `--commit-only` covers commit objects alone. Over
+ a repository of five commits cut to the two branch heads it is 3, where the
+ same cut without the option deletes the trees too. Needs a repository holding
+ history.
+
+family: M10
+subcommand: prune
+cell: prune/commit-only-leaves-the-tree
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_commit_only_matches_the_tool,
+ ostrya::prune_options::commit_only_deletes_commits_and_leaves_their_trees
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the dirtrees, the dirmetas, and the file objects a deleted commit reached
+ stay where they stand, whether or not anything else reaches them. The first
+ cited test compares the loose-object inventory the two implementations leave.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-epoch
+setup: repo-with-commit
+run: prune --repo=$REPO --keep-younger-than=@1700000000
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the `@SECONDS` form, which both implementations read. The setup commits
+ at `@1700000000`, so the cut names that second and the ref's own target is kept
+ whatever the cut says.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-offset-datetime
+setup: repo-with-commit
+run: prune --repo=$REPO --keep-younger-than=2023-11-15T00:00:00Z
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: an absolute date and time carrying a UTC offset, the second form both
+ read. The port's reader is the one `commit --timestamp` takes, so the accepted
+ set is the same at both sites.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-unparseable
+setup: repo-with-commit
+run: prune --repo=$REPO --keep-younger-than=garbage
+expect-exit: 1
+expect-stderr: contains "error: Could not parse 'garbage'"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Could not parse 'garbage'"
+oracle: exit-status stderr-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: both refuse a value neither reader holds, in the same words and at exit 1,
+ and neither removes an object. `stderr-text` is an oracle here because the two
+ lines agree byte for byte.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-local-time
+setup: repo-with-commit
+run: prune --repo=$REPO --keep-younger-than=2023-11-15
+expect-exit: 1
+expect-stderr: contains "Could not parse '2023-11-15'"
+ref-expect-exit: 0
+ref-expect-stderr: empty
+outcome: lossy
+severity: interop
+loss: a date carrying no UTC offset. The tool reads it in the process's local
+ zone; the port refuses it, reading such a value needing a time-zone database
+ the port does not link. The refusal is the tool's own words at exit 1 and
+ removes nothing (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::prune_keep_younger_than_dialect_parts_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ same subset parts at `commit --timestamp`, which is the one date reader the
+ port's CLI carries.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-relative
+setup: repo-with-commit
+run: prune --repo=$REPO --keep-younger-than=now
+expect-exit: 1
+expect-stderr: contains "Could not parse 'now'"
+ref-expect-exit: 0
+ref-expect-stderr: empty
+outcome: lossy
+severity: interop
+loss: a relative expression. The tool reads `now`, `yesterday`, and `1 hour
+ ago`; the port refuses each, reading them needing a natural-language date
+ reader the port does not link (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::prune_keep_younger_than_dialect_parts_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ cited test states the relative forms holding a space, which a `run:` line does
+ not spell.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-empty
+setup: repo-with-commit
+run: prune --repo=$REPO --keep-younger-than=
+expect-exit: 1
+expect-stderr: contains "Could not parse ''"
+ref-expect-exit: 0
+ref-expect-stderr: empty
+outcome: lossy
+severity: interop
+loss: an empty value. The tool reads it as today's midnight in the process's
+ local zone; the port refuses it, on the terms the two forms above are refused
+ on (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::prune_keep_younger_than_dialect_parts_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-implies-refs-only
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_keep_younger_than_matches_the_tool,
+ ostrya::prune_options::keep_younger_than_roots_on_refs_alone
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the option roots the walk on the refs alone, so a commit no ref names is
+ swept whatever its own timestamp, where the same run without the option keeps
+ it. Needs an unreferenced commit, which the setup does not bind.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-keeps-every-ref-head
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_keep_younger_than_matches_the_tool,
+ ostrya::prune_options::keep_younger_than_keeps_every_ref_head
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a ref's own target is kept whatever its timestamp; the bound acts on the
+ `parent` edge alone. Stated over a cut past every commit in the repository,
+ which deletes every non-tip and keeps every tip. Needs a parent chain.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-replaces-depth
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_keep_younger_than_matches_the_tool,
+ ostrya::prune_options::keep_younger_than_replaces_depth
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `--depth` is read for no branch the option bounds, so `--depth=0` beside a
+ cut older than every commit leaves each branch whole where `--depth=0` alone
+ keeps each head alone. Needs a parent chain.
+
+family: M10
+subcommand: prune
+cell: prune/only-branch-names-the-branch
+setup: repo-with-commit
+run: prune --repo=$REPO --only-branch=$BRANCH --depth=0
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a branch the option names takes the global `--depth`. The setup's one
+ commit is the branch head, so depth 0 keeps it and the run deletes nothing;
+ `prune/only-branch-retains-the-others` below states the cut over history.
+
+family: M10
+subcommand: prune
+cell: prune/only-branch-unknown
+setup: repo-with-commit
+run: prune --repo=$REPO --only-branch=nosuch --depth=0
+expect-exit: 1
+expect-stderr: contains "error: Refspec 'nosuch' not found"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Refspec 'nosuch' not found"
+oracle: exit-status stderr-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the value is resolved as a revision, so one naming nothing fails the run
+ before an object is removed. Both write the one resolution message and leave
+ the store as it stood.
+
+family: M10
+subcommand: prune
+cell: prune/only-branch-abbreviated-checksum
+setup: repo-with-commit
+run: prune --repo=$REPO --only-branch=$REV --depth=0
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a value that resolves and matches no ref name assigns the depth to no
+ branch, so every branch is retained in full and the run deletes nothing. A full
+ checksum, an abbreviated one, and `<branch>^` each read this way; the cited
+ test of `prune/only-branch-retains-the-others` states the abbreviated form over
+ a repository where the depth would otherwise bite.
+
+family: M10
+subcommand: prune
+cell: prune/only-branch-implies-refs-only
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_only_branch_matches_the_tool,
+ ostrya::prune_options::only_branch_implies_refs_only
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a non-empty selection roots the walk on the refs alone, so an unreferenced
+ commit goes where the same run without the option keeps it. Needs an
+ unreferenced commit.
+
+family: M10
+subcommand: prune
+cell: prune/only-branch-retains-the-others
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_only_branch_matches_the_tool,
+ ostrya::prune_options::only_branch_retains_the_branches_it_does_not_name
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a branch the option does not name, and no `--retain-branch-depth` entry
+ names, keeps its whole ancestry whatever `--depth` says. Needs two branches
+ holding history.
+
+family: M10
+subcommand: prune
+cell: prune/only-branch-repeated
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_only_branch_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the option is repeatable in both, each occurrence adding a branch, and a
+ branch named twice is the same as one named once. Needs two branches.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-value
+setup: repo-with-commit
+run: prune --repo=$REPO --retain-branch-depth=$BRANCH=1
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a `BRANCH=DEPTH` value both accept. The setup's one commit has no parent,
+ so the depth costs nothing here; the depth rules are stated over history by the
+ four cells below.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-no-equals
+setup: repo-with-commit
+run: prune --repo=$REPO --retain-branch-depth=$BRANCH
+expect-exit: 1
+expect-stderr: contains "must specify BRANCH=DEPTH"
+ref-expect-exit: 1
+ref-expect-stderr: contains "must specify BRANCH=DEPTH"
+oracle: exit-status stderr-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a value carrying no `=` is refused by both at exit 1, in the same words,
+ and neither removes an object.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-nonnumeric
+setup: repo-with-commit
+run: prune --repo=$REPO --retain-branch-depth=$BRANCH=abc
+expect-exit: 1
+expect-stderr: contains "error: Invalid depth abc"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Invalid depth abc"
+oracle: exit-status stderr-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a depth holding no digit run after an optional sign is refused by both at
+ exit 1, in the same words. The spellings the two readers part on are
+ `prune/retain-branch-depth-trailing-text` below.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-unknown-branch
+setup: repo-with-commit
+run: prune --repo=$REPO --retain-branch-depth=nosuch=1
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: an entry naming a branch the repository does not hold is accepted by both
+ and does nothing. The value is matched against the ref names, not resolved as a
+ revision, so an unknown name is no refusal here where `--only-branch=nosuch` is
+ one.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-trailing-text
+setup: repo-with-commit
+run: prune --repo=$REPO --retain-branch-depth=$BRANCH=0x1
+expect-exit: 1
+expect-stderr: contains "error: Invalid depth 0x1"
+ref-expect-exit: 0
+ref-expect-stderr: empty
+outcome: lossy
+severity: interop
+loss: the depth dialect. The tool reads a leading sign and a leading run of
+ decimal digits and drops the rest of the string, so `0x1` and `0=1` read as
+ depth 0, `+1`, ` 1`, and `1 ` read as depth 1, and an overflowing value reads
+ as a very large depth. The port reads a decimal integer with an optional
+ leading `-` and refuses each of those five at exit 1, removing nothing
+ (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::prune_retain_branch_depth_value_dialect_parts_from_the_tool,
+ ostrya::main::a_retain_branch_depth_value_reads_strictly
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ spellings holding a space are in the cited tests, a `run:` line not spelling
+ them.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-replaces-the-global
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_retain_branch_depth_matches_the_tool,
+ ostrya::prune_options::retain_branch_depth_replaces_the_global_depth
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: an entry replaces `--depth` for the branch it names and leaves every other
+ branch at `--depth`. The first cited test crosses three global depths with six
+ entry depths over three branch names, 54 invocations, and holds the two
+ implementations to one line and one inventory each time. Needs history.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-zero-is-no-value
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_retain_branch_depth_matches_the_tool,
+ ostrya::prune_options::retain_branch_depth_zero_leaves_the_global_depth
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: an entry whose depth reads as 0 leaves the branch at the global `--depth`,
+ where a negative other than `-1` is a real depth 0. Needs history.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-last-wins
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_retain_branch_depth_matches_the_tool,
+ ostrya::prune_options::retain_branch_depth_takes_the_last_entry_for_a_branch
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: two entries naming one branch leave the last one deciding it, and entries
+ naming two branches each decide their own. Needs history.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-suppresses-only-branch-retention
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_retain_branch_depth_matches_the_tool,
+ ostrya::prune_options::retain_branch_depth_suppresses_only_branch_retention
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: an entry naming a branch counts for `--only-branch`, so the full retention
+ an unnamed branch takes does not reach it -- an entry of depth 0 sends the
+ branch to the global `--depth` and not to full retention. Needs two branches
+ holding history.
+
+family: M10
+subcommand: prune
+cell: prune/retain-branch-depth-implies-refs-only
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_bounds_stand_at_every_ref_target_matching_the_tool,
+ ostrya::prune_options::retain_branch_depth_roots_on_refs_alone
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a non-empty entry list roots the walk on the refs alone, so a commit no
+ ref reaches goes where the same run without the option keeps it, as it does
+ under `--only-branch` and `--keep-younger-than`. An entry naming an unknown
+ branch and an entry with an empty branch name each imply it too. Needs a
+ commit the roots do not reach.
+
+family: M10
+subcommand: prune
+cell: prune/ref-target-bound-replaces-the-inherited-one
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_bounds_stand_at_every_ref_target_matching_the_tool,
+ ostrya::prune_options::a_ref_target_takes_its_own_bound_over_an_inherited_one
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a branch bound belongs to the commit the ref names, so a walk that reaches
+ that commit over the `parent` edge drops the bound it carried and continues
+ under the ref's own. A branch cut short cuts every history running through its
+ head. Needs two refs sharing history.
+
+family: M10
+subcommand: prune
+cell: prune/ref-target-bound-is-not-narrowed
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_bounds_stand_at_every_ref_target_matching_the_tool,
+ ostrya::prune_options::a_ref_target_bound_replaces_and_does_not_narrow
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the bound at a ref target stands whole in place of the inherited one: a
+ ref at the global depth 3, reached with one parent hop left, keeps three more
+ parents. Needs two refs sharing history.
+
+family: M10
+subcommand: prune
+cell: prune/only-branch-cuts-shared-history
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_bounds_stand_at_every_ref_target_matching_the_tool,
+ ostrya::prune_options::only_branch_bounds_the_history_running_through_the_branch_it_names
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a branch `--only-branch` names cuts the history of a branch it does not
+ name, where the second branch runs through the first one's head. Needs two
+ refs sharing history.
+
+family: M10
+subcommand: prune
+cell: prune/keep-younger-than-cuts-shared-history
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_bounds_stand_at_every_ref_target_matching_the_tool,
+ ostrya::prune_options::a_time_bound_at_a_ref_target_replaces_an_inherited_depth
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a ref left at the global timestamp cut bounds by time the history a
+ branch retained in full runs through it. Needs two refs sharing history.
+
+family: M10
+subcommand: prune
+cell: prune/depth-minus-two
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_depth_outside_minus_one_matches_the_tool,
+ ostrya::prune_options::depth_minus_two_keeps_the_head_alone
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `-1` is the one negative depth that keeps the whole ancestry; every other
+ negative value keeps the head alone. The first cited test runs seven depths
+ from `-3` to `3` and holds the two implementations to one line and one
+ inventory each time. Needs history.
+
+family: M10
+subcommand: prune
+cell: prune/static-delta-swept-with-its-target
+setup: repo-with-commit
+modes: archive
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_sweeps_the_static_delta_of_a_pruned_commit,
+ ostrya::prune_options::static_delta_is_swept_with_its_target_commit
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a delta is keyed by the commit it produces, so a run that deleted that
+ commit removes the delta directory whole and leaves its fanout parent in place,
+ empty where this was its last entry. Needs two commits and a delta between
+ them.
+
+family: M10
+subcommand: prune
+cell: prune/static-delta-source-is-kept
+setup: repo-with-commit
+modes: archive
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_sweeps_the_static_delta_of_a_pruned_commit,
+ ostrya::prune_options::static_delta_is_swept_with_its_target_commit
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a delta whose source commit the run deleted is kept, and a commit that is
+ no delta's target removes no delta at all. Delta files are counted in neither
+ number the run reports, and `--no-prune` removes no delta. Needs two deltas.
+
+family: M10
+subcommand: prune
+cell: prune/static-deltas-only-needs-delete-commit
+setup: repo-with-commit
+run: prune --repo=$REPO --static-deltas-only
+expect-exit: 1
+expect-stderr: contains "--static-deltas-only requires --delete-commit"
+ref-expect-exit: 1
+ref-expect-stderr: contains "--static-deltas-only requires --delete-commit"
+oracle: exit-status inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: both refuse the option without `--delete-commit` at exit 1 and remove
+ nothing, whatever else the line carries. The tool's line ends with a URL naming
+ its own issue tracker, so `stderr-text` is not an oracle here and each side is
+ held to the sentence the two share (`cli-surface.md`, "P2").
+
+family: M10
+subcommand: prune
+cell: prune/static-deltas-only-deletes-the-delta-alone
+setup: repo-with-commit
+modes: archive
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_static_deltas_only_matches_the_tool,
+ ostrya::prune_options::static_deltas_only_deletes_the_delta_and_nothing_else
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: with `--delete-commit` the run removes the static deltas the named commit
+ targets and nothing else: no loose object is touched, the named commit's own
+ object included, and the two lines report the store as it stands. The commit a
+ ref names is accepted here, where a plain `--delete-commit` refuses it. Needs
+ two deltas.
+
+family: M10
+subcommand: prune
+cell: prune/delete-commit-is-a-ref-target
+setup: repo-with-commit
+run: prune --repo=$REPO --delete-commit=$REV
+expect-exit: 1
+ref-expect-exit: 1
+oracle: exit-status inventory
+outcome: full
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: both refuse a commit a ref names and remove nothing. The tool reports
+ `Commit '<checksum>' is referenced by '<ref>'` and the port
+ `invalid format: cannot delete commit <checksum>: it is the target of a ref`,
+ so `stderr-text` is not an oracle here (`cli-surface.md`, "P2"). `inventory`
+ states that the two left the same store.
+
+family: M10
+subcommand: prune
+cell: prune/tombstone-on-delete-commit
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_writes_a_tombstone_for_every_commit_it_removes,
+ ostrya::prune_options::a_tombstone_is_written_for_every_commit_a_delete_commit_run_removes
+spec: format-reference.md#object-types
+note: `--delete-commit` turns tombstone writing on for the whole run, not for
+ its own target alone, so every commit the run removes gains a
+ `.tombstone-commit` and every commit it keeps gains none. The cited CLI test
+ compares the object inventory the two implementations leave, which is where the
+ markers stand. Needs a commit the run can delete.
+
+family: M10
+subcommand: prune
+cell: prune/tombstone-on-config-key
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::prune_writes_a_tombstone_for_every_commit_it_removes,
+ ostrya::prune_options::a_tombstone_is_written_when_the_config_key_is_set
+spec: format-reference.md#object-types
+note: `[core] tombstone-commits` turns the same behavior on for a run that names
+ no commit, and `--no-prune`, which removes nothing, writes none. A marker is
+ never pruned itself and is outside both numbers the next run reports. Needs a
+ repository the case configures and a commit the run can delete.
+
+family: M10
+subcommand: prune
+cell: prune/commit-only-repeated
+setup: repo-with-commit
+run: prune --repo=$REPO --commit-only --commit-only
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: contains "Total (commit only) objects: 1"
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag. The tool takes a second occurrence of
+ `--commit-only` and prunes as it does for one. The port refuses it at exit 1,
+ as it refuses every repeated boolean flag in its CLI (`cli-surface.md`, "P2").
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+ `--depth` and `--keep-younger-than` each take the last occurrence in both, and
+ `--only-branch` and `--retain-branch-depth` are repeatable options in both.
+
+family: M10
+subcommand: prune
+cell: prune/refs-only-repeated
+setup: repo-with-commit
+run: prune --repo=$REPO --refs-only --refs-only
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 0
+ref-expect-stdout: contains "Total objects: "
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag, the class `prune/commit-only-repeated` above
+ records. `--no-prune` and `--static-deltas-only` carry it too
+ (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::prune_repeated_boolean_flags_part_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ cited test states the three boolean flags together.
+
+family: M10
+subcommand: prune
+cell: prune/refs-only-deletes-a-shadowed-ref-commit
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: a ref name outside the character class the tool validates against. The
+ tool's ref enumeration skips such a name without a word, so its
+ `prune --refs-only` reads the commit that ref holds as unreachable and deletes
+ it, leaving the ref file over an absent object. The port enumerates the name
+ and keeps the commit (`cli-surface.md`, "P1").
+evidence: ostrya_cli::cli::prune_refs_only_parts_on_a_shadowed_ref_name
+spec: cli-surface.md#p1----reading-and-resolution
+note: a name of that shape reaches a repository by an out-of-band write alone,
+ which the cited test performs, so no `run:` line states the case. The test
+ states the pair over `odd~1` and `main^`, the two spellings of the one class.
+ The character class itself is deferred; adopting it tightens `resolve_rev`,
+ `commit -b`, and every pull path at once.

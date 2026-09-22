@@ -72,6 +72,59 @@ impl ParentBound {
     }
 }
 
+/// The bounds one commit takes from the weak refs that name it.
+///
+/// At most one bound of each kind is held: the depth bound that follows the
+/// furthest and the earliest timestamp bound. A further bound of the same kind
+/// is dropped where a held bound already reaches at least as far, because
+/// [`Expanded::covers`] skips the expansion that bound asks for. The two kinds
+/// are held apart, because `covers` compares a depth with a depth and a
+/// timestamp with a timestamp.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WeakBounds {
+    /// The furthest reaching depth bound, `-1` for the whole ancestry.
+    depth: Option<i32>,
+    /// The earliest timestamp bound.
+    since: Option<u64>,
+}
+
+impl WeakBounds {
+    /// Fold one more bound in.
+    pub(crate) fn add(&mut self, bound: ParentBound) {
+        match bound {
+            ParentBound::Depth(depth) => {
+                if !self.depth.is_some_and(|prev| reaches_at_least(prev, depth)) {
+                    self.depth = Some(depth);
+                }
+            }
+            ParentBound::Since(since) => {
+                if self.since.is_none_or(|prev| prev > since) {
+                    self.since = Some(since);
+                }
+            }
+        }
+    }
+
+    /// The bounds to seed, at most one of each kind.
+    fn seeds(self) -> impl Iterator<Item = ParentBound> {
+        self.depth
+            .map(ParentBound::Depth)
+            .into_iter()
+            .chain(self.since.map(ParentBound::Since))
+    }
+}
+
+/// The directory of `refs/` one ref lives under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefSpace {
+    /// A local ref, below `refs/heads`.
+    Heads,
+    /// A remote ref, below `refs/remotes`.
+    Remotes,
+    /// A mirror ref, below `refs/mirrors`.
+    Mirrors,
+}
+
 /// How the walk arrived at a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival {
@@ -172,6 +225,14 @@ pub(crate) struct GcRoots {
     /// commit names alone and reads no dirtree, which is the set
     /// `prune --commit-only` consults.
     pub traverse_tree: bool,
+    /// The commits weak refs name, each with the bounds those refs' own names
+    /// carry.
+    ///
+    /// A weak ref is no seed, so an arrival at one of these commits is replaced
+    /// by a seed at the bounds recorded here. A commit several weak refs name
+    /// takes the bounds [`WeakBounds`] holds: the depth bound that follows the
+    /// furthest and the earliest timestamp bound.
+    pub weak_roots: HashMap<Checksum, WeakBounds>,
 }
 
 impl GcRoots {
@@ -182,6 +243,7 @@ impl GcRoots {
             metadata_keys: Vec::new(),
             traverse_parent: true,
             traverse_tree: true,
+            weak_roots: HashMap::new(),
         }
     }
 }
@@ -337,6 +399,20 @@ impl Repo {
     /// `parent`-edge arrival at one is dropped, so the seed's bound stands in
     /// place of the bound the arrival inherited.
     ///
+    /// A commit `gc.weak_roots` names carries its own bounds as well, and
+    /// enters the walk through no seed of the caller's. The first arrival at
+    /// one pushes a seed for each bound the map records, at most one of each
+    /// kind. A `parent`-edge arrival
+    /// is then dropped the way a `bounded_roots` arrival is, so the pushed
+    /// seeds stand in place of the bound the arrival inherited. An arrival that
+    /// is a root in its own right stands, and the commit expands under the
+    /// arrival's bound and under the pushed seeds alike. The pushed seeds go
+    /// through the same memoization as every other entry: a commit already
+    /// expanded under a bound that reaches at least as far is skipped, and one
+    /// reached under a longer bound is expanded again. A commit takes its weak
+    /// seeds once, and each extra entry is either skipped or strictly improves
+    /// the recorded depth or timestamp, so the walk terminates.
+    ///
     /// A conditional arrival is one a [`ParentBound::Since`] parent edge made.
     /// It contributes nothing at all where the commit's own timestamp is below
     /// the bound, and no expansion is recorded for it, so a root naming that
@@ -357,13 +433,41 @@ impl Repo {
         let mut commit_stack = seeds;
         let mut seen_commits: HashMap<Checksum, Expanded> = HashMap::new();
         let mut seen_dirtrees: HashSet<Checksum> = HashSet::new();
+        // The commits a weak-ref seed was pushed for. A pushed seed matches
+        // `weak_roots` again on its own pop, so the set is what stops the walk
+        // from pushing it a second time.
+        let mut weak_seeded: HashSet<Checksum> = HashSet::new();
 
         while let Some((commit_checksum, bound, arrival)) = commit_stack.pop() {
+            // A weak ref's commit takes the bound that ref's own name carries,
+            // the moment the walk reaches it over any edge. The seed is a
+            // `Root` arrival, so the bound is the commit's own and the commit
+            // is kept whatever its timestamp under a `Since` bound, which is
+            // what a strong ref's target already gets.
+            //
+            // The test stands ahead of the `inherited` drop below and covers
+            // every arrival kind. A metadata-key edge pushes a `Root` arrival
+            // at the run's global bound, so a rule keyed on `inherited` alone
+            // would let that arrival expand the commit at the global bound
+            // while the weak ref's own bound reaches further, and the sweep
+            // would then take the ancestry of a ref that still stands.
+            if let Some(bounds) = gc.weak_roots.get(&commit_checksum)
+                && weak_seeded.insert(commit_checksum)
+            {
+                for weak_bound in bounds.seeds() {
+                    commit_stack.push((commit_checksum, weak_bound, Arrival::Root));
+                }
+            }
+
             // A commit that carries its own bound takes it whatever the
             // `parent` edge that reached it had left. The seed holds that
             // bound, so the arrival is dropped here and the seed's expansion
-            // stands for it.
-            if arrival.inherited() && bounded_roots.contains(&commit_checksum) {
+            // stands for it. A weak ref's commit is dropped on the same terms:
+            // the seed pushed above holds its bound.
+            if arrival.inherited()
+                && (bounded_roots.contains(&commit_checksum)
+                    || gc.weak_roots.contains_key(&commit_checksum))
+            {
                 continue;
             }
 
@@ -541,7 +645,7 @@ impl Repo {
             .list_all_refs()
             .await?
             .into_iter()
-            .map(|(_, checksum)| checksum)
+            .map(|(_, _, checksum)| checksum)
             .collect())
     }
 
@@ -552,13 +656,18 @@ impl Repo {
     /// keeps its `/`. A remote ref is named by its `<remote>:<name>` refspec. A
     /// mirror ref is named by its path under `refs/mirrors`, which is the
     /// collection id and the ref name below it. Prune reads the names to decide
-    /// which branch a depth applies to.
-    pub(crate) async fn list_all_refs(&self) -> Result<Vec<(String, Checksum)>> {
+    /// which branch a depth applies to, and reads the [`RefSpace`] to decide
+    /// which refs its classifier sees.
+    pub(crate) async fn list_all_refs(&self) -> Result<Vec<(RefSpace, String, Checksum)>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
             let mut out = Vec::new();
-            for top in ["refs/heads", "refs/remotes", "refs/mirrors"] {
-                collect_named_refs(repo.repo_fd(), top, &mut out)?;
+            for (space, top) in [
+                (RefSpace::Heads, "refs/heads"),
+                (RefSpace::Remotes, "refs/remotes"),
+                (RefSpace::Mirrors, "refs/mirrors"),
+            ] {
+                collect_named_refs(repo.repo_fd(), space, top, &mut out)?;
             }
             Ok(out)
         })
@@ -731,14 +840,16 @@ pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Recursively collect the name and the checksum of each ref file under `top`,
-/// following the `refs/` subtree. Alias symlinks are followed; a dangling one is
-/// skipped. A ref under `refs/remotes` takes its `<remote>:<name>` refspec, and
-/// a ref under either of the other two takes its path below `top`.
+/// Recursively collect the space, the name, and the checksum of each ref file
+/// under `top`, following the `refs/` subtree. Alias symlinks are followed; a
+/// dangling one is skipped. A ref under `refs/remotes` takes its
+/// `<remote>:<name>` refspec, and a ref under either of the other two takes its
+/// path below `top`.
 fn collect_named_refs(
     repo_fd: BorrowedFd<'_>,
+    space: RefSpace,
     top: &str,
-    out: &mut Vec<(String, Checksum)>,
+    out: &mut Vec<(RefSpace, String, Checksum)>,
 ) -> Result<()> {
     let dir = match rustix::fs::openat(
         repo_fd,
@@ -750,14 +861,13 @@ fn collect_named_refs(
         Err(Errno::NOENT) => return Ok(()),
         Err(e) => return Err(Error::Io(e.into())),
     };
-    let remotes = top == "refs/remotes";
     walk_ref_dir(dir.as_fd(), "", &mut |entry| {
         if let Some(checksum) = read_ref_target(entry.dir, entry.name)? {
-            let name = match remotes {
-                true => entry.path.replacen('/', ":", 1),
-                false => entry.path.to_owned(),
+            let name = match space {
+                RefSpace::Remotes => entry.path.replacen('/', ":", 1),
+                RefSpace::Heads | RefSpace::Mirrors => entry.path.to_owned(),
             };
-            out.push((name, checksum));
+            out.push((space, name, checksum));
         }
         Ok(())
     })

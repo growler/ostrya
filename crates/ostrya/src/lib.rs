@@ -259,7 +259,7 @@ pub use ostrya_core::{
     TextError, Type, Value, Xattrs, from_bytes, from_text, loose_path, to_text,
     to_text_unannotated,
 };
-pub use prune::{PruneOptions, PruneStats};
+pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 pub use pull::{
     DetachedMetadataFilter, DetachedMetadataFilterFn, PullFlags, PullOptions, PullStats,
     PullVerify, TimestampCheck,

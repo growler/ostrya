@@ -776,6 +776,22 @@ fn refspec_to_relpath(refspec: &str) -> Result<String> {
     }
 }
 
+/// Whether a local ref name round-trips through the refspec mapping: the path
+/// [`refspec_to_relpath`] gives it is `refs/heads/<name>`.
+///
+/// A ref file below `refs/heads` is listed by its path, and that path may hold
+/// a `:`. The refspec mapping reads a `:` as the separator of a remote name, so
+/// a listed name such as `foo:bar` maps to `refs/remotes/foo/bar`, which is a
+/// different file. Prune classifies a local ref only where this answers true,
+/// so every ref the classifier sees reads and deletes through the file it was
+/// listed from. A name the mapping refuses answers false.
+///
+/// The mapping takes its `refs/heads/` branch for a name that holds no `:` and
+/// is a valid ref path, so the test reads the name in place.
+pub(crate) fn heads_name_round_trips(name: &str) -> bool {
+    !name.contains(':') && is_ref_path(name)
+}
+
 /// The same rule as [`Error::InvalidRefspec`]-bearing validation, for a bare
 /// ref name.
 ///
@@ -932,14 +948,72 @@ fn write_alias_blocking(
     Ok(())
 }
 
+/// Remove every ref that still names the checksum the caller recorded for it,
+/// relative to `repo_fd`, in one blocking pass.
+///
+/// Each name is mapped to its path by the same refspec rule the asynchronous
+/// writes use, so the read and the unlink address the file the rest of the
+/// library addresses. The read sits immediately ahead of its own unlink: a ref
+/// that now names a different commit is left where it stands, which covers a
+/// repository whose `[core] locking` is false and a caller that moved the ref
+/// after it recorded the checksum. A read that finds no file unlinks all the
+/// same -- the name the caller recorded is gone or dangles, `unlinkat` removes
+/// a symlink and not the file it names, and an already-absent name is success.
+///
+/// Under `fsync` each directory that held a removed ref is `fsync`-ed once,
+/// after the last unlink, so every removed name is durable.
+///
+/// Returns the names it removed, in the order it was given them.
+pub(crate) fn delete_matching_refs_blocking(
+    repo_fd: BorrowedFd<'_>,
+    refs: Vec<(String, Checksum)>,
+    fsync: bool,
+) -> Result<Vec<String>> {
+    let mut removed = Vec::with_capacity(refs.len());
+    let mut parents: Vec<String> = Vec::new();
+    for (name, target) in refs {
+        let relpath = refspec_to_relpath(&name)?;
+        if let Some(bytes) = read_ref_file(repo_fd, &relpath)?
+            && parse_ref_content(&bytes)? != target
+        {
+            continue;
+        }
+        match rustix::fs::unlinkat(repo_fd, relpath.as_str(), AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => {}
+            Err(e) => return Err(Error::Io(e.into())),
+        }
+        if fsync {
+            let parent = ref_parent(&relpath);
+            if !parents.iter().any(|held| held == parent) {
+                parents.push(parent.to_owned());
+            }
+        }
+        removed.push(name);
+    }
+    for parent in &parents {
+        sync_dir(repo_fd, parent)?;
+    }
+    Ok(removed)
+}
+
+/// The directory holding the ref at `relpath`. A refspec always maps below
+/// `refs/`, so the path carries a parent; a bare name names the repository
+/// root.
+fn ref_parent(relpath: &str) -> &str {
+    relpath.rsplit_once('/').map_or(".", |(dir, _)| dir)
+}
+
 /// `fsync` the directory holding the ref at `relpath`, making a rename or an
-/// unlink of that name durable. A refspec always maps below `refs/`, so the
-/// path carries a parent; a bare name would sync the repository root.
+/// unlink of that name durable.
 fn sync_ref_parent(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<()> {
-    let parent = relpath.rsplit_once('/').map_or(".", |(dir, _)| dir);
+    sync_dir(repo_fd, ref_parent(relpath))
+}
+
+/// `fsync` one directory named relative to the repository root.
+fn sync_dir(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
     let dir = rustix::fs::openat(
         repo_fd,
-        parent,
+        path,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
@@ -1087,6 +1161,19 @@ mod tests {
             relative_link("refs/heads/alias", "refs/remotes/origin/main"),
             "../remotes/origin/main"
         );
+    }
+
+    #[test]
+    fn a_heads_name_round_trips_only_without_a_colon() {
+        assert!(heads_name_round_trips("main"));
+        assert!(heads_name_round_trips("test/main"));
+        // A `:` reads as the separator of a remote name, so the mapping gives
+        // a path under `refs/remotes`.
+        assert!(!heads_name_round_trips("foo:bar"));
+        assert!(!heads_name_round_trips("a/b:c"));
+        // A name the mapping refuses answers false as well.
+        assert!(!heads_name_round_trips("a/../b"));
+        assert!(!heads_name_round_trips(""));
     }
 
     #[test]

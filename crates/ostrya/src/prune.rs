@@ -64,6 +64,19 @@
 //!   waits out the timeout and then fails, and a transaction the process opens
 //!   while the run stands waits for the run to finish.
 //!
+//! A third option carries a behavior the tool has no counterpart for:
+//! [`weak_ref_filter`](PruneOptions::weak_ref_filter) classifies each ref under
+//! `refs/heads` as strong or weak. A strong ref roots the walk as every ref
+//! does. A weak ref roots nothing: it survives where the walk reaches its
+//! commit over some other edge, and the run unlinks it otherwise and names it
+//! in [`PruneStats::deleted_refs`]. Where the walk arrives at a weak ref's
+//! commit over a `parent` edge, that commit takes the bound the weak ref's own
+//! name carries in place of the bound the edge had left, which is the rule a
+//! strong ref's target already gets. An arrival over any other edge carries a
+//! bound of its own, and the commit expands under that bound and under the weak
+//! ref's bound alike. A set filter requires
+//! [`refs_only`](PruneOptions::refs_only).
+//!
 //! Two options carry reachability the tool has no counterpart for, so a prune
 //! that leaves them at their defaults is the tool's:
 //! [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) names metadata
@@ -77,8 +90,9 @@
 //! The library reads one config key of its own, `[core] tombstone-commits`; the
 //! rest of a prune acts on the options it is given.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::BorrowedFd;
+use std::sync::Arc;
 
 use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, loose_path};
 use rustix::fs::AtFlags;
@@ -88,7 +102,77 @@ use crate::error::{Error, Result};
 use crate::lock::LockKind;
 use crate::repo::Repo;
 use crate::tombstone::write_tombstone;
-use crate::traverse::ParentBound;
+use crate::traverse::{ParentBound, RefSpace, WeakBounds};
+
+/// A verdict on one ref, taken as a prune classifies the ref space.
+///
+/// The arguments are the ref's name and the commit it resolves to. True
+/// classifies the ref strong, so it roots the walk under the bound its name
+/// carries. False classifies it weak, so it is no root: a weak ref survives
+/// where the walk reaches its commit over some other edge, and the run deletes
+/// it otherwise.
+pub type WeakRefFilterFn = Arc<dyn Fn(&str, &Checksum) -> bool + Send + Sync>;
+
+/// The ref classifier a prune applies, unset by default.
+///
+/// An unset filter classifies every ref strong, so a prune that leaves it unset
+/// deletes no ref.
+///
+/// The callback runs on the executor thread while the run holds the repository
+/// lock exclusive, so it must call no [`Repo`] method. [`Repo::transaction`]
+/// from inside it waits out `[core] lock-timeout-secs` and then fails, and
+/// `ostrya_rt::block_on` inside it re-enters the runtime. The callback must be
+/// pure over its two arguments and over the state the caller captured before
+/// the call.
+///
+/// A classifier that repoints a ref as a side effect of its own call is the
+/// caller's own hazard. The compare-and-delete guard keeps the run from
+/// unlinking a ref that moved, and the run walks once, so the objects under the
+/// commit the ref now names can still go.
+///
+/// The callback is shared rather than exclusive, so a caller holds one
+/// classifier across several [`PruneOptions`]. A classifier that accumulates
+/// state carries its own interior mutability.
+#[derive(Clone, Default)]
+pub struct WeakRefFilter(Option<WeakRefFilterFn>);
+
+impl WeakRefFilter {
+    /// A filter that calls `f` for every ref it classifies.
+    pub fn new<F>(f: F) -> WeakRefFilter
+    where
+        F: Fn(&str, &Checksum) -> bool + Send + Sync + 'static,
+    {
+        WeakRefFilter(Some(Arc::new(f)))
+    }
+
+    /// A filter over a callback the caller already holds, for a callback shared
+    /// with another [`PruneOptions`].
+    pub fn from_fn(f: WeakRefFilterFn) -> WeakRefFilter {
+        WeakRefFilter(Some(f))
+    }
+
+    /// Whether a callback stands.
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.is_some()
+    }
+
+    /// Whether the ref is strong. An unset filter answers true for every ref.
+    pub(crate) fn is_strong(&self, name: &str, target: &Checksum) -> bool {
+        match &self.0 {
+            Some(f) => f(name, target),
+            None => true,
+        }
+    }
+}
+
+impl std::fmt::Debug for WeakRefFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(_) => f.write_str("WeakRefFilter(set)"),
+            None => f.write_str("WeakRefFilter(unset)"),
+        }
+    }
+}
 
 /// Options controlling [`Repo::prune`].
 #[derive(Debug, Clone)]
@@ -116,7 +200,9 @@ pub struct PruneOptions {
     /// edge by time in place of by [`depth`](PruneOptions::depth), which is
     /// then read for no branch that
     /// [`retain_branch_depth`](PruneOptions::retain_branch_depth) leaves at the
-    /// global value. A ref's own target is kept whatever its timestamp.
+    /// global value. A ref's own target is kept whatever its timestamp. A ref
+    /// [`weak_ref_filter`](PruneOptions::weak_ref_filter) calls weak is outside
+    /// that, because it roots the walk under no bound.
     pub keep_younger_than: Option<u64>,
     /// The branches the run prunes, each named as
     /// [`Repo::list_refs`](crate::Repo::list_refs) and
@@ -129,6 +215,10 @@ pub struct PruneOptions {
     /// fails the prune before any object is removed; a value that resolves and
     /// matches no ref name selects no branch, which leaves every branch
     /// retained in full.
+    ///
+    /// A ref [`weak_ref_filter`](PruneOptions::weak_ref_filter) calls weak is
+    /// outside the retention this states, because it roots the walk under no
+    /// bound.
     pub only_branch: Vec<String>,
     /// A depth for one branch, in place of [`depth`](PruneOptions::depth) for
     /// it. A branch named here is never retained in full by
@@ -176,6 +266,40 @@ pub struct PruneOptions {
     /// CLI prune adds roots and takes none away, so it keeps at least what the
     /// tool keeps.
     pub traverse_parent: bool,
+    /// The classifier that splits the ref space into strong refs and weak refs.
+    ///
+    /// Unset by default, which classifies every ref strong and deletes no ref.
+    /// A set filter requires [`refs_only`](PruneOptions::refs_only); the two
+    /// apart fail the prune with [`Error::InvalidFormat`] before the run reads
+    /// anything.
+    ///
+    /// The filter sees each ref under `refs/heads` by its path below that
+    /// directory. A ref under `refs/remotes` and a ref under `refs/mirrors` is
+    /// strong and never reaches the filter. A name below `refs/heads` holding a
+    /// `:` maps to a path under `refs/remotes` through the refspec rule, so it
+    /// is strong as well and the filter never learns it exists.
+    ///
+    /// A strong ref roots the walk under the bound
+    /// [`retain_branch_depth`](PruneOptions::retain_branch_depth),
+    /// [`only_branch`](PruneOptions::only_branch), and
+    /// [`depth`](PruneOptions::depth) give its name. A weak ref roots nothing.
+    /// It survives where the walk reaches its commit over some other edge. An
+    /// arrival over a `parent` edge gives the commit the bound that weak ref's
+    /// own name carries in place of the bound the edge had left; an arrival
+    /// over any other edge carries a bound of its own, and the commit expands
+    /// under that bound and under the weak ref's bound alike. The run deletes
+    /// each weak ref the walk did not reach and names it in
+    /// [`PruneStats::deleted_refs`].
+    ///
+    /// A weak ref roots nothing, so the branch selection has nothing to select
+    /// for it: a weak ref outside an
+    /// [`only_branch`](PruneOptions::only_branch) selection is classified all
+    /// the same, and the run deletes it and sweeps its objects where the walk
+    /// does not reach its commit.
+    /// [`keep_younger_than`](PruneOptions::keep_younger_than) holds its
+    /// guarantee for a strong ref's own target: the run deletes a weak ref the
+    /// walk does not reach whatever the timestamp of the commit it names.
+    pub weak_ref_filter: WeakRefFilter,
 }
 
 impl Default for PruneOptions {
@@ -192,6 +316,7 @@ impl Default for PruneOptions {
             static_deltas_only: false,
             gc_root_metadata_keys: Vec::new(),
             traverse_parent: true,
+            weak_ref_filter: WeakRefFilter::default(),
         }
     }
 }
@@ -286,7 +411,7 @@ fn counted(ty: ObjectType, commit_only: bool) -> bool {
 }
 
 /// The outcome of a [`Repo::prune`] run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PruneStats {
     /// The number of loose objects considered: the store's total after any
     /// `delete_commit` removal, with detached commit metadata and tombstone
@@ -300,6 +425,22 @@ pub struct PruneStats {
     /// The on-disk bytes freed by the objects `pruned_objects` counts (or that
     /// would be).
     pub freed_bytes: u64,
+    /// The weak refs the run deleted, sorted by name in byte order.
+    ///
+    /// Under [`no_prune`](PruneOptions::no_prune) it names the refs the run
+    /// would have deleted, and the run removes no ref. A ref the
+    /// compare-and-delete guard skipped is in neither, because the run left it
+    /// where it stood.
+    ///
+    /// A [`static_deltas_only`](PruneOptions::static_deltas_only) run returns
+    /// before it reads the ref space, so it classifies no ref and the list is
+    /// empty whatever
+    /// [`weak_ref_filter`](PruneOptions::weak_ref_filter) holds.
+    ///
+    /// Where the run fails part way through the deletions, the refs it already
+    /// removed stay removed, and this list goes with the error the caller gets
+    /// in place of the statistics.
+    pub deleted_refs: Vec<String>,
 }
 
 /// What the blocking half of a prune does with each doomed object.
@@ -341,6 +482,17 @@ impl Repo {
             ));
         }
 
+        // The classifier decides which refs the run deletes, and a run that
+        // roots every commit in the store deletes none of them. The pair is
+        // refused ahead of the lock, so a contended repository gives the same
+        // refusal as a free one, and ahead of every read, so the classifier is
+        // never called.
+        if opts.weak_ref_filter.is_set() && !opts.refs_only {
+            return Err(Error::InvalidFormat(
+                "weak_ref_filter requires refs_only".into(),
+            ));
+        }
+
         let _lock = self.lock_repo(LockKind::Exclusive).await?;
 
         let Some(delta_target) = opts.delete_commit else {
@@ -362,6 +514,8 @@ impl Repo {
                 total_objects,
                 pruned_objects: 0,
                 freed_bytes: 0,
+                // A delta-only run reads no ref, so it deletes none.
+                deleted_refs: Vec::new(),
             });
         }
         self.prune_objects(opts, mode).await
@@ -392,16 +546,45 @@ impl Repo {
         for value in &opts.only_branch {
             self.resolve_rev(value, false).await?;
         }
-        let mut roots: Vec<(Checksum, ParentBound)> = named_refs
-            .iter()
-            .map(|(name, checksum)| (*checksum, opts.ref_bound(name)))
-            .collect();
-        // A ref's bound belongs to the commit it names, not to the path the
-        // walk took to reach it, so the walk replaces an inherited bound at
-        // every ref target it arrives at. Where two refs name one commit, both
-        // roots stand and the commit is expanded under each of the two bounds.
-        let ref_targets: HashSet<Checksum> =
-            named_refs.iter().map(|(_, checksum)| *checksum).collect();
+        // Classify the ref space in one pass, so the strong roots and the weak
+        // targets cannot disagree. A ref is weak where it lives below
+        // `refs/heads`, the classifier answers false for it, and its name
+        // round-trips through the refspec mapping. Every other ref is strong.
+        //
+        // A weak target stays out of `ref_targets`: the walk needs a seed for
+        // every checksum that set names, and a weak ref supplies none. The weak
+        // targets ride on `GcRoots::weak_roots` instead, where the walk seeds
+        // one on the arrival that reaches it.
+        //
+        // A commit a strong ref and a weak ref both name enters through the
+        // strong ref, so the commit is reachable and the weak ref survives.
+        //
+        // An unset classifier makes every ref strong, so the unset case tests
+        // one boolean for each ref.
+        let filtering = opts.weak_ref_filter.is_set();
+        let mut roots: Vec<(Checksum, ParentBound)> = Vec::new();
+        let mut ref_targets: HashSet<Checksum> = HashSet::new();
+        let mut weak_refs: Vec<(String, Checksum)> = Vec::new();
+        let mut weak_roots: HashMap<Checksum, WeakBounds> = HashMap::new();
+        for (space, name, checksum) in named_refs {
+            let bound = opts.ref_bound(&name);
+            let weak = filtering
+                && space == RefSpace::Heads
+                && crate::refs::heads_name_round_trips(&name)
+                && !opts.weak_ref_filter.is_strong(&name, &checksum);
+            if weak {
+                weak_roots.entry(checksum).or_default().add(bound);
+                weak_refs.push((name, checksum));
+                continue;
+            }
+            // A ref's bound belongs to the commit it names, not to the path the
+            // walk took to reach it, so the walk replaces an inherited bound at
+            // every ref target it arrives at. Where two refs name one commit,
+            // both roots stand and the commit is expanded under each of the two
+            // bounds.
+            roots.push((checksum, bound));
+            ref_targets.insert(checksum);
+        }
 
         let mut all_objects = self.list_objects().await?;
         if let Some(commit) = opts.delete_commit {
@@ -424,6 +607,7 @@ impl Repo {
             // A `commit_only` run consults the reachable set for commit names
             // alone, so the trees are neither read nor collected.
             traverse_tree: !opts.commit_only,
+            weak_roots,
         };
         let mut keep = self
             .traverse_reachable_gc(roots, global_bound, &gc, &ref_targets, opts.delete_commit)
@@ -471,6 +655,41 @@ impl Repo {
             commit_only: opts.commit_only,
         };
 
+        // Delete each weak ref the walk did not reach. This runs after the
+        // walk, because a walk that fails must leave the repository as it
+        // stood, and before the commit deletion and the sweep:
+        // `refuse_referenced_commit` ran over the whole ref listing and would
+        // have refused a `delete_commit` any weak ref names, so the two cannot
+        // meet.
+        //
+        // The pass unlinks ref files alone and takes no lock of its own, so it
+        // cannot deadlock against the hold the run keeps. An emptied parent
+        // directory below `refs/heads` stays where it is, because an rmdir walk
+        // races a writer creating a sibling ref.
+        //
+        // The whole pass runs in one blocking hop, the way the object sweep
+        // does. Each name is read immediately ahead of its own unlink, and the
+        // directories that held a removed ref are `fsync`-ed once at the end.
+        let mut doomed_refs: Vec<(String, Checksum)> = Vec::with_capacity(weak_refs.len());
+        for (name, target) in weak_refs {
+            if !keep.contains(&ObjectName::new(target, ObjectType::Commit)) {
+                doomed_refs.push((name, target));
+            }
+        }
+        // A dry run reports what the walk decided and touches nothing, so it
+        // reads no ref a second time.
+        let mut deleted_refs: Vec<String> = if opts.no_prune {
+            doomed_refs.into_iter().map(|(name, _)| name).collect()
+        } else {
+            let repo = self.clone();
+            let fsync = sweep.fsync;
+            ostrya_rt::unblock(move || {
+                crate::refs::delete_matching_refs_blocking(repo.repo_fd(), doomed_refs, fsync)
+            })
+            .await?
+        };
+        deleted_refs.sort();
+
         // The walk succeeded, so no data the prune reads can refuse it now:
         // remove the named commit, then sweep what it orphaned. A dry run keeps
         // the commit and reports the sweep its removal would cause.
@@ -498,6 +717,7 @@ impl Repo {
             total_objects,
             pruned_objects,
             freed_bytes,
+            deleted_refs,
         })
     }
 

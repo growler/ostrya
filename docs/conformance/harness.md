@@ -216,9 +216,11 @@ artifact. The set is closed and matches the vocabulary in `README.md`.
   setup commit, which passes one. Without a fixed timestamp two checksums differ
   by wall-clock time and the oracle would fail on every cell.
 - `fsck` -- the exit status of each implementation's own `fsck` run against
-  its own repository. The two word their progress and summary lines
-  differently, and the claim is that both find the repository sound, so the
+  its own repository. The claim is that both find the repository sound, so the
   captured text goes to the artifact directory and not into the comparison.
+  Two properties keep it out: the tool writes a progress line the port does
+  not, and it emits its findings in the iteration order of its own hash
+  containers (`cli-surface.md`, "fsck").
 
 Some oracles depend on CLI surface that arrives during Phase 17. A cell whose
 oracle is unavailable reports `skip: unimplemented-cli` and names the missing
@@ -277,8 +279,10 @@ oracles and `refs-bytes` normalize before comparison:
   path but `$BRANCH` and `$REV`, which are a ref name and a checksum;
 - a 64-character lowercase hex run becomes `<checksum>`, unless the cell names
   the `checksum-agreement` oracle;
-- progress lines carrying a rate or an elapsed time are dropped. This step
-  applies to the text oracles alone, a ref name not being a progress line.
+- progress lines are dropped: a line carrying a rate or an elapsed time, and
+  `fsck`'s own `fsck objects (n/total) pct%`, which the tool writes and the
+  port does not (`cli-surface.md`, "fsck"). This step applies to the text
+  oracles alone, a ref name not being a progress line.
 
 The raw bytes go to the artifact directory in every case, so a comparison
 failure is diagnosed against what the process actually wrote.

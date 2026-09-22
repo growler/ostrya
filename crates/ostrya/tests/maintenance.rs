@@ -524,6 +524,18 @@ fn fsck_passes_on_a_healthy_repo() {
         // Every reachable object is examined.
         let reachable = repo.traverse_commit(&commit, -1).await.unwrap();
         assert_eq!(report.objects_checked, reachable.len());
+
+        // Detached commit metadata is outside the count: it raises the loose
+        // count and leaves `objects_checked` where it was
+        // (`docs/format-reference.md`, "CLI output formats", `fsck`).
+        let detached = tmp
+            .path()
+            .join("repo/objects")
+            .join(ObjectName::new(commit, ObjectType::CommitMeta).loose_path(RepoMode::Archive));
+        std::fs::write(&detached, [0x61, 0x7b, 0x73, 0x76, 0x7d, 0x00]).unwrap();
+        let again = repo.fsck(&FsckOptions::new()).await.unwrap();
+        assert!(again.is_ok(), "healthy fsck: {:?}", again.errors);
+        assert_eq!(again.objects_checked, reachable.len());
     });
 }
 
@@ -641,6 +653,7 @@ fn fsck_mark_partial_can_be_disabled() {
         let report = repo
             .fsck(&FsckOptions {
                 mark_partial: false,
+                ..FsckOptions::new()
             })
             .await
             .unwrap();
@@ -764,6 +777,507 @@ fn fsck_marks_commits_sharing_a_missing_file_via_distinct_dirs() {
             "the second commit is marked partial"
         );
     });
+}
+
+/// A two-commit `main` branch in a fresh repository of `mode`, the second
+/// commit parented on the first. Returns the repository and the two commits.
+async fn build_two_commit_repo(base: &Path, mode: RepoMode) -> (Repo, Checksum, Checksum) {
+    write_tree(&base.join("one"), "a.txt", b"one\n");
+    write_tree(&base.join("two"), "a.txt", b"two\n");
+    let repo = Repo::create(&base.join("repo"), CreateOptions::new(mode))
+        .await
+        .unwrap();
+    let c1 = library_commit(&repo, base, "one", None).await;
+    let c2 = library_commit(&repo, base, "two", Some(c1)).await;
+    (repo, c1, c2)
+}
+
+/// Commit the tree at `base/rel` with `metadata` as the commit's metadata dict,
+/// binding no ref, and return the new commit.
+async fn commit_with_metadata(
+    repo: &Repo,
+    base: &Path,
+    rel: &str,
+    metadata: ostrya::Value,
+) -> Checksum {
+    use ostrya::{CommitModifier, CommitModifierFlags, CommitOptions, MutableTree};
+    use std::os::fd::AsFd;
+
+    let txn = repo.transaction().await.unwrap();
+    let mut modifier = CommitModifier::new(
+        CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS,
+    );
+    let mut mtree = MutableTree::new();
+    let dfd = std::fs::File::open(base).unwrap();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new(rel), &mut mtree, Some(&mut modifier))
+        .await
+        .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                subject: Some("c".to_owned()),
+                timestamp: Some(1_700_000_000),
+                metadata: Some(metadata),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    commit
+}
+
+/// A metadata dict carrying an `ostree.ref-binding` and, where `collection` is
+/// given, an `ostree.collection-binding`.
+fn binding_metadata(refs: &[&str], collection: Option<&str>) -> ostrya::Value {
+    let names: Vec<String> = refs.iter().map(|r| (*r).to_owned()).collect();
+    let mut builder = ostrya::DictBuilder::new();
+    builder.insert_strv("ostree.ref-binding", &names);
+    if let Some(collection) = collection {
+        builder.insert_str("ostree.collection-binding", collection);
+    }
+    builder.build()
+}
+
+#[test]
+fn fsck_skips_a_commit_already_marked_partial() {
+    let tmp = TmpDir::new("maint-fsck-skip-partial");
+    block_on(async {
+        let base = tmp.path();
+        let (repo, _c1, c2) = build_two_commit_repo(base, RepoMode::Archive).await;
+
+        let both = repo.fsck(&FsckOptions::new()).await.unwrap();
+        assert_eq!(both.commits_checked, 2);
+        assert_eq!(both.commits_partial, 0);
+        assert!(both.is_ok());
+
+        // Mark the tip partial by hand, as an interrupted pull leaves it.
+        let marker = base.join(format!("repo/state/{}.commitpartial", c2.to_hex()));
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, [0x66]).unwrap();
+
+        let skipped = repo.fsck(&FsckOptions::new()).await.unwrap();
+        assert_eq!(skipped.commits_checked, 1, "the partial commit is skipped");
+        assert_eq!(skipped.commits_partial, 1);
+        assert!(
+            skipped.objects_checked < both.objects_checked,
+            "the skipped commit's objects leave the denominator: {} against {}",
+            skipped.objects_checked,
+            both.objects_checked
+        );
+        assert!(!skipped.is_ok(), "a skipped commit is not a clean run");
+    });
+}
+
+#[test]
+fn fsck_delete_unlinks_and_marks() {
+    let tmp = TmpDir::new("maint-fsck-delete");
+    block_on(async {
+        let base = tmp.path();
+        let (repo, c1, c2) = build_two_commit_repo(base, RepoMode::Archive).await;
+        let repo_dir = base.join("repo");
+
+        // Corrupt both commits' own content object, so the run has two faults
+        // to carry and each commit reaches one.
+        let mut corrupted = Vec::new();
+        for name in [c1, c2] {
+            let reachable = repo.traverse_commit(&name, 0).await.unwrap();
+            let object = reachable
+                .iter()
+                .find(|o| o.ty == ObjectType::File)
+                .copied()
+                .expect("a content object");
+            let path = repo_dir
+                .join("objects")
+                .join(object.loose_path(RepoMode::Archive));
+            std::fs::write(&path, b"not the object these bytes are named for").unwrap();
+            corrupted.push(object);
+        }
+
+        // The walk runs to its end whatever the options carry, so a default
+        // run reports both faults. It unlinks nothing and marks nothing, a
+        // checksum mismatch alone leaving the commit complete.
+        let plain = repo.fsck(&FsckOptions::new()).await.unwrap();
+        assert_eq!(
+            plain.errors.len(),
+            2,
+            "the walk carries past the first fault: {:?}",
+            plain.errors
+        );
+        assert!(plain.deleted.is_empty() && plain.marked_partial.is_empty());
+
+        let report = repo
+            .fsck(&FsckOptions {
+                delete: true,
+                ..FsckOptions::new()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            report.errors.len(),
+            2,
+            "`delete` continues past the first fault: {:?}",
+            report.errors
+        );
+        for object in &corrupted {
+            assert!(report.deleted.contains(object), "{object} was unlinked");
+            assert!(
+                !repo_dir
+                    .join("objects")
+                    .join(object.loose_path(RepoMode::Archive))
+                    .exists(),
+                "{object} is gone from the store"
+            );
+        }
+        assert_eq!(report.marked_partial, {
+            let mut expected = vec![c1, c2];
+            expected.sort();
+            expected
+        });
+        for commit in [c1, c2] {
+            assert_eq!(
+                repo.commit_state(&commit).await.unwrap(),
+                ostrya::CommitState::Partial
+            );
+        }
+    });
+}
+
+#[test]
+fn fsck_add_tombstones_replaces_the_commit() {
+    // `bare` records the source inode's owner, which an unprivileged run
+    // cannot write, so the three modes here are the ones the suite commits in.
+    for mode in [
+        RepoMode::BareUser,
+        RepoMode::BareUserOnly,
+        RepoMode::Archive,
+    ] {
+        let tmp = TmpDir::new("maint-fsck-tombstone");
+        block_on(async {
+            let base = tmp.path();
+            let (repo, c1, c2) = build_two_commit_repo(base, mode).await;
+            let repo_dir = base.join("repo");
+
+            // Remove the parent commit object, which is the condition the
+            // option acts on.
+            let parent = repo_dir
+                .join("objects")
+                .join(ObjectName::new(c1, ObjectType::Commit).loose_path(mode));
+            std::fs::remove_file(&parent).unwrap();
+
+            let report = repo
+                .fsck(&FsckOptions {
+                    add_tombstones: true,
+                    ..FsckOptions::new()
+                })
+                .await
+                .unwrap();
+            assert_eq!(report.tombstoned, vec![c2], "the child is tombstoned");
+
+            let commit_path = repo_dir
+                .join("objects")
+                .join(ObjectName::new(c2, ObjectType::Commit).loose_path(mode));
+            assert!(!commit_path.exists(), "the child commit object is gone");
+
+            let tombstone = repo_dir
+                .join("objects")
+                .join(ObjectName::new(c2, ObjectType::TombstoneCommit).loose_path(mode));
+            let bytes = std::fs::read(&tombstone).unwrap();
+            assert_eq!(bytes.len(), 78, "the marker is 78 bytes in {mode:?}");
+            let mut expected = b"commit\0\0".to_vec();
+            expected.extend_from_slice(c2.to_hex().as_bytes());
+            assert!(
+                bytes.starts_with(&expected),
+                "the marker names the commit in {mode:?}"
+            );
+            let meta = std::fs::metadata(&tombstone).unwrap();
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777,
+                0o644,
+                "the marker's permission bits in {mode:?}"
+            );
+        });
+    }
+}
+
+/// The tombstone step writes to the repository, so a walk that found a corrupt
+/// object reaches it under `all` or `delete` alone. An absent object leaves the
+/// walk sound for this purpose and the step runs beside it.
+#[test]
+fn fsck_add_tombstones_needs_a_walk_that_found_no_corruption() {
+    // Each arm acts on the repository, so each gets a repository of its own.
+    // `arm` names it, `corrupt` says which fault to plant, and `opts` carries
+    // the switches under test.
+    let arm = |name: &str, corrupt: bool, opts: FsckOptions| {
+        let tmp = TmpDir::new(name);
+        block_on(async {
+            let base = tmp.path();
+            let (repo, c1, c2) = build_two_commit_repo(base, RepoMode::Archive).await;
+            let objects = base.join("repo").join("objects");
+            std::fs::remove_file(
+                objects.join(ObjectName::new(c1, ObjectType::Commit).loose_path(RepoMode::Archive)),
+            )
+            .unwrap();
+
+            let reachable = repo.traverse_commit(&c2, 0).await.unwrap();
+            let object = reachable
+                .iter()
+                .find(|o| o.ty == ObjectType::File)
+                .copied()
+                .expect("a content object");
+            let path = objects.join(object.loose_path(RepoMode::Archive));
+            if corrupt {
+                std::fs::write(&path, b"not the object these bytes are named for").unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+
+            let report = repo.fsck(&opts).await.unwrap();
+            assert_eq!(report.errors.len(), 1, "the walk reports the one fault");
+            let commit =
+                objects.join(ObjectName::new(c2, ObjectType::Commit).loose_path(RepoMode::Archive));
+            let tombstone = objects.join(
+                ObjectName::new(c2, ObjectType::TombstoneCommit).loose_path(RepoMode::Archive),
+            );
+            (report.tombstoned, commit.exists(), tombstone.exists())
+        })
+    };
+    let tombstones = |opts: FsckOptions| FsckOptions {
+        add_tombstones: true,
+        ..opts
+    };
+
+    // A corrupt object with neither switch: the step is held back and the
+    // child commit object stands.
+    let (tombstoned, commit, tombstone) =
+        arm("maint-fsck-tomb-held", true, tombstones(FsckOptions::new()));
+    assert!(tombstoned.is_empty(), "no commit is tombstoned");
+    assert!(commit, "the child commit object stands");
+    assert!(!tombstone, "no tombstone is written");
+
+    // The same repository under `all`, and under `delete`: the step runs.
+    for (name, opts) in [
+        (
+            "maint-fsck-tomb-all",
+            FsckOptions {
+                all: true,
+                ..FsckOptions::new()
+            },
+        ),
+        (
+            "maint-fsck-tomb-delete",
+            FsckOptions {
+                delete: true,
+                ..FsckOptions::new()
+            },
+        ),
+    ] {
+        let (tombstoned, commit, tombstone) = arm(name, true, tombstones(opts));
+        assert_eq!(tombstoned.len(), 1, "{name}: the child is tombstoned");
+        assert!(!commit, "{name}: the child commit object is gone");
+        assert!(tombstone, "{name}: the tombstone is written");
+    }
+
+    // An absent object is a fault the walk carries on its own, so the step
+    // runs under no switch at all.
+    let (tombstoned, commit, tombstone) = arm(
+        "maint-fsck-tomb-absent",
+        false,
+        tombstones(FsckOptions::new()),
+    );
+    assert_eq!(tombstoned.len(), 1, "the child is tombstoned");
+    assert!(!commit, "the child commit object is gone");
+    assert!(tombstone, "the tombstone is written");
+}
+
+#[test]
+fn fsck_binding_checks_report_each_kind() {
+    use ostrya::{FsckBindingErrorKind, FsckFailure};
+
+    let tmp = TmpDir::new("maint-fsck-bindings");
+    block_on(async {
+        let base = tmp.path();
+        write_tree(&base.join("one"), "a.txt", b"one\n");
+        write_tree(&base.join("two"), "a.txt", b"two\n");
+
+        let bindings = |back: bool| {
+            let mut opts = FsckOptions::new();
+            opts.verify_bindings = !back;
+            opts.verify_back_refs = back;
+            opts
+        };
+        let kind = |failure: Option<FsckFailure>| match failure {
+            Some(FsckFailure::Binding(error)) => error.kind,
+            other => panic!("a binding finding, got {other:?}"),
+        };
+
+        // RefNotBound: a second ref at a commit bound to one name alone.
+        let repo = Repo::create(
+            &base.join("not-bound"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let commit =
+            commit_with_metadata(&repo, base, "one", binding_metadata(&["alpha"], None)).await;
+        repo.set_ref_immediate("alpha", Some(&commit))
+            .await
+            .unwrap();
+        repo.set_ref_immediate("beta", Some(&commit)).await.unwrap();
+        let report = repo.fsck(&bindings(false)).await.unwrap();
+        match kind(report.failure) {
+            FsckBindingErrorKind::RefNotBound { ref_name, bindings } => {
+                assert_eq!(ref_name, "beta");
+                assert_eq!(bindings, vec!["alpha".to_owned()]);
+            }
+            other => panic!("RefNotBound, got {other:?}"),
+        }
+
+        // CollectionMismatch: a mirror ref under an id the commit does not
+        // carry.
+        let repo = Repo::create(
+            &base.join("collection"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let commit = commit_with_metadata(
+            &repo,
+            base,
+            "one",
+            binding_metadata(&["main"], Some("org.test.Coll")),
+        )
+        .await;
+        let cref = ostrya::CollectionRef::new("org.test.Other", "main");
+        repo.set_collection_ref_immediate(&cref, Some(&commit))
+            .await
+            .unwrap();
+        let report = repo.fsck(&bindings(false)).await.unwrap();
+        match kind(report.failure) {
+            FsckBindingErrorKind::CollectionMismatch { bound, found_under } => {
+                assert_eq!(bound, "org.test.Coll");
+                assert_eq!(found_under, "org.test.Other");
+            }
+            other => panic!("CollectionMismatch, got {other:?}"),
+        }
+
+        // BackRefMissing: a bound name no ref carries.
+        let repo = Repo::create(&base.join("no-ref"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let commit = commit_with_metadata(
+            &repo,
+            base,
+            "one",
+            binding_metadata(&["alpha", "delta"], None),
+        )
+        .await;
+        repo.set_ref_immediate("alpha", Some(&commit))
+            .await
+            .unwrap();
+        let report = repo.fsck(&bindings(true)).await.unwrap();
+        match kind(report.failure) {
+            FsckBindingErrorKind::BackRefMissing { ref_name } => assert_eq!(ref_name, "delta"),
+            other => panic!("BackRefMissing, got {other:?}"),
+        }
+
+        // BackRefMismatch: the ref exists and names another commit.
+        let repo = Repo::create(&base.join("moved"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let first =
+            commit_with_metadata(&repo, base, "one", binding_metadata(&["alpha"], None)).await;
+        let second =
+            commit_with_metadata(&repo, base, "two", binding_metadata(&["alpha"], None)).await;
+        repo.set_ref_immediate("alpha", Some(&second))
+            .await
+            .unwrap();
+        let report = repo.fsck(&bindings(true)).await.unwrap();
+        match kind(report.failure) {
+            FsckBindingErrorKind::BackRefMismatch { ref_name } => assert_eq!(ref_name, "alpha"),
+            other => panic!("BackRefMismatch, got {other:?}"),
+        }
+        assert_ne!(first, second);
+
+        // BackCollectionRefMissing: the collection ref the binding names is
+        // not in the store.
+        let repo = Repo::create(
+            &base.join("no-collection-ref"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let commit = commit_with_metadata(
+            &repo,
+            base,
+            "one",
+            binding_metadata(&["main"], Some("org.test.Coll")),
+        )
+        .await;
+        repo.set_ref_immediate("main", Some(&commit)).await.unwrap();
+        let report = repo.fsck(&bindings(true)).await.unwrap();
+        match kind(report.failure) {
+            FsckBindingErrorKind::BackCollectionRefMissing {
+                collection_id,
+                ref_name,
+            } => {
+                assert_eq!(collection_id, "org.test.Coll");
+                assert_eq!(ref_name, "main");
+            }
+            other => panic!("BackCollectionRefMissing, got {other:?}"),
+        }
+
+        // BackCollectionRefMismatch: the collection ref exists and names
+        // another commit.
+        let repo = Repo::create(
+            &base.join("moved-collection-ref"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        // The first commit binds nothing, so the check reaches the second
+        // alone: its plain ref resolves and its collection ref names the
+        // first.
+        let first = commit_with_metadata(&repo, base, "one", binding_metadata(&[], None)).await;
+        let second = commit_with_metadata(
+            &repo,
+            base,
+            "two",
+            binding_metadata(&["main"], Some("org.test.Coll")),
+        )
+        .await;
+        repo.set_ref_immediate("main", Some(&second)).await.unwrap();
+        let cref = ostrya::CollectionRef::new("org.test.Coll", "main");
+        repo.set_collection_ref_immediate(&cref, Some(&first))
+            .await
+            .unwrap();
+        let report = repo.fsck(&bindings(true)).await.unwrap();
+        match kind(report.failure) {
+            FsckBindingErrorKind::BackCollectionRefMismatch {
+                collection_id,
+                ref_name,
+            } => {
+                assert_eq!(collection_id, "org.test.Coll");
+                assert_eq!(ref_name, "main");
+            }
+            other => panic!("BackCollectionRefMismatch, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn fsck_options_and_report_are_send_sync() {
+    // `FsckOptions` carries a boxed `FnMut`, so it is `Send` and not `Sync`,
+    // which is what `CheckoutOptions` is. The report is both.
+    fn assert_send<T: Send>() {}
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send::<FsckOptions>();
+    assert_send_sync::<ostrya::FsckReport>();
+    assert_send_sync::<ostrya::FsckError>();
+    assert_send_sync::<ostrya::FsckBindingError>();
+    assert_send_sync::<ostrya::FsckFailure>();
 }
 
 /// Find one loose object with the given extension under a repository.

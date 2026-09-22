@@ -324,7 +324,11 @@ One resolution behavior the tool has and the port does not, recorded in
   in the port, which prints nothing and exits 0. And the tool's
   ref enumeration skips such a name without a word: `refs`, `refs --list`, `refs
   -r`, a `PREFIX` above it, `fsck`, and `summary -u` each print the other refs
-  and exit 0, and `prune --refs-only` reads the commit that ref holds as
+  and exit 0. The port's `fsck` enumerates the name and loads the commit it
+  holds, so a ref of that shape over an absent commit ends the port's run at
+  exit 1 where the tool's run passes, which is one of the divergences the
+  `fsck` entry under "P2" records. And `prune --refs-only` reads the commit
+  that ref holds as
   unreachable and deletes it, so after `ostrya commit -b 'odd~1'` and `ostree
   prune --refs-only` the ref file stands over an absent commit object and
   `ostrya cat 'odd~1' PATH` reports `error: object not found`. The port
@@ -1835,9 +1839,110 @@ Neither key is derived from the other, and no harness repository sets either
 (`harness.md`, "Constraints"), so every matrix cell reads the tool's own
 behavior.
 
-`fsck` accepts `--repo` and the port extension `--no-mark-partial`. Missing:
-`--add-tombstones`, `-q/--quiet`, `-a/--all`, `--delete`, `--verify-bindings`,
-`--verify-back-refs`.
+`fsck` accepts `--repo`, `--add-tombstones`, `-q/--quiet`, `-a/--all`,
+`--delete`, `--verify-bindings`, `--verify-back-refs`, and the port extension
+`--no-mark-partial`. Nothing is missing. The phase, finding, and summary text
+the command writes, the two binding checks, and the exit statuses are in
+`../format-reference.md`, "CLI output formats", `fsck`, together with the
+progress line the tool writes and the port does not.
+
+The port's object walk runs to its end whatever the switches carry, so one run
+reports every fault it reaches and marks every commit an absent object leaves
+incomplete. A run ends early at three conditions alone, each of which stops the
+port from reading what it must read next: a ref over a commit object the store
+does not hold, because the phase cannot checksum a commit it cannot load; a
+dirtree that is absent, because the objects beneath it cannot be named, so a
+run that went on would state an object set it never had; and a
+`--verify-bindings` or `--verify-back-refs` failure, because it states a fact
+about the ref graph rather than about an object, marks nothing, and leaves the
+phase that found it with nothing further to decide. The tool ends a run at the
+same three conditions and at the first faulty object as well, unless `-a` or
+`--delete` carries it on.
+
+`-a` therefore carries a meaning of the port's own. In the tool it decides
+where a run ends; in the port the walk runs to its end without it, and the
+switch selects one thing: whether `--add-tombstones` may act after a walk that
+found an object whose bytes do not match its name. The tombstone step deletes
+a commit object and writes a `.tombstone-commit`, so the port holds it to the
+walk the tool holds it to. `--delete` carries the same permission on its own,
+because it carries the tool's walk to its end as well, and a walk whose
+findings are absent objects alone needs neither: an absent object never ends a
+run in either implementation. The repository the two leave therefore agrees in
+every combination of `-a`, `--delete`, and `--add-tombstones`, over a sound
+repository and over a faulty one alike. `--delete` takes no such gate of its
+own: the objects it unlinks and the commits it marks are the same set with
+`-a` and without it in both implementations.
+
+Eight divergences stand at `fsck`:
+
+- the progress line. The tool writes `fsck objects (n/total) pct%` to standard
+  output: the first update, the last one, and about one more a second between
+  them, so a short run writes two lines and a long run writes more, their
+  numerators following the host's throughput. On a tty it draws a `[=  ]` bar
+  sized to the terminal and repaints it in place with `ESC 7` and `ESC 8`. The
+  port writes no progress line at all, on a tty or off one. The object count
+  the line reports is `FsckReport::objects_checked`, which a library caller
+  reads. The repository is unaffected, and the cited tests drop the block from
+  both sides before comparing;
+- the order of the findings, and the order of the commits inside one. The tool
+  emits both in the iteration order of its own hash containers; the port emits
+  the findings sorted by object checksum and each commit list sorted. The same
+  reaches the back-reference check: where more than one commit fails it, the
+  two name different commits. This is the hash-container carve-out of
+  `CLAUDE.md`, "CLI compatibility is functional, not literal", and the cited
+  tests sort both before comparing;
+- a faulty repository run with neither `-a` nor `--delete`. The tool ends at
+  the first fault its own walk order reaches, writes that one finding as its
+  own `error: ` line, and writes no closing line. The port carries the walk to
+  its end, writes every finding plain, and closes with
+  `error: Repository corruption encountered`. The port's finding set and its
+  `state/` markers are therefore a superset of the tool's over a repository
+  holding more than one fault, and they do not follow a walk order: one
+  repository gives one finding set. `-a` and `--delete` carry the tool to the
+  end of the object set and the two agree again, which is the form the cited
+  tests compare; a no-switch run is compared on its exit status and its object
+  and `state/` inventory, and the port's own text is stated beside it;
+- what `-a` selects. The tool reads it as "do not stop at the first fault",
+  which decides where a run ends. The port's walk reaches its end without it,
+  so the port reads it as the permission `--add-tombstones` needs to act after
+  a walk that found a corrupt object. The two meanings pick out the same runs:
+  the tool's walk reaches the tombstone step under `-a` and the port's step is
+  released by it, so the repository agrees in both arms;
+- an object whose own framing is broken. Over a content object the two part in
+  wording alone -- the tool's `File header size 1476395034 exceeds size 38`
+  against the port's `content header exceeds the size cap`, over one `.filez`
+  whose first byte was flipped -- and the exit status and the repository
+  agree. Over a metadata object they part further, because the two readers
+  part. The port's GVariant reader takes normal-form input alone, so an object
+  whose framing is broken is reported and left where it stands: `--delete`
+  unlinks nothing and no commit is marked. The tool's reader takes data that
+  is not in normal form and yields default values for the parts it cannot
+  frame, so what the tool does next follows what those defaults are. Where the
+  shifted offset reads as an entry, the tool refuses the object before it
+  checksums anything (`error: Invalid checksum of length 5 expected 32`),
+  exits 1, and writes nothing, which is the outcome the port reaches by its
+  own path. Where the shifted offset reads past the object's own end, the tool
+  sees an empty dirtree, checksums the object, and under `--delete` unlinks it
+  and marks the commit partial, where the port keeps both. The two exit 1
+  either way;
+- a dangling ref whose name the tool's ref enumeration skips. The tool never
+  reads the name, so its run passes; the port enumerates it, loads the commit
+  the ref names, and ends the run at exit 1. This is the ref-name character
+  class of "P1" reaching a second command. A ref of that shape whose commit is
+  present parts the two in neither direction;
+- a positional argument. The tool accepts one and ignores it; `clap` refuses it
+  with `error: unexpected argument '<value>' found` at exit 1. This is the
+  class already recorded for the other commands that take no positional;
+- a repeated boolean flag. The tool takes a second `-a`, `-q`, `--delete`,
+  `--add-tombstones`, `--verify-bindings`, or `--verify-back-refs`; the port
+  refuses it with `error: the argument '<flag>' cannot be used multiple times`
+  at exit 1. This is the repeated-boolean-flag class already recorded for
+  `export --no-xattrs` and the four `prune` flags.
+
+`fsck --add-tombstones` deletes a commit object and leaves a branch ref
+standing over it, so repeated runs walk a broken branch backwards one commit
+per run until the ref cannot resolve. The port reproduces that: the object
+inventory is the oracle and the port writes the bytes the tool writes.
 
 `diff` accepts `--repo`. Missing: `--stats`, `--fs-diff`, `--no-xattrs`,
 `--owner-uid=UID`, `--owner-gid=GID`.
@@ -2405,14 +2510,13 @@ Observed by running the tool (2026.1).
 
 A script reads standard output, so the format is part of the surface. The
 formats of `commit`, including its `--table-output` block, `refs`, `rev-parse`,
-`cat`, `show`, `log`, `ls`, `config get`, and `prune`, together with the
+`cat`, `show`, `log`, `ls`, `config get`, `prune`, and `fsck`, together with the
 GVariant text form the reading commands share,
 are recovered and recorded in `../format-reference.md`, "CLI output formats" and
 "The GVariant text form". Each format below still needs a black-box observation
 pass, and the results belong in that same section.
 
 - `diff`, including the per-path change prefixes and `--stats`.
-- `fsck` progress output and its `-q` form.
 - `summary -v`, `--raw`, and `--list-metadata-keys`, whose formats are the ones
   `remote summary` reports and whose flags the local command still lacks.
 - `static-delta list`, `show`, and `indexes`.

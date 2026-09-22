@@ -311,6 +311,10 @@ impl Repo {
     pub async fn list_remote_refs(&self) -> Result<Vec<(String, Checksum)>>;
     /// refs/mirrors, as (collection_id, ref_name, commit).
     pub async fn list_mirror_refs(&self) -> Result<Vec<(String, String, Checksum)>>;
+    /// The collection-qualified refs: the local refs qualified by the
+    /// repository's own `[core] collection-id`, plus every mirror ref, sorted
+    /// by collection id and then by ref name.
+    pub async fn list_collection_refs(&self) -> Result<Vec<CollectionRefEntry>>;
     /// The refs stored as alias symlinks, under heads and remotes, with each
     /// link body verbatim.
     pub async fn list_ref_aliases(&self) -> Result<Vec<RefAlias>>;
@@ -426,6 +430,69 @@ impl PruneOptions {
     pub fn gc_roots<I: IntoIterator<Item = S>, S: Into<String>>(keys: I)
         -> PruneOptions;
 }
+
+/// What a check reads and what it does with a fault. Every field but
+/// `mark_partial` is off by default, and `mark_partial` is a port extension
+/// the tool has no counterpart for.
+#[derive(Debug, Clone)]
+pub struct FsckOptions {
+    pub mark_partial: bool,               // default true; a port extension
+    pub delete: bool,                     // unlink each mismatching object
+    pub all: bool,                        // let `add_tombstones` act after a
+                                          // walk that found a corrupt object
+    pub add_tombstones: bool,             // tombstone a commit whose parent
+                                          // commit object is absent
+    pub verify_bindings: bool,            // each ref against its commit
+    pub verify_back_refs: bool,           // each commit against its refs
+}
+
+/// What a check found. `failure` names the one condition that ends a run
+/// before the walk finishes; every other fault is in `errors`.
+pub struct FsckReport {
+    pub reached: FsckPhase,
+    pub commits_checked: usize,
+    pub commits_partial: usize,           // skipped, already marked partial
+    pub objects_checked: usize,           // the objects the walk examined
+    pub errors: Vec<FsckError>,           // sorted by object checksum
+    pub marked_partial: Vec<Checksum>,
+    pub deleted: Vec<ObjectName>,
+    pub tombstoned: Vec<Checksum>,
+    pub failure: Option<FsckFailure>,
+}
+impl FsckReport {
+    /// No faulty object, no condition that ended the run, and no commit
+    /// skipped as already partial.
+    pub fn is_ok(&self) -> bool;
+}
+
+pub enum FsckPhase { ValidateRefs, ValidateCollectionRefs,
+                     EnumerateCommits, VerifyObjects }
+
+pub struct FsckError {
+    pub object: ObjectName,
+    pub kind: FsckErrorKind,
+    pub in_commits: Vec<Checksum>,        // sorted; empty for a ref-phase find
+}
+pub enum FsckErrorKind {
+    Missing,
+    ChecksumMismatch { actual: Checksum },
+    Corrupt(String),
+}
+
+pub enum FsckFailure {
+    RefTarget { ref_name: String, commit: Checksum, removed: bool },
+    MissingDirTree(Checksum),
+    Binding(FsckBindingError),
+}
+pub struct FsckBindingError { pub commit: Checksum, pub kind: FsckBindingErrorKind }
+pub enum FsckBindingErrorKind {
+    RefNotBound { ref_name: String, bindings: Vec<String> },
+    CollectionMismatch { bound: String, found_under: String },
+    BackRefMissing { ref_name: String },
+    BackRefMismatch { ref_name: String },
+    BackCollectionRefMissing { collection_id: String, ref_name: String },
+    BackCollectionRefMismatch { collection_id: String, ref_name: String },
+}
 ```
 
 ## Commit / tree value types
@@ -478,6 +545,16 @@ impl FileObject {
 
 /// One ref stored as an alias.
 pub struct RefAlias { pub refspec: String, pub target: String }
+
+/// One collection-qualified ref. `local` says the ref lives under
+/// `refs/heads`, qualified by the repository's own collection id, rather than
+/// under `refs/mirrors`.
+pub struct CollectionRefEntry {
+    pub collection: String,
+    pub name: String,
+    pub commit: Checksum,
+    pub local: bool,
+}
 
 /// Whether a refspec names a path under `refs/`: a ref name, optionally
 /// preceded by a `<remote>:` prefix. A refspec that would leave the tree is

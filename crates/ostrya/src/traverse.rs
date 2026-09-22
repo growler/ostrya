@@ -198,6 +198,27 @@ impl Repo {
         ostrya_rt::unblock(move || list_objects_blocking(repo.objects_fd())).await
     }
 
+    /// List the checksums of the loose objects of one type, sorted.
+    ///
+    /// The enumeration is the one [`list_objects`](Repo::list_objects) makes,
+    /// with the type read off the entry's extension before its name is parsed,
+    /// so a caller after one type pays for no other type's name.
+    pub(crate) async fn list_objects_of_type(&self, ty: ObjectType) -> Result<Vec<Checksum>> {
+        let repo = self.clone();
+        let mut names = ostrya_rt::unblock(move || -> Result<Vec<Checksum>> {
+            let mut out = Vec::new();
+            for_each_object(
+                repo.objects_fd(),
+                |candidate| candidate == ty,
+                |name| out.push(name.checksum),
+            )?;
+            Ok(out)
+        })
+        .await?;
+        names.sort();
+        Ok(names)
+    }
+
     /// Count the loose objects under `objects/` whose type `keep` admits.
     ///
     /// The enumeration is the one [`list_objects`](Repo::list_objects) makes
@@ -596,9 +617,16 @@ pub(crate) fn reaches_at_least(prev: i32, depth: i32) -> bool {
 /// Call `f` with the [`ObjectName`] of each loose object under an `objects/`
 /// directory fd.
 ///
+/// `keep` is read off the entry's extension, before its checksum is parsed, so
+/// a caller after one type pays for no other type's hexadecimal.
+///
 /// The enumeration holds one directory open at a time and borrows each entry
 /// name from the reader, so it allocates nothing per object.
-fn for_each_object(objects_fd: BorrowedFd<'_>, mut f: impl FnMut(ObjectName)) -> Result<()> {
+fn for_each_object(
+    objects_fd: BorrowedFd<'_>,
+    keep: impl Fn(ObjectType) -> bool,
+    mut f: impl FnMut(ObjectName),
+) -> Result<()> {
     for_each_dir_name(objects_fd, |fanout| {
         // Object fanout directories are exactly two hex characters; anything
         // else under `objects/` (a stray file, a cache directory) is not a
@@ -617,7 +645,7 @@ fn for_each_object(objects_fd: BorrowedFd<'_>, mut f: impl FnMut(ObjectName)) ->
             Err(e) => return Err(Error::Io(e.into())),
         };
         for_each_dir_name(dir.as_fd(), |entry| {
-            if let Some(name) = parse_object_entry(fanout, entry) {
+            if let Some(name) = parse_object_entry(fanout, entry, &keep) {
                 f(name);
             }
             Ok(())
@@ -628,9 +656,13 @@ fn for_each_object(objects_fd: BorrowedFd<'_>, mut f: impl FnMut(ObjectName)) ->
 /// Enumerate loose objects under an `objects/` directory fd.
 fn list_objects_blocking(objects_fd: BorrowedFd<'_>) -> Result<HashSet<ObjectName>> {
     let mut out = HashSet::new();
-    for_each_object(objects_fd, |name| {
-        out.insert(name);
-    })?;
+    for_each_object(
+        objects_fd,
+        |_| true,
+        |name| {
+            out.insert(name);
+        },
+    )?;
     Ok(out)
 }
 
@@ -641,22 +673,28 @@ fn count_objects_blocking(
     keep: impl Fn(ObjectType) -> bool,
 ) -> Result<usize> {
     let mut count = 0usize;
-    for_each_object(objects_fd, |name| {
-        if keep(name.ty) {
-            count += 1;
-        }
+    for_each_object(objects_fd, keep, |_| {
+        count += 1;
     })?;
     Ok(count)
 }
 
 /// Parse one `objects/<fanout>/<rest>.<ext>` entry into an [`ObjectName`], or
-/// `None` when the name is not a valid loose object.
-fn parse_object_entry(fanout: &str, entry: &str) -> Option<ObjectName> {
+/// `None` when the name is not a valid loose object or `keep` refuses its
+/// type.
+fn parse_object_entry(
+    fanout: &str,
+    entry: &str,
+    keep: &impl Fn(ObjectType) -> bool,
+) -> Option<ObjectName> {
     let (rest, ext) = entry.rsplit_once('.')?;
     if fanout.len() != 2 || rest.len() != 62 {
         return None;
     }
     let ty = ObjectType::from_extension(ext)?;
+    if !keep(ty) {
+        return None;
+    }
     let mut hex = [0u8; 64];
     hex[..2].copy_from_slice(fanout.as_bytes());
     hex[2..].copy_from_slice(rest.as_bytes());

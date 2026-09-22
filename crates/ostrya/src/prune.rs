@@ -71,20 +71,14 @@
 use std::collections::HashSet;
 use std::os::fd::BorrowedFd;
 
-use ostrya_core::{
-    Checksum, DictBuilder, ObjectName, ObjectType, RepoMode, Type, loose_path, to_bytes,
-};
+use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, loose_path};
 use rustix::fs::AtFlags;
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::repo::Repo;
+use crate::tombstone::write_tombstone;
 use crate::traverse::ParentBound;
-
-/// The GVariant type a `.tombstone-commit` object holds.
-const TOMBSTONE_SIGNATURE: &str = "a{sv}";
-/// The one key a `.tombstone-commit` dict carries.
-const TOMBSTONE_KEY: &str = "commit";
 
 /// Options controlling [`Repo::prune`].
 #[derive(Debug, Clone)]
@@ -508,7 +502,7 @@ impl Repo {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
             if sweep.tombstones {
-                write_tombstone(repo.objects_fd(), &commit, &sweep)?;
+                write_tombstone(repo.objects_fd(), &commit, sweep.mode, sweep.fsync)?;
             }
             let commit_path = loose_path(&commit, ObjectType::Commit, mode);
             unlink_optional(repo.objects_fd(), &commit_path)?;
@@ -563,7 +557,7 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
         };
         if !sweep.no_prune {
             if sweep.tombstones && name.ty == ObjectType::Commit {
-                write_tombstone(objects_fd, &name.checksum, sweep)?;
+                write_tombstone(objects_fd, &name.checksum, sweep.mode, sweep.fsync)?;
             }
             unlink_optional(objects_fd, &path)?;
             if name.ty == ObjectType::Commit {
@@ -578,22 +572,6 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
         freed += size;
     }
     Ok((count, freed))
-}
-
-/// Write the `.tombstone-commit` marker naming `commit`.
-///
-/// The object is the `a{sv}` holding one `commit` key whose `ay` value is the
-/// commit checksum in lowercase hex, NUL-terminated
-/// (`docs/format-reference.md`, "Object types").
-fn write_tombstone(objects_fd: BorrowedFd<'_>, commit: &Checksum, sweep: &Sweep) -> Result<()> {
-    let mut payload = commit.to_hex().into_bytes();
-    payload.push(0);
-    let mut builder = DictBuilder::new();
-    builder.insert_bytes(TOMBSTONE_KEY, &payload);
-    let ty = Type::parse(TOMBSTONE_SIGNATURE).map_err(ostrya_core::Error::from)?;
-    let bytes = to_bytes(&ty, &builder.build()).map_err(ostrya_core::Error::from)?;
-    let dest = loose_path(commit, ObjectType::TombstoneCommit, sweep.mode);
-    crate::commit::write_detached_blocking(objects_fd, &dest, &bytes, sweep.fsync, sweep.mode)
 }
 
 /// Unlink a path relative to `dir`, treating an already-absent file as success.

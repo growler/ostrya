@@ -79,7 +79,10 @@ no error, and `log` does not read them.
 A prune writes the marker for every commit it removes where the command line
 carries `--delete-commit` or the repository config sets
 `[core] tombstone-commits`. A marker is never pruned itself and is counted in
-neither number a prune reports.
+neither number a prune reports. `fsck --add-tombstones` writes the same bytes
+for every commit whose parent commit object is absent, removing that commit
+object in the same step and needing no config key ("CLI output formats",
+`fsck`).
 
 The is-meta predicate is `t` in 2..=6. Types 7/8/9 are not "meta" despite being
 auxiliary. The checksum rules key off the is-meta predicate. The `z` loose-path
@@ -5052,3 +5055,217 @@ The bytes a deleted `.commitmeta` freed are not in the sum, the object not
 being in the count. Every measurement here was taken under `LC_ALL=C.UTF-8`,
 which renders the decimal separator as `.`
 (`conformance/cli-surface.md`, "prune").
+
+### `fsck`
+
+The command writes its phase lines and its summary lines to standard output,
+and every finding and every `error: ` line to standard error. The tool writes
+a progress line to standard output as well, which the port does not
+(`../conformance/cli-surface.md`, "fsck").
+
+#### The phase lines
+
+A run writes four phase lines, in this order, one as it enters each phase.
+
+```
+Validating refs...
+Validating refs in collections...
+Enumerating commits...
+Verifying content integrity of <N> commit objects...
+```
+
+A run that ends inside a phase writes the lines up to and including that
+phase. `-q`/`--quiet` suppresses these four lines and nothing else: the
+tombstone lines, the partial-commit line, the summary line, and every finding
+are still written.
+
+`<N>` is the number of commit objects in the store that carry no
+`state/<commit>.commitpartial` marker.
+
+Phase 1 reads every ref under `refs/heads` and `refs/remotes` and loads the
+commit object each names. Phase 2 reads every collection-qualified ref -- the
+local refs qualified by the repository's own `[core] collection-id`, plus the
+refs under `refs/mirrors/<collection-id>/` -- and loads the same way. Both
+phases verify the commit object's checksum. Phase 3 lists the commit objects
+and separates the ones already marked partial. Phase 4 walks the objects the
+verified commits reference and verifies each.
+
+#### The progress line
+
+The tool writes a progress line to standard output. The port writes none: its
+report carries the object count and its terminal output reports no progress
+(`../conformance/cli-surface.md`, "fsck").
+
+```
+fsck objects (<n>/<total>) <pct>%
+```
+
+`<n>` is the count of objects verified, `<total>` the count of distinct
+objects the verified commits reference, and `<pct>` is
+`floor(n * 100 / total)`. The tool writes the first update, the last one, and
+about one more a second between them, so a short run writes two lines and a
+long run writes more. A run that ends before it verifies an object writes
+none, and a run over a store of zero objects writes none either.
+
+`<total>` counts the objects the verified commits reach, present or absent,
+and not the loose objects on disk. An object reachable only from a commit the
+run skipped is outside it, an object that is referenced and absent is inside
+it, detached commit metadata (`.commitmeta`) is outside it, and a static delta
+is outside it. `FsckReport::objects_checked` is the port's own count over the
+same set.
+
+#### The summary lines
+
+```
+object fsck of <N> commits completed successfully - no errors found.
+<N> partial commits not verified
+```
+
+The first line closes a run that found no fault and skipped no commit, and
+goes to standard output at exit 0. The second states the commits phase 3
+skipped, goes to standard output, and is paired with
+`error: <N> partial commits from fsck-detected corruption` on standard error
+at exit 1. `--add-tombstones` suppresses the standard-output line and keeps
+the error line.
+
+#### The findings
+
+A faulty object draws one line naming the commits that reach it.
+
+```
+In commits <c>, <c>: fsck content object <checksum>: Corrupted file object; checksum expected='<name>' actual='<computed>'
+In commits <c>, <c>: fsck <checksum>.<type>: Corrupted <type> object; checksum expected='<name>' actual='<computed>'
+Object missing in commits <c>, <c>: <checksum>.<type>
+```
+
+`<type>` is the mode-independent type string, so a content object is `file`
+even in an `archive` repository, where the loose object is a `.filez`. A
+commit object a ref names is read by phase 1 or phase 2, which reaches no
+commit through it, so its finding drops the `In commits <list>: ` prefix.
+
+The tool's run carrying neither `-a/--all` nor `--delete` ends at the first
+object whose checksum does not match and writes that finding as its own
+`error: ` line. Every other run of the tool, and every run of the port, writes
+each finding plain and closes with `error: Repository corruption encountered`.
+An object that is absent never ends a run, whatever the switches: it is
+reported and the walk goes on. Every commit that reaches an absent object is
+marked partial, each marking drawing
+
+```
+Marking commit as partial: <commit>
+```
+
+A checksum mismatch marks no commit by itself. Under `--delete` the object is
+unlinked and the commits that reach it are then marked.
+
+A metadata object whose bytes do not read as the type its name gives it is
+outside that. The port reports the mismatch, unlinks nothing, and marks
+nothing: an object it cannot read at its own type is an object it cannot say
+the repository is better without. The tool reads such an object under
+GVariant's own rules for data that is not in normal form, and what it does
+next follows what those rules yield (`../conformance/cli-surface.md`,
+"fsck").
+
+The port's run never ends at a fault it can read past, so it reports every
+faulty object one walk reaches and marks every commit an absent object leaves
+incomplete. It ends a run where it cannot read what it must read next -- a ref
+over an absent commit object and an absent dirtree -- and where a binding check
+fails (`../conformance/cli-surface.md`, "fsck").
+
+A dirtree that is absent ends the run, the subtree beneath it being
+unreadable, and marks nothing:
+
+```
+error: No such metadata object <checksum>.dirtree
+```
+
+A ref over a commit object the store does not hold ends the run in the phase
+that read the ref:
+
+```
+Object missing: <checksum>.commit
+error: Loading commit for ref <name>: No such metadata object <checksum>.commit
+```
+
+`<name>` is the bare ref name for a ref under `refs/heads` or `refs/remotes`,
+the remote prefix dropped, and `(<collection-id>, <name>)` for a ref under
+`refs/mirrors`.
+
+#### The binding checks
+
+`--verify-bindings` adds one check to each of the two ref phases, and each
+ends the run at its first failure whatever the other switches say. A commit
+carrying no `ostree.ref-binding` key passes.
+
+```
+error: Commit <c>: Commit has no requested ref ‘<ref>’ in ref binding metadata (‘a’, ‘b’)
+error: Commit <c>: Commit has collection ID ‘<bound>’ in collection binding metadata, while the remote it came from has collection ID ‘<found>’
+```
+
+The parenthetical lists the stored bindings in stored order, each in U+2018
+and U+2019 quotes, separated by `, `, and reads `(no refs)` for an empty list.
+
+`--verify-back-refs` adds a per-commit check to the enumerate phase, over
+every commit object in the store. Each name in a commit's
+`ostree.ref-binding` must name a ref that resolves to that commit, the refs
+under `refs/remotes` counting by their bare names, and where the commit
+carries an `ostree.collection-binding` the collection ref `(binding, name)`
+must exist and resolve to it as well.
+
+```
+error: Ref ‘<name>’ in bindings for commit <c> does not exist
+error: Ref ‘<name>’ in bindings for commit <c> does not resolve to that commit
+error: Collection–ref (<id>, <name>) in bindings for commit <c> does not exist
+error: Collection–ref (<id>, <name>) in bindings for commit <c> does not resolve to that commit
+```
+
+The dash in `Collection–ref` is U+2013 EN DASH. The check fails on any branch
+carrying more than one commit, the parent holding the branch name its tip
+resolves to.
+
+The two options are independent. Naming `--verify-back-refs` alone runs the
+back-reference check alone, and the order the two are written in makes no
+difference, the bindings check running first because its phase runs first.
+
+#### `--add-tombstones`
+
+The option acts on a commit object whose `parent` names a commit object the
+store does not hold. It deletes that commit object, writes the
+`.tombstone-commit` naming it, and writes one line after the object walk:
+
+```
+Adding tombstone for commit <commit>
+```
+
+The step runs after the object walk. The tool's run that ended at its first
+fault never reaches it and writes no tombstone, and `-a` and `--delete` carry
+that walk to its end so the step then runs beside the findings. The port's walk
+always reaches its end, so the port holds the step to the same condition
+directly: it acts after a walk that found a corrupt object under `-a` or
+`--delete` alone. An absent object ends no walk, so the step runs beside one
+under neither switch (`../conformance/cli-surface.md`, "fsck").
+
+The absence is read against the object listing the run took at its start, so
+one run removes one generation, and a branch whose history is broken loses one
+commit per run. The run exits 0: an absent parent commit is not a fault, and a
+run with no option over the same repository reports nothing. The option needs
+no `[core] tombstone-commits` setting, and an existing tombstone for the
+absent parent does not suppress the action. The branch ref is left standing
+over the deleted commit, so the next run ends in the ref phase.
+
+#### Exit status
+
+- 0 -- the repository is sound, or the only condition found is an absent
+  parent commit.
+- 1 -- any faulty object, any commit skipped as already partial, any ref over
+  an absent commit, any absent dirtree, and any binding failure.
+
+`-q` never changes an exit status. In the tool, `--delete` continues past the
+first fault whether or not `-a` is given, and `-a` carries the ref phase and
+the collection phase past a commit object whose checksum does not match, as it
+carries the object walk. It carries nothing past a ref over an absent commit
+object, a `--verify-bindings` failure, or a `--verify-back-refs` failure: each
+of those ends the run where it stands. The port's walk runs to the end whatever
+the switches say, so it reads `-a` as the permission `--add-tombstones` needs
+to act after a walk that found a corrupt object, and it ends a run at the same
+three conditions. `-a` changes no exit status in either implementation.

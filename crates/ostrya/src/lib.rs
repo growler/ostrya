@@ -217,6 +217,7 @@ mod staging;
 pub mod staging_tree;
 pub mod summary;
 pub mod tar;
+mod tombstone;
 pub mod transaction;
 pub mod traverse;
 pub mod tree;
@@ -235,7 +236,10 @@ pub use fetch::{
     Protocol, Proxy, Target, TlsOptions, TrustRoots, Validators,
 };
 pub use file::{ContentReader, FileKind, FileObject};
-pub use fsck::{FsckError, FsckErrorKind, FsckOptions, FsckReport};
+pub use fsck::{
+    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
+    FsckPhase, FsckReport,
+};
 #[cfg(feature = "sign-gpg")]
 pub use gpg::GpgSigner;
 #[cfg(feature = "verify-gpg")]
@@ -261,7 +265,7 @@ pub use pull::{
     PullVerify, TimestampCheck,
 };
 pub use read::{CommitSizes, CommitState, MetadataReader};
-pub use refs::{CollectionRef, RefAlias, validate_refspec};
+pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};
 pub use sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, SignFuture, SignKeys,

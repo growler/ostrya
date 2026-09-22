@@ -10076,3 +10076,520 @@ note: a name of that shape reaches a repository by an out-of-band write alone,
  states the pair over `odd~1` and `main^`, the two spellings of the one class.
  The character class itself is deferred; adopting it tightens `resolve_rev`,
  `commit -b`, and every pull path at once.
+
+# ---------------------------------------------------------------------------
+# fsck -- the option set, the output format, and the two verification
+# passes (Phase 17f, F19).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: fsck
+cell: fsck/clean-default
+setup: repo-with-commit
+run: fsck --repo=$REPO
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#fsck
+note: the five lines a sound one-commit repository writes: the four phase
+ lines and the summary line. The tool writes a progress line on top of them,
+ which the port does not write at all, so the block is dropped from both sides
+ before the comparison (`cli-surface.md`, "fsck").
+
+family: M10
+subcommand: fsck
+cell: fsck/clean-quiet
+setup: repo-with-commit
+run: fsck --repo=$REPO -q
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#fsck
+note: `-q` suppresses the four phase lines and nothing else. The summary line
+ is still written, which is what parts this cell from `fsck/clean-default`
+ above.
+
+family: M10
+subcommand: fsck
+cell: fsck/clean-quiet-long
+setup: repo-with-commit
+run: fsck --repo=$REPO --quiet
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#fsck
+note: `-q` and `--quiet` are one flag, so this cell and `fsck/clean-quiet`
+ above write the same lines.
+
+family: M10
+subcommand: fsck
+cell: fsck/clean-all
+setup: repo-with-commit
+run: fsck --repo=$REPO -a
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#fsck
+note: `-a` decides where the tool's run ends once a fault is found, and in the
+ port it releases the `--add-tombstones` step after a walk that found a corrupt
+ object, so over a sound repository both write the text of
+ `fsck/clean-default` above.
+
+family: M10
+subcommand: fsck
+cell: fsck/clean-delete
+setup: repo-with-commit
+run: fsck --repo=$REPO --delete
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#fsck
+note: a run that finds no fault unlinks nothing, so the `inventory` oracle
+ states that the option left every object where it stands.
+
+family: M10
+subcommand: fsck
+cell: fsck/clean-add-tombstones
+setup: repo-with-commit
+run: fsck --repo=$REPO --add-tombstones
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#fsck
+note: the setup's one commit has no parent, so no commit meets the condition
+ the option acts on and no marker is written. The `inventory` oracle states
+ that.
+
+family: M10
+subcommand: fsck
+cell: fsck/clean-verify-bindings
+setup: repo-with-commit
+run: fsck --repo=$REPO --verify-bindings
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#fsck
+note: the setup commit carries its own branch in its `ostree.ref-binding`, and
+ the repository sets no collection id, so both phases pass.
+
+family: M10
+subcommand: fsck
+cell: fsck/clean-verify-back-refs
+setup: repo-with-commit
+run: fsck --repo=$REPO --verify-back-refs
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text inventory
+outcome: full
+severity: interop
+spec: format-reference.md#fsck
+note: the setup's single commit is its branch's tip, so the name its binding
+ carries resolves to it. A branch carrying a second commit fails the check,
+ which `fsck/verify-back-refs-non-tip` below states.
+
+family: M10
+subcommand: fsck
+cell: fsck/corrupt-no-switch-continues
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: one object whose checksum does not match, with neither `-a` nor
+ `--delete`. The tool ends the run there, writes that one finding as its own
+ `error: ` line, and writes no closing line; the port carries the walk to its
+ end, writes every finding plain, and closes with
+ `error: Repository corruption encountered` (`cli-surface.md`, "fsck").
+evidence: ostrya_cli::cli::fsck_corruption_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two exit 1 and leave the same repository, so the exit status and the
+ object and `state/` inventory are what the cited test compares, and the port's
+ own text is stated beside them. A corrupt object reaches a repository by an
+ out-of-band write alone, which the cited test performs.
+
+family: M10
+subcommand: fsck
+cell: fsck/corrupt-all-continues
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_corruption_matches_the_tool
+spec: format-reference.md#fsck
+note: `-a` runs the tool's walk to its end, and the port's walk reaches its
+ end with or without the switch, so both write each finding without the
+ `error: ` prefix and close with `error: Repository corruption encountered` at
+ exit 1.
+
+family: M10
+subcommand: fsck
+cell: fsck/corrupt-metadata-wording
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_corruption_matches_the_tool
+spec: format-reference.md#fsck
+note: a metadata object's finding names it as `<checksum>.<type>` and reads
+ `Corrupted <type> object`, where a content object's names the checksum alone
+ and reads `Corrupted file object`. The cited test states the pair over a
+ dirtree and over a commit object.
+
+family: M10
+subcommand: fsck
+cell: fsck/delete-removes-and-marks
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_delete_matches_the_tool
+spec: format-reference.md#fsck
+note: `--delete` unlinks every object whose checksum does not match and marks
+ every commit that reaches one partial. It carries the tool's walk past the
+ first fault, and the port's walk reaches the end of the object set whatever
+ the switches carry.
+
+family: M10
+subcommand: fsck
+cell: fsck/delete-inventory
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_delete_matches_the_tool
+spec: format-reference.md#fsck
+note: the `objects/` tree and the `state/` tree a `--delete` run leaves agree
+ between the two, which the cited test states by running the comparison again
+ over the repository the first run left.
+
+family: M10
+subcommand: fsck
+cell: fsck/missing-content-marks-partial
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_missing_object_matches_the_tool
+spec: format-reference.md#fsck
+note: an absent content object or dirmeta is collected during the walk and
+ reported after it, the walk still reaching the end of the object set, and
+ every commit that reaches it is marked partial. The suffix the message names
+ is `.file` in every mode, including `archive`, where the loose object is a
+ `.filez`.
+
+family: M10
+subcommand: fsck
+cell: fsck/missing-dirtree-aborts
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_missing_object_matches_the_tool
+spec: format-reference.md#fsck
+note: an absent dirtree ends the run with
+ `error: No such metadata object <c>.dirtree` and marks nothing, in both
+ implementations. `-a` reproduces it unchanged, the subtree being unreadable
+ either way, and it is one of the three conditions the port still ends a run at
+ (`cli-surface.md`, "fsck").
+
+family: M10
+subcommand: fsck
+cell: fsck/partial-commit-skipped
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_partial_commit_matches_the_tool
+spec: format-reference.md#fsck
+note: a commit carrying a `state/<commit>.commitpartial` marker is outside the
+ commit count, its objects are outside the object set, and the run
+ writes `<N> partial commits not verified` on standard output and
+ `error: <N> partial commits from fsck-detected corruption` on standard error
+ at exit 1. `-q` and `-a` leave both lines in place.
+
+family: M10
+subcommand: fsck
+cell: fsck/partial-line-suppressed-by-tombstones
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_partial_commit_matches_the_tool
+spec: format-reference.md#fsck
+note: `--add-tombstones` drops the standard-output count line and keeps the
+ error line, so the exit status stands and the text parts from
+ `fsck/partial-commit-skipped` above.
+
+family: M10
+subcommand: fsck
+cell: fsck/add-tombstones-writes-and-deletes
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_add_tombstones_matches_the_tool
+spec: format-reference.md#fsck format-reference.md#object-types
+note: the child of an absent parent commit is deleted and tombstoned, one
+ `Adding tombstone for commit <c>` line is written after the walk, and the run
+ exits 0. The marker holds the 78 bytes `format-reference.md`, "Object types"
+ records, which the cited test compares between the two byte for byte. A run
+ with no option over the same repository reports nothing and writes nothing.
+
+family: M10
+subcommand: fsck
+cell: fsck/add-tombstones-cascade
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_add_tombstones_matches_the_tool
+spec: format-reference.md#fsck
+note: the absence is read against the object listing the run took at its
+ start, so each run walks the branch back one commit. The run after the last
+ one ends in the ref phase, the branch ref standing over the commit the
+ previous run removed.
+
+family: M10
+subcommand: fsck
+cell: fsck/verify-bindings-extra-ref
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_verify_bindings_matches_the_tool
+spec: format-reference.md#fsck
+note: a second ref at a commit bound to one branch alone fails the ref-phase
+ check at exit 1, and `-a` does not make the phase continue. The parenthetical
+ lists the stored bindings in stored order and reads `(no refs)` for an empty
+ list. A remote ref is matched by its bare name.
+
+family: M10
+subcommand: fsck
+cell: fsck/verify-bindings-collection
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_verify_bindings_matches_the_tool
+spec: format-reference.md#fsck
+note: a commit whose `ostree.collection-binding` is not the collection id its
+ collection ref sits under fails in the collection phase. The cited test makes
+ the case by changing `[core] collection-id` after the commit was written.
+
+family: M10
+subcommand: fsck
+cell: fsck/verify-back-refs-non-tip
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_verify_back_refs_matches_the_tool
+spec: format-reference.md#fsck
+note: the check fails on any branch carrying more than one commit, the parent
+ holding the branch name its tip resolves to. The collection form fails the
+ same way over a collection ref the store no longer holds.
+
+family: M10
+subcommand: fsck
+cell: fsck/verify-back-refs-absent-ref
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_verify_back_refs_matches_the_tool
+spec: format-reference.md#fsck
+note: a bound name that names no ref draws the `does not exist` form, where a
+ bound name that names another commit draws the `does not resolve to that
+ commit` form. The names are walked in stored order.
+
+family: M10
+subcommand: fsck
+cell: fsck/verify-back-refs-does-not-imply-bindings
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_verify_back_refs_matches_the_tool
+spec: format-reference.md#fsck
+note: the tool's help text states that `--verify-back-refs` implies
+ `--verify-bindings`; the two checks are independent in both implementations.
+ The repository `--verify-bindings` refuses passes `--verify-back-refs`, and
+ only naming both runs both, in either written order.
+
+family: M10
+subcommand: fsck
+cell: fsck/dangling-ref-ends-run
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_dangling_ref_matches_the_tool
+spec: format-reference.md#fsck
+note: a ref over a commit object the store does not hold writes
+ `Object missing: <c>.commit` and
+ `error: Loading commit for ref <name>: No such metadata object <c>.commit`,
+ both on standard error, and ends the run at exit 1. A remote ref is named by
+ its bare name, the remote prefix dropped.
+
+family: M10
+subcommand: fsck
+cell: fsck/dangling-mirror-ref-ends-run
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_dangling_ref_matches_the_tool
+spec: format-reference.md#fsck
+note: a ref under `refs/mirrors/<collection-id>/` is read by the collection
+ phase and is named `(<collection-id>, <name>)` in the same two lines. A name
+ directly under `refs/mirrors`, carrying no collection component, is read by
+ neither implementation.
+
+family: M10
+subcommand: fsck
+cell: fsck/repeated-flag-refused
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag, the class `export/no-xattrs-given-twice` and
+ `prune/commit-only-repeated` already record. The tool takes a second `-a`,
+ `-q`, `--delete`, `--add-tombstones`, `--verify-bindings`, or
+ `--verify-back-refs` and runs the command; the port refuses it at exit 1
+ (`cli-surface.md`, "fsck").
+evidence: ostrya_cli::cli::fsck_argument_handling_parts_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ cited test states the six flags together.
+
+family: M10
+subcommand: fsck
+cell: fsck/positional-ignored
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: a positional argument. `fsck` takes none, and the tool accepts one and
+ ignores it, running as if it were absent; the port refuses it with `clap`'s
+ own `error: unexpected argument '<value>' found` at exit 1
+ (`cli-surface.md`, "fsck").
+evidence: ostrya_cli::cli::fsck_argument_handling_parts_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+
+family: M10
+subcommand: fsck
+cell: fsck/no-mark-partial-extension
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_no_mark_partial_survives_the_new_options
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `--no-mark-partial` is a port extension the tool has no counterpart for,
+ so the cited test states the port's own claim and compares nothing. The
+ extension keeps working under the options `F19` adds: a
+ `--delete --no-mark-partial` run unlinks the faulty object and writes no
+ marker, so the next run verifies the commit again rather than skipping it.
+
+family: M10
+subcommand: fsck
+cell: fsck/missing-continues-the-walk
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_missing_object_does_not_end_the_walk
+spec: format-reference.md#fsck
+note: an absent object never ends a run, whatever the switches. Over two
+ branches each missing one content object, both implementations report both
+ findings, mark both commits partial, and carry the walk to the end of the
+ object set. Beside a mismatch the two part, the tool's no-switch run ending at
+ the mismatch, so the cited test compares the pair under `-a` and states the
+ port's own text for the run with no switch.
+
+family: M10
+subcommand: fsck
+cell: fsck/reports-every-fault
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the faults a run reports over a repository holding more than one, with
+ neither `-a` nor `--delete`. The port carries the walk to its end, so it
+ reports every fault and marks every commit an absent object leaves
+ incomplete; the tool ends at the first fault its own walk order reaches, so
+ its findings and its `state/` markers are a subset of the port's
+ (`cli-surface.md`, "fsck").
+evidence: ostrya_cli::cli::fsck_reports_every_fault_the_tool_ends_at
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the cited test builds three branches, corrupts one branch's commit
+ object, and removes one content object under each of the other two. The port
+ reports every fault and marks both incomplete commits; the tool reports the
+ one its ref phase ends at and marks none. `-a` and `--delete` carry the tool
+ to the end of the object set and the two agree again.
+
+family: M10
+subcommand: fsck
+cell: fsck/add-tombstones-under-all
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_add_tombstones_follows_the_all_switch
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: over a repository holding both a corrupt object and a commit whose
+ parent is absent, the tombstone step runs in both implementations under `-a`
+ and under `--delete`, and in neither with no switch. The tool's walk reaches
+ the step under those switches and the port's `all` field releases it, which
+ is the `-a` divergence `cli-surface.md`, "fsck", records. An absent object
+ ends no walk, so the step runs beside one under no switch in both. The cited
+ test compares the object and `state/` inventory in every arm.
+
+family: M10
+subcommand: fsck
+cell: fsck/delete-needs-no-all
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_add_tombstones_follows_the_all_switch
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `--delete` unlinks the same objects and marks the same commits with `-a`
+ and without it. The two arms leave one repository in each implementation and
+ the two implementations agree, so the option takes no gate of its own.
+
+family: M10
+subcommand: fsck
+cell: fsck/broken-framing-dirtree-untouched
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_leaves_a_broken_framing_dirtree_alone
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: over a dirtree whose appended byte reads as a framing offset inside the
+ object, both implementations exit 1 and leave the repository as they found
+ it, under no switch, under `-a`, and under `--delete`. Each names the fault
+ in its own words, which is the framing divergence `cli-surface.md`, "fsck",
+ records; the object inventory is the oracle the cited test reads.
+
+family: M10
+subcommand: fsck
+cell: fsck/broken-framing-dirtree-kept
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: a dirtree whose appended byte reads as a framing offset past the
+ object's own end. The tool's reader yields an empty dirtree, so the tool
+ checksums the object and `--delete` unlinks it and marks the commit partial;
+ the port's reader takes normal-form input alone, refuses the object, and
+ keeps both (`cli-surface.md`, "fsck").
+evidence: ostrya_cli::cli::fsck_leaves_a_broken_framing_dirtree_alone
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two exit 1 either way, so the exit status reads the same and the
+ object inventory is what parts. The port keeps an object it cannot read at
+ its own type rather than removing one the tool may preserve.

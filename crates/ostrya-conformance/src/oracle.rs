@@ -453,9 +453,15 @@ fn substitute(text: &str, bindings: &BTreeMap<String, String>) -> String {
     text
 }
 
+/// Whether one line reports progress rather than a result.
+///
+/// A rate or an elapsed time names one. `fsck` names its own, which the tool
+/// writes and the port does not
+/// (`docs/conformance/cli-surface.md`, "fsck").
 fn is_progress(line: &str) -> bool {
     let lowered = line.to_ascii_lowercase();
-    lowered.contains("elapsed")
+    lowered.starts_with("fsck objects (")
+        || lowered.contains("elapsed")
         || ["b/s", "kb/s", "mb/s", "gb/s", "kib/s", "mib/s"]
             .iter()
             .any(|rate| lowered.contains(rate))

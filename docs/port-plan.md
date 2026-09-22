@@ -5492,6 +5492,132 @@ validates against is skipped by the tool's enumeration, so its
 executable and all 21 pass; the conformance run reports 856 cells and 350
 passes.
 
+`F19` completes `fsck`. The CLI gained `--add-tombstones`, `-q/--quiet`,
+`-a/--all`, `--delete`, `--verify-bindings`, and `--verify-back-refs`, and the
+command's whole output format is recovered and recorded in
+`format-reference.md`, "CLI output formats", `fsck`: four phase lines, three
+summary forms, the finding sentences with their `In commits <list>` prefix,
+the six binding sentences, the exit statuses, and the tool's progress line,
+whose percentage is `floor(n * 100 / total)` and which the port does not
+write.
+
+`Repo::fsck` is restructured into the tool's four phases, and the phase
+boundaries are what the CLI's lines follow. Phase 1 loads and checksums the
+commit each ref under `refs/heads` and `refs/remotes` names. Phase 2 does the
+same for every collection-qualified ref, which is the local refs qualified by
+the repository's own `[core] collection-id` together with the refs under
+`refs/mirrors/<collection-id>/`. Phase 3 lists the commit objects and
+separates the ones already carrying a `state/<commit>.commitpartial` marker.
+Phase 4 collects the objects the verified commits reference and verifies each
+one. `FsckReport` carries the phase the run reached, so the CLI writes one
+line per phase entered and nothing for a phase the run never reached.
+
+The object walk splits into a collecting pass and a verifying pass. The
+collecting pass builds the distinct object set with one visited set for the
+whole run, so a subtree two commits share is read once, and it names the
+absent dirtree that ends a run. The verifying pass examines every object in
+that set, whatever the findings before it, streaming every content payload
+through one read buffer of
+`write.rs`'s `COPY_CHUNK`, so a store of many small objects allocates one
+buffer and not one per object. Which commits reach a faulty object is then
+recovered by a third pass, over the verified commits, and that pass runs only
+where the run found a fault. It carries the faulty set into the walk and
+records the hits alone, so its memory follows the count of findings and not
+the size of a tree; holding the commit list of every object during the walk
+would cost one entry per (commit, object) pair, which is the product of the
+two counts for a store whose commits share a tree.
+
+Two costs the item leaves standing. Each content object is opened twice: the
+header is read through `load_file`, whose descriptor is dropped, and
+`reader()` opens the object again and seeks past the header. A
+`FileObject::into_reader` that carried the descriptor forward would close
+that, and it is a larger change than this command. And the verifying pass is
+sequential, one object in flight, so the handoff to the blocking pool is a
+measurable share of a run over many small objects. The `Slots` driver Phase
+16c built is the shape that would fix it, and the walk runs to its end over
+the whole object set whatever the switches carry, so the driver is bounded by
+nothing but the set itself.
+
+Phase 3 lists the commit objects through `list_objects_of_type`, which reads
+each entry's type off its extension and parses the checksum of that type
+alone, so a store of many objects and few commits is not hexadecimal-parsed
+end to end. The refs the four phases read are read once, at the head of the
+run, and passed down.
+
+`FsckOptions` gained `delete`, `add_tombstones`, `verify_bindings`, and
+`verify_back_refs`. It keeps `Debug` and `Clone`, and `Repo::fsck` keeps its
+`&FsckOptions` signature: the command reports nothing per object, so it needs
+no per-object callback and the call takes no `&mut`. The added fields are a
+breaking change to the struct alone, which takes a minor version, the struct
+carrying no `#[non_exhaustive]` by decision 14. `all` carries the tool's
+`-a/--all` under a meaning of the port's own: the walk runs to its end whatever
+the switches carry, so the field selects whether the destructive
+`add_tombstones` step may act after a walk that found a corrupt object.
+`FsckReport` gained `reached`,
+`commits_partial`, `marked_partial`, `deleted`,
+`tombstoned`, and `failure`; `FsckError` gained `in_commits`; and
+`FsckBindingError`, `FsckBindingErrorKind`, `FsckFailure`, and `FsckPhase` are
+new. A binding check and a ref over an absent commit end a run rather than
+adding a finding, and `failure` carries which of them did, so a caller reads
+one report for every ending a run takes and `Repo::fsck` still returns `Err`
+for an I/O fault alone.
+
+Two moves came with the item. The `.tombstone-commit` writer moved out of
+`prune.rs` into `crates/ostrya/src/tombstone.rs` and takes the repository mode
+and the fsync policy directly, so `prune` and `fsck --add-tombstones` write the
+marker through one call. The collection-ref listing moved out of the CLI into
+`Repo::list_collection_refs`, which returns the new public
+`CollectionRefEntry`, so `refs --collections`, `refs -c --delete`, and `fsck`
+share one definition of what a repository's collection refs are.
+
+One behavior of the port's own default changed. A commit already carrying a
+`.commitpartial` marker is now skipped rather than re-verified, its objects
+leave the object set, and the run ends at exit 1 reporting the count.
+That is the tool's behavior and is the point of the item.
+
+Two decisions part the port from the tool on purpose. The port writes no
+progress line, so the only thing a run reports is its result. And the port's
+object walk runs to its end whatever the switches carry, so one run reports
+every fault it reaches and marks every commit an absent object leaves
+incomplete, where the tool ends at its first fault unless `-a` or `--delete`
+carries it on. A run still ends early at the three conditions that stop the
+port reading what it must read next -- a ref over an absent commit object, an
+absent dirtree, and a binding failure -- and `cli-surface.md`, "fsck", states
+the reason for each arm. The findings a run reports are therefore a superset
+of the tool's and follow no walk order. The one step that writes to the
+repository past the walk, `--add-tombstones`, is held to the walk the tool
+holds it to: `all` or `delete` releases it after a walk that found a corrupt
+object, so the repository the two leave agrees in every arm.
+
+Two observations corrected the plan the item was written from. The tool's
+`Validating refs in collections...` phase loads and checksums the commit each
+collection ref names, so a dangling ref under `refs/mirrors/<collection-id>/`
+ends the tool's run too, naming the ref `(<collection-id>, <name>)`; the port
+reproduces that, and the mirror-ref divergence the plan expected does not
+exist. And a ref whose own commit object fails its checksum is reported by the
+ref phase, without the `In commits <list>` prefix, and under `--delete` that
+object is unlinked and the run then ends on the ref it can no longer load.
+
+Eight divergences stand, all in `cli-surface.md`, "fsck": the progress line,
+which the tool writes and repaints on a tty and the port does not write at
+all; the order of the findings and of the commits inside one, which is the
+hash-container carve-out and reaches which commit a back-reference failure
+names; a faulty repository run with neither `-a` nor `--delete`, where the
+port reports every fault and closes with its own `error: ` line and the tool
+reports the first its walk order reaches and prefixes that one; what `-a`
+selects, which in the tool is where a run ends and in the port is the
+permission the tombstone step needs after a walk that found a corrupt object;
+an object whose own framing is broken,
+where the two readers part -- the port takes normal-form GVariant alone and
+leaves such an object where it stands, and the tool reads the non-normal
+bytes and acts on what its defaults yield; a dangling ref whose name the
+tool's ref enumeration skips, which ends the port's run alone and is the
+ref-name character class of "P1" reaching a second command; a positional
+argument, which the tool ignores and the port refuses; and a repeated boolean
+flag, which the tool takes and the port refuses. The item adds 35 `m10` cells,
+of which 8 are executable and all 8 pass; the conformance run reports 891
+cells and 358 passes.
+
 #### Phase 17g -- P3 commands with no matrix weight
 
 `reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and

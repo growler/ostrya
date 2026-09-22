@@ -71,6 +71,21 @@ impl CollectionRef {
     }
 }
 
+/// One collection-qualified ref of a repository, as
+/// [`Repo::list_collection_refs`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionRefEntry {
+    /// The collection id the ref is qualified by.
+    pub collection: String,
+    /// The ref name, which for a local ref is its refspec.
+    pub name: String,
+    /// The commit the ref names.
+    pub commit: Checksum,
+    /// Whether the ref lives under `refs/heads`, qualified by the repository's
+    /// own collection id, rather than under `refs/mirrors`.
+    pub local: bool,
+}
+
 /// One ref stored as an alias: a relative symlink to another ref's file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefAlias {
@@ -271,6 +286,52 @@ impl Repo {
     pub async fn list_mirror_refs(&self) -> Result<Vec<(String, String, Checksum)>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || collect_mirrors(&repo)).await
+    }
+
+    /// List the collection-qualified refs of the repository, sorted by
+    /// collection id and then by ref name.
+    ///
+    /// The set is the local refs qualified by the repository's own
+    /// `[core] collection-id`, where it sets one, together with every ref under
+    /// `refs/mirrors`, which carries its collection id in its path. A mirror
+    /// ref under the repository's own id is listed as a mirror ref.
+    pub async fn list_collection_refs(&self) -> Result<Vec<CollectionRefEntry>> {
+        let heads = match self.config().collection_id() {
+            Some(_) => self.list_refs(None).await?,
+            None => Vec::new(),
+        };
+        self.collection_refs_over(&heads).await
+    }
+
+    /// The listing [`list_collection_refs`](Repo::list_collection_refs) makes,
+    /// over a `refs/heads` listing the caller has already read. A repository
+    /// carrying no `[core] collection-id` qualifies no local ref, and `heads`
+    /// is then ignored.
+    pub(crate) async fn collection_refs_over(
+        &self,
+        heads: &[(String, Checksum)],
+    ) -> Result<Vec<CollectionRefEntry>> {
+        let mut all = Vec::new();
+        if let Some(collection) = self.config().collection_id().map(str::to_owned) {
+            for (name, commit) in heads {
+                all.push(CollectionRefEntry {
+                    collection: collection.clone(),
+                    name: name.clone(),
+                    commit: *commit,
+                    local: true,
+                });
+            }
+        }
+        for (collection, name, commit) in self.list_mirror_refs().await? {
+            all.push(CollectionRefEntry {
+                collection,
+                name,
+                commit,
+                local: false,
+            });
+        }
+        all.sort_by(|a, b| (&a.collection, &a.name).cmp(&(&b.collection, &b.name)));
+        Ok(all)
     }
 
     /// List the local and remote refs stored as aliases, sorted by refspec. An

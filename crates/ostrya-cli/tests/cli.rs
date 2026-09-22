@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions,
-    LockKind, MutableTree, ObjectType, Repo, RepoMode, Type, Value, base64,
+    LockKind, MutableTree, ObjectName, ObjectType, Repo, RepoMode, Type, Value, base64,
 };
 use ostrya_rt::block_on;
 
@@ -19950,6 +19950,1340 @@ fn prune_repeated_boolean_flags_part_from_the_tool() {
         std::fs::remove_dir_all(&port_repo).unwrap();
         std::fs::remove_dir_all(&tool_repo).unwrap();
     }
+}
+
+// ---------------------------------------------------------------------------
+// fsck -- the option set, the progress format, and the two verification
+// passes (Phase 17f, F19).
+// ---------------------------------------------------------------------------
+
+/// The environment every `fsck` comparison runs under, so the quotation marks
+/// the binding messages carry render the same way on any host.
+const FSCK_ENV: [(&str, &str); 1] = [("LC_ALL", "C.UTF-8")];
+
+/// The timestamp every `fsck` fixture commits at, so a rebuild of the fixture
+/// writes the same commits.
+const FSCK_BASE_TS: u64 = 1_700_000_000;
+
+/// Commit `tree` onto `branch` at a fixed timestamp, returning the checksum.
+fn fsck_commit(repo: &Path, branch: &str, tree: &Path, step: u64) -> String {
+    ostrya(
+        &[
+            "commit",
+            &format!("--repo={}", repo.display()),
+            "-b",
+            branch,
+            "-s",
+            branch,
+            "--canonical-permissions",
+            &format!("--timestamp=@{}", FSCK_BASE_TS + step),
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed()
+}
+
+/// A repository at `base/name` holding `test` with `commits` commits over a
+/// two-entry tree: a regular file that changes each time and a nested file.
+///
+/// Every content object is a regular file, so a test that corrupts one reaches
+/// a payload both implementations read the same way.
+fn build_fsck_repo(base: &Path, name: &str, mode: RepoMode, commits: u64) -> PathBuf {
+    let repo = base.join(name);
+    block_on(async {
+        Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+    });
+    let tree = base.join(format!("{name}-tree"));
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("sub/b.txt"), "b\n").unwrap();
+    for step in 0..commits {
+        std::fs::write(tree.join("a.txt"), format!("a{step}\n")).unwrap();
+        fsck_commit(&repo, "test", &tree, step);
+    }
+    repo
+}
+
+/// Every loose object and every `state/` marker of a repository, sorted: the
+/// oracle for what a `fsck` run removed, wrote, and marked.
+fn fsck_inventory(repo: &Path) -> Vec<String> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = format!("{prefix}{name}");
+            if entry.path().symlink_metadata().unwrap().is_dir() {
+                walk(&entry.path(), &format!("{rel}/"), out);
+            } else {
+                out.push(rel);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&repo.join("objects"), "objects/", &mut out);
+    walk(&repo.join("state"), "state/", &mut out);
+    out.sort();
+    out
+}
+
+/// Standard output with the progress block dropped.
+///
+/// The tool writes a progress line and the port writes none
+/// (`docs/conformance/cli-surface.md`, "fsck"), so the block is outside every
+/// comparison.
+fn fsck_normalize_stdout(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        if line.starts_with("fsck objects (") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Standard error with each finding's commit list sorted and the lines sorted.
+///
+/// The tool emits its findings, and the commits inside one finding, in the
+/// iteration order of its own hash containers; the port emits both sorted
+/// (`docs/conformance/cli-surface.md`, "fsck").
+fn fsck_normalize_stderr(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(fsck_sort_commit_list).collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+/// One line with the commit list after `in commits ` sorted.
+fn fsck_sort_commit_list(line: &str) -> String {
+    for marker in ["In commits ", "in commits "] {
+        let Some(head) = line.find(marker) else {
+            continue;
+        };
+        let start = head + marker.len();
+        let Some(end) = line[start..].find(':') else {
+            continue;
+        };
+        let mut commits: Vec<&str> = line[start..start + end].split(", ").collect();
+        commits.sort_unstable();
+        return format!(
+            "{}{}{}",
+            &line[..start],
+            commits.join(", "),
+            &line[start + end..]
+        );
+    }
+    line.to_owned()
+}
+
+/// Run one `fsck` invocation under both implementations over byte-identical
+/// copies of `repo`, and hold them to the same exit status, the same
+/// normalized standard output and standard error, and the same object and
+/// `state/` inventory. Returns the port's standard output.
+fn assert_fsck_agrees(base: &Path, repo: &Path, tag: &str, args: &[&str]) -> String {
+    let port_repo = clone_repo(base, repo, &format!("{tag}-port"));
+    let tool_repo = clone_repo(base, repo, &format!("{tag}-tool"));
+    let port_arg = format!("--repo={}", port_repo.display());
+    let tool_arg = format!("--repo={}", tool_repo.display());
+    let mut port_args = vec!["fsck", port_arg.as_str()];
+    port_args.extend_from_slice(args);
+    let mut tool_args = vec!["fsck", tool_arg.as_str()];
+    tool_args.extend_from_slice(args);
+    let port = ostrya(&port_args, None, &FSCK_ENV);
+    let tool = ostree_env(&tool_args, &FSCK_ENV);
+    let spelled = args.join(" ");
+    assert_eq!(
+        port.status.code(),
+        tool.status.code(),
+        "{tag}: exit status parts for `{spelled}`\nport: {}\ntool: {}",
+        String::from_utf8_lossy(&port.stderr),
+        String::from_utf8_lossy(&tool.stderr),
+    );
+    let port_out = String::from_utf8_lossy(&port.stdout).into_owned();
+    let tool_out = String::from_utf8_lossy(&tool.stdout).into_owned();
+    assert_eq!(
+        fsck_normalize_stdout(&port_out),
+        fsck_normalize_stdout(&tool_out),
+        "{tag}: standard output parts for `{spelled}`",
+    );
+    assert_eq!(
+        fsck_normalize_stderr(&String::from_utf8_lossy(&port.stderr)),
+        fsck_normalize_stderr(&String::from_utf8_lossy(&tool.stderr)),
+        "{tag}: standard error parts for `{spelled}`",
+    );
+    assert_eq!(
+        fsck_inventory(&port_repo),
+        fsck_inventory(&tool_repo),
+        "{tag}: the two left different repositories for `{spelled}`",
+    );
+    std::fs::remove_dir_all(&port_repo).unwrap();
+    std::fs::remove_dir_all(&tool_repo).unwrap();
+    String::from_utf8(port.stdout).unwrap()
+}
+
+/// One `fsck` run of the port alone over a copy of `repo`, returning its
+/// standard error. `assert_fsck_agrees` holds the two implementations
+/// together; this states what the port writes where the two part.
+fn fsck_port_stderr(base: &Path, repo: &Path, tag: &str, args: &[&str]) -> String {
+    let port_repo = clone_repo(base, repo, &format!("{tag}-port-only"));
+    let repo_arg = format!("--repo={}", port_repo.display());
+    let mut port_args = vec!["fsck", repo_arg.as_str()];
+    port_args.extend_from_slice(args);
+    let port = ostrya(&port_args, None, &FSCK_ENV);
+    std::fs::remove_dir_all(&port_repo).unwrap();
+    String::from_utf8_lossy(&port.stderr).into_owned()
+}
+
+/// One loose object of `ty` reachable from the repository, by its path.
+fn fsck_object_path(repo: &Path, checksum: &str, ty: ObjectType, mode: RepoMode) -> PathBuf {
+    let name = ObjectName::new(Checksum::from_hex(checksum).unwrap(), ty);
+    repo.join("objects").join(name.loose_path(mode))
+}
+
+/// Append one byte to `path`, so the object no longer hashes to its name while
+/// it still reads as the object it is. A flipped byte would break a symlink
+/// object's target or a compressed object's frame, which each implementation
+/// then reports in its own words.
+fn fsck_corrupt_object(path: &Path) {
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes.push(b'x');
+    std::fs::write(path, &bytes).unwrap();
+}
+
+/// Change one byte of a commit object's text, so the object no longer hashes
+/// to its name while its GVariant framing stands. An appended byte moves the
+/// framing the trailing offsets state, and the tool then refuses the object
+/// before it checksums it. `branch` is the name the commit carries, whose
+/// first byte is the one changed.
+fn fsck_corrupt_commit(path: &Path, branch: &str) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let needle = branch.as_bytes();
+    let at = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("the branch name the commit carries");
+    bytes[at] = bytes[at].to_ascii_uppercase();
+    std::fs::write(path, &bytes).unwrap();
+}
+
+/// The checksum of one object of `ty` the commit at `rev` reaches, chosen by
+/// its position in the sorted set.
+fn fsck_reachable_object(repo: &Path, rev: &str, ty: ObjectType) -> String {
+    block_on(async {
+        let handle = Repo::open(repo).await.unwrap();
+        let commit = handle.resolve_rev(rev, false).await.unwrap().unwrap();
+        let mut names: Vec<String> = handle
+            .traverse_commit(&commit, 0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|o| o.ty == ty)
+            .map(|o| o.checksum.to_hex())
+            .collect();
+        names.sort();
+        names.into_iter().next().expect("an object of that type")
+    })
+}
+
+/// The five-line text a sound repository writes, what `-q` drops from it, and
+/// that the five other switches leave it whole. Carries `fsck/clean-default`,
+/// `fsck/clean-quiet`, `fsck/clean-quiet-long`, `fsck/clean-all`,
+/// `fsck/clean-delete`, `fsck/clean-add-tombstones`,
+/// `fsck/clean-verify-bindings`, and `fsck/clean-verify-back-refs`.
+#[test]
+fn fsck_clean_output_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-clean");
+    let base = tmp.path();
+    let repo = build_fsck_repo(base, "repo", RepoMode::BareUser, 1);
+
+    let default = assert_fsck_agrees(base, &repo, "clean", &[]);
+    let lines: Vec<&str> = default.lines().collect();
+    assert_eq!(
+        &lines[..4],
+        &[
+            "Validating refs...",
+            "Validating refs in collections...",
+            "Enumerating commits...",
+            "Verifying content integrity of 1 commit objects...",
+        ],
+        "the four phase lines, in order: {default:?}"
+    );
+    assert_eq!(lines.len(), 5, "the summary line closes it: {default:?}");
+    assert_eq!(
+        lines[4],
+        "object fsck of 1 commits completed successfully - no errors found."
+    );
+    assert!(
+        !default.contains("fsck objects ("),
+        "the port writes no progress line: {default:?}"
+    );
+
+    // `-q` and `--quiet` are one flag, and it drops the four phase lines and
+    // nothing else.
+    for spelling in ["-q", "--quiet"] {
+        let quiet = assert_fsck_agrees(base, &repo, "quiet", &[spelling]);
+        assert_eq!(
+            quiet,
+            lines[4..].join("\n") + "\n",
+            "`{spelling}` drops the four phase lines alone"
+        );
+    }
+
+    // The five switches leave a sound repository's text and its objects
+    // untouched.
+    for switch in [
+        "-a",
+        "--delete",
+        "--add-tombstones",
+        "--verify-bindings",
+        "--verify-back-refs",
+    ] {
+        let text = assert_fsck_agrees(base, &repo, "clean-switch", &[switch]);
+        assert_eq!(text, default, "`{switch}` over a sound repository");
+    }
+}
+
+/// A checksum mismatch, over a content object, a dirtree, and a commit object,
+/// with and without `-a`. Carries `fsck/corrupt-no-switch-continues`,
+/// `fsck/corrupt-all-continues`, and `fsck/corrupt-metadata-wording`.
+#[test]
+fn fsck_corruption_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-corrupt");
+    let base = tmp.path();
+    let sound = build_fsck_repo(base, "repo", RepoMode::BareUser, 2);
+
+    for (label, ty) in [
+        ("content", ObjectType::File),
+        ("dirtree", ObjectType::DirTree),
+        ("commit", ObjectType::Commit),
+    ] {
+        let checksum = if ty == ObjectType::Commit {
+            resolve(&sound, "test^").unwrap()
+        } else {
+            fsck_reachable_object(&sound, "test", ty)
+        };
+        let repo = clone_repo(base, &sound, &format!("{label}-src"));
+        let object = fsck_object_path(&repo, &checksum, ty, RepoMode::BareUser);
+        if ty == ObjectType::Commit {
+            fsck_corrupt_commit(&object, "test");
+        } else {
+            fsck_corrupt_object(&object);
+        }
+        for args in [vec!["-a"], vec!["-q", "-a"]] {
+            assert_fsck_agrees(base, &repo, label, &args);
+        }
+        // A run naming neither `-a` nor `--delete` carries the walk to its end
+        // in the port and ends the tool at the mismatch, so the two exit 1
+        // over the same repository and part on the text alone: the port writes
+        // the finding plain and closes with its own `error: ` line
+        // (`docs/conformance/cli-surface.md`, "fsck").
+        let ((port_code, port_inv), (tool_code, tool_inv)) =
+            fsck_repository_outcome(base, &repo, &format!("{label}-plain"), &[]);
+        assert_eq!(port_code, Some(1), "{label}: the port exits 1");
+        assert_eq!(tool_code, Some(1), "{label}: the tool exits 1");
+        assert_eq!(port_inv, tool_inv, "{label}: neither writes to the store");
+        let text = fsck_port_stderr(base, &repo, label, &[]);
+        assert!(
+            text.lines()
+                .any(|line| line.contains("Corrupted") && !line.starts_with("error: ")),
+            "{label}: the finding is written plain: {text:?}"
+        );
+        assert!(
+            text.contains("error: Repository corruption encountered"),
+            "{label}: the closing line stands: {text:?}"
+        );
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+}
+
+/// `--delete` unlinks each mismatching object, marks every commit that reaches
+/// one partial, and runs to the end of the walk. Carries
+/// `fsck/delete-removes-and-marks` and `fsck/delete-inventory`.
+#[test]
+fn fsck_delete_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-delete");
+    let base = tmp.path();
+    let sound = build_fsck_repo(base, "repo", RepoMode::BareUser, 2);
+
+    // Two faulty objects, so the run has a second to reach after the first.
+    let repo = clone_repo(base, &sound, "two-faults");
+    for rev in ["test", "test^"] {
+        let checksum = fsck_reachable_object(&repo, rev, ObjectType::File);
+        fsck_corrupt_object(&fsck_object_path(
+            &repo,
+            &checksum,
+            ObjectType::File,
+            RepoMode::BareUser,
+        ));
+    }
+    let findings = fsck_port_stderr(base, &repo, "delete", &["--delete"]);
+    assert_eq!(
+        findings
+            .lines()
+            .filter(|line| line.contains("Corrupted"))
+            .count(),
+        2,
+        "`--delete` runs to the end of the walk: {findings:?}"
+    );
+    assert_fsck_agrees(base, &repo, "delete", &["--delete"]);
+    // A second run over the deleted objects reports them absent, which states
+    // the two left the same repository behind.
+    assert_fsck_agrees(base, &repo, "delete-twice", &["--delete"]);
+}
+
+/// A referenced object that is absent: reported after the walk as `.file`
+/// whatever the mode, marking every commit that reaches it partial, except a
+/// dirtree, which ends the run. Carries
+/// `fsck/missing-content-marks-partial` and `fsck/missing-dirtree-aborts`.
+#[test]
+fn fsck_missing_object_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-missing");
+    let base = tmp.path();
+
+    for mode in [RepoMode::BareUser, RepoMode::Archive] {
+        let tag = if mode == RepoMode::Archive {
+            "archive"
+        } else {
+            "bare-user"
+        };
+        let sound = build_fsck_repo(base, &format!("{tag}-repo"), mode, 2);
+        for (label, ty) in [
+            ("content", ObjectType::File),
+            ("dirmeta", ObjectType::DirMeta),
+            ("dirtree", ObjectType::DirTree),
+        ] {
+            let checksum = fsck_reachable_object(&sound, "test", ty);
+            let repo = clone_repo(base, &sound, &format!("{tag}-{label}-src"));
+            std::fs::remove_file(fsck_object_path(&repo, &checksum, ty, mode)).unwrap();
+            for args in [vec![], vec!["-a"]] {
+                assert_fsck_agrees(base, &repo, &format!("{tag}-{label}"), &args);
+            }
+            std::fs::remove_dir_all(&repo).unwrap();
+        }
+        std::fs::remove_dir_all(&sound).unwrap();
+    }
+}
+
+/// A commit already carrying a `.commitpartial` marker is skipped, counted,
+/// and reported, and `--add-tombstones` drops the standard-output count.
+/// Carries `fsck/partial-commit-skipped` and
+/// `fsck/partial-line-suppressed-by-tombstones`.
+#[test]
+fn fsck_partial_commit_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-partial");
+    let base = tmp.path();
+    let repo = build_fsck_repo(base, "repo", RepoMode::BareUser, 2);
+    let tip = resolve(&repo, "test").unwrap();
+    std::fs::create_dir_all(repo.join("state")).unwrap();
+    std::fs::write(repo.join(format!("state/{tip}.commitpartial")), [0x66]).unwrap();
+
+    let plain = assert_fsck_agrees(base, &repo, "partial", &[]);
+    assert!(
+        plain.contains("Verifying content integrity of 1 commit objects..."),
+        "the partial commit is out of the count: {plain:?}"
+    );
+    assert!(
+        plain.ends_with("1 partial commits not verified\n"),
+        "the count line closes standard output: {plain:?}"
+    );
+    assert_fsck_agrees(base, &repo, "partial-quiet", &["-q"]);
+    assert_fsck_agrees(base, &repo, "partial-all", &["-a"]);
+    let tombstones = assert_fsck_agrees(base, &repo, "partial-tomb", &["--add-tombstones"]);
+    assert!(
+        !tombstones.contains("partial commits not verified"),
+        "`--add-tombstones` drops the count line: {tombstones:?}"
+    );
+}
+
+/// `--add-tombstones` deletes the commit whose parent commit object is absent
+/// and writes the marker naming it, one generation per run. Carries
+/// `fsck/add-tombstones-writes-and-deletes` and `fsck/add-tombstones-cascade`.
+#[test]
+fn fsck_add_tombstones_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-tombstones");
+    let base = tmp.path();
+    let sound = build_fsck_repo(base, "repo", RepoMode::BareUser, 4);
+    let second = resolve(&sound, "test^^^").unwrap();
+
+    let repo = clone_repo(base, &sound, "cascade-src");
+    std::fs::remove_file(fsck_object_path(
+        &repo,
+        &second,
+        ObjectType::Commit,
+        RepoMode::BareUser,
+    ))
+    .unwrap();
+
+    // A run with no option reports nothing and writes nothing.
+    let quiet = assert_fsck_agrees(base, &repo, "no-option", &[]);
+    assert!(
+        quiet.contains("no errors found"),
+        "an absent parent commit is not a fault: {quiet:?}"
+    );
+
+    // Each run walks the branch back one commit. The third fails in the ref
+    // phase, the ref standing over the commit the second run removed.
+    let port_repo = clone_repo(base, &repo, "cascade-port");
+    let tool_repo = clone_repo(base, &repo, "cascade-tool");
+    for round in 1..=3 {
+        let port = ostrya(
+            &[
+                "fsck",
+                &format!("--repo={}", port_repo.display()),
+                "--add-tombstones",
+            ],
+            None,
+            &FSCK_ENV,
+        );
+        let tool = ostree_env(
+            &[
+                "fsck",
+                &format!("--repo={}", tool_repo.display()),
+                "--add-tombstones",
+            ],
+            &FSCK_ENV,
+        );
+        assert_eq!(
+            port.status.code(),
+            tool.status.code(),
+            "round {round}: exit status"
+        );
+        let port_out = String::from_utf8_lossy(&port.stdout).into_owned();
+        let tool_out = String::from_utf8_lossy(&tool.stdout).into_owned();
+        assert_eq!(
+            fsck_normalize_stdout(&port_out),
+            fsck_normalize_stdout(&tool_out),
+            "round {round}: standard output"
+        );
+        assert_eq!(
+            fsck_normalize_stderr(&String::from_utf8_lossy(&port.stderr)),
+            fsck_normalize_stderr(&String::from_utf8_lossy(&tool.stderr)),
+            "round {round}: standard error"
+        );
+        assert_eq!(
+            fsck_inventory(&port_repo),
+            fsck_inventory(&tool_repo),
+            "round {round}: the two left different repositories"
+        );
+    }
+
+    // The marker each wrote holds the same bytes.
+    let third = resolve(&sound, "test^^").unwrap();
+    let marker = |repo: &Path| {
+        std::fs::read(fsck_object_path(
+            repo,
+            &third,
+            ObjectType::TombstoneCommit,
+            RepoMode::BareUser,
+        ))
+        .unwrap()
+    };
+    assert_eq!(marker(&port_repo), marker(&tool_repo));
+    assert_eq!(marker(&port_repo).len(), 78);
+}
+
+/// `--verify-bindings` over a ref the commit does not name, over a commit
+/// carrying several bindings, over a commit carrying none, over a remote ref,
+/// and over a collection id the commit does not carry. Carries
+/// `fsck/verify-bindings-extra-ref` and `fsck/verify-bindings-collection`.
+#[test]
+fn fsck_verify_bindings_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-bindings");
+    let base = tmp.path();
+
+    // A second ref at a commit bound to one branch alone.
+    let extra = build_fsck_repo(base, "extra", RepoMode::BareUser, 1);
+    ostrya(
+        &[
+            &format!("--repo={}", extra.display()),
+            "refs",
+            "--create=beta",
+            "test",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    for args in [vec!["--verify-bindings"], vec!["-a", "--verify-bindings"]] {
+        assert_fsck_agrees(base, &extra, "extra-ref", &args);
+    }
+
+    // The same ref written under `refs/remotes`, which the message names by
+    // its bare name.
+    let remote = clone_repo(base, &extra, "remote-src");
+    let tip = resolve(&remote, "test").unwrap();
+    std::fs::remove_file(remote.join("refs/heads/beta")).unwrap();
+    std::fs::create_dir_all(remote.join("refs/remotes/origin")).unwrap();
+    std::fs::write(remote.join("refs/remotes/origin/beta"), format!("{tip}\n")).unwrap();
+    assert_fsck_agrees(base, &remote, "remote-ref", &["--verify-bindings"]);
+
+    // A commit carrying three bindings, so the parenthetical lists them all.
+    let many = build_fsck_repo(base, "many", RepoMode::BareUser, 0);
+    let tree = base.join("many-tree");
+    ostrya(
+        &[
+            "commit",
+            &format!("--repo={}", many.display()),
+            "-b",
+            "alpha",
+            "-s",
+            "c",
+            "--canonical-permissions",
+            "--bind-ref=delta",
+            "--bind-ref=gamma",
+            &format!("--timestamp=@{FSCK_BASE_TS}"),
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    ostrya(
+        &[
+            &format!("--repo={}", many.display()),
+            "refs",
+            "--create=beta",
+            "alpha",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_fsck_agrees(base, &many, "many-bindings", &["--verify-bindings"]);
+
+    // An orphan commit, whose binding list is empty, reached through a ref.
+    let orphan = build_fsck_repo(base, "orphan", RepoMode::BareUser, 0);
+    let checksum = ostrya(
+        &[
+            "commit",
+            &format!("--repo={}", orphan.display()),
+            "--orphan",
+            "-s",
+            "o",
+            "--canonical-permissions",
+            &format!("--timestamp=@{FSCK_BASE_TS}"),
+            base.join("orphan-tree").to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+    ostrya(
+        &[
+            &format!("--repo={}", orphan.display()),
+            "refs",
+            "--create=named",
+            &checksum,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_fsck_agrees(base, &orphan, "no-refs", &["--verify-bindings"]);
+
+    // A collection id the commit's own binding does not carry.
+    let collection = base.join("collection");
+    ostrya(
+        &[
+            "init",
+            &format!("--repo={}", collection.display()),
+            "--mode=bare-user",
+            "--collection-id=org.test.Coll",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    fsck_commit(&collection, "main", &base.join("extra-tree"), 0);
+    assert_fsck_agrees(base, &collection, "collection-ok", &["--verify-bindings"]);
+    ostrya(
+        &[
+            "config",
+            &format!("--repo={}", collection.display()),
+            "set",
+            "core.collection-id",
+            "org.test.Other",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_fsck_agrees(base, &collection, "collection-bad", &["--verify-bindings"]);
+}
+
+/// `--verify-back-refs` over a branch with a parent, over a bound name no ref
+/// carries, over a collection ref, and beside `--verify-bindings`, which it
+/// does not turn on. Carries `fsck/verify-back-refs-non-tip`,
+/// `fsck/verify-back-refs-absent-ref`, and
+/// `fsck/verify-back-refs-does-not-imply-bindings`.
+#[test]
+fn fsck_verify_back_refs_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-back-refs");
+    let base = tmp.path();
+
+    // A single-commit branch passes and a two-commit branch does not, the
+    // parent carrying the branch name its tip holds.
+    let one = build_fsck_repo(base, "one", RepoMode::BareUser, 1);
+    let text = assert_fsck_agrees(base, &one, "one-commit", &["--verify-back-refs"]);
+    assert!(text.contains("no errors found"), "{text:?}");
+    let two = build_fsck_repo(base, "two", RepoMode::BareUser, 2);
+    assert_fsck_agrees(base, &two, "two-commits", &["--verify-back-refs"]);
+
+    // A bound name no ref carries.
+    let bound = build_fsck_repo(base, "bound", RepoMode::BareUser, 0);
+    ostrya(
+        &[
+            "commit",
+            &format!("--repo={}", bound.display()),
+            "-b",
+            "alpha",
+            "-s",
+            "c",
+            "--canonical-permissions",
+            "--bind-ref=delta",
+            &format!("--timestamp=@{FSCK_BASE_TS}"),
+            base.join("bound-tree").to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_fsck_agrees(base, &bound, "absent-bound-ref", &["--verify-back-refs"]);
+
+    // A collection ref the binding names that the store no longer carries.
+    let collection = base.join("back-collection");
+    ostrya(
+        &[
+            "init",
+            &format!("--repo={}", collection.display()),
+            "--mode=bare-user",
+            "--collection-id=org.test.Coll",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    fsck_commit(&collection, "main", &base.join("one-tree"), 0);
+    let text = assert_fsck_agrees(base, &collection, "coll-ok", &["--verify-back-refs"]);
+    assert!(text.contains("no errors found"), "{text:?}");
+    ostrya(
+        &[
+            "config",
+            &format!("--repo={}", collection.display()),
+            "set",
+            "core.collection-id",
+            "org.test.Other",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_fsck_agrees(base, &collection, "coll-gone", &["--verify-back-refs"]);
+
+    // The two options are independent: the repository `--verify-bindings`
+    // refuses passes `--verify-back-refs`, and only naming both runs both.
+    let extra = build_fsck_repo(base, "independent", RepoMode::BareUser, 1);
+    ostrya(
+        &[
+            &format!("--repo={}", extra.display()),
+            "refs",
+            "--create=beta",
+            "test",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let passes = assert_fsck_agrees(base, &extra, "back-only", &["--verify-back-refs"]);
+    assert!(passes.contains("no errors found"), "{passes:?}");
+    for args in [
+        vec!["--verify-bindings"],
+        vec!["--verify-bindings", "--verify-back-refs"],
+        vec!["--verify-back-refs", "--verify-bindings"],
+    ] {
+        let both = assert_fsck_agrees(base, &extra, "both", &args);
+        assert!(!both.contains("no errors found"), "{args:?}: {both:?}");
+    }
+}
+
+/// A ref over an absent commit ends the run in the phase that reads it, and a
+/// remote ref is named by its bare name where a mirror ref is named by its
+/// collection pair. Carries `fsck/dangling-ref-ends-run` and
+/// `fsck/dangling-mirror-ref-ends-run`.
+#[test]
+fn fsck_dangling_ref_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-dangling");
+    let base = tmp.path();
+    let sound = build_fsck_repo(base, "repo", RepoMode::BareUser, 1);
+    let absent = "0".repeat(64);
+
+    for (label, relpath) in [
+        ("local", "refs/heads/bad"),
+        ("remote", "refs/remotes/origin/bad"),
+        ("mirror", "refs/mirrors/org.test.Coll/badm"),
+    ] {
+        let repo = clone_repo(base, &sound, &format!("{label}-src"));
+        let path = repo.join(relpath);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{absent}\n")).unwrap();
+        assert_fsck_agrees(base, &repo, label, &[]);
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+}
+
+/// The two argument-parsing divergences at `fsck`: a repeated boolean flag and
+/// a positional argument, each of which the tool takes and the port refuses.
+/// Carries `fsck/repeated-flag-refused` and `fsck/positional-ignored`.
+#[test]
+fn fsck_argument_handling_parts_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-arguments");
+    let base = tmp.path();
+    let repo = build_fsck_repo(base, "repo", RepoMode::BareUser, 1);
+    let repo_arg = format!("--repo={}", repo.display());
+
+    for flag in [
+        "-a",
+        "-q",
+        "--delete",
+        "--add-tombstones",
+        "--verify-bindings",
+        "--verify-back-refs",
+    ] {
+        let port = ostrya(&["fsck", &repo_arg, flag, flag], None, &FSCK_ENV);
+        let tool = ostree_env(&["fsck", &repo_arg, flag, flag], &FSCK_ENV);
+        assert_eq!(
+            port.status.code(),
+            Some(1),
+            "the port refused `{flag}` twice"
+        );
+        assert_eq!(tool.status.code(), Some(0), "the tool took `{flag}` twice");
+    }
+
+    let port = ostrya(&["fsck", &repo_arg, "extra"], None, &FSCK_ENV);
+    let tool = ostree_env(&["fsck", &repo_arg, "extra"], &FSCK_ENV);
+    assert_eq!(port.status.code(), Some(1), "the port refuses a positional");
+    assert_eq!(tool.status.code(), Some(0), "the tool ignores a positional");
+}
+
+/// One run's exit status and the inventory it left behind.
+type FsckOutcome = (Option<i32>, Vec<String>);
+
+/// Run one `fsck` invocation under both implementations over byte-identical
+/// copies of `repo`, and return the two exit statuses and the two
+/// inventories. The text each writes is the caller's to state, so a case whose
+/// two implementations word one condition differently can still hold them to
+/// the same repository.
+fn fsck_repository_outcome(
+    base: &Path,
+    repo: &Path,
+    tag: &str,
+    args: &[&str],
+) -> (FsckOutcome, FsckOutcome) {
+    let port_repo = clone_repo(base, repo, &format!("{tag}-port"));
+    let tool_repo = clone_repo(base, repo, &format!("{tag}-tool"));
+    let port_arg = format!("--repo={}", port_repo.display());
+    let tool_arg = format!("--repo={}", tool_repo.display());
+    let mut port_args = vec!["fsck", port_arg.as_str()];
+    port_args.extend_from_slice(args);
+    let mut tool_args = vec!["fsck", tool_arg.as_str()];
+    tool_args.extend_from_slice(args);
+    let port = ostrya(&port_args, None, &FSCK_ENV);
+    let tool = ostree_env(&tool_args, &FSCK_ENV);
+    let outcome = (
+        (port.status.code(), fsck_inventory(&port_repo)),
+        (tool.status.code(), fsck_inventory(&tool_repo)),
+    );
+    std::fs::remove_dir_all(&port_repo).unwrap();
+    std::fs::remove_dir_all(&tool_repo).unwrap();
+    outcome
+}
+
+/// Whether an inventory holds the loose object `checksum` of type `ty`.
+fn fsck_holds(inventory: &[String], checksum: &str, ty: ObjectType, mode: RepoMode) -> bool {
+    let name = ObjectName::new(Checksum::from_hex(checksum).unwrap(), ty);
+    let path = format!("objects/{}", name.loose_path(mode));
+    inventory.contains(&path)
+}
+
+/// The checksum of the largest dirtree the commit at `rev` reaches, which is
+/// the root of a tree whose root holds more entries than any directory under
+/// it.
+fn fsck_widest_dirtree(repo: &Path, rev: &str, mode: RepoMode) -> String {
+    block_on(async {
+        let handle = Repo::open(repo).await.unwrap();
+        let commit = handle.resolve_rev(rev, false).await.unwrap().unwrap();
+        let mut widest: Option<(u64, String)> = None;
+        for object in handle.traverse_commit(&commit, 0).await.unwrap() {
+            if object.ty != ObjectType::DirTree {
+                continue;
+            }
+            let hex = object.checksum.to_hex();
+            let size = std::fs::metadata(fsck_object_path(repo, &hex, ObjectType::DirTree, mode))
+                .unwrap()
+                .len();
+            if widest.as_ref().is_none_or(|(seen, _)| size > *seen) {
+                widest = Some((size, hex));
+            }
+        }
+        widest.expect("a dirtree").1
+    })
+}
+
+/// A repository at `base/name` holding one independent branch per name, each
+/// over a one-entry tree whose single file differs, so no two reach an object
+/// in common but the dirmeta.
+fn build_branch_fsck_repo(base: &Path, name: &str, mode: RepoMode, branches: &[&str]) -> PathBuf {
+    let repo = base.join(name);
+    block_on(async {
+        Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+    });
+    let tree = base.join(format!("{name}-tree"));
+    std::fs::create_dir_all(&tree).unwrap();
+    for branch in branches {
+        std::fs::write(tree.join("f.txt"), format!("{branch}\n")).unwrap();
+        fsck_commit(&repo, branch, &tree, 0);
+    }
+    repo
+}
+
+/// An absent object never ends the walk: a run over two branches each missing
+/// one content object reports both and marks both commits partial. Carries
+/// `fsck/missing-continues-the-walk`.
+#[test]
+fn fsck_missing_object_does_not_end_the_walk() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-missing-two");
+    let base = tmp.path();
+    let repo = build_branch_fsck_repo(base, "repo", RepoMode::BareUser, &["one", "two"]);
+    for branch in ["one", "two"] {
+        let checksum = fsck_reachable_object(&repo, branch, ObjectType::File);
+        std::fs::remove_file(fsck_object_path(
+            &repo,
+            &checksum,
+            ObjectType::File,
+            RepoMode::BareUser,
+        ))
+        .unwrap();
+    }
+
+    assert_fsck_agrees(base, &repo, "two-missing", &[]);
+    let text = fsck_port_stderr(base, &repo, "two-missing", &[]);
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.starts_with("Object missing in commits "))
+            .count(),
+        2,
+        "the walk runs to its end: {text:?}"
+    );
+
+    // An absent object beside a mismatch. The tool ends its run at the
+    // mismatch where the port carries the walk to its end, so the two are
+    // compared under `-a`, which carries both, and the no-switch run states
+    // the port's own claim: both findings are written plain and the run closes
+    // with its own `error: ` line.
+    let mixed = build_branch_fsck_repo(base, "mixed", RepoMode::BareUser, &["one", "two"]);
+    // The port takes the commits in checksum order, so the branch whose commit
+    // sorts first loses its object and the other's is corrupted.
+    let mut branches = [
+        (resolve(&mixed, "one").unwrap(), "one"),
+        (resolve(&mixed, "two").unwrap(), "two"),
+    ];
+    branches.sort();
+    let absent = fsck_reachable_object(&mixed, branches[0].1, ObjectType::File);
+    let corrupt = fsck_reachable_object(&mixed, branches[1].1, ObjectType::File);
+    std::fs::remove_file(fsck_object_path(
+        &mixed,
+        &absent,
+        ObjectType::File,
+        RepoMode::BareUser,
+    ))
+    .unwrap();
+    fsck_corrupt_object(&fsck_object_path(
+        &mixed,
+        &corrupt,
+        ObjectType::File,
+        RepoMode::BareUser,
+    ));
+    assert_fsck_agrees(base, &mixed, "missing-and-corrupt", &["-a"]);
+
+    let run = ostrya(
+        &["fsck", &format!("--repo={}", mixed.display())],
+        None,
+        &FSCK_ENV,
+    );
+    assert_eq!(run.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("Object missing in commits ")),
+        "the absent object is written plain: {text:?}"
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("In commits ") && line.contains("Corrupted")),
+        "the mismatch is written plain as well: {text:?}"
+    );
+    assert!(
+        text.contains("error: Repository corruption encountered"),
+        "the run closes with its own line: {text:?}"
+    );
+}
+
+/// The port carries a run past every fault it can continue past, so a
+/// repository holding three independent faults reports all three and marks
+/// both commits an absent object leaves incomplete, where the tool's run ends
+/// in its ref phase and marks none. Carries `fsck/reports-every-fault`.
+#[test]
+fn fsck_reports_every_fault_the_tool_ends_at() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-every-fault");
+    let base = tmp.path();
+    let repo = build_branch_fsck_repo(base, "repo", RepoMode::BareUser, &["one", "two", "three"]);
+
+    // One commit object whose checksum does not match, which ends the tool's
+    // ref phase, and one absent content object under each of the two other
+    // branches.
+    let tip = resolve(&repo, "three").unwrap();
+    fsck_corrupt_commit(
+        &fsck_object_path(&repo, &tip, ObjectType::Commit, RepoMode::BareUser),
+        "three",
+    );
+    let mut marked: Vec<String> = Vec::new();
+    for branch in ["one", "two"] {
+        let checksum = fsck_reachable_object(&repo, branch, ObjectType::File);
+        std::fs::remove_file(fsck_object_path(
+            &repo,
+            &checksum,
+            ObjectType::File,
+            RepoMode::BareUser,
+        ))
+        .unwrap();
+        marked.push(resolve(&repo, branch).unwrap());
+    }
+    marked.sort();
+
+    let ((port_code, port_inv), (tool_code, tool_inv)) =
+        fsck_repository_outcome(base, &repo, "every-fault", &[]);
+    assert_eq!(port_code, Some(1));
+    assert_eq!(tool_code, Some(1));
+
+    let markers = |inventory: &[String]| {
+        let mut found: Vec<String> = inventory
+            .iter()
+            .filter_map(|entry| entry.strip_prefix("state/"))
+            .filter_map(|entry| entry.strip_suffix(".commitpartial"))
+            .map(str::to_owned)
+            .collect();
+        found.sort();
+        found
+    };
+    assert_eq!(markers(&port_inv), marked, "the port marks both commits");
+    assert!(markers(&tool_inv).is_empty(), "the tool marks none");
+
+    let port_text = fsck_port_stderr(base, &repo, "every-fault", &[]);
+    assert_eq!(
+        port_text
+            .lines()
+            .filter(|line| line.starts_with("Object missing in commits "))
+            .count(),
+        2,
+        "both absent objects are reported: {port_text:?}"
+    );
+    assert!(
+        port_text.contains("Corrupted commit object"),
+        "the commit-object mismatch is reported: {port_text:?}"
+    );
+    assert!(
+        port_text.contains("error: Repository corruption encountered"),
+        "the run closes with its own line: {port_text:?}"
+    );
+
+    let tool_repo = clone_repo(base, &repo, "every-fault-ref");
+    let tool = ostree_env(
+        &["fsck", &format!("--repo={}", tool_repo.display())],
+        &FSCK_ENV,
+    );
+    let tool_text = String::from_utf8_lossy(&tool.stderr);
+    assert_eq!(
+        tool_text.lines().count(),
+        1,
+        "the tool reports the one fault it ends at: {tool_text:?}"
+    );
+}
+/// `--add-tombstones` acts after the object walk, and the walk beside a corrupt
+/// object reaches its end under `-a` or `--delete` alone, so the repository the
+/// two leave agrees in every arm. Carries `fsck/add-tombstones-under-all` and
+/// `fsck/delete-needs-no-all`.
+#[test]
+fn fsck_add_tombstones_follows_the_all_switch() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-tomb-fault");
+    let base = tmp.path();
+    let sound = build_fsck_repo(base, "repo", RepoMode::BareUser, 3);
+    let oldest = resolve(&sound, "test^^").unwrap();
+
+    let repo = clone_repo(base, &sound, "fault-src");
+    std::fs::remove_file(fsck_object_path(
+        &repo,
+        &oldest,
+        ObjectType::Commit,
+        RepoMode::BareUser,
+    ))
+    .unwrap();
+    let checksum = fsck_reachable_object(&repo, "test", ObjectType::File);
+    fsck_corrupt_object(&fsck_object_path(
+        &repo,
+        &checksum,
+        ObjectType::File,
+        RepoMode::BareUser,
+    ));
+
+    // `-a` carries both implementations to the end of the walk, and the step
+    // then runs in each.
+    let ran = assert_fsck_agrees(base, &repo, "tomb-all", &["-a", "--add-tombstones"]);
+    assert!(
+        ran.contains("Adding tombstone"),
+        "the step runs once the walk reaches its end: {ran:?}"
+    );
+
+    let tombstones = |inventory: &[String]| {
+        inventory
+            .iter()
+            .filter(|entry| entry.ends_with(".tombstone-commit"))
+            .count()
+    };
+
+    // With no switch the walk ends at the corrupt object in both, so neither
+    // writes a tombstone. The text still parts -- the tool names the one fault
+    // it ends at and the port names every fault it reaches -- so the
+    // repository and the exit status are what the two are held to here.
+    let ((port_code, port_inv), (tool_code, tool_inv)) =
+        fsck_repository_outcome(base, &repo, "tomb-plain", &["--add-tombstones"]);
+    assert_eq!(port_code, Some(1));
+    assert_eq!(tool_code, Some(1));
+    assert_eq!(port_inv, tool_inv, "neither writes a tombstone");
+    assert_eq!(tombstones(&port_inv), 0, "the step is held back");
+
+    // `--delete` carries the walk to its end on its own, so the step runs
+    // under it with no `-a`, and `-a --delete` leaves the same repository.
+    for args in [
+        vec!["--delete", "--add-tombstones"],
+        vec!["-a", "--delete", "--add-tombstones"],
+    ] {
+        let ((port_code, port_inv), (tool_code, tool_inv)) =
+            fsck_repository_outcome(base, &repo, "tomb-delete", &args);
+        assert_eq!(port_code, Some(1), "{args:?}");
+        assert_eq!(tool_code, Some(1), "{args:?}");
+        assert_eq!(port_inv, tool_inv, "{args:?}: the same repository");
+        assert_eq!(tombstones(&port_inv), 1, "{args:?}: the step runs");
+    }
+
+    // `--delete` alone takes no `-a` of its own: the two arms leave the same
+    // repository in each implementation.
+    let ((port_plain, plain_inv), (tool_plain, tool_plain_inv)) =
+        fsck_repository_outcome(base, &repo, "del-plain", &["--delete"]);
+    let ((port_all, all_inv), (tool_all, tool_all_inv)) =
+        fsck_repository_outcome(base, &repo, "del-all", &["-a", "--delete"]);
+    assert_eq!(port_plain, Some(1));
+    assert_eq!(port_all, Some(1));
+    assert_eq!(tool_plain, Some(1));
+    assert_eq!(tool_all, Some(1));
+    assert_eq!(
+        plain_inv, tool_plain_inv,
+        "`--delete` leaves one repository"
+    );
+    assert_eq!(all_inv, tool_all_inv, "`-a --delete` leaves one repository");
+    assert_eq!(plain_inv, all_inv, "`-a` adds nothing to `--delete`");
+    assert_eq!(tombstones(&plain_inv), 0, "no tombstone without the switch");
+
+    // An absent object never ends a walk, so the step runs beside one with no
+    // switch at all.
+    let absent = clone_repo(base, &sound, "absent-src");
+    std::fs::remove_file(fsck_object_path(
+        &absent,
+        &oldest,
+        ObjectType::Commit,
+        RepoMode::BareUser,
+    ))
+    .unwrap();
+    let gone = fsck_reachable_object(&absent, "test", ObjectType::File);
+    std::fs::remove_file(fsck_object_path(
+        &absent,
+        &gone,
+        ObjectType::File,
+        RepoMode::BareUser,
+    ))
+    .unwrap();
+    let ran = assert_fsck_agrees(base, &absent, "tomb-absent", &["--add-tombstones"]);
+    assert!(
+        ran.contains("Adding tombstone"),
+        "an absent object leaves the walk able to reach the step: {ran:?}"
+    );
+}
+
+/// A metadata object whose bytes do not read as the type its name gives it is
+/// reported and left alone: `--delete` unlinks nothing and no commit is marked
+/// partial. Carries `fsck/broken-framing-dirtree-untouched` and
+/// `fsck/broken-framing-dirtree-kept`.
+#[test]
+fn fsck_leaves_a_broken_framing_dirtree_alone() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-framing");
+    let base = tmp.path();
+
+    // A root dirtree wide enough that the appended byte reads as a framing
+    // offset inside the object. The tool's own reader then draws an entry out
+    // of the shifted bytes and ends the run before it checksums anything.
+    let wide = base.join("wide");
+    block_on(async {
+        Repo::create(&wide, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+    });
+    let tree = base.join("wide-tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("sub/b.txt"), "b\n").unwrap();
+    for name in ["a", "c", "d", "e"] {
+        std::fs::write(tree.join(format!("{name}.txt")), format!("{name}\n")).unwrap();
+    }
+    fsck_commit(&wide, "test", &tree, 0);
+    let root = fsck_widest_dirtree(&wide, "test", RepoMode::Archive);
+    let path = fsck_object_path(&wide, &root, ObjectType::DirTree, RepoMode::Archive);
+    assert!(
+        std::fs::metadata(&path).unwrap().len() > 121,
+        "the appended byte must read as an offset inside the object"
+    );
+    fsck_corrupt_object(&path);
+
+    for args in [vec![], vec!["-a"], vec!["--delete"]] {
+        let ((port_code, port_inv), (tool_code, tool_inv)) =
+            fsck_repository_outcome(base, &wide, "wide", &args);
+        assert_eq!(port_code, Some(1), "{args:?}: the port exits 1");
+        assert_eq!(tool_code, Some(1), "{args:?}: the tool exits 1");
+        assert_eq!(
+            port_inv, tool_inv,
+            "{args:?}: neither writes to the repository"
+        );
+        assert!(
+            fsck_holds(&port_inv, &root, ObjectType::DirTree, RepoMode::Archive),
+            "{args:?}: the dirtree stands"
+        );
+        assert!(
+            !port_inv
+                .iter()
+                .any(|entry| entry.ends_with(".commitpartial")),
+            "{args:?}: no marker is written"
+        );
+    }
+
+    // The recorded divergence: over a dirtree small enough that the appended
+    // byte reads as an offset past the object's own end, the tool's reader
+    // yields an empty dirtree, so the tool checksums the object and `--delete`
+    // removes it. The port refuses the object and keeps it
+    // (`docs/conformance/cli-surface.md`, "fsck").
+    let narrow = build_fsck_repo(base, "narrow", RepoMode::Archive, 1);
+    let small = fsck_widest_dirtree(&narrow, "test", RepoMode::Archive);
+    let small_path = fsck_object_path(&narrow, &small, ObjectType::DirTree, RepoMode::Archive);
+    assert!(std::fs::metadata(&small_path).unwrap().len() < 121);
+    fsck_corrupt_object(&small_path);
+    let ((port_code, port_inv), (tool_code, tool_inv)) =
+        fsck_repository_outcome(base, &narrow, "narrow", &["--delete"]);
+    assert_eq!(port_code, Some(1));
+    assert_eq!(tool_code, Some(1));
+    assert!(
+        fsck_holds(&port_inv, &small, ObjectType::DirTree, RepoMode::Archive),
+        "the port keeps the object"
+    );
+    assert!(
+        !fsck_holds(&tool_inv, &small, ObjectType::DirTree, RepoMode::Archive),
+        "the tool removes it"
+    );
+}
+
+/// The port's `--no-mark-partial` extension keeps working under the options
+/// `F19` adds: `--delete` removes the object and writes no marker, so the next
+/// run verifies the commit again. Carries `fsck/no-mark-partial-extension`.
+#[test]
+fn fsck_no_mark_partial_survives_the_new_options() {
+    let tmp = TmpDir::new("fsck-no-mark");
+    let base = tmp.path();
+    let repo = build_fsck_repo(base, "repo", RepoMode::BareUser, 1);
+    let checksum = fsck_reachable_object(&repo, "test", ObjectType::File);
+    let object = fsck_object_path(&repo, &checksum, ObjectType::File, RepoMode::BareUser);
+    fsck_corrupt_object(&object);
+
+    let run = ostrya(
+        &[
+            "fsck",
+            &format!("--repo={}", repo.display()),
+            "--delete",
+            "--no-mark-partial",
+        ],
+        None,
+        &FSCK_ENV,
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(!object.exists(), "the faulty object is unlinked");
+    assert!(
+        !repo.join("state").exists() || std::fs::read_dir(repo.join("state")).unwrap().count() == 0,
+        "no marker is written"
+    );
+
+    // The commit is still verified, the marker that would skip it absent.
+    let again = ostrya(
+        &["fsck", &format!("--repo={}", repo.display())],
+        None,
+        &FSCK_ENV,
+    );
+    let text = String::from_utf8_lossy(&again.stdout);
+    assert!(
+        text.contains("Verifying content integrity of 1 commit objects..."),
+        "the commit is verified again: {text:?}"
+    );
 }
 
 /// `pull-local` reads `[ex-ostrya] detached-metadata-exclude` from the

@@ -59,15 +59,16 @@ use std::sync::{Arc, Mutex};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
-    CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions,
-    CreateOptions, DeltaOptions, DetachedMetadataFilter, DevInoCache, DictBuilder, DiffChange,
-    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
-    FsckOptions, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
-    PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, SignatureInfo, Signer,
-    Summary, SummaryOptions, SummaryRef, TarExportOptions, TarImportOptions, TimestampCheck,
-    Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy,
-    Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
-    validate_refspec,
+    CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags, CommitOptions,
+    ComposefsOptions, CreateOptions, DeltaOptions, DetachedMetadataFilter, DevInoCache,
+    DictBuilder, DiffChange, Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject,
+    FilterResult, FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure,
+    FsckOptions, FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags,
+    PullOptions, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, SignatureInfo,
+    Signer, Summary, SummaryOptions, SummaryRef, TarExportOptions, TarImportOptions,
+    TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome,
+    VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text,
+    to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -822,6 +823,28 @@ struct FsckArgs {
     /// Do not mark commits partial when a referenced object is missing.
     #[arg(long)]
     no_mark_partial: bool,
+    /// Add tombstones for missing commits.
+    #[arg(long)]
+    add_tombstones: bool,
+    /// Only print error messages.
+    #[arg(short, long)]
+    quiet: bool,
+    // The port's walk runs to its end whatever the switches carry, so the
+    // option selects one thing: whether `--add-tombstones` may act on a walk
+    // that found a corrupt object
+    // (`docs/conformance/cli-surface.md`, "fsck").
+    /// Don't stop on first error.
+    #[arg(short, long)]
+    all: bool,
+    /// Remove corrupted objects.
+    #[arg(long)]
+    delete: bool,
+    /// Verify ref bindings.
+    #[arg(long)]
+    verify_bindings: bool,
+    /// Verify back-references.
+    #[arg(long)]
+    verify_back_refs: bool,
 }
 
 #[derive(Args)]
@@ -4387,18 +4410,6 @@ async fn refs_list_collections(repo: &Repo, args: &RefsArgs) -> Result<()> {
     Ok(())
 }
 
-/// One collection-qualified ref, as `refs -c` lists it.
-#[derive(Clone)]
-struct CollectionEntry {
-    collection: String,
-    /// The ref name, which for a local ref is its refspec.
-    name: String,
-    commit: Checksum,
-    /// Whether the ref lives under `refs/heads`, qualified by the repository's
-    /// own collection id, rather than under `refs/mirrors`.
-    local: bool,
-}
-
 /// Every local and remote ref, sorted by refspec, which is the order a listing
 /// prints and the set each prefix filters.
 async fn all_refs(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
@@ -4412,28 +4423,8 @@ async fn all_refs(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
 /// listing groups ref-name prefixes. The repository's own
 /// `collection-id` qualifies its local refs; the mirror refs carry theirs in
 /// the path.
-async fn select_collection_refs(repo: &Repo, ids: &[String]) -> Result<Vec<CollectionEntry>> {
-    let mut all = Vec::new();
-    if let Some(collection) = repo.config().collection_id().map(str::to_owned) {
-        for (name, commit) in repo.list_refs(None).await? {
-            all.push(CollectionEntry {
-                collection: collection.clone(),
-                name,
-                commit,
-                local: true,
-            });
-        }
-    }
-    for (collection, name, commit) in repo.list_mirror_refs().await? {
-        all.push(CollectionEntry {
-            collection,
-            name,
-            commit,
-            local: false,
-        });
-    }
-    all.sort_by(|a, b| (&a.collection, &a.name).cmp(&(&b.collection, &b.name)));
-
+async fn select_collection_refs(repo: &Repo, ids: &[String]) -> Result<Vec<CollectionRefEntry>> {
+    let all = repo.list_collection_refs().await?;
     let mut out = Vec::new();
     for id in prefixes(ids) {
         out.extend(
@@ -6342,27 +6333,220 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     Ok(())
 }
 
+/// The opening quote the tool wraps a ref name or a collection id in.
+const OPEN_QUOTE: char = '\u{2018}';
+/// The closing quote the tool wraps a ref name or a collection id in.
+const CLOSE_QUOTE: char = '\u{2019}';
+/// The word the tool writes for a collection ref in a back-reference finding.
+/// The dash is U+2013 EN DASH.
+const COLLECTION_REF: &str = "Collection\u{2013}ref";
+
 async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     use std::io::Write;
     let opts = FsckOptions {
         mark_partial: !args.no_mark_partial,
+        delete: args.delete,
+        all: args.all,
+        add_tombstones: args.add_tombstones,
+        verify_bindings: args.verify_bindings,
+        // The tool's help text says `--verify-back-refs` implies
+        // `--verify-bindings`; the tool runs the two checks independently, so
+        // only naming both runs both (`docs/format-reference.md`, "CLI output
+        // formats", `fsck`).
+        verify_back_refs: args.verify_back_refs,
     };
-    let report = repo.fsck(&opts).await?;
-    for error in &report.errors {
-        eprintln!("{error}");
+    let report = match repo.fsck(&opts).await {
+        Ok(report) => report,
+        Err(e) => exit_error(&fsck_error_text(&e)),
+    };
+
+    if !args.quiet {
+        println!("Validating refs...");
+        if report.reached >= FsckPhase::ValidateCollectionRefs {
+            println!("Validating refs in collections...");
+        }
+        if report.reached >= FsckPhase::EnumerateCommits {
+            println!("Enumerating commits...");
+        }
+        if report.reached >= FsckPhase::VerifyObjects {
+            println!(
+                "Verifying content integrity of {} commit objects...",
+                report.commits_checked
+            );
+        }
     }
-    println!(
-        "fsck: {} commits, {} objects checked, {} error(s)",
-        report.commits_checked,
-        report.objects_checked,
-        report.errors.len()
-    );
-    // Match the tool's convention: a repository with faults exits nonzero.
+    // The walk runs to its end, so every finding is written plain and the run
+    // closes with one `error: ` line of its own
+    // (`docs/conformance/cli-surface.md`, "fsck").
+    for error in &report.errors {
+        eprintln!("{}", fsck_finding_line(error));
+    }
+    for commit in &report.marked_partial {
+        eprintln!("Marking commit as partial: {commit}");
+    }
+    // A run the ref, collection, or enumerate phase ended writes that
+    // condition and nothing the object walk would have written.
+    if let Some(failure) = &report.failure {
+        std::io::stdout().flush().ok();
+        fsck_report_failure(failure);
+    }
+    for commit in &report.tombstoned {
+        println!("Adding tombstone for commit {commit}");
+    }
+    // `--add-tombstones` suppresses the standard-output count and keeps the
+    // error line.
+    if report.commits_partial > 0 && !args.add_tombstones {
+        println!("{} partial commits not verified", report.commits_partial);
+    }
+
     std::io::stdout().flush().ok();
-    if !report.is_ok() {
+    if !report.errors.is_empty() {
+        eprintln!("error: Repository corruption encountered");
         exit_process(1);
     }
+    if report.commits_partial > 0 {
+        eprintln!(
+            "error: {} partial commits from fsck-detected corruption",
+            report.commits_partial
+        );
+        exit_process(1);
+    }
+    println!(
+        "object fsck of {} commits completed successfully - no errors found.",
+        report.commits_checked
+    );
+    std::io::stdout().flush().ok();
     Ok(())
+}
+
+/// One finding, in the tool's words. A content object is named by its
+/// checksum alone and a metadata object by its `<checksum>.<type>` form, and
+/// each carries the commits that reach it.
+fn fsck_finding_line(error: &FsckError) -> String {
+    let object = error.object;
+    let subject = if object.ty == ObjectType::File {
+        format!("content object {}", object.checksum)
+    } else {
+        format!("{}.{}", object.checksum, object.ty.type_str())
+    };
+    let detail = match &error.kind {
+        FsckErrorKind::Missing => {
+            return format!(
+                "Object missing in commits {}: {}.{}",
+                fsck_commit_list(&error.in_commits),
+                object.checksum,
+                object.ty.type_str(),
+            );
+        }
+        FsckErrorKind::ChecksumMismatch { actual } => format!(
+            "Corrupted {} object; checksum expected='{}' actual='{actual}'",
+            object.ty.type_str(),
+            object.checksum,
+        ),
+        FsckErrorKind::Corrupt(detail) => detail.clone(),
+    };
+    if error.in_commits.is_empty() {
+        return format!("fsck {subject}: {detail}");
+    }
+    format!(
+        "In commits {}: fsck {subject}: {detail}",
+        fsck_commit_list(&error.in_commits)
+    )
+}
+
+/// The commits a finding names, comma-and-space separated. The port writes
+/// them sorted where the tool writes them in the order its own hash container
+/// holds (`docs/conformance/cli-surface.md`, "fsck").
+fn fsck_commit_list(commits: &[Checksum]) -> String {
+    commits
+        .iter()
+        .map(|c| c.to_hex())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Write the condition that ended the run, then exit 1.
+fn fsck_report_failure(failure: &FsckFailure) -> ! {
+    match failure {
+        FsckFailure::RefTarget {
+            ref_name,
+            commit,
+            removed,
+        } => {
+            if !removed {
+                eprintln!("Object missing: {commit}.commit");
+            }
+            exit_error(&format!(
+                "Loading commit for ref {ref_name}: No such metadata object {commit}.commit"
+            ));
+        }
+        FsckFailure::MissingDirTree(checksum) => {
+            exit_error(&format!("No such metadata object {checksum}.dirtree"))
+        }
+        FsckFailure::Binding(binding) => exit_error(&fsck_binding_text(binding)),
+    }
+}
+
+/// One binding finding, in the tool's words. The quotes are U+2018 and
+/// U+2019 and the dash in `Collection-ref` is U+2013, as the tool writes them.
+fn fsck_binding_text(error: &FsckBindingError) -> String {
+    let commit = error.commit;
+    match &error.kind {
+        FsckBindingErrorKind::RefNotBound { ref_name, bindings } => {
+            let listed = if bindings.is_empty() {
+                "no refs".to_owned()
+            } else {
+                bindings
+                    .iter()
+                    .map(|name| format!("{OPEN_QUOTE}{name}{CLOSE_QUOTE}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let named = format!("{OPEN_QUOTE}{ref_name}{CLOSE_QUOTE}");
+            format!(
+                "Commit {commit}: Commit has no requested ref {named} in ref binding metadata ({listed})"
+            )
+        }
+        FsckBindingErrorKind::CollectionMismatch { bound, found_under } => {
+            let bound = format!("{OPEN_QUOTE}{bound}{CLOSE_QUOTE}");
+            let under = format!("{OPEN_QUOTE}{found_under}{CLOSE_QUOTE}");
+            format!(
+                "Commit {commit}: Commit has collection ID {bound} in collection binding metadata, while the remote it came from has collection ID {under}"
+            )
+        }
+        FsckBindingErrorKind::BackRefMissing { ref_name } => {
+            let named = format!("{OPEN_QUOTE}{ref_name}{CLOSE_QUOTE}");
+            format!("Ref {named} in bindings for commit {commit} does not exist")
+        }
+        FsckBindingErrorKind::BackRefMismatch { ref_name } => {
+            let named = format!("{OPEN_QUOTE}{ref_name}{CLOSE_QUOTE}");
+            format!("Ref {named} in bindings for commit {commit} does not resolve to that commit")
+        }
+        FsckBindingErrorKind::BackCollectionRefMissing {
+            collection_id,
+            ref_name,
+        } => format!(
+            "{COLLECTION_REF} ({collection_id}, {ref_name}) in bindings for commit {commit} does not exist"
+        ),
+        FsckBindingErrorKind::BackCollectionRefMismatch {
+            collection_id,
+            ref_name,
+        } => format!(
+            "{COLLECTION_REF} ({collection_id}, {ref_name}) in bindings for commit {commit} does not resolve to that commit"
+        ),
+    }
+}
+
+/// An error that ends the command, in the tool's words where the two conditions
+/// coincide. A referenced object the store cannot supply is the tool's
+/// `No such metadata object` sentence.
+fn fsck_error_text(error: &Error) -> String {
+    match error {
+        Error::ObjectNotFound { checksum, ty } => {
+            format!("No such metadata object {checksum}.{}", ty.type_str())
+        }
+        other => other.to_string(),
+    }
 }
 
 async fn diff(repo: Repo, name: &str, args: DiffArgs) -> Result<()> {

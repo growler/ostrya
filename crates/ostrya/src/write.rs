@@ -59,8 +59,9 @@ const S_IFMT: u32 = 0o170000;
 const CANONICAL_PERM_MASK: u32 = 0o755;
 /// The fixed inode mode metadata objects and archive/shared content take.
 const FIXED_MODE: u32 = 0o644;
-/// The chunk size for the streaming copy in [`Transaction::write_content`].
-const COPY_CHUNK: usize = 64 * 1024;
+/// The chunk size for a streaming pass over a content object's payload: the
+/// copy in [`Transaction::write_content`] and the hash `Repo::fsck` takes.
+pub(crate) const COPY_CHUNK: usize = 64 * 1024;
 /// The size of the output buffer [`DeflateSink`] compresses into before it
 /// writes the compressed bytes through to the file under it.
 const DEFLATE_CHUNK: usize = 64 * 1024;

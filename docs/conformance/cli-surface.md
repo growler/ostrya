@@ -1743,7 +1743,35 @@ removed), and the port refuses the same pair in the same words. The totals text
 the command writes is in `../format-reference.md`, "CLI output formats",
 `prune`.
 
-Six divergences stand at `prune`:
+Both implementations hold the repository lock for the whole of a prune, and
+both take it exclusive. Measured against `ostree` 2026.1 on an archive
+repository holding one commit, with a helper process holding a POSIX record
+lock on `<repo>/.lock` through `fcntl.lockf`, which is the lock space the port
+takes; `../format-reference.md`, "Repository lock and staging", records the
+lock file and the lock kind the tool uses, recovered by tracing.
+
+- `ostree prune --refs-only` blocks under a foreign exclusive lock.
+- `ostree prune --refs-only` blocks under a foreign shared lock as well.
+- `ostree prune --refs-only --no-prune` blocks under the same lock, so a dry
+  run takes the lock too.
+- With `core.lock-timeout-secs` at 2 the tool writes `error: Locking repo
+  exclusive failed: Resource temporarily unavailable` and exits 1.
+- With `core.locking` false the tool proceeds under a held foreign exclusive
+  lock, writes nothing to standard error, and exits 0. Against the same
+  repository with the key absent it writes the same standard-output lines and
+  leaves the same loose objects, so the key decides the lock alone.
+
+That the tool takes the lock exclusive rather than shared is an inference over
+the first two observations: a shared acquirer blocks on an exclusive holder and
+not on a shared one, and the tool blocks on both. The port takes the lock
+exclusive over the whole run, a `--no-prune` dry run and a
+`--static-deltas-only` run included, reads `[core] locking` and
+`[core] lock-timeout-secs` as the tool does, and proceeds under a held foreign
+lock where `[core] locking` is false. At the timeout the port exits 1 with its
+own wording, `error: timed out acquiring repository lock after <N>s`, which is
+the diagnostic carve-out of "Scope of CLI compatibility" above.
+
+Seven divergences stand at `prune`:
 
 - the `--keep-younger-than` value dialect. The port takes `@SECONDS` and an
   absolute date and time carrying a UTC offset, and refuses the tool's
@@ -1790,7 +1818,21 @@ Six divergences stand at `prune`:
   and sweeps what it orphaned, and the run exits 0. This is the revision
   superset the port carries at every site that takes a revision, and `prune` is
   the one site where the superset removes objects: a value the tool refuses
-  deletes here.
+  deletes here;
+- the line the port writes where the repository config sets `[core] locking`
+  false. With that key set the tool takes no lock, prunes beside a held foreign
+  lock, exits 0, and writes nothing to standard error. The port does the same
+  work and writes one line to standard error before the run, in its own name:
+  `ostrya: [core] locking is false, so this prune holds no repository lock.
+  Another writer can change the repository while the prune runs.` Both exit 0.
+  The key decides whether the run takes the repository lock and decides nothing
+  else, so each implementation writes the two standard-output lines it writes
+  with the key absent and leaves the same objects
+  (`ostrya_cli::cli::prune_warns_where_locking_is_disabled` holds the port
+  half: the two arms write one standard-output text and leave one object
+  inventory). No matrix cell reaches the line, because no harness setup edits
+  `config` (`harness.md`, "Constraints"), so every cell runs against a
+  repository whose `[core] locking` holds its default of true.
 
 Two corners at `prune` are not settled by an observation this host can make:
 
@@ -2457,7 +2499,17 @@ Observed by running the tool (2026.1).
   the first checkout. A record stream carrying no pair reaches the read and
   refuses such a value too. A `--composefs` line reaches it nowhere, so the port
   exports the image at exit 0 where the tool refuses the repository, which
-  "checkout" above records as a divergence.
+  "checkout" above records as a divergence. Within `prune` the port reads
+  `[ex-ostrya] gc-root-metadata-keys` first. It then reads `[core] locking` in
+  the `prune` handler, for the line it writes where that key is false. It reads
+  `[core] locking` a second time, together with `[core] lock-timeout-secs`, as
+  it takes the repository lock, and it reads `[core] tombstone-commits` and
+  `[core] fsync` inside the run. All of them come after every option refusal and
+  after the revision `--delete-commit` names, so a line the port refuses on its
+  options refuses the same way whatever those values hold. The timeout is read
+  even where `locking` is false, so a malformed `lock-timeout-secs` refuses a
+  prune on a repository that takes no lock. A `--static-deltas-only` run returns
+  before the last two, so it refuses neither of them.
 - `init --mode=<mode>` rejects a mode it does not recognize with `error:
   Invalid mode '<mode>' in repository configuration` and exits 1, before
   writing anything to the target directory. Confirmed for an unknown string

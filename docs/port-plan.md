@@ -5418,7 +5418,7 @@ whatever its timestamp, and a commit the bound rules out contributes nothing and
 is not recorded, so a ref naming that same commit still reaches it. A commit is
 expanded again only under a bound that follows further than every bound it was
 expanded under, which is what bounds the walk with two kinds of bound in play.
-The branch a depth applies to is matched by name, so `refs.rs`'s walk gained
+The branch a depth applies to is matched by name, so the ref walk gained
 `Repo::list_all_refs`, which names a local ref by its path under `refs/heads`, a
 remote ref by its `<remote>:<name>` refspec, and a mirror ref by its path under
 `refs/mirrors`; `list_all_ref_targets` reads it.
@@ -6351,6 +6351,168 @@ paths, and `commit --tree=dir=` ingests from disk, where the kernel and not
 ostrya resolves the symlink. The clean-room rule forbids confirming the
 comparison in the reference source, and no black-box angle to confirm it was
 found. The fix is justified on the debles field defect alone.
+
+### Phase 25 -- Weak refs in prune and the repository lock (DONE)
+
+An out-of-tree consumer, debles, keeps one ref for each cached artifact and each
+intermediate build, and it must decide which of those refs are still needed.
+That decision repeats the walk `Repo::prune` already makes, over two
+commit-metadata keys and the ostree `parent` edge, and it costs a second prune
+over the survivors. This phase carries the walk inside `Repo::prune` and leaves
+the consumer the policy alone. The classification is a function, so no
+`[ex-ostrya]` config key carries it; a name-pattern key is a separate decision
+for a later phase. Every default the phase adds is the behavior that stands
+without it, so `PruneOptions::default()` is still the tool's prune.
+
+The release is 0.2.5. `PruneOptions` gains a field, and `PruneStats` gains one
+and loses `Copy`. Decision 14 calls a field added to an option struct a breaking
+change that takes a minor version before 1.0. Per the maintainer, this project
+is pre-1.0 and carries no compatibility burden yet, so the release takes a patch
+version, the exception Phase 23 opened and Phase 24 restated. Decision 14 stays
+unchanged. 0.2.4 is published and the consumer resolves it from the registry
+with a checksum, so 0.2.4 cannot carry the break.
+
+`25a` -- the repository lock (DONE). `Repo::prune` holds the repository lock
+exclusive from end to end, a `no_prune` dry run and a `static_deltas_only` run
+included, which is what the tool does. It reads `[core] locking` and
+`[core] lock-timeout-secs` through the path `Repo::transaction_with_lock` reads
+them, and it fails with `Error::LockTimeout` where another holder keeps the lock
+past the timeout. The in-process gate is symmetric: a shared acquire waits for
+an exclusive holder, an exclusive acquire waits for either, and the exclusive
+hold is not re-entrant. A gate that holds in one direction alone admits a
+transaction opened after the prune acquired, and the prune can then sweep an
+object that transaction is staging through the dedup path. One hazard follows
+and is accepted: a caller that prunes while it holds a transaction of its own
+open waits out `lock-timeout-secs` and then fails. `transaction_with_lock` reads
+all four `[core]` keys before it acquires, so a malformed `min-free-space-size`
+refuses at once, ahead of the wait a contended repository imposes. The
+tool-agreement direction is measured both ways: `commit --tree=tar=-` holds the
+tool's lock for an interval the test controls, because the tool takes the lock
+before it reads the first byte of the tar, and the editor route holds nothing,
+because the tool takes its lock after the editor returns. `cli-surface.md`,
+"prune", carries the observation the agreement rests on.
+
+`25b` -- weak refs over local refs (DONE). `WeakRefFilter` wraps a
+`WeakRefFilterFn`, an `Arc<dyn Fn(&str, &Checksum) -> bool + Send + Sync>`. It
+derives `Clone` and `Default` and carries a hand-written `Debug`, so
+`PruneOptions` keeps its `Debug` and `Clone` derives and its hand-written
+`Default`. `PruneOptions::weak_ref_filter` is unset by default, and an unset
+filter classifies every ref strong. A set filter together with `refs_only` false
+fails the prune with `Error::InvalidFormat` before the run reads anything,
+because a run that roots every commit in the store deletes no ref. A strong ref
+roots the walk under the bound its own name carries. A weak ref roots nothing,
+and it survives where the walk reaches its commit over some other edge. Where
+the walk arrives at a weak ref's commit over a `parent` edge, the commit takes
+the bound that weak ref's own name carries in place of the bound the edge had
+left; the tests name this Rule B, and this document calls it the re-seeding
+rule. The rule is required and not a preference, because one walk decides both
+which weak refs survive and which objects the sweep deletes, and the other rule
+can delete the commits of a surviving ref's own history. It also closes the
+consumer's second pass: a weak ref re-seeded inside the walk reaches commits
+whose metadata keys name further weak refs, and one walk finds them while the
+stack is still running. `PruneStats` gains `deleted_refs`, sorted by name in
+byte order, and loses `Copy`. The deletion runs between the walk and the sweep,
+because a walk that fails must leave the repository as it stood, and it goes
+through a blocking unlink pass in `refs.rs`, which takes no lock of its own and
+honors `[core] fsync`. Each ref is read again immediately ahead of its own
+unlink.
+
+Six properties the pipeline holds:
+
+- `list_all_refs` carries the ref space each listed ref came from, because a
+  name alone cannot tell a `refs/heads` ref from a `refs/mirrors` ref, and 25b
+  classifies heads alone.
+- A `refs/heads` name holding a `:` maps under `refs/remotes` through the
+  refspec rule, so a deletion would unlink a different file and the guard would
+  read a different file. Such a name stays strong and never reaches the filter.
+- The guard skips a ref only where the ref moved to a different checksum. An
+  absent read unlinks. A weak alias over an already-unlinked weak ref otherwise
+  leaves a dangling symlink whose commit the sweep then takes.
+- The deletion pass runs in one blocking hop and syncs each distinct parent
+  directory once. One hop and one sync for each ref cost 22.1 s at 5,000 refs
+  against 0.09 s, and 192 s at 40,000.
+- The bounds one commit's weak refs carry collapse to the furthest `Depth` and
+  the earliest `Since`. A LIFO stack pops a listing-ordered bound list
+  shortest-first and re-expands the chain once for each bound: 540 ms against
+  5.6 ms at 800 commits and 400 weak refs.
+- The re-seeding replaces the bound of a `parent`-edge arrival alone. A
+  metadata-key edge arrives as a root in its own right and stands, so the commit
+  expands under both bounds, which is the retention direction.
+
+Three further facts:
+
+- A run that fails part way keeps the refs it already removed and loses the list
+  with the error.
+- A weak ref outside an `only_branch` selection or younger than
+  `keep_younger_than` is still classified and still deleted, because it roots
+  nothing.
+- A `static_deltas_only` run returns before it reads the ref space, so its list
+  is empty whatever the filter holds.
+
+`25c` -- the rest of the ref space (DONE). A ref under `refs/remotes` reaches
+the classifier under its `<remote>:<name>` refspec and deletes through the same
+path. A ref under `refs/mirrors` is strong and never reaches the classifier.
+
+Five properties the widened ref space holds:
+
+- Addressability is a per-ref flag. The listing names a remote ref by replacing
+  the first `/` of its path below `refs/remotes` with a `:`, and the refspec
+  mapping splits at the first `:`, so `refs/remotes/a:b/main` and
+  `refs/remotes/a/b:main` share the listed name `a:b:main` and only the second
+  addresses its own file. The addressability test takes the listed path, so
+  only a ref whose name maps back to its own file reaches the classifier. The
+  guard derives the path from the name, so it always reads the file the ref was
+  listed from.
+- Four ref-file shapes are not addressable: a local path holding a `:`; a remote
+  directory whose name holds a `:`; a file directly under `refs/remotes`; and
+  such a file whose own name holds a `:`.
+- The sync set records a parent directory only where the unlink removed a file.
+  Syncing a parent that is already absent fails the whole run after other refs
+  are unlinked, and the pass takes an absent parent as done.
+- The distinct-parent set is a hash set. Routing remote refs through the same
+  path multiplies the parent count, because the count follows the leaf
+  directories and not the remotes: 8,000 refs over 8,000 parents cost 606 ms
+  under a linear scan against 239 ms.
+- A prefix classifier is not safe by construction across this widening. A prefix
+  holding a `/` ahead of any `:` matches a local name alone. A bare segment
+  prefix matches a remote refspec too, so `pool` matches the remote `poolcache`
+  under the name `poolcache:main`.
+
+Two further facts: the mirrors rule holds twice in the code, through the space
+test and through the addressability test, and the tests prove only the
+conjunction, because no mirror name is addressable; and the addressability flag
+is computed on every ref listing and read by the classification alone, which
+costs about 92 ns for each ref.
+
+`25d` -- the CLI warning and the documents (DONE). `ostrya prune` writes one
+line to standard error, in its own name, where the repository config sets
+`[core] locking` false, stating that the run holds no repository lock and that
+another writer can change the repository while it runs. The read stands after
+the options are assembled, so it leaves the place an `[ex-ostrya]
+gc-root-metadata-keys` refusal lands unmoved. One divergence stands, and
+`cli-surface.md`, "prune", records it: with that key set the tool takes no lock
+either, prunes beside a held foreign lock, exits 0, and writes nothing to
+standard error. 25a closed a difference that stood between the two
+implementations, and it opened none; `cli-surface.md`, "prune", now carries the
+observation both implementations are measured against. No matrix cell reaches
+the line, because no harness setup edits `config`
+(`conformance/harness.md`, "Constraints").
+
+Six decisions the phase carries:
+
+- The classifier is a function and not a list of names. A repository config key
+  cannot carry a function, so the classification has no `[ex-ostrya]` key.
+- `refs/mirrors` is always strong, and an alias reaches the classifier under its
+  own name.
+- A classifier together with `refs_only` false is refused.
+- The library reports no warning and no count of a `parent` edge or a
+  metadata-key edge that names an absent commit. Phase 22 settled that prune has
+  no warning channel, and this phase adds none.
+- The re-seeding rule is required and not a preference. One walk decides both
+  which weak refs survive and which objects the sweep deletes, and the other
+  rule can delete the commits of a surviving ref's own history.
+- The out-of-tree consumer loses its own missing-edge warning when it drops its
+  walk. This is the maintainer's decision.
 
 ## Risk register
 

@@ -68,11 +68,14 @@
 //! `/etc` -> `/usr/etc` remap. It also covers maintenance (Phase 12):
 //! [`Repo::list_objects`] and the reachability walks
 //! [`Repo::traverse_commit`]/[`Repo::traverse_reachable`], [`Repo::prune`]
-//! ([`PruneOptions`]/[`PruneStats`]) which deletes objects unreachable from the
-//! chosen roots (refs, optionally every commit, to a depth, with an optional
-//! `delete_commit`, and with the extra roots
-//! [`PruneOptions::gc_root_metadata_keys`] names under an optional
-//! [`PruneOptions::traverse_parent`]), [`Repo::fsck`] ([`FsckOptions`]/[`FsckReport`]) which
+//! ([`PruneOptions`]/[`PruneStats`]) which holds the repository lock exclusive
+//! for the whole run, deletes objects unreachable from the chosen roots (refs,
+//! optionally every commit, to a depth, with an optional `delete_commit`, and
+//! with the extra roots [`PruneOptions::gc_root_metadata_keys`] names under an
+//! optional [`PruneOptions::traverse_parent`]), and deletes each ref the walk
+//! did not reach that [`PruneOptions::weak_ref_filter`] classified weak,
+//! naming it in [`PruneStats::deleted_refs`],
+//! [`Repo::fsck`] ([`FsckOptions`]/[`FsckReport`]) which
 //! verifies object integrity and completeness and marks incomplete commits
 //! partial, and [`Repo::diff_commits`] ([`DiffEntry`]/[`DiffChange`]) which
 //! reports the paths that changed between two commits. It also covers

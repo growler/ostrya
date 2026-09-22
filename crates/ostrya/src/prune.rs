@@ -64,6 +64,20 @@
 //!   waits out the timeout and then fails, and a transaction the process opens
 //!   while the run stands waits for the run to finish.
 //!
+//! Two options carry reachability the tool has no counterpart for:
+//! [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) names metadata
+//! keys whose value names further commits to keep, and
+//! [`traverse_parent`](PruneOptions::traverse_parent) decides whether a commit's
+//! `parent` is reachable from it at all.
+//!
+//! The `ostrya` CLI fills the first of the two from the repository config key
+//! `[ex-ostrya] gc-root-metadata-keys`
+//! ([`RepoConfig::gc_root_metadata_keys`](crate::RepoConfig::gc_root_metadata_keys)).
+//! The library reads four `[core]` keys of its own: `locking` and
+//! `lock-timeout-secs` as it takes the repository lock, and
+//! `tombstone-commits` and `fsync` inside the run. The rest of a prune acts on
+//! the options it is given.
+//!
 //! A third option carries a behavior the tool has no counterpart for:
 //! [`weak_ref_filter`](PruneOptions::weak_ref_filter) classifies each
 //! addressable ref under `refs/heads` and each addressable ref under
@@ -81,18 +95,9 @@
 //! ref's bound alike. A set filter requires
 //! [`refs_only`](PruneOptions::refs_only).
 //!
-//! Two options carry reachability the tool has no counterpart for, so a prune
-//! that leaves them at their defaults is the tool's:
-//! [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) names metadata
-//! keys whose value names further commits to keep, and
-//! [`traverse_parent`](PruneOptions::traverse_parent) decides whether a commit's
-//! `parent` is reachable from it at all.
-//!
-//! The `ostrya` CLI fills the first of the two from the repository config key
-//! `[ex-ostrya] gc-root-metadata-keys`
-//! ([`RepoConfig::gc_root_metadata_keys`](crate::RepoConfig::gc_root_metadata_keys)).
-//! The library reads one config key of its own, `[core] tombstone-commits`; the
-//! rest of a prune acts on the options it is given.
+//! Those three options are the port extensions of this module. Each default is
+//! the behavior that stands without it, so a prune that leaves all three at
+//! their defaults is the tool's.
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::BorrowedFd;
@@ -697,12 +702,12 @@ impl Repo {
         // The whole pass runs in one blocking hop, the way the object sweep
         // does. Each name is read immediately ahead of its own unlink, and the
         // directories that held a removed ref are `fsync`-ed once at the end.
-        let mut doomed_refs: Vec<(String, Checksum)> = Vec::with_capacity(weak_refs.len());
-        for (name, target) in weak_refs {
-            if !keep.contains(&ObjectName::new(target, ObjectType::Commit)) {
-                doomed_refs.push((name, target));
-            }
-        }
+        // The doomed list is the weak list less the refs the walk reached, in
+        // the order the listing gave them, so the weak list is narrowed where
+        // it stands.
+        let mut doomed_refs = weak_refs;
+        doomed_refs
+            .retain(|(_, target)| !keep.contains(&ObjectName::new(*target, ObjectType::Commit)));
         // A dry run reports what the walk decided and touches nothing, so it
         // reads no ref a second time.
         let mut deleted_refs: Vec<String> = if opts.no_prune {

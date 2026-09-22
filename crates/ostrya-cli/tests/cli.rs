@@ -19841,6 +19841,61 @@ fn prune_writes_a_tombstone_for_every_commit_it_removes() {
     assert_prune_agrees(base, &swept, "tomb-second-run", &[]);
 }
 
+/// `prune` writes one line of its own to standard error where the repository
+/// config sets `[core] locking` false, and writes none where the key holds its
+/// default. The key decides whether the run takes the repository lock and
+/// decides nothing else, so the two arms write one standard-output text and
+/// leave one object inventory, and the line is additive.
+#[test]
+fn prune_warns_where_locking_is_disabled() {
+    let mut outcomes: Vec<(String, Vec<String>)> = Vec::new();
+
+    for locking in [true, false] {
+        let tag = if locking { "on" } else { "off" };
+        let tmp = TmpDir::new(&format!("prune-locking-{tag}"));
+        let base = tmp.path();
+        let repo = create_repo(base, RepoMode::Archive);
+        let repo_arg = format!("--repo={}", repo.display());
+        ex_ostrya_commit(&repo, base, "head", None, Some("main"));
+        // An unreferenced commit, so the run has something to remove and the
+        // inventory the two arms leave is an oracle rather than a constant.
+        ex_ostrya_commit(&repo, base, "orphan", None, None);
+
+        if !locking {
+            // A fresh config holds `[core]` as its only group, so a bare
+            // append lands inside it.
+            let mut config = std::fs::read_to_string(repo.join("config")).unwrap();
+            config.push_str("locking=false\n");
+            std::fs::write(repo.join("config"), config).unwrap();
+        }
+
+        let run = ostrya(&[&repo_arg, "prune", "--refs-only"], None, &[]);
+        run.ok();
+        let stderr = String::from_utf8(run.stderr.clone()).unwrap();
+        assert_eq!(
+            stderr.contains("[core] locking is false"),
+            !locking,
+            "{tag}: the line stands where locking is false and nowhere else, \
+             stderr was {stderr:?}"
+        );
+        outcomes.push((run.stdout_trimmed(), prune_inventory(&repo)));
+    }
+
+    assert!(
+        outcomes[0].0.contains("Total objects:") && outcomes[0].0.contains("Deleted "),
+        "the totals line stands and the run removed the orphan's objects: {:?}",
+        outcomes[0].0
+    );
+    assert_eq!(
+        outcomes[0].0, outcomes[1].0,
+        "both arms write the same standard output"
+    );
+    assert_eq!(
+        outcomes[0].1, outcomes[1].1,
+        "both arms leave the same object inventory"
+    );
+}
+
 /// The port and the tool part on a ref name the tool's ref enumeration skips:
 /// the tool's `prune --refs-only` reads the commit that ref holds as
 /// unreachable and deletes it, and the port enumerates the name and keeps the

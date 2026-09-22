@@ -4995,7 +4995,9 @@ destination.
 
 The command writes two lines to standard output and nothing to standard error.
 `-v` adds `OT: ` trace lines on standard error and leaves standard output
-unchanged.
+unchanged. Over a repository whose config sets `[core] locking` false the port
+writes one line of its own to standard error before the run, which the tool does
+not (`conformance/cli-surface.md`, "prune").
 
 The first line states how many objects the run considered.
 

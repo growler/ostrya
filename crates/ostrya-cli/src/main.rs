@@ -6309,6 +6309,28 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         gc_root_metadata_keys: repo.config().gc_root_metadata_keys()?,
         ..PruneOptions::default()
     };
+    // A repository whose config sets `[core] locking` false takes no lock, so
+    // the run below shares the repository with any other writer. The tool
+    // writes nothing here, which makes the line a divergence
+    // (`docs/conformance/cli-surface.md`, "prune").
+    //
+    // The read stands here, after the options are assembled, so it does not
+    // move where an `[ex-ostrya] gc-root-metadata-keys` refusal lands. A read
+    // hoisted to the top of this function, the way `commit` hoists the four
+    // `[core]` keys its transaction needs, would put a `locking=bogus` refusal
+    // ahead of the `--keep-younger-than`, `--retain-branch-depth`, and
+    // `--delete-commit` refusals. That order contradicts the conformance
+    // record, which states that every config read `prune` makes comes after
+    // every option refusal (`docs/conformance/cli-surface.md`, "Global
+    // conventions"). `Repo::prune` reads the same key again as it takes the
+    // lock; this is a lookup over the config the handle already parsed and
+    // reads no file.
+    if !repo.config().locking()? {
+        eprintln!(
+            "ostrya: [core] locking is false, so this prune holds no repository \
+             lock. Another writer can change the repository while the prune runs."
+        );
+    }
     let stats = repo.prune(&opts).await.map_err(report_resolution_failure)?;
     if args.commit_only {
         println!("Total (commit only) objects: {}", stats.total_objects);

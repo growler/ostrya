@@ -988,7 +988,9 @@ fn write_alias_blocking(
 /// directory that is gone by the time the pass reaches it holds no entry to
 /// make durable, so its absence is success as well. A hash set carries the
 /// membership test, and a vector carries the order the `fsync` calls run in.
-/// That order is the order the first unlink of each directory ran in.
+/// That order is the order the first unlink of each directory ran in. The
+/// membership test reads the borrowed path, so a parent the set already holds
+/// costs no allocation.
 ///
 /// Returns the names it removed, in the order it was given them.
 pub(crate) fn delete_matching_refs_blocking(
@@ -1010,7 +1012,8 @@ pub(crate) fn delete_matching_refs_blocking(
             Ok(()) => {
                 if fsync {
                     let parent = ref_parent(&relpath);
-                    if held.insert(parent.to_owned()) {
+                    if !held.contains(parent) {
+                        held.insert(parent.to_owned());
                         parents.push(parent.to_owned());
                     }
                 }

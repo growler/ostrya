@@ -359,6 +359,14 @@ impl Repo {
     pub async fn set_ref_alias_immediate(&self, refspec: &str, target: &str) -> Result<()>;
 
     // --- maintenance ---
+    /// The run holds the repository lock exclusive from end to end, a
+    /// `no_prune` dry run and a `static_deltas_only` run included. It reads
+    /// `[core] locking` and `[core] lock-timeout-secs`, and it fails with
+    /// `Error::LockTimeout` where another holder keeps the lock past the
+    /// timeout. The hold excludes every other writer, in this process and in
+    /// another: a caller holding a transaction of its own open across the call
+    /// waits out the timeout and then fails, and a transaction the process
+    /// opens while the run stands waits for the run to finish.
     pub async fn prune(&self, opts: &PruneOptions) -> Result<PruneStats>;
     pub async fn fsck(&self, opts: &FsckOptions) -> Result<FsckReport>;
     pub async fn traverse_commit(&self, c: &Checksum, depth: i32)
@@ -373,9 +381,9 @@ pub struct SummaryOptions {
     pub metadata_commit_timestamp: Option<u64>,
 }
 
-/// What a prune keeps. The first nine fields are the tool's; the last two are
-/// port extensions the tool has no counterpart for, and their defaults are what
-/// the tool does.
+/// What a prune keeps. The first nine fields are the tool's; the last three
+/// are port extensions the tool has no counterpart for, and their defaults are
+/// what the tool does.
 pub struct PruneOptions {
     pub refs_only: bool,                  // roots are the refs alone
     pub depth: i32,                       // parents kept: -1 all, 0 the head,
@@ -423,12 +431,95 @@ pub struct PruneOptions {
     /// Whether a commit's `parent` is reachable from it. True by default,
     /// which is the edge `depth` bounds.
     pub traverse_parent: bool,
+    /// The classifier that splits the ref space into strong refs and weak
+    /// refs. Unset by default, which classifies every ref strong, so a prune
+    /// that leaves it unset deletes no ref. A set filter requires `refs_only`;
+    /// the two apart fail the prune with `Error::InvalidFormat` before the run
+    /// reads anything.
+    ///
+    /// The filter sees each ref under `refs/heads` by its path below that
+    /// directory, and each ref under `refs/remotes` by its `<remote>:<name>`
+    /// refspec. A ref under `refs/mirrors` is strong and never reaches the
+    /// filter.
+    ///
+    /// A ref is addressable where the name the listing gave it maps back to
+    /// the file it was listed from. A non-addressable ref is strong and never
+    /// reaches the filter either. The mapping splits a name at its first `:`,
+    /// and the listing builds a remote name by replacing the first `/` of the
+    /// path below `refs/remotes` with a `:`, so `refs/remotes/a:b/main` and
+    /// `refs/remotes/a/b:main` share the listed name `a:b:main` and only the
+    /// second addresses its own file.
+    ///
+    /// A strong ref roots the walk under the bound `retain_branch_depth`,
+    /// `only_branch`, and `depth` give its name. A weak ref roots nothing, so
+    /// the branch selection and the time bound have nothing to select for it.
+    /// It survives where the walk reaches its commit over some other edge. An
+    /// arrival over a `parent` edge gives the commit the bound that weak ref's
+    /// own name carries in place of the bound the edge had left; an arrival
+    /// over any other edge carries a bound of its own, and the commit expands
+    /// under that bound and under the weak ref's bound alike. The run deletes
+    /// each weak ref the walk did not reach and names it in
+    /// `PruneStats::deleted_refs`.
+    ///
+    /// A classifier that tests a prefix of the name keeps the meaning it had
+    /// where that prefix holds a `/` ahead of any `:`, which matches a local
+    /// name alone. A bare segment prefix matches a remote refspec too: `pool`
+    /// matches `poolcache:main`, the refspec of a ref of the remote
+    /// `poolcache`.
+    ///
+    /// The callback runs while the run holds the repository lock exclusive, so
+    /// it must call no `Repo` method: a transaction from inside it waits out
+    /// `[core] lock-timeout-secs` and then fails.
+    pub weak_ref_filter: WeakRefFilter,
 }
 impl PruneOptions {
     /// Refs alone, no `parent` edge, and the named metadata keys as the extra
     /// roots: what an application recording its own reachability prunes with.
     pub fn gc_roots<I: IntoIterator<Item = S>, S: Into<String>>(keys: I)
         -> PruneOptions;
+}
+
+/// A verdict on one ref: its name and the commit it resolves to. True
+/// classifies the ref strong, false weak.
+pub type WeakRefFilterFn = Arc<dyn Fn(&str, &Checksum) -> bool + Send + Sync>;
+
+/// The ref classifier a prune applies, unset by default, which classifies
+/// every ref strong. `Debug` is hand-written over the callback and prints
+/// `WeakRefFilter(set)` or `WeakRefFilter(unset)`, so `PruneOptions` keeps its
+/// own `Debug` derive.
+#[derive(Clone, Default)]
+pub struct WeakRefFilter(Option<WeakRefFilterFn>);
+impl WeakRefFilter {
+    pub fn new<F: Fn(&str, &Checksum) -> bool + Send + Sync + 'static>(f: F)
+        -> WeakRefFilter;
+    // Over a callback the caller holds, shared with another PruneOptions.
+    pub fn from_fn(f: WeakRefFilterFn) -> WeakRefFilter;
+}
+
+/// The outcome of a prune run. `Clone`, and not `Copy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneStats {
+    /// The loose objects considered: the store's total after any
+    /// `delete_commit` removal, with detached commit metadata and tombstone
+    /// markers left out and static deltas outside it. Under `commit_only` it
+    /// counts commit objects alone.
+    pub total_objects: usize,
+    /// The objects deleted, or under `no_prune` that would be, on the terms
+    /// `total_objects` states.
+    pub pruned_objects: usize,
+    /// The on-disk bytes the objects `pruned_objects` counts freed, or would
+    /// free.
+    pub freed_bytes: u64,
+    /// The weak refs the run deleted, sorted by name in byte order.
+    ///
+    /// Under `no_prune` it names the refs the run would have deleted, and the
+    /// run removes no ref. A ref the compare-and-delete guard skipped is in no
+    /// list, because the run left it where it stood. A `static_deltas_only`
+    /// run returns before it reads the ref space, so the list is empty
+    /// whatever `weak_ref_filter` holds. Where the run fails part way through
+    /// the deletions, the refs it already removed stay removed, and this list
+    /// goes with the error the caller gets in place of the statistics.
+    pub deleted_refs: Vec<String>,
 }
 
 /// What a check reads and what it does with a fault. Every field but

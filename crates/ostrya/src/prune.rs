@@ -65,9 +65,13 @@
 //!   while the run stands waits for the run to finish.
 //!
 //! A third option carries a behavior the tool has no counterpart for:
-//! [`weak_ref_filter`](PruneOptions::weak_ref_filter) classifies each ref under
-//! `refs/heads` as strong or weak. A strong ref roots the walk as every ref
-//! does. A weak ref roots nothing: it survives where the walk reaches its
+//! [`weak_ref_filter`](PruneOptions::weak_ref_filter) classifies each
+//! addressable ref under `refs/heads` and each addressable ref under
+//! `refs/remotes` as strong or weak. A ref is addressable where the name the
+//! listing gave it maps back to the file it was listed from. A ref under
+//! `refs/mirrors` is strong and never reaches the classifier, and so is a ref
+//! whose listed name maps to another file. A strong ref roots the walk as every
+//! ref does. A weak ref roots nothing: it survives where the walk reaches its
 //! commit over some other edge, and the run unlinks it otherwise and names it
 //! in [`PruneStats::deleted_refs`]. Where the walk arrives at a weak ref's
 //! commit over a `parent` edge, that commit takes the bound the weak ref's own
@@ -102,7 +106,7 @@ use crate::error::{Error, Result};
 use crate::lock::LockKind;
 use crate::repo::Repo;
 use crate::tombstone::write_tombstone;
-use crate::traverse::{ParentBound, RefSpace, WeakBounds};
+use crate::traverse::{ListedRef, ParentBound, RefSpace, WeakBounds};
 
 /// A verdict on one ref, taken as a prune classifies the ref space.
 ///
@@ -274,10 +278,23 @@ pub struct PruneOptions {
     /// anything.
     ///
     /// The filter sees each ref under `refs/heads` by its path below that
-    /// directory. A ref under `refs/remotes` and a ref under `refs/mirrors` is
-    /// strong and never reaches the filter. A name below `refs/heads` holding a
-    /// `:` maps to a path under `refs/remotes` through the refspec rule, so it
-    /// is strong as well and the filter never learns it exists.
+    /// directory, and each ref under `refs/remotes` by its `<remote>:<name>`
+    /// refspec. A ref under `refs/mirrors` is strong and never reaches the
+    /// filter.
+    ///
+    /// A ref whose listed name maps to a different file through the refspec
+    /// rule is strong as well, and the filter never learns it exists. A local
+    /// name addresses its own file where the name holds no `:`. A remote
+    /// refspec addresses its own file where the first `/` of the path below
+    /// `refs/remotes` is the first `:` of the name. A ref file whose name
+    /// fails its rule maps to another path, so the filter never sees it.
+    ///
+    /// A classifier that tests a prefix of the name keeps the meaning it had
+    /// where that prefix holds a `/` ahead of any `:`. Such a prefix matches a
+    /// local name alone. A prefix that is a bare segment matches a remote
+    /// refspec as well, and so does a test of a substring. The prefix `pool`
+    /// matches `poolcache:main`, the refspec of a ref of the remote
+    /// `poolcache`.
     ///
     /// A strong ref roots the walk under the bound
     /// [`retain_branch_depth`](PruneOptions::retain_branch_depth),
@@ -548,8 +565,12 @@ impl Repo {
         }
         // Classify the ref space in one pass, so the strong roots and the weak
         // targets cannot disagree. A ref is weak where it lives below
-        // `refs/heads`, the classifier answers false for it, and its name
-        // round-trips through the refspec mapping. Every other ref is strong.
+        // `refs/heads` or `refs/remotes`, the name it was listed under
+        // addresses the file it was listed from, and the classifier answers
+        // false for it. Every other ref is strong. A ref below `refs/mirrors`
+        // is always strong and never reaches the classifier, which the space
+        // test states and the addressability test holds a second time, because
+        // no refspec maps to a path below `refs/mirrors`.
         //
         // A weak target stays out of `ref_targets`: the walk needs a seed for
         // every checksum that set names, and a weak ref supplies none. The weak
@@ -566,11 +587,17 @@ impl Repo {
         let mut ref_targets: HashSet<Checksum> = HashSet::new();
         let mut weak_refs: Vec<(String, Checksum)> = Vec::new();
         let mut weak_roots: HashMap<Checksum, WeakBounds> = HashMap::new();
-        for (space, name, checksum) in named_refs {
+        for ListedRef {
+            space,
+            name,
+            addressable,
+            checksum,
+        } in named_refs
+        {
             let bound = opts.ref_bound(&name);
             let weak = filtering
-                && space == RefSpace::Heads
-                && crate::refs::heads_name_round_trips(&name)
+                && matches!(space, RefSpace::Heads | RefSpace::Remotes)
+                && addressable
                 && !opts.weak_ref_filter.is_strong(&name, &checksum);
             if weak {
                 weak_roots.entry(checksum).or_default().add(bound);

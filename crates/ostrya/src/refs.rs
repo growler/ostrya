@@ -28,6 +28,7 @@
 //! writes; [`Repo::set_ref_immediate`](Repo::set_ref_immediate) writes one
 //! outside a transaction and reads `[core] fsync` itself.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
@@ -776,20 +777,41 @@ fn refspec_to_relpath(refspec: &str) -> Result<String> {
     }
 }
 
-/// Whether a local ref name round-trips through the refspec mapping: the path
-/// [`refspec_to_relpath`] gives it is `refs/heads/<name>`.
+/// Whether the name a listing gave a ref addresses the file it was listed
+/// from: whether [`refspec_to_relpath`] maps `name` to exactly `<top>/<path>`,
+/// where `top` is the directory of `refs/` the listing walked and `path` is the
+/// path of the ref file below it.
 ///
-/// A ref file below `refs/heads` is listed by its path, and that path may hold
-/// a `:`. The refspec mapping reads a `:` as the separator of a remote name, so
-/// a listed name such as `foo:bar` maps to `refs/remotes/foo/bar`, which is a
-/// different file. Prune classifies a local ref only where this answers true,
-/// so every ref the classifier sees reads and deletes through the file it was
-/// listed from. A name the mapping refuses answers false.
+/// Prune classifies a ref only where this answers true, so every ref the
+/// classifier sees reads and deletes through the file it was listed from. A
+/// name the mapping refuses answers false.
 ///
-/// The mapping takes its `refs/heads/` branch for a name that holds no `:` and
-/// is a valid ref path, so the test reads the name in place.
-pub(crate) fn heads_name_round_trips(name: &str) -> bool {
-    !name.contains(':') && is_ref_path(name)
+/// The name alone decides this for a ref below `refs/heads`, where a `:` in the
+/// name sends the mapping to `refs/remotes` and so to a different file. The
+/// name alone cannot decide it for a ref below `refs/remotes`. A listing names
+/// such a ref by replacing the first `/` of its path with a `:`, and the
+/// mapping splits at the first `:`, so two files give one name: both
+/// `refs/remotes/a:b/main` and `refs/remotes/a/b:main` list as `a:b:main`, and
+/// the mapping sends that name to the second of the two. The signature takes
+/// the path for this reason.
+///
+/// No refspec maps to a path below `refs/mirrors`, so a mirror ref always
+/// answers false.
+///
+/// The body mirrors [`refspec_to_relpath`] branch for branch and allocates
+/// nothing, because prune calls it once for each ref in the repository.
+pub(crate) fn listed_name_addresses_it(name: &str, top: &str, path: &str) -> bool {
+    match name.split_once(':') {
+        Some((remote, rest)) => {
+            top == "refs/remotes"
+                && is_component(remote)
+                && is_ref_path(rest)
+                && path
+                    .split_once('/')
+                    .is_some_and(|(dir, below)| dir == remote && below == rest)
+        }
+        None => top == "refs/heads" && is_ref_path(name) && path == name,
+    }
 }
 
 /// The same rule as [`Error::InvalidRefspec`]-bearing validation, for a bare
@@ -960,8 +982,13 @@ fn write_alias_blocking(
 /// same -- the name the caller recorded is gone or dangles, `unlinkat` removes
 /// a symlink and not the file it names, and an already-absent name is success.
 ///
-/// Under `fsync` each directory that held a removed ref is `fsync`-ed once,
-/// after the last unlink, so every removed name is durable.
+/// Under `fsync` each directory an unlink emptied of one name is `fsync`-ed
+/// once, after the last unlink, so every removed name is durable. A directory
+/// is recorded only where its own unlink reported success. A recorded
+/// directory that is gone by the time the pass reaches it holds no entry to
+/// make durable, so its absence is success as well. A hash set carries the
+/// membership test, and a vector carries the order the `fsync` calls run in.
+/// That order is the order the first unlink of each directory ran in.
 ///
 /// Returns the names it removed, in the order it was given them.
 pub(crate) fn delete_matching_refs_blocking(
@@ -971,6 +998,7 @@ pub(crate) fn delete_matching_refs_blocking(
 ) -> Result<Vec<String>> {
     let mut removed = Vec::with_capacity(refs.len());
     let mut parents: Vec<String> = Vec::new();
+    let mut held: HashSet<String> = HashSet::new();
     for (name, target) in refs {
         let relpath = refspec_to_relpath(&name)?;
         if let Some(bytes) = read_ref_file(repo_fd, &relpath)?
@@ -979,19 +1007,21 @@ pub(crate) fn delete_matching_refs_blocking(
             continue;
         }
         match rustix::fs::unlinkat(repo_fd, relpath.as_str(), AtFlags::empty()) {
-            Ok(()) | Err(Errno::NOENT) => {}
-            Err(e) => return Err(Error::Io(e.into())),
-        }
-        if fsync {
-            let parent = ref_parent(&relpath);
-            if !parents.iter().any(|held| held == parent) {
-                parents.push(parent.to_owned());
+            Ok(()) => {
+                if fsync {
+                    let parent = ref_parent(&relpath);
+                    if held.insert(parent.to_owned()) {
+                        parents.push(parent.to_owned());
+                    }
+                }
             }
+            Err(Errno::NOENT) => {}
+            Err(e) => return Err(Error::Io(e.into())),
         }
         removed.push(name);
     }
     for parent in &parents {
-        sync_dir(repo_fd, parent)?;
+        sync_dir_present(repo_fd, parent)?;
     }
     Ok(removed)
 }
@@ -1007,6 +1037,16 @@ fn ref_parent(relpath: &str) -> &str {
 /// unlink of that name durable.
 fn sync_ref_parent(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<()> {
     sync_dir(repo_fd, ref_parent(relpath))
+}
+
+/// `fsync` one directory named relative to the repository root, where it still
+/// stands. A directory that is gone carries no entry to make durable, so its
+/// absence is success.
+fn sync_dir_present(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
+    match sync_dir(repo_fd, path) {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 /// `fsync` one directory named relative to the repository root.
@@ -1163,17 +1203,71 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_heads_name_round_trips_only_without_a_colon() {
-        assert!(heads_name_round_trips("main"));
-        assert!(heads_name_round_trips("test/main"));
+    /// Every case the addressability predicate is checked against, as
+    /// `(name, top, path, expected)`.
+    const ADDRESSABILITY_CASES: &[(&str, &str, &str, bool)] = &[
+        // A local name addresses its own file where the mapping accepts it.
+        ("main", "refs/heads", "main", true),
+        ("test/main", "refs/heads", "test/main", true),
         // A `:` reads as the separator of a remote name, so the mapping gives
         // a path under `refs/remotes`.
-        assert!(!heads_name_round_trips("foo:bar"));
-        assert!(!heads_name_round_trips("a/b:c"));
+        ("foo:bar", "refs/heads", "foo:bar", false),
+        ("a/b:c", "refs/heads", "a/b:c", false),
+        // A local name the mapping accepts still has to match the path it was
+        // listed at.
+        ("main", "refs/heads", "other", false),
         // A name the mapping refuses answers false as well.
-        assert!(!heads_name_round_trips("a/../b"));
-        assert!(!heads_name_round_trips(""));
+        ("a/../b", "refs/heads", "a/../b", false),
+        ("", "refs/heads", "", false),
+        // A remote name addresses its own file where the first `/` of the path
+        // is the `:` of the name.
+        ("origin:main", "refs/remotes", "origin/main", true),
+        ("origin:foo:bar", "refs/remotes", "origin/foo:bar", true),
+        // One name, two files. The name addresses the second of the two.
+        ("a:b:main", "refs/remotes", "a:b/main", false),
+        ("a:b:main", "refs/remotes", "a/b:main", true),
+        // A file directly under `refs/remotes` names no remote, so its name
+        // maps under `refs/heads`.
+        ("stray", "refs/remotes", "stray", false),
+        // An empty remote component is refused.
+        (":x:main", "refs/remotes", ":x/main", false),
+        // So is a traversal, in the remote component and in the name below it.
+        ("..:main", "refs/remotes", "../main", false),
+        ("origin:a/../b", "refs/remotes", "origin/a/../b", false),
+        // No refspec maps below `refs/mirrors`.
+        (
+            "org.example.Coll/mm",
+            "refs/mirrors",
+            "org.example.Coll/mm",
+            false,
+        ),
+        // A remote refspec at the path it would take under another top answers
+        // false, because the mapping names one top alone.
+        ("origin:main", "refs/mirrors", "origin/main", false),
+    ];
+
+    #[test]
+    fn a_listed_name_addresses_its_own_file_only_where_the_mapping_returns_it() {
+        for (name, top, path, expected) in ADDRESSABILITY_CASES {
+            assert_eq!(
+                listed_name_addresses_it(name, top, path),
+                *expected,
+                "{name:?} under {top:?} at {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_addressability_predicate_agrees_with_the_refspec_mapping() {
+        // The predicate reads the name in place, so this holds it to the
+        // mapping it mirrors.
+        for (name, top, path, _) in ADDRESSABILITY_CASES {
+            assert_eq!(
+                listed_name_addresses_it(name, top, path),
+                refspec_to_relpath(name).ok() == Some(format!("{top}/{path}")),
+                "{name:?} under {top:?} at {path:?}"
+            );
+        }
     }
 
     #[test]

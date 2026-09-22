@@ -125,6 +125,20 @@ pub(crate) enum RefSpace {
     Mirrors,
 }
 
+/// One ref a listing found, as [`Repo::list_all_refs`] reports it.
+#[derive(Debug)]
+pub(crate) struct ListedRef {
+    /// The directory of `refs/` the ref file lives under.
+    pub(crate) space: RefSpace,
+    /// The name the listing gave the ref.
+    pub(crate) name: String,
+    /// Whether that name addresses the file it was listed from, by
+    /// [`crate::refs::listed_name_addresses_it`].
+    pub(crate) addressable: bool,
+    /// The commit the ref resolves to.
+    pub(crate) checksum: Checksum,
+}
+
 /// How the walk arrived at a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival {
@@ -645,20 +659,23 @@ impl Repo {
             .list_all_refs()
             .await?
             .into_iter()
-            .map(|(_, _, checksum)| checksum)
+            .map(|listed| listed.checksum)
             .collect())
     }
 
-    /// Collect every ref as a `(name, commit)` pair, across `refs/heads`,
-    /// `refs/remotes`, and `refs/mirrors`.
+    /// Collect every ref across `refs/heads`, `refs/remotes`, and
+    /// `refs/mirrors`.
     ///
     /// A local ref is named by its path under `refs/heads`, so a nested name
     /// keeps its `/`. A remote ref is named by its `<remote>:<name>` refspec. A
     /// mirror ref is named by its path under `refs/mirrors`, which is the
-    /// collection id and the ref name below it. Prune reads the names to decide
-    /// which branch a depth applies to, and reads the [`RefSpace`] to decide
-    /// which refs its classifier sees.
-    pub(crate) async fn list_all_refs(&self) -> Result<Vec<(RefSpace, String, Checksum)>> {
+    /// collection id and the ref name below it. Each ref also reports whether
+    /// the name it was given addresses the file it was listed from, which is
+    /// the test a caller that reads or unlinks a ref by its name needs. Prune
+    /// reads the names to decide which branch a depth applies to, and reads the
+    /// [`RefSpace`] and the addressability to decide which refs its classifier
+    /// sees.
+    pub(crate) async fn list_all_refs(&self) -> Result<Vec<ListedRef>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
             let mut out = Vec::new();
@@ -840,16 +857,15 @@ pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Recursively collect the space, the name, and the checksum of each ref file
-/// under `top`, following the `refs/` subtree. Alias symlinks are followed; a
-/// dangling one is skipped. A ref under `refs/remotes` takes its
-/// `<remote>:<name>` refspec, and a ref under either of the other two takes its
-/// path below `top`.
+/// Recursively collect each ref file under `top`, following the `refs/`
+/// subtree. Alias symlinks are followed; a dangling one is skipped. A ref under
+/// `refs/remotes` takes its `<remote>:<name>` refspec, and a ref under either
+/// of the other two takes its path below `top`.
 fn collect_named_refs(
     repo_fd: BorrowedFd<'_>,
     space: RefSpace,
     top: &str,
-    out: &mut Vec<(RefSpace, String, Checksum)>,
+    out: &mut Vec<ListedRef>,
 ) -> Result<()> {
     let dir = match rustix::fs::openat(
         repo_fd,
@@ -867,7 +883,15 @@ fn collect_named_refs(
                 RefSpace::Remotes => entry.path.replacen('/', ":", 1),
                 RefSpace::Heads | RefSpace::Mirrors => entry.path.to_owned(),
             };
-            out.push((space, name, checksum));
+            // A mirror entry answers false by construction: no refspec maps to
+            // a path below `refs/mirrors`.
+            let addressable = crate::refs::listed_name_addresses_it(&name, top, entry.path);
+            out.push(ListedRef {
+                space,
+                name,
+                addressable,
+                checksum,
+            });
         }
         Ok(())
     })

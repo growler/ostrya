@@ -218,19 +218,12 @@ impl Repo {
     /// `tmp/`, and stale staging directories left by dead transactions are
     /// reaped first.
     pub async fn transaction_with_lock(&self, kind: LockKind) -> Result<Transaction> {
-        let locking = self.inner.config.locking()?;
-        let timeout_secs = self.inner.config.lock_timeout_secs()?;
+        // Every `[core]` key the open reads is parsed before the lock, so a
+        // value the config cannot carry refuses the call at once instead of
+        // behind the wait a contended repository imposes.
         let expiry_secs = self.inner.config.tmp_expiry_secs()?;
         let min_free = self.inner.config.min_free_space()?;
-
-        let guard = if locking {
-            let repo = self.clone();
-            let lock = ostrya_rt::unblock(move || repo.inner.repo_lock()).await?;
-            let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
-            lock::acquire(lock, kind, timeout).await?
-        } else {
-            LockGuard::disabled()
-        };
+        let guard = self.lock_repo(kind).await?;
 
         let repo = self.clone();
         let staging = ostrya_rt::unblock(move || {
@@ -245,6 +238,25 @@ impl Repo {
         let budget = ostrya_rt::unblock(move || free_budget(repo_fd.as_fd(), min_free)).await?;
 
         Ok(Transaction::new(self.clone(), guard, staging, budget))
+    }
+
+    /// Take the repository lock in `kind`, held until the guard drops.
+    ///
+    /// The call reads `[core] locking` and `[core] lock-timeout-secs`. Where
+    /// `locking` is true the acquisition retries until the timeout elapses and
+    /// then fails with [`Error::LockTimeout`]; where it is false the guard
+    /// holds no lock. `lock-timeout-secs` is read in both cases, so a value the
+    /// config cannot carry refuses the call.
+    pub(crate) async fn lock_repo(&self, kind: LockKind) -> Result<LockGuard> {
+        let locking = self.inner.config.locking()?;
+        let timeout_secs = self.inner.config.lock_timeout_secs()?;
+        if !locking {
+            return Ok(LockGuard::disabled());
+        }
+        let repo = self.clone();
+        let lock = ostrya_rt::unblock(move || repo.inner.repo_lock()).await?;
+        let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
+        lock::acquire(lock, kind, timeout).await
     }
 
     /// The repository root directory fd, anchoring fd-relative access to

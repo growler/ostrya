@@ -13,9 +13,16 @@
 //! keyed by the lock file's `(device, inode)` hands every repository handle to
 //! one underlying repository -- clones and independent opens alike -- the same
 //! [`RepoLock`], so a single descriptor and a shared reference count mediate all
-//! in-process holders. The reference count also supports nested locks and
-//! shared-to-exclusive upgrade and downgrade, touching the descriptor only at
-//! the transitions that change the effective lock.
+//! in-process holders. The reference count lets several shared holders share
+//! one descriptor lock, touching the descriptor only at the transitions that
+//! change the effective lock.
+//!
+//! A shared acquire and an exclusive acquire exclude each other inside the
+//! process: an exclusive acquire waits while any shared holder stands, and a
+//! shared acquire waits while an exclusive holder stands. An exclusive acquire
+//! is not re-entrant, so a second one waits for the first to release. A
+//! destructive run therefore excludes this process's own transactions for the
+//! whole of the run.
 //!
 //! Cross-process contention is resolved by a non-blocking attempt followed by an
 //! [`ostrya_rt::Timer`] retry loop bounded by `lock-timeout-secs`, matching the
@@ -157,11 +164,21 @@ impl RepoLock {
     }
 
     /// Add one holder of `kind` without blocking.
+    ///
+    /// A record lock is process-associated, so the descriptor alone cannot hold
+    /// one in-process holder off another. The hold counts do that: an acquire
+    /// that the rule excludes reports [`TryOutcome::WouldBlock`], which sends
+    /// the caller into the retry loop, and it raises no count.
     fn try_acquire(&self, kind: LockKind) -> std::io::Result<TryOutcome> {
         let mut st = self.state.lock().unwrap();
         match kind {
             LockKind::Shared => {
-                if matches!(st.os, OsLock::Shared | OsLock::Exclusive) {
+                // An exclusive holder excludes every other holder in this
+                // process.
+                if st.exclusive > 0 {
+                    return Ok(TryOutcome::WouldBlock);
+                }
+                if st.os == OsLock::Shared {
                     st.shared += 1;
                     return Ok(TryOutcome::Acquired);
                 }
@@ -176,9 +193,11 @@ impl RepoLock {
                 }
             }
             LockKind::Exclusive => {
-                if st.os == OsLock::Exclusive {
-                    st.exclusive += 1;
-                    return Ok(TryOutcome::Acquired);
+                // An exclusive acquire waits for every other holder, an
+                // exclusive one included: the hold is not re-entrant, so two
+                // callers never share it.
+                if st.shared > 0 || st.exclusive > 0 {
+                    return Ok(TryOutcome::WouldBlock);
                 }
                 match rustix::fs::fcntl_lock(&self.fd, FlockOperation::NonBlockingLockExclusive) {
                     Ok(()) => {
@@ -193,8 +212,8 @@ impl RepoLock {
         }
     }
 
-    /// Drop one holder of `kind`, weakening or releasing the descriptor lock
-    /// when the last holder of a level goes away.
+    /// Drop one holder of `kind`, releasing the descriptor lock when the last
+    /// holder goes away.
     fn release(&self, kind: LockKind) {
         let mut st = self.state.lock().unwrap();
         match kind {
@@ -211,16 +230,10 @@ impl RepoLock {
         if target == st.os {
             return;
         }
-        // A release never escalates to exclusive, so the descriptor operation is
-        // an unlock or a downgrade to shared, neither of which blocks on our own
-        // descriptor. Errors are ignored so a release (including Drop) never
-        // fails.
-        let op = match target {
-            OsLock::Unlocked => FlockOperation::Unlock,
-            OsLock::Shared => FlockOperation::LockShared,
-            OsLock::Exclusive => FlockOperation::LockExclusive,
-        };
-        let _ = rustix::fs::fcntl_lock(&self.fd, op);
+        // A shared holder and an exclusive holder exclude each other, so one of
+        // the two counts is zero and the target reached here is `Unlocked`.
+        // Errors are ignored so a release (including Drop) never fails.
+        let _ = rustix::fs::fcntl_lock(&self.fd, FlockOperation::Unlock);
         st.os = target;
     }
 }
@@ -339,6 +352,12 @@ mod tests {
         lock.state.lock().unwrap().os
     }
 
+    /// The in-process hold counts, as `(shared, exclusive)`.
+    fn counts(lock: &RepoLock) -> (usize, usize) {
+        let st = lock.state.lock().unwrap();
+        (st.shared, st.exclusive)
+    }
+
     #[test]
     fn shared_holders_share_one_descriptor_lock() {
         let scratch = Scratch::new("shared");
@@ -361,24 +380,101 @@ mod tests {
     }
 
     #[test]
-    fn exclusive_upgrades_and_downgrades_around_a_shared_holder() {
-        let scratch = Scratch::new("upgrade");
+    fn exclusive_waits_for_a_shared_holder() {
+        let scratch = Scratch::new("wait");
         let lock = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
 
         lock.try_acquire(LockKind::Shared).unwrap();
         assert_eq!(os_lock(&lock), OsLock::Shared);
 
-        // Upgrade: an exclusive holder joins the shared holder on the same
-        // descriptor, so the effective lock becomes exclusive.
-        lock.try_acquire(LockKind::Exclusive).unwrap();
+        // The exclusive attempt reports `WouldBlock` while the shared holder
+        // stands, and the effective lock stays shared.
+        assert!(matches!(
+            lock.try_acquire(LockKind::Exclusive).unwrap(),
+            TryOutcome::WouldBlock
+        ));
+        assert_eq!(os_lock(&lock), OsLock::Shared);
+        assert_eq!(counts(&lock), (1, 0));
+
+        // Once the shared holder releases, the attempt succeeds.
+        lock.release(LockKind::Shared);
+        assert_eq!(os_lock(&lock), OsLock::Unlocked);
+        assert!(matches!(
+            lock.try_acquire(LockKind::Exclusive).unwrap(),
+            TryOutcome::Acquired
+        ));
         assert_eq!(os_lock(&lock), OsLock::Exclusive);
 
-        // Downgrade: dropping the exclusive holder returns to shared while the
-        // shared holder remains.
         lock.release(LockKind::Exclusive);
+        assert_eq!(os_lock(&lock), OsLock::Unlocked);
+    }
+
+    #[test]
+    fn shared_waits_for_an_exclusive_holder() {
+        let scratch = Scratch::new("shared-waits");
+        let lock = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+
+        assert!(matches!(
+            lock.try_acquire(LockKind::Exclusive).unwrap(),
+            TryOutcome::Acquired
+        ));
+        assert_eq!(os_lock(&lock), OsLock::Exclusive);
+
+        // The shared attempt reports `WouldBlock` while the exclusive holder
+        // stands, the effective lock stays exclusive, and no count rises.
+        assert!(matches!(
+            lock.try_acquire(LockKind::Shared).unwrap(),
+            TryOutcome::WouldBlock
+        ));
+        assert_eq!(os_lock(&lock), OsLock::Exclusive);
+        assert_eq!(counts(&lock), (0, 1));
+
+        // Once the exclusive holder releases, the attempt succeeds.
+        lock.release(LockKind::Exclusive);
+        assert_eq!(os_lock(&lock), OsLock::Unlocked);
+        assert_eq!(counts(&lock), (0, 0));
+        assert!(matches!(
+            lock.try_acquire(LockKind::Shared).unwrap(),
+            TryOutcome::Acquired
+        ));
         assert_eq!(os_lock(&lock), OsLock::Shared);
+        assert_eq!(counts(&lock), (1, 0));
 
         lock.release(LockKind::Shared);
+        assert_eq!(os_lock(&lock), OsLock::Unlocked);
+    }
+
+    #[test]
+    fn a_second_exclusive_waits_for_the_first() {
+        let scratch = Scratch::new("exclusive-waits");
+        let lock = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+
+        assert!(matches!(
+            lock.try_acquire(LockKind::Exclusive).unwrap(),
+            TryOutcome::Acquired
+        ));
+
+        // The hold is not re-entrant: a second exclusive attempt waits, and the
+        // count stays at the one holder.
+        assert!(matches!(
+            lock.try_acquire(LockKind::Exclusive).unwrap(),
+            TryOutcome::WouldBlock
+        ));
+        assert_eq!(os_lock(&lock), OsLock::Exclusive);
+        assert_eq!(counts(&lock), (0, 1));
+
+        // Once the first holder releases, the second attempt succeeds.
+        lock.release(LockKind::Exclusive);
+        assert_eq!(os_lock(&lock), OsLock::Unlocked);
+        assert_eq!(counts(&lock), (0, 0));
+        assert!(matches!(
+            lock.try_acquire(LockKind::Exclusive).unwrap(),
+            TryOutcome::Acquired
+        ));
+        assert_eq!(os_lock(&lock), OsLock::Exclusive);
+        assert_eq!(counts(&lock), (0, 1));
+
+        lock.release(LockKind::Exclusive);
         assert_eq!(os_lock(&lock), OsLock::Unlocked);
     }
 

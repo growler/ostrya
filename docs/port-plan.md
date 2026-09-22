@@ -233,11 +233,14 @@ Cross-process and cross-`Repo` safety uses a two-layer lock on `<repo>/.lock`.
 The outer layer is a classic `fcntl` record lock (`F_SETLK`, via
 `rustix::fs::fcntl_lock`), which shares a lock space with the OFD locks the
 `ostree` tool takes, so the library and the tool exclude each other on the same
-repository. The inner layer is a per-repository reference count that supports
-same-repo reentrancy and shared-to-exclusive upgrade and downgrade, touching the
-descriptor only at the transitions that change the effective lock. A normal
-transaction takes the lock shared, matching the read lock the tool holds during
-a commit; destructive maintenance takes it exclusive.
+repository. The inner layer is a per-repository reference count that lets
+several shared holders share one descriptor lock, touching the descriptor only
+at the transitions that change the effective lock. A shared acquire and an
+exclusive acquire exclude each other inside the process: an exclusive acquire
+waits while any shared holder stands, a shared acquire waits while an exclusive
+holder stands, and the exclusive hold is not re-entrant. A normal transaction
+takes the lock shared, matching the read lock the tool holds during a commit;
+destructive maintenance takes it exclusive.
 
 Record locks are process-associated: two descriptors in one process do not
 conflict, and closing any one descriptor to the file drops every lock the
@@ -6488,10 +6491,11 @@ Resolved:
    by holding each side's lock while the other acquires). Record locks are
    process-associated, so a process-global registry keyed by the lock file's
    `(device, inode)` keeps one descriptor and one reference count per repository
-   per process; the reference count also serves same-repo reentrancy and
-   shared-to-exclusive upgrade and downgrade. Acquisition is a non-blocking
-   attempt plus an `rt::Timer` retry loop bounded by `lock-timeout-secs`. No new
-   external crates: `rt::Timer` wraps the existing backends (`smol::Timer`,
+   per process; the reference count also lets several shared holders share one
+   descriptor lock, and a shared acquire and an exclusive acquire exclude each
+   other inside the process. Acquisition is a non-blocking attempt plus an
+   `rt::Timer` retry loop bounded by `lock-timeout-secs`. No new external
+   crates: `rt::Timer` wraps the existing backends (`smol::Timer`,
    `tokio::time`) and the in-process coordination uses `std::sync::Mutex`.
 
 9. Repo finders: the config and mount finders land with the phase that brings

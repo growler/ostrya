@@ -54,6 +54,15 @@
 //! - A run writes a `.tombstone-commit` for every commit it removes where
 //!   [`delete_commit`](PruneOptions::delete_commit) is given or the repository
 //!   config sets `[core] tombstone-commits`.
+//! - A run holds the repository lock exclusive from end to end, a
+//!   [`no_prune`](PruneOptions::no_prune) dry run and a
+//!   [`static_deltas_only`](PruneOptions::static_deltas_only) run included. It
+//!   reads `[core] locking` and `[core] lock-timeout-secs`, and it fails with
+//!   [`Error::LockTimeout`] where another holder keeps the lock past the
+//!   timeout. The hold excludes every other writer, in this process and in
+//!   another: a caller that holds a transaction of its own open across the call
+//!   waits out the timeout and then fails, and a transaction the process opens
+//!   while the run stands waits for the run to finish.
 //!
 //! Two options carry reachability the tool has no counterpart for, so a prune
 //! that leaves them at their defaults is the tool's:
@@ -76,6 +85,7 @@ use rustix::fs::AtFlags;
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
+use crate::lock::LockKind;
 use crate::repo::Repo;
 use crate::tombstone::write_tombstone;
 use crate::traverse::ParentBound;
@@ -309,17 +319,31 @@ struct Sweep {
 
 impl Repo {
     /// Prune unreachable objects, returning the run's statistics.
+    ///
+    /// The run holds the repository lock exclusive from end to end, a
+    /// [`no_prune`](PruneOptions::no_prune) dry run and a
+    /// [`static_deltas_only`](PruneOptions::static_deltas_only) run included.
+    /// It reads `[core] locking` and `[core] lock-timeout-secs`, and it fails
+    /// with [`Error::LockTimeout`] where another holder keeps the lock past the
+    /// timeout. The hold excludes every other writer, in this process and in
+    /// another: a caller that holds a transaction of its own open across the
+    /// call waits out the timeout and then fails, and a transaction the process
+    /// opens while the run stands waits for the run to finish.
     pub async fn prune(&self, opts: &PruneOptions) -> Result<PruneStats> {
         let mode = self.mode();
 
-        // The delta-only run needs the commit it keys on, so refuse the pair
-        // before anything is read.
+        // The delta-only run needs the commit it keys on. The pair is refused
+        // ahead of the lock, so a contended repository gives the same refusal
+        // as a free one.
+        if opts.static_deltas_only && opts.delete_commit.is_none() {
+            return Err(Error::InvalidFormat(
+                "static_deltas_only requires delete_commit".into(),
+            ));
+        }
+
+        let _lock = self.lock_repo(LockKind::Exclusive).await?;
+
         let Some(delta_target) = opts.delete_commit else {
-            if opts.static_deltas_only {
-                return Err(Error::InvalidFormat(
-                    "static_deltas_only requires delete_commit".into(),
-                ));
-            }
             return self.prune_objects(opts, mode).await;
         };
         if opts.static_deltas_only {
@@ -348,8 +372,8 @@ impl Repo {
     async fn prune_objects(&self, opts: &PruneOptions, mode: RepoMode) -> Result<PruneStats> {
         // A commit a ref points at is not deletable. Refuse it here, so a prune
         // that cannot succeed fails before the traversal. The unlink checks
-        // again, because a ref naming the commit can appear while the walk
-        // runs.
+        // again, because a writer that takes no repository lock can publish a
+        // ref naming the commit while the walk runs.
         if let Some(commit) = opts.delete_commit {
             self.refuse_referenced_commit(&commit).await?;
         }

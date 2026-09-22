@@ -11,12 +11,13 @@ mod common;
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use common::{TmpDir, ostree_available};
 use ostrya::{
-    Checksum, CreateOptions, DiffChange, DiffEntry, FsckOptions, ObjectName, ObjectType, Repo,
-    RepoMode,
+    Checksum, CreateOptions, DiffChange, DiffEntry, FsckOptions, LockKind, ObjectName, ObjectType,
+    Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -428,6 +429,308 @@ fn prune_refuses_to_delete_a_referenced_commit() {
             "deleting a ref's target is refused"
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// The repository lock, across processes.
+// ---------------------------------------------------------------------------
+
+/// The environment variable naming the repository the foreign-lock helper holds.
+const FOREIGN_LOCK_REPO: &str = "OSTRYA_FOREIGN_LOCK_REPO";
+
+/// The `lock-timeout-secs` every case below configures, in seconds. It bounds
+/// how long a contended acquisition waits before it fails.
+const LOCK_TIMEOUT_SECS: u64 = 1;
+
+/// The longest a readiness wait runs before it reports a holder that never
+/// arrived.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One readiness poll.
+const READY_POLL: Duration = Duration::from_millis(20);
+
+/// A spawned child, killed and reaped when the guard drops.
+///
+/// A panic skips a reap written at the end of a test, and the child then keeps
+/// its hold on the repository while the test directory is removed under it. The
+/// guard ends the child on every path out of the test.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Append `lock-timeout-secs` to the repository config.
+///
+/// The config is read once at open, so this runs before the handle exists.
+fn set_lock_timeout(repo: &Path, secs: u64) {
+    let config = repo.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("lock-timeout-secs={secs}\n"));
+    std::fs::write(&config, text).unwrap();
+}
+
+/// Wait for `marker` to appear, up to [`READY_TIMEOUT`].
+fn wait_for_marker(marker: &Path) -> bool {
+    wait_until(|| marker.exists())
+}
+
+/// Wait for a staging directory to appear under `<repo>/tmp`, up to
+/// [`READY_TIMEOUT`].
+///
+/// The `ostree` tool creates one once it holds the repository, so the entry
+/// states that the tool's own lock stands. Observed with ostree 2026.1: a probe
+/// of `<repo>/.lock` reports the lock held at every point the entry exists.
+fn wait_for_tool_staging(repo: &Path) -> bool {
+    wait_until(|| {
+        let Ok(entries) = std::fs::read_dir(repo.join("tmp")) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TOOL_STAGING_PREFIX)
+        })
+    })
+}
+
+/// The prefix of the staging directory the `ostree` tool creates under `tmp/`.
+const TOOL_STAGING_PREFIX: &str = "staging-";
+
+/// Poll `ready` until it holds or [`READY_TIMEOUT`] elapses.
+fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(READY_POLL);
+    }
+}
+
+/// The tool's prune waits on the repository lock the port holds, so the two
+/// exclude each other on one repository.
+///
+/// The port takes the lock exclusive in this process and the tool runs as a
+/// child, which is the arrangement a record lock resolves. The elapsed wall
+/// clock of the tool's run is the evidence that it waited on the lock rather
+/// than failing for another reason. The wording of the tool's diagnostic is
+/// outside the scope of this project, so the rest of the assertion covers the
+/// exit status and the object inventory alone.
+#[test]
+fn the_tool_prune_waits_on_a_lock_the_port_holds() {
+    if !ostree_available() {
+        eprintln!("skipping the_tool_prune_waits_on_a_lock_the_port_holds: no ostree tool");
+        return;
+    }
+    let tmp = TmpDir::new("maint-lock-tool");
+    let repo = tmp.path().join("repo");
+    build_three_commit_repo(tmp.path(), &repo);
+    set_lock_timeout(&repo, LOCK_TIMEOUT_SECS);
+
+    let before = disk_object_paths(&repo);
+
+    block_on(async {
+        let handle = Repo::open(&repo).await.unwrap();
+        let txn = handle
+            .transaction_with_lock(LockKind::Exclusive)
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let out = Command::new("ostree")
+            .args([
+                &format!("--repo={}", repo.display()),
+                "prune",
+                "--refs-only",
+                "--depth=0",
+            ])
+            .output()
+            .expect("run ostree");
+        let waited = started.elapsed();
+        assert!(
+            !out.status.success(),
+            "the tool's prune fails while the port holds the lock"
+        );
+        assert!(
+            waited >= Duration::from_secs(LOCK_TIMEOUT_SECS),
+            "the tool ran for {waited:?}, short of the configured timeout, so it \
+             did not wait on the lock"
+        );
+
+        txn.abort().await.unwrap();
+    });
+
+    assert_eq!(
+        disk_object_paths(&repo),
+        before,
+        "the refused tool prune removed no object"
+    );
+}
+
+/// The port's prune waits on the repository the tool holds, which is the other
+/// side of the exclusion between the two.
+///
+/// The tool commits a tar tree read from its standard input. It takes the
+/// repository lock and creates its staging directory before it reads the first
+/// byte, so a child whose standard input stays open and silent holds the
+/// repository for as long as the test needs.
+#[test]
+fn prune_waits_while_the_tool_holds_the_repository() {
+    if !ostree_available() {
+        eprintln!("skipping prune_waits_while_the_tool_holds_the_repository: no ostree tool");
+        return;
+    }
+    let tmp = TmpDir::new("maint-lock-port");
+    let repo = tmp.path().join("repo");
+    build_three_commit_repo(tmp.path(), &repo);
+    set_lock_timeout(&repo, LOCK_TIMEOUT_SECS);
+
+    let before = disk_object_paths(&repo);
+
+    let holder = ChildGuard(
+        Command::new("ostree")
+            .args([
+                &format!("--repo={}", repo.display()),
+                "commit",
+                "-b",
+                "held",
+                "-s",
+                "held",
+                "--tree=tar=-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the tool"),
+    );
+    assert!(
+        wait_for_tool_staging(&repo),
+        "the tool never took the repository"
+    );
+
+    let (err, waited) = block_on(async {
+        let handle = Repo::open(&repo).await.unwrap();
+        let started = Instant::now();
+        let err = handle
+            .prune(&ostrya::PruneOptions::new())
+            .await
+            .expect_err("a prune fails while the tool holds the repository");
+        (err, started.elapsed())
+    });
+    assert!(
+        matches!(err, ostrya::Error::LockTimeout { secs: 1 }),
+        "the contended prune reports the configured timeout: {err:?}"
+    );
+    assert!(
+        waited >= Duration::from_secs(LOCK_TIMEOUT_SECS),
+        "the prune returned after {waited:?}, short of the configured timeout"
+    );
+
+    drop(holder);
+    assert_eq!(
+        disk_object_paths(&repo),
+        before,
+        "the refused prune removed no object"
+    );
+}
+
+/// The port's prune waits on a repository lock another process holds, and fails
+/// with [`ostrya::Error::LockTimeout`] once `lock-timeout-secs` elapses.
+///
+/// The holder is this test binary re-executed, taking an `fcntl` exclusive
+/// record lock on `<repo>/.lock`. That is the lock space the library and the
+/// tool share. The helper keeps the lock until its standard input closes, so
+/// the hold covers every assertion here and the guard is what ends it.
+#[test]
+fn prune_waits_on_a_foreign_lock_holder() {
+    let tmp = TmpDir::new("maint-lock-foreign");
+    let repo = tmp.path().join("repo");
+    block_on(Repo::create(
+        &repo,
+        ostrya::CreateOptions::new(RepoMode::Archive),
+    ))
+    .unwrap();
+    set_lock_timeout(&repo, LOCK_TIMEOUT_SECS);
+
+    let marker = repo.join(FOREIGN_LOCK_MARKER);
+    let holder = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "foreign_lock_holder_subprocess",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(FOREIGN_LOCK_REPO, &repo)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the foreign lock holder"),
+    );
+    assert!(wait_for_marker(&marker), "the holder never took the lock");
+
+    let (err, waited) = block_on(async {
+        let handle = Repo::open(&repo).await.unwrap();
+        let started = Instant::now();
+        let err = handle
+            .prune(&ostrya::PruneOptions::new())
+            .await
+            .expect_err("a prune under a foreign lock fails");
+        (err, started.elapsed())
+    });
+    assert!(
+        matches!(err, ostrya::Error::LockTimeout { secs: 1 }),
+        "the contended prune reports the configured timeout: {err:?}"
+    );
+    assert!(
+        waited >= Duration::from_secs(LOCK_TIMEOUT_SECS),
+        "the prune returned after {waited:?}, short of the configured timeout"
+    );
+
+    drop(holder);
+}
+
+/// The file the foreign-lock helper writes once it holds the lock.
+const FOREIGN_LOCK_MARKER: &str = ".foreign-held";
+
+/// The lock-holder half of [`prune_waits_on_a_foreign_lock_holder`], run only
+/// when this test binary is re-executed with the environment set. It takes an
+/// `fcntl` exclusive record lock on `<repo>/.lock`, states that it holds it, and
+/// keeps it until its standard input closes.
+#[test]
+#[ignore = "helper process for prune_waits_on_a_foreign_lock_holder"]
+fn foreign_lock_holder_subprocess() {
+    use rustix::fs::{FlockOperation, Mode, OFlags};
+    use std::io::Read;
+
+    let Ok(repo) = std::env::var(FOREIGN_LOCK_REPO) else {
+        return;
+    };
+
+    let repo = Path::new(&repo);
+    let fd = rustix::fs::open(
+        repo.join(".lock"),
+        OFlags::RDWR | OFlags::CREATE,
+        Mode::from_raw_mode(0o660),
+    )
+    .expect("open the lock file");
+    rustix::fs::fcntl_lock(&fd, FlockOperation::LockExclusive).expect("take the record lock");
+    std::fs::write(repo.join(FOREIGN_LOCK_MARKER), b"1").expect("write the readiness marker");
+
+    // The parent holds the write half of this pipe for as long as it needs the
+    // lock, so the read returns when the parent ends the child or exits.
+    let mut sink = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut sink);
 }
 
 // ---------------------------------------------------------------------------

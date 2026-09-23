@@ -340,6 +340,19 @@ insertion order is the on-disk order):
 - `ostree.summary.expires` -> `t` big-endian. Emitted only when an expiry is
   requested.
 
+Keys a caller adds with `summary -m` follow. A caller key that names a key the
+writer writes in the same run gives way to the writer's value: the four keys
+always written, and `ostree.static-deltas`, `ostree.summary.collection-map`, and
+`ostree.summary.collection-id` in a run that writes them. A caller key the
+writer does not write in the run is kept, whatever its name, and the empty key
+is kept too. A repeated caller key is stored once, with its last value. The
+value is the GVariant text form, stored in host order. The tool stores the whole
+dict in the order of a hash table once any caller key is present; the port keeps
+the order above and appends the caller keys in the order of their first
+occurrence (`conformance/cli-surface.md`, "summary"). In a repository with a
+collection id the tool also adds the caller keys to the anchor commit, and the
+port refuses them ("The `ostree-metadata` anchor commit" below).
+
 Endianness summary: all `t` timestamps and `expires` are big-endian; the
 per-ref commit-object size `t` is host-order.
 
@@ -359,6 +372,17 @@ anchor with the previous anchor as its parent, so the checksum advances on every
 run; the first generation on a fresh repository is parentless and reproducible.
 The anchor ref appears in field 0 by name like any other local ref.
 
+`summary -m` in the tool adds the caller keys to the anchor metadata too. The
+bindings win over a caller key of the same name, a repeated caller key takes
+its last value, and any other caller key is kept, `ostree.summary.mode` among
+them. With a caller key present, the tool stores the anchor dict in the order
+of a hash table, even for one key: `-m k=1` stores `ostree.collection-binding`,
+`k`, `ostree.ref-binding`, and `-m b=1 -m n=2` stores `n`, `b`,
+`ostree.collection-binding`, `ostree.ref-binding`. The anchor checksum follows
+that order. The port does not rebuild a hash-table order, so it refuses any
+caller key in a repository with a collection id, before the anchor advances
+and before any write (`conformance/cli-surface.md`, "summary").
+
 ### Summary signature -- `a{sv}`
 
 File `summary.sig` at repo root, a bare `a{sv}` with the same signature keys as
@@ -366,6 +390,16 @@ detached commit metadata. The signed payload is the exact byte content of the
 `summary` file. Regenerating the summary removes any existing `summary.sig`,
 since a new summary invalidates the old signature; a caller that wants a signed
 summary regenerates and then signs.
+
+`summary -u` writes its signatures after the regeneration: every `--gpg-sign`
+signature under `ostree.gpgsigs` first, then every `--sign` signature under
+`ostree.sign.<type>`, so a file holding both engines stores `ostree.gpgsigs`
+first whatever the command-line order. Inside each array the signatures follow
+the command-line order, and a key given twice signs twice. A GPG signature
+carries its creation instant, so two runs of one GPG key write different bytes;
+two runs of one ed25519 key over one `summary` write the same bytes. The port
+makes every signature of the run and then replaces `summary.sig` in one write,
+so a signer that fails leaves `summary.sig` in the state the regeneration left.
 
 ## Checksum computation
 
@@ -4920,6 +4954,13 @@ appears only where the ref metadata carries the key, and its string prints
 unquoted. The `Timestamp` line converts the stored big-endian field and renders
 it as `YYYY-MM-DDTHH:MM:SS` and a UTC offset.
 
+`summary -m` can store any value under `ostree.summary.collection-map`, so the
+report reads the map with no refusal. A value of type `a{sa(s(taya{sv}))}`
+lists its refs. A value of any other type lists no refs, and the metadata line
+still prints `(printed above)`. A commit checksum in the map that is not 32
+bytes prints `Invalid checksum of length <n> expected 32` in place of the hex,
+and the other lines of the ref print as usual.
+
 The global metadata prints in the order the summary stores it, one line per
 entry, with a label for each key the format defines:
 
@@ -4930,17 +4971,23 @@ Has Tombstone Commits (ostree.summary.tombstone-commits): No
 Static Deltas (ostree.static-deltas): {'<from>-<to>': <[byte 0xeb, 0x57]>}
 Collection Map (ostree.summary.collection-map): (printed above)
 Collection ID (ostree.summary.collection-id): org.example.C
+Expires (ostree.summary.expires): 2023-11-14T22:13:20+00
 ostree.summary.indexed-deltas: true
 ```
 
-`Last-Modified` converts its big-endian field the way a `Timestamp` line does.
-`Has Tombstone Commits` prints `Yes` or `No`. `Collection Map` prints
+`Last-Modified` and `Expires` convert their big-endian field the way a
+`Timestamp` line does. The three read the field as a signed count of seconds
+and write the year with no zero padding, so the first second of year 1 reads
+`1-01-01T00:00:00+00`. An instant before year 1 or after year 9999 prints
+`invalid`. `Has Tombstone Commits` prints `Yes` or `No`. `Collection Map` prints
 `(printed above)`, its refs having been reported with the others. A key the
 format does not define, `ostree.summary.indexed-deltas` among them, prints its
 own name and its value; a string value prints unquoted where the key carries a
-label and quoted where it does not. Every value outside the labeled set prints in
-the GVariant text form with no type annotation and no byte-order conversion, so a
-`t` value stored little-endian reads as the number it holds.
+label and quoted where it does not. `Static Deltas` is read as a whole value,
+so a string stored under its key prints quoted too. Every value outside the
+labeled set prints in the GVariant text form with no type annotation and no
+byte-order conversion, so a `t` value stored little-endian reads as the number
+it holds.
 
 `remote gpg-import NAME [KEY-ID...]` adds the keys of each `-k`/`--keyring=FILE`,
 or of standard input under `--stdin`, to the remote's `<remote>.trustedkeys.gpg`
@@ -5430,7 +5477,9 @@ prints after the per-path block, whatever order the two flags were given in.
 
 ### `summary`
 
-`summary` writes the repository summary, signs it, or reads it. The four
+`summary` writes the repository summary, signs it, or reads it. The writing
+options are `-m`/`--add-metadata=KEY=VALUE`, `--sign=KEY-ID`,
+`--gpg-sign=KEY-ID`, and `--sign-type`, all read with `-u` alone. The four
 reading options are `-v`/`--view`, `--raw`, `--list-metadata-keys`, and
 `--print-metadata-key=KEY`. All of them read `<repo>/summary` and nothing else;
 `summary.sig` is never opened by a reading option, so a signed summary and an
@@ -5441,11 +5490,11 @@ in:
 
 1. `--verify` reports the signatures and returns. The option is a port
    extension the tool does not carry.
-2. `-u`/`--update` regenerates the summary, returns, and writes no report.
-3. A signing key, given as a positional argument or with `--keys-file`, signs
-   the summary and returns. The tool states this surface with `--sign=KEY-ID`,
-   which the port does not carry, and the two arms are the divergence
-   `cli-surface.md`, "summary", records.
+2. `-u`/`--update` checks the writing options, regenerates the summary, signs
+   it, returns, and writes no report.
+3. A signing key given as a positional argument or with `--keys-file` signs the
+   summary that stands and returns. The two are port extensions, and the arm is
+   the divergence `cli-surface.md`, "summary", records.
 4. `--raw`.
 5. `-v`/`--view`.
 6. `--list-metadata-keys`.
@@ -5454,9 +5503,53 @@ in:
 Arms 1 and 3 are the port's own. Arms 2 and 4 through 7 are the order the tool
 takes, measured by giving it each competing pair in both orders.
 
-With no option at all the command refuses at exit 1. A repository holding no
-`summary` file refuses every reading option at exit 1 with nothing on standard
-output.
+With no option at all the command refuses at exit 1. Without `-u` the writing
+options are read by nothing: beside a reading option they are inert, and the
+report is written, and alone they draw the no-option refusal before any value
+is read. The port draws that refusal before it reads a positional key. A
+repository holding no `summary` file refuses every reading option at exit 1
+with nothing on standard output.
+
+Under `-u` every check runs before the regeneration, in this order, so a
+refusal leaves `summary` and `summary.sig` as they stood and a ref added since
+is not listed:
+
+1. Each `-m` argument, in command-line order. The argument splits at its first
+   `=`, and a missing `=` reports `error: Missing '=' in KEY=VALUE metadata
+   '<arg>'`. The value is then parsed in the GVariant text form before the next
+   argument is read, and a parse failure reports `error: Error parsing variant
+   ‘<value>’: : <offsets>:<reason>`, with U+2018 and U+2019 around the value.
+   The empty key is accepted.
+2. Each `--gpg-sign` lookup, in command-line order, in the home directory
+   `--gpg-homedir` names. A selector under eight bytes reports `error: Unable to
+   lookup key ID <sel>: GPGME: Invalid value`, one naming no key reports
+   `error: No gpg key found with ID <sel> (homedir: <path>)`, and one naming
+   several reports `error: gpg key id <sel> ambiguous (homedir: <path>). Try
+   the fingerprint instead`. The homedir term is the literal `<default>` where
+   `--gpg-homedir` is absent. `--gpg-homedir` with no `--gpg-sign` is not
+   opened.
+3. `--sign-type`, read only where `--sign` names a key. The last occurrence
+   decides. `dummy` reports `error: dummy signature type is only for ostree
+   testing`, and a name no engine carries reports `error: Requested signature
+   type is not implemented`. With no key the name is not read.
+4. Each `--sign` key, in command-line order. A key that is not a 64-byte
+   ed25519 secret reports `error: Invalid ed25519 secret key: Ill-formed input:
+   expected 64 bytes, got <n> bytes`. The port also refuses a 64-byte value
+   whose trailing 32 bytes are not the public key of the leading 32-byte seed,
+   64 zero bytes among them, with `error: signature: ed25519 secret key:
+   signature error: Mismatched Keypair detected`. The tool signs with such a
+   value, which is the divergence `cli-surface.md`, "summary", records. The
+   port's gpg engine, which the tool's build does not carry for `--sign`, looks
+   up each key here with the refusals of check 2.
+5. In the port, the positional and `--keys-file` keys, under the same engine. A
+   gpg selector is looked up here with the refusals of check 2.
+6. In the port, any `-m` key in a repository with a collection id, refused with
+   `error: unsupported: summary metadata keys in a repository with a collection
+   id`. The tool takes the keys and adds them to the anchor commit ("The
+   `ostree-metadata` anchor commit").
+
+The regeneration then removes `summary.sig`, and the signatures are written in
+the order "Summary signature" states, in one write of `summary.sig`.
 
 `-v`/`--view` writes the report `remote summary` writes, byte for byte: each
 ref of field 0, then the refs of every collection `ostree.summary.collection-map`
@@ -5488,8 +5581,9 @@ in the report and `uint32 704643072` under `--raw` on a little-endian host.
 #### Exit status
 
 - 0 -- the summary was written, signed, or reported.
-- 1 -- no option given, an absent `summary` file, and a key the metadata dict
-  does not hold.
+- 1 -- no option given, a writing option given without `-u` and without a
+  reading option, an absent `summary` file, a key the metadata dict does not
+  hold, and every refusal of a `-u` check above.
 
 A `summary` file whose bytes are not a document of the summary type reaches a
 repository only through a write that is neither implementation's. The tool

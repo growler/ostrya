@@ -66,13 +66,13 @@ use ostrya::{
     FileKind, FileMeta, FileObject, FilterResult, FsckBindingError, FsckBindingErrorKind,
     FsckError, FsckErrorKind, FsckFailure, FsckOptions, FsckPhase, MutableTree, ObjectType,
     OverwriteMode, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias, Repo,
-    RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef,
-    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
-    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
+    RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
+    TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
+    Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
     load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
-use ostrya::{GpgSigner, GpgVerifier};
+use ostrya::{GpgSigner, GpgVerifier, SignatureInfo};
 #[cfg(feature = "spki")]
 use ostrya::{SpkiSigner, SpkiVerifier};
 
@@ -963,12 +963,31 @@ struct SummaryArgs {
     /// Print the value of one metadata key.
     #[arg(long, value_name = "KEY")]
     print_metadata_key: Option<String>,
+    /// Additional metadata field to add, as KEY=VALUE with the value in the
+    /// GVariant text form. Repeatable. Read with -u alone.
+    #[arg(short = 'm', long = "add-metadata", value_name = "KEY=VALUE")]
+    add_metadata: Vec<String>,
+    /// Sign the summary with this key: for ed25519 and spki, the base64 of the
+    /// secret key. Repeatable, and each occurrence adds one signature. Read
+    /// with -u alone.
+    #[arg(long, value_name = "KEY-ID")]
+    sign: Vec<String>,
+    /// Sign the summary with the GPG key this selector names. Repeatable, and
+    /// each occurrence adds one signature. Read with -u alone.
+    #[arg(long, value_name = "KEY-ID")]
+    gpg_sign: Vec<String>,
     /// Verify the summary's signatures instead of regenerating or signing.
     #[arg(long)]
     verify: bool,
-    /// The signature engine to use for --verify or signing.
-    #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
-    sign_type: SignType,
+    /// The signature engine to use for --verify, --sign, and the positional
+    /// keys (defaults to 'ed25519'). Given more than once, the last value wins.
+    #[arg(
+        short = 's',
+        long = "sign-type",
+        value_name = "NAME",
+        overrides_with = "sign_type"
+    )]
+    sign_type: Option<String>,
     /// Override `ostree.summary.last-modified` (seconds since the Unix epoch)
     /// for reproducible output; defaults to the current time.
     #[arg(long)]
@@ -993,6 +1012,8 @@ struct SummaryArgs {
     #[arg(long)]
     remote: Option<String>,
     /// Signing or verification key identifiers, same format as `ostrya sign`.
+    /// A port extension: with -u the keys sign after every --sign key, and
+    /// without it they sign the summary that stands.
     key_id: Vec<String>,
 }
 
@@ -2223,20 +2244,25 @@ async fn sign_staged_commit(
         };
     }
     if !args.sign.is_empty() || !args.sign_from_file.is_empty() {
-        let engine = refuse!(commit_sign_type(
+        let engine = refuse!(sign_type_from_name(
             args.sign_type.as_deref().unwrap_or(DEFAULT_SIGN_TYPE)
         ));
+        let homedir = args.gpg_homedir.as_deref();
         for key in &args.sign {
-            let signer = refuse!(commit_signer(engine, key.as_bytes(), args));
+            let signer = refuse!(sign_api_signer(engine, key.as_bytes(), homedir));
             txn.sign_commit(checksum, signer.as_ref()).await?;
         }
         for path in &args.sign_from_file {
             let key = refuse!(read_sign_key_file(Path::new(path)));
-            let signer = refuse!(commit_signer(engine, &key, args));
+            let signer = refuse!(sign_api_signer(engine, &key, homedir));
             txn.sign_commit(checksum, signer.as_ref()).await?;
         }
     }
-    refuse!(sign_staged_commit_gpg(txn, checksum, args).await?);
+    let signers =
+        refuse!(resolve_gpg_selectors(&args.gpg_sign, args.gpg_homedir.as_deref()).await?);
+    for signer in &signers {
+        txn.sign_commit(checksum, signer.as_ref()).await?;
+    }
     Ok(Ok(()))
 }
 
@@ -2246,65 +2272,64 @@ async fn sign_staged_commit(
 #[cfg(feature = "gpg")]
 const GPG_SIGN_SELECTOR_MIN: usize = 8;
 
-/// Add the `--gpg-sign` signatures, one per occurrence and in command-line
+/// Resolve the `--gpg-sign` selectors into one signer each, in command-line
 /// order.
 ///
-/// Each selector is resolved in the GnuPG home directory `--gpg-homedir` names,
-/// or the one gpg resolves for itself, and it must name exactly one secret key.
-/// A selector under [`GPG_SIGN_SELECTOR_MIN`] bytes is refused without a lookup,
+/// Each selector is resolved in the GnuPG home directory `homedir` names, or
+/// the one gpg resolves for itself, and it must name exactly one secret key. A
+/// selector under [`GPG_SIGN_SELECTOR_MIN`] bytes is refused without a lookup,
 /// one that names no key and one that names several each carry their own
-/// refusal, and the refusal comes before any signature is produced. The
-/// signature is then made against the fingerprint the lookup returned, so the
-/// key that signs is the key the lookup named.
+/// refusal, and every selector is resolved before the caller produces any
+/// signature. Each signer is bound to the fingerprint the lookup returned, so
+/// the key that signs is the key the lookup named.
 #[cfg(feature = "gpg")]
-async fn sign_staged_commit_gpg(
-    txn: &Transaction,
-    checksum: &Checksum,
-    args: &CommitArgs,
-) -> Result<std::result::Result<(), String>> {
-    for key in &args.gpg_sign {
+async fn resolve_gpg_selectors(
+    selectors: &[String],
+    homedir: Option<&Path>,
+) -> Result<std::result::Result<Vec<Box<dyn Signer>>, String>> {
+    let mut signers: Vec<Box<dyn Signer>> = Vec::with_capacity(selectors.len());
+    for key in selectors {
         if key.len() < GPG_SIGN_SELECTOR_MIN {
             return Ok(Err(format!(
                 "Unable to lookup key ID {key}: GPGME: Invalid value"
             )));
         }
-        let lookup = commit_gpg_signer(key, args);
-        let homedir = gpg_homedir_text(&lookup);
+        let lookup = gpg_signer(key, homedir);
+        let homedir_text = gpg_homedir_text(&lookup);
         let found = lookup.secret_key_fingerprints().await?;
         let [fingerprint] = found.as_slice() else {
             return Ok(Err(if found.is_empty() {
-                format!("No gpg key found with ID {key} (homedir: {homedir})")
+                format!("No gpg key found with ID {key} (homedir: {homedir_text})")
             } else {
                 format!(
-                    "gpg key id {key} ambiguous (homedir: {homedir}). Try the fingerprint instead"
+                    "gpg key id {key} ambiguous (homedir: {homedir_text}). Try the fingerprint \
+                     instead"
                 )
             }));
         };
-        let signer = commit_gpg_signer(fingerprint, args);
-        txn.sign_commit(checksum, &signer).await?;
+        signers.push(Box::new(gpg_signer(fingerprint, homedir)));
     }
-    Ok(Ok(()))
+    Ok(Ok(signers))
 }
 
 #[cfg(not(feature = "gpg"))]
-async fn sign_staged_commit_gpg(
-    _: &Transaction,
-    _: &Checksum,
-    args: &CommitArgs,
-) -> Result<std::result::Result<(), String>> {
-    if args.gpg_sign.is_empty() {
-        return Ok(Ok(()));
+async fn resolve_gpg_selectors(
+    selectors: &[String],
+    _: Option<&Path>,
+) -> Result<std::result::Result<Vec<Box<dyn Signer>>, String>> {
+    if selectors.is_empty() {
+        return Ok(Ok(Vec::new()));
     }
     // A build without the engine refuses through the same channel as every
     // other signing refusal, so the line reads the same wherever it comes from.
     Ok(Err("Requested signature type is not implemented".to_owned()))
 }
 
-/// The `--gpg-sign` signer for one key selector.
+/// The gpg signer for one key selector, bound to `homedir` where one is given.
 #[cfg(feature = "gpg")]
-fn commit_gpg_signer(key: &str, args: &CommitArgs) -> GpgSigner {
+fn gpg_signer(key: &str, homedir: Option<&Path>) -> GpgSigner {
     let signer = GpgSigner::new(key);
-    match &args.gpg_homedir {
+    match homedir {
         Some(dir) => signer.with_homedir(dir),
         None => signer,
     }
@@ -2326,7 +2351,7 @@ fn gpg_homedir_text(signer: &GpgSigner) -> String {
 /// no trimming, so `ED25519` and a whitespace-padded name each name no engine.
 /// `dummy` is a registered engine the command line does not reach, and it
 /// carries its own refusal.
-fn commit_sign_type(name: &str) -> std::result::Result<SignType, String> {
+fn sign_type_from_name(name: &str) -> std::result::Result<SignType, String> {
     match name {
         "ed25519" => Ok(SignType::Ed25519),
         #[cfg(feature = "spki")]
@@ -2343,11 +2368,12 @@ fn commit_sign_type(name: &str) -> std::result::Result<SignType, String> {
 /// The key arrives as bytes, since `--sign-from-file` reads a line of a file
 /// and the tool places no encoding requirement on it. The ed25519 engine reads
 /// the bytes directly; the engines whose key is a text selector read the same
-/// bytes with every invalid UTF-8 sequence replaced.
-fn commit_signer(
+/// bytes with every invalid UTF-8 sequence replaced. `gpg_homedir` binds the gpg
+/// engine alone.
+fn sign_api_signer(
     engine: SignType,
     key: &[u8],
-    args: &CommitArgs,
+    gpg_homedir: Option<&Path>,
 ) -> std::result::Result<Box<dyn Signer>, String> {
     match engine {
         SignType::Ed25519 => {
@@ -2356,30 +2382,33 @@ fn commit_signer(
                 .map(|signer| Box::new(signer) as Box<dyn Signer>)
                 .map_err(|err| err.to_string())
         }
-        SignType::Spki => commit_signer_spki(&String::from_utf8_lossy(key)),
-        SignType::Gpg => commit_signer_gpg(&String::from_utf8_lossy(key), args),
+        SignType::Spki => sign_api_signer_spki(&String::from_utf8_lossy(key)),
+        SignType::Gpg => sign_api_signer_gpg(&String::from_utf8_lossy(key), gpg_homedir),
     }
 }
 
 #[cfg(feature = "spki")]
-fn commit_signer_spki(key: &str) -> std::result::Result<Box<dyn Signer>, String> {
+fn sign_api_signer_spki(key: &str) -> std::result::Result<Box<dyn Signer>, String> {
     SpkiSigner::from_base64(key)
         .map(|signer| Box::new(signer) as Box<dyn Signer>)
         .map_err(|err| err.to_string())
 }
 
 #[cfg(not(feature = "spki"))]
-fn commit_signer_spki(_: &str) -> std::result::Result<Box<dyn Signer>, String> {
+fn sign_api_signer_spki(_: &str) -> std::result::Result<Box<dyn Signer>, String> {
     Err("Requested signature type is not implemented".to_owned())
 }
 
 #[cfg(feature = "gpg")]
-fn commit_signer_gpg(key: &str, args: &CommitArgs) -> std::result::Result<Box<dyn Signer>, String> {
-    Ok(Box::new(commit_gpg_signer(key, args)))
+fn sign_api_signer_gpg(
+    key: &str,
+    homedir: Option<&Path>,
+) -> std::result::Result<Box<dyn Signer>, String> {
+    Ok(Box::new(gpg_signer(key, homedir)))
 }
 
 #[cfg(not(feature = "gpg"))]
-fn commit_signer_gpg(_: &str, _: &CommitArgs) -> std::result::Result<Box<dyn Signer>, String> {
+fn sign_api_signer_gpg(_: &str, _: Option<&Path>) -> std::result::Result<Box<dyn Signer>, String> {
     Err("Requested signature type is not implemented".to_owned())
 }
 
@@ -5704,6 +5733,7 @@ const SUMMARY_LABELS: &[(&str, &str)] = &[
     ("ostree.static-deltas", "Static Deltas"),
     ("ostree.summary.collection-map", "Collection Map"),
     ("ostree.summary.collection-id", "Collection ID"),
+    ("ostree.summary.expires", "Expires"),
 ];
 
 /// The per-ref metadata keys the report labels, with the same treatment.
@@ -6060,13 +6090,15 @@ fn print_summary_report(summary: &Summary) -> Result<()> {
         .and_then(Value::as_str)
         .map(str::to_owned);
     for entry in &summary.refs {
-        print_summary_ref(collection_id.as_deref(), entry)?;
+        print_summary_ref(
+            collection_id.as_deref(),
+            &entry.name,
+            entry.commit_size,
+            &entry.commit.to_hex(),
+            &entry.metadata,
+        )?;
     }
-    for (collection, refs) in summary.collection_map()? {
-        for entry in &refs {
-            print_summary_ref(Some(&collection), entry)?;
-        }
-    }
+    print_collection_map_refs(summary)?;
     for entry in summary.metadata.as_array().unwrap_or_default() {
         let Some((key, value)) = dict_entry(entry) else {
             continue;
@@ -6076,17 +6108,64 @@ fn print_summary_report(summary: &Summary) -> Result<()> {
     Ok(())
 }
 
+/// The type `ostree.summary.collection-map` holds.
+const COLLECTION_MAP_TYPE: &str = "a{sa(s(taya{sv}))}";
+
+/// Report the refs `ostree.summary.collection-map` lists, the way the tool
+/// reads the map for its report. A value of any other type lists no refs, and a
+/// commit checksum that is not 32 bytes is named in place of the hex. The map
+/// reaches a summary through `summary -m` in both implementations, so the
+/// report does not refuse a map of another shape
+/// (`docs/format-reference.md`, "CLI output formats", `summary`).
+fn print_collection_map_refs(summary: &Summary) -> Result<()> {
+    let Some((ty, map)) = summary
+        .metadata
+        .dict_get("ostree.summary.collection-map")
+        .and_then(Value::as_variant)
+    else {
+        return Ok(());
+    };
+    if *ty != parse_type(COLLECTION_MAP_TYPE)? {
+        return Ok(());
+    }
+    for collection in map.as_array().unwrap_or_default() {
+        let Some([Value::Str(id), Value::Array(refs)]) = collection.as_tuple() else {
+            continue;
+        };
+        for entry in refs {
+            let Some([Value::Str(name), Value::Tuple(inner)]) = entry.as_tuple() else {
+                continue;
+            };
+            let [Value::U64(size), Value::Bytes(checksum), metadata] = inner.as_slice() else {
+                continue;
+            };
+            let commit = match <[u8; 32]>::try_from(checksum.as_slice()) {
+                Ok(raw) => Checksum::from_bytes(raw).to_hex(),
+                Err(_) => format!("Invalid checksum of length {} expected 32", checksum.len()),
+            };
+            print_summary_ref(Some(id), name, *size, &commit, metadata)?;
+        }
+    }
+    Ok(())
+}
+
 /// Report one ref of a summary: its name, the size and checksum of the commit it
 /// names, and the metadata the summary records for it. A repository that states
 /// a collection id names each of its refs as a `(collection, ref)` pair.
-fn print_summary_ref(collection_id: Option<&str>, entry: &SummaryRef) -> Result<()> {
+fn print_summary_ref(
+    collection_id: Option<&str>,
+    name: &str,
+    commit_size: u64,
+    commit: &str,
+    metadata: &Value,
+) -> Result<()> {
     match collection_id {
-        Some(collection) => println!("* ({collection}, {})", entry.name),
-        None => println!("* {}", entry.name),
+        Some(collection) => println!("* ({collection}, {name})"),
+        None => println!("* {name}"),
     }
-    println!("    Latest Commit ({} bytes):", entry.commit_size);
-    println!("      {}", entry.commit.to_hex());
-    for member in entry.metadata.as_array().unwrap_or_default() {
+    println!("    Latest Commit ({commit_size} bytes):");
+    println!("      {commit}");
+    for member in metadata.as_array().unwrap_or_default() {
         let Some((key, value)) = dict_entry(member) else {
             continue;
         };
@@ -6117,7 +6196,7 @@ fn print_summary_metadata(key: &str, value: &Value) -> Result<()> {
         return Ok(());
     };
     match key {
-        "ostree.summary.last-modified" => {
+        "ostree.summary.last-modified" | "ostree.summary.expires" => {
             let seconds = inner.as_u64().unwrap_or_default().swap_bytes();
             println!("{label}: {}", format_iso_utc(seconds));
         }
@@ -6129,8 +6208,11 @@ fn print_summary_metadata(key: &str, value: &Value) -> Result<()> {
         "ostree.summary.collection-map" => println!("{label}: (printed above)"),
         _ => match inner {
             // A labeled string prints bare; an unlabeled one keeps the quotes
-            // the text form gives it.
-            Value::Str(text) if labeled => println!("{label}: {text}"),
+            // the text form gives it. The delta map is read as a whole value,
+            // so a string stored under its key keeps the quotes too.
+            Value::Str(text) if labeled && key != "ostree.static-deltas" => {
+                println!("{label}: {text}")
+            }
             _ => println!("{label}: {}", unannotated_text(ty, inner)?),
         },
     }
@@ -6158,16 +6240,25 @@ fn unannotated_text(ty: &Type, value: &Value) -> Result<String> {
     to_text_unannotated(ty, value).map_err(|err| Error::InvalidFormat(err.to_string()))
 }
 
+/// The first and the last second a summary report renders as a date: the
+/// start of year 1 and the end of year 9999, in seconds from the Unix epoch.
+const REPORT_INSTANT_RANGE: std::ops::RangeInclusive<i64> = -62_135_596_800..=253_402_300_799;
+
 /// Render a timestamp the way a summary report does: UTC, in
-/// `YYYY-MM-DDTHH:MM:SS+00`. The tool renders the same instant in the host's
-/// time zone (`docs/conformance/cli-surface.md`, "P3").
+/// `YYYY-MM-DDTHH:MM:SS+00`, with the year unpadded. The field is read as a
+/// signed count of seconds, and an instant outside years 1 through 9999
+/// renders as `invalid`. The tool renders the same instant in the host's time
+/// zone (`docs/conformance/cli-surface.md`, "P3").
 fn format_iso_utc(timestamp: u64) -> String {
     let seconds = timestamp as i64;
+    if !REPORT_INSTANT_RANGE.contains(&seconds) {
+        return "invalid".to_owned();
+    }
     let days = seconds.div_euclid(86_400);
     let rest = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
     let (hour, minute, second) = (rest / 3600, (rest % 3600) / 60, rest % 60);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}+00")
+    format!("{year}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}+00")
 }
 
 /// Read a keyring file whole, refusing what the tool refuses in its own words.
@@ -6787,7 +6878,8 @@ async fn sign(repo: Repo, repo_path: PathBuf, name: &str, args: SignArgs) -> Res
 
 async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()> {
     if args.verify {
-        let verifier = summary_verifier(&repo_path, &args)?;
+        let engine = summary_sign_type(&args);
+        let verifier = summary_verifier(&repo_path, engine, &args)?;
         let outcome = repo.verify_summary(&[verifier.as_ref()]).await?;
         report_verify(&outcome);
         if !outcome.valid {
@@ -6797,32 +6889,106 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
     }
 
     if args.update {
-        repo.regenerate_summary(&SummaryOptions {
-            last_modified: args.last_modified,
-            metadata_commit_timestamp: args.metadata_commit_timestamp,
-        })
-        .await?;
-    }
-
-    let signing = !args.key_id.is_empty() || !args.keys_file.is_empty();
-    if signing {
-        summary_sign(&repo, &args).await?;
-    }
-    if args.update || signing {
         // An update does its work and returns; the tool writes no report beside
-        // it. A signing key returns on the same terms. Nothing observed orders
-        // a signing key against a reading option, because the tool states that
-        // surface with `--sign=KEY-ID`, which the port does not carry
-        // (`docs/conformance/cli-surface.md`, "summary").
-        return Ok(());
+        // it.
+        return summary_update(&repo, &args).await;
     }
 
-    if !args.raw && !args.view && !args.list_metadata_keys && args.print_metadata_key.is_none() {
-        return Err(Error::InvalidFormat(
-            "nothing to do: pass --update, --verify, a reading option, or a signing key".into(),
-        ));
+    // Without `-u` the writing options are read by nothing. Beside a reading
+    // option they are inert; alone they draw the no-option refusal, before a
+    // positional key is read (`docs/format-reference.md`, "CLI output
+    // formats", `summary`).
+    let reading =
+        args.raw || args.view || args.list_metadata_keys || args.print_metadata_key.is_some();
+    let writing =
+        !args.sign.is_empty() || !args.gpg_sign.is_empty() || !args.add_metadata.is_empty();
+    if !reading && writing {
+        return Err(summary_nothing_to_do());
+    }
+    // A positional key or a `--keys-file` signs the summary that stands, a port
+    // extension, and signing precedes every reading option. Every signer is
+    // built before the first signature is written.
+    if !args.key_id.is_empty() || !args.keys_file.is_empty() {
+        let signers = summary_extension_signers(&args, summary_sign_type(&args)).await?;
+        return repo.sign_summary_all(&signer_refs(&signers)).await;
+    }
+    if !reading {
+        return Err(summary_nothing_to_do());
     }
     summary_read(&repo, &args).await
+}
+
+/// The port's refusal for a `summary` run that names nothing to do. The tool
+/// words it differently (`docs/conformance/cli-surface.md`, "summary").
+fn summary_nothing_to_do() -> Error {
+    Error::InvalidFormat(
+        "nothing to do: pass --update, --verify, a reading option, or a signing key".into(),
+    )
+}
+
+/// The engine `--sign-type` names, refused in the tool's own words where no
+/// engine carries the name.
+fn summary_sign_type(args: &SummaryArgs) -> SignType {
+    match sign_type_from_name(args.sign_type.as_deref().unwrap_or(DEFAULT_SIGN_TYPE)) {
+        Ok(engine) => engine,
+        Err(message) => exit_error(&message),
+    }
+}
+
+/// Regenerate the summary and sign it with every key the options name.
+///
+/// Every argument is checked before the regeneration, so a refusal leaves
+/// `summary` and `summary.sig` as they stood. The checks run in the tool's
+/// order: each `-m` argument in command-line order, then each `--gpg-sign`
+/// lookup, then `--sign-type` where a key needs an engine, then each `--sign`
+/// key, then the positional and `--keys-file` keys. Under the gpg engine a
+/// `--sign` key and a positional key are looked up the way a `--gpg-sign`
+/// selector is. The GPG signatures are written first and the `--sign`
+/// signatures after them, in one write of `summary.sig`
+/// (`docs/format-reference.md`, "Summary signature").
+async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
+    let additional_metadata = match summary_added_metadata(&args.add_metadata) {
+        Ok(entries) => entries,
+        Err(message) => exit_error(&message),
+    };
+    let homedir = args.gpg_homedir.as_deref();
+    let mut signers = match resolve_gpg_selectors(&args.gpg_sign, homedir).await? {
+        Ok(signers) => signers,
+        Err(message) => exit_error(&message),
+    };
+    let extension = !args.key_id.is_empty() || !args.keys_file.is_empty();
+    if !args.sign.is_empty() || extension {
+        let engine = summary_sign_type(args);
+        if engine == SignType::Gpg {
+            match resolve_gpg_selectors(&args.sign, homedir).await? {
+                Ok(resolved) => signers.extend(resolved),
+                Err(message) => exit_error(&message),
+            }
+        } else {
+            for key in &args.sign {
+                match sign_api_signer(engine, key.as_bytes(), homedir) {
+                    Ok(signer) => signers.push(signer),
+                    Err(message) => exit_error(&message),
+                }
+            }
+        }
+        if extension {
+            signers.extend(summary_extension_signers(args, engine).await?);
+        }
+    }
+
+    repo.regenerate_summary(&SummaryOptions {
+        last_modified: args.last_modified,
+        metadata_commit_timestamp: args.metadata_commit_timestamp,
+        additional_metadata,
+    })
+    .await?;
+    repo.sign_summary_all(&signer_refs(&signers)).await
+}
+
+/// Borrow each boxed signer, in order, for a batch signing call.
+fn signer_refs(signers: &[Box<dyn Signer>]) -> Vec<&dyn Signer> {
+    signers.iter().map(|signer| signer.as_ref()).collect()
 }
 
 /// The refusal a reading option draws when the repository holds no `summary`
@@ -6846,58 +7012,53 @@ async fn summary_read(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     )
 }
 
-/// Sign the summary once per supplied key, under the selected engine.
-async fn summary_sign(repo: &Repo, args: &SummaryArgs) -> Result<()> {
-    match args.sign_type {
-        SignType::Ed25519 => {
-            for key in summary_secret_keys(args)? {
-                repo.sign_summary(&Ed25519Signer::from_base64(&key)?)
-                    .await?;
-            }
-            Ok(())
-        }
-        SignType::Spki => summary_sign_spki(repo, args).await,
-        SignType::Gpg => summary_sign_gpg(repo, args).await,
+/// The signers the positional keys and `--keys-file` name under `engine`, a
+/// port extension. The keys are read strictly, the way `ostrya sign` reads
+/// them, and a gpg selector is looked up before the signer is returned.
+async fn summary_extension_signers(
+    args: &SummaryArgs,
+    engine: SignType,
+) -> Result<Vec<Box<dyn Signer>>> {
+    match engine {
+        SignType::Ed25519 => summary_secret_keys(args)?
+            .iter()
+            .map(|key| {
+                Ed25519Signer::from_base64(key).map(|signer| Box::new(signer) as Box<dyn Signer>)
+            })
+            .collect(),
+        SignType::Spki => summary_signers_spki(args),
+        SignType::Gpg => summary_signers_gpg(args).await,
     }
 }
 
 #[cfg(feature = "spki")]
-async fn summary_sign_spki(repo: &Repo, args: &SummaryArgs) -> Result<()> {
-    for key in summary_secret_keys(args)? {
-        repo.sign_summary(&SpkiSigner::from_base64(&key)?).await?;
-    }
-    Ok(())
+fn summary_signers_spki(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
+    summary_secret_keys(args)?
+        .iter()
+        .map(|key| SpkiSigner::from_base64(key).map(|signer| Box::new(signer) as Box<dyn Signer>))
+        .collect()
 }
 
 #[cfg(not(feature = "spki"))]
-async fn summary_sign_spki(_: &Repo, _: &SummaryArgs) -> Result<()> {
+fn summary_signers_spki(_: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
     Err(unsupported_type("spki"))
 }
 
 #[cfg(feature = "gpg")]
-async fn summary_sign_gpg(repo: &Repo, args: &SummaryArgs) -> Result<()> {
+async fn summary_signers_gpg(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
     if !args.keys_file.is_empty() {
         return Err(Error::Signature(
             "gpg signing takes KEY-ID arguments; --keys-file keyrings serve verify".into(),
         ));
     }
-    if args.key_id.is_empty() {
-        return Err(Error::Signature(
-            "gpg signing requires at least one KEY-ID (a fingerprint, key id, or user id)".into(),
-        ));
+    match resolve_gpg_selectors(&args.key_id, args.gpg_homedir.as_deref()).await? {
+        Ok(signers) => Ok(signers),
+        Err(message) => exit_error(&message),
     }
-    for key in &args.key_id {
-        let mut signer = GpgSigner::new(key);
-        if let Some(dir) = &args.gpg_homedir {
-            signer = signer.with_homedir(dir);
-        }
-        repo.sign_summary(&signer).await?;
-    }
-    Ok(())
 }
 
 #[cfg(not(feature = "gpg"))]
-async fn summary_sign_gpg(_: &Repo, _: &SummaryArgs) -> Result<()> {
+async fn summary_signers_gpg(_: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
     Err(unsupported_type("gpg"))
 }
 
@@ -6917,8 +7078,12 @@ fn summary_secret_keys(args: &SummaryArgs) -> Result<Vec<String>> {
 }
 
 /// Build the verifier for `ostrya summary --verify`, mirroring `ostrya sign`.
-fn summary_verifier(repo_path: &Path, args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
-    match args.sign_type {
+fn summary_verifier(
+    repo_path: &Path,
+    engine: SignType,
+    args: &SummaryArgs,
+) -> Result<Box<dyn Verifier>> {
+    match engine {
         SignType::Gpg => summary_gpg_verifier(repo_path, args),
         engine => {
             let name = sign_type_name(engine);
@@ -7517,24 +7682,47 @@ fn string_entry(key: &str, value: &str) -> Value {
 fn metadata_pairs(arguments: &[String]) -> std::result::Result<Vec<(&str, &str)>, String> {
     arguments
         .iter()
-        .map(|argument| {
-            argument
-                .split_once('=')
-                .ok_or_else(|| format!("Missing '=' in KEY=VALUE metadata '{argument}'"))
-        })
+        .map(|argument| metadata_pair(argument))
         .collect()
+}
+
+/// Split one `KEY=VALUE` metadata argument at its first `=`, refusing a missing
+/// `=` in the tool's own words.
+fn metadata_pair(argument: &str) -> std::result::Result<(&str, &str), String> {
+    argument
+        .split_once('=')
+        .ok_or_else(|| format!("Missing '=' in KEY=VALUE metadata '{argument}'"))
 }
 
 /// Read every `--add-metadata` argument into the key it names and the variant
 /// its value states. The value goes through the GVariant text form, and a
-/// refusal names the whole argument and the reader's own offsets.
+/// refusal names the whole argument and the reader's own offsets. Each argument
+/// is split and parsed before the next one is read, so the refusal names the
+/// first bad argument in command-line order.
 fn parse_added_metadata(arguments: &[String]) -> std::result::Result<Vec<(&str, Value)>, String> {
     let mut entries = Vec::with_capacity(arguments.len());
-    for (key, text) in metadata_pairs(arguments)? {
-        let argument = format!("{key}={text}");
+    for argument in arguments {
+        let (key, text) = metadata_pair(argument)?;
         let (ty, value) =
             ostrya::from_text(text).map_err(|error| format!("Parsing {argument}: {error}"))?;
         entries.push((key, Value::variant(ty, value)));
+    }
+    Ok(entries)
+}
+
+/// Read every `summary -m` argument into the key it names and the variant its
+/// value states, one argument at a time in command-line order. The empty key is
+/// accepted. The refusals carry the tool's own words for this command, which
+/// name the value alone where `commit` names the whole argument.
+fn summary_added_metadata(
+    arguments: &[String],
+) -> std::result::Result<Vec<(String, Value)>, String> {
+    let mut entries = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        let (key, text) = metadata_pair(argument)?;
+        let (ty, value) = ostrya::from_text(text)
+            .map_err(|error| format!("Error parsing variant \u{2018}{text}\u{2019}: : {error}"))?;
+        entries.push((key.to_owned(), Value::variant(ty, value)));
     }
     Ok(entries)
 }

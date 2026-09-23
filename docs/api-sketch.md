@@ -379,6 +379,12 @@ impl Repo {
 pub struct SummaryOptions {
     pub last_modified: Option<u64>,
     pub metadata_commit_timestamp: Option<u64>,
+    /// Keys added to the global metadata dict, each with the `v` it carries.
+    /// They follow the standard entries in first-occurrence order; a repeated
+    /// key takes its last value, and a key the writer writes in the same run
+    /// keeps the writer's value. A repository with a collection id refuses
+    /// any key with `Error::Unsupported`.
+    pub additional_metadata: Vec<(String, Value)>,
 }
 
 /// What a prune keeps. The first nine fields are the tool's; the last three
@@ -1397,8 +1403,13 @@ impl Repo {
     pub async fn verify_commit(&self, c: &Checksum, verifiers: &[&dyn Verifier])
         -> Result<VerifyOutcome>;
     /// Append a signature over the repository's `summary` bytes to
-    /// `summary.sig`.
+    /// `summary.sig`. The batch of one signer.
     pub async fn sign_summary(&self, signer: &dyn Signer) -> Result<()>;
+    /// Append one signature per signer, in slice order, reading `summary` and
+    /// `summary.sig` once and replacing `summary.sig` in one write. A signer
+    /// that fails stops the batch before the write. An empty slice writes
+    /// nothing.
+    pub async fn sign_summary_all(&self, signers: &[&dyn Signer]) -> Result<()>;
     pub async fn verify_summary(&self, verifiers: &[&dyn Verifier])
         -> Result<VerifyOutcome>;
 }

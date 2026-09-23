@@ -11,7 +11,11 @@
 //! (big-endian), `ostree.summary.tombstone-commits`, the optional
 //! `ostree.static-deltas`, the optional `ostree.summary.collection-map`,
 //! `ostree.summary.indexed-deltas`, and the optional
-//! `ostree.summary.collection-id`.
+//! `ostree.summary.collection-id`. The keys a caller adds through
+//! [`SummaryOptions::additional_metadata`] follow the standard entries in the
+//! order the caller first names them. A caller key that names a key the writer
+//! writes in the same run gives way to the writer's value, and a repeated caller
+//! key keeps its first position and takes its last value.
 //!
 //! `ostree.static-deltas` maps each delta under `deltas/` to the SHA-256 of its
 //! `superblock`, which is what lets a pull find a delta and check the superblock
@@ -41,6 +45,8 @@
 //! [`Summary`] is the read side of the same file: the ref list a pull resolves
 //! its targets against, and the global metadata dict verbatim.
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::os::fd::{AsFd, BorrowedFd};
 
 use ostrya_core::{
@@ -261,6 +267,15 @@ pub struct SummaryOptions {
     /// `SOURCE_DATE_EPOCH` if set, otherwise the current time. Ignored when the
     /// repository has no collection id.
     pub metadata_commit_timestamp: Option<u64>,
+    /// Keys the caller adds to the global metadata dict, each paired with the
+    /// `v` the entry carries. Every value must be a [`Value::Variant`]. The
+    /// entries follow the standard ones in the order of their first
+    /// occurrence, and a repeated key takes its last value. A key the writer
+    /// writes in the same run is dropped, so the writer's value stands. A key
+    /// the writer does not write in this run is kept, whatever its name, and
+    /// the empty key is kept too. A repository with a collection id refuses
+    /// any caller key.
+    pub additional_metadata: Vec<(String, Value)>,
 }
 
 impl Repo {
@@ -273,11 +288,38 @@ impl Repo {
     /// refreshed first, and mirror refs from other collections populate
     /// `ostree.summary.collection-map`.
     ///
+    /// [`SummaryOptions::additional_metadata`] is merged into the global
+    /// metadata dict after the standard entries. A value that is not a
+    /// [`Value::Variant`] fails with [`Error::InvalidFormat`] before anything is
+    /// written, the anchor commit included. In a repository with a collection
+    /// id, any caller key fails with [`Error::Unsupported`] at the same point.
+    ///
     /// The write honors `[core] fsync`. Concurrent regeneration is not
     /// serialized beyond each file's atomic replace; run at most one regeneration
     /// per repository at a time.
     pub async fn regenerate_summary(&self, opts: &SummaryOptions) -> Result<()> {
+        // A caller value the dict cannot hold is refused before the anchor
+        // commit advances, so a refusal leaves the repository as it stood.
+        if let Some((key, _)) = opts
+            .additional_metadata
+            .iter()
+            .find(|(_, value)| !matches!(value, Value::Variant(_)))
+        {
+            return Err(Error::InvalidFormat(format!(
+                "summary metadata key '{key}' does not hold a variant"
+            )));
+        }
         let collection_id = self.config().collection_id().map(str::to_owned);
+        // The tool copies the caller keys into the metadata of the anchor
+        // commit, in an order the port does not reproduce, so a collection
+        // repository refuses them before the anchor advances rather than write
+        // another anchor (`docs/format-reference.md`, "The `ostree-metadata`
+        // anchor commit").
+        if collection_id.is_some() && !opts.additional_metadata.is_empty() {
+            return Err(Error::Unsupported(
+                "summary metadata keys in a repository with a collection id".into(),
+            ));
+        }
 
         // A collection repository advertises a fresh anchor commit, so refresh
         // it before enumerating refs -- it lands on refs/heads/ostree-metadata
@@ -333,6 +375,9 @@ impl Repo {
                 variant("s", Value::Str(cid.clone()))?,
             )?;
         }
+        for (key, value) in caller_entries(&metadata, &opts.additional_metadata) {
+            append_dict_entry(&mut metadata, key, value.clone())?;
+        }
 
         let summary = Value::Tuple(vec![Value::Array(ref_entries), metadata]);
         let ty = Type::parse(SUMMARY_SIGNATURE).map_err(ostrya_core::Error::from)?;
@@ -364,16 +409,36 @@ impl Repo {
     /// absent, leaving other engines' arrays in place; `summary.sig` is replaced
     /// atomically. Like [`sign_commit`](Repo::sign_commit), the read-modify-write
     /// is not serialized across calls; sign a summary from one task at a time.
+    /// [`sign_summary_all`](Repo::sign_summary_all) signs with several signers
+    /// in one write.
     pub async fn sign_summary(&self, signer: &dyn Signer) -> Result<()> {
+        self.sign_summary_all(&[signer]).await
+    }
+
+    /// Sign the summary with every signer in `signers`, appending the
+    /// signatures to `summary.sig` in slice order.
+    ///
+    /// The result is the `summary.sig` one [`sign_summary`](Repo::sign_summary)
+    /// call per signer writes, in the same order. The batch reads `summary` and
+    /// `summary.sig` once, makes every signature, and then replaces
+    /// `summary.sig` atomically in one write. A signer that fails stops the
+    /// batch before the write, so `summary.sig` stays as it stood. An empty
+    /// slice reads and writes nothing.
+    pub async fn sign_summary_all(&self, signers: &[&dyn Signer]) -> Result<()> {
+        if signers.is_empty() {
+            return Ok(());
+        }
         let data = self.read_summary().await?.ok_or_else(|| {
             Error::InvalidFormat("no summary to sign; regenerate it first".into())
         })?;
-        let signature = signer.sign(&data).await?;
         let mut dict = self
             .read_summary_signature()
             .await?
             .unwrap_or_else(|| Value::Array(Vec::new()));
-        append_signature(&mut dict, signer.metadata_key(), signature)?;
+        for signer in signers {
+            let signature = signer.sign(&data).await?;
+            append_signature(&mut dict, signer.metadata_key(), signature)?;
+        }
         let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
         let bytes = to_bytes(&ty, &dict).map_err(ostrya_core::Error::from)?;
         let fsync = self.config().fsync()?;
@@ -598,6 +663,29 @@ fn ref_entry(
         refmeta,
     ]);
     Ok(Value::Tuple(vec![Value::Str(name.to_owned()), inner]))
+}
+
+/// The caller keys to append after the standard entries of `standard`, in
+/// the order of their first occurrence, each with its last value. A key
+/// `standard` already holds is left out, so the writer's own value stands.
+fn caller_entries<'a>(standard: &Value, added: &'a [(String, Value)]) -> Vec<(&'a str, &'a Value)> {
+    let mut entries: Vec<(&str, &Value)> = Vec::new();
+    // The slot each key holds in `entries`, so a repeated key is found in
+    // constant time and keeps the position of its first occurrence.
+    let mut slots: HashMap<&str, usize> = HashMap::new();
+    for (key, value) in added {
+        if standard.dict_get(key).is_some() {
+            continue;
+        }
+        match slots.entry(key.as_str()) {
+            Entry::Occupied(slot) => entries[*slot.get()].1 = value,
+            Entry::Vacant(slot) => {
+                slot.insert(entries.len());
+                entries.push((key.as_str(), value));
+            }
+        }
+    }
+    entries
 }
 
 /// Wrap `value` in a GVariant variant of type `type_str`, for an `a{sv}` value.

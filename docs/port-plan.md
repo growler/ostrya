@@ -2083,10 +2083,13 @@ timestamps), summary signing and verification.
 timestamp and the fixed-order global metadata, writes `summary` atomically at
 the repo root, and drops any stale `summary.sig`. `SummaryOptions` overrides the
 wall-clock `last-modified` (not pinned by `SOURCE_DATE_EPOCH`) for reproducible
-output. Collection repositories are supported in full: regeneration refreshes
-the empty-tree `ostree-metadata` anchor commit (collection/ref bindings,
+output, and its `additional_metadata` appends caller keys after the standard
+entries, a key the writer writes in the same run keeping the writer's value.
+Collection repositories are supported in full: regeneration refreshes the
+empty-tree `ostree-metadata` anchor commit (collection/ref bindings,
 parent-chained onto the previous anchor) and groups mirror refs into
-`ostree.summary.collection-map`. `Repo::sign_summary` and
+`ostree.summary.collection-map`. A collection repository refuses caller keys
+(Phase 17f, `F22b`). `Repo::sign_summary`, `Repo::sign_summary_all`, and
 `Repo::verify_summary` reuse the Phase 13 signing framework over the exact
 `summary` bytes, storing signatures in the `summary.sig` `a{sv}`. A native
 `ostrya summary` subcommand exposes update, sign, and verify. The recovered
@@ -5753,6 +5756,100 @@ instant in is the divergence "P3" already records for `remote summary`, reached
 here by the local command. The item adds 23 `m10` cells, of which 11 are
 executable and all 11 pass; the conformance run reports 957 cells and 394
 passes.
+
+`F22` completes `summary`'s writing half in three parts: `F22a` lands
+`--sign=KEY-ID` and its interaction with `--sign-type`, `F22b` lands
+`-m/--add-metadata=KEY=VALUE`, and `F22c` lands `--gpg-sign=KEY-ID` beside the
+`--gpg-homedir` the port already carried. The three are read with `-u` alone.
+`format-reference.md`, "CLI output formats", `summary`, states the recovered
+rules, and "Summary signature" states where each signature goes.
+
+The tool checks every writing option before it regenerates, so a refusal leaves
+`summary` and `summary.sig` as they stood and a ref added since is not listed.
+The order is each `-m` argument, then each `--gpg-sign` lookup, then
+`--sign-type` where a `--sign` key needs an engine, then each `--sign` key.
+`summary_update` follows that order: it builds every signer and parses every
+value first, then calls `regenerate_summary`, then signs. Under the gpg engine
+it looks up each `--sign` key and each positional key through
+`resolve_gpg_selectors` before the regeneration, the way it looks up each
+`--gpg-sign` selector, so a key the home directory does not hold refuses with
+the files as they stood. The GPG signatures come first whatever the
+command-line order, so a `summary.sig` holding both engines stores
+`ostree.gpgsigs` ahead of `ostree.sign.ed25519`. `resolve_gpg_selectors` holds
+the `--gpg-sign` lookup for `commit` and `summary` both, and `sign_api_signer`
+builds a `--sign` signer from the engine, the key, and the GnuPG home
+directory. `--sign-type` on `summary` is an optional string read by
+`sign_type_from_name`, so a name no engine carries is refused in the tool's
+words and is not read where no key needs it.
+
+The signatures go through `Repo::sign_summary_all`, which takes the signers as
+a slice. It reads `summary` and `summary.sig` once, makes every signature in
+slice order, and replaces `summary.sig` in one write, which is the one write the
+tool makes. `Repo::sign_summary` is the batch of one. A signer that fails stops
+the batch before the write, so `summary.sig` keeps the state it had before the
+batch. With 64 `--sign` keys the port's `summary -u` takes 23 ms and the tool's
+15 ms. The positional keys the port signs with outside `-u` go through the same
+call.
+
+`F22b` needs library work. `SummaryOptions` gains `additional_metadata`, the
+caller keys each paired with the `v` it carries. The option structs stay
+exhaustive by decision 14, so the field breaks every struct literal outside the
+crate, and decision 14 gives that break a minor version before 1.0. The version
+number is left to the release. `regenerate_summary` appends the keys after the
+standard entries in first-occurrence order, a repeated key taking its last
+value. The last-value lookup goes through a map from key to slot, so 60,000
+distinct keys take 0.17 s in the port and 0.23 s in the tool. A caller key
+naming a key the writer writes in the same run is dropped, so the writer's
+value stands. That set is decided per run: `ostree.static-deltas` in a
+repository holding no delta, and `ostree.summary.collection-id` in one with no
+collection id, are kept, which the tool does too. A value that is not a variant
+is refused before the collection anchor commit advances. The CLI reads the
+values through `summary_added_metadata` in the tool's words for this command,
+which name the value alone where `commit` names the whole argument. The
+observation also covers `commit --add-metadata`: the tool splits and parses
+each argument before it reads the next one, so `--add-metadata=k=@@
+--add-metadata=x` reports the parse, and `parse_added_metadata` takes the same
+order.
+
+In a repository with a collection id, the tool copies the caller keys into the
+metadata of the `ostree-metadata` anchor commit as well, beside the two
+bindings and in the order of a hash table, so the anchor checksum follows that
+order. `regenerate_summary` refuses any caller key in such a repository with
+`Error::Unsupported`, before the anchor advances and before any write. This
+decision is open to reversal. The alternative carries the keys into the anchor
+in the port's order and records the anchor checksum as a divergence.
+
+The positional `KEY_ID...` stays as a port extension. With `-u` the positional
+and `--keys-file` keys sign after every `--sign` key under the same
+`--sign-type`. Without `-u` they sign the summary that stands, and `--sign`,
+`--gpg-sign`, or `-m` given without `-u` and without a reading option draws the
+no-option refusal before a positional key is read. Beside a reading option the
+three are inert in both implementations, which is the observation the F21
+divergence on the place of a signing key waited on.
+
+The shared report printer follows the tool on three rules that `-m` reaches,
+and `remote summary` shares each of them. `ostree.summary.expires` carries the
+label `Expires` and converts like `Last-Modified`. A string stored under
+`ostree.static-deltas` prints quoted, since the tool reads that key as a whole
+value. The timestamp field reads as a signed count of seconds, the year carries
+no zero padding, and an instant outside years 1 through 9999 prints `invalid`.
+The report also reads `ostree.summary.collection-map` the way the tool does: a
+value of any type other than the map type lists no refs, and a commit checksum
+that is not 32 bytes prints `Invalid checksum of length <n> expected 32` in
+place of the hex. `Summary::collection_map` keeps its strict reading for a
+library caller.
+
+Eleven divergences stand on `summary`, four of them from this item: the entry
+order of the metadata dict after `-m`, which the tool stores in hash-table order
+and the port in the standard order followed by the caller keys, the class `F9`
+records for `commit --bootable`; `--sign-type=spki` or `--sign-type=gpg` beside
+`--sign`, which the tool's build refuses and the port carries where it is built
+with the engine, the class `commit --sign-type` records; `-m` in a repository
+with a collection id, which the tool carries into the anchor commit and the port
+refuses; and a 64-byte `--sign` value whose halves are not an ed25519 key pair,
+which the tool signs with and the port refuses, the class `commit --sign`
+records. The item adds 26 `m10` cells, of which 11 are executable and all 11
+pass; the conformance run reports 983 cells and 405 passes.
 
 #### Phase 17g -- P3 commands with no matrix weight
 

@@ -2040,14 +2040,18 @@ inventory is the oracle and the port writes the bytes the tool writes.
   not valid UTF-8 reports `M` in both.
 
 `summary` accepts `--repo`, `-u/--update`, `-v/--view`, `--raw`,
-`--list-metadata-keys`, `--print-metadata-key=KEY`, `--verify`,
-`-s/--sign-type`, and the port extensions `--last-modified`,
-`--metadata-commit-timestamp`, `--keys-file`, `--keys-dir`, `--gpg-homedir`,
-`--remote`. Missing: `-m/--add-metadata=KEY`, `--gpg-sign=KEY-ID`,
-`--sign=KEY-ID`. On this command the tool binds `-v` to `--view`, and
-`--verbose` has no short form. The port carries the same shape: `summary`
-declares `-v/--view` and a long-only `--verbose`, and every other subcommand,
-together with the top level, keeps `-v/--verbose`. Seven differences stand.
+`--list-metadata-keys`, `--print-metadata-key=KEY`, `-m/--add-metadata=KEY`,
+`--gpg-sign=KEY-ID`, `--gpg-homedir`, `--sign=KEY-ID`, `-s/--sign-type`,
+`--verify`, and the port extensions `--last-modified`,
+`--metadata-commit-timestamp`, `--keys-file`, `--keys-dir`, `--remote`, and a
+positional `KEY_ID...`. Nothing is missing. On this command the tool binds `-v`
+to `--view`, and `--verbose` has no short form. The port carries the same
+shape: `summary` declares `-v/--view` and a long-only `--verbose`, and every
+other subcommand, together with the top level, keeps `-v/--verbose`. `-m`,
+`--sign`, and `--gpg-sign` are read with `-u` alone, and both implementations
+check every one of them before the regeneration, so a refusal leaves `summary`
+and `summary.sig` as they stood (`../format-reference.md`, "CLI output
+formats", `summary`). Eleven differences stand.
 
 - `-v` does not turn on the debug stream. The tool binds `-v` to `--view` and
   `--verbose` together and writes `OT: using fuse: 0` for a read-only view; the
@@ -2057,9 +2061,11 @@ together with the top level, keeps `-v/--verbose`. Seven differences stand.
   `ostrya summary --verbose` still writes the repository-resolution line the
   port's global `--verbose` writes everywhere;
 - a positional argument. `summary` takes none in the tool, which accepts one
-  and ignores it, writing the report as if it were absent. The port reads a
-  positional as a signing key identifier, the surface the tool states with
-  `--sign=KEY-ID`, and signing precedes every reading option, so
+  and ignores it, writing the report as if it were absent. The port keeps the
+  positional as a signing key identifier, a port extension beside
+  `--sign=KEY-ID` read under the same `--sign-type`. With `-u` the positional
+  keys sign after every `--sign` key. Without `-u` they sign the summary that
+  stands, and signing precedes every reading option, so
   `summary --view <word>` signs where the word is a key and refuses at exit 1
   where it is not. The tool writes the report and the port writes none;
 - a repeated switch. The tool takes a second `-v`, `--view`, `--raw`, or
@@ -2074,15 +2080,50 @@ together with the top level, keeps `-v/--verbose`. Seven differences stand.
 - the no-option refusal wording. The tool reports `error: No option specified;
   use -u to update summary`; the port reports `error: invalid format: nothing
   to do: pass --update, --verify, a reading option, or a signing key`, naming
-  the options it carries, two of which the tool does not. Both exit 1;
-- the place a signing key takes among the reading options. The port signs and
-  returns before any reading option is read, so `summary --view --keys-file=F`
-  writes a signature and no report, and so does a signing key given as a
-  positional. Nothing observed orders the two. The tool states the signing
-  surface with `--sign=KEY-ID`, refuses that option without `-u`, and writes
-  the report and no signature for `summary --sign=KEY-ID --view`. The port's
-  order is the port's own; the observation that settles it is available once
-  the port carries `--sign`;
+  the options it carries, two of which the tool does not. Both exit 1. The
+  refusal is also what `--sign`, `--gpg-sign`, or `-m` draws without `-u` and
+  without a reading option, in both, before any value is read. The port
+  reaches it before a positional key is read;
+- the place a signing key takes among the reading options. The observation
+  that settles it is `summary --sign=K --view`: both write the report and sign
+  nothing, and `--sign`, `--gpg-sign`, and `-m` are inert beside every reading
+  option in both. The port's extensions order the other way. A positional key
+  or a `--keys-file` signs and returns before any reading option is read, so
+  `summary --view --keys-file=F` writes a signature and no report. The tool
+  carries neither surface;
+- the entry order of the metadata dict after `-m`. With any `-m`, the tool
+  stores the whole dict, its own keys included, in the order of a hash table,
+  which follows the key set and not the command line: `-m b=1 -m n=2` stores
+  `mode, n, b, last-modified, indexed-deltas, tombstone-commits`. The port
+  stores the standard order and then the user keys in first-occurrence order.
+  Rebuilding a hash-table order is the engine rule 2 forbids, and
+  `commit --bootable` carries the same class of divergence
+  (`../port-plan.md`, Phase 17f, `F9`). The key set and every value agree, the
+  report follows the stored order, and some key sets keep the standard order in
+  the tool, where the two `summary` files agree byte for byte;
+- `--sign-type` names an engine the port carries and this tool build does not,
+  the rule `commit --sign-type` already records. The tool's build reports
+  `error: Requested signature type is not implemented` for `spki` and `gpg`
+  beside `--sign`, where the port reads the key under `spki` when it is built
+  with the `spki` feature and under `gpg` when it is built with the `gpg`
+  feature. The port reads a `spki` key before the regeneration, and it looks
+  up a `gpg` selector given to `--sign` or as a positional key before the
+  regeneration, the way it looks up a `--gpg-sign` selector;
+- `-m` in a repository with a collection id. The tool adds the caller keys to
+  the metadata of the `ostree-metadata` anchor commit as well, beside the two
+  bindings and in the order of a hash table, so the anchor checksum follows that
+  order. The port refuses the run at exit 1 before the regeneration with
+  `error: unsupported: summary metadata keys in a repository with a collection
+  id`, and `summary`, `summary.sig`, and the anchor ref keep their state. Rule 1
+  decides it: carrying the keys in the port's own order writes an anchor with
+  another checksum (`../format-reference.md`, "The `ostree-metadata` anchor
+  commit");
+- a 64-byte `--sign` value whose halves are not an ed25519 key pair, the class
+  `commit --sign` records above. 64 zero bytes are one such value. The tool
+  signs with it at exit 0. The port refuses it at exit 1 before the
+  regeneration with `error: signature: ed25519 secret key: signature error:
+  Mismatched Keypair detected`, and `summary` and `summary.sig` keep their
+  state;
 - a `summary` file whose bytes are not a document of the summary type. Such a
   file reaches a repository only through a write that is neither
   implementation's. The tool reads it as an empty document, so `--raw` writes

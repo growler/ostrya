@@ -11951,6 +11951,10 @@ fn commit_metadata_matches_the_tool() {
     agrees(&["--add-metadata-string=noequals"]);
     agrees(&["--add-metadata-string==emptykey"]);
     agrees(&["--add-metadata=noequals"]);
+    // Each `--add-metadata` is split and then parsed before the next one is
+    // read, so the refusal names the first bad argument in command-line order.
+    agrees(&["--add-metadata=k=@@", "--add-metadata=noequals"]);
+    agrees(&["--add-metadata=noequals", "--add-metadata=k=@@"]);
     agrees(&["--add-metadata=='x'"]);
     agrees(&["--add-metadata==empty"]);
     agrees(&["--add-detached-metadata-string=noequals"]);
@@ -28015,5 +28019,898 @@ fn summary_argument_handling_parts_from_the_tool() {
             "the tool refused `{}`",
             args.join(" ")
         );
+    }
+}
+
+// --- summary: the writing options (Phase 17f, F22a/F22b/F22c) ----------------
+//
+// `summary -u` with `--sign`, `-m/--add-metadata`, and `--gpg-sign`. The tool
+// writes `ostree.summary.last-modified` from the wall clock, so each
+// comparison lets the tool write first, reads the instant it wrote, and gives
+// the port the same instant through `--last-modified`. The two copies of one
+// repository then hold the same `summary` bytes wherever the two writers
+// agree.
+
+/// The `ostree.summary.last-modified` value the tool reads out of `repo`, as
+/// seconds since the Unix epoch.
+fn summary_last_modified(repo: &Path) -> String {
+    let printed = ostree(&[
+        &format!("--repo={}", repo.display()),
+        "summary",
+        "--print-metadata-key=ostree.summary.last-modified",
+    ])
+    .ok()
+    .stdout_trimmed();
+    printed
+        .strip_prefix("uint64 ")
+        .expect("the key holds a uint64")
+        .to_owned()
+}
+
+/// Run `summary -u` with `extra` in the tool over `tool_repo`, then in the port
+/// over `port_repo`. Where the tool wrote a summary, the port is given the
+/// instant the tool wrote.
+fn summary_update_both(
+    port_repo: &Path,
+    tool_repo: &Path,
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> (Run, Run) {
+    let tool_arg = format!("--repo={}", tool_repo.display());
+    let mut tool_args = vec![tool_arg.as_str(), "summary", "-u"];
+    tool_args.extend_from_slice(extra);
+    let tool = ostree_env(&tool_args, env);
+    let last_modified = tool
+        .status
+        .success()
+        .then(|| format!("--last-modified={}", summary_last_modified(tool_repo)));
+    let port_arg = format!("--repo={}", port_repo.display());
+    let mut port_args = vec!["summary", port_arg.as_str(), "-u"];
+    if let Some(flag) = &last_modified {
+        port_args.push(flag);
+    }
+    port_args.extend_from_slice(extra);
+    let port = ostrya(&port_args, None, env);
+    (port, tool)
+}
+
+/// The bytes of `summary` and `summary.sig` in `repo`, `None` for an absent
+/// file.
+fn summary_files(repo: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    (
+        std::fs::read(repo.join("summary")).ok(),
+        std::fs::read(repo.join("summary.sig")).ok(),
+    )
+}
+
+/// The engine keys of `summary.sig` in `repo` in stored order, each with the
+/// signature blobs it holds.
+fn summary_signatures(repo: &Path) -> Vec<(String, Vec<Vec<u8>>)> {
+    let bytes = std::fs::read(repo.join("summary.sig")).expect("summary.sig exists");
+    let dict = ostrya::from_bytes(&Type::parse("a{sv}").unwrap(), &bytes).unwrap();
+    dict.as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            let [Value::Str(key), value] = entry.as_tuple().unwrap() else {
+                panic!("a summary.sig entry is not (key, value)");
+            };
+            let (_, blobs) = value.as_variant().unwrap();
+            let blobs = blobs
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|blob| blob.as_bytes().unwrap().to_vec())
+                .collect();
+            (key.clone(), blobs)
+        })
+        .collect()
+}
+
+/// The keys of the summary's global metadata dict in `repo`, in stored order.
+fn summary_metadata_keys(repo: &Path) -> Vec<String> {
+    let bytes = std::fs::read(repo.join("summary")).unwrap();
+    ostrya::Summary::parse(&bytes)
+        .unwrap()
+        .metadata
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_tuple().unwrap()[0].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The first line of a run's standard error.
+fn first_stderr_line(run: &Run) -> String {
+    String::from_utf8_lossy(&run.stderr)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// A tool-built archive repository with two refs and a summary, and a copy of
+/// it for the port.
+fn summary_writing_pair(base: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let tree = base.join(format!("{name}-tree"));
+    write_at(&tree.join("hello.txt"), b"hello\n");
+    write_at(&tree.join("subdir/world.txt"), b"world\n");
+    let tool = summary_fixture(
+        base,
+        &format!("{name}-tool"),
+        &tree,
+        &["one", "two/branch"],
+        &[],
+        &[],
+    );
+    let port = clone_repo(base, &tool, &format!("{name}-port"));
+    (port, tool)
+}
+
+/// A plain `summary -u` writes the bytes the tool writes, given the instant
+/// the tool wrote.
+#[test]
+fn summary_update_matches_the_tool_byte_for_byte() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-update-bytes");
+    let (port, tool) = summary_writing_pair(tmp.path(), "plain");
+    let (port_run, tool_run) = summary_update_both(&port, &tool, &[], &[]);
+    port_run.ok();
+    tool_run.ok();
+    assert_eq!(
+        summary_files(&port),
+        summary_files(&tool),
+        "`summary -u` wrote different bytes"
+    );
+}
+
+/// `summary -u --sign` writes the `summary.sig` the tool writes, one signature
+/// per occurrence in command-line order, and `--sign` is read with `-u` alone.
+#[test]
+fn summary_sign_matches_the_tool() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-sign");
+    let base = tmp.path();
+    let k1 = format!("--sign={ED25519_SECRET_B64}");
+    let k2 = format!("--sign={ED25519_SECRET2_B64}");
+    let env = &[("TZ", "UTC")];
+
+    // Two keys, and one key twice: the signatures are not deduplicated.
+    for (label, extra) in [
+        ("two keys", vec![k1.as_str(), k2.as_str()]),
+        ("one key twice", vec![k1.as_str(), k1.as_str()]),
+    ] {
+        let (port, tool) = summary_writing_pair(base, &label.replace(' ', "-"));
+        let (port_run, tool_run) = summary_update_both(&port, &tool, &extra, &[]);
+        port_run.ok();
+        tool_run.ok();
+        assert_eq!(
+            summary_files(&port),
+            summary_files(&tool),
+            "{label}: the files differ"
+        );
+        let signatures = summary_signatures(&port);
+        assert_eq!(signatures.len(), 1, "{label}: {signatures:?}");
+        assert_eq!(signatures[0].0, "ostree.sign.ed25519");
+        assert_eq!(signatures[0].1.len(), 2, "{label}: two signatures");
+    }
+
+    // The positional keys the port carries sign the summary that stands with
+    // the bytes `--sign` gives under `-u`.
+    let (port, tool) = summary_writing_pair(base, "positional");
+    let (port_run, tool_run) = summary_update_both(&port, &tool, &[&k1, &k2], &[]);
+    port_run.ok();
+    tool_run.ok();
+    std::fs::remove_file(port.join("summary.sig")).unwrap();
+    ostrya(
+        &[
+            "summary",
+            &format!("--repo={}", port.display()),
+            ED25519_SECRET_B64,
+            ED25519_SECRET2_B64,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        summary_files(&port),
+        summary_files(&tool),
+        "the positional keys signed other bytes"
+    );
+
+    // Beside a reading option `--sign` is inert: the report is written and
+    // nothing changes. Alone, it draws the no-option refusal.
+    let before = summary_files(&tool);
+    let (port_run, tool_run) = run_both_env(&port, &tool, &["summary", &k1, "--view"], env);
+    assert_runs_agree(&port_run, &tool_run, "summary --sign --view");
+    assert_eq!(tool_run.status.code(), Some(0));
+    assert_eq!(summary_files(&port), before, "the port changed the files");
+    assert_eq!(summary_files(&tool), before, "the tool changed the files");
+    let (port_run, tool_run) = run_both(&port, &tool, &["summary", &k1]);
+    for (who, run) in [("port", &port_run), ("tool", &tool_run)] {
+        assert_eq!(run.status.code(), Some(1), "the {who} took --sign alone");
+        assert!(run.stdout.is_empty(), "the {who} wrote a report");
+    }
+    assert_eq!(
+        first_stderr_line(&tool_run),
+        "error: No option specified; use -u to update summary"
+    );
+    assert_eq!(summary_files(&port), before);
+    assert_eq!(summary_files(&tool), before);
+
+    // `--sign-type` with no key signs nothing, and the regeneration removes
+    // the signature that stood.
+    for engine in ["ed25519", "dummy"] {
+        let flag = format!("--sign-type={engine}");
+        let (port_run, tool_run) = summary_update_both(&port, &tool, &[&flag], &[]);
+        port_run.ok();
+        tool_run.ok();
+        assert_eq!(summary_files(&port), summary_files(&tool), "{flag}");
+        assert!(summary_files(&port).1.is_none(), "{flag} kept summary.sig");
+        // Sign again for the next round.
+        summary_update_both(&port, &tool, &[&k1], &[]);
+    }
+}
+
+/// Every refusal of `summary -u` comes before the regeneration, so `summary`
+/// and `summary.sig` stay as they stood and a ref added since is not listed.
+/// The checks run in the tool's order: `-m`, then `--sign-type`, then the
+/// `--sign` keys.
+#[test]
+fn summary_sign_refusals_keep_files() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-refusals");
+    let base = tmp.path();
+    let k1 = format!("--sign={ED25519_SECRET_B64}");
+    let tree = base.join("tree");
+    write_at(&tree.join("hello.txt"), b"hello\n");
+    let tool = summary_fixture(base, "tool", &tree, &["one"], &[], &[&k1]);
+    // A ref the next regeneration would list.
+    ostree(&[
+        &format!("--repo={}", tool.display()),
+        "commit",
+        "-b",
+        "added",
+        FIXED_TIMESTAMP,
+        tree.to_str().unwrap(),
+    ])
+    .ok();
+    let port = clone_repo(base, &tool, "port");
+    let before = summary_files(&tool);
+    assert!(before.1.is_some(), "the fixture carries a signature");
+
+    let same_words: &[&[&str]] = &[
+        &["--sign=zzz"],
+        &[&k1, "--sign=zzz"],
+        &["--sign=zzz", "--sign-type=dummy"],
+        &[&k1, "--sign-type=dummy"],
+        &[&k1, "--sign-type=bogus"],
+        &[&k1, "--sign-type="],
+        &[&k1, "--sign-type=dummy", "--sign-type=bogus"],
+        &["-m", "x"],
+        &["-m", "k=@@"],
+        &["-m", "a=1=2"],
+        &["--add-metadata=x"],
+        &["-m", "x", "-m", "k=@@"],
+        &["-m", "k=@@", "-m", "x"],
+        &["-m", "x", "--sign=zzz"],
+        &["--sign=zzz", "-m", "k=@@"],
+        &["-m", "k=@@", "--sign-type=dummy", &k1],
+    ];
+    for extra in same_words {
+        let (port_run, tool_run) = summary_update_both(&port, &tool, extra, &[]);
+        let label = format!("summary -u {}", extra.join(" "));
+        for (who, run) in [("port", &port_run), ("tool", &tool_run)] {
+            assert_eq!(run.status.code(), Some(1), "the {who} took `{label}`");
+            assert!(run.stdout.is_empty(), "the {who} wrote to stdout");
+        }
+        assert_eq!(
+            first_stderr_line(&port_run),
+            first_stderr_line(&tool_run),
+            "`{label}` refused in other words"
+        );
+        assert_eq!(summary_files(&port), before, "the port changed `{label}`");
+        assert_eq!(summary_files(&tool), before, "the tool changed `{label}`");
+    }
+
+    // The engines the tool's build does not carry for this option: the tool
+    // refuses the name, and the port refuses the key the engine cannot read.
+    // Both refuse before the regeneration.
+    let (port_run, tool_run) =
+        summary_update_both(&port, &tool, &["--sign=zzz", &k1, "--sign-type=spki"], &[]);
+    assert_eq!(
+        first_stderr_line(&tool_run),
+        "error: Requested signature type is not implemented"
+    );
+    assert_eq!(port_run.status.code(), Some(1));
+    assert_eq!(summary_files(&port), before);
+    assert_eq!(summary_files(&tool), before);
+
+    // 64 zero bytes are no ed25519 key pair: the port refuses before the
+    // regeneration, and the tool signs.
+    let zero = format!("--sign={}", ostrya::base64::encode(&[0u8; 64]));
+    let (port_run, tool_run) = summary_update_both(&port, &tool, &[&zero], &[]);
+    assert_eq!(port_run.status.code(), Some(1));
+    assert_eq!(
+        first_stderr_line(&port_run),
+        "error: signature: ed25519 secret key: signature error: Mismatched Keypair detected"
+    );
+    assert_eq!(summary_files(&port), before);
+    tool_run.ok();
+}
+
+/// `summary -u -m` stores each value in the GVariant text form, host order
+/// included, and merges the caller keys with the writer's own.
+#[test]
+fn summary_add_metadata_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-add-metadata");
+    let base = tmp.path();
+    let env = &[("TZ", "UTC")];
+    // Each round is a whole `summary -u`, which rebuilds the summary from the
+    // refs alone, so one pair serves every round.
+    let (port, tool) = summary_writing_pair(base, "pair");
+
+    // Byte-identical where the tool keeps the standard key order: a writer key
+    // replaced by the writer's value, a writer key given twice, the empty key.
+    for extra in [
+        vec!["-m", "ostree.summary.mode=\"x\""],
+        vec!["-m", "ostree.summary.last-modified=uint64 5"],
+        vec!["-m", "=1"],
+    ] {
+        let (port_run, tool_run) = summary_update_both(&port, &tool, &extra, &[]);
+        port_run.ok();
+        tool_run.ok();
+        assert_eq!(
+            summary_files(&port),
+            summary_files(&tool),
+            "`-u {}` wrote different bytes",
+            extra.join(" ")
+        );
+    }
+
+    // The value each key reads back as, where the stored order parts.
+    let expires = |seconds: i64| {
+        format!(
+            "ostree.summary.expires=uint64 {}",
+            (seconds as u64).swap_bytes()
+        )
+    };
+    for (extra, keys) in [
+        (vec!["-m", "n=uint32 7"], vec!["n"]),
+        (vec!["-m", "k=1", "-m", "k=2"], vec!["k"]),
+        (
+            vec!["-m", "ostree.summary.tombstone-commits=true"],
+            vec!["ostree.summary.tombstone-commits"],
+        ),
+        (
+            vec!["-m", "ostree.summary.indexed-deltas=false"],
+            vec!["ostree.summary.indexed-deltas"],
+        ),
+        (
+            vec!["-m", "ostree.summary.expires=uint64 9"],
+            vec!["ostree.summary.expires"],
+        ),
+        // The report reads `expires` big-endian as a signed count of seconds,
+        // and names an instant outside years 1 through 9999 invalid.
+        (
+            vec!["-m", &expires(1_700_000_000)],
+            vec!["ostree.summary.expires"],
+        ),
+        (vec!["-m", &expires(-62_135_596_800)], vec![]),
+        (vec!["-m", &expires(-62_135_596_801)], vec![]),
+        (vec!["-m", &expires(253_402_300_799)], vec![]),
+        (vec!["-m", &expires(253_402_300_800)], vec![]),
+        (vec!["-m", &expires(-1)], vec![]),
+        (
+            vec!["-m", "ostree.static-deltas='kept'"],
+            vec!["ostree.static-deltas"],
+        ),
+        (
+            vec!["-m", "ostree.summary.collection-id='x'"],
+            vec!["ostree.summary.collection-id"],
+        ),
+    ] {
+        let (port_run, tool_run) = summary_update_both(&port, &tool, &extra, &[]);
+        port_run.ok();
+        tool_run.ok();
+        assert_agrees_env(&port, &tool, &["summary", "--list-metadata-keys"], env);
+        for key in keys {
+            let flag = format!("--print-metadata-key={key}");
+            assert_agrees_env(&port, &tool, &["summary", &flag], env);
+        }
+        // The report follows the stored order, so its lines agree as a set.
+        let (port_run, tool_run) = run_both_env(&port, &tool, &["summary", "--view"], env);
+        let lines = |run: &Run| {
+            let mut lines: Vec<String> = String::from_utf8_lossy(&run.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect();
+            lines.sort();
+            lines
+        };
+        assert_eq!(lines(&port_run), lines(&tool_run), "{}", extra.join(" "));
+    }
+
+    // The key order: the tool writes the whole dict in hash-table order and
+    // the port writes the standard order, then the caller keys in
+    // first-occurrence order. The key set agrees.
+    let (port_run, tool_run) = summary_update_both(&port, &tool, &["-m", "b=1", "-m", "n=2"], &[]);
+    port_run.ok();
+    tool_run.ok();
+    assert_agrees_env(&port, &tool, &["summary", "--list-metadata-keys"], env);
+    let port_keys = summary_metadata_keys(&port);
+    assert_eq!(
+        port_keys,
+        [
+            "ostree.summary.mode",
+            "ostree.summary.last-modified",
+            "ostree.summary.tombstone-commits",
+            "ostree.summary.indexed-deltas",
+            "b",
+            "n",
+        ]
+    );
+    let tool_keys = summary_metadata_keys(&tool);
+    assert_ne!(tool_keys, port_keys, "the tool kept the standard order");
+    let sorted = |mut keys: Vec<String>| {
+        keys.sort();
+        keys
+    };
+    assert_eq!(sorted(tool_keys), sorted(port_keys));
+
+    // Without `-u`, `-m` beside a reading option is inert, even one that
+    // cannot parse, and alone it draws the no-option refusal.
+    // A plain regeneration first, so the two `summary` files agree again.
+    summary_update_both(&port, &tool, &[], &[]);
+    let before = summary_files(&tool);
+    assert_eq!(summary_files(&port), before);
+    assert_agrees_env(&port, &tool, &["summary", "-m", "k=@@", "--view"], env);
+    let (port_run, tool_run) = run_both(&port, &tool, &["summary", "-m", "k=@@"]);
+    for (who, run) in [("port", &port_run), ("tool", &tool_run)] {
+        assert_eq!(run.status.code(), Some(1), "the {who} took -m alone");
+        assert!(run.stdout.is_empty());
+    }
+    assert_eq!(
+        first_stderr_line(&tool_run),
+        "error: No option specified; use -u to update summary"
+    );
+    assert_eq!(summary_files(&port), before);
+    assert_eq!(summary_files(&tool), before);
+}
+
+/// `--gpg-homedir` with no `--gpg-sign` is inert under `-u`.
+#[test]
+fn summary_gpg_homedir_alone_is_inert() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-gpg-homedir");
+    let (port, tool) = summary_writing_pair(tmp.path(), "homedir");
+    let (port_run, tool_run) =
+        summary_update_both(&port, &tool, &["--gpg-homedir=/nonexistent-zz-home"], &[]);
+    port_run.ok();
+    tool_run.ok();
+    assert_eq!(summary_files(&port), summary_files(&tool));
+}
+
+/// The key id `gpg --list-packets` reports for one signature blob.
+#[cfg(feature = "gpg")]
+fn signature_key_id(home: &GpgHome, dir: &Path, blob: &[u8]) -> String {
+    let path = dir.join("blob.sig");
+    std::fs::write(&path, blob).unwrap();
+    let out = home
+        .gpg()
+        .arg("--list-packets")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix(":signature packet:")?;
+            Some(rest.rsplit("keyid ").next()?.trim().to_uppercase())
+        })
+        .unwrap_or_else(|| panic!("no signature packet in:\n{text}"))
+}
+
+/// Whether the tool verifies the summary of `server` with the certificate at
+/// `keyring` imported for the remote, through a client repository of its own.
+#[cfg(feature = "gpg")]
+fn tool_verifies_summary(base: &Path, name: &str, server: &Path, keyring: &Path) -> bool {
+    let client = base.join(name);
+    let client_arg = format!("--repo={}", client.display());
+    ostree(&[&client_arg, "init", "--mode=archive"]).ok();
+    ostree(&[
+        &client_arg,
+        "remote",
+        "add",
+        &format!("--gpg-import={}", keyring.display()),
+        "--set=gpg-verify-summary=true",
+        "--set=gpg-verify=false",
+        "origin",
+        &format!("file://{}", server.display()),
+    ])
+    .ok();
+    ostree(&[&client_arg, "remote", "summary", "origin"])
+        .status
+        .success()
+}
+
+/// `summary -u --gpg-sign` writes the GPG signatures under `ostree.gpgsigs`,
+/// ahead of `ostree.sign.ed25519` whatever the command-line order, one per
+/// occurrence in command-line order, and resolves every selector before the
+/// regeneration. Each implementation verifies what the other signed.
+#[cfg(feature = "gpg")]
+#[test]
+fn summary_gpg_sign_matches_the_tool() {
+    if !ostree_supports_ed25519() || !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-gpg-sign");
+    let base = tmp.path();
+    let home_base = base.join("home-a");
+    std::fs::create_dir(&home_base).unwrap();
+    let home = GpgHome::create(&home_base, "Summary Signer A <a@example.org>");
+    home.add_key("Summary Signer B <b@example.org>");
+    let fpr_a = home.fingerprint_of("a@example.org");
+    let fpr_b = home.fingerprint_of("b@example.org");
+    let homedir = format!("--gpg-homedir={}", home.dir.display());
+    let sign_a = format!("--gpg-sign={fpr_a}");
+    let sign_b = format!("--gpg-sign={fpr_b}");
+    let k1 = format!("--sign={ED25519_SECRET_B64}");
+    let env = &[("TZ", "UTC")];
+
+    // Beside an ed25519 key, in both command-line orders: the GPG signature
+    // is stored first, and the ed25519 one over the same summary bytes is the
+    // same in both.
+    for (label, extra) in [
+        (
+            "gpg first",
+            vec![sign_a.as_str(), homedir.as_str(), k1.as_str()],
+        ),
+        (
+            "gpg last",
+            vec![k1.as_str(), sign_a.as_str(), homedir.as_str()],
+        ),
+    ] {
+        let (port, tool) = summary_writing_pair(base, &label.replace(' ', "-"));
+        let (port_run, tool_run) = summary_update_both(&port, &tool, &extra, &[]);
+        port_run.ok();
+        tool_run.ok();
+        assert_eq!(summary_files(&port).0, summary_files(&tool).0, "{label}");
+        let port_sigs = summary_signatures(&port);
+        let tool_sigs = summary_signatures(&tool);
+        for sigs in [&port_sigs, &tool_sigs] {
+            let keys: Vec<&str> = sigs.iter().map(|(key, _)| key.as_str()).collect();
+            assert_eq!(keys, ["ostree.gpgsigs", "ostree.sign.ed25519"], "{label}");
+            assert_eq!(sigs[0].1.len(), 1, "{label}");
+        }
+        assert_eq!(port_sigs[1], tool_sigs[1], "{label}: the ed25519 signature");
+    }
+
+    // Two GPG keys: one signature each, in command-line order.
+    for order in [[&sign_a, &sign_b], [&sign_b, &sign_a]] {
+        let (port, tool) = summary_writing_pair(base, &format!("two-{}", &order[0][11..19]));
+        let (port_run, tool_run) =
+            summary_update_both(&port, &tool, &[order[0], order[1], &homedir], &[]);
+        port_run.ok();
+        tool_run.ok();
+        let want: Vec<String> = order
+            .iter()
+            .map(|flag| flag[flag.len() - 16..].to_owned())
+            .collect();
+        for (who, repo) in [("port", &port), ("tool", &tool)] {
+            let sigs = summary_signatures(repo);
+            assert_eq!(sigs.len(), 1, "{who}");
+            let got: Vec<String> = sigs[0]
+                .1
+                .iter()
+                .map(|blob| signature_key_id(&home, base, blob))
+                .collect();
+            assert_eq!(got, want, "the {who} stored another order");
+        }
+    }
+
+    // The lookup refusals, and the refusal orders against the other options.
+    // Each leaves both files as they stood.
+    let (port, tool) = summary_writing_pair(base, "refusals");
+    summary_update_both(&port, &tool, &[&k1], &[]);
+    let port = {
+        std::fs::remove_dir_all(&port).unwrap();
+        clone_repo(base, &tool, "refusals-port-2")
+    };
+    let before = summary_files(&tool);
+    let absent = "--gpg-sign=0123456789ABCDEF";
+    let absent_home = "--gpg-homedir=/nonexistent-zz-home";
+    let refusals: &[&[&str]] = &[
+        &["--gpg-sign=abc"],
+        &["--gpg-sign=1234567"],
+        &["--gpg-sign="],
+        &[absent, &homedir],
+        &[absent, absent_home],
+        &["--gpg-sign=example.org", &homedir],
+        &[&sign_a, absent, &homedir],
+        &["-m", "x", absent, &homedir],
+        &[absent, &homedir, &k1, "--sign-type=dummy"],
+        &[&sign_a, &homedir, "--sign=zzz"],
+    ];
+    for extra in refusals {
+        let (port_run, tool_run) = summary_update_both(&port, &tool, extra, &[]);
+        let label = format!("summary -u {}", extra.join(" "));
+        for (who, run) in [("port", &port_run), ("tool", &tool_run)] {
+            assert_eq!(run.status.code(), Some(1), "the {who} took `{label}`");
+            assert!(run.stdout.is_empty());
+        }
+        assert_eq!(
+            first_stderr_line(&port_run),
+            first_stderr_line(&tool_run),
+            "`{label}` refused in other words"
+        );
+        assert_eq!(summary_files(&port), before, "the port changed `{label}`");
+        assert_eq!(summary_files(&tool), before, "the tool changed `{label}`");
+    }
+    // With no `--gpg-homedir` the refusal names `<default>`. `GNUPGHOME`
+    // points both at the isolated home.
+    let gnupghome = home.dir.display().to_string();
+    let (port_run, tool_run) =
+        summary_update_both(&port, &tool, &[absent], &[("GNUPGHOME", &gnupghome)]);
+    assert_eq!(
+        first_stderr_line(&tool_run),
+        "error: No gpg key found with ID 0123456789ABCDEF (homedir: <default>)"
+    );
+    assert_eq!(first_stderr_line(&port_run), first_stderr_line(&tool_run));
+    assert_eq!(summary_files(&port), before);
+
+    // Without `-u`: inert beside a reading option, refused alone.
+    assert_agrees_env(
+        &port,
+        &tool,
+        &["summary", absent, absent_home, "--view"],
+        env,
+    );
+    let (port_run, tool_run) = run_both(&port, &tool, &["summary", &sign_a, &homedir]);
+    assert_eq!(port_run.status.code(), Some(1));
+    assert_eq!(
+        first_stderr_line(&tool_run),
+        "error: No option specified; use -u to update summary"
+    );
+    assert_eq!(summary_files(&port), before);
+    assert_eq!(summary_files(&tool), before);
+
+    // Each implementation verifies what either signed, and a foreign key
+    // verifies neither.
+    let keyring = base.join("a.gpg");
+    home.export_one_to(&fpr_a, &keyring);
+    let other_base = base.join("home-o");
+    std::fs::create_dir(&other_base).unwrap();
+    let other = GpgHome::create(&other_base, "Other <o@example.org>");
+    let foreign = base.join("o.gpg");
+    other.export_to(&foreign);
+    let (port, tool) = summary_writing_pair(base, "verify");
+    summary_update_both(&port, &tool, &[&sign_a, &homedir], &[]);
+    for (who, repo) in [("port", &port), ("tool", &tool)] {
+        let verify = |ring: &Path| {
+            ostrya(
+                &[
+                    "summary",
+                    &format!("--repo={}", repo.display()),
+                    "--verify",
+                    "--sign-type=gpg",
+                    &format!("--keys-file={}", ring.display()),
+                ],
+                None,
+                &[],
+            )
+        };
+        let good = verify(&keyring);
+        assert!(
+            good.status.success(),
+            "the port did not verify the {who}'s signature:\n{}",
+            String::from_utf8_lossy(&good.stdout)
+        );
+        assert!(!verify(&foreign).status.success(), "{who}: foreign key");
+        assert!(
+            tool_verifies_summary(base, &format!("client-{who}-good"), repo, &keyring),
+            "the tool did not verify the {who}'s signature"
+        );
+        assert!(
+            !tool_verifies_summary(base, &format!("client-{who}-foreign"), repo, &foreign),
+            "the tool verified the {who}'s signature with a foreign key"
+        );
+    }
+}
+
+/// In a collection repository the port refuses `-m` before the regeneration,
+/// where the tool carries the caller keys into the `ostree-metadata` anchor
+/// commit. The refusal leaves `summary`, `summary.sig`, and the anchor ref as
+/// they stood.
+#[test]
+fn summary_add_metadata_in_a_collection_repository_is_refused() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-add-metadata-collection");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    write_at(&tree.join("hello.txt"), b"hello\n");
+    let k1 = format!("--sign={ED25519_SECRET_B64}");
+    let tool = summary_fixture(
+        base,
+        "tool",
+        &tree,
+        &["one"],
+        &["--collection-id=org.example.C"],
+        &[&k1],
+    );
+    let port = clone_repo(base, &tool, "port");
+    let anchor = |repo: &Path| std::fs::read(repo.join("refs/heads/ostree-metadata")).unwrap();
+    let before = summary_files(&port);
+    assert!(before.1.is_some(), "the fixture carries a signature");
+    let anchor_before = anchor(&port);
+
+    let run = ostrya(
+        &[
+            "summary",
+            &format!("--repo={}", port.display()),
+            "-u",
+            "-m",
+            "k=uint32 1",
+            &k1,
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1), "the port took -m");
+    assert!(run.stdout.is_empty());
+    assert_eq!(
+        first_stderr_line(&run),
+        "error: unsupported: summary metadata keys in a repository with a collection id"
+    );
+    assert_eq!(summary_files(&port), before, "the port changed the files");
+    assert_eq!(anchor(&port), anchor_before, "the port moved the anchor");
+
+    // The tool takes the run and stores the key in the anchor commit.
+    let tool_arg = format!("--repo={}", tool.display());
+    ostree(&[&tool_arg, "summary", "-u", "-m", "k='v'"]).ok();
+    let stored = ostree(&[
+        &tool_arg,
+        "show",
+        "--print-metadata-key=k",
+        "ostree-metadata",
+    ])
+    .ok()
+    .stdout_trimmed();
+    assert_eq!(stored, "'v'");
+}
+
+/// Under the gpg engine, a `--sign` key and a positional key are looked up
+/// before the regeneration, so a key the home directory does not hold leaves
+/// `summary`, `summary.sig`, and the ref list as they stood. A key the home
+/// directory holds signs.
+#[cfg(feature = "gpg")]
+#[test]
+fn summary_gpg_engine_key_refusal_keeps_files() {
+    if !ostree_supports_ed25519() || !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-gpg-engine");
+    let base = tmp.path();
+    let home = GpgHome::create(base, "Summary Signer <s@example.org>");
+    let fpr = home.fingerprint_of("s@example.org");
+    let homedir = format!("--gpg-homedir={}", home.dir.display());
+    let k1 = format!("--sign={ED25519_SECRET_B64}");
+    let tree = base.join("tree");
+    write_at(&tree.join("hello.txt"), b"hello\n");
+    let tool = summary_fixture(base, "tool", &tree, &["one"], &[], &[&k1]);
+    let port = clone_repo(base, &tool, "port");
+    // A ref the next regeneration would list.
+    ostree(&[
+        &format!("--repo={}", port.display()),
+        "commit",
+        "-b",
+        "added",
+        FIXED_TIMESTAMP,
+        tree.to_str().unwrap(),
+    ])
+    .ok();
+    let before = summary_files(&port);
+    let port_arg = format!("--repo={}", port.display());
+
+    let want = format!(
+        "error: No gpg key found with ID DEADBEEFDEADBEEF (homedir: {})",
+        home.dir.display()
+    );
+    for key in ["--sign=DEADBEEFDEADBEEF", "DEADBEEFDEADBEEF"] {
+        let run = ostrya(
+            &["summary", &port_arg, "-u", "--sign-type=gpg", &homedir, key],
+            None,
+            &[],
+        );
+        assert_eq!(run.status.code(), Some(1), "the port took {key}");
+        assert_eq!(first_stderr_line(&run), want, "{key}");
+        assert_eq!(summary_files(&port), before, "the port changed the files");
+    }
+
+    let sign = format!("--sign={fpr}");
+    for key in [sign.as_str(), fpr.as_str()] {
+        ostrya(
+            &["summary", &port_arg, "-u", "--sign-type=gpg", &homedir, key],
+            None,
+            &[],
+        )
+        .ok();
+        let sigs = summary_signatures(&port);
+        assert_eq!(sigs.len(), 1, "{key}: {sigs:?}");
+        assert_eq!(sigs[0].0, "ostree.gpgsigs", "{key}");
+        assert_eq!(sigs[0].1.len(), 1, "{key}");
+    }
+}
+
+/// The report reads `ostree.summary.collection-map` the way the tool does: a
+/// map of the type the key promises lists its refs, a checksum of another
+/// length is named in place of the hex, and a value of any other type lists
+/// no refs. `--print-metadata-key` and `--list-metadata-keys` agree too.
+#[test]
+fn summary_report_reads_a_collection_map_of_any_shape() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-collection-map-shape");
+    let base = tmp.path();
+    let env = &[("TZ", "UTC")];
+    let (port, tool) = summary_writing_pair(base, "map");
+    let checksum: Vec<String> = (0..32).map(|byte| format!("0x{byte:02x}")).collect();
+    let good = format!(
+        "ostree.summary.collection-map={{'org.x': [('mref', (uint64 7, @ay [{}], \
+         @a{{sv}} {{'ostree.commit.timestamp': <uint64 0>}}))]}}",
+        checksum.join(", ")
+    );
+    for value in [
+        good.as_str(),
+        "ostree.summary.collection-map=uint32 1",
+        "ostree.summary.collection-map='str'",
+        "ostree.summary.collection-map=@a{sv} {}",
+        "ostree.summary.collection-map={'org.x': [('mref', (uint64 7, @ay [0x01], @a{sv} {}))]}",
+        "ostree.summary.collection-map={'org.x': [('mref', (uint64 7, @ay [], @a{sv} {}))]}",
+        "ostree.summary.collection-map={'org.x': [('mref', (uint64 7, @ay [], @a{ss} {}))]}",
+        "ostree.summary.collection-map={'org.y': @a(s(taya{sv})) []}",
+    ] {
+        let (port_run, tool_run) = summary_update_both(&port, &tool, &["-m", value], &[]);
+        port_run.ok();
+        tool_run.ok();
+        assert_agrees_env(&port, &tool, &["summary", "--list-metadata-keys"], env);
+        assert_agrees_env(
+            &port,
+            &tool,
+            &[
+                "summary",
+                "--print-metadata-key=ostree.summary.collection-map",
+            ],
+            env,
+        );
+        // The report follows the stored order, which parts after `-m`, so its
+        // lines agree as a sequence of ref blocks and as a set of metadata
+        // lines.
+        let (port_run, tool_run) = run_both_env(&port, &tool, &["summary", "--view"], env);
+        assert_eq!(port_run.status.code(), Some(0), "{value}");
+        assert_eq!(tool_run.status.code(), Some(0), "{value}");
+        let split = |run: &Run| {
+            let text = String::from_utf8_lossy(&run.stdout).into_owned();
+            let (refs, metadata) = text.rsplit_once("\n\n").expect("a blank line");
+            let mut metadata: Vec<String> = metadata.lines().map(str::to_owned).collect();
+            metadata.sort();
+            (refs.to_owned(), metadata)
+        };
+        assert_eq!(split(&port_run), split(&tool_run), "{value}");
     }
 }

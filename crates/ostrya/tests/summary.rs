@@ -62,6 +62,7 @@ fn plain_summary_is_byte_identical_to_the_tool() {
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
         })
         .await
         .unwrap();
@@ -83,6 +84,7 @@ fn regenerate_removes_a_stale_signature() {
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
         })
         .await
         .unwrap();
@@ -95,6 +97,7 @@ fn regenerate_removes_a_stale_signature() {
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
         })
         .await
         .unwrap();
@@ -115,6 +118,7 @@ fn collection_summary_and_anchor_match_the_tool() {
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: Some(FIXED_EPOCH),
+            additional_metadata: Vec::new(),
         })
         .await
         .unwrap();
@@ -149,6 +153,7 @@ fn sign_and_verify_round_trip() {
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
         })
         .await
         .unwrap();
@@ -184,6 +189,7 @@ fn tool_verifies_a_port_signed_summary() {
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
         })
         .await
         .unwrap();
@@ -233,6 +239,7 @@ fn the_summary_advertises_the_deltas_the_repository_holds() {
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
         })
         .await
         .unwrap();
@@ -256,6 +263,7 @@ fn the_summary_advertises_the_deltas_the_repository_holds() {
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
         })
         .await
         .unwrap();
@@ -336,6 +344,7 @@ fn the_tool_reads_the_port_written_delta_map() {
         repo.regenerate_summary(&SummaryOptions {
             last_modified: Some(FIXED_EPOCH),
             metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
         })
         .await
         .unwrap();
@@ -357,4 +366,270 @@ fn the_tool_reads_the_port_written_delta_map() {
         text.contains(&to.to_hex()),
         "the tool must list the delta the port advertised: {text}"
     );
+}
+
+/// A caller key paired with a string variant.
+fn string_entry(key: &str, value: &str) -> (String, Value) {
+    (
+        key.to_owned(),
+        Value::variant(ostrya::Type::Str, Value::Str(value.to_owned())),
+    )
+}
+
+/// The keys of the summary's global metadata dict, in the order it stores them.
+fn metadata_keys(summary: &Summary) -> Vec<String> {
+    summary
+        .metadata
+        .as_array()
+        .expect("the summary metadata is a dict")
+        .iter()
+        .filter_map(|entry| entry.as_tuple()?.first()?.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Regenerate `repo` at the fixed epoch with `added` as the caller keys and
+/// parse the summary written.
+async fn regenerate_with(repo: &Repo, added: Vec<(String, Value)>) -> Summary {
+    repo.regenerate_summary(&SummaryOptions {
+        last_modified: Some(FIXED_EPOCH),
+        metadata_commit_timestamp: Some(FIXED_EPOCH),
+        additional_metadata: added,
+    })
+    .await
+    .unwrap();
+    Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap()
+}
+
+/// The caller keys follow the standard entries in first-occurrence order. A
+/// repeated key keeps its first position and its last value, the empty key is
+/// kept, and a key the writer writes in the same run keeps the writer's value.
+#[test]
+fn caller_metadata_follows_the_standard_entries() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-added");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let summary = regenerate_with(
+            &repo,
+            vec![
+                string_entry("b", "first"),
+                string_entry("ostree.summary.mode", "x"),
+                string_entry("", "empty"),
+                string_entry("a", "only"),
+                string_entry("b", "last"),
+                string_entry("ostree.summary.last-modified", "y"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            metadata_keys(&summary),
+            [
+                "ostree.summary.mode",
+                "ostree.summary.last-modified",
+                "ostree.summary.tombstone-commits",
+                "ostree.summary.indexed-deltas",
+                "b",
+                "",
+                "a",
+            ]
+        );
+        let text = |key: &str| {
+            summary
+                .metadata_value(key)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        assert_eq!(text("b").as_deref(), Some("last"));
+        assert_eq!(text("").as_deref(), Some("empty"));
+        assert_eq!(text("ostree.summary.mode").as_deref(), Some("archive-z2"));
+        assert_eq!(
+            summary
+                .metadata_value("ostree.summary.last-modified")
+                .and_then(Value::as_u64)
+                .map(u64::swap_bytes),
+            Some(FIXED_EPOCH)
+        );
+    });
+}
+
+/// A caller key the writer does not write in this run survives, whatever its
+/// name: `ostree.summary.expires` and a `ostree.static-deltas` in a repository
+/// that holds no delta.
+#[test]
+fn caller_metadata_keeps_keys_the_writer_does_not_write() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-added-kept");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let expires = (
+            "ostree.summary.expires".to_owned(),
+            Value::variant(ostrya::Type::U64, Value::U64(9)),
+        );
+        let summary = regenerate_with(
+            &repo,
+            vec![expires, string_entry("ostree.static-deltas", "none")],
+        )
+        .await;
+        assert_eq!(
+            summary
+                .metadata_value("ostree.summary.expires")
+                .and_then(Value::as_u64),
+            Some(9)
+        );
+        assert_eq!(
+            summary
+                .metadata_value("ostree.static-deltas")
+                .and_then(Value::as_str),
+            Some("none")
+        );
+    });
+}
+
+/// A caller value that is not a variant is refused before anything is written:
+/// the summary stays as it stood and the collection anchor commit does not
+/// advance.
+#[test]
+fn caller_metadata_that_is_no_variant_is_refused_first() {
+    let (_tmp, repo_dir) = writable_fixture("summary-collection", "summary-added-bad");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        regenerate_with(&repo, Vec::new()).await;
+        let before = repo.read_summary().await.unwrap();
+        let anchor = repo.resolve_rev("ostree-metadata", false).await.unwrap();
+
+        let err = repo
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_EPOCH + 1),
+                metadata_commit_timestamp: Some(FIXED_EPOCH + 1),
+                additional_metadata: vec![("bare".to_owned(), Value::U32(1))],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ostrya::Error::InvalidFormat(_)), "{err}");
+        assert!(err.to_string().contains("'bare'"), "{err}");
+        assert_eq!(repo.read_summary().await.unwrap(), before);
+        assert_eq!(
+            repo.resolve_rev("ostree-metadata", false).await.unwrap(),
+            anchor
+        );
+    });
+}
+
+/// With no caller keys the summary stays byte-identical to the tool's golden,
+/// for the plain and the collection fixture alike.
+#[test]
+fn no_caller_metadata_keeps_the_golden_bytes() {
+    for fixture in ["summary", "summary-collection"] {
+        let (_tmp, repo_dir) = writable_fixture(fixture, "summary-added-none");
+        block_on(async {
+            let repo = Repo::open(&repo_dir).await.unwrap();
+            regenerate_with(&repo, Vec::new()).await;
+            let got = repo.read_summary().await.unwrap().unwrap();
+            let want = std::fs::read(fixture_root().join(fixture).join("summary")).unwrap();
+            assert_eq!(got, want, "{fixture}");
+        });
+    }
+}
+
+/// In a collection repository a caller key is refused before anything is
+/// written. The tool copies the caller keys into the `ostree-metadata` anchor
+/// commit, which the port does not reproduce, so the port refuses rather than
+/// write another anchor. The summary, its signature, and the anchor ref stay
+/// as they stood.
+#[test]
+fn caller_metadata_in_a_collection_repository_is_refused() {
+    let (_tmp, repo_dir) = writable_fixture("summary-collection", "summary-added-collection");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        regenerate_with(&repo, Vec::new()).await;
+        repo.sign_summary(&Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        let summary = repo.read_summary().await.unwrap();
+        let signature = std::fs::read(repo_dir.join("summary.sig")).unwrap();
+        let anchor = repo.resolve_rev("ostree-metadata", false).await.unwrap();
+
+        let err = repo
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_EPOCH + 1),
+                metadata_commit_timestamp: Some(FIXED_EPOCH + 1),
+                additional_metadata: vec![string_entry("k", "v")],
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ostrya::Error::Unsupported(_)), "{err}");
+        assert_eq!(repo.read_summary().await.unwrap(), summary);
+        assert_eq!(
+            std::fs::read(repo_dir.join("summary.sig")).unwrap(),
+            signature
+        );
+        assert_eq!(
+            repo.resolve_rev("ostree-metadata", false).await.unwrap(),
+            anchor
+        );
+    });
+}
+
+/// A signer that refuses to sign, for the batch refusal test.
+struct RefusingSigner;
+
+impl ostrya::Signer for RefusingSigner {
+    fn name(&self) -> &str {
+        "ed25519"
+    }
+
+    fn metadata_key(&self) -> &str {
+        "ostree.sign.ed25519"
+    }
+
+    fn sign<'a>(&'a self, _: &'a [u8]) -> ostrya::SignFuture<'a> {
+        Box::pin(async { Err(ostrya::Error::Signature("refused".into())) })
+    }
+}
+
+/// One batch of signers writes the `summary.sig` that one call per signer
+/// writes, in slice order, and the dummy engine's entry keeps the place its
+/// first signature gives it.
+#[test]
+fn sign_summary_all_writes_what_one_call_per_signer_writes() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-sign-all");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        regenerate_with(&repo, Vec::new()).await;
+        let ed25519 = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        let dummy = ostrya::DummySigner::new("dummy-key");
+        let signers: [&dyn ostrya::Signer; 3] = [&dummy, &ed25519, &ed25519];
+        for signer in signers {
+            repo.sign_summary(signer).await.unwrap();
+        }
+        let one_by_one = std::fs::read(repo_dir.join("summary.sig")).unwrap();
+
+        regenerate_with(&repo, Vec::new()).await;
+        repo.sign_summary_all(&signers).await.unwrap();
+        let batch = std::fs::read(repo_dir.join("summary.sig")).unwrap();
+        assert_eq!(batch, one_by_one);
+
+        // An empty batch writes nothing.
+        repo.sign_summary_all(&[]).await.unwrap();
+        assert_eq!(std::fs::read(repo_dir.join("summary.sig")).unwrap(), batch);
+    });
+}
+
+/// A signer that fails in the middle of a batch leaves `summary.sig` as it
+/// stood: the batch writes the file once, after every signature is made.
+#[test]
+fn sign_summary_all_writes_nothing_when_a_signer_fails() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-sign-all-fail");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        regenerate_with(&repo, Vec::new()).await;
+        let ed25519 = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        repo.sign_summary(&ed25519).await.unwrap();
+        let before = std::fs::read(repo_dir.join("summary.sig")).unwrap();
+
+        let err = repo
+            .sign_summary_all(&[&ed25519, &RefusingSigner, &ed25519])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ostrya::Error::Signature(_)), "{err}");
+        assert_eq!(std::fs::read(repo_dir.join("summary.sig")).unwrap(), before);
+    });
 }

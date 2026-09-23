@@ -11687,10 +11687,11 @@ setup: repo-with-commit
 outcome: lossy
 severity: interop
 loss: a positional argument. The tool takes none and accepts one, ignoring it
- and writing the report as if it were absent. The port reads a positional as a
- signing key identifier, a surface the tool states with `--sign=KEY-ID`, and
- signing precedes every reading option, so a word that is no key refuses at
- exit 1 (`cli-surface.md`, "summary").
+ and writing the report as if it were absent. The port keeps the positional as
+ a signing key identifier, a port extension beside `--sign=KEY-ID`: without
+ `-u` it signs the summary that stands, and signing precedes every reading
+ option, so a word that is no key refuses at exit 1 (`cli-surface.md`,
+ "summary").
 evidence: ostrya_cli::cli::summary_argument_handling_parts_from_the_tool
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: the two reach different exit statuses, so no oracle reads the pair. The
@@ -11713,3 +11714,421 @@ spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: the two reach different exit statuses, so no oracle reads the pair. The
  cited test states `-v -v`, `--raw --raw`, and two `--print-metadata-key`
  occurrences together.
+
+# ---------------------------------------------------------------------------
+# summary -- the writing options: `--sign`, `-m/--add-metadata`, and
+# `--gpg-sign`, the order of the checks before the regeneration, and the place
+# each signature takes (Phase 17f, F22a, F22b, F22c).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: summary
+cell: summary/sign-needs-update
+setup: repo-with-commit
+run: summary --repo=$REPO --sign=o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "nothing to do"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No option specified; use -u to update summary"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: `--sign` is read with `-u` alone, so without it and without a reading
+ option the run draws the no-option refusal and writes no file. The two word
+ the refusal differently, which `summary/no-option` records, so `stderr-text`
+ is no oracle here.
+
+family: M10
+subcommand: summary
+cell: summary/sign-with-view-reports
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_sign_matches_the_tool
+spec: format-reference.md#summary
+note: `--sign=K --view` writes the report and signs nothing: `summary` and
+ `summary.sig` keep their bytes in both. No setup binds a `summary` file, so the
+ cited test builds one and compares the report with `TZ=UTC`.
+
+family: M10
+subcommand: summary
+cell: summary/sign-two-keys
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_sign_matches_the_tool
+spec: format-reference.md#summary-signature----asv
+note: `-u --sign=K1 --sign=K2` writes one `ostree.sign.ed25519` array holding
+ both signatures in command-line order, and a key given twice is signed twice.
+ ed25519 is deterministic, so the cited test gives the port the tool's
+ `ostree.summary.last-modified` through `--last-modified` and compares the
+ `summary` and `summary.sig` bytes. It also states that the port's positional
+ keys write the same `summary.sig` over the same `summary`.
+
+family: M10
+subcommand: summary
+cell: summary/sign-bad-key-keeps-files
+setup: repo-with-commit
+run: summary --repo=$REPO -u --sign=zzz
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid ed25519 secret key: Ill-formed input: expected 64 bytes, got 0 bytes"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Invalid ed25519 secret key: Ill-formed input: expected 64 bytes, got 0 bytes"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::summary_sign_refusals_keep_files
+spec: format-reference.md#summary
+note: the keys are read before the regeneration. The cited test holds the
+ refusal over a signed summary and a ref added since, and states that
+ `summary` and `summary.sig` keep their bytes, for a bad key alone and for a
+ good key ahead of a bad one.
+
+family: M10
+subcommand: summary
+cell: summary/update-without-sign-drops-sig
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_sign_matches_the_tool
+spec: format-reference.md#summary-signature----asv
+note: `-u` with `--sign-type=ed25519` or `--sign-type=dummy` and no key signs
+ nothing and removes the `summary.sig` that stood, since `--sign-type` is read
+ only where a key needs an engine.
+
+family: M10
+subcommand: summary
+cell: summary/sign-type-dummy-refused
+setup: repo-with-commit
+run: summary --repo=$REPO -u --sign=zzz --sign-type=dummy
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: dummy signature type is only for ostree testing"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: dummy signature type is only for ostree testing"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: `--sign-type` is read before the keys, so a bad key beside the `dummy`
+ name reports the name.
+
+family: M10
+subcommand: summary
+cell: summary/sign-type-unread-without-a-key
+setup: repo-with-commit
+run: summary --repo=$REPO -u --sign-type=bogus
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#summary
+note: a name no engine carries passes unremarked through a run that signs
+ nothing.
+
+family: M10
+subcommand: summary
+cell: summary/sign-type-engine-port-carries
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: `--sign-type=spki` and `--sign-type=gpg` beside `--sign`. The tool's build
+ carries neither engine for this option and refuses the name with
+ `error: Requested signature type is not implemented`; the port carries both
+ where it is built with them and reads the key, the divergence `commit
+ --sign-type` already records (`cli-surface.md`, "summary").
+evidence: ostrya_cli::cli::summary_sign_refusals_keep_files
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the cited test gives a key the spki engine cannot read, which both refuse
+ at exit 1 in their own words before the regeneration.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-value-host-order
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_add_metadata_matches_the_tool
+spec: format-reference.md#summary
+note: `-m 'n=uint32 7'` stores the value in the GVariant text form in host
+ order: `--print-metadata-key=n` and the report read it back the same in both.
+ The report also reads `ostree.summary.expires` big-endian as a signed count of
+ seconds and renders an instant outside years 1 through 9999 as `invalid`,
+ which the cited test states at both ends of the range.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-parse-error
+setup: repo-with-commit
+run: summary --repo=$REPO -u -m 'a=1=2'
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Error parsing variant ‘1=2’: : 1:expected end of input"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Error parsing variant ‘1=2’: : 1:expected end of input"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: the argument splits at its first `=`, so the value `1=2` fails the parse
+ at offset 1. The refusal names the value alone, with typographic quotes and a
+ doubled `: :`.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-missing-equals
+setup: repo-with-commit
+run: summary --repo=$REPO -u -m x
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Missing '=' in KEY=VALUE metadata 'x'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Missing '=' in KEY=VALUE metadata 'x'"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: an argument with no `=` is refused before any value is parsed.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-needs-update
+setup: repo-with-commit
+run: summary --repo=$REPO -m k=@@
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "nothing to do"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No option specified; use -u to update summary"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: without `-u` the value is never parsed, so a value that cannot parse
+ draws the no-option refusal. The two word it differently.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-order-of-checks
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::summary_sign_refusals_keep_files
+spec: format-reference.md#summary
+note: each `-m` argument is split and then parsed before the next one is read,
+ so `-m x -m k=@@` reports the missing `=` and `-m k=@@ -m x` reports the
+ parse. Every `-m` refusal comes before the `--sign-type` and `--sign` checks,
+ and each leaves `summary` and `summary.sig` as they stood.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-reserved-key-ignored
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_add_metadata_matches_the_tool
+spec: format-reference.md#summary
+note: a user key naming a key the writer writes in the same run takes the
+ writer's value: `ostree.summary.mode`, `ostree.summary.last-modified`,
+ `ostree.summary.tombstone-commits`, and `ostree.summary.indexed-deltas`. A key
+ the writer does not write in the run is kept, which the cited test states for
+ `ostree.summary.expires`, for `ostree.static-deltas` in a repository holding no
+ delta, and for `ostree.summary.collection-id` in a repository with none.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-duplicate-last-wins
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_add_metadata_matches_the_tool
+spec: format-reference.md#summary
+note: a key given twice is stored once, with the last value.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-empty-key
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_add_metadata_matches_the_tool
+spec: format-reference.md#summary
+note: `-m '=1'` stores an entry under the empty key, and the two `summary`
+ files agree byte for byte.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-key-order
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the entry order of the metadata dict. With any `-m`, the tool stores the
+ whole dict, its own keys included, in the order of a hash table, which follows
+ the key set and not the command line. The port stores the standard order and
+ then the user keys in first-occurrence order (`cli-surface.md`, "summary").
+evidence: ostrya_cli::cli::summary_add_metadata_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the key set and every value agree, so `--list-metadata-keys`,
+ `--print-metadata-key`, and the report lines taken as a set agree. The cited
+ test states the port's order for `-m b=1 -m n=2` and that the tool's differs.
+ Some key sets keep the standard order in the tool, and there the two
+ `summary` files agree byte for byte.
+
+family: M10
+subcommand: summary
+cell: summary/add-metadata-collection-refused
+setup: repo-with-commit
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::summary_add_metadata_in_a_collection_repository_is_refused
+spec: format-reference.md#the-ostree-metadata-anchor-commit
+note: in a repository with a collection id the port refuses `-u -m` at exit 1
+ before the regeneration, with `error: unsupported: summary metadata keys in a
+ repository with a collection id`, and `summary`, `summary.sig`, and the
+ anchor ref keep their state. The tool takes the run and adds the caller keys
+ to the `ostree-metadata` anchor commit in the order of a hash table, which the
+ port does not rebuild, so carrying them would write an anchor with another
+ checksum (`cli-surface.md`, "summary"). The cited test states the refusal and
+ the key the tool stores in its anchor. No setup binds a collection id.
+
+family: M10
+subcommand: summary
+cell: summary/update-byte-exact
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_update_matches_the_tool_byte_for_byte
+spec: format-reference.md#summary
+note: a plain `summary -u` agrees byte for byte with the tool's, given the
+ tool's `ostree.summary.last-modified` through `--last-modified`.
+
+family: M10
+subcommand: summary
+cell: summary/gpg-sign-needs-update
+setup: repo-with-commit
+run: summary --repo=$REPO --gpg-sign=0123456789ABCDEF
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "nothing to do"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No option specified; use -u to update summary"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: `--gpg-sign` is read with `-u` alone, so no key lookup runs. The two
+ word the refusal differently.
+
+family: M10
+subcommand: summary
+cell: summary/gpg-sign-absent-key
+setup: repo-with-commit
+run: summary --repo=$REPO -u --gpg-sign=0123456789ABCDEF --gpg-homedir=/nonexistent-zz-home
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: No gpg key found with ID 0123456789ABCDEF (homedir: /nonexistent-zz-home)"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: No gpg key found with ID 0123456789ABCDEF (homedir: /nonexistent-zz-home)"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::summary_gpg_sign_matches_the_tool
+spec: format-reference.md#summary
+note: a home directory that does not exist holds no key. The cited test holds
+ the refusal for a populated home directory too, with the literal `<default>`
+ term where `--gpg-homedir` is absent, and for an ambiguous selector.
+
+family: M10
+subcommand: summary
+cell: summary/gpg-sign-selector-length
+setup: repo-with-commit
+run: summary --repo=$REPO -u --gpg-sign=abc
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Unable to lookup key ID abc: GPGME: Invalid value"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Unable to lookup key ID abc: GPGME: Invalid value"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: a selector under eight bytes is refused without a key lookup.
+
+family: M10
+subcommand: summary
+cell: summary/gpg-homedir-alone
+setup: repo-with-commit
+run: summary --repo=$REPO -u --gpg-homedir=/nonexistent-zz-home
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_gpg_homedir_alone_is_inert
+spec: format-reference.md#summary
+note: with no `--gpg-sign` the home directory is never opened. The cited test
+ states that the two `summary` files agree byte for byte.
+
+family: M10
+subcommand: summary
+cell: summary/gpg-sign-with-ed25519
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_gpg_sign_matches_the_tool
+spec: format-reference.md#summary-signature----asv
+note: with `--gpg-sign` and `--sign` together, `summary.sig` holds
+ `ostree.gpgsigs` ahead of `ostree.sign.ed25519` whatever the command-line
+ order, and two `--gpg-sign` keys store their signatures in command-line order.
+ A GPG signature carries a creation instant, so the claim is the key order, the
+ element count, and the signing key of each element rather than the bytes. A
+ `run:` line cannot state it: the harness has no setup that generates a GnuPG
+ home directory.
+
+family: M10
+subcommand: summary
+cell: summary/gpg-sign-round-trip
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_gpg_sign_matches_the_tool
+spec: format-reference.md#summary
+note: a summary either implementation signs with `--gpg-sign` verifies through
+ the tool's `remote summary` with `gpg-verify-summary=true` and through the
+ port's `summary --verify --sign-type=gpg`, and a foreign certificate verifies
+ it in neither.
+
+family: M10
+subcommand: summary
+cell: summary/gpg-sign-bad-key-keeps-files
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::summary_gpg_sign_matches_the_tool
+spec: format-reference.md#summary
+note: every `--gpg-sign` lookup runs before the regeneration, after the `-m`
+ checks and before the `--sign-type` and `--sign` checks. A good selector ahead
+ of one naming no key refuses on the second, and a good selector beside a bad
+ `--sign` key reports the key. Each refusal leaves `summary` and `summary.sig`
+ as they stood.

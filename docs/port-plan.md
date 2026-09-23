@@ -5705,6 +5705,55 @@ tool reads as one value for every such target and the port compares on its
 bytes. The item adds 43 `m10` cells, of which 25 are executable and all 25 pass;
 the conformance run reports 934 cells and 383 passes.
 
+`F21` completes `summary`'s reading half: the four options `-v/--view`,
+`--raw`, `--list-metadata-keys`, and `--print-metadata-key=KEY`, the precedence
+among them, and the report format. `format-reference.md`, "CLI output formats",
+`summary`, states the recovered format.
+
+The library half of the item is `Repo::read_summary`, which returns the file
+bytes or `None` for an absent file, and two readers of those bytes.
+`Summary::parse` reads the whole document, and `Summary::parse_metadata` reads
+the global metadata dict alone and leaves the ref list undecoded, which is what
+the key listing and one value read by name need. Field 0 grows with the ref
+count: on a 20,500-ref summary of 1.89 MB, decoding it costs 11.5 MB of
+resident memory and 22 ms that neither option reads. `Summary::parse_metadata`
+rests on `tuple_field_from_bytes`, the codec entry point that carves one member
+out of a tuple under the framing checks `from_bytes` applies. The four formats
+are the four `remote summary` already writes, so the two commands share one
+helper over `print_summary_report`, `print_sorted_keys`,
+`print_metadata_value`, and the annotated text form the `SUMMARY_SIGNATURE`
+parse feeds. `Repo::read_summary` returning `None` rather than an error is what
+lets the CLI word its own refusal for an absent file.
+
+The one defect the item found is in the shared report printer. A string value
+whose key carries no label printed bare where the tool prints it in the text
+form, quotes included; `format-reference.md`, "`remote`", already stated the
+rule the printer missed. The fix reaches `remote summary` in the same stroke,
+the two commands sharing one printer.
+
+`clap` gives one short form to one argument, so the port cannot bind `-v` to
+both `--view` and the global `--verbose` the way the tool does. `SummaryArgs`
+declares a long-only `verbose` field of its own, which stops the global from
+propagating into this subcommand alone and leaves `-v` free for `--view`. The
+value still reaches `Cli::verbose`, so `ostrya summary --verbose` and
+`ostrya --verbose summary` both set the flag `resolve_repo` reads, and every
+other subcommand keeps `-v/--verbose`.
+
+Seven divergences stand, all in `cli-surface.md`, "P2": `-v` writing no debug
+line, where the tool binds it to `--verbose` as well; a positional argument,
+which the tool ignores and the port reads as a signing key identifier; a
+repeated switch, which the tool takes and the port refuses; the absent-summary
+wording; the no-option refusal wording; the place a signing key takes among the
+reading options, which the port settles for itself because the tool states that
+surface with `--sign=KEY-ID` and the port carries no such option; and a
+`summary` file whose bytes are not a document of the summary type, which the
+tool reads as an empty document and the port refuses. The time zone a report
+renders an
+instant in is the divergence "P3" already records for `remote summary`, reached
+here by the local command. The item adds 23 `m10` cells, of which 11 are
+executable and all 11 pass; the conformance run reports 957 cells and 394
+passes.
+
 #### Phase 17g -- P3 commands with no matrix weight
 
 `reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and

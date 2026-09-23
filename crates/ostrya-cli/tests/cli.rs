@@ -27590,3 +27590,430 @@ fn diff_mtime_is_not_compared() {
         &["diff", one.to_str().unwrap(), two.to_str().unwrap()],
     );
 }
+
+// --- summary: the reading options --------------------------------------------
+//
+// `summary -v/--view`, `--raw`, `--list-metadata-keys`, and
+// `--print-metadata-key=KEY` read a `summary` file that no harness setup binds,
+// so the matrix records name these tests instead of a `run:` line
+// (`docs/conformance/m10-cli-behavior.matrix`).
+//
+// Each fixture is one repository that both implementations read, so both read
+// one `ostree.summary.last-modified`, which is wall-clock. `TZ` fixes the zone
+// the tool renders an instant in; the port renders in UTC whatever the zone,
+// which `docs/conformance/cli-surface.md`, "P3", records.
+
+/// Build one archive repository under `base/<name>` with the tool: `init` with
+/// `init_extra`, commit `tree` on each branch of `branches` at the fixed
+/// timestamp, then regenerate the summary with `summary_extra`.
+fn summary_fixture(
+    base: &Path,
+    name: &str,
+    tree: &Path,
+    branches: &[&str],
+    init_extra: &[&str],
+    summary_extra: &[&str],
+) -> PathBuf {
+    let repo = base.join(name);
+    let repo_arg = format!("--repo={}", repo.display());
+    let mut init = vec![repo_arg.as_str(), "init", "--mode=archive"];
+    init.extend_from_slice(init_extra);
+    ostree(&init).ok();
+    for branch in branches {
+        ostree(&[
+            &repo_arg,
+            "commit",
+            "-b",
+            branch,
+            FIXED_TIMESTAMP,
+            tree.to_str().unwrap(),
+        ])
+        .ok();
+    }
+    let mut update = vec![repo_arg.as_str(), "summary", "-u"];
+    update.extend_from_slice(summary_extra);
+    ostree(&update).ok();
+    repo
+}
+
+/// The four reading options report what the tool reports over one summary, and
+/// the precedence among them is the tool's: `--raw`, then `--view`, then
+/// `--list-metadata-keys`, then `--print-metadata-key`.
+#[test]
+fn summary_reading_options_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-read");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    write_at(&tree.join("hello.txt"), b"hello\n");
+    write_at(&tree.join("subdir/world.txt"), b"world\n");
+    let env = &[("TZ", "UTC")];
+
+    // Two refs, and the four metadata keys the writer states.
+    let plain = summary_fixture(base, "plain", &tree, &["one", "two/branch"], &[], &[]);
+    for args in [
+        vec!["summary", "--view"],
+        vec!["summary", "--raw"],
+        vec!["summary", "--list-metadata-keys"],
+        vec!["summary", "--print-metadata-key=ostree.summary.mode"],
+        vec![
+            "summary",
+            "--print-metadata-key=ostree.summary.last-modified",
+        ],
+        vec![
+            "summary",
+            "--print-metadata-key=ostree.summary.tombstone-commits",
+        ],
+        vec![
+            "summary",
+            "--print-metadata-key=ostree.summary.indexed-deltas",
+        ],
+        vec!["summary", "--print-metadata-key=absent"],
+        vec!["summary", "--print-metadata-key="],
+        // The precedence, written in both orders where two switches compete.
+        vec!["summary", "--view", "--raw"],
+        vec!["summary", "--raw", "--view"],
+        vec!["summary", "--raw", "--list-metadata-keys"],
+        vec!["summary", "--list-metadata-keys", "--raw"],
+        vec![
+            "summary",
+            "--raw",
+            "--print-metadata-key=ostree.summary.mode",
+        ],
+        vec![
+            "summary",
+            "--print-metadata-key=ostree.summary.mode",
+            "--raw",
+        ],
+        vec!["summary", "--view", "--list-metadata-keys"],
+        vec!["summary", "--list-metadata-keys", "--view"],
+        vec![
+            "summary",
+            "--view",
+            "--print-metadata-key=ostree.summary.mode",
+        ],
+        vec![
+            "summary",
+            "--print-metadata-key=ostree.summary.mode",
+            "--view",
+        ],
+        vec![
+            "summary",
+            "--list-metadata-keys",
+            "--print-metadata-key=ostree.summary.mode",
+        ],
+        vec![
+            "summary",
+            "--print-metadata-key=ostree.summary.mode",
+            "--list-metadata-keys",
+        ],
+    ] {
+        assert_agrees_env(&plain, &plain, &args, env);
+    }
+
+    // `-v` writes the report `--view` writes. The tool turns its debug stream
+    // on with the short form and the port does not, so the claim here is
+    // standard output and the exit status (`cli-surface.md`, "summary"). The
+    // `--view` run is the one the `remote summary` cross-check below reads.
+    let local = run_both_env(&plain, &plain, &["summary", "--view"], env);
+    let (port, tool) = run_both_env(&plain, &plain, &["summary", "-v"], env);
+    assert_eq!(
+        String::from_utf8_lossy(&port.stdout),
+        String::from_utf8_lossy(&tool.stdout),
+        "`summary -v` wrote a different report"
+    );
+    assert_eq!(port.status.code(), Some(0), "the port refused `summary -v`");
+    assert_eq!(tool.status.code(), Some(0), "the tool refused `summary -v`");
+    assert!(
+        String::from_utf8_lossy(&port.stdout).contains("Latest Commit"),
+        "`summary -v` wrote no ref block"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&port.stdout),
+        String::from_utf8_lossy(&local.0.stdout),
+        "`-v` and `--view` wrote different reports"
+    );
+
+    // Metadata the command line supplied: the listing is sorted where the
+    // stored order is not, a labeled string prints bare and an unlabeled one
+    // keeps the quotes the text form gives it, and the report reads a value
+    // outside the labeled set in host order where `--raw` reads the whole
+    // document big-endian.
+    let extra = summary_fixture(
+        base,
+        "extra",
+        &tree,
+        &["one"],
+        &[],
+        &[
+            "-m",
+            "zzz.last=@u 42",
+            "-m",
+            "aaa.first='str val'",
+            "-m",
+            "mmm.mid=true",
+            "-m",
+            "bbb.arr=['x','y']",
+            "-m",
+            "ccc.u64=@t 9999999999",
+            "-m",
+            "ddd.bytes=@ay [0x01,0x02]",
+        ],
+    );
+    for args in [
+        vec!["summary", "--view"],
+        vec!["summary", "--raw"],
+        vec!["summary", "--list-metadata-keys"],
+        vec!["summary", "--print-metadata-key=zzz.last"],
+        vec!["summary", "--print-metadata-key=aaa.first"],
+        vec!["summary", "--print-metadata-key=mmm.mid"],
+        vec!["summary", "--print-metadata-key=bbb.arr"],
+        vec!["summary", "--print-metadata-key=ccc.u64"],
+        vec!["summary", "--print-metadata-key=ddd.bytes"],
+    ] {
+        assert_agrees_env(&extra, &extra, &args, env);
+    }
+
+    // A ref whose commit records a `version` key gains a `Version` line.
+    let versioned = base.join("versioned");
+    let versioned_arg = format!("--repo={}", versioned.display());
+    ostree(&[&versioned_arg, "init", "--mode=archive"]).ok();
+    ostree(&[
+        &versioned_arg,
+        "commit",
+        "-b",
+        "main",
+        FIXED_TIMESTAMP,
+        "--add-metadata-string=version=1.2.3",
+        tree.to_str().unwrap(),
+    ])
+    .ok();
+    ostree(&[&versioned_arg, "summary", "-u"]).ok();
+    for args in [vec!["summary", "--view"], vec!["summary", "--raw"]] {
+        assert_agrees_env(&versioned, &versioned, &args, env);
+    }
+
+    // A collection repository names each ref of field 0 as a pair, and a
+    // mirrored collection's refs are reported with them.
+    let other = summary_fixture(
+        base,
+        "other",
+        &tree,
+        &["other/ref"],
+        &["--collection-id=org.example.Other"],
+        &[],
+    );
+    let coll = summary_fixture(
+        base,
+        "coll",
+        &tree,
+        &["one", "two/branch"],
+        &["--collection-id=org.example.Coll"],
+        &[],
+    );
+    let coll_arg = format!("--repo={}", coll.display());
+    ostree(&[
+        &coll_arg,
+        "remote",
+        "add",
+        "--no-gpg-verify",
+        "--collection-id=org.example.Other",
+        "other",
+        &format!("file://{}", other.display()),
+    ])
+    .ok();
+    let mirrored = ostree(&[&coll_arg, "pull", "--mirror", "other", "other/ref"])
+        .status
+        .success();
+    ostree(&[&coll_arg, "summary", "-u"]).ok();
+    for args in [
+        vec!["summary", "--view"],
+        vec!["summary", "--raw"],
+        vec!["summary", "--list-metadata-keys"],
+        vec![
+            "summary",
+            "--print-metadata-key=ostree.summary.collection-id",
+        ],
+    ] {
+        assert_agrees_env(&coll, &coll, &args, env);
+    }
+    if mirrored {
+        assert_agrees_env(
+            &coll,
+            &coll,
+            &[
+                "summary",
+                "--print-metadata-key=ostree.summary.collection-map",
+            ],
+            env,
+        );
+    } else {
+        eprintln!("note: the mirror pull did not run, so the collection map is unstated");
+    }
+
+    // A summary carrying a static delta prints the whole `a{sv}` on the
+    // `Static Deltas` line.
+    let delta = summary_fixture(base, "delta", &tree, &["one"], &[], &[]);
+    let delta_arg = format!("--repo={}", delta.display());
+    write_at(&tree.join("second.txt"), b"second\n");
+    ostree(&[
+        &delta_arg,
+        "commit",
+        "-b",
+        "one",
+        "--timestamp=@1700003600",
+        tree.to_str().unwrap(),
+    ])
+    .ok();
+    let generated = ostree(&[&delta_arg, "static-delta", "generate", "one"])
+        .status
+        .success();
+    ostree(&[&delta_arg, "summary", "-u"]).ok();
+    if generated {
+        for args in [
+            vec!["summary", "--view"],
+            vec!["summary", "--raw"],
+            vec!["summary", "--list-metadata-keys"],
+            vec!["summary", "--print-metadata-key=ostree.static-deltas"],
+        ] {
+            assert_agrees_env(&delta, &delta, &args, env);
+        }
+    } else {
+        eprintln!("note: the delta did not generate, so that report is unstated");
+    }
+
+    // The local report is the report `remote summary` writes, in both
+    // implementations.
+    let server = FileServer::start(&plain);
+    let (port_client, tool_client) = create_repo_pair(base, RepoMode::Archive);
+    for repo in [&port_client, &tool_client] {
+        configure_remote(repo, &server.url(), "gpg-verify=false\n");
+    }
+    let remote = run_remote_both(
+        &port_client,
+        &tool_client,
+        &["remote", "summary", "origin"],
+        env,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&local.0.stdout),
+        String::from_utf8_lossy(&remote.0.stdout),
+        "the port's local report parts from its own remote report"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&local.1.stdout),
+        String::from_utf8_lossy(&remote.1.stdout),
+        "the tool's local report parts from its own remote report"
+    );
+}
+
+/// The port's own side of the `summary` argument handling: a repository with no
+/// `summary` file, the no-option refusal, a positional argument, and a repeated
+/// switch. Each of the four is a divergence `docs/conformance/cli-surface.md`,
+/// "P2", records under "summary".
+#[test]
+fn summary_argument_handling_parts_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-args");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    write_at(&tree.join("hello.txt"), b"hello\n");
+
+    // A repository with no summary file refuses every reading option at exit 1
+    // with nothing on standard output. The two word the refusal differently.
+    let bare = base.join("bare");
+    ostree(&[
+        &format!("--repo={}", bare.display()),
+        "init",
+        "--mode=archive",
+    ])
+    .ok();
+    for args in [
+        vec!["summary", "--view"],
+        vec!["summary", "-v"],
+        vec!["summary", "--raw"],
+        vec!["summary", "--list-metadata-keys"],
+        vec!["summary", "--print-metadata-key=ostree.summary.mode"],
+    ] {
+        let (port, tool) = run_both(&bare, &bare, &args);
+        assert_runs_agree_on_error(&port, &tool, &args.join(" "), "No such file or directory");
+    }
+
+    // With no option at all both refuse at exit 1 in their own words.
+    let (port, tool) = run_both(&bare, &bare, &["summary"]);
+    assert_eq!(port.status.code(), Some(1), "the port did not refuse");
+    assert_eq!(tool.status.code(), Some(1), "the tool did not refuse");
+    assert_eq!(String::from_utf8_lossy(&port.stdout), "");
+    assert_eq!(String::from_utf8_lossy(&tool.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&port.stderr).contains("nothing to do"),
+        "the port's refusal does not name what to pass"
+    );
+
+    // `-u` does its work and returns, so no reading option writes a report
+    // beside it.
+    let repo = summary_fixture(base, "updated", &tree, &["one"], &[], &[]);
+    for args in [
+        vec!["summary", "-u", "--view"],
+        vec!["summary", "-u", "--raw"],
+        vec!["summary", "-u", "--list-metadata-keys"],
+        vec!["summary", "-u", "--print-metadata-key=ostree.summary.mode"],
+    ] {
+        assert_agrees_env(&repo, &repo, &args, &[("TZ", "UTC")]);
+    }
+
+    // A positional argument: the tool accepts one and ignores it, writing the
+    // report as if it were absent. The port reads a positional as a signing
+    // key identifier, and signing precedes every reading option, so a word
+    // that is no key refuses and no report is written.
+    let (port, tool) = run_both(&repo, &repo, &["summary", "--view", "extra"]);
+    assert_eq!(port.status.code(), Some(1), "the port took the positional");
+    assert_eq!(
+        String::from_utf8_lossy(&port.stdout),
+        "",
+        "the port wrote a report beside the positional"
+    );
+    assert_eq!(
+        tool.status.code(),
+        Some(0),
+        "the tool refused the positional"
+    );
+    assert!(
+        !String::from_utf8_lossy(&tool.stdout).is_empty(),
+        "the tool wrote no report beside the positional"
+    );
+
+    // A repeated switch: the tool takes a second occurrence and the port
+    // refuses it, the repeated-flag class the port carries throughout its CLI.
+    for args in [
+        vec!["summary", "-v", "-v"],
+        vec!["summary", "--raw", "--raw"],
+        vec![
+            "summary",
+            "--print-metadata-key=ostree.summary.mode",
+            "--print-metadata-key=ostree.summary.last-modified",
+        ],
+    ] {
+        let (port, tool) = run_both(&repo, &repo, &args);
+        assert_eq!(
+            port.status.code(),
+            Some(1),
+            "the port took `{}` twice",
+            args.join(" ")
+        );
+        assert!(
+            String::from_utf8_lossy(&port.stderr).contains("cannot be used multiple times"),
+            "the port refused the repeat in other words"
+        );
+        assert_eq!(
+            tool.status.code(),
+            Some(0),
+            "the tool refused `{}`",
+            args.join(" ")
+        );
+    }
+}

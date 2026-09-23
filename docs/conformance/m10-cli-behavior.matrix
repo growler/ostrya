@@ -11338,3 +11338,378 @@ evidence: ostrya_cli::cli::diff_mtime_is_not_compared
 spec: format-reference.md#diff
 note: two directories holding one file of one content and two modification times
  report nothing, the time being outside every checksum the comparison reads.
+
+# ---------------------------------------------------------------------------
+# summary -- the four reading options, the report format, and the precedence
+# among them (Phase 17f, F21).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: summary
+cell: summary/no-option
+setup: repo
+run: summary --repo=$REPO
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "nothing to do"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No option specified"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#summary
+note: the two word the refusal differently, the port naming the options it
+ carries and two of those being port extensions, so `stderr-text` is no oracle
+ here. The shared claim is that neither writes a report and both exit 1
+ (`cli-surface.md`, "summary").
+
+family: M10
+subcommand: summary
+cell: summary/view-no-summary
+setup: repo
+run: summary --repo=$REPO --view
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No such file or directory"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: a repository holding no `summary` file refuses the reading option. The
+ two word the refusal differently and both name the absent file
+ (`cli-surface.md`, "summary").
+
+family: M10
+subcommand: summary
+cell: summary/raw-no-summary
+setup: repo
+run: summary --repo=$REPO --raw
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No such file or directory"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: the raw form reads the file bytes, so the absent file is the refusal it
+ reaches first.
+
+family: M10
+subcommand: summary
+cell: summary/list-metadata-keys-no-summary
+setup: repo
+run: summary --repo=$REPO --list-metadata-keys
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No such file or directory"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: the listing writes no line before the file is opened.
+
+family: M10
+subcommand: summary
+cell: summary/print-metadata-key-no-summary
+setup: repo
+run: summary --repo=$REPO --print-metadata-key=ostree.summary.mode
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "No such file or directory"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: the absent file is reported, not the absent key, so the refusal is the
+ one the other three reading options reach.
+
+family: M10
+subcommand: summary
+cell: summary/view-short-no-summary
+setup: repo
+run: summary --repo=$REPO -v
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#summary
+note: `-v` is `--view` on this command in both implementations. No claim is
+ made about the reference's standard error: the tool binds `-v` to `--verbose`
+ as well and writes a debug line, which the port does not
+ (`cli-surface.md`, "summary").
+
+family: M10
+subcommand: summary
+cell: summary/verbose-long-writes-no-report
+setup: repo
+run: summary --repo=$REPO --verbose
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#summary
+note: `--verbose` carries no short form on this command in either
+ implementation and writes no report. Each writes its own debug text, so no
+ claim is made about standard error.
+
+family: M10
+subcommand: summary
+cell: summary/update-suppresses-view
+setup: repo-with-commit
+run: summary --repo=$REPO -u --view
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#summary
+note: `-u` does its work and returns, so the reading option writes no report
+ beside it.
+
+family: M10
+subcommand: summary
+cell: summary/update-suppresses-raw
+setup: repo-with-commit
+run: summary --repo=$REPO -u --raw
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#summary
+note: the summary `-u` wrote is not reported.
+
+family: M10
+subcommand: summary
+cell: summary/update-suppresses-list
+setup: repo-with-commit
+run: summary --repo=$REPO -u --list-metadata-keys
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#summary
+note: the keys of the summary `-u` wrote are not listed.
+
+family: M10
+subcommand: summary
+cell: summary/update-suppresses-print
+setup: repo-with-commit
+run: summary --repo=$REPO -u --print-metadata-key=ostree.summary.mode
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#summary
+note: the key is present in the summary `-u` just wrote, and neither
+ implementation prints it.
+
+family: M10
+subcommand: summary
+cell: summary/view-report
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#summary
+note: the report over a repository holding two refs: the ref block, the byte
+ count, the checksum line, the `Timestamp` line, the blank line after each ref
+ block, and the global metadata in stored order. No setup binds a `summary`
+ file and `ostree.summary.last-modified` is wall-clock, so the cited test
+ builds one repository, runs `summary -u` once, and points both
+ implementations at that one directory. It fixes `TZ=UTC`, the rendering being
+ the divergence `cli-surface.md`, "P3", records.
+
+family: M10
+subcommand: summary
+cell: summary/view-equals-remote-report
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#summary
+note: the local report and the report `remote summary` writes over one summary
+ document are equal line for line, in both implementations. The cited test
+ serves the one fixture over HTTP and compares each implementation against
+ itself.
+
+family: M10
+subcommand: summary
+cell: summary/view-version-line
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#summary
+note: a ref whose commit records a `version` key gains
+ `Version (ostree.commit.version): 1.2.3` above the `Timestamp` line, and the
+ string prints bare, a labeled string carrying no quotes.
+
+family: M10
+subcommand: summary
+cell: summary/view-collections
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#summary
+note: a collection repository names each ref of field 0 as
+ `* (<collection>, <ref>)`, reports every ref the collection map lists in the
+ same block, and writes
+ `Collection Map (ostree.summary.collection-map): (printed above)` and
+ `Collection ID (ostree.summary.collection-id): <id>` in the metadata block.
+ The cited test states nothing about the map where the mirror pull that builds
+ it did not run.
+
+family: M10
+subcommand: summary
+cell: summary/view-static-deltas
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#summary
+note: the `Static Deltas` line prints the whole `a{sv}` with no outer type
+ annotation and with the inner `v` boxes annotated. The cited test states
+ nothing about the line where the delta did not generate.
+
+family: M10
+subcommand: summary
+cell: summary/raw
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#the-gvariant-text-form
+note: one line, the whole document in the annotated text form, with the
+ big-endian fields converted and a single trailing newline. A type annotation
+ appears on the first occurrence of a type inside a container and is dropped on
+ the following ones.
+
+family: M10
+subcommand: summary
+cell: summary/list-metadata-keys-sorted
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#summary
+note: the listing is sorted rather than in stored order. The cited test builds
+ a summary carrying six keys supplied with `--add-metadata`, whose stored order
+ is not sorted, and lists them alongside the keys the writer states.
+
+family: M10
+subcommand: summary
+cell: summary/print-metadata-key
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#the-gvariant-text-form
+note: one value, unwrapped from its `v`, in the annotated text form read as a
+ big-endian document: a string prints quoted, a `t` prints `uint64 <n>` with
+ the field converted, a `b` prints `true` or `false`, and a container prints
+ whole. The quoted string parts from the report, where a labeled string prints
+ bare. The cited test states nothing about a container carrying inner `v`
+ boxes where the delta did not generate and the mirror pull did not run: the
+ two keys that hold one are `ostree.static-deltas` and
+ `ostree.summary.collection-map`.
+
+family: M10
+subcommand: summary
+cell: summary/print-metadata-key-absent
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#summary
+note: a key the dict does not hold, and an empty key, both draw
+ `error: No such metadata key '<key>'` at exit 1 with nothing on standard
+ output.
+
+family: M10
+subcommand: summary
+cell: summary/reading-precedence
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::summary_reading_options_match_the_tool
+spec: format-reference.md#summary
+note: over one summary, `--raw` wins over `--view`, over
+ `--list-metadata-keys`, and over `--print-metadata-key`; `--view` wins over
+ `--list-metadata-keys` and over `--print-metadata-key`; and
+ `--list-metadata-keys` wins over `--print-metadata-key`. The winner does not
+ depend on the order the switches are written in, which the cited test states
+ by giving each competing pair in both orders.
+
+family: M10
+subcommand: summary
+cell: summary/positional-ignored
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: a positional argument. The tool takes none and accepts one, ignoring it
+ and writing the report as if it were absent. The port reads a positional as a
+ signing key identifier, a surface the tool states with `--sign=KEY-ID`, and
+ signing precedes every reading option, so a word that is no key refuses at
+ exit 1 (`cli-surface.md`, "summary").
+evidence: ostrya_cli::cli::summary_argument_handling_parts_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ cited test states that the port writes no report beside the positional and
+ that the tool writes one.
+
+family: M10
+subcommand: summary
+cell: summary/repeated-switch-refused
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: a repeated switch, the class `export/no-xattrs-given-twice` and
+ `prune/commit-only-repeated` already record. The tool takes a second `-v`,
+ `--view`, `--raw`, or `--list-metadata-keys` and runs the command, and takes
+ the last occurrence of a repeated `--print-metadata-key`; the port refuses
+ each at exit 1 (`cli-surface.md`, "summary").
+evidence: ostrya_cli::cli::summary_argument_handling_parts_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ cited test states `-v -v`, `--raw --raw`, and two `--print-metadata-key`
+ occurrences together.

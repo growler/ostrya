@@ -944,6 +944,25 @@ struct SummaryArgs {
     /// Regenerate the summary from the repository's refs.
     #[arg(short = 'u', long)]
     update: bool,
+    /// View the local summary file.
+    #[arg(short = 'v', long)]
+    view: bool,
+    /// Print debug information during command processing.
+    // The subcommand declares the switch itself so that `-v` stays bound to
+    // `--view` here. `clap` carries the value up to the global flag, which is
+    // the one every handler reads, so this field itself is never read.
+    #[arg(long)]
+    #[allow(dead_code)]
+    verbose: bool,
+    /// View the raw bytes of the summary file.
+    #[arg(long)]
+    raw: bool,
+    /// List the available metadata keys.
+    #[arg(long)]
+    list_metadata_keys: bool,
+    /// Print the value of one metadata key.
+    #[arg(long, value_name = "KEY")]
+    print_metadata_key: Option<String>,
     /// Verify the summary's signatures instead of regenerating or signing.
     #[arg(long)]
     verify: bool,
@@ -5974,32 +5993,62 @@ async fn remote_refs(repo: &Repo, nested: &str, args: &RemoteRefsArgs) -> Result
 /// value, or the summary report itself.
 async fn remote_summary(repo: &Repo, nested: &str, args: &RemoteSummaryArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
-    if args.raw {
-        require_remote(repo, name);
-        let (bytes, _) = repo.remote_fetch_summary(name).await?;
-        let Some(bytes) = bytes else {
-            exit_error("Remote server has no summary file");
-        };
+    require_remote(repo, name);
+    let (bytes, _) = repo.remote_fetch_summary(name).await?;
+    let Some(bytes) = bytes else {
+        exit_error("Remote server has no summary file");
+    };
+    print_summary_document(
+        &bytes,
+        args.raw,
+        // `remote summary` carries no view switch; the report is its fallback.
+        false,
+        args.list_metadata_keys,
+        args.print_metadata_key.as_deref(),
+    )
+}
+
+/// Report one summary document under the reading options, in the precedence the
+/// tool takes them in (`docs/format-reference.md`, "CLI output formats", under
+/// `summary`): the raw variant, the report, the metadata keys, then one
+/// metadata value. With none of them the report is written.
+fn print_summary_document(
+    bytes: &[u8],
+    raw: bool,
+    view: bool,
+    list_metadata_keys: bool,
+    print_metadata_key: Option<&str>,
+) -> Result<()> {
+    if raw {
         let ty = parse_type(SUMMARY_SIGNATURE)?;
-        let value = from_bytes(&ty, &bytes).map_err(|err| Error::InvalidFormat(err.to_string()))?;
-        println!("{}", variant_text(&ty, &value.byteswapped())?);
+        let value = from_bytes(&ty, bytes).map_err(|err| Error::InvalidFormat(err.to_string()))?;
+        // The text form renders the converted tree, so the tree it was
+        // converted out of is dropped before the text is built.
+        let converted = value.byteswapped();
+        drop(value);
+        println!("{}", variant_text(&ty, &converted)?);
         return Ok(());
     }
-    let summary = fetch_remote_summary(repo, name, "Remote server has no summary file").await?;
-    if args.list_metadata_keys {
-        print_sorted_keys(&summary.metadata);
-        return Ok(());
+    if !view {
+        // The key listing and one value by name report the metadata dict alone,
+        // so the ref list is left undecoded.
+        if list_metadata_keys {
+            print_sorted_keys(&Summary::parse_metadata(bytes)?);
+            return Ok(());
+        }
+        if let Some(key) = print_metadata_key {
+            let metadata = Summary::parse_metadata(bytes)?;
+            let Some(value) = metadata.dict_get(key) else {
+                exit_error(&format!("No such metadata key '{key}'"));
+            };
+            // The raw reports convert the stored big-endian fields, so a value
+            // read by name reads as the number the field states. The lookup
+            // precedes the conversion, so one value is converted and not the
+            // whole dict.
+            return print_metadata_value(&value.byteswapped(), false);
+        }
     }
-    if let Some(key) = args.print_metadata_key.as_deref() {
-        // The raw reports convert the stored big-endian fields, so a value read
-        // by name reads as the number the field states.
-        let metadata = summary.metadata.byteswapped();
-        let Some(value) = metadata.dict_get(key) else {
-            exit_error(&format!("No such metadata key '{key}'"));
-        };
-        return print_metadata_value(value, false);
-    }
-    print_summary_report(&summary)
+    print_summary_report(&Summary::parse(bytes)?)
 }
 
 /// Report a summary the way the tool reports one: each ref of field 0, then the
@@ -6062,6 +6111,7 @@ fn print_summary_ref(collection_id: Option<&str>, entry: &SummaryRef) -> Result<
 /// and their own rendering; every other key prints its name and its value in the
 /// text form, with no type annotation.
 fn print_summary_metadata(key: &str, value: &Value) -> Result<()> {
+    let labeled = SUMMARY_LABELS.iter().any(|(name, _)| *name == key);
     let label = label_for(SUMMARY_LABELS, key);
     let Some((ty, inner)) = value.as_variant() else {
         return Ok(());
@@ -6078,7 +6128,9 @@ fn print_summary_metadata(key: &str, value: &Value) -> Result<()> {
         // The map's refs are reported with the other refs, above.
         "ostree.summary.collection-map" => println!("{label}: (printed above)"),
         _ => match inner {
-            Value::Str(text) => println!("{label}: {text}"),
+            // A labeled string prints bare; an unlabeled one keeps the quotes
+            // the text form gives it.
+            Value::Str(text) if labeled => println!("{label}: {text}"),
             _ => println!("{label}: {}", unannotated_text(ty, inner)?),
         },
     }
@@ -6755,12 +6807,43 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
     let signing = !args.key_id.is_empty() || !args.keys_file.is_empty();
     if signing {
         summary_sign(&repo, &args).await?;
-    } else if !args.update {
+    }
+    if args.update || signing {
+        // An update does its work and returns; the tool writes no report beside
+        // it. A signing key returns on the same terms. Nothing observed orders
+        // a signing key against a reading option, because the tool states that
+        // surface with `--sign=KEY-ID`, which the port does not carry
+        // (`docs/conformance/cli-surface.md`, "summary").
+        return Ok(());
+    }
+
+    if !args.raw && !args.view && !args.list_metadata_keys && args.print_metadata_key.is_none() {
         return Err(Error::InvalidFormat(
-            "nothing to do: pass --update, --verify, or a signing key".into(),
+            "nothing to do: pass --update, --verify, a reading option, or a signing key".into(),
         ));
     }
-    Ok(())
+    summary_read(&repo, &args).await
+}
+
+/// The refusal a reading option draws when the repository holds no `summary`
+/// file. The tool words it as its own errno wrapper
+/// (`docs/conformance/cli-surface.md`, "summary").
+const SUMMARY_ABSENT: &str = "opening summary: No such file or directory";
+
+/// Report the local summary: the raw variant, the report, the metadata keys, or
+/// one metadata value. The precedence is the tool's own
+/// (`docs/format-reference.md`, "CLI output formats", under `summary`).
+async fn summary_read(repo: &Repo, args: &SummaryArgs) -> Result<()> {
+    let Some(bytes) = repo.read_summary().await? else {
+        exit_error(SUMMARY_ABSENT);
+    };
+    print_summary_document(
+        &bytes,
+        args.raw,
+        args.view,
+        args.list_metadata_keys,
+        args.print_metadata_key.as_deref(),
+    )
 }
 
 /// Sign the summary once per supplied key, under the selected engine.

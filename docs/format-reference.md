@@ -5427,3 +5427,71 @@ prints after the per-path block, whatever order the two flags were given in.
 - 0 -- both sides were read, whether or not a difference was found.
 - 1 -- a side that cannot be read, a revision that does not resolve, and an
   object the store cannot supply.
+
+### `summary`
+
+`summary` writes the repository summary, signs it, or reads it. The four
+reading options are `-v`/`--view`, `--raw`, `--list-metadata-keys`, and
+`--print-metadata-key=KEY`. All of them read `<repo>/summary` and nothing else;
+`summary.sig` is never opened by a reading option, so a signed summary and an
+unsigned one report the same text.
+
+The precedence is fixed and does not follow the order the switches are written
+in:
+
+1. `--verify` reports the signatures and returns. The option is a port
+   extension the tool does not carry.
+2. `-u`/`--update` regenerates the summary, returns, and writes no report.
+3. A signing key, given as a positional argument or with `--keys-file`, signs
+   the summary and returns. The tool states this surface with `--sign=KEY-ID`,
+   which the port does not carry, and the two arms are the divergence
+   `cli-surface.md`, "summary", records.
+4. `--raw`.
+5. `-v`/`--view`.
+6. `--list-metadata-keys`.
+7. `--print-metadata-key=KEY`.
+
+Arms 1 and 3 are the port's own. Arms 2 and 4 through 7 are the order the tool
+takes, measured by giving it each competing pair in both orders.
+
+With no option at all the command refuses at exit 1. A repository holding no
+`summary` file refuses every reading option at exit 1 with nothing on standard
+output.
+
+`-v`/`--view` writes the report `remote summary` writes, byte for byte: each
+ref of field 0, then the refs of every collection `ostree.summary.collection-map`
+lists, then the global metadata in stored order. The ref block, the label set,
+the `(printed above)` line, and the quoting rule for a string value are the
+rules "`remote`" above states.
+
+`--raw` writes one line: the whole document in the annotated GVariant text form
+with the big-endian fields converted, followed by one newline.
+
+`--list-metadata-keys` writes the global metadata keys, one per line, sorted
+rather than in stored order.
+
+`--print-metadata-key=KEY` writes one value, unwrapped from its `v`, in the
+annotated text form with the same conversion. A key the dict does not hold, and
+an empty key, report `error: No such metadata key '<key>'` at exit 1 with
+nothing on standard output.
+
+The report and the two annotated forms read one value two ways. `--raw` and
+`--print-metadata-key` read the whole document as a big-endian GVariant, which
+is the format's own convention. The report converts a labeled `t` field per
+field and reads every other value in host order, which is the rule "`remote`"
+above states. A value supplied with `-m`/`--add-metadata` is stored in host
+order, while the format's own `t` fields are big-endian, so the two reports
+state different numbers for such a value and each is right about a different
+thing. A summary carrying `zzz.last` as the `u` value 42 reports `zzz.last: 42`
+in the report and `uint32 704643072` under `--raw` on a little-endian host.
+
+#### Exit status
+
+- 0 -- the summary was written, signed, or reported.
+- 1 -- no option given, an absent `summary` file, and a key the metadata dict
+  does not hold.
+
+A `summary` file whose bytes are not a document of the summary type reaches a
+repository only through a write that is neither implementation's. The tool
+reads such a file as an empty document and the port refuses it, which
+`cli-surface.md`, "summary", records.

@@ -2039,12 +2039,62 @@ inventory is the oracle and the port writes the bytes the tool writes.
   so two targets that differ report `M`. A valid target held against one that is
   not valid UTF-8 reports `M` in both.
 
-`summary` accepts `--repo`, `-u/--update`, `--verify`, `-s/--sign-type`, and the
-port extensions `--last-modified`, `--metadata-commit-timestamp`, `--keys-file`,
-`--keys-dir`, `--gpg-homedir`, `--remote`. Missing: `-v/--view`, `--raw`,
-`--list-metadata-keys`, `--print-metadata-key=KEY`, `-m/--add-metadata=KEY`,
-`--gpg-sign=KEY-ID`, `--sign=KEY-ID`. Note that on this command the tool binds
-`-v` to `--view`, and `--verbose` has no short form.
+`summary` accepts `--repo`, `-u/--update`, `-v/--view`, `--raw`,
+`--list-metadata-keys`, `--print-metadata-key=KEY`, `--verify`,
+`-s/--sign-type`, and the port extensions `--last-modified`,
+`--metadata-commit-timestamp`, `--keys-file`, `--keys-dir`, `--gpg-homedir`,
+`--remote`. Missing: `-m/--add-metadata=KEY`, `--gpg-sign=KEY-ID`,
+`--sign=KEY-ID`. On this command the tool binds `-v` to `--view`, and
+`--verbose` has no short form. The port carries the same shape: `summary`
+declares `-v/--view` and a long-only `--verbose`, and every other subcommand,
+together with the top level, keeps `-v/--verbose`. Seven differences stand.
+
+- `-v` does not turn on the debug stream. The tool binds `-v` to `--view` and
+  `--verbose` together and writes `OT: using fuse: 0` for a read-only view; the
+  port binds `-v` to `--view` alone and writes nothing to standard error.
+  `clap` gives one short form to one argument, so the port carries `-v/--view`
+  as one flag and `--verbose` as another. Standard output is unaffected, and
+  `ostrya summary --verbose` still writes the repository-resolution line the
+  port's global `--verbose` writes everywhere;
+- a positional argument. `summary` takes none in the tool, which accepts one
+  and ignores it, writing the report as if it were absent. The port reads a
+  positional as a signing key identifier, the surface the tool states with
+  `--sign=KEY-ID`, and signing precedes every reading option, so
+  `summary --view <word>` signs where the word is a key and refuses at exit 1
+  where it is not. The tool writes the report and the port writes none;
+- a repeated switch. The tool takes a second `-v`, `--view`, `--raw`, or
+  `--list-metadata-keys` and runs the command, and takes the last occurrence of
+  a repeated `--print-metadata-key`; the port refuses each with `error: the
+  argument '<flag>' cannot be used multiple times` at exit 1. This is the
+  repeated-flag class already recorded for `export --no-xattrs` and the four
+  `prune` flags;
+- the absent-summary wording. The tool reports `error: openat(summary): No such
+  file or directory` and the port reports `error: opening summary: No such file
+  or directory`. Both exit 1 and write nothing to standard output;
+- the no-option refusal wording. The tool reports `error: No option specified;
+  use -u to update summary`; the port reports `error: invalid format: nothing
+  to do: pass --update, --verify, a reading option, or a signing key`, naming
+  the options it carries, two of which the tool does not. Both exit 1;
+- the place a signing key takes among the reading options. The port signs and
+  returns before any reading option is read, so `summary --view --keys-file=F`
+  writes a signature and no report, and so does a signing key given as a
+  positional. Nothing observed orders the two. The tool states the signing
+  surface with `--sign=KEY-ID`, refuses that option without `-u`, and writes
+  the report and no signature for `summary --sign=KEY-ID --view`. The port's
+  order is the port's own; the observation that settles it is available once
+  the port carries `--sign`;
+- a `summary` file whose bytes are not a document of the summary type. Such a
+  file reaches a repository only through a write that is neither
+  implementation's. The tool reads it as an empty document, so `--raw` writes
+  `(@a(s(taya{sv})) [], @a{sv} {})`, `-v/--view` and `--list-metadata-keys`
+  write nothing, all three exit 0, and `--print-metadata-key=KEY` refuses at
+  exit 1 with `error: No such metadata key '<key>'`. The port refuses the
+  document itself at exit 1 with nothing on standard output, for all four
+  options. A zero-length `summary` file reads the same way on each side.
+
+The time zone a `summary -v` report renders an instant in is the divergence
+"P3" records for `remote summary`, reached here by the local command: the tool
+renders in the host zone with that zone's offset and the port renders in UTC.
 
 `static-delta` accepts the subcommands `list`, `generate`, `apply-offline`, and
 `reindex`. Missing: `show`, `delete`, `verify`, `indexes`.
@@ -2612,15 +2662,13 @@ Observed by running the tool (2026.1).
 
 A script reads standard output, so the format is part of the surface. The
 formats of `commit`, including its `--table-output` block, `refs`, `rev-parse`,
-`cat`, `show`, `log`, `ls`, `config get`, `prune`, `fsck`, and `diff`, together
-with the
+`cat`, `show`, `log`, `ls`, `config get`, `prune`, `fsck`, `diff`, and
+`summary`, together with the
 GVariant text form the reading commands share,
 are recovered and recorded in `../format-reference.md`, "CLI output formats" and
 "The GVariant text form". Each format below still needs a black-box observation
 pass, and the results belong in that same section.
 
-- `summary -v`, `--raw`, and `--list-metadata-keys`, whose formats are the ones
-  `remote summary` reports and whose flags the local command still lacks.
 - `static-delta list`, `show`, and `indexes`.
 - `pull` progress output.
 

@@ -10593,3 +10593,748 @@ spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: the two exit 1 either way, so the exit status reads the same and the
  object inventory is what parts. The port keeps an object it cannot read at
  its own type rather than removing one the tool may preserve.
+
+# ---------------------------------------------------------------------------
+# diff -- the five options, the per-path block, the stats block, and the
+# directory side (Phase 17f, F20).
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: diff
+cell: diff/no-arguments
+setup: repo-with-commit
+run: diff --repo=$REPO
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "REV must be specified"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "REV must be specified"
+oracle: exit-status
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: the missing-positional check runs after the repository resolves, which is
+ the order `cli-surface.md`, "Global conventions", states. Each implementation
+ prints the subcommand's usage text before the error line, the port's being
+ clap's rendering and the tool's GOption's, so the shared claim is the shape
+ and `stderr-text` is no oracle here.
+
+family: M10
+subcommand: diff
+cell: diff/no-repository
+run: diff
+expect-exit: 1
+expect-stderr: contains "error: Command requires a --repo argument"
+ref-expect-exit: 1
+ref-expect-stderr: contains "error: Command requires a --repo argument"
+oracle: exit-status
+outcome: full
+severity: interop
+spec: cli-surface.md#global-conventions
+note: the cell runs in its own scratch root, which is not a repository, with no
+ `--repo` and no `OSTREE_REPO`, and with no positional either. The repository
+ check wins over the missing positional in both, which is the `diff` instance
+ of the global convention. `stderr-text` is no oracle here for the reason
+ `refs/no-repo-resolvable` gives.
+
+family: M10
+subcommand: diff
+cell: diff/one-argument-root-commit
+setup: repo-with-commit
+run: diff --repo=$REPO $REV
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "has no parent"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "has no parent"
+oracle: exit-status
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: with one argument the first side is that argument with `^` appended, so a
+ root commit reaches the resolution wording every subcommand taking a revision
+ gives. The full line carries the checksum, which the normalizer rewrites, so
+ the claim states `contains` and does not rest on the rewriting.
+ `diff/parent-form` below holds the whole form over a branch carrying three
+ commits.
+
+family: M10
+subcommand: diff
+cell: diff/same-commit-twice
+setup: repo-with-commit
+run: diff --repo=$REPO $REV $REV
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: a commit differs from itself nowhere, so the per-path block is empty and
+ the run exits 0.
+
+family: M10
+subcommand: diff
+cell: diff/fs-diff-same-commit
+setup: repo-with-commit
+run: diff --repo=$REPO --fs-diff $REV $REV
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: `--fs-diff` names the block the default form already writes, so a run
+ carrying it alone writes what `diff/same-commit-twice` above writes.
+
+family: M10
+subcommand: diff
+cell: diff/stats-same-commit
+setup: repo-with-commit
+modes: bare
+run: diff --repo=$REPO --stats $REV $REV
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: the four lines of the stats block, with the per-path block suppressed. A
+ `bare` repository stores each content object as the raw payload, so the two
+ implementations record one byte count per object and `Common Object Size`
+ compares.
+
+family: M10
+subcommand: diff
+cell: diff/stats-archive
+setup: repo-with-commit
+modes: archive
+run: diff --repo=$REPO --stats $REV $REV
+expect-exit: 0
+expect-stdout: contains "Common Object Count:"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: contains "Common Object Count:"
+ref-expect-stderr: empty
+oracle: exit-status
+outcome: lossy
+severity: interop
+loss: `Common Object Size` over an `archive` repository. The size is the
+ on-disk size of the loose object file, which follows each implementation's
+ own DEFLATE encoder, and the two encoders reach two lengths for most
+ payloads (`cli-surface.md`, "P2"). The three count lines agree.
+spec: format-reference.md#diff
+note: the object counts do not depend on the encoder, so the cell states that
+ the block is written and that the run exits 0. `diff/stats-same-commit` above
+ compares the whole block in `bare`.
+
+family: M10
+subcommand: diff
+cell: diff/stats-and-fs-diff-same-commit
+setup: repo-with-commit
+modes: bare
+run: diff --repo=$REPO --stats --fs-diff $REV $REV
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: the two blocks print in one order whichever order the flags carry. The
+ per-path block is empty here, the two sides naming one commit, so what the
+ cell compares is the stats block written under both flags.
+ `diff/stats-after-fs-diff` below holds the order over a non-empty per-path
+ block.
+
+family: M10
+subcommand: diff
+cell: diff/tree-side-matches-its-commit
+setup: repo-with-commit tree
+run: diff --repo=$REPO $REV $TREE
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: the setup commits the tree `$TREE` names, so the whole directory-side
+ reader is held against the commit made from that directory: every uid, gid,
+ mode, extended attribute set, symlink target, and payload reaches the same
+ content object checksum, and every directory the same metadata checksum.
+
+family: M10
+subcommand: diff
+cell: diff/tree-side-owner-uid
+setup: repo-with-commit tree
+run: diff --repo=$REPO --owner-uid=0 $REV $TREE
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: the override gives the entries of the second side the user id 0, so every
+ path of the tree is a modification. The lines are named by the first side,
+ which is the commit, so the order is the commit side's and the text is
+ deterministic in both.
+
+family: M10
+subcommand: diff
+cell: diff/tree-side-owner-gid
+setup: repo-with-commit tree
+run: diff --repo=$REPO --owner-gid=0 $REV $TREE
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: the group id takes the same terms as the user id above.
+
+family: M10
+subcommand: diff
+cell: diff/tree-side-owner-uid-negative
+setup: repo-with-commit tree
+run: diff --repo=$REPO --owner-uid=-1 $REV $TREE
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: a negative value declares nothing, so the run writes what
+ `diff/tree-side-matches-its-commit` above writes.
+
+family: M10
+subcommand: diff
+cell: diff/owner-uid-not-an-integer
+setup: repo-with-commit
+run: diff --repo=$REPO --owner-uid=abc $REV $REV
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Cannot parse integer value “abc” for --owner-uid"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Cannot parse integer value “abc” for --owner-uid"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#diff
+note: the value is read while the options are read, so the refusal stands ahead
+ of the repository and of everything the subcommand does. The reader is the one
+ `commit --owner-uid` already uses.
+
+family: M10
+subcommand: diff
+cell: diff/owner-uid-out-of-range
+setup: repo-with-commit
+run: diff --repo=$REPO --owner-uid=2147483648 $REV $REV
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Integer value “2147483648” for --owner-uid out of range"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Integer value “2147483648” for --owner-uid out of range"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#diff
+note: the value is read as a C `int`, so one more than the largest it holds is
+ out of range in both.
+
+family: M10
+subcommand: diff
+cell: diff/owner-uid-hexadecimal
+setup: repo-with-commit tree
+run: diff --repo=$REPO --owner-uid=0x10 $REV $TREE
+expect-exit: 0
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stderr: empty
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: the C `int` dialect reaches this command, so a `0x`-prefixed value is read
+ in base 16 and declares the user id 16, which no entry of the tree carries.
+
+family: M10
+subcommand: diff
+cell: diff/owner-uid-ignored-on-commit-sides
+setup: repo-with-commit
+run: diff --repo=$REPO --owner-uid=0 $REV $REV
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: the override reaches a directory side alone, so two commit sides report
+ what they report without it.
+
+family: M10
+subcommand: diff
+cell: diff/no-xattrs-on-commit-sides
+setup: repo-with-commit
+corpus: C4
+run: diff --repo=$REPO --no-xattrs $REV $REV
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: a commit carries the extended attributes it was made with, so the switch
+ reaches neither commit side. Corpus `C4` carries the attributes that would
+ show if it did.
+
+family: M10
+subcommand: diff
+cell: diff/no-xattrs-tree-side
+setup: repo-with-commit tree
+corpus: C4
+modes: bare
+run: diff --repo=$REPO --no-xattrs $REV $TREE
+expect-exit: 0
+expect-stdout: contains "M    /one"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: contains "M    /one"
+ref-expect-stderr: empty
+oracle: exit-status
+outcome: lossy
+severity: interop
+loss: the entry of corpus `C4` whose extended attribute value is zero bytes
+ long. The port records such an attribute at ingest and the tool drops it, so
+ each side commits a different object for that entry and the stripped
+ directory side parts from one commit and not from the other. The loss is the
+ ingest divergence `m0-content.matrix`, corpus `C4`, records, reaching this
+ cell because each side commits its own copy of the corpus.
+spec: format-reference.md#diff
+note: the switch strips the directory side, so every entry of corpus `C4` that
+ carries an extended attribute parts from the commit that holds it. The lines
+ are named by the commit side, so the order is deterministic in both.
+ `diff/no-xattrs-reaches-both-directory-sides` below compares the whole text
+ over a tree the cited test builds, which carries no such attribute.
+
+family: M10
+subcommand: diff
+cell: diff/absent-directory-side
+setup: repo-with-commit
+run: diff --repo=$REPO $REV $SCRATCH/nosuch
+expect-exit: 1
+expect-stdout: empty
+ref-expect-exit: 1
+ref-expect-stdout: empty
+oracle: exit-status
+outcome: lossy
+severity: interop
+loss: the wording of a directory side that does not open. The tool writes
+ `Error when getting information for file “<path>”: No such file or
+ directory`, naming the lexically absolute path, and the port writes its own
+ sentence naming the call and the path as the command line spelled it
+ (`cli-surface.md`, "P2").
+spec: format-reference.md#diff
+note: an argument beginning with `/` names a directory, so the run reaches the
+ directory open and not the ref store. Both exit 1 and write nothing.
+
+family: M10
+subcommand: diff
+cell: diff/relative-path-is-a-revision
+setup: repo-with-commit
+run: diff --repo=$REPO $REV corpus-C0
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Refspec 'corpus-C0' not found"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Refspec 'corpus-C0' not found"
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: an argument is a directory where it begins with `/` or with `./`, and a
+ revision otherwise, the rule reading the spelling alone. `corpus-C0` is the
+ corpus tree the setup materialized in the directory the cell runs from, so the
+ argument names a directory each run can reach and the spelling rule is the
+ only thing that sends it to the ref store, which holds no such name.
+
+family: M10
+subcommand: diff
+cell: diff/dot-is-a-revision
+setup: repo-with-commit
+run: diff --repo=$REPO $REV .
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Invalid refspec ."
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Invalid refspec ."
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: `.` begins with neither `/` nor `./`, so it is read as a revision and the
+ ref rule refuses it. Both write that one line.
+
+family: M10
+subcommand: diff
+cell: diff/stats-refuses-a-directory-side
+setup: repo-with-commit tree
+run: diff --repo=$REPO --stats $REV $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Invalid refspec"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Invalid refspec"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: `--stats` reads both arguments as revisions whatever their spelling, so a
+ path the per-path block would take as a directory is refused there and no
+ line of either block is written.
+
+family: M10
+subcommand: diff
+cell: diff/stats-with-fs-diff-writes-the-block-first
+setup: repo-with-commit tree
+run: diff --repo=$REPO --stats --fs-diff $REV $TREE
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Invalid refspec"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Invalid refspec"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: the per-path block is written in full before the stats pass runs, so the
+ refusal stands after it. The block is empty here, the commit and the tree
+ agreeing, so the cell states the ordering through the refusal; the non-empty
+ case is `diff/stats-after-fs-diff` below.
+
+family: M10
+subcommand: diff
+cell: diff/absent-revision
+setup: repo-with-commit
+run: diff --repo=$REPO $REV nosuchrev
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Refspec 'nosuchrev' not found"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Refspec 'nosuchrev' not found"
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: a second side that resolves to nothing ends the run before the first
+ side's tree is read.
+
+family: M10
+subcommand: diff
+cell: diff/change-classes
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_change_classes_match_the_tool
+spec: format-reference.md#diff
+note: the three prefixes over an added file, a deleted file, a content change, a
+ mode change, an extended attribute change, a symlink target change, an added
+ directory, and a deleted directory. The setup commits one tree, so the two
+ commits the claim needs are built by the cited test.
+
+family: M10
+subcommand: diff
+cell: diff/print-order
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_print_order_matches_the_tool
+ ostrya::maintenance::diff_print_order_is_the_walk_order
+spec: format-reference.md#diff
+note: the three groups print modified, then removed, then added, and within one
+ group the order is the order the walk found the entries. An entry added inside
+ a shared directory is named before the entries the root itself adds, the
+ descent standing inside the first pass. The library test pins the order
+ against a fixture it builds and needs no reference tool.
+
+family: M10
+subcommand: diff
+cell: diff/added-directory-expands
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_directory_expansion_matches_the_tool
+spec: format-reference.md#diff
+note: an added directory lists itself and every descendant, and a removed
+ directory is one entry without its former children. The cited test compares
+ both directions over one pair of commits.
+
+family: M10
+subcommand: diff
+cell: diff/type-change-is-one-entry
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_type_change_matches_the_tool
+spec: format-reference.md#diff
+note: a name that is a file on one side and a directory on the other is one
+ modification, and the comparison does not descend into it. The cited test
+ covers a regular file, a directory, and a symlink in each position.
+
+family: M10
+subcommand: diff
+cell: diff/root-metadata-not-reported
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_root_metadata_matches_the_tool
+spec: format-reference.md#diff
+note: two commits differing in the root directory's own metadata alone report
+ nothing. The cited test reads each root's mode through `ls -d` first, so the
+ difference the two commits carry is on the record.
+
+family: M10
+subcommand: diff
+cell: diff/parent-form
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_parent_form_matches_the_tool
+spec: format-reference.md#diff
+note: `diff REV` compares the commit's parent against it and `diff REV^` the
+ grandparent against the parent, the one-argument form appending `^` to the
+ argument as given. The cited test builds a branch of three commits and holds
+ the root commit's refusal beside them.
+
+family: M10
+subcommand: diff
+cell: diff/stats-counts
+setup: repo-with-commit
+modes: bare
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_stats_match_the_tool
+spec: format-reference.md#diff
+note: the four lines over two differing commits: each commit's own object count,
+ the size of the intersection, and the sum of the on-disk sizes of that
+ intersection. The cited test also holds two commits sharing no object, which
+ report a count and a size of zero.
+
+family: M10
+subcommand: diff
+cell: diff/stats-excludes-parents-and-detached-metadata
+setup: repo-with-commit
+modes: bare
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_stats_object_set_matches_the_tool
+spec: format-reference.md#diff
+note: a commit counts its own objects alone. A commit carrying a parent counts
+ the parent's objects nowhere, and a commit carrying detached metadata counts
+ the `.commitmeta` nowhere. The cited test asserts the detached metadata object
+ is on disk before it reads the counts.
+
+family: M10
+subcommand: diff
+cell: diff/stats-after-fs-diff
+setup: repo-with-commit
+modes: bare
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_stats_block_order_matches_the_tool
+spec: format-reference.md#diff
+note: over two differing commits the per-path block is written before the stats
+ block, whichever order the two flags carry on the command line.
+
+family: M10
+subcommand: diff
+cell: diff/directory-side-path-rendering
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_path_rendering_matches_the_tool
+spec: format-reference.md#diff
+note: an `M` or a `D` path is named the way the first side names it and an `A`
+ path the way the second does, a commit side naming a path with a leading `/`
+ and a directory side naming it relative to the argument. The cited test also
+ holds the spelling rule that decides which of the two an argument is: it runs
+ both implementations from a directory that holds `sub/dir` and both read the
+ argument as a revision.
+
+family: M10
+subcommand: diff
+cell: diff/directory-side-readdir-order
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the order of a directory side's lines. Both implementations name the
+ entries in the order the directory returns them, so the two agree wherever
+ two copies of one tree are returned in one order and part where they are not
+ (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::diff_directory_order_matches_the_tool
+spec: format-reference.md#diff
+note: the cited test builds two copies of one tree whose entries were created in
+ opposite orders and sorts both line sets before comparing, so it holds the set
+ of paths and states nothing about their order.
+ `diff/directory-side-walk-order` holds the order over one pair of directories
+ both implementations read.
+
+family: M10
+subcommand: diff
+cell: diff/directory-side-walk-order
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_directory_side_order_is_exact
+spec: format-reference.md#diff
+note: one pair of directories is read by both implementations, so the order the
+ directories return their entries in is not the port's own choice and the
+ comparison is exact. The cell holds the walk order and the `M`, `D`, `A`
+ grouping together, and the test refuses a fixture whose paths come out in
+ sorted order, under which the claim would be empty.
+
+family: M10
+subcommand: diff
+cell: diff/directory-side-special-files
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_special_files_match_the_tool
+spec: format-reference.md#diff
+note: a fifo and a socket carry no prefix of their own: one on a single side is
+ an addition, one against a regular file of the same name is a modification,
+ and two of one name differ where their mode differs. A device node needs
+ privilege to create, so the claim rests on the two kinds an unprivileged user
+ makes, and the mode is the one field of such an entry an unprivileged run can
+ vary: the kernel takes a `user.*` attribute on a regular file and a directory
+ alone, and a uid or a gid needs privilege.
+
+family: M10
+subcommand: diff
+cell: diff/no-xattrs-reaches-both-directory-sides
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_no_xattrs_reaches_both_sides
+spec: format-reference.md#diff
+note: the switch strips both directory sides, so two directories differing in
+ one extended attribute alone report nothing under it, and one directory
+ against the commit made from it reports every entry that carries one.
+
+family: M10
+subcommand: diff
+cell: diff/owner-override-reaches-the-second-side
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_owner_override_side_matches_the_tool
+spec: format-reference.md#diff
+note: the override reaches the second argument alone, so a directory compared
+ against itself reports every entry under it and reports nothing where the
+ directory is the first argument. The cited test also holds the last
+ occurrence of a repeated `--owner-uid` and a repeated `--owner-gid` in both
+ directions, one value declaring nothing and the other declaring one.
+
+family: M10
+subcommand: diff
+cell: diff/repeated-owner-uid
+setup: repo-with-commit
+run: diff --repo=$REPO --owner-uid=5 --owner-uid=0 $REV $REV
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+spec: format-reference.md#diff
+note: a repeated value option is accepted and takes the last occurrence, which
+ is the convention `cli-surface.md`, "P2", states for a repeated `--depth` and
+ a repeated `--keep-younger-than`. Two commit sides ignore the value, so the
+ cell holds the acceptance and
+ `diff/owner-override-reaches-the-second-side` cites the test that holds the
+ last occurrence over a directory side.
+
+family: M10
+subcommand: diff
+cell: diff/type-change-over-an-unreadable-entry
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_type_change_over_an_unreadable_entry_matches_the_tool
+spec: format-reference.md#diff
+note: a name the two sides hold at two kinds is one modification reached from
+ the listing alone, so neither side is opened. The cited test holds a regular
+ file against a mode-0 directory, a mode-0 regular file against a symlink, and
+ a commit against a directory holding the name at another kind; each reports
+ one modification at exit 0. A run that reads a mode-0 entry states nothing
+ about the case, so the test checks that before it claims anything.
+
+family: M10
+subcommand: diff
+cell: diff/directory-side-non-utf8-names
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the rendering of a directory side's entry name and symlink target that is
+ not valid UTF-8. The tool writes the bytes the filesystem returned; the port
+ writes U+FFFD for each invalid byte, `DiffEntry::path` being a `String`. Two
+ targets that are each not valid UTF-8 compare equal in the tool and compare on
+ their bytes in the port (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::diff_non_utf8_names_do_not_end_the_run
+spec: format-reference.md#diff
+note: such a name is listed, descended into, and carried to the end of the run
+ in both, and both exit 0. The cited test holds the exit status, the count of
+ paths named, the valid name that changes alongside them, and the added entry
+ below a directory whose name is not valid UTF-8.
+
+family: M10
+subcommand: diff
+cell: diff/mtime-is-not-compared
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::diff_mtime_is_not_compared
+spec: format-reference.md#diff
+note: two directories holding one file of one content and two modification times
+ report nothing, the time being outside every checksum the comparison reads.

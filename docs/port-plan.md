@@ -4453,10 +4453,14 @@ cells, 100 pass, 0 fail, where it reported 83 passes before the phase.
 One finding outside the phase's scope came out of building its tests, recorded in
 `m0-content.matrix`'s `C4` row and left undecided: an xattr whose value is zero
 bytes long is recorded by the port and dropped by the tool, so the object
-checksums part for any tree carrying one. The loss is at ingest alone -- the
-tool's checkout writes such an xattr back out of an object that holds one -- and
-it reaches `archive`, `bare`, and `bare-user` alike. Deciding what the port
-records touches the ingest path, so it wants a phase of its own.
+checksums part for any tree carrying one. The loss is in the tool's reader,
+wherever it reads an attribute off the filesystem: it reaches ingest, and
+`diff` over two directory sides, which performs no ingest, reports `M` in the
+port and nothing in the tool for a file that carries one. The tool's checkout
+writes such an xattr back out of an object that holds one, and the loss reaches
+`archive`, `bare`, and `bare-user` alike. Deciding what the port records touches
+the ingest path, so it wants a phase of its own. The `diff` half is recorded as
+a divergence in `conformance/cli-surface.md`, "P2".
 
 #### Phase 17d -- `show`, `log`, `ls`, `config get`, and the GVariant text-form printer (DONE)
 
@@ -4734,11 +4738,12 @@ cross-cutting decisions several items share and the record of any option
 deliberately skipped.
 
 Deliverables: the remaining flags on each command, read-only
-superblock/index accessors on `delta.rs` for `static-delta show`/`indexes`, and
-the per-transaction fsync override and reporting counters `commit --fsync` and
+superblock/index accessors on `delta.rs` for `static-delta show`/`indexes`, the
+per-transaction fsync override and reporting counters `commit --fsync` and
 `commit --table-output` need (`Transaction::set_fsync`, and `metadata_total`,
 `content_total`, and `content_bytes_unpacked` on `TransactionStats`; item
-`F10`).
+`F10`), and the comparison surface `diff` needs -- `Repo::diff`, `DiffSide`,
+`DiffOptions`, `DiffStats`, and `Repo::diff_stats` (item `F20`).
 
 Verify: each option's `m10` record and the option's owning `m0`/`m1` cells
 move from `unimplemented-cli`/`unobserved` to `full` (or a named, justified
@@ -5620,6 +5625,85 @@ argument, which the tool ignores and the port refuses; and a repeated boolean
 flag, which the tool takes and the port refuses. The item adds 35 `m10` cells,
 of which 8 are executable and all 8 pass; the conformance run reports 891
 cells and 358 passes.
+
+`F20` completes `diff`: the five options `--stats`, `--fs-diff`, `--no-xattrs`,
+`--owner-uid=UID`, and `--owner-gid=GID`, the whole output format, the print
+order, the one-argument form, and the side that names a directory on the
+filesystem. `format-reference.md`, "CLI output formats", `diff`, states the
+recovered format, which was unrecorded before the item.
+
+The library gained the comparison surface the options need. `Repo::diff` takes
+two `DiffSide` values -- a commit in the repository or a directory on the
+filesystem -- under a `DiffOptions` carrying `skip_xattrs`, `owner_uid`, and
+`owner_gid`, and returns the same `DiffEntry` list `Repo::diff_commits` returns,
+that call now being the two-commit case with the default options.
+`Repo::diff_stats` returns a `DiffStats` holding each commit's own object count,
+the size of the intersection, and the sum of the on-disk sizes of that
+intersection, read through `traverse_commit` at depth 0 and `loose_object_size`.
+
+The walk changed shape. It collects three lists and prints them modified, then
+removed, then added, and within one list the order is the order the walk found
+the entries: at each pair of directories of one name the first side's entries
+come in that side's own order, with the descent into a pair of directories
+standing where it is found, and the second side's entries follow in its own
+order. A commit side's own order is the files of the directory in stored order
+then the subdirectories in stored order; a directory side's own order is the
+order the directory returns its entries in.
+
+A directory side is read as the filesystem holds it, with no repository-mode
+canonicalization, which is what the tool does: a `bare-user-only` repository
+compares its reduced objects against the full form the directory carries, and
+every entry of one tree is a modification there. A device node, a fifo, and a
+socket carry no change kind of their own and compare on the uid, the gid, the
+mode, and the extended attributes.
+
+The reading is lazy, which is what keeps an added subtree cheap and what keeps
+an entry no read can reach from ending a run. The extended attributes are read
+for the names both sides hold whose two kinds pair and for no other, so a name
+one side holds as a directory and the other as a file is one modification
+reached from the listing alone. A pair a fact already in hand decides is decided
+there: two local entries whose uid, gid, mode, extended attributes, or size
+differ part without a payload read, and equal sizes decide nothing, so a pair
+that agrees on all five is hashed. A payload that is hashed streams through a
+fixed 64 KiB buffer whatever the file's size, and the open and the first chunk
+share one dispatch. A directory side holds one descriptor for its root and opens
+every entry below it from that descriptor by the relative path the walk builds,
+so the descriptor count does not follow the depth; a total path longer than the
+kernel's limit ends the run, which is the limit the tool's own path-based reader
+carries. `--stats` sizes the whole intersection in one pass on the blocking
+pool. A directory side's entry names and symlink targets are carried as the
+bytes the filesystem returned, so a name that is not valid UTF-8 is compared,
+descended into, and listed. `ostrya_core::ContentHasher` supplies the hashing
+and the item adds no dependency and no `unsafe`.
+
+The CLI reads an argument as a directory where it begins with `/` or with `./`
+and as a revision otherwise, the rule reading the spelling alone. With one
+argument the first side is that argument with `^` appended, so the parent
+condition carries the resolution wording every subcommand taking a revision
+gives: `diff <root commit>` reports the tool's own `Commit <checksum> has no
+parent` through `report_resolution_failure`. `--stats` reads both arguments as
+revisions whatever their spelling, and the per-path block is written in full
+before the stats pass runs.
+
+Ten divergences stand, all in `cli-surface.md`, "P2": a third positional
+argument, which the tool ignores and the port refuses; a repeated boolean flag,
+which the tool takes and the port refuses; the order of a directory side's
+lines, which both take from the directory and which is the hash-container
+carve-out; the wording of a directory side's read failure, where the tool names
+the lexically absolute path and the port the path as the command line spelled
+it; a path argument naming a regular file, where the tool's message names a
+path that was never given; a `--stats` run over a repository missing a content
+object, where the tool writes the three count lines before the refusal and the
+port writes none, `diff_stats` returning the counts and the size together; `-v`;
+an extended attribute whose value is zero bytes long, which the tool's reader
+drops and the port keeps, the ingest half of that rule standing undecided in
+`m0-content.matrix`, row `C4`; the rendering of a directory side's entry name
+that is not valid UTF-8, which the tool writes as the bytes the directory
+returned and the port writes with U+FFFD for each invalid byte, `DiffEntry`
+carrying a `String`; and a symlink target that is not valid UTF-8, which the
+tool reads as one value for every such target and the port compares on its
+bytes. The item adds 43 `m10` cells, of which 25 are executable and all 25 pass;
+the conformance run reports 934 cells and 383 passes.
 
 #### Phase 17g -- P3 commands with no matrix weight
 

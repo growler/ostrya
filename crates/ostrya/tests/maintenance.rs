@@ -1693,6 +1693,82 @@ fn diff_matches_the_tool() {
     );
 }
 
+/// The order the walk reports: the three groups modified, removed, then added,
+/// and within one group the order the walk found the entries. At each pair of
+/// directories of one name the first side's entries come in that side's own
+/// order -- the files in stored order, then the subdirectories in stored order
+/// -- with the descent into a pair of directories standing where it is found,
+/// and the second side's entries follow in its own order
+/// (`docs/format-reference.md`, "CLI output formats", `diff`).
+#[test]
+fn diff_print_order_is_the_walk_order() {
+    let tmp = TmpDir::new("maint-diff-order");
+    let base = tmp.path();
+    let repo_path = base.join("repo");
+
+    let one = base.join("t1");
+    write_tree(&one.join("M1/s"), "x", b"x\n");
+    write_tree(&one.join("M1"), "y", b"y\n");
+    write_tree(&one.join("M2"), "w", b"w\n");
+    write_tree(&one.join("D1"), "keep", b"k\n");
+    write_tree(&one, "aa", b"a\n");
+    write_tree(&one, "gone", b"g\n");
+    write_tree(&one.join("gonedir"), "inner", b"i\n");
+
+    let two = base.join("t2");
+    write_tree(&two.join("M1/s"), "x", b"x2\n");
+    write_tree(&two.join("M1"), "y", b"y2\n");
+    write_tree(&two.join("M2"), "w", b"w2\n");
+    write_tree(&two.join("D1"), "keep", b"k\n");
+    write_tree(&two.join("D1"), "new1", b"n\n");
+    write_tree(&two, "aa", b"a2\n");
+    write_tree(&two, "zz_added", b"z\n");
+    write_tree(&two.join("N/b1/deep"), "g", b"g\n");
+    write_tree(&two.join("N/b1"), "f", b"f\n");
+    write_tree(&two.join("N"), "a", b"a\n");
+
+    let ordered = block_on(async {
+        let repo = Repo::create(&repo_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let a = library_commit(&repo, base, "t1", None).await;
+        let b = library_commit(&repo, base, "t2", Some(a)).await;
+        let entries = repo.diff_commits(&a, &b).await.unwrap();
+        entries
+            .iter()
+            .map(|entry| {
+                let code = match entry.change {
+                    DiffChange::Added => 'A',
+                    DiffChange::Removed => 'D',
+                    DiffChange::Modified => 'M',
+                };
+                format!("{code} {}", entry.path)
+            })
+            .collect::<Vec<_>>()
+    });
+
+    assert_eq!(
+        ordered,
+        vec![
+            "M /aa",
+            "M /M1/y",
+            "M /M1/s/x",
+            "M /M2/w",
+            "D /gone",
+            "D /gonedir",
+            "A /D1/new1",
+            "A /zz_added",
+            "A /N",
+            "A /N/a",
+            "A /N/b1",
+            "A /N/b1/f",
+            "A /N/b1/deep",
+            "A /N/b1/deep/g",
+        ],
+        "the walk order"
+    );
+}
+
 #[test]
 fn diff_of_identical_commits_is_empty() {
     if !ostree_available() {

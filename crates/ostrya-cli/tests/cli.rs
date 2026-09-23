@@ -26716,3 +26716,877 @@ fn shared_repo_partial_marker_mode_does_not_follow_the_umask() {
         assert_eq!(mode, want, "the {repo_mode} marker");
     }
 }
+
+// ---------------------------------------------------------------------------
+// `diff`: the five options, the change classes, the print order, and the
+// directory side. `docs/format-reference.md`, "CLI output formats", `diff`,
+// states the format these tests hold the two implementations to.
+// ---------------------------------------------------------------------------
+
+/// Assert that both implementations agree on the exit status, standard error,
+/// and the set of lines standard output carries, the lines sorted first.
+///
+/// A directory side names its entries in the order the directory returns them,
+/// which is the tool's own mechanism and which two copies of one tree need not
+/// share, so a run with a directory side is compared on its line set
+/// (`docs/conformance/cli-surface.md`, "P2").
+fn assert_diff_agrees_sorted(port_repo: &Path, tool_repo: &Path, args: &[&str]) {
+    let (port, tool) = run_both(port_repo, tool_repo, args);
+    let label = args.join(" ");
+    assert_eq!(
+        port.status.code(),
+        tool.status.code(),
+        "`{label}` exited differently"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&port.stderr),
+        String::from_utf8_lossy(&tool.stderr),
+        "`{label}` wrote different standard error"
+    );
+    let sorted = |run: &Run| {
+        let text = String::from_utf8_lossy(&run.stdout).into_owned();
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(sorted(&port), sorted(&tool), "`{label}` named other paths");
+}
+
+/// Make a named pipe at `path` through `mkfifo`, reporting whether it landed.
+/// A host without the tool, or a filesystem that takes no fifo, reports false
+/// and the caller states nothing about the kind.
+fn make_fifo(path: &Path) -> bool {
+    Command::new("mkfifo")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Write `content` into `path`, creating every parent directory.
+fn write_at(path: &Path, content: &[u8]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+/// The three prefixes over an added file, a deleted file, a content change, a
+/// mode change, an extended attribute change, a symlink target change, an
+/// added directory, and a deleted directory.
+#[test]
+fn diff_change_classes_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-classes");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("t1");
+    write_at(&one.join("kept.txt"), b"same\n");
+    write_at(&one.join("content.txt"), b"one\n");
+    write_at(&one.join("mode.txt"), b"m\n");
+    write_at(&one.join("gone.txt"), b"x\n");
+    write_at(&one.join("gonedir/inner.txt"), b"g\n");
+    write_at(&one.join("attr.txt"), b"a\n");
+    std::os::unix::fs::symlink("old", one.join("link")).unwrap();
+    chmod_to(&one.join("mode.txt"), 0o755);
+    let xattrs = set_user_xattr(&one.join("attr.txt"), "user.demo", "first");
+
+    let two = base.join("t2");
+    write_at(&two.join("kept.txt"), b"same\n");
+    write_at(&two.join("content.txt"), b"two\n");
+    write_at(&two.join("mode.txt"), b"m\n");
+    write_at(&two.join("added.txt"), b"new\n");
+    write_at(&two.join("addeddir/nested/leaf.txt"), b"n\n");
+    write_at(&two.join("attr.txt"), b"a\n");
+    std::os::unix::fs::symlink("new", two.join("link")).unwrap();
+    chmod_to(&two.join("mode.txt"), 0o700);
+    if xattrs {
+        assert!(set_user_xattr(&two.join("attr.txt"), "user.demo", "second"));
+    }
+
+    let a = commit_both(&port_repo, &tool_repo, &one, "base");
+    let b = commit_both(&port_repo, &tool_repo, &two, "base");
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, &b]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &b, &a]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, &a]);
+    if !xattrs {
+        eprintln!("note: the filesystem took no user xattr, so that class is unstated");
+    }
+}
+
+/// The walk order: the first side's entries in that side's own order,
+/// descending into a pair of directories where it stands, then the second
+/// side's entries in its own order.
+#[test]
+fn diff_print_order_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-order");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    // A root file, a file in a subdirectory, a file in a nested subdirectory, a
+    // file in a second subdirectory, and one added subtree.
+    let one = base.join("g1");
+    write_at(&one.join("aa"), b"a\n");
+    write_at(&one.join("M1/y"), b"y\n");
+    write_at(&one.join("M1/s/x"), b"x\n");
+    write_at(&one.join("M2/w"), b"w\n");
+    let two = base.join("g2");
+    write_at(&two.join("aa"), b"a2\n");
+    write_at(&two.join("M1/y"), b"y2\n");
+    write_at(&two.join("M1/s/x"), b"x2\n");
+    write_at(&two.join("M2/w"), b"w2\n");
+    write_at(&two.join("N/a"), b"a\n");
+    write_at(&two.join("N/z"), b"z\n");
+    write_at(&two.join("N/b1/f"), b"f\n");
+    write_at(&two.join("N/b1/deep/g"), b"g\n");
+    write_at(&two.join("N/b2/f"), b"f\n");
+    let ga = commit_both(&port_repo, &tool_repo, &one, "g");
+    let gb = commit_both(&port_repo, &tool_repo, &two, "g");
+    assert_agrees(&port_repo, &tool_repo, &["diff", &ga, &gb]);
+
+    // An entry added inside a shared directory is named before the entries the
+    // root itself adds, the descent standing inside the first pass.
+    let three = base.join("h1");
+    write_at(&three.join("D1/keep"), b"k\n");
+    write_at(&three.join("D2/keep"), b"k\n");
+    let four = base.join("h2");
+    write_at(&four.join("D1/keep"), b"k\n");
+    write_at(&four.join("D1/new1"), b"n\n");
+    write_at(&four.join("D2/keep"), b"k\n");
+    write_at(&four.join("D2/newdir/q"), b"q\n");
+    write_at(&four.join("aaa_added"), b"a\n");
+    write_at(&four.join("zzz_added"), b"z\n");
+    let ha = commit_both(&port_repo, &tool_repo, &three, "h");
+    let hb = commit_both(&port_repo, &tool_repo, &four, "h");
+    assert_agrees(&port_repo, &tool_repo, &["diff", &ha, &hb]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &hb, &ha]);
+}
+
+/// An added directory lists itself and every descendant; a removed directory is
+/// one entry, without its former children.
+#[test]
+fn diff_directory_expansion_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-expand");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("e1");
+    write_at(&one.join("keep.txt"), b"k\n");
+    let two = base.join("e2");
+    write_at(&two.join("keep.txt"), b"k\n");
+    write_at(&two.join("sub/a.txt"), b"a\n");
+    write_at(&two.join("sub/deep/b.txt"), b"b\n");
+    write_at(&two.join("sub/deep/more/c.txt"), b"c\n");
+    let a = commit_both(&port_repo, &tool_repo, &one, "e");
+    let b = commit_both(&port_repo, &tool_repo, &two, "e");
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, &b]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &b, &a]);
+}
+
+/// A name that is a file on one side and a directory on the other is one
+/// modification, and the comparison does not descend into it.
+#[test]
+fn diff_type_change_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-type");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("y1");
+    write_at(&one.join("thing"), b"file form\n");
+    write_at(&one.join("other/inner"), b"i\n");
+    std::os::unix::fs::symlink("elsewhere", one.join("linked")).unwrap();
+    let two = base.join("y2");
+    write_at(&two.join("thing/inner"), b"dir form\n");
+    write_at(&two.join("other"), b"file form\n");
+    write_at(&two.join("linked/inner"), b"d\n");
+    let a = commit_both(&port_repo, &tool_repo, &one, "y");
+    let b = commit_both(&port_repo, &tool_repo, &two, "y");
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, &b]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &b, &a]);
+}
+
+/// The root directory's own metadata is outside the comparison.
+#[test]
+fn diff_root_metadata_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-root-meta");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("u1");
+    write_at(&one.join("f.txt"), b"a\n");
+    chmod_to(&one, 0o755);
+    let two = base.join("u2");
+    write_at(&two.join("f.txt"), b"a\n");
+    chmod_to(&two, 0o700);
+    let a = commit_both(&port_repo, &tool_repo, &one, "u");
+    let b = commit_both(&port_repo, &tool_repo, &two, "u");
+    assert_agrees(&port_repo, &tool_repo, &["ls", "-d", &a, "/"]);
+    assert_agrees(&port_repo, &tool_repo, &["ls", "-d", &b, "/"]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, &b]);
+}
+
+/// With one argument the first side is that argument with `^` appended, so
+/// `diff REV` compares the commit's parent against it and `diff REV^` compares
+/// the grandparent against the parent.
+#[test]
+fn diff_parent_form_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-parent");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("p1");
+    write_at(&one.join("f.txt"), b"one\n");
+    let two = base.join("p2");
+    write_at(&two.join("f.txt"), b"two\n");
+    let three = base.join("p3");
+    write_at(&three.join("f.txt"), b"three\n");
+    let a = commit_both(&port_repo, &tool_repo, &one, "base");
+    let b = commit_both(&port_repo, &tool_repo, &two, "base");
+    let c = commit_both(&port_repo, &tool_repo, &three, "base");
+
+    assert_agrees(&port_repo, &tool_repo, &["diff", &c]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", "base"]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &format!("{c}^")]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", "base^"]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &b]);
+    // A root commit has no parent, and both name it in the same words.
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &c]);
+}
+
+/// The four lines `--stats` writes over two differing commits, and what each
+/// flag combination prints.
+#[test]
+fn diff_stats_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-stats");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("s1");
+    write_at(&one.join("shared.txt"), b"shared\n");
+    write_at(&one.join("only-a.txt"), b"a\n");
+    write_at(&one.join("sub/leaf.txt"), b"leaf\n");
+    let two = base.join("s2");
+    write_at(&two.join("shared.txt"), b"shared\n");
+    write_at(&two.join("only-b.txt"), b"b\n");
+    write_at(&two.join("sub/leaf.txt"), b"leaf\n");
+    let a = commit_both(&port_repo, &tool_repo, &one, "s");
+    let b = commit_both(&port_repo, &tool_repo, &two, "s");
+
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, &b]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, &a]);
+    // Two commits sharing no object report a count and a size of zero.
+    let three = base.join("s3");
+    write_at(&three.join("nothing-in-common.txt"), b"z\n");
+    let c = commit_both(&port_repo, &tool_repo, &three, "z");
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, &c]);
+    // `--stats` alone writes no per-path line, and `--fs-diff` brings them
+    // back.
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--fs-diff", &a, &b]);
+}
+
+/// A commit counts its own objects alone: its parents and its detached
+/// metadata object are outside the set.
+#[test]
+fn diff_stats_object_set_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-stats-set");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("o1");
+    write_at(&one.join("f.txt"), b"one\n");
+    let two = base.join("o2");
+    write_at(&two.join("f.txt"), b"two\n");
+    let a = commit_both(&port_repo, &tool_repo, &one, "o");
+    let b = commit_both(&port_repo, &tool_repo, &two, "o");
+    // `b` carries `a` as its parent and still counts its own four objects.
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, &b]);
+
+    // A commit carrying detached metadata counts the same objects, the
+    // `.commitmeta` being outside the set.
+    let three = base.join("o3");
+    write_at(&three.join("f.txt"), b"three\n");
+    let args = [
+        "commit",
+        "-b",
+        "detached",
+        FIXED_TIMESTAMP,
+        "--add-detached-metadata-string=k=v",
+        three.to_str().unwrap(),
+    ];
+    let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+    assert_runs_agree(&port, &tool, &args.join(" "));
+    let d = port.ok().stdout_trimmed();
+    assert!(
+        port_repo
+            .join(format!("objects/{}/{}.commitmeta", &d[..2], &d[2..]))
+            .exists(),
+        "the detached metadata object was written"
+    );
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &d, &d]);
+}
+
+/// The per-path block is written before the stats block, whichever order the
+/// two flags carry.
+#[test]
+fn diff_stats_block_order_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-block-order");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("b1");
+    write_at(&one.join("f.txt"), b"one\n");
+    write_at(&one.join("gone.txt"), b"g\n");
+    let two = base.join("b2");
+    write_at(&two.join("f.txt"), b"two\n");
+    write_at(&two.join("added.txt"), b"a\n");
+    let a = commit_both(&port_repo, &tool_repo, &one, "b");
+    let b = commit_both(&port_repo, &tool_repo, &two, "b");
+
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--stats", "--fs-diff", &a, &b],
+    );
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--fs-diff", "--stats", &a, &b],
+    );
+}
+
+/// An `M` or a `D` path is named the way the first side names it and an `A`
+/// path the way the second does, and a directory side names a path with no
+/// leading separator.
+#[test]
+fn diff_path_rendering_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-render");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("r1");
+    write_at(&one.join("changed.txt"), b"one\n");
+    write_at(&one.join("gone.txt"), b"g\n");
+    let two = base.join("r2");
+    write_at(&two.join("changed.txt"), b"two\n");
+    write_at(&two.join("added.txt"), b"a\n");
+    let a = commit_both(&port_repo, &tool_repo, &one, "r");
+    let second = two.to_str().unwrap();
+
+    // The tree the commit was made from compares equal to it.
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, one.to_str().unwrap()]);
+    // A commit against a directory, and the reverse.
+    assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", &a, second]);
+    assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", second, &a]);
+    assert_diff_agrees_sorted(
+        &port_repo,
+        &tool_repo,
+        &["diff", one.to_str().unwrap(), second],
+    );
+    // A path that begins with neither `/` nor `./` is a revision, whatever the
+    // filesystem holds under that name. The two runs stand in the directory
+    // that holds `sub/dir`, so each argument names a directory the run can
+    // reach and the rule is the only thing that sends it to the ref store.
+    std::fs::create_dir_all(base.join("sub/dir")).unwrap();
+    for spelled in ["sub", "sub/dir"] {
+        let port = ostrya_in(
+            Some(base),
+            &["diff", "--repo", port_repo.to_str().unwrap(), &a, spelled],
+            None,
+            &[],
+        );
+        let tool = ostree_in(
+            base,
+            &["diff", "--repo", tool_repo.to_str().unwrap(), &a, spelled],
+        );
+        assert_runs_agree(&port, &tool, &format!("diff {a} {spelled}"));
+    }
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, "."]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, ".."]);
+    // `--stats` reads both arguments as revisions, whatever their spelling.
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--stats", &a, second]);
+}
+
+/// Both implementations name a directory side's entries in the order the
+/// directory returns them, which two copies of one tree need not share, so the
+/// line sets are what this compares.
+#[test]
+fn diff_directory_order_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-dir-order");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    // Two copies of one tree, the entries created in opposite orders.
+    let forward = base.join("f1");
+    let backward = base.join("f2");
+    let names = ["zz", "aa", "mm", "bb", "yy"];
+    for name in names {
+        write_at(&forward.join(name), b"same\n");
+    }
+    for name in names.iter().rev() {
+        write_at(&backward.join(*name), b"same\n");
+    }
+    write_at(&forward.join("d1/i"), b"i\n");
+    write_at(&backward.join("d1/i"), b"i\n");
+    assert_diff_agrees_sorted(
+        &port_repo,
+        &tool_repo,
+        &[
+            "diff",
+            forward.to_str().unwrap(),
+            backward.to_str().unwrap(),
+        ],
+    );
+
+    // An added subtree on a directory side expands in that side's own order.
+    let empty = base.join("f3");
+    std::fs::create_dir_all(&empty).unwrap();
+    let grown = base.join("f4");
+    write_at(&grown.join("new/z"), b"z\n");
+    write_at(&grown.join("new/sub/q"), b"q\n");
+    write_at(&grown.join("new/a"), b"a\n");
+    assert_diff_agrees_sorted(
+        &port_repo,
+        &tool_repo,
+        &["diff", empty.to_str().unwrap(), grown.to_str().unwrap()],
+    );
+    assert_diff_agrees_sorted(
+        &port_repo,
+        &tool_repo,
+        &["diff", grown.to_str().unwrap(), empty.to_str().unwrap()],
+    );
+}
+
+/// A device, a fifo, and a socket carry no prefix of their own: such an entry
+/// is `A` where it is on one side alone, and `M` where the other side holds a
+/// regular file of the same name or where its own metadata differs.
+#[test]
+fn diff_special_files_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-special");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("q1");
+    let two = base.join("q2");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    let fifos = [
+        one.join("same"),
+        two.join("same"),
+        two.join("onlyfifo"),
+        two.join("swap"),
+        one.join("perm"),
+        two.join("perm"),
+    ];
+    for path in &fifos {
+        if !make_fifo(path) {
+            eprintln!("skipped: `mkfifo` made no named pipe here");
+            return;
+        }
+    }
+    // A socket the second side alone holds.
+    let _socket = std::os::unix::net::UnixListener::bind(two.join("sock")).unwrap();
+    // A fifo against a regular file of the same name.
+    write_at(&one.join("swap"), b"regular\n");
+    // One fifo whose permission bits differ from the other side's.
+    chmod_to(&one.join("perm"), 0o644);
+    chmod_to(&two.join("perm"), 0o600);
+
+    assert_diff_agrees_sorted(
+        &port_repo,
+        &tool_repo,
+        &["diff", one.to_str().unwrap(), two.to_str().unwrap()],
+    );
+    assert_diff_agrees_sorted(
+        &port_repo,
+        &tool_repo,
+        &["diff", two.to_str().unwrap(), one.to_str().unwrap()],
+    );
+}
+
+/// `--no-xattrs` reads no extended attribute from a directory side, and it
+/// reaches both directory sides and neither commit side.
+#[test]
+fn diff_no_xattrs_reaches_both_sides() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-no-xattrs");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("x1");
+    write_at(&one.join("fx"), b"f\n");
+    std::fs::create_dir_all(one.join("dx")).unwrap();
+    let two = base.join("x2");
+    write_at(&two.join("fx"), b"f\n");
+    std::fs::create_dir_all(two.join("dx")).unwrap();
+    if !set_user_xattr(&one.join("fx"), "user.k", "first")
+        || !set_user_xattr(&one.join("dx"), "user.k", "first")
+        || !set_user_xattr(&two.join("fx"), "user.k", "second")
+        || !set_user_xattr(&two.join("dx"), "user.k", "second")
+    {
+        eprintln!("skipped: the filesystem takes no user extended attribute");
+        return;
+    }
+    let a = commit_both(&port_repo, &tool_repo, &one, "x");
+    let b = commit_both(&port_repo, &tool_repo, &two, "x");
+    let first = one.to_str().unwrap();
+    let second = two.to_str().unwrap();
+
+    // Two commits carry the attributes they were committed with, so the switch
+    // changes nothing there.
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, &b]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--no-xattrs", &a, &b]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--no-xattrs", &a, &a]);
+    // The switch strips a directory side, so the stripped side then parts from
+    // the commit that carries the attributes.
+    assert_agrees(&port_repo, &tool_repo, &["diff", first, &a]);
+    assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", "--no-xattrs", first, &a]);
+    assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", "--no-xattrs", &a, first]);
+    // It strips both directory sides, so two directories differing in one
+    // attribute alone report nothing under it.
+    assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", first, second]);
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--no-xattrs", first, second],
+    );
+}
+
+/// `--owner-uid` and `--owner-gid` reach the second argument alone, and only
+/// where that argument is a directory.
+#[test]
+fn diff_owner_override_side_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-owner");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let tree = base.join("w1");
+    write_at(&tree.join("f.txt"), b"one\n");
+    write_at(&tree.join("sub/leaf.txt"), b"leaf\n");
+    std::os::unix::fs::symlink("target", tree.join("link")).unwrap();
+    let a = commit_both(&port_repo, &tool_repo, &tree, "w");
+    let path = tree.to_str().unwrap();
+
+    // The tree the commit was made from compares equal to it until an
+    // override reaches the second side.
+    assert_agrees(&port_repo, &tool_repo, &["diff", &a, path]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-uid=0", &a, path]);
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-gid=0", &a, path]);
+    // The first side is unaffected, so the same override the other way round
+    // reports nothing.
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-uid=0", path, &a]);
+    // Two commit sides ignore it.
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-uid=0", &a, &a]);
+    // With two directory sides it still reaches one, so a directory compared
+    // against itself reports every entry.
+    assert_diff_agrees_sorted(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--owner-uid=0", path, path],
+    );
+    // A negative value declares nothing, and the C `int` dialect reaches the
+    // command.
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--owner-uid=-1", &a, path],
+    );
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--owner-uid=0x10", "--owner-gid=0x10", &a, path],
+    );
+    // A repeated value option takes the last occurrence in both.
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--owner-uid=5", "--owner-uid=0", &a, path],
+    );
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--owner-gid=5", "--owner-gid=0", &a, path],
+    );
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--owner-uid=0", "--owner-uid=-1", &a, path],
+    );
+    // A value neither reader can hold is refused in the same words.
+    assert_agrees(&port_repo, &tool_repo, &["diff", "--owner-uid=abc", &a, &a]);
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", "--owner-gid=2147483648", &a, &a],
+    );
+}
+
+/// One pair of directories, read by both implementations, holds the port to the
+/// order the directories return their entries in and to the `M`, `D`, `A`
+/// grouping. The two runs read the same two directories, so the order is not
+/// the port's own choice and the comparison can be exact.
+#[test]
+fn diff_directory_side_order_is_exact() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-dir-exact");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("k1");
+    write_at(&one.join("dir_same/inner"), b"i\n");
+    write_at(&one.join("dir_mode/inner"), b"i\n");
+    write_at(&one.join("dir_gone/inner"), b"g\n");
+    write_at(&one.join("dir_grow/keep"), b"k\n");
+    write_at(&one.join("zz_content"), b"one\n");
+    write_at(&one.join("aa_same"), b"same\n");
+    write_at(&one.join("mm_gone"), b"m\n");
+    std::os::unix::fs::symlink("old", one.join("link_change")).unwrap();
+    chmod_to(&one.join("dir_mode"), 0o755);
+
+    let two = base.join("k2");
+    write_at(&two.join("dir_same/inner"), b"i\n");
+    write_at(&two.join("dir_mode/inner"), b"i\n");
+    write_at(&two.join("dir_grow/keep"), b"k\n");
+    write_at(&two.join("dir_grow/added_inner"), b"a\n");
+    write_at(&two.join("zz_content"), b"two\n");
+    write_at(&two.join("aa_same"), b"same\n");
+    std::os::unix::fs::symlink("new", two.join("link_change")).unwrap();
+    write_at(&two.join("yy_added"), b"y\n");
+    write_at(&two.join("dir_added/nested/leaf"), b"l\n");
+    chmod_to(&two.join("dir_mode"), 0o700);
+
+    let args = ["diff", one.to_str().unwrap(), two.to_str().unwrap()];
+    let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+    assert_runs_agree(&port, &tool, &args.join(" "));
+
+    // The claim is the order, so the run must name paths in an order sorting
+    // would change. `A` sorts ahead of `D` ahead of `M`, and the run carries
+    // all three groups.
+    let text = String::from_utf8_lossy(&port.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut sorted = lines.clone();
+    sorted.sort_unstable();
+    assert_ne!(
+        lines, sorted,
+        "the fixture named its paths in sorted order, so the comparison holds no order:\n{text}"
+    );
+}
+
+/// A name the two sides hold at two kinds is one modification reached from the
+/// listing alone, so neither side is opened and an entry no read can reach does
+/// not end the run.
+#[test]
+fn diff_type_change_over_an_unreadable_entry_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-unreadable");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    // A run that reads a mode-0 entry states nothing about this case.
+    let probe = base.join("probe");
+    std::fs::write(&probe, b"x").unwrap();
+    chmod_to(&probe, 0o000);
+    if std::fs::File::open(&probe).is_ok() {
+        eprintln!("skipped: this run reads a mode-0 entry");
+        return;
+    }
+
+    // A regular file against a directory no read can enter.
+    let one = base.join("t1");
+    write_at(&one.join("n"), b"file form\n");
+    write_at(&one.join("other"), b"one\n");
+    let two = base.join("t2");
+    write_at(&two.join("n/inner"), b"dir form\n");
+    write_at(&two.join("other"), b"two\n");
+    chmod_to(&two.join("n"), 0o000);
+
+    // A regular file no read can open against a symlink.
+    let three = base.join("t3");
+    write_at(&three.join("n"), b"file form\n");
+    let four = base.join("t4");
+    std::fs::create_dir_all(&four).unwrap();
+    std::os::unix::fs::symlink("target", four.join("n")).unwrap();
+    chmod_to(&three.join("n"), 0o000);
+
+    let first = one.to_str().unwrap();
+    let second = two.to_str().unwrap();
+    assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", first, second]);
+    assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", second, first]);
+    assert_diff_agrees_sorted(
+        &port_repo,
+        &tool_repo,
+        &["diff", three.to_str().unwrap(), four.to_str().unwrap()],
+    );
+
+    // A commit side against a directory holding the same name at another kind.
+    let five = base.join("t5");
+    write_at(&five.join("n"), b"file form\n");
+    let a = commit_both(&port_repo, &tool_repo, &five, "unreadable");
+    assert_diff_agrees_sorted(&port_repo, &tool_repo, &["diff", &a, second]);
+
+    // The unreadable entry is restored so the temporary directory can be
+    // removed.
+    chmod_to(&two.join("n"), 0o755);
+    chmod_to(&three.join("n"), 0o644);
+    chmod_to(&probe, 0o644);
+}
+
+/// An entry name and a symlink target that are not valid UTF-8 are listed,
+/// descended into, and carried to the end of the run. The port renders an
+/// invalid byte as U+FFFD, which `docs/conformance/cli-surface.md`, "P2",
+/// records.
+#[test]
+fn diff_non_utf8_names_do_not_end_the_run() {
+    if !ostree_available() {
+        return;
+    }
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = TmpDir::new("diff-non-utf8");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let raw = |parent: &Path, bytes: &[u8]| -> PathBuf {
+        parent.join(std::ffi::OsStr::from_bytes(bytes))
+    };
+    let one = base.join("u1");
+    let two = base.join("u2");
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    // A file of one invalid name whose content differs, a directory of another
+    // invalid name holding a changed file and an added one, and one valid name
+    // that changes.
+    write_at(&raw(&one, b"\xffname"), b"one\n");
+    write_at(&raw(&two, b"\xffname"), b"two\n");
+    write_at(&raw(&one, b"\xfedir").join("inner"), b"one\n");
+    write_at(&raw(&two, b"\xfedir").join("inner"), b"two\n");
+    write_at(&raw(&two, b"\xfedir").join("added"), b"a\n");
+    write_at(&one.join("plain"), b"one\n");
+    write_at(&two.join("plain"), b"two\n");
+
+    let args = ["diff", one.to_str().unwrap(), two.to_str().unwrap()];
+    let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+    assert_eq!(port.status.code(), Some(0), "the port ended the run");
+    assert_eq!(tool.status.code(), Some(0), "the tool ended the run");
+    assert_eq!(
+        String::from_utf8_lossy(&port.stderr),
+        "",
+        "the port wrote to standard error"
+    );
+    let count = |run: &Run| String::from_utf8_lossy(&run.stdout).lines().count();
+    assert_eq!(
+        count(&port),
+        count(&tool),
+        "the two named a different number of paths"
+    );
+    let text = String::from_utf8_lossy(&port.stdout).into_owned();
+    assert!(
+        text.lines().any(|line| line == "M    plain"),
+        "the valid name was not reported:\n{text}"
+    );
+    assert_eq!(
+        text.lines().filter(|line| line.starts_with('A')).count(),
+        1,
+        "the added entry below the invalid directory name was not reported:\n{text}"
+    );
+
+    // A symlink target that is not valid UTF-8 is carried the same way. The
+    // tool writes GLib criticals to standard error here, so the claim is the
+    // exit status and the paths standard output names.
+    let three = base.join("u3");
+    let four = base.join("u4");
+    std::fs::create_dir_all(&three).unwrap();
+    std::fs::create_dir_all(&four).unwrap();
+    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(b"\xfftarget"), three.join("l"))
+        .unwrap();
+    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(b"\xfftarget"), four.join("l")).unwrap();
+    write_at(&three.join("plain"), b"one\n");
+    write_at(&four.join("plain"), b"two\n");
+    let args = ["diff", three.to_str().unwrap(), four.to_str().unwrap()];
+    let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+    assert_eq!(port.status.code(), Some(0), "the port ended the run");
+    assert_eq!(tool.status.code(), Some(0), "the tool ended the run");
+    assert_eq!(
+        String::from_utf8_lossy(&port.stdout),
+        String::from_utf8_lossy(&tool.stdout),
+        "one invalid target on each side named other paths"
+    );
+}
+
+/// Modification time is outside the comparison.
+#[test]
+fn diff_mtime_is_not_compared() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("diff-mtime");
+    let base = tmp.path();
+    let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Bare);
+
+    let one = base.join("m1");
+    write_at(&one.join("f.txt"), b"same\n");
+    let two = base.join("m2");
+    write_at(&two.join("f.txt"), b"same\n");
+    for (path, secs) in [(&one, 978_307_200_u64), (&two, 1_591_401_600)] {
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        let times = std::fs::FileTimes::new()
+            .set_accessed(when)
+            .set_modified(when);
+        std::fs::File::options()
+            .write(true)
+            .open(path.join("f.txt"))
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+    }
+    assert_agrees(
+        &port_repo,
+        &tool_repo,
+        &["diff", one.to_str().unwrap(), two.to_str().unwrap()],
+    );
+}

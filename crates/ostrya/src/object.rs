@@ -156,16 +156,19 @@ pub(crate) fn read_all_xattrs(fd: rustix::fd::BorrowedFd<'_>) -> Result<Xattrs> 
     collect_xattrs(names, |name| read_xattr(fd, name))
 }
 
-/// Read a symlink's own extended attributes -- the link itself, not its
-/// target -- relative to a directory fd. A symlink cannot be opened for an fd,
-/// so the fd-based [`read_all_xattrs`] cannot reach it; this addresses the link
-/// no-follow through `/proc/self/fd` and reads it with the path-based `l` xattr
-/// calls.
-pub(crate) fn read_link_xattrs(dir: rustix::fd::BorrowedFd<'_>, name: &str) -> Result<Xattrs> {
-    let link = proc_fd_path(dir, name);
+/// Read one entry's own extended attributes -- the entry itself, not the target
+/// of a symlink -- relative to a directory fd. A symlink cannot be opened for an
+/// fd, so the fd-based [`read_all_xattrs`] cannot reach it; this addresses the
+/// entry no-follow through `/proc/self/fd` and reads it with the path-based `l`
+/// xattr calls. `name` may name an entry several directories below `dir`.
+pub(crate) fn read_link_xattrs(
+    dir: rustix::fd::BorrowedFd<'_>,
+    name: impl AsRef<std::ffi::OsStr>,
+) -> Result<Xattrs> {
+    let link = proc_fd_path(dir, name.as_ref());
     let mut names_buf = vec![0u8; 256];
     let names = loop {
-        match rustix::fs::llistxattr(link.as_str(), &mut names_buf[..]) {
+        match rustix::fs::llistxattr(&link, &mut names_buf[..]) {
             Ok(n) => break &names_buf[..n],
             Err(Errno::RANGE) => {
                 let grown = names_buf.len().saturating_mul(2).max(512);
@@ -175,13 +178,13 @@ pub(crate) fn read_link_xattrs(dir: rustix::fd::BorrowedFd<'_>, name: &str) -> R
             Err(e) => return Err(Error::Io(e.into())),
         }
     };
-    collect_xattrs(names, |xname| read_link_xattr(link.as_str(), xname))
+    collect_xattrs(names, |xname| read_link_xattr(&link, xname))
 }
 
-/// Read one extended attribute of a symlink addressed by a `/proc/self/fd`
+/// Read one extended attribute of an entry addressed by a `/proc/self/fd`
 /// path, no-follow, or `None` when the attribute is absent. Mirrors
 /// [`read_xattr`] with the path-based `lgetxattr`.
-fn read_link_xattr(link: &str, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+fn read_link_xattr(link: &std::path::Path, name: &str) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf = vec![0u8; 256];
     loop {
         match rustix::fs::lgetxattr(link, name, &mut buf[..]) {
@@ -226,9 +229,12 @@ fn collect_xattrs(
 
 /// The `/proc/self/fd/<dirfd>/<name>` path addressing `name` relative to a
 /// directory fd. The path-based no-follow xattr calls reach a symlink this way,
-/// since a symlink cannot be opened for an fd.
-fn proc_fd_path(dir: rustix::fd::BorrowedFd<'_>, name: &str) -> String {
-    format!("/proc/self/fd/{}/{}", dir.as_raw_fd(), name)
+/// since a symlink cannot be opened for an fd, and they reach an entry of any
+/// other kind without opening it.
+fn proc_fd_path(dir: rustix::fd::BorrowedFd<'_>, name: &std::ffi::OsStr) -> std::path::PathBuf {
+    let mut path = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    path.push(name);
+    path
 }
 
 #[cfg(test)]

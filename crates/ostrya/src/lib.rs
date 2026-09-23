@@ -77,8 +77,11 @@
 //! naming it in [`PruneStats::deleted_refs`],
 //! [`Repo::fsck`] ([`FsckOptions`]/[`FsckReport`]) which
 //! verifies object integrity and completeness and marks incomplete commits
-//! partial, and [`Repo::diff_commits`] ([`DiffEntry`]/[`DiffChange`]) which
-//! reports the paths that changed between two commits. It also covers
+//! partial, [`Repo::diff`] ([`DiffSide`]/[`DiffOptions`]/[`DiffEntry`]/
+//! [`DiffChange`]) which reports the paths that changed between two commits or
+//! between a commit and a directory on the filesystem, and
+//! [`Repo::diff_stats`] ([`DiffStats`]) which reports the object counts and
+//! the shared size of two commits. It also covers
 //! repository fs-verity (Phase pre13): with `[ex-integrity] fsverity` set to
 //! `maybe` or `yes` (see [`RepoConfig::fsverity`] and [`Tristate`]), each loose
 //! object stored as a regular file is sealed with fs-verity as it is staged,
@@ -232,7 +235,7 @@ pub use commit::CommitOptions;
 pub use composefs::{ComposefsOptions, VerityPolicy};
 pub use config::{MinFreeSpace, Remote, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate};
 pub use deltagen::DeltaOptions;
-pub use diff::{DiffChange, DiffEntry};
+pub use diff::{DiffChange, DiffEntry, DiffOptions, DiffSide, DiffStats};
 pub use error::{Error, Result};
 pub use fetch::{
     BasicAuth, Body, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, Priority,

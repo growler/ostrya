@@ -5271,3 +5271,159 @@ of those ends the run where it stands. The port's walk runs to the end whatever
 the switches say, so it reads `-a` as the permission `--add-tombstones` needs
 to act after a walk that found a corrupt object, and it ends a run at the same
 three conditions. `-a` changes no exit status in either implementation.
+
+### `diff`
+
+The command compares two sides and writes the paths that changed. A side is a
+commit in the repository or a directory on the filesystem.
+
+The per-path lines and the stats block go to standard output, and every
+`error: ` line goes to standard error. A run that compares two readable sides
+exits 0, whether or not it found a difference.
+
+#### The per-path line
+
+```
+<prefix><four spaces><path>
+```
+
+The prefix is one of three characters, and there is no fourth.
+
+- `A` -- the path is on the second side alone.
+- `D` -- the path is on the first side alone.
+- `M` -- the path is on both sides and its stored form differs.
+
+#### What a change is
+
+`M` covers a content change, a mode change, an ownership change, an extended
+attribute change, a symlink target change, a directory metadata change, and a
+name whose type differs between the two sides. Modification time is outside the
+comparison.
+
+For a commit side the comparison reads the checksums the directory tree objects
+hold, so no payload is read.
+
+- A regular file or a symlink differs where its content object checksum
+  differs. That checksum covers the uid, the gid, the mode, the extended
+  attributes, the symlink target, and the payload.
+- A directory differs where its directory metadata checksum differs. That
+  checksum covers the uid, the gid, the mode, and the extended attributes.
+- A device node, a fifo, and a socket carry no prefix of their own. Such an
+  entry is `A` where it is on one side alone, and `M` where the other side
+  holds a regular file or a symlink of the same name. Two of them of one name
+  differ where their mode differs. The kernel takes a `user.*` extended
+  attribute on a regular file and a directory alone, and a uid and a gid need
+  privilege to set, so the mode is the one field of such a pair an unprivileged
+  run varies and the one this reference states.
+- A name held by a directory on one side and by a file on the other differs,
+  and the comparison does not descend into it.
+
+The root directory's own metadata is outside the comparison.
+
+A directory side is read as the filesystem holds it, so a repository whose mode
+reduces what a commit records -- `bare-user-only` -- compares its reduced
+objects against the full form the directory carries.
+
+A directory side names an entry with the bytes the directory returned, so a
+name that is not valid UTF-8 is listed, descended into, and written to standard
+output as those bytes. A symlink target that is not valid UTF-8 reaches the
+comparison as one value, so two such targets of one name compare equal and a
+valid target differs from every one of them.
+
+#### The groups and the order
+
+A run collects three lists and prints them in the order `M`, `D`, `A`. Within
+one list the order is the order the walk found the entries.
+
+The walk starts at the two root directories and, at each pair of directories of
+one name, runs two passes.
+
+1. The first pass reads the first side's entries in that side's own order. An
+   entry the second side does not hold is `D`, and a removed directory's former
+   children are not listed. An entry both sides hold whose stored form differs
+   is `M`. Where both sides hold a directory of that name, the pass descends
+   into the pair where it stands, before it reads the first side's next entry.
+2. The second pass reads the second side's entries in that side's own order. An
+   entry the first side does not hold is `A`. An added directory lists itself,
+   then its own entries in that side's order, descending into each
+   subdirectory where it stands.
+
+A side's own order is:
+
+- for a commit side, the files of the directory in stored order, then the
+  subdirectories of the directory in stored order. Both arrays a directory tree
+  object holds are sorted by name, so the order is the file names sorted
+  followed by the subdirectory names sorted;
+- for a directory side, the order the directory returns its entries in, with
+  files and subdirectories interleaved as the directory returns them.
+
+#### How a path prints
+
+An `M` or a `D` path is named the way the first side names it. An `A` path is
+named the way the second side names it. A commit side names a path with a
+leading `/`. A directory side names a path relative to the directory the
+argument gave, with no leading separator.
+
+#### The stats block
+
+```
+[A] Object Count: <count>
+[B] Object Count: <count>
+Common Object Count: <count>
+Common Object Size: <size>
+```
+
+`[A]` and `[B]` are literal. The first two counts are the size of each commit's
+own object set. That set holds the commit object, the root directory metadata
+object, every directory tree object, every further directory metadata object,
+and every content object the commit's tree reaches. It holds neither the
+commit's parents nor its detached metadata object.
+
+`Common Object Count` is the size of the intersection of the two sets.
+`Common Object Size` is the sum of the on-disk sizes of the loose object files
+of that intersection, so an `archive` repository counts the compressed size and
+a `bare` repository counts the payload size. The rendering is the one the
+`prune` totals line uses, stated under `prune` above: below 1000 bytes the
+count, a space, and `byte` or `bytes`; at 1000 and above the count divided by
+the largest power of 1000 that leaves it at or above 1, one fractional digit,
+U+00A0, and the unit. An empty intersection prints `0 bytes`.
+
+#### The arguments
+
+The command takes one or two positional arguments.
+
+An argument is a directory on the filesystem where it begins with `/` or with
+`./`, and a revision otherwise. The rule reads the argument's spelling alone, so
+an existing directory named by a relative path without `./` is read as a
+revision, and `.` and `..` are revisions.
+
+With one argument, the first side is that argument with `^` appended and the
+second side is the argument as given. The classification rule above is applied
+to the appended form.
+
+`--stats` reads both arguments as revisions, whatever their spelling, so a
+directory side is refused there. The per-path block is written in full before
+the stats pass runs, so a run carrying both `--fs-diff` and a directory side
+writes the block and then the refusal.
+
+#### The options
+
+- `--stats` -- print the stats block.
+- `--fs-diff` -- print the per-path block.
+- `--no-xattrs` -- read no extended attributes from a directory side. It
+  reaches both directory sides and neither commit side.
+- `--owner-uid=UID` -- give the entries of the second side the user id `UID`,
+  where that side is a directory. It reaches neither the first side nor a
+  commit side. A negative value declares nothing. The value is read as a C
+  `int`, the reader `commit` above states in full.
+- `--owner-gid=GID` -- the same for the group id.
+
+With neither `--stats` nor `--fs-diff`, the per-path block prints. With
+`--stats` and no `--fs-diff`, it does not. With `--stats`, the stats block
+prints after the per-path block, whatever order the two flags were given in.
+
+#### Exit status
+
+- 0 -- both sides were read, whether or not a difference was found.
+- 1 -- a side that cannot be read, a revision that does not resolve, and an
+  object the store cannot supply.

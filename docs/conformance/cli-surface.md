@@ -1986,8 +1986,58 @@ standing over it, so repeated runs walk a broken branch backwards one commit
 per run until the ref cannot resolve. The port reproduces that: the object
 inventory is the oracle and the port writes the bytes the tool writes.
 
-`diff` accepts `--repo`. Missing: `--stats`, `--fs-diff`, `--no-xattrs`,
-`--owner-uid=UID`, `--owner-gid=GID`.
+`diff` accepts `--repo`, `--stats`, `--fs-diff`, `--no-xattrs`,
+`--owner-uid=UID`, and `--owner-gid=GID`. Ten differences stand.
+
+- a third positional argument. The tool accepts one and ignores it; `clap`
+  refuses it with `error: unexpected argument '<value>' found` at exit 1. This
+  is the class already recorded for the other commands;
+- a repeated boolean flag. The tool takes a second `--stats`, `--fs-diff`, or
+  `--no-xattrs`; the port refuses it with `error: the argument '<flag>' cannot
+  be used multiple times` at exit 1. This is the repeated-boolean-flag class
+  already recorded for `export --no-xattrs` and the four `prune` flags;
+- the order of a directory side's lines. Both implementations name the entries
+  in the order the directory returns them, so the two agree wherever the two
+  copies of one tree are returned in one order and part where they are not.
+  This is the hash-container carve-out of `CLAUDE.md`, "CLI compatibility is
+  functional, not literal". A cited test that builds two copies of one tree
+  sorts both sides before comparing; a cited test that reads one pair of
+  directories through both implementations compares the lines as they stand,
+  since the order is then the directories' own;
+- the wording of a directory side's read failure. The tool writes `Error when
+  getting information for file “<path>”: No such file or directory`, `Error
+  opening file <path>: Permission denied`, and `Error opening directory
+  '<path>': Permission denied`, each naming the lexically absolute path; the
+  port writes its own sentence naming the call and the path as the command line
+  spelled it. Both exit 1 and write no object;
+- a path argument naming a regular file. The tool opens it as a directory and,
+  where the file is the second side, reports the first child it queried, so its
+  message names a path that was never given (`“<file>/<first entry of the other
+  side>”: Not a directory`); where the file is the first side it names the
+  argument. The port names the argument in both positions. Both exit 1;
+- a `--stats` run over a repository missing a content object. The tool writes
+  the three count lines and then `error: Querying object <checksum>.file: No
+  such file or directory`; the port writes no line of the block, `Repo::diff_stats`
+  returning the counts and the size together. Both exit 1 and change nothing on
+  disk;
+- `-v`. The tool writes `OT: ` trace lines to standard error and leaves
+  standard output unchanged. The port's `-v` writes its own lines. This is the
+  class already recorded for `prune`;
+- an extended attribute whose value is zero bytes long, on a directory side.
+  The tool's reader drops such an attribute and the port keeps it, so the port
+  reports a modification the tool does not. Two directories differing in one
+  such attribute alone report `M` in the port and nothing in the tool, and no
+  ingest takes place on either side. The same rule at ingest is recorded in
+  `m0-content.matrix`, row `C4`, and left undecided there;
+- the rendering of a directory side's entry name that is not valid UTF-8. The
+  tool writes the bytes the directory returned; the port writes U+FFFD for each
+  invalid byte, `DiffEntry::path` being a `String`. Both list the entry, descend
+  into it, report every other change, and exit 0;
+- a symlink target that is not valid UTF-8, on a directory side. The tool reads
+  every such target as one value, so two of them of one name report nothing and
+  it writes two GLib criticals to standard error; the port compares the bytes,
+  so two targets that differ report `M`. A valid target held against one that is
+  not valid UTF-8 reports `M` in both.
 
 `summary` accepts `--repo`, `-u/--update`, `--verify`, `-s/--sign-type`, and the
 port extensions `--last-modified`, `--metadata-commit-timestamp`, `--keys-file`,
@@ -2562,13 +2612,13 @@ Observed by running the tool (2026.1).
 
 A script reads standard output, so the format is part of the surface. The
 formats of `commit`, including its `--table-output` block, `refs`, `rev-parse`,
-`cat`, `show`, `log`, `ls`, `config get`, `prune`, and `fsck`, together with the
+`cat`, `show`, `log`, `ls`, `config get`, `prune`, `fsck`, and `diff`, together
+with the
 GVariant text form the reading commands share,
 are recovered and recorded in `../format-reference.md`, "CLI output formats" and
 "The GVariant text form". Each format below still needs a black-box observation
 pass, and the results belong in that same section.
 
-- `diff`, including the per-path change prefixes and `--stats`.
 - `summary -v`, `--raw`, and `--list-metadata-keys`, whose formats are the ones
   `remote summary` reports and whose flags the local command still lacks.
 - `static-delta list`, `show`, and `indexes`.

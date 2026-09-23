@@ -33,7 +33,8 @@
 //!   remote's refs and summary, and manage a remote's trusted GPG keys.
 //! - `prune` -- delete unreachable objects.
 //! - `fsck` -- verify object integrity and completeness.
-//! - `diff` -- report the paths that changed between two commits.
+//! - `diff` -- report the paths that changed between two revisions, or
+//!   between a revision and a directory.
 //! - `sign` -- add, verify, or delete commit signatures under one of the
 //!   ed25519, spki, or gpg engines.
 //! - `summary` -- regenerate, sign, or verify the repository summary.
@@ -61,14 +62,14 @@ use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
     CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags, CommitOptions,
     ComposefsOptions, CreateOptions, DeltaOptions, DetachedMetadataFilter, DevInoCache,
-    DictBuilder, DiffChange, Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject,
-    FilterResult, FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure,
-    FsckOptions, FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags,
-    PullOptions, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, SignatureInfo,
-    Signer, Summary, SummaryOptions, SummaryRef, TarExportOptions, TarImportOptions,
-    TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome,
-    VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text,
-    to_text_unannotated, validate_refspec,
+    DictBuilder, DiffChange, DiffOptions, DiffSide, Ed25519Signer, Ed25519Verifier, Error,
+    FileKind, FileMeta, FileObject, FilterResult, FsckBindingError, FsckBindingErrorKind,
+    FsckError, FsckErrorKind, FsckFailure, FsckOptions, FsckPhase, MutableTree, ObjectType,
+    OverwriteMode, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias, Repo,
+    RepoMode, RepoTree, Result, SignatureInfo, Signer, Summary, SummaryOptions, SummaryRef,
+    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
+    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
+    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier};
@@ -135,7 +136,8 @@ enum Command {
     Prune(PruneArgs),
     /// Verify object integrity and completeness across every commit.
     Fsck(FsckArgs),
-    /// Report the paths that changed between two commits.
+    /// Report the paths that changed between two revisions, or between a
+    /// revision and a directory.
     Diff(DiffArgs),
     /// Add, verify, or delete signatures on a commit.
     Sign(SignArgs),
@@ -849,13 +851,37 @@ struct FsckArgs {
 
 #[derive(Args)]
 struct DiffArgs {
-    /// The first revision. With no second revision, its parent is compared
-    /// against it. Required; checked after the repository resolves, matching
-    /// the tool's error-ordering (`docs/conformance/cli-surface.md`, "Global
-    /// conventions").
+    /// Print various statistics.
+    #[arg(long)]
+    stats: bool,
+    /// Print filesystem diff.
+    #[arg(long)]
+    fs_diff: bool,
+    /// Skip output of extended attributes.
+    #[arg(long)]
+    no_xattrs: bool,
+    /// Use file ownership user id for local files.
+    #[arg(
+        long,
+        value_name = "UID",
+        allow_hyphen_values = true,
+        overrides_with = "owner_uid"
+    )]
+    owner_uid: Option<String>,
+    /// Use file ownership group id for local files.
+    #[arg(
+        long,
+        value_name = "GID",
+        allow_hyphen_values = true,
+        overrides_with = "owner_gid"
+    )]
+    owner_gid: Option<String>,
+    /// The first revision or directory. With no second argument, this argument
+    /// with `^` appended is compared against it. Required; checked after the
+    /// repository resolves, matching the tool's error-ordering
+    /// (`docs/conformance/cli-surface.md`, "Global conventions").
     from: Option<String>,
-    /// The second revision; when omitted, `from` is compared against its
-    /// parent.
+    /// The second revision or directory.
     to: Option<String>,
 }
 
@@ -1278,8 +1304,15 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             fsck(repo, args).await
         }
         Command::Diff(args) => {
+            // `--owner-uid` and `--owner-gid` are read while the options are
+            // read here too, so a value the reader refuses stands ahead of the
+            // repository (`docs/format-reference.md`, "CLI output formats").
+            let owner = Owner {
+                uid: owner_id(args.owner_uid.as_deref(), "--owner-uid"),
+                gid: owner_id(args.owner_gid.as_deref(), "--owner-gid"),
+            };
             let (repo, _) = resolve_repo(repo, verbose, name).await;
-            diff(repo, name, args).await
+            diff(repo, name, args, owner).await
         }
         Command::Sign(args) => {
             let (repo, path) = resolve_repo(repo, verbose, name).await;
@@ -6571,32 +6604,102 @@ fn fsck_error_text(error: &Error) -> String {
     }
 }
 
-async fn diff(repo: Repo, name: &str, args: DiffArgs) -> Result<()> {
-    let Some(from_rev) = args.from.as_deref() else {
+/// One `REV_OR_DIR` argument, read as the rule of
+/// `docs/format-reference.md`, "CLI output formats", `diff` states it.
+enum DiffArgSide {
+    /// A commit the argument resolved to.
+    Commit(Checksum),
+    /// A directory on the filesystem.
+    Directory(PathBuf),
+}
+
+impl DiffArgSide {
+    /// The library side this argument names.
+    fn as_side(&self) -> DiffSide<'_> {
+        match self {
+            DiffArgSide::Commit(checksum) => DiffSide::Commit(checksum),
+            DiffArgSide::Directory(path) => DiffSide::Directory(path),
+        }
+    }
+
+    /// Whether the side names a path relative to a directory, which decides
+    /// how a path it owns prints.
+    fn is_directory(&self) -> bool {
+        matches!(self, DiffArgSide::Directory(_))
+    }
+}
+
+/// A `REV_OR_DIR` argument names a directory where it begins with `/` or with
+/// `./`, and a revision otherwise. The rule reads the spelling alone, so an
+/// existing directory named by a relative path without `./` is read as a
+/// revision (`docs/format-reference.md`, "CLI output formats", `diff`).
+fn diff_side_is_directory(argument: &str) -> bool {
+    argument.starts_with('/') || argument.starts_with("./")
+}
+
+/// Read one `REV_OR_DIR` argument.
+async fn diff_arg_side(repo: &Repo, argument: &str) -> Result<DiffArgSide> {
+    if diff_side_is_directory(argument) {
+        Ok(DiffArgSide::Directory(PathBuf::from(argument)))
+    } else {
+        Ok(DiffArgSide::Commit(resolve(repo, argument).await?))
+    }
+}
+
+/// The character each change prints.
+fn diff_prefix(change: DiffChange) -> char {
+    match change {
+        DiffChange::Added => 'A',
+        DiffChange::Removed => 'D',
+        DiffChange::Modified => 'M',
+    }
+}
+
+async fn diff(repo: Repo, name: &str, args: DiffArgs, owner: Owner) -> Result<()> {
+    let Some(first) = args.from.as_deref() else {
         exit_with_error(name, "REV must be specified");
     };
-    let (from, to) = match args.to.as_deref() {
-        Some(second) => (
-            resolve(&repo, from_rev).await?,
-            resolve(&repo, second).await?,
-        ),
-        None => {
-            // With one revision, compare its parent against it.
-            let rev = resolve(&repo, from_rev).await?;
-            let (commit, _) = repo.load_commit(&rev).await?;
-            let parent = commit.parent.ok_or_else(|| {
-                Error::InvalidFormat("commit has no parent to diff against".into())
-            })?;
-            (parent, rev)
-        }
+    // With one argument the first side is that argument with `^` appended, so
+    // the parent condition carries the resolution wording every subcommand
+    // taking a revision gives.
+    let (from_text, to_text) = match args.to.as_deref() {
+        Some(second) => (first.to_owned(), second.to_owned()),
+        None => (format!("{first}^"), first.to_owned()),
     };
-    for entry in repo.diff_commits(&from, &to).await? {
-        let code = match entry.change {
-            DiffChange::Added => 'A',
-            DiffChange::Removed => 'D',
-            DiffChange::Modified => 'M',
+
+    // The per-path block is written in full before the stats pass runs, so a
+    // run carrying both writes the block and then the stats pass's refusal.
+    if args.fs_diff || !args.stats {
+        let options = DiffOptions {
+            skip_xattrs: args.no_xattrs,
+            owner_uid: owner.uid,
+            owner_gid: owner.gid,
         };
-        println!("{code}    {}", entry.path);
+        let from = diff_arg_side(&repo, &from_text).await?;
+        let to = diff_arg_side(&repo, &to_text).await?;
+        for entry in repo.diff(from.as_side(), to.as_side(), &options).await? {
+            let owning_side = match entry.change {
+                DiffChange::Added => &to,
+                DiffChange::Removed | DiffChange::Modified => &from,
+            };
+            let rendered = if owning_side.is_directory() {
+                entry.path.strip_prefix('/').unwrap_or(&entry.path)
+            } else {
+                entry.path.as_str()
+            };
+            println!("{}    {rendered}", diff_prefix(entry.change));
+        }
+    }
+
+    // `--stats` reads both arguments as revisions, whatever their spelling.
+    if args.stats {
+        let from = resolve(&repo, &from_text).await?;
+        let to = resolve(&repo, &to_text).await?;
+        let stats = repo.diff_stats(&from, &to).await?;
+        println!("[A] Object Count: {}", stats.from_objects);
+        println!("[B] Object Count: {}", stats.to_objects);
+        println!("Common Object Count: {}", stats.common_objects);
+        println!("Common Object Size: {}", format_size(stats.common_bytes));
     }
     Ok(())
 }

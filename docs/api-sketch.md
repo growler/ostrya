@@ -2004,6 +2004,67 @@ impl Repo {
     /// The stored deltas, each named as the tool names it: the target commit
     /// hex, or `<from-hex>-<to-hex>`.
     pub async fn list_static_deltas(&self) -> Result<Vec<String>>;
+    /// The target commits `delta-indexes/` holds an index file for, sorted.
+    pub async fn list_static_delta_indexes(&self) -> Result<Vec<Checksum>>;
+}
+/// `deltas/<fanout>/<rest>` for a delta, relative to the repository root.
+pub fn static_delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> String;
+```
+
+A superblock is read without a transaction, so a read-only repository can
+report one. The part statistics check a part against its declared size and
+checksum before they decompress it, and read the part in up to three passes,
+so no payload is held and no temp file is written. The xz decoder takes at most
+128 MiB, and a part whose xz stream needs more is refused.
+
+```rust
+pub struct DeltaSuperblock { /* fields private */ }
+impl DeltaSuperblock {
+    pub fn parse(bytes: Vec<u8>) -> Result<DeltaSuperblock>;
+    /// Read a superblock file, signed or not, under the metadata ceiling.
+    pub async fn read(path: &Path) -> Result<DeltaSuperblock>;
+    pub fn from_commit(&self) -> Option<&Checksum>;
+    pub fn to_commit(&self) -> &Checksum;
+    pub fn is_signed(&self) -> bool;
+    pub fn endianness(&self) -> DeltaEndianness;
+    pub fn timestamp(&self) -> u64;
+    /// Field 5's byte length over 64.
+    pub fn parent_count(&self) -> usize;
+    pub fn parts(&self) -> &[DeltaPart];
+    pub fn fallbacks(&self) -> &[DeltaFallback];
+    pub fn relative_dir(&self) -> String;
+    /// Part `index`, from the metadata dict where the superblock carries it
+    /// inline and from `dir/<index>` otherwise.
+    pub async fn part_stats(&self, index: usize, dir: &Path) -> Result<DeltaPartStats>;
+}
+pub enum DeltaEndianness { Little, Big }
+impl DeltaPart {
+    pub fn checksum(&self) -> &Checksum;
+    pub fn size(&self) -> u64;
+    pub fn uncompressed_size(&self) -> u64;
+    pub fn objects(&self) -> &[(ObjectType, Checksum)];
+}
+impl DeltaFallback {
+    pub fn object_type(&self) -> ObjectType;
+    pub fn checksum(&self) -> &Checksum;
+    pub fn size(&self) -> u64;
+    pub fn uncompressed_size(&self) -> u64;
+}
+pub struct DeltaPartStats {
+    pub modes: u64,
+    pub xattrs: u64,
+    pub blob_size: u64,
+    pub ops_size: u64,
+    pub ops: DeltaOpCounts,
+}
+pub struct DeltaOpCounts {
+    pub open_splice_close: u64,
+    pub open: u64,
+    pub write: u64,
+    pub set_read_source: u64,
+    pub unset_read_source: u64,
+    pub close: u64,
+    pub bspatch: u64,
 }
 ```
 

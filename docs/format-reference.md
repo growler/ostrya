@@ -1994,6 +1994,27 @@ On-disk framing of a part file before decompression is `(y@ay)` = compression
 byte plus body. Compression: 0 = none, `x` = xz/lzma (the only real
 compression written; the reader accepts only 0 and `x`).
 
+A part payload `PART_PAYLOAD_FORMAT_V0` of `n` bytes ends with three framing
+offsets, each `z` bytes wide, where `z` is the offset width a GVariant container
+of `n` bytes takes (1, 2, 4, or 8). Read from the end, the last `z` bytes state
+the end of the mode table, the `z` bytes before them the end of the xattr table,
+and the `z` bytes before those the end of the data-source blob. The operation
+stream runs from the end of the blob to `n - 3z`. From these ends:
+
+- the mode count is the end of the mode table divided by 12;
+- the blob size is the end of the blob less the end of the xattr table;
+- the operation size is `n - 3z` less the end of the blob;
+- the xattr count is 0 for an empty table. For a table of `x` bytes, with
+  offset width `w` for `x` bytes, the last `w` bytes of the table state where
+  its own framing starts, and the count is `x` less that value, divided by `w`.
+
+Recovered by decoding two parts the tool wrote and comparing the counts with
+`static-delta show`: a part of 2 modes, 1 xattr set, a 300,130-byte blob, and a
+26-byte operation stream, and a part of 1 mode, 1 xattr set, a 9,477-byte blob,
+and a 245-byte operation stream. The framing sits at the end of the payload, so
+a reader that streams the payload reads it to the end to find the framing, and
+reads again the parts of the tables and the operations it did not keep.
+
 Constants: objtype+csum stride is 33 bytes (1 objtype + 32 csum). Part max size
 16 MiB (advisory). Delta part version 0. The `SIGNED_FORMAT` magic is the eight
 ASCII bytes `OSTSGNDT`; read as a little-endian `t` that is `0x54444E475354534F`,
@@ -2065,8 +2086,13 @@ is the content size alone (5,000,000), with no header included.
 
 Part meta-entry sizes. `size` is the part file's on-disk byte size, compression
 byte included. `usize` is the uncompressed payload the part delivers, summed over
-its objects: a metadata object's serialized length, a file's content length, a
-symlink's target length -- the file header is not counted. Recovered by
+its objects: a metadata object's serialized length and a regular file's content
+length. A symlink's target length and the file header are not counted: a
+from-scratch part of a 300,000-byte file, a 6-byte file, a 1-byte symlink
+target, and two metadata objects reports `usize=300129` and `blobsize=300130`.
+The port's generator differs: it counts the symlink target, and reports
+`usize=300130` for the same part (`conformance/cli-surface.md`, "P2",
+`static-delta generate`). Recovered by
 comparing `static-delta show` against the objects a part carries: a part
 delivering one 8,192-byte file plus its one-entry dirtree (41 bytes, with dirmeta
 12) reports `usize=8233`, and a part of two 1,000,000-byte splices reports
@@ -2185,13 +2211,18 @@ Endianness hazard: the `u`/`t` fields in meta entries, fallbacks, and fallback
 headers are host byte order gated by an `ostree.endianness` byte (`l`/`B`) in
 superblock metadata (a historical inconsistency, with a size-ratio heuristic
 fallback when the byte is missing). The superblock timestamp is always BE; the
-`(uuu)` mode triple is always BE regardless of that byte. Applying a delta reads
-one host-order-gated field, a meta-entry's `size`, which is the ceiling a part is
-read under: the port swaps it where the byte states `B` and reads it as
-little-endian where the byte is absent. The rest go unread -- parts are read by
-name and checked by their SHA-256, the modes are swapped from their fixed
-big-endian form, and the embedded commit is normal-form little-endian -- so a
-big-endian delta applies through the same path.
+`(uuu)` mode triple is always BE regardless of that byte. Under `B` the tool
+swaps four size fields: a meta entry's `size` and `usize`, and a fallback's two
+sizes. Recovered by generating a delta with `--set-endianness=B` over a
+5,000,000-byte fallback object: the superblock holds 5,001,564 and 5,000,000 as
+big-endian `u64` values, and `static-delta show` prints 5001564 and 5000000.
+Applying a delta reads one of the four, a meta-entry's `size`, which is the
+ceiling a part is read under, and `static-delta show` reads all four: the port
+swaps each where the byte states `B` and reads each as little-endian where the
+byte is absent or states another value. Nothing else turns on the byte -- parts
+are read by name and checked by their SHA-256, the modes are swapped from their
+fixed big-endian form, and the embedded commit is normal-form little-endian --
+so a big-endian delta applies through the same path.
 
 ## Signing details
 
@@ -5589,3 +5620,179 @@ A `summary` file whose bytes are not a document of the summary type reaches a
 repository only through a write that is neither implementation's. The tool
 reads such a file as an empty document and the port refuses it, which
 `cli-surface.md`, "summary", records.
+
+### `static-delta`
+
+`static-delta show DELTA` reports one delta's superblock and what each of its
+parts holds. `static-delta indexes` lists the `delta-indexes/` cache. Both read
+and write nothing else. The repository resolves before the argument is read,
+so `Command requires a --repo argument` stands ahead of a missing `DELTA`.
+
+#### The arguments
+
+An argument that holds a `/` is the path of a superblock file, relative to the
+working directory or absolute. Any other argument is a delta name, also where a
+file of that name exists in the working directory: `show sbfile` reports
+`error: Invalid rev sbfile`, and `show dd` for a directory `dd` holding a
+`superblock` reports `error: Invalid rev dd`.
+
+A name is `TO` or `FROM-TO`, split at the first `-`. Each half must be 64
+lowercase hex characters:
+
+- A half whose byte length is not 64 reports `error: Invalid rev <half>`, the
+  half cut to its first 64 bytes. The empty half of `C-` and `-C` reports
+  `error: Invalid rev ` with nothing after the space, and the `TO` half of
+  `C1-C2-C2` reports the first 64 bytes, `C2`.
+- A half of 64 bytes that holds a byte outside `[0-9a-f]` reports `error:
+  Invalid character '<n>' in rev '<half>'`, where `<n>` is the decimal value of
+  the first such byte: `70` for `F`, `71` for `G`.
+
+A name in the valid form reads `deltas/<fanout>/<rest>/superblock` in the
+repository, the directory "Object store layout" states. An absent delta reports
+`error: openat(deltas/<fanout>/<rest>/superblock): No such file or directory`.
+A path reports `error: openat(<path>): No such file or directory` where it is
+absent, and `error: Is a directory` where it names a directory.
+
+The part files a name reads are `deltas/<fanout>/<rest>/<i>`. The part files a
+path reads differ between the two implementations. The port reads them from the
+directory that holds the superblock file. The tool reads them from the
+repository, at `deltas/<fanout>/<rest>/<i>` for the source and target the
+superblock itself names, and opens no file beside the path.
+
+A part the superblock carries inline, in its metadata dict under the key
+`deltas/<fanout>/<rest>/<i>`, is read from the dict by the port in both forms.
+The tool reads no inline part: it opens the part file in both forms, and
+refuses where the repository holds none.
+
+#### `show`
+
+`show` writes these lines, one field per line, in this order:
+
+```
+Delta: <argument as given>
+Signed: no|yes
+From <scratch>            or   From: <hex>
+To: <hex>
+Endianness: little|big   (the tool also prints invalid or big (heuristic))
+Timestamp: <n>
+Number of parents: <n>
+Number of fallback entries: <n>
+  <fallback checksum>     (one line each, two-space indent)
+Total Fallback Size: <n> (<size>)
+Total Fallback Uncompressed Size: <n> (<size>)
+Number of parts: <n>
+PartMeta<i>: nobjects=<n> size=<n> usize=<n>
+PartPayload<i>: nmodes=<n> nxattrs=<n> blobsize=<n> opsize=<n>
+PartPayloadOps<i>: openspliceclose=<n> open=<n> write=<n> setread=<n> unsetread=<n> close=<n> bspatch=<n>
+Total Part Size: <n> (<size>)
+Total Part Uncompressed Size: <n> (<size>)
+Total Size: <n> (<size>)
+Total Uncompressed Size: <n> (<size>)
+```
+
+`From <scratch>` carries no colon; `From: <hex>` carries one. The three
+`Part` lines repeat for each part, in part order. Each field comes from the
+superblock, "Static delta wire format":
+
+- `Signed` is `yes` for a superblock in the signed envelope.
+- `Endianness` is `big` where the `ostree.endianness` byte is `B`, and `little`
+  where it is `l`. The tool prints `invalid` where the key is absent over a
+  delta whose sizes are little-endian, and where the byte is another value
+  such as `x`. It prints `big (heuristic)` where the key is absent over a
+  delta written under `B`, and then swaps the sizes. The port prints `little`
+  in these three cases.
+- `Timestamp` is field 1, read big-endian whatever the endianness byte states.
+- `Number of parents` is the byte length of field 5, the recursion array,
+  divided by 64 and rounded down. The tool writes field 5 empty.
+- The fallback line prints each fallback checksum. The two fallback totals sum
+  the compressed and the uncompressed size of each fallback.
+- `PartMeta<i>` prints the object count, `size`, and `usize` of meta entry `i`.
+- `PartPayload<i>` and `PartPayloadOps<i>` read part `i`: the table counts and
+  the member sizes the payload framing states, and the count of each opcode in
+  the operation stream (`S`, `o`, `w`, `r`, `R`, `c`, `B`).
+- `Total Part Size` sums the `size` of each part, and `Total Part Uncompressed
+  Size` sums the `usize`. `Total Size` is the part size plus the fallback size,
+  and `Total Uncompressed Size` is the part `usize` plus the fallback
+  uncompressed size.
+
+Under `B` each size field is swapped before it is printed. A 4-part delta with
+one 5,000,000-byte fallback prints `Total Size: 8602260 (8.6 MB)` and `Total
+Uncompressed Size: 8600163 (8.6 MB)`, the space before `MB` being U+00A0.
+
+The lines are written one at a time, so the lines before a refusal reach
+standard output. A missing part refuses after its `PartMeta<i>` line.
+
+The port checks each part against the size and the checksum its meta entry
+declares, before it decompresses a byte of it, and refuses a part that fails
+with `error: invalid format: static delta part checksum mismatch` or `error:
+invalid format: static delta: a stream passed the <n> byte(s) declared for it`
+after the `PartMeta<i>` line. The tool checks neither: where the part still
+decodes, it prints the counts of what it decodes.
+
+Both refuse an operation stream holding an unknown opcode, a stream that ends
+inside an operation, an `S` range past the data-source blob, or an `r` range
+past the blob. The tool prints the `PartPayload<i>` line first, and the port
+prints no `PartPayload<i>` line. Neither checks the range of a `w` with no read
+source set or of a `B`: both count the operation. An `o` whose mode or xattr
+index is outside its table makes the tool abort on `SIGABRT` after the
+`PartPayload<i>` line. The port counts it at exit 0.
+
+The port reads a part in up to three passes. It keeps the last 1 MiB of the
+payload as it finds the framing, and reads the payload again only for what
+that tail does not hold. It holds one fixed-size buffer, the tail, and the xz
+decoder's state, whatever the payload size. The decoder takes at most 128 MiB,
+and the port refuses a part whose xz stream states a dictionary that needs
+more, with `error: invalid format: static delta: part payload needs more than
+128 MiB of xz decoder memory`. The tool allocates what the stream states.
+
+#### The size wording
+
+The `<size>` term is a byte count in words:
+
+- `0 bytes`, `1 byte`, and `<n> bytes` below 1000, with an ASCII space.
+- From 1000, the unit is the largest of `kB`, `MB`, `GB`, `TB`, `PB`, and `EB`
+  whose factor, a power of 1000, the raw count reaches. The count divided by
+  that factor is printed to one decimal place, rounded from the exact double
+  with ties to even, then U+00A0 (bytes `C2 A0`) and the unit.
+
+Examples: 1000 prints `1.0 kB`, 1250 `1.2 kB`, 1750 `1.8 kB`, 999950 and 999999
+`1000.0 kB`, 1000000 `1.0 MB`, and 18446744073709551615 `18.4 EB`, each with
+U+00A0 before the unit. The wording is the same under `LC_ALL=C` and
+`C.UTF-8`. The tool formats through the C library's locale; the port always
+writes `.` as the decimal separator.
+
+#### `indexes`
+
+`indexes` prints the target commit of each index file, one per line, in full
+hex. With none it prints `(No static deltas indexes)`, also where
+`delta-indexes/` is absent.
+
+An entry is an index file when it is a regular file, not a symlink, named with
+41 bytes and `.index`, in a directory, not a symlink, named with 2 bytes directly
+under `delta-indexes/`. Every other entry is skipped: a fanout of 1, 3, or 44
+bytes, a stem of 40 or 42 bytes, the suffixes `.INDEX`, `.index.index`,
+`.index~`, and `.idx`, a directory named `*.index`, a symlink, a regular file
+used as a fanout, and a file at the top. No delta directory is read, so a target
+is listed whether or not a delta for it exists.
+
+The two implementations differ in two rules. The tool prints the targets in the
+order the directory returns them, and the port sorts them. The tool does not
+check the characters of a name: a name outside the modified-base64 alphabet, or
+whose last character carries nonzero low bits, is listed from a lenient decode,
+and for some such names the tool prints bytes the name does not determine. The
+port lists a name only where it decodes as a checksum.
+
+`delta-indexes` that is a regular file refuses at exit 1: the tool reports
+`error: opendirat: Not a directory`, and the port `error: i/o error: Not a
+directory (os error 20)`. A fanout that does not open refuses at exit 1 in both.
+
+#### Exit status
+
+- 0 -- the report or the listing was written.
+- 1 -- no `DELTA` (`error: DELTA must be specified`, with no usage text), a
+  name the parser refuses, an absent or unreadable superblock or part, a
+  superblock that does not parse, and a `delta-indexes/` that does not read.
+
+A superblock that does not parse prints no line in the port. The tool prints
+the lines it read before the failure. Only a write that is neither
+implementation's makes such a superblock.

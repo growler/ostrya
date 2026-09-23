@@ -22,7 +22,8 @@ use std::process::Command;
 use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
 use ostrya::{
-    CommitState, CreateOptions, Ed25519Verifier, FileKind, Repo, RepoMode, TreeEntry, base64,
+    Checksum, CommitState, CreateOptions, DeltaEndianness, DeltaSuperblock, Ed25519Verifier,
+    FileKind, Repo, RepoMode, TreeEntry, base64,
 };
 use ostrya_rt::block_on;
 
@@ -382,6 +383,143 @@ fn op_count(show: &str, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The part lines of the tool's `static-delta show` for the delta in `dir`,
+/// against the superblock accessors and `DeltaSuperblock::part_stats` over the
+/// same files.
+fn assert_part_stats_match_the_tool(repo_arg: &str, name: &str, dir: &Path) {
+    let show = String::from_utf8(ostree(&[repo_arg, "static-delta", "show", name])).unwrap();
+    let lines: Vec<&str> = show.lines().collect();
+    block_on(async {
+        let sb = DeltaSuperblock::read(&dir.join("superblock"))
+            .await
+            .unwrap();
+        assert!(lines.contains(&format!("To: {}", sb.to_commit()).as_str()));
+        assert!(lines.contains(&format!("Timestamp: {}", sb.timestamp()).as_str()));
+        assert!(lines.contains(&format!("Number of parts: {}", sb.parts().len()).as_str()));
+        assert_eq!(sb.endianness(), DeltaEndianness::Little);
+        for (i, part) in sb.parts().iter().enumerate() {
+            let stats = sb.part_stats(i, dir).await.unwrap();
+            let ops = stats.ops;
+            let expected = [
+                format!(
+                    "PartMeta{i}: nobjects={} size={} usize={}",
+                    part.objects().len(),
+                    part.size(),
+                    part.uncompressed_size()
+                ),
+                format!(
+                    "PartPayload{i}: nmodes={} nxattrs={} blobsize={} opsize={}",
+                    stats.modes, stats.xattrs, stats.blob_size, stats.ops_size
+                ),
+                format!(
+                    "PartPayloadOps{i}: openspliceclose={} open={} write={} setread={} \
+                     unsetread={} close={} bspatch={}",
+                    ops.open_splice_close,
+                    ops.open,
+                    ops.write,
+                    ops.set_read_source,
+                    ops.unset_read_source,
+                    ops.close,
+                    ops.bspatch
+                ),
+            ];
+            for line in &expected {
+                assert!(lines.contains(&line.as_str()), "{line} not in:\n{show}");
+            }
+        }
+    });
+}
+
+/// The part statistics the library reads agree with the tool's report over a
+/// from-scratch delta and a from->to delta carrying a bspatch object.
+#[test]
+fn part_stats_match_the_tool_show() {
+    if !ostree_available() {
+        eprintln!("skipping: ostree tool not available");
+        return;
+    }
+    let tmp = TmpDir::new("delta-stats");
+    let base = tmp.path();
+    let (src_repo, c1, c2) = build_source_repo(base);
+    let repo_arg = format!("--repo={}", src_repo.display());
+    let (scratch, fromto) = find_delta_dirs(&src_repo);
+    assert_part_stats_match_the_tool(&repo_arg, &c1, &scratch.unwrap());
+    let show = String::from_utf8(ostree(&[
+        &repo_arg,
+        "static-delta",
+        "show",
+        &format!("{c1}-{c2}"),
+    ]))
+    .unwrap();
+    assert!(op_count(&show, "bspatch=") > 0, "no bspatch op:\n{show}");
+    assert_part_stats_match_the_tool(&repo_arg, &format!("{c1}-{c2}"), &fromto.unwrap());
+}
+
+/// The `delta-indexes/` listing takes a regular file `<2 chars>/<41
+/// chars>.index` that decodes as a checksum, sorted, and skips every other
+/// entry.
+#[test]
+fn static_delta_indexes_skip_what_is_not_an_index() {
+    let tmp = TmpDir::new("delta-indexes");
+    let base = tmp.path();
+    let path = base.join("repo");
+    block_on(async {
+        let repo = Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        assert!(repo.list_static_delta_indexes().await.unwrap().is_empty());
+
+        let indexes = path.join("delta-indexes");
+        std::fs::create_dir_all(&indexes).unwrap();
+        assert!(repo.list_static_delta_indexes().await.unwrap().is_empty());
+
+        let targets = [
+            Checksum::from_bytes([0xee; 32]),
+            Checksum::from_bytes([0x01; 32]),
+        ];
+        for to in &targets {
+            let b64 = to.to_base64_modified();
+            std::fs::create_dir_all(indexes.join(&b64[..2])).unwrap();
+            std::fs::write(
+                indexes.join(&b64[..2]).join(format!("{}.index", &b64[2..])),
+                b"",
+            )
+            .unwrap();
+        }
+
+        let a41 = "A".repeat(41);
+        let skipped = [
+            format!("abc/{}.index", "A".repeat(40)),
+            format!("abc/{a41}.index"),
+            format!("AA/{}.index", "A".repeat(40)),
+            format!("AA/{}.index", "A".repeat(42)),
+            format!("AA/{a41}.INDEX"),
+            format!("AA/{a41}.index.index"),
+            format!("AA/{a41}.index~"),
+            format!("AA/{a41}.idx"),
+            // A last character with nonzero low bits, and one outside the
+            // alphabet.
+            format!("AA/{}B.index", "A".repeat(40)),
+            format!("AA/{}!.index", "A".repeat(40)),
+        ];
+        for entry in &skipped {
+            let file = indexes.join(entry);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"").unwrap();
+        }
+        std::fs::create_dir_all(indexes.join("AB").join(format!("{a41}.index"))).unwrap();
+        std::fs::create_dir_all(indexes.join("AC")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", indexes.join("AC").join(format!("{a41}.index")))
+            .unwrap();
+        std::os::unix::fs::symlink("AA", indexes.join("AD")).unwrap();
+        std::fs::write(indexes.join("stray"), b"").unwrap();
+
+        let mut expected = targets.to_vec();
+        expected.sort();
+        assert_eq!(repo.list_static_delta_indexes().await.unwrap(), expected);
+    });
+}
+
 #[test]
 fn applies_from_to_delta_with_rollsum() {
     use std::os::unix::fs::PermissionsExt;
@@ -457,6 +595,7 @@ fn applies_from_to_delta_with_rollsum() {
 
     let (_, fromto) = find_delta_dirs(&src);
     let fromto = fromto.expect("from->to delta dir");
+    assert_part_stats_match_the_tool(&src_arg, &format!("{c1}-{c2}"), &fromto);
 
     // A destination repo holding only the source commit's objects.
     let dst = base.join("dst");
@@ -692,6 +831,9 @@ fn applies_delta_with_object_over_half_gib_packed() {
 
     let (scratch, _) = find_delta_dirs(&src);
     let scratch = scratch.expect("from-scratch delta dir");
+    // The statistics walk streams the part three times with no temp file, and
+    // its payload framing takes 4-byte offsets.
+    assert_part_stats_match_the_tool(&src_arg, &c, &scratch);
 
     let dst = base.join("dst");
     let dst_arg = format!("--repo={}", dst.display());

@@ -12132,3 +12132,231 @@ note: every `--gpg-sign` lookup runs before the regeneration, after the `-m`
  of one naming no key refuses on the second, and a good selector beside a bad
  `--sign` key reports the key. Each refusal leaves `summary` and `summary.sig`
  as they stood.
+
+# ---------------------------------------------------------------------------
+# static-delta -- `show`, the superblock and part report, and `indexes`, the
+# listing of the `delta-indexes/` cache.
+#
+# `show` and `indexes` write nothing, so each cited test runs both
+# implementations over one repository and compares the exit status and both
+# streams. A cell that needs a delta cites a test: no setup generates one.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-invalid-name
+setup: repo
+run: static-delta --repo=$REPO show ABC
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid rev ABC"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Invalid rev ABC"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_show_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: an argument holding no `/` is a delta name, `TO` or `FROM-TO`, each half
+ 64 lowercase hex characters. A half of another length is refused with its first
+ 64 bytes, and a half of 64 bytes holding another character is refused with the
+ decimal value of that character. The cited test states both forms over an
+ uppercase name, an abbreviated checksum, a ref name, an empty half, a third
+ half, and the empty argument.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-absent
+setup: repo
+run: static-delta --repo=$REPO show 0000000000000000000000000000000000000000000000000000000000000000
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: openat(deltas/AA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/superblock): No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: openat(deltas/AA/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/superblock): No such file or directory"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+spec: format-reference.md#static-delta
+note: a valid name the repository holds no delta for names the superblock path
+ relative to the repository, the modified-base64 form of the checksum with its
+ first two characters as the fanout.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-scratch
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a delta from scratch, written by the tool and by the port's `generate
+ --timestamp`, reports the same bytes on standard output in both: `From
+ <scratch>`, the timestamp the generator stored, and the part and total lines.
+ No setup generates a delta, so the cited tests build the repositories.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-from-to
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a delta from a source commit, `FROM-TO`, reports `From: <hex>` and the
+ operation counts of its open, write, set-read-source, unset-read-source, and
+ close operations the same way in both.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-fallback
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a 5,000,000-byte object delivered as a fallback prints its checksum on an
+ indented line, and its two sizes reach the fallback totals and the two grand
+ totals. The totals from 1,000,000 bytes print in `MB` after U+00A0.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-multipart
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a delta of four parts prints the three part lines once for each part, in
+ part order, and sums the part sizes into the totals.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-bspatch
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_tools_deltas
+spec: format-reference.md#static-delta
+note: the tool's delta from a source commit carries a bspatch operation and
+ rollsum write operations, and both implementations count them alike. The cited
+ test asserts that each count is above zero.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-signed
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_show_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a superblock in the signed envelope prints `Signed: yes` and reads the
+ wrapped superblock. The tool's half of the cited test needs its ed25519 engine
+ and skips without it.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-big-endian
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_show_reads_a_big_endian_delta
+spec: format-reference.md#static-delta
+note: a superblock whose `ostree.endianness` byte is `B` prints `Endianness:
+ big`, and both implementations swap the part sizes and the two fallback sizes
+ before they print them. The timestamp is big-endian whatever the byte states.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-inline
+setup: repo
+outcome: lossy
+severity: interop
+loss: the part lines of a part carried inline. The tool reads no inline part:
+ in the name form and the path form it opens the part file the repository would
+ hold, and it refuses at exit 1 after the `PartMeta0` line with `error:
+ openat(deltas/<fanout>/<rest>/0): No such file or directory`. The port reads
+ the part from the metadata dict at exit 0 (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::static_delta_show_reads_an_inline_delta
+spec: format-reference.md#static-delta
+note: the lines before the refusal agree byte for byte. The cited test also
+ states that the port's part lines for the inline part equal the tool's for the
+ same delta written with its part as a file.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/show-path-arg
+setup: repo
+outcome: lossy
+severity: interop
+loss: the part source of a superblock named by path. The port reads the parts
+ from the directory that holds the superblock file, and the tool reads the
+ repository's parts for the delta the superblock names. A superblock copied
+ away from its parts reports in the tool and refuses in the port after
+ `PartMeta0` (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::static_delta_show_takes_a_superblock_path
+spec: format-reference.md#static-delta
+note: an argument holding a `/` is the path of a superblock file, relative to
+ the working directory or absolute, and the report names it as given. A
+ directory refuses with `error: Is a directory` and an absent path with
+ `error: openat(<path>): No such file or directory`, in both. Over a
+ superblock inside the repository's own `deltas/` tree the two read the same
+ files and agree byte for byte. The cited test states the copied-superblock
+ case each way.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/indexes-empty
+setup: repo
+run: static-delta --repo=$REPO indexes
+expect-exit: 0
+expect-stdout: equals "(No static deltas indexes)"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: equals "(No static deltas indexes)"
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_indexes_matches_the_tool
+spec: format-reference.md#static-delta
+note: a repository with no `delta-indexes/` lists nothing. The cited test states
+ the same for an empty `delta-indexes/`.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/indexes-after-reindex
+setup: repo
+outcome: lossy
+severity: interop
+loss: the line order. The tool prints the targets in the order the directory
+ returns them, and the port sorts them, the hash-order class `CLAUDE.md`,
+ "CLI compatibility is functional, not literal", puts out of scope.
+evidence: ostrya_cli::cli::static_delta_indexes_matches_the_tool
+spec: format-reference.md#static-delta
+note: after `reindex` over two deltas the two list one set of targets, one
+ checksum per line in full hex.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/indexes-skips-invalid
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_indexes_matches_the_tool
+spec: format-reference.md#static-delta
+note: an entry is listed when it is a regular file named with 41 characters and
+ `.index` in a directory named with two characters. The cited test states that
+ both skip a three-character fanout, a stem of 40 or 42 characters, a wrong
+ suffix, a directory named `*.index`, a symlink, and a file at the top, beside
+ valid entries. A name outside the modified-base64 form is the divergence
+ `cli-surface.md`, "P2", records. The cell stays full: every name the cited
+ test writes is in the modified-base64 alphabet, and each is skipped by a
+ rule both apply, so the test reaches no name the lenient decode lists.

@@ -399,6 +399,20 @@ impl Repo {
         Ok(Some(Value::variant(map_ty, map)))
     }
 
+    /// The target commits the `delta-indexes/` cache holds an index file for,
+    /// sorted.
+    ///
+    /// An index file is a regular file `delta-indexes/<fanout>/<rest>.index`
+    /// whose fanout is a two-character directory and whose `<fanout><rest>` is
+    /// the 43-character modified-base64 form of the target checksum. Every other
+    /// entry is skipped, a symlink included, and no delta directory is read, so
+    /// a target is listed whether or not a delta for it exists. A repository
+    /// with no `delta-indexes/` lists nothing.
+    pub async fn list_static_delta_indexes(&self) -> Result<Vec<Checksum>> {
+        let repo = self.clone();
+        ostrya_rt::unblock(move || list_delta_indexes_blocking(repo.repo_fd())).await
+    }
+
     /// Remove the index files under `delta-indexes/` that this pass did not
     /// write.
     ///
@@ -1421,6 +1435,15 @@ pub(crate) fn delta_index_relative_path(to: &Checksum) -> String {
     format!("{DELTA_INDEXES_DIR}/{fanout}/{name}")
 }
 
+/// A delta's directory relative to the repository root,
+/// `deltas/<fanout>/<rest>`: the modified-base64 form of the target commit for
+/// a delta from scratch, and of the source commit followed by `-` and the target
+/// for a delta from a source commit, the first two characters forming the
+/// fanout.
+pub fn static_delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> String {
+    delta_relative_dir(from, to)
+}
+
 /// The delta's directory relative to the repository root: base64-checksum
 /// fanout, with the source checksum leading a from-to delta's name.
 ///
@@ -1678,6 +1701,85 @@ fn prune_delta_indexes_blocking(repo_fd: BorrowedFd<'_>, written: &BTreeSet<Stri
     Ok(())
 }
 
+/// Walk `delta-indexes/<fanout>/` and collect the target of every index file,
+/// by the rule [`Repo::list_static_delta_indexes`] states.
+fn list_delta_indexes_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<Checksum>> {
+    use rustix::fs::{Dir, FileType, Mode, OFlags, openat};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let indexes = match openat(repo_fd, DELTA_INDEXES_DIR, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    let mut indexes = Dir::new(indexes).map_err(|e| Error::Io(e.into()))?;
+
+    let mut out = Vec::new();
+    for fanout in entries_of_type(&mut indexes, FileType::Directory)? {
+        if fanout.len() != 2 {
+            continue;
+        }
+        let fan_fd = openat(
+            indexes.fd().map_err(|e| Error::Io(e.into()))?,
+            fanout.as_slice(),
+            flags | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|e| Error::Io(e.into()))?;
+        let mut fan_dir = Dir::new(fan_fd).map_err(|e| Error::Io(e.into()))?;
+        for name in entries_of_type(&mut fan_dir, FileType::RegularFile)? {
+            let Some(rest) = name.strip_suffix(INDEX_SUFFIX.as_bytes()) else {
+                continue;
+            };
+            if rest.len() != 41 {
+                continue;
+            }
+            let mut b64 = fanout.clone();
+            b64.extend_from_slice(rest);
+            let Ok(b64) = std::str::from_utf8(&b64) else {
+                continue;
+            };
+            if let Ok(to) = Checksum::from_base64_modified(b64) {
+                out.push(to);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The names of the entries of an open directory whose type is `ty`, not
+/// following a symlink. Where the directory reports no type for an entry, the
+/// entry is examined.
+fn entries_of_type(dir: &mut rustix::fs::Dir, ty: rustix::fs::FileType) -> Result<Vec<Vec<u8>>> {
+    use rustix::fs::{AtFlags, FileType, statat};
+
+    let mut out = Vec::new();
+    while let Some(entry) = dir.next() {
+        let entry = entry.map_err(|e| Error::Io(e.into()))?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let entry_ty = match entry.file_type() {
+            FileType::Unknown => match statat(
+                dir.fd().map_err(|e| Error::Io(e.into()))?,
+                name,
+                AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(e) => return Err(Error::Io(e.into())),
+            },
+            known => known,
+        };
+        if entry_ty == ty {
+            out.push(name.to_bytes().to_vec());
+        }
+    }
+    Ok(out)
+}
+
 /// The temp name a delta file is written under before being renamed into place.
 fn temp_name(name: &str) -> String {
     format!(
@@ -1764,10 +1866,11 @@ async fn open_dir_path(path: &Path) -> Result<OwnedFd> {
     ostrya_rt::unblock(move || open_dir_blocking(&path)).await
 }
 
-/// `DeltaOptions` moves freely across tasks and threads.
+/// `DeltaOptions` and `DeltaSuperblock` move freely across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<DeltaOptions>();
+    assert_send_sync::<crate::delta::DeltaSuperblock>();
 };
 
 #[cfg(test)]

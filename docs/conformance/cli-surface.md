@@ -2137,8 +2137,91 @@ The time zone a `summary -v` report renders an instant in is the divergence
 "P3" records for `remote summary`, reached here by the local command: the tool
 renders in the host zone with that zone's offset and the port renders in UTC.
 
-`static-delta` accepts the subcommands `list`, `generate`, `apply-offline`, and
-`reindex`. Missing: `show`, `delete`, `verify`, `indexes`.
+`static-delta` accepts the subcommands `list`, `generate`, `apply-offline`,
+`reindex`, `show`, and `indexes`. Missing: `delete`, `verify`. `show` takes a
+delta name or the path of a superblock file, and `indexes` lists the
+`delta-indexes/` cache (`../format-reference.md`, "CLI output formats",
+`static-delta`). Thirteen differences stand on `show` and `indexes`.
+
+- a part that fails its checksum or passes its declared size. The port refuses
+  it at exit 1 after the `PartMeta<i>` line, before it decompresses a byte of
+  it. The tool checks neither. Where the tampered part still decodes, the tool
+  prints the counts of what it decodes at exit 0. A truncated xz part makes
+  the tool fail with `Input buffer too small` at exit 1. Only a write that is
+  neither implementation's reaches this;
+- a part the superblock carries inline. The port reads it from the metadata
+  dict, in the name form and the path form. The tool reads no inline part: in
+  both forms it opens `deltas/<fanout>/<rest>/<i>` in the repository and
+  refuses at exit 1 after the `PartMeta<i>` line where that file is absent;
+- the part files of a superblock named by path. The port reads them from the
+  directory that holds the superblock file. The tool reads the repository's
+  part files for the delta the superblock names, and refuses where the
+  repository holds none. Over a superblock inside the repository's own
+  `deltas/` tree the two read the same files;
+- a superblock that does not parse. The tool prints the lines it read before
+  the failure, for example `Delta:`, `Signed:`, and `From <scratch>`, and then
+  `error: Invalid checksum of length 0 expected 32`. The port prints no line
+  and its own `error: invalid format:` sentence. Both exit 1. Only a write that
+  is neither implementation's makes such a superblock;
+- an operation stream that both refuse, in a part that passes its checksum: an
+  unknown opcode, a stream that ends inside an operation, an operand the port
+  reads as past 64 bits, an `S` range past the data-source blob, and an `r`
+  range past the blob. The port prints no `PartPayload<i>` line and refuses
+  with its own `error: invalid format: static delta:` or `error: invalid
+  varint:` sentence. The tool prints the line and then refuses, for example
+  with `error: Unknown opcode 88 at offset 0` or `error: opcode
+  open-splice-and-close: Invalid offset/length 0/100`. Both exit 1. A `w`
+  range past the blob with no read source set and a `B` range past the blob
+  are no refusal: both count the operation and exit 0. A publisher's own bytes
+  alone reach this;
+- an `o` whose mode index or xattr index is outside its table. The tool prints
+  the `PartPayload<i>` line and then aborts on a GLib error, `Attempt to
+  access item 0 in a container with only 0 items` for an empty mode table, and
+  dies on `SIGABRT`. The port reads no table entry to count the operation, so
+  it counts the `o` and exits 0. A publisher's own bytes alone reach this;
+- a part whose xz stream states a dictionary that needs more than 128 MiB of
+  decoder memory. The port refuses it at exit 1 after the `PartMeta<i>` line
+  with `error: invalid format: static delta: part payload needs more than 128
+  MiB of xz decoder memory`. The tool allocates what the stream states: a
+  234,413-byte part stating a 1.5 GiB dictionary reports at exit 0 with 1,549
+  MiB of resident memory. A part the tool's generator or the port's writes
+  states a 32 MiB dictionary;
+- the line order of `indexes`. The tool prints the targets in the order the
+  directory returns them, and the port sorts them. This is the hash-container
+  carve-out of `CLAUDE.md`, "CLI compatibility is functional, not literal";
+- an index name outside the modified-base64 form: a character outside the
+  alphabet, or a last character whose low bits are not zero. The tool lists a
+  lenient decode, and for some such names bytes the name does not determine.
+  The port skips the entry. Only a write that is neither implementation's makes
+  such a name;
+- the wording of an `indexes` read failure. The tool writes `error: opendirat:
+  Not a directory` and `error: opendir(<fanout>): Permission denied`, and the
+  port writes the library's `error: i/o error:` sentence. Both exit 1;
+- an extra positional argument. The tool ignores it on `show` and on
+  `indexes`, and `clap` refuses it with `error: unexpected argument '<value>'
+  found` at exit 1. This is the class already recorded for `diff`;
+- `Endianness:` for a superblock with no `ostree.endianness` key, or a byte
+  other than `l` and `B`. The port prints `little` and reads the size fields as
+  little-endian in all three cases. With the key absent over a delta whose
+  sizes are little-endian, the tool prints `Endianness: invalid`. With the key
+  absent over a delta the tool wrote under `B`, the tool prints `Endianness:
+  big (heuristic)` and swaps the sizes, by a size-ratio heuristic
+  (`../format-reference.md`, "Static delta wire format"). With the byte `x`,
+  the tool prints `Endianness: invalid`. Only a write that is neither
+  implementation's makes such a superblock: both generators write the key;
+- the decimal separator of the size wording. The port always writes `.`. The
+  tool formats through the C library's locale, and only the `C` and `C.UTF-8`
+  behavior is observed on this host.
+
+`static-delta generate` carries one open divergence, in the `usize` of a part's
+meta entry. The port's generator counts the target length of each symlink the
+part carries, and the tool's generator does not. A from-scratch part of a
+300,000-byte file, a 6-byte file, a symlink with the 1-byte target `a`, and two
+metadata objects reports `usize=300129` from the tool's generator and
+`usize=300130` from the port's. The objects the delta produces are the same:
+the port's application reads no `usize`, and `show` prints the value the
+superblock holds. The port's generator keeps its rule until a change to it is
+decided.
 
 `pull` accepts a large set already. Missing: `--cache-dir`, `--disable-fsync`,
 `--per-object-fsync`, `--disable-retry-on-network-errors`, `--subpath`,
@@ -2703,14 +2786,14 @@ Observed by running the tool (2026.1).
 
 A script reads standard output, so the format is part of the surface. The
 formats of `commit`, including its `--table-output` block, `refs`, `rev-parse`,
-`cat`, `show`, `log`, `ls`, `config get`, `prune`, `fsck`, `diff`, and
-`summary`, together with the
+`cat`, `show`, `log`, `ls`, `config get`, `prune`, `fsck`, `diff`,
+`summary`, `static-delta show`, and `static-delta indexes`, together with the
 GVariant text form the reading commands share,
 are recovered and recorded in `../format-reference.md`, "CLI output formats" and
 "The GVariant text form". Each format below still needs a black-box observation
 pass, and the results belong in that same section.
 
-- `static-delta list`, `show`, and `indexes`.
+- `static-delta list`.
 - `pull` progress output.
 
 `remote list`, `show-url`, `refs`, and `summary` are recovered, in

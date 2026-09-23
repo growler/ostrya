@@ -39,7 +39,7 @@ mod value;
 pub use codec::{
     ArrayIter, GvDecode, GvEncode, GvType, Slice, Variant, encode_to_vec, write_array,
 };
-pub use de::{from_bytes, tuple_field_from_bytes};
+pub use de::{from_bytes, offset_size_for, tuple_field_from_bytes};
 pub use dict::DictBuilder;
 pub use error::{Error, Result};
 pub use print::{to_text, to_text_unannotated};

@@ -175,7 +175,12 @@ pub(crate) fn check_padding(padding: &[u8]) -> Result<()> {
 }
 
 /// The framing-offset size implied by a container's total serialized size.
-pub(crate) fn offset_size_for(len: usize) -> usize {
+///
+/// Public alongside [`choose_offset_size`](crate::choose_offset_size) so a
+/// reader of a container too large to buffer -- a static-delta part payload,
+/// read as a stream -- can locate the framing offsets at the end of the
+/// container once it knows the total length, the same way this parser does.
+pub fn offset_size_for(len: usize) -> usize {
     for z in [1usize, 2, 4] {
         if len <= offset_max(z) {
             return z;

@@ -39,7 +39,8 @@
 //!   ed25519, spki, or gpg engines.
 //! - `summary` -- regenerate, sign, or verify the repository summary.
 //! - `static-delta` -- list the repository's static deltas, apply one offline,
-//!   generate one, or rebuild the delta index cache.
+//!   generate one, rebuild the delta index cache, show a delta's superblock and
+//!   parts, or list the index cache.
 //! - `pull` -- fetch refs and their objects from an HTTP remote.
 //! - `pull-local` -- import refs and their objects from another local
 //!   repository.
@@ -61,15 +62,16 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
     CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags, CommitOptions,
-    ComposefsOptions, CreateOptions, DeltaOptions, DetachedMetadataFilter, DevInoCache,
-    DictBuilder, DiffChange, DiffOptions, DiffSide, Ed25519Signer, Ed25519Verifier, Error,
-    FileKind, FileMeta, FileObject, FilterResult, FsckBindingError, FsckBindingErrorKind,
-    FsckError, FsckErrorKind, FsckFailure, FsckOptions, FsckPhase, MutableTree, ObjectType,
-    OverwriteMode, PruneOptions, PullFlags, PullOptions, PullStats, PullVerify, RefAlias, Repo,
-    RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
-    TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
-    Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
-    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
+    ComposefsOptions, CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock,
+    DetachedMetadataFilter, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
+    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
+    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
+    FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
+    PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, Signer, Summary,
+    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
+    TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs,
+    base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
+    validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier, SignatureInfo};
@@ -1044,6 +1046,15 @@ enum StaticDeltaCommand {
     Generate(DeltaGenerateArgs),
     /// Rebuild the `delta-indexes/` cache from the deltas present.
     Reindex,
+    /// Print a delta's superblock fields and what each of its parts holds.
+    Show {
+        /// A delta name, `TO` or `FROM-TO` in full lowercase hex, or the path
+        /// of a superblock file: any argument holding a `/`. The parts of a
+        /// superblock named by path are read from the directory that holds it.
+        delta: Option<String>,
+    },
+    /// List the target commits the `delta-indexes/` cache holds an index for.
+    Indexes,
 }
 
 #[derive(Args)]
@@ -1693,8 +1704,8 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
     Ok(())
 }
 
-/// List the repository's static deltas, apply one offline, generate one, or
-/// rebuild the index cache.
+/// List the repository's static deltas, apply one offline, generate one,
+/// rebuild the index cache, show one delta, or list the index cache.
 async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaCommand) -> Result<()> {
     match command {
         StaticDeltaCommand::List => {
@@ -1710,6 +1721,203 @@ async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaComman
         }
         StaticDeltaCommand::Generate(generate) => delta_generate(&repo, &repo_path, generate).await,
         StaticDeltaCommand::Reindex => repo.reindex_static_deltas().await,
+        StaticDeltaCommand::Show { delta } => delta_show(&repo_path, delta).await,
+        StaticDeltaCommand::Indexes => {
+            let indexes = repo.list_static_delta_indexes().await?;
+            if indexes.is_empty() {
+                println!("(No static deltas indexes)");
+            }
+            for to in indexes {
+                println!("{}", to.to_hex());
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Read one half of a delta name: 64 lowercase hex characters. `Err` holds the
+/// tool's refusal text, which names at most the first 64 bytes of a half of
+/// the wrong length, and the decimal value of the first byte outside
+/// `[0-9a-f]` in a half of the right length.
+fn delta_name_half(half: &str) -> std::result::Result<Checksum, String> {
+    let bytes = half.as_bytes();
+    if bytes.len() != 64 {
+        let shown = String::from_utf8_lossy(&bytes[..bytes.len().min(64)]);
+        return Err(format!("Invalid rev {shown}"));
+    }
+    if let Some(&bad) = bytes
+        .iter()
+        .find(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(format!("Invalid character '{bad}' in rev '{half}'"));
+    }
+    Checksum::from_hex_lower(half).map_err(|_| format!("Invalid rev {half}"))
+}
+
+/// Read a delta name, `TO` or `FROM-TO`, split at the first `-`.
+fn parse_delta_name(arg: &str) -> std::result::Result<(Option<Checksum>, Checksum), String> {
+    match arg.split_once('-') {
+        Some((from, to)) => Ok((Some(delta_name_half(from)?), delta_name_half(to)?)),
+        None => Ok((None, delta_name_half(arg)?)),
+    }
+}
+
+/// Where the files of a `static-delta` argument are, with the spellings the
+/// refusals name them by.
+struct DeltaFiles {
+    superblock: PathBuf,
+    superblock_shown: String,
+    parts: PathBuf,
+    parts_shown: String,
+}
+
+/// Resolve a `static-delta` argument. An argument holding `/` is the path of a
+/// superblock file, whose parts are read from the directory that holds it. Any
+/// other argument is a delta name, read under the repository's `deltas/` tree;
+/// a name the parser refuses exits 1 with the parser's text.
+fn resolve_delta_arg(repo_path: &Path, arg: &str) -> DeltaFiles {
+    if arg.contains('/') {
+        let superblock = PathBuf::from(arg);
+        let parts = superblock
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_owned();
+        return DeltaFiles {
+            superblock_shown: arg.to_owned(),
+            parts_shown: parts.display().to_string(),
+            superblock,
+            parts,
+        };
+    }
+    let (from, to) = parse_delta_name(arg).unwrap_or_else(|text| exit_error(&text));
+    let relative = ostrya::static_delta_relative_dir(from.as_ref(), &to);
+    DeltaFiles {
+        superblock: repo_path.join(&relative).join("superblock"),
+        superblock_shown: format!("{relative}/superblock"),
+        parts: repo_path.join(&relative),
+        parts_shown: relative,
+    }
+}
+
+/// The refusal a delta file read reaches, in the tool's words where the read
+/// failed in the system: `Is a directory` for a directory, `openat(<path>):
+/// <reason>` for every other system error. Any other error is returned.
+fn delta_read_error(err: Error, shown: &str) -> Error {
+    match &err {
+        Error::Io(io) if io.kind() == std::io::ErrorKind::IsADirectory => {
+            exit_error("Is a directory")
+        }
+        Error::Io(io) if io.raw_os_error().is_some() => {
+            exit_error(&format!("openat({shown}): {}", io_reason(io)))
+        }
+        _ => err,
+    }
+}
+
+/// Print a delta's superblock fields and the statistics of each part, one line
+/// at a time, so the lines before a refusal reach standard output
+/// (`docs/format-reference.md`, "CLI output formats", `static-delta`).
+async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
+    let Some(arg) = delta else {
+        exit_error("DELTA must be specified");
+    };
+    let files = resolve_delta_arg(repo_path, &arg);
+    let sb = DeltaSuperblock::read(&files.superblock)
+        .await
+        .map_err(|err| delta_read_error(err, &files.superblock_shown))?;
+
+    println!("Delta: {arg}");
+    println!("Signed: {}", if sb.is_signed() { "yes" } else { "no" });
+    match sb.from_commit() {
+        Some(from) => println!("From: {}", from.to_hex()),
+        None => println!("From <scratch>"),
+    }
+    println!("To: {}", sb.to_commit().to_hex());
+    let endianness = match sb.endianness() {
+        DeltaEndianness::Little => "little",
+        DeltaEndianness::Big => "big",
+    };
+    println!("Endianness: {endianness}");
+    println!("Timestamp: {}", sb.timestamp());
+    println!("Number of parents: {}", sb.parent_count());
+    println!("Number of fallback entries: {}", sb.fallbacks().len());
+    // The sums wrap, the unsigned arithmetic a crafted superblock's sizes
+    // reach.
+    let (mut fallback_size, mut fallback_usize) = (0u64, 0u64);
+    for fallback in sb.fallbacks() {
+        println!("  {}", fallback.checksum().to_hex());
+        fallback_size = fallback_size.wrapping_add(fallback.size());
+        fallback_usize = fallback_usize.wrapping_add(fallback.uncompressed_size());
+    }
+    print_delta_size("Total Fallback Size", fallback_size);
+    print_delta_size("Total Fallback Uncompressed Size", fallback_usize);
+    println!("Number of parts: {}", sb.parts().len());
+
+    let (mut part_size, mut part_usize) = (0u64, 0u64);
+    for (i, part) in sb.parts().iter().enumerate() {
+        println!(
+            "PartMeta{i}: nobjects={} size={} usize={}",
+            part.objects().len(),
+            part.size(),
+            part.uncompressed_size()
+        );
+        let stats = sb
+            .part_stats(i, &files.parts)
+            .await
+            .map_err(|err| delta_read_error(err, &format!("{}/{i}", files.parts_shown)))?;
+        println!(
+            "PartPayload{i}: nmodes={} nxattrs={} blobsize={} opsize={}",
+            stats.modes, stats.xattrs, stats.blob_size, stats.ops_size
+        );
+        let ops = stats.ops;
+        println!(
+            "PartPayloadOps{i}: openspliceclose={} open={} write={} setread={} unsetread={} \
+             close={} bspatch={}",
+            ops.open_splice_close,
+            ops.open,
+            ops.write,
+            ops.set_read_source,
+            ops.unset_read_source,
+            ops.close,
+            ops.bspatch
+        );
+        part_size = part_size.wrapping_add(part.size());
+        part_usize = part_usize.wrapping_add(part.uncompressed_size());
+    }
+    print_delta_size("Total Part Size", part_size);
+    print_delta_size("Total Part Uncompressed Size", part_usize);
+    print_delta_size("Total Size", part_size.wrapping_add(fallback_size));
+    print_delta_size(
+        "Total Uncompressed Size",
+        part_usize.wrapping_add(fallback_usize),
+    );
+    Ok(())
+}
+
+/// Print one `<label>: <n> (<size wording>)` line of `static-delta show`.
+fn print_delta_size(label: &str, n: u64) {
+    println!("{label}: {n} ({})", format_delta_size(n));
+}
+
+/// A byte count in the tool's wording: `1 byte`, and `N bytes` for any other
+/// count below 1000. From 1000, the count over the largest power of 1000 it
+/// reaches, to one decimal place with ties to even on the exact double, then
+/// U+00A0 and the unit.
+fn format_delta_size(n: u64) -> String {
+    const UNITS: [(u64, &str); 6] = [
+        (1_000_000_000_000_000_000, "EB"),
+        (1_000_000_000_000_000, "PB"),
+        (1_000_000_000_000, "TB"),
+        (1_000_000_000, "GB"),
+        (1_000_000, "MB"),
+        (1_000, "kB"),
+    ];
+    match UNITS.iter().find(|(factor, _)| n >= *factor) {
+        // Each factor is exact as a double, 5^18 being below 2^53.
+        Some((factor, unit)) => format!("{:.1}\u{a0}{unit}", n as f64 / *factor as f64),
+        None if n == 1 => "1 byte".to_owned(),
+        None => format!("{n} bytes"),
     }
 }
 
@@ -8100,6 +8308,51 @@ fn stdout_file() -> Result<ostrya_rt::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The size wording below 1000, the U+00A0 before a unit, the unit chosen
+    /// on the raw count, and the ties-to-even rounding of the exact double.
+    #[test]
+    fn a_delta_size_is_worded_as_the_tool_words_it() {
+        for (n, text) in [
+            (0, "0 bytes"),
+            (1, "1 byte"),
+            (2, "2 bytes"),
+            (999, "999 bytes"),
+            (1_000, "1.0\u{a0}kB"),
+            (1_250, "1.2\u{a0}kB"),
+            (1_750, "1.8\u{a0}kB"),
+            (999_950, "1000.0\u{a0}kB"),
+            (999_999, "1000.0\u{a0}kB"),
+            (1_000_000, "1.0\u{a0}MB"),
+            (u64::MAX, "18.4\u{a0}EB"),
+        ] {
+            assert_eq!(format_delta_size(n), text, "{n}");
+        }
+    }
+
+    /// Each half of a delta name is 64 lowercase hex characters; the two
+    /// refusals name what the tool names.
+    #[test]
+    fn a_delta_name_is_read_as_the_tool_reads_it() {
+        let hex = "ab".repeat(32);
+        assert_eq!(parse_delta_name(&hex).unwrap().1.to_hex(), hex);
+        let pair = parse_delta_name(&format!("{hex}-{hex}")).unwrap();
+        assert_eq!(pair.0.unwrap().to_hex(), hex);
+        assert_eq!(parse_delta_name("ABC").unwrap_err(), "Invalid rev ABC");
+        assert_eq!(
+            parse_delta_name(&format!("{hex}-")).unwrap_err(),
+            "Invalid rev "
+        );
+        assert_eq!(
+            parse_delta_name(&format!("{hex}-{hex}-{hex}")).unwrap_err(),
+            format!("Invalid rev {hex}")
+        );
+        let upper = hex.to_uppercase();
+        assert_eq!(
+            parse_delta_name(&upper).unwrap_err(),
+            format!("Invalid character '65' in rev '{upper}'")
+        );
+    }
 
     /// The error paths render a subcommand's usage text by name, so a name
     /// `clap` does not know would abort the process instead of printing. This

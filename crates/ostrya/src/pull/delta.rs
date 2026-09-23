@@ -63,7 +63,7 @@ use std::collections::HashMap;
 use ostrya_core::{Checksum, ObjectName, ObjectType, Type, Value, from_bytes};
 
 use crate::delta::{
-    Fallback, MAX_SUPERBLOCK, MetaEntry, Superblock, apply_part, decode_part_stream,
+    DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, decode_part_stream,
 };
 use crate::deltagen::{
     STATIC_DELTAS_KEY, SUPERBLOCK_FILE, delta_index_relative_path, delta_name, delta_relative_dir,
@@ -102,9 +102,9 @@ pub(crate) struct DeltaJob {
     pub(crate) commit_bytes: Vec<u8>,
     /// The per-part meta-entries, in part order: what each part hashes to, the
     /// size it is fetched under, and the objects it produces.
-    meta_entries: Vec<MetaEntry>,
+    meta_entries: Vec<DeltaPart>,
     /// The objects the delta references and hands over loose.
-    fallbacks: Vec<Fallback>,
+    fallbacks: Vec<DeltaFallback>,
 }
 
 impl DeltaJob {
@@ -258,7 +258,7 @@ async fn discover_one(
         }
     }
 
-    let superblock = Superblock::parse(bytes)?;
+    let superblock = DeltaSuperblock::parse(bytes)?;
     if superblock.to != to || superblock.from != from {
         return Err(Error::Pull(format!(
             "static delta {name}: its superblock produces {} from {}",
@@ -272,7 +272,7 @@ async fn discover_one(
     // Destructured, so the compiler establishes that the raw bytes and the
     // signature array reach verification and go no further: what the job carries
     // is what application reads.
-    let Superblock {
+    let DeltaSuperblock {
         commit_bytes,
         meta_entries,
         fallbacks,

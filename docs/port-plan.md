@@ -3396,9 +3396,10 @@ remote chose. A pull of N tips holds N such jobs at once.
 A meta-entry's `size` is host order, which
 the superblock's `ostree.endianness` byte declares: it is swapped where the byte
 states `B` and read as little-endian where the byte is absent, which is what every
-producer of these deltas writes. The `usize` field goes unread, since it counts
-what the part's objects add up to rather than the size of the payload that carries
-them.
+producer of these deltas writes. Application does not use the `usize` field,
+since it counts what the part's objects add up to rather than the size of the
+payload that carries them. The parse keeps it, swapped by the same rule, and
+`static-delta show` prints it.
 
 A content object a part produces is held to the same mode checks a loose one is:
 `BAREUSERONLY_FILES` bounds a regular file's logical mode, and a bare-user-only
@@ -5850,6 +5851,83 @@ refuses; and a 64-byte `--sign` value whose halves are not an ed25519 key pair,
 which the tool signs with and the port refuses, the class `commit --sign`
 records. The item adds 26 `m10` cells, of which 11 are executable and all 11
 pass; the conformance run reports 983 cells and 405 passes.
+
+`static-delta show` and `static-delta indexes` land, together with the public
+surface the other `static-delta` subcommands read a delta through.
+`format-reference.md`, "CLI output formats", `static-delta`, states the
+recovered formats, and "Static delta wire format" states the payload framing
+and the four size fields the endianness byte swaps.
+
+The superblock types become public as `DeltaSuperblock`, `DeltaPart`, and
+`DeltaFallback`, with accessor methods over fields that stay `pub(crate)`, so
+application and the pull keep their direct reads and no struct literal leaves
+the crate. The parse keeps what it dropped before: the metadata dict, which
+moves out of the parsed tree rather than being copied, the timestamp, the byte
+length of field 5, each meta entry's `usize`, and both fallback sizes, all four
+size fields swapped under `B`. `DeltaSuperblock::read` reads a superblock file
+under the metadata ceiling. `DeltaEndianness` names the byte order.
+`static_delta_relative_dir` names a delta's directory, and
+`Repo::list_static_delta_indexes` lists the `delta-indexes/` cache, sorted.
+`offset_size_for` becomes public in `ostrya-gvariant` and `ostrya-core`, the
+reading mirror of `choose_offset_size`.
+
+`DeltaSuperblock::part_stats` returns `DeltaPartStats` and `DeltaOpCounts` for
+one part. A part payload has no size ceiling and its framing offsets sit at its
+end, so the read takes up to three passes over one part source. The first
+hashes the part under its declared size and asserts its checksum with no byte
+decompressed. The second streams the payload to its end, keeping its length and
+its last 1 MiB in a ring; for an uncompressed part the first pass keeps these,
+since the body is the payload. Where the tail holds the operation stream and
+the xattr table's last framing offset, the read ends there. Otherwise the third
+pass reads what the tail misses: an uncompressed part seeks to the two regions,
+and a compressed one streams again up to the end of the xattr table, or up to
+the end of the operation stream where the tail does not hold it. The operations
+go to a streaming counter that takes the operand rules of `apply_part`, the `S`
+arity from the object at the current index included. `operand_count` states
+those rules once, beside the opcode constants. Each pass holds one 128 KiB
+buffer and the tail, and a compressed pass holds the xz decoder's state under a
+128 MiB limit. A dictionary the xz stream states sets the decoder's
+allocation: the tool reads a 234,413-byte part stating a 1.5 GiB dictionary at
+exit 0 with 1,549 MiB of resident memory, and the port refuses it. No
+transaction, staging
+directory, or temp file is needed, so a read-only repository reports a delta.
+The ignored 520 MiB test reads the statistics of its part too. A part carried
+inline is read from the metadata dict in both argument forms.
+
+The CLI reads an argument holding a `/` as a superblock path and any other
+argument as a delta name. `parse_delta_name` splits a name at its first `-` and
+refuses a half in the tool's two forms, and `resolve_delta_arg` gives the
+superblock and the part directory with the spellings the refusals name.
+`format_delta_size` writes the size wording, U+00A0 before the unit
+included. The lines of `show` go out one at a time, so a missing part refuses
+after its `PartMeta<i>` line in both implementations.
+
+Four observed rules decide the design. `show` in the tool reads no inline part
+and no part file beside a superblock path: in both argument forms it opens the
+repository's `deltas/<fanout>/<rest>/<i>`. `indexes` takes a two-byte fanout
+and a 41-byte stem, and checks no character of the name. The size wording puts
+U+00A0 before the unit. Under `B` the two fallback sizes swap as the meta-entry
+sizes do. The same observation shows that a meta entry's `usize` leaves a
+symlink target out, which `format-reference.md`, "Part meta-entry sizes",
+states in its first sentence. The port's generator counts the target, an open
+divergence of `static-delta generate` that `cli-surface.md`, "P2", records:
+`usize=300130` against the tool's `usize=300129` for one part.
+
+Thirteen divergences stand, all in `cli-surface.md`, "P2": a part that fails
+its checksum or its declared size, which the port refuses and the tool reads
+where the part still decodes; an inline part, which the port reads and the tool
+does not; the part files of a superblock path; a superblock that does not
+parse, where the tool prints the lines read before the failure; an operation
+stream both refuse, where the tool prints the `PartPayload<i>` line first; an
+`o` whose mode or xattr index leaves its table, on which the tool aborts and
+which the port counts; a part whose xz stream needs more than 128 MiB of
+decoder memory, which the port refuses and the tool allocates for; the
+`indexes` line order; an index name outside the modified-base64 form; the
+wording of an `indexes` read failure; an extra positional argument, which the
+tool ignores; the `Endianness` line where the key is absent or holds another
+byte, where the tool prints `invalid` or `big (heuristic)` and the port prints
+`little`; and the decimal separator of the size wording. The work adds 14 `m10` cells, of which 3 are executable and all 3
+pass; the conformance run reports 997 cells and 408 passes.
 
 #### Phase 17g -- P3 commands with no matrix weight
 

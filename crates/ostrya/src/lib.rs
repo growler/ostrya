@@ -117,8 +117,10 @@
 //! between a splice, a rollsum copy-from-source stream, a bspatch stream, and
 //! a loose fallback. [`Repo::sign_static_delta`] wraps a superblock in the
 //! signed envelope, [`Repo::verify_static_delta`] checks those signatures with
-//! the signing engines over the raw superblock bytes, and
-//! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache. It also
+//! the signing engines over the raw superblock bytes,
+//! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache, and
+//! [`Repo::list_static_delta_indexes`] lists it. [`DeltaSuperblock`] reads a
+//! superblock and what each part holds without applying the delta. It also
 //! covers the fetcher pull is built on (Phase 16a): [`Fetcher`] serves
 //! [`FetchRequest`]s naming a [`Target`] -- a path under a remote's mirrors, or
 //! an absolute URL of the request's own -- over HTTP/1.1 and HTTP/2 -- ALPN
@@ -234,7 +236,10 @@ pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMod
 pub use commit::CommitOptions;
 pub use composefs::{ComposefsOptions, VerityPolicy};
 pub use config::{MinFreeSpace, Remote, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate};
-pub use deltagen::DeltaOptions;
+pub use delta::{
+    DeltaEndianness, DeltaFallback, DeltaOpCounts, DeltaPart, DeltaPartStats, DeltaSuperblock,
+};
+pub use deltagen::{DeltaOptions, static_delta_relative_dir};
 pub use diff::{DiffChange, DiffEntry, DiffOptions, DiffSide, DiffStats};
 pub use error::{Error, Result};
 pub use fetch::{

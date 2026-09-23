@@ -28914,3 +28914,788 @@ fn summary_report_reads_a_collection_map_of_any_shape() {
         assert_eq!(split(&port_run), split(&tool_run), "{value}");
     }
 }
+
+// --- static-delta: show and indexes -----------------------------------------
+//
+// `show` and `indexes` write nothing, so each test runs both implementations
+// over one repository and compares the exit status and both streams. The
+// deltas are the tool's own and the port's own, generated over trees built
+// here; the timestamp a delta carries is the one its generator wrote, and both
+// implementations read it from the one file.
+
+/// `len` bytes of xorshift64 output from `seed`, so two seeds give two objects.
+fn delta_noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x & 0xff) as u8
+        })
+        .collect()
+}
+
+/// Run the tool against `repo` with `args`, asserting it succeeded, and return
+/// its trimmed standard output.
+fn ostree_ok(repo: &Path, args: &[&str]) -> String {
+    let repo_arg = format!("--repo={}", repo.display());
+    let mut all = vec![repo_arg.as_str()];
+    all.extend_from_slice(args);
+    let run = ostree(&all);
+    assert!(
+        run.status.success(),
+        "ostree {args:?} failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    String::from_utf8(run.stdout).unwrap().trim().to_owned()
+}
+
+/// A tool archive repository at `base/<name>` holding two commits on `m`: a
+/// small file, a 300,000-byte file, and a symlink, then the small file edited
+/// and 1,000 bytes appended to the large one. Returns the path and both
+/// commits.
+fn delta_show_repo(base: &Path, name: &str) -> (PathBuf, String, String) {
+    let repo = base.join(name);
+    ostree_ok(&repo, &["init", "--mode=archive"]);
+    let tree = base.join(format!("{name}-tree"));
+    std::fs::create_dir_all(&tree).unwrap();
+    let big = delta_noise(300_000, 1);
+    std::fs::write(tree.join("a"), b"hello\n").unwrap();
+    std::fs::write(tree.join("big"), &big).unwrap();
+    let _ = std::fs::remove_file(tree.join("l"));
+    std::os::unix::fs::symlink("a", tree.join("l")).unwrap();
+    let tree_arg = format!("--tree=dir={}", tree.display());
+    let c1 = ostree_ok(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "m",
+            "-s",
+            "one",
+            "--timestamp=@1700000000",
+            &tree_arg,
+        ],
+    );
+    std::fs::write(tree.join("a"), b"hello\nx\n").unwrap();
+    let mut grown = big;
+    grown.extend_from_slice(&delta_noise(1_000, 2));
+    std::fs::write(tree.join("big"), &grown).unwrap();
+    let c2 = ostree_ok(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "m",
+            "-s",
+            "two",
+            "--timestamp=@1700000100",
+            &tree_arg,
+        ],
+    );
+    (repo, c1, c2)
+}
+
+/// A tool archive repository at `base/<name>` holding one commit of a
+/// 5,000,000-byte file and, where `parts` is set, three 1,200,000-byte files
+/// that a 1-byte chunk size spreads over parts of their own. Returns the path
+/// and the commit.
+fn delta_fallback_repo(base: &Path, name: &str, parts: bool) -> (PathBuf, String) {
+    let repo = base.join(name);
+    ostree_ok(&repo, &["init", "--mode=archive"]);
+    let tree = base.join(format!("{name}-tree"));
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("huge"), delta_noise(5_000_000, 3)).unwrap();
+    for i in (1..=3u64).filter(|_| parts) {
+        std::fs::write(tree.join(format!("f{i}")), delta_noise(1_200_000, 3 + i)).unwrap();
+    }
+    let tree_arg = format!("--tree=dir={}", tree.display());
+    let c = ostree_ok(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "m",
+            "-s",
+            "three",
+            "--timestamp=@1700000200",
+            &tree_arg,
+        ],
+    );
+    (repo, c)
+}
+
+/// `static-delta show ARG` agrees between the two implementations over `repo`,
+/// run from `cwd`, and the output of the port is returned.
+fn assert_show_agrees_in(cwd: &Path, repo: &Path, arg: &str) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let args = ["static-delta", &repo_arg, "show", arg];
+    let port = ostrya_in(Some(cwd), &args, None, &[]);
+    let tool = ostree_in(cwd, &args);
+    assert_runs_agree(&port, &tool, &args.join(" "));
+    port
+}
+
+/// The same from the repository's parent directory.
+fn assert_show_agrees(repo: &Path, arg: &str) -> Run {
+    assert_show_agrees_in(repo.parent().unwrap(), repo, arg)
+}
+
+/// A count on a `show` line, `key` being for example `"bspatch="`, summed over
+/// the parts.
+fn show_count(run: &Run, key: &str) -> u64 {
+    String::from_utf8_lossy(&run.stdout)
+        .split_whitespace()
+        .filter_map(|tok| tok.strip_prefix(key).and_then(|n| n.parse::<u64>().ok()))
+        .sum()
+}
+
+/// `show` agrees byte for byte over the tool's deltas: from scratch, from a
+/// source commit with bspatch and rollsum write operations, a 5 MB fallback
+/// over four parts, and a signed delta. Carries
+/// `static-delta/show-{scratch,from-to,fallback,multipart,bspatch,signed}`.
+#[test]
+fn static_delta_show_matches_the_tool_over_the_tools_deltas() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-show-tool");
+    let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    ostree_ok(
+        &repo,
+        &["static-delta", "generate", "--from", &c1, "--to", &c2],
+    );
+
+    let scratch = assert_show_agrees(&repo, &c1);
+    assert!(show_count(&scratch, "openspliceclose=") > 0);
+    let from_to = assert_show_agrees(&repo, &format!("{c1}-{c2}"));
+    assert!(show_count(&from_to, "bspatch=") > 0, "no bspatch op");
+    assert!(show_count(&from_to, "write=") > 0, "no write op");
+    assert!(
+        show_count(&from_to, "setread=") > 0,
+        "no set-read-source op"
+    );
+
+    let (fallback, c3) = delta_fallback_repo(tmp.path(), "fallback", true);
+    ostree_ok(
+        &fallback,
+        &[
+            "static-delta",
+            "generate",
+            "--empty",
+            "--to",
+            &c3,
+            "--max-chunk-size=1",
+        ],
+    );
+    let run = assert_show_agrees(&fallback, &c3);
+    let text = String::from_utf8_lossy(&run.stdout);
+    assert!(text.contains("Number of fallback entries: 1\n"), "{text}");
+    assert!(text.contains("Number of parts: 4\n"), "{text}");
+    assert!(text.contains("\u{a0}MB)\n"), "{text}");
+
+    if ostree_supports_ed25519() {
+        let sign = format!("--sign={ED25519_SECRET_B64}");
+        ostree_ok(
+            &repo,
+            &[
+                "static-delta",
+                "generate",
+                "--empty",
+                "--to",
+                &c2,
+                "--sign-type=ed25519",
+                &sign,
+            ],
+        );
+        let run = assert_show_agrees(&repo, &c2);
+        assert!(String::from_utf8_lossy(&run.stdout).contains("Signed: yes\n"));
+    }
+}
+
+/// `show` agrees byte for byte over the port's deltas, with the timestamp the
+/// port's `--timestamp` pins. Carries the same six cells as the test above,
+/// for the port as the producer.
+#[test]
+fn static_delta_show_matches_the_tool_over_the_ports_deltas() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-show-port");
+    let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
+    let repo_str = repo.to_str().unwrap();
+    let generate = |repo: &str, extra: &[&str]| {
+        let mut args = vec![
+            "static-delta",
+            "--repo",
+            repo,
+            "generate",
+            "--timestamp=1700000000",
+        ];
+        args.extend_from_slice(extra);
+        ostrya(&args, None, &[]).ok();
+    };
+    generate(repo_str, &["--to", &c1]);
+    generate(repo_str, &["--from", &c1, "--to", &c2]);
+    let run = assert_show_agrees(&repo, &c1);
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Timestamp: 1700000000\n"));
+    let from_to = assert_show_agrees(&repo, &format!("{c1}-{c2}"));
+    assert!(show_count(&from_to, "open=") > 0, "no open op");
+
+    let (fallback, c3) = delta_fallback_repo(tmp.path(), "fallback", true);
+    generate(
+        fallback.to_str().unwrap(),
+        &["--to", &c3, "--max-chunk-size=1000000"],
+    );
+    let run = assert_show_agrees(&fallback, &c3);
+    let text = String::from_utf8_lossy(&run.stdout);
+    assert!(text.contains("Number of fallback entries: 1\n"), "{text}");
+    assert!(text.contains("Number of parts: 4\n"), "{text}");
+
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    generate(repo_str, &["--to", &c2, &sign]);
+    let run = assert_show_agrees(&repo, &c2);
+    assert!(String::from_utf8_lossy(&run.stdout).contains("Signed: yes\n"));
+}
+
+/// A delta the tool writes with `--set-endianness=B` reads the same in both:
+/// `Endianness: big`, and every size field swapped. Carries
+/// `static-delta/show-big-endian`.
+#[test]
+fn static_delta_show_reads_a_big_endian_delta() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-show-big");
+    let (repo, c) = delta_fallback_repo(tmp.path(), "repo", false);
+    ostree_ok(
+        &repo,
+        &[
+            "static-delta",
+            "generate",
+            "--empty",
+            "--to",
+            &c,
+            "--set-endianness=B",
+        ],
+    );
+    let run = assert_show_agrees(&repo, &c);
+    let text = String::from_utf8_lossy(&run.stdout);
+    assert!(text.contains("Endianness: big\n"), "{text}");
+    assert!(
+        text.contains("Total Fallback Uncompressed Size: 5000000 "),
+        "{text}"
+    );
+}
+
+/// The tool's `--inline` delta carries its part in the metadata dict. The port
+/// reads the part from there in the name form and the path form alike. The tool
+/// reads no inline part: in both forms it opens the part file the repository
+/// would hold and refuses after `PartMeta0`, which is the recorded divergence.
+/// The port's part lines equal the tool's over the same delta written with its
+/// part as a file. Carries `static-delta/show-inline`.
+#[test]
+fn static_delta_show_reads_an_inline_delta() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-show-inline");
+    let (repo, c1, _) = delta_show_repo(tmp.path(), "repo");
+    let plain = clone_repo(tmp.path(), &repo, "plain");
+    ostree_ok(
+        &repo,
+        &[
+            "static-delta",
+            "generate",
+            "--empty",
+            "--to",
+            &c1,
+            "--inline",
+        ],
+    );
+    ostree_ok(
+        &plain,
+        &["static-delta", "generate", "--empty", "--to", &c1],
+    );
+    let relative = ostrya::static_delta_relative_dir(None, &Checksum::from_hex(&c1).unwrap());
+    assert!(
+        !repo.join(&relative).join("0").exists(),
+        "the part was written as a file"
+    );
+
+    let part_lines = |run: &Run| {
+        String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .filter(|line| line.starts_with("PartPayload"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let as_file = assert_show_agrees(&plain, &c1);
+    let repo_arg = format!("--repo={}", repo.display());
+    let path_arg = repo.join(&relative).join("superblock");
+    for arg in [c1.as_str(), path_arg.to_str().unwrap()] {
+        let args = ["static-delta", &repo_arg, "show", arg];
+        let port = ostrya(&args, None, &[]);
+        port.ok();
+        assert_eq!(part_lines(&port), part_lines(&as_file), "{arg}");
+        let tool = ostree(&args);
+        assert_eq!(tool.status.code(), Some(1), "{arg}");
+        assert_eq!(
+            String::from_utf8_lossy(&tool.stderr),
+            format!("error: openat({relative}/0): No such file or directory\n"),
+            "{arg}"
+        );
+        // The tool's lines up to its refusal are the port's up to the first
+        // part's payload line.
+        let printed = String::from_utf8_lossy(&port.stdout).into_owned();
+        let cut = printed.find("PartPayload0").unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&tool.stdout),
+            printed[..cut],
+            "{arg}"
+        );
+    }
+}
+
+/// A superblock named by path, relative or absolute, agrees in both. A
+/// directory and an absent path refuse alike. A superblock copied away from its
+/// parts is the recorded divergence: the tool reads the repository's parts for
+/// the delta it names, and the port reads the parts beside the file. Carries
+/// `static-delta/show-path-arg`.
+#[test]
+fn static_delta_show_takes_a_superblock_path() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-show-path");
+    let (repo, c1, _) = delta_show_repo(tmp.path(), "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    let relative = ostrya::static_delta_relative_dir(None, &Checksum::from_hex(&c1).unwrap());
+
+    let by_name = assert_show_agrees(&repo, &c1);
+    let relative_arg = format!("{relative}/superblock");
+    let by_relative = assert_show_agrees_in(&repo, &repo, &relative_arg);
+    let absolute = repo.join(&relative_arg);
+    let by_absolute = assert_show_agrees(&repo, absolute.to_str().unwrap());
+    let tail = |run: &Run| {
+        let text = String::from_utf8_lossy(&run.stdout).into_owned();
+        text.split_once('\n').unwrap().1.to_owned()
+    };
+    assert_eq!(tail(&by_relative), tail(&by_name));
+    assert_eq!(tail(&by_absolute), tail(&by_name));
+
+    let dir_arg = format!("{relative}/");
+    let run = assert_show_agrees_in(&repo, &repo, &dir_arg);
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        "error: Is a directory\n"
+    );
+    let run = assert_show_agrees_in(&repo, &repo, "a/b");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        "error: openat(a/b): No such file or directory\n"
+    );
+
+    let copy = tmp.path().join("copy");
+    std::fs::create_dir(&copy).unwrap();
+    std::fs::copy(absolute, copy.join("superblock")).unwrap();
+    let repo_arg = format!("--repo={}", repo.display());
+    let args = ["static-delta", &repo_arg, "show", "copy/superblock"];
+    let tool = ostree_in(tmp.path(), &args);
+    let port = ostrya_in(Some(tmp.path()), &args, None, &[]);
+    assert!(
+        tool.status.success(),
+        "the tool reads the repository's parts"
+    );
+    assert_eq!(tail(&tool), tail(&by_name));
+    assert_eq!(port.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&port.stderr),
+        "error: openat(copy/0): No such file or directory\n"
+    );
+    let printed = String::from_utf8_lossy(&port.stdout);
+    assert!(printed.contains("\nPartMeta0: "), "{printed}");
+    assert!(!printed.contains("PartPayload0"), "{printed}");
+}
+
+/// The offsets of the two size fields of the fallback entry whose checksum is
+/// `hex`, in unsigned superblock bytes: the element `(yaytt)` starts one byte
+/// before the checksum, and its two `t` fields sit at 40 and 48 in it.
+fn fallback_size_offsets(bytes: &[u8], hex: &str) -> (usize, usize) {
+    let checksum = Checksum::from_hex(hex).unwrap();
+    let at = bytes
+        .windows(32)
+        .position(|window| window == checksum.as_bytes())
+        .expect("the fallback checksum is in the superblock");
+    (at - 1 + 40, at - 1 + 48)
+}
+
+/// The size wording agrees at every boundary: `0 bytes`, `1 byte`, `N bytes`,
+/// the U+00A0 before the unit, the unit chosen on the raw count, and the
+/// rounding of the exact double. The superblocks are the tool's own with the
+/// fallback entry's two sizes patched in place, beside the delta's parts, so
+/// both implementations read one set of parts.
+#[test]
+fn static_delta_show_size_format_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-show-sizes");
+    let (repo, c) = delta_fallback_repo(tmp.path(), "repo", false);
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c]);
+    let dir = repo.join(ostrya::static_delta_relative_dir(
+        None,
+        &Checksum::from_hex(&c).unwrap(),
+    ));
+    let original = std::fs::read(dir.join("superblock")).unwrap();
+    let show = assert_show_agrees(&repo, &c);
+    let text = String::from_utf8_lossy(&show.stdout).into_owned();
+    let hex = text
+        .lines()
+        .find_map(|line| line.strip_prefix("  "))
+        .expect("one fallback line")
+        .to_owned();
+    let (size_at, usize_at) = fallback_size_offsets(&original, &hex);
+    assert_eq!(size_at + 8, usize_at);
+    assert_eq!(
+        u64::from_le_bytes(original[usize_at..usize_at + 8].try_into().unwrap()),
+        5_000_000
+    );
+
+    for value in [
+        0u64,
+        1,
+        2,
+        999,
+        1_000,
+        1_250,
+        1_750,
+        999_950,
+        999_999,
+        1_000_000,
+        (1 << 53) + 1,
+        u64::MAX,
+    ] {
+        let mut bytes = original.clone();
+        bytes[size_at..size_at + 8].copy_from_slice(&value.to_le_bytes());
+        bytes[usize_at..usize_at + 8].copy_from_slice(&value.to_le_bytes());
+        let name = format!("sb-{value}");
+        std::fs::write(dir.join(&name), &bytes).unwrap();
+        let run = assert_show_agrees(&repo, dir.join(&name).to_str().unwrap());
+        assert!(run.status.success(), "{value}");
+    }
+}
+
+/// Rebuild an unsigned superblock with field 5, the recursion array, replaced
+/// by `recursion`. The tuple's variable members are carved out at the framing
+/// offsets it ends with and laid out again under their alignments, and the
+/// framing is written at the width the new length takes.
+fn superblock_with_recursion(bytes: &[u8], recursion: &[u8]) -> Vec<u8> {
+    // `(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))`: the alignment of
+    // each member, and the members whose end a framing offset states.
+    const ALIGN: [usize; 8] = [8, 8, 1, 1, 8, 1, 8, 8];
+    const FRAMED: [usize; 6] = [0, 2, 3, 4, 5, 6];
+    let width = |len: usize| match len {
+        0..=0xff => 1,
+        0x100..=0xffff => 2,
+        _ => 4,
+    };
+    let z = width(bytes.len());
+    let framing_start = bytes.len() - FRAMED.len() * z;
+    let mut ends = [0usize; 8];
+    for (k, &member) in FRAMED.iter().enumerate() {
+        let at = bytes.len() - (k + 1) * z;
+        let mut raw = [0u8; 8];
+        raw[..z].copy_from_slice(&bytes[at..at + z]);
+        ends[member] = u64::from_le_bytes(raw) as usize;
+    }
+    let mut members = Vec::new();
+    let mut pos = 0usize;
+    for (member, align) in ALIGN.iter().enumerate() {
+        let start = pos.next_multiple_of(*align);
+        let end = match member {
+            1 => start + 8,
+            7 => framing_start,
+            _ => ends[member],
+        };
+        members.push(bytes[start..end].to_vec());
+        pos = end;
+    }
+    members[5] = recursion.to_vec();
+
+    let mut out = Vec::new();
+    let mut new_ends = Vec::new();
+    for (member, align) in ALIGN.iter().enumerate() {
+        out.resize(out.len().next_multiple_of(*align), 0);
+        out.extend_from_slice(&members[member]);
+        if FRAMED.contains(&member) {
+            new_ends.push(out.len());
+        }
+    }
+    let z = [1usize, 2, 4]
+        .into_iter()
+        .find(|z| out.len() + new_ends.len() * z <= (1usize << (8 * z)) - 1)
+        .unwrap_or(8);
+    for end in new_ends.iter().rev() {
+        out.extend_from_slice(&end.to_le_bytes()[..z]);
+    }
+    out
+}
+
+/// `Number of parents` is field 5's byte length over 64, in both.
+#[test]
+fn static_delta_show_parent_count_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-show-parents");
+    let (repo, c1, _) = delta_show_repo(tmp.path(), "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    let dir = repo.join(ostrya::static_delta_relative_dir(
+        None,
+        &Checksum::from_hex(&c1).unwrap(),
+    ));
+    let original = std::fs::read(dir.join("superblock")).unwrap();
+    assert_eq!(superblock_with_recursion(&original, &[]), original);
+
+    for (len, parents) in [(0usize, 0usize), (63, 0), (64, 1), (130, 2)] {
+        let name = format!("sb-{len}");
+        std::fs::write(
+            dir.join(&name),
+            superblock_with_recursion(&original, &vec![7; len]),
+        )
+        .unwrap();
+        let run = assert_show_agrees(&repo, dir.join(&name).to_str().unwrap());
+        let text = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            text.contains(&format!("\nNumber of parents: {parents}\n")),
+            "{len}: {text}"
+        );
+    }
+}
+
+/// The name parser and the refusals agree: exit status, standard output, and
+/// standard error. Carries `static-delta/show-invalid-name` and
+/// `static-delta/show-absent`.
+#[test]
+fn static_delta_show_refusals_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-show-refusals");
+    let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    let repo_arg = format!("--repo={}", repo.display());
+
+    let no_argument = ["static-delta", &repo_arg, "show"];
+    let port = ostrya(&no_argument, None, &[]);
+    let tool = ostree(&no_argument);
+    assert_runs_agree(&port, &tool, "static-delta show");
+    assert_eq!(
+        String::from_utf8_lossy(&port.stderr),
+        "error: DELTA must be specified\n"
+    );
+
+    let upper = c1.to_uppercase();
+    let bad_last = format!("{}G", &c1[..63]);
+    let empty_to = format!("{c1}-");
+    let triple = format!("{c1}-{c2}-{c2}");
+    let leading = format!(" {c1}");
+    let absent = format!("{c1}-{c1}");
+    for arg in [
+        "ABC",
+        "m",
+        &c1[..10],
+        upper.as_str(),
+        bad_last.as_str(),
+        empty_to.as_str(),
+        triple.as_str(),
+        leading.as_str(),
+        absent.as_str(),
+        "",
+    ] {
+        let run = assert_show_agrees(&repo, arg);
+        assert_eq!(run.status.code(), Some(1), "{arg}");
+        assert!(run.stdout.is_empty(), "{arg}");
+    }
+
+    // A missing part fails after its `PartMeta` line in both.
+    let dir = repo.join(ostrya::static_delta_relative_dir(
+        None,
+        &Checksum::from_hex(&c1).unwrap(),
+    ));
+    std::fs::remove_file(dir.join("0")).unwrap();
+    let run = assert_show_agrees(&repo, &c1);
+    assert_eq!(run.status.code(), Some(1));
+    let printed = String::from_utf8_lossy(&run.stdout);
+    assert!(printed.contains("\nPartMeta0: "), "{printed}");
+    assert!(!printed.contains("PartPayload0"), "{printed}");
+}
+
+/// An uncompressed part payload with empty tables, a 64-byte blob, and `ops`,
+/// framed at a one-byte offset width.
+fn crafted_part(ops: &[u8]) -> Vec<u8> {
+    let blob = [0u8; 64];
+    let mut part = vec![0u8];
+    part.extend_from_slice(&blob);
+    part.extend_from_slice(ops);
+    assert!(part.len() + 3 < 0x100);
+    // The blob end, the xattr table end, the mode table end.
+    part.extend_from_slice(&[blob.len() as u8, 0, 0]);
+    part
+}
+
+/// The operands of an operation stream the tool's `show` counts unchecked
+/// count the same in the port: a `w` past the blob with no read source set and
+/// a `B` past the blob, at exit 0. An `S` past the blob refuses in both. An
+/// `o` whose mode index is outside the empty mode table aborts the tool and
+/// counts in the port, the recorded exit split. Each part is written in place
+/// of the tool's own, with its meta entry's checksum and size patched.
+#[test]
+fn static_delta_show_counts_unchecked_operands_as_the_tool_does() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-show-operands");
+    let (repo, c1, _) = delta_show_repo(tmp.path(), "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    let dir = repo.join(ostrya::static_delta_relative_dir(
+        None,
+        &Checksum::from_hex(&c1).unwrap(),
+    ));
+    let superblock = std::fs::read(dir.join("superblock")).unwrap();
+    let part = std::fs::read(dir.join("0")).unwrap();
+    // The meta entry `(uayttay)` holds the part checksum at 4 and the size at
+    // 40.
+    let entry = superblock
+        .windows(32)
+        .position(|window| window == ostrya::Checksum::sha256(&part).as_bytes())
+        .expect("the part checksum is in the superblock")
+        - 4;
+    assert_eq!(
+        u64::from_le_bytes(superblock[entry + 40..entry + 48].try_into().unwrap()),
+        part.len() as u64
+    );
+    let install = |ops: &[u8]| {
+        let part = crafted_part(ops);
+        let mut bytes = superblock.clone();
+        bytes[entry + 4..entry + 36].copy_from_slice(ostrya::Checksum::sha256(&part).as_bytes());
+        bytes[entry + 40..entry + 48].copy_from_slice(&(part.len() as u64).to_le_bytes());
+        std::fs::write(dir.join("superblock"), bytes).unwrap();
+        std::fs::write(dir.join("0"), part).unwrap();
+    };
+
+    for (ops, key) in [
+        (&b"w\x64\x00"[..], "write="),
+        (&b"B\x00\x64"[..], "bspatch="),
+    ] {
+        install(ops);
+        let run = assert_show_agrees(&repo, &c1);
+        assert!(run.status.success(), "{key}");
+        assert_eq!(show_count(&run, key), 1, "{key}");
+    }
+
+    install(b"S\x64\x00");
+    let repo_arg = format!("--repo={}", repo.display());
+    let args = ["static-delta", &repo_arg, "show", &c1];
+    let port = ostrya(&args, None, &[]);
+    let tool = ostree(&args);
+    assert_eq!(port.status.code(), Some(1));
+    assert_eq!(tool.status.code(), Some(1));
+
+    install(b"o\x00\x00\x05c");
+    let port = ostrya(&args, None, &[]);
+    port.ok();
+    assert_eq!(show_count(&port, "open="), 1);
+    let tool = ostree(&args);
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(tool.status.signal(), Some(6), "the tool did not abort");
+}
+
+/// `indexes` agrees: nothing for an absent or empty `delta-indexes/`, the
+/// targets `reindex` wrote, as a set since the tool prints `readdir` order and
+/// the port sorts, and the entries both skip. A `delta-indexes` that is a file
+/// fails in both. Carries `static-delta/indexes-empty`,
+/// `static-delta/indexes-after-reindex`, and
+/// `static-delta/indexes-skips-invalid`.
+#[test]
+fn static_delta_indexes_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-indexes");
+    let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
+    // The tool reads `static-delta --repo PATH` as a subcommand named PATH, so
+    // the repository goes in the `=` form.
+    let repo_arg = format!("--repo={}", repo.display());
+    let args = ["static-delta", repo_arg.as_str(), "indexes"];
+    let both = || (ostrya(&args, None, &[]), ostree(&args));
+    let (port, tool) = both();
+    assert_runs_agree(&port, &tool, "static-delta indexes");
+    assert_eq!(
+        String::from_utf8_lossy(&port.stdout),
+        "(No static deltas indexes)\n"
+    );
+    std::fs::create_dir(repo.join("delta-indexes")).unwrap();
+    let (port, tool) = both();
+    assert_runs_agree(&port, &tool, "static-delta indexes");
+
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    ostree_ok(
+        &repo,
+        &["static-delta", "generate", "--from", &c1, "--to", &c2],
+    );
+    ostree_ok(&repo, &["static-delta", "reindex"]);
+    let lines = |run: &Run| {
+        String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let (port, tool) = both();
+    port.ok();
+    let mut sorted = lines(&tool);
+    sorted.sort();
+    assert_eq!(lines(&port), sorted);
+    let mut expected = vec![c1.clone(), c2.clone()];
+    expected.sort();
+    assert_eq!(lines(&port), expected);
+
+    let indexes = repo.join("delta-indexes");
+    let a41 = "A".repeat(41);
+    let a40 = "A".repeat(40);
+    for entry in [
+        format!("abc/{a40}.index"),
+        format!("abc/{a41}.index"),
+        format!("AA/{a40}.index"),
+        format!("AA/{}.index", "A".repeat(42)),
+        format!("AA/{a41}.INDEX"),
+        format!("AA/{a41}.index.index"),
+        format!("AA/{a41}.index~"),
+        format!("AA/{a41}.idx"),
+    ] {
+        let file = indexes.join(entry);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"").unwrap();
+    }
+    std::fs::create_dir_all(indexes.join("AB").join(format!("{a41}.index"))).unwrap();
+    std::fs::create_dir_all(indexes.join("AC")).unwrap();
+    std::os::unix::fs::symlink("/dev/null", indexes.join("AC").join(format!("{a41}.index")))
+        .unwrap();
+    std::fs::write(indexes.join("stray"), b"").unwrap();
+    let (port, tool) = both();
+    port.ok();
+    let mut sorted = lines(&tool);
+    sorted.sort();
+    assert_eq!(lines(&port), sorted);
+    assert_eq!(lines(&port), expected);
+
+    std::fs::remove_dir_all(&indexes).unwrap();
+    std::fs::write(&indexes, b"").unwrap();
+    let (port, tool) = both();
+    assert_eq!(port.status.code(), Some(1));
+    assert_eq!(tool.status.code(), Some(1));
+    assert!(port.stdout.is_empty() && tool.stdout.is_empty());
+}

@@ -43,7 +43,10 @@
 
 use std::os::fd::{AsFd, BorrowedFd};
 
-use ostrya_core::{Checksum, Commit, DirMeta, ObjectType, Type, Value, from_bytes, to_bytes};
+use ostrya_core::{
+    Checksum, Commit, DirMeta, ObjectType, Type, Value, from_bytes, to_bytes,
+    tuple_field_from_bytes,
+};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
@@ -146,6 +149,17 @@ impl Summary {
         Ok(Summary { refs, metadata })
     }
 
+    /// Parse the global metadata dict of a `summary` file and nothing else.
+    ///
+    /// The ref list is left undecoded, so a reader that reports the metadata
+    /// alone -- the key listing and one value looked up by name -- pays for the
+    /// framing of field 0 and not for its contents. The framing checks are the
+    /// ones [`Summary::parse`] applies.
+    pub fn parse_metadata(bytes: &[u8]) -> Result<Value> {
+        let ty = Type::parse(SUMMARY_SIGNATURE).map_err(ostrya_core::Error::from)?;
+        Ok(tuple_field_from_bytes(&ty, bytes, 1).map_err(ostrya_core::Error::from)?)
+    }
+
     /// The value stored under `key` in the global metadata dict, unwrapped from
     /// the variant the dict holds it in.
     ///
@@ -198,15 +212,16 @@ impl Summary {
 
 /// One field-0 entry `(s, (t, ay, a{sv}))`.
 fn parse_ref_entry(entry: Value) -> Result<SummaryRef> {
-    let Value::Tuple(fields) = entry else {
+    let Value::Tuple(mut fields) = entry else {
         return Err(malformed("a summary ref entry is not a tuple"));
     };
-    let [Value::Str(name), Value::Tuple(inner)] = &fields[..] else {
+    let [Value::Str(name), Value::Tuple(inner)] = &mut fields[..] else {
         return Err(malformed("a summary ref entry is not (name, details)"));
     };
     let Some(Value::U64(size)) = inner.first() else {
         return Err(malformed("a summary ref entry holds no commit size"));
     };
+    let size = *size;
     let Some(Value::Bytes(checksum)) = inner.get(1) else {
         return Err(malformed("a summary ref entry holds no commit checksum"));
     };
@@ -216,14 +231,16 @@ fn parse_ref_entry(entry: Value) -> Result<SummaryRef> {
             checksum.len()
         ))
     })?;
-    let Some(metadata) = inner.get(2) else {
+    let Some(metadata) = inner.get_mut(2) else {
         return Err(malformed("a summary ref entry holds no metadata dict"));
     };
+    // The entry is owned, so the name and the metadata dict move out of it
+    // rather than being cloned out; a summary lists one entry per ref.
     Ok(SummaryRef {
-        name: name.clone(),
+        name: std::mem::take(name),
         commit: Checksum::from_bytes(raw),
-        commit_size: *size,
-        metadata: metadata.clone(),
+        commit_size: size,
+        metadata: std::mem::replace(metadata, Value::Array(Vec::new())),
     })
 }
 
@@ -626,10 +643,15 @@ fn read_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<Option
         Err(Errno::NOENT) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let mut buf = Vec::new();
-    std::fs::File::from(fd)
-        .take(SUMMARY_READ_CAP)
-        .read_to_end(&mut buf)?;
+    let file = std::fs::File::from(fd);
+    // The buffer is sized from the file before the read, so the file lands in
+    // one allocation. Without the hint the buffer grows by doubling and the
+    // bytes already read are copied at every step of the ladder. The hint is
+    // clamped to the same bound the reader takes, so a file that states a
+    // hostile size allocates no more than that.
+    let hint = file.metadata()?.len().min(SUMMARY_READ_CAP) + 1;
+    let mut buf = Vec::with_capacity(hint as usize);
+    file.take(SUMMARY_READ_CAP).read_to_end(&mut buf)?;
     Ok(Some(buf))
 }
 
@@ -762,6 +784,21 @@ mod tests {
         let ty = Type::parse(SUMMARY_SIGNATURE).unwrap();
         let bytes = to_bytes(&ty, &value).unwrap();
         assert_eq!(Summary::parse(&bytes).unwrap().metadata, metadata);
+        assert_eq!(Summary::parse_metadata(&bytes).unwrap(), metadata);
+    }
+
+    /// The metadata dict reads the same whether the ref list is decoded with
+    /// it or left alone, and a document the framing checks refuse is refused
+    /// either way.
+    #[test]
+    fn reads_the_metadata_dict_without_the_ref_list() {
+        let bytes = encode(&[("test/main", checksum(1)), ("other", checksum(2))]);
+        assert_eq!(
+            Summary::parse_metadata(&bytes).unwrap(),
+            Summary::parse(&bytes).unwrap().metadata
+        );
+        let err = Summary::parse_metadata(b"not a summary at all").unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "{err}");
     }
 
     #[test]

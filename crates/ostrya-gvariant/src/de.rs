@@ -17,6 +17,40 @@ pub fn from_bytes(ty: &Type, data: &[u8]) -> Result<Value> {
     parse(ty, data, 0)
 }
 
+/// Deserialize one member of a tuple, leaving the other members undecoded.
+///
+/// `ty` is the type of the whole tuple and `index` names the member to decode,
+/// counting from zero. The framing of every member is checked the way
+/// [`from_bytes`] checks it, so a document that is not in normal form fails
+/// here as it fails there; only the decode of the members the caller does not
+/// name is skipped. A reader of one member of a document whose other members
+/// are large pays for the framing alone.
+pub fn tuple_field_from_bytes(ty: &Type, data: &[u8], index: usize) -> Result<Value> {
+    let Type::Tuple(members) = ty else {
+        return Err(Error::NotNormal("the type is not a tuple"));
+    };
+    let n = members.len();
+    if index >= n {
+        return Err(Error::NotNormal("the tuple holds no member of that index"));
+    }
+    let n_offsets = members
+        .iter()
+        .take(n - 1)
+        .filter(|member| member.fixed_size().is_none())
+        .count();
+    let mut reader = TupleReader::new(data, n_offsets, ty.fixed_size())?;
+    let mut field = None;
+    let last = n - 1;
+    for (i, member_ty) in members.iter().enumerate() {
+        let slice = reader.field(member_ty.alignment(), member_ty.fixed_size(), i == last)?;
+        if i == index {
+            field = Some(parse(member_ty, slice, 1)?);
+        }
+    }
+    reader.finish()?;
+    Ok(field.expect("the index names a member of the tuple"))
+}
+
 fn parse(ty: &Type, data: &[u8], depth: usize) -> Result<Value> {
     if depth > MAX_VALUE_DEPTH {
         return Err(Error::DepthExceeded);
@@ -175,6 +209,40 @@ mod tests {
 
     fn checksum_bytes(seed: u8) -> Value {
         Value::Bytes((0..32).map(|i| seed.wrapping_add(i)).collect())
+    }
+
+    /// One member of a tuple decodes to the value the whole parse gives it, the
+    /// framing of every member is still checked, and an index outside the tuple
+    /// is refused.
+    #[test]
+    fn decodes_one_tuple_member() {
+        let ty = Type::parse("(asa{sv}t)").unwrap();
+        let value = Value::Tuple(vec![
+            Value::Array(vec!["a".into(), "bb".into()]),
+            Value::Array(vec![Value::Tuple(vec![
+                "k".into(),
+                Value::variant(Type::U32, Value::U32(9)),
+            ])]),
+            Value::U64(0x0123_4567_89ab_cdef),
+        ]);
+        let bytes = to_bytes(&ty, &value).unwrap();
+        let Value::Tuple(members) = from_bytes(&ty, &bytes).unwrap() else {
+            panic!("the summary type is a tuple");
+        };
+        for (index, member) in members.iter().enumerate() {
+            assert_eq!(
+                &tuple_field_from_bytes(&ty, &bytes, index).unwrap(),
+                member,
+                "member {index}"
+            );
+        }
+        assert!(tuple_field_from_bytes(&ty, &bytes, 3).is_err());
+        assert!(tuple_field_from_bytes(&Type::Str, &bytes, 0).is_err());
+        // The framing the other members carry is read whichever member is named.
+        let mut torn = bytes.clone();
+        let last = torn.len() - 1;
+        torn[last] = 0xff;
+        assert!(tuple_field_from_bytes(&ty, &torn, 2).is_err());
     }
 
     #[test]

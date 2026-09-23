@@ -1938,6 +1938,8 @@ pub struct SummaryRef {
 }
 impl Summary {
     pub fn parse(bytes: &[u8]) -> Result<Summary>;
+    /// The global metadata dict alone, the ref list left undecoded.
+    pub fn parse_metadata(bytes: &[u8]) -> Result<Value>;
     pub fn lookup(&self, ref_name: &str) -> Option<Checksum>;
     pub fn metadata_value(&self, key: &str) -> Option<&Value>;
     /// The refs of each collection `ostree.summary.collection-map` lists.

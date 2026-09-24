@@ -1972,8 +1972,10 @@ impl Repo {
 ## Static deltas
 
 The three size thresholds are in bytes, where the tool's options take decimal
-megabytes. Generation, signing, and index publication are three calls, so a
-caller signs a delta it has just written and publishes it once.
+megabytes. Generation signs the superblock with the signers `DeltaOptions`
+names before it writes the superblock, so a signer that fails leaves no
+superblock. `sign_static_delta` adds a signature to a delta already written.
+Index publication is a separate call, so a caller publishes once.
 
 ```rust
 pub struct DeltaOptions {
@@ -1987,11 +1989,16 @@ pub struct DeltaOptions {
     /// Write the superblock and the part files here instead of the
     /// repository's `deltas/` tree.
     pub output_dir: Option<PathBuf>,
+    /// Write the superblock to this file and the part files to the directory
+    /// that holds it. The directory must exist. Refused beside `output_dir`.
+    pub superblock_file: Option<PathBuf>,
+    /// Sign the superblock with each signer, in order, before it is written.
+    pub signers: Vec<Arc<dyn Signer>>,
 }
 impl Repo {
     /// Returns the directory the delta was written to: relative to the
-    /// repository root for the default location, and `output_dir` verbatim
-    /// where that option is set.
+    /// repository root for the default location, and `output_dir` or
+    /// `superblock_file` verbatim where one is set.
     pub async fn generate_static_delta(&self, from: Option<&Checksum>,
         to: &Checksum, opts: &DeltaOptions) -> Result<PathBuf>;
     /// Apply the delta in `dir` and return the commit it delivered.

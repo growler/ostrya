@@ -2304,15 +2304,83 @@ differences stand on `show`, `delete`, `list`, `indexes`, and `verify`.
   `error: gvariant:` sentence at exit 1. Only a publisher's own bytes reach the last
   case.
 
-`static-delta generate` carries one open divergence, in the `usize` of a part's
-meta entry. The port's generator counts the target length of each symlink the
-part carries, and the tool's generator does not. A from-scratch part of a
-300,000-byte file, a 6-byte file, a symlink with the 1-byte target `a`, and two
-metadata objects reports `usize=300129` from the tool's generator and
-`usize=300130` from the port's. The objects the delta produces are the same:
-the port's application reads no `usize`, and `show` prints the value the
-superblock holds. The port's generator keeps its rule until a change to it is
-decided.
+`static-delta generate` carries fourteen differences. Two of them are open.
+
+- the `usize` of a part's meta entry. This difference is open. The port's
+  generator counts the target length of each symlink the part carries, and the
+  tool's generator does not. A from-scratch part of a 300,000-byte file, a
+  6-byte file, a symlink with the 1-byte target `a`, and two metadata objects
+  reports `usize=300129` from the tool's generator and `usize=300130` from the
+  port's. The objects the delta produces are the same: the port's application
+  reads no `usize`, and `show` prints the value the superblock holds. The
+  port's generator keeps its rule until a change to it is decided;
+- signing with a repeated `--keys-file`. This difference is in the bytes of
+  the repository and is open. The tool signs with the last `--keys-file`
+  alone. The port signs with each key of every file, so the superblock bytes
+  differ. A `--sign` value beside one `--keys-file` signs with both keys in
+  both implementations. `sign` carries the same difference;
+- the statistics. The tool writes seven or more lines to standard error on
+  every run that reaches generation (`../format-reference.md`, "CLI output
+  formats", `static-delta`). The port writes nothing to standard error on
+  success. The terminal is outside the compatibility scope;
+- a size value outside whole decimal digits, and a value whose byte count is
+  past `u64::MAX`. The tool reads `abc` as 0 and accepts `1.5`, `-1`, ` 3`,
+  `+3`, and `3x`. `clap` refuses each with `error: invalid value` at exit 1,
+  before the repository reads, and nothing is written;
+- `--max-chunk-size=0`. The tool writes one object in each part and exits 0.
+  The port refuses at exit 1 after the block with `error: invalid format:
+  static delta max chunk size must be positive`, and writes nothing;
+- an extra positional argument. The tool ignores it, and `clap` refuses it
+  with `error: unexpected argument '<value>' found` at exit 1. This is the
+  class recorded for `show` and `diff`;
+- a `--filename` PATH that is a directory, that ends in `/`, or whose last
+  component is `.` or `..` after a directory. The tool writes part `0` and
+  then refuses at the rename with `error: renameat(<temp>, <name>):
+  <reason>`. The port refuses before it writes a file with `error: i/o error:
+  Is a directory (os error 21)`. Both exit 1 after the block;
+- a `--filename` PATH whose name is a part file name, `0` for example. The
+  tool renames the superblock over that part and exits 0, which gives a delta
+  that `show` and `apply-offline` refuse. The port refuses at exit 1 after the
+  block with `error: invalid format: static delta superblock file name <name>
+  is a part file name`, and writes nothing;
+- the wording of a missing `--filename` parent. The tool writes `error:
+  opendir(<dir>): No such file or directory`, and the port writes the
+  library's `error: i/o error:` sentence. Both exit 1 after the block and
+  create nothing. A PATH `X/.` where `X` is absent or is not a directory takes
+  the same outcome: the tool writes `error: opendir(X): <reason>`, and the
+  port writes `error: i/o error: Is a directory (os error 21)`;
+- a `--filename` name that is not UTF-8. The tool writes the delta under that
+  name and exits 0. The port refuses at exit 1 after the block with `error:
+  invalid format: static delta superblock file name <path> is not UTF-8`,
+  and writes nothing;
+- an empty `--filename` value. The tool prints the block and then `error:
+  Invalid 'filename' parameter`. `clap` refuses it with `error: a value is
+  required for '--filename <PATH>' but none was supplied` before the block.
+  Both exit 1 and write nothing. Standard output differs, since the port
+  prints no block;
+- the wording of a source commit the repository does not hold, for example
+  the default parent in a shallow repository. The tool writes `error: No such
+  metadata object <hex>.commit` and leaves an empty delta directory. The port
+  writes `error: object not found: Commit <hex>` and creates no directory.
+  Both exit 1 after the block, and neither lists a delta;
+- a bad signing key. The tool writes the parts and then refuses the key, so it
+  leaves part `0` and writes no superblock. The port reads the keys before it
+  writes a part and writes nothing. Both exit 1 after the block with the same
+  error line. At a location that holds no delta, neither lists a delta. At a
+  location that holds one, both keep the earlier superblock, and the tool
+  also rewrites the parts. A `--sign-type=gpg` key, which the tool does not
+  carry, fails in the port after the parts, and at the repository's own
+  location it also removes the earlier superblock;
+- an unknown `--sign-type`. The tool ignores it where no key is given, and
+  refuses it with `error: Requested signature type is not implemented` after
+  the parts are written where a key is given. `clap` refuses it at exit 1
+  before the repository reads.
+
+The port adds `--output-dir=DIR`, which writes the superblock and the parts to
+DIR, `--timestamp`, `--reindex`, `--gpg-homedir`, and `-s` for
+`--sign-type`. `-n` reads the repository's superblock also under
+`--output-dir`. The port reads a `--sign` key with the lenient base64 reader
+`commit --sign` uses.
 
 `pull` accepts a large set already. Missing: `--cache-dir`, `--disable-fsync`,
 `--per-object-fsync`, `--disable-retry-on-network-errors`, `--subpath`,

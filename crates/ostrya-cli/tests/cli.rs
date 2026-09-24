@@ -4047,13 +4047,14 @@ fn static_delta_generate_signs_and_indexes() {
     let repo = commit_fixture(base);
     let repo_arg = repo.to_str().unwrap().to_owned();
 
-    // `generate` prints the directory it wrote, signs it, and indexes it.
+    // `generate` prints what it generates from and to, signs, and indexes.
     let generated = ostrya(
         &[
             "static-delta",
             "--repo",
             &repo_arg,
             "generate",
+            "--empty",
             "--to",
             COMMIT,
             "--sign",
@@ -4063,9 +4064,12 @@ fn static_delta_generate_signs_and_indexes() {
         None,
         &[],
     );
-    let dir = PathBuf::from(generated.ok().stdout_trimmed());
+    assert_eq!(
+        String::from_utf8(generated.ok().stdout.clone()).unwrap(),
+        format!("Generating static delta:\n  From: empty\n  To:   {COMMIT}\n")
+    );
+    let dir = only_delta_dir(&repo);
     assert!(dir.join("superblock").exists(), "no superblock at {dir:?}");
-    assert_eq!(dir, only_delta_dir(&repo), "delta written outside deltas/");
 
     // The tool verifies the signature the port wrote and applies the delta.
     let verified = Command::new("ostree")
@@ -4134,6 +4138,7 @@ fn static_delta_generate_relative_output_dir() {
             "--repo",
             repo.to_str().unwrap(),
             "generate",
+            "--empty",
             "--to",
             COMMIT,
             "--output-dir",
@@ -4144,7 +4149,10 @@ fn static_delta_generate_relative_output_dir() {
         None,
         &[],
     );
-    assert_eq!(generated.ok().stdout_trimmed(), "rel");
+    assert_eq!(
+        String::from_utf8(generated.ok().stdout.clone()).unwrap(),
+        format!("Generating static delta:\n  From: empty\n  To:   {COMMIT}\n")
+    );
     let dir = base.join("rel");
     assert!(dir.join("superblock").exists(), "no superblock at {dir:?}");
     assert!(
@@ -4771,6 +4779,7 @@ fn pull_static_delta_switches() {
             "--repo",
             &remote_s,
             "generate",
+            "--empty",
             "--to",
             COMMIT,
             "--reindex",
@@ -29144,7 +29153,7 @@ fn static_delta_show_matches_the_tool_over_the_ports_deltas() {
         args.extend_from_slice(extra);
         ostrya(&args, None, &[]).ok();
     };
-    generate(repo_str, &["--to", &c1]);
+    generate(repo_str, &["--empty", "--to", &c1]);
     generate(repo_str, &["--from", &c1, "--to", &c2]);
     let run = assert_show_agrees(&repo, &c1);
     assert!(String::from_utf8_lossy(&run.stdout).contains("Timestamp: 1700000000\n"));
@@ -29154,7 +29163,7 @@ fn static_delta_show_matches_the_tool_over_the_ports_deltas() {
     let (fallback, c3) = delta_fallback_repo(tmp.path(), "fallback", true);
     generate(
         fallback.to_str().unwrap(),
-        &["--to", &c3, "--max-chunk-size=1000000"],
+        &["--empty", "--to", &c3, "--max-chunk-size=1"],
     );
     let run = assert_show_agrees(&fallback, &c3);
     let text = String::from_utf8_lossy(&run.stdout);
@@ -29162,7 +29171,7 @@ fn static_delta_show_matches_the_tool_over_the_ports_deltas() {
     assert!(text.contains("Number of parts: 4\n"), "{text}");
 
     let sign = format!("--sign={ED25519_SECRET_B64}");
-    generate(repo_str, &["--to", &c2, &sign]);
+    generate(repo_str, &["--empty", "--to", &c2, &sign]);
     let run = assert_show_agrees(&repo, &c2);
     assert!(String::from_utf8_lossy(&run.stdout).contains("Signed: yes\n"));
 }
@@ -30387,7 +30396,7 @@ fn verify_fixture(base: &Path) -> PathBuf {
     let repo_s = repo.to_str().unwrap();
     let sign = format!("--sign={ED25519_SECRET_B64}");
     let generate = ["static-delta", "--repo", repo_s, "generate"];
-    let pinned = ["--timestamp=1700000000", "--to", COMMIT];
+    let pinned = ["--timestamp=1700000000", "--empty", "--to", COMMIT];
     ostrya(&[&generate[..], &pinned[..], &[&sign]].concat(), None, &[]).ok();
     let out = format!("--output-dir={}", base.join("unsigned").display());
     ostrya(&[&generate[..], &pinned[..], &[&out]].concat(), None, &[]).ok();
@@ -30772,6 +30781,7 @@ fn static_delta_verify_sign_types() {
                 "--repo",
                 repo.to_str().unwrap(),
                 "generate",
+                "--empty",
                 "--to",
                 COMMIT,
                 "--sign-type=spki",
@@ -31036,8 +31046,8 @@ fn static_delta_verify_matches_the_tool_over_the_ports_deltas() {
         ];
         ostrya(&[&base[..], extra].concat(), None, &[]).ok();
     };
-    generate(&["--to", &c1]);
-    generate(&["--to", &c2, &sign]);
+    generate(&["--empty", "--to", &c1]);
+    generate(&["--empty", "--to", &c2, &sign]);
     generate(&["--from", &c1, "--to", &c2, &sign]);
     assert_verify_cases_agree(tmp.path(), &repo, &c1, &c2);
 }
@@ -31092,6 +31102,588 @@ fn static_delta_verify_refusals_match_the_tool() {
         assert_eq!(run.status.code(), Some(1));
         assert!(run.stdout.is_empty() || run.stdout == b"Sign-type not supported\n");
     }
+}
+
+// --- static-delta generate ----------------------------------------------------
+
+/// The standard output of a `generate` run that reaches generation.
+fn generate_block(from: Option<&str>, to: &str) -> String {
+    format!(
+        "Generating static delta:\n  From: {}\n  To:   {to}\n",
+        from.unwrap_or("empty")
+    )
+}
+
+/// Run `static-delta generate ARGS` from `cwd` against `repo` under one
+/// implementation, the port where `port` is set.
+fn run_generate(port: bool, cwd: &Path, repo: &Path, args: &[&str]) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let all = [&["static-delta", repo_arg.as_str(), "generate"][..], args].concat();
+    if port {
+        ostrya_in(Some(cwd), &all, None, &[])
+    } else {
+        ostree_in(cwd, &all)
+    }
+}
+
+/// Run `static-delta generate ARGS` under both implementations, each against
+/// its own repository and from its own working directory, and return the port's
+/// run and the tool's.
+fn generate_both(port: (&Path, &Path), tool: (&Path, &Path), args: &[&str]) -> (Run, Run) {
+    (
+        run_generate(true, port.0, port.1, args),
+        run_generate(false, tool.0, tool.1, args),
+    )
+}
+
+/// The `static-delta list` output of `repo`, as the tool prints it, sorted.
+fn listed_deltas(repo: &Path) -> Vec<String> {
+    let run = ostree(&[
+        &format!("--repo={}", repo.display()),
+        "static-delta",
+        "list",
+    ]);
+    assert!(run.status.success());
+    let mut names: Vec<String> = String::from_utf8(run.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Every `superblock` file under `repo/deltas`.
+fn delta_superblocks(repo: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(fanouts) = std::fs::read_dir(repo.join("deltas")) else {
+        return out;
+    };
+    for fanout in fanouts {
+        for leaf in std::fs::read_dir(fanout.unwrap().path()).unwrap() {
+            let superblock = leaf.unwrap().path().join("superblock");
+            if superblock.exists() {
+                out.push(superblock);
+            }
+        }
+    }
+    out
+}
+
+/// The sorted names in a directory, or nothing where it is absent.
+fn entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// The default source, the positional target, and the two refusals agree:
+/// with neither `--from` nor `--empty` the source is the parent of TO, a root
+/// commit refuses, `--empty` with `--from` refuses before any revision
+/// resolves, and `--to` wins over the positional. A default parent absent from
+/// the repository fails after the block in both, with nothing listed. Carries
+/// `static-delta/generate-{default-parent,no-parent-refused,empty-and-from-refused,positional-to}`.
+#[test]
+fn static_delta_generate_defaults_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-generate-defaults");
+    let base = tmp.path();
+    let (repo, c1, c2) = delta_show_repo(base, "repo");
+    let port_repo = clone_repo(base, &repo, "port");
+    let tool_repo = clone_repo(base, &repo, "tool");
+    let port = (base, port_repo.as_path());
+    let tool = (base, tool_repo.as_path());
+
+    let (p, t) = generate_both(port, tool, &["--to=m"]);
+    for (who, run) in [("port", &p), ("tool", &t)] {
+        assert!(run.status.success(), "{who}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            generate_block(Some(&c1), &c2),
+            "{who}"
+        );
+    }
+    assert!(
+        p.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&p.stderr)
+    );
+    let from_to = vec![format!("{c1}-{c2}")];
+    assert_eq!(listed_deltas(&port_repo), from_to);
+    assert_eq!(listed_deltas(&tool_repo), from_to);
+
+    let (p, t) = generate_both(port, tool, &["--empty", "m"]);
+    assert!(p.status.success() && t.status.success());
+    assert_eq!(p.stdout, t.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&p.stdout),
+        generate_block(None, &c2)
+    );
+    assert!(listed_deltas(&port_repo).contains(&c2));
+    assert!(listed_deltas(&tool_repo).contains(&c2));
+
+    let to_c1 = format!("--to={c1}");
+    let (p, t) = generate_both(port, tool, &["--empty", &to_c1, &c2]);
+    assert!(p.status.success() && t.status.success());
+    assert_eq!(p.stdout, t.stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&p.stdout),
+        generate_block(None, &c1)
+    );
+
+    let (p, t) = generate_both(port, tool, &[&to_c1]);
+    assert_runs_agree(&p, &t, &format!("generate {to_c1}"));
+    assert_eq!(
+        String::from_utf8_lossy(&p.stderr),
+        format!("error: Commit {c1} has no parent\n")
+    );
+
+    let from_c1 = format!("--from={c1}");
+    let (p, t) = generate_both(port, tool, &["--empty", &from_c1, "--to=m"]);
+    assert_runs_agree(&p, &t, "generate --empty --from --to");
+    assert_eq!(
+        String::from_utf8_lossy(&p.stderr),
+        "error: Cannot specify both --empty and --from=REV\n"
+    );
+    let (p, t) = generate_both(port, tool, &["--empty", &from_c1]);
+    assert_runs_agree(&p, &t, "generate --empty --from");
+    assert_eq!(
+        String::from_utf8_lossy(&p.stderr),
+        "error: TO revision must be specified\n"
+    );
+
+    // A shallow copy holds the tip and not its parent.
+    let mut shallow = Vec::new();
+    for name in ["port-shallow", "tool-shallow"] {
+        let copy = base.join(name);
+        ostree_ok(&copy, &["init", "--mode=archive"]);
+        ostree_ok(
+            &copy,
+            &["pull-local", "--depth=0", repo.to_str().unwrap(), "m"],
+        );
+        shallow.push(copy);
+    }
+    let (p, t) = generate_both((base, &shallow[0]), (base, &shallow[1]), &["--to=m"]);
+    for (who, run) in [("port", &p), ("tool", &t)] {
+        assert_eq!(run.status.code(), Some(1), "{who}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            generate_block(Some(&c1), &c2),
+            "{who}"
+        );
+    }
+    assert_eq!(listed_deltas(&shallow[0]), vec!["(No static deltas)"]);
+    assert_eq!(listed_deltas(&shallow[1]), vec!["(No static deltas)"]);
+}
+
+/// `-n` prints `Delta <name> already exists.` and writes nothing where the
+/// repository holds the delta's superblock, under `--filename` too, and
+/// regenerates where the directory holds a part alone. Carries
+/// `static-delta/generate-if-not-exists`.
+#[test]
+fn static_delta_generate_if_not_exists_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-generate-if-not-exists");
+    let base = tmp.path();
+    let (repo, c1, c2) = delta_show_repo(base, "repo");
+    let port_repo = clone_repo(base, &repo, "port");
+    let tool_repo = clone_repo(base, &repo, "tool");
+    let port_cwd = base.join("port-cwd");
+    let tool_cwd = base.join("tool-cwd");
+    std::fs::create_dir_all(&port_cwd).unwrap();
+    std::fs::create_dir_all(&tool_cwd).unwrap();
+    let port = (port_cwd.as_path(), port_repo.as_path());
+    let tool = (tool_cwd.as_path(), tool_repo.as_path());
+    let to_c1 = format!("--to={c1}");
+    for args in [&["--to=m"][..], &["--empty", "m"], &["--empty", &to_c1]] {
+        let (p, t) = generate_both(port, tool, args);
+        assert!(p.status.success() && t.status.success(), "{args:?}");
+    }
+    let before: Vec<(Vec<u8>, std::time::SystemTime)> = delta_superblocks(&port_repo)
+        .iter()
+        .map(|path| {
+            (
+                std::fs::read(path).unwrap(),
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+
+    for (args, name) in [
+        (&["-n", "--to=m"][..], format!("{c1}-{c2}")),
+        (&["-n", "--empty", "m"], c2.clone()),
+        (&["-n", "--empty", &to_c1, "--filename=out/sb"], c1.clone()),
+    ] {
+        let (p, t) = generate_both(port, tool, args);
+        assert_runs_agree(&p, &t, &format!("generate {args:?}"));
+        assert!(p.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&p.stdout),
+            format!("Delta {name} already exists.\n")
+        );
+    }
+    assert!(!port_cwd.join("out").exists() && !tool_cwd.join("out").exists());
+    let after: Vec<(Vec<u8>, std::time::SystemTime)> = delta_superblocks(&port_repo)
+        .iter()
+        .map(|path| {
+            (
+                std::fs::read(path).unwrap(),
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(before, after, "-n rewrote a superblock");
+
+    // A delta directory holding a part alone counts as absent.
+    let relative = ostrya::static_delta_relative_dir(None, &Checksum::from_hex(&c1).unwrap());
+    for r in [&port_repo, &tool_repo] {
+        std::fs::remove_file(r.join(&relative).join("superblock")).unwrap();
+    }
+    let (p, t) = generate_both(port, tool, &["-n", "--empty", &to_c1]);
+    for (who, run) in [("port", &p), ("tool", &t)] {
+        assert!(run.status.success(), "{who}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            generate_block(None, &c1),
+            "{who}"
+        );
+    }
+    assert!(port_repo.join(&relative).join("superblock").exists());
+    assert!(tool_repo.join(&relative).join("superblock").exists());
+}
+
+/// `--filename=PATH` writes the superblock to PATH and the parts beside it,
+/// and the refused targets exit 1 in both. The tool's `verify` reads a
+/// superblock the port signed under `--filename`. Carries
+/// `static-delta/generate-filename-{file,dir-refused}`.
+#[test]
+fn static_delta_generate_filename_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-generate-filename");
+    let base = tmp.path();
+    let (repo, c1, _) = delta_show_repo(base, "repo");
+    let port_repo = clone_repo(base, &repo, "port");
+    let tool_repo = clone_repo(base, &repo, "tool");
+    let port_cwd = base.join("port-cwd");
+    let tool_cwd = base.join("tool-cwd");
+    for cwd in [&port_cwd, &tool_cwd] {
+        std::fs::create_dir_all(cwd.join("out")).unwrap();
+        std::fs::create_dir_all(cwd.join("dir")).unwrap();
+    }
+    let port = (port_cwd.as_path(), port_repo.as_path());
+    let tool = (tool_cwd.as_path(), tool_repo.as_path());
+    let to_c1 = format!("--to={c1}");
+    let block = generate_block(None, &c1);
+
+    let (p, t) = generate_both(port, tool, &["--empty", &to_c1, "--filename=out/sb"]);
+    for (who, run, cwd) in [("port", &p, &port_cwd), ("tool", &t, &tool_cwd)] {
+        assert!(run.status.success(), "{who}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), block, "{who}");
+        assert_eq!(entry_names(&cwd.join("out")), vec!["0", "sb"], "{who}");
+    }
+    assert!(delta_superblocks(&port_repo).is_empty());
+    assert!(delta_superblocks(&tool_repo).is_empty());
+
+    // A path with no `/` puts both in the working directory.
+    let (p, t) = generate_both(port, tool, &["--empty", &to_c1, "--filename=sbx"]);
+    for (who, run, cwd) in [("port", &p, &port_cwd), ("tool", &t, &tool_cwd)] {
+        assert!(run.status.success(), "{who}");
+        assert_eq!(entry_names(cwd), vec!["0", "dir", "out", "sbx"], "{who}");
+    }
+
+    // A directory at PATH: the port refuses before any write, the tool at the
+    // rename after part 0 is written.
+    for cwd in [&port_cwd, &tool_cwd] {
+        std::fs::remove_dir_all(cwd.join("out")).unwrap();
+        std::fs::create_dir_all(cwd.join("out/d")).unwrap();
+    }
+    let (p, t) = generate_both(port, tool, &["--empty", &to_c1, "--filename=out/d"]);
+    for (who, run) in [("port", &p), ("tool", &t)] {
+        assert_eq!(run.status.code(), Some(1), "{who}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), block, "{who}");
+    }
+    assert_eq!(entry_names(&port_cwd.join("out")), vec!["d"]);
+    assert_eq!(entry_names(&tool_cwd.join("out")), vec!["0", "d"]);
+
+    let (p, t) = generate_both(port, tool, &["--empty", &to_c1, "--filename=dir/"]);
+    assert_eq!(p.status.code(), Some(1));
+    assert_eq!(t.status.code(), Some(1));
+    assert!(entry_names(&port_cwd.join("dir")).is_empty());
+
+    // A last component `.` after a file or an absent name: both refuse after
+    // the block and change nothing.
+    for cwd in [&port_cwd, &tool_cwd] {
+        std::fs::write(cwd.join("dir/keep"), b"keep\n").unwrap();
+    }
+    for path in ["dir/keep/.", "dir/new/."] {
+        let arg = format!("--filename={path}");
+        let (p, t) = generate_both(port, tool, &["--empty", &to_c1, &arg]);
+        for (who, run, cwd) in [("port", &p, &port_cwd), ("tool", &t, &tool_cwd)] {
+            assert_eq!(run.status.code(), Some(1), "{who} {path}");
+            assert_eq!(String::from_utf8_lossy(&run.stdout), block, "{who} {path}");
+            assert_eq!(entry_names(&cwd.join("dir")), vec!["keep"], "{who} {path}");
+            assert_eq!(
+                std::fs::read(cwd.join("dir/keep")).unwrap(),
+                b"keep\n",
+                "{who} {path}"
+            );
+        }
+    }
+    // A last component `.` or `..` after a directory: the port refuses before
+    // any write, the tool at the rename after part 0 is written.
+    for path in ["dir/.", "dir/.."] {
+        let arg = format!("--filename={path}");
+        let (p, t) = generate_both(port, tool, &["--empty", &to_c1, &arg]);
+        for (who, run) in [("port", &p), ("tool", &t)] {
+            assert_eq!(run.status.code(), Some(1), "{who} {path}");
+            assert_eq!(String::from_utf8_lossy(&run.stdout), block, "{who} {path}");
+        }
+        assert_eq!(entry_names(&port_cwd.join("dir")), vec!["keep"], "{path}");
+    }
+
+    // An empty PATH: `clap` refuses before the block, the tool after it.
+    let (p, t) = generate_both(port, tool, &["--empty", &to_c1, "--filename="]);
+    assert_eq!(p.status.code(), Some(1));
+    assert!(p.stdout.is_empty());
+    assert_eq!(t.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&t.stdout), block);
+
+    let (p, t) = generate_both(port, tool, &["--empty", &to_c1, "--filename=nodir/x/sb"]);
+    for (who, run, cwd) in [("port", &p, &port_cwd), ("tool", &t, &tool_cwd)] {
+        assert_eq!(run.status.code(), Some(1), "{who}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), block, "{who}");
+        assert!(!cwd.join("nodir").exists(), "{who}");
+    }
+
+    // A part file name: the tool writes a delta whose superblock replaced its
+    // part, the port refuses and writes nothing.
+    let (p, t) = generate_both(port, tool, &["--empty", &to_c1, "--filename=out/0"]);
+    assert_eq!(p.status.code(), Some(1));
+    assert!(t.status.success());
+    assert_eq!(entry_names(&port_cwd.join("out")), vec!["d"]);
+
+    // Port only: --output-dir and --reindex beside --filename.
+    for extra in ["--output-dir=elsewhere", "--reindex"] {
+        let run = run_generate(
+            true,
+            &port_cwd,
+            &port_repo,
+            &["--empty", &to_c1, "--filename=out/sb", extra],
+        );
+        assert_eq!(run.status.code(), Some(1), "{extra}");
+        assert!(run.stdout.is_empty(), "{extra}");
+        assert_eq!(entry_names(&port_cwd.join("out")), vec!["d"], "{extra}");
+        assert!(!port_cwd.join("elsewhere").exists());
+    }
+
+    if ostree_supports_ed25519() {
+        let sign = format!("--sign={ED25519_SECRET_B64}");
+        let run = run_generate(
+            true,
+            &port_cwd,
+            &port_repo,
+            &["--empty", &to_c1, "--filename=out/signed", &sign],
+        );
+        assert!(run.status.success());
+        let verified = ostree_in(
+            &port_cwd,
+            &[
+                &format!("--repo={}", port_repo.display()),
+                "static-delta",
+                "verify",
+                "out/signed",
+                ED25519_PUBLIC_B64,
+            ],
+        );
+        assert!(
+            verified.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verified.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&verified.stdout),
+            "Verification OK\n"
+        );
+    }
+}
+
+/// A bad signing key exits 1 in both after the block, with the same last line
+/// on standard error and no superblock: the tool leaves part 0, the port reads
+/// the key before any part is written. Carries
+/// `static-delta/generate-bad-sign-key-no-superblock`.
+#[test]
+fn static_delta_generate_bad_sign_key_writes_no_superblock() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-generate-bad-key");
+    let base = tmp.path();
+    let (repo, c1, _) = delta_show_repo(base, "repo");
+    let port_repo = clone_repo(base, &repo, "port");
+    let tool_repo = clone_repo(base, &repo, "tool");
+    let to_c1 = format!("--to={c1}");
+    let (p, t) = generate_both(
+        (base, &port_repo),
+        (base, &tool_repo),
+        &["--empty", &to_c1, "--sign=AAAA"],
+    );
+    let last_line = |run: &Run| {
+        String::from_utf8_lossy(&run.stderr)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    for (who, run) in [("port", &p), ("tool", &t)] {
+        assert_eq!(run.status.code(), Some(1), "{who}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            generate_block(None, &c1),
+            "{who}"
+        );
+        assert_eq!(
+            last_line(run),
+            "error: Invalid ed25519 secret key: Ill-formed input: expected 64 bytes, got 3 bytes",
+            "{who}"
+        );
+    }
+    for r in [&port_repo, &tool_repo] {
+        assert_eq!(listed_deltas(r), vec!["(No static deltas)"]);
+        assert!(delta_superblocks(r).is_empty());
+    }
+    let relative = ostrya::static_delta_relative_dir(None, &Checksum::from_hex(&c1).unwrap());
+    assert!(tool_repo.join(&relative).join("0").exists());
+    assert!(!port_repo.join("deltas").exists());
+}
+
+/// The three size options are decimal megabytes in both: the fallback count
+/// and the part count agree between the tool's delta and the port's. The port
+/// patches a 1,024-byte edit at `--max-bsdiff-size=1`, which a 1-byte limit
+/// would not allow, and not at 0. A value outside whole decimal digits, or
+/// past the largest byte count, is refused by the port with nothing written;
+/// the tool takes it. `--max-chunk-size=0` is refused by the port. Carries
+/// `static-delta/generate-units-megabytes` and
+/// `static-delta/generate-size-junk-refused`.
+#[test]
+fn static_delta_generate_sizes_are_megabytes() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-generate-sizes");
+    let base = tmp.path();
+    // The fallback thresholds need the 5,000,000-byte file alone; the three
+    // 1,200,000-byte files are there for the chunk size.
+    let (repo, c) = delta_fallback_repo(base, "repo", false);
+    let (parts_repo, parts_c) = delta_fallback_repo(base, "parts", true);
+    let counts = |run: &Run| {
+        String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .filter(|line| {
+                line.starts_with("Number of fallback entries")
+                    || line.starts_with("Number of parts")
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    for (index, (source, c, extra)) in [
+        (&repo, &c, &[][..]),
+        (&repo, &c, &["--min-fallback-size=5"]),
+        (&repo, &c, &["--min-fallback-size=6"]),
+        (&parts_repo, &parts_c, &["--max-chunk-size=1"]),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let port_repo = clone_repo(base, source, &format!("port{index}"));
+        let tool_repo = clone_repo(base, source, &format!("tool{index}"));
+        let to = format!("--to={c}");
+        let args = [&["--empty", to.as_str()][..], extra].concat();
+        let (p, t) = generate_both((base, &port_repo), (base, &tool_repo), &args);
+        assert!(p.status.success() && t.status.success(), "{extra:?}");
+        let show = |r: &Path| {
+            ostree(&[
+                &format!("--repo={}", r.display()),
+                "static-delta",
+                "show",
+                c.as_str(),
+            ])
+        };
+        let port_counts = counts(&show(&port_repo));
+        assert_eq!(port_counts.len(), 2, "{extra:?}");
+        assert_eq!(port_counts, counts(&show(&tool_repo)), "{extra:?}");
+        // The 5,000,000-byte object reaches a 5 MB threshold and not a 6 MB one.
+        let fallbacks = if index == 2 { 0 } else { 1 };
+        assert!(
+            port_counts.contains(&format!("Number of fallback entries: {fallbacks}")),
+            "{extra:?}: {port_counts:?}"
+        );
+    }
+
+    // A 1,024-byte object with a 2-byte edit, which the port patches with
+    // bspatch where the limit allows it.
+    let small = base.join("small");
+    ostree_ok(&small, &["init", "--mode=archive"]);
+    let tree = base.join("small-tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let mut data = delta_noise(1024, 9);
+    std::fs::write(tree.join("s"), &data).unwrap();
+    let tree_arg = format!("--tree=dir={}", tree.display());
+    ostree_ok(&small, &["commit", "-b", "m", "-s", "one", &tree_arg]);
+    data[500] ^= 0xff;
+    data[501] ^= 0xff;
+    std::fs::write(tree.join("s"), &data).unwrap();
+    let c2 = ostree_ok(&small, &["commit", "-b", "m", "-s", "two", &tree_arg]);
+    let name = format!("{}-{c2}", resolve(&small, "m^").unwrap());
+    for (value, patches) in [("1", true), ("0", false)] {
+        let port_repo = clone_repo(base, &small, &format!("port-bsdiff{value}"));
+        let arg = format!("--max-bsdiff-size={value}");
+        let run = run_generate(true, base, &port_repo, &["--to=m", &arg]);
+        assert!(run.status.success(), "{arg}");
+        let shown = ostree(&[
+            &format!("--repo={}", port_repo.display()),
+            "static-delta",
+            "show",
+            &name,
+        ]);
+        assert!(shown.status.success(), "{arg}");
+        assert_eq!(show_count(&shown, "bspatch=") > 0, patches, "{arg}");
+    }
+
+    for option in [
+        "--min-fallback-size",
+        "--max-bsdiff-size",
+        "--max-chunk-size",
+    ] {
+        for value in ["abc", "1.5", "-1", "+3", " 3", "3x", "", "18446744073710"] {
+            let arg = format!("{option}={value}");
+            let run = run_generate(true, base, &small, &["--to=m", &arg]);
+            assert_eq!(run.status.code(), Some(1), "{arg}");
+            assert!(run.stdout.is_empty(), "{arg}");
+            assert!(!small.join("deltas").exists(), "{arg}");
+        }
+    }
+    let tool_junk = clone_repo(base, &small, "tool-junk");
+    for value in ["abc", "1.5", "-1"] {
+        let arg = format!("--min-fallback-size={value}");
+        let run = run_generate(false, base, &tool_junk, &["--to=m", &arg]);
+        assert!(run.status.success(), "the tool refused {arg}");
+    }
+
+    let run = run_generate(true, base, &small, &["--to=m", "--max-chunk-size=0"]);
+    assert_eq!(run.status.code(), Some(1));
+    assert!(delta_superblocks(&small).is_empty());
 }
 
 // --- sign --verify and summary --verify key sources ---------------------------

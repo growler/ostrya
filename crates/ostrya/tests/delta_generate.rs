@@ -19,13 +19,14 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
     DeltaSuperblock, DummyVerifier, Ed25519Signer, Ed25519Verifier, Error, MutableTree, Repo,
-    RepoMode, SummaryOptions, TreeEntry, base64, static_delta_relative_dir,
+    RepoMode, SignFuture, Signer, SummaryOptions, TreeEntry, base64, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -1806,4 +1807,356 @@ fn generating_into_an_output_dir_leaves_the_callers_files_alone() {
         "generation removed a file it does not own"
     );
     assert!(out.join("superblock").exists() && out.join("0").exists());
+}
+
+/// Commit a one-file tree into a fresh archive repository at `base/src`, and
+/// return the repository path, the handle, and the commit.
+async fn one_file_repo(base: &Path) -> (PathBuf, Repo, Checksum) {
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"superblock target content\n").unwrap();
+    let src = base.join("src");
+    let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let commit = commit_tree(&repo, &tree, None).await;
+    (src, repo, commit)
+}
+
+/// The sorted names in a directory.
+fn dir_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A signer that always fails.
+struct FailingSigner;
+
+impl Signer for FailingSigner {
+    fn name(&self) -> &str {
+        "failing"
+    }
+
+    fn metadata_key(&self) -> &str {
+        "ostree.sign.failing"
+    }
+
+    fn sign<'a>(&'a self, _data: &'a [u8]) -> SignFuture<'a> {
+        Box::pin(async { Err(Error::Signature("the test signer fails".to_owned())) })
+    }
+}
+
+/// Signing through `DeltaOptions::signers` writes the same superblock bytes as
+/// an unsigned generation followed by `sign_static_delta`. ed25519 signatures
+/// are deterministic, so the two envelopes are equal.
+#[test]
+fn signing_through_the_options_equals_signing_after() {
+    let tmp = TmpDir::new("gen-sign-options");
+    let base = tmp.path();
+    let (signed_now, signed_after) = block_on(async {
+        let (_src, repo, commit) = one_file_repo(base).await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        let now = base.join("now");
+        repo.generate_static_delta(
+            None,
+            &commit,
+            &DeltaOptions {
+                timestamp: Some(1_700_000_500),
+                output_dir: Some(now.clone()),
+                signers: vec![Arc::new(signer.clone())],
+                ..DeltaOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let after = base.join("after");
+        repo.generate_static_delta(
+            None,
+            &commit,
+            &DeltaOptions {
+                timestamp: Some(1_700_000_500),
+                output_dir: Some(after.clone()),
+                ..DeltaOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        repo.sign_static_delta(&after, &signer).await.unwrap();
+        (
+            std::fs::read(now.join("superblock")).unwrap(),
+            std::fs::read(after.join("superblock")).unwrap(),
+        )
+    });
+    assert!(signed_now.starts_with(b"OSTSGNDT"));
+    assert_eq!(signed_now, signed_after);
+}
+
+/// A signer that fails fails the generation with no superblock written, and a
+/// superblock an earlier generation left at the same location is gone too, so
+/// the delta is not listed.
+#[test]
+fn a_failing_signer_leaves_no_superblock() {
+    let tmp = TmpDir::new("gen-sign-fails");
+    let base = tmp.path();
+    block_on(async {
+        let (src, repo, commit) = one_file_repo(base).await;
+        let delta = src.join(
+            repo.generate_static_delta(None, &commit, &DeltaOptions::default())
+                .await
+                .unwrap(),
+        );
+        assert!(delta.join("superblock").exists());
+
+        let err = repo
+            .generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    signers: vec![Arc::new(FailingSigner)],
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err}");
+        assert_eq!(dir_names(&delta), vec!["0"]);
+        assert!(repo.list_static_deltas().await.unwrap().is_empty());
+    });
+}
+
+/// A file at the `superblock_file` path is replaced only by the final rename,
+/// so a signer that fails after the parts are written leaves it as it was.
+#[test]
+fn a_failing_signer_leaves_the_file_at_the_superblock_path() {
+    let tmp = TmpDir::new("gen-sign-fails-file");
+    let base = tmp.path();
+    let out = base.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let sb = out.join("sb");
+    std::fs::write(&sb, b"keep\n").unwrap();
+    block_on(async {
+        let (_src, repo, commit) = one_file_repo(base).await;
+        let err = repo
+            .generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    superblock_file: Some(sb.clone()),
+                    signers: vec![Arc::new(FailingSigner)],
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err}");
+    });
+    assert_eq!(std::fs::read(&sb).unwrap(), b"keep\n");
+    assert_eq!(dir_names(&out), vec!["0", "sb"]);
+}
+
+/// With `superblock_file` set, the superblock goes to that path and the parts
+/// to the directory that holds it, byte for byte what the repository location
+/// receives, and nothing goes under `deltas/`. A signed superblock written
+/// there verifies.
+#[test]
+fn a_superblock_file_takes_the_superblock_and_its_directory_the_parts() {
+    let tmp = TmpDir::new("gen-superblock-file");
+    let base = tmp.path();
+    let out = base.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let sb = out.join("sb");
+    block_on(async {
+        let (src, repo, commit) = one_file_repo(base).await;
+        let returned = repo
+            .generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    timestamp: Some(1_700_000_500),
+                    superblock_file: Some(sb.clone()),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(returned, sb);
+        assert!(!src.join("deltas").exists() || dir_names(&src.join("deltas")).is_empty());
+        assert_eq!(dir_names(&out), vec!["0", "sb"]);
+
+        let delta = src.join(
+            repo.generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    timestamp: Some(1_700_000_500),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(
+            std::fs::read(&sb).unwrap(),
+            std::fs::read(delta.join("superblock")).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(out.join("0")).unwrap(),
+            std::fs::read(delta.join("0")).unwrap()
+        );
+
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        repo.generate_static_delta(
+            None,
+            &commit,
+            &DeltaOptions {
+                superblock_file: Some(sb.clone()),
+                signers: vec![Arc::new(signer)],
+                ..DeltaOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let read = DeltaSuperblock::read(&sb).await.unwrap();
+        let trusted =
+            Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
+                .unwrap();
+        assert!(read.verify(&[&trusted]).await.unwrap().valid);
+    });
+}
+
+/// Each superblock-file target the generator cannot write is refused before
+/// anything is written: a directory at the path, a trailing `/`, a last
+/// component `.` or `..` (also after a file or an absent name), a missing
+/// parent, a part file name, and `output_dir` set beside it.
+#[test]
+fn a_superblock_file_target_is_refused_before_anything_is_written() {
+    let tmp = TmpDir::new("gen-superblock-file-refused");
+    let base = tmp.path();
+    let out = base.join("out");
+    std::fs::create_dir_all(out.join("d")).unwrap();
+    std::fs::write(out.join("keep"), b"the caller's file\n").unwrap();
+    block_on(async {
+        let (_src, repo, commit) = one_file_repo(base).await;
+        let before = dir_names(&out);
+        let cases: Vec<(DeltaOptions, &str)> = vec![
+            (
+                DeltaOptions {
+                    superblock_file: Some(out.join("d")),
+                    ..DeltaOptions::default()
+                },
+                "directory",
+            ),
+            (
+                DeltaOptions {
+                    superblock_file: Some(PathBuf::from(format!("{}/", out.display()))),
+                    ..DeltaOptions::default()
+                },
+                "trailing slash",
+            ),
+            (
+                DeltaOptions {
+                    superblock_file: Some(out.join("keep/.")),
+                    ..DeltaOptions::default()
+                },
+                "dot after a file",
+            ),
+            (
+                DeltaOptions {
+                    superblock_file: Some(out.join("new/.")),
+                    ..DeltaOptions::default()
+                },
+                "dot after an absent name",
+            ),
+            (
+                DeltaOptions {
+                    superblock_file: Some(out.join("..")),
+                    ..DeltaOptions::default()
+                },
+                "dot dot",
+            ),
+            (
+                DeltaOptions {
+                    superblock_file: Some(out.join("nodir/x/sb")),
+                    ..DeltaOptions::default()
+                },
+                "missing parent",
+            ),
+            (
+                DeltaOptions {
+                    superblock_file: Some(out.join("0")),
+                    ..DeltaOptions::default()
+                },
+                "part name",
+            ),
+            (
+                DeltaOptions {
+                    superblock_file: Some(out.join("sb")),
+                    output_dir: Some(out.clone()),
+                    ..DeltaOptions::default()
+                },
+                "both targets",
+            ),
+        ];
+        for (opts, what) in cases {
+            let err = repo
+                .generate_static_delta(None, &commit, &opts)
+                .await
+                .expect_err(what);
+            match what {
+                "directory"
+                | "trailing slash"
+                | "dot after a file"
+                | "dot after an absent name"
+                | "dot dot" => assert!(
+                    matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::IsADirectory),
+                    "{what}: {err}"
+                ),
+                "missing parent" => assert!(
+                    matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+                    "{what}: {err}"
+                ),
+                _ => assert!(matches!(err, Error::InvalidFormat(_)), "{what}: {err}"),
+            }
+            assert_eq!(dir_names(&out), before, "{what}");
+            assert!(dir_names(&out.join("d")).is_empty(), "{what}");
+            assert_eq!(
+                std::fs::read(out.join("keep")).unwrap(),
+                b"the caller's file\n",
+                "{what}"
+            );
+        }
+    });
+}
+
+/// A symlink at the superblock-file path is replaced by the superblock, and
+/// the directory it pointed at is left as it was.
+#[test]
+fn a_symlink_at_the_superblock_file_is_replaced_not_followed() {
+    let tmp = TmpDir::new("gen-superblock-file-symlink");
+    let base = tmp.path();
+    let out = base.join("out");
+    let elsewhere = base.join("elsewhere");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let sb = out.join("sb");
+    std::os::unix::fs::symlink(&elsewhere, &sb).unwrap();
+    block_on(async {
+        let (_src, repo, commit) = one_file_repo(base).await;
+        repo.generate_static_delta(
+            None,
+            &commit,
+            &DeltaOptions {
+                superblock_file: Some(sb.clone()),
+                ..DeltaOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+    });
+    assert!(std::fs::symlink_metadata(&sb).unwrap().is_file());
+    assert!(dir_names(&elsewhere).is_empty());
 }

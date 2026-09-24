@@ -5,9 +5,10 @@
 //! `format-reference.md` records: a `superblock` carrying the target commit
 //! whole plus per-part and fallback tables, and numbered part files carrying the
 //! objects. [`Repo::sign_static_delta`] wraps a written superblock in the signed
-//! envelope, and [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/`
-//! cache. The read side is in [`crate::delta`], and the two are tested against
-//! each other as well as against the `ostree` tool.
+//! envelope, [`DeltaOptions::signers`] signs the superblock as it is written,
+//! and [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache.
+//! The read side is in [`crate::delta`], and the two are tested against each
+//! other as well as against the `ostree` tool.
 //!
 //! An object reaches the receiver one of four ways, decided per object:
 //!
@@ -57,6 +58,7 @@ use std::io::SeekFrom;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use async_compression::Level;
@@ -132,7 +134,7 @@ const DELTA_DIR_MODE: u32 = 0o755;
 /// The three size thresholds are the ones the tool exposes on
 /// `static-delta generate`, in bytes rather than the tool's decimal megabytes:
 /// pass `4 * 1_000_000` where the tool takes `--min-fallback-size=4`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeltaOptions {
     /// An object whose uncompressed stream (file header plus content) reaches
     /// this size is delivered as a loose fallback instead of being packed into a
@@ -162,6 +164,36 @@ pub struct DeltaOptions {
     /// longer previous delta's extra part files stay behind. A reader takes the
     /// parts the superblock lists, so they cost disk rather than correctness.
     pub output_dir: Option<PathBuf>,
+    /// Write the superblock to this file and the numbered part files to the
+    /// directory that holds it, instead of the repository's `deltas/` tree. A
+    /// path with no `/` puts both in the working directory. The directory must
+    /// exist; it is not created. A path that names a directory, and a path
+    /// whose last component is empty, `.`, `..`, or a part file name (`0`, `1`,
+    /// ...), are refused before anything is written. A file already at the path
+    /// is replaced only by the rename that puts the superblock in place, so a
+    /// generation that fails leaves it as it was. `None` by default. Setting it
+    /// together with [`output_dir`](DeltaOptions::output_dir) is refused.
+    pub superblock_file: Option<PathBuf>,
+    /// The engines that sign the superblock before it is written, each once, in
+    /// order. Empty by default, which writes an unsigned superblock. A signer
+    /// that fails fails the generation with no superblock written.
+    pub signers: Vec<Arc<dyn Signer>>,
+}
+
+impl std::fmt::Debug for DeltaOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let signers: Vec<&str> = self.signers.iter().map(|signer| signer.name()).collect();
+        f.debug_struct("DeltaOptions")
+            .field("min_fallback_size", &self.min_fallback_size)
+            .field("max_bsdiff_size", &self.max_bsdiff_size)
+            .field("max_chunk_size", &self.max_chunk_size)
+            .field("bsdiff", &self.bsdiff)
+            .field("timestamp", &self.timestamp)
+            .field("output_dir", &self.output_dir)
+            .field("superblock_file", &self.superblock_file)
+            .field("signers", &signers)
+            .finish()
+    }
 }
 
 impl Default for DeltaOptions {
@@ -173,6 +205,8 @@ impl Default for DeltaOptions {
             bsdiff: true,
             timestamp: None,
             output_dir: None,
+            superblock_file: None,
+            signers: Vec::new(),
         }
     }
 }
@@ -183,20 +217,27 @@ impl Repo {
     ///
     /// Both commits and every object the delta packs must be present. The
     /// delta's files land under `deltas/` by default, in the base64-fanout
-    /// directory the tool uses, or in [`DeltaOptions::output_dir`] when set.
-    /// Part files are written before the superblock, so a delta interrupted
-    /// part-way leaves no superblock for a reader to trust. Each file is written
+    /// directory the tool uses, in [`DeltaOptions::output_dir`] when set, or,
+    /// with [`DeltaOptions::superblock_file`] set, the superblock at that path
+    /// and the parts in the directory that holds it. Part files are written
+    /// before the superblock, so a delta interrupted part-way leaves no
+    /// superblock for a reader to trust, and the superblock is signed before it
+    /// is written, so a generation that fails at signing writes no superblock.
+    /// Each file is written
     /// under a temp name that is unlinked unless the rename putting it in place
     /// runs, so a generation that fails or is cancelled leaves no partial file
     /// in the directory. Regenerating over an
     /// existing delta overwrites its parts in place, so that delta's superblock
     /// is unlinked before the first part is written rather than being left to
-    /// describe files this run has replaced; once the new superblock is in place,
+    /// describe files this run has replaced. A file at a
+    /// [`DeltaOptions::superblock_file`] path is the caller's and is not
+    /// unlinked. Once the new superblock is in place,
     /// part files left by a longer previous delta are removed, along with temp
     /// files a generation that was killed mid-write left behind once they are an
     /// hour old (see `TEMP_STALE_SECS`). That pass covers the repository's own
     /// `deltas/` tree; a directory named through [`DeltaOptions::output_dir`]
-    /// belongs to the caller and nothing in it is removed.
+    /// or [`DeltaOptions::superblock_file`] belongs to the caller and nothing
+    /// else in it is removed.
     ///
     /// Generating the same delta twice at once, into one directory, is not
     /// supported: both runs write the same file names, so they overwrite each
@@ -208,12 +249,13 @@ impl Repo {
     /// descriptors rather than a path: `root.join(returned)` is the directory
     /// [`apply_static_delta_offline`](Repo::apply_static_delta_offline) and
     /// [`sign_static_delta`](Repo::sign_static_delta) take. With
-    /// [`DeltaOptions::output_dir`] set the returned path is that option
-    /// verbatim, resolved against the process's working directory when
-    /// relative, and is passed on unchanged.
+    /// [`DeltaOptions::output_dir`] or [`DeltaOptions::superblock_file`] set
+    /// the returned path is that option verbatim, resolved against the
+    /// process's working directory when relative, and is passed on unchanged.
     ///
-    /// The result is unsigned; pass it to
-    /// [`sign_static_delta`](Repo::sign_static_delta) to sign it, and to
+    /// Set [`DeltaOptions::signers`] to sign the superblock.
+    /// [`sign_static_delta`](Repo::sign_static_delta) adds a signature to a
+    /// delta already written. Pass the result to
     /// [`reindex_static_deltas`](Repo::reindex_static_deltas) to publish it in
     /// the index cache.
     pub async fn generate_static_delta(
@@ -225,6 +267,11 @@ impl Repo {
         if opts.max_chunk_size == 0 {
             return Err(Error::InvalidFormat(
                 "static delta max chunk size must be positive".to_owned(),
+            ));
+        }
+        if opts.output_dir.is_some() && opts.superblock_file.is_some() {
+            return Err(Error::InvalidFormat(
+                "static delta output_dir and superblock_file cannot both be set".to_owned(),
             ));
         }
         // The target commit is embedded in the superblock whole, so it is
@@ -246,14 +293,36 @@ impl Repo {
             });
         }
 
+        // A superblock-file target creates nothing when it opens, so it opens
+        // before the selection walk, and a target it refuses costs no walk.
+        let superblock_target = match &opts.superblock_file {
+            Some(file) => {
+                let target = file.clone();
+                let (fd, name) =
+                    ostrya_rt::unblock(move || open_superblock_parent_blocking(&target)).await?;
+                Some((file.clone(), fd, name))
+            }
+            None => None,
+        };
+
         let selection = self.select_objects(from, to, opts).await?;
-        let (dir_path, dir_fd) = self.open_delta_dir(from, to, opts).await?;
+        let (dir_path, dir_fd, superblock_name) = match superblock_target {
+            Some(target) => target,
+            None => {
+                let (path, fd) = self.open_delta_dir(from, to, opts).await?;
+                (path, fd, SUPERBLOCK_FILE.to_owned())
+            }
+        };
         let tmp_fd = self.open_tmp_dir().await?;
         let fsync = self.config().fsync()?;
 
         // Parts are overwritten in place, so a superblock describing the
-        // previous delta at this location goes before the first of them.
-        remove_superblock(&dir_fd).await?;
+        // previous delta at this location goes before the first of them. A file
+        // at a superblock-file path is the caller's: only the final rename
+        // replaces it, so a generation that fails leaves it as it was.
+        if opts.superblock_file.is_none() {
+            remove_superblock(&dir_fd).await?;
+        }
 
         let mut entries: Vec<PartEntry> = Vec::new();
         let mut part = Part::default();
@@ -276,12 +345,17 @@ impl Repo {
             entries.push(write_part(&dir_fd, entries.len(), part, fsync).await?);
         }
 
-        let superblock = self.build_superblock(from, to, &target, &entries, &selection, opts)?;
-        write_delta_file(&dir_fd, SUPERBLOCK_FILE, &superblock, fsync).await?;
+        let mut superblock =
+            self.build_superblock(from, to, &target, &entries, &selection, opts)?;
+        if !opts.signers.is_empty() {
+            let signers: Vec<&dyn Signer> = opts.signers.iter().map(|s| s.as_ref()).collect();
+            superblock = sign_superblock(superblock, Value::Array(Vec::new()), &signers).await?;
+        }
+        write_delta_file(&dir_fd, &superblock_name, &superblock, fsync).await?;
         // The sweep recognizes what it removes by name, which holds only where
         // every entry is this code's own: an output directory the caller named can
         // hold files whose names a delta's own files also take.
-        if opts.output_dir.is_none() {
+        if opts.output_dir.is_none() && opts.superblock_file.is_none() {
             clean_delta_dir(&dir_fd, entries.len()).await?;
         }
         Ok(dir_path)
@@ -301,18 +375,8 @@ impl Repo {
     /// refuses.
     pub async fn sign_static_delta(&self, dir: &Path, signer: &dyn Signer) -> Result<()> {
         let bytes = read_capped(dir.join(SUPERBLOCK_FILE)).await?;
-        let (payload, mut signatures) = split_envelope(bytes)?;
-        let signature = signer.sign(&payload).await?;
-        append_signature(&mut signatures, signer.metadata_key(), signature)?;
-
-        let envelope = Value::Tuple(vec![
-            Value::U64(u64::from_le_bytes(*SIGNED_MAGIC)),
-            Value::Bytes(payload),
-            signatures,
-        ]);
-        let ty = Type::parse(SIGNED_SIG).map_err(ostrya_core::Error::from)?;
-        let encoded = to_bytes(&ty, &envelope).map_err(ostrya_core::Error::from)?;
-        check_superblock_size(encoded.len())?;
+        let (payload, signatures) = split_envelope(bytes)?;
+        let encoded = sign_superblock(payload, signatures, &[signer]).await?;
 
         let dir_fd = open_dir_path(dir).await?;
         let fsync = self.config().fsync()?;
@@ -1371,6 +1435,28 @@ fn split_envelope(bytes: Vec<u8>) -> Result<(Vec<u8>, Value)> {
     Ok((payload, fields[2].clone()))
 }
 
+/// Sign `payload` with each signer in order, appending to `signatures`, and
+/// return the signed envelope, held to the superblock ceiling.
+async fn sign_superblock(
+    payload: Vec<u8>,
+    mut signatures: Value,
+    signers: &[&dyn Signer],
+) -> Result<Vec<u8>> {
+    for signer in signers {
+        let signature = signer.sign(&payload).await?;
+        append_signature(&mut signatures, signer.metadata_key(), signature)?;
+    }
+    let envelope = Value::Tuple(vec![
+        Value::U64(u64::from_le_bytes(*SIGNED_MAGIC)),
+        Value::Bytes(payload),
+        signatures,
+    ]);
+    let ty = Type::parse(SIGNED_SIG).map_err(ostrya_core::Error::from)?;
+    let encoded = to_bytes(&ty, &envelope).map_err(ostrya_core::Error::from)?;
+    check_superblock_size(encoded.len())?;
+    Ok(encoded)
+}
+
 /// One delta present under `deltas/`: its name, its target commit, and the
 /// SHA-256 of its superblock, which is what both advertisements carry.
 pub(crate) struct DeltaDigest {
@@ -1847,6 +1933,63 @@ fn create_dir_path_blocking(path: &Path) -> Result<OwnedFd> {
         .create(path)
         .map_err(Error::Io)?;
     open_dir_blocking(path)
+}
+
+/// Open the existing directory that holds a superblock file, and return the
+/// descriptor and the file's name in it.
+///
+/// The directory is the path's parent, or the working directory for a path
+/// with no `/`, and it is not created. A path whose last component is empty,
+/// `.`, or `..` (the empty path, `/`, and `x/.` among them) and a path that
+/// names a directory are refused with `EISDIR`; a name that is a part file name is
+/// refused too, since the superblock would replace a part. A symlink at the
+/// path is not followed: the rename that puts the superblock in place replaces
+/// the link.
+fn open_superblock_parent_blocking(path: &Path) -> Result<(OwnedFd, String)> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let is_dir = || Error::Io(rustix::io::Errno::ISDIR.into());
+    // The last component comes from the bytes: `Path::file_name` skips a
+    // trailing `.`, which would make `x/.` name `x`.
+    let bytes = path.as_os_str().as_bytes();
+    let (parent, name) = match bytes.iter().rposition(|b| *b == b'/') {
+        Some(slash) => (&bytes[..slash], &bytes[slash + 1..]),
+        None => (&b""[..], bytes),
+    };
+    if matches!(name, b"" | b"." | b"..") {
+        return Err(is_dir());
+    }
+    let name = std::str::from_utf8(name).map_err(|_| {
+        Error::InvalidFormat(format!(
+            "static delta superblock file name {} is not UTF-8",
+            path.display()
+        ))
+    })?;
+    if name
+        .parse::<usize>()
+        .is_ok_and(|index| index.to_string() == name)
+    {
+        return Err(Error::InvalidFormat(format!(
+            "static delta superblock file name {name} is a part file name"
+        )));
+    }
+    let parent = match parent {
+        b"" if bytes.first() == Some(&b'/') => Path::new("/"),
+        b"" => Path::new("."),
+        parent => Path::new(std::ffi::OsStr::from_bytes(parent)),
+    };
+    let fd = open_dir_blocking(parent)?;
+    match rustix::fs::statat(&fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat)
+            if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                == rustix::fs::FileType::Directory =>
+        {
+            return Err(is_dir());
+        }
+        Ok(_) | Err(rustix::io::Errno::NOENT) => {}
+        Err(e) => return Err(Error::Io(e.into())),
+    }
+    Ok((fd, name.to_owned()))
 }
 
 /// Open an existing directory by path.

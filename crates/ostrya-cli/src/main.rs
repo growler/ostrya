@@ -1048,10 +1048,7 @@ enum StaticDeltaCommand {
         /// The delta directory (holding `superblock` and numbered part files).
         dir: PathBuf,
     },
-    /// Generate a static delta and print the directory it was written to.
-    ///
-    /// The three size thresholds take a count of bytes. The same-named `ostree`
-    /// options take decimal megabytes, so pass 4000000 where `ostree` takes 4.
+    /// Generate a static delta and print what it is generated from and to.
     Generate(DeltaGenerateArgs),
     /// Rebuild the `delta-indexes/` cache from the deltas present.
     Reindex,
@@ -1104,21 +1101,36 @@ struct DeltaVerifyArgs {
 
 #[derive(Args)]
 struct DeltaGenerateArgs {
-    /// The source commit (a checksum or a ref); omit for a delta from scratch.
-    #[arg(long)]
+    /// Create the delta from revision REV. With neither --from nor --empty,
+    /// the parent of TO.
+    #[arg(long, value_name = "REV")]
     from: Option<String>,
-    /// The target commit (a checksum or a ref).
+    /// Create the delta from scratch.
     #[arg(long)]
-    to: String,
-    /// Deliver an object whose stream reaches this many bytes as a loose
-    /// fallback instead of packing it into a part.
-    #[arg(long, default_value_t = 4_000_000)]
+    empty: bool,
+    /// Create the delta to revision REV. Wins over the positional TO.
+    #[arg(long, value_name = "REV")]
+    to: Option<String>,
+    /// The target revision, where --to is not given.
+    #[arg(value_name = "TO")]
+    to_positional: Option<String>,
+    /// Only generate where the repository holds no superblock for the delta.
+    #[arg(short = 'n', long)]
+    if_not_exists: bool,
+    /// Write the superblock to PATH and the part files to the directory that
+    /// holds it. The directory is not created.
+    #[arg(long, value_name = "PATH", conflicts_with = "output_dir")]
+    filename: Option<PathBuf>,
+    /// Deliver an object whose stream reaches this many decimal megabytes as a
+    /// loose fallback instead of packing it into a part.
+    #[arg(long, value_name = "MB", default_value = "4", value_parser = parse_megabytes)]
     min_fallback_size: u64,
-    /// The largest content size a bspatch stream is attempted for.
-    #[arg(long, default_value_t = 64_000_000)]
+    /// The largest content size, in decimal megabytes, a bspatch stream is
+    /// attempted for.
+    #[arg(long, value_name = "MB", default_value = "64", value_parser = parse_megabytes)]
     max_bsdiff_size: u64,
-    /// Close a part once its payload would pass this many bytes.
-    #[arg(long, default_value_t = 32_000_000)]
+    /// Close a part once its payload would pass this many decimal megabytes.
+    #[arg(long, value_name = "MB", default_value = "32", value_parser = parse_megabytes)]
     max_chunk_size: u64,
     /// Never emit bspatch streams; splice what chunking cannot express.
     #[arg(long)]
@@ -1147,7 +1159,8 @@ struct DeltaGenerateArgs {
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
     /// Rebuild the index cache after generating. Covers the deltas under the
-    /// repository's `deltas/` tree, so it cannot be combined with --output-dir.
+    /// repository's `deltas/` tree, so it cannot be combined with --output-dir
+    /// or --filename.
     #[arg(long)]
     reindex: bool,
 }
@@ -1670,6 +1683,19 @@ async fn pull(repo: Repo, name: &str, args: PullArgs) -> Result<()> {
         .await?;
     report_pull(&stats);
     Ok(())
+}
+/// Read a size option in decimal megabytes, as the tool reads it, into bytes.
+/// Only ASCII digits are taken. A value the tool reads leniently (`abc`,
+/// `1.5`, `-1`, ` 3`, `+3`, `3x`) and a value past `u64::MAX` bytes are
+/// refused.
+fn parse_megabytes(text: &str) -> std::result::Result<u64, String> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("expected a whole number of megabytes".to_owned());
+    }
+    text.parse::<u64>()
+        .ok()
+        .and_then(|mb| mb.checked_mul(1_000_000))
+        .ok_or_else(|| "the size is past the largest byte count".to_owned())
 }
 
 /// Split a `NAME=VALUE` header argument at its first `=`.
@@ -2198,23 +2224,57 @@ fn format_delta_size(n: u64) -> String {
     }
 }
 
-/// Generate a static delta, optionally sign it, and print its directory.
+/// Generate a static delta, optionally sign it, and print what it is
+/// generated from and to.
 async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) -> Result<()> {
     // Indexing rebuilds the cache from the deltas present under the
     // repository's `deltas/` tree, which a delta written elsewhere is not part
     // of, so the pair would silently index nothing.
-    if args.reindex && args.output_dir.is_some() {
+    if args.reindex && (args.output_dir.is_some() || args.filename.is_some()) {
         return Err(Error::InvalidFormat(
             "--reindex covers the deltas under the repository's deltas/ tree, so it \
-             cannot be combined with --output-dir"
+             cannot be combined with --output-dir or --filename"
                 .into(),
         ));
     }
-    let from = match args.from.as_deref() {
-        Some(rev) => Some(resolve(repo, rev).await?),
-        None => None,
+    let Some(to_rev) = args.to.as_deref().or(args.to_positional.as_deref()) else {
+        exit_error("TO revision must be specified");
     };
-    let to = resolve(repo, &args.to).await?;
+    if args.empty && args.from.is_some() {
+        exit_error("Cannot specify both --empty and --from=REV");
+    }
+    let to = resolve(repo, to_rev).await?;
+    let from = match (&args.from, args.empty) {
+        (Some(rev), _) => Some(resolve(repo, rev).await?),
+        (None, true) => None,
+        (None, false) => Some(resolve(repo, &format!("{}^", to.to_hex())).await?),
+    };
+
+    // The tool reads the repository's own superblock for the delta, whatever
+    // location this run writes to.
+    if args.if_not_exists {
+        let superblock = repo_path
+            .join(ostrya::static_delta_relative_dir(from.as_ref(), &to))
+            .join("superblock");
+        if superblock.try_exists().map_err(Error::Io)? {
+            let name = match &from {
+                Some(from) => format!("{}-{}", from.to_hex(), to.to_hex()),
+                None => to.to_hex(),
+            };
+            println!("Delta {name} already exists.");
+            return Ok(());
+        }
+    }
+
+    // The block comes before the keys are read and before anything is
+    // written, as the tool prints it, so a run that fails later prints it too.
+    println!("Generating static delta:");
+    println!(
+        "  From: {}",
+        from.as_ref()
+            .map_or_else(|| "empty".to_owned(), Checksum::to_hex)
+    );
+    println!("  To:   {}", to.to_hex());
 
     let opts = DeltaOptions {
         min_fallback_size: args.min_fallback_size,
@@ -2223,82 +2283,29 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
         bsdiff: !args.disable_bsdiff,
         timestamp: args.timestamp,
         output_dir: args.output_dir.clone(),
+        superblock_file: args.filename.clone(),
+        signers: delta_signers(&args)?,
     };
-    let written = repo
-        .generate_static_delta(from.as_ref(), &to, &opts)
+    repo.generate_static_delta(from.as_ref(), &to, &opts)
         .await?;
-    // The default location is repository-relative; an output directory is
-    // already resolved against this process's working directory.
-    let dir = match &args.output_dir {
-        Some(dir) => dir.clone(),
-        None => repo_path.join(written),
-    };
-
-    if !args.sign.is_empty() || !args.keys_file.is_empty() {
-        delta_sign(repo, &dir, &args).await?;
-    }
     if args.reindex {
         repo.reindex_static_deltas().await?;
     }
-    println!("{}", dir.display());
     Ok(())
 }
 
-/// Sign a generated delta once per requested key, under the chosen engine.
-async fn delta_sign(repo: &Repo, dir: &Path, args: &DeltaGenerateArgs) -> Result<()> {
-    match args.sign_type {
-        SignType::Ed25519 => {
-            for key in delta_secret_keys(args)? {
-                repo.sign_static_delta(dir, &Ed25519Signer::from_base64(&key)?)
-                    .await?;
-            }
-            Ok(())
-        }
-        SignType::Spki => delta_sign_spki(repo, dir, args).await,
-        SignType::Gpg => delta_sign_gpg(repo, dir, args).await,
+/// The signers of a generate run: one per `--sign` value and per line of each
+/// `--keys-file`, under `--sign-type`. Empty where neither is given.
+fn delta_signers(args: &DeltaGenerateArgs) -> Result<Vec<Arc<dyn Signer>>> {
+    if args.sign.is_empty() && args.keys_file.is_empty() {
+        return Ok(Vec::new());
     }
-}
-
-#[cfg(feature = "spki")]
-async fn delta_sign_spki(repo: &Repo, dir: &Path, args: &DeltaGenerateArgs) -> Result<()> {
-    for key in delta_secret_keys(args)? {
-        repo.sign_static_delta(dir, &SpkiSigner::from_base64(&key)?)
-            .await?;
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "spki"))]
-async fn delta_sign_spki(_: &Repo, _: &Path, _: &DeltaGenerateArgs) -> Result<()> {
-    Err(unsupported_type("spki"))
-}
-
-#[cfg(feature = "gpg")]
-async fn delta_sign_gpg(repo: &Repo, dir: &Path, args: &DeltaGenerateArgs) -> Result<()> {
-    if !args.keys_file.is_empty() {
+    if args.sign_type == SignType::Gpg && !args.keys_file.is_empty() {
         return Err(Error::Signature(
             "gpg signing takes --sign KEY-ID arguments; --keys-file serves the other engines"
                 .into(),
         ));
     }
-    for key in &args.sign {
-        let mut signer = GpgSigner::new(key);
-        if let Some(dir) = &args.gpg_homedir {
-            signer = signer.with_homedir(dir);
-        }
-        repo.sign_static_delta(dir, &signer).await?;
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "gpg"))]
-async fn delta_sign_gpg(_: &Repo, _: &Path, _: &DeltaGenerateArgs) -> Result<()> {
-    Err(unsupported_type("gpg"))
-}
-
-/// The base64 secret keys for a delta signing run: the `--sign` values plus the
-/// non-blank lines of each `--keys-file`.
-fn delta_secret_keys(args: &DeltaGenerateArgs) -> Result<Vec<String>> {
     let mut keys = args.sign.clone();
     for path in &args.keys_file {
         keys.extend(read_key_lines(path)?);
@@ -2308,7 +2315,14 @@ fn delta_secret_keys(args: &DeltaGenerateArgs) -> Result<Vec<String>> {
             "no signing key given; pass --sign or --keys-file".into(),
         ));
     }
-    Ok(keys)
+    keys.iter()
+        .map(|key| {
+            match sign_api_signer(args.sign_type, key.as_bytes(), args.gpg_homedir.as_deref()) {
+                Ok(signer) => Ok(Arc::from(signer)),
+                Err(message) => exit_error(&message),
+            }
+        })
+        .collect()
 }
 
 /// The one `--parent` value that is a literal rather than a revision, in

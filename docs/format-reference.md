@@ -5724,7 +5724,8 @@ write nothing else. `static-delta delete DELTA` removes one delta.
 `static-delta verify DELTA [KEY-ID...]` checks the signatures of one delta's
 superblock and writes nothing. The repository resolves before the argument is
 read, so `Command requires a --repo argument` stands ahead of a missing
-`DELTA`.
+`DELTA`. `static-delta generate [TO]` writes one delta, and the same rule puts
+`Command requires a --repo argument` ahead of a missing `TO`.
 
 #### The arguments
 
@@ -6032,15 +6033,123 @@ port skips a line that is then empty and reads the file up to 1 MiB. A line of
 whitespace is a key of 0 bytes and refuses the run. A file with no key line
 reports `error: signature: <type>: no valid keys in file '<path>'`.
 
+#### `generate`
+
+`generate` writes the delta from FROM to TO. The options both implementations
+carry are:
+
+- `--from=REV` -- the source commit.
+- `--empty` -- a delta from scratch.
+- `--to=REV` -- the target commit. It wins over the positional `TO`. The tool
+  ignores a second positional, and the port refuses it.
+- `-n`, `--if-not-exists` -- generate only where the delta is absent.
+- `--filename=PATH` -- the superblock file.
+- `--min-fallback-size=MB`, `--max-bsdiff-size=MB`, `--max-chunk-size=MB` --
+  the three size thresholds, default 4, 64, and 32.
+- `--disable-bsdiff`, `--sign=KEY`, `--sign-type=NAME`, and
+  `--keys-file=PATH`.
+
+With neither `--from` nor `--empty`, FROM is the parent of TO. A revision takes
+the forms `rev-parse` takes: a ref, a checksum or its abbreviation, and a
+trailing `^`.
+
+The checks run in this order:
+
+1. No TO reports `error: TO revision must be specified`, also with `--empty`
+   and `--from`.
+2. `--empty` with `--from` reports `error: Cannot specify both --empty and
+   --from=REV`. No revision resolves before this check.
+3. The revisions resolve. An absent ref reports `error: Refspec '<rev>' not
+   found`.
+4. A TO with no parent, where FROM is the default, reports `error: Commit
+   <hex> has no parent`.
+5. The `-n` check.
+6. Standard output receives the block below.
+7. The delta is generated. Every later failure comes after the block, so a
+   run that fails there prints the block too.
+
+```
+Generating static delta:
+  From: <hex>|empty
+  To:   <hex>
+```
+
+`-n` reads the repository's `deltas/<fanout>/<rest>/superblock` for the delta,
+symlinks followed, whatever location the run writes to. Where the file exists,
+standard output holds `Delta <name> already exists.`, with `<name>` as `list`
+prints it, and the run exits 0 and writes nothing. A delta directory that holds
+parts and no superblock counts as absent. Without `-n` the delta is written
+again over the one present.
+
+The tool writes statistics to standard error on every run that reaches step 7:
+
+```
+modified: 0
+new reachable: metadata=2 content regular=1 symlink=0
+rollsum for 0/0 modified
+part 1 n:2 compressed:169 uncompressed:83
+uncompressed=83 compressed=169 loose=119
+rollsum=0 objects, 0 bytes
+bsdiff=0 objects
+```
+
+The port writes nothing to standard error on success.
+
+The three size options are decimal megabytes, the factor 1,000,000. The tool
+reads a value leniently: `abc` reads as 0, and `1.5`, `-1`, ` 3`, `+3`, `3x`,
+and values past the largest byte count are accepted. The port takes ASCII
+digits alone, refuses every other value at exit 1 before the repository
+reads, and refuses a value whose byte count is past `u64::MAX`. The tool
+takes `--max-chunk-size=0` as one object for each part, and the port refuses
+it after the block.
+
+`--filename=PATH` writes the superblock to PATH and the part files to the
+directory that holds it, the working directory where PATH holds no `/`. The
+directory is not created. The tool opens the directory before it writes a
+part, so a missing parent reports `error: opendir(<dir>): No such file or
+directory`. The tool takes the directory and the name from the text of PATH,
+so for `X/.` it opens `X`: where `X` is absent or is not a directory, the
+tool reports `error: opendir(X): <reason>` and writes nothing. A PATH that is
+a directory, that ends in `/`, or whose last component is `.` or `..` after a
+directory fails in the tool at the final rename, after part `0` is written:
+`error: renameat(<temp>, <name>): <reason>`, with `Is a directory` or
+`Device or resource busy` as the reason. A PATH whose name is a part file
+name, `0` for example, is accepted by the tool, and the superblock replaces
+that part, which gives a delta that `show` and `apply-offline` refuse. The
+port refuses each of these before it writes a file. It reads the last
+component from the bytes of PATH, refuses it where it is empty, `.`, or `..`,
+and refuses a PATH that names a directory without following a symlink. An
+empty PATH reports `error: Invalid 'filename' parameter` in the tool after the
+block, and `clap` refuses it in the port before the block. The tool accepts a
+name that is not UTF-8, and the port refuses it. A file already at
+PATH is replaced only by the final rename in both, so a run that fails leaves
+it as it was.
+
+The tool writes the parts, then reads the signing keys, then writes the
+superblock. A bad key therefore leaves the parts and writes no superblock. At a
+location that holds no delta, `list` does not show the delta. At a location
+that holds one, the tool keeps the earlier superblock beside the parts it wrote
+again, and `list` shows it. An ed25519 key of the wrong length reports `error:
+Invalid ed25519 secret key: Ill-formed input: expected 64 bytes, got <n>
+bytes`. The port reads the keys before it writes a part and signs the
+superblock before it writes it, so a bad ed25519 or SPKI key writes no file. A
+`--sign-type=gpg` key, which the tool does not carry, is proved only when it
+signs, after the parts are written. A failure there writes no superblock, and
+at the repository's own location the earlier superblock is gone too, since the
+port unlinks it before the first part. Each `--sign` value signs. The key is
+decoded with the lenient base64 reader `commit --sign` uses.
+
 #### Exit status
 
-- 0 -- the report or the listing was written, the delta was removed, or
-  `verify` printed `Verification OK`.
+- 0 -- the report or the listing was written, the delta was removed,
+  `verify` printed `Verification OK`, `generate` wrote the delta, or `-n`
+  found it.
 - 1 -- no `DELTA` (`error: DELTA must be specified`, with no usage text), a
   name the parser refuses, an absent or unreadable superblock or part, a
   superblock that does not parse, a `delta-indexes/` that does not read, an
-  absent delta for `delete`, a removal that fails, and every `verify` outcome
-  other than `Verification OK`.
+  absent delta for `delete`, a removal that fails, every `verify` outcome
+  other than `Verification OK`, and every `generate` refusal and failure the
+  section above states.
 
 A superblock that does not parse prints no line in the port. The tool prints
 the lines it read before the failure. Only a write that is neither

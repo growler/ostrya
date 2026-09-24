@@ -12287,16 +12287,17 @@ note: in the port, a `--keys-file` or a positional KEY-ID leaves `--keys-dir`
 # ---------------------------------------------------------------------------
 # static-delta -- `show`, the superblock and part report, `list`, the listing
 # of the `deltas/` tree, `indexes`, the listing of the `delta-indexes/` cache,
-# `delete`, the removal of one delta, and `verify`, the signature check of one
-# superblock.
+# `delete`, the removal of one delta, `verify`, the signature check of one
+# superblock, and `generate`, the writing of one delta.
 #
 # `show`, `list`, `indexes`, and `verify` write nothing, so each cited test
 # runs both implementations over one repository and compares the exit status
 # and both streams. `delete` removes files, so its cited tests give each
 # implementation its own byte-identical copy of one repository and compare the
-# trees after each run. A cell that needs a delta cites a test: no setup
-# generates one. A `verify` cell whose invocation needs the tool's ed25519
-# engine cites `evidence:`.
+# trees after each run. `generate` writes files, so its cited tests give each
+# implementation its own copy of one repository. A cell that needs a delta
+# cites a test: no setup generates one. A `verify` cell whose invocation needs
+# the tool's ed25519 engine cites `evidence:`.
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -12756,3 +12757,172 @@ severity: interop
 evidence: ostrya_cli::cli::static_delta_verify_refusals_match_the_tool
 spec: format-reference.md#static-delta
 note: no argument refuses before the sign type and the keys are read, in both.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-default-parent
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_defaults_match_the_tool
+spec: format-reference.md#static-delta
+note: with neither --from nor --empty the source is the parent of TO, so the
+ block names the parent on its `From:` line and `list` holds `FROM-TO` in both.
+ A parent absent from the repository fails after the block in both, and
+ nothing is listed. The setup's single commit has no parent, so the cited test
+ builds a repository of two commits.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-no-parent-refused
+setup: repo-with-commit
+run: static-delta --repo=$REPO generate --to=$BRANCH
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Commit $REV has no parent"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Commit $REV has no parent"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_defaults_match_the_tool
+spec: format-reference.md#static-delta
+note: with neither --from nor --empty the source is the parent of TO, and a
+ root commit has none. The refusal comes before the block and before `-n`.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-empty-and-from-refused
+setup: repo-with-commit
+run: static-delta --repo=$REPO generate --empty --from=$BRANCH --to=$BRANCH
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Cannot specify both --empty and --from=REV"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Cannot specify both --empty and --from=REV"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_defaults_match_the_tool
+spec: format-reference.md#static-delta
+note: the pair refuses before either revision resolves. With no TO at all,
+ `TO revision must be specified` comes first in both, which the cited test
+ states.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-positional-to
+setup: repo-with-commit
+run: static-delta --repo=$REPO generate --empty $BRANCH
+expect-exit: 0
+expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_defaults_match_the_tool
+spec: format-reference.md#static-delta
+note: the tool writes its statistics to standard error, and the port writes
+ none (`cli-surface.md`, "P2"), so standard error is not compared. The cited
+ test states that --to wins over the positional.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-if-not-exists
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_if_not_exists_matches_the_tool
+spec: format-reference.md#static-delta
+note: where the repository holds the delta's superblock, `-n` prints `Delta
+ <name> already exists.` at exit 0 and writes nothing, under --filename too. A
+ delta directory that holds a part and no superblock is generated again. The
+ cell needs an existing delta, which no setup writes, so the cited test builds
+ it.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-filename-file
+setup: repo-with-commit out-dir
+run: static-delta --repo=$REPO generate --empty --to=$BRANCH --filename=$OUT/sb
+expect-exit: 0
+expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_filename_matches_the_tool
+spec: format-reference.md#static-delta
+note: the superblock goes to PATH and the parts to the directory that holds
+ it. The cited test states the files, a PATH with no `/`, and the tool's
+ `verify` over a superblock the port signed under --filename.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-filename-dir-refused
+setup: repo
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_filename_matches_the_tool
+spec: format-reference.md#static-delta
+note: a PATH that is a directory, a PATH that ends in `/`, and a PATH whose
+ parent is absent exit 1 in both, after the block. The port refuses before it
+ writes anything; the tool leaves part `0` where it refuses at the rename. The
+ wording differs (`cli-surface.md`, "P2"), and the claim that the port writes
+ nothing needs the directory listing, so the cited test carries the cell.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-bad-sign-key-no-superblock
+setup: repo
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_bad_sign_key_writes_no_superblock
+spec: format-reference.md#static-delta
+note: a --sign key of the wrong length exits 1 after the block in both, with
+ the same last line on standard error, and neither writes a superblock, so
+ `list` prints `(No static deltas)`. The tool leaves part `0`; the port reads
+ the key before it writes a part. The absent superblock is a second
+ invocation, and the key needs the tool's ed25519 engine, so the cited test
+ carries the cell.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-units-megabytes
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_sizes_are_megabytes
+spec: format-reference.md#static-delta
+note: --min-fallback-size, --max-bsdiff-size, and --max-chunk-size are decimal
+ megabytes in both, so the fallback and part counts agree between the tool's
+ delta and the port's. The port patches a 1,024-byte edit with bspatch at
+ --max-bsdiff-size=1, which a 1-byte limit does not allow, and not at 0. The
+ bspatch count is not compared: the two generators choose bspatch by different
+ rules (`port-plan.md`, Phase 15b). The port refuses a value outside whole
+ decimal digits, which the tool accepts (`cli-surface.md`, "P2");
+ `static-delta/generate-size-junk-refused` below states it.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-size-junk-refused
+setup: repo-with-commit
+run: static-delta --repo=$REPO generate --empty --to=$BRANCH --min-fallback-size=abc
+ref-run: n-a
+expect-exit: 1
+expect-stdout: empty
+oracle: exit-status
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_sizes_are_megabytes
+spec: format-reference.md#static-delta
+note: a size value outside whole decimal digits is refused by the port before
+ the repository is read, and nothing is written. `ref-run: n-a` states that the
+ tool has no comparable outcome: it reads `abc` as 0 and generates the delta
+ (`cli-surface.md`, "P2").

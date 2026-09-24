@@ -2190,8 +2190,10 @@ directory with `/commitmeta` appended, which is where a tool pull reads the
 signatures it holds a delta-delivered commit to; a commit with no detached
 metadata gets no entry. `Repo::sign_static_delta` wraps a written
 superblock in the `OSTSGNDT` envelope through the Phase 13 engines, once per
-engine, and `Repo::reindex_static_deltas` rebuilds `delta-indexes/`. A native
-`ostrya static-delta generate` exposes the knobs, `--sign`, and `--reindex`, and
+engine, `DeltaOptions::signers` signs the superblock before it is written, and
+`Repo::reindex_static_deltas` rebuilds `delta-indexes/`. A native
+`ostrya static-delta generate` exposes the knobs in decimal megabytes, `--sign`,
+and `--reindex`, and
 `ostrya static-delta reindex` the index pass. Newly recovered format facts -- the
 meta-entry `size`/`usize` accounting, the fallback entry's two sizes, the part
 packing rule, the index file's `a{sv}` shape, and the tool's offline-application
@@ -2235,7 +2237,12 @@ delta for several times the CPU.
 
 A delta's files are written parts first, so an interrupted generation leaves no
 superblock for a reader to trust, and regenerating at an existing location unlinks
-that delta's superblock before the first part is overwritten. Each file is written
+that delta's superblock before the first part is overwritten. The superblock is
+signed before it is written, so a signer that fails writes no superblock. A
+`superblock_file` target puts the superblock at that path and the parts in the
+directory that holds it, which must exist. A file already at that path is the
+caller's and is not unlinked: only the final rename replaces it, so a
+generation that fails leaves it as it was. Each file is written
 under a temp name held by a drop guard that unlinks it until the rename putting the
 file in place disarms it, so a write that fails part-way -- an `ENOSPC` while a part
 is being compressed, say -- and a generation future dropped mid-await both take
@@ -2249,9 +2256,10 @@ generation running right now is still writing, since two generations in one proc
 share it.
 Unlinking a file still being written would fail that run's rename. The sweep
 recognizes what it removes by name, so it covers the repository's own `deltas/`
-tree alone: a directory named through `output_dir` is the caller's, nothing in it
-is removed, and a longer previous delta's extra parts stay there, costing disk
-rather than correctness since a reader takes the parts the superblock lists.
+tree alone: a directory named through `output_dir` or `superblock_file` is the
+caller's, nothing else in it is removed, and a longer previous delta's extra
+parts stay there, costing disk rather than correctness since a reader takes the
+parts the superblock lists.
 Generating one delta twice at once into one directory is unsupported either way,
 as both runs write the same names; generating different deltas concurrently is
 supported, each having its own directory.
@@ -2320,7 +2328,8 @@ Dependency: `bsdiff` 0.2.1 (BSD-2-Clause, no dependencies of its own, no
 
 Object-selection thresholds (the `ostree static-delta generate` knobs, defaults
 recovered by observing the tool). All three take a value in decimal megabytes (a
-factor of 1,000,000); `DeltaOptions` takes the same values in bytes. The
+factor of 1,000,000); `DeltaOptions` takes the same values in bytes, and the
+port's CLI reads the tool's unit. The
 generator reproduces them so it packs, patches, and falls back the way the tool
 does:
 
@@ -2362,9 +2371,14 @@ both sides of its boundary against the tool's own generation over the same
 commit at the same threshold, so the compared size is pinned to the tool's byte
 for byte; a temp file aged past the sweep's hour is removed while a fresh one
 survives; a caller's files named `0` and `.notes.tmp-1-1` in an `output_dir` are
-left alone; and generation is byte-identical across two runs over one input
-(`tests/delta_generate.rs`, `static_delta_generate_signs_and_indexes` in the CLI
-tests). Unit tests cover the data source's two failure modes: a spill write the
+left alone; a `superblock_file` target takes the same bytes as the repository
+location and refuses a directory, a trailing `/`, a last component `.` or `..`
+(also after a file or an absent name), a missing parent, and a part file name
+before it writes; a signer that fails writes no superblock, and leaves a file
+already at a `superblock_file` path as it was; and generation is
+byte-identical across two runs over one input (`tests/delta_generate.rs`,
+`static_delta_generate_signs_and_indexes` in the CLI tests). Unit tests cover
+the data source's two failure modes: a spill write the
 async file defers fails the handover to the blocking side, and a data source
 holding fewer bytes than the framing counts fails the part. That second failure
 also drives a whole `write_part`, which fails after its temp file exists and has to
@@ -6114,6 +6128,71 @@ holds a superblock, which the tool lists from a lenient decode and the port
 refuses at exit 1. `list` also joins the extra-positional entry. The work adds
 3 `m10` cells, of which 1 is executable and it passes; the conformance run
 reports 1022 cells and 413 passes (the M10 family 410).
+
+`static-delta generate` takes the tool's options and defaults. The target is
+`--to`, else the positional `TO`. With neither `--from` nor `--empty` the source
+is the parent of TO, and `--empty` with `--from` refuses. `-n` prints
+`Delta <name> already exists.` at exit 0 where the repository holds the delta's
+superblock. `--filename=PATH` writes the superblock to PATH and the parts to the
+directory that holds it. The three size options read decimal megabytes. Standard
+output is the tool's three-line block, printed before the keys are read and
+before anything is written, so a run that fails later prints it too.
+`DeltaOptions` gains two fields: `superblock_file`, the `--filename` target,
+refused beside `output_dir`; and `signers`, which sign the superblock before it
+is written. `sign_static_delta` and the generator share one envelope helper. The
+target opener reads the last component from the bytes of the path. It refuses a
+last component that is empty, `.`, or `..`, a directory at the path, and a part
+file name, all before the selection walk and before a file is written, and
+replaces a symlink at the path without following it. A file already at the path
+is not unlinked before the parts, as in the tool, so a run that fails leaves it
+as it was. The CLI builds its signers through the key reader `commit --sign`
+uses, so a `--sign` key decodes leniently, as the tool decodes it, and a bad key
+reports the tool's words.
+
+Observation added these rules. The check order is: no TO, `--empty` with
+`--from`, the revisions, the missing parent, `-n`, the block, and then the
+generation. `-n` reads the repository's superblock also under `--filename`, and
+a delta directory that holds parts and no superblock counts as absent. A default
+parent the repository does not hold fails after the block. The tool writes the
+parts before it reads the signing keys, so a bad key leaves part `0` and writes
+no superblock. At a location that holds no delta, no superblock is there. At a
+location that holds one, the earlier superblock stays and `list` shows it. The
+tool takes the directory of `--filename=X/.` as `X`, and refuses an empty value
+after the block. The tool signs with every `--sign` value, and with the last
+`--keys-file` alone.
+
+Eleven decisions stand, each open to reversal. They were taken without the
+maintainer. The three size options are decimal megabytes, and the port refuses a
+value outside whole decimal digits, where the tool reads `abc` as 0. The default
+source is the parent of TO, and a root commit refuses. `--output-dir` stays as a
+port extension. The library signs before it writes the superblock, so a bad key
+leaves no superblock. Standard output is the tool's block, and the port writes
+no statistics to standard error. The block comes before the signers are built.
+The port keeps its refusal of `--max-chunk-size=0`, which the tool reads as one
+object for each part. A `--filename` whose name is a part file name is refused,
+where the tool writes a broken delta. `-n` reads the repository's superblock
+under every target, `--output-dir` included. A repeated `--keys-file` signs with
+every file, and the difference stays open. The port keeps its unlink of the
+earlier superblock at the repository's own location, so a `--sign-type=gpg` key
+that fails after the parts leaves no superblock there. The tool does not carry
+that key type, and it keeps the earlier superblock on a bad key. `DeltaOptions`
+gains its two fields in this change. The option structs stay exhaustive by
+decision 14, so the fields break every struct literal outside the crate, and
+decision 14 gives that break a minor version before 1.0. The version number is
+left to the maintainer.
+
+Fourteen divergences on `static-delta generate` are recorded, all in
+`cli-surface.md`, "P2", `static-delta generate`: the `usize` of a part's meta
+entry, open from Phase 15b; a repeated `--keys-file`, open; the statistics; a
+size value outside whole decimal digits or past the largest byte count;
+`--max-chunk-size=0`; an extra positional; a `--filename` that is a directory,
+ends in `/`, or ends in `.` or `..` after a directory; a `--filename` with a
+part file name; the wording of a missing `--filename` parent; a `--filename`
+name that is not UTF-8; an empty `--filename`; the wording of an absent source
+commit; a bad signing key, which the port refuses before it writes a part; and
+an unknown `--sign-type`, which `clap` refuses. The work adds 10 `m10` cells, of
+which 5 are executable and all pass; the conformance run reports 1032 cells and
+418 passes (the M10 family 415).
 
 #### Phase 17g -- P3 commands with no matrix weight
 

@@ -8,9 +8,17 @@
 //! current boot, whose owner may still be alive, from earlier boots, whose owner
 //! is certainly gone.
 //!
-//! On transaction start the reaper removes leftover staging directories whose
-//! owner has died. It takes each sibling lock non-blockingly; a directory whose
-//! lock it can take, with no live holder, is removed. A directory with no lock
+//! On transaction start the reaper reads the top level of `tmp/`. It never
+//! touches `cache`. A `staging-*` directory and its `-lock` sibling follow the
+//! staging rule below. Every other entry is removed once its mtime is older
+//! than `tmp-expiry-secs`, as the tool does: a directory as a whole tree judged
+//! by its own mtime, and a symlink as the link itself. A staging lock file is
+//! exempt from that age test, because the lock of a transaction that lives
+//! past the window is still held.
+//!
+//! The staging rule removes leftover staging directories whose owner has died.
+//! It takes each sibling lock non-blockingly; a directory whose lock it can
+//! take, with no live holder, is removed. A directory with no lock
 //! file is removed only once it is older than `tmp-expiry-secs`, since it may be
 //! mid-creation in another process. A process-global map of the staging
 //! directories this process currently owns keeps the reaper from touching them:
@@ -26,7 +34,7 @@
 //! [`reap_process_staging`](crate::reap_process_staging).
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Mutex, OnceLock};
@@ -330,25 +338,69 @@ fn random_suffix() -> String {
     suffix
 }
 
-/// Remove leftover staging directories whose owning transaction has died.
+/// Remove the leftover entries at the top level of `tmp/`.
+///
+/// A `staging-*` directory goes through [`reap_one`], and its `-lock` sibling
+/// is left to that directory's reap. `cache` is never touched. Every other
+/// entry is removed through [`reap_aged`] once it is past `expiry_secs`.
 fn reap_stale(tmp_fd: BorrowedFd<'_>, expiry_secs: i64) {
     let Ok(entries) = Dir::read_from(tmp_fd) else {
         return;
     };
     // Collect names first so removals do not disturb the directory read.
-    let mut names: Vec<String> = Vec::new();
+    let mut staging: Vec<String> = Vec::new();
+    let mut other: Vec<CString> = Vec::new();
     for entry in entries {
         let Ok(entry) = entry else { continue };
-        let Ok(name) = entry.file_name().to_str() else {
-            continue;
-        };
-        if !name.starts_with("staging-") || name.ends_with("-lock") {
+        let name = entry.file_name();
+        if name == c"." || name == c".." || name == c"cache" {
             continue;
         }
-        names.push(name.to_owned());
+        if let Ok(text) = name.to_str()
+            && text.starts_with("staging-")
+        {
+            if text.ends_with("-lock") {
+                continue;
+            }
+            if is_dir_entry(tmp_fd, &entry) {
+                staging.push(text.to_owned());
+                continue;
+            }
+        }
+        other.push(name.to_owned());
     }
-    for name in names {
+    for name in staging {
         reap_one(tmp_fd, &name, expiry_secs);
+    }
+    for name in other {
+        reap_aged(tmp_fd, &name, expiry_secs);
+    }
+}
+
+/// Whether `entry` under `dir` is a directory, not following a symlink.
+fn is_dir_entry(dir: BorrowedFd<'_>, entry: &rustix::fs::DirEntry) -> bool {
+    match entry.file_type() {
+        FileType::Directory => true,
+        FileType::Unknown => rustix::fs::statat(dir, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW)
+            .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Directory),
+        _ => false,
+    }
+}
+
+/// Remove the entry `name` under `tmp_fd` once its mtime is past
+/// `expiry_secs`: a directory as a whole tree, any other entry, a symlink
+/// included, with one `unlinkat`. A symlink is never followed.
+fn reap_aged(tmp_fd: BorrowedFd<'_>, name: &CStr, expiry_secs: i64) {
+    let Ok(stat) = rustix::fs::statat(tmp_fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
+        return;
+    };
+    if !expired(stat.st_mtime, expiry_secs) {
+        return;
+    }
+    if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+        let _ = remove_tree_at(tmp_fd, name);
+    } else {
+        let _ = rustix::fs::unlinkat(tmp_fd, name, AtFlags::empty());
     }
 }
 
@@ -395,14 +447,20 @@ fn older_than(tmp_fd: BorrowedFd<'_>, name: &str, expiry_secs: i64) -> bool {
     let Ok(stat) = rustix::fs::statat(tmp_fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
         return false;
     };
+    expired(stat.st_mtime, expiry_secs)
+}
+
+/// Whether an entry with mtime `mtime` is older than `expiry_secs`, strict on
+/// whole seconds.
+fn expired(mtime: i64, expiry_secs: i64) -> bool {
     let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
         return false;
     };
-    (now.as_secs() as i64 - stat.st_mtime) > expiry_secs
+    (now.as_secs() as i64 - mtime) > expiry_secs
 }
 
 /// Remove the directory `name` under `parent` and everything below it.
-fn remove_tree_at(parent: BorrowedFd<'_>, name: &str) -> io::Result<()> {
+fn remove_tree_at<P: rustix::path::Arg + Copy>(parent: BorrowedFd<'_>, name: P) -> io::Result<()> {
     match rustix::fs::openat(
         parent,
         name,

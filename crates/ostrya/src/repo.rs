@@ -216,7 +216,8 @@ impl Repo {
     /// [`Error::LockTimeout`]. With `[core] locking` disabled the transaction
     /// takes no repository lock. A fresh staging directory is allocated under
     /// `tmp/`, and stale staging directories left by dead transactions are
-    /// reaped first.
+    /// reaped first, together with the other `tmp/` entries older than
+    /// `tmp-expiry-secs`.
     pub async fn transaction_with_lock(&self, kind: LockKind) -> Result<Transaction> {
         // Every `[core]` key the open reads is parsed before the lock, so a
         // value the config cannot carry refuses the call at once instead of

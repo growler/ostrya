@@ -217,6 +217,157 @@ fn a_transaction_reaps_a_stale_staging_dir() {
     });
 }
 
+/// Set the mtime of `path` to `epoch` seconds, on a symlink itself and not on
+/// its target.
+fn stamp(path: &Path, epoch: i64) {
+    let status = Command::new("touch")
+        .arg("-h")
+        .arg("-d")
+        .arg(format!("@{epoch}"))
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "touch could not stamp {}", path.display());
+}
+
+/// The sorted names of the top-level entries of `dir`.
+fn listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// 2020-01-01T00:00:00Z, far past the default `tmp-expiry-secs`.
+const OLD: i64 = 1_577_836_800;
+
+#[test]
+fn a_transaction_reaps_aged_tmp_entries() {
+    let (dir, repo_path) = new_repo("txn-reap-aged");
+    let tmp = repo_path.join("tmp");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"k").unwrap();
+    stamp(&outside, OLD);
+
+    // Entries past the expiry window, each of which the reap removes.
+    std::fs::write(tmp.join("oldfile"), b"o").unwrap();
+    stamp(&tmp.join("oldfile"), OLD);
+    std::fs::write(tmp.join(".tmp-old"), b"o").unwrap();
+    stamp(&tmp.join(".tmp-old"), OLD);
+    std::fs::write(tmp.join("staging-not-a-dir"), b"o").unwrap();
+    stamp(&tmp.join("staging-not-a-dir"), OLD);
+    let fifo = Command::new("mkfifo")
+        .arg(tmp.join("oldfifo"))
+        .status()
+        .unwrap();
+    assert!(fifo.success(), "mkfifo failed");
+    stamp(&tmp.join("oldfifo"), OLD);
+    // A directory is judged by its own mtime alone: a fresh child inside an
+    // old directory does not keep it.
+    std::fs::create_dir_all(tmp.join("olddir/sub")).unwrap();
+    std::fs::write(tmp.join("olddir/sub/fresh"), b"n").unwrap();
+    stamp(&tmp.join("olddir"), OLD);
+    // A symlink is removed as the link, and its target stays.
+    std::os::unix::fs::symlink(&outside, tmp.join("oldlink")).unwrap();
+    stamp(&tmp.join("oldlink"), OLD);
+
+    // Entries the reap keeps.
+    std::fs::write(tmp.join("newfile"), b"n").unwrap();
+    std::fs::create_dir(tmp.join("newdir")).unwrap();
+    std::fs::write(tmp.join("newdir/oldkid"), b"o").unwrap();
+    stamp(&tmp.join("newdir/oldkid"), OLD);
+    std::fs::write(tmp.join("cache/oldentry"), b"o").unwrap();
+    stamp(&tmp.join("cache/oldentry"), OLD);
+    stamp(&tmp.join("cache"), OLD);
+    // A staging lock file is exempt from the age test.
+    std::fs::write(tmp.join("staging-orphan-lock"), b"").unwrap();
+    stamp(&tmp.join("staging-orphan-lock"), OLD);
+
+    block_on(async {
+        let repo = Repo::open(&repo_path).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        // The live transaction's own staging pair is not part of the claim.
+        let own: Vec<String> = staging_dirs(&repo_path)
+            .into_iter()
+            .flat_map(|n| [format!("{n}-lock"), n])
+            .collect();
+        let mut left = listing(&tmp);
+        left.retain(|n| !own.contains(n));
+        assert_eq!(
+            left,
+            ["cache", "newdir", "newfile", "staging-orphan-lock"],
+            "the reap at transaction start removes the aged entries only"
+        );
+        txn.commit().await.unwrap();
+    });
+    assert!(
+        tmp.join("cache/oldentry").exists(),
+        "tmp/cache is not touched"
+    );
+    assert!(
+        tmp.join("newdir/oldkid").exists(),
+        "a fresh directory is kept whole"
+    );
+    assert!(outside.join("keep").exists(), "the symlink target stays");
+}
+
+#[test]
+fn the_tmp_age_test_is_strict_on_whole_seconds() {
+    let (_dir, repo_path) = new_repo("txn-reap-age");
+    let config = repo_path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("tmp-expiry-secs=5\n");
+    std::fs::write(&config, text).unwrap();
+    let tmp = repo_path.join("tmp");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for age in [3, 8] {
+        let path = tmp.join(format!("age{age}"));
+        std::fs::write(&path, b"a").unwrap();
+        stamp(&path, now - age);
+    }
+
+    block_on(async {
+        let repo = Repo::open(&repo_path).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        assert!(
+            tmp.join("age3").exists(),
+            "an entry inside the window stays"
+        );
+        assert!(!tmp.join("age8").exists(), "an entry past the window goes");
+        txn.commit().await.unwrap();
+    });
+}
+
+#[test]
+fn an_aged_lock_of_a_live_transaction_is_kept() {
+    let (_dir, repo_path) = new_repo("txn-reap-live-lock");
+    let tmp = repo_path.join("tmp");
+
+    block_on(async {
+        let repo = Repo::open(&repo_path).await.unwrap();
+        let live = repo.transaction().await.unwrap();
+        let name = staging_dirs(&repo_path).pop().unwrap();
+        let lock = tmp.join(format!("{name}-lock"));
+        stamp(&tmp.join(&name), OLD);
+        stamp(&lock, OLD);
+
+        let second = repo.transaction().await.unwrap();
+        assert!(
+            lock.exists(),
+            "the lock of a live transaction is kept at any age"
+        );
+        assert!(tmp.join(&name).exists(), "the live staging dir is kept");
+        second.commit().await.unwrap();
+        live.commit().await.unwrap();
+    });
+}
+
 #[test]
 fn cross_process_lock_contention() {
     let (_dir, repo_path) = new_repo("txn-xproc");

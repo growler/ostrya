@@ -31510,3 +31510,114 @@ fn summary_verify_key_sources_over_both_signers() {
         );
     }
 }
+
+/// Fill `tmp` with top-level entries on both sides of the default expiry
+/// window: an old file, fifo, dotfile, and non-directory `staging-` name, an old
+/// directory holding a fresh child, an old symlink to `outside`, a fresh file, a
+/// fresh directory holding an old child, and an old `cache/` entry.
+fn aged_tmp_layout(tmp: &Path, outside: &Path) {
+    let stamp = |path: &Path| {
+        let status = Command::new("touch")
+            .args(["-h", "-d", "2020-01-01T00:00:00Z"])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "touch could not stamp {}", path.display());
+    };
+    for name in ["oldfile", ".tmp-old", "staging-not-a-dir"] {
+        std::fs::write(tmp.join(name), b"o").unwrap();
+        stamp(&tmp.join(name));
+    }
+    let fifo = Command::new("mkfifo")
+        .arg(tmp.join("oldfifo"))
+        .status()
+        .unwrap();
+    assert!(fifo.success(), "mkfifo failed");
+    stamp(&tmp.join("oldfifo"));
+    std::fs::create_dir_all(tmp.join("olddir/sub")).unwrap();
+    std::fs::write(tmp.join("olddir/sub/fresh"), b"n").unwrap();
+    stamp(&tmp.join("olddir"));
+    std::os::unix::fs::symlink(outside, tmp.join("oldlink")).unwrap();
+    stamp(&tmp.join("oldlink"));
+    std::fs::write(tmp.join("newfile"), b"n").unwrap();
+    std::fs::create_dir(tmp.join("newdir")).unwrap();
+    std::fs::write(tmp.join("newdir/oldkid"), b"o").unwrap();
+    stamp(&tmp.join("newdir/oldkid"));
+    std::fs::write(tmp.join("cache/oldentry"), b"o").unwrap();
+    stamp(&tmp.join("cache/oldentry"));
+    stamp(&tmp.join("cache"));
+}
+
+/// The sorted relative paths under `dir`, every depth.
+fn tmp_tree(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            out.push(path.strip_prefix(dir).unwrap().display().to_string());
+            if entry.file_type().unwrap().is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A `commit` removes the same aged `tmp/` entries in the port and in the tool:
+/// each entry past `tmp-expiry-secs` by its own mtime goes, a directory as a
+/// whole tree and a symlink as the link, and `tmp/cache` and the fresh entries
+/// stay.
+#[test]
+fn commit_reaps_aged_tmp_entries_as_the_tool_does() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("tmp-reap");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(tree.join("a"), b"a\n").unwrap();
+    let outside = base.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"k").unwrap();
+
+    let tree_arg = format!("--tree=dir={}", tree.display());
+    let mut left = Vec::new();
+    for side in ["port", "tool"] {
+        let repo = base.join(side);
+        block_on(Repo::create(&repo, CreateOptions::new(RepoMode::Archive))).unwrap();
+        aged_tmp_layout(&repo.join("tmp"), &outside);
+        let repo_arg = format!("--repo={}", repo.display());
+        let args = ["commit", &repo_arg, "-b", "main", &tree_arg, "-s", "s"];
+        let run = if side == "port" {
+            ostrya(&args, None, &[])
+        } else {
+            ostree(&args)
+        };
+        assert!(
+            run.status.success(),
+            "{side} commit failed: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        left.push(tmp_tree(&repo.join("tmp")));
+    }
+    assert_eq!(
+        left[0],
+        [
+            "cache",
+            "cache/oldentry",
+            "newdir",
+            "newdir/oldkid",
+            "newfile"
+        ],
+        "the port's tmp/ after commit"
+    );
+    assert_eq!(
+        left[0], left[1],
+        "the port and the tool leave the same tmp/"
+    );
+    assert!(outside.join("keep").exists(), "the symlink target stays");
+}

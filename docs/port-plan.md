@@ -638,6 +638,23 @@ excludes another process, and excludes and is excluded by the `ostree` tool;
 drop reaps the staging directory and releases the lock. Independent-commit
 verification arrives with the write path.
 
+The reap at transaction start reads the top level of `tmp/`. It skips `cache`.
+It removes every entry that is not a `staging-*` directory or a
+`staging-*-lock` file once its mtime is older than `tmp-expiry-secs`, which is
+the tool's rule: a directory goes as a whole tree judged by its own mtime, and
+a symlink goes as the link itself. A `staging-*` directory goes when its lock
+can be taken, and a staging directory with no lock file goes only once it is
+past the same window. The removal runs on the blocking pool, and it lists one
+directory level at a time. Three divergences stand, all in
+`conformance/cli-surface.md`, "Global conventions": the port exempts staging
+lock files from the age test and keeps its age guard for a staging directory
+with no lock file, because the tool's rule removes the staging directory of a
+live transaction that runs longer than `tmp-expiry-secs`; the port reaps at
+transaction start where the tool reaps at transaction end; and the tool reuses
+a staging directory of the current boot where the port creates a new one for
+each transaction. `format-reference.md`, "Object store layout" states both
+rules.
+
 ### Phase 6a -- Mode refactor: bare-user-shared and bare-split-xattrs read (DONE)
 
 Supersedes the `bare-user-split-attrs` design (the `.filea`/`.fileb` object

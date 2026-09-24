@@ -828,13 +828,52 @@ marker as its last syscall, with no `fsync` of the marker or of `state/`
 anywhere; `ostree fsck` writing a marker issues no `fsync`, `fdatasync`, or
 `syncfs` in the entire run.
 
-A leftover directory under `tmp/` whose lock can be taken, or that has no lock
-sibling, is removed once its age exceeds `tmp-expiry-secs`. The age test is
-strict on whole seconds: feeding the tool aged and freshly created `tmp/`
-entries shows that at `tmp-expiry-secs=0` an entry created in the current second
-survives and only entries at least one second old are removed, and at
-`tmp-expiry-secs=5` an entry aged three seconds survives while one aged eight
-seconds is removed.
+The tool reaps `tmp/` at the end of each transaction, after it removes its own
+staging directory, on a commit and on an abort. `commit`, `reset`,
+`pull-local`, `summary -u` over a repository with a collection id, and
+`static-delta apply-offline` reap; `prune`, `fsck`, `summary -u` over a
+repository with no collection id, `refs`, `checkout`, and `static-delta
+generate` do not. The pass reads the top level of `tmp/` and does an `lstat` of
+each entry:
+
+- It skips `cache` by name and touches nothing below it, whatever the age.
+- For a directory whose name starts with `staging-`, it opens `<name>-lock`
+  `O_RDWR|O_CREAT` and tries an exclusive OFD lock. When it gets the lock, it
+  removes the directory tree and the lock file at any age. A staging directory
+  with no lock file is therefore removed at any age. When another process
+  holds the lock, the directory stays at any age. An `flock` hold does not
+  protect it.
+- Every other entry, a `staging-*-lock` file and a `staging-*` entry that is not
+  a directory included, is removed when its age exceeds `tmp-expiry-secs`. The
+  age is the current time minus `st_mtime`: an old atime does not remove an
+  entry, and a new ctime does not keep it. A directory goes as a whole tree,
+  judged by its own mtime alone, so an old directory with a fresh child is
+  removed and a fresh directory with old children stays. Any other entry, a
+  fifo and a symlink included, goes with one `unlinkat`, so the target of a
+  symlink stays.
+
+The age test is strict on whole seconds: at `tmp-expiry-secs=0` an entry
+created in the current second survives and entries one second old or more are
+removed, and at `tmp-expiry-secs=5` entries aged up to five seconds survive
+while one aged six seconds is removed. At transaction start the tool also
+reuses a staging directory of the current boot whose lock it can take, and
+sets its times with `utimensat`. Recovered by tracing the tool's syscalls over
+`tmp/` entries of each kind and age, and over staging directories whose lock
+files another process held with POSIX, OFD, and `flock` locks. A held lock file
+older than `tmp-expiry-secs` is unlinked by the age test, and the next
+transaction then takes the lockless staging directory for its own.
+
+The port reaps `tmp/` at the start of each transaction, on the same top-level
+read. It skips `cache`, and it applies the tool's age test, removal of a
+directory as a whole tree, and removal of a symlink as the link to every entry
+that is not a `staging-*` directory or a `staging-*-lock` file. It exempts a
+staging lock file from the age test, because the lock of a transaction that
+lives past `tmp-expiry-secs` is still held. It removes a `staging-*` directory
+when its lock can be taken, and a staging directory with no lock file only once
+its age exceeds `tmp-expiry-secs`, because another process can be between the
+directory create and the lock create. The port does not reuse a staging
+directory: each transaction creates a new one. `conformance/cli-surface.md`,
+"Global conventions" records the divergences.
 
 Static delta directories use base64-checksum fanout. From-scratch:
 `deltas/<to_b64[0:2]>/<to_b64[2:]>/<target>`. From->to:

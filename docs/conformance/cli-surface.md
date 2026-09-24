@@ -2904,6 +2904,32 @@ Observed by running the tool (2026.1).
   even where `locking` is false, so a malformed `lock-timeout-secs` refuses a
   prune on a repository that takes no lock. A `--static-deltas-only` run returns
   before the last two, so it refuses neither of them.
+- Every subcommand that opens a transaction reaps `tmp/`, in the port and in
+  the tool. Both skip `cache`, and both remove an entry that is not a staging
+  entry once its mtime is older than `tmp-expiry-secs`: a directory as a whole
+  tree judged by its own mtime, and a symlink as the link itself.
+  `../format-reference.md`, "Object store layout" states the tool's rule and
+  the port's rule. `commit` over the same aged `tmp/` leaves the same
+  entries on both sides (`commit_reaps_aged_tmp_entries_as_the_tool_does` in
+  `crates/ostrya-cli/tests/cli.rs`). No matrix cell states the comparison,
+  because `tmp/` carries no published state and the oracles read `objects/`
+  and the refs tree. Three divergences stand:
+  - The port exempts a `staging-*-lock` file from the age test, and it removes a
+    staging directory with no lock file only once its age exceeds
+    `tmp-expiry-secs`. The tool unlinks a held lock file that is older than
+    `tmp-expiry-secs`, and the next transaction then removes the lockless
+    staging directory at any age. The tool's rule removes the staging
+    directory of a live transaction that runs longer than `tmp-expiry-secs`,
+    and it can remove a directory that another process creates before its lock
+    exists.
+  - The port reaps at the start of a transaction, and the tool reaps at the end
+    of a transaction, on a commit and on an abort. A run that opens one
+    transaction therefore reaps before it writes in the port and after it
+    writes in the tool.
+  - The tool reuses a staging directory of the current boot whose lock it can
+    take. The port creates a new staging directory for each transaction and
+    reuses none. "P2", in the signing divergences, records what each leaves
+    in `tmp/` after a run.
 - `init --mode=<mode>` rejects a mode it does not recognize with `error:
   Invalid mode '<mode>' in repository configuration` and exits 1, before
   writing anything to the target directory. Confirmed for an unknown string

@@ -5441,10 +5441,13 @@ head alone, where the port read every negative as the whole ancestry, so
 `--depth=-2` stops meaning "all history" and starts meaning "the head alone";
 the rule sits in `ParentBound::depth` and reaches `Repo::traverse_commit` and
 `Repo::traverse_reachable` with it. And `Repo::prune` now removes the static
-delta of every commit it deleted, the delta directory whole and its fanout
-parent in place, which is what keeps a pruned repository from offering a delta
-whose target commit is gone; a delta whose source commit the run deleted is
-kept, and the `delta-indexes/` cache is left alone, as the tool leaves it.
+delta of every commit it deleted, the delta directory whole, nested
+directories included, and its fanout parent in place, which is what keeps a
+pruned repository from offering a delta whose target commit is gone. The sweep
+follows no symlink at or below the delta path, and an entry at the delta path
+that is not a directory is left, as the tool leaves it; a delta whose source
+commit the run deleted is kept, and the `delta-indexes/` cache is left alone,
+as the tool leaves it.
 `delta.rs` carries the two helpers that reach it, `list_delta_dirs` and
 `remove_delta_dir`.
 
@@ -5927,6 +5930,43 @@ tool ignores; the `Endianness` line where the key is absent or holds another
 byte, where the tool prints `invalid` or `big (heuristic)` and the port prints
 `little`; and the decimal separator of the size wording. The work adds 14 `m10` cells, of which 3 are executable and all 3
 pass; the conformance run reports 997 cells and 408 passes.
+
+`static-delta delete` lands, with `Repo::delete_static_delta(from, to)`. The
+call reports an absent delta as `Error::StaticDeltaNotFound`, whose message is
+the tool's `Can't find delta <name>` and whose `std::io::ErrorKind` is
+`NotFound`. The existence check follows symlinks, as the tool's does, so a
+dangling symlink at the delta path is an absent delta and stays. The removal
+follows no symlink at or below the delta path: a symlink there is removed as a
+link, and a regular file or a directory with no superblock is removed too. The
+directory removal is a loop over an explicit stack of levels that holds at
+most two directory descriptors of its own at a time, whatever the depth, and it
+keeps names as bytes, so a tree deeper than the descriptor limit and a name
+that is not UTF-8 are removed. It reads each directory through the descriptor
+that opened it, and it removes a child directory with no entries without a
+descent, so an empty directory with read permission and no search permission
+is removed, as the tool removes it. Each level keeps the device and inode of
+its directory, and the descriptor that `..` opens on the way up must match the
+recorded parent, so a concurrent rename stops the removal and does not redirect
+an unlink. The fanout directory, `delta-indexes/`, and `summary` stay as they
+are.
+
+The call takes no repository lock. The tool takes none: under a held foreign
+exclusive lock its `delete` completes. The port's `generate`, `reindex`, and
+`sign` take none either, and no port transaction reads the local `deltas/`
+tree, so a lock would make `delete` wait behind every open transaction for no
+gain. A concurrent generation of the same delta can fail or leave a partial
+directory.
+
+The prune sweep, `remove_delta_dir`, opens the delta path with no symlink
+followed. It leaves an entry there that is not a directory, a symlink included,
+as the tool's prune does, and it removes a directory whole, nested directories
+included, through the same removal loop as `delete`.
+
+Two divergences on `static-delta` are new, both in `cli-surface.md`, "P2": an
+extra positional argument on `delete`, which the tool ignores and `clap`
+refuses, so the port removes nothing; and the wording of a removal failure other
+than an absent delta. The work adds 3 `m10` cells, of which 1 is executable and
+it passes; the conformance run reports 1002 cells and 408 passes.
 
 #### Phase 17g -- P3 commands with no matrix weight
 

@@ -1052,6 +1052,14 @@ enum StaticDeltaCommand {
         /// superblock named by path are read from the directory that holds it.
         delta: Option<String>,
     },
+    /// Remove a static delta: the entry at its path under `deltas/` and
+    /// everything in it. The `delta-indexes/` cache and `summary` stay as they
+    /// are.
+    Delete {
+        /// A delta name, `TO` or `FROM-TO` in full lowercase hex. A path is
+        /// read as a name and refused.
+        delta: Option<String>,
+    },
     /// List the target commits the `delta-indexes/` cache holds an index for.
     Indexes,
 }
@@ -1704,7 +1712,8 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
 }
 
 /// List the repository's static deltas, apply one offline, generate one,
-/// rebuild the index cache, show one delta, or list the index cache.
+/// rebuild the index cache, show one delta, delete one, or list the index
+/// cache.
 async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaCommand) -> Result<()> {
     match command {
         StaticDeltaCommand::List => {
@@ -1721,6 +1730,7 @@ async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaComman
         StaticDeltaCommand::Generate(generate) => delta_generate(&repo, &repo_path, generate).await,
         StaticDeltaCommand::Reindex => repo.reindex_static_deltas().await,
         StaticDeltaCommand::Show { delta } => delta_show(&repo_path, delta).await,
+        StaticDeltaCommand::Delete { delta } => delta_delete(&repo, delta).await,
         StaticDeltaCommand::Indexes => {
             let indexes = repo.list_static_delta_indexes().await?;
             if indexes.is_empty() {
@@ -1812,6 +1822,16 @@ fn delta_read_error(err: Error, shown: &str) -> Error {
         }
         _ => err,
     }
+}
+
+/// Remove one static delta by name. A path is read as a name, so the name
+/// parser refuses it, as the tool refuses it.
+async fn delta_delete(repo: &Repo, delta: Option<String>) -> Result<()> {
+    let Some(arg) = delta else {
+        exit_error("DELTA must be specified");
+    };
+    let (from, to) = parse_delta_name(&arg).unwrap_or_else(|text| exit_error(&text));
+    repo.delete_static_delta(from.as_ref(), &to).await
 }
 
 /// Print a delta's superblock fields and the statistics of each part, one line

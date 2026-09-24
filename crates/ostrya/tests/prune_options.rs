@@ -15,6 +15,7 @@ use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
     Error, MutableTree, ObjectName, ObjectType, PruneOptions, PruneStats, Repo, RepoMode,
+    static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -666,6 +667,85 @@ fn static_deltas_only_deletes_the_delta_and_nothing_else() {
             repo.list_static_deltas().await.unwrap(),
             vec![format!("{}-{}", main[0].to_hex(), main[1].to_hex())],
             "the delta the named commit targets goes and the other stays"
+        );
+    });
+}
+
+#[test]
+fn static_deltas_only_removes_a_nested_delta_directory() {
+    let tmp = TmpDir::new("prune-deltas-nested");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let main = chain(&repo, tmp.path(), "main").await;
+        repo.generate_static_delta(Some(&main[1]), &main[2], &DeltaOptions::default())
+            .await
+            .unwrap();
+        let dir = tmp
+            .path()
+            .join("repo")
+            .join(static_delta_relative_dir(Some(&main[1]), &main[2]));
+        std::fs::create_dir_all(dir.join("n1/n2")).unwrap();
+        std::fs::write(dir.join("n1/n2/f"), b"nested\n").unwrap();
+
+        repo.prune(&PruneOptions {
+            delete_commit: Some(main[2]),
+            static_deltas_only: true,
+            ..PruneOptions::default()
+        })
+        .await
+        .unwrap();
+        assert!(
+            std::fs::symlink_metadata(&dir).is_err(),
+            "the delta directory goes whole, its subdirectories included"
+        );
+        assert!(dir.parent().unwrap().is_dir(), "the fanout stays");
+    });
+}
+
+#[test]
+fn static_delta_sweep_leaves_a_symlink_at_the_delta_path() {
+    let tmp = TmpDir::new("prune-deltas-symlink");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let main = chain(&repo, tmp.path(), "main").await;
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("file"), b"keep\n").unwrap();
+        let link = tmp
+            .path()
+            .join("repo")
+            .join(static_delta_relative_dir(Some(&main[1]), &main[2]));
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        repo.prune(&PruneOptions {
+            delete_commit: Some(main[2]),
+            static_deltas_only: true,
+            ..PruneOptions::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(victim.join("file")).unwrap(),
+            b"keep\n",
+            "the sweep follows no symlink at the delta path"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "an entry at the delta path that is not a directory stays"
         );
     });
 }

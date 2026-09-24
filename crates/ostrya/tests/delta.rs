@@ -10,9 +10,10 @@
 //! edit; another exercises the rollsum copy-from-source `write` op over a 2 MiB
 //! file edited in place; and a signed delta is verified with the ed25519 engine.
 //!
-//! Every test is skipped when the tool is absent, matching the other
-//! interop tests. The signed-delta test also needs the tool's ed25519 engine
-//! and is skipped where the build carries none.
+//! Every test that drives the tool is skipped when the tool is absent,
+//! matching the other interop tests. The signed-delta test also needs the
+//! tool's ed25519 engine and is skipped where the build carries none. The
+//! removal tests build their delta entries by hand and need no tool.
 
 mod common;
 
@@ -22,8 +23,8 @@ use std::process::Command;
 use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
 use ostrya::{
-    Checksum, CommitState, CreateOptions, DeltaEndianness, DeltaSuperblock, Ed25519Verifier,
-    FileKind, Repo, RepoMode, TreeEntry, base64,
+    Checksum, CommitState, CreateOptions, DeltaEndianness, DeltaSuperblock, Ed25519Verifier, Error,
+    FileKind, Repo, RepoMode, TreeEntry, base64, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -847,4 +848,347 @@ fn applies_delta_with_object_over_half_gib_packed() {
     });
     // The tool validates the checksums of the objects the port wrote.
     ostree(&[&dst_arg, "fsck"]);
+}
+
+/// Two distinct commit checksums for the removal tests. No commit object backs
+/// them: the removal reads only the `deltas/` tree.
+fn removal_checksums() -> (Checksum, Checksum) {
+    (
+        Checksum::from_hex(&"1a".repeat(32)).unwrap(),
+        Checksum::from_hex(&"2b".repeat(32)).unwrap(),
+    )
+}
+
+/// A fresh `archive` repository under `base/repo`.
+async fn removal_repo(base: &Path) -> Repo {
+    Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap()
+}
+
+/// The absolute path of one delta's `deltas/<fanout>/<rest>` entry.
+fn delta_entry(base: &Path, from: Option<&Checksum>, to: &Checksum) -> PathBuf {
+    base.join("repo").join(static_delta_relative_dir(from, to))
+}
+
+/// A delta directory holding a superblock and one part, as a generator leaves
+/// it.
+fn write_flat_delta(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("superblock"), b"superblock").unwrap();
+    std::fs::write(dir.join("0"), b"part").unwrap();
+}
+
+#[test]
+fn delete_static_delta_removes_the_entry_and_keeps_the_fanout() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = TmpDir::new("delta-delete-tree");
+    let base = tmp.path();
+    let (c1, c2) = removal_checksums();
+    block_on(async {
+        let repo = removal_repo(base).await;
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file"), b"keep\n").unwrap();
+
+        let scratch = delta_entry(base, None, &c2);
+        let from_to = delta_entry(base, Some(&c1), &c2);
+        write_flat_delta(&scratch);
+        write_flat_delta(&from_to);
+        std::fs::create_dir_all(scratch.join("n1/n2/n3")).unwrap();
+        std::fs::write(scratch.join("n1/n2/n3/f"), b"nested").unwrap();
+        std::os::unix::fs::symlink(&outside, scratch.join("n1/outside")).unwrap();
+        std::os::unix::fs::symlink("nowhere", scratch.join("dangling")).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            scratch.join("fifo"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        std::fs::write(scratch.join(OsStr::from_bytes(b"n\xff\xfe")), b"bytes").unwrap();
+
+        let b64 = c2.to_base64_modified();
+        let index_dir = base.join("repo/delta-indexes").join(&b64[..2]);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let index = index_dir.join(format!("{}.index", &b64[2..]));
+        std::fs::write(&index, b"index").unwrap();
+        std::fs::write(base.join("repo/summary"), b"summary").unwrap();
+
+        repo.delete_static_delta(None, &c2).await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(&scratch).is_err(),
+            "the entry goes"
+        );
+        assert!(scratch.parent().unwrap().is_dir(), "the fanout stays");
+        assert_eq!(
+            std::fs::read(outside.join("file")).unwrap(),
+            b"keep\n",
+            "no symlink below the entry is followed"
+        );
+        assert!(
+            from_to.join("superblock").is_file(),
+            "the other delta stays"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), b"index");
+        assert_eq!(
+            std::fs::read(base.join("repo/summary")).unwrap(),
+            b"summary"
+        );
+        assert_eq!(
+            repo.list_static_delta_indexes().await.unwrap(),
+            vec![c2],
+            "the index still names the target"
+        );
+
+        repo.delete_static_delta(Some(&c1), &c2).await.unwrap();
+        assert!(std::fs::symlink_metadata(&from_to).is_err());
+        assert!(repo.list_static_deltas().await.unwrap().is_empty());
+    });
+}
+
+#[test]
+fn delete_static_delta_removes_a_file_or_a_link_at_the_path() {
+    let tmp = TmpDir::new("delta-delete-leaf");
+    let base = tmp.path();
+    let (_, c2) = removal_checksums();
+    block_on(async {
+        let repo = removal_repo(base).await;
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("file"), b"keep\n").unwrap();
+        let entry = delta_entry(base, None, &c2);
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+
+        let cases: [(&str, &dyn Fn()); 4] = [
+            ("a regular file", &|| {
+                std::fs::write(&entry, b"file").unwrap()
+            }),
+            ("an empty directory", &|| {
+                std::fs::create_dir(&entry).unwrap()
+            }),
+            ("a symlink to a directory", &|| {
+                std::os::unix::fs::symlink(&outside, &entry).unwrap()
+            }),
+            ("a symlink to a file", &|| {
+                std::os::unix::fs::symlink(outside.join("file"), &entry).unwrap()
+            }),
+        ];
+        for (case, make) in cases {
+            make();
+            repo.delete_static_delta(None, &c2)
+                .await
+                .unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert!(
+                std::fs::symlink_metadata(&entry).is_err(),
+                "{case} at the path is removed"
+            );
+            assert_eq!(
+                std::fs::read(outside.join("file")).unwrap(),
+                b"keep\n",
+                "{case}: the link target stays"
+            );
+        }
+    });
+}
+
+#[test]
+fn delete_static_delta_reports_an_absent_delta() {
+    let tmp = TmpDir::new("delta-delete-absent");
+    let base = tmp.path();
+    let (c1, c2) = removal_checksums();
+    block_on(async {
+        let repo = removal_repo(base).await;
+        let absent = |err: Error, from: Option<Checksum>| {
+            let name = match from {
+                Some(from) => format!("{}-{}", from.to_hex(), c2.to_hex()),
+                None => c2.to_hex(),
+            };
+            assert_eq!(err.to_string(), format!("Can't find delta {name}"));
+            assert!(
+                matches!(&err, Error::StaticDeltaNotFound { from: f, to } if *f == from && *to == c2),
+                "{err:?}"
+            );
+            assert_eq!(
+                std::io::Error::from(err).kind(),
+                std::io::ErrorKind::NotFound
+            );
+        };
+
+        // No `deltas/` directory at all.
+        let deltas = base.join("repo/deltas");
+        if deltas.exists() {
+            std::fs::remove_dir_all(&deltas).unwrap();
+        }
+        absent(repo.delete_static_delta(None, &c2).await.unwrap_err(), None);
+
+        // `deltas/` with no fanout.
+        std::fs::create_dir(&deltas).unwrap();
+        absent(
+            repo.delete_static_delta(Some(&c1), &c2).await.unwrap_err(),
+            Some(c1),
+        );
+
+        // A dangling symlink at the path is an absent delta, and it stays.
+        let entry = delta_entry(base, None, &c2);
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("nowhere", &entry).unwrap();
+        absent(repo.delete_static_delta(None, &c2).await.unwrap_err(), None);
+        assert!(std::fs::symlink_metadata(&entry).is_ok(), "the link stays");
+        std::fs::remove_file(&entry).unwrap();
+
+        // A symlink loop fails the existence check with its own errno.
+        std::os::unix::fs::symlink(entry.file_name().unwrap(), &entry).unwrap();
+        let err = repo.delete_static_delta(None, &c2).await.unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+    });
+}
+
+/// Marks the re-executed child of
+/// [`delete_static_delta_removes_a_tree_deeper_than_the_descriptor_limit`], and
+/// names the file the child writes to record that the removal ran.
+const DEEP_DELETE_CHILD: &str = "OSTRYA_DEEP_DELTA_DELETE_CHILD";
+/// The soft descriptor limit the child runs under. It stands well above what
+/// the repository, the runtime, and the blocking pool open for themselves.
+const DEEP_DELETE_NOFILE: usize = 256;
+/// The depth of the tree the child removes. It stands well above
+/// [`DEEP_DELETE_NOFILE`], so a removal holding one descriptor per level runs
+/// out.
+const DEEP_DELETE_DEPTH: usize = 1024;
+
+#[test]
+fn delete_static_delta_removes_a_tree_deeper_than_the_descriptor_limit() {
+    // The limit is a property of the process and the tests of this binary run
+    // in parallel threads, so the lowered limit goes to a child: this test
+    // binary re-executed for this test alone, through `sh` with `ulimit -n`.
+    if let Some(marker) = std::env::var_os(DEEP_DELETE_CHILD) {
+        delete_a_deep_delta();
+        std::fs::write(marker, b"removed").expect("record that the deep removal ran");
+        return;
+    }
+    let tmp = TmpDir::new("delta-delete-deep-marker");
+    let marker = tmp.path().join("removed");
+    let exe = std::env::current_exe().expect("the path of the running test binary");
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"ulimit -n "$1" || exit 111; shift; exec "$@""#)
+        .arg("sh")
+        .arg(DEEP_DELETE_NOFILE.to_string())
+        .arg(&exe)
+        .arg("--exact")
+        .arg("delete_static_delta_removes_a_tree_deeper_than_the_descriptor_limit")
+        .arg("--nocapture")
+        .env(DEEP_DELETE_CHILD, &marker)
+        .status()
+        .expect("re-run the test binary under a lowered descriptor limit");
+    assert!(
+        status.success(),
+        "the deep removal failed under a soft limit of {DEEP_DELETE_NOFILE} descriptors: {status}"
+    );
+    // A name the child's filter does not match runs nothing and still exits 0,
+    // so the marker is what proves the removal ran.
+    assert!(
+        marker.exists(),
+        "the child ran no deep removal: the test name the filter names is stale"
+    );
+}
+
+/// Remove a delta directory [`DEEP_DELETE_DEPTH`] levels deep. Runs in the
+/// child process, under the lowered descriptor limit.
+fn delete_a_deep_delta() {
+    use std::os::fd::AsFd;
+
+    let tmp = TmpDir::new("delta-delete-deep");
+    let base = tmp.path();
+    let (_, c2) = removal_checksums();
+    block_on(async {
+        let repo = removal_repo(base).await;
+        let entry = delta_entry(base, None, &c2);
+        write_flat_delta(&entry);
+        // The tree is built through a descending descriptor, so no path of its
+        // own grows past the kernel's limit.
+        let mut dir: std::os::fd::OwnedFd = std::fs::File::open(&entry).unwrap().into();
+        for _ in 0..DEEP_DELETE_DEPTH {
+            rustix::fs::mkdirat(dir.as_fd(), "d", rustix::fs::Mode::from_raw_mode(0o755)).unwrap();
+            dir = rustix::fs::openat(
+                dir.as_fd(),
+                "d",
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap();
+        }
+        rustix::fs::openat(
+            dir.as_fd(),
+            "marker",
+            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o644),
+        )
+        .unwrap();
+        drop(dir);
+
+        repo.delete_static_delta(None, &c2).await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(&entry).is_err(),
+            "the deep entry goes"
+        );
+    });
+}
+
+#[test]
+fn delete_static_delta_removes_an_empty_directory_with_no_search_permission() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipping: root ignores the directory permissions this test relies on");
+        return;
+    }
+    let tmp = TmpDir::new("delta-delete-no-search");
+    let base = tmp.path();
+    let (c1, c2) = removal_checksums();
+    let read_only = || std::fs::Permissions::from_mode(0o400);
+    block_on(async {
+        let repo = removal_repo(base).await;
+
+        // An empty subdirectory that can be read but not searched.
+        let entry = delta_entry(base, None, &c2);
+        write_flat_delta(&entry);
+        std::fs::create_dir(entry.join("sub")).unwrap();
+        std::fs::set_permissions(entry.join("sub"), read_only()).unwrap();
+        repo.delete_static_delta(None, &c2).await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(&entry).is_err(),
+            "the entry with an empty mode-0400 subdirectory goes"
+        );
+
+        // The delta directory itself, empty, with no search permission.
+        let entry = delta_entry(base, Some(&c1), &c2);
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::set_permissions(&entry, read_only()).unwrap();
+        repo.delete_static_delta(Some(&c1), &c2).await.unwrap();
+        assert!(
+            std::fs::symlink_metadata(&entry).is_err(),
+            "the empty mode-0400 delta directory goes"
+        );
+
+        // A subdirectory with no search permission and an entry in it cannot
+        // be emptied, and the removal fails.
+        let entry = delta_entry(base, None, &c2);
+        std::fs::create_dir_all(entry.join("sub")).unwrap();
+        std::fs::write(entry.join("sub/f"), b"f").unwrap();
+        std::fs::set_permissions(entry.join("sub"), read_only()).unwrap();
+        let err = repo.delete_static_delta(None, &c2).await.unwrap_err();
+        std::fs::set_permissions(entry.join("sub"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(
+            std::io::Error::from(err).kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(entry.join("sub/f").is_file(), "the unreachable entry stays");
+    });
 }

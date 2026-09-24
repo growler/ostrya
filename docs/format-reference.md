@@ -859,7 +859,9 @@ commit hex per line.
 `reindex` rebuilds the cache from the deltas present: after one of two delta
 directories is deleted, the pass removes that target's `.index` file and
 `static-delta indexes` lists only the remaining target. The fanout directory the
-removal empties stays in place.
+removal empties stays in place. `static-delta delete` does not refresh the
+cache, so the target of a removed delta stays listed until the next
+`reindex`.
 
 ### HTTP pull surface
 
@@ -5636,8 +5638,9 @@ reads such a file as an empty document and the port refuses it, which
 
 `static-delta show DELTA` reports one delta's superblock and what each of its
 parts holds. `static-delta indexes` lists the `delta-indexes/` cache. Both read
-and write nothing else. The repository resolves before the argument is read,
-so `Command requires a --repo argument` stands ahead of a missing `DELTA`.
+and write nothing else. `static-delta delete DELTA` removes one delta. The
+repository resolves before the argument is read, so `Command requires a --repo
+argument` stands ahead of a missing `DELTA`.
 
 #### The arguments
 
@@ -5797,12 +5800,49 @@ port lists a name only where it decodes as a checksum.
 `error: opendirat: Not a directory`, and the port `error: i/o error: Not a
 directory (os error 20)`. A fanout that does not open refuses at exit 1 in both.
 
+#### `delete`
+
+`delete` takes a delta name alone. The name rules above apply, and an argument
+that holds a `/` is read as a name too, so `delete ./x` reports `error: Invalid
+rev ./x` and the path of a superblock file is refused the same way.
+
+The existence check reads `deltas/<fanout>/<rest>` and follows symlinks. Where
+nothing resolves there, `delete` reports `error: Can't find delta <name>`, the
+name in full hex. A missing `deltas/`, a missing fanout, and a dangling symlink
+at the path report this text, and the dangling symlink stays.
+
+`delete` removes the entry at `deltas/<fanout>/<rest>` and everything below it:
+
+- a delta directory, nested directories included;
+- a regular file, or a directory with no superblock;
+- a symlink, which is removed as a link, and its target stays.
+
+A directory at or below the path is read with read permission alone. An empty
+directory with no search permission is removed, and a directory with no search
+permission that holds an entry fails the removal, as does a directory with no
+read permission.
+
+No symlink below the path is followed. A symlink in the fanout position is
+followed, as for every other read of the path. The fanout directory stays, also
+where it becomes empty. `delta-indexes/` and `summary` stay as they are, so they
+can still name the removed delta and `indexes` still lists its target. A
+`reindex` and a new summary refresh them. `delete` writes nothing to either
+stream, and takes no repository lock.
+
+A removal that fails stops where it failed and leaves the entries it did not
+reach. The tool reports `error: fstatat(<path>): <reason>` for a failed
+existence check, `error: open(<path>): <reason>` for a directory it cannot
+open, and `error: Removing <path>: unlinkat(<name>): <reason>` for an entry it
+cannot remove. The port reports each as `error: i/o error: <reason> (os error
+<n>)`.
+
 #### Exit status
 
-- 0 -- the report or the listing was written.
+- 0 -- the report or the listing was written, or the delta was removed.
 - 1 -- no `DELTA` (`error: DELTA must be specified`, with no usage text), a
   name the parser refuses, an absent or unreadable superblock or part, a
-  superblock that does not parse, and a `delta-indexes/` that does not read.
+  superblock that does not parse, a `delta-indexes/` that does not read, an
+  absent delta for `delete`, and a removal that fails.
 
 A superblock that does not parse prints no line in the port. The tool prints
 the lines it read before the failure. Only a write that is neither

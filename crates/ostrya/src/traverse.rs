@@ -16,7 +16,7 @@
 //! negative depth keeps the named commit alone, which `ostree prune
 //! --refs-only --depth=-2` and `--depth=-3` show.
 //!
-//! A walk bounds the `parent` chain by depth or by time. [`ParentBound::Since`]
+//! A walk bounds the `parent` chain by depth or by time. `ParentBound::Since`
 //! follows the chain while each parent commit's own timestamp is at or after a
 //! chosen second count, which is what `ostree prune --keep-younger-than=DATE`
 //! does. A commit a root names is kept whatever its timestamp; the bound acts

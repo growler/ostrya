@@ -118,8 +118,9 @@
 //! a loose fallback. [`Repo::sign_static_delta`] wraps a superblock in the
 //! signed envelope, [`Repo::verify_static_delta`] checks those signatures with
 //! the signing engines over the raw superblock bytes,
-//! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache, and
-//! [`Repo::list_static_delta_indexes`] lists it. [`DeltaSuperblock`] reads a
+//! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache,
+//! [`Repo::list_static_delta_indexes`] lists it, and
+//! [`Repo::delete_static_delta`] removes one delta. [`DeltaSuperblock`] reads a
 //! superblock and what each part holds without applying the delta. It also
 //! covers the fetcher pull is built on (Phase 16a): [`Fetcher`] serves
 //! [`FetchRequest`]s naming a [`Target`] -- a path under a remote's mirrors, or

@@ -99,6 +99,7 @@ pub enum Error {
     EntryExists { path: String },
     Staging(String),
     MergeConflict(String),
+    StaticDeltaNotFound { from: Option<Checksum>, to: Checksum },
     // ... one variant per class of refusal the library reports
 }
 
@@ -110,7 +111,7 @@ impl From<Error> for std::io::Error;
 The `io::ErrorKind` an error converts to:
 
 - `NotFound`: `PathNotFound`, `DanglingSymlink`, `ObjectNotFound`,
-  `RefNotFound`, `HttpStatus` with status 404.
+  `RefNotFound`, `StaticDeltaNotFound`, `HttpStatus` with status 404.
 - `NotADirectory`: `NotADirectory`, `ReplaceFileWithDir`.
 - `AlreadyExists`: `EntryExists`, `MergeConflict`, `ReplaceDirWithFile`.
 - `InvalidInput`: `MutableTree`.
@@ -2006,6 +2007,11 @@ impl Repo {
     pub async fn list_static_deltas(&self) -> Result<Vec<String>>;
     /// The target commits `delta-indexes/` holds an index file for, sorted.
     pub async fn list_static_delta_indexes(&self) -> Result<Vec<Checksum>>;
+    /// Remove one delta's `deltas/<fanout>/<rest>` entry and all below it,
+    /// following no symlink. The fanout directory, `delta-indexes/`, and
+    /// `summary` stay. An absent delta is `Error::StaticDeltaNotFound`.
+    pub async fn delete_static_delta(&self, from: Option<&Checksum>, to: &Checksum)
+        -> Result<()>;
 }
 /// `deltas/<fanout>/<rest>` for a delta, relative to the repository root.
 pub fn static_delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> String;

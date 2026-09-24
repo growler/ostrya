@@ -47,6 +47,7 @@
 //! holds one fixed-size buffer and the tail, and a compressed pass holds the xz
 //! decoder's state under a 128 MiB limit, whatever the payload size.
 
+use std::ffi::{CStr, CString};
 use std::io::{self, SeekFrom};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -388,6 +389,84 @@ impl Repo {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || list_static_deltas_blocking(repo_fd.as_fd())).await
     }
+
+    /// Remove one static delta: from scratch to `to` where `from` is `None`,
+    /// and from `from` to `to` otherwise.
+    ///
+    /// The call removes the entry at the delta's `deltas/<fanout>/<rest>` path
+    /// and everything below it: nested directories, and also a regular file or
+    /// a directory with no superblock at that path. A symlink at that path is
+    /// removed as a link, and its target stays. No symlink below the path is
+    /// followed. The fanout directory stays, also where it becomes empty.
+    /// `delta-indexes/` and `summary` stay as they are, so they can still name
+    /// the delta; [`reindex_static_deltas`](Repo::reindex_static_deltas) and a
+    /// new summary refresh them.
+    ///
+    /// Where nothing resolves at the path, the call returns
+    /// [`Error::StaticDeltaNotFound`]. The check follows symlinks, so a
+    /// dangling symlink at the path reports the same error and stays.
+    ///
+    /// The call takes no repository lock. A concurrent generation of the same
+    /// delta can fail, or can leave a partial directory. A removal that fails
+    /// leaves the entries it did not reach.
+    pub async fn delete_static_delta(&self, from: Option<&Checksum>, to: &Checksum) -> Result<()> {
+        let (from, to) = (from.copied(), *to);
+        let repo_fd = self.repo_fd().try_clone_to_owned()?;
+        ostrya_rt::unblock(move || {
+            delete_static_delta_blocking(repo_fd.as_fd(), from.as_ref(), &to)
+        })
+        .await
+    }
+}
+
+/// Remove the entry at one delta's `deltas/<fanout>/<rest>` path, following no
+/// symlink at or below that path.
+fn delete_static_delta_blocking(
+    repo_fd: BorrowedFd<'_>,
+    from: Option<&Checksum>,
+    to: &Checksum,
+) -> Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags, openat, statat, unlinkat};
+    use rustix::io::Errno;
+
+    let not_found = || Error::StaticDeltaNotFound {
+        from: from.copied(),
+        to: *to,
+    };
+    let rel = crate::deltagen::delta_relative_dir(from, to);
+    let (parent_rel, leaf) = rel
+        .rsplit_once('/')
+        .expect("a delta path holds a fanout directory");
+    // The existence check follows symlinks, as the tool's does: a dangling
+    // symlink at the path is an absent delta.
+    match statat(repo_fd, rel.as_str(), AtFlags::empty()) {
+        Ok(_) => {}
+        Err(Errno::NOENT) => return Err(not_found()),
+        Err(e) => return Err(Error::Io(e.into())),
+    }
+    let parent = match openat(
+        repo_fd,
+        parent_rel,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Err(not_found()),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    let leaf = CString::new(leaf).expect("a delta name holds no NUL");
+    // The no-follow directory open refuses a symlink and every other
+    // non-directory with `ENOTDIR`, and that entry is unlinked alone.
+    match open_dir_nofollow(parent.as_fd(), &leaf) {
+        Ok(dir) => remove_dir_tree(parent.as_fd(), &leaf, dir),
+        Err(Errno::NOTDIR) => match unlinkat(&parent, leaf.as_c_str(), AtFlags::empty()) {
+            Ok(()) => Ok(()),
+            Err(Errno::NOENT) => Err(not_found()),
+            Err(e) => Err(Error::Io(e.into())),
+        },
+        Err(Errno::NOENT) => Err(not_found()),
+        Err(e) => Err(Error::Io(e.into())),
+    }
 }
 
 /// Scan `deltas/<fanout>/<leaf>` and reconstruct each delta's tool name.
@@ -429,37 +508,170 @@ pub(crate) fn list_delta_dirs(repo_fd: BorrowedFd<'_>) -> Result<Vec<DeltaDir>> 
     })
 }
 
-/// Remove one `deltas/<fanout>/<leaf>` directory and every file in it.
+/// Remove one `deltas/<fanout>/<leaf>` directory and everything below it.
 ///
-/// A delta directory holds a `superblock` and its numbered part files and no
-/// subdirectory. The fanout directory above it is left in place, empty where
-/// this was its last entry, which is what a prune by the `ostree` tool leaves.
-/// A directory that is already gone is success.
+/// A delta directory is removed whole, nested directories included, and no
+/// symlink at or below the path is followed. An entry at the path that is not
+/// a directory is left in place, which is what a prune by the `ostree` tool
+/// leaves. The fanout directory above it is left in place, empty where this
+/// was its last entry. A directory that is already gone is success.
 pub(crate) fn remove_delta_dir(repo_fd: BorrowedFd<'_>, dir: &DeltaDir) -> Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
+    use rustix::fs::{Mode, OFlags, openat};
+    use rustix::io::Errno;
 
-    let path = format!("deltas/{}/{}", dir.fanout, dir.leaf);
-    let fd = match openat(
+    let fanout = match openat(
         repo_fd,
-        path.as_str(),
+        format!("deltas/{}", dir.fanout).as_str(),
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(Errno::NOENT) => return Ok(()),
         Err(e) => return Err(Error::Io(e.into())),
     };
-    for name in dir_child_names(&fd)? {
-        match unlinkat(&fd, name.as_str(), AtFlags::empty()) {
-            Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-            Err(e) => return Err(Error::Io(e.into())),
+    let leaf = CString::new(dir.leaf.as_str()).expect("a directory entry name holds no NUL");
+    // The no-follow directory open refuses a symlink and every other
+    // non-directory with `ENOTDIR`, and that entry stays.
+    match open_dir_nofollow(fanout.as_fd(), &leaf) {
+        Ok(level) => remove_dir_tree(fanout.as_fd(), &leaf, level),
+        Err(Errno::NOTDIR | Errno::NOENT) => Ok(()),
+        Err(e) => Err(Error::Io(e.into())),
+    }
+}
+
+/// Remove the directory `name` under `parent`, open as `dir`, and everything
+/// below it, following no symlink. A symlink below it is unlinked as a link.
+///
+/// The removal is a loop over an explicit stack of levels, and it holds at
+/// most two directory descriptors of its own at a time, whatever the depth:
+/// the level in hand, and the child or the `..` it opens next. Descending
+/// replaces the level's descriptor with the child's, and ascending replaces it
+/// with the one `..` opens, which names the parent while the emptied level is
+/// still linked where it was opened. Each level keeps the device and inode of
+/// its directory, and the descriptor `..` opens must match the recorded
+/// parent, so a directory that a concurrent rename moves stops the removal
+/// instead of redirecting it. Depth costs a name and an entry list on the
+/// heap, so a tree deeper than the process descriptor limit is removed whole.
+///
+/// A directory is read through the descriptor that opened it, which needs
+/// read permission alone. A child directory with no entries is removed from
+/// its parent at once, so an empty directory with no search permission goes
+/// too. Names are kept as bytes, so a name that is not UTF-8 is removed too.
+/// An entry that is gone before it is reached is skipped.
+fn remove_dir_tree(parent: BorrowedFd<'_>, name: &CStr, dir: OwnedFd) -> Result<()> {
+    use rustix::fs::{AtFlags, Dir};
+    use rustix::io::Errno;
+
+    let io_err = |e: Errno| Error::Io(e.into());
+    let identity = dir_identity(dir.as_fd())?;
+    let mut level = Dir::new(dir).map_err(io_err)?;
+    // One entry per level on the path from `name` down to the level in hand:
+    // the level's own name, its device and inode, and what is left to remove
+    // within it.
+    let mut levels = vec![(name.to_owned(), identity, read_tree_level(&mut level)?)];
+
+    while let Some((_, _, entries)) = levels.last_mut() {
+        match entries.pop() {
+            Some((child, false)) => {
+                unlink_tree_entry(level.fd().map_err(io_err)?, &child, AtFlags::empty())?
+            }
+            Some((child, true)) => {
+                let child_fd = match open_dir_nofollow(level.fd().map_err(io_err)?, &child) {
+                    Ok(fd) => fd,
+                    // The child is gone, which the removal wanted anyway.
+                    Err(Errno::NOENT) => continue,
+                    Err(e) => return Err(io_err(e)),
+                };
+                let identity = dir_identity(child_fd.as_fd())?;
+                let mut child_dir = Dir::new(child_fd).map_err(io_err)?;
+                let child_entries = read_tree_level(&mut child_dir)?;
+                if child_entries.is_empty() {
+                    drop(child_dir);
+                    unlink_tree_entry(level.fd().map_err(io_err)?, &child, AtFlags::REMOVEDIR)?;
+                    continue;
+                }
+                level = child_dir;
+                levels.push((child, identity, child_entries));
+            }
+            None => {
+                let (cleared, _, _) = levels.pop().expect("a level is in hand within the loop");
+                let Some((_, parent_identity, _)) = levels.last() else {
+                    drop(level);
+                    return unlink_tree_entry(parent, &cleared, AtFlags::REMOVEDIR);
+                };
+                let up = open_dir_nofollow(level.fd().map_err(io_err)?, c"..").map_err(io_err)?;
+                level = Dir::new(up).map_err(io_err)?;
+                let level_fd = level.fd().map_err(io_err)?;
+                if dir_identity(level_fd)? != *parent_identity {
+                    return Err(Error::Io(io::Error::other(
+                        "a directory moved during the removal",
+                    )));
+                }
+                unlink_tree_entry(level_fd, &cleared, AtFlags::REMOVEDIR)?;
+            }
         }
     }
-    drop(fd);
-    match unlinkat(repo_fd, path.as_str(), AtFlags::REMOVEDIR) {
+    Ok(())
+}
+
+/// Unlink `name` under `dir`. A name that is already gone is not an error.
+fn unlink_tree_entry(dir: BorrowedFd<'_>, name: &CStr, flags: rustix::fs::AtFlags) -> Result<()> {
+    match rustix::fs::unlinkat(dir, name, flags) {
         Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
         Err(e) => Err(Error::Io(e.into())),
     }
+}
+
+/// Open the directory `name` under `dir`, following no symlink.
+fn open_dir_nofollow(dir: BorrowedFd<'_>, name: &CStr) -> rustix::io::Result<OwnedFd> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// The device and inode of an open directory.
+fn dir_identity(dir: BorrowedFd<'_>) -> Result<(u64, u64)> {
+    let st = rustix::fs::fstat(dir).map_err(|e| Error::Io(e.into()))?;
+    Ok((st.st_dev, st.st_ino))
+}
+
+/// The entries of one directory level, each with whether it is a directory.
+///
+/// `getdents64` already carries the type. A filesystem that reports
+/// [`FileType::Unknown`](rustix::fs::FileType::Unknown) leaves the type to one
+/// no-follow `statat` for that name alone; a name that is gone by the time that
+/// call runs is left out.
+fn read_tree_level(dir: &mut rustix::fs::Dir) -> Result<Vec<(CString, bool)>> {
+    use rustix::fs::{AtFlags, FileType, statat};
+
+    let mut read = Vec::new();
+    for entry in dir.by_ref() {
+        let entry = entry.map_err(|e| Error::Io(e.into()))?;
+        let name = entry.file_name();
+        if name != c"." && name != c".." {
+            read.push((name.to_owned(), entry.file_type()));
+        }
+    }
+    let fd = dir.fd().map_err(|e| Error::Io(e.into()))?;
+    let mut entries = Vec::with_capacity(read.len());
+    for (name, file_type) in read {
+        let is_dir = match file_type {
+            FileType::Directory => true,
+            FileType::Unknown => match statat(fd, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => FileType::from_raw_mode(st.st_mode) == FileType::Directory,
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(e) => return Err(Error::Io(e.into())),
+            },
+            _ => false,
+        };
+        entries.push((name, is_dir));
+    }
+    Ok(entries)
 }
 
 /// Walk the two-level `deltas/` tree, applying `parse` to each delta's fanout
@@ -535,9 +747,16 @@ fn parse_delta_dir(fanout: &str, leaf: &str) -> Result<(Option<Checksum>, Checks
 
 /// Reconstruct a delta's hex name from its `deltas/<fanout>/<leaf>` directory.
 fn delta_name(fanout: &str, leaf: &str) -> Result<String> {
-    match parse_delta_dir(fanout, leaf)? {
-        (Some(from), to) => Ok(format!("{}-{}", from.to_hex(), to.to_hex())),
-        (None, to) => Ok(to.to_hex()),
+    let (from, to) = parse_delta_dir(fanout, leaf)?;
+    Ok(delta_hex_name(from.as_ref(), &to))
+}
+
+/// A delta's hex name as the tool names it: the target hex for a delta from
+/// scratch, and `<from-hex>-<to-hex>` otherwise.
+pub(crate) fn delta_hex_name(from: Option<&Checksum>, to: &Checksum) -> String {
+    match from {
+        Some(from) => format!("{}-{}", from.to_hex(), to.to_hex()),
+        None => to.to_hex(),
     }
 }
 

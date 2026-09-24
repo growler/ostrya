@@ -12144,12 +12144,14 @@ note: every `--gpg-sign` lookup runs before the regeneration, after the `-m`
  as they stood.
 
 # ---------------------------------------------------------------------------
-# static-delta -- `show`, the superblock and part report, and `indexes`, the
-# listing of the `delta-indexes/` cache.
+# static-delta -- `show`, the superblock and part report, `indexes`, the
+# listing of the `delta-indexes/` cache, and `delete`, the removal of one delta.
 #
 # `show` and `indexes` write nothing, so each cited test runs both
 # implementations over one repository and compares the exit status and both
-# streams. A cell that needs a delta cites a test: no setup generates one.
+# streams. `delete` removes files, so its cited tests give each implementation
+# its own byte-identical copy of one repository and compare the trees after
+# each run. A cell that needs a delta cites a test: no setup generates one.
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -12370,3 +12372,51 @@ note: an entry is listed when it is a regular file named with 41 characters and
  `cli-surface.md`, "P2", records. The cell stays full: every name the cited
  test writes is in the modified-base64 alphabet, and each is skipped by a
  rule both apply, so the test reaches no name the lenient decode lists.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/delete-absent
+setup: repo
+run: static-delta --repo=$REPO delete 0000000000000000000000000000000000000000000000000000000000000000
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Can't find delta 0000000000000000000000000000000000000000000000000000000000000000"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Can't find delta 0000000000000000000000000000000000000000000000000000000000000000"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_delete_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: a valid name that nothing resolves at is an absent delta. The existence
+ check follows symlinks, so a missing `deltas/`, a missing fanout, and a
+ dangling symlink at the delta path report the same text, and the symlink
+ stays. The cited test also states that no argument, a name the parser
+ refuses, and a path refuse with the text of `show`, in both.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/delete-ok
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_delete_matches_the_tool
+spec: format-reference.md#static-delta
+note: `delete` writes nothing to either stream and exits 0. It removes the
+ entry at the delta path whole: a delta directory with nested directories, a
+ regular file, and a directory with no superblock. A symlink at the path is
+ removed as a link and its target stays. The fanout directory stays, also where
+ it becomes empty. No setup generates a delta, so the cited test builds the
+ repositories.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/delete-leaves-index
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_delete_matches_the_tool
+spec: format-reference.md#static-delta
+note: after every delta is removed, `delta-indexes/` and `summary` hold the
+ bytes they held before, in both, and `indexes` still lists both targets.

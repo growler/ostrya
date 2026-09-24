@@ -20,7 +20,7 @@
 //!
 //! In a `bare-user-shared` repository each directory this module creates is
 //! forced to `02770` after the create, independent of the umask (see
-//! [`crate::perm`]). A directory that already stands keeps the mode and the
+//! `crate::perm`). A directory that already stands keeps the mode and the
 //! group it has, the repository root included: the group and the mode of a root
 //! ostrya did not create are the caller's responsibility.
 

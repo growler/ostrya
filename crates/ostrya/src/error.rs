@@ -284,6 +284,16 @@ pub enum Error {
         /// What the value holds instead.
         reason: String,
     },
+    /// The repository holds no static delta from `from` to `to`: nothing
+    /// resolves at its `deltas/<fanout>/<rest>` path. The message names the
+    /// delta the way the tool names it.
+    #[error("Can't find delta {}", crate::delta::delta_hex_name(.from.as_ref(), .to))]
+    StaticDeltaNotFound {
+        /// The source commit, `None` for a delta from scratch.
+        from: Option<Checksum>,
+        /// The target commit.
+        to: Checksum,
+    },
 }
 
 impl From<rustix::io::Errno> for Error {
@@ -324,6 +334,7 @@ impl From<Error> for std::io::Error {
             | Error::DanglingSymlink { .. }
             | Error::ObjectNotFound { .. }
             | Error::RefNotFound(_)
+            | Error::StaticDeltaNotFound { .. }
             | Error::HttpStatus { status: 404, .. } => ErrorKind::NotFound,
             Error::HttpStatus {
                 status: 401 | 403, ..
@@ -376,6 +387,13 @@ mod tests {
                 ErrorKind::NotFound,
             ),
             (Error::RefNotFound("x/y".into()), ErrorKind::NotFound),
+            (
+                Error::StaticDeltaNotFound {
+                    from: None,
+                    to: Checksum::from_hex(&"ab".repeat(32)).unwrap(),
+                },
+                ErrorKind::NotFound,
+            ),
             (
                 Error::NotADirectory { path: path() },
                 ErrorKind::NotADirectory,

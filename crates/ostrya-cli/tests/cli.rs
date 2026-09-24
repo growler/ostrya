@@ -29706,3 +29706,248 @@ fn static_delta_indexes_matches_the_tool() {
     assert_eq!(tool.status.code(), Some(1));
     assert!(port.stdout.is_empty() && tool.stdout.is_empty());
 }
+
+/// Run `static-delta delete` with `args` against each implementation's own
+/// repository, the repository in the `=` form the tool reads.
+fn run_delta_delete(port_repo: &Path, tool_repo: &Path, args: &[&str]) -> (Run, Run) {
+    let run = |repo: &Path, tool: bool| {
+        let repo_arg = format!("--repo={}", repo.display());
+        let mut all = vec!["static-delta", repo_arg.as_str(), "delete"];
+        all.extend_from_slice(args);
+        if tool {
+            ostree(&all)
+        } else {
+            ostrya(&all, None, &[])
+        }
+    };
+    (run(port_repo, false), run(tool_repo, true))
+}
+
+/// `delete` agrees: no output at exit 0, the entry at the delta path removed
+/// whole whatever it is, a symlink removed as a link, and the fanout,
+/// `delta-indexes/`, and `summary` left as they were, so `indexes` still lists
+/// the targets. Carries `static-delta/delete-ok` and
+/// `static-delta/delete-leaves-index`.
+#[test]
+fn static_delta_delete_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-delete");
+    let (tool_repo, c1, c2) = delta_show_repo(tmp.path(), "tool");
+    ostree_ok(
+        &tool_repo,
+        &["static-delta", "generate", "--empty", "--to", &c1],
+    );
+    ostree_ok(
+        &tool_repo,
+        &["static-delta", "generate", "--from", &c1, "--to", &c2],
+    );
+    ostree_ok(&tool_repo, &["static-delta", "reindex"]);
+    ostree_ok(&tool_repo, &["summary", "-u"]);
+    let to1 = Checksum::from_hex(&c1).unwrap();
+    let to2 = Checksum::from_hex(&c2).unwrap();
+    let nested = tool_repo.join(ostrya::static_delta_relative_dir(None, &to1));
+    std::fs::create_dir_all(nested.join("n1/n2")).unwrap();
+    std::fs::write(nested.join("n1/n2/f"), b"nested\n").unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("file"), b"keep\n").unwrap();
+    let scratch2 = ostrya::static_delta_relative_dir(None, &to2);
+    let fanout2 = tool_repo.join(&scratch2);
+    std::fs::create_dir_all(fanout2.parent().unwrap()).unwrap();
+    std::fs::write(tool_repo.join(&scratch2), b"not a delta\n").unwrap();
+    let summary = std::fs::read(tool_repo.join("summary")).unwrap();
+    let port_repo = clone_repo(tmp.path(), &tool_repo, "port");
+
+    let from_to = format!("{c1}-{c2}");
+    // What each step places at the from-scratch path of `c2` before it runs,
+    // in both repositories.
+    enum Place {
+        Nothing,
+        LinkToOutside,
+        EmptyDir,
+    }
+    let steps = [
+        (c1.as_str(), Place::Nothing),
+        (from_to.as_str(), Place::Nothing),
+        (c2.as_str(), Place::Nothing),
+        (c2.as_str(), Place::LinkToOutside),
+        (c2.as_str(), Place::EmptyDir),
+    ];
+    for (name, place) in steps {
+        for repo in [&port_repo, &tool_repo] {
+            match place {
+                Place::Nothing => {}
+                Place::LinkToOutside => {
+                    std::os::unix::fs::symlink(&outside, repo.join(&scratch2)).unwrap()
+                }
+                Place::EmptyDir => std::fs::create_dir(repo.join(&scratch2)).unwrap(),
+            }
+        }
+        let (port, tool) = run_delta_delete(&port_repo, &tool_repo, &[name]);
+        assert_runs_agree(&port, &tool, &format!("static-delta delete {name}"));
+        port.ok();
+        assert!(port.stdout.is_empty() && port.stderr.is_empty(), "{name}");
+        assert_eq!(
+            describe_tree(&port_repo.join("deltas")),
+            describe_tree(&tool_repo.join("deltas")),
+            "{name}"
+        );
+    }
+    assert!(
+        std::fs::read_dir(port_repo.join("deltas"))
+            .unwrap()
+            .all(|fanout| std::fs::read_dir(fanout.unwrap().path())
+                .unwrap()
+                .next()
+                .is_none()),
+        "every delta is gone and every fanout stays"
+    );
+    assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"keep\n");
+    assert_eq!(
+        describe_tree_with_content(&port_repo.join("delta-indexes")),
+        describe_tree_with_content(&tool_repo.join("delta-indexes")),
+    );
+    for repo in [&port_repo, &tool_repo] {
+        assert_eq!(std::fs::read(repo.join("summary")).unwrap(), summary);
+    }
+    let repo_arg = format!("--repo={}", port_repo.display());
+    let port = ostrya(&["static-delta", &repo_arg, "indexes"], None, &[]);
+    let repo_arg = format!("--repo={}", tool_repo.display());
+    let tool = ostree(&["static-delta", &repo_arg, "indexes"]);
+    let lines = |run: &Run| {
+        let mut lines: Vec<String> = String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    };
+    port.ok();
+    let mut expected = vec![c1.clone(), c2.clone()];
+    expected.sort();
+    assert_eq!(lines(&port), lines(&tool));
+    assert_eq!(lines(&port), expected, "the index still lists both targets");
+}
+
+/// The refusals of `delete` agree: no argument, a name the parser refuses, a
+/// path, and an absent delta, a dangling symlink at the delta path and a
+/// missing `deltas/` included. An extra positional and a symlink loop are the
+/// recorded divergences. Carries `static-delta/delete-absent`.
+#[test]
+fn static_delta_delete_refusals_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-delete-refusals");
+    let (tool_repo, c1, c2) = delta_show_repo(tmp.path(), "tool");
+    ostree_ok(
+        &tool_repo,
+        &["static-delta", "generate", "--empty", "--to", &c1],
+    );
+    let port_repo = clone_repo(tmp.path(), &tool_repo, "port");
+    let to1 = Checksum::from_hex(&c1).unwrap();
+    let to2 = Checksum::from_hex(&c2).unwrap();
+    let relative = ostrya::static_delta_relative_dir(None, &to1);
+    let superblock = format!("{relative}/superblock");
+    let upper = c1.to_uppercase();
+    let agree = |args: &[&str]| {
+        let (port, tool) = run_delta_delete(&port_repo, &tool_repo, args);
+        let label = format!("static-delta delete {}", args.join(" "));
+        assert_runs_agree(&port, &tool, &label);
+        assert_eq!(port.status.code(), Some(1), "{label}");
+        assert!(port.stdout.is_empty(), "{label}");
+        port
+    };
+    let deltas = |repo: &Path| describe_tree(&repo.join("deltas"));
+    let before = deltas(&tool_repo);
+
+    let port = agree(&[]);
+    assert_eq!(
+        String::from_utf8_lossy(&port.stderr),
+        "error: DELTA must be specified\n"
+    );
+    for arg in [
+        "ABC",
+        "m",
+        &c1[..10],
+        upper.as_str(),
+        "a/b-c",
+        "./x",
+        relative.as_str(),
+        superblock.as_str(),
+        "",
+        "C-",
+    ] {
+        agree(&[arg]);
+    }
+    assert_eq!(deltas(&port_repo), before);
+    assert_eq!(deltas(&tool_repo), before);
+
+    let not_found = format!("error: Can't find delta {c2}\n");
+    let port = agree(&[&c2]);
+    assert_eq!(String::from_utf8_lossy(&port.stderr), not_found);
+
+    // A dangling symlink at the delta path is an absent delta, and it stays.
+    let scratch2 = ostrya::static_delta_relative_dir(None, &to2);
+    for repo in [&port_repo, &tool_repo] {
+        let link = repo.join(&scratch2);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("nowhere", &link).unwrap();
+    }
+    let port = agree(&[&c2]);
+    assert_eq!(String::from_utf8_lossy(&port.stderr), not_found);
+    for repo in [&port_repo, &tool_repo] {
+        assert!(std::fs::symlink_metadata(repo.join(&scratch2)).is_ok());
+        std::fs::remove_file(repo.join(&scratch2)).unwrap();
+    }
+
+    // A symlink loop at the delta path fails in both, worded apart.
+    let leaf = Path::new(&scratch2).file_name().unwrap().to_owned();
+    for repo in [&port_repo, &tool_repo] {
+        std::os::unix::fs::symlink(&leaf, repo.join(&scratch2)).unwrap();
+    }
+    let (port, tool) = run_delta_delete(&port_repo, &tool_repo, &[&c2]);
+    for run in [&port, &tool] {
+        assert_eq!(run.status.code(), Some(1));
+        assert!(run.stdout.is_empty());
+    }
+    assert!(
+        String::from_utf8_lossy(&tool.stderr).contains("Too many levels of symbolic links"),
+        "{}",
+        String::from_utf8_lossy(&tool.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&port.stderr).starts_with("error: i/o error: "),
+        "{}",
+        String::from_utf8_lossy(&port.stderr)
+    );
+    for repo in [&port_repo, &tool_repo] {
+        std::fs::remove_file(repo.join(&scratch2)).unwrap();
+    }
+
+    // An extra positional: the tool ignores it and removes the delta, and the
+    // port refuses it and removes nothing.
+    let before = deltas(&port_repo);
+    let (port, tool) = run_delta_delete(&port_repo, &tool_repo, &[&c1, "extra"]);
+    assert_eq!(tool.status.code(), Some(0));
+    assert_eq!(port.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&port.stderr).contains("unexpected argument 'extra'"),
+        "{}",
+        String::from_utf8_lossy(&port.stderr)
+    );
+    assert_eq!(deltas(&port_repo), before);
+    std::fs::remove_dir_all(port_repo.join(&relative)).unwrap();
+
+    // A missing `deltas/` is an absent delta.
+    for repo in [&port_repo, &tool_repo] {
+        std::fs::remove_dir_all(repo.join("deltas")).unwrap();
+    }
+    let port = agree(&[&c1]);
+    assert_eq!(
+        String::from_utf8_lossy(&port.stderr),
+        format!("error: Can't find delta {c1}\n")
+    );
+}

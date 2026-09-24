@@ -2376,6 +2376,16 @@ the tree uses. Observed over one tree committed with
 reach one commit checksum and so one digest; `bare-user-only` canonicalizes the
 tree and reaches another.
 
+`ostree checkout --composefs` and `--composefs-noverity` export from every
+repository mode. Observed with ostree 2026.1 over one tree committed into
+`bare-user`, `archive`, `bare`, and `bare-user-only`: each checkout exits 0,
+and the `archive` and `bare` images are byte-identical to the `bare-user` image
+under both switches. The tool refuses a commit into `bare-split-xattrs`
+(`Writing content object: Not allowed due to repo mode`), so that mode is
+observed over a repository built by hand, which the tool exports from and
+whose image the port reproduces
+(`ostrya::read_split_xattrs::composefs_export_matches_the_tool`).
+
 The tool builds the image in an anonymous temporary file (`O_TMPFILE`) opened
 relative to the current directory and links it into place next to the
 destination, so the export runs with a working directory on the destination's
@@ -2997,10 +3007,11 @@ Integrity (fsck) and reachability (prune). As `bare-user`:
 and no extra reachability edges. The inode mode is not authoritative and is
 not checked.
 
-composefs. This mode is the intended composefs backing store. The EROFS
-metadata layer is built from the `user.ostreemeta` attributes (mode, uid,
-gid, xattrs), and each regular file redirects to its `.file` loose path.
-Per-file fs-verity is computed over the payload. Ownership is presented
+composefs. This mode is the intended composefs backing store. Its `.file`
+objects hold the raw payload at the loose paths each image redirect names, so
+the repository serves as the lower layer of an image exported from any mode
+holding the same tree. Per-file fs-verity is computed over the payload.
+Ownership is presented
 through composefs uid mapping at mount time, so the real root-owned metadata
 is correct even inside a rootless, non-root container.
 

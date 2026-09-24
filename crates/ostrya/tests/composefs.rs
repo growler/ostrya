@@ -4,7 +4,8 @@
 //!
 //! The tree the composefs fixture was exported from is the same source tree the
 //! bare-user fixture commits, so [`Repo::export_composefs`] over the bare-user
-//! fixture commit must reproduce the golden image `tree.cfs` byte-for-byte and
+//! fixture commit, and over the archive fixture that holds the same commit,
+//! must reproduce the golden image `tree.cfs` byte-for-byte and
 //! the fs-verity digest the tool recorded in the MANIFEST. A second test drives
 //! the digest into a commit's metadata and reads it back.
 //!
@@ -109,8 +110,19 @@ fn to_hex(bytes: &[u8]) -> String {
 /// Export the fixture commit under `verity`, and require the image to equal
 /// `<stem>.cfs` byte-for-byte and its fs-verity digest to equal the MANIFEST
 /// value at `digest_key`. The fd form is held to the same bytes and the same
-/// digest. Skips when the golden fixture is absent.
+/// digest. The `bare-user` and `archive` fixtures hold the same commit, so the
+/// export from each is held to the golden image the tool exported from
+/// `bare-user`. That the tool writes the same image from `archive` is the
+/// observation `format-reference.md`, "composefs", records.
+/// Skips when the golden fixture is absent.
 fn check_export(stem: &str, digest_key: &str, verity: VerityPolicy) {
+    for mode in ["bare-user", "archive"] {
+        check_export_from(mode, stem, digest_key, verity);
+    }
+}
+
+/// [`check_export`] over the fixture repository of `mode`.
+fn check_export_from(mode: &str, stem: &str, digest_key: &str, verity: VerityPolicy) {
     let (Some(digest), Ok(golden)) = (
         manifest_digest(digest_key),
         std::fs::read(composefs_dir().join(format!("{stem}.cfs"))),
@@ -121,7 +133,9 @@ fn check_export(stem: &str, digest_key: &str, verity: VerityPolicy) {
 
     let scratch = TmpDir::new("composefs-export-to");
     let image_path = scratch.path().join(format!("{stem}.cfs"));
-    let repo_dir = fixture_repo("bare-user");
+    let repo_dir = fixture_repo(mode);
+    let stem = format!("{mode} {stem}");
+    let stem = stem.as_str();
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
         let commit = Checksum::from_hex(COMMIT).unwrap();
@@ -326,7 +340,7 @@ enum Carrier {
     File,
 }
 
-/// Walk the composefs model of a tree whose `carrier` inode holds `xattrs`, in a
+/// Export the composefs image of a tree whose `carrier` inode holds `xattrs`, in a
 /// repository of its own in `mode`. The dirmeta object is built directly rather
 /// than by setting the attributes on a real directory, because a host
 /// filesystem's own ceiling decides whether they can be set at all. `mode` is
@@ -353,7 +367,12 @@ async fn export_xattrs(
                 mode: 0o100644,
                 xattrs,
             };
-            let file = txn.write_regfile_inline(None, &meta, b"").await.unwrap();
+            // A file with content is backed, so the export adds the redirect
+            // and metacopy attributes to its inode.
+            let file = txn
+                .write_regfile_inline(None, &meta, b"backed\n")
+                .await
+                .unwrap();
             mtree.replace_file("f", file).unwrap();
             Xattrs::empty()
         }
@@ -383,23 +402,22 @@ async fn export_xattrs(
         )
         .await
         .unwrap();
-    txn.set_ref("budget", Some(&commit));
+    // The staged digest path reads the objects through the transaction, so it
+    // is held to the outcome the export reaches over the published commit.
+    let staged = txn.composefs_digest(&root).await.map(|_| ());
     txn.commit().await.unwrap();
 
-    // A backing mode writes the image. Any other mode reaches the same refusal
-    // through the digest path, which builds no image and so takes no mode.
     // `Image` holds no `Debug`, so each value is dropped rather than matched on.
-    if mode == RepoMode::BareUser {
-        return repo
-            .export_composefs(&commit, &ComposefsOptions::default())
-            .await
-            .map(|_| ());
-    }
-    let (tree, _) = repo.read_commit("budget").await.unwrap();
-    let txn = repo.transaction().await.unwrap();
-    let walked = txn.composefs_digest(&tree).await.map(|_| ());
-    txn.abort().await.unwrap();
-    walked
+    let exported = repo
+        .export_composefs(&commit, &ComposefsOptions::default())
+        .await
+        .map(|_| ());
+    assert_eq!(
+        staged.is_ok(),
+        exported.is_ok(),
+        "the staged digest path reached {staged:?} and the export {exported:?}"
+    );
+    exported
 }
 
 /// One xattr spends its name, its value, and 7 bytes from the inode's budget of
@@ -628,11 +646,10 @@ fn holds_an_xattr_name_to_the_erofs_length_field() {
     });
 }
 
-/// `commit_add_composefs_metadata` builds no image, so it runs in a repository
-/// of any mode and records the digest a composefs backing mode records. The
-/// export forms keep the mode rule, which the same repository shows.
+/// `commit_add_composefs_metadata` runs in an `archive` repository and records
+/// the digest a `bare-user` repository records for the same tree.
 #[test]
-fn digest_metadata_runs_in_a_non_backing_mode() {
+fn digest_metadata_runs_in_an_archive_repository() {
     let Some(digest) = manifest_digest("composefs_digest") else {
         eprintln!("composefs fixture absent; skipping");
         return;
@@ -646,18 +663,6 @@ fn digest_metadata_runs_in_a_non_backing_mode() {
         let repo = Repo::open(&dst).await.unwrap();
         assert_eq!(repo.mode(), RepoMode::Archive, "the fixture is archive");
         let commit = Checksum::from_hex(COMMIT).unwrap();
-
-        // `Image` holds no `Debug`, so the value is dropped rather than
-        // matched on.
-        let err = repo
-            .export_composefs(&commit, &ComposefsOptions::default())
-            .await
-            .map(|_| ())
-            .expect_err("an archive repository writes no image");
-        assert!(
-            matches!(err, Error::Unsupported(_)),
-            "the export refused with {err:?}"
-        );
 
         let txn = repo.transaction().await.unwrap();
         let stored = repo

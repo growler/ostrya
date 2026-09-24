@@ -422,12 +422,11 @@ struct CheckoutArgs {
     #[arg(long)]
     allow_noent: bool,
     /// Write the commit's composefs EROFS image to the destination instead of a
-    /// tree (requires a bare-user or bare-user-shared repository).
+    /// tree.
     #[arg(long)]
     composefs: bool,
-    /// Write the composefs EROFS image with no fs-verity digest in it
-    /// (requires a bare-user or bare-user-shared repository). The two composefs
-    /// switches are independent, and this one decides in any order.
+    /// Write the composefs EROFS image with no fs-verity digest in it. The two
+    /// composefs switches are independent, and this one decides in any order.
     #[arg(long)]
     composefs_noverity: bool,
     /// Read NUL-separated (REFSPEC, SUBPATH) records from standard input and

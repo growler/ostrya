@@ -42,15 +42,14 @@
 //! carries the fs-verity digest of the file's content, so a repository holding
 //! the same tree produces the same image and the same digest whatever its mode.
 //!
-//! The export applies to the composefs backing modes, `bare-user` and
-//! `bare-user-shared`: the EROFS metadata comes from the logical
-//! `user.ostreemeta` attributes and each regular file redirects to its `.file`
-//! loose object. Ownership is presented through composefs uid mapping at mount,
-//! so the stored uid/gid are the logical owners regardless of who runs the
-//! export. Other modes are rejected. The two digest-only paths,
-//! [`Repo::commit_add_composefs_metadata`] and
-//! [`Transaction::composefs_digest`], build no image and run in every mode,
-//! since the value is a fact about the tree.
+//! Every path here runs in every repository mode. The EROFS metadata of each
+//! file comes from the file object as [`Repo::load_file`] reads it in the
+//! repository's mode. Ownership is presented through composefs uid mapping at
+//! mount, so the stored uid/gid are the logical owners regardless of who runs
+//! the export. An `archive` repository holds its content objects in `.filez`
+//! form, so an image exported from it mounts over a store that holds the same
+//! objects in `.file` form, such as a `bare-user` repository the tree is pulled
+//! into.
 //!
 //! One tree fact has no place in the image: an inode that spends too much on
 //! extended attributes. Each attribute spends its name, its value, and 7 bytes
@@ -202,8 +201,10 @@ impl Repo {
     /// Build the composefs EROFS image for `commit` and return its bytes and
     /// fs-verity digest.
     ///
-    /// The repository must be a composefs backing mode (`bare-user` or
-    /// `bare-user-shared`); any other mode is [`Error::Unsupported`].
+    /// The export runs in every repository mode. Each regular file redirects
+    /// to its `.file` loose path, which an `archive` repository does not hold,
+    /// so an image built there mounts over a store that holds the same objects
+    /// in `.file` form.
     ///
     /// `opts.verity` decides whether each backed file carries the fs-verity
     /// digest of its content. Under [`VerityPolicy::Disabled`] the image's own
@@ -214,7 +215,6 @@ impl Repo {
         commit: &Checksum,
         opts: &ComposefsOptions,
     ) -> Result<Image> {
-        self.ensure_composefs_backing_mode()?;
         let dir = self.composefs_export_model(commit, opts).await?;
         ostrya_rt::unblock(move || build_image(&dir))
             .await
@@ -227,7 +227,7 @@ impl Repo {
     /// The image goes to the file descriptor as it is serialized, so no
     /// image-sized buffer is held. `out` is written from its current offset
     /// onward and is never seeked, and a call that fails leaves the prefix it
-    /// had already written. The mode rule and `opts.verity` are those of
+    /// had already written. The mode scope and `opts.verity` are those of
     /// [`Repo::export_composefs`].
     pub async fn export_composefs_to(
         &self,
@@ -235,7 +235,6 @@ impl Repo {
         opts: &ComposefsOptions,
         out: BorrowedFd<'_>,
     ) -> Result<[u8; 32]> {
-        self.ensure_composefs_backing_mode()?;
         let dir = self.composefs_export_model(commit, opts).await?;
         // The blocking pool needs an owned handle, so the caller's descriptor is
         // duplicated for the closure to move.
@@ -246,8 +245,7 @@ impl Repo {
     }
 
     /// The composefs tree model for `commit`'s root, the step the two export
-    /// entry points share. Every mode reaches the same model, so the mode check
-    /// belongs to the two entry points that write an image and not here.
+    /// entry points share.
     async fn composefs_export_model(
         &self,
         commit: &Checksum,
@@ -301,17 +299,6 @@ impl Repo {
         append_dict_entry(&mut commit_obj.metadata, COMPOSEFS_DIGEST_KEY, value)?;
         let bytes = commit_obj.serialize()?;
         txn.write_metadata(ObjectType::Commit, None, &bytes).await
-    }
-
-    /// Reject a repository whose mode is not a composefs backing mode.
-    fn ensure_composefs_backing_mode(&self) -> Result<()> {
-        match self.mode() {
-            RepoMode::BareUser | RepoMode::BareUserShared => Ok(()),
-            other => Err(Error::Unsupported(format!(
-                "composefs export requires a bare-user or bare-user-shared \
-                 repository, not {other:?}"
-            ))),
-        }
     }
 }
 

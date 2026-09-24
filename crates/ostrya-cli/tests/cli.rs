@@ -3375,12 +3375,13 @@ fn composefs_checkout_matches_library() {
     assert!(!cli_bytes.is_empty(), "composefs image is non-empty");
 }
 
-/// The two composefs switches of `checkout`, over a `bare-user` repository
-/// holding one tree. `--composefs` writes the verity image, and
-/// `--composefs-noverity` writes the image whose metacopy xattr carries no
-/// digest. The switches are independent and the no-verity switch decides, so
-/// the two combined forms write the no-verity image whatever their order. Each
-/// form is held against the tool's own image for the same commit.
+/// The two composefs switches of `checkout`, over a repository holding one
+/// tree, in each mode the port and the tool can both commit into.
+/// `--composefs` writes the verity image, and `--composefs-noverity` writes
+/// the image whose metacopy xattr carries no digest. The switches are
+/// independent and the no-verity switch decides, so the two combined forms
+/// write the no-verity image whatever their order. Each form is held against
+/// the tool's own image for the same commit.
 ///
 /// Every destination is created at mode 0600 first, so each form also states
 /// that both implementations replace a destination that already exists rather
@@ -3395,8 +3396,22 @@ fn checkout_composefs_switches_match_the_tool() {
         return;
     }
     let tmp = TmpDir::new("checkout-composefs-switches");
-    let base = tmp.path();
-    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::BareUser);
+    for (name, mode) in [
+        ("bare-user", RepoMode::BareUser),
+        ("archive", RepoMode::Archive),
+        ("bare", RepoMode::Bare),
+        ("bare-user-only", RepoMode::BareUserOnly),
+    ] {
+        let base = tmp.path().join(name);
+        std::fs::create_dir_all(&base).unwrap();
+        composefs_switches_match_the_tool(&base, mode);
+    }
+}
+
+/// [`checkout_composefs_switches_match_the_tool`] over a repository pair in
+/// `mode` under `base`.
+fn composefs_switches_match_the_tool(base: &Path, mode: RepoMode) {
+    let (port_repo, tool_repo, tree) = commit_pair(base, mode);
     assert_agrees(
         &port_repo,
         &tool_repo,
@@ -3437,7 +3452,7 @@ fn checkout_composefs_switches_match_the_tool() {
     .iter()
     .enumerate()
     {
-        let label = flags.join(" ");
+        let label = format!("{} ({mode:?})", flags.join(" "));
         let port_image = base.join(format!("port{n}.cfs"));
         let tool_image = base.join(format!("tool{n}.cfs"));
         for dest in [&port_image, &tool_image] {
@@ -3512,42 +3527,50 @@ fn checkout_composefs_switches_match_the_tool() {
     );
 }
 
-/// The composefs export refuses a repository outside the backing modes, where
-/// the tool exports an image whose redirects name loose paths that repository
-/// does not hold. `cli-surface.md`, "P2" records the divergence. The refusal
-/// writes no destination and leaves a destination that already exists as it
-/// was, byte for byte and at the mode it carried.
+/// A composefs export that fails part way writes no destination and leaves a
+/// destination that already exists as it was, byte for byte and at the mode it
+/// carried. The failure comes from a content object removed from the
+/// repository after the commit, which the export reaches only while it builds
+/// the image.
 #[test]
-fn checkout_composefs_refuses_an_archive_repository() {
-    if !ostree_available() {
-        return;
-    }
-    let tmp = TmpDir::new("checkout-composefs-archive");
+fn checkout_composefs_failure_leaves_no_destination() {
+    let tmp = TmpDir::new("checkout-composefs-failure");
     let base = tmp.path();
-    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
-    assert_agrees(
-        &port_repo,
-        &tool_repo,
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    let repo = create_repo(base, RepoMode::Archive);
+    ostrya(
         &[
             "commit",
+            &format!("--repo={}", repo.display()),
             "-b",
             BRANCH,
             "-s",
             SUBJECT,
             FIXED_TIMESTAMP,
-            "--orphan",
             tree.to_str().unwrap(),
         ],
-    );
+        None,
+        &[],
+    )
+    .ok();
+    let checksum = fsck_reachable_object(&repo, BRANCH, ObjectType::File);
+    std::fs::remove_file(fsck_object_path(
+        &repo,
+        &checksum,
+        ObjectType::File,
+        RepoMode::Archive,
+    ))
+    .unwrap();
 
     for flag in ["--composefs", "--composefs-noverity"] {
         let name = flag.trim_start_matches('-');
-        let refuse = |dest: &Path| {
+        let fail = |dest: &Path| {
             let port = ostrya_in(
                 Some(base),
                 &[
                     "checkout",
-                    &format!("--repo={}", port_repo.display()),
+                    &format!("--repo={}", repo.display()),
                     flag,
                     BRANCH,
                     dest.to_str().unwrap(),
@@ -3555,64 +3578,48 @@ fn checkout_composefs_refuses_an_archive_repository() {
                 None,
                 &[],
             );
-            assert_eq!(port.status.code(), Some(1), "the port took `{flag}`");
+            assert_ne!(
+                port.status.code(),
+                Some(0),
+                "`{flag}` exported a tree with a missing object",
+            );
             let stderr = String::from_utf8_lossy(&port.stderr).into_owned();
             assert!(
-                stderr.contains("composefs export requires a bare-user or bare-user-shared"),
-                "the refusal for `{flag}` does not name the mode rule:\n{stderr}",
+                stderr.contains("object not found"),
+                "`{flag}` failed for a reason other than the missing object:\n{stderr}",
             );
         };
 
-        // A destination the refusal would have had to create is not created.
+        // A destination the failed export would have had to create is not
+        // created.
         let port_image = base.join(format!("port-{name}.cfs"));
-        refuse(&port_image);
+        fail(&port_image);
         assert!(
             !port_image.exists(),
-            "the refusal for `{flag}` left a destination behind",
+            "the failed `{flag}` left a destination behind",
         );
 
         // A destination that already exists is left as it was. The export
         // serializes as it builds, so a destination it opened directly would be
-        // truncated before the refusal reached it.
+        // truncated before the failure reached it.
         let kept = base.join(format!("kept-{name}.cfs"));
         std::fs::write(&kept, b"a file the export has no claim on").unwrap();
         std::fs::set_permissions(&kept, PermissionsExt::from_mode(0o600)).unwrap();
-        refuse(&kept);
+        fail(&kept);
         assert_eq!(
             std::fs::read(&kept).unwrap(),
             b"a file the export has no claim on",
-            "the refusal for `{flag}` changed a destination that already existed",
+            "the failed `{flag}` changed a destination that already existed",
         );
         assert_eq!(
             std::fs::metadata(&kept).unwrap().permissions().mode() & 0o777,
             0o600,
-            "the refusal for `{flag}` changed the destination's mode",
-        );
-
-        let tool_image = base.join(format!("tool-{name}.cfs"));
-        let tool = ostree_in(
-            base,
-            &[
-                "checkout",
-                &format!("--repo={}", tool_repo.display()),
-                flag,
-                BRANCH,
-                tool_image.to_str().unwrap(),
-            ],
-        );
-        assert_eq!(
-            tool.status.code(),
-            Some(0),
-            "the tool refused `{flag}` against an archive repository",
-        );
-        assert!(
-            !std::fs::read(&tool_image).unwrap().is_empty(),
-            "the tool wrote an empty image for `{flag}`",
+            "the failed `{flag}` changed the destination's mode",
         );
     }
 
     // The port exports through a temporary file in the destination's directory.
-    // A refusal removes it, so four refusals leave the directory with none.
+    // A failure removes it, so four failures leave the directory with none.
     let leftover: Vec<_> = std::fs::read_dir(base)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -3620,7 +3627,7 @@ fn checkout_composefs_refuses_an_archive_repository() {
         .collect();
     assert!(
         leftover.is_empty(),
-        "the refusals left temporary files behind: {leftover:?}",
+        "the failed exports left temporary files behind: {leftover:?}",
     );
 }
 

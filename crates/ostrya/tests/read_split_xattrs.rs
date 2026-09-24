@@ -277,6 +277,73 @@ fn tool_accepts_the_hand_built_repository() {
     );
 }
 
+/// The port and the tool export the same composefs image from a
+/// bare-split-xattrs repository, under both verity policies. The file's
+/// attributes come from the split object and each redirect names the `.file`
+/// object the repository holds.
+#[test]
+fn composefs_export_matches_the_tool() {
+    if !ostree_available() {
+        eprintln!("skipping bare-split-xattrs tool cross-check: ostree not on PATH");
+        return;
+    }
+    let tmp = TmpDir::new("bsx-composefs");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        Repo::create(&root, CreateOptions::new(MODE)).await.unwrap();
+    });
+    let (uid, gid) = current_owner(tmp.path());
+    let demo = Xattrs::new([(b"user.demo\0".to_vec(), b"bar".to_vec())]).unwrap();
+    let hello = write_file_object(&root, uid, gid, 0o100644, "", &demo, b"hello ostree\n");
+    let link = write_file_object(
+        &root,
+        uid,
+        gid,
+        0o120777,
+        "hello.txt",
+        &Xattrs::empty(),
+        b"",
+    );
+    let commit = write_commit(&root, &[("hello.txt", hello), ("link", link)]);
+
+    for (flag, verity) in [
+        ("--composefs", ostrya::VerityPolicy::Computed),
+        ("--composefs-noverity", ostrya::VerityPolicy::Disabled),
+    ] {
+        // The tool writes the image through a temporary file in the working
+        // directory, so it runs from the directory the destination sits in.
+        let dest = tmp.path().join(format!("tool{flag}.cfs"));
+        let out = Command::new("ostree")
+            .current_dir(tmp.path())
+            .arg(format!("--repo={}", root.display()))
+            .args(["checkout", flag, "test/main"])
+            .arg(&dest)
+            .output()
+            .expect("run ostree checkout");
+        assert!(
+            out.status.success(),
+            "ostree checkout {flag} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tool_bytes = fs::read(&dest).unwrap();
+        let port_bytes = block_on(async {
+            let repo = Repo::open(&root).await.unwrap();
+            repo.export_composefs(&commit, &ostrya::ComposefsOptions { verity })
+                .await
+                .expect("the port exports from bare-split-xattrs")
+                .bytes
+        });
+        assert!(
+            !port_bytes.is_empty(),
+            "{flag}: the port wrote an empty image"
+        );
+        assert_eq!(
+            port_bytes, tool_bytes,
+            "{flag}: the port and the tool wrote different image bytes"
+        );
+    }
+}
+
 /// The tool treats a `.file` with no companion `.file-xattrs-link` as
 /// corruption, even for a file with no xattrs (which links to the shared
 /// empty-set object). Recovered by observation: removing the link from an

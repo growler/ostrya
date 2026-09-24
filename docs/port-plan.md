@@ -421,7 +421,7 @@ tests, all reading a composefs fixture. `composefs` runs 11 tests, of which
 `noverity_export_matches_golden_image_and_digest`,
 `stores_digest_in_commit_metadata`,
 `transaction_digest_matches_recorded_digest`,
-`digest_metadata_runs_in_a_non_backing_mode`). The other 6 build and verify
+`digest_metadata_runs_in_an_archive_repository`). The other 6 build and verify
 a composefs image without reading one. Neither command needs the `ostree`
 tool. Each fixture-reading test loads only the checked-in `.cfs`, `.dump`,
 and `MANIFEST` files. Building or comparing an image is pure Rust.
@@ -4851,10 +4851,9 @@ image builder became mode-independent for it: each backing file redirects to the
 than of the loose object, so `archive`, `bare`, and `bare-user` holding one tree
 produce one image and one digest, which is what the tool stores.
 `bare-user-only` canonicalizes the tree and so reaches another digest, in both
-implementations. `Repo::commit_add_composefs_metadata` runs in every mode for
-the same reason: it builds no image, so the composefs backing-mode check sits on
-`Repo::export_composefs` and `Repo::export_composefs_to`, the two forms that
-write one. A symlink states its target inline in its inode, so a target the
+implementations. `Repo::commit_add_composefs_metadata`,
+`Repo::export_composefs`, and `Repo::export_composefs_to` run in every mode for
+the same reason. A symlink states its target inline in its inode, so a target the
 inode's block does not hold has no place in the image, and the writer refuses it
 with `Error::Unsupported`. The tool aborts on the same trees
 (`format-reference.md`, "composefs", records the measurement), so both sides
@@ -6036,7 +6035,7 @@ Deliverables, one line each:
   hasher as it goes, `build_image` buffers that same pass, and the two
   digest-only paths, `Transaction::composefs_digest` and
   `Repo::commit_add_composefs_metadata`, run it into `std::io::sink` and so
-  need no backing mode. The walk refuses a tree whose inode spends more than
+  hold no image. The walk refuses a tree whose inode spends more than
   the 32755 bytes the tool allows an inode's attributes, and holds the one EROFS
   length field that budget leaves unbound: 255 bytes of name. The writer refuses
   a symlink target its inode's block does not hold, the bound the tool aborts
@@ -6049,10 +6048,10 @@ Deliverables, one line each:
   bytes. Both switches export through `Repo::export_composefs_to` into a
   temporary file in the destination's directory, renamed over the destination
   once the image is whole, so a refused export leaves a destination that
-  already existed as it was and an export that finishes replaces it. The port
-  refuses a repository outside the composefs backing modes, where the tool
-  exports from any mode. Five `m10` cells hold the switches, four of them the
-  image a form writes and one the refusal.
+  already existed as it was and an export that finishes replaces it. Both
+  implementations export from every mode they can commit into. Seven `m10`
+  cells hold the switches: four for the image each form writes from
+  `bare-user`, and one for each of `archive`, `bare`, and `bare-user-only`.
 - `D6` -- `DictBuilder`, the `loose_path` re-export, and a public
   `Transaction::write_dirmeta` (DONE): the builder appends, so an `a{sv}` holds
   its entries in insertion order, which is the order the dict holds on disk and

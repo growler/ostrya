@@ -2127,20 +2127,20 @@ pub struct ComposefsOptions { pub verity: VerityPolicy }
 
 impl Repo {
     /// Produce the EROFS/composefs image for a commit and its fs-verity digest.
-    /// Inode metadata always comes from the real file attributes (no canonical
-    /// mode); in bare-user-shared mode metadata comes from `user.ostreemeta`
-    /// and each regular file redirects to its `.file` loose path. Ownership is
-    /// presented via composefs uid mapping at mount. A repository outside the
-    /// composefs backing modes (`bare-user`, `bare-user-shared`) is
-    /// `Error::Unsupported`. Every backing object is opened under either
-    /// policy, because the inode's metadata comes from it.
+    /// Inode metadata comes from each file object as `load_file` reads it in
+    /// the repository's mode, and each regular file redirects to its `.file`
+    /// loose path. Ownership is presented via composefs uid mapping at mount.
+    /// The export runs in every repository mode; an image exported from an
+    /// `archive` repository mounts over a store that holds the objects in
+    /// `.file` form. Every backing object is opened under either policy,
+    /// because the inode's metadata comes from it.
     pub async fn export_composefs(&self, commit: &Checksum,
         opts: &ComposefsOptions) -> Result<Image>;
     /// Write that image through `out` and return its fs-verity digest. Emission
     /// is append-only, so the image reaches the descriptor as it is serialized
     /// and no image-sized buffer is held. `out` is written from its current
     /// offset onward and is never seeked, and a call that fails leaves the
-    /// prefix it had already written. The mode rule and `opts` are those of
+    /// prefix it had already written. The mode scope and `opts` are those of
     /// `export_composefs`.
     ///
     /// Every path here refuses a tree whose inode spends more than 32755 bytes
@@ -2155,8 +2155,7 @@ impl Repo {
         opts: &ComposefsOptions, out: BorrowedFd<'_>) -> Result<[u8; 32]>;
     /// Compute and store `ostree.composefs.digest.v0` in the commit's metadata.
     /// The digest derives from the tree alone, so this builds no image and runs
-    /// in every repository mode, as `Transaction::composefs_digest` does. The
-    /// mode rule applies to the two forms that write an image.
+    /// in every repository mode, as `Transaction::composefs_digest` does.
     pub async fn commit_add_composefs_metadata(&self, txn: &Transaction,
         commit: &Checksum) -> Result<Checksum>;
 }

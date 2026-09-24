@@ -1468,7 +1468,7 @@ directory: /`), and the port reads a value carrying no name component as the
 whole tree and exits 0.
 
 Two divergences stand at the values `--subpath` takes, one at the wording of
-the `-H` refusals, three at the composefs switches, two at `--allow-noent`, one
+the `-H` refusals, two at the composefs switches, two at `--allow-noent`, one
 at a repeated boolean flag, four at the path-selection options, and three at
 the durability policy:
 
@@ -1514,18 +1514,6 @@ the durability policy:
   for a tree whose first entry refuses, and the entries already written for one
   that refuses part-way through
   (`ostrya_cli::cli::checkout_require_hardlinks_leaves_the_same_destination_on_a_refusal`);
-- the tool exports a composefs image from any repository mode, and from an
-  `archive` repository it writes `trusted.overlay.redirect` values naming
-  `.file` loose paths that repository does not hold, whose objects are
-  `.filez`, so the image cannot be mounted against the repository that produced
-  it. The port refuses a repository outside the composefs backing modes
-  (`bare-user` and `bare-user-shared`) at exit 1 and leaves no destination
-  behind, naming the mode it got: `error: unsupported: composefs export
-  requires a bare-user or bare-user-shared repository, not Archive`. `commit
-  --generate-composefs-metadata` is unaffected and works in every mode in both,
-  the digest path applying no mode check (`../format-reference.md`,
-  "composefs"). Both sides of the divergence stand in
-  `ostrya_cli::cli::checkout_composefs_refuses_an_archive_repository`;
 - the tool writes the image through a temporary file it creates in the working
   directory and links to the destination, so a destination on another
   filesystem ends the export at exit 1 with `error: linkat: Invalid
@@ -1538,7 +1526,7 @@ the durability policy:
   (`ostrya_cli::cli::checkout_composefs_switches_match_the_tool`), and an
   export that does not finish leaves a destination that already existed as it
   was, byte for byte and at its own mode
-  (`ostrya_cli::cli::checkout_composefs_refuses_an_archive_repository`);
+  (`ostrya_cli::cli::checkout_composefs_failure_leaves_no_destination`);
 - the tool takes `--composefs` alongside `--union` and `--allow-noent` and
   refuses it alongside `--union-add` or `--union-identical` at exit 1
   (`error: Specified options are incompatible with --composefs`), writing no

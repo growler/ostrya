@@ -120,8 +120,10 @@ severity: interop
 identity: n-a
 oracle: exit-status
 evidence: -
-note: Hardlink checkout applies to bare mode only. The composefs export path
- reads the bare-user family metadata form.
+note: Hardlink checkout applies to bare mode only. The tool writes no content
+ object in this mode, so no repository the tool populated holds a tree to
+ export. Over a repository built by hand the two export the same composefs
+ image (`ostrya::read_split_xattrs::composefs_export_matches_the_tool`).
 
 family: M1
 created-by: t
@@ -268,7 +270,7 @@ created-by: t
 populated-by: t
 operated-by: p
 op: composefs-export
-modes: bare-user
+modes: archive bare bare-user bare-user-only
 tier: T0
 outcome: unobserved
 severity: interop
@@ -276,26 +278,12 @@ identity: unobserved
 oracle: checksum-agreement
 evidence: ostrya::composefs (against the golden image and digest)
 spec: format-reference.md#composefs
-question: The golden fixture proves the port reproduces the tool's image for one
- tree. Confirm it for a repository the tool created and populated, comparing the
- fs-verity digest.
-
-family: M1
-created-by: t
-populated-by: t
-operated-by: p
-op: composefs-export
-modes: archive bare bare-user-only
-tier: T0
-outcome: unobserved
-severity: interop
-identity: n-a
-oracle: exit-status
-evidence: -
-spec: format-reference.md#composefs
-question: The port requires a bare-user or bare-user-shared repository for this
- export. Record whether the tool exports a composefs image from these three
- modes, and if it refuses, record the text so the port can match it.
+question: The golden fixture proves the port reproduces, from the tool's
+ `bare-user` and `archive` fixture repositories, the image the tool exported
+ from `bare-user` for one tree. That the tool writes the same image from
+ `archive` is the observation `format-reference.md`, "composefs", records.
+ Confirm it for a repository the tool created and populated in each mode,
+ comparing the fs-verity digest.
 
 # ---------------------------------------------------------------------------
 # D2 -- the port creates and populates, the tool operates.
@@ -417,7 +405,7 @@ created-by: p
 populated-by: p
 operated-by: t
 op: composefs-export
-modes: bare-user
+modes: archive bare bare-user bare-user-only
 tier: T0
 outcome: unobserved
 severity: interop
@@ -425,23 +413,8 @@ identity: unobserved
 oracle: checksum-agreement
 evidence: ostrya::composefs
 spec: format-reference.md#composefs
-question: Have the tool export the composefs image from a port-made bare-user
- repository and compare the fs-verity digest with the port's own export.
-
-family: M1
-created-by: p
-populated-by: p
-operated-by: t
-op: composefs-export
-modes: archive bare bare-user-only
-tier: T0
-outcome: unobserved
-severity: interop
-identity: n-a
-oracle: exit-status
-evidence: -
-question: As the matching D1 record: establish whether the tool exports from
- these modes at all before deciding whether the cell is a refusal or a result.
+question: Have the tool export the composefs image from a port-made repository
+ in each mode and compare the fs-verity digest with the port's own export.
 
 family: M1
 created-by: p

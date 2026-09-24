@@ -29951,3 +29951,731 @@ fn static_delta_delete_refusals_match_the_tool() {
         format!("error: Can't find delta {c1}\n")
     );
 }
+
+// --- static-delta verify ------------------------------------------------------
+
+/// The public key of `ED25519_SECRET2_B64`.
+const ED25519_PUBLIC2_B64: &str = "5WYA48XDLt1Tw6UD6mF5sMzJRCXqpaUjPPrO2C37pto=";
+/// The hex of `ED25519_PUBLIC2_B64`, as a failure line names the key.
+const ED25519_PUBLIC2_HEX: &str =
+    "e56600e3c5c32edd53c3a503ea6179b0ccc94425eaa5a5233cfaced82dfba6da";
+/// A 32-byte ed25519 public key of all zero bytes: a valid curve point that
+/// verifies no signature.
+const ED25519_ZERO_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+/// 32 bytes that decode to no point on the curve.
+const ED25519_NOT_A_POINT_B64: &str = "AgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+/// The fixture repository with a from-scratch delta to `COMMIT` the port
+/// signed with the shared key, and an unsigned delta of the same commit
+/// written to `base/unsigned`.
+fn verify_fixture(base: &Path) -> PathBuf {
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    let generate = ["static-delta", "--repo", repo_s, "generate"];
+    let pinned = ["--timestamp=1700000000", "--to", COMMIT];
+    ostrya(&[&generate[..], &pinned[..], &[&sign]].concat(), None, &[]).ok();
+    let out = format!("--output-dir={}", base.join("unsigned").display());
+    ostrya(&[&generate[..], &pinned[..], &[&out]].concat(), None, &[]).ok();
+    repo
+}
+
+/// Run `static-delta verify ARGS` against `repo` from `cwd`.
+fn run_delta_verify(cwd: &Path, repo: &Path, args: &[&str]) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let all = [&["static-delta", repo_arg.as_str(), "verify"][..], args].concat();
+    ostrya_in(Some(cwd), &all, None, &[])
+}
+
+/// Assert the exit status and both streams of a `static-delta verify` run.
+fn assert_verify_run(run: &Run, code: i32, stdout: &str, stderr: &str, label: &str) {
+    assert_eq!(
+        (
+            run.status.code(),
+            String::from_utf8_lossy(&run.stdout).into_owned(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        ),
+        (Some(code), stdout.to_owned(), stderr.to_owned()),
+        "{label}"
+    );
+}
+
+/// The key-list failure line for keys listed in the order the line names
+/// them.
+fn verify_key_list_error(hexes: &[&str]) -> String {
+    let keys: Vec<String> = hexes.iter().map(|hex| format!("key '{hex}'")).collect();
+    format!(
+        "error: ed25519: Signature couldn't be verified with: {}\n",
+        keys.join("; ")
+    )
+}
+
+/// Write a key store under `base/<name>` with `trusted` and `revoked` lines in
+/// `trusted.ed25519` and `revoked.ed25519`, each file only when given.
+fn verify_key_store(base: &Path, name: &str, trusted: &[&str], revoked: &[&str]) -> PathBuf {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    for (file, keys) in [("trusted.ed25519", trusted), ("revoked.ed25519", revoked)] {
+        if !keys.is_empty() {
+            std::fs::write(dir.join(file), format!("{}\n", keys.join("\n"))).unwrap();
+        }
+    }
+    dir
+}
+
+/// `static-delta verify` prints `Verification OK` at exit 0 under the signing
+/// key, and `Verification fails` with the key-list line at exit 1 under any
+/// other key, the keys named in reverse order.
+#[test]
+fn static_delta_verify_reports_ok_and_fails() {
+    let tmp = TmpDir::new("delta-verify-ok");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let run = |args: &[&str]| run_delta_verify(base, &repo, args);
+
+    assert_verify_run(
+        &run(&[COMMIT, ED25519_PUBLIC_B64]),
+        0,
+        "Verification OK\n",
+        "",
+        "ok",
+    );
+    assert_verify_run(
+        &run(&[COMMIT, ED25519_PUBLIC2_B64]),
+        1,
+        "Verification fails\n",
+        &verify_key_list_error(&[ED25519_PUBLIC2_HEX]),
+        "wrong key",
+    );
+    assert_verify_run(
+        &run(&[COMMIT, ED25519_PUBLIC2_B64, ED25519_PUBLIC_B64]),
+        0,
+        "Verification OK\n",
+        "",
+        "wrong then right",
+    );
+    assert_verify_run(
+        &run(&[COMMIT, ED25519_PUBLIC2_B64, ED25519_ZERO_B64]),
+        1,
+        "Verification fails\n",
+        &verify_key_list_error(&[&"0".repeat(64), ED25519_PUBLIC2_HEX]),
+        "two wrong keys",
+    );
+    let unsigned = base.join("unsigned/superblock");
+    assert_verify_run(
+        &run(&[unsigned.to_str().unwrap(), ED25519_PUBLIC_B64]),
+        1,
+        "Verification fails\n",
+        "error: no signatures in static-delta\n",
+        "unsigned",
+    );
+}
+
+/// The key sources: the positionals and the last `--keys-file` combine, either
+/// one makes `--keys-dir` unread, the last `--keys-dir` is read with its
+/// `.d` directory and its revoked set, and `no keys loaded` is judged before
+/// revocation.
+#[test]
+fn static_delta_verify_key_sources() {
+    let tmp = TmpDir::new("delta-verify-keys");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let run = |args: &[&str]| run_delta_verify(base, &repo, args);
+    let ok = |args: &[&str], label: &str| {
+        assert_verify_run(&run(args), 0, "Verification OK\n", "", label);
+    };
+    let fails = |args: &[&str], stderr: &str, label: &str| {
+        assert_verify_run(&run(args), 1, "Verification fails\n", stderr, label);
+    };
+    let refused = |args: &[&str], stderr: &str, label: &str| {
+        assert_verify_run(&run(args), 1, "", stderr, label);
+    };
+    std::fs::write(base.join("k1"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
+    std::fs::write(base.join("k2"), format!("{ED25519_PUBLIC2_B64}\n")).unwrap();
+    std::fs::write(base.join("kz"), format!("{ED25519_ZERO_B64}\n")).unwrap();
+    verify_key_store(base, "store1", &[ED25519_PUBLIC_B64], &[]);
+    verify_key_store(base, "store2", &[ED25519_PUBLIC2_B64], &[]);
+    verify_key_store(
+        base,
+        "revoked",
+        &[ED25519_PUBLIC_B64],
+        &[ED25519_PUBLIC_B64],
+    );
+    verify_key_store(base, "only-revoked", &[], &[ED25519_PUBLIC_B64]);
+    verify_key_store(
+        base,
+        "some-revoked",
+        &[ED25519_PUBLIC2_B64, ED25519_ZERO_B64],
+        &[ED25519_ZERO_B64],
+    );
+    let dotd = base.join("dotd/trusted.ed25519.d");
+    std::fs::create_dir_all(&dotd).unwrap();
+    std::fs::write(dotd.join("key"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
+
+    ok(&["--keys-file=k1", COMMIT], "keys file");
+    ok(
+        &["--keys-file=k2", "--keys-file=k1", COMMIT],
+        "last keys file, right",
+    );
+    fails(
+        &["--keys-file=k1", "--keys-file=k2", COMMIT],
+        &verify_key_list_error(&[ED25519_PUBLIC2_HEX]),
+        "last keys file, wrong",
+    );
+    ok(
+        &["--keys-file=k1", COMMIT, ED25519_PUBLIC2_B64],
+        "positional and file",
+    );
+    fails(
+        &["--keys-file=kz", COMMIT, ED25519_PUBLIC2_B64],
+        &verify_key_list_error(&[&"0".repeat(64), ED25519_PUBLIC2_HEX]),
+        "positional before file lines, listed reversed",
+    );
+    fails(
+        &["--keys-dir=store1", "--keys-file=k2", COMMIT],
+        &verify_key_list_error(&[ED25519_PUBLIC2_HEX]),
+        "a keys file makes keys-dir unread",
+    );
+    fails(
+        &["--keys-dir=store1", COMMIT, ED25519_PUBLIC2_B64],
+        &verify_key_list_error(&[ED25519_PUBLIC2_HEX]),
+        "a positional makes keys-dir unread",
+    );
+    ok(&["--keys-dir=store1", COMMIT], "keys dir");
+    ok(
+        &["--keys-dir=store2", "--keys-dir=store1", COMMIT],
+        "last keys dir, right",
+    );
+    fails(
+        &["--keys-dir=store1", "--keys-dir=store2", COMMIT],
+        &verify_key_list_error(&[ED25519_PUBLIC2_HEX]),
+        "last keys dir, wrong",
+    );
+    ok(&["--keys-dir=dotd", COMMIT], "trusted.ed25519.d");
+    fails(
+        &["--keys-dir=revoked", COMMIT],
+        "error: ed25519: no signatures found\n",
+        "every trusted key revoked",
+    );
+    // A key given twice is named once, at its first place.
+    verify_key_store(
+        base,
+        "dups",
+        &[ED25519_PUBLIC2_B64, ED25519_ZERO_B64, ED25519_PUBLIC2_B64],
+        &[],
+    );
+    let zero_then_2 = verify_key_list_error(&["0".repeat(64).as_str(), ED25519_PUBLIC2_HEX]);
+    fails(
+        &[
+            COMMIT,
+            ED25519_PUBLIC2_B64,
+            ED25519_ZERO_B64,
+            ED25519_PUBLIC2_B64,
+        ],
+        &zero_then_2,
+        "duplicate positionals",
+    );
+    fails(
+        &[
+            "--keys-file=kz",
+            COMMIT,
+            ED25519_PUBLIC2_B64,
+            ED25519_ZERO_B64,
+        ],
+        &zero_then_2,
+        "a positional repeated in the keys file",
+    );
+    fails(
+        &["--keys-dir=dups", COMMIT],
+        &zero_then_2,
+        "duplicate store keys",
+    );
+    fails(
+        &["--keys-dir=some-revoked", COMMIT],
+        &verify_key_list_error(&[ED25519_PUBLIC2_HEX]),
+        "a revoked key is left out of the failure line",
+    );
+    refused(
+        &["--keys-dir=only-revoked", COMMIT],
+        "error: signature: ed25519: no keys loaded\n",
+        "revoked keys alone",
+    );
+    refused(
+        &["--keys-dir=nodir", COMMIT],
+        "error: signature: ed25519: no keys loaded\n",
+        "absent keys dir",
+    );
+    refused(
+        &["--keys-dir=nodir", "m"],
+        "error: signature: ed25519: no keys loaded\n",
+        "the keys load before the argument resolves",
+    );
+
+    // Empty lines and lone `\r` lines are skipped; CRLF, padding, and a
+    // character outside the alphabet are read leniently.
+    let junk = format!("{}!{}", &ED25519_PUBLIC_B64[..4], &ED25519_PUBLIC_B64[4..]);
+    std::fs::write(base.join("lenient"), format!("\n\r\n  {junk}  \r\n\n")).unwrap();
+    ok(&["--keys-file=lenient", COMMIT], "lenient keys file");
+    ok(&[COMMIT, &format!(" {junk}\t")], "lenient positional");
+
+    std::fs::write(base.join("empty"), b"").unwrap();
+    refused(
+        &["--keys-file=empty", COMMIT],
+        "error: signature: ed25519: no valid keys in file 'empty'\n",
+        "empty keys file",
+    );
+    std::fs::write(base.join("blank"), b"\n\r\n").unwrap();
+    refused(
+        &["--keys-file=blank", COMMIT],
+        "error: signature: ed25519: no valid keys in file 'blank'\n",
+        "blank keys file",
+    );
+    // A line of whitespace is a key of no byte.
+    let no_byte = "error: Invalid ed25519 public key: Ill-formed input: expected 32 bytes, \
+                   got 0 bytes\n";
+    for (name, text) in [
+        ("ws3", "   \n".to_owned()),
+        ("ws1", " \n".to_owned()),
+        ("wscr", " \r\n".to_owned()),
+        ("ws-beside", format!("{ED25519_PUBLIC_B64}\n   \n")),
+    ] {
+        std::fs::write(base.join(name), text).unwrap();
+        refused(&[&format!("--keys-file={name}"), COMMIT], no_byte, name);
+    }
+    mkfifo_at(&base.join("fifo"));
+    std::fs::create_dir_all(base.join("dir")).unwrap();
+    for path in ["nosuch", "dir", "fifo", ""] {
+        refused(
+            &[&format!("--keys-file={path}"), COMMIT],
+            &format!("error: File object '{path}' is not a regular file\n"),
+            path,
+        );
+    }
+    std::os::unix::fs::symlink("k1", base.join("link")).unwrap();
+    ok(&["--keys-file=link", COMMIT], "a symlink to a keys file");
+
+    let mut big = format!("{ED25519_PUBLIC_B64}\n").into_bytes();
+    big.resize(1024 * 1024 + 1, b'\n');
+    std::fs::write(base.join("big"), &big).unwrap();
+    let run_big = run(&["--keys-file=big", COMMIT]);
+    assert_eq!(run_big.status.code(), Some(1));
+    assert!(run_big.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&run_big.stderr).contains("'big' is over the 1048576-byte ceiling"),
+        "{}",
+        String::from_utf8_lossy(&run_big.stderr)
+    );
+}
+
+/// A key that is not a valid key refuses the run before standard output: a
+/// positional of the wrong length, a keys-file line of the wrong length beside
+/// a valid one, and 32 bytes that are no curve point.
+#[test]
+fn static_delta_verify_refuses_invalid_keys_before_output() {
+    let tmp = TmpDir::new("delta-verify-invalid");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let run = |args: &[&str]| run_delta_verify(base, &repo, args);
+    let wrong_length = "error: Invalid ed25519 public key: Ill-formed input: expected 32 bytes, \
+                        got 3 bytes\n";
+    assert_verify_run(
+        &run(&[COMMIT, ED25519_PUBLIC_B64, "AAAA"]),
+        1,
+        "",
+        wrong_length,
+        "invalid positional",
+    );
+    std::fs::write(base.join("mixed"), format!("AAAA\n{ED25519_PUBLIC_B64}\n")).unwrap();
+    assert_verify_run(
+        &run(&["--keys-file=mixed", COMMIT]),
+        1,
+        "",
+        wrong_length,
+        "invalid keys-file line beside a valid one",
+    );
+    std::fs::write(base.join("latin1"), b"\xe9AAAAAAAA\n").unwrap();
+    assert_verify_run(
+        &run(&["--keys-file=latin1", COMMIT]),
+        1,
+        "",
+        "error: Invalid ed25519 public key: Ill-formed input: expected 32 bytes, got 0 bytes\n",
+        "a line that is not UTF-8 decodes to no byte",
+    );
+    let run_point = run(&[COMMIT, ED25519_NOT_A_POINT_B64]);
+    assert_eq!(run_point.status.code(), Some(1));
+    assert!(run_point.stdout.is_empty());
+}
+
+/// The sign types: `ed25519` is the default, `dummy` refuses in its own words
+/// with nothing on standard output, `gpg` and any unknown name print `Sign-type
+/// not supported`, and the last `--sign-type` wins. A build with the `spki`
+/// engine verifies a delta the port signs with it.
+#[test]
+fn static_delta_verify_sign_types() {
+    let tmp = TmpDir::new("delta-verify-types");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let run = |args: &[&str]| run_delta_verify(base, &repo, args);
+    assert_verify_run(
+        &run(&["--sign-type=dummy", COMMIT, ED25519_PUBLIC_B64]),
+        1,
+        "",
+        "error: dummy signature type is only for ostree testing\n",
+        "dummy",
+    );
+    for name in ["gpg", "nosuch", "", "ED25519"] {
+        assert_verify_run(
+            &run(&[&format!("--sign-type={name}"), COMMIT, ED25519_PUBLIC_B64]),
+            1,
+            "Sign-type not supported\n",
+            "error: Requested signature type is not implemented\n",
+            name,
+        );
+    }
+    assert_verify_run(
+        &run(&[
+            "--sign-type=nosuch",
+            "--sign-type=ed25519",
+            COMMIT,
+            ED25519_PUBLIC_B64,
+        ]),
+        0,
+        "Verification OK\n",
+        "",
+        "last sign type wins",
+    );
+
+    #[cfg(feature = "spki")]
+    {
+        const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+        const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+        const OTHER_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAECmz6W9QPu0HuggzW4vGvsnvQIl4Jyl/b9kVl8fm/qw/xJSQfCEzhnGMQzmyj2quUo96zvuxlCllcTkzsOhwEAg==";
+        let out = format!("--output-dir={}", base.join("spki").display());
+        let sign = format!("--sign={SECRET_PKCS8_B64}");
+        ostrya(
+            &[
+                "static-delta",
+                "--repo",
+                repo.to_str().unwrap(),
+                "generate",
+                "--to",
+                COMMIT,
+                "--sign-type=spki",
+                &sign,
+                &out,
+            ],
+            None,
+            &[],
+        )
+        .ok();
+        let superblock = base.join("spki/superblock");
+        let superblock = superblock.to_str().unwrap();
+        assert_verify_run(
+            &run(&["--sign-type=spki", superblock, PUBLIC_SPKI_B64]),
+            0,
+            "Verification OK\n",
+            "",
+            "spki",
+        );
+        let other = run(&["--sign-type=spki", superblock, OTHER_SPKI_B64]);
+        assert_eq!(other.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&other.stdout),
+            "Verification fails\n"
+        );
+        assert!(
+            String::from_utf8_lossy(&other.stderr)
+                .starts_with("error: spki: Signature couldn't be verified with: key '"),
+            "{}",
+            String::from_utf8_lossy(&other.stderr)
+        );
+        assert_verify_run(
+            &run(&["--sign-type=spki", COMMIT, PUBLIC_SPKI_B64]),
+            1,
+            "Verification fails\n",
+            "error: no signature for 'ostree.sign.spki' in static-delta superblock\n",
+            "spki over an ed25519-signed delta",
+        );
+    }
+}
+
+/// The argument is a name or, holding `/`, a superblock path; only the
+/// superblock is read, so a copy under another name verifies away from its
+/// parts. Every failure to resolve or read it follows `Verification fails`,
+/// and a missing argument refuses before the sign type is read.
+#[test]
+fn static_delta_verify_argument_forms() {
+    let tmp = TmpDir::new("delta-verify-args");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let run = |args: &[&str]| run_delta_verify(base, &repo, args);
+    let relative = ostrya::static_delta_relative_dir(None, &Checksum::from_hex(COMMIT).unwrap());
+    let in_repo = format!("repo/{relative}/superblock");
+    std::fs::copy(base.join(&in_repo), base.join("sbcopy")).unwrap();
+    let absolute = base.join("sbcopy");
+    for arg in [in_repo.as_str(), "./sbcopy", absolute.to_str().unwrap()] {
+        assert_verify_run(
+            &run(&[arg, ED25519_PUBLIC_B64]),
+            0,
+            "Verification OK\n",
+            "",
+            arg,
+        );
+    }
+    let fails = |args: &[&str], stderr: &str| {
+        assert_verify_run(&run(args), 1, "Verification fails\n", stderr, args[0]);
+    };
+    fails(&["./", ED25519_PUBLIC_B64], "error: Is a directory\n");
+    fails(
+        &["./nosuch", ED25519_PUBLIC_B64],
+        "error: openat(./nosuch): No such file or directory\n",
+    );
+    fails(&["m", ED25519_PUBLIC_B64], "error: Invalid rev m\n");
+    let absent = format!("{COMMIT}-{COMMIT}");
+    let absent_dir = ostrya::static_delta_relative_dir(
+        Some(&Checksum::from_hex(COMMIT).unwrap()),
+        &Checksum::from_hex(COMMIT).unwrap(),
+    );
+    fails(
+        &[&absent, ED25519_PUBLIC_B64],
+        &format!("error: openat({absent_dir}/superblock): No such file or directory\n"),
+    );
+    assert_verify_run(
+        &run(&[]),
+        1,
+        "",
+        "error: DELTA must be specified\n",
+        "no argument",
+    );
+    assert_verify_run(
+        &run(&["--sign-type=nosuch"]),
+        1,
+        "",
+        "error: DELTA must be specified\n",
+        "the argument check precedes the sign type",
+    );
+}
+
+/// A file that is not a superblock refuses after `Verification fails` with the
+/// port's parse sentence, where the tool reads the magic alone.
+#[test]
+fn static_delta_verify_does_not_parse_as_the_tool_does() {
+    let tmp = TmpDir::new("delta-verify-parse");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    std::fs::write(base.join("garbage"), b"garbage\n").unwrap();
+    let run = run_delta_verify(base, &repo, &["./garbage", ED25519_PUBLIC_B64]);
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "Verification fails\n");
+    assert!(String::from_utf8_lossy(&run.stderr).starts_with("error: "));
+}
+
+/// Run `static-delta verify ARGS` against `repo` from `cwd` under both
+/// implementations and assert the exit status and both streams agree.
+fn assert_verify_agrees(cwd: &Path, repo: &Path, args: &[&str]) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let all = [&["static-delta", repo_arg.as_str(), "verify"][..], args].concat();
+    let port = ostrya_in(Some(cwd), &all, None, &[]);
+    let tool = ostree_in(cwd, &all);
+    assert_runs_agree(&port, &tool, &all.join(" "));
+    port
+}
+
+/// The cases both cross-tool tests run over `repo`, which holds an unsigned
+/// delta to `c1`, a delta to `c2` and a delta from `c1` to `c2`, both signed
+/// with the shared key. The key files, stores, and the copied superblock sit
+/// in `base`, the working directory of every run.
+fn assert_verify_cases_agree(base: &Path, repo: &Path, c1: &str, c2: &str) {
+    std::fs::write(base.join("k1"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
+    std::fs::write(base.join("k2"), format!("{ED25519_PUBLIC2_B64}\n")).unwrap();
+    verify_key_store(base, "store1", &[ED25519_PUBLIC_B64], &[]);
+    verify_key_store(base, "store2", &[ED25519_PUBLIC2_B64], &[]);
+    verify_key_store(
+        base,
+        "revoked",
+        &[ED25519_PUBLIC_B64],
+        &[ED25519_PUBLIC_B64],
+    );
+    // An empty --keys-dir names the working directory.
+    std::fs::write(
+        base.join("trusted.ed25519"),
+        format!("{ED25519_PUBLIC_B64}\n"),
+    )
+    .unwrap();
+    std::fs::write(base.join("kz"), format!("{ED25519_ZERO_B64}\n")).unwrap();
+    verify_key_store(
+        base,
+        "dups",
+        &[ED25519_PUBLIC2_B64, ED25519_ZERO_B64, ED25519_PUBLIC2_B64],
+        &[],
+    );
+    let relative = ostrya::static_delta_relative_dir(None, &Checksum::from_hex(c2).unwrap());
+    let repo_name = repo.file_name().unwrap().to_str().unwrap();
+    let in_repo = format!("{repo_name}/{relative}/superblock");
+    std::fs::copy(base.join(&in_repo), base.join("sbcopy")).unwrap();
+    let absolute = base.join("sbcopy");
+    let from_to = format!("{c1}-{c2}");
+    let absent = format!("{c2}-{c1}");
+
+    let cases: Vec<Vec<&str>> = vec![
+        vec![c2, ED25519_PUBLIC_B64],
+        vec![&from_to, ED25519_PUBLIC_B64],
+        vec![c2, ED25519_PUBLIC2_B64],
+        vec![c2, ED25519_PUBLIC2_B64, ED25519_PUBLIC_B64],
+        vec![c2, ED25519_PUBLIC2_B64, ED25519_ZERO_B64],
+        vec![c1, ED25519_PUBLIC_B64],
+        vec!["--keys-file=k2", "--keys-file=k1", c2],
+        vec!["--keys-file=k1", "--keys-file=k2", c2],
+        vec!["--keys-dir=store1", "--keys-file=k2", c2],
+        vec!["--keys-dir=store1", c2, ED25519_PUBLIC2_B64],
+        vec!["--keys-dir=store1", c2],
+        vec!["--keys-dir=revoked", c2],
+        vec!["--keys-dir=store1", "--keys-dir=store2", c2],
+        vec!["--keys-dir=store2", "--keys-dir=store1", c2],
+        vec![
+            "--sign-type=nosuch",
+            "--sign-type=ed25519",
+            c2,
+            ED25519_PUBLIC_B64,
+        ],
+        vec![&in_repo, ED25519_PUBLIC_B64],
+        vec!["./sbcopy", ED25519_PUBLIC_B64],
+        vec![absolute.to_str().unwrap(), ED25519_PUBLIC2_B64],
+        vec!["./", ED25519_PUBLIC_B64],
+        vec![&absent, ED25519_PUBLIC_B64],
+        vec!["m", ED25519_PUBLIC_B64],
+        vec!["--keys-dir=nodir", c2],
+        vec!["--keys-dir=", c2],
+        vec![
+            c2,
+            ED25519_PUBLIC2_B64,
+            ED25519_ZERO_B64,
+            ED25519_PUBLIC2_B64,
+        ],
+        vec!["--keys-file=kz", c2, ED25519_PUBLIC2_B64, ED25519_ZERO_B64],
+        vec!["--keys-dir=dups", c2],
+    ];
+    for case in &cases {
+        assert_verify_agrees(base, repo, case);
+    }
+}
+
+/// `verify` agrees byte for byte over the tool's deltas. Carries
+/// `static-delta/verify-{ok,wrong-key,unsigned,keys-file-last-wins,keys-file-overrides-keys-dir,path-arg}`
+/// for the tool as the producer.
+#[test]
+fn static_delta_verify_matches_the_tool_over_the_tools_deltas() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-verify-tool");
+    let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    ostree_ok(
+        &repo,
+        &[
+            "static-delta",
+            "generate",
+            "--empty",
+            "--to",
+            &c2,
+            "--sign-type=ed25519",
+            &sign,
+        ],
+    );
+    ostree_ok(
+        &repo,
+        &[
+            "static-delta",
+            "generate",
+            "--from",
+            &c1,
+            "--to",
+            &c2,
+            "--sign-type=ed25519",
+            &sign,
+        ],
+    );
+    assert_verify_cases_agree(tmp.path(), &repo, &c1, &c2);
+}
+
+/// `verify` agrees byte for byte over the port's deltas: the tool's `verify`
+/// reads a delta the port signs. Carries the same cells as the test above, for
+/// the port as the producer.
+#[test]
+fn static_delta_verify_matches_the_tool_over_the_ports_deltas() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-verify-port");
+    let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
+    let repo_s = repo.to_str().unwrap();
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    let generate = |extra: &[&str]| {
+        let base = [
+            "static-delta",
+            "--repo",
+            repo_s,
+            "generate",
+            "--timestamp=1700000000",
+        ];
+        ostrya(&[&base[..], extra].concat(), None, &[]).ok();
+    };
+    generate(&["--to", &c1]);
+    generate(&["--to", &c2, &sign]);
+    generate(&["--from", &c1, "--to", &c2, &sign]);
+    assert_verify_cases_agree(tmp.path(), &repo, &c1, &c2);
+}
+
+/// The refusals agree byte for byte: no argument, an unknown sign type, no key
+/// loaded, a positional of the wrong length, an empty keys file, and a missing
+/// one. Carries `static-delta/verify-no-keys`.
+#[test]
+fn static_delta_verify_refusals_match_the_tool() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-verify-refusals");
+    let base = tmp.path();
+    let (repo, _, c2) = delta_show_repo(base, "repo");
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    ostree_ok(
+        &repo,
+        &[
+            "static-delta",
+            "generate",
+            "--empty",
+            "--to",
+            &c2,
+            "--sign-type=ed25519",
+            &sign,
+        ],
+    );
+    std::fs::write(base.join("empty"), b"").unwrap();
+    std::fs::write(base.join("bad"), b"AAAA\n").unwrap();
+    std::fs::write(base.join("ws3"), b"   \n").unwrap();
+    std::fs::write(base.join("wscr"), b" \r\n").unwrap();
+    std::fs::write(base.join("tabs"), b"\t\t\n").unwrap();
+    let cases: Vec<Vec<&str>> = vec![
+        vec![],
+        vec!["--sign-type=nosuch", &c2, ED25519_PUBLIC_B64],
+        vec!["--sign-type=gpg", &c2, ED25519_PUBLIC_B64],
+        vec!["--keys-dir=nodir", &c2],
+        vec![&c2, "AAAA"],
+        vec![&c2, ED25519_PUBLIC_B64, "not-base64!!!"],
+        vec!["--keys-file=empty", &c2],
+        vec!["--keys-file=bad", &c2],
+        vec!["--keys-file=ws3", &c2],
+        vec!["--keys-file=wscr", &c2],
+        vec!["--keys-file=tabs", &c2],
+        vec!["--keys-file=nosuch", &c2],
+        vec!["--keys-file=.", &c2],
+        vec!["--keys-file=", &c2],
+    ];
+    for case in &cases {
+        let run = assert_verify_agrees(base, &repo, case);
+        assert_eq!(run.status.code(), Some(1));
+        assert!(run.stdout.is_empty() || run.stdout == b"Sign-type not supported\n");
+    }
+}

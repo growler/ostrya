@@ -5638,9 +5638,11 @@ reads such a file as an empty document and the port refuses it, which
 
 `static-delta show DELTA` reports one delta's superblock and what each of its
 parts holds. `static-delta indexes` lists the `delta-indexes/` cache. Both read
-and write nothing else. `static-delta delete DELTA` removes one delta. The
-repository resolves before the argument is read, so `Command requires a --repo
-argument` stands ahead of a missing `DELTA`.
+and write nothing else. `static-delta delete DELTA` removes one delta.
+`static-delta verify DELTA [KEY-ID...]` checks the signatures of one delta's
+superblock and writes nothing. The repository resolves before the argument is
+read, so `Command requires a --repo argument` stands ahead of a missing
+`DELTA`.
 
 #### The arguments
 
@@ -5836,13 +5838,82 @@ open, and `error: Removing <path>: unlinkat(<name>): <reason>` for an entry it
 cannot remove. The port reports each as `error: i/o error: <reason> (os error
 <n>)`.
 
+#### `verify`
+
+`verify` takes a delta name or a superblock path, under the rules above, and
+reads the superblock alone. It opens no part, so a copy of a superblock under
+any file name, away from its parts, verifies. The options are
+`--sign-type=NAME`, `--keys-file=PATH`, and `--keys-dir=PATH`. Each keeps its
+last value when given more than once.
+
+Standard output holds one line: `Verification OK` at exit 0, or `Verification
+fails` at exit 1 with the reason on standard error. The checks run in this
+order. A refusal before step 4 writes nothing to standard output, except the
+`Sign-type not supported` line of step 2:
+
+1. No `DELTA` reports `error: DELTA must be specified`. This check comes before
+   the sign type.
+2. The sign type. `ed25519` is the default. The port also takes `spki` in a
+   build that carries the engine, the rule `../conformance/cli-surface.md`,
+   "P2", states for `commit --sign-type`. `gpg`, the empty name, and every name no engine carries
+   print `Sign-type not supported` on standard output and report `error:
+   Requested signature type is not implemented`. The port refuses `dummy` with
+   `error: dummy signature type is only for ostree testing` and nothing on
+   standard output.
+3. The keys load, under the rules below. A key of the wrong length, a keys file
+   that is not a regular file, a keys file with no key, and no trusted key
+   each refuse here. An invalid name with no key source reports `no keys
+   loaded`, since the keys load before the argument resolves.
+4. The argument resolves and the superblock reads. `Invalid rev`, `Invalid
+   character`, `openat(<path>): <reason>`, and `Is a directory` follow
+   `Verification fails`.
+5. The signatures. A superblock with no signed envelope reports `error: no
+   signatures in static-delta`. An envelope with no signature under the
+   engine's key reports `error: no signature for 'ostree.sign.<type>' in
+   static-delta superblock`. Where no signature verifies, the line is
+   `error: <type>: Signature couldn't be verified with: key '<hex>'`, one `key
+   '<hex>'` for each effective key joined by `; `, in reverse load order. A
+   key loaded more than once is named once, at its first place in load order,
+   before the order is reversed. Where
+   the revoked set removed every trusted key, the line is `error: <type>: no
+   signatures found`.
+
+The key sources:
+
+- Each positional KEY-ID and each line of the last `--keys-file` are trusted,
+  in that load order.
+- With a KEY-ID or a `--keys-file`, `--keys-dir` and the system key
+  directories are not read, and no key is revoked.
+- With neither, the last `--keys-dir` supplies `trusted.<type>` and
+  `revoked.<type>` and their `.d` directories, the key store "Signing details"
+  states. Without `--keys-dir`, the system key directories supply them.
+  An empty `--keys-dir` names the working directory.
+- No trusted key reports `error: signature: <type>: no keys loaded`. The check
+  comes before revocation, so a store whose trusted keys are all revoked
+  reaches step 5 and reports `no signatures found`.
+
+A key is decoded with the lenient base64 reader `commit --sign` uses: a byte
+outside the alphabet is skipped, so surrounding whitespace and a stray
+character decode. A line that is not UTF-8 decodes to no byte. An ed25519 key
+of another length than 32 bytes reports `error: Invalid ed25519 public key:
+Ill-formed input: expected 32 bytes, got <n> bytes`.
+
+A `--keys-file` must be a regular file, symlinks followed. A missing path, a
+directory, a FIFO, and the empty path report `error: File object '<path>' is
+not a regular file`. Each line is one key, with a trailing `\r` removed. The
+port skips a line that is then empty and reads the file up to 1 MiB. A line of
+whitespace is a key of 0 bytes and refuses the run. A file with no key line
+reports `error: signature: <type>: no valid keys in file '<path>'`.
+
 #### Exit status
 
-- 0 -- the report or the listing was written, or the delta was removed.
+- 0 -- the report or the listing was written, the delta was removed, or
+  `verify` printed `Verification OK`.
 - 1 -- no `DELTA` (`error: DELTA must be specified`, with no usage text), a
   name the parser refuses, an absent or unreadable superblock or part, a
   superblock that does not parse, a `delta-indexes/` that does not read, an
-  absent delta for `delete`, and a removal that fails.
+  absent delta for `delete`, a removal that fails, and every `verify` outcome
+  other than `Verification OK`.
 
 A superblock that does not parse prints no line in the port. The tool prints
 the lines it read before the failure. Only a write that is neither

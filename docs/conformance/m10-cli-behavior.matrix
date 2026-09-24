@@ -12145,13 +12145,16 @@ note: every `--gpg-sign` lookup runs before the regeneration, after the `-m`
 
 # ---------------------------------------------------------------------------
 # static-delta -- `show`, the superblock and part report, `indexes`, the
-# listing of the `delta-indexes/` cache, and `delete`, the removal of one delta.
+# listing of the `delta-indexes/` cache, `delete`, the removal of one delta,
+# and `verify`, the signature check of one superblock.
 #
-# `show` and `indexes` write nothing, so each cited test runs both
+# `show`, `indexes`, and `verify` write nothing, so each cited test runs both
 # implementations over one repository and compares the exit status and both
 # streams. `delete` removes files, so its cited tests give each implementation
 # its own byte-identical copy of one repository and compare the trees after
-# each run. A cell that needs a delta cites a test: no setup generates one.
+# each run. A cell that needs a delta cites a test: no setup generates one. A
+# `verify` cell whose invocation needs the tool's ed25519 engine cites
+# `evidence:`.
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -12420,3 +12423,140 @@ evidence: ostrya_cli::cli::static_delta_delete_matches_the_tool
 spec: format-reference.md#static-delta
 note: after every delta is removed, `delta-indexes/` and `summary` hold the
  bytes they held before, in both, and `indexes` still lists both targets.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/verify-ok
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a delta the tool signs and a delta the port signs each verify in both
+ implementations under the signing key: `Verification OK` on standard output,
+ nothing on standard error, exit 0. A right key after a wrong one also
+ verifies. No setup generates a delta, so the cited tests build the
+ repositories.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/verify-wrong-key
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: under keys that verify no signature, both print `Verification fails` on
+ standard output and `error: ed25519: Signature couldn't be verified with:`
+ followed by each effective key in hex, in reverse load order, on standard
+ error, exit 1. The cited tests state it over the deltas of both producers.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/verify-unsigned
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: an unsigned delta reports `Verification fails` and then `error: no
+ signatures in static-delta`, exit 1, in both, over the unsigned deltas of both
+ producers.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/verify-no-keys
+setup: repo
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_verify_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: `--keys-dir` naming an absent directory with no other key source reports
+ `error: signature: ed25519: no keys loaded` with nothing on standard output,
+ exit 1, before the argument resolves. The cited test also states an empty and
+ a missing `--keys-file` and a key of the wrong length, each refused before
+ standard output in both.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/verify-keys-file-last-wins
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: of two `--keys-file` options, only the last is read: the right key last
+ verifies and the wrong key last fails, in both orders and over the deltas of
+ both producers. A repeated `--keys-dir` and a repeated `--sign-type` also keep
+ the last.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/verify-keys-file-overrides-keys-dir
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a `--keys-file` makes both implementations leave `--keys-dir` unread, and
+ a positional KEY-ID does the same. With neither, `--keys-dir` supplies the
+ trusted keys less the revoked ones; a store whose every trusted key is revoked
+ reports `Verification fails` and `error: ed25519: no signatures found`.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/verify-path-arg
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: an argument holding `/` is a superblock path. `verify` reads the
+ superblock alone and no part, so a copy of it under another name, away from its
+ parts, verifies in both. A directory reports `Verification fails` and then
+ `error: Is a directory`; an absent name reports the `openat` line after
+ `Verification fails`.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/verify-sign-type-unknown
+setup: repo
+run: static-delta --repo=$REPO verify --sign-type=nosuch 0000000000000000000000000000000000000000000000000000000000000000 AAAA
+expect-exit: 1
+expect-stdout: equals "Sign-type not supported"
+expect-stderr: contains "error: Requested signature type is not implemented"
+ref-expect-exit: 1
+ref-expect-stdout: equals "Sign-type not supported"
+ref-expect-stderr: contains "error: Requested signature type is not implemented"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_verify_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: a sign type no engine carries prints `Sign-type not supported` on
+ standard output before any key is read, in both. `gpg` is refused the same
+ way.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/verify-missing-delta
+setup: repo
+run: static-delta --repo=$REPO verify
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: DELTA must be specified"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: DELTA must be specified"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_verify_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: no argument refuses before the sign type and the keys are read, in both.

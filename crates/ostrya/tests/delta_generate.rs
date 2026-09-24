@@ -24,7 +24,8 @@ use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    Ed25519Signer, Ed25519Verifier, MutableTree, Repo, RepoMode, SummaryOptions, TreeEntry, base64,
+    DeltaSuperblock, DummyVerifier, Ed25519Signer, Ed25519Verifier, Error, MutableTree, Repo,
+    RepoMode, SummaryOptions, TreeEntry, base64,
 };
 use ostrya_rt::block_on;
 
@@ -1215,6 +1216,94 @@ fn a_signed_delta_verifies_and_indexes() {
         &delta.to_string_lossy(),
     ]);
     ostree(&[&dst_arg, "fsck"]);
+}
+
+/// Generate a from-scratch delta of a one-file tree in a fresh archive
+/// repository at `base/src`, sign it with the shared key where `sign` is set,
+/// and return the delta directory.
+fn verify_fixture_delta(base: &Path, sign: bool) -> PathBuf {
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"verify content\n").unwrap();
+    let src = base.join("src");
+    block_on(async {
+        let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, &tree, None).await;
+        let relative = repo
+            .generate_static_delta(None, &commit, &DeltaOptions::default())
+            .await
+            .unwrap();
+        let delta = src.join(relative);
+        if sign {
+            let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+            repo.sign_static_delta(&delta, &signer).await.unwrap();
+        }
+        delta
+    })
+}
+
+/// `DeltaSuperblock::verify` reads a superblock file under any name, away from
+/// its parts: a copy named `sbcopy` verifies under the signing key and fails
+/// under another.
+#[test]
+fn superblock_verify_reads_a_superblock_under_any_name() {
+    let tmp = TmpDir::new("sb-verify-any-name");
+    let delta = verify_fixture_delta(tmp.path(), true);
+    let away = tmp.path().join("away");
+    std::fs::create_dir_all(&away).unwrap();
+    let copy = away.join("sbcopy");
+    std::fs::copy(delta.join("superblock"), &copy).unwrap();
+    block_on(async {
+        let sb = DeltaSuperblock::read(&copy).await.unwrap();
+        let trusted =
+            Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
+                .unwrap();
+        let outcome = sb.verify(&[&trusted]).await.unwrap();
+        assert!(
+            outcome.valid,
+            "the trusted key verifies the copied superblock"
+        );
+        let other = Ed25519Verifier::new([vec![0u8; 32]], Vec::<Vec<u8>>::new()).unwrap();
+        let rejected = sb.verify(&[&other]).await.unwrap();
+        assert!(!rejected.valid, "an untrusted key verifies the superblock");
+        assert_eq!(rejected.signatures.len(), 1);
+    });
+}
+
+/// `DeltaSuperblock::verify` refuses a superblock with no signed envelope.
+#[test]
+fn superblock_verify_refuses_an_unsigned_superblock() {
+    let tmp = TmpDir::new("sb-verify-unsigned");
+    let delta = verify_fixture_delta(tmp.path(), false);
+    block_on(async {
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        let trusted =
+            Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
+                .unwrap();
+        let err = sb.verify(&[&trusted]).await.unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err}");
+    });
+}
+
+/// A verifier whose engine key holds no blob in the envelope reports an
+/// invalid outcome with no signature examined.
+#[test]
+fn superblock_verify_reports_no_blob_for_an_absent_engine() {
+    let tmp = TmpDir::new("sb-verify-absent-engine");
+    let delta = verify_fixture_delta(tmp.path(), true);
+    block_on(async {
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        let dummy = DummyVerifier::new([b"key".to_vec()]);
+        let outcome = sb.verify(&[&dummy]).await.unwrap();
+        assert!(!outcome.valid);
+        assert!(outcome.signatures.is_empty());
+    });
 }
 
 /// A delta carries a copy of the target commit's detached metadata in its

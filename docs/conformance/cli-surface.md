@@ -2131,11 +2131,13 @@ The time zone a `summary -v` report renders an instant in is the divergence
 renders in the host zone with that zone's offset and the port renders in UTC.
 
 `static-delta` accepts the subcommands `list`, `generate`, `apply-offline`,
-`reindex`, `show`, `delete`, and `indexes`. Missing: `verify`. `show` takes a
-delta name or the path of a superblock file, `delete` takes a delta name alone,
-and `indexes` lists the `delta-indexes/` cache (`../format-reference.md`, "CLI
-output formats", `static-delta`). Fourteen differences stand on `show`,
-`delete`, and `indexes`.
+`reindex`, `show`, `delete`, `indexes`, and `verify`. `show` and `verify` take
+a delta name or the path of a superblock file, `delete` takes a delta name
+alone, and `indexes` lists the `delta-indexes/` cache
+(`../format-reference.md`, "CLI output formats", `static-delta`). `verify`
+takes `spki` in a build that carries the engine, the sign-type rule this
+section states for `commit --sign-type`. Twenty-four differences stand on
+`show`, `delete`, `indexes`, and `verify`.
 
 - a part that fails its checksum or passes its declared size. The port refuses
   it at exit 1 after the `PartMeta<i>` line, before it decompresses a byte of
@@ -2211,7 +2213,68 @@ output formats", `static-delta`). Fourteen differences stand on `show`,
   implementation's makes such a superblock: both generators write the key;
 - the decimal separator of the size wording. The port always writes `.`. The
   tool formats through the C library's locale, and only the `C` and `C.UTF-8`
-  behavior is observed on this host.
+  behavior is observed on this host;
+- `verify --sign-type=dummy`. The port refuses before it reads a key, with
+  `error: dummy signature type is only for ostree testing` and nothing on
+  standard output. The tool reads the keys and reports `Verification fails`
+  with a reason, for example `no signature for 'ostree.sign.dummy' in
+  static-delta superblock`, or `error: not implemented` where no key is given.
+  Both exit 1. Under its test switch `OSTREE_DUMMY_SIGN_ENABLED=1` the tool
+  verifies a dummy-signed delta, which only that switch lets it write;
+- a `verify --keys-file` line of the wrong length beside a valid line. A line
+  of two or more whitespace bytes is a key of 0 bytes and counts as such a
+  line. The tool loads the valid lines, prints `Verification OK` or
+  `Verification fails`, and then exits 1 with the invalid-key error. The port
+  refuses the run with the same error and nothing on standard output. Both
+  exit 1. Where the file holds one line of two or more bytes and that line is
+  not a valid key, the two agree byte for byte. Where the file holds two or
+  more such lines, the tool writes a GLib warning and names the first line in
+  an error that carries the `Invalid ed25519 public key:` prefix twice. The
+  port names the first line with the prefix once;
+- a `verify --keys-file` line of 0 or 1 byte, a lone `\r` included. The tool
+  dies on `SIGSEGV` after a GLib assertion. The port skips an empty line and a
+  lone `\r` line. It refuses any other 1-byte line, whitespace included, at
+  exit 1 with `error: Invalid ed25519 public key: Ill-formed input: expected
+  32 bytes, got 0 bytes` and nothing on standard output;
+- a key-store line of 0 or 1 byte. The tool dies on `SIGSEGV` after a GLib
+  assertion. The port skips an empty line and a line of whitespace, and
+  refuses any other 1-byte line with its strict base64 error;
+- a `verify --keys-file` over 1 MiB (1048576 bytes). The tool reads the whole
+  file and verifies with its keys. The port refuses the run at exit 1 with
+  `error: signature: the key file '<path>' is over the 1048576-byte ceiling`
+  and nothing on standard output. The ceiling is the one the port's key store
+  applies to each of its files;
+- a key-store file that cannot be read, for example a file of mode 000. The
+  tool skips the file. It verifies with the other keys, and a skipped file
+  that holds the only key reports `error: signature: ed25519: no keys loaded`.
+  A skipped `revoked.ed25519` revokes nothing, so the tool reports
+  `Verification OK` at exit 0 with a key that file revokes. The port refuses
+  the run at exit 1 with `error: signature: the key file '<path>' cannot be
+  opened: Permission denied (os error 13)` and nothing on standard output;
+- a key-store line (`--keys-dir` or the system key directories) that does not
+  decode to a valid key, in the trusted or the revoked set. The tool skips the
+  line with a GLib warning and verifies with the other keys. The port refuses
+  the run with `error: signature: ed25519 public key must be 32 bytes, got
+  <n>` and nothing on standard output. The store reader also decodes strictly,
+  where the tool decodes leniently;
+- `verify --keys-dir` naming a regular file. The tool reports `error:
+  signature: ed25519: no keys loaded`. The port reports `error: signature: the
+  key file '<path>/trusted.ed25519' cannot be opened: Not a directory (os
+  error 20)`. Both
+  exit 1 with nothing on standard output;
+- a 32-byte `verify` key that decodes to no curve point. The tool reports
+  `Verification fails` and names the key in the failure line. The port refuses
+  before standard output with `error: signature: ed25519 public key: signature
+  error: Cannot decompress Edwards point`. Both exit 1;
+- a superblock file that does not parse, given to `verify`. The tool reads the
+  8-byte magic alone: a file with no magic, an empty file, and a truncated
+  unsigned superblock report `no signatures in static-delta`, a truncated
+  signed envelope aborts on `SIGABRT` after `Verification fails`, and a validly
+  signed envelope around a payload that is not a superblock reports
+  `Verification OK` at exit 0. The port parses the whole superblock and refuses
+  each after `Verification fails` with its own `error: invalid format:` or
+  `error: gvariant:` sentence at exit 1. Only a publisher's own bytes reach the last
+  case.
 
 `static-delta generate` carries one open divergence, in the `usize` of a part's
 meta entry. The port's generator counts the target length of each symlink the

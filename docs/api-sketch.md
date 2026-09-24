@@ -2032,6 +2032,9 @@ impl DeltaSuperblock {
     pub fn from_commit(&self) -> Option<&Checksum>;
     pub fn to_commit(&self) -> &Checksum;
     pub fn is_signed(&self) -> bool;
+    /// Verify the signed envelope against `verifiers`: valid when any verifier
+    /// reports a valid signature; `Error::Signature` with no envelope.
+    pub async fn verify(&self, verifiers: &[&dyn Verifier]) -> Result<VerifyOutcome>;
     pub fn endianness(&self) -> DeltaEndianness;
     pub fn timestamp(&self) -> u64;
     /// Field 5's byte length over 64.

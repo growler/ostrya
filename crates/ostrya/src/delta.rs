@@ -30,7 +30,9 @@
 //!
 //! Signed deltas wrap the superblock in a magic-prefixed envelope carrying the
 //! detached signatures; [`Repo::verify_static_delta`] checks them with the
-//! Phase 13 signing engines over the raw superblock bytes.
+//! Phase 13 signing engines over the raw superblock bytes, and
+//! [`DeltaSuperblock::verify`] does the same for a superblock file read under
+//! any name.
 //!
 //! An HTTP pull reads a delta through the same superblock parse and part
 //! application, over a fetched response body rather than a part file, and applies
@@ -363,19 +365,10 @@ impl Repo {
         dir: &Path,
         verifiers: &[&dyn Verifier],
     ) -> Result<VerifyOutcome> {
-        let sb_bytes = read_capped(dir.join("superblock")).await?;
-        let sb = DeltaSuperblock::parse(sb_bytes)?;
-        let signatures = sb
-            .signatures
-            .ok_or_else(|| Error::Signature("static delta carries no signatures".to_owned()))?;
-        let mut outcome = VerifyOutcome::default();
-        for verifier in verifiers {
-            let blobs = signatures_for(&signatures, verifier.metadata_key());
-            let result = verifier.verify(&sb.superblock_bytes, &blobs).await?;
-            outcome.valid |= result.valid;
-            outcome.signatures.extend(result.signatures);
-        }
-        Ok(outcome)
+        DeltaSuperblock::read(&dir.join("superblock"))
+            .await?
+            .verify(verifiers)
+            .await
     }
 
     /// List the static deltas stored in the repository under `deltas/`.
@@ -853,6 +846,29 @@ impl DeltaSuperblock {
     /// Whether the superblock file is the signed envelope.
     pub fn is_signed(&self) -> bool {
         self.signatures.is_some()
+    }
+
+    /// Verify the signed envelope's signatures against `verifiers`.
+    ///
+    /// Each verifier receives the signature blobs stored under its engine key
+    /// in the envelope together with the raw superblock bytes the envelope
+    /// wraps (the signed payload). A verifier whose engine key holds no blob
+    /// examines no signature. The outcome is valid when any verifier reports a
+    /// valid signature. A superblock with no envelope returns
+    /// [`Error::Signature`].
+    pub async fn verify(&self, verifiers: &[&dyn Verifier]) -> Result<VerifyOutcome> {
+        let signatures = self
+            .signatures
+            .as_ref()
+            .ok_or_else(|| Error::Signature("static delta carries no signatures".to_owned()))?;
+        let mut outcome = VerifyOutcome::default();
+        for verifier in verifiers {
+            let blobs = signatures_for(signatures, verifier.metadata_key());
+            let result = verifier.verify(&self.superblock_bytes, &blobs).await?;
+            outcome.valid |= result.valid;
+            outcome.signatures.extend(result.signatures);
+        }
+        Ok(outcome)
     }
 
     /// The byte order the `ostree.endianness` byte declares.

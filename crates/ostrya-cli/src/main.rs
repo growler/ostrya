@@ -1062,6 +1062,34 @@ enum StaticDeltaCommand {
     },
     /// List the target commits the `delta-indexes/` cache holds an index for.
     Indexes,
+    /// Verify the signatures of a static delta's superblock and print
+    /// `Verification OK` or `Verification fails`.
+    Verify(DeltaVerifyArgs),
+}
+
+#[derive(Args)]
+struct DeltaVerifyArgs {
+    /// The signature engine (defaults to 'ed25519'). Given more than once, the
+    /// last value wins.
+    #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
+    sign_type: Option<String>,
+    /// Read public keys from a file, one base64 key per line. Given more than
+    /// once, the last value wins. With this option or a KEY-ID, --keys-dir and
+    /// the system key directories are not read. An empty value is taken as
+    /// given and refused as no regular file.
+    #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
+    keys_file: Option<std::ffi::OsString>,
+    /// Read trusted.<type> and revoked.<type> from this directory in place of
+    /// the system key directories. Given more than once, the last value wins.
+    /// An empty value names the working directory.
+    #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
+    keys_dir: Option<std::ffi::OsString>,
+    /// A delta name, `TO` or `FROM-TO` in full lowercase hex, or the path of a
+    /// superblock file: any argument holding a `/`. Only the superblock is
+    /// read. Required; checked after the repository resolves.
+    delta: Option<String>,
+    /// base64 public keys.
+    key_id: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1712,8 +1740,8 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
 }
 
 /// List the repository's static deltas, apply one offline, generate one,
-/// rebuild the index cache, show one delta, delete one, or list the index
-/// cache.
+/// rebuild the index cache, show one delta, delete one, list the index cache,
+/// or verify one delta's signatures.
 async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaCommand) -> Result<()> {
     match command {
         StaticDeltaCommand::List => {
@@ -1741,6 +1769,7 @@ async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaComman
             }
             Ok(())
         }
+        StaticDeltaCommand::Verify(args) => delta_verify(&repo_path, args).await,
     }
 }
 
@@ -1783,8 +1812,8 @@ struct DeltaFiles {
 /// Resolve a `static-delta` argument. An argument holding `/` is the path of a
 /// superblock file, whose parts are read from the directory that holds it. Any
 /// other argument is a delta name, read under the repository's `deltas/` tree;
-/// a name the parser refuses exits 1 with the parser's text.
-fn resolve_delta_arg(repo_path: &Path, arg: &str) -> DeltaFiles {
+/// a name the parser refuses is `Err` with the parser's text.
+fn resolve_delta_arg(repo_path: &Path, arg: &str) -> std::result::Result<DeltaFiles, String> {
     if arg.contains('/') {
         let superblock = PathBuf::from(arg);
         let parts = superblock
@@ -1792,35 +1821,44 @@ fn resolve_delta_arg(repo_path: &Path, arg: &str) -> DeltaFiles {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
             .to_owned();
-        return DeltaFiles {
+        return Ok(DeltaFiles {
             superblock_shown: arg.to_owned(),
             parts_shown: parts.display().to_string(),
             superblock,
             parts,
-        };
+        });
     }
-    let (from, to) = parse_delta_name(arg).unwrap_or_else(|text| exit_error(&text));
+    let (from, to) = parse_delta_name(arg)?;
     let relative = ostrya::static_delta_relative_dir(from.as_ref(), &to);
-    DeltaFiles {
+    Ok(DeltaFiles {
         superblock: repo_path.join(&relative).join("superblock"),
         superblock_shown: format!("{relative}/superblock"),
         parts: repo_path.join(&relative),
         parts_shown: relative,
+    })
+}
+
+/// The tool's words for a delta file read that failed in the system: `Is a
+/// directory` for a directory, `openat(<path>): <reason>` for every other
+/// system error. `None` for any other error.
+fn delta_read_text(err: &Error, shown: &str) -> Option<String> {
+    match err {
+        Error::Io(io) if io.kind() == std::io::ErrorKind::IsADirectory => {
+            Some("Is a directory".to_owned())
+        }
+        Error::Io(io) if io.raw_os_error().is_some() => {
+            Some(format!("openat({shown}): {}", io_reason(io)))
+        }
+        _ => None,
     }
 }
 
-/// The refusal a delta file read reaches, in the tool's words where the read
-/// failed in the system: `Is a directory` for a directory, `openat(<path>):
-/// <reason>` for every other system error. Any other error is returned.
+/// The refusal a delta file read reaches: exit 1 with the text
+/// [`delta_read_text`] gives, or return any other error.
 fn delta_read_error(err: Error, shown: &str) -> Error {
-    match &err {
-        Error::Io(io) if io.kind() == std::io::ErrorKind::IsADirectory => {
-            exit_error("Is a directory")
-        }
-        Error::Io(io) if io.raw_os_error().is_some() => {
-            exit_error(&format!("openat({shown}): {}", io_reason(io)))
-        }
-        _ => err,
+    match delta_read_text(&err, shown) {
+        Some(text) => exit_error(&text),
+        None => err,
     }
 }
 
@@ -1841,7 +1879,7 @@ async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
     let Some(arg) = delta else {
         exit_error("DELTA must be specified");
     };
-    let files = resolve_delta_arg(repo_path, &arg);
+    let files = resolve_delta_arg(repo_path, &arg).unwrap_or_else(|text| exit_error(&text));
     let sb = DeltaSuperblock::read(&files.superblock)
         .await
         .map_err(|err| delta_read_error(err, &files.superblock_shown))?;
@@ -1912,6 +1950,210 @@ async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
         part_usize.wrapping_add(fallback_usize),
     );
     Ok(())
+}
+
+/// The largest `--keys-file` `static-delta verify` reads, the ceiling the
+/// library's key store applies to each of its files.
+const VERIFY_KEYS_FILE_LIMIT: u64 = 1024 * 1024;
+
+/// The keys a `static-delta verify` run checks with: the verifier, and the
+/// trusted and revoked keys in load order, from which the failure line names
+/// the keys.
+struct VerifyKeys {
+    verifier: Box<dyn Verifier>,
+    trusted: Vec<Vec<u8>>,
+    revoked: Vec<Vec<u8>>,
+}
+
+/// Print `Verification fails` on standard output, then `error: {text}`, and
+/// exit 1: the shape of every `static-delta verify` failure after the keys
+/// load.
+fn verification_fails(text: &str) -> ! {
+    println!("Verification fails");
+    exit_error(text)
+}
+
+/// Verify a static delta's signatures, in the tool's check order: the
+/// argument is present, the sign type is carried, the keys load, the argument
+/// resolves and the superblock reads, then the signatures verify. Every
+/// failure from the argument resolution on prints `Verification fails` first
+/// (`docs/format-reference.md`, "CLI output formats", `static-delta`).
+async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
+    let Some(arg) = args.delta else {
+        exit_error("DELTA must be specified");
+    };
+    let engine = verify_sign_type(args.sign_type.as_deref().unwrap_or("ed25519"));
+    let name = sign_type_name(engine);
+    let keys = load_verify_keys(
+        engine,
+        &args.key_id,
+        args.keys_file.as_deref().map(Path::new),
+        args.keys_dir.as_deref().map(Path::new),
+    )?;
+    let files = resolve_delta_arg(repo_path, &arg).unwrap_or_else(|text| verification_fails(&text));
+    let sb = match DeltaSuperblock::read(&files.superblock).await {
+        Ok(sb) => sb,
+        Err(err) => match delta_read_text(&err, &files.superblock_shown) {
+            Some(text) => verification_fails(&text),
+            None => {
+                println!("Verification fails");
+                return Err(err);
+            }
+        },
+    };
+    if !sb.is_signed() {
+        verification_fails("no signatures in static-delta");
+    }
+    let outcome = match sb.verify(&[keys.verifier.as_ref()]).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            println!("Verification fails");
+            return Err(err);
+        }
+    };
+    if outcome.valid {
+        println!("Verification OK");
+        return Ok(());
+    }
+    if outcome.signatures.is_empty() {
+        verification_fails(&format!(
+            "no signature for '{}' in static-delta superblock",
+            sign_metadata_key(engine)
+        ));
+    }
+    // The failure line names each trusted key that is not revoked once, at
+    // its first place, in reverse order.
+    let revoked: HashSet<&[u8]> = keys.revoked.iter().map(Vec::as_slice).collect();
+    let mut seen = HashSet::new();
+    let effective: Vec<&[u8]> = keys
+        .trusted
+        .iter()
+        .map(Vec::as_slice)
+        .filter(|key| !revoked.contains(key) && seen.insert(*key))
+        .collect();
+    if effective.is_empty() {
+        verification_fails(&format!("{name}: no signatures found"));
+    }
+    let listed: Vec<String> = effective
+        .iter()
+        .rev()
+        .map(|key| {
+            let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!("key '{hex}'")
+        })
+        .collect();
+    verification_fails(&format!(
+        "{name}: Signature couldn't be verified with: {}",
+        listed.join("; ")
+    ))
+}
+
+/// Read the `static-delta verify` sign type. `ed25519`, and `spki` in a build
+/// that carries it, proceed. `dummy` refuses in its own words with nothing on
+/// standard output. Every other name, `gpg` included, prints `Sign-type not
+/// supported` and refuses, as the tool does.
+fn verify_sign_type(name: &str) -> SignType {
+    match sign_type_from_name(name) {
+        Ok(engine @ (SignType::Ed25519 | SignType::Spki)) => engine,
+        Err(text) if name == "dummy" => exit_error(&text),
+        Ok(SignType::Gpg) | Err(_) => {
+            println!("Sign-type not supported");
+            exit_error("Requested signature type is not implemented")
+        }
+    }
+}
+
+/// Load the keys of a `static-delta verify` run. The trusted keys are each
+/// `key_ids` entry, then each line of `keys_file`. With neither given, the
+/// trusted and revoked keys come from `keys_dir`, or from the system key
+/// directories where it is absent. No trusted key before revocation is
+/// `{type}: no keys loaded`. A key that is not a valid key refuses the run.
+fn load_verify_keys(
+    engine: SignType,
+    key_ids: &[String],
+    keys_file: Option<&Path>,
+    keys_dir: Option<&Path>,
+) -> Result<VerifyKeys> {
+    let name = sign_type_name(engine);
+    let mut trusted: Vec<Vec<u8>> = key_ids
+        .iter()
+        .map(|key| verify_key_bytes(engine, key.as_bytes()))
+        .collect();
+    let mut revoked = Vec::new();
+    if let Some(path) = keys_file {
+        trusted.extend(read_verify_keys_file(engine, path)?);
+    } else if key_ids.is_empty() {
+        let keys = match keys_dir {
+            Some(root) => load_sign_keys_from(&[root], name)?,
+            None => load_sign_keys(name)?,
+        };
+        trusted = keys.trusted;
+        revoked = keys.revoked;
+    }
+    if trusted.is_empty() {
+        return Err(Error::Signature(format!("{name}: no keys loaded")));
+    }
+    let verifier = build_sign_api_verifier(engine, &trusted, &revoked)?;
+    Ok(VerifyKeys {
+        verifier,
+        trusted,
+        revoked,
+    })
+}
+
+/// Decode one public key of a `static-delta verify` run with the tool's
+/// lenient base64 reader. Text that is not UTF-8 decodes to no byte. An
+/// ed25519 key of any length but 32 bytes refuses the run in the tool's
+/// words; the spki engine validates its own keys.
+fn verify_key_bytes(engine: SignType, text: &[u8]) -> Vec<u8> {
+    let key = match std::str::from_utf8(text) {
+        Ok(_) => lenient_base64(text),
+        Err(_) => Vec::new(),
+    };
+    if engine == SignType::Ed25519 && key.len() != 32 {
+        exit_error(&format!(
+            "Invalid ed25519 public key: Ill-formed input: expected 32 bytes, got {} bytes",
+            key.len()
+        ));
+    }
+    key
+}
+
+/// Read the public keys of a `static-delta verify` `--keys-file`, one per
+/// line. The path must name a regular file, symlinks followed, which is
+/// checked before the open so a FIFO is refused and not waited on. The file is
+/// read up to [`VERIFY_KEYS_FILE_LIMIT`] and refused past it. Each line is
+/// read as bytes with a trailing `\r` removed. A line that is then empty is
+/// skipped; every other line, a line of whitespace included, is decoded as a
+/// key. A file with no key line is refused.
+fn read_verify_keys_file(engine: SignType, path: &Path) -> Result<Vec<Vec<u8>>> {
+    use std::io::Read;
+    let shown = path.display();
+    if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+        exit_error(&format!("File object '{shown}' is not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(VERIFY_KEYS_FILE_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > VERIFY_KEYS_FILE_LIMIT {
+        return Err(Error::Signature(format!(
+            "the key file '{shown}' is over the {VERIFY_KEYS_FILE_LIMIT}-byte ceiling"
+        )));
+    }
+    let keys: Vec<Vec<u8>> = bytes
+        .split(|&byte| byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .map(|line| verify_key_bytes(engine, line))
+        .collect();
+    if keys.is_empty() {
+        return Err(Error::Signature(format!(
+            "{}: no valid keys in file '{shown}'",
+            sign_type_name(engine)
+        )));
+    }
+    Ok(keys)
 }
 
 /// Print one `<label>: <n> (<size wording>)` line of `static-delta show`.
@@ -7334,7 +7576,7 @@ fn summary_verifier(
                 trusted.extend(keys.trusted);
                 revoked.extend(keys.revoked);
             }
-            build_sign_api_verifier(engine, trusted, revoked)
+            build_sign_api_verifier(engine, &trusted, &revoked)
         }
     }
 }
@@ -7455,7 +7697,7 @@ async fn delete_signatures(
             // A sign-api blob belongs to a KEY-ID when it verifies under that
             // public key. Verification is async, so the blobs to remove are
             // decided up front and the predicate matches by bytes.
-            let verifier = build_sign_api_verifier(engine, public_key_bytes(args)?, Vec::new())?;
+            let verifier = build_sign_api_verifier(engine, &public_key_bytes(args)?, &[])?;
             let key = sign_metadata_key(engine);
             let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
             let mut doomed: Vec<Vec<u8>> = Vec::new();
@@ -7562,13 +7804,13 @@ fn sign_api_verifier(engine: SignType, args: &SignArgs) -> Result<Box<dyn Verifi
         trusted.extend(keys.trusted);
         revoked.extend(keys.revoked);
     }
-    build_sign_api_verifier(engine, trusted, revoked)
+    build_sign_api_verifier(engine, &trusted, &revoked)
 }
 
 fn build_sign_api_verifier(
     engine: SignType,
-    trusted: Vec<Vec<u8>>,
-    revoked: Vec<Vec<u8>>,
+    trusted: &[Vec<u8>],
+    revoked: &[Vec<u8>],
 ) -> Result<Box<dyn Verifier>> {
     match engine {
         SignType::Ed25519 => Ok(Box::new(Ed25519Verifier::new(trusted, revoked)?)),

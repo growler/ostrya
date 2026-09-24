@@ -121,7 +121,9 @@
 //! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache,
 //! [`Repo::list_static_delta_indexes`] lists it, and
 //! [`Repo::delete_static_delta`] removes one delta. [`DeltaSuperblock`] reads a
-//! superblock and what each part holds without applying the delta. It also
+//! superblock and what each part holds without applying the delta, and
+//! [`DeltaSuperblock::verify`] checks the signatures of a superblock file read
+//! under any name. It also
 //! covers the fetcher pull is built on (Phase 16a): [`Fetcher`] serves
 //! [`FetchRequest`]s naming a [`Target`] -- a path under a remote's mirrors, or
 //! an absolute URL of the request's own -- over HTTP/1.1 and HTTP/2 -- ALPN

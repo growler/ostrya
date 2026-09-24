@@ -34,6 +34,7 @@
 //! a system search path -- parameterized by sign-type name so the spki engine
 //! reuses it; a verifier trusts the loaded set minus the revoked set.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::Read;
 use std::os::fd::OwnedFd;
@@ -507,7 +508,7 @@ impl Ed25519Verifier {
         R: IntoIterator,
         R::Item: AsRef<[u8]>,
     {
-        let revoked: Vec<[u8; ED25519_PUBLIC_KEY_LEN]> = revoked
+        let revoked: HashSet<[u8; ED25519_PUBLIC_KEY_LEN]> = revoked
             .into_iter()
             .map(|k| ed25519_public_bytes(k.as_ref()))
             .collect::<Result<_>>()?;

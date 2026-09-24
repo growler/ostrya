@@ -5968,6 +5968,56 @@ refuses, so the port removes nothing; and the wording of a removal failure other
 than an absent delta. The work adds 3 `m10` cells, of which 1 is executable and
 it passes; the conformance run reports 1002 cells and 408 passes.
 
+`static-delta verify` lands, with `DeltaSuperblock::verify(verifiers)`, which
+checks the signed envelope of a superblock already read. The CLI needs it
+because the path form names a superblock file of any name, and
+`Repo::verify_static_delta` takes a delta directory; that call now reads the
+superblock and delegates to the method, with the same outcome and error text.
+`verify` reads the superblock alone, under the metadata ceiling
+`DeltaSuperblock::read` applies, and opens no part, so a copied superblock
+verifies away from its parts. `resolve_delta_arg` returns its refusal text in
+place of exiting, and `delta_read_text` gives the tool's words for a failed
+read, so `verify` prints `Verification fails` ahead of each.
+
+The check order is the tool's: `DELTA` is present, the sign type is carried,
+the keys load, the argument resolves and the superblock reads, and then the
+signatures verify. Every refusal before the argument resolves writes nothing to
+standard output, except the `Sign-type not supported` line an uncarried sign
+type prints, and every failure after it writes `Verification fails` first.
+The keys are each positional KEY-ID and each line of the last `--keys-file`,
+in that order. With neither, the last `--keys-dir`, or the system key
+directories, supply the trusted and the revoked sets through
+`load_sign_keys_from`. `no keys loaded` is judged on the trusted set before
+revocation, and a store whose every trusted key is revoked reports `no
+signatures found`. A key decodes with the lenient base64 reader of `commit
+--sign`. The `--keys-file` must be a regular file, which a `metadata` check
+states before the open, so a FIFO is refused and not waited on; the file is
+read up to 1 MiB. A line empty once a trailing `\r` is removed is skipped, and
+a line of whitespace is a key of 0 bytes. The failure line names the effective
+keys in hex, each once at its first place, in reverse load order, as the tool
+names them.
+
+Five decisions stand, each open to reversal. `dummy` refuses before the keys
+load, in the words `sign_type_from_name` already carries. `spki` is taken in a
+build with the engine, the sign-type rule of the other signing commands, and
+`gpg` prints `Sign-type not supported` as the tool does. A `--keys-file` line of
+the wrong length beside a valid one refuses the run before standard output,
+where the tool prints a verdict and then exits 1. The superblock is parsed
+whole, where the tool reads the magic alone. `sign --verify` and `summary
+--verify` keep their own key-source rules.
+
+Ten divergences on `static-delta` are new, all in `cli-surface.md`, "P2":
+`dummy`; a wrong-length `--keys-file` line beside a valid one; a `--keys-file`
+line of 0 or 1 byte and a key-store line of 0 or 1 byte, on which the tool
+dies; a `--keys-file` over 1 MiB, which the port refuses; a key-store file that
+cannot be read, which the tool skips; a key-store line that does not decode to
+a valid key, which the tool skips; a `--keys-dir` that names a regular file; a
+32-byte key that is no curve point; and a superblock that does not parse. Both custody
+directions agree byte for byte in the cross-tool tests: the tool's `verify`
+reads a delta the port signs. The work adds 9 `m10` cells, of which 2 are
+executable and both pass; the conformance run reports 1011 cells and 410
+passes.
+
 #### Phase 17g -- P3 commands with no matrix weight
 
 `reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and

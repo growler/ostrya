@@ -9976,13 +9976,16 @@ modes: archive
 outcome: full
 severity: interop
 evidence: ostrya_cli::cli::prune_static_deltas_only_matches_the_tool,
+ ostrya_cli::cli::prune_static_delta_sweep_follows_no_symlink_like_the_tool,
  ostrya::prune_options::static_deltas_only_deletes_the_delta_and_nothing_else
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: with `--delete-commit` the run removes the static deltas the named commit
  targets and nothing else: no loose object is touched, the named commit's own
  object included, and the two lines report the store as it stands. The commit a
  ref names is accepted here, where a plain `--delete-commit` refuses it. Needs
- two deltas.
+ two deltas. The second cited test states that the sweep follows no symlink at
+ a fanout or at a delta path and skips a regular file directly under
+ `deltas/`, at exit 0 in both.
 
 family: M10
 subcommand: prune
@@ -12282,17 +12285,18 @@ note: in the port, a `--keys-file` or a positional KEY-ID leaves `--keys-dir`
  `sign --verify`, over a summary each implementation signed.
 
 # ---------------------------------------------------------------------------
-# static-delta -- `show`, the superblock and part report, `indexes`, the
-# listing of the `delta-indexes/` cache, `delete`, the removal of one delta,
-# and `verify`, the signature check of one superblock.
+# static-delta -- `show`, the superblock and part report, `list`, the listing
+# of the `deltas/` tree, `indexes`, the listing of the `delta-indexes/` cache,
+# `delete`, the removal of one delta, and `verify`, the signature check of one
+# superblock.
 #
-# `show`, `indexes`, and `verify` write nothing, so each cited test runs both
-# implementations over one repository and compares the exit status and both
-# streams. `delete` removes files, so its cited tests give each implementation
-# its own byte-identical copy of one repository and compare the trees after
-# each run. A cell that needs a delta cites a test: no setup generates one. A
-# `verify` cell whose invocation needs the tool's ed25519 engine cites
-# `evidence:`.
+# `show`, `list`, `indexes`, and `verify` write nothing, so each cited test
+# runs both implementations over one repository and compares the exit status
+# and both streams. `delete` removes files, so its cited tests give each
+# implementation its own byte-identical copy of one repository and compare the
+# trees after each run. A cell that needs a delta cites a test: no setup
+# generates one. A `verify` cell whose invocation needs the tool's ed25519
+# engine cites `evidence:`.
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -12513,6 +12517,60 @@ note: an entry is listed when it is a regular file named with 41 characters and
  `cli-surface.md`, "P2", records. The cell stays full: every name the cited
  test writes is in the modified-base64 alphabet, and each is skipped by a
  rule both apply, so the test reaches no name the lenient decode lists.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/list-empty
+setup: repo
+run: static-delta --repo=$REPO list
+expect-exit: 0
+expect-stdout: equals "(No static deltas)"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: equals "(No static deltas)"
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_list_matches_the_tool
+spec: format-reference.md#static-delta
+note: a repository with no `deltas/` lists nothing. The cited test states the
+ same for an empty `deltas/` and an empty fanout directory.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/list-skips-dir-without-superblock
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_list_matches_the_tool,
+ ostrya_cli::cli::static_delta_scan_follows_no_symlink_like_the_tool
+spec: format-reference.md#static-delta
+note: an entry is listed when its fanout and its delta path are directories
+ and its `superblock` resolves. The first cited test states that both skip an
+ empty directory, a directory with a part alone, a regular file, and a
+ directory whose `superblock` is a dangling symlink, beside two deltas the tool
+ generated. The second states that both follow no symlink at a fanout or at a
+ delta path, skip a regular file directly under `deltas/` and a symlink loop
+ at a fanout or at a delta path, and refuse a `superblock` that is a symlink
+ loop at exit 1, for `list`, `reindex`, and `summary -u`. A name that does not
+ decode is the divergence `cli-surface.md`, "P2", records. The cell stays
+ full: every name the cited tests list decodes.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/list-order
+setup: repo
+outcome: lossy
+severity: interop
+loss: the line order. The tool prints the delta names in the order the
+ directories return them, and the port sorts them, the hash-order class
+ `CLAUDE.md`, "CLI compatibility is functional, not literal", puts out of
+ scope.
+evidence: ostrya_cli::cli::static_delta_list_matches_the_tool
+spec: format-reference.md#static-delta
+note: over a delta from scratch and a delta from a source commit the two list
+ one set of names, in full hex, the second as `<from-hex>-<to-hex>`.
 
 family: M10
 subcommand: static-delta

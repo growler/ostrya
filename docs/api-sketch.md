@@ -2002,8 +2002,10 @@ impl Repo {
     /// Rebuild the `delta-indexes/` cache that advertises the stored deltas to
     /// a fetcher.
     pub async fn reindex_static_deltas(&self) -> Result<()>;
-    /// The stored deltas, each named as the tool names it: the target commit
-    /// hex, or `<from-hex>-<to-hex>`.
+    /// The stored deltas, sorted, each named as the tool names it: the target
+    /// commit hex, or `<from-hex>-<to-hex>`. An entry counts only where its
+    /// fanout and its delta path are directories, not symlinks, and its
+    /// `superblock` resolves.
     pub async fn list_static_deltas(&self) -> Result<Vec<String>>;
     /// The target commits `delta-indexes/` holds an index file for, sorted.
     pub async fn list_static_delta_indexes(&self) -> Result<Vec<Checksum>>;

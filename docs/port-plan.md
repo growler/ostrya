@@ -5449,8 +5449,9 @@ the rule sits in `ParentBound::depth` and reaches `Repo::traverse_commit` and
 delta of every commit it deleted, the delta directory whole, nested
 directories included, and its fanout parent in place, which is what keeps a
 pruned repository from offering a delta whose target commit is gone. The sweep
-follows no symlink at or below the delta path, and an entry at the delta path
-that is not a directory is left, as the tool leaves it; a delta whose source
+follows no symlink at the fanout, at the delta path, or below it, and an entry
+at the fanout or at the delta path that is not a directory is left, as the tool
+leaves it; a delta whose source
 commit the run deleted is kept, and the `delta-indexes/` cache is left alone,
 as the tool leaves it.
 `delta.rs` carries the two helpers that reach it, `list_delta_dirs` and
@@ -6067,6 +6068,35 @@ the key kind of `-d`. Six `static-delta` key-file entries name `sign --verify`
 and `summary --verify` as well. The work adds 8 `m10` cells, of which 2
 are executable and both pass; the conformance run reports 1019 cells and 412
 passes (the M10 family 409).
+
+`static-delta list` takes the tool's listing rules. An entry
+`deltas/<fanout>/<rest>` is a delta only where `<fanout>` and `<rest>` are
+directories and `<rest>/superblock` resolves, and an empty listing prints
+`(No static deltas)` at exit 0. No symlink at `<fanout>` or at `<rest>` is
+followed, and a regular file directly under `deltas/` is skipped. The entry
+type comes from the `getdents` type the directory read returns, and a
+no-follow `statat` runs only for an entry of unknown type. The superblock
+check is one `statat` per directory entry, through the fanout descriptor the
+scan already holds, and no superblock byte is read. The fanout opens with
+`O_NOFOLLOW`. The checks stand in the shared `deltas/` scan, ahead of the name
+parse, so a malformed name with no superblock is skipped. The `deltas`
+directory itself opens with symlinks followed, inside or outside the
+repository, because the tool follows a symlink there for `list`, `show`,
+`verify`, `delete`, `reindex`, `summary -u`, `generate`, and a prune. A
+dangling symlink at `deltas` holds no delta. `reindex`, the
+summary's `ostree.static-deltas` map, and the prune sweep read the same scan,
+and the sweep opens the fanout with `O_NOFOLLOW` too, so it removes no delta
+behind a symlinked fanout. A prune by the tool leaves a delta directory that
+holds no superblock, also where its commit is the one the prune deletes,
+observed with `prune --static-deltas-only --delete-commit` and with a
+`--refs-only` prune that deletes the commit, so the sweep takes the filter too.
+
+Two divergences on `static-delta list` are recorded, both in `cli-surface.md`,
+"P2": the line order, which the port sorts; and a name that does not decode and
+holds a superblock, which the tool lists from a lenient decode and the port
+refuses at exit 1. `list` also joins the extra-positional entry. The work adds
+3 `m10` cells, of which 1 is executable and it passes; the conformance run
+reports 1022 cells and 413 passes (the M10 family 410).
 
 #### Phase 17g -- P3 commands with no matrix weight
 

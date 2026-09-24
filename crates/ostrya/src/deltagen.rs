@@ -356,9 +356,10 @@ impl Repo {
     /// superblock.
     ///
     /// This is what the `delta-indexes/` cache and the summary's
-    /// `ostree.static-deltas` map both advertise, so both are built from it. A
-    /// delta whose superblock is missing is skipped, which leaves a half-written
-    /// delta unadvertised rather than failing the caller.
+    /// `ostree.static-deltas` map both advertise, so both are built from it. The
+    /// scan lists only a directory that holds a superblock, so a half-written
+    /// delta stays unadvertised. A superblock that goes between the scan and
+    /// the read is skipped too, and does not fail the caller.
     pub(crate) async fn static_delta_digests(&self) -> Result<Vec<DeltaDigest>> {
         let mut out = Vec::new();
         for (from, to) in self.list_static_delta_targets().await? {

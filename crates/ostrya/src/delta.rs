@@ -371,13 +371,22 @@ impl Repo {
             .await
     }
 
-    /// List the static deltas stored in the repository under `deltas/`.
+    /// List the static deltas stored in the repository under `deltas/`, sorted
+    /// by name.
     ///
     /// Each is named as the tool names it: the target commit hex for a
     /// from-scratch delta, or `<from-hex>-<to-hex>` for a delta against a source
-    /// commit. The `delta-indexes/` cache that advertises these deltas to a
-    /// fetcher is written by
-    /// [`reindex_static_deltas`](Repo::reindex_static_deltas) and read by a pull.
+    /// commit. A `deltas/<fanout>/<rest>` entry is a delta only where
+    /// `<fanout>` and `<rest>` are directories and `<rest>/superblock`
+    /// resolves. No symlink at `<fanout>` or at `<rest>` is followed, and a
+    /// symlink at `superblock` or at `deltas` itself is followed. A dangling
+    /// symlink at `deltas` holds no delta. Other entries are skipped, also
+    /// where their names do not decode. An entry that holds a superblock and
+    /// whose name does not decode fails the call.
+    ///
+    /// The `delta-indexes/` cache that advertises these deltas to a fetcher is
+    /// written by [`reindex_static_deltas`](Repo::reindex_static_deltas) and
+    /// read by a pull.
     pub async fn list_static_deltas(&self) -> Result<Vec<String>> {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || list_static_deltas_blocking(repo_fd.as_fd())).await
@@ -489,7 +498,9 @@ pub(crate) struct DeltaDir {
 }
 
 /// Scan `deltas/<fanout>/<leaf>` and collect each delta's directory names
-/// alongside the commit it produces.
+/// alongside the commit it produces. A directory with no superblock is not a
+/// delta, so the prune sweep leaves it, which is what the `ostree` tool's prune
+/// leaves.
 pub(crate) fn list_delta_dirs(repo_fd: BorrowedFd<'_>) -> Result<Vec<DeltaDir>> {
     scan_deltas(repo_fd, |fanout, leaf| {
         let (_, to) = parse_delta_dir(fanout, leaf)?;
@@ -504,17 +515,18 @@ pub(crate) fn list_delta_dirs(repo_fd: BorrowedFd<'_>) -> Result<Vec<DeltaDir>> 
 /// Remove one `deltas/<fanout>/<leaf>` directory and everything below it.
 ///
 /// A delta directory is removed whole, nested directories included, and no
-/// symlink at or below the path is followed. An entry at the path that is not
-/// a directory is left in place, which is what a prune by the `ostree` tool
-/// leaves. The fanout directory above it is left in place, empty where this
-/// was its last entry. A directory that is already gone is success.
+/// symlink at the fanout, at the path, or below it is followed. An entry at the
+/// fanout or at the path that is not a directory is left in place, which is
+/// what a prune by the `ostree` tool leaves. The fanout directory above it is
+/// left in place, empty where this was its last entry. A directory that is
+/// already gone is success.
 pub(crate) fn remove_delta_dir(repo_fd: BorrowedFd<'_>, dir: &DeltaDir) -> Result<()> {
     use rustix::fs::{Mode, OFlags, openat};
     use rustix::io::Errno;
 
-    let fanout = match openat(
+    let deltas = match openat(
         repo_fd,
-        format!("deltas/{}", dir.fanout).as_str(),
+        "deltas",
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
@@ -522,12 +534,19 @@ pub(crate) fn remove_delta_dir(repo_fd: BorrowedFd<'_>, dir: &DeltaDir) -> Resul
         Err(Errno::NOENT) => return Ok(()),
         Err(e) => return Err(Error::Io(e.into())),
     };
-    let leaf = CString::new(dir.leaf.as_str()).expect("a directory entry name holds no NUL");
+    let name = |s: &str| CString::new(s).expect("a directory entry name holds no NUL");
     // The no-follow directory open refuses a symlink and every other
-    // non-directory with `ENOTDIR`, and that entry stays.
+    // non-directory, at the fanout and at the delta path, with `ENOTDIR` or
+    // `ELOOP`, and that entry stays.
+    let fanout = match open_dir_nofollow(deltas.as_fd(), &name(&dir.fanout)) {
+        Ok(fd) => fd,
+        Err(Errno::NOTDIR | Errno::LOOP | Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    let leaf = name(&dir.leaf);
     match open_dir_nofollow(fanout.as_fd(), &leaf) {
         Ok(level) => remove_dir_tree(fanout.as_fd(), &leaf, level),
-        Err(Errno::NOTDIR | Errno::NOENT) => Ok(()),
+        Err(Errno::NOTDIR | Errno::LOOP | Errno::NOENT) => Ok(()),
         Err(e) => Err(Error::Io(e.into())),
     }
 }
@@ -669,11 +688,23 @@ fn read_tree_level(dir: &mut rustix::fs::Dir) -> Result<Vec<(CString, bool)>> {
 
 /// Walk the two-level `deltas/` tree, applying `parse` to each delta's fanout
 /// and leaf directory names. A repository with no `deltas/` yields nothing.
+///
+/// A fanout and a leaf count only where they are directories, and no symlink
+/// at either is followed. A symlink at `deltas` itself is followed, as the
+/// tool follows it. A leaf counts as a delta only where
+/// `<leaf>/superblock` resolves, following symlinks, which is the `ostree`
+/// tool's rule. Any other entry is skipped before its name is parsed, so such
+/// an entry with a malformed name is skipped too. The entry type comes from
+/// the directory read, and only a filesystem that reports no type costs one
+/// no-follow `statat` per entry more; no superblock byte is read.
 fn scan_deltas<T>(
     repo_fd: BorrowedFd<'_>,
     parse: impl Fn(&str, &str) -> Result<T>,
 ) -> Result<Vec<T>> {
-    use rustix::fs::{Mode, OFlags, openat};
+    use rustix::fs::{AtFlags, Dir, Mode, OFlags, openat, statat};
+    use rustix::io::Errno;
+
+    let io_err = |e: Errno| Error::Io(e.into());
 
     let deltas = match openat(
         repo_fd,
@@ -682,21 +713,40 @@ fn scan_deltas<T>(
         Mode::empty(),
     ) {
         Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
-        Err(e) => return Err(Error::Io(e.into())),
+        Err(Errno::NOENT) => return Ok(Vec::new()),
+        Err(e) => return Err(io_err(e)),
     };
 
+    let mut deltas = Dir::new(deltas).map_err(io_err)?;
     let mut out = Vec::new();
-    for fanout in dir_child_names(&deltas)? {
-        let fan_fd = openat(
-            &deltas,
-            fanout.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| Error::Io(e.into()))?;
-        for leaf in dir_child_names(&fan_fd)? {
-            out.push(parse(&fanout, &leaf)?);
+    for (fanout, is_dir) in read_tree_level(&mut deltas)? {
+        // Delta directory names are base64, so a name that is not UTF-8 is
+        // no fanout.
+        let (true, Ok(fanout_name)) = (is_dir, fanout.to_str()) else {
+            continue;
+        };
+        // The no-follow open refuses an entry that became a symlink or a
+        // non-directory since the read, and that entry is skipped too.
+        let fan_fd = match open_dir_nofollow(deltas.fd().map_err(io_err)?, &fanout) {
+            Ok(fd) => fd,
+            Err(Errno::NOTDIR | Errno::LOOP | Errno::NOENT) => continue,
+            Err(e) => return Err(io_err(e)),
+        };
+        let mut fan_dir = Dir::new(fan_fd).map_err(io_err)?;
+        for (leaf, is_dir) in read_tree_level(&mut fan_dir)? {
+            let (true, Ok(leaf_name)) = (is_dir, leaf.to_str()) else {
+                continue;
+            };
+            match statat(
+                fan_dir.fd().map_err(io_err)?,
+                format!("{leaf_name}/superblock").as_str(),
+                AtFlags::empty(),
+            ) {
+                Ok(_) => {}
+                Err(Errno::NOENT | Errno::NOTDIR) => continue,
+                Err(e) => return Err(io_err(e)),
+            }
+            out.push(parse(fanout_name, leaf_name)?);
         }
     }
     Ok(out)

@@ -751,6 +751,134 @@ fn static_delta_sweep_leaves_a_symlink_at_the_delta_path() {
 }
 
 #[test]
+fn static_delta_sweep_leaves_a_directory_without_a_superblock() {
+    let tmp = TmpDir::new("prune-deltas-no-superblock");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let main = chain(&repo, tmp.path(), "main").await;
+        let dir = tmp
+            .path()
+            .join("repo")
+            .join(static_delta_relative_dir(Some(&main[1]), &main[2]));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0"), b"part\n").unwrap();
+
+        repo.prune(&PruneOptions {
+            delete_commit: Some(main[2]),
+            static_deltas_only: true,
+            ..PruneOptions::default()
+        })
+        .await
+        .unwrap();
+        assert!(
+            dir.join("0").is_file(),
+            "a delta directory with no superblock is not a delta, so it stays"
+        );
+    });
+}
+
+#[test]
+fn static_delta_sweep_follows_no_symlink_at_the_fanout() {
+    let tmp = TmpDir::new("prune-deltas-fanout-symlink");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let main = chain(&repo, tmp.path(), "main").await;
+        let rel = std::path::PathBuf::from(static_delta_relative_dir(Some(&main[1]), &main[2]));
+        let fanout = tmp.path().join("repo").join(rel.parent().unwrap());
+        let outside = tmp.path().join("outside");
+        let kept = outside.join(rel.file_name().unwrap());
+        std::fs::create_dir_all(&kept).unwrap();
+        std::fs::write(kept.join("superblock"), b"superblock\n").unwrap();
+        std::fs::create_dir_all(fanout.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &fanout).unwrap();
+
+        repo.prune(&PruneOptions {
+            delete_commit: Some(main[2]),
+            static_deltas_only: true,
+            ..PruneOptions::default()
+        })
+        .await
+        .unwrap();
+        assert!(
+            kept.join("superblock").is_file(),
+            "the sweep follows no symlink at the fanout"
+        );
+    });
+}
+
+#[test]
+fn static_delta_sweep_follows_a_symlink_at_deltas() {
+    let tmp = TmpDir::new("prune-deltas-symlink");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let main = chain(&repo, tmp.path(), "main").await;
+        let rel = static_delta_relative_dir(Some(&main[1]), &main[2]);
+        let rel = std::path::Path::new(&rel).strip_prefix("deltas").unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join(rel)).unwrap();
+        std::fs::write(outside.join(rel).join("superblock"), b"superblock\n").unwrap();
+        let deltas = tmp.path().join("repo/deltas");
+        let _ = std::fs::remove_dir_all(&deltas);
+        std::os::unix::fs::symlink(&outside, &deltas).unwrap();
+
+        repo.prune(&PruneOptions {
+            delete_commit: Some(main[2]),
+            static_deltas_only: true,
+            ..PruneOptions::default()
+        })
+        .await
+        .unwrap();
+        assert!(
+            !outside.join(rel).exists(),
+            "the sweep follows a symlink at `deltas`"
+        );
+        assert!(outside.join(rel).parent().unwrap().is_dir());
+        assert!(deltas.symlink_metadata().unwrap().is_symlink());
+    });
+}
+
+#[test]
+fn static_delta_sweep_skips_a_file_directly_under_deltas() {
+    let tmp = TmpDir::new("prune-deltas-file");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let main = chain(&repo, tmp.path(), "main").await;
+        let deltas = tmp.path().join("repo/deltas");
+        std::fs::create_dir_all(&deltas).unwrap();
+        std::fs::write(deltas.join("file"), b"file\n").unwrap();
+
+        repo.prune(&PruneOptions {
+            delete_commit: Some(main[2]),
+            static_deltas_only: true,
+            ..PruneOptions::default()
+        })
+        .await
+        .unwrap();
+        assert!(deltas.join("file").is_file(), "the file stays");
+    });
+}
+
+#[test]
 fn a_tombstone_is_written_for_every_commit_a_delete_commit_run_removes() {
     let tmp = TmpDir::new("prune-tombstone-delete-commit");
     block_on(async {

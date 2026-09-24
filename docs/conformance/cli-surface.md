@@ -1732,9 +1732,15 @@ the command writes is in `../format-reference.md`, "CLI output formats",
 `prune`.
 
 The static-delta sweep of a prune removes each delta directory it selects
-whole, nested directories included, and follows no symlink at or below the
-delta path. An entry at the delta path that is not a directory, a symlink or a
-regular file, stays in both.
+whole, nested directories included, and follows no symlink at the fanout, at
+the delta path, or below it. An entry at the fanout or at the delta path that
+is not a directory, a symlink or a regular file, stays in both, and so do the
+deltas behind a symlinked fanout. A regular file directly under `deltas/` is
+skipped, and the run exits 0 in both. A delta directory that holds no
+`superblock` is not a delta, so it stays in both, also where its commit is the
+one the prune deletes. A symlink at `deltas` itself is followed in both, and
+the deltas behind it that the sweep selects are removed. A dangling symlink at
+`deltas` holds no delta, and the run exits 0 in both.
 
 Both implementations hold the repository lock for the whole of a prune, and
 both take it exclusive. Measured against `ostree` 2026.1 on an archive
@@ -2137,11 +2143,11 @@ renders in the host zone with that zone's offset and the port renders in UTC.
 `static-delta` accepts the subcommands `list`, `generate`, `apply-offline`,
 `reindex`, `show`, `delete`, `indexes`, and `verify`. `show` and `verify` take
 a delta name or the path of a superblock file, `delete` takes a delta name
-alone, and `indexes` lists the `delta-indexes/` cache
-(`../format-reference.md`, "CLI output formats", `static-delta`). `verify`
-takes `spki` in a build that carries the engine, the sign-type rule this
-section states for `commit --sign-type`. Twenty-four differences stand on
-`show`, `delete`, `indexes`, and `verify`.
+alone, `list` lists the deltas under `deltas/`, and `indexes` lists the
+`delta-indexes/` cache (`../format-reference.md`, "CLI output formats",
+`static-delta`). `verify` takes `spki` in a build that carries the engine, the
+sign-type rule this section states for `commit --sign-type`. Twenty-six
+differences stand on `show`, `delete`, `list`, `indexes`, and `verify`.
 
 - a part that fails its checksum or passes its declared size. The port refuses
   it at exit 1 after the `PartMeta<i>` line, before it decompresses a byte of
@@ -2189,6 +2195,16 @@ section states for `commit --sign-type`. Twenty-four differences stand on
 - the line order of `indexes`. The tool prints the targets in the order the
   directory returns them, and the port sorts them. This is the hash-container
   carve-out of `CLAUDE.md`, "CLI compatibility is functional, not literal";
+- the line order of `list`. The tool prints the delta names in the order the
+  directories return them, and the port sorts them. This is the same
+  hash-container carve-out;
+- a `deltas/<fanout>/<rest>` name that does not decode, where `<rest>` holds a
+  `superblock`. The tool lists a lenient decode at exit 0: for
+  `deltas/zz/garbage` it prints a line that starts `cf381aadb6a07b`, and the
+  bytes after the decoded ones change from run to run. The port refuses the
+  listing at exit 1 with `error: invalid checksum:` and nothing on standard
+  output. Where `<rest>` holds no `superblock`, both skip the entry. Only a
+  write that is neither implementation's makes such a name;
 - an index name outside the modified-base64 form: a character outside the
   alphabet, or a last character whose low bits are not zero. The tool lists a
   lenient decode, and for some such names bytes the name does not determine.
@@ -2202,10 +2218,10 @@ section states for `commit --sign-type`. Twenty-four differences stand on
   and `error: Removing <path>: unlinkat(<name>): <reason>`, and the port writes
   the library's `error: i/o error:` sentence. Both exit 1, and both leave the
   entries the removal did not reach;
-- an extra positional argument. The tool ignores it on `show`, `delete`, and
-  `indexes`, and `clap` refuses it with `error: unexpected argument '<value>'
-  found` at exit 1. For `delete` the port removes nothing. This is the class
-  already recorded for `diff`;
+- an extra positional argument. The tool ignores it on `show`, `delete`,
+  `list`, and `indexes`, and `clap` refuses it with
+  `error: unexpected argument '<value>' found` at exit 1. For `delete` the port
+  removes nothing. This is the class already recorded for `diff`;
 - `Endianness:` for a superblock with no `ostree.endianness` key, or a byte
   other than `l` and `B`. The port prints `little` and reads the size fields as
   little-endian in all three cases. With the key absent over a delta whose
@@ -2941,13 +2957,13 @@ Observed by running the tool (2026.1).
 A script reads standard output, so the format is part of the surface. The
 formats of `commit`, including its `--table-output` block, `refs`, `rev-parse`,
 `cat`, `show`, `log`, `ls`, `config get`, `prune`, `fsck`, `diff`,
-`summary`, `static-delta show`, and `static-delta indexes`, together with the
+`summary`, `static-delta show`, `static-delta list`, and
+`static-delta indexes`, together with the
 GVariant text form the reading commands share,
 are recovered and recorded in `../format-reference.md`, "CLI output formats" and
 "The GVariant text form". Each format below still needs a black-box observation
 pass, and the results belong in that same section.
 
-- `static-delta list`.
 - `pull` progress output.
 
 `remote list`, `show-url`, `refs`, and `summary` are recovered, in

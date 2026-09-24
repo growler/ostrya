@@ -29707,6 +29707,420 @@ fn static_delta_indexes_matches_the_tool() {
     assert!(port.stdout.is_empty() && tool.stdout.is_empty());
 }
 
+/// `list` agrees: `(No static deltas)` for an absent `deltas/`, an empty one,
+/// and an empty fanout, and the names of the deltas the tool generated, as a
+/// set since the tool prints `readdir` order and the port sorts. An entry with
+/// no superblock is skipped by both: an empty directory, a directory with a
+/// part alone, a regular file, and a dangling `superblock` symlink. Carries
+/// `static-delta/list-empty`, `static-delta/list-skips-dir-without-superblock`,
+/// and `static-delta/list-order`.
+#[test]
+fn static_delta_list_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-list");
+    let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
+    let repo_arg = format!("--repo={}", repo.display());
+    let args = ["static-delta", repo_arg.as_str(), "list"];
+    let both = || (ostrya(&args, None, &[]), ostree(&args));
+    let deltas = repo.join("deltas");
+    let _ = std::fs::remove_dir_all(&deltas);
+    for step in ["absent", "empty", "empty fanout"] {
+        match step {
+            "empty" => std::fs::create_dir(&deltas).unwrap(),
+            "empty fanout" => std::fs::create_dir(deltas.join("AA")).unwrap(),
+            _ => {}
+        }
+        let (port, tool) = both();
+        assert_runs_agree(&port, &tool, "static-delta list");
+        assert_eq!(
+            String::from_utf8_lossy(&port.stdout),
+            "(No static deltas)\n",
+            "{step}"
+        );
+    }
+
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    ostree_ok(
+        &repo,
+        &["static-delta", "generate", "--from", &c1, "--to", &c2],
+    );
+    let to1 = Checksum::from_hex(&c1).unwrap();
+    let to2 = Checksum::from_hex(&c2).unwrap();
+    let entry = |from: Option<&Checksum>, to: &Checksum| {
+        let path = repo.join(ostrya::static_delta_relative_dir(from, to));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    };
+    std::fs::create_dir(entry(None, &to2)).unwrap();
+    let part_only = entry(Some(&to2), &to1);
+    std::fs::create_dir(&part_only).unwrap();
+    std::fs::write(part_only.join("0"), b"part").unwrap();
+    std::fs::write(entry(Some(&to1), &to1), b"file").unwrap();
+    let dangling = entry(Some(&to2), &to2);
+    std::fs::create_dir(&dangling).unwrap();
+    std::os::unix::fs::symlink("nowhere", dangling.join("superblock")).unwrap();
+
+    let lines = |run: &Run| {
+        String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let (port, tool) = both();
+    port.ok();
+    assert!(tool.status.success() && tool.stderr.is_empty());
+    let mut sorted = lines(&tool);
+    sorted.sort();
+    assert_eq!(lines(&port), sorted);
+    let mut expected = vec![c1.clone(), format!("{c1}-{c2}")];
+    expected.sort();
+    assert_eq!(lines(&port), expected);
+}
+
+/// The recorded `list` divergences stand. The tool lists an entry whose name
+/// does not decode and that holds a superblock, and the port refuses it. The
+/// tool ignores an extra operand, and the port's parser refuses it.
+#[test]
+fn static_delta_list_divergences_stand_as_recorded() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-list-divergences");
+    let repo = tmp.path().join("repo");
+    ostree_ok(&repo, &["init", "--mode=archive"]);
+    let repo_arg = format!("--repo={}", repo.display());
+
+    let args = ["static-delta", repo_arg.as_str(), "list", "extra"];
+    let (port, tool) = (ostrya(&args, None, &[]), ostree(&args));
+    assert_eq!(tool.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&tool.stdout),
+        "(No static deltas)\n"
+    );
+    assert_ne!(port.status.code(), Some(0));
+    assert!(port.stdout.is_empty());
+
+    let garbage = repo.join("deltas/zz/garbage");
+    std::fs::create_dir_all(&garbage).unwrap();
+    std::fs::write(garbage.join("superblock"), b"superblock").unwrap();
+    let args = ["static-delta", repo_arg.as_str(), "list"];
+    let (port, tool) = (ostrya(&args, None, &[]), ostree(&args));
+    assert_eq!(tool.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&tool.stdout).lines().count(), 1);
+    assert_eq!(port.status.code(), Some(1));
+    assert!(port.stdout.is_empty());
+}
+
+/// What `lay_delta_tree` places in a `deltas/` tree.
+#[derive(Clone, Copy, Debug)]
+enum DeltaTreeCase {
+    /// The delta from a source commit moves out, and a symlink at its delta
+    /// path points to it.
+    LeafSymlink,
+    /// The fanout both deltas share moves out, and a symlink points to it.
+    FanoutSymlink,
+    /// A regular file directly under `deltas/`.
+    File,
+    /// A symlink to itself at a delta path.
+    LeafLoop,
+    /// A symlink to itself used as a fanout.
+    FanoutLoop,
+    /// A directory at a delta path whose `superblock` is a symlink to itself.
+    SuperblockLoop,
+    /// The whole `deltas/` directory moves out, and a symlink at `deltas`
+    /// points to it.
+    DeltasSymlink,
+    /// A symlink at `deltas` that points to nothing.
+    DeltasDangling,
+    /// A regular file at `deltas`.
+    DeltasFile,
+}
+
+/// Copy `repo`, whose `deltas/` holds a delta from scratch to `c1` and a delta
+/// from `c1` to `c2` under one fanout, to `base/<tag>/repo`, and place `case`
+/// in the copy. What a symlink points to moves to `base/<tag>/outside`, and
+/// each symlink names its target relative to itself, so two copies describe
+/// the same.
+fn lay_delta_tree(
+    base: &Path,
+    repo: &Path,
+    tag: &str,
+    case: DeltaTreeCase,
+    c1: &str,
+    c2: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(base.join(tag)).unwrap();
+    let copy = clone_repo(base, repo, &format!("{tag}/repo"));
+    let outside = base.join(tag).join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let from = Checksum::from_hex(c1).unwrap();
+    let to = Checksum::from_hex(c2).unwrap();
+    let pair = copy.join(ostrya::static_delta_relative_dir(Some(&from), &to));
+    let fanout = pair.parent().unwrap().to_owned();
+    let deltas = copy.join("deltas");
+    let symlink = |target: &str, link: &Path| std::os::unix::fs::symlink(target, link).unwrap();
+    match case {
+        DeltaTreeCase::LeafSymlink => {
+            std::fs::rename(&pair, outside.join("leaf")).unwrap();
+            symlink("../../../outside/leaf", &pair);
+        }
+        DeltaTreeCase::FanoutSymlink => {
+            std::fs::rename(&fanout, outside.join("fanout")).unwrap();
+            symlink("../../outside/fanout", &fanout);
+        }
+        DeltaTreeCase::File => std::fs::write(deltas.join("file"), b"file\n").unwrap(),
+        DeltaTreeCase::LeafLoop => symlink("loop", &fanout.join("loop")),
+        DeltaTreeCase::FanoutLoop => symlink("floop", &deltas.join("floop")),
+        DeltaTreeCase::SuperblockLoop => {
+            std::fs::create_dir(fanout.join("zz")).unwrap();
+            symlink("superblock", &fanout.join("zz/superblock"));
+        }
+        DeltaTreeCase::DeltasSymlink => {
+            std::fs::rename(&deltas, outside.join("deltas")).unwrap();
+            symlink("../outside/deltas", &deltas);
+        }
+        DeltaTreeCase::DeltasDangling => {
+            std::fs::remove_dir_all(&deltas).unwrap();
+            symlink("../outside/none", &deltas);
+        }
+        DeltaTreeCase::DeltasFile => {
+            std::fs::remove_dir_all(&deltas).unwrap();
+            std::fs::write(&deltas, b"file\n").unwrap();
+        }
+    }
+    copy
+}
+
+/// The delta names and digests in the `Static Deltas` line of the tool's
+/// `summary --view` of `repo`, sorted, since the tool writes the map in the
+/// order it walked `deltas/`. Empty where the summary carries no delta.
+fn summary_delta_entries(repo: &Path) -> Vec<String> {
+    let run = ostree(&["summary", &format!("--repo={}", repo.display()), "--view"]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let text = String::from_utf8_lossy(&run.stdout);
+    let Some(line) = text.lines().find(|line| line.starts_with("Static Deltas")) else {
+        return Vec::new();
+    };
+    let map = line.split_once(": {").unwrap().1.trim_end_matches('}');
+    let mut entries: Vec<String> = map.split(">, ").map(str::to_owned).collect();
+    for entry in &mut entries {
+        if !entry.ends_with('>') {
+            entry.push('>');
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// `list`, `reindex`, and `summary -u` agree over a `deltas/` tree that holds
+/// a symlink, a file, or a symlink loop. A symlink at a delta path or used as
+/// a fanout is not followed, and the deltas behind it are not listed, indexed,
+/// or advertised. A regular file directly under `deltas/` and a symlink loop
+/// at a delta path or used as a fanout are skipped. A symlink at `deltas`
+/// itself is followed, and the deltas behind it are listed, indexed, and
+/// advertised. A dangling symlink at `deltas` holds no delta. A `superblock`
+/// that is a symlink loop and a regular file at `deltas` refuse all three at
+/// exit 1. Carries
+/// `static-delta/list-skips-dir-without-superblock`.
+#[test]
+fn static_delta_scan_follows_no_symlink_like_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-scan-symlinks");
+    let base = tmp.path();
+    let (repo, c1, c2) = delta_show_repo(base, "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    ostree_ok(
+        &repo,
+        &["static-delta", "generate", "--from", &c1, "--to", &c2],
+    );
+    let _ = std::fs::remove_dir_all(repo.join("delta-indexes"));
+    let lines = |run: &Run| {
+        let mut lines: Vec<String> = String::from_utf8_lossy(&run.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        lines.sort();
+        lines
+    };
+    for case in [
+        DeltaTreeCase::LeafSymlink,
+        DeltaTreeCase::FanoutSymlink,
+        DeltaTreeCase::File,
+        DeltaTreeCase::LeafLoop,
+        DeltaTreeCase::FanoutLoop,
+        DeltaTreeCase::SuperblockLoop,
+        DeltaTreeCase::DeltasSymlink,
+        DeltaTreeCase::DeltasDangling,
+        DeltaTreeCase::DeltasFile,
+    ] {
+        let port_repo = lay_delta_tree(base, &repo, &format!("{case:?}-port"), case, &c1, &c2);
+        let tool_repo = lay_delta_tree(base, &repo, &format!("{case:?}-tool"), case, &c1, &c2);
+        let run = |args: &[&str]| {
+            let port_arg = format!("--repo={}", port_repo.display());
+            let tool_arg = format!("--repo={}", tool_repo.display());
+            let mut port_args = vec![args[0], port_arg.as_str()];
+            port_args.extend_from_slice(&args[1..]);
+            let mut tool_args = vec![args[0], tool_arg.as_str()];
+            tool_args.extend_from_slice(&args[1..]);
+            (ostrya(&port_args, None, &[]), ostree(&tool_args))
+        };
+        let (port, tool) = run(&["static-delta", "list"]);
+        assert_eq!(port.status.code(), tool.status.code(), "{case:?} list");
+        assert_eq!(lines(&port), lines(&tool), "{case:?} list");
+        if matches!(
+            case,
+            DeltaTreeCase::SuperblockLoop | DeltaTreeCase::DeltasFile
+        ) {
+            assert_eq!(tool.status.code(), Some(1), "{case:?} list");
+            for args in [&["static-delta", "reindex"][..], &["summary", "-u"]] {
+                let (port, tool) = run(args);
+                assert_eq!(port.status.code(), Some(1), "{case:?} {args:?}");
+                assert_eq!(tool.status.code(), Some(1), "{case:?} {args:?}");
+            }
+            continue;
+        }
+        assert!(tool.status.success() && tool.stderr.is_empty(), "{case:?}");
+        let (port, tool) = run(&["static-delta", "reindex"]);
+        assert_runs_agree(&port, &tool, &format!("static-delta reindex ({case:?})"));
+        let indexes = |repo: &Path| {
+            let dir = repo.join("delta-indexes");
+            dir.exists().then(|| describe_tree(&dir))
+        };
+        assert_eq!(indexes(&port_repo), indexes(&tool_repo), "{case:?} reindex");
+        let (port, tool) = run(&["summary", "-u"]);
+        assert_runs_agree(&port, &tool, &format!("summary -u ({case:?})"));
+        let entries = summary_delta_entries(&port_repo);
+        assert_eq!(
+            entries,
+            summary_delta_entries(&tool_repo),
+            "{case:?} summary"
+        );
+        let advertised = match case {
+            DeltaTreeCase::LeafSymlink => 1,
+            DeltaTreeCase::FanoutSymlink | DeltaTreeCase::DeltasDangling => 0,
+            _ => 2,
+        };
+        assert_eq!(entries.len(), advertised, "{case:?} summary");
+    }
+}
+
+/// The static-delta sweep of a prune agrees over a `deltas/` tree that holds a
+/// symlink, a file, or a symlink loop: it follows no symlink at a delta path or
+/// at a fanout, and it skips a regular file directly under `deltas/`, so the
+/// deltas behind a symlink stay and the run exits 0. A symlink at `deltas`
+/// itself is followed, and the delta behind it is removed. A dangling symlink
+/// at `deltas` holds no delta, and the run exits 0.
+#[test]
+fn prune_static_delta_sweep_follows_no_symlink_like_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-delta-symlinks");
+    let base = tmp.path();
+    let (repo, c1, c2) = delta_show_repo(base, "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    ostree_ok(
+        &repo,
+        &["static-delta", "generate", "--from", &c1, "--to", &c2],
+    );
+    let delete = format!("--delete-commit={c2}");
+    for case in [
+        DeltaTreeCase::LeafSymlink,
+        DeltaTreeCase::FanoutSymlink,
+        DeltaTreeCase::File,
+        DeltaTreeCase::LeafLoop,
+        DeltaTreeCase::FanoutLoop,
+        DeltaTreeCase::DeltasSymlink,
+        DeltaTreeCase::DeltasDangling,
+    ] {
+        let port_repo = lay_delta_tree(base, &repo, &format!("{case:?}-port"), case, &c1, &c2);
+        let tool_repo = lay_delta_tree(base, &repo, &format!("{case:?}-tool"), case, &c1, &c2);
+        let port_arg = format!("--repo={}", port_repo.display());
+        let tool_arg = format!("--repo={}", tool_repo.display());
+        let args = |repo_arg| ["prune", repo_arg, "--static-deltas-only", delete.as_str()];
+        let port = ostrya(&args(port_arg.as_str()), None, &PRUNE_ENV);
+        let tool = ostree_env(&args(tool_arg.as_str()), &PRUNE_ENV);
+        assert_runs_agree(&port, &tool, &format!("prune ({case:?})"));
+        port.ok();
+        for dir in ["repo/deltas", "outside"] {
+            let at = |repo: &Path| {
+                let path = repo.parent().unwrap().join(dir);
+                match std::fs::read_link(&path) {
+                    Ok(target) => vec![format!("symlink -> {}", target.display())],
+                    Err(_) => describe_tree(&path),
+                }
+            };
+            assert_eq!(at(&port_repo), at(&tool_repo), "{case:?} {dir}");
+        }
+        if matches!(case, DeltaTreeCase::DeltasSymlink) {
+            let deltas = port_repo.join("deltas");
+            assert!(deltas.join(scratch_dir(&c1)).join("superblock").exists());
+            assert!(!deltas.join(pair_dir(&c1, &c2)).exists());
+        }
+    }
+}
+
+/// The path of the delta to `to` from scratch below `deltas/`.
+fn scratch_dir(to: &str) -> PathBuf {
+    let to = Checksum::from_hex(to).unwrap();
+    let dir = ostrya::static_delta_relative_dir(None, &to);
+    PathBuf::from(dir.strip_prefix("deltas/").unwrap())
+}
+
+/// The path of the delta from `from` to `to` below `deltas/`.
+fn pair_dir(from: &str, to: &str) -> PathBuf {
+    let from = Checksum::from_hex(from).unwrap();
+    let to = Checksum::from_hex(to).unwrap();
+    let dir = ostrya::static_delta_relative_dir(Some(&from), &to);
+    PathBuf::from(dir.strip_prefix("deltas/").unwrap())
+}
+
+/// `delete` agrees where `deltas` is a symlink. A symlink at `deltas` is
+/// followed, the delta behind it is removed, and the link stays. A dangling
+/// symlink at `deltas` holds no delta, and both refuse at exit 1.
+#[test]
+fn static_delta_delete_follows_a_deltas_symlink_like_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-delete-deltas-symlink");
+    let base = tmp.path();
+    let (repo, c1, c2) = delta_show_repo(base, "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    ostree_ok(
+        &repo,
+        &["static-delta", "generate", "--from", &c1, "--to", &c2],
+    );
+    let name = format!("{c1}-{c2}");
+    for case in [DeltaTreeCase::DeltasSymlink, DeltaTreeCase::DeltasDangling] {
+        let port_repo = lay_delta_tree(base, &repo, &format!("{case:?}-port"), case, &c1, &c2);
+        let tool_repo = lay_delta_tree(base, &repo, &format!("{case:?}-tool"), case, &c1, &c2);
+        let (port, tool) = run_delta_delete(&port_repo, &tool_repo, &[&name]);
+        assert_eq!(port.status.code(), tool.status.code(), "{case:?}");
+        let outside = |repo: &Path| describe_tree(&repo.parent().unwrap().join("outside"));
+        assert_eq!(outside(&port_repo), outside(&tool_repo), "{case:?}");
+        for repo in [&port_repo, &tool_repo] {
+            assert!(repo.join("deltas").symlink_metadata().unwrap().is_symlink());
+        }
+        if matches!(case, DeltaTreeCase::DeltasSymlink) {
+            port.ok();
+            let deltas = port_repo.join("deltas");
+            assert!(deltas.join(scratch_dir(&c1)).join("superblock").exists());
+            assert!(!deltas.join(pair_dir(&c1, &c2)).exists());
+        } else {
+            assert_eq!(tool.status.code(), Some(1), "{case:?}");
+        }
+    }
+}
+
 /// Run `static-delta delete` with `args` against each implementation's own
 /// repository, the repository in the `=` form the tool reads.
 fn run_delta_delete(port_repo: &Path, tool_repo: &Path, args: &[&str]) -> (Run, Run) {

@@ -1755,7 +1755,11 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
 async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaCommand) -> Result<()> {
     match command {
         StaticDeltaCommand::List => {
-            for name in repo.list_static_deltas().await? {
+            let names = repo.list_static_deltas().await?;
+            if names.is_empty() {
+                println!("(No static deltas)");
+            }
+            for name in names {
                 println!("{name}");
             }
             Ok(())

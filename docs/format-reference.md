@@ -5679,8 +5679,9 @@ reads such a file as an empty document and the port refuses it, which
 ### `static-delta`
 
 `static-delta show DELTA` reports one delta's superblock and what each of its
-parts holds. `static-delta indexes` lists the `delta-indexes/` cache. Both read
-and write nothing else. `static-delta delete DELTA` removes one delta.
+parts holds. `static-delta list` lists the deltas under `deltas/`, and
+`static-delta indexes` lists the `delta-indexes/` cache. The three read and
+write nothing else. `static-delta delete DELTA` removes one delta.
 `static-delta verify DELTA [KEY-ID...]` checks the signatures of one delta's
 superblock and writes nothing. The repository resolves before the argument is
 read, so `Command requires a --repo argument` stands ahead of a missing
@@ -5844,6 +5845,50 @@ port lists a name only where it decodes as a checksum.
 `error: opendirat: Not a directory`, and the port `error: i/o error: Not a
 directory (os error 20)`. A fanout that does not open refuses at exit 1 in both.
 
+#### `list`
+
+`list` prints the name of each delta, one per line: the target commit in full
+hex for a delta from scratch, and `<from-hex>-<to-hex>` for a delta from a
+source commit. With none it prints `(No static deltas)` at exit 0, also where
+`deltas/` is absent and where a fanout directory is empty.
+
+An entry `deltas/<fanout>/<rest>` is a delta when `<fanout>` and `<rest>` are
+directories and `<rest>/superblock` resolves. No symlink at `<fanout>` or at
+`<rest>` is followed, and a symlink at `superblock` is followed. The superblock
+is not read, so an empty file or a directory named `superblock` counts. Every
+other entry is skipped: an empty directory, a directory that holds parts and no
+superblock, a regular file, a directory whose `superblock` is a dangling
+symlink, and a symlink at `<fanout>` or at `<rest>`, also where it points to a
+directory that holds deltas or where it is a loop. A regular file directly
+under `deltas/` is skipped too. A symlink at `deltas` itself is followed, also
+where it points to a directory outside the repository, and a dangling symlink
+at `deltas` holds no delta. `show`, `verify`, `delete`, and `generate` follow
+it too, and `generate` writes the new delta below its target. A `superblock`
+that is a symlink loop refuses at exit 1: the tool reports `error:
+fstatat(<rest>/superblock): Too many levels of symbolic links`, and the port
+`error: i/o error: Too many levels of symbolic links (os error 40)`. An entry
+that cannot be searched refuses at exit 1: the tool reports `error:
+fstatat(<rest>/superblock): Permission denied`, and the port `error: i/o error:
+Permission denied (os error 13)`. `deltas` that is a regular file refuses at
+exit 1: the tool reports `error: opendirat: Not a directory`, and the port
+`error: i/o error: Not a directory (os error 20)`.
+
+The two implementations differ in two rules:
+
+- The tool prints the names in the order the directories return them, and the
+  port sorts them.
+- A name that does not decode, where the entry holds a superblock, is listed by
+  the tool from a lenient decode, with bytes the name does not determine. The
+  port refuses the listing at exit 1. Where such an entry holds no superblock,
+  both skip it.
+
+The same rule selects the deltas that `reindex`, a summary's
+`ostree.static-deltas` map, and a prune read. A prune leaves a delta directory
+that holds no superblock, also where its commit is the one the prune deletes,
+and it leaves the deltas behind a symlink at `<fanout>` or at `<rest>`, which
+is what the tool's prune leaves. A prune follows a symlink at `deltas` and
+removes the deltas behind it that it selects. The link stays.
+
 #### `delete`
 
 `delete` takes a delta name alone. The name rules above apply, and an argument
@@ -5866,12 +5911,13 @@ directory with no search permission is removed, and a directory with no search
 permission that holds an entry fails the removal, as does a directory with no
 read permission.
 
-No symlink below the path is followed. A symlink in the fanout position is
-followed, as for every other read of the path. The fanout directory stays, also
-where it becomes empty. `delta-indexes/` and `summary` stay as they are, so they
-can still name the removed delta and `indexes` still lists its target. A
-`reindex` and a new summary refresh them. `delete` writes nothing to either
-stream, and takes no repository lock.
+No symlink below the path is followed. A symlink in the fanout position and a
+symlink at `deltas` are followed, as for every other read of the path, so the
+delta behind a symlink at `deltas` is removed and the link stays. The fanout
+directory stays, also where it becomes empty. `delta-indexes/` and `summary`
+stay as they are, so they can still name the removed delta and `indexes` still
+lists its target. A `reindex` and a new summary refresh them. `delete` writes
+nothing to either stream, and takes no repository lock.
 
 A removal that fails stops where it failed and leaves the entries it did not
 reach. The tool reports `error: fstatat(<path>): <reason>` for a failed

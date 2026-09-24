@@ -25,7 +25,7 @@ use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
     DeltaSuperblock, DummyVerifier, Ed25519Signer, Ed25519Verifier, Error, MutableTree, Repo,
-    RepoMode, SummaryOptions, TreeEntry, base64,
+    RepoMode, SummaryOptions, TreeEntry, base64, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -741,6 +741,81 @@ fn reindexing_removes_the_index_of_a_deleted_delta() {
         !listed.contains(&c1.to_hex().as_str()),
         "the tool still lists the deleted delta:\n{indexes}"
     );
+}
+
+#[test]
+fn reindexing_skips_a_malformed_directory_without_a_superblock() {
+    let tmp = TmpDir::new("gen-reindex-malformed");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"indexed\n").unwrap();
+
+    let src = base.join("src");
+    let commit = block_on(async {
+        let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, &tree, None).await;
+        repo.generate_static_delta(None, &commit, &DeltaOptions::default())
+            .await
+            .unwrap();
+        std::fs::create_dir_all(src.join("deltas/zz/garbage")).unwrap();
+        repo.reindex_static_deltas().await.unwrap();
+        commit
+    });
+    assert_eq!(index_files(&src), vec![index_path(&src, &commit)]);
+}
+
+#[test]
+fn reindexing_follows_no_symlink_and_skips_a_file_in_the_tree() {
+    let tmp = TmpDir::new("gen-reindex-symlinks");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"one\n").unwrap();
+
+    let src = base.join("src");
+    let outside = base.join("outside");
+    block_on(async {
+        let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let c1 = commit_tree(&repo, &tree, None).await;
+        std::fs::write(tree.join("a.txt"), b"two\n").unwrap();
+        let c2 = commit_tree(&repo, &tree, Some(c1)).await;
+        for (from, to) in [(None, &c1), (Some(&c1), &c2)] {
+            repo.generate_static_delta(from, to, &DeltaOptions::default())
+                .await
+                .unwrap();
+        }
+        std::fs::create_dir(&outside).unwrap();
+
+        // The delta from scratch moves behind a symlink at its delta path.
+        let scratch = src.join(static_delta_relative_dir(None, &c1));
+        std::fs::rename(&scratch, outside.join("leaf")).unwrap();
+        std::os::unix::fs::symlink(outside.join("leaf"), &scratch).unwrap();
+        std::fs::write(src.join("deltas/file"), b"file").unwrap();
+        repo.reindex_static_deltas().await.unwrap();
+        assert_eq!(
+            index_files(&src),
+            vec![index_path(&src, &c2)],
+            "only the delta at a real directory is indexed"
+        );
+
+        // The fanout both deltas share moves behind a symlink.
+        std::fs::remove_file(&scratch).unwrap();
+        std::fs::rename(outside.join("leaf"), &scratch).unwrap();
+        let fanout = scratch.parent().unwrap();
+        std::fs::rename(fanout, outside.join("fanout")).unwrap();
+        std::os::unix::fs::symlink(outside.join("fanout"), fanout).unwrap();
+        repo.reindex_static_deltas().await.unwrap();
+        assert_eq!(
+            index_files(&src),
+            Vec::<PathBuf>::new(),
+            "no delta behind a symlinked fanout is indexed"
+        );
+    });
 }
 
 #[test]

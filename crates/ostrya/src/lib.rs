@@ -110,13 +110,15 @@
 //! (agent-held and hardware-token keys included), and turns on `verify-gpg`
 //! with it. It also covers static deltas
 //! in both directions (Phase 15): [`Repo::apply_static_delta_offline`] reads a
-//! delta -- the superblock, the xz-compressed parts, and the operation stream
-//! (splice, open/close, set-read-source, rollsum write, and bspatch) -- and
+//! delta -- the superblock, the xz-compressed parts, from part files or carried
+//! inline in the superblock, and the operation stream (splice, open/close,
+//! set-read-source, rollsum write, and bspatch) -- and
 //! produces the target commit's objects, asserting each checksum as written,
 //! while [`Repo::generate_static_delta`] writes one, choosing per object
 //! between a splice, a rollsum copy-from-source stream, a bspatch stream, and
-//! a loose fallback, and signs the superblock through [`DeltaOptions::signers`]
-//! before it writes it. [`Repo::sign_static_delta`] wraps a superblock in the
+//! a loose fallback, writes the parts to files or inline, in either byte
+//! order, and signs the superblock through [`DeltaOptions::signers`] before it
+//! writes it. [`Repo::sign_static_delta`] wraps a superblock in the
 //! signed envelope, [`Repo::verify_static_delta`] checks those signatures with
 //! the signing engines over the raw superblock bytes,
 //! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache,

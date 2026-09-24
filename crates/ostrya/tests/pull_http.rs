@@ -34,9 +34,9 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState, CreateOptions,
-    DeltaOptions, DetachedMetadataFilter, Ed25519Signer, Error, FilterResult, FsckOptions,
-    MutableTree, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions,
-    TimestampCheck, TreeEntry, Type, Value,
+    DeltaEndianness, DeltaOptions, DetachedMetadataFilter, Ed25519Signer, Error, FilterResult,
+    FsckOptions, MutableTree, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode,
+    SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 
@@ -3440,6 +3440,257 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
                 "{mode:?}"
             );
         }
+    });
+}
+
+/// The part requests among `seen`: a path under `deltas/` whose last
+/// component is a part number.
+fn part_requests(seen: &[String]) -> Vec<String> {
+    seen.iter()
+        .filter(|path| path.starts_with("deltas/"))
+        .filter(|path| {
+            path.rsplit('/')
+                .next()
+                .is_some_and(|name| name.parse::<usize>().is_ok())
+        })
+        .cloned()
+        .collect()
+}
+
+/// A pull applies the tool's inline deltas with no part request: a
+/// from-scratch one whose part is past the heap threshold, then a from-to one
+/// written under `--set-endianness=B`. The superblock is the one delta request
+/// each time, and no content object is fetched loose.
+#[test]
+fn a_tool_inline_delta_is_pulled_without_a_part_request() {
+    if !ostree_available() {
+        eprintln!("skipping: the ostree tool is not installed");
+        return;
+    }
+    block_on(async {
+        let dir = TmpDir::new("pull-http-inline-tool");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        let mut bulk = incompressible(256 * 1024);
+        std::fs::write(src.join("bulk.bin"), &bulk).unwrap();
+        let remote = dir.path().join("remote");
+        let remote_arg = format!("--repo={}", remote.display());
+        let tree_arg = format!("--tree=dir={}", src.display());
+        ostree(&[&remote_arg, "init", "--mode=archive"]);
+        let commit = |ts: &str| {
+            String::from_utf8(ostree(&[
+                &remote_arg,
+                "commit",
+                "-b",
+                "test/main",
+                &format!("--timestamp={ts}"),
+                &tree_arg,
+            ]))
+            .unwrap()
+            .trim()
+            .to_owned()
+        };
+        let c1 = commit("2020-01-01 00:00:00 +0000");
+        ostree(&[
+            &remote_arg,
+            "static-delta",
+            "generate",
+            "--inline",
+            "--empty",
+            &format!("--to={c1}"),
+        ]);
+
+        let server = RepoServer::start(&remote, false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        let pull = PullOptions {
+            refs: vec!["test/main".to_owned()],
+            ..PullOptions::default()
+        };
+        dest.pull("origin", pull.clone()).await.unwrap();
+        let seen = server.seen();
+        assert!(
+            seen.iter().any(|path| path.ends_with("/superblock")),
+            "the pull took the delta: {seen:?}"
+        );
+        assert_eq!(part_requests(&seen), Vec::<String>::new());
+        assert!(
+            !seen.iter().any(|path| path.ends_with(".filez")),
+            "{seen:?}"
+        );
+        let c1 = Checksum::from_hex(&c1).unwrap();
+        assert_eq!(dest.commit_state(&c1).await.unwrap(), CommitState::Normal);
+
+        bulk[128 * 1024..128 * 1024 + 4].copy_from_slice(b"edit");
+        std::fs::write(src.join("bulk.bin"), &bulk).unwrap();
+        let c2 = commit("2020-01-02 00:00:00 +0000");
+        ostree(&[
+            &remote_arg,
+            "static-delta",
+            "generate",
+            "--inline",
+            "--set-endianness=B",
+            &format!("--from={}", c1.to_hex()),
+            &format!("--to={c2}"),
+        ]);
+        server.forget();
+        dest.pull("origin", pull).await.unwrap();
+        let seen = server.seen();
+        assert!(
+            seen.iter().any(|path| path.ends_with("/superblock")),
+            "the pull took the delta: {seen:?}"
+        );
+        assert_eq!(part_requests(&seen), Vec::<String>::new());
+        let c2 = Checksum::from_hex(&c2).unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(c2)
+        );
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        ostree(&[
+            &format!("--repo={}", dir.path().join("dest").display()),
+            "fsck",
+        ]);
+    });
+}
+
+/// A pull applies a port-written inline delta whose size fields are
+/// big-endian, with no part request.
+#[test]
+fn a_big_endian_inline_delta_is_pulled() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-inline-big");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        std::fs::write(src.join("bulk.bin"), incompressible(256 * 1024)).unwrap();
+        let remote_path = dir.path().join("remote");
+        let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let tip = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        remote
+            .generate_static_delta(
+                None,
+                &tip,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    inline: true,
+                    endianness: DeltaEndianness::Big,
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let server = RepoServer::start(&remote_path, false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let seen = server.seen();
+        assert!(
+            seen.iter().any(|path| path.ends_with("/superblock")),
+            "the pull took the delta: {seen:?}"
+        );
+        assert_eq!(part_requests(&seen), Vec::<String>::new());
+        assert!(
+            !seen.iter().any(|path| path.ends_with(".filez")),
+            "{seen:?}"
+        );
+        assert_eq!(dest.commit_state(&tip).await.unwrap(), CommitState::Normal);
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// The superblock type string, for a test that rewrites a superblock.
+const SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))";
+
+/// An inline part whose bytes were changed fails the pull at discovery, before
+/// any part request, and the pull publishes nothing. The superblock carries its
+/// last part inline and the parts before it as files, so a check made when
+/// the inline part is applied, and not at discovery, would let the part files
+/// be requested first. The remote serves no summary, so no advertised digest
+/// catches the superblock first.
+#[test]
+fn a_tampered_inline_part_fails_discovery_before_any_part_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-inline-tamper");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        std::fs::write(src.join("one.bin"), incompressible(64 * 1024)).unwrap();
+        std::fs::write(src.join("two.bin"), incompressible(96 * 1024)).unwrap();
+        let remote_path = dir.path().join("remote");
+        let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let tip = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        let relative = remote
+            .generate_static_delta(
+                None,
+                &tip,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    min_fallback_size: 0,
+                    max_chunk_size: 48 * 1024,
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let superblock_path = format!("{}/superblock", relative.display());
+        let ty = Type::parse(SUPERBLOCK_SIG).unwrap();
+        let Value::Tuple(mut fields) = ostrya::from_bytes(
+            &ty,
+            &std::fs::read(remote_path.join(&superblock_path)).unwrap(),
+        )
+        .unwrap() else {
+            panic!("a superblock is a tuple");
+        };
+        let parts = fields[6].as_array().unwrap().len();
+        assert!(parts >= 2, "{parts} parts");
+        // The last part goes inline with one body byte changed. Its file stays,
+        // and the inline part is what a reader takes.
+        let last = parts - 1;
+        let mut part = std::fs::read(remote_path.join(&relative).join(last.to_string())).unwrap();
+        let middle = part.len() / 2;
+        part[middle] ^= 0xff;
+        let Value::Array(dict) = &mut fields[0] else {
+            panic!("the superblock metadata is a dict");
+        };
+        dict.push(Value::Tuple(vec![
+            Value::Str(format!("{}/{last}", relative.display())),
+            Value::variant(
+                Type::parse("(yay)").unwrap(),
+                Value::Tuple(vec![Value::Byte(part[0]), Value::Bytes(part[1..].to_vec())]),
+            ),
+        ]));
+        let superblock = ostrya_core::to_bytes(&ty, &Value::Tuple(fields)).unwrap();
+
+        let server = RepoServer::start(&remote_path, false).await;
+        server.tamper(&superblock_path, superblock);
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("part checksum mismatch"), "{err}");
+        assert_nothing_published(&dest).await;
+        let seen = server.seen();
+        assert!(
+            seen.iter().any(|path| path.ends_with("/superblock")),
+            "the pull took the delta: {seen:?}"
+        );
+        assert_eq!(part_requests(&seen), Vec::<String>::new());
     });
 }
 

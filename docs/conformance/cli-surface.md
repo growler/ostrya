@@ -2146,8 +2146,18 @@ a delta name or the path of a superblock file, `delete` takes a delta name
 alone, `list` lists the deltas under `deltas/`, and `indexes` lists the
 `delta-indexes/` cache (`../format-reference.md`, "CLI output formats",
 `static-delta`). `verify` takes `spki` in a build that carries the engine, the
-sign-type rule this section states for `commit --sign-type`. Twenty-six
-differences stand on `show`, `delete`, `list`, `indexes`, and `verify`.
+sign-type rule this section states for `commit --sign-type`. Twenty-seven
+differences stand on `show`, `delete`, `list`, `indexes`, `verify`, and
+`apply-offline`.
+
+- a superblock file over 128 MiB (134217728 bytes). The port refuses it in
+  `show`, `verify`, and `apply-offline`, and a pull refuses the fetched
+  superblock, with `error: i/o error: static delta file <path> exceeds the
+  size ceiling` or the fetcher's size refusal. The tool has no such ceiling:
+  it writes a 140,007,544-byte superblock with `--inline` and applies it
+  offline at exit 0. Only an inline delta whose parts add up to more than 128
+  MiB reaches the ceiling. The ceiling is the bound the port holds for
+  metadata that it reads whole;
 
 - a part that fails its checksum or passes its declared size. The port refuses
   it at exit 1 after the `PartMeta<i>` line, before it decompresses a byte of
@@ -2304,7 +2314,33 @@ differences stand on `show`, `delete`, `list`, `indexes`, and `verify`.
   `error: gvariant:` sentence at exit 1. Only a publisher's own bytes reach the last
   case.
 
-`static-delta generate` carries fourteen differences. Two of them are open.
+`static-delta generate` accepts `--inline`, `--set-endianness=l|B`, and
+`--swap-endianness`, which take the tool's rules (`../format-reference.md`,
+"CLI output formats", `static-delta`). The byte order starts from the host
+order, as in the tool. Only a little-endian host is observed.
+
+`static-delta generate` carries sixteen differences. Two of them are open.
+
+- an inline superblock over the 128 MiB ceiling. The port refuses at exit 1
+  after the block, with one of two messages. The inline parts share the
+  ceiling with the embedded commit, 33 bytes for each object, and 49 bytes for
+  each fallback. The part that passes what they leave is refused with `error:
+  invalid format: static delta inline parts pass the 134217728-byte
+  superblock ceiling`. Where the parts fit and the framing, the detached
+  metadata copy, or a signature takes the serialized superblock past the
+  ceiling, the refusal is `error: invalid format: static delta superblock is
+  <n> bytes, over the 134217728-byte ceiling`. The port writes no file on
+  either path, and a delta that an earlier run wrote at the same location
+  stays as it was. The tool writes the superblock, 140,007,544 bytes for one
+  140 MB file, and applies it;
+- the part files an earlier delta left at the repository location. The tool
+  never removes a part file when it writes a delta again: a 13-part delta
+  written again with `--inline` keeps `0` to `12` beside the new superblock,
+  and one written again as 3 parts keeps `3` to `12`. The port removes every
+  numbered part file the new superblock does not name, all of them under
+  `--inline`. A reader takes the parts the superblock names, so the objects a
+  delta delivers are the same. Under `--filename` and `--output-dir` neither
+  removes a file;
 
 - the `usize` of a part's meta entry. This difference is open. The port's
   generator counts the target length of each symlink the part carries, and the
@@ -2326,7 +2362,12 @@ differences stand on `show`, `delete`, `list`, `indexes`, and `verify`.
 - a size value outside whole decimal digits, and a value whose byte count is
   past `u64::MAX`. The tool reads `abc` as 0 and accepts `1.5`, `-1`, ` 3`,
   `+3`, and `3x`. `clap` refuses each with `error: invalid value` at exit 1,
-  before the repository reads, and nothing is written;
+  before the repository reads, and nothing is written. `clap` reads every
+  option value before the port checks `--set-endianness`, so
+  `--set-endianness=q --max-chunk-size=abc` gets the `clap` refusal where the
+  tool writes `error: Invalid endianness 'q'`. An unknown `--sign-type` beside
+  an invalid endianness value takes the same order. Both exit 1 and write
+  nothing;
 - `--max-chunk-size=0`. The tool writes one object in each part and exits 0.
   The port refuses at exit 1 after the block with `error: invalid format:
   static delta max chunk size must be positive`, and writes nothing;
@@ -2370,7 +2411,8 @@ differences stand on `show`, `delete`, `list`, `indexes`, and `verify`.
   location that holds one, both keep the earlier superblock, and the tool
   also rewrites the parts. A `--sign-type=gpg` key, which the tool does not
   carry, fails in the port after the parts, and at the repository's own
-  location it also removes the earlier superblock;
+  location it also removes the earlier superblock. Under `--inline` the port
+  writes no part, so the earlier superblock and its parts stay;
 - an unknown `--sign-type`. The tool ignores it where no key is given, and
   refuses it with `error: Requested signature type is not implemented` after
   the parts are written where a key is given. `clap` refuses it at exit 1

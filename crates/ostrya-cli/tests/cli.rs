@@ -31686,6 +31686,389 @@ fn static_delta_generate_sizes_are_megabytes() {
     assert!(delta_superblocks(&small).is_empty());
 }
 
+/// The superblock type string, for reading the metadata dict of a
+/// superblock file.
+const DELTA_SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))";
+
+/// The metadata dict keys of an unsigned superblock file, in dict order.
+fn superblock_keys(path: &Path) -> Vec<String> {
+    let bytes = std::fs::read(path).unwrap();
+    let value = ostrya::from_bytes(&Type::parse(DELTA_SUPERBLOCK_SIG).unwrap(), &bytes).unwrap();
+    value.as_tuple().unwrap()[0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_tuple().unwrap()[0].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// The `ostree.endianness` byte of a superblock file, and its parsed form.
+fn superblock_endianness(path: &Path) -> (u8, ostrya::DeltaSuperblock) {
+    let bytes = std::fs::read(path).unwrap();
+    let value = ostrya::from_bytes(&Type::parse(DELTA_SUPERBLOCK_SIG).unwrap(), &bytes).unwrap();
+    let byte = value.as_tuple().unwrap()[0]
+        .dict_get("ostree.endianness")
+        .and_then(Value::as_variant)
+        .and_then(|(_, byte)| byte.as_byte())
+        .unwrap();
+    (byte, ostrya::DeltaSuperblock::parse(bytes).unwrap())
+}
+
+/// The `PartPayload` lines the port's `show` prints for a delta.
+fn port_part_payloads(repo: &Path, arg: &str) -> Vec<String> {
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = ostrya(&["static-delta", &repo_arg, "show", arg], None, &[]);
+    run.ok();
+    String::from_utf8_lossy(&run.stdout)
+        .lines()
+        .filter(|line| line.starts_with("PartPayload"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `ls -R` of a commit in `repo`, through the tool.
+fn tool_listing(repo: &Path, commit: &str) -> String {
+    ostree_ok(repo, &["ls", "-R", "-C", commit])
+}
+
+/// `--inline` agrees: both print the block, neither writes a part file, the
+/// metadata keys are the same in the same order, and the port's `show` reads
+/// the parts of both superblocks. Each implementation
+/// applies the other's inline delta and the trees agree. Under `--filename`
+/// the key stays repository-relative and no part file is written beside PATH.
+/// Carries `static-delta/generate-inline`.
+#[test]
+fn static_delta_generate_inline_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-generate-inline");
+    let base = tmp.path();
+    let (repo, c1, c2) = delta_show_repo(base, "repo");
+    let port_repo = clone_repo(base, &repo, "port");
+    let tool_repo = clone_repo(base, &repo, "tool");
+    let port = (base, port_repo.as_path());
+    let tool = (base, tool_repo.as_path());
+    let (from1, to2) = (
+        Checksum::from_hex(&c1).unwrap(),
+        Checksum::from_hex(&c2).unwrap(),
+    );
+    for (args, from, name) in [
+        (&["--empty", "--to=m", "--inline"][..], None, c2.clone()),
+        (&["--to=m", "--inline"], Some(&from1), format!("{c1}-{c2}")),
+    ] {
+        let (p, t) = generate_both(port, tool, args);
+        assert_runs_agree_on_stdout(&p, &t, args);
+        assert_eq!(
+            String::from_utf8_lossy(&p.stdout),
+            generate_block(from.map(|_| c1.as_str()), &c2)
+        );
+        let relative = ostrya::static_delta_relative_dir(from, &to2);
+        assert_eq!(entry_names(&port_repo.join(&relative)), ["superblock"]);
+        assert_eq!(entry_names(&tool_repo.join(&relative)), ["superblock"]);
+        let keys = superblock_keys(&port_repo.join(&relative).join("superblock"));
+        assert_eq!(
+            keys,
+            superblock_keys(&tool_repo.join(&relative).join("superblock"))
+        );
+        assert_eq!(keys[1], format!("{}/0", relative));
+        // The port reads the inline parts of both. The operand offsets of the
+        // two generators differ, so the part count is compared, and the
+        // operation counts where both splice alone.
+        let (port_lines, tool_lines) = (
+            port_part_payloads(&port_repo, &name),
+            port_part_payloads(&tool_repo, &name),
+        );
+        assert_eq!(port_lines.len(), tool_lines.len(), "{args:?}");
+        if from.is_none() {
+            let ops = |lines: &[String]| {
+                lines
+                    .iter()
+                    .filter(|line| line.starts_with("PartPayloadOps"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ops(&port_lines), ops(&tool_lines));
+        }
+    }
+
+    // Cross-apply the from-scratch deltas into fresh archive repositories.
+    let scratch = ostrya::static_delta_relative_dir(None, &to2);
+    let into_port = base.join("into-port");
+    let into_tool = base.join("into-tool");
+    ostree_ok(&into_port, &["init", "--mode=archive"]);
+    ostree_ok(&into_tool, &["init", "--mode=archive"]);
+    ostree_ok(
+        &into_tool,
+        &[
+            "static-delta",
+            "apply-offline",
+            port_repo.join(&scratch).to_str().unwrap(),
+        ],
+    );
+    let into_port_arg = format!("--repo={}", into_port.display());
+    ostrya(
+        &[
+            "static-delta",
+            &into_port_arg,
+            "apply-offline",
+            tool_repo.join(&scratch).to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    ostree_ok(&into_port, &["fsck"]);
+    ostree_ok(&into_tool, &["fsck"]);
+    assert_eq!(tool_listing(&into_port, &c2), tool_listing(&into_tool, &c2));
+
+    let port_cwd = base.join("port-cwd");
+    let tool_cwd = base.join("tool-cwd");
+    for cwd in [&port_cwd, &tool_cwd] {
+        std::fs::create_dir_all(cwd.join("out")).unwrap();
+    }
+    let args = ["--empty", "--to=m", "--inline", "--filename=out/sb"];
+    let (p, t) = generate_both(
+        (port_cwd.as_path(), port_repo.as_path()),
+        (tool_cwd.as_path(), tool_repo.as_path()),
+        &args,
+    );
+    assert_runs_agree_on_stdout(&p, &t, &args);
+    assert_eq!(entry_names(&port_cwd.join("out")), ["sb"]);
+    assert_eq!(entry_names(&tool_cwd.join("out")), ["sb"]);
+    let keys = superblock_keys(&port_cwd.join("out/sb"));
+    assert_eq!(keys, superblock_keys(&tool_cwd.join("out/sb")));
+    assert_eq!(keys[1], format!("{scratch}/0"));
+}
+
+/// Both runs succeed with the same standard output.
+fn assert_runs_agree_on_stdout(port: &Run, tool: &Run, args: &[&str]) {
+    for (who, run) in [("port", port), ("tool", tool)] {
+        assert!(
+            run.status.success(),
+            "the {who} failed {args:?}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+    assert_eq!(port.stdout, tool.stdout, "{args:?}");
+}
+
+/// The endianness options agree over eight forms: the byte both write, the
+/// sizes read back through it, and the part file, which the byte leaves
+/// unchanged. The last `--set-endianness` wins, the flag order does not
+/// matter, and a repeated `--swap-endianness` swaps once. Carries
+/// `static-delta/generate-set-endianness-big` and
+/// `static-delta/generate-swap-endianness`.
+#[test]
+fn static_delta_generate_endianness_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-generate-endianness");
+    let base = tmp.path();
+    let (repo, c) = delta_fallback_repo(base, "repo", false);
+    let port_repo = clone_repo(base, &repo, "port");
+    let tool_repo = clone_repo(base, &repo, "tool");
+    let port = (base, port_repo.as_path());
+    let tool = (base, tool_repo.as_path());
+    let relative = ostrya::static_delta_relative_dir(None, &Checksum::from_hex(&c).unwrap());
+    let to = format!("--to={c}");
+    // The host of these runs is little-endian.
+    let cases: [(&[&str], u8); 8] = [
+        (&[], b'l'),
+        (&["--swap-endianness"], b'B'),
+        (&["--set-endianness=B", "--swap-endianness"], b'l'),
+        (&["--set-endianness=l", "--swap-endianness"], b'B'),
+        (&["--swap-endianness", "--set-endianness=B"], b'l'),
+        (&["--set-endianness=B", "--set-endianness=l"], b'l'),
+        (&["--set-endianness", "l", "--set-endianness", "B"], b'B'),
+        (&["--swap-endianness", "--swap-endianness"], b'B'),
+    ];
+    let mut reference: Option<(Vec<u64>, Vec<u8>, Vec<u8>)> = None;
+    for (extra, byte) in cases {
+        let args = [&["--empty", to.as_str()][..], extra].concat();
+        let (p, t) = generate_both(port, tool, &args);
+        assert_runs_agree_on_stdout(&p, &t, &args);
+        let mut sizes = Vec::new();
+        for r in [&port_repo, &tool_repo] {
+            let (found, sb) = superblock_endianness(&r.join(&relative).join("superblock"));
+            assert_eq!(found, byte, "{extra:?} in {}", r.display());
+            let mut these = Vec::new();
+            for part in sb.parts() {
+                these.extend([part.size(), part.uncompressed_size()]);
+            }
+            for fallback in sb.fallbacks() {
+                these.extend([fallback.size(), fallback.uncompressed_size()]);
+            }
+            sizes.push(these);
+        }
+        let parts = (
+            std::fs::read(port_repo.join(&relative).join("0")).unwrap(),
+            std::fs::read(tool_repo.join(&relative).join("0")).unwrap(),
+        );
+        match &reference {
+            None => reference = Some((sizes[0].clone(), parts.0, parts.1)),
+            Some((port_sizes, port_part, tool_part)) => {
+                assert_eq!(&sizes[0], port_sizes, "{extra:?}");
+                assert_eq!(&parts.0, port_part, "{extra:?}");
+                assert_eq!(&parts.1, tool_part, "{extra:?}");
+            }
+        }
+        // The fallback sizes agree. The part sizes are each generator's own.
+        assert_eq!(sizes[0][2..], sizes[1][2..], "{extra:?}");
+    }
+}
+
+/// A value other than `l` or `B` is refused in both at exit 1 with the same
+/// line, nothing on standard output, and nothing written. The value is
+/// checked after `-n` and after the default parent, and before the
+/// `--filename` directory. Carries
+/// `static-delta/generate-invalid-endianness-refused`.
+#[test]
+fn static_delta_generate_invalid_endianness_is_refused() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-generate-bad-endianness");
+    let base = tmp.path();
+    let (repo, c1, c2) = delta_show_repo(base, "repo");
+    let port_repo = clone_repo(base, &repo, "port");
+    let tool_repo = clone_repo(base, &repo, "tool");
+    let port = (base, port_repo.as_path());
+    let tool = (base, tool_repo.as_path());
+    for (value, extra) in [
+        ("b", None),
+        ("L", None),
+        ("", None),
+        ("little", None),
+        ("big", None),
+        ("Bx", None),
+        ("x", Some("--swap-endianness")),
+    ] {
+        let set = format!("--set-endianness={value}");
+        let mut args = vec!["--empty", "--to=m", set.as_str()];
+        args.extend(extra);
+        let (p, t) = generate_both(port, tool, &args);
+        assert_runs_agree(&p, &t, &format!("generate {args:?}"));
+        assert_eq!(p.status.code(), Some(1));
+        assert!(p.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8_lossy(&p.stderr),
+            format!("error: Invalid endianness '{value}'\n")
+        );
+    }
+    assert_eq!(listed_deltas(&port_repo), vec!["(No static deltas)"]);
+    assert_eq!(listed_deltas(&tool_repo), vec!["(No static deltas)"]);
+
+    // `-n` over a delta the repository holds exits 0 before the value.
+    let (p, t) = generate_both(port, tool, &["--to=m"]);
+    assert_runs_agree_on_stdout(&p, &t, &["--to=m"]);
+    let args = ["-n", "--to=m", "--set-endianness=q"];
+    let (p, t) = generate_both(port, tool, &args);
+    assert_runs_agree(&p, &t, &format!("generate {args:?}"));
+    assert_eq!(
+        String::from_utf8_lossy(&p.stdout),
+        format!("Delta {c1}-{c2} already exists.\n")
+    );
+
+    // A root commit with no source refuses before the value.
+    let to_c1 = format!("--to={c1}");
+    let args = [to_c1.as_str(), "--set-endianness=q"];
+    let (p, t) = generate_both(port, tool, &args);
+    assert_runs_agree(&p, &t, &format!("generate {args:?}"));
+    assert_eq!(
+        String::from_utf8_lossy(&p.stderr),
+        format!("error: Commit {c1} has no parent\n")
+    );
+
+    // The value refuses before the `--filename` directory is opened.
+    let args = [
+        "--empty",
+        "--to=m",
+        "--set-endianness=q",
+        "--filename=missing/sb",
+    ];
+    let (p, t) = generate_both(port, tool, &args);
+    assert_runs_agree(&p, &t, &format!("generate {args:?}"));
+    assert_eq!(
+        String::from_utf8_lossy(&p.stderr),
+        "error: Invalid endianness 'q'\n"
+    );
+}
+
+/// The port's `apply-offline` reads the tool's inline delta, and the objects
+/// agree with the tool's own apply. Standard output is not compared.
+#[test]
+fn static_delta_apply_offline_reads_an_inline_delta() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-apply-inline");
+    let base = tmp.path();
+    let (repo, _c1, c2) = delta_show_repo(base, "repo");
+    ostree_ok(
+        &repo,
+        &["static-delta", "generate", "--inline", "--empty", "--to=m"],
+    );
+    let dir = repo.join(ostrya::static_delta_relative_dir(
+        None,
+        &Checksum::from_hex(&c2).unwrap(),
+    ));
+    assert_eq!(entry_names(&dir), ["superblock"]);
+    let into_port = base.join("into-port");
+    let into_tool = base.join("into-tool");
+    ostree_ok(&into_port, &["init", "--mode=bare-user"]);
+    ostree_ok(&into_tool, &["init", "--mode=bare-user"]);
+    ostree_ok(
+        &into_tool,
+        &["static-delta", "apply-offline", dir.to_str().unwrap()],
+    );
+    let into_port_arg = format!("--repo={}", into_port.display());
+    ostrya(
+        &[
+            "static-delta",
+            &into_port_arg,
+            "apply-offline",
+            dir.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    ostree_ok(&into_port, &["fsck"]);
+    assert_eq!(tool_listing(&into_port, &c2), tool_listing(&into_tool, &c2));
+}
+
+/// Regenerating a delta at the repository location with `--inline`: the tool
+/// leaves the part files of the earlier delta, and the port removes them.
+/// Carries `static-delta/generate-inline-stale-parts`.
+#[test]
+fn static_delta_generate_inline_removes_stale_parts() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-generate-inline-stale");
+    let base = tmp.path();
+    let (repo, c) = delta_fallback_repo(base, "repo", true);
+    let port_repo = clone_repo(base, &repo, "port");
+    let tool_repo = clone_repo(base, &repo, "tool");
+    let port = (base, port_repo.as_path());
+    let tool = (base, tool_repo.as_path());
+    let to = format!("--to={c}");
+    let args = ["--empty", to.as_str(), "--max-chunk-size=1"];
+    let (p, t) = generate_both(port, tool, &args);
+    assert_runs_agree_on_stdout(&p, &t, &args);
+    let relative = ostrya::static_delta_relative_dir(None, &Checksum::from_hex(&c).unwrap());
+    let parts = entry_names(&tool_repo.join(&relative));
+    assert!(parts.len() > 2, "{parts:?}");
+
+    let args = ["--empty", to.as_str(), "--inline"];
+    let (p, t) = generate_both(port, tool, &args);
+    assert_runs_agree_on_stdout(&p, &t, &args);
+    assert_eq!(entry_names(&port_repo.join(&relative)), ["superblock"]);
+    assert_eq!(entry_names(&tool_repo.join(&relative)), parts);
+}
+
 // --- sign --verify and summary --verify key sources ---------------------------
 
 /// What one key-source row of `sign --verify` or `summary --verify` gives.

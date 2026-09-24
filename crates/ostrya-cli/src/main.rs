@@ -1163,6 +1163,20 @@ struct DeltaGenerateArgs {
     /// or --filename.
     #[arg(long)]
     reindex: bool,
+    /// Carry the parts in the superblock and write no part file.
+    #[arg(long)]
+    inline: bool,
+    /// The byte order of the superblock size fields, 'l' or 'B'. Given more
+    /// than once, the last value wins.
+    #[arg(
+        long = "set-endianness",
+        value_name = "ENDIAN",
+        overrides_with = "set_endianness"
+    )]
+    set_endianness: Option<String>,
+    /// Swap the byte order from the host order, or from --set-endianness.
+    #[arg(long, overrides_with = "swap_endianness")]
+    swap_endianness: bool,
 }
 
 #[derive(Args)]
@@ -2266,6 +2280,21 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
         }
     }
 
+    // The byte order starts from the host order, as the tool's does, and is
+    // checked after `-n` and the default parent and before the block.
+    let endianness = match args.set_endianness.as_deref() {
+        None if cfg!(target_endian = "big") => DeltaEndianness::Big,
+        None => DeltaEndianness::Little,
+        Some("l") => DeltaEndianness::Little,
+        Some("B") => DeltaEndianness::Big,
+        Some(other) => exit_error(&format!("Invalid endianness '{other}'")),
+    };
+    let endianness = match (args.swap_endianness, endianness) {
+        (false, endianness) => endianness,
+        (true, DeltaEndianness::Little) => DeltaEndianness::Big,
+        (true, DeltaEndianness::Big) => DeltaEndianness::Little,
+    };
+
     // The block comes before the keys are read and before anything is
     // written, as the tool prints it, so a run that fails later prints it too.
     println!("Generating static delta:");
@@ -2285,6 +2314,8 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
         output_dir: args.output_dir.clone(),
         superblock_file: args.filename.clone(),
         signers: delta_signers(&args)?,
+        inline: args.inline,
+        endianness,
     };
     repo.generate_static_delta(from.as_ref(), &to, &opts)
         .await?;

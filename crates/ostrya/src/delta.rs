@@ -92,7 +92,7 @@ pub(crate) const ENDIANNESS_KEY: &str = "ostree.endianness";
 /// The little-endian marker the `ostree.endianness` byte carries.
 pub(crate) const ENDIANNESS_LITTLE: u8 = b'l';
 /// The big-endian marker the `ostree.endianness` byte carries.
-const ENDIANNESS_BIG: u8 = b'B';
+pub(crate) const ENDIANNESS_BIG: u8 = b'B';
 
 /// No compression: the part body is the payload verbatim.
 const COMPRESSION_NONE: u8 = 0;
@@ -163,11 +163,15 @@ pub struct DeltaSuperblock {
     pub(crate) fallbacks: Vec<DeltaFallback>,
     /// The detached signatures when the delta is signed.
     pub(crate) signatures: Option<Value>,
-    /// The raw superblock bytes: the payload signatures cover.
+    /// The raw superblock bytes: the payload signatures cover. Empty for an
+    /// unsigned superblock, which no signature check reads.
     pub(crate) superblock_bytes: Vec<u8>,
     /// The leading `a{sv}`: `ostree.endianness`, a copy of the target commit's
     /// detached metadata, and any part carried inline.
     pub(crate) metadata: Value,
+    /// For each meta-entry, in part order, the position in `metadata` of the
+    /// entry that carries the part inline, from [`index_inline_parts`].
+    pub(crate) inline_index: Vec<Option<usize>>,
     /// Field 1, converted from big-endian.
     pub(crate) timestamp: u64,
     /// The byte length of field 5, the recursion `ay`.
@@ -247,13 +251,17 @@ impl DeltaFallback {
 }
 
 /// The byte order the `ostree.endianness` byte declares for the host-order
-/// fields of a superblock. A superblock carrying no such byte, or any byte
-/// other than `B`, reads as little-endian.
+/// fields of a superblock: a meta-entry's `size` and `usize`, and a fallback's
+/// two sizes. A superblock carrying no such byte, or any byte other than `B`,
+/// reads as little-endian. [`DeltaOptions::endianness`](crate::DeltaOptions)
+/// selects the order the generator writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeltaEndianness {
-    /// The byte is `l`, absent, or another value.
+    /// Read: the byte is `l`, absent, or another value. Write: the byte `l`,
+    /// and the four fields little-endian.
     Little,
-    /// The byte is `B`.
+    /// Read: the byte is `B`. Write: the byte `B`, and the four fields
+    /// big-endian.
     Big,
 }
 
@@ -311,6 +319,12 @@ impl Repo {
     /// Apply a static delta from `dir` offline, producing the target commit and
     /// its objects into the repository, and return the target commit checksum.
     ///
+    /// A part the superblock carries inline, under the metadata key
+    /// `<relative_dir>/<index>`, is read from the metadata dict, and any other
+    /// part from the file `dir/<index>`. Where both are present, the inline part
+    /// is used. An inline part is checked against the size and the checksum its
+    /// meta-entry declares before it is decompressed, as a part file is.
+    ///
     /// The delta's source objects (for parts that patch against a source commit)
     /// must already be present in the repository. Every produced object's
     /// checksum is asserted as it is written. Fallback objects the delta
@@ -318,7 +332,10 @@ impl Repo {
     /// them. The target commit's ref is not set: the caller decides that.
     pub async fn apply_static_delta_offline(&self, dir: &Path) -> Result<Checksum> {
         let sb_bytes = read_capped(dir.join("superblock")).await?;
-        let sb = DeltaSuperblock::parse(sb_bytes)?;
+        let mut sb = DeltaSuperblock::parse(sb_bytes)?;
+        // Nothing here checks a signature, so a signed superblock's payload
+        // goes before the parts are applied.
+        drop(std::mem::take(&mut sb.superblock_bytes));
 
         // Fallback objects the delta references but does not carry must already
         // be present; offline application does not fetch them. Checked up front,
@@ -346,8 +363,19 @@ impl Repo {
         // than through the checksum the content writer would miss.
         let checks = ModeChecks::new(PullFlags::empty(), self.mode());
         for (i, entry) in sb.meta_entries.iter().enumerate() {
-            let blob = decode_part(dir.join(i.to_string()), entry, &staging).await?;
-            apply_part(&txn, &blob, &entry.objects, &staging, checks).await?;
+            // A part the superblock carries inline is read from there, also
+            // where a part file of the same number is present.
+            match sb.inline_part(i)? {
+                Some((compression, body)) => {
+                    verify_inline_part(compression, body, entry)?;
+                    let payload = decode_inline_part(compression, body, &staging).await?;
+                    apply_part(&txn, payload.as_slice(), &entry.objects, &staging, checks).await?;
+                }
+                None => {
+                    let blob = decode_part(dir.join(i.to_string()), entry, &staging).await?;
+                    apply_part(&txn, blob.as_slice(), &entry.objects, &staging, checks).await?;
+                }
+            }
         }
 
         txn.commit().await?;
@@ -806,19 +834,42 @@ pub(crate) fn delta_hex_name(from: Option<&Checksum>, to: &Checksum) -> String {
 impl DeltaSuperblock {
     /// Parse a superblock file's bytes, detecting and unwrapping the signed
     /// envelope.
+    ///
+    /// The file bytes are dropped once they are decoded, and the payload of the
+    /// signed envelope moves out of the decoded envelope with no copy, so the
+    /// parse holds at most two copies of the superblock at once: the bytes and
+    /// the tree decoded from them. The signed payload is kept after the parse,
+    /// since [`verify`](DeltaSuperblock::verify) reads it. An unsigned
+    /// superblock keeps no raw bytes.
     pub fn parse(bytes: Vec<u8>) -> Result<DeltaSuperblock> {
-        let (superblock_bytes, signatures) = if bytes.starts_with(SIGNED_MAGIC) {
+        let (payload, signatures) = if bytes.starts_with(SIGNED_MAGIC) {
             let ty = Type::parse(SIGNED_SIG).map_err(ostrya_core::Error::from)?;
             let value = from_bytes(&ty, &bytes).map_err(ostrya_core::Error::from)?;
+            drop(bytes);
             let fields = tuple(&value)?;
-            let inner = bytes_field(&fields[1], "signed superblock payload")?.to_vec();
-            (inner, Some(fields[2].clone()))
+            bytes_field(&fields[1], "signed superblock payload")?;
+            let Value::Tuple(mut owned) = value else {
+                unreachable!("`tuple` accepted the envelope as a tuple");
+            };
+            let signatures = owned.swap_remove(2);
+            let Value::Bytes(inner) = owned.swap_remove(1) else {
+                unreachable!("`bytes_field` accepted the payload as bytes");
+            };
+            (inner, Some(signatures))
         } else {
             (bytes, None)
         };
 
         let ty = Type::parse(SUPERBLOCK_SIG).map_err(ostrya_core::Error::from)?;
-        let value = from_bytes(&ty, &superblock_bytes).map_err(ostrya_core::Error::from)?;
+        let value = from_bytes(&ty, &payload).map_err(ostrya_core::Error::from)?;
+        // Only a signature check reads the raw bytes, so an unsigned
+        // superblock drops them here.
+        let superblock_bytes = if signatures.is_some() {
+            payload
+        } else {
+            drop(payload);
+            Vec::new()
+        };
         let fields = tuple(&value)?;
 
         // The `ostree.endianness` metadata byte gates the meta-entry and
@@ -863,6 +914,11 @@ impl DeltaSuperblock {
             unreachable!("`tuple` accepted the value as a tuple");
         };
         let metadata = owned.swap_remove(0);
+        let inline_index = index_inline_parts(
+            &metadata,
+            &crate::deltagen::delta_relative_dir(from.as_ref(), &to),
+            meta_entries.len(),
+        );
 
         Ok(DeltaSuperblock {
             from,
@@ -873,6 +929,7 @@ impl DeltaSuperblock {
             signatures,
             superblock_bytes,
             metadata,
+            inline_index,
             timestamp,
             recursion_len,
         })
@@ -957,6 +1014,15 @@ impl DeltaSuperblock {
         crate::deltagen::delta_relative_dir(self.from.as_ref(), &self.to)
     }
 
+    /// Part `index` as the superblock carries it inline: its compression byte
+    /// and its body, borrowed from the metadata dict. `None` where the dict
+    /// holds no key for it.
+    pub(crate) fn inline_part(&self, index: usize) -> Result<Option<(u8, &[u8])>> {
+        inline_part_at(&self.metadata, &self.inline_index, index, || {
+            self.relative_dir()
+        })
+    }
+
     /// Read what part `index` holds without applying it.
     ///
     /// A part the superblock carries inline, under the metadata key
@@ -974,19 +1040,14 @@ impl DeltaSuperblock {
             .meta_entries
             .get(index)
             .ok_or_else(|| Error::InvalidFormat(format!("static delta has no part {index}")))?;
-        let key = format!("{}/{index}", self.relative_dir());
-        match self.metadata.dict_get(&key) {
-            Some(inline) => {
-                let (ty, value) = inline
-                    .as_variant()
-                    .filter(|(ty, _)| ty.signature() == INLINE_PART_SIG)
-                    .ok_or_else(|| {
-                        Error::InvalidFormat(format!(
-                            "static delta inline part {key} is not a {INLINE_PART_SIG} variant"
-                        ))
-                    })?;
-                let bytes = to_bytes(ty, value).map_err(ostrya_core::Error::from)?;
-                part_stats_from(Cursor::new(bytes), entry).await
+        match self.inline_part(index)? {
+            Some((compression, body)) => {
+                let source = InlineSource {
+                    compression,
+                    body,
+                    pos: 0,
+                };
+                part_stats_from(source, entry).await
             }
             None => {
                 let path = dir.join(index.to_string());
@@ -996,6 +1057,205 @@ impl DeltaSuperblock {
                 part_stats_from(RtFile::from(file), entry).await
             }
         }
+    }
+}
+
+/// Find, in one pass over a superblock metadata dict, the entry that carries
+/// each of `parts` parts inline: for part `index`, the position of the first
+/// entry keyed `<dir>/<index>`, where `dir` is the delta's repository-relative
+/// directory, and `None` where the dict holds no such key. A later entry under
+/// the same key is not read, which is the rule of a lookup by key. A key whose
+/// last component is not a part number in plain decimal, or is a number no
+/// meta-entry has, names no part. Nothing is type-checked here:
+/// [`inline_part_at`] checks each value when its part is read.
+pub(crate) fn index_inline_parts(metadata: &Value, dir: &str, parts: usize) -> Vec<Option<usize>> {
+    let mut index = vec![None; parts];
+    let Some(entries) = metadata.as_array() else {
+        return index;
+    };
+    for (position, entry) in entries.iter().enumerate() {
+        let Some([key, _]) = entry.as_tuple() else {
+            continue;
+        };
+        let Some(number) = key
+            .as_str()
+            .and_then(|key| key.strip_prefix(dir))
+            .and_then(|rest| rest.strip_prefix('/'))
+        else {
+            continue;
+        };
+        // The key is `format!("{dir}/{index}")`, so a sign, a leading zero, or
+        // any other character is another key.
+        let plain = !number.is_empty()
+            && number.bytes().all(|b| b.is_ascii_digit())
+            && (number == "0" || !number.starts_with('0'));
+        let Some(slot) = plain
+            .then(|| number.parse::<usize>().ok())
+            .flatten()
+            .and_then(|i| index.get_mut(i))
+        else {
+            continue;
+        };
+        if slot.is_none() {
+            *slot = Some(position);
+        }
+    }
+    index
+}
+
+/// Part `part` as a superblock metadata dict carries it inline, at the
+/// position [`index_inline_parts`] found for it: its compression byte and its
+/// body, borrowed from the dict. `None` where the dict carries the part
+/// nowhere. A value of a type other than `(yay)` is refused, and the caller
+/// does not read the part file in its place. `dir` gives the delta's
+/// repository-relative directory, for the refusal text alone.
+pub(crate) fn inline_part_at<'a>(
+    metadata: &'a Value,
+    index: &[Option<usize>],
+    part: usize,
+    dir: impl FnOnce() -> String,
+) -> Result<Option<(u8, &'a [u8])>> {
+    let Some(position) = index.get(part).copied().flatten() else {
+        return Ok(None);
+    };
+    let fields = metadata
+        .as_array()
+        .and_then(|entries| entries.get(position))
+        .and_then(Value::as_tuple)
+        .and_then(|pair| pair.get(1))
+        .and_then(Value::as_variant)
+        .filter(|(ty, _)| ty.signature() == INLINE_PART_SIG)
+        .and_then(|(_, value)| value.as_tuple());
+    match fields {
+        Some([Value::Byte(compression), Value::Bytes(body)]) => Ok(Some((*compression, body))),
+        _ => Err(Error::InvalidFormat(format!(
+            "static delta inline part {}/{part} is not a {INLINE_PART_SIG} variant",
+            dir()
+        ))),
+    }
+}
+
+/// Check an inline part against its meta-entry by the rules a part file is
+/// read under: the compression byte and the body together fit in the size the
+/// entry declares, their SHA-256 is the checksum the entry names, and the
+/// compression byte is one the reader decodes. Nothing is decompressed.
+pub(crate) fn verify_inline_part(compression: u8, body: &[u8], entry: &DeltaPart) -> Result<()> {
+    let limit = entry.size.saturating_sub(1);
+    if body.len() as u64 > limit {
+        return Err(op_error(&format!(
+            "a stream passed the {limit} byte(s) declared for it"
+        )));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update([compression]);
+    hasher.update(body);
+    if Checksum::from_bytes(hasher.finalize().into()) != entry.part_csum {
+        return Err(Error::InvalidFormat(
+            "static delta part checksum mismatch".to_owned(),
+        ));
+    }
+    match compression {
+        COMPRESSION_NONE | COMPRESSION_XZ => Ok(()),
+        other => Err(Error::InvalidFormat(format!(
+            "static delta part compression byte {other:#x} is not supported"
+        ))),
+    }
+}
+
+/// The payload of an inline part: the body itself where it is uncompressed, and
+/// the decompressed [`Blob`] where it is xz.
+pub(crate) enum InlinePayload<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Blob),
+}
+
+impl InlinePayload<'_> {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        match self {
+            InlinePayload::Borrowed(bytes) => bytes,
+            InlinePayload::Owned(blob) => blob.as_slice(),
+        }
+    }
+}
+
+/// Decode the body of an inline part that [`verify_inline_part`] accepted. An
+/// uncompressed body is used where it lies, with no copy. An xz body
+/// decompresses through [`spill_to_blob`], on the heap at or below
+/// [`MMAP_THRESHOLD`] and into a mapped temp file in `staging` above it.
+pub(crate) async fn decode_inline_part<'a>(
+    compression: u8,
+    body: &'a [u8],
+    staging: &OwnedFd,
+) -> Result<InlinePayload<'a>> {
+    match compression {
+        COMPRESSION_NONE => Ok(InlinePayload::Borrowed(body)),
+        COMPRESSION_XZ => {
+            let decoder = XzDecoder::new(Cursor::new(body));
+            Ok(InlinePayload::Owned(
+                spill_to_blob(decoder, staging, None).await?,
+            ))
+        }
+        other => Err(Error::InvalidFormat(format!(
+            "static delta part compression byte {other:#x} is not supported"
+        ))),
+    }
+}
+
+/// An inline part read as the part file it stands for: the compression byte,
+/// then the body, borrowed from the metadata dict. It seeks, so
+/// [`part_stats_from`] reads it as it reads a file.
+struct InlineSource<'a> {
+    compression: u8,
+    body: &'a [u8],
+    pos: u64,
+}
+
+impl AsyncRead for InlineSource<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if buf.is_empty() || this.pos > this.body.len() as u64 {
+            return Poll::Ready(Ok(0));
+        }
+        if this.pos == 0 {
+            buf[0] = this.compression;
+            this.pos = 1;
+            return Poll::Ready(Ok(1));
+        }
+        let rest = &this.body[(this.pos - 1) as usize..];
+        let n = rest.len().min(buf.len());
+        buf[..n].copy_from_slice(&rest[..n]);
+        this.pos += n as u64;
+        Poll::Ready(Ok(n))
+    }
+}
+
+impl AsyncSeek for InlineSource<'_> {
+    fn poll_seek(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        pos: SeekFrom,
+    ) -> Poll<io::Result<u64>> {
+        let this = self.get_mut();
+        let len = 1 + this.body.len() as u64;
+        let target = match pos {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(delta) => len.checked_add_signed(delta),
+            SeekFrom::Current(delta) => this.pos.checked_add_signed(delta),
+        };
+        Poll::Ready(match target {
+            Some(target) => {
+                this.pos = target;
+                Ok(target)
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before the start of an inline part",
+            )),
+        })
     }
 }
 
@@ -1751,6 +2011,33 @@ pub(crate) async fn spill_to_blob<R: AsyncRead + Unpin>(
     }
 }
 
+/// Copy `slices`, in order, into one [`Blob`]: on the heap where they total
+/// [`MMAP_THRESHOLD`] or less, and otherwise into one anonymous temp file in
+/// `staging`, mapped read-only. A slice starts in the blob at the sum of the
+/// lengths before it. The heap held after the call is [`MMAP_THRESHOLD`] at
+/// most, whatever the number of slices.
+pub(crate) async fn concat_to_blob(slices: &[&[u8]], staging: &OwnedFd) -> Result<Blob> {
+    let total = slices
+        .iter()
+        .try_fold(0usize, |sum, slice| sum.checked_add(slice.len()))
+        .ok_or_else(|| op_error("blob size overflows usize"))?;
+    if total <= MMAP_THRESHOLD {
+        return Ok(Blob::Ram(slices.concat()));
+    }
+    let owned = staging.try_clone()?;
+    let fd = ostrya_rt::unblock(move || open_rw_temp(owned.as_fd())).await?;
+    let mut file = RtFile::from(fd);
+    for slice in slices {
+        file.write_all(slice).await.map_err(Error::Io)?;
+    }
+    file.flush().await.map_err(Error::Io)?;
+    let std_file = file.into_std().await;
+    let mmap = ostrya_rt::unblock(move || ostrya_sys::Mmap::read_only(&std_file, total))
+        .await
+        .map_err(|e| Error::Io(e.into()))?;
+    Ok(Blob::Mapped(mmap))
+}
+
 /// Open an anonymous read-write temp file on the staging filesystem: `O_TMPFILE`
 /// where supported, a named temp unlinked immediately otherwise. Both yield a
 /// readable-writable descriptor that needs no later cleanup.
@@ -1801,12 +2088,12 @@ pub(crate) fn open_rw_temp(staging: BorrowedFd<'_>) -> Result<OwnedFd> {
 /// object would be refused.
 pub(crate) async fn apply_part(
     txn: &Transaction,
-    blob: &Blob,
+    payload: &[u8],
     objects: &[(ObjectType, Checksum)],
     staging: &OwnedFd,
     checks: ModeChecks,
 ) -> Result<()> {
-    let view: PartView<'_> = GvDecode::decode(blob.as_slice()).map_err(ostrya_core::Error::from)?;
+    let view: PartView<'_> = GvDecode::decode(payload).map_err(ostrya_core::Error::from)?;
     let (mode_it, xattr_it, data_source, ops) = view;
 
     // The (uuu) mode triples are big-endian on the wire regardless of the
@@ -2623,6 +2910,157 @@ mod tests {
             objects,
         };
         (file, entry)
+    }
+
+    /// A metadata dict carrying `value` under `<dir>/<index>`.
+    fn inline_dict(dir: &str, index: usize, value: Value) -> Value {
+        let mut dict = endianness_dict(ENDIANNESS_LITTLE);
+        crate::commit::append_dict_entry(&mut dict, &format!("{dir}/{index}"), value).unwrap();
+        dict
+    }
+
+    /// The `(yay)` variant an inline part is carried as.
+    fn inline_value(compression: u8, body: &[u8]) -> Value {
+        Value::variant(
+            Type::parse(INLINE_PART_SIG).unwrap(),
+            Value::Tuple(vec![Value::Byte(compression), Value::Bytes(body.to_vec())]),
+        )
+    }
+
+    /// The inline part at `index` of `dict`, looked up as a superblock does.
+    fn lookup<'a>(
+        dict: &'a Value,
+        dir: &str,
+        parts: usize,
+        index: usize,
+    ) -> Result<Option<(u8, &'a [u8])>> {
+        let found = index_inline_parts(dict, dir, parts);
+        inline_part_at(dict, &found, index, || dir.to_owned())
+    }
+
+    /// An inline part is borrowed from the dict under its own key, an absent
+    /// key reads as no inline part, and a value of another type is refused.
+    #[test]
+    fn an_inline_part_is_borrowed_from_the_metadata_dict() {
+        let dir = "deltas/ab/cdef";
+        let dict = inline_dict(dir, 0, inline_value(COMPRESSION_XZ, b"body"));
+        assert_eq!(
+            lookup(&dict, dir, 2, 0).unwrap(),
+            Some((COMPRESSION_XZ, &b"body"[..]))
+        );
+        assert_eq!(lookup(&dict, dir, 2, 1).unwrap(), None);
+        assert_eq!(lookup(&dict, "deltas/ab/other", 2, 0).unwrap(), None);
+        // A part number no meta-entry has is not looked up.
+        assert_eq!(lookup(&dict, dir, 0, 0).unwrap(), None);
+
+        let ay = Value::variant(Type::parse("ay").unwrap(), Value::Bytes(b"xbody".to_vec()));
+        let dict = inline_dict(dir, 0, ay);
+        let Err(Error::InvalidFormat(message)) = lookup(&dict, dir, 1, 0) else {
+            panic!("an inline part that is not a (yay) variant was accepted");
+        };
+        assert!(message.contains("deltas/ab/cdef/0"), "{message}");
+    }
+
+    /// The one-pass index reads the keys a lookup by key reads: the first
+    /// entry under a key wins, and a part number written with a sign, a
+    /// leading zero, or a trailing character is another key.
+    #[test]
+    fn the_inline_index_takes_the_first_entry_under_the_exact_key() {
+        let dir = "deltas/ab/cdef";
+        let mut dict = inline_dict(dir, 1, inline_value(COMPRESSION_NONE, b"first"));
+        for (key, body) in [
+            (format!("{dir}/1"), &b"second"[..]),
+            (format!("{dir}/01"), b"leading zero"),
+            (format!("{dir}/+0"), b"sign"),
+            (format!("{dir}/0x"), b"trailing"),
+            (format!("{dir}0"), b"no slash"),
+            (format!("{dir}/0"), b"zero"),
+        ] {
+            crate::commit::append_dict_entry(&mut dict, &key, inline_value(COMPRESSION_NONE, body))
+                .unwrap();
+        }
+        let index = index_inline_parts(&dict, dir, 3);
+        assert_eq!(index, [Some(7), Some(1), None]);
+        let read = |part| inline_part_at(&dict, &index, part, || dir.to_owned()).unwrap();
+        assert_eq!(read(0), Some((COMPRESSION_NONE, &b"zero"[..])));
+        assert_eq!(read(1), Some((COMPRESSION_NONE, &b"first"[..])));
+        assert_eq!(read(2), None);
+    }
+
+    /// An inline part is held to the rules a part file is read under, each
+    /// checked before any decoder runs: the declared size, the checksum, and
+    /// the compression byte.
+    #[test]
+    fn an_inline_part_is_checked_against_its_size_and_checksum() {
+        let (file, entry) = part_file(b"a part payload", COMPRESSION_XZ, Vec::new());
+        verify_inline_part(file[0], &file[1..], &entry).unwrap();
+
+        let short = DeltaPart {
+            size: entry.size - 1,
+            ..entry.clone()
+        };
+        let err = verify_inline_part(file[0], &file[1..], &short).unwrap_err();
+        assert!(err.to_string().contains("byte(s) declared"), "{err}");
+
+        let mut swapped = file.clone();
+        let last = swapped.len() - 1;
+        swapped[last] ^= 0xff;
+        let err = verify_inline_part(swapped[0], &swapped[1..], &entry).unwrap_err();
+        assert!(err.to_string().contains("part checksum mismatch"), "{err}");
+
+        let mut odd = file.clone();
+        odd[0] = b'z';
+        let odd_entry = meta_entry(&odd, odd.len() as u64);
+        let err = verify_inline_part(odd[0], &odd[1..], &odd_entry).unwrap_err();
+        assert!(err.to_string().contains("compression byte"), "{err}");
+    }
+
+    /// An uncompressed inline body is the payload where it lies, and an xz
+    /// body decodes into a blob.
+    #[test]
+    fn an_uncompressed_inline_part_decodes_without_a_blob() {
+        let body = b"a part payload";
+        // `part_file` drives its own executor, so it runs outside this one.
+        let (file, _) = part_file(body, COMPRESSION_XZ, Vec::new());
+        block_on(async {
+            let staging = staging_fd();
+            let payload = decode_inline_part(COMPRESSION_NONE, body, &staging)
+                .await
+                .unwrap();
+            let InlinePayload::Borrowed(bytes) = payload else {
+                panic!("an uncompressed inline body was copied");
+            };
+            assert!(std::ptr::eq(bytes, &body[..]));
+
+            let payload = decode_inline_part(file[0], &file[1..], &staging)
+                .await
+                .unwrap();
+            assert!(matches!(payload, InlinePayload::Owned(_)));
+            assert_eq!(payload.as_slice(), body);
+        });
+    }
+
+    /// `part_stats` reads an inline part through the seekable source as it
+    /// reads the same bytes from a part file, compressed or not.
+    #[test]
+    fn an_inline_part_reads_the_same_statistics_as_its_file() {
+        // A blob past the kept tail makes the uncompressed walk seek back.
+        for (blob_len, compression) in [
+            (1_000, COMPRESSION_NONE),
+            (1_000, COMPRESSION_XZ),
+            (2 * PAYLOAD_TAIL, COMPRESSION_NONE),
+        ] {
+            let bytes = payload(3, 2, blob_len, &every_opcode());
+            let (file, entry) = part_file(&bytes, compression, two_objects());
+            let from_file = block_on(part_stats_from(Cursor::new(file.clone()), &entry)).unwrap();
+            let source = InlineSource {
+                compression: file[0],
+                body: &file[1..],
+                pos: 0,
+            };
+            let inline = block_on(part_stats_from(source, &entry)).unwrap();
+            assert_eq!(inline, from_file);
+        }
     }
 
     /// The framing offsets are read at the width the payload's total length

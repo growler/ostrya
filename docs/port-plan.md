@@ -2237,7 +2237,11 @@ delta for several times the CPU.
 
 A delta's files are written parts first, so an interrupted generation leaves no
 superblock for a reader to trust, and regenerating at an existing location unlinks
-that delta's superblock before the first part is overwritten. The superblock is
+that delta's superblock before the first part is overwritten. With `inline` set,
+the parts go into the superblock metadata dict, capped together at the
+superblock ceiling, and no part file is written. No part is overwritten then, so
+the earlier superblock stays until the rename of the new one replaces it, and an
+inline generation that fails leaves the earlier delta whole. The superblock is
 signed before it is written, so a signer that fails writes no superblock. A
 `superblock_file` target puts the superblock at that path and the parts in the
 directory that holds it, which must exist. A file already at that path is the
@@ -2248,7 +2252,8 @@ file in place disarms it, so a write that fails part-way -- an `ENOSPC` while a 
 is being compressed, say -- and a generation future dropped mid-await both take
 their temp file with them, leaving the sweep below what a killed process abandoned.
 Once the new superblock is in place, that sweep removes numbered parts past the new
-part count and temp files that have aged past an hour. Age is what keeps two runs
+part count, every numbered part where the new delta carries its parts inline, and
+temp files that have aged past an hour. Age is what keeps two runs
 out of each other's way: a generation renames each of its own temp files into place
 as it goes, so every temp file the sweep meets belongs to another run, and the
 process id in the name does not separate an abandoned leftover from a file a
@@ -3423,11 +3428,21 @@ body and the payload, each on the heap at or below the 128 KiB threshold and
 spilled to a mapped temp file above it.
 
 What a pull retains per delta, for the length of the pull: the target commit's
-bytes, the per-part meta-entries, and the fallback list. The raw superblock bytes
-and the signature array are read by the verification above and dropped there, so
-what stays resident is proportional to the target commit's object count -- 33
-bytes per object across the meta-entries -- rather than to the superblock size the
-remote chose. A pull of N tips holds N such jobs at once.
+bytes, the per-part meta-entries, the fallback list, and the bodies of the
+parts the superblock carries inline. The raw superblock bytes and the signature
+array are read by the verification above and dropped there. Each inline part is
+checked against its meta-entry's size and checksum at discovery, in part order
+and before any part request. The bodies are then copied out of the metadata dict
+into one blob per job, and the dict is dropped. The blob is on the heap where
+the bodies total 128 KiB or less, and otherwise one anonymous temp file in the
+repository's `tmp/`, mapped read-only. What stays resident on the heap is then
+proportional to the target commit's object count -- 33 bytes per object across
+the meta-entries -- plus 128 KiB at most of inline bodies, rather than to the
+superblock size the remote chose. The temp file costs disk space and address
+space up to the size of the superblock, which is 128 MiB at most, and its pages
+are file-backed, so the kernel can evict them. It is released when the pull
+returns, not when its parts are applied. An inline part is applied from the
+blob with no request. A pull of N tips holds N such jobs at once.
 
 A meta-entry's `size` is host order, which
 the superblock's `ostree.endianness` byte declares: it is swapped where the byte
@@ -3539,7 +3554,6 @@ scratch and from a source commit -- each under its own superblock's digest,
 positioned between `tombstone-commits` and `indexed-deltas`, and read back by the
 tool's `summary --print-metadata-key`.
 
-Deferred: inline delta parts, which no remote the port pulls from publishes.
 `ostrya pull --disable-static-deltas` and `--require-static-deltas` landed with
 the CLI command in 16f. The body of the delta signature check landed in 16e,
 which supplies the policy the seam applies.
@@ -6193,6 +6207,93 @@ commit; a bad signing key, which the port refuses before it writes a part; and
 an unknown `--sign-type`, which `clap` refuses. The work adds 10 `m10` cells, of
 which 5 are executable and all pass; the conformance run reports 1032 cells and
 418 passes (the M10 family 415).
+
+`static-delta generate` takes `--inline`, `--set-endianness=l|B`, and
+`--swap-endianness`, and the read path takes inline parts. `DeltaOptions` gains
+two fields: `inline`, which puts each part into the superblock metadata dict
+under `deltas/<fanout>/<rest>/<i>` as a `(yay)` variant and writes no part file;
+and `endianness`, which writes the `ostree.endianness` byte and swaps a
+meta-entry's `size` and `usize` and a fallback's two sizes under `Big`. The
+library default is `Little` on every host, and the CLI starts from the host
+order, as the tool does. The generator compresses each inline part into a
+buffer capped at what the superblock ceiling leaves once the embedded commit,
+33 bytes for each object, and 49 bytes for each fallback are counted. The heap
+then holds at most the ceiling of inline bytes, and a delta whose parts cannot
+fit is refused at the part that passes the cap. The size check on the
+serialized superblock refuses what the framing, the detached metadata copy, and
+a signature push past the ceiling. An inline generation unlinks no earlier
+superblock, so a refusal, a failing signer, or any other failure leaves an
+earlier delta at the same location whole. The dict entries are in the tool's order:
+`ostree.endianness`, the parts, and `commitmeta`. `apply_static_delta_offline`
+reads an inline part from the dict, and uses it also where a part file of the
+same number is present. The part is checked against its meta-entry's size and
+checksum before it is decompressed, as a part file is, and an uncompressed body
+is applied where it lies. A pull checks each inline part at discovery, ahead of
+any part request, and copies the bodies of a job into one blob, on the heap up
+to 128 KiB in total and one mapped anonymous temp file in `tmp/` above that, so
+it drops the metadata dict (Phase 16d). `show` reads an inline part through the
+same helper, with no copy of it. `apply_part` takes the payload as a slice.
+
+The parse finds every inline part in one pass over the metadata dict, and each
+reader takes a part by its position, so a superblock with many meta-entries and
+many other dict entries costs time in proportion to its size. The first entry
+under a part key wins, as a lookup by key finds it, and a value is type-checked
+when its part is read. The parse drops the file bytes once they are decoded,
+moves the payload of a signed envelope out with no copy, and keeps the raw
+bytes only for a signed superblock, which `verify` reads.
+`apply_static_delta_offline` drops them as well. The peak of the parse is then
+two copies of the superblock, the bytes and the tree. After it, `show` and
+`apply-offline` hold the tree alone for an unsigned superblock, and `show` holds
+the signed payload beside the tree. The pull's superblock fetch reads into a
+chunk of 128 KiB at most and appends it to a buffer sized from the declared
+length, so a read that waits does not touch the rest of the buffer.
+
+Observation added these rules. The inline value is the exact bytes of the part
+file, and a meta-entry's `size` is their length. The key is
+repository-relative also under `--filename`, and the tool writes no part file.
+The tool pulls its own inline delta over HTTP and requests the superblock
+alone, where the port's pull requested part `0` and failed with a 404. The tool never
+removes a part file when it writes a delta again. The last `--set-endianness`
+wins, the flag order does not matter, a repeated `--swap-endianness` swaps
+once, and the value is checked after `-n` and the default parent and before the
+`--filename` directory. Under `B` only the byte and the four size fields
+change; the timestamp and the part files stay the same. A tool delta timestamp
+is wall-clock, and `SOURCE_DATE_EPOCH` does not pin it, so the tests compare
+fields. The tool applies a port-written inline big-endian delta offline into a
+port-made `bare-user` repository, from scratch and from a source commit with
+`w` operations, and a splice-only one into `archive`. It applies a port-written
+little-endian delta with the parts in files on the same terms. It pulls a
+port-written inline delta, little-endian and big-endian, over a `file://`
+remote with `--require-static-deltas`, from a delta directory that holds the
+superblock alone, and its `fsck` passes. It verifies the port's signed inline superblock, and
+the port verifies the tool's and reads its part statistics. A big-endian host
+is not observed.
+
+Ten decisions stand, each open to reversal. The CLI starts from the host order
+and the library default is little-endian. An invalid value is refused late,
+after `-n` and the default parent, with the tool's words. The port keeps its
+128 MiB superblock ceiling on read and on write, and records the tool's larger
+inline superblocks as a divergence. The port keeps its part sweep at the
+repository location, now all numbered parts under `--inline`, and records the
+difference, which also covers the regeneration with fewer parts. A pull keeps
+the inline bodies of a job in one temp file where they total more than 128 KiB,
+and releases it when the pull returns. An inline part wins over a part
+file. A value under a part key that is not a `(yay)` variant is refused with no
+fall back to the file; a key whose number no meta-entry has is not read. The
+`apply-offline` record for an inline delta is left to the item that changes
+the `apply-offline` output. The two new `DeltaOptions` fields break struct
+literals outside the crate under decision 14, and the version number is left
+to the maintainer. `show` reads inline parts through the shared helper.
+
+Three divergences are recorded in `cli-surface.md`, "P2", `static-delta`: the
+superblock ceiling in `show`, `verify`, `apply-offline`, and pull, where the
+tool reads a larger superblock; the ceiling in `generate --inline`, where the
+tool writes one; and the part sweep at the repository location. The work adds
+6 `m10` cells, of which 4 are executable and all pass, and splits
+`static-delta-apply` out of the grouped `m1` record for the port-made
+repositories the tool operates on: `full` for `bare-user` and `archive`, and
+`unobserved` for `bare` and `bare-user-only`. The conformance run reports 1038
+cells and 422 passes (the M10 family 419).
 
 #### Phase 17g -- P3 commands with no matrix weight
 

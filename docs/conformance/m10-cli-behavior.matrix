@@ -12926,3 +12926,116 @@ note: a size value outside whole decimal digits is refused by the port before
  the repository is read, and nothing is written. `ref-run: n-a` states that the
  tool has no comparable outcome: it reads `abc` as 0 and generates the delta
  (`cli-surface.md`, "P2").
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-inline
+setup: repo-with-commit
+run: static-delta --repo=$REPO generate --empty --to=$BRANCH --inline
+expect-exit: 0
+expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_inline_matches_the_tool
+spec: format-reference.md#static-delta
+note: the parts go into the superblock metadata dict and no part file is
+ written, in both. The cited test states the missing part files, the dict keys
+ in the same order, the repository-relative key under --filename, and each
+ implementation applying the other's inline delta.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-set-endianness-big
+setup: repo-with-commit
+run: static-delta --repo=$REPO generate --empty --to=$BRANCH --set-endianness=B
+expect-exit: 0
+expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_endianness_matches_the_tool
+spec: format-reference.md#static-delta
+note: `B` writes the endianness byte `B` and swaps the meta-entry and fallback
+ sizes, in both. The cited test reads the byte and the sizes back from each
+ superblock, and states that the part file does not change.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-swap-endianness
+setup: repo-with-commit
+run: static-delta --repo=$REPO generate --empty --to=$BRANCH --set-endianness=B --swap-endianness
+expect-exit: 0
+expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: equals "Generating static delta:\n  From: empty\n  To:   $REV"
+oracle: exit-status stdout-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_endianness_matches_the_tool
+spec: format-reference.md#static-delta
+note: --swap-endianness swaps from the host order or from --set-endianness, so
+ this run writes `l` in both. The last --set-endianness wins, the flag order
+ does not matter, and a repeated --swap-endianness swaps once. Only a
+ little-endian host is observed.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-invalid-endianness-refused
+setup: repo-with-commit
+run: static-delta --repo=$REPO generate --empty --to=$BRANCH --set-endianness=b
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid endianness 'b'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Invalid endianness 'b'"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_generate_invalid_endianness_is_refused
+spec: format-reference.md#static-delta
+note: a value other than `l` or `B` refuses before the block, and nothing is
+ written. The check comes after `-n` and after the default parent, and before
+ the --filename directory, in both; the cited test states the order.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-inline-stale-parts
+setup: repo
+outcome: lossy
+severity: interop
+loss: the part files an earlier delta left at the repository location. The
+ tool keeps them when it writes the delta again, with --inline or with fewer
+ parts, and the port removes every numbered part file the new delta does not
+ name (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::static_delta_generate_inline_removes_stale_parts
+spec: format-reference.md#static-delta
+note: the cell needs an existing delta, which no setup writes, so the cited
+ test builds it and regenerates it with --inline in both.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/generate-inline-over-ceiling
+setup: repo
+outcome: refused-clean
+severity: interop
+evidence: ostrya::deltagen::tests::an_inline_generation_over_the_ceiling_keeps_the_earlier_delta,
+ ostrya::deltagen::tests::the_capped_part_buffer_refuses_past_its_limit,
+ ostrya::delta_generate::a_failing_signer_under_inline_keeps_the_earlier_delta
+spec: format-reference.md#static-delta
+note: the port refuses an inline superblock that passes the 128 MiB ceiling
+ and writes no file. A delta that an earlier run wrote at the same location
+ keeps its superblock and its part files and stays listed. The tool has no
+ such ceiling: it writes a 140,007,544-byte inline superblock and applies it
+ (`cli-surface.md`, "P2"). A run past the ceiling needs a delta of more than
+ 128 MiB, so the first cited test drives the library generation with a
+ smaller ceiling, over an earlier delta and into an empty output directory.
+ The third holds the same outcome where the signer fails after the parts.

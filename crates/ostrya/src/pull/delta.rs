@@ -6,7 +6,8 @@
 //! index for the target commit, the delta's `superblock`, then the objects the
 //! delta hands over loose and its numbered part files. The commit object itself
 //! rides in the superblock and is staged from there, so no `.commit` request
-//! follows.
+//! follows. A part the superblock carries inline, in its metadata dict, is
+//! applied from there, and no request is made for it.
 //!
 //! Which delta. A pull looks for exactly one: `<from>-<to>` where `from` is the
 //! commit the ref being pulled names in this repository, and the from-scratch
@@ -34,8 +35,10 @@
 //! delta's name claims. The delta's own signatures are then checked over the raw
 //! superblock bytes, ahead of any part request, so a delta that fails
 //! verification costs no part bytes; the policy is the pull's own, described in
-//! [`verify`](super::verify). Every object a part produces is written with its
-//! expected checksum asserted, which is the read path's own rule. Each part is
+//! [`verify`](super::verify). Each inline part is then checked against the size
+//! and the checksum its meta-entry declares, also ahead of any part request.
+//! Every object a part produces is written with its expected checksum asserted,
+//! which is the read path's own rule. Each part is
 //! taken off the connection under the size its meta-entry declares and hashed
 //! against the checksum that entry names before it is decompressed, so what a
 //! remote can drive onto the staging filesystem for one part is the size the
@@ -63,7 +66,8 @@ use std::collections::HashMap;
 use ostrya_core::{Checksum, ObjectName, ObjectType, Type, Value, from_bytes};
 
 use crate::delta::{
-    DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, decode_part_stream,
+    Blob, DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, concat_to_blob,
+    decode_inline_part, decode_part_stream, inline_part_at, verify_inline_part,
 };
 use crate::deltagen::{
     STATIC_DELTAS_KEY, SUPERBLOCK_FILE, delta_index_relative_path, delta_name, delta_relative_dir,
@@ -87,10 +91,16 @@ pub(crate) const PART_CAP: usize = 2;
 ///
 /// A job is built during discovery and lives until the pull returns, so a pull
 /// retains one of these per target commit. It holds what application reads and
-/// nothing else: the superblock's raw bytes and its signature array are read at
-/// acquisition and dropped there, so what a job retains is bounded by the target
-/// commit -- one meta-entry per part, listing every object the delta produces --
-/// rather than by the superblock size a remote chooses.
+/// nothing else: the superblock's raw bytes, its signature array, and its
+/// metadata dict are read at acquisition and dropped there, so what a job
+/// retains on the heap is bounded by the target commit -- one meta-entry per
+/// part, listing every object the delta produces -- plus 128 KiB at most of
+/// inline part bodies, rather than by the superblock size a remote chooses.
+/// The inline part bodies are kept in one [`Blob`]: on the heap where they
+/// total 128 KiB or less, and otherwise one read-only map of an anonymous temp
+/// file in the repository's `tmp/`. That file costs disk space and address
+/// space up to the size of the superblock, and it is released when the pull
+/// returns.
 pub(crate) struct DeltaJob {
     /// The delta's request path prefix, `deltas/<fanout>/<rest>`.
     dir: String,
@@ -105,6 +115,23 @@ pub(crate) struct DeltaJob {
     meta_entries: Vec<DeltaPart>,
     /// The objects the delta references and hands over loose.
     fallbacks: Vec<DeltaFallback>,
+    /// One slot per part, in part order: the part where the superblock carries
+    /// it inline, already checked against its meta-entry, and `None` where the
+    /// part is fetched as a file.
+    inline: Vec<Option<InlinePart>>,
+    /// The bodies of the inline parts, one after the other in part order.
+    inline_bodies: Blob,
+}
+
+/// A part the superblock carries inline, copied out of the metadata dict.
+struct InlinePart {
+    /// The compression byte.
+    compression: u8,
+    /// Where the body that follows the compression byte starts in
+    /// [`DeltaJob::inline_bodies`].
+    start: usize,
+    /// The length of that body.
+    len: usize,
 }
 
 impl DeltaJob {
@@ -117,7 +144,7 @@ impl DeltaJob {
             .collect()
     }
 
-    /// How many part files the delta carries.
+    /// How many parts the delta carries, inline or as files.
     pub(crate) fn parts(&self) -> usize {
         self.meta_entries.len()
     }
@@ -153,7 +180,9 @@ pub(crate) async fn discover(
             continue;
         }
         let from = source_commit(repo, ref_name, to, ref_prefix).await?;
-        if let Some(job) = discover_one(fetcher, summary, from, *to, opts, verification).await? {
+        if let Some(job) =
+            discover_one(repo, fetcher, summary, from, *to, opts, verification).await?
+        {
             jobs.insert(*to, job);
         }
     }
@@ -205,6 +234,7 @@ enum Advertisement {
 /// Find and read the delta from `from` to `to`, or `None` when the remote
 /// publishes none.
 async fn discover_one(
+    repo: &Repo,
     fetcher: &Fetcher,
     summary: Option<&Summary>,
     from: Option<Checksum>,
@@ -269,25 +299,72 @@ async fn discover_one(
             }
         )));
     }
-    // Destructured, so the compiler establishes that the raw bytes and the
-    // signature array reach verification and go no further: what the job carries
-    // is what application reads.
+    // Destructured, so the compiler establishes that the raw bytes, the
+    // signature array, and the metadata dict reach verification and the inline
+    // parts and go no further: what the job carries is what application reads.
     let DeltaSuperblock {
         commit_bytes,
         meta_entries,
         fallbacks,
         signatures,
         superblock_bytes,
+        metadata,
+        inline_index,
         ..
     } = superblock;
     verify_fetched_delta(verification, &name, &superblock_bytes, signatures.as_ref()).await?;
+    drop(superblock_bytes);
+    let dir = delta_relative_dir(from.as_ref(), &to);
+    let (inline, inline_bodies) =
+        take_inline_parts(repo, &metadata, &inline_index, &dir, &meta_entries).await?;
+    drop(metadata);
     Ok(Some(DeltaJob {
-        dir: delta_relative_dir(from.as_ref(), &to),
+        dir,
         name,
         commit_bytes,
         meta_entries,
         fallbacks,
+        inline,
+        inline_bodies,
     }))
+}
+
+/// Check each part the superblock carries inline against its meta-entry, in
+/// part order, and copy the bodies out of the metadata dict into one [`Blob`],
+/// so the dict can be dropped. Where the bodies total more than the heap
+/// threshold of 128 KiB, the blob is one anonymous temp file in the
+/// repository's `tmp/`, mapped read-only, and the job keeps no copy of them on
+/// the heap.
+async fn take_inline_parts(
+    repo: &Repo,
+    metadata: &Value,
+    index: &[Option<usize>],
+    dir: &str,
+    meta_entries: &[DeltaPart],
+) -> Result<(Vec<Option<InlinePart>>, Blob)> {
+    let mut inline = Vec::with_capacity(meta_entries.len());
+    let mut bodies: Vec<&[u8]> = Vec::new();
+    let mut start = 0usize;
+    for (part, entry) in meta_entries.iter().enumerate() {
+        let Some((compression, body)) = inline_part_at(metadata, index, part, || dir.to_owned())?
+        else {
+            inline.push(None);
+            continue;
+        };
+        verify_inline_part(compression, body, entry)?;
+        inline.push(Some(InlinePart {
+            compression,
+            start,
+            len: body.len(),
+        }));
+        start += body.len();
+        bodies.push(body);
+    }
+    if bodies.is_empty() {
+        return Ok((inline, Blob::Ram(Vec::new())));
+    }
+    let tmp = repo.open_tmp_dir().await?;
+    Ok((inline, concat_to_blob(&bodies, &tmp).await?))
 }
 
 /// Verify a fetched delta's detached signatures over the raw superblock bytes.
@@ -374,6 +451,9 @@ fn map_digest(map: &Value, name: &str) -> Result<Option<Checksum>> {
 
 /// Fetch one part of a delta and apply it into the pull's transaction.
 ///
+/// A part the superblock carries inline was checked at discovery, so it is
+/// decompressed and applied with no request.
+///
 /// The part streams off the connection under the size the superblock declares for
 /// it and is hashed against the superblock's checksum for it; the verified body
 /// then decompresses into the random-access blob the operations read, which is on
@@ -398,6 +478,12 @@ pub(crate) async fn fetch_part(
             job.name
         ))
     })?;
+    if let Some(Some(part)) = job.inline.get(index) {
+        let staging = txn.staging_fd().try_clone_to_owned()?;
+        let body = &job.inline_bodies.as_slice()[part.start..part.start + part.len];
+        let payload = decode_inline_part(part.compression, body, &staging).await?;
+        return apply_part(txn, payload.as_slice(), &entry.objects, &staging, checks).await;
+    }
     let path = format!("{}/{index}", job.dir);
     // The superblock states the part file's size, so the fetcher refuses a
     // `Content-Length` above it before the body arrives and stops a body that
@@ -417,7 +503,7 @@ pub(crate) async fn fetch_part(
     };
     let staging = txn.staging_fd().try_clone_to_owned()?;
     let blob = decode_part_stream(body, entry, &staging).await?;
-    apply_part(txn, &blob, &entry.objects, &staging, checks).await
+    apply_part(txn, blob.as_slice(), &entry.objects, &staging, checks).await
 }
 
 #[cfg(test)]

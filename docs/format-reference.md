@@ -2075,6 +2075,33 @@ its bytes carry `ostree.sign.ed25519` inside that key. A tool pull checks a
 delta-delivered commit against this copy rather than against the `.commitmeta`
 it fetches and stores.
 
+Inline parts. `static-delta generate --inline` puts each part into the same
+dict, under the key `deltas/<fanout>/<rest>/<i>` -- the delta's own relative
+directory with the part number appended -- as a variant of type `(yay)`. The
+value holds the exact bytes of the part file: the compression byte and the
+body. A meta-entry's `size` is the length of those bytes, as it is for a part
+file. The key is the repository-relative name also under `--filename`, and the
+tool writes no part file, under the repository location and under
+`--filename`. The dict entries are in this order: `ostree.endianness`, then the
+inline parts in part order (`/0` to `/12` over a 13-part delta, in insertion
+order and not string order), then `<rest>/commitmeta`. Recovered by generating
+one delta with `--inline` and one without, with `--min-fallback-size=0`: the
+part file's bytes occur whole in the inline superblock, and both forms state
+`size=300393`.
+
+On apply, an inline part is used also where a part file of the same number is
+present: the tool applies an inline superblock beside a garbage `0` file at exit
+0, and its `fsck` passes. The tool also pulls an inline delta over HTTP and
+requests the superblock alone. The port reads an inline part on the same terms,
+in `apply-offline`, in a pull, and in `show`, and checks it against its
+meta-entry's size and checksum before it decompresses it, as it checks a part
+file. The port refuses a value under a part key that is not a `(yay)` variant.
+
+Inline parts make the superblock as large as the parts. The tool writes a
+140,007,544-byte inline superblock and applies it offline. The port reads and
+writes a superblock of 128 MiB at most, and refuses a larger one
+(`conformance/cli-surface.md`, "P2", `static-delta`).
+
 Object delivery. The target commit object is embedded whole in the superblock
 (the `(a{sv}aya(say)sstayay)` field); it is not carried in any part, and
 re-serializing it hashes to the `to` checksum. Every other object is produced by
@@ -2164,9 +2191,11 @@ and xattr tables, and the port's part boundaries differ from the tool's for such
 object. Both layouts are valid: a part's contents are named by its meta-entry, so
 where the boundaries fall decides a delta's size, not whether it applies.
 
-Superblock fields the tool writes. The metadata dict holds exactly one entry,
-`ostree.endianness` as a byte (`l` on a little-endian host). The timestamp is the
-generation wall-clock time, big-endian. `from` is an empty `ay` for a
+Superblock fields the tool writes. The metadata dict holds `ostree.endianness`
+as a byte (`l` on a little-endian host), then any inline parts, then the
+`commitmeta` copy where the target commit has detached metadata. The timestamp
+is the generation wall-clock time, big-endian. `SOURCE_DATE_EPOCH` does not pin
+it. `from` is an empty `ay` for a
 from-scratch delta. The recursion array is always empty. A meta-entry's version
 field is 0.
 
@@ -2257,6 +2286,11 @@ swaps four size fields: a meta entry's `size` and `usize`, and a fallback's two
 sizes. Recovered by generating a delta with `--set-endianness=B` over a
 5,000,000-byte fallback object: the superblock holds 5,001,564 and 5,000,000 as
 big-endian `u64` values, and `static-delta show` prints 5001564 and 5000000.
+Under `B` nothing else changes: `cmp -l` of the `l` and the `B` superblock of
+one delta shows the endianness byte and the four fields, each byte-reversed.
+The timestamp is the same, and part `0` of the two deltas is identical. The
+port's generator writes the byte and swaps the same four fields under
+`DeltaEndianness::Big`.
 Applying a delta reads one of the four, a meta-entry's `size`, which is the
 ceiling a part is read under, and `static-delta show` reads all four: the port
 swaps each where the byte states `B` and reads each as little-endian where the
@@ -6048,6 +6082,10 @@ carry are:
   the three size thresholds, default 4, 64, and 32.
 - `--disable-bsdiff`, `--sign=KEY`, `--sign-type=NAME`, and
   `--keys-file=PATH`.
+- `--inline` -- the parts go into the superblock, and no part file is written
+  ("Static delta wire format").
+- `--set-endianness=l|B` and `--swap-endianness` -- the `ostree.endianness`
+  byte and the order of the four size fields.
 
 With neither `--from` nor `--empty`, FROM is the parent of TO. A revision takes
 the forms `rev-parse` takes: a ref, a checksum or its abbreviation, and a
@@ -6064,8 +6102,10 @@ The checks run in this order:
 4. A TO with no parent, where FROM is the default, reports `error: Commit
    <hex> has no parent`.
 5. The `-n` check.
-6. Standard output receives the block below.
-7. The delta is generated. Every later failure comes after the block, so a
+6. An endianness value other than `l` or `B` reports `error: Invalid
+   endianness '<value>'`, and nothing is written.
+7. Standard output receives the block below.
+8. The delta is generated. Every later failure comes after the block, so a
    run that fails there prints the block too.
 
 ```
@@ -6081,7 +6121,18 @@ prints it, and the run exits 0 and writes nothing. A delta directory that holds
 parts and no superblock counts as absent. Without `-n` the delta is written
 again over the one present.
 
-The tool writes statistics to standard error on every run that reaches step 7:
+The byte order starts from the host order. `--set-endianness` replaces it, and
+the last value wins where the option is given more than once. The value also
+takes the separate-argument form `--set-endianness B`. `--swap-endianness`
+then swaps the order once, where it stands on the command line and however
+many times it is given. On a little-endian host, `--swap-endianness` alone
+writes `B`, and `--swap-endianness --set-endianness=B` writes `l`. The value is
+compared as given: `b`, `L`, `little`, `big`, `Bx`, and the empty value are
+refused. The value is checked after `-n` and after the default parent, so `-n`
+over a delta that exists exits 0 whatever the value, and before the
+`--filename` directory is opened. Only a little-endian host is observed.
+
+The tool writes statistics to standard error on every run that reaches step 8:
 
 ```
 modified: 0

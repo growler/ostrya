@@ -73,10 +73,11 @@ use sha2::{Digest, Sha256};
 
 use crate::commit::append_dict_entry;
 use crate::delta::{
-    Blob, COMMIT_SIG, COMPRESSION_XZ, ENDIANNESS_KEY, ENDIANNESS_LITTLE, IO_CHUNK, MAX_SUPERBLOCK,
-    MAX_TABLE_BYTES, MMAP_THRESHOLD, OP_BSPATCH, OP_CLOSE, OP_OPEN, OP_OPEN_SPLICE_CLOSE,
-    OP_SET_READ_SOURCE, OP_UNSET_READ_SOURCE, OP_WRITE, SIGNED_MAGIC, SIGNED_SIG, SUPERBLOCK_SIG,
-    dir_child_names, open_rw_temp, read_capped, spill_to_blob,
+    Blob, COMMIT_SIG, COMPRESSION_XZ, DeltaEndianness, ENDIANNESS_BIG, ENDIANNESS_KEY,
+    ENDIANNESS_LITTLE, IO_CHUNK, MAX_SUPERBLOCK, MAX_TABLE_BYTES, MMAP_THRESHOLD, OP_BSPATCH,
+    OP_CLOSE, OP_OPEN, OP_OPEN_SPLICE_CLOSE, OP_SET_READ_SOURCE, OP_UNSET_READ_SOURCE, OP_WRITE,
+    SIGNED_MAGIC, SIGNED_SIG, SUPERBLOCK_SIG, dir_child_names, open_rw_temp, read_capped,
+    spill_to_blob,
 };
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
@@ -178,6 +179,22 @@ pub struct DeltaOptions {
     /// order. Empty by default, which writes an unsigned superblock. A signer
     /// that fails fails the generation with no superblock written.
     pub signers: Vec<Arc<dyn Signer>>,
+    /// Carry each part in the superblock metadata dict under
+    /// `deltas/<fanout>/<rest>/<i>` as a `(yay)` variant, and write no part
+    /// file. The value holds the bytes a part file would hold. The key is the
+    /// repository-relative name also under
+    /// [`output_dir`](DeltaOptions::output_dir) and
+    /// [`superblock_file`](DeltaOptions::superblock_file). The parts count
+    /// toward the superblock ceiling of 128 MiB. A generation whose
+    /// superblock passes it fails before the superblock is written, and a
+    /// superblock that an earlier delta left at the same location stays in
+    /// place. Default false.
+    pub inline: bool,
+    /// The byte order written into `ostree.endianness` and used for a
+    /// meta-entry's `size` and `usize` and a fallback's two sizes. The
+    /// timestamp, the parts, and the embedded commit do not change with it.
+    /// Default [`DeltaEndianness::Little`], on every host.
+    pub endianness: DeltaEndianness,
 }
 
 impl std::fmt::Debug for DeltaOptions {
@@ -192,6 +209,8 @@ impl std::fmt::Debug for DeltaOptions {
             .field("output_dir", &self.output_dir)
             .field("superblock_file", &self.superblock_file)
             .field("signers", &signers)
+            .field("inline", &self.inline)
+            .field("endianness", &self.endianness)
             .finish()
     }
 }
@@ -207,6 +226,8 @@ impl Default for DeltaOptions {
             output_dir: None,
             superblock_file: None,
             signers: Vec::new(),
+            inline: false,
+            endianness: DeltaEndianness::Little,
         }
     }
 }
@@ -221,18 +242,24 @@ impl Repo {
     /// with [`DeltaOptions::superblock_file`] set, the superblock at that path
     /// and the parts in the directory that holds it. Part files are written
     /// before the superblock, so a delta interrupted part-way leaves no
-    /// superblock for a reader to trust, and the superblock is signed before it
-    /// is written, so a generation that fails at signing writes no superblock.
+    /// superblock for a reader to trust. With [`DeltaOptions::inline`] set the
+    /// parts go into the superblock and no part file is written. The
+    /// superblock is signed before it is written, so a generation that fails
+    /// at signing writes no superblock.
     /// Each file is written
     /// under a temp name that is unlinked unless the rename putting it in place
     /// runs, so a generation that fails or is cancelled leaves no partial file
     /// in the directory. Regenerating over an
     /// existing delta overwrites its parts in place, so that delta's superblock
     /// is unlinked before the first part is written rather than being left to
-    /// describe files this run has replaced. A file at a
+    /// describe files this run has replaced. An inline generation replaces no
+    /// part file, so the previous superblock stays in place until the rename
+    /// of the new one replaces it, and an inline generation that fails leaves
+    /// the previous delta as it was. A file at a
     /// [`DeltaOptions::superblock_file`] path is the caller's and is not
     /// unlinked. Once the new superblock is in place,
-    /// part files left by a longer previous delta are removed, along with temp
+    /// part files left by a longer previous delta are removed (every numbered
+    /// part file where the new delta carries its parts inline), along with temp
     /// files a generation that was killed mid-write left behind once they are an
     /// hour old (see `TEMP_STALE_SECS`). That pass covers the repository's own
     /// `deltas/` tree; a directory named through [`DeltaOptions::output_dir`]
@@ -264,6 +291,21 @@ impl Repo {
         to: &Checksum,
         opts: &DeltaOptions,
     ) -> Result<PathBuf> {
+        self.generate_static_delta_under(from, to, opts, MAX_SUPERBLOCK)
+            .await
+    }
+
+    /// [`generate_static_delta`](Repo::generate_static_delta), with the
+    /// superblock size that inline parts are budgeted against given as
+    /// `ceiling`. The public call gives [`MAX_SUPERBLOCK`]. A test gives a
+    /// smaller ceiling to reach the inline refusal without a 128 MiB part.
+    async fn generate_static_delta_under(
+        &self,
+        from: Option<&Checksum>,
+        to: &Checksum,
+        opts: &DeltaOptions,
+        ceiling: u64,
+    ) -> Result<PathBuf> {
         if opts.max_chunk_size == 0 {
             return Err(Error::InvalidFormat(
                 "static delta max chunk size must be positive".to_owned(),
@@ -280,7 +322,7 @@ impl Repo {
         // is what a verifying tool pull checks the delivered commit against.
         let commit_bytes = self.load_object_bytes(ObjectType::Commit, to).await?;
         let detached = self.read_commit_detached_metadata(to).await?;
-        let target = Target {
+        let commit = Target {
             bytes: &commit_bytes,
             detached: detached.as_ref(),
         };
@@ -319,11 +361,36 @@ impl Repo {
         // Parts are overwritten in place, so a superblock describing the
         // previous delta at this location goes before the first of them. A file
         // at a superblock-file path is the caller's: only the final rename
-        // replaces it, so a generation that fails leaves it as it was.
-        if opts.superblock_file.is_none() {
+        // replaces it, so a generation that fails leaves it as it was. An inline
+        // generation overwrites no part file, so the previous superblock stays
+        // until the rename replaces it, and a generation that fails leaves the
+        // previous delta whole.
+        if opts.superblock_file.is_none() && !opts.inline {
             remove_superblock(&dir_fd).await?;
         }
 
+        // Inline parts are held until the superblock is serialized, so they
+        // share the superblock ceiling: each part is compressed into a buffer
+        // capped at what the rest of the superblock and the parts before it
+        // left. The rest is counted at its least -- the embedded commit, 33
+        // bytes for each object in the meta-entries, and 49 for each fallback
+        // -- so a delta whose parts cannot fit is refused at the part that
+        // passes the ceiling. The framing, the detached metadata copy, and any
+        // signature are not counted, and the size check on the serialized
+        // superblock refuses what they push past the ceiling.
+        let mut target = if opts.inline {
+            let fixed = commit_bytes
+                .len()
+                .saturating_add(selection.packed.len().saturating_mul(1 + 32))
+                .saturating_add(selection.fallbacks.len().saturating_mul(1 + 32 + 8 + 8));
+            PartTarget::Inline {
+                budget: usize::try_from(ceiling)
+                    .unwrap_or(usize::MAX)
+                    .saturating_sub(fixed),
+            }
+        } else {
+            PartTarget::File(&dir_fd)
+        };
         let mut entries: Vec<PartEntry> = Vec::new();
         let mut part = Part::default();
         for item in &selection.packed {
@@ -335,18 +402,20 @@ impl Repo {
             // part it would have fit in -- one extra xz stream and one extra pair
             // of mode and xattr tables, in exchange for the ceiling holding.
             if !part.is_empty() && part.payload_len() + item.content_size > opts.max_chunk_size {
-                entries.push(write_part(&dir_fd, entries.len(), part, fsync).await?);
+                entries.push(write_part(&mut target, entries.len(), part, fsync).await?);
                 part = Part::default();
             }
             self.add_object(&mut part, item, opts, tmp_fd.as_fd())
                 .await?;
         }
         if !part.is_empty() {
-            entries.push(write_part(&dir_fd, entries.len(), part, fsync).await?);
+            entries.push(write_part(&mut target, entries.len(), part, fsync).await?);
         }
+        let part_files = if opts.inline { 0 } else { entries.len() };
 
         let mut superblock =
-            self.build_superblock(from, to, &target, &entries, &selection, opts)?;
+            self.build_superblock(from, to, &commit, &mut entries, &selection, opts)?;
+        drop(entries);
         if !opts.signers.is_empty() {
             let signers: Vec<&dyn Signer> = opts.signers.iter().map(|s| s.as_ref()).collect();
             superblock = sign_superblock(superblock, Value::Array(Vec::new()), &signers).await?;
@@ -356,7 +425,7 @@ impl Repo {
         // every entry is this code's own: an output directory the caller named can
         // hold files whose names a delta's own files also take.
         if opts.output_dir.is_none() && opts.superblock_file.is_none() {
-            clean_delta_dir(&dir_fd, entries.len()).await?;
+            clean_delta_dir(&dir_fd, part_files).await?;
         }
         Ok(dir_path)
     }
@@ -754,24 +823,57 @@ impl Repo {
     /// checks a delta-delivered commit against that copy, so a signed commit
     /// reaches a verifying destination only where the copy is here. A commit
     /// holding no detached metadata gets no entry.
+    ///
+    /// The dict entries are in the tool's order: `ostree.endianness`, then each
+    /// inline part in part order under `<dir>/<i>`, then `<dir>/commitmeta`.
+    /// The inline bytes move out of `entries` into the dict, and are dropped
+    /// with it once the superblock is serialized.
     fn build_superblock(
         &self,
         from: Option<&Checksum>,
         to: &Checksum,
         target: &Target<'_>,
-        entries: &[PartEntry],
+        entries: &mut [PartEntry],
         selection: &Selection,
         opts: &DeltaOptions,
     ) -> Result<Vec<u8>> {
+        let (byte, big_endian) = match opts.endianness {
+            DeltaEndianness::Little => (ENDIANNESS_LITTLE, false),
+            DeltaEndianness::Big => (ENDIANNESS_BIG, true),
+        };
+        // Sizes are host order, which the `ostree.endianness` byte declares.
+        // The serializer writes little-endian on every host, so a big-endian
+        // field is swapped here.
+        let host = |value: u64| {
+            if big_endian {
+                value.swap_bytes()
+            } else {
+                value
+            }
+        };
         let mut metadata = Value::Array(Vec::new());
         crate::commit::append_dict_entry(
             &mut metadata,
             ENDIANNESS_KEY,
             Value::variant(
                 Type::parse("y").map_err(ostrya_core::Error::from)?,
-                Value::Byte(ENDIANNESS_LITTLE),
+                Value::Byte(byte),
             ),
         )?;
+        let inline_ty = Type::parse("(yay)").map_err(ostrya_core::Error::from)?;
+        for (index, entry) in entries.iter_mut().enumerate() {
+            let Some((compression, body)) = entry.inline.take() else {
+                continue;
+            };
+            crate::commit::append_dict_entry(
+                &mut metadata,
+                &format!("{}/{index}", delta_relative_dir(from, to)),
+                Value::variant(
+                    inline_ty.clone(),
+                    Value::Tuple(vec![Value::Byte(compression), Value::Bytes(body)]),
+                ),
+            )?;
+        }
         if let Some(detached) = target.detached {
             crate::commit::append_dict_entry(
                 &mut metadata,
@@ -792,10 +894,8 @@ impl Repo {
                 Value::Tuple(vec![
                     Value::U32(PART_VERSION),
                     Value::Bytes(entry.checksum.as_bytes().to_vec()),
-                    // Sizes are host order, which the `ostree.endianness` byte
-                    // declares as little for everything this serializer writes.
-                    Value::U64(entry.size),
-                    Value::U64(entry.uncompressed_size),
+                    Value::U64(host(entry.size)),
+                    Value::U64(host(entry.uncompressed_size)),
                     Value::Bytes(object_array(&entry.objects)),
                 ])
             })
@@ -808,8 +908,8 @@ impl Repo {
                 Value::Tuple(vec![
                     Value::Byte(ObjectType::File.as_u32() as u8),
                     Value::Bytes(fallback.checksum.as_bytes().to_vec()),
-                    Value::U64(fallback.compressed_size),
-                    Value::U64(fallback.content_size),
+                    Value::U64(host(fallback.compressed_size)),
+                    Value::U64(host(fallback.content_size)),
                 ])
             })
             .collect();
@@ -880,7 +980,7 @@ impl Repo {
     }
 
     /// Open the repository's `tmp/` directory, where spill files are created.
-    async fn open_tmp_dir(&self) -> Result<OwnedFd> {
+    pub(crate) async fn open_tmp_dir(&self) -> Result<OwnedFd> {
         self.open_repo_subdir("tmp").await
     }
 
@@ -953,6 +1053,19 @@ struct PartEntry {
     /// The uncompressed payload the part delivers, summed over its objects.
     uncompressed_size: u64,
     objects: Vec<(ObjectType, Checksum)>,
+    /// The bytes a part file would hold, where the superblock carries the part
+    /// inline: the compression byte, and the body after it. The superblock
+    /// build takes them.
+    inline: Option<(u8, Vec<u8>)>,
+}
+
+/// Where [`write_part`] puts a part's bytes.
+enum PartTarget<'a> {
+    /// The numbered part file in this delta directory.
+    File(&'a OwnedFd),
+    /// A buffer the superblock carries inline. `budget` is what the superblock
+    /// ceiling leaves for the parts not yet written.
+    Inline { budget: usize },
 }
 
 /// A part under construction: the mode and xattr tables, the data source, the
@@ -1170,7 +1283,8 @@ impl BlockingSpill {
     }
 }
 
-/// Write one part file and return its meta-entry.
+/// Write one part and return its meta-entry: to its numbered part file, or
+/// into a buffer the superblock carries inline.
 ///
 /// The payload GVariant `(a(uuu)aa(ayay)ayay)` is emitted straight into the xz
 /// encoder: the two tables first (bounded metadata, built in memory), then the
@@ -1180,7 +1294,12 @@ impl BlockingSpill {
 /// on-disk file, compression byte included, which is what the meta-entry
 /// records. Framing and the two tables are assembled here; the compression and
 /// the file write happen in [`compress_part`], on the blocking pool.
-async fn write_part(dir_fd: &OwnedFd, index: usize, part: Part, fsync: bool) -> Result<PartEntry> {
+async fn write_part(
+    target: &mut PartTarget<'_>,
+    index: usize,
+    part: Part,
+    fsync: bool,
+) -> Result<PartEntry> {
     let modes = mode_table(&part.modes);
     let xattrs = xattr_table(&part.xattrs)?;
     check_table_size(modes.len() + xattrs.len())?;
@@ -1205,6 +1324,32 @@ async fn write_part(dir_fd: &OwnedFd, index: usize, part: Part, fsync: bool) -> 
     write_offset(&mut offsets, modes.len() + xattrs.len(), width);
     write_offset(&mut offsets, modes.len(), width);
 
+    let dir_fd = match target {
+        PartTarget::File(dir_fd) => *dir_fd,
+        PartTarget::Inline { budget } => {
+            let limit = *budget;
+            let blob = part.blob.into_blocking().await?;
+            let ops = part.ops;
+            let (checksum, size, inline) = ostrya_rt::unblock(move || {
+                let mut capped = CappedBuf::new(limit);
+                match compress_part(&mut capped, &modes, &xattrs, blob, &ops, &offsets) {
+                    Ok((checksum, size)) => Ok((checksum, size, capped.into_parts())),
+                    Err(_) if capped.len() == limit => Err(inline_ceiling_error()),
+                    Err(err) => Err(err),
+                }
+            })
+            .await?;
+            *budget -= 1 + inline.1.len();
+            return Ok(PartEntry {
+                checksum,
+                size,
+                uncompressed_size: part.uncompressed_size,
+                objects: part.objects,
+                inline: Some(inline),
+            });
+        }
+    };
+
     let name = index.to_string();
     let temp = TempFile::create(dir_fd, &name);
     let fd = {
@@ -1217,9 +1362,11 @@ async fn write_part(dir_fd: &OwnedFd, index: usize, part: Part, fsync: bool) -> 
     // compression, and the file write all happen on one blocking-pool thread.
     let blob = part.blob.into_blocking().await?;
     let ops = part.ops;
-    let (checksum, size) =
-        ostrya_rt::unblock(move || compress_part(fd, &modes, &xattrs, blob, &ops, &offsets))
-            .await?;
+    let (checksum, size) = ostrya_rt::unblock(move || {
+        let file = std::fs::File::from(fd);
+        compress_part(file, &modes, &xattrs, blob, &ops, &offsets)
+    })
+    .await?;
 
     finish_file(dir_fd, temp.name(), &name, fsync).await?;
     temp.keep();
@@ -1228,11 +1375,76 @@ async fn write_part(dir_fd: &OwnedFd, index: usize, part: Part, fsync: bool) -> 
         size,
         uncompressed_size: part.uncompressed_size,
         objects: part.objects,
+        inline: None,
     })
 }
 
-/// Compress a part's payload into `fd`, returning the file's SHA-256 and its
-/// size.
+/// A buffer that takes at most `limit` bytes. A write past the limit fills the
+/// buffer to the limit and then fails, so a caller finds the cause by the
+/// length. The first byte, the compression byte of a part, is held apart from
+/// the body after it, which is the form the superblock carries.
+struct CappedBuf {
+    compression: Option<u8>,
+    body: Vec<u8>,
+    limit: usize,
+}
+
+impl CappedBuf {
+    fn new(limit: usize) -> CappedBuf {
+        CappedBuf {
+            compression: None,
+            body: Vec::new(),
+            limit,
+        }
+    }
+
+    /// The bytes taken, the compression byte included.
+    fn len(&self) -> usize {
+        usize::from(self.compression.is_some()) + self.body.len()
+    }
+
+    /// The compression byte and the body. A part always starts with its
+    /// compression byte, so a buffer that took no byte reads as uncompressed.
+    fn into_parts(self) -> (u8, Vec<u8>) {
+        (self.compression.unwrap_or(0), self.body)
+    }
+}
+
+impl std::io::Write for CappedBuf {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let room = self.limit - self.len();
+        if room == 0 && !bytes.is_empty() {
+            return Err(std::io::Error::other(
+                "static delta inline part passes the superblock ceiling",
+            ));
+        }
+        let n = bytes.len().min(room);
+        let mut taken = &bytes[..n];
+        if self.compression.is_none()
+            && let Some((&first, rest)) = taken.split_first()
+        {
+            self.compression = Some(first);
+            taken = rest;
+        }
+        self.body.extend_from_slice(taken);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The refusal of inline parts that do not fit in a superblock the read path
+/// accepts.
+fn inline_ceiling_error() -> Error {
+    Error::InvalidFormat(format!(
+        "static delta inline parts pass the {MAX_SUPERBLOCK}-byte superblock ceiling"
+    ))
+}
+
+/// Compress a part's payload into `out`, a part file or an inline buffer,
+/// returning the SHA-256 of what was written and its size.
 ///
 /// This is the expensive half of writing a part: xz at [`PART_XZ_LEVEL`] costs
 /// seconds of CPU per tens of megabytes and holds about 370 MiB of encoder state,
@@ -1244,15 +1456,15 @@ async fn write_part(dir_fd: &OwnedFd, index: usize, part: Part, fsync: bool) -> 
 /// never buffered whole. [`SyncWriter`] and [`BlockingSpill`] complete every I/O
 /// call in place, so the future never returns `Pending` and `block_on` drives it
 /// to completion on this thread with no executor behind it.
-fn compress_part(
-    fd: OwnedFd,
+fn compress_part<W: std::io::Write + Unpin>(
+    out: W,
     modes: &[u8],
     xattrs: &[u8],
     blob: BlockingSpill,
     ops: &[u8],
     offsets: &[u8],
 ) -> Result<(Checksum, u64)> {
-    let mut hashing = HashingWriter::new(Sha256::new(), SyncWriter(std::fs::File::from(fd)));
+    let mut hashing = HashingWriter::new(Sha256::new(), SyncWriter(out));
     futures_lite::future::block_on(async {
         hashing
             .write_all(&[COMPRESSION_XZ])
@@ -1271,14 +1483,14 @@ fn compress_part(
     Ok(hashing.finalize())
 }
 
-/// A `futures-io` writer over a blocking file.
+/// A `futures-io` writer over a blocking writer: a file, or a buffer.
 ///
 /// Every method performs its syscall and returns `Ready`, so a future built over
 /// it never parks. That is what lets [`compress_part`] drive the async xz encoder
 /// to completion on a blocking-pool thread.
-struct SyncWriter(std::fs::File);
+struct SyncWriter<W>(W);
 
-impl futures_io::AsyncWrite for SyncWriter {
+impl<W: std::io::Write + Unpin> futures_io::AsyncWrite for SyncWriter<W> {
     fn poll_write(
         self: Pin<&mut Self>,
         _: &mut Context<'_>,
@@ -2213,7 +2425,7 @@ mod tests {
                 ..Part::default()
             };
             part.finish_object(ObjectType::File, Checksum::sha256(b"x"), 9);
-            write_part(&dir_fd, 0, part, false).await
+            write_part(&mut PartTarget::File(&dir_fd), 0, part, false).await
         });
         let leftovers = dir_child_names(&dir_fd).unwrap();
         let _ = std::fs::remove_dir_all(&root);
@@ -2223,6 +2435,175 @@ mod tests {
             leftovers.is_empty(),
             "the failed part left files behind: {leftovers:?}"
         );
+    }
+
+    /// A repository at `root/repo` holding one commit of `files`, each a
+    /// file of `size` bytes of noise, as `(repo, commit)`.
+    async fn noise_commit(root: &Path, files: usize, size: usize) -> (Repo, Checksum) {
+        use crate::{
+            CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
+        };
+
+        let tree = root.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for i in 0..files {
+            let bytes: Vec<u8> = (0..size)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect();
+            std::fs::write(tree.join(format!("f{i}")), bytes).unwrap();
+        }
+        let repo = Repo::create(
+            &root.join("repo"),
+            CreateOptions::new(ostrya_core::RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let dfd = std::fs::File::open(&tree).unwrap();
+        let mut modifier = Some(CommitModifier::new(
+            CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS,
+        ));
+        let mut mtree = MutableTree::new();
+        txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), &mut mtree, modifier.as_mut())
+            .await
+            .unwrap();
+        let root_tree = txn.write_mtree(&mut mtree).await.unwrap();
+        let commit = txn
+            .write_commit(
+                CommitOptions {
+                    timestamp: Some(1_700_000_000),
+                    ..CommitOptions::default()
+                },
+                &root_tree,
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        (repo, commit)
+    }
+
+    /// An inline generation whose parts pass the superblock ceiling is
+    /// refused, and it leaves what was there before: the earlier delta at the
+    /// repository location keeps its superblock and its part files and stays
+    /// listed, and a fresh output directory receives no file.
+    #[test]
+    fn an_inline_generation_over_the_ceiling_keeps_the_earlier_delta() {
+        let root = scratch("inline-ceiling");
+        let out = root.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let outcome = ostrya_rt::block_on(async {
+            let (repo, commit) = noise_commit(&root, 3, 200_000).await;
+            let files = DeltaOptions {
+                timestamp: Some(1_700_000_000),
+                min_fallback_size: 0,
+                max_chunk_size: 150_000,
+                ..DeltaOptions::default()
+            };
+            let relative = repo
+                .generate_static_delta(None, &commit, &files)
+                .await
+                .unwrap();
+            let delta = root.join("repo").join(&relative);
+            let before = dir_child_names(&open_dir_blocking(&delta).unwrap()).unwrap();
+            let superblock = std::fs::read(delta.join(SUPERBLOCK_FILE)).unwrap();
+            let listed = repo.list_static_deltas().await.unwrap();
+            assert_eq!(listed.len(), 1);
+
+            let inline = DeltaOptions {
+                inline: true,
+                ..files
+            };
+            let err = repo
+                .generate_static_delta_under(None, &commit, &inline, 100_000)
+                .await
+                .unwrap_err();
+            let Error::InvalidFormat(message) = err else {
+                panic!("the ceiling refusal is an invalid-format error: {err}");
+            };
+            assert!(message.contains("superblock ceiling"), "{message}");
+            let mut after = dir_child_names(&open_dir_blocking(&delta).unwrap()).unwrap();
+            let mut before = before;
+            before.sort();
+            after.sort();
+            assert_eq!(after, before);
+            assert_eq!(
+                std::fs::read(delta.join(SUPERBLOCK_FILE)).unwrap(),
+                superblock
+            );
+            assert_eq!(repo.list_static_deltas().await.unwrap(), listed);
+
+            let err = repo
+                .generate_static_delta_under(
+                    None,
+                    &commit,
+                    &DeltaOptions {
+                        output_dir: Some(out.clone()),
+                        ..inline
+                    },
+                    100_000,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
+            dir_child_names(&open_dir_blocking(&out).unwrap()).unwrap()
+        });
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(outcome.is_empty(), "{outcome:?}");
+    }
+
+    /// The inline part buffer takes bytes up to its limit and refuses the
+    /// first byte past it, and the part write reports the superblock ceiling
+    /// where the buffer filled, so the ceiling holds without a 128 MiB part.
+    #[test]
+    fn the_capped_part_buffer_refuses_past_its_limit() {
+        use std::io::Write;
+
+        let mut capped = CappedBuf::new(4);
+        assert_eq!(capped.write(b"abc").unwrap(), 3);
+        assert_eq!(capped.write(b"de").unwrap(), 1);
+        assert!(capped.write(b"f").is_err());
+        assert_eq!(capped.write(b"").unwrap(), 0);
+        assert_eq!(capped.len(), 4);
+        assert_eq!(capped.into_parts(), (b'a', b"bcd".to_vec()));
+
+        let root = scratch("capped-part");
+        let tmp = open_dir_blocking(&root).unwrap();
+        let outcome = ostrya_rt::block_on(async {
+            let mut part = Part::default();
+            part.blob.append(&[7u8; 4096], tmp.as_fd()).await?;
+            part.finish_object(ObjectType::File, Checksum::sha256(b"x"), 4096);
+            write_part(&mut PartTarget::Inline { budget: 16 }, 0, part, false).await
+        });
+        let Err(Error::InvalidFormat(message)) = outcome else {
+            panic!("an inline part past the budget must be refused");
+        };
+        assert!(message.contains("superblock ceiling"), "{message}");
+
+        let mut budget = PartTarget::Inline { budget: 1 << 20 };
+        let entry = ostrya_rt::block_on(async {
+            let mut part = Part::default();
+            part.blob.append(&[7u8; 4096], tmp.as_fd()).await?;
+            part.finish_object(ObjectType::File, Checksum::sha256(b"x"), 4096);
+            write_part(&mut budget, 0, part, false).await
+        })
+        .unwrap();
+        let (compression, body) = entry.inline.expect("an inline part keeps its bytes");
+        let mut bytes = vec![compression];
+        bytes.extend_from_slice(&body);
+        assert_eq!(bytes.len() as u64, entry.size);
+        assert_eq!(compression, COMPRESSION_XZ);
+        assert_eq!(Checksum::sha256(&bytes), entry.checksum);
+        let PartTarget::Inline { budget } = budget else {
+            unreachable!();
+        };
+        assert_eq!(budget, (1 << 20) - bytes.len());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

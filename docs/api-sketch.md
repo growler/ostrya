@@ -1994,6 +1994,14 @@ pub struct DeltaOptions {
     pub superblock_file: Option<PathBuf>,
     /// Sign the superblock with each signer, in order, before it is written.
     pub signers: Vec<Arc<dyn Signer>>,
+    /// Carry each part in the superblock metadata dict under
+    /// `deltas/<fanout>/<rest>/<i>` and write no part file. The parts count
+    /// toward the 128 MiB superblock ceiling. A generation over the ceiling
+    /// writes no file, and an earlier delta at the same location stays whole.
+    pub inline: bool,
+    /// The `ostree.endianness` byte and the order of the four size fields.
+    /// Default `Little` on every host.
+    pub endianness: DeltaEndianness,
 }
 impl Repo {
     /// Returns the directory the delta was written to: relative to the
@@ -2001,7 +2009,9 @@ impl Repo {
     /// `superblock_file` verbatim where one is set.
     pub async fn generate_static_delta(&self, from: Option<&Checksum>,
         to: &Checksum, opts: &DeltaOptions) -> Result<PathBuf>;
-    /// Apply the delta in `dir` and return the commit it delivered.
+    /// Apply the delta in `dir` and return the commit it delivered. A part the
+    /// superblock carries inline is read from there, also where a part file of
+    /// the same number is present.
     pub async fn apply_static_delta_offline(&self, dir: &Path) -> Result<Checksum>;
     pub async fn sign_static_delta(&self, dir: &Path, signer: &dyn Signer) -> Result<()>;
     pub async fn verify_static_delta(&self, dir: &Path, verifiers: &[&dyn Verifier])
@@ -2055,6 +2065,7 @@ impl DeltaSuperblock {
     /// inline and from `dir/<index>` otherwise.
     pub async fn part_stats(&self, index: usize, dir: &Path) -> Result<DeltaPartStats>;
 }
+/// What a superblock declares, and what the generator writes.
 pub enum DeltaEndianness { Little, Big }
 impl DeltaPart {
     pub fn checksum(&self) -> &Checksum;

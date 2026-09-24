@@ -137,11 +137,16 @@ severity: interop
 identity: full
 oracle: manifest checksum-agreement
 evidence: ostrya::read, ostrya::read_modes, ostrya::checkout, ostrya::tar,
- ostrya::delta
+ ostrya::delta, ostrya::delta::the_port_applies_the_tools_inline_delta,
+ ostrya::delta::the_port_applies_the_tools_big_endian_inline_delta
 spec: format-reference.md#object-store-layout
 note: These are the paths the checked-in golden fixtures already exercise: the
  port reads the tool's archive tree and bare-user tarball, imports the tool's tar
- export, and applies a tool-generated delta.
+ export, and applies a tool-generated delta. The applied deltas include one that
+ carries its parts inline and one written under `--set-endianness=B`, each
+ applied into repositories the tool created. The port
+ reads a superblock of 128 MiB at most, and a tool inline superblock can pass
+ that size (`cli-surface.md`, "P2", `static-delta`).
 
 family: M1
 created-by: t
@@ -370,7 +375,7 @@ created-by: p
 populated-by: p
 operated-by: t
 op: commit-into refs-update prune summary-regenerate sign-verify
- static-delta-generate static-delta-apply tar-export diff config-read
+ static-delta-generate tar-export diff config-read
 modes: archive bare bare-user bare-user-only
 tier: T0
 outcome: unobserved
@@ -385,6 +390,62 @@ question: Hand a port-made repository to the tool and have the tool mutate it,
  extend them to the tool writing into the repository afterwards. This group is
  where an interleaved-mutation defect would first appear, and m8-custody covers
  the longer sequences.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: static-delta-apply
+modes: bare-user
+tier: T0
+outcome: full
+severity: interop
+identity: n-a
+oracle: checksum-agreement exit-status
+evidence: ostrya::delta_generate::the_tool_applies_a_port_inline_big_endian_delta,
+ ostrya::delta_generate::the_tool_applies_a_port_file_part_little_endian_delta
+spec: format-reference.md#static-delta-wire-format
+note: The tool applies the port's deltas offline into a repository the port
+ created, from scratch and from a source commit: with the parts inline under
+ the big-endian byte, and with the parts in files under the little-endian
+ byte. The tool's `fsck` passes. The deltas carry no fallback, since the tool
+ refuses a delta with fallbacks offline.
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: static-delta-apply
+modes: archive
+tier: T0
+outcome: full
+severity: interop
+identity: n-a
+oracle: checksum-agreement exit-status
+evidence: ostrya::delta_generate::the_tool_applies_a_port_inline_big_endian_delta,
+ ostrya::delta_generate::the_tool_applies_a_port_file_part_little_endian_delta
+spec: format-reference.md#static-delta-wire-format
+note: The tool applies the port's from-scratch delta, which carries splices
+ alone, into an archive repository the port created, with the parts inline
+ under the big-endian byte and with the parts in files under the
+ little-endian byte, and its `fsck` passes. A delta that carries an `o` operation applies in the tool into a bare
+ family repository alone. That limit holds for the tool's own deltas too
+ (`format-reference.md`, "Static delta wire format").
+
+family: M1
+created-by: p
+populated-by: p
+operated-by: t
+op: static-delta-apply
+modes: bare bare-user-only
+tier: T0
+outcome: unobserved
+severity: interop
+identity: unobserved
+oracle: exit-status checksum-agreement inventory
+evidence: -
+question: Have the tool apply a port-generated delta into a port-made bare and
+ bare-user-only repository, and confirm the objects from the port's side.
 
 family: M1
 created-by: p

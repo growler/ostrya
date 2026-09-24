@@ -24,9 +24,10 @@ use std::sync::Arc;
 use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    DeltaSuperblock, DummyVerifier, Ed25519Signer, Ed25519Verifier, Error, MutableTree, Repo,
-    RepoMode, SignFuture, Signer, SummaryOptions, TreeEntry, base64, static_delta_relative_dir,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaEndianness,
+    DeltaOptions, DeltaSuperblock, DummyVerifier, Ed25519Signer, Ed25519Verifier, Error,
+    MutableTree, Repo, RepoMode, SignFuture, Signer, SummaryOptions, TreeEntry, Type, Value,
+    base64, from_bytes, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -1928,6 +1929,53 @@ fn a_failing_signer_leaves_no_superblock() {
     });
 }
 
+/// An inline generation writes no part file, so the superblock of an earlier
+/// delta at the same location stays until the new one replaces it. A signer
+/// that fails leaves the earlier delta whole: its superblock and its part
+/// file are unchanged, it stays listed, and it still applies.
+#[test]
+fn a_failing_signer_under_inline_keeps_the_earlier_delta() {
+    let tmp = TmpDir::new("gen-sign-fails-inline");
+    let base = tmp.path();
+    block_on(async {
+        let (src, repo, commit) = one_file_repo(base).await;
+        let delta = src.join(
+            repo.generate_static_delta(None, &commit, &DeltaOptions::default())
+                .await
+                .unwrap(),
+        );
+        let superblock = std::fs::read(delta.join("superblock")).unwrap();
+        let part = std::fs::read(delta.join("0")).unwrap();
+        let listed = repo.list_static_deltas().await.unwrap();
+
+        let err = repo
+            .generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    inline: true,
+                    signers: vec![Arc::new(FailingSigner)],
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err}");
+        assert_eq!(dir_names(&delta), vec!["0", "superblock"]);
+        assert_eq!(std::fs::read(delta.join("superblock")).unwrap(), superblock);
+        assert_eq!(std::fs::read(delta.join("0")).unwrap(), part);
+        assert_eq!(repo.list_static_deltas().await.unwrap(), listed);
+
+        let dst = Repo::create(&base.join("dst"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.apply_static_delta_offline(&delta).await.unwrap(),
+            commit
+        );
+    });
+}
+
 /// A file at the `superblock_file` path is replaced only by the final rename,
 /// so a signer that fails after the parts are written leaves it as it was.
 #[test]
@@ -2159,4 +2207,558 @@ fn a_symlink_at_the_superblock_file_is_replaced_not_followed() {
     });
     assert!(std::fs::symlink_metadata(&sb).unwrap().is_file());
     assert!(dir_names(&elsewhere).is_empty());
+}
+
+// --- inline parts and the endianness byte -------------------------------------
+
+/// The superblock type string, for reading a superblock the tests hold.
+const SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))";
+
+/// The fields of an unsigned superblock file.
+fn superblock_fields(path: &Path) -> Vec<Value> {
+    let bytes = std::fs::read(path).unwrap();
+    let value = from_bytes(&Type::parse(SUPERBLOCK_SIG).unwrap(), &bytes).unwrap();
+    let Value::Tuple(fields) = value else {
+        panic!("a superblock is a tuple");
+    };
+    fields
+}
+
+/// The metadata dict of an unsigned superblock file, as keys and values in
+/// dict order.
+fn superblock_dict(path: &Path) -> Vec<(String, Value)> {
+    let fields = superblock_fields(path);
+    fields[0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            let pair = entry.as_tuple().unwrap();
+            (pair[0].as_str().unwrap().to_owned(), pair[1].clone())
+        })
+        .collect()
+}
+
+/// The bytes an inline part value stands for: the compression byte and the
+/// body, which is what the part file holds.
+fn inline_bytes(value: &Value) -> Vec<u8> {
+    let (ty, inner) = value.as_variant().unwrap();
+    assert_eq!(ty.signature(), "(yay)");
+    let pair = inner.as_tuple().unwrap();
+    let mut bytes = vec![pair[0].as_byte().unwrap()];
+    bytes.extend_from_slice(pair[1].as_bytes().unwrap());
+    bytes
+}
+
+/// A repository at `base/src` holding one signed commit of three 300,000-byte
+/// files, which a 250,000-byte chunk size puts into parts of their own.
+async fn multi_part_repo(base: &Path) -> (PathBuf, Repo, Checksum) {
+    let tree = base.join("multi-tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    for i in 0..3u64 {
+        std::fs::write(tree.join(format!("f{i}")), noise(300_000, 20 + i)).unwrap();
+    }
+    std::os::unix::fs::symlink("f0", tree.join("link")).unwrap();
+    let src = base.join("src");
+    let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let commit = commit_tree(&repo, &tree, None).await;
+    let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+    repo.sign_commit(&commit, &signer).await.unwrap();
+    (src, repo, commit)
+}
+
+/// The options the inline tests share: a pinned timestamp, no fallback, and a
+/// chunk size that gives each file of [`multi_part_repo`] a part.
+fn inline_test_options() -> DeltaOptions {
+    DeltaOptions {
+        timestamp: Some(1_700_000_000),
+        min_fallback_size: 0,
+        max_chunk_size: 250_000,
+        ..DeltaOptions::default()
+    }
+}
+
+/// An inline delta carries each part in the superblock and writes no part
+/// file. The dict holds `ostree.endianness`, the parts in part order, and then
+/// `commitmeta`, the order the tool writes. Each value holds the bytes of the
+/// part file a generation with the same options writes, and the port applies
+/// the delta.
+#[test]
+fn an_inline_delta_carries_its_parts_in_the_superblock() {
+    let tmp = TmpDir::new("gen-inline");
+    let base = tmp.path();
+    let files = base.join("files");
+    block_on(async {
+        let (src, repo, commit) = multi_part_repo(base).await;
+        repo.generate_static_delta(
+            None,
+            &commit,
+            &DeltaOptions {
+                output_dir: Some(files.clone()),
+                ..inline_test_options()
+            },
+        )
+        .await
+        .unwrap();
+        let relative = repo
+            .generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    inline: true,
+                    ..inline_test_options()
+                },
+            )
+            .await
+            .unwrap();
+        let delta = src.join(&relative);
+        assert_eq!(dir_names(&delta), ["superblock"]);
+
+        let dict = superblock_dict(&delta.join("superblock"));
+        let dir = relative.display().to_string();
+        let parts = dir_names(&files).len() - 1;
+        assert!(parts >= 4, "{parts} parts");
+        let mut expected = vec!["ostree.endianness".to_owned()];
+        expected.extend((0..parts).map(|i| format!("{dir}/{i}")));
+        expected.push(format!("{dir}/commitmeta"));
+        let keys: Vec<String> = dict.iter().map(|(key, _)| key.clone()).collect();
+        assert_eq!(keys, expected);
+        for (i, (_, value)) in dict[1..=parts].iter().enumerate() {
+            assert_eq!(
+                inline_bytes(value),
+                std::fs::read(files.join(i.to_string())).unwrap(),
+                "part {i}"
+            );
+        }
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        let stats = sb.part_stats(1, &delta).await.unwrap();
+        assert_eq!(stats.ops.open_splice_close, 1);
+
+        let dst = Repo::create(&base.join("dst"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let applied = dst.apply_static_delta_offline(&delta).await.unwrap();
+        assert_eq!(applied, commit);
+        assert_eq!(
+            read_file(&dst, &commit.to_hex(), "f2").await,
+            noise(300_000, 22)
+        );
+    });
+}
+
+/// The inline key is the repository-relative name under `output_dir` and
+/// under `superblock_file` as well, and neither target receives a part file.
+#[test]
+fn the_inline_key_is_repository_relative_under_every_target() {
+    let tmp = TmpDir::new("gen-inline-targets");
+    let base = tmp.path();
+    let out = base.join("out");
+    let sb_dir = base.join("sb-dir");
+    std::fs::create_dir_all(&sb_dir).unwrap();
+    block_on(async {
+        let (_src, repo, commit) = multi_part_repo(base).await;
+        let dir = static_delta_relative_dir(None, &commit);
+        for opts in [
+            DeltaOptions {
+                output_dir: Some(out.clone()),
+                ..DeltaOptions::default()
+            },
+            DeltaOptions {
+                superblock_file: Some(sb_dir.join("sb")),
+                ..DeltaOptions::default()
+            },
+        ] {
+            repo.generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    inline: true,
+                    ..opts.clone()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(dir_names(&out), ["superblock"]);
+        assert_eq!(dir_names(&sb_dir), ["sb"]);
+        for path in [out.join("superblock"), sb_dir.join("sb")] {
+            let keys: Vec<String> = superblock_dict(&path)
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            assert!(keys.contains(&format!("{dir}/0")), "{keys:?}");
+        }
+    });
+}
+
+/// Regenerating a delta inline at the repository location removes the part
+/// files the earlier delta wrote there. Under `output_dir` the caller's files
+/// stay.
+#[test]
+fn regenerating_inline_removes_the_stale_part_files() {
+    let tmp = TmpDir::new("gen-inline-stale");
+    let base = tmp.path();
+    let out = base.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("0"), b"the caller's part\n").unwrap();
+    block_on(async {
+        let (src, repo, commit) = multi_part_repo(base).await;
+        let relative = repo
+            .generate_static_delta(None, &commit, &inline_test_options())
+            .await
+            .unwrap();
+        assert!(dir_names(&src.join(&relative)).len() > 2);
+        let inline = DeltaOptions {
+            inline: true,
+            ..inline_test_options()
+        };
+        repo.generate_static_delta(None, &commit, &inline)
+            .await
+            .unwrap();
+        assert_eq!(dir_names(&src.join(&relative)), ["superblock"]);
+
+        repo.generate_static_delta(
+            None,
+            &commit,
+            &DeltaOptions {
+                output_dir: Some(out.clone()),
+                ..inline
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dir_names(&out), ["0", "superblock"]);
+        assert_eq!(
+            std::fs::read(out.join("0")).unwrap(),
+            b"the caller's part\n"
+        );
+    });
+}
+
+/// A big-endian generation writes the byte `B` and swaps the four size fields,
+/// a meta-entry's `size` and `usize` and a fallback's two sizes, and changes
+/// nothing else: the superblocks have the same length, every other field is
+/// equal, and the part files are identical. Both read back to the same sizes.
+#[test]
+fn a_big_endian_superblock_swaps_the_four_size_fields_only() {
+    let tmp = TmpDir::new("gen-big-endian");
+    let base = tmp.path();
+    let (little, big) = (base.join("little"), base.join("big"));
+    block_on(async {
+        let (_src, repo, commit) = multi_part_repo(base).await;
+        for (dir, endianness) in [
+            (&little, DeltaEndianness::Little),
+            (&big, DeltaEndianness::Big),
+        ] {
+            repo.generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    timestamp: Some(1_700_000_000),
+                    // One file travels as a fallback.
+                    min_fallback_size: 250_000,
+                    output_dir: Some(dir.clone()),
+                    endianness,
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+    });
+    let (l_path, b_path) = (little.join("superblock"), big.join("superblock"));
+    assert_eq!(
+        std::fs::metadata(&l_path).unwrap().len(),
+        std::fs::metadata(&b_path).unwrap().len()
+    );
+    assert_eq!(
+        std::fs::read(little.join("0")).unwrap(),
+        std::fs::read(big.join("0")).unwrap()
+    );
+
+    let (l, b) = (superblock_fields(&l_path), superblock_fields(&b_path));
+    let byte = |dict: &Value| {
+        dict.dict_get("ostree.endianness")
+            .and_then(Value::as_variant)
+            .and_then(|(_, value)| value.as_byte())
+    };
+    assert_eq!(byte(&l[0]), Some(b'l'));
+    assert_eq!(byte(&b[0]), Some(b'B'));
+    assert_eq!(
+        &l[1..6],
+        &b[1..6],
+        "the timestamp, the commits, the recursion"
+    );
+    let swapped = |value: &Value, sizes: &[usize]| -> Value {
+        let Value::Array(entries) = value else {
+            panic!("an array");
+        };
+        Value::Array(
+            entries
+                .iter()
+                .map(|entry| {
+                    let mut fields = entry.as_tuple().unwrap().to_vec();
+                    for &i in sizes {
+                        fields[i] = Value::U64(fields[i].as_u64().unwrap().swap_bytes());
+                    }
+                    Value::Tuple(fields)
+                })
+                .collect(),
+        )
+    };
+    assert_eq!(swapped(&l[6], &[2, 3]), b[6], "the meta-entry sizes");
+    assert_eq!(swapped(&l[7], &[2, 3]), b[7], "the fallback sizes");
+    assert_eq!(l[7].as_array().unwrap().len(), 3);
+
+    let (l_sb, b_sb) = block_on(async {
+        (
+            DeltaSuperblock::read(&l_path).await.unwrap(),
+            DeltaSuperblock::read(&b_path).await.unwrap(),
+        )
+    });
+    assert_eq!(b_sb.endianness(), DeltaEndianness::Big);
+    for (lp, bp) in l_sb.parts().iter().zip(b_sb.parts()) {
+        assert_eq!(
+            (lp.size(), lp.uncompressed_size()),
+            (bp.size(), bp.uncompressed_size())
+        );
+    }
+    for (lf, bf) in l_sb.fallbacks().iter().zip(b_sb.fallbacks()) {
+        assert_eq!(
+            (lf.size(), lf.uncompressed_size()),
+            (bf.size(), bf.uncompressed_size())
+        );
+    }
+}
+
+/// The tool applies the port's inline big-endian deltas offline into a
+/// `bare-user` repository the port created: a from-scratch one, and a from-to
+/// one that copies runs out of the source object. The tool applies the
+/// from-scratch one into a port-created `archive` repository as well, since it
+/// carries splices alone. The tool's `fsck` passes each time.
+#[test]
+fn the_tool_applies_a_port_inline_big_endian_delta() {
+    tool_applies_port_deltas("gen-inline-tool-apply", true, DeltaEndianness::Big);
+}
+
+/// The tool applies the port's little-endian deltas with the parts in files
+/// offline into a `bare-user` repository the port created, from scratch and
+/// from a source commit, and the from-scratch one into a port-created
+/// `archive` repository. The tool's `fsck` passes each time.
+#[test]
+fn the_tool_applies_a_port_file_part_little_endian_delta() {
+    tool_applies_port_deltas("gen-file-tool-apply", false, DeltaEndianness::Little);
+}
+
+/// Generate a from-scratch and a from-to delta in a port repository, with the
+/// parts inline or in files and under `endianness`, and have the tool apply
+/// them into port-created `bare-user` and `archive` repositories.
+fn tool_applies_port_deltas(tag: &str, inline: bool, endianness: DeltaEndianness) {
+    if !ostree_available() {
+        eprintln!("skipping: ostree not available");
+        return;
+    }
+    let tmp = TmpDir::new(tag);
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let mut bulk = noise(2 * 1024 * 1024, 31);
+    std::fs::write(tree.join("bulk.bin"), &bulk).unwrap();
+    std::fs::write(tree.join("app"), b"version one\n").unwrap();
+    let src = base.join("src");
+    let options = DeltaOptions {
+        timestamp: Some(1_700_000_000),
+        min_fallback_size: 0,
+        inline,
+        endianness,
+        ..DeltaOptions::default()
+    };
+    let (scratch, fromto, c1, c2) = block_on(async {
+        let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let c1 = commit_tree(&repo, &tree, None).await;
+        bulk[1024 * 1024..1024 * 1024 + 4].copy_from_slice(b"edit");
+        std::fs::write(tree.join("bulk.bin"), &bulk).unwrap();
+        std::fs::write(tree.join("app"), b"version two\n").unwrap();
+        let c2 = commit_tree(&repo, &tree, Some(c1)).await;
+        let scratch = repo
+            .generate_static_delta(None, &c1, &options)
+            .await
+            .unwrap();
+        let fromto = repo
+            .generate_static_delta(Some(&c1), &c2, &options)
+            .await
+            .unwrap();
+        (src.join(scratch), src.join(fromto), c1, c2)
+    });
+    if inline {
+        assert_eq!(dir_names(&fromto), ["superblock"]);
+    } else {
+        assert_eq!(dir_names(&fromto), ["0", "superblock"]);
+    }
+    // The tool's `show` reads no inline part, so the port reads the byte.
+    let sb = block_on(DeltaSuperblock::read(&fromto.join("superblock"))).unwrap();
+    assert_eq!(sb.endianness(), endianness);
+    let payload = block_on(sb.part_stats(0, &fromto)).unwrap();
+    assert!(
+        payload.ops.write > 0,
+        "no copy out of the source: {payload:?}"
+    );
+
+    for mode in [RepoMode::BareUser, RepoMode::Archive] {
+        // The destination is one the port created.
+        let dst = base.join(format!("tool-{}", mode.as_mode_str()));
+        block_on(Repo::create(&dst, CreateOptions::new(mode))).unwrap();
+        let dst_arg = format!("--repo={}", dst.display());
+        ostree(&[
+            &dst_arg,
+            "static-delta",
+            "apply-offline",
+            &scratch.to_string_lossy(),
+        ]);
+        ostree(&[&dst_arg, "fsck"]);
+        assert_eq!(
+            ostree(&[&dst_arg, "cat", &c1.to_hex(), "/app"]),
+            b"version one\n"
+        );
+        if mode == RepoMode::BareUser {
+            ostree(&[
+                &dst_arg,
+                "static-delta",
+                "apply-offline",
+                &fromto.to_string_lossy(),
+            ]);
+            ostree(&[&dst_arg, "fsck"]);
+            assert_eq!(ostree(&[&dst_arg, "cat", &c2.to_hex(), "/bulk.bin"]), bulk);
+        }
+    }
+}
+
+/// The tool, as a client, pulls the port's inline deltas over a `file://`
+/// remote into `bare-user`, little-endian and big-endian, with
+/// `--require-static-deltas`, and its `fsck` passes. The delta directory holds
+/// the superblock alone, so the parts the tool applies are the inline ones.
+/// The remote is `file://`, so the test does not see the tool's requests.
+#[test]
+fn the_tool_pulls_a_port_inline_delta() {
+    if !ostree_available() {
+        eprintln!("skipping: ostree not available");
+        return;
+    }
+    let tmp = TmpDir::new("gen-inline-tool-pull");
+    let base = tmp.path();
+    for endianness in [DeltaEndianness::Little, DeltaEndianness::Big] {
+        let case = base.join(format!("{endianness:?}"));
+        std::fs::create_dir_all(&case).unwrap();
+        let (src, commit) = block_on(async {
+            let (src, repo, commit) = multi_part_repo(&case).await;
+            let relative = repo
+                .generate_static_delta(
+                    None,
+                    &commit,
+                    &DeltaOptions {
+                        inline: true,
+                        endianness,
+                        ..inline_test_options()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(dir_names(&src.join(relative)), ["superblock"]);
+            repo.reindex_static_deltas().await.unwrap();
+            repo.regenerate_summary(&SummaryOptions::default())
+                .await
+                .unwrap();
+            (src, commit)
+        });
+        let dest = case.join("dest");
+        let dest_arg = format!("--repo={}", dest.display());
+        ostree(&[&dest_arg, "init", "--mode=bare-user"]);
+        let url = format!("file://{}", src.display());
+        ostree(&[
+            &dest_arg,
+            "remote",
+            "add",
+            "origin",
+            &url,
+            "--no-gpg-verify",
+        ]);
+        ostree(&[
+            &dest_arg,
+            "pull",
+            "--require-static-deltas",
+            "origin",
+            "test",
+        ]);
+        let resolved = String::from_utf8(ostree(&[&dest_arg, "rev-parse", "origin:test"])).unwrap();
+        assert_eq!(resolved.trim(), commit.to_hex(), "{endianness:?}");
+        ostree(&[&dest_arg, "fsck"]);
+    }
+}
+
+/// A signed inline delta verifies in both implementations: the tool verifies
+/// the port's, the port verifies the tool's, and the port reads the part
+/// statistics of the tool's signed inline superblock.
+#[test]
+fn a_signed_inline_delta_verifies_in_both() {
+    if !ostree_supports_ed25519() {
+        eprintln!("skipping: ostree has no ed25519 engine");
+        return;
+    }
+    let tmp = TmpDir::new("gen-inline-signed");
+    let base = tmp.path();
+    let (src, commit) = block_on(async {
+        let (src, repo, commit) = multi_part_repo(base).await;
+        let signer: Arc<dyn Signer> = Arc::new(Ed25519Signer::from_base64(SECRET_B64).unwrap());
+        repo.generate_static_delta(
+            None,
+            &commit,
+            &DeltaOptions {
+                inline: true,
+                signers: vec![signer],
+                ..inline_test_options()
+            },
+        )
+        .await
+        .unwrap();
+        (src, commit)
+    });
+    let src_arg = format!("--repo={}", src.display());
+    let name = delta_name(None, &commit);
+    assert!(
+        ostree_status(&[&src_arg, "static-delta", "verify", &name, PUBLIC_B64]),
+        "the tool rejected the port's signed inline delta"
+    );
+
+    // The tool signs its own inline delta of the same commit.
+    let _ = std::fs::remove_dir_all(src.join("deltas"));
+    ostree(&[
+        &src_arg,
+        "static-delta",
+        "generate",
+        "--inline",
+        "--empty",
+        &format!("--to={}", commit.to_hex()),
+        "--min-fallback-size=0",
+        &format!("--sign={SECRET_B64}"),
+    ]);
+    let delta = src.join(static_delta_relative_dir(None, &commit));
+    assert_eq!(dir_names(&delta), ["superblock"]);
+    block_on(async {
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        assert!(sb.is_signed());
+        let trusted =
+            Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
+                .unwrap();
+        assert!(sb.verify(&[&trusted]).await.unwrap().valid);
+        let stats = sb.part_stats(0, &delta).await.unwrap();
+        assert!(stats.ops.open_splice_close > 0);
+    });
 }

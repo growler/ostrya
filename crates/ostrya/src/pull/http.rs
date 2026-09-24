@@ -166,6 +166,7 @@ use ostrya_core::{
 };
 
 use crate::config::RepoConfig;
+use crate::delta::IO_CHUNK;
 use crate::error::{Error, Result};
 use crate::fetch::gate::Gate;
 use crate::fetch::{
@@ -1385,10 +1386,12 @@ pub(crate) async fn fetch_optional(
 ///
 /// The buffer is sized from the declared length, which the fetcher has already
 /// held to the cap, so the body lands in one allocation of its own size and the
-/// resident peak is what the cap states. The one spare byte is where the final
-/// read finds the end of the stream: a buffer filled to its capacity is grown
-/// before that read, which would double it. A remote declaring no length grows
-/// its buffer as it reads, under the same cap.
+/// resident peak is what the cap states. Each read goes into a chunk of at most
+/// 128 KiB and is appended to the buffer, so no read touches the rest of the
+/// buffer, also where the body arrives slowly and a read waits many times. The
+/// final read, which finds the end of the stream, goes into the chunk, so a
+/// buffer filled to its declared length is not grown. A remote declaring no
+/// length grows its buffer as it reads, under the same cap.
 async fn fetch_whole(
     fetcher: &Fetcher,
     path: &str,
@@ -1407,10 +1410,16 @@ async fn fetch_whole(
             "{path}: the remote answered 304 to an unconditional request"
         )));
     };
-    let declared = body.content_length().unwrap_or(0).min(max_size);
-    let mut out = Vec::with_capacity(usize::try_from(declared).unwrap_or(0).saturating_add(1));
-    body.read_to_end(&mut out).await?;
-    Ok(out)
+    let declared = usize::try_from(body.content_length().unwrap_or(0).min(max_size)).unwrap_or(0);
+    let mut out = Vec::with_capacity(declared);
+    let mut chunk = vec![0u8; declared.saturating_add(1).clamp(4096, IO_CHUNK)];
+    loop {
+        let n = body.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
 }
 
 /// Read the archive framing off the front of a content object's stream: a

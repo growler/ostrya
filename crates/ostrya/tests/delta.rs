@@ -456,6 +456,142 @@ fn part_stats_match_the_tool_show() {
     assert_part_stats_match_the_tool(&repo_arg, &format!("{c1}-{c2}"), &fromto.unwrap());
 }
 
+/// Replace the deltas of `src_repo` with the one the tool generates with
+/// `args` and `--inline`, and return its directory. The tool leaves the part
+/// files of an earlier delta in place, so the tree is removed first: a part
+/// file left there would let a reader that ignores the inline parts pass.
+fn tool_inline_delta(src_repo: &Path, args: &[&str]) -> PathBuf {
+    let _ = std::fs::remove_dir_all(src_repo.join("deltas"));
+    let repo_arg = format!("--repo={}", src_repo.display());
+    let all = [
+        &[repo_arg.as_str(), "static-delta", "generate", "--inline"][..],
+        args,
+    ]
+    .concat();
+    ostree(&all);
+    let (scratch, fromto) = find_delta_dirs(src_repo);
+    let dir = scratch.or(fromto).expect("the inline delta directory");
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["superblock"], "the tool wrote part files");
+    dir
+}
+
+/// The port applies the tool's inline delta, one object to each part, into
+/// `archive` and `bare-user` repositories the tool created. The commit and the
+/// file contents agree, and the tool's `fsck` passes over what the port wrote.
+#[test]
+fn the_port_applies_the_tools_inline_delta() {
+    if !ostree_available() {
+        eprintln!("skipping: ostree tool not available");
+        return;
+    }
+    let tmp = TmpDir::new("delta-inline");
+    let base = tmp.path();
+    let (src_repo, c1, _c2) = build_source_repo(base);
+    // The tool reads a chunk size of 0 as one object for each part.
+    let to = format!("--to={c1}");
+    let dir = tool_inline_delta(
+        &src_repo,
+        &[
+            "--empty",
+            &to,
+            "--min-fallback-size=0",
+            "--max-chunk-size=0",
+        ],
+    );
+    let sb = block_on(DeltaSuperblock::read(&dir.join("superblock"))).unwrap();
+    assert!(sb.parts().len() > 3, "{} parts", sb.parts().len());
+
+    for mode in [RepoMode::Archive, RepoMode::BareUser] {
+        let dst = base.join(format!("dst-{mode:?}"));
+        ostree(&[
+            &format!("--repo={}", dst.display()),
+            "init",
+            &format!("--mode={}", mode.as_mode_str()),
+        ]);
+        block_on(async {
+            let repo = Repo::open(&dst).await.unwrap();
+            let to = repo.apply_static_delta_offline(&dir).await.unwrap();
+            assert_eq!(to.to_hex(), c1);
+            let (_commit, state) = repo.load_commit(&to).await.unwrap();
+            assert_eq!(state, CommitState::Normal);
+            assert_eq!(read_file(&repo, &c1, "usr/bin/app").await, APP_V1);
+            assert_eq!(
+                read_file(&repo, &c1, "usr/share/data.bin").await,
+                data_bin()
+            );
+            assert_eq!(read_symlink(&repo, &c1, "usr/bin/applink").await, "app");
+            repo.set_ref_immediate("test", Some(&to)).await.unwrap();
+        });
+        ostree(&[&format!("--repo={}", dst.display()), "fsck"]);
+    }
+}
+
+/// The port applies the tool's inline from-to delta written under
+/// `--set-endianness=B`, whose meta-entry sizes are big-endian.
+#[test]
+fn the_port_applies_the_tools_big_endian_inline_delta() {
+    if !ostree_available() {
+        eprintln!("skipping: ostree tool not available");
+        return;
+    }
+    let tmp = TmpDir::new("delta-inline-big");
+    let base = tmp.path();
+    let (src_repo, c1, c2) = build_source_repo(base);
+    let (from, to) = (format!("--from={c1}"), format!("--to={c2}"));
+    let dir = tool_inline_delta(&src_repo, &[&from, &to, "--set-endianness=B"]);
+    let sb = block_on(DeltaSuperblock::read(&dir.join("superblock"))).unwrap();
+    assert_eq!(sb.endianness(), DeltaEndianness::Big);
+
+    let dst = base.join("dst");
+    let dst_arg = format!("--repo={}", dst.display());
+    ostree(&[&dst_arg, "init", "--mode=bare-user"]);
+    ostree(&[&dst_arg, "pull-local", &src_repo.to_string_lossy(), &c1]);
+    block_on(async {
+        let repo = Repo::open(&dst).await.unwrap();
+        let to = repo.apply_static_delta_offline(&dir).await.unwrap();
+        assert_eq!(to.to_hex(), c2);
+        assert_eq!(
+            read_file(&repo, &c2, "usr/share/patch.bin").await,
+            patch_bin(true)
+        );
+        assert_eq!(read_file(&repo, &c2, "usr/bin/app").await, APP_V2);
+        repo.set_ref_immediate("test", Some(&to)).await.unwrap();
+    });
+    ostree(&[&dst_arg, "fsck"]);
+}
+
+/// A part file beside an inline superblock is not read: the inline part is
+/// applied, as the tool applies it, so a garbage `0` changes nothing.
+#[test]
+fn an_inline_part_wins_over_a_part_file() {
+    if !ostree_available() {
+        eprintln!("skipping: ostree tool not available");
+        return;
+    }
+    let tmp = TmpDir::new("delta-inline-wins");
+    let base = tmp.path();
+    let (src_repo, c1, _c2) = build_source_repo(base);
+    let to = format!("--to={c1}");
+    let dir = tool_inline_delta(&src_repo, &["--empty", &to]);
+    std::fs::write(dir.join("0"), b"not a part").unwrap();
+    block_on(async {
+        let repo = Repo::create(&base.join("dst"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let to = repo.apply_static_delta_offline(&dir).await.unwrap();
+        assert_eq!(to.to_hex(), c1);
+        let sb = DeltaSuperblock::read(&dir.join("superblock"))
+            .await
+            .unwrap();
+        let stats = sb.part_stats(0, &dir).await.unwrap();
+        assert!(stats.ops.open_splice_close > 0);
+    });
+}
+
 /// The `delta-indexes/` listing takes a regular file `<2 chars>/<41
 /// chars>.index` that decodes as a checksum, sorted, and skips every other
 /// entry.

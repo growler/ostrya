@@ -2034,10 +2034,14 @@ inventory is the oracle and the port writes the bytes the tool writes.
 
 `summary` accepts `--repo`, `-u/--update`, `-v/--view`, `--raw`,
 `--list-metadata-keys`, `--print-metadata-key=KEY`, `-m/--add-metadata=KEY`,
-`--gpg-sign=KEY-ID`, `--gpg-homedir`, `--sign=KEY-ID`, `-s/--sign-type`,
-`--verify`, and the port extensions `--last-modified`,
-`--metadata-commit-timestamp`, `--keys-file`, `--keys-dir`, `--remote`, and a
-positional `KEY_ID...`. Nothing is missing. On this command the tool binds `-v`
+`--gpg-sign=KEY-ID`, `--gpg-homedir`, `--sign=KEY-ID`, `--sign-type`, and the
+port extensions `-s` (the short form of `--sign-type`), `--verify`,
+`--last-modified`, `--metadata-commit-timestamp`, `--keys-file`, `--keys-dir`,
+`--remote`, and a positional `KEY_ID...`. Nothing is missing. The tool refuses
+`--verify`, `--keys-file`, `--keys-dir`, and `-s` with `error: Unknown option
+<arg>` at exit 1, and verifies a summary signature through a remote alone. The
+port's `summary --verify` reads the key sources of its `sign --verify`
+(`../format-reference.md`, "CLI output formats", `sign`). On this command the tool binds `-v`
 to `--view`, and `--verbose` has no short form. The port carries the same
 shape: `summary` declares `-v/--view` and a long-only `--verbose`, and every
 other subcommand, together with the top level, keeps `-v/--verbose`. `-m`,
@@ -2231,16 +2235,19 @@ section states for `commit --sign-type`. Twenty-four differences stand on
   more such lines, the tool writes a GLib warning and names the first line in
   an error that carries the `Invalid ed25519 public key:` prefix twice. The
   port names the first line with the prefix once;
-- a `verify --keys-file` line of 0 or 1 byte, a lone `\r` included. The tool
-  dies on `SIGSEGV` after a GLib assertion. The port skips an empty line and a
+- a `--keys-file` line of 0 or 1 byte, a lone `\r` included, under `verify`,
+  `sign --verify`, or `summary --verify`. The tool's `verify` and `sign
+  --verify` die on `SIGSEGV` after a GLib assertion. The port skips an empty line and a
   lone `\r` line. It refuses any other 1-byte line, whitespace included, at
   exit 1 with `error: Invalid ed25519 public key: Ill-formed input: expected
   32 bytes, got 0 bytes` and nothing on standard output;
-- a key-store line of 0 or 1 byte. The tool dies on `SIGSEGV` after a GLib
-  assertion. The port skips an empty line and a line of whitespace, and
+- a key-store line of 0 or 1 byte, under `verify`, `sign --verify`, or
+  `summary --verify`. The tool's `verify` and `sign --verify` die on `SIGSEGV`
+  after a GLib assertion. The port skips an empty line and a line of whitespace, and
   refuses any other 1-byte line with its strict base64 error;
-- a `verify --keys-file` over 1 MiB (1048576 bytes). The tool reads the whole
-  file and verifies with its keys. The port refuses the run at exit 1 with
+- a `--keys-file` over 1 MiB (1048576 bytes), under `verify`, `sign --verify`,
+  or `summary --verify`. The tool's `verify` and `sign --verify` read the whole
+  file and verify with its keys. The port refuses the run at exit 1 with
   `error: signature: the key file '<path>' is over the 1048576-byte ceiling`
   and nothing on standard output. The ceiling is the one the port's key store
   applies to each of its files;
@@ -2250,15 +2257,20 @@ section states for `commit --sign-type`. Twenty-four differences stand on
   A skipped `revoked.ed25519` revokes nothing, so the tool reports
   `Verification OK` at exit 0 with a key that file revokes. The port refuses
   the run at exit 1 with `error: signature: the key file '<path>' cannot be
-  opened: Permission denied (os error 13)` and nothing on standard output;
+  opened: Permission denied (os error 13)` and nothing on standard output. The
+  port's `sign --verify` and `summary --verify` refuse such a file the same
+  way;
 - a key-store line (`--keys-dir` or the system key directories) that does not
   decode to a valid key, in the trusted or the revoked set. The tool skips the
   line with a GLib warning and verifies with the other keys. The port refuses
   the run with `error: signature: ed25519 public key must be 32 bytes, got
   <n>` and nothing on standard output. The store reader also decodes strictly,
-  where the tool decodes leniently;
-- `verify --keys-dir` naming a regular file. The tool reports `error:
-  signature: ed25519: no keys loaded`. The port reports `error: signature: the
+  where the tool decodes leniently. The port's `sign --verify` and `summary
+  --verify` read the store with the same reader;
+- `--keys-dir` naming a regular file, under `verify`, `sign --verify`, or
+  `summary --verify`. The tool's `verify` and `sign --verify` report `error:
+  signature: ed25519: no keys loaded`, and a later `--keys-dir` replaces the
+  file. The port reports `error: signature: the
   key file '<path>/trusted.ed25519' cannot be opened: Not a directory (os
   error 20)`. Both
   exit 1 with nothing on standard output;
@@ -2298,8 +2310,87 @@ extensions `--force-copy` and `-L/--localcache-repo`. Missing:
 `--disable-fsync`, `--per-object-fsync`, `--require-static-deltas`,
 `--disable-static-deltas`, `--gpg-verify`, `--gpg-verify-summary`.
 
-`sign` accepts the whole tool option set and adds `--gpg-homedir` and
-`--remote`. No change is required.
+`sign` accepts the whole tool option set and adds `--gpg-homedir`,
+`--remote`, the `gpg` engine, and the `spki` engine. The tool build at hand,
+`ostree` 2026.1 with the `sign-ed25519` feature, refuses `-s spki` in signing,
+`--verify`, and `-d` with `error: Requested signature type is not
+implemented` at exit 1. Under `-s gpg` each `--keys-file` is a
+keyring, and every keyring given is read. Under `ed25519` and `spki`,
+`--verify` reads the key sources of `static-delta verify`: the positionals and
+the last `--keys-file`, either one leaving `--keys-dir` unread, the last
+`--keys-dir`, an empty one naming the working directory, and `no keys loaded`
+judged before revocation (`../format-reference.md`, "CLI output formats",
+`sign`). Over a commit either implementation signed, the verdict and the exit
+status agree for these rules, and so do the refusals `no keys loaded`, `File
+object '<path>' is not a regular file`, and `no valid keys in file '<path>'`,
+byte for byte. The key-file entries under `static-delta` above also hold for
+`sign --verify`. Nine differences stand.
+
+- the verdict report. The tool writes one line on success, `ed25519: Signature
+  verified successfully with key '<hex>'`, naming the key that verified. On
+  failure it writes nothing to standard output and one `error:` line: `No
+  valid signatures found` where the keys are positionals alone, over a
+  signed commit and over an unsigned one. Where a keys file or a key store
+  supplies keys, the line is `ed25519: commit have no signatures of my type`
+  over a commit with no signature of the engine, `ed25519: no signatures
+  found` over a signed commit where every trusted key of the store is
+  revoked, and `ed25519: Signature couldn't be verified with: key '<hex>';
+  ...` over a signed commit where no key verifies. The
+  port writes `signature <n>: good`, `no public key`, or `BAD` for each
+  signature and then `verification OK` or `verification FAILED`, or `no
+  signatures found`, all to standard output. The exit status agrees. The
+  report is the one the port's `summary --verify` and its gpg engine write;
+- a key that is not a valid key. The tool skips a positional that does not
+  decode to 32 bytes with no message, so `COMMIT AAAA P1` verifies at exit 0.
+  It also ignores a keys-file line of that kind, a line of whitespace
+  included, where another line verifies. The port refuses the run at exit 1
+  before verification with `error: Invalid ed25519 public key: Ill-formed
+  input: expected 32 bytes, got <n> bytes` and nothing on standard output.
+  Where no key verifies, both exit 1;
+- a keys-file line that is not UTF-8. The tool decodes a line of the bytes
+  `\xff\xfe` followed by a valid key as that key and verifies at exit 0. The
+  port decodes a line that is not UTF-8 to no byte and refuses the run with
+  the invalid-key error above at exit 1;
+- the time the keys file is read. The tool tries the positionals first and
+  reads the last `--keys-file` only where no positional verifies, so a missing
+  or empty keys file beside a verifying positional is never opened and the run
+  verifies at exit 0. The port loads every key source before verification and
+  refuses such a file at exit 1 with `File object '<path>' is not a regular
+  file` or `no valid keys in file '<path>'`;
+- a key-store line of whitespace of two or more bytes. The tool skips it with
+  a GLib warning on standard error. The port skips it with no message. Both
+  verify with the other keys;
+- a repeated `-s/--sign-type`. The tool keeps the last. `clap` refuses the
+  second with `error: the argument '--sign-type <SIGN_TYPE>' cannot be used
+  multiple times` at exit 1;
+- signing with a repeated `--keys-file`. This difference is in the bytes of
+  the repository and is open. The tool reads the last `--keys-file` when it
+  signs, so `sign COMMIT --keys-file=s1 --keys-file=s2` writes one signature,
+  by the key of `s2`. The port reads every file and writes one signature for
+  each key, so the `.commitmeta` bytes differ. A positional secret key beside
+  one `--keys-file` signs with both keys in both implementations;
+- the key kind `-d/--delete` takes. This difference is in the bytes of the
+  repository and is open. The tool reads a `-d` KEY-ID and each line of its
+  keys file as an ed25519 secret key and signs with it: `sign -d COMMIT <secret
+  key>` exits 0 and writes the `.commitmeta` bytes `sign COMMIT <secret key>`
+  writes, one more signature, over a signed commit and over an unsigned one.
+  It refuses a public key with `error: Invalid ed25519 secret key: Ill-formed
+  input: expected 64 bytes, got 32 bytes` at exit 1. The port reads a `-d`
+  KEY-ID and each `--keys-file` line as a public key and removes each
+  signature that key verifies. It refuses a secret key with `error:
+  signature: ed25519 public key must be 32 bytes, got 64` at exit 1 and
+  writes nothing. The tool writes a signature where the port refuses, and the
+  port removes a signature where the tool refuses;
+- a signing or delete `--keys-file` that is not a regular file, an empty
+  `--keys-file=` included. With no positional KEY-ID both refuse at exit 1
+  and write nothing. The tool writes the GLib warning `Can't open file
+  '<path>' with keys` and `error: File object '<path>' is not a regular
+  file`. The port writes `error: i/o error: No such file or directory (os
+  error 2)`, or `Is a directory (os error 21)` for a directory, and `-d`
+  with no positional KEY-ID writes `error: signature: delete requires at
+  least one KEY-ID`. Beside a positional secret key, the tool writes the
+  warning, signs with the positional key, and exits 0. The port refuses at
+  exit 1 and writes nothing.
 
 ## P3 -- shell-suite surface with no matrix weight
 

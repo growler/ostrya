@@ -5519,6 +5519,46 @@ prints after the per-path block, whatever order the two flags were given in.
 - 1 -- a side that cannot be read, a revision that does not resolve, and an
   object the store cannot supply.
 
+### `sign`
+
+`sign --verify COMMIT [KEY-ID...]` checks the signatures of one commit. The
+options are `-s`/`--sign-type=NAME`, `--keys-file=PATH`, and
+`--keys-dir=PATH`.
+
+Under the `ed25519` and `spki` engines, the key sources are the ones
+"`static-delta`", "`verify`", states:
+
+- Each positional KEY-ID and each line of the last `--keys-file` are trusted.
+  An earlier `--keys-file` is not read.
+- With a KEY-ID or a `--keys-file`, `--keys-dir` and the system key
+  directories are not read, and no key is revoked.
+- With neither, the last `--keys-dir` supplies the trusted and revoked keys.
+  Without `--keys-dir`, the system key directories supply them. An empty
+  `--keys-dir` names the working directory.
+- No trusted key reports `error: signature: <type>: no keys loaded`. The check
+  comes before revocation.
+- A key is decoded with the lenient base64 reader, and a `--keys-file` is read
+  under the rules of that section: a regular file, symlinks followed, up to
+  1 MiB.
+
+Every key source loads before a signature is read. A key source that does not
+load refuses the run at exit 1 with nothing on standard output: `no keys
+loaded`, `File object '<path>' is not a regular file`, `no valid keys in file
+'<path>'`, and `Invalid ed25519 public key: Ill-formed input: expected 32
+bytes, got <n> bytes`.
+
+Under the `gpg` engine, a port engine on `sign`, each `--keys-file` is a
+keyring, and every keyring given is read. The engine refuses `--keys-dir`.
+
+The port's report writes one line for each signature, `signature <n>: good`,
+`signature <n>: no public key`, or `signature <n>: BAD`, then `verification
+OK` at exit 0 or `verification FAILED` at exit 1. A commit with no signature
+of the engine writes `no signatures found` at exit 1. All of these lines go to
+standard output. The tool words the report differently, which
+`../conformance/cli-surface.md`, "P2", `sign`, records.
+
+Signing and `-d`/`--delete` read every `--keys-file` given.
+
 ### `summary`
 
 `summary` writes the repository summary, signs it, or reads it. The writing
@@ -5533,7 +5573,9 @@ The precedence is fixed and does not follow the order the switches are written
 in:
 
 1. `--verify` reports the signatures and returns. The option is a port
-   extension the tool does not carry.
+   extension the tool does not carry. The key sources are the ones `sign
+   --verify` takes ("`sign`"), and the report is the port's `sign --verify`
+   report.
 2. `-u`/`--update` checks the writing options, regenerates the summary, signs
    it, returns, and writes no report.
 3. A signing key given as a positional argument or with `--keys-file` signs the

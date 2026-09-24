@@ -2029,16 +2029,21 @@ covers the three engines through `-s|--sign-type` (`ed25519` default, `spki`,
 ```
 ostrya sign [--repo <repo>] [-d|--delete] [--verify]
             [-s|--sign-type ed25519|spki|gpg] [--gpg-homedir <dir>]
-            [--remote <name>] [--keys-file <path>]... [--keys-dir <path>]...
+            [--remote <name>] [--keys-file <path>]... [--keys-dir <path>]
             <commit> [key-id]...
 ```
 
-For ed25519 and spki the KEY-IDs are base64 keys, as the tool treats them: a
-secret key for signing, a public key for verify and delete. `--keys-file` adds
-keys of the same kind, one base64 per line. `--keys-dir` overrides the
-`trusted.<type>[.d]` / `revoked.<type>[.d]` system search roots for verify; with
-nothing supplied inline, verify falls back to the system store. A delete matches
-a stored blob to a KEY-ID by re-verifying it under that public key.
+For ed25519 and spki the KEY-IDs are base64 keys: a secret key for signing, a
+public key for verify, as the tool treats them, and a public key for delete.
+The tool reads a delete KEY-ID as a secret key and signs with it, which
+`conformance/cli-surface.md`, "P2", `sign`, records as an open divergence.
+`--keys-file` adds keys of the same kind, one base64 per line. Signing and delete read every
+`--keys-file`. Verify reads the key sources of `static-delta verify`: the
+KEY-IDs and the last `--keys-file`; with neither, the last `--keys-dir` in
+place of the `trusted.<type>[.d]` / `revoked.<type>[.d]` system search roots,
+or the system store where it is absent; and `no keys loaded` where no trusted
+key loads. A delete matches a stored blob to a KEY-ID by re-verifying it under
+that public key.
 
 For gpg the KEY-IDs name the signing keys the way `gpg --local-user` resolves
 them -- a fingerprint, a key id, or a user id -- in the default GnuPG home
@@ -6003,8 +6008,7 @@ build with the engine, the sign-type rule of the other signing commands, and
 `gpg` prints `Sign-type not supported` as the tool does. A `--keys-file` line of
 the wrong length beside a valid one refuses the run before standard output,
 where the tool prints a verdict and then exits 1. The superblock is parsed
-whole, where the tool reads the magic alone. `sign --verify` and `summary
---verify` keep their own key-source rules.
+whole, where the tool reads the magic alone.
 
 Ten divergences on `static-delta` are new, all in `cli-surface.md`, "P2":
 `dummy`; a wrong-length `--keys-file` line beside a valid one; a `--keys-file`
@@ -6017,6 +6021,52 @@ directions agree byte for byte in the cross-tool tests: the tool's `verify`
 reads a delta the port signs. The work adds 9 `m10` cells, of which 2 are
 executable and both pass; the conformance run reports 1011 cells and 410
 passes.
+
+`sign --verify` and `summary --verify` load their keys under the ed25519 and
+spki engines through `load_verify_keys`, the loader of `static-delta verify`,
+so the three sign-api verify commands have one key-source rule. No library
+code changes. In `SignArgs` and `SummaryArgs`, `--keys-dir` takes one value
+and keeps the last, and `--keys-file` stays a list that the verify path reads
+the last element of. Signing, delete, and the gpg engine read every
+`--keys-file`, and gpg reads each as a keyring. Both options take the value as
+an `OsString`. On the two verify paths an empty `--keys-file=` reaches the
+regular-file check and draws the tool's `File object '' is not a regular
+file`, an empty `--keys-dir=` names the working directory, and the regular-file
+check refuses a FIFO before it is opened. On signing, on `sign -d`, and on
+`summary -u`, an empty `--keys-file=` is refused with `error: i/o error: No
+such file or directory (os error 2)` at exit 1, where the tool's `sign` writes
+`error: File object '' is not a regular file`. The gpg engine refuses
+`--keys-dir` on `sign` and on `summary --verify` with the same message.
+
+The observation covered both custody directions, a commit the tool signed and
+a commit the port signed, and no result changed with the direction. The tool
+carries no `summary --verify`: it refuses `--verify`, `--keys-file`,
+`--keys-dir`, and `-s` on `summary`, so the port's options are extensions, and
+`cli-surface.md`, "P2", `summary`, lists them as such.
+
+Four decisions stand, each open to reversal. The port keeps its verdict report,
+where the tool writes one line on success and one `error:` line on failure;
+the exit status agrees, and the terminal is outside the compatibility scope.
+A key that is not a valid key refuses the run before verification, where the
+tool skips such a positional and ignores such a keys-file line beside a
+verifying key. Every key source loads before verification, where the tool
+reads the keys file only when no positional verifies. `summary --verify` takes
+the rule of `sign --verify`, though the tool gives it no rule to follow.
+
+Nine divergences on `sign` are recorded, all in `cli-surface.md`, "P2",
+`sign`: the verdict report; a key that is not a valid key; a keys-file line
+that is not UTF-8; the time the keys file is read; a key-store line of
+whitespace, which the tool skips with a warning; a repeated `--sign-type`,
+which `clap` refuses; signing with a repeated `--keys-file`, which the tool
+reads as the last file and the port reads as every file; the key kind `-d`
+takes, a secret key that signs in the tool and a public key that deletes in
+the port; and a signing or delete `--keys-file` that is not a regular file,
+which the tool skips beside a positional key and the port refuses. Two of them
+change the bytes of `.commitmeta` and are open: the repeated `--keys-file` and
+the key kind of `-d`. Six `static-delta` key-file entries name `sign --verify`
+and `summary --verify` as well. The work adds 8 `m10` cells, of which 2
+are executable and both pass; the conformance run reports 1019 cells and 412
+passes (the M10 family 409).
 
 #### Phase 17g -- P3 commands with no matrix weight
 

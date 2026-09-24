@@ -30679,3 +30679,420 @@ fn static_delta_verify_refusals_match_the_tool() {
         assert!(run.stdout.is_empty() || run.stdout == b"Sign-type not supported\n");
     }
 }
+
+// --- sign --verify and summary --verify key sources ---------------------------
+
+/// What one key-source row of `sign --verify` or `summary --verify` gives.
+enum KeySourceOutcome {
+    /// The keys load and the signatures are checked: the exit status of the
+    /// verdict, 0 for verified and 1 for not.
+    Verdict(i32),
+    /// The keys do not load: exit 1 with nothing on standard output and this
+    /// standard error.
+    Refused(String),
+}
+
+/// One key-source row: the options before the commit, the KEY-ID positionals
+/// after it, the outcome, and whether the tool's `sign --verify` gives the
+/// same outcome.
+struct KeySourceRow {
+    options: Vec<&'static str>,
+    keys: Vec<&'static str>,
+    outcome: KeySourceOutcome,
+    tool_agrees: bool,
+}
+
+/// Write the key files and key stores the key-source rows name into `base`,
+/// the working directory of every run.
+fn key_source_fixtures(base: &Path) {
+    std::fs::write(base.join("k1"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
+    std::fs::write(base.join("k2"), format!("{ED25519_PUBLIC2_B64}\n")).unwrap();
+    verify_key_store(base, "store1", &[ED25519_PUBLIC_B64], &[]);
+    verify_key_store(base, "store2", &[ED25519_PUBLIC2_B64], &[]);
+    verify_key_store(
+        base,
+        "revoked",
+        &[ED25519_PUBLIC_B64],
+        &[ED25519_PUBLIC_B64],
+    );
+    verify_key_store(base, "only-revoked", &[], &[ED25519_PUBLIC_B64]);
+    let dotd = base.join("dotd/trusted.ed25519.d");
+    std::fs::create_dir_all(&dotd).unwrap();
+    std::fs::write(dotd.join("key"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
+    // An empty --keys-dir names the working directory.
+    std::fs::write(
+        base.join("trusted.ed25519"),
+        format!("{ED25519_PUBLIC_B64}\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(base.join("adir")).unwrap();
+    mkfifo_at(&base.join("fifo"));
+    std::fs::write(base.join("empty"), b"").unwrap();
+    std::fs::write(
+        base.join("blank-first"),
+        format!("\n{ED25519_PUBLIC_B64}\n"),
+    )
+    .unwrap();
+    let junk = format!("{}!{}", &ED25519_PUBLIC_B64[..4], &ED25519_PUBLIC_B64[4..]);
+    std::fs::write(base.join("lenient2"), format!("  {junk}  \r\n")).unwrap();
+    std::fs::write(base.join("onebyte-A"), format!("A\n{ED25519_PUBLIC_B64}\n")).unwrap();
+}
+
+/// The key-source rows over a commit or a summary signed with the shared key
+/// alone. A refusal row sits after every verdict row, and the FIFO row last,
+/// so a build that waits on a FIFO fails an earlier row first.
+fn key_source_rows() -> Vec<KeySourceRow> {
+    use KeySourceOutcome::{Refused, Verdict};
+    let row =
+        |options: &[&'static str], keys: &[&'static str], outcome, tool_agrees| KeySourceRow {
+            options: options.to_vec(),
+            keys: keys.to_vec(),
+            outcome,
+            tool_agrees,
+        };
+    let no_keys = || Refused("error: signature: ed25519: no keys loaded\n".to_owned());
+    let not_regular = |path: &str| {
+        Refused(format!(
+            "error: File object '{path}' is not a regular file\n"
+        ))
+    };
+    let invalid = |n: usize| {
+        Refused(format!(
+            "error: Invalid ed25519 public key: Ill-formed input: expected 32 bytes, got {n} \
+             bytes\n"
+        ))
+    };
+    vec![
+        row(&["--keys-file=k2", "--keys-file=k1"], &[], Verdict(0), true),
+        row(&["--keys-file=k1", "--keys-file=k2"], &[], Verdict(1), true),
+        row(
+            &["--keys-file=k1"],
+            &[ED25519_PUBLIC2_B64],
+            Verdict(0),
+            true,
+        ),
+        row(
+            &["--keys-dir=store1", "--keys-file=k2"],
+            &[],
+            Verdict(1),
+            true,
+        ),
+        row(
+            &["--keys-dir=store1"],
+            &[ED25519_PUBLIC2_B64],
+            Verdict(1),
+            true,
+        ),
+        row(
+            &["--keys-dir=revoked"],
+            &[ED25519_PUBLIC_B64],
+            Verdict(0),
+            true,
+        ),
+        row(
+            &["--keys-dir=revoked", "--keys-file=k1"],
+            &[],
+            Verdict(0),
+            true,
+        ),
+        row(&["--keys-dir=store1"], &[], Verdict(0), true),
+        row(
+            &["--keys-dir=store1", "--keys-dir=store2"],
+            &[],
+            Verdict(1),
+            true,
+        ),
+        row(
+            &["--keys-dir=store2", "--keys-dir=store1"],
+            &[],
+            Verdict(0),
+            true,
+        ),
+        row(&["--keys-dir="], &[], Verdict(0), true),
+        row(&["--keys-dir=dotd"], &[], Verdict(0), true),
+        row(&["--keys-dir=revoked"], &[], Verdict(1), true),
+        row(
+            &["--keys-dir=nodir"],
+            &[ED25519_PUBLIC_B64],
+            Verdict(0),
+            true,
+        ),
+        row(&["--keys-file=lenient2"], &[], Verdict(0), true),
+        row(&["--keys-file=blank-first"], &[], Verdict(0), false),
+        row(&["--keys-dir=only-revoked"], &[], no_keys(), true),
+        row(&["--keys-dir=nodir"], &[], no_keys(), true),
+        row(
+            &["--keys-file=empty"],
+            &[],
+            Refused("error: signature: ed25519: no valid keys in file 'empty'\n".to_owned()),
+            true,
+        ),
+        row(&["--keys-file=onebyte-A"], &[], invalid(0), false),
+        row(&[], &["AAAA"], invalid(3), false),
+        row(&["--keys-file=nosuch"], &[], not_regular("nosuch"), true),
+        row(&["--keys-file=adir"], &[], not_regular("adir"), true),
+        row(&["--keys-file="], &[], not_regular(""), true),
+        row(&["--keys-file=fifo"], &[], not_regular("fifo"), true),
+    ]
+}
+
+/// The label of a key-source row.
+fn key_source_label(row: &KeySourceRow) -> String {
+    [&row.options[..], &row.keys[..]].concat().join(" ")
+}
+
+/// Assert the outcome of each key-source row, with `run` building and running
+/// the command for the row's options and KEY-IDs. `verified` and `failed` are
+/// the standard output of a verified and a failed verdict.
+fn assert_key_source_rows(run: &dyn Fn(&[&str], &[&str]) -> Run, verified: &str, failed: &str) {
+    for row in key_source_rows() {
+        let label = key_source_label(&row);
+        let got = run(&row.options, &row.keys);
+        let (code, stdout, stderr) = match &row.outcome {
+            KeySourceOutcome::Verdict(0) => (0, verified, ""),
+            KeySourceOutcome::Verdict(code) => (*code, failed, ""),
+            KeySourceOutcome::Refused(stderr) => (1, "", stderr.as_str()),
+        };
+        assert_verify_run(&got, code, stdout, stderr, &label);
+    }
+}
+
+/// A commit fixture under `base/<name>`, signed with the shared key by the
+/// port, or by the tool when `tool` is set.
+fn signed_commit_fixture(base: &Path, name: &str, tool: bool) -> PathBuf {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo = commit_fixture(&dir);
+    if tool {
+        ostree_ok(
+            &repo,
+            &["sign", "--sign-type=ed25519", COMMIT, ED25519_SECRET_B64],
+        );
+    } else {
+        let repo_arg = format!("--repo={}", repo.display());
+        ostrya(&["sign", &repo_arg, COMMIT, ED25519_SECRET_B64], None, &[]).ok();
+    }
+    repo
+}
+
+/// A commit fixture under `base/<name>` whose summary is signed with the
+/// shared key by the port, or by the tool when `tool` is set.
+fn signed_summary_fixture(base: &Path, name: &str, tool: bool) -> PathBuf {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo = commit_fixture(&dir);
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    if tool {
+        ostree_ok(&repo, &["summary", "-u", "--sign-type=ed25519", &sign]);
+    } else {
+        let repo_arg = format!("--repo={}", repo.display());
+        ostrya(
+            &[
+                "summary",
+                &repo_arg,
+                "-u",
+                "--last-modified=1700000000",
+                &sign,
+            ],
+            None,
+            &[],
+        )
+        .ok();
+    }
+    repo
+}
+
+/// Run `sign --verify` over `COMMIT` in `repo` from `cwd`, with `options`
+/// before the commit and `keys` after it, in the port or in the tool.
+fn run_sign_verify(cwd: &Path, repo: &Path, options: &[&str], keys: &[&str], tool: bool) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let head = ["sign", repo_arg.as_str(), "--verify"];
+    let all = [&head[..], options, &[COMMIT], keys].concat();
+    if tool {
+        ostree_in(cwd, &all)
+    } else {
+        ostrya_in(Some(cwd), &all, None, &[])
+    }
+}
+
+/// Run the port's `summary --verify` over `repo` from `cwd`.
+fn run_summary_verify(cwd: &Path, repo: &Path, options: &[&str], keys: &[&str]) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let head = ["summary", repo_arg.as_str(), "--verify"];
+    ostrya_in(Some(cwd), &[&head[..], options, keys].concat(), None, &[])
+}
+
+/// `sign --verify` reads the key sources `static-delta verify` reads: the
+/// positionals and the last `--keys-file`, either one leaving `--keys-dir`
+/// unread, the last `--keys-dir`, an empty one naming the working directory,
+/// and `no keys loaded` judged before revocation. A key source that does not
+/// load refuses the run with nothing on standard output.
+#[test]
+fn sign_verify_key_sources() {
+    let tmp = TmpDir::new("sign-verify-keys");
+    let base = tmp.path();
+    let repo = signed_commit_fixture(base, "p", false);
+    key_source_fixtures(base);
+    assert_key_source_rows(
+        &|options, keys| run_sign_verify(base, &repo, options, keys, false),
+        "signature 1: good\nverification OK\n",
+        "signature 1: no public key\nverification FAILED\n",
+    );
+}
+
+/// `summary --verify` reads the key sources `sign --verify` reads.
+#[test]
+fn summary_verify_key_sources() {
+    let tmp = TmpDir::new("summary-verify-keys");
+    let base = tmp.path();
+    let repo = signed_summary_fixture(base, "p", false);
+    key_source_fixtures(base);
+    assert_key_source_rows(
+        &|options, keys| run_summary_verify(base, &repo, options, keys),
+        "signature 1: good\nverification OK\n",
+        "signature 1: no public key\nverification FAILED\n",
+    );
+}
+
+/// The gpg engine reads keyrings from `--keys-file` alone. `sign --verify` and
+/// `summary --verify` both refuse `--keys-dir` under it, with the same message
+/// and exit status, and write nothing on standard output.
+#[test]
+fn gpg_verify_refuses_keys_dir() {
+    let tmp = TmpDir::new("gpg-verify-keys-dir");
+    let base = tmp.path();
+    key_source_fixtures(base);
+    let options = ["-s", "gpg", "--keys-dir=store1"];
+    let refusal = "error: signature: --keys-dir is not used by the gpg engine; \
+                   supply keyrings with --keys-file\n";
+    let commit_repo = signed_commit_fixture(base, "c", false);
+    let sign = run_sign_verify(base, &commit_repo, &options, &[], false);
+    assert_verify_run(&sign, 1, "", refusal, "sign --verify -s gpg --keys-dir");
+    let summary_repo = signed_summary_fixture(base, "s", false);
+    let summary = run_summary_verify(base, &summary_repo, &options, &[]);
+    assert_verify_run(
+        &summary,
+        1,
+        "",
+        refusal,
+        "summary --verify -s gpg --keys-dir",
+    );
+}
+
+/// Over a commit the tool signed and a commit the port signed, the port's
+/// `sign --verify` gives the tool's verdict on every key-source row the tool
+/// carries, and each refusal before verification agrees byte for byte. The
+/// verdict report is worded differently. Carries
+/// `sign/verify-{keys-file-last-wins,keys-file-overrides-keys-dir,keys-dir-last-wins,no-keys,keys-file-not-regular,report}`.
+#[test]
+fn sign_verify_key_sources_match_the_tool() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("sign-verify-keys-tool");
+    let base = tmp.path();
+    key_source_fixtures(base);
+    for (who, tool_signed) in [("tool", true), ("port", false)] {
+        let repo = signed_commit_fixture(base, who, tool_signed);
+        for row in key_source_rows().iter().filter(|row| row.tool_agrees) {
+            let label = format!("{who}-signed: {}", key_source_label(row));
+            let port = run_sign_verify(base, &repo, &row.options, &row.keys, false);
+            let tool = run_sign_verify(base, &repo, &row.options, &row.keys, true);
+            match &row.outcome {
+                KeySourceOutcome::Verdict(code) => {
+                    assert_eq!(port.status.code(), Some(*code), "port, {label}");
+                    assert_eq!(tool.status.code(), Some(*code), "tool, {label}");
+                }
+                KeySourceOutcome::Refused(_) => assert_runs_agree(&port, &tool, &label),
+            }
+        }
+        // The report: the tool prints one line naming the key that verified,
+        // the port one line per signature and the verdict.
+        let port = run_sign_verify(base, &repo, &[], &[ED25519_PUBLIC_B64], false);
+        let tool = run_sign_verify(base, &repo, &[], &[ED25519_PUBLIC_B64], true);
+        assert_eq!(
+            String::from_utf8_lossy(&tool.stdout),
+            "ed25519: Signature verified successfully with key \
+             'c23b346c1d572f8184e8cfacce6f93af2bfbfc9c7e8a7cb47775f76c9fa652c9'\n",
+            "{who}-signed"
+        );
+        assert_verify_run(
+            &port,
+            0,
+            "signature 1: good\nverification OK\n",
+            "",
+            &format!("{who}-signed report"),
+        );
+    }
+}
+
+/// Whether the tool verifies the summary of `server` under the ed25519 public
+/// key file `key`, through a client repository of its own.
+fn tool_verifies_ed25519_summary(base: &Path, name: &str, server: &Path, key: &Path) -> bool {
+    let client = base.join(name);
+    let client_arg = format!("--repo={}", client.display());
+    ostree(&[&client_arg, "init", "--mode=archive"]).ok();
+    ostree(&[
+        &client_arg,
+        "remote",
+        "add",
+        "--set=gpg-verify=false",
+        "--set=gpg-verify-summary=false",
+        "--set=sign-verify-summary=true",
+        &format!("--set=verification-ed25519-file={}", key.display()),
+        "origin",
+        &format!("file://{}", server.display()),
+    ])
+    .ok();
+    ostree(&[&client_arg, "remote", "summary", "origin"])
+        .status
+        .success()
+}
+
+/// The tool carries no `summary --verify`. Over a summary the tool signed and
+/// a summary the port signed, the port's `summary --verify` applies the
+/// `sign --verify` key sources, and the tool's `remote summary` verifies each
+/// summary under the signing key and refuses it under another. Carries
+/// `summary/verify-{keys-file-last-wins,keys-file-overrides-keys-dir}`.
+#[test]
+fn summary_verify_key_sources_over_both_signers() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-verify-keys-tool");
+    let base = tmp.path();
+    key_source_fixtures(base);
+    for (who, tool_signed) in [("tool", true), ("port", false)] {
+        let repo = signed_summary_fixture(base, who, tool_signed);
+        let refused = ostree(&[&format!("--repo={}", repo.display()), "summary", "--verify"]);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("error: Unknown option --verify"),
+            "{}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+        assert_key_source_rows(
+            &|options, keys| run_summary_verify(base, &repo, options, keys),
+            "signature 1: good\nverification OK\n",
+            "signature 1: no public key\nverification FAILED\n",
+        );
+        assert!(
+            tool_verifies_ed25519_summary(
+                base,
+                &format!("client-{who}-k1"),
+                &repo,
+                &base.join("k1")
+            ),
+            "the tool did not verify the {who}'s summary"
+        );
+        assert!(
+            !tool_verifies_ed25519_summary(
+                base,
+                &format!("client-{who}-k2"),
+                &repo,
+                &base.join("k2")
+            ),
+            "the tool verified the {who}'s summary under another key"
+        );
+    }
+}

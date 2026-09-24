@@ -911,15 +911,20 @@ struct SignArgs {
     /// The signature engine to use.
     #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
     sign_type: SignType,
-    /// Read key(s) from a file; repeatable. For ed25519/spki: base64 secret
-    /// keys (signing) or public keys (verify), one per line. For gpg: a
-    /// keyring, binary or armored (verify and delete).
-    #[arg(long)]
-    keys_file: Vec<PathBuf>,
-    /// Override the system trusted/revoked key directories for ed25519/spki
-    /// verification; repeatable. Not used by the gpg engine.
-    #[arg(long)]
-    keys_dir: Vec<PathBuf>,
+    /// Read key(s) from a file. For ed25519/spki: base64 secret keys
+    /// (signing) or public keys (verify and delete), one per line. Signing and
+    /// delete read every file. For ed25519/spki verify, the last value wins,
+    /// and with it or a KEY-ID --keys-dir and the system key directories are
+    /// not read. For gpg: a keyring, binary or armored (verify and delete),
+    /// every file read.
+    #[arg(long, value_name = "PATH")]
+    keys_file: Vec<std::ffi::OsString>,
+    /// Read trusted.<type> and revoked.<type> from this directory in place of
+    /// the system key directories, for ed25519/spki verify. Given more than
+    /// once, the last value wins. An empty value names the working directory.
+    /// Not used by the gpg engine.
+    #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
+    keys_dir: Option<std::ffi::OsString>,
     /// The GnuPG home directory gpg resolves signing keys in (default: gpg's
     /// own resolution). Only for the gpg engine.
     #[arg(long)]
@@ -998,13 +1003,18 @@ struct SummaryArgs {
     /// a collection repository.
     #[arg(long)]
     metadata_commit_timestamp: Option<u64>,
-    /// Read key(s) from a file; repeatable, same format as `ostrya sign`.
-    #[arg(long)]
-    keys_file: Vec<PathBuf>,
-    /// Override the system trusted/revoked key directories for ed25519/spki
-    /// verification; repeatable.
-    #[arg(long)]
-    keys_dir: Vec<PathBuf>,
+    /// Read key(s) from a file, same format as `ostrya sign`. For ed25519/spki
+    /// verify, the last value wins, and with it or a KEY-ID --keys-dir and the
+    /// system key directories are not read. For signing and for gpg, every
+    /// file is read.
+    #[arg(long, value_name = "PATH")]
+    keys_file: Vec<std::ffi::OsString>,
+    /// Read trusted.<type> and revoked.<type> from this directory in place of
+    /// the system key directories, for ed25519/spki verify. Given more than
+    /// once, the last value wins. An empty value names the working directory.
+    /// Refused by gpg verify.
+    #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
+    keys_dir: Option<std::ffi::OsString>,
     /// The GnuPG home directory gpg resolves signing keys in. Only for gpg.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
@@ -1952,13 +1962,14 @@ async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// The largest `--keys-file` `static-delta verify` reads, the ceiling the
-/// library's key store applies to each of its files.
+/// The largest `--keys-file` a sign-api verify run (`sign --verify`,
+/// `summary --verify`, `static-delta verify`) reads, the ceiling the library's
+/// key store applies to each of its files.
 const VERIFY_KEYS_FILE_LIMIT: u64 = 1024 * 1024;
 
-/// The keys a `static-delta verify` run checks with: the verifier, and the
-/// trusted and revoked keys in load order, from which the failure line names
-/// the keys.
+/// The keys a sign-api verify run checks with: the verifier, and the trusted
+/// and revoked keys in load order, from which the `static-delta verify`
+/// failure line names the keys.
 struct VerifyKeys {
     verifier: Box<dyn Verifier>,
     trusted: Vec<Vec<u8>>,
@@ -2063,7 +2074,8 @@ fn verify_sign_type(name: &str) -> SignType {
     }
 }
 
-/// Load the keys of a `static-delta verify` run. The trusted keys are each
+/// Load the keys of a sign-api verify run: `sign --verify`, `summary
+/// --verify`, and `static-delta verify`. The trusted keys are each
 /// `key_ids` entry, then each line of `keys_file`. With neither given, the
 /// trusted and revoked keys come from `keys_dir`, or from the system key
 /// directories where it is absent. No trusted key before revocation is
@@ -2101,7 +2113,7 @@ fn load_verify_keys(
     })
 }
 
-/// Decode one public key of a `static-delta verify` run with the tool's
+/// Decode one public key of a sign-api verify run with the tool's
 /// lenient base64 reader. Text that is not UTF-8 decodes to no byte. An
 /// ed25519 key of any length but 32 bytes refuses the run in the tool's
 /// words; the spki engine validates its own keys.
@@ -2119,7 +2131,7 @@ fn verify_key_bytes(engine: SignType, text: &[u8]) -> Vec<u8> {
     key
 }
 
-/// Read the public keys of a `static-delta verify` `--keys-file`, one per
+/// Read the public keys of a sign-api verify `--keys-file`, one per
 /// line. The path must name a regular file, symlinks followed, which is
 /// checked before the open so a FIFO is refused and not waited on. The file is
 /// read up to [`VERIFY_KEYS_FILE_LIMIT`] and refused past it. Each line is
@@ -7316,15 +7328,21 @@ async fn diff(repo: Repo, name: &str, args: DiffArgs, owner: Owner) -> Result<()
     Ok(())
 }
 
+/// The refusal of `--keys-dir` under the gpg engine, which reads keyrings from
+/// `--keys-file` alone.
+fn gpg_keys_dir_refusal() -> Error {
+    Error::Signature(
+        "--keys-dir is not used by the gpg engine; supply keyrings with --keys-file".into(),
+    )
+}
+
 async fn sign(repo: Repo, repo_path: PathBuf, name: &str, args: SignArgs) -> Result<()> {
     let Some(commit_rev) = args.commit.as_deref() else {
         exit_with_error(name, "Need a COMMIT to sign or verify");
     };
     let commit = resolve(&repo, commit_rev).await?;
-    if args.sign_type == SignType::Gpg && !args.keys_dir.is_empty() {
-        return Err(Error::Signature(
-            "--keys-dir is not used by the gpg engine; supply keyrings with --keys-file".into(),
-        ));
+    if args.sign_type == SignType::Gpg && args.keys_dir.is_some() {
+        return Err(gpg_keys_dir_refusal());
     }
     if args.sign_type != SignType::Gpg && args.gpg_homedir.is_some() {
         return Err(Error::Signature(
@@ -7536,7 +7554,7 @@ async fn summary_signers_gpg(_: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
 fn summary_secret_keys(args: &SummaryArgs) -> Result<Vec<String>> {
     let mut keys = args.key_id.clone();
     for path in &args.keys_file {
-        keys.extend(read_key_lines(path)?);
+        keys.extend(read_key_lines(Path::new(path))?);
     }
     if keys.is_empty() {
         return Err(Error::Signature(
@@ -7546,38 +7564,24 @@ fn summary_secret_keys(args: &SummaryArgs) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-/// Build the verifier for `ostrya summary --verify`, mirroring `ostrya sign`.
+/// Build the verifier for `ostrya summary --verify`. The sign-api engines read
+/// the key sources of `ostrya sign --verify`; gpg reads every `--keys-file`
+/// keyring and refuses `--keys-dir`.
 fn summary_verifier(
     repo_path: &Path,
     engine: SignType,
     args: &SummaryArgs,
 ) -> Result<Box<dyn Verifier>> {
     match engine {
+        SignType::Gpg if args.keys_dir.is_some() => Err(gpg_keys_dir_refusal()),
         SignType::Gpg => summary_gpg_verifier(repo_path, args),
-        engine => {
-            let name = sign_type_name(engine);
-            let mut trusted = Vec::new();
-            for key in &args.key_id {
-                trusted.push(base64::decode(key.trim())?);
-            }
-            for path in &args.keys_file {
-                for line in read_key_lines(path)? {
-                    trusted.push(base64::decode(&line)?);
-                }
-            }
-            let mut revoked = Vec::new();
-            if !args.keys_dir.is_empty() {
-                let roots: Vec<&Path> = args.keys_dir.iter().map(PathBuf::as_path).collect();
-                let keys = load_sign_keys_from(&roots, name)?;
-                trusted.extend(keys.trusted);
-                revoked.extend(keys.revoked);
-            } else if trusted.is_empty() {
-                let keys = load_sign_keys(name)?;
-                trusted.extend(keys.trusted);
-                revoked.extend(keys.revoked);
-            }
-            build_sign_api_verifier(engine, &trusted, &revoked)
-        }
+        engine => Ok(load_verify_keys(
+            engine,
+            &args.key_id,
+            args.keys_file.last().map(Path::new),
+            args.keys_dir.as_deref().map(Path::new),
+        )?
+        .verifier),
     }
 }
 
@@ -7787,24 +7791,18 @@ async fn gpg_delete(_: &Repo, _: &Checksum, _: &Path, _: &SignArgs) -> Result<us
     Err(unsupported_type("gpg"))
 }
 
-/// Build a sign-api (ed25519/spki) verifier from the KEY-IDs, the `--keys-file`
-/// keys, and the trusted/revoked key directories: `--keys-dir` if given,
-/// otherwise the system store when nothing was supplied inline.
+/// Build the sign-api (ed25519/spki) verifier of `sign --verify` through
+/// [`load_verify_keys`]: the KEY-IDs and the last `--keys-file`; with neither,
+/// the last `--keys-dir`, or the system key directories where it is absent.
+/// No trusted key before revocation is `{type}: no keys loaded`.
 fn sign_api_verifier(engine: SignType, args: &SignArgs) -> Result<Box<dyn Verifier>> {
-    let name = sign_type_name(engine);
-    let mut trusted = public_key_bytes(args)?;
-    let mut revoked: Vec<Vec<u8>> = Vec::new();
-    if !args.keys_dir.is_empty() {
-        let roots: Vec<&Path> = args.keys_dir.iter().map(PathBuf::as_path).collect();
-        let keys = load_sign_keys_from(&roots, name)?;
-        trusted.extend(keys.trusted);
-        revoked.extend(keys.revoked);
-    } else if trusted.is_empty() {
-        let keys = load_sign_keys(name)?;
-        trusted.extend(keys.trusted);
-        revoked.extend(keys.revoked);
-    }
-    build_sign_api_verifier(engine, &trusted, &revoked)
+    let keys = load_verify_keys(
+        engine,
+        &args.key_id,
+        args.keys_file.last().map(Path::new),
+        args.keys_dir.as_deref().map(Path::new),
+    )?;
+    Ok(keys.verifier)
 }
 
 fn build_sign_api_verifier(
@@ -7852,7 +7850,7 @@ fn gpg_trust(repo_path: &Path, args: &SignArgs) -> Result<GpgVerifier> {
 fn secret_key_lines(args: &SignArgs) -> Result<Vec<String>> {
     let mut keys = args.key_id.clone();
     for path in &args.keys_file {
-        keys.extend(read_key_lines(path)?);
+        keys.extend(read_key_lines(Path::new(path))?);
     }
     if keys.is_empty() {
         return Err(Error::Signature(
@@ -7870,7 +7868,7 @@ fn public_key_bytes(args: &SignArgs) -> Result<Vec<Vec<u8>>> {
         keys.push(base64::decode(key.trim())?);
     }
     for path in &args.keys_file {
-        for line in read_key_lines(path)? {
+        for line in read_key_lines(Path::new(path))? {
             keys.push(base64::decode(&line)?);
         }
     }

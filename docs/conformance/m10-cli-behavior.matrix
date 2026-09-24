@@ -11350,6 +11350,115 @@ note: two directories holding one file of one content and two modification times
  report nothing, the time being outside every checksum the comparison reads.
 
 # ---------------------------------------------------------------------------
+# sign -- the key sources of `--verify`.
+#
+# No setup signs a commit, so a cell that verifies a signature cites the test
+# that signs one commit with the tool and one with the port and runs both
+# implementations over each. The two refusals before verification state
+# themselves over the unsigned commit of `repo-with-commit`, because both
+# implementations refuse before they read a signature.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: sign
+cell: sign/verify-keys-file-last-wins
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::sign_verify_key_sources_match_the_tool
+spec: format-reference.md#sign
+note: of two `--keys-file` options, only the last is read: the right key last
+ verifies and the wrong key last fails, in both, over a commit each
+ implementation signed. A positional KEY-ID joins the last `--keys-file`. The
+ verdict report is worded differently (`sign/verify-report`).
+
+family: M10
+subcommand: sign
+cell: sign/verify-keys-file-overrides-keys-dir
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::sign_verify_key_sources_match_the_tool
+spec: format-reference.md#sign
+note: a `--keys-file` or a positional KEY-ID makes both implementations leave
+ `--keys-dir` unread, so the revoked keys of the store do not reach the key the
+ option names, and a store that holds the right key does not help a wrong
+ positional.
+
+family: M10
+subcommand: sign
+cell: sign/verify-keys-dir-last-wins
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::sign_verify_key_sources_match_the_tool
+spec: format-reference.md#sign
+note: with no positional KEY-ID and no `--keys-file`, the last `--keys-dir`
+ supplies the trusted keys less the revoked ones, with the `.d` directory, and
+ an empty `--keys-dir=` names the working directory, in both.
+
+family: M10
+subcommand: sign
+cell: sign/verify-no-keys
+setup: repo-with-commit
+run: sign --repo=$REPO --verify --keys-dir=nodir $REV
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: signature: ed25519: no keys loaded"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: signature: ed25519: no keys loaded"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::sign_verify_key_sources_match_the_tool
+spec: format-reference.md#sign
+note: an absent `--keys-dir` with no other key source loads no key, and both
+ refuse before they read a signature. The cited test also states a store with
+ no trusted key and a revoked one, which is `no keys loaded` too, because the
+ check comes before the revocation. A store whose trusted keys are all revoked
+ loads keys and fails the verdict at exit 1: the tool writes `error: ed25519:
+ no signatures found`, and the port writes `signature 1: no public key` and
+ `verification FAILED`.
+
+family: M10
+subcommand: sign
+cell: sign/verify-keys-file-not-regular
+setup: repo-with-commit
+run: sign --repo=$REPO --verify --keys-file=nosuch $REV
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: File object 'nosuch' is not a regular file"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: File object 'nosuch' is not a regular file"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::sign_verify_key_sources_match_the_tool
+spec: format-reference.md#sign
+note: a `--keys-file` that names no regular file is refused before
+ verification. The cited test also states a directory, a FIFO, the empty value,
+ and an empty file, each refused byte for byte the same in both.
+
+family: M10
+subcommand: sign
+cell: sign/verify-report
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the verdict report (`cli-surface.md`, "P2", `sign`). The tool prints one
+ line, `ed25519: Signature verified successfully with key '<hex>'`, on success,
+ and on failure nothing on standard output and one `error:` line. The port
+ prints `signature <n>: good`, `no public key`, or `BAD` for each signature and
+ then `verification OK` or `verification FAILED`, all on standard output. The
+ exit status agrees.
+evidence: ostrya_cli::cli::sign_verify_key_sources_match_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the cited test compares the exit status of every key-source row and
+ states both reports over a commit each implementation signed.
+
+# ---------------------------------------------------------------------------
 # summary -- the four reading options, the report format, and the precedence
 # among them (Phase 17f, F21).
 # ---------------------------------------------------------------------------
@@ -12142,6 +12251,35 @@ note: every `--gpg-sign` lookup runs before the regeneration, after the `-m`
  of one naming no key refuses on the second, and a good selector beside a bad
  `--sign` key reports the key. Each refusal leaves `summary` and `summary.sig`
  as they stood.
+
+family: M10
+subcommand: summary
+cell: summary/verify-keys-file-last-wins
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the tool carries no `summary --verify`; it refuses the option with
+ `error: Unknown option --verify`. The port's `--verify` is an extension.
+evidence: ostrya_cli::cli::summary_verify_key_sources_over_both_signers
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port applies the `sign --verify` key sources, of which the last
+ `--keys-file` is one, over a summary each implementation signed. The tool's
+ `remote summary` verifies each summary under the signing key and refuses it
+ under another.
+
+family: M10
+subcommand: summary
+cell: summary/verify-keys-file-overrides-keys-dir
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: the tool carries no `summary --verify`; it refuses the option with
+ `error: Unknown option --verify`. The port's `--verify` is an extension.
+evidence: ostrya_cli::cli::summary_verify_key_sources_over_both_signers
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: in the port, a `--keys-file` or a positional KEY-ID leaves `--keys-dir`
+ unread, and with neither the last `--keys-dir` supplies the keys, as for
+ `sign --verify`, over a summary each implementation signed.
 
 # ---------------------------------------------------------------------------
 # static-delta -- `show`, the superblock and part report, `indexes`, the

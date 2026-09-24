@@ -130,3 +130,10 @@ smol-tar = { version = "0.1.7", default-features = false, features = ["smol"] }
 # The fetcher tests serve requests from an in-process HTTP/1.1 and HTTP/2
 # server, so the test build adds hyper's server half.
 hyper = { version = "1.11", default-features = false, features = ["server"] }
+# The root-dependent tests call `process::geteuid`. The smol backend reaches
+# rustix's `process` feature through its own dependencies and the tokio
+# backend does not, so the test build asks for it here.
+rustix = { version = "1", default-features = false, features = [
+    "std",
+    "process",
+] }

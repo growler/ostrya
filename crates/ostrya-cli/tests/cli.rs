@@ -1849,6 +1849,64 @@ fn commit_fsync_policy_controls_the_syscalls() {
     }
 }
 
+/// Under `[core] per-object-fsync=true`, `commit` syncs the file of each
+/// content object stored as a regular file and no metadata object, in the tool
+/// and in the port, over corpus `C0`: four in `archive` and `bare-user`, three
+/// in `bare`, where the symlink object is a symlink inode. The rest of the
+/// inventory is the one `commit_fsync_policy_controls_the_syscalls` holds, so
+/// the totals are tool 15, 15, and 14, and port 16, 16, and 15. Runs where
+/// `strace` is installed.
+#[test]
+fn commit_per_object_fsync_syncs_content_objects_alone() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-per-object-fsync");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    let source = tree.to_str().unwrap();
+    for (who, binary) in &durability_binaries() {
+        for (mode, content) in [
+            (RepoMode::Archive, 4),
+            (RepoMode::BareUser, 4),
+            (RepoMode::Bare, 3),
+        ] {
+            let label = format!("`{who}` {mode:?}");
+            let repo = base.join(format!("{who}-{mode:?}"));
+            block_on(async {
+                Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+            });
+            set_core_key(&repo, "per-object-fsync=true");
+            let repo_arg = format!("--repo={}", repo.display());
+            let args = [
+                repo_arg.as_str(),
+                "commit",
+                "-b",
+                "main",
+                "-s",
+                "x",
+                "--timestamp=@1700000000",
+                source,
+            ];
+            let trace = base.join(format!("trace-{who}-{mode:?}"));
+            let (run, calls) = sync_calls(binary, &repo, &trace, &args);
+            assert!(
+                run.status.success(),
+                "{label} failed: {}",
+                String::from_utf8_lossy(&run.stderr),
+            );
+            assert_eq!(regular_content_objects(&repo), content, "{label}");
+            let (extra, total): (&[&str], usize) = if *who == "port" {
+                (&["refs/heads"], 12 + content)
+            } else {
+                (&[], 11 + content)
+            };
+            assert_durability_syncs(&label, &repo, &calls, content, "refs/heads/", extra, total);
+        }
+    }
+}
+
 /// The directories under `refs/` one traced run `fsync`-ed, in call order, each
 /// named relative to the repository. `strace -y` prints the path behind a
 /// descriptor, which is what makes the target of each call readable.
@@ -4413,6 +4471,9 @@ fn serve_connection(
     log: &Mutex<Vec<ServedRequest>>,
     fault: Option<&Injected>,
 ) {
+    // Each answer goes out as a head write and a body write. Without
+    // `TCP_NODELAY` the body waits for the client's delayed ACK of the head.
+    let _ = stream.set_nodelay(true);
     let mut reader = BufReader::new(stream.try_clone().expect("clone connection"));
     let mut writer = stream;
     loop {
@@ -4464,7 +4525,6 @@ fn serve_connection(
                     bytes: step,
                     interval,
                 } => {
-                    let _ = writer.set_nodelay(true);
                     let head =
                         format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len());
                     if writer.write_all(head.as_bytes()).is_err() {
@@ -5611,6 +5671,629 @@ fn pull_stops_at_the_first_exhausted_object() {
         let markers = entries(&theirs.dest.join("state"));
         assert_eq!(markers.len(), 1, "{markers:?}");
         assert!(markers[0].ends_with(".commitpartial"), "{markers:?}");
+    }
+}
+
+// --- pull and pull-local: durability -----------------------------------------
+//
+// These tests are the `evidence:` the M10 records under "pull -- durability"
+// and "pull-local -- durability" cite: the harness serves no remote and reads
+// no syscall, so the sync-call claims are stated here, under `strace`, for the
+// port and for the tool wherever each is installed.
+
+/// The durability rows the `pull` and `pull-local` syscall tests share: a tag,
+/// a line written into the destination's `[core]` section, the switches,
+/// whether any sync call is expected, and whether the per-object sync is.
+type DurabilityRow = (
+    &'static str,
+    Option<&'static str>,
+    &'static [&'static str],
+    bool,
+    bool,
+);
+
+const PULL_DURABILITY_ROWS: [DurabilityRow; 6] = [
+    ("default", None, &[], true, false),
+    ("disable", None, &["--disable-fsync"], false, false),
+    ("per-object", None, &["--per-object-fsync"], true, true),
+    (
+        "both",
+        None,
+        &["--per-object-fsync", "--disable-fsync"],
+        false,
+        false,
+    ),
+    ("key", Some("per-object-fsync=true"), &[], true, true),
+    (
+        "fsync-off",
+        Some("fsync=false"),
+        &["--per-object-fsync"],
+        false,
+        false,
+    ),
+];
+
+/// Write `line` into the `[core]` section of a repository's config.
+fn set_core_key(repo: &Path, line: &str) {
+    let config = repo.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replacen("[core]\n", &format!("[core]\n{line}\n"), 1),
+    )
+    .unwrap();
+}
+
+/// How many content objects a repository stores as regular files: the objects
+/// the per-object sync covers. A `bare` symlink object is a symlink inode and
+/// is not counted.
+fn regular_content_objects(repo: &Path) -> usize {
+    files_under(&repo.join("objects"))
+        .into_iter()
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("file" | "filez")
+            )
+        })
+        .filter(|path| {
+            std::fs::symlink_metadata(repo.join("objects").join(path))
+                .unwrap()
+                .is_file()
+        })
+        .count()
+}
+
+/// Every file under `objects/` and `refs/` with its bytes, and the summary
+/// where the repository holds one: what a durability option must not change.
+fn stored_bytes(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    for sub in ["objects", "refs"] {
+        for path in files_under(&repo.join(sub)) {
+            let full = repo.join(sub).join(&path);
+            out.push((Path::new(sub).join(path), std::fs::read(full).unwrap()));
+        }
+    }
+    if let Ok(summary) = std::fs::read(repo.join("summary")) {
+        out.push((PathBuf::from("summary"), summary));
+    }
+    out
+}
+
+/// Hold the sync calls of one syncing run to the inventory the tables in
+/// `docs/format-reference.md`, "The fsync vocabulary", record: `per_object`
+/// calls on a staged temporary file under `tmp/`, one `fsync` per fanout
+/// directory under `objects/`, one of `objects/`, one of each directory in
+/// `extra_dirs`, one `fdatasync` of the ref's temporary file under `ref_dir`,
+/// one `syncfs` of the repository, and `total` calls in all.
+fn assert_durability_syncs(
+    label: &str,
+    repo: &Path,
+    calls: &[(&'static str, String)],
+    per_object: usize,
+    ref_dir: &str,
+    extra_dirs: &[&str],
+    total: usize,
+) {
+    let (staged, rest): (Vec<_>, Vec<_>) =
+        calls.iter().partition(|(_, path)| path.starts_with("tmp/"));
+    assert_eq!(
+        staged.len(),
+        per_object,
+        "{label}: {} sync calls on a staged file, where {per_object} content objects \
+         are synced: {staged:?}",
+        staged.len(),
+    );
+    let mut expected = object_fanouts(repo);
+    expected.push("objects".to_owned());
+    expected.extend(extra_dirs.iter().map(|dir| (*dir).to_owned()));
+    expected.sort();
+    let mut fsyncs: Vec<String> = rest
+        .iter()
+        .filter(|(kind, _)| *kind == "fsync")
+        .map(|(_, path)| path.clone())
+        .collect();
+    fsyncs.sort();
+    assert_eq!(fsyncs, expected, "{label}: the directory syncs differ");
+    let datasyncs: Vec<&String> = rest
+        .iter()
+        .filter(|(kind, _)| *kind == "fdatasync")
+        .map(|(_, path)| path)
+        .collect();
+    assert!(
+        datasyncs.len() == 1 && datasyncs[0].starts_with(ref_dir),
+        "{label}: the ref's temporary file under {ref_dir} takes one `fdatasync`: {datasyncs:?}",
+    );
+    let syncfs: Vec<&String> = rest
+        .iter()
+        .filter(|(kind, _)| *kind == "syncfs")
+        .map(|(_, path)| path)
+        .collect();
+    assert_eq!(syncfs, ["."], "{label}: the repository takes one `syncfs`");
+    assert_eq!(
+        calls.len(),
+        total,
+        "{label}: {} sync calls, where `docs/format-reference.md`, \"The fsync \
+         vocabulary\", records {total}: {calls:?}",
+        calls.len(),
+    );
+}
+
+/// An archive repository at `base/remote` holding corpus `C0` on `main`, with
+/// a summary, committed by the port under a fixed timestamp.
+fn build_c0_remote(base: &Path) -> PathBuf {
+    build_c0_remote_with(base, &[])
+}
+
+/// [`build_c0_remote`] with `extra` added to the `commit` arguments.
+fn build_c0_remote_with(base: &Path, extra: &[&str]) -> PathBuf {
+    let tree = base.join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    let remote = base.join("remote");
+    block_on(async {
+        Repo::create(&remote, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+    });
+    let repo_arg = format!("--repo={}", remote.display());
+    let mut args = vec![
+        repo_arg.as_str(),
+        "commit",
+        "-b",
+        "main",
+        "-s",
+        "x",
+        "--timestamp=@1700000000",
+    ];
+    args.extend_from_slice(extra);
+    args.push(tree.to_str().unwrap());
+    ostrya(&args, None, &[]).ok();
+    ostrya(&[&repo_arg, "summary", "-u"], None, &[]).ok();
+    remote
+}
+
+/// The binaries a durability test measures: the port always, and the tool
+/// wherever it is installed.
+fn durability_binaries() -> Vec<(&'static str, String)> {
+    let mut binaries = vec![("port", env!("CARGO_BIN_EXE_ostrya").to_owned())];
+    if ostree_available() {
+        binaries.push(("tool", "ostree".to_owned()));
+    }
+    binaries
+}
+
+/// `--disable-fsync` and `--per-object-fsync` on an HTTP `pull`, and the two
+/// `[core]` keys beside them, over corpus `C0` into an `archive` and a
+/// `bare-user` destination. `--disable-fsync` and `[core] fsync=false` each
+/// turn every sync off and win over `--per-object-fsync`; the switch and the
+/// `per-object-fsync` key each add one sync per content object and none per
+/// metadata object. The syncing rows are held to the whole call inventory, and
+/// the totals (tool 11 and 15, port 13 and 17) are asserted beside it. The port
+/// also syncs `refs/remotes/origin`, which holds the ref, and `refs/remotes`,
+/// where the ref write creates `origin`, which the tool does not. Every row of
+/// both binaries exits 0 and stores the same bytes.
+#[test]
+fn pull_fsync_switches_control_the_syscalls() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-fsync-syscalls");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    let remote = build_c0_remote(base);
+    let server = FileServer::start(&remote);
+    let binaries = durability_binaries();
+    for mode in [RepoMode::Archive, RepoMode::BareUser] {
+        let mut answer: Option<Vec<(PathBuf, Vec<u8>)>> = None;
+        for (who, binary) in &binaries {
+            for (tag, key, switches, syncs, per_object) in PULL_DURABILITY_ROWS {
+                let label = format!("`{who}` {mode:?} `{tag}`");
+                let repo = base.join(format!("{who}-{mode:?}-{tag}"));
+                block_on(async {
+                    Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+                });
+                configure_remote(&repo, &server.url(), "gpg-verify=false\n");
+                if let Some(line) = key {
+                    set_core_key(&repo, line);
+                }
+                let repo_arg = format!("--repo={}", repo.display());
+                let mut args = vec![repo_arg.as_str(), "pull"];
+                args.extend_from_slice(switches);
+                args.extend(["origin", "main"]);
+                let trace = base.join(format!("trace-{who}-{mode:?}-{tag}"));
+                let (run, calls) = sync_calls(binary, &repo, &trace, &args);
+                assert!(
+                    run.status.success(),
+                    "{label} failed: {}",
+                    String::from_utf8_lossy(&run.stderr),
+                );
+                if syncs {
+                    let content = if per_object {
+                        regular_content_objects(&repo)
+                    } else {
+                        0
+                    };
+                    let (extra, total): (&[&str], usize) = if *who == "port" {
+                        (&["refs/remotes", "refs/remotes/origin"], 13 + content)
+                    } else {
+                        (&[], 11 + content)
+                    };
+                    assert_durability_syncs(
+                        &label,
+                        &repo,
+                        &calls,
+                        content,
+                        "refs/remotes/origin/",
+                        extra,
+                        total,
+                    );
+                    if per_object {
+                        assert_eq!(content, 4, "{label}: corpus C0 holds four content objects");
+                    }
+                } else {
+                    assert!(calls.is_empty(), "{label} synced: {calls:?}");
+                }
+                let stored = stored_bytes(&repo);
+                match &answer {
+                    None => answer = Some(stored),
+                    Some(first) => assert_eq!(&stored, first, "{label} stored other bytes"),
+                }
+            }
+        }
+    }
+}
+
+/// A `--mirror` pull of every ref copies the remote's summary. By default the
+/// port also syncs the summary file and the repository root, which the tool
+/// does not (tool 11 calls, port 14 over corpus `C0`); under `--disable-fsync`
+/// neither makes a sync call, and both copy the same summary.
+#[test]
+fn pull_mirror_disable_fsync_syncs_nothing() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-mirror-fsync");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    let remote = build_c0_remote(base);
+    let published = std::fs::read(remote.join("summary")).unwrap();
+    let server = FileServer::start(&remote);
+    for (who, binary) in &durability_binaries() {
+        for disable in [false, true] {
+            let label = format!("`{who}` --mirror disable={disable}");
+            let repo = base.join(format!("{who}-mirror-{disable}"));
+            block_on(async {
+                Repo::create(&repo, CreateOptions::new(RepoMode::Archive))
+                    .await
+                    .unwrap();
+            });
+            configure_remote(&repo, &server.url(), "gpg-verify=false\n");
+            let repo_arg = format!("--repo={}", repo.display());
+            let mut args = vec![repo_arg.as_str(), "pull", "--mirror"];
+            if disable {
+                args.push("--disable-fsync");
+            }
+            args.push("origin");
+            let trace = base.join(format!("trace-{who}-mirror-{disable}"));
+            let (run, calls) = sync_calls(binary, &repo, &trace, &args);
+            assert!(
+                run.status.success(),
+                "{label} failed: {}",
+                String::from_utf8_lossy(&run.stderr),
+            );
+            assert_eq!(std::fs::read(repo.join("summary")).unwrap(), published);
+            if disable {
+                assert!(calls.is_empty(), "{label} synced: {calls:?}");
+                continue;
+            }
+            let summary: Vec<&(&str, String)> = calls
+                .iter()
+                .filter(|(_, path)| path.starts_with("summary"))
+                .collect();
+            let root_fsyncs = calls
+                .iter()
+                .filter(|(kind, path)| *kind == "fsync" && path == ".")
+                .count();
+            if *who == "port" {
+                assert!(
+                    summary.len() == 1 && summary[0].0 == "fdatasync" && root_fsyncs == 1,
+                    "{label}: the port syncs the summary and the root: {calls:?}",
+                );
+                assert_eq!(calls.len(), 14, "{label}: {calls:?}");
+            } else {
+                assert!(
+                    summary.is_empty() && root_fsyncs == 0,
+                    "{label}: the tool syncs no summary: {calls:?}",
+                );
+                assert_eq!(calls.len(), 11, "{label}: {calls:?}");
+            }
+        }
+    }
+}
+
+/// A pulled commit that carries detached metadata, over corpus `C0` into an
+/// `archive` destination: under `--disable-fsync` neither the tool nor the port
+/// makes a sync call on `pull-local`, on an HTTP `pull`, or on a `--mirror`
+/// pull, and both store the source's `.commitmeta`. By default the tool makes
+/// no sync call for the `.commitmeta` (11 calls on each pull), and the port
+/// makes three: an `fdatasync` of its temporary file, an `fsync` of its fanout
+/// directory, and an `fsync` of `objects/` (15, 16, and 17 calls).
+#[test]
+fn pull_disable_fsync_syncs_no_detached_metadata() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-detached-fsync");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    let remote = build_c0_remote_with(base, &["--add-detached-metadata-string=foo=bar"]);
+    let src = remote.to_str().unwrap();
+    let server = FileServer::start(&remote);
+    let commitmeta = |repo: &Path| {
+        files_under(&repo.join("objects"))
+            .into_iter()
+            .filter(|path| path.extension().is_some_and(|e| e == "commitmeta"))
+            .count()
+    };
+    assert_eq!(commitmeta(&remote), 1, "the source holds detached metadata");
+    // (tag, command, the port's default call count)
+    let pulls: [(&str, &[&str], usize); 3] = [
+        ("pull-local", &["pull-local", src, "main"], 15),
+        ("pull", &["pull", "origin", "main"], 16),
+        ("mirror", &["pull", "--mirror", "origin"], 17),
+    ];
+    for (who, binary) in &durability_binaries() {
+        for (tag, command, port_total) in pulls {
+            for disable in [false, true] {
+                let label = format!("`{who}` {tag} disable={disable}");
+                let repo = base.join(format!("{who}-{tag}-{disable}"));
+                block_on(async {
+                    Repo::create(&repo, CreateOptions::new(RepoMode::Archive))
+                        .await
+                        .unwrap();
+                });
+                configure_remote(&repo, &server.url(), "gpg-verify=false\n");
+                let repo_arg = format!("--repo={}", repo.display());
+                let mut args = vec![repo_arg.as_str(), command[0]];
+                if disable {
+                    args.push("--disable-fsync");
+                }
+                args.extend_from_slice(&command[1..]);
+                let trace = base.join(format!("trace-{who}-{tag}-{disable}"));
+                let (run, calls) = sync_calls(binary, &repo, &trace, &args);
+                assert!(
+                    run.status.success(),
+                    "{label} failed: {}",
+                    String::from_utf8_lossy(&run.stderr),
+                );
+                assert_eq!(commitmeta(&repo), 1, "{label}: the metadata is stored");
+                if disable {
+                    assert!(calls.is_empty(), "{label} synced: {calls:?}");
+                    continue;
+                }
+                let on_commitmeta = calls
+                    .iter()
+                    .filter(|(_, path)| path.contains(".commitmeta"))
+                    .count();
+                let (expected_meta, total) = if *who == "port" {
+                    (1, port_total)
+                } else {
+                    (0, 11)
+                };
+                assert_eq!(on_commitmeta, expected_meta, "{label}: {calls:?}");
+                assert_eq!(calls.len(), total, "{label}: {calls:?}");
+            }
+        }
+    }
+}
+
+/// `--disable-fsync` and `--per-object-fsync` on `pull-local`, with the rows of
+/// the HTTP test, from an `archive` source. Into an `archive` destination every
+/// object is hardlinked, so no row syncs an object (tool 11, port 12); into a
+/// `bare-user` destination the content is re-ingested and the per-object rows
+/// sync each content object (tool 15, port 16). The port also syncs
+/// `refs/heads`, which the tool does not. A port-only row copies into
+/// `archive` under `--force-copy --per-object-fsync`, where the content
+/// objects are synced and the copied metadata objects are not.
+#[test]
+fn pull_local_fsync_switches_control_the_syscalls() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-fsync-syscalls");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    let remote = build_c0_remote(base);
+    let src = remote.to_str().unwrap();
+    let binaries = durability_binaries();
+    for mode in [RepoMode::Archive, RepoMode::BareUser] {
+        let linked = mode == RepoMode::Archive;
+        let mut answer: Option<Vec<(PathBuf, Vec<u8>)>> = None;
+        for (who, binary) in &binaries {
+            let mut rows = PULL_DURABILITY_ROWS.to_vec();
+            if *who == "port" && linked {
+                rows.push((
+                    "force-copy",
+                    None,
+                    &["--force-copy", "--per-object-fsync"],
+                    true,
+                    true,
+                ));
+            }
+            for (tag, key, switches, syncs, per_object) in rows {
+                let label = format!("`{who}` {mode:?} `{tag}`");
+                let repo = base.join(format!("{who}-{mode:?}-{tag}"));
+                block_on(async {
+                    Repo::create(&repo, CreateOptions::new(mode)).await.unwrap();
+                });
+                if let Some(line) = key {
+                    set_core_key(&repo, line);
+                }
+                let repo_arg = format!("--repo={}", repo.display());
+                let mut args = vec![repo_arg.as_str(), "pull-local"];
+                args.extend_from_slice(switches);
+                args.extend([src, "main"]);
+                let trace = base.join(format!("trace-{who}-{mode:?}-{tag}"));
+                let (run, calls) = sync_calls(binary, &repo, &trace, &args);
+                assert!(
+                    run.status.success(),
+                    "{label} failed: {}",
+                    String::from_utf8_lossy(&run.stderr),
+                );
+                if syncs {
+                    let copied = !linked || tag == "force-copy";
+                    let content = if per_object && copied {
+                        regular_content_objects(&repo)
+                    } else {
+                        0
+                    };
+                    let (extra, total): (&[&str], usize) = if *who == "port" {
+                        (&["refs/heads"], 12 + content)
+                    } else {
+                        (&[], 11 + content)
+                    };
+                    assert_durability_syncs(
+                        &label,
+                        &repo,
+                        &calls,
+                        content,
+                        "refs/heads/",
+                        extra,
+                        total,
+                    );
+                    if per_object && copied {
+                        assert_eq!(content, 4, "{label}: corpus C0 holds four content objects");
+                    }
+                } else {
+                    assert!(calls.is_empty(), "{label} synced: {calls:?}");
+                }
+                let stored = stored_bytes(&repo);
+                match &answer {
+                    None => answer = Some(stored),
+                    Some(first) => assert_eq!(&stored, first, "{label} stored other bytes"),
+                }
+            }
+        }
+    }
+}
+
+/// Both switches take no value and are given once. The tool reads and discards
+/// an `=VALUE` suffix and accepts a repeat; the port refuses both at exit 1 and
+/// writes no object and no ref. Both refuse `--fsync`, which neither command
+/// has. A `[core] fsync` or `[core] per-object-fsync` value the reader refuses
+/// is refused under every switch state by both, whether the pull has objects
+/// to import or finds the destination already holding them, and the
+/// destination is left as it stood. One held destination per command serves
+/// every held row: each row writes the refused key, and the config is restored
+/// after the row.
+#[test]
+fn pull_fsync_switches_parse_as_switches() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-fsync-parse");
+    let base = tmp.path();
+    let remote = build_c0_remote(base);
+    let src = remote.to_str().unwrap().to_owned();
+    let server = FileServer::start(&remote);
+    let mut count = 0;
+    let mut fresh = || -> PathBuf {
+        count += 1;
+        let repo = base.join(format!("dest{count}"));
+        block_on(async {
+            Repo::create(&repo, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+        });
+        configure_remote(&repo, &server.url(), "gpg-verify=false\n");
+        repo
+    };
+    let run = |who: &str, repo: &Path, command: &str, switches: &[&str]| -> Run {
+        let repo_arg = format!("--repo={}", repo.display());
+        let mut args = vec![repo_arg.as_str(), command];
+        args.extend_from_slice(switches);
+        if command == "pull" {
+            args.extend(["origin", "main"]);
+        } else {
+            args.extend([src.as_str(), "main"]);
+        }
+        if who == "port" {
+            ostrya(&args, None, &[])
+        } else {
+            ostree(&args)
+        }
+    };
+    let mut whos = vec!["port"];
+    if tool {
+        whos.push("tool");
+    }
+    // (switches, the port's refusal text; `None` where both refuse)
+    let parse_cases: [(&[&str], Option<&str>); 5] = [
+        (&["--disable-fsync=false"], Some("unexpected value 'false'")),
+        (
+            &["--per-object-fsync=bogus"],
+            Some("unexpected value 'bogus'"),
+        ),
+        (
+            &["--disable-fsync", "--disable-fsync"],
+            Some("cannot be used multiple times"),
+        ),
+        (
+            &["--per-object-fsync", "--per-object-fsync"],
+            Some("cannot be used multiple times"),
+        ),
+        (&["--fsync=true"], None),
+    ];
+    for command in ["pull-local", "pull"] {
+        for (switches, refusal) in parse_cases {
+            for who in &whos {
+                let label = format!("`{who}` {command} {switches:?}");
+                let repo = fresh();
+                let out = run(who, &repo, command, switches);
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                match (refusal, *who) {
+                    (Some(_), "tool") => {
+                        assert_eq!(out.status.code(), Some(0), "{label}: {stderr}");
+                        continue;
+                    }
+                    (Some(text), _) => {
+                        assert_eq!(out.status.code(), Some(1), "{label}: {stderr}");
+                        assert!(stderr.contains(text), "{label}: {stderr}");
+                    }
+                    (None, _) => assert_eq!(out.status.code(), Some(1), "{label}: {stderr}"),
+                }
+                assert!(files_under(&repo.join("objects")).is_empty(), "{label}");
+                assert!(files_under(&repo.join("refs")).is_empty(), "{label}");
+            }
+        }
+        // A destination that already holds the commit under the ref the
+        // command writes.
+        let held_repo = fresh();
+        let repo_arg = format!("--repo={}", held_repo.display());
+        if command == "pull" {
+            ostrya(&[&repo_arg, "pull", "origin", "main"], None, &[]).ok();
+        } else {
+            ostrya(&[&repo_arg, "pull-local", &src, "main"], None, &[]).ok();
+        }
+        let held_config = std::fs::read(held_repo.join("config")).unwrap();
+        for key in ["fsync=bogus", "per-object-fsync=bogus"] {
+            let switch_states: [&[&str]; 3] = [&[], &["--disable-fsync"], &["--per-object-fsync"]];
+            for switches in switch_states {
+                for held in [false, true] {
+                    for who in &whos {
+                        let label = format!("`{who}` {command} {key} {switches:?} held={held}");
+                        let repo = if held { held_repo.clone() } else { fresh() };
+                        let before = stored_bytes(&repo);
+                        set_core_key(&repo, key);
+                        let out = run(who, &repo, command, switches);
+                        assert_eq!(
+                            out.status.code(),
+                            Some(1),
+                            "{label}: {}",
+                            String::from_utf8_lossy(&out.stderr),
+                        );
+                        assert_eq!(stored_bytes(&repo), before, "{label}");
+                        if held {
+                            std::fs::write(repo.join("config"), &held_config).unwrap();
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

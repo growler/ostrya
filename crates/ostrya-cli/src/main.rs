@@ -1245,6 +1245,14 @@ struct PullArgs {
     /// Consult this repository for an object before the network; repeatable.
     #[arg(short = 'L', long = "localcache-repo")]
     localcache_repo: Vec<PathBuf>,
+    /// Do not sync anything this pull writes. Changes no byte the pull writes.
+    #[arg(long)]
+    disable_fsync: bool,
+    /// Sync the file of each content object as it is staged. Metadata objects
+    /// are not synced on their own. --disable-fsync and `[core] fsync=false`
+    /// win over it.
+    #[arg(long)]
+    per_object_fsync: bool,
     /// Send NAME=VALUE as an HTTP header with every request; repeatable.
     #[arg(long = "http-header", value_name = "NAME=VALUE", value_parser = parse_http_header)]
     http_header: Vec<(String, String)>,
@@ -1348,6 +1356,14 @@ struct PullLocalArgs {
     /// repeatable.
     #[arg(short = 'L', long = "localcache-repo")]
     localcache_repo: Vec<PathBuf>,
+    /// Do not sync anything this pull writes. Changes no byte the pull writes.
+    #[arg(long)]
+    disable_fsync: bool,
+    /// Sync the file of each content object as it is staged. Metadata objects
+    /// are not synced on their own. --disable-fsync and `[core] fsync=false`
+    /// win over it.
+    #[arg(long)]
+    per_object_fsync: bool,
     /// The repository to pull from. Required; checked after the repository
     /// resolves, matching the tool's error-ordering
     /// (`docs/conformance/cli-surface.md`, "Global conventions").
@@ -1755,6 +1771,8 @@ async fn pull(repo: Repo, name: &str, args: PullArgs, low_speed: LowSpeedArgs) -
                 flags,
                 depth: args.depth,
                 localcache_repos,
+                disable_fsync: args.disable_fsync,
+                per_object_fsync: args.per_object_fsync,
                 url: args.url,
                 http_headers: args.http_header,
                 max_outstanding_fetches: args.max_outstanding_fetcher_requests,
@@ -1867,6 +1885,8 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
                 flags,
                 depth: args.depth,
                 localcache_repos,
+                disable_fsync: args.disable_fsync,
+                per_object_fsync: args.per_object_fsync,
                 detached_metadata_filter: detached_metadata_filter(&repo)?,
                 ..PullOptions::default()
             },

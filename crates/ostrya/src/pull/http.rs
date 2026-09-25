@@ -200,7 +200,7 @@ use super::drive::Slots;
 use super::verify::{Defaults, Verification};
 use super::{
     DetachedMetadataFilter, ModeChecks, PullFlags, PullOptions, PullStats, READ_CHUNK,
-    TimestampCheck, check_ref_binding, refspec,
+    TimestampCheck, apply_durability, check_ref_binding, refspec,
 };
 
 /// How many fetches are in flight when the caller names no limit.
@@ -293,7 +293,8 @@ impl Repo {
         )
         .await?;
 
-        let txn = self.transaction().await?;
+        let mut txn = self.transaction().await?;
+        apply_durability(&mut txn, &opts);
         // The markers the pull writes, held outside the span that writes them so
         // a failure in that span clears the ones it left behind.
         let mut marked = Vec::new();
@@ -339,7 +340,7 @@ impl Repo {
             && opts.refs.is_empty()
             && let Some(bytes) = summary_bytes
         {
-            let fsync = self.config().fsync()?;
+            let fsync = self.config().fsync()? && !opts.disable_fsync;
             self.write_root_file(SUMMARY_FILE, bytes, fsync).await?;
             // The signature covers those bytes, so it is copied with them: a
             // client pulling from this repository with `gpg-verify-summary=true`
@@ -688,7 +689,9 @@ impl Repo {
         if let Some(meta) = detached
             && let Some(meta) = ctx.detached_filter.apply(&checksum, meta)?
         {
-            self.write_commit_detached_bytes(&checksum, meta).await?;
+            let (fsync, _) = ctx.txn.fsync_flags()?;
+            self.write_commit_detached_bytes(&checksum, meta, fsync)
+                .await?;
         }
         // Where the commit's objects come from. A commit already complete here
         // needs none of them: what it references is present. Its parent is a

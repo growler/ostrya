@@ -219,7 +219,8 @@ impl RepoConfig {
         Ok(self.keyfile.get_bool(CORE, "fsync")?.unwrap_or(true))
     }
 
-    /// Whether each object is fsynced individually. Default `false`.
+    /// Whether the file of each content object is fsynced individually as it
+    /// is staged. A metadata object is not synced on its own. Default `false`.
     pub fn per_object_fsync(&self) -> Result<bool> {
         Ok(self
             .keyfile

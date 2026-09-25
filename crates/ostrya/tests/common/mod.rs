@@ -189,3 +189,34 @@ pub fn gnupg_available(programs: &[&str]) -> bool {
     }
     true
 }
+
+/// Every regular file and symlink under `root/sub`, as its path relative to
+/// `root` and its bytes (a symlink's target), sorted by path.
+pub fn file_inventory(root: &Path, sub: &str) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.join(sub)];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(&path).unwrap();
+                out.push((name, target.into_os_string().into_encoded_bytes()));
+            } else {
+                out.push((name, std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}

@@ -134,6 +134,9 @@
 //! on a commit that is complete. That direction costs availability rather than
 //! integrity: checkout refuses the commit until the next pull of it, or a prune
 //! of it, clears the marker.
+//! [`PullOptions::disable_fsync`] turns every sync of the pull off, over
+//! `[core] fsync`, and [`PullOptions::per_object_fsync`] turns the per-object
+//! sync of content objects on. Markers stay unsynced under every option.
 //!
 //! Trust: by default an object is imported without its checksum being checked,
 //! which is what makes the link and clone paths possible.
@@ -455,6 +458,18 @@ pub struct PullOptions {
     /// Extra local repositories consulted for an object the source does not
     /// hold, in order.
     pub localcache_repos: Vec<Repo>,
+    /// Turn every sync of this pull off: the per-object syncs, the `syncfs` and
+    /// the directory syncs of publication, the detached metadata of each pulled
+    /// commit, the ref writes, and the summary a mirror pull copies. `false`
+    /// leaves `[core] fsync` in charge. The option never turns a sync on, and
+    /// no byte the pull writes changes.
+    pub disable_fsync: bool,
+    /// Sync the file of each content object this pull stages, as it is
+    /// staged, whatever `[core] per-object-fsync` says. `false` leaves the key
+    /// in charge. A metadata object and an object imported by hardlink are not
+    /// synced on their own. Under fsync off, from `[core] fsync` or
+    /// [`disable_fsync`](PullOptions::disable_fsync), nothing is synced.
+    pub per_object_fsync: bool,
     /// The base URL an HTTP pull fetches from, overriding the remote's
     /// configured `url`. `None` uses the configuration.
     pub url: Option<String>,
@@ -497,6 +512,16 @@ pub struct PullOptions {
     /// Which properties of a commit's detached metadata this pull stores. The
     /// default keeps every one, which stores the source's bytes verbatim.
     pub detached_metadata_filter: DetachedMetadataFilter,
+}
+
+/// Apply the durability options of a pull to its transaction.
+fn apply_durability(txn: &mut Transaction, opts: &PullOptions) {
+    if opts.disable_fsync {
+        txn.set_fsync(false);
+    }
+    if opts.per_object_fsync {
+        txn.set_per_object_fsync(true);
+    }
 }
 
 /// What a pull imported.
@@ -598,7 +623,8 @@ impl Repo {
             }
         }
 
-        let txn = self.transaction().await?;
+        let mut txn = self.transaction().await?;
+        apply_durability(&mut txn, &opts);
 
         // The markers the pull writes, held outside the span that writes them so
         // a failure in that span clears the ones it left behind.
@@ -626,8 +652,13 @@ impl Repo {
                     self.import_object(&txn, &sources, name, flags, &mut verify_buf)
                         .await?;
                 }
-                self.import_detached_metadata(&sources, commit, &opts.detached_metadata_filter)
-                    .await?;
+                self.import_detached_metadata(
+                    &txn,
+                    &sources,
+                    commit,
+                    &opts.detached_metadata_filter,
+                )
+                .await?;
             }
             for (ref_name, tip) in &targets {
                 txn.set_ref(&refspec(opts.remote.as_deref(), ref_name), Some(tip));
@@ -783,11 +814,13 @@ impl Repo {
     }
 
     /// Copy a commit's detached metadata from the first source holding it,
-    /// through `filter`. The stored bytes are the source's verbatim where the
-    /// filter keeps every property. A source with no `.commitmeta`, and a
-    /// filter that allows no property, each leave the destination's alone.
+    /// through `filter`, under the fsync policy of `txn`. The stored bytes are
+    /// the source's verbatim where the filter keeps every property. A source
+    /// with no `.commitmeta`, and a filter that allows no property, each leave
+    /// the destination's alone.
     async fn import_detached_metadata(
         &self,
+        txn: &Transaction,
         sources: &[&Repo],
         commit: &Checksum,
         filter: &DetachedMetadataFilter,
@@ -795,7 +828,9 @@ impl Repo {
         if let Some(bytes) = detached_bytes_from(sources, commit).await?
             && let Some(bytes) = filter.apply(commit, bytes)?
         {
-            self.write_commit_detached_bytes(commit, bytes).await?;
+            let (fsync, _) = txn.fsync_flags()?;
+            self.write_commit_detached_bytes(commit, bytes, fsync)
+                .await?;
         }
         Ok(())
     }

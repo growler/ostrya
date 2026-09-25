@@ -902,6 +902,11 @@ impl Transaction {
     /// Changes durability and no stored byte.
     pub fn set_fsync(&mut self, enabled: bool);
 
+    /// Replaces `[core] per-object-fsync` for this transaction alone: each
+    /// content object's file is synced as it is staged, and no metadata object.
+    /// No effect while fsync is off. Changes durability and no stored byte.
+    pub fn set_per_object_fsync(&mut self, enabled: bool);
+
     /// Settles whether every commit this transaction writes carries
     /// `ostree.sizes`, for an ingest that runs no commit modifier. The answer
     /// holds for the whole transaction and wins over the flag an ingest sets.
@@ -1904,6 +1909,8 @@ pub struct PullOptions {
     pub flags: PullFlags,
     pub depth: i32,                       // 0 = the commit alone, -1 = all
     pub localcache_repos: Vec<Repo>,
+    pub disable_fsync: bool,              // every sync off; never turns one on
+    pub per_object_fsync: bool,           // sync each content object as staged
     // The rest are the HTTP pull's; each defaults to what a local pull does.
     pub url: Option<String>,              // overrides the remote's configured url
     pub http_headers: Vec<(String, String)>,

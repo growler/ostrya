@@ -2429,6 +2429,20 @@ note: what the policy does, which no artifact this harness reads can show: the
 
 family: M10
 subcommand: commit
+cell: commit/per-object-fsync-content-only
+setup: repo tree
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::commit_per_object_fsync_syncs_content_objects_alone
+spec: format-reference.md#the-fsync-vocabulary
+note: under `[core] per-object-fsync=true` both implementations sync the file of
+ each content object stored as a regular file and no metadata object: four
+ calls over corpus C0 in `archive` and `bare-user`, and three in `bare`, where
+ the symlink object is a symlink inode. The tool makes 15, 15, and 14 calls in
+ all, and the port 16, 16, and 15.
+
+family: M10
+subcommand: commit
 cell: commit/table-output-counters
 setup: repo tree
 outcome: full
@@ -13518,3 +13532,250 @@ spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: both exit 1 after one request for the object under
  `--network-retries=0`, and neither writes an object under `objects/` or a
  ref.
+
+# ---------------------------------------------------------------------------
+# pull -- durability (Phase 17f). The harness serves no remote and reads no
+# syscall, so each cell cites the `cli.rs` test that pulls with each
+# implementation from a standard-library server of its own under `strace`.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: pull
+cell: pull/disable-fsync-syscalls
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_fsync_switches_control_the_syscalls
+spec: format-reference.md#the-fsync-vocabulary
+note: under `--disable-fsync` an HTTP pull of corpus C0 into an `archive` and a
+ `bare-user` destination makes no `fsync`, `fdatasync`, or `syncfs` call, in
+ both implementations. By default the tool makes 11 and the port 13.
+
+family: M10
+subcommand: pull
+cell: pull/per-object-fsync-syscalls
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_fsync_switches_control_the_syscalls
+spec: format-reference.md#the-fsync-vocabulary
+note: `--per-object-fsync`, and `[core] per-object-fsync=true` with no switch,
+ each add one sync per content object the pull stages and none per metadata
+ object: four calls over corpus C0, on the staged files under `tmp/`. The tool
+ makes 15 and the port 17.
+
+family: M10
+subcommand: pull
+cell: pull/fsync-off-wins
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_fsync_switches_control_the_syscalls
+spec: format-reference.md#the-fsync-vocabulary
+note: `--disable-fsync` beside `--per-object-fsync`, and `[core] fsync=false`
+ beside `--per-object-fsync`, each make no sync call in both implementations.
+
+family: M10
+subcommand: pull
+cell: pull/fsync-switches-change-no-byte
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_fsync_switches_control_the_syscalls
+spec: format-reference.md#the-fsync-vocabulary
+note: every row of the cited test exits 0, and each destination mode holds the
+ same object and ref bytes across the rows and across the two
+ implementations. `ostrya::pull_http::http_pull_durability_options_change_no_byte`
+ states the same for the library, and for the summary a mirror pull copies.
+
+family: M10
+subcommand: pull
+cell: pull/default-ref-directory-syncs
+setup: repo
+outcome: lossy
+severity: interop
+loss: syncs by default that the tool does not make. The port syncs
+ `refs/remotes/<remote>`, which holds the ref, and `refs/remotes`, where the
+ ref write creates `refs/remotes/<remote>`; a later pull from the same remote
+ syncs `refs/remotes/<remote>` alone. Under `--mirror` it syncs the summary
+ file and the repository root, which the tool does not (`format-reference.md`,
+ "The fsync vocabulary"). No byte differs, and
+ `--disable-fsync` turns every one of them off.
+evidence: ostrya_cli::cli::pull_fsync_switches_control_the_syscalls
+spec: format-reference.md#the-fsync-vocabulary
+note: `ostrya_cli::cli::pull_mirror_disable_fsync_syncs_nothing` holds the
+ mirror half: tool 11 calls and port 14 by default, 0 in both under
+ `--disable-fsync`, and one summary in both.
+
+family: M10
+subcommand: pull
+cell: pull/fsync-switch-value-suffix
+setup: repo
+outcome: lossy
+severity: interop
+loss: a value given to a switch. The tool reads and discards `=VALUE` on
+ `--disable-fsync` and on `--per-object-fsync`, and a repeat of either; the
+ port refuses both at exit 1 and writes no object and no ref (`cli-surface.md`,
+ "P2").
+evidence: ostrya_cli::cli::pull_fsync_switches_parse_as_switches
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the tool reads `--disable-fsync=false` as "disable". Both refuse
+ `--fsync`, which neither command has.
+
+# ---------------------------------------------------------------------------
+# pull-local -- durability (Phase 17f). The setup commits corpus C0 into
+# `$SRC` on `conformance`. Standard output carries a byte figure the two
+# implementations count apart, so the cells compare a prefix of it.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: pull-local
+cell: pull-local/disable-fsync
+src-mode: archive
+dst-mode: archive
+setup: src-dst
+run: pull-local --repo=$DST --disable-fsync $SRC conformance
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: contains "4 metadata, 4 content objects imported;"
+oracle: exit-status stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#the-fsync-vocabulary
+note: the switch changes the sync calls alone, so the two hold one ref and one
+ object store. `ostrya_cli::cli::pull_local_fsync_switches_control_the_syscalls`
+ states the calls.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/per-object-fsync
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --per-object-fsync $SRC conformance
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: contains "4 metadata, 4 content objects imported;"
+oracle: exit-status stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_local_fsync_switches_control_the_syscalls
+spec: format-reference.md#the-fsync-vocabulary
+note: into `bare-user` the content objects are re-ingested, and the switch
+ syncs each of them: four calls over corpus C0, none for a metadata object.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/both-switches
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --per-object-fsync --disable-fsync $SRC conformance
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: contains "4 metadata, 4 content objects imported;"
+oracle: exit-status stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#the-fsync-vocabulary
+note: `--disable-fsync` wins, and neither implementation makes a sync call
+ (`ostrya_cli::cli::pull_local_fsync_switches_control_the_syscalls`).
+
+family: M10
+subcommand: pull-local
+cell: pull-local/fsync-refused
+src-mode: archive
+dst-mode: archive
+setup: src-dst
+run: pull-local --repo=$DST --fsync=true $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "unexpected argument '--fsync' found"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --fsync=true"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `pull-local` has no `--fsync` in either implementation. The words differ,
+ and neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/disable-fsync-value-suffix
+src-mode: archive
+dst-mode: archive
+setup: src-dst
+run: pull-local --repo=$DST --disable-fsync=false $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "unexpected value 'false' for '--disable-fsync'"
+ref-expect-exit: 0
+ref-expect-stdout: contains "4 metadata, 4 content objects imported;"
+ref-expect-stderr: empty
+outcome: lossy
+severity: interop
+loss: a value given to a switch, which stays open. The tool reads and discards
+ the suffix and reads `--disable-fsync=false` as "disable"; the port refuses it
+ at exit 1 and writes no object and no ref (`cli-surface.md`, "P2").
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/per-object-fsync-value-suffix
+src-mode: archive
+dst-mode: archive
+setup: src-dst
+run: pull-local --repo=$DST --per-object-fsync=bogus $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "unexpected value 'bogus' for '--per-object-fsync'"
+ref-expect-exit: 0
+ref-expect-stdout: contains "4 metadata, 4 content objects imported;"
+ref-expect-stderr: empty
+outcome: lossy
+severity: interop
+loss: a value given to a switch, which stays open. The tool reads and discards
+ any suffix, `=bogus` among them; the port refuses it at exit 1 and writes no
+ object and no ref (`cli-surface.md`, "P2").
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/disable-fsync-given-twice
+src-mode: archive
+dst-mode: archive
+setup: src-dst
+run: pull-local --repo=$DST --disable-fsync --disable-fsync $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "cannot be used multiple times"
+ref-expect-exit: 0
+ref-expect-stdout: contains "4 metadata, 4 content objects imported;"
+ref-expect-stderr: empty
+outcome: lossy
+severity: interop
+loss: a repeated boolean flag. The tool takes a second `--disable-fsync`; the
+ port refuses it at exit 1, as it refuses every repeated boolean flag
+ (`cli-surface.md`, "P2"). `--per-object-fsync` given twice is the
+ same.
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/fsync-syscalls
+setup: src-dst
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_local_fsync_switches_control_the_syscalls
+spec: format-reference.md#the-fsync-vocabulary
+note: from `archive` into `archive` every object is hardlinked, so no row syncs
+ an object: tool 11 calls and port 12 by default and under either
+ per-object form. Into `bare-user` the per-object forms add four, one per
+ content object: tool 15 and port 16. `--disable-fsync` and `[core]
+ fsync=false` make 0 in both. The port also syncs `refs/heads`, which the tool
+ does not.

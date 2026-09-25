@@ -2490,9 +2490,9 @@ DIR, `--timestamp`, `--reindex`, `--gpg-homedir`, and `-s` for
 `--output-dir`. The port reads a `--sign` key with the lenient base64 reader
 `commit --sign` uses.
 
-`pull` accepts a large set already. Missing: `--cache-dir`, `--disable-fsync`,
-`--per-object-fsync`, `--subpath`, `--untrusted`, `--http-trusted`,
-`--dry-run`, `--update-frequency=FREQUENCY`. The port adds `--force-copy`,
+`pull` accepts a large set already. Missing: `--cache-dir`, `--subpath`,
+`--untrusted`, `--http-trusted`, `--dry-run`,
+`--update-frequency=FREQUENCY`. The port adds `--force-copy`,
 `--sign-verify`, and `--sign-verify-summary`. It also adds the valued forms
 `--gpg-verify[=BOOL]` and `--gpg-verify-summary[=BOOL]`, which the tool refuses
 with `error: Unknown option --gpg-verify` (or the option as written, value
@@ -2566,11 +2566,47 @@ differences stand:
   port abandons each at the second the tool does, or completes each where the
   tool does.
 
+`--disable-fsync` turns off every sync of the pull, and `--per-object-fsync`
+syncs the file of each content object the pull stages and no metadata object,
+as in the tool. `[core] fsync=false` and `--disable-fsync` each win over
+`--per-object-fsync`. Neither switch changes a byte the pull writes, and
+`../format-reference.md`, "The fsync vocabulary", gives the counts. A
+configured `[core] fsync` or `[core] per-object-fsync` value the reader refuses
+is refused at exit 1 under every state of the two switches, in both. Three
+differences stand:
+
+- syncs by default. The port syncs `refs/remotes/<remote>`, which holds the
+  ref, and `refs/remotes`, where the ref write creates `refs/remotes/<remote>`.
+  A later pull from the same remote syncs `refs/remotes/<remote>` alone. Under
+  `--mirror` the port also syncs the summary file and the repository root. The
+  tool makes none of these syncs. The count over corpus `C0` is 13 in the port
+  and 11 in the tool, and 14 and 11 under `--mirror`. For a pulled commit that
+  carries detached metadata, the port also syncs the `.commitmeta` temp file,
+  its fanout directory, and `objects/`, which the tool does not: 16 in the port
+  and 11 in the tool, and 17 and 11 under `--mirror`. `--disable-fsync` turns
+  every one of them off;
+- a value given to either switch. The tool reads and discards an `=VALUE`
+  suffix, so `--disable-fsync=false` disables fsync and
+  `--per-object-fsync=bogus` is accepted. `clap` refuses the suffix with
+  `error: unexpected value '<value>' for '<switch>' found; no more were
+  expected` at exit 1, and the port writes no object and no ref. The open
+  decision on a value given to a switch covers it;
+- a repeated switch. The tool takes a second `--disable-fsync` or
+  `--per-object-fsync`; the port refuses it with `error: the argument
+  '<switch>' cannot be used multiple times` at exit 1. This is the
+  repeated-boolean-flag class.
+
 `pull-local` accepts `--repo`, `--remote`, `--depth`, `--commit-metadata-only`,
-`--untrusted`, `--bareuseronly-files`, `--disable-verify-bindings`, and the port
-extensions `--force-copy` and `-L/--localcache-repo`. Missing:
-`--disable-fsync`, `--per-object-fsync`, `--require-static-deltas`,
-`--disable-static-deltas`, `--gpg-verify`, `--gpg-verify-summary`.
+`--untrusted`, `--bareuseronly-files`, `--disable-verify-bindings`,
+`--disable-fsync`, `--per-object-fsync`, and the port extensions `--force-copy`
+and `-L/--localcache-repo`. Missing: `--require-static-deltas`,
+`--disable-static-deltas`, `--gpg-verify`, `--gpg-verify-summary`. The two
+durability switches follow the `pull` paragraph above. An object hardlinked from
+the source is not synced, in both, so from `archive` into `archive`
+`--per-object-fsync` adds no call. The same three differences stand, with
+`refs/heads` in place of `refs/remotes/<remote>` and no summary: the count
+over corpus `C0` is 12 in the port and 11 in the tool, and 15 and 11 for a
+commit that carries detached metadata.
 
 `sign` accepts the whole tool option set and adds `--gpg-homedir`,
 `--remote`, the `gpg` engine, and the `spki` engine. The tool build at hand,

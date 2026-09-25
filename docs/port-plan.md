@@ -6469,6 +6469,63 @@ under the head window keeps the fetch future at 5048 bytes, 136 more than
 before, and the pull step at 5848 bytes under smol, so no other future is
 boxed.
 
+`pull` and `pull-local` take `--disable-fsync` and `--per-object-fsync`. The
+library adds `Transaction::set_per_object_fsync`, which replaces `[core]
+per-object-fsync` for one transaction as `set_fsync` replaces `[core] fsync`,
+and `PullOptions::disable_fsync` and `PullOptions::per_object_fsync`, which both
+pulls apply to their transaction. A mirror pull writes the summary it copies
+under the same policy, and both pulls write the detached metadata of each pulled
+commit under the policy of their transaction. The transaction reads both
+configured values under every override, so a value the reader refuses is refused
+under every switch state. The per-object sync covers the file of each content
+object alone, on every transaction: the metadata staging path and the metadata
+copy of `--force-copy` sync no file of their own, and the `syncfs` that opens
+publication makes them durable. `commit` under `[core] per-object-fsync=true`
+over corpus `C0` in `archive` makes 16 calls, where the tool makes 15. A sync of
+each staged metadata file would make 21, since one dirmeta is staged twice.
+
+Observation added these rules. The tool syncs each content object and no
+metadata object under the switch and under the key alike, in `pull`,
+`pull-local`, and `commit`: an HTTP pull of `C0` makes 11 calls by default and
+15 under either form, in `archive` and in `bare-user`. A `pull-local` from
+`archive` into `archive` hardlinks every object and makes 11 under either form,
+and into `bare-user` 15. `--disable-fsync` and `[core] fsync=false` each make
+0, beside `--per-object-fsync` too, and a `--mirror` pull under
+`--disable-fsync` syncs no summary. The tool discards an `=VALUE` suffix on
+both switches, so `--disable-fsync=false` disables fsync, and takes a repeat of
+either. `format-reference.md`, "Durability and staging" and "The fsync
+vocabulary", gives the measurements. Measured with `strace -f -c -e
+trace=fsync,fdatasync,syncfs` over an HTTP pull of `C0` into `archive` under
+`--per-object-fsync`, the port makes 17 calls and the tool 15. Under
+`--disable-fsync` both make 0.
+
+Five decisions stand, each taken without the maintainer and open to reversal.
+The per-object sync covers content objects alone on every transaction and not
+only on a pull, since the tool gives the key and the switch one scope; this
+changes the port's calls under the key for `commit` too. The syncs the port
+makes by default and the tool does not -- the ref directories of "Ref
+durability", the summary file and the repository root of a mirror pull, and
+the `.commitmeta` temp file, its fanout directory, and `objects/` for a pulled
+commit that carries detached metadata -- stay, and are recorded as a
+divergence; the changes on that path are that the mirror summary write and
+the detached-metadata write obey `--disable-fsync`. Over `C0` committed with
+`--add-detached-metadata-string`, the tool makes 11 calls by default on
+`pull-local`, `pull`, and a `--mirror` pull, and the port makes 15, 16, and 17.
+Under `--disable-fsync` both make 0. A value on either switch is
+refused by `clap` at exit 1, which the open decision on a value given to a
+switch covers; the tool reads `--disable-fsync=false` as "disable", so
+accepting the value would give it a meaning the tool does not. A repeated
+switch is refused by `clap`, the repeated-boolean-flag class. `[core]
+fsync=false` or `--disable-fsync` wins over `--per-object-fsync` and over the
+key, and `--per-object-fsync` turns the per-object sync on whatever the key
+says, while the key is in charge when the switch is absent.
+
+Three divergences are recorded in `cli-surface.md`, "P2", `pull` and
+`pull-local`: the default syncs (the ref directories, the mirror summary and
+root, and the detached metadata), the refused value suffix, and the refused
+repeat. The work adds 15 `m10` cells, of which 7 are executable and all 7 pass;
+the conformance run reports 1083 cells and 439 passes (the M10 family 436).
+
 #### Phase 17g -- P3 commands with no matrix weight
 
 `reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and

@@ -145,6 +145,11 @@ pub struct Transaction {
     /// setting, from [`set_fsync`](Transaction::set_fsync). `None` leaves the
     /// config in charge.
     fsync_override: Option<bool>,
+    /// A per-transaction replacement for the repository config's
+    /// `[core] per-object-fsync` setting, from
+    /// [`set_per_object_fsync`](Transaction::set_per_object_fsync). `None`
+    /// leaves the config in charge.
+    per_object_fsync_override: Option<bool>,
     /// Set by a filesystem ingest under
     /// [`GENERATE_SIZES`](crate::CommitModifierFlags::GENERATE_SIZES). Read by
     /// commit assembly (Phase 7d) to decide whether to emit `ostree.sizes`.
@@ -188,6 +193,7 @@ impl Transaction {
         Transaction {
             repo,
             fsync_override: None,
+            per_object_fsync_override: None,
             generate_sizes: AtomicBool::new(false),
             generate_sizes_override: None,
             staged: Mutex::new(Staged {
@@ -211,6 +217,17 @@ impl Transaction {
     /// durability of the writes and no byte the repository stores.
     pub fn set_fsync(&mut self, enabled: bool) {
         self.fsync_override = Some(enabled);
+    }
+
+    /// Replace the repository config's `[core] per-object-fsync` setting for
+    /// this transaction alone. With the setting on, the file of each content
+    /// object is synced as it is staged, before publication. A metadata object
+    /// is never synced on its own, and an object imported by hardlink is not
+    /// synced. The setting has no effect while fsync is off, from the config or
+    /// from [`set_fsync`](Transaction::set_fsync). It changes the durability of
+    /// the writes and no byte the repository stores.
+    pub fn set_per_object_fsync(&mut self, enabled: bool) {
+        self.per_object_fsync_override = Some(enabled);
     }
 
     /// Settle whether this transaction emits `ostree.sizes` in every commit it
@@ -845,20 +862,26 @@ impl Transaction {
     }
 
     /// The `fsync` and `per-object-fsync` settings, the first from
-    /// [`set_fsync`](Transaction::set_fsync) where the transaction carries an
-    /// override and from the repository config otherwise. Every write path of
-    /// the transaction reads this pair: the per-object writes, the publication
-    /// step, the detached-metadata writes, and the ref writes.
+    /// [`set_fsync`](Transaction::set_fsync) and the second from
+    /// [`set_per_object_fsync`](Transaction::set_per_object_fsync) where the
+    /// transaction carries an override, and each from the repository config
+    /// otherwise. Every write path of the transaction reads this pair: the
+    /// per-object writes, the publication step, the detached-metadata writes,
+    /// and the ref writes.
     ///
-    /// The configured `[core] fsync` is read whether or not an override stands,
-    /// so a value the reader refuses is reported from every transaction and an
-    /// override never conceals it (`docs/format-reference.md`, "The fsync
-    /// vocabulary").
+    /// The configured `[core] fsync` and `[core] per-object-fsync` are both
+    /// read whether or not an override stands, so a value the reader refuses is
+    /// reported from every transaction and an override never conceals it
+    /// (`docs/format-reference.md`, "The fsync vocabulary").
     pub(crate) fn fsync_flags(&self) -> Result<(bool, bool)> {
         let config = self.repo.config();
         let configured = config.fsync()?;
+        let configured_per_object = config.per_object_fsync()?;
         let fsync = self.fsync_override.unwrap_or(configured);
-        Ok((fsync, config.per_object_fsync()?))
+        let per_object = self
+            .per_object_fsync_override
+            .unwrap_or(configured_per_object);
+        Ok((fsync, per_object))
     }
 
     /// The effective `[ex-integrity] fsverity` setting from the repository

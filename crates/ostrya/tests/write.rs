@@ -445,6 +445,58 @@ fn a_bad_configured_fsync_is_refused_under_every_override() {
     });
 }
 
+/// A `[core] per-object-fsync` value the reader does not hold reaches every
+/// write path, with a [`Transaction::set_per_object_fsync`] override of either
+/// polarity, with none, and with fsync turned off by
+/// [`Transaction::set_fsync`]. The override replaces the configured setting and
+/// never the reading of it.
+#[test]
+fn a_bad_configured_per_object_fsync_is_refused_under_every_override() {
+    let tmp = TmpDir::new("write-per-object-fsync-bad-config");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        let config = root.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("per-object-fsync=bogus\n");
+        std::fs::write(&config, text).unwrap();
+        let repo = Repo::open(&root).await.unwrap();
+
+        // (per-object override, fsync override)
+        let rows = [
+            (None, None),
+            (Some(true), None),
+            (Some(false), None),
+            (None, Some(false)),
+            (Some(true), Some(false)),
+        ];
+        for (per_object, fsync) in rows {
+            let mut txn = repo.transaction().await.unwrap();
+            if let Some(enabled) = per_object {
+                txn.set_per_object_fsync(enabled);
+            }
+            if let Some(enabled) = fsync {
+                txn.set_fsync(enabled);
+            }
+            let err = txn
+                .write_regfile_inline(None, &reg(), HELLO)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::Core(ostrya_core::Error::KeyFile(text))
+                        if text.contains("core.per-object-fsync")
+                ),
+                "overrides {per_object:?}/{fsync:?} gave {err:?} in place of the config refusal",
+            );
+            txn.abort().await.unwrap();
+        }
+    });
+}
+
 #[test]
 fn concurrent_writers_share_one_transaction() {
     let tmp = TmpDir::new("write-concurrent");

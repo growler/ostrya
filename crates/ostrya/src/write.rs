@@ -697,7 +697,8 @@ pub(crate) struct StageCtx<'a> {
     pub(crate) mode: RepoMode,
     /// Whether durability syncs run at all.
     pub(crate) fsync: bool,
-    /// Whether each object is fsynced individually at ingest.
+    /// Whether the file of each content object is synced at ingest. Metadata
+    /// objects are not.
     pub(crate) per_object_fsync: bool,
     /// The effective `[ex-integrity] fsverity` setting. Each freshly staged
     /// regular-file object is sealed with fs-verity unless this is
@@ -900,7 +901,10 @@ pub(crate) fn stage_metadata_blocking(
         bytes,
         FIXED_MODE,
         None,
-        ctx.fsync && ctx.per_object_fsync,
+        // A metadata object is made durable by the `syncfs` that opens
+        // publication; the per-object sync covers content objects alone
+        // (`docs/format-reference.md`, "Durability and staging").
+        false,
         ctx.verity,
     )?;
     Ok(StageOutcome {
@@ -1186,9 +1190,9 @@ fn clone_metadata(
     let (dst, temp, blocks) = clone_payload(ctx.staging_fd, src.as_fd())?;
     let apply = || -> Result<(u64, Blocks)> {
         rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(FIXED_MODE))?;
-        if ctx.fsync && ctx.per_object_fsync {
-            rustix::fs::fsync(dst.as_fd())?;
-        }
+        // A metadata object is made durable by the `syncfs` that opens
+        // publication; the per-object sync covers content objects alone
+        // (`docs/format-reference.md`, "Durability and staging").
         let on_disk_size = size_of(dst.as_fd())?;
         let link_fd = if ctx.verity == Tristate::No {
             OwnedFd::from(dst)

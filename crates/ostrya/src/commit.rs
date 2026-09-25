@@ -280,7 +280,9 @@ impl Repo {
             }
             None => Vec::new(),
         };
-        self.write_commit_detached_bytes(checksum, bytes).await
+        let fsync = self.config().fsync()?;
+        self.write_commit_detached_bytes(checksum, bytes, fsync)
+            .await
     }
 
     /// Apply one detached-metadata edit at a commit's `.commitmeta` loose path.
@@ -372,16 +374,17 @@ impl Repo {
     }
 
     /// Write a commit's detached metadata from its serialized bytes, replaced
-    /// atomically. Used by the pull path, which copies a source repository's
-    /// `.commitmeta` verbatim rather than re-serializing a decoded dict.
+    /// atomically, syncing it where `fsync` is set. Used by the pull path,
+    /// which copies a source repository's `.commitmeta` verbatim rather than
+    /// re-serializing a decoded dict, under its transaction's fsync policy.
     pub(crate) async fn write_commit_detached_bytes(
         &self,
         checksum: &Checksum,
         bytes: Vec<u8>,
+        fsync: bool,
     ) -> Result<()> {
         let repo_mode = self.mode();
         let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
-        let fsync = self.config().fsync()?;
         let objects_fd = self.objects_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || {
             write_detached_blocking(objects_fd.as_fd(), &dest, &bytes, fsync, repo_mode)

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 
-use common::{TmpDir, ostree_available, ostree_supports_ed25519};
+use common::{TmpDir, file_inventory, ostree_available, ostree_supports_ed25519};
 use futures_io::{AsyncRead, AsyncWrite};
 use hyper::body::{Bytes, Frame, SizeHint};
 use hyper::service::service_fn;
@@ -4416,5 +4416,69 @@ fn a_pull_verifies_what_the_tool_signed() {
             "{err}"
         );
         assert_nothing_published(&dest).await;
+    });
+}
+
+/// The durability options change the sync calls of an HTTP pull and no byte it
+/// writes: a pull under each combination of the two stores the same objects and
+/// refs and reports the same statistics, in an `archive` and a `bare-user`
+/// destination, and a mirror pull of every ref copies the same summary. The
+/// sync calls themselves are read under `strace` by the CLI tests.
+#[test]
+fn http_pull_durability_options_change_no_byte() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-durability");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let rows = [(false, false), (true, false), (false, true), (true, true)];
+        for (mode, flags) in [
+            (RepoMode::Archive, PullFlags::empty()),
+            (RepoMode::BareUser, PullFlags::empty()),
+            (RepoMode::Archive, PullFlags::MIRROR),
+        ] {
+            let mut answer = None;
+            for (disable_fsync, per_object_fsync) in rows {
+                let row = dir.path().join(format!(
+                    "{mode:?}-{}-{disable_fsync}-{per_object_fsync}",
+                    flags.bits()
+                ));
+                std::fs::create_dir(&row).unwrap();
+                let dest = build_dest(&row, mode, &server.url(), "").await;
+                let refs = if flags.contains(PullFlags::MIRROR) {
+                    Vec::new()
+                } else {
+                    vec!["test/main".to_owned()]
+                };
+                let stats = dest
+                    .pull(
+                        "origin",
+                        PullOptions {
+                            refs,
+                            flags,
+                            disable_fsync,
+                            per_object_fsync,
+                            ..PullOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let root = row.join("dest");
+                let mut files = file_inventory(&root, "objects");
+                files.extend(file_inventory(&root, "refs"));
+                if flags.contains(PullFlags::MIRROR) {
+                    let summary = std::fs::read(root.join("summary")).unwrap();
+                    files.push(("summary".to_owned(), summary));
+                }
+                let seen = (files, stats);
+                match &answer {
+                    None => answer = Some(seen),
+                    Some(first) => assert_eq!(
+                        &seen, first,
+                        "{mode:?} {flags:?} disable_fsync={disable_fsync} \
+                         per_object_fsync={per_object_fsync} changed what the pull wrote",
+                    ),
+                }
+            }
+        }
     });
 }

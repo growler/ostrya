@@ -12,7 +12,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use common::{TmpDir, ostree_available};
+use common::{TmpDir, file_inventory, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState, CreateOptions,
     DetachedMetadataFilter, DetachedMetadataFilterFn, Ed25519Signer, Error, FilterResult,
@@ -2888,5 +2888,53 @@ fn a_check_without_a_remote_name_is_refused() {
             "{err}"
         );
         assert!(dst.list_refs(None).await.unwrap().is_empty());
+    });
+}
+
+/// The durability options change the sync calls of a pull and no byte it
+/// writes: a pull under each combination of the two stores the same objects,
+/// the same refs, and reports the same statistics, whether the objects are
+/// linked (`archive` to `archive`) or re-ingested (`archive` to `bare-user`).
+/// The sync calls themselves are read under `strace` by the CLI tests.
+#[test]
+fn pull_local_durability_options_change_no_byte() {
+    let tmp = TmpDir::new("pull-durability");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        for mode in [RepoMode::Archive, RepoMode::BareUser] {
+            let mut answer = None;
+            for (disable_fsync, per_object_fsync) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let name = format!("dst-{mode:?}-{disable_fsync}-{per_object_fsync}");
+                let (dst_dir, dst) = make_repo(base, &name, mode).await;
+                let stats = dst
+                    .pull_local(
+                        &src,
+                        PullOptions {
+                            refs: vec!["main".to_owned()],
+                            disable_fsync,
+                            per_object_fsync,
+                            ..PullOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let seen = (
+                    file_inventory(&dst_dir, "objects"),
+                    dst.list_refs(None).await.unwrap(),
+                    stats,
+                );
+                match &answer {
+                    None => answer = Some(seen),
+                    Some(first) => assert_eq!(
+                        &seen, first,
+                        "{mode:?} disable_fsync={disable_fsync} \
+                         per_object_fsync={per_object_fsync} changed what the pull wrote",
+                    ),
+                }
+            }
+        }
     });
 }

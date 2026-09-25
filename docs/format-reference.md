@@ -1272,14 +1272,21 @@ temp file (`O_TMPFILE` in the staging directory) and materializes it with
   staging directory under their loose path, then `syncfs(repo)` runs once, then
   each object is `renameat`-ed into `objects/<xx>/`, then each touched
   `objects/<xx>` and `objects/` is `fsync`-ed.
-- `per-object-fsync=true`: each object's temp file is `fsync`-ed at ingest; the
-  `syncfs(repo)` and directory `fsync`s still run at publication.
+- `per-object-fsync=true`: the temp file of each content object is `fsync`-ed
+  at ingest. A metadata object is not synced at ingest. An object linked from
+  another repository by `pull-local` is not synced. The `syncfs(repo)` and
+  directory `fsync`s still run at publication. The switch `--per-object-fsync`
+  on `pull` and `pull-local` has the scope of the key.
 - `fsync=false`: no `syncfs`, `fsync`, or `fdatasync` is issued.
 
 The port always stages then renames (the default path) and honors the two
 settings for the syncs it issues: `fsync=false` makes every sync a no-op,
-`per-object-fsync=true` `fsync`s each object at ingest, and otherwise a single
-`syncfs` precedes the renames with directory `fsync`s after. The staging
+`per-object-fsync=true` `fsync`s the file of each content object at ingest and
+no metadata object, and otherwise a single `syncfs` precedes the renames with
+directory `fsync`s after. A content object the port stores as a symlink inode
+(a symlink in `bare` and `bare-user-only`) and an object it hardlinks from
+another repository are not synced at ingest. The `syncfs` that opens
+publication makes every staged object durable, metadata included. The staging
 directory layout is transient and is not part of the on-disk format.
 
 ## Write path: fs-verity (ex-integrity)
@@ -3252,8 +3259,14 @@ Which command takes which spelling:
 - `pull` and `pull-local` document `--disable-fsync` and refuse `--fsync` with
   `error: Unknown option --fsync=<value>` at exit 1.
 - `--per-object-fsync` is a separate valueless flag on `pull` and `pull-local`,
-  covering write scheduling and standing outside this vocabulary. `commit`
-  refuses it with `error: Unknown option --per-object-fsync` at exit 1.
+  covering write scheduling and standing outside this vocabulary. It turns the
+  per-object sync of `[core] per-object-fsync` on, whatever the key says, with
+  the scope of the key: the file of each content object the pull stages, and
+  no metadata object. It takes no value, and the tool reads and discards an
+  `=VALUE` suffix, so `--per-object-fsync=bogus` is accepted. It cannot turn a
+  configured `per-object-fsync=true` off. `[core] fsync=false` and
+  `--disable-fsync` each win over it. `commit` refuses it with `error: Unknown
+  option --per-object-fsync` at exit 1.
 
 The option value is read after the configured value, so an option value never
 conceals a configured one the reader refuses. A repository holding a `[core]
@@ -3316,6 +3329,81 @@ which no exit status shows, since both orders exit 0. It is the last one:
 the run creates for itself, because the uncompressed object cache a first
 `archive` checkout fills would take a second measurement in the same repository
 to 0 whatever the policy resolves to.
+
+The same measurement over a `pull` of corpus `C0` gives the counts below. The
+remote is an `archive` repository holding the commit on `main` and a summary,
+served over HTTP, and the pull writes `refs/remotes/origin/main` into a fresh
+destination. The counts are the same in an `archive` and in a `bare-user`
+destination:
+
+```
+switch or [core] key                         tool   port
+(none)                                        11     13
+--per-object-fsync                            15     17
+per-object-fsync=true                         15     17
+--disable-fsync                                0      0
+--per-object-fsync --disable-fsync             0      0
+fsync=false with --per-object-fsync            0      0
+```
+
+The tool's 11 calls are the 11 of the `commit` table: one `fsync` per fanout
+directory and one of `objects/`, the `fdatasync` of the ref's temp file, and the
+`syncfs`. The per-object rows add one `fsync` per content object, on its staged
+file under `tmp/`, and none for a metadata object: 4 over `C0`. The port adds
+two directory syncs for the ref ("Ref durability" above). `init` creates
+`refs/remotes`, and the ref write creates `refs/remotes/origin`, so the port
+syncs `refs/remotes/origin`, which holds the ref, and `refs/remotes`, which
+holds the created `origin` entry. A later pull from the same remote finds
+`refs/remotes/origin` in place and syncs it alone. A `--mirror` pull of every
+ref copies the remote's summary: the tool makes 11 calls and syncs no summary
+file. The port makes 14: the tool's 11, an `fsync` of `refs/heads`, an
+`fdatasync` of the summary's temp file, and an `fsync` of the repository root.
+Under `--disable-fsync` both make 0.
+
+A pulled commit that carries detached metadata adds a `.commitmeta` to the
+pull. The tool makes no sync call for it, and its counts stay 11 on
+`pull-local`, on `pull`, and on a `--mirror` pull of `C0` committed with
+`--add-detached-metadata-string` into `archive`. The port writes the
+`.commitmeta` before publication with an `fdatasync` of its temp file, an
+`fsync` of its fanout directory, and an `fsync` of `objects/`, so it makes 15,
+16, and 17 calls. Under `--disable-fsync` both make 0.
+
+Over `pull-local` of the same commit out of an `archive` source:
+
+```
+switch or [core] key                  archive dest    bare-user dest
+                                      tool   port     tool   port
+(none)                                 11     12       11     12
+--per-object-fsync                     11     12       15     16
+per-object-fsync=true                  11     12       15     16
+--disable-fsync                         0      0        0      0
+fsync=false with --per-object-fsync     0      0        0      0
+```
+
+Into `archive` every object is hardlinked from the source, so no object is
+synced on any row. Into `bare-user` the content objects are ingested again and
+the metadata objects are hardlinked, so the per-object rows add one sync per
+content object. The port adds one `fsync` of `refs/heads`, the directory holding
+the ref. Under the port's `--force-copy --per-object-fsync` into `archive`, every
+object is copied and the port makes 16 calls: the 4 content objects are synced
+and the 4 metadata objects are not.
+
+`commit` under `[core] per-object-fsync=true` follows the same scope. Over `C0`
+the tool makes 15 calls in `archive` and in `bare-user` and 14 in `bare`, where
+the symlink object is a symlink inode. The port makes 16, 16, and 15.
+
+The port accepts `--disable-fsync` and `--per-object-fsync` on `pull` and on
+`pull-local`. `--disable-fsync` turns off every sync of the pull: the per-object
+syncs, the publication step, the detached metadata of each pulled commit, the
+ref writes, and the summary a mirror pull copies. `--per-object-fsync` turns the
+per-object sync on for the content objects the pull stages. The port reads the
+configured `[core] fsync` and `[core] per-object-fsync` under every state of the
+two switches, so a value the reader refuses is refused at exit 1 under each,
+with no object and no ref written, as the tool refuses it. Neither switch
+changes a byte the pull writes. The port refuses an `=VALUE` suffix on either
+switch and a repeat of either at exit 1, with no object and no ref written,
+where the tool discards the suffix and accepts the repeat
+(`conformance/cli-surface.md`, "P2").
 
 ### `commit`
 

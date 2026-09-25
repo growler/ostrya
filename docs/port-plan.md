@@ -6585,6 +6585,74 @@ value suffix and repeat of the two switches.
 The work adds 19 `m10` cells, of which 2 are executable and both pass; the
 conformance run reports 1102 cells and 441 passes (the M10 family 438).
 
+`pull` prints the tool's statistics line, and takes
+`--update-frequency=FREQUENCY`. `PullStats` adds `content_bytes_unpacked`,
+`metadata_fetched`, `content_fetched`, `delta_parts`, `bytes_transferred`, and
+`elapsed`, and `PullOptions::progress` takes a `PullProgress` handle of atomic
+counters, which a caller reads with `snapshot()` while the pull runs. There is
+no callback. Each pull counts into counters of its own, from which its
+`PullStats` come, and adds the same counts to the handle where it has one. The
+pull never sets the handle to zero, so a handle that several pulls share shows
+the sum of their counters. A count costs one relaxed atomic add, and one more
+for the handle. The fetcher adds the bytes of each data frame it reads to the
+counters in the same way, and the pull takes back the bytes counted before the
+summary, the config, and the ref files are read. Each loose metadata object
+and `.commitmeta` fetched, and each delta index and superblock request,
+whatever the answer, adds to `metadata_fetched`, and each delta part fetched as
+a file adds to `delta_parts`. The objects a static delta writes pass through a
+content writer that adds nothing to `TransactionStats::content_bytes_unpacked`,
+so that figure reads zero for a delta-applied object; `commit --table-output`
+applies no delta and is unchanged. `PullStats` and `PullOptions` stay
+exhaustive by decision 14, so the new fields break every struct literal
+outside the crate, and decision 14 gives that break a minor version before
+1.0. The version number is left to the maintainer. The CLI prints the line
+from these fields. When standard output is a terminal it also redraws a
+progress line on a thread of its own every `--update-frequency` milliseconds,
+1000 by default, as `ESC 8` and the text padded to 80 bytes, the first redraw
+led by `ESC 7`. The thread writes each redraw from one buffer. It reads no
+terminal width, which would need a dependency, and pads to a fixed width
+instead.
+
+Observation corrected four rules of the item. A delta index and a superblock
+request count as metadata fetched, even when the remote answers 404, and a
+`.commitmeta` counts only when served. The transferred figure leaves out the
+summary, the config, and the ref files, and rounds down to whole KiB. A pull
+that reads no body byte after them drops the transfer clause. A delta whose
+parts are all inline takes the loose form. `format-reference.md`, "`pull`",
+gives the rules.
+
+A review round found three defects and fixed them. The transferred figure
+counted the `refs/heads` body of each ref read from a remote with no summary,
+which the tool does not count: 298 bytes where the tool printed 233.
+`the_transferred_count_leaves_out_the_ref_files` holds the rule. A handle
+shared by two pulls that ran at once corrupted the `PullStats` of both, since
+each pull set the handle to zero and read its statistics back from it;
+`concurrent_pulls_sharing_a_progress_handle_keep_their_own_statistics` holds
+the fix. A malformed detached-metadata filter key failed the CLI after the
+progress thread had started, which left the thread unjoined. The key is read
+before the thread starts. The round also measured the tool on a terminal with
+`script` and `stty cols`: it pads each line, the statistics line included, to
+the terminal width counted in bytes, writes `ESC 7` when the pull starts,
+writes a newline after the last line of a failed pull, and writes `-/s` before
+it has measured a rate. The port pads to 80 bytes, pads the statistics line
+too, writes `-/s` until a whole second has passed, and ends a failed pull the
+same way. The CLI test compares the transferred figure exactly, with the
+seconds alone masked.
+
+Two decisions stand, each taken without the maintainer and open to reversal:
+the fixed 80-byte padding, and the port's progress totals, which count the
+units of work its walk handles and change form when no commit or dirtree is
+queued. Six divergences are recorded in `cli-surface.md`, "P2", `pull`: a delta
+into `archive`, by the index or, from a remote with no summary, by the
+superblock name; the delta index on a repeat pull; the body of an error
+answer; the loose count and the written figure of a pull that reaches the same
+objects by a loose walk and by a delta part, which change from run to run in
+both implementations and differ between them; `pull-local` from `bare-user`
+into `bare-user-only`; and the terminal progress line. The work adds 11 `m10`
+cells, of which 4 are executable and all pass, and makes three `pull-local`
+cells compare the whole line; the conformance run reports 1113 cells and 445
+passes (the M10 family 442).
+
 #### Phase 17g -- P3 commands with no matrix weight
 
 `reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and

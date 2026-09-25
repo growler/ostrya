@@ -61,7 +61,9 @@ pub struct TransactionStats {
     /// objects, before any compression the repository mode applies. A symlink
     /// contributes nothing, and an object hardlinked from another repository
     /// contributes nothing, its payload never being read; an object whose
-    /// payload was cloned contributes that payload's length.
+    /// payload was cloned contributes that payload's length. An object a
+    /// static delta produced contributes nothing, which is what the tool
+    /// reports for a pull.
     pub content_bytes_unpacked: u64,
     /// Content objects skipped because their (device, inode) was already known
     /// through a [`DevInoCache`](crate::DevInoCache) hit during a filesystem
@@ -575,6 +577,8 @@ impl Transaction {
 
     /// Stage a regular-file content object whose payload is already written to
     /// `file`. Called by [`ContentWriter::finish`](crate::ContentWriter::finish).
+    /// `counted` chooses whether the payload adds to
+    /// [`content_bytes_unpacked`](TransactionStats::content_bytes_unpacked).
     pub(crate) async fn stage_regular(
         &self,
         checksum: Checksum,
@@ -582,6 +586,7 @@ impl Transaction {
         file: std::fs::File,
         temp: TempKind,
         unpacked: u64,
+        counted: bool,
     ) -> Result<Checksum> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
@@ -601,7 +606,7 @@ impl Transaction {
             stage_content_blocking(&ctx, &key, &header, file, temp, unpacked)
         })
         .await?;
-        self.record(checksum, ObjectType::File, mode, outcome, true)
+        self.record(checksum, ObjectType::File, mode, outcome, counted)
     }
 
     /// Stage a symlink content object. Called by

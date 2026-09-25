@@ -6566,3 +6566,106 @@ was reached` in the tool. The port reports `error: i/o error: fetched body
 averaged below <limit> bytes per second for <time>` for a body, and `error:
 fetch: <url>: transfer below <limit> bytes per second for <time>` for a
 response head. Both exit 1 and write no ref.
+
+`--update-frequency=FREQUENCY` is read with the same reader, at the same step,
+and with the same two messages, `--update-frequency` in place of the option
+name. It sets the redraw interval of the terminal progress line in
+milliseconds. 0 and a negative value keep the default of 1000 ms. To a pipe the
+value changes no byte of output. Recovered by running the tool against a
+repository with no remote: `abc`, an empty value, and `1.5` are refused as a
+syntax, `99999999999`, `2147483648`, and `-2147483649` as out of range, and
+`-1`, `0x10`, `010`, ` 5`, `+5`, and `2147483647` are accepted.
+
+A pull that succeeds prints one statistics line on standard output. To a pipe
+it is the whole of the output, and nothing is written to standard error. A
+pull that fails prints no statistics line. The line takes one of four forms:
+
+- `M metadata, C content objects fetched; T transferred in S seconds; W
+  content written`, for an HTTP pull that fetched no delta part as a file;
+- `P delta parts, L loose fetched; T transferred in S seconds; W content
+  written`, for an HTTP pull that fetched at least one delta part as a file.
+  `L` is `M` plus `C`;
+- either of the two forms above with `; T transferred in S seconds` left out,
+  for an HTTP pull that read no body byte after the summary, the config, and
+  the ref files;
+- `M metadata, C content objects imported; W content written`, for
+  `pull-local`, and in the tool for a `file://` remote, which the port
+  refuses.
+
+The words `delta parts` and `content objects` stay plural for a count of 1.
+The figures are these:
+
+- `M` counts each loose metadata object and each `.commitmeta` the remote
+  served, and each delta index request and delta superblock request, whatever
+  the remote answered. A `.commitmeta` request answered 404 does not count.
+- `C` counts each content object fetched loose from the remote.
+- `P` counts each delta part fetched as a file. A part the superblock carries
+  inline does not count, so a delta whose parts are all inline takes the first
+  form, with the index and the superblock counted in `M`.
+- `T` is the bytes of the response bodies read after the summary, the config,
+  and the ref files: the `summary.sig`, `summary`, and `config` requests do
+  not count, and from a remote with no summary the `refs/heads` request of
+  each ref does not count either. It
+  is `N B` below 1024 bytes, and above that the whole KiB rounded down, `N
+  KiB`. 3842 bytes print as `3 KiB`. The tool counts the body of an error
+  answer too; the port counts the bodies of the answers it reads.
+- `S` is the whole seconds the pull ran, rounded down.
+- `W` is the total payload size of the regular-file content objects written,
+  before any compression the destination mode applies. A symlink, an object
+  shared by hardlink, and an object a static delta produced count nothing.
+  An object `pull-local` copies between two `archive` repositories counts
+  nothing, and an object an HTTP pull fetches into `archive` counts its
+  payload. `W`
+  takes the wording of the `prune` totals line: `1 byte`, `N bytes` below
+  1000, and above that one decimal digit, U+00A0, and an SI unit (`3.0 kB`).
+
+When one pull reaches the same objects by a loose walk and by a delta part,
+`L` and `W` change from run to run, in the tool and in the port, and the two
+disagree (`conformance/cli-surface.md`, "P2", `pull`).
+
+Recovered by running the tool with standard output a pipe against a server
+that logs each request and the size of each body it sends. Over a tree of a
+3000-byte file, a 6-byte file, a 1-byte file, and a symlink, a loose pull into
+`archive` prints `4 metadata, 4 content objects fetched; 3 KiB transferred in
+0 seconds; 3.0 kB content written`, into `bare-user` `5 metadata` for the
+delta index request it adds, and a tree of a 1-byte file prints `1 byte
+content written`. A from-scratch delta of one part into `bare-user` prints `1
+delta parts, 2 loose fetched; 6 KiB transferred in 0 seconds; 0 bytes content
+written`, and the same delta generated with `--inline` prints `2 metadata, 0
+content objects fetched`. A repeat pull into `archive` whose requests all
+answer 404 with an empty body prints `0 metadata, 0 content objects fetched; 0
+bytes content written`. Into `bare-user` the tool asks for the delta index
+again on a repeat pull and prints `1 metadata`. From a remote with no summary,
+a loose pull of one ref into `archive`, whose five objects total 233 bytes,
+prints `4 metadata, 1 content objects fetched; 233 B transferred`, so the
+65-byte `refs/heads` body does not count. `pull-local` from `archive` prints `0 bytes content written` into
+`archive` and `3.0 kB content written` into `bare-user`, and from `bare-user`
+it prints `0 bytes content written` into `bare-user` and `3.0 kB content
+written` into `bare` and into `archive`.
+
+Standard output that is a terminal also carries a progress line. The tool
+writes `ESC 7` when the pull starts, then each redraw as `ESC 8` and the
+progress text padded with spaces to the terminal width, and last `ESC 8`, the
+statistics line padded the same way, and a newline. The width is counted in
+bytes, so each U+00A0 in the line takes two of the columns, and a line longer
+than the width is written whole. A pull that fails writes a newline after the
+last line, and the error follows on standard error. Three forms of the
+progress text were seen: `Receiving metadata objects: 5/(estimating) 237
+bytes/s 948 bytes`, `Receiving objects: 38% (59/155) 454.8 kB/s 1.4 MB`, and
+`Receiving delta parts: 0/1 0 bytes/3.4 MB 356.2 kB/s 9 seconds remaining`.
+The rate reads `-/s` before the tool has measured one. Recovered with `script`
+and `stty cols` at 60, 80, and 100 columns: at 100 columns the progress line
+and the statistics line each take 100 bytes, and a pull that ends before the
+first redraw writes `ESC 7`, `ESC 8`, and the statistics line. At a redraw
+interval of 1 or 50 ms the tool was also seen to write a `Writing objects: N`
+form and to end on a progress line with no statistics line after it.
+
+The port writes the same sequences and the same three forms, pads each line to
+80 bytes, and does not read the terminal width. It writes `ESC 7` with its
+first redraw, or with the last line when the pull ends before the first
+redraw, so a pull that draws no progress line writes the bytes the tool
+writes. Its rate, the bytes transferred over the whole time the pull ran,
+reads `-/s` until a whole second has passed, and it always ends on the
+statistics line. Its progress totals count the units of work its own walk
+handles, and `pull-local` writes no progress line. The progress line is
+outside the byte-exact scope.

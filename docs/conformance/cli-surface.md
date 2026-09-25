@@ -2490,9 +2490,8 @@ DIR, `--timestamp`, `--reindex`, `--gpg-homedir`, and `-s` for
 `--output-dir`. The port reads a `--sign` key with the lenient base64 reader
 `commit --sign` uses.
 
-`pull` accepts a large set already. Missing: `--cache-dir`, `--dry-run`,
-`--update-frequency=FREQUENCY`. The port adds `--force-copy`,
-`--sign-verify`, and `--sign-verify-summary`. It also adds the valued forms
+`pull` accepts a large set already. Missing: `--cache-dir`, `--dry-run`. The
+port adds `--force-copy`, `--sign-verify`, and `--sign-verify-summary`. It also adds the valued forms
 `--gpg-verify[=BOOL]` and `--gpg-verify-summary[=BOOL]`, which the tool refuses
 with `error: Unknown option --gpg-verify` (or the option as written, value
 included) at exit 1. The port's fetcher serves `http` and `https` alone, so a
@@ -2636,6 +2635,50 @@ fetches no `file://` remote. Under `--require-static-deltas` into `archive`
 the tool refuses with `error: Can't use static deltas in an archive repo`, and
 the port takes the delta, with or without `--subpath`, which is the capability
 difference `../port-plan.md`, Phase 16d, records.
+
+The statistics line a pull prints to a pipe takes the tool's forms, words, and
+counts (`../format-reference.md`, "CLI output formats", `pull`), and
+`--update-frequency=FREQUENCY` is read with the reader and the messages of the
+low-speed values. The same line agrees for a loose pull into `bare-user`, a
+repeat pull into `archive` that reads no body byte, a delta pull into
+`bare-user`, and `pull-local` between the modes the port imports. Six
+differences stand:
+
+- a delta into `archive`. From a remote that indexes its deltas the tool asks
+  for no delta index into `archive`, and the port asks for it and counts it in
+  `M`, so it prints `5 metadata` where the tool prints `4 metadata`. From a
+  remote with no summary the port asks for the superblock by name into
+  `archive` and counts it in the same way, where the tool asks for none. From
+  a remote that publishes a delta the port takes it into `archive`, as the
+  capability difference above states, and prints the delta form where the
+  tool prints the loose form and a nonzero written figure;
+- the delta index on a repeat pull. Into a destination other than `archive`,
+  the tool asks for the delta index again for a commit it holds, and counts
+  it: `1 metadata, 0 content objects fetched`. The port asks for no delta for
+  a commit it holds and prints `0 metadata`;
+- the body of an error answer. The tool adds the body of a 404 to `T`, and
+  the port adds the bodies of successful answers alone. Against a server that
+  answers 404 with an empty body the two agree;
+- one pull that reaches the same objects by a loose walk and by a delta part.
+  Where a delta carries one ref and the tree of a second ref pulled loose in
+  the same run shares objects with it, the loose count and the written figure
+  change from run to run in both. In the port the objects the walk fetches
+  depend on which of its concurrent steps stores each shared object first.
+  Over one such remote into `bare-user` the tool printed `7 loose fetched` in
+  seven of eight runs and `8` in one, each with `0 bytes content written`,
+  and the port printed `8` or `9`, with `0 bytes`, `3 bytes`, or `5 bytes`.
+  The port keeps its own walk order and concurrency;
+- `pull-local` from `bare-user` into `bare-user-only`. The tool hardlinks each
+  object and prints `0 bytes content written`. The port writes each object
+  afresh where it accepts it, which is the difference `../port-plan.md`, Phase
+  16b, records, and counts its payload;
+- the terminal progress line. The port pads each line to 80 bytes and does not
+  read the terminal width, where the tool pads to the width counted in bytes.
+  The port counts its progress totals over the units of work its own walk
+  handles, so the percentages, the moments the form changes, and the moment
+  its rate replaces `-/s` are its own. It always ends on the statistics line,
+  where the tool at a redraw interval of a few milliseconds was seen to end on
+  a progress line. `pull-local` writes no progress line in the port.
 
 `pull-local` accepts `--repo`, `--remote`, `--depth`, `--commit-metadata-only`,
 `--untrusted`, `--bareuseronly-files`, `--disable-verify-bindings`,
@@ -3314,10 +3357,8 @@ formats of `commit`, including its `--table-output` block, `refs`, `rev-parse`,
 `static-delta indexes`, together with the
 GVariant text form the reading commands share,
 are recovered and recorded in `../format-reference.md`, "CLI output formats" and
-"The GVariant text form". Each format below still needs a black-box observation
-pass, and the results belong in that same section.
-
-- `pull` progress output.
+"The GVariant text form". The `pull` statistics line and progress line are
+recovered, in `../format-reference.md`, "`pull`".
 
 `remote list`, `show-url`, `refs`, and `summary` are recovered, in
 `../format-reference.md`, "`remote`".

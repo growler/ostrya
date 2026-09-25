@@ -242,6 +242,9 @@ pub struct ContentWriter<'txn> {
     expected: Option<Checksum>,
     temp: PendingTemp<'txn>,
     sink: Sink,
+    /// Whether the payload adds to
+    /// [`content_bytes_unpacked`](crate::TransactionStats::content_bytes_unpacked).
+    counted: bool,
 }
 
 /// The disk sink under a [`ContentWriter`].
@@ -253,6 +256,14 @@ enum Sink {
 }
 
 impl ContentWriter<'_> {
+    /// The same writer, whose payload adds nothing to
+    /// [`content_bytes_unpacked`](crate::TransactionStats::content_bytes_unpacked).
+    /// A static delta writes its objects through such a writer.
+    pub(crate) fn uncounted(mut self) -> Self {
+        self.counted = false;
+        self
+    }
+
     /// Finish the object: finalize the digest, verify it against the caller's
     /// expectation, apply per-mode metadata, and stage it under its loose name.
     /// A dedup hit (the object already in `objects/` or this transaction's
@@ -266,6 +277,7 @@ impl ContentWriter<'_> {
             expected,
             temp,
             sink,
+            counted,
         } = self;
 
         let file = match sink {
@@ -297,8 +309,15 @@ impl ContentWriter<'_> {
         }
 
         let std_file = file.into_std().await;
-        txn.stage_regular(checksum, header, std_file, temp.into_inner(), uncompressed)
-            .await
+        txn.stage_regular(
+            checksum,
+            header,
+            std_file,
+            temp.into_inner(),
+            uncompressed,
+            counted,
+        )
+        .await
     }
 }
 
@@ -400,6 +419,7 @@ impl Transaction {
             expected: expected.copied(),
             temp,
             sink,
+            counted: true,
         })
     }
 
@@ -520,6 +540,7 @@ impl Transaction {
             std_file,
             temp.into_inner(),
             declared,
+            true,
         )
         .await
     }

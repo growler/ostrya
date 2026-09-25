@@ -13624,8 +13624,8 @@ note: the tool reads `--disable-fsync=false` as "disable". Both refuse
 
 # ---------------------------------------------------------------------------
 # pull-local -- durability (Phase 17f). The setup commits corpus C0 into
-# `$SRC` on `conformance`. Standard output carries a byte figure the two
-# implementations count apart, so the cells compare a prefix of it.
+# `$SRC` on `conformance`. The statistics line is compared whole where both
+# implementations exit 0.
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -13637,8 +13637,8 @@ setup: src-dst
 run: pull-local --repo=$DST --disable-fsync $SRC conformance
 expect-exit: 0
 expect-stderr: empty
-expect-stdout: contains "4 metadata, 4 content objects imported;"
-oracle: exit-status stderr-text refs-bytes inventory
+expect-stdout: equals "4 metadata, 4 content objects imported; 0 bytes content written"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
 outcome: full
 severity: interop
 spec: format-reference.md#the-fsync-vocabulary
@@ -13655,8 +13655,8 @@ setup: src-dst
 run: pull-local --repo=$DST --per-object-fsync $SRC conformance
 expect-exit: 0
 expect-stderr: empty
-expect-stdout: contains "4 metadata, 4 content objects imported;"
-oracle: exit-status stderr-text refs-bytes inventory
+expect-stdout: equals "4 metadata, 4 content objects imported; 45 bytes content written"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
 outcome: full
 severity: interop
 evidence: ostrya_cli::cli::pull_local_fsync_switches_control_the_syscalls
@@ -13673,8 +13673,8 @@ setup: src-dst
 run: pull-local --repo=$DST --per-object-fsync --disable-fsync $SRC conformance
 expect-exit: 0
 expect-stderr: empty
-expect-stdout: contains "4 metadata, 4 content objects imported;"
-oracle: exit-status stderr-text refs-bytes inventory
+expect-stdout: equals "4 metadata, 4 content objects imported; 45 bytes content written"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
 outcome: full
 severity: interop
 spec: format-reference.md#the-fsync-vocabulary
@@ -14044,3 +14044,183 @@ severity: interop
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: `pull-local` has no `--http-trusted` in either implementation. The words
  differ, and neither side writes an object or a ref.
+
+# ---------------------------------------------------------------------------
+# pull -- progress and the statistics line (Phase 17f). The harness serves no
+# remote, so each `pull` cell but the two value refusals cites the `cli.rs`
+# test that pulls with each implementation from a standard-library server of
+# its own, with standard output a pipe. The `pull-local` cells commit corpus
+# C0 into `$SRC` on `conformance`.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: pull
+cell: pull/update-frequency-parse-refusal
+setup: repo
+run: pull --repo=$REPO --update-frequency=abc origin
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Cannot parse integer value “abc” for --update-frequency"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Cannot parse integer value “abc” for --update-frequency"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#pull
+note: the value is read as a C `int` while the options are read, ahead of the
+ repository and ahead of the remote, which this repository does not
+ configure.
+
+family: M10
+subcommand: pull
+cell: pull/update-frequency-out-of-range
+setup: repo
+run: pull --repo=$REPO --update-frequency=99999999999 origin
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Integer value “99999999999” for --update-frequency out of range"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Integer value “99999999999” for --update-frequency out of range"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#pull
+note: a value no C `int` holds is refused in the words `commit --owner-uid`
+ uses.
+
+family: M10
+subcommand: pull
+cell: pull/statistics-line-loose
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_statistics_line_matches_the_tool
+spec: format-reference.md#pull
+note: a loose pull into `bare-user` prints `5 metadata, 4 content objects
+ fetched; 565 B transferred in <n> seconds; 20 bytes content written` in
+ both, the delta index request counted as metadata. The test server answers
+ 404 with an empty body, and only the seconds are replaced before the
+ compare.
+
+family: M10
+subcommand: pull
+cell: pull/statistics-line-nothing-transferred
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_statistics_line_matches_the_tool
+spec: format-reference.md#pull
+note: a repeat pull into `archive` finds the commit present and reads no body
+ byte after the summary and the config, and both print `0 metadata, 0
+ content objects fetched; 0 bytes content written` with no transfer clause.
+
+family: M10
+subcommand: pull
+cell: pull/statistics-line-delta
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_statistics_line_matches_the_tool
+spec: format-reference.md#pull
+note: a from-scratch delta pull into `bare-user` prints `1 delta parts, 2
+ loose fetched; 1 KiB transferred in <n> seconds; 0 bytes content written`
+ in both. The two loose requests are the delta index and the superblock, and
+ the objects the delta wrote count no content written.
+
+family: M10
+subcommand: pull
+cell: pull/statistics-line-counts
+setup: repo
+outcome: lossy
+severity: interop
+loss: three counts of the statistics line. Into `archive`, the port asks for
+ a delta, by the index from a remote that indexes its deltas and by the
+ superblock name from a remote with no summary, and counts the request,
+ where the tool asks for none, and the port takes a delta the tool refuses.
+ A repeat pull into a non-`archive` repository leaves out the delta index
+ request the tool makes and counts. The transferred figure leaves out the
+ body of an error answer, which the tool counts. When one pull reaches the
+ same objects by a loose walk and by a delta part, the loose count and the
+ written figure change from run to run in both, and the port's differ from
+ the tool's (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::pull_statistics_line_matches_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the cited test holds the rows where the counts agree.
+
+family: M10
+subcommand: pull
+cell: pull/statistics-line-sizes
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::tests::the_statistics_line_takes_the_tool_forms
+spec: format-reference.md#pull
+note: the written figure is `1 byte`, `N bytes`, or a decimal size with
+ U+00A0 before the unit, and the transferred figure is `N B` below 1024 and
+ the whole KiB rounded down above
+ (`ostrya_cli::tests::the_transferred_figure_rounds_down_to_whole_kib`).
+
+family: M10
+subcommand: pull
+cell: pull/update-frequency-terminal-only
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::tests::the_update_frequency_defaults_to_a_second
+spec: format-reference.md#pull
+note: the value changes the redraw interval of the terminal progress line
+ alone; 0 and a negative value keep 1000 ms. To a pipe no progress line is
+ written, so no byte of output and no byte of the repository changes.
+
+family: M10
+subcommand: pull
+cell: pull/terminal-progress
+setup: repo
+outcome: lossy
+severity: interop
+loss: the terminal progress line. The port pads each line to 80 bytes and
+ does not read the terminal width, where the tool pads to the width in
+ bytes. The port's phase boundaries, its object totals, and the moment its
+ rate replaces `-` are its own, it always ends on the statistics line, and
+ `pull-local` draws no progress line (`cli-surface.md`, "P2").
+evidence: ostrya_cli::tests::the_progress_text_takes_three_forms
+spec: format-reference.md#pull
+note: both write `ESC 7` once, each redraw as `ESC 8` and the padded line,
+ and last `ESC 8` and the statistics line, padded the same way
+ (`ostrya_cli::tests::a_terminal_line_is_padded_to_80_bytes`).
+
+family: M10
+subcommand: pull-local
+cell: pull-local/statistics-line-hardlinked
+src-mode: archive
+dst-mode: archive
+setup: src-dst
+run: pull-local --repo=$DST $SRC conformance
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: equals "4 metadata, 4 content objects imported; 0 bytes content written"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#pull
+note: two repositories of one mode share each object by hardlink, and a
+ hardlinked object counts no content written.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/statistics-line-reingested
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST $SRC conformance
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: equals "4 metadata, 4 content objects imported; 45 bytes content written"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+spec: format-reference.md#pull
+note: across the archive boundary each regular file is written afresh, and
+ its uncompressed payload counts.

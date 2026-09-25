@@ -1874,8 +1874,21 @@ other property is kept. This is the constructor the `ostrya` CLI builds from
 as `[ex-ostrya] gc-root-metadata-keys`, and neither list is derived from the
 other.
 
-Still remote-only and unimplemented: `subdirs`, `override_commit_ids`, and a
-progress callback.
+Still remote-only and unimplemented: `subdirs` and `override_commit_ids`.
+
+`progress` is a handle of live counters, not a callback. The pull adds to the
+counters with relaxed atomic adds and never sets them to zero, and a caller
+reads `snapshot()` from another task or thread on its own timer. The `ostrya`
+CLI reads it for its terminal progress line. A handle that several pulls
+share, or that one pull after another takes, shows the sum of their counters,
+so a caller gives each pull a handle of its own to see that pull alone. Each
+pull also counts into counters of its own, and its `PullStats` come from
+those, whatever the handle holds. A count costs one relaxed atomic add, and
+one more when the pull has a handle; the fetcher counts the bytes transferred
+so once per data frame of each body. `PullStats` carries the counters at the
+end of the pull, with the elapsed time and `content_bytes_unpacked`, which is
+the figure the tool prints as the content written: a symlink, a hardlinked
+object, and an object a static delta produced count nothing.
 
 ```rust
 pub struct PullFlags(u32);                // a bitset, as CommitModifierFlags is
@@ -1928,6 +1941,27 @@ pub struct PullOptions {
     pub require_static_deltas: bool,      // refuse a remote advertising none
     pub verify: PullVerify,               // the signature checks to make
     pub detached_metadata_filter: DetachedMetadataFilter,  // what to store
+    pub progress: Option<PullProgress>,   // live counters for the caller
+}
+
+#[derive(Clone, Default)]
+pub struct PullProgress { /* Arc of atomic counters */ }
+impl PullProgress {
+    pub fn new() -> PullProgress;
+    pub fn snapshot(&self) -> PullProgressSnapshot;
+}
+pub struct PullProgressSnapshot {
+    pub bytes_transferred: u64,
+    pub metadata_fetched: u32,
+    pub content_fetched: u32,
+    pub objects_done: u32,                // units of work finished
+    pub objects_total: u32,               // finished, in flight, and queued
+    pub scanning: bool,                   // a pull with a commit or dirtree
+                                          // still queued
+    pub delta_parts_fetched: u32,
+    pub delta_parts_total: u32,
+    pub delta_bytes_fetched: u64,
+    pub delta_bytes_total: u64,
 }
 
 /// A verdict on one property of a commit's detached metadata: the commit, the
@@ -1963,7 +1997,15 @@ pub struct PullVerify {
 pub struct PullStats {
     pub metadata_imported: u32,
     pub content_imported: u32,
-    pub content_bytes_written: u64,
+    pub content_bytes_written: u64,       // stored size, hardlinks included
+    pub content_bytes_unpacked: u64,      // payload written, the tool's figure
+    pub metadata_fetched: u32,            // HTTP only, delta index and
+                                          // superblock requests included
+    pub content_fetched: u32,             // HTTP only
+    pub delta_parts: u32,                 // parts fetched as files
+    pub bytes_transferred: u64,           // successful bodies after the
+                                          // summary, config, and ref files
+    pub elapsed: Duration,
 }
 
 /// The read side of a `summary` file: the ref list a pull resolves against, and

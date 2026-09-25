@@ -4633,7 +4633,7 @@ fn pull_over_http_reproduces_the_remote_tree() {
         pulled
             .ok()
             .stdout_trimmed()
-            .ends_with("bytes content written"),
+            .starts_with("5 metadata, 4 content objects fetched; "),
         "unexpected stats line: {}",
         pulled.stdout_trimmed()
     );
@@ -4676,6 +4676,138 @@ fn pull_over_http_reproduces_the_remote_tree() {
         "the remote's config was not read: {:?}",
         server.seen()
     );
+}
+
+/// The statistics line with its seconds replaced, the one figure a rerun of
+/// the same pull may change. The transferred figure stays: the test server
+/// answers 404 with an empty body, so the tool and the port count the same
+/// bytes.
+fn normalized_statistics(stdout: &[u8]) -> String {
+    let text = String::from_utf8(stdout.to_vec()).unwrap();
+    text.split("; ")
+        .map(|field| match field.split_once(" transferred in ") {
+            Some((size, _)) if field.ends_with(" seconds") => {
+                format!("{size} transferred in <n> seconds")
+            }
+            _ => field.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Pull `test/main` from `url` into a new repository of `mode` under
+/// `base/<name>` with `bin`, the port or the tool, `times` times, and return
+/// the last pull's run. Standard output is a pipe, so no progress line is
+/// written.
+fn statistics_pull(
+    base: &Path,
+    name: &str,
+    mode: RepoMode,
+    url: &str,
+    tool: bool,
+    times: usize,
+) -> Run {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = create_repo(&dir, mode);
+    configure_remote(&dest, url, "gpg-verify=false\n");
+    let args = ["pull", "--repo", dest.to_str().unwrap(), "origin", BRANCH];
+    let mut last = None;
+    for _ in 0..times {
+        last = Some(if tool {
+            ostree(&args)
+        } else {
+            ostrya(&args, None, &[])
+        });
+    }
+    last.unwrap()
+}
+
+/// To a pipe, each implementation prints one statistics line on standard
+/// output and nothing on standard error, in the same words and counts: a loose
+/// pull into `bare-user`, a repeat pull into `archive` that finds the commit
+/// present and reads no body byte, which drops the transfer clause, and a
+/// delta pull into `bare-user`. The transferred figure and the seconds are
+/// replaced before the lines are compared.
+#[test]
+fn pull_statistics_line_matches_the_tool() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-statistics");
+    let base = tmp.path();
+    let loose = FileServer::start(&build_remote(base, "remote"));
+    let delta = FileServer::start(&build_subpath_remote(base, "delta-remote", true));
+    // Each row: a name, the server, the destination mode, how many pulls, and
+    // the line the port prints last.
+    let rows: [(&str, &FileServer, RepoMode, usize, &str); 3] = [
+        (
+            "loose",
+            &loose,
+            RepoMode::BareUser,
+            1,
+            "5 metadata, 4 content objects fetched; 565 B transferred in <n> seconds; \
+             20 bytes content written\n",
+        ),
+        (
+            "repeat",
+            &loose,
+            RepoMode::Archive,
+            2,
+            "0 metadata, 0 content objects fetched; 0 bytes content written\n",
+        ),
+        (
+            "delta",
+            &delta,
+            RepoMode::BareUser,
+            1,
+            "1 delta parts, 2 loose fetched; 1 KiB transferred in <n> seconds; \
+             0 bytes content written\n",
+        ),
+    ];
+    for (name, server, mode, times, expected) in rows {
+        let ours = statistics_pull(
+            base,
+            &format!("{name}-port"),
+            mode,
+            &server.url(),
+            false,
+            times,
+        );
+        assert!(
+            ours.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&ours.stderr)
+        );
+        assert!(
+            ours.stderr.is_empty(),
+            "{name}: {}",
+            String::from_utf8_lossy(&ours.stderr)
+        );
+        assert!(
+            !ours.stdout.contains(&0x1b),
+            "{name}: an escape reached a pipe"
+        );
+        assert_eq!(normalized_statistics(&ours.stdout), expected, "{name}");
+        if tool {
+            let theirs = statistics_pull(
+                base,
+                &format!("{name}-tool"),
+                mode,
+                &server.url(),
+                true,
+                times,
+            );
+            assert!(theirs.status.success(), "{name}: the tool failed");
+            assert!(
+                theirs.stderr.is_empty(),
+                "{name}: the tool wrote to standard error"
+            );
+            assert_eq!(
+                normalized_statistics(&ours.stdout),
+                normalized_statistics(&theirs.stdout),
+                "{name}"
+            );
+        }
+    }
 }
 
 #[test]

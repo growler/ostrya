@@ -159,7 +159,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use futures_lite::AsyncReadExt;
 use ostrya_core::{
@@ -525,6 +526,10 @@ pub struct PullOptions {
     /// Which properties of a commit's detached metadata this pull stores. The
     /// default keeps every one, which stores the source's bytes verbatim.
     pub detached_metadata_filter: DetachedMetadataFilter,
+    /// The handle an HTTP pull adds its live counters to, for a caller that
+    /// shows progress while the pull runs. `None` keeps them in the pull's
+    /// own counters alone. A local pull does not touch it.
+    pub progress: Option<PullProgress>,
 }
 
 /// Apply the durability options of a pull to its transaction.
@@ -537,10 +542,10 @@ fn apply_durability(txn: &mut Transaction, opts: &PullOptions) {
     }
 }
 
-/// What a pull imported.
+/// What a pull imported and what it fetched.
 ///
-/// The counters cover the objects this pull staged, so an object the destination
-/// already held is excluded from all three, and a
+/// The import and written counters cover the objects this pull staged, so an
+/// object the destination already held is excluded from them, and a
 /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull, whose plan is the commit objects
 /// alone, reports those and no content at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -555,6 +560,257 @@ pub struct PullStats {
     /// their bytes were written, shared by reflink, or shared by hardlink. This
     /// is the storage those objects occupy, not the space the pull consumed.
     pub content_bytes_written: u64,
+    /// The total payload size of the regular-file content objects this pull
+    /// wrote, before any compression the destination mode applies. A symlink,
+    /// an object shared by hardlink, and an object a static delta produced
+    /// contribute nothing. This is the figure the tool reports as the content
+    /// written.
+    pub content_bytes_unpacked: u64,
+    /// The metadata requests an HTTP pull made that the tool counts as
+    /// metadata fetched: each loose metadata object and `.commitmeta` the
+    /// remote served, and each delta index and delta superblock request,
+    /// whatever the remote answered. Zero for a local pull.
+    pub metadata_fetched: u32,
+    /// The content objects an HTTP pull fetched loose from the remote. An
+    /// object taken from a localcache repository does not count. Zero for a
+    /// local pull.
+    pub content_fetched: u32,
+    /// The static delta parts an HTTP pull fetched as files. A part the
+    /// superblock carries inline does not count. Zero for a local pull.
+    pub delta_parts: u32,
+    /// The bytes of the successful response bodies an HTTP pull read after
+    /// the remote's summary, config, and ref files, retried bodies included.
+    /// Zero for a local pull.
+    pub bytes_transferred: u64,
+    /// How long the pull ran.
+    pub elapsed: Duration,
+}
+
+/// The live counters of HTTP pulls, which a caller reads while they run.
+///
+/// A caller sets a clone of the handle in [`PullOptions::progress`] and reads
+/// [`snapshot`](PullProgress::snapshot) from another task or thread. A pull
+/// adds to the counters of the handle and never sets them to zero. A handle
+/// that several pulls share, or that one pull after another takes, shows the
+/// sum of their counters, and its `scanning` state is on while any of them
+/// scans, so a caller gives each pull a handle of its own to see the progress
+/// of that pull. A local pull does not touch the handle.
+///
+/// The [`PullStats`] of a pull come from counters of its own, whatever the
+/// handle holds. Each count a pull makes is one relaxed atomic add to those
+/// counters, and one more to the handle when the pull has one; the bytes
+/// transferred are counted so once per data frame of each response body.
+#[derive(Debug, Clone, Default)]
+pub struct PullProgress {
+    inner: Arc<ProgressCounters>,
+}
+
+/// The counters behind a [`PullProgress`], and the counters of one pull.
+#[derive(Debug, Default)]
+pub(crate) struct ProgressCounters {
+    /// Shared with the pull's fetcher, which adds each body's bytes.
+    transferred: Arc<AtomicU64>,
+    metadata_fetched: AtomicU32,
+    content_fetched: AtomicU32,
+    objects_done: AtomicU32,
+    objects_total: AtomicU32,
+    /// How many pulls are scanning: 0 or 1 in the counters of one pull.
+    scanning: AtomicU32,
+    delta_parts_fetched: AtomicU32,
+    delta_parts_total: AtomicU32,
+    delta_bytes_fetched: AtomicU64,
+    delta_bytes_total: AtomicU64,
+}
+
+/// The counters one HTTP pull counts into: its own, which its [`PullStats`]
+/// read, and the caller's handle, which receives the same additions.
+pub(crate) struct PullCounters {
+    own: ProgressCounters,
+    caller: Option<Arc<ProgressCounters>>,
+}
+
+impl PullCounters {
+    /// The counters of a pull that starts now, scanning, which also counts
+    /// into `caller` where there is one.
+    pub(crate) fn new(caller: Option<&PullProgress>) -> PullCounters {
+        let counters = PullCounters {
+            own: ProgressCounters::default(),
+            caller: caller.map(|progress| Arc::clone(&progress.inner)),
+        };
+        counters.each(|c| {
+            c.scanning.fetch_add(1, Ordering::Relaxed);
+        });
+        counters
+    }
+
+    /// Run `f` on the pull's own counters, then on the caller's.
+    fn each(&self, f: impl Fn(&ProgressCounters)) {
+        f(&self.own);
+        if let Some(caller) = &self.caller {
+            f(caller);
+        }
+    }
+
+    /// The byte counters the pull's fetcher adds each body's bytes to.
+    pub(crate) fn transferred_sinks(&self) -> Vec<Arc<AtomicU64>> {
+        let mut sinks = vec![Arc::clone(&self.own.transferred)];
+        if let Some(caller) = &self.caller {
+            sinks.push(Arc::clone(&caller.transferred));
+        }
+        sinks
+    }
+
+    /// Take back every byte counted so far, from both counter sets, so the
+    /// count starts again from here. No request is in flight when a pull
+    /// calls this.
+    pub(crate) fn restart_transferred(&self) {
+        let counted = self.own.transferred.swap(0, Ordering::Relaxed);
+        if let Some(caller) = &self.caller {
+            caller.transferred.fetch_sub(counted, Ordering::Relaxed);
+        }
+    }
+
+    /// Count one metadata request the tool counts as metadata fetched.
+    pub(crate) fn metadata_fetched(&self) {
+        self.each(|c| {
+            c.metadata_fetched.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Count one content object fetched loose.
+    pub(crate) fn content_fetched(&self) {
+        self.each(|c| {
+            c.content_fetched.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Count one unit of work finished.
+    pub(crate) fn object_done(&self) {
+        self.each(|c| {
+            c.objects_done.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Count one delta part fetched as a file, of declared size `size`.
+    pub(crate) fn part_fetched(&self, size: u64) {
+        self.each(|c| {
+            c.delta_parts_fetched.fetch_add(1, Ordering::Relaxed);
+            c.delta_bytes_fetched.fetch_add(size, Ordering::Relaxed);
+        });
+    }
+
+    /// Add `parts` delta parts of declared sizes `bytes` to the totals.
+    pub(crate) fn parts_planned(&self, parts: u32, bytes: u64) {
+        self.each(|c| {
+            c.delta_parts_total.fetch_add(parts, Ordering::Relaxed);
+            c.delta_bytes_total.fetch_add(bytes, Ordering::Relaxed);
+        });
+    }
+
+    /// Set the pull's total units of work to `total` and its scanning state
+    /// to `scanning`, and move the caller's sums by the same change.
+    pub(crate) fn report(&self, total: u32, scanning: bool) {
+        let before = self.own.objects_total.swap(total, Ordering::Relaxed);
+        let was = self
+            .own
+            .scanning
+            .swap(u32::from(scanning), Ordering::Relaxed);
+        if let Some(caller) = &self.caller {
+            caller
+                .objects_total
+                .fetch_add(total.wrapping_sub(before), Ordering::Relaxed);
+            match (was, scanning) {
+                (0, true) => caller.scanning.fetch_add(1, Ordering::Relaxed),
+                (1, false) => caller.scanning.fetch_sub(1, Ordering::Relaxed),
+                _ => 0,
+            };
+        }
+    }
+
+    /// The pull's own count of metadata fetched.
+    pub(crate) fn metadata(&self) -> u32 {
+        self.own.metadata_fetched.load(Ordering::Relaxed)
+    }
+
+    /// The pull's own count of content objects fetched.
+    pub(crate) fn content(&self) -> u32 {
+        self.own.content_fetched.load(Ordering::Relaxed)
+    }
+
+    /// The pull's own count of delta parts fetched.
+    pub(crate) fn parts(&self) -> u32 {
+        self.own.delta_parts_fetched.load(Ordering::Relaxed)
+    }
+
+    /// The pull's own count of bytes transferred.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.own.transferred.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for PullCounters {
+    /// A pull that ends while it scans, on an error, stops scanning in the
+    /// caller's handle.
+    fn drop(&mut self) {
+        if let Some(caller) = &self.caller
+            && self.own.scanning.load(Ordering::Relaxed) != 0
+        {
+            caller.scanning.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl PullProgress {
+    /// A handle whose counters are all zero.
+    pub fn new() -> PullProgress {
+        PullProgress::default()
+    }
+
+    /// The counters as they stand. Each counter is read on its own, so two
+    /// counters of one snapshot can differ by the work of one step.
+    pub fn snapshot(&self) -> PullProgressSnapshot {
+        let c = &self.inner;
+        PullProgressSnapshot {
+            bytes_transferred: c.transferred.load(Ordering::Relaxed),
+            metadata_fetched: c.metadata_fetched.load(Ordering::Relaxed),
+            content_fetched: c.content_fetched.load(Ordering::Relaxed),
+            objects_done: c.objects_done.load(Ordering::Relaxed),
+            objects_total: c.objects_total.load(Ordering::Relaxed),
+            scanning: c.scanning.load(Ordering::Relaxed) != 0,
+            delta_parts_fetched: c.delta_parts_fetched.load(Ordering::Relaxed),
+            delta_parts_total: c.delta_parts_total.load(Ordering::Relaxed),
+            delta_bytes_fetched: c.delta_bytes_fetched.load(Ordering::Relaxed),
+            delta_bytes_total: c.delta_bytes_total.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The counters of a [`PullProgress`] at one point in time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PullProgressSnapshot {
+    /// As [`PullStats::bytes_transferred`], so far.
+    pub bytes_transferred: u64,
+    /// As [`PullStats::metadata_fetched`], so far.
+    pub metadata_fetched: u32,
+    /// As [`PullStats::content_fetched`], so far.
+    pub content_fetched: u32,
+    /// The units of work the pull has finished: one per commit, object, and
+    /// delta part it handled, fetched or found present.
+    pub objects_done: u32,
+    /// The units of work the pull knows of: those finished, those in flight,
+    /// and those queued. It grows as the walk reads each dirtree.
+    pub objects_total: u32,
+    /// Whether a pull has yet to reach its objects, or has a commit or a
+    /// dirtree still queued, so the total is still growing.
+    pub scanning: bool,
+    /// As [`PullStats::delta_parts`], so far.
+    pub delta_parts_fetched: u32,
+    /// The delta parts the pull fetches as files, over every delta it takes.
+    pub delta_parts_total: u32,
+    /// The declared sizes of the delta parts fetched so far.
+    pub delta_bytes_fetched: u64,
+    /// The declared sizes of every delta part the pull fetches as a file.
+    pub delta_bytes_total: u64,
 }
 
 impl Repo {
@@ -571,6 +827,7 @@ impl Repo {
     /// source does not hold ends that chain without error, so a source with
     /// truncated history pulls what it has.
     pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<PullStats> {
+        let started = Instant::now();
         // A local pull copies whole trees; the tool's `pull-local` takes no
         // subpath either.
         if !opts.subpaths.is_empty() {
@@ -704,6 +961,9 @@ impl Repo {
             metadata_imported: stats.metadata_written,
             content_imported: stats.content_written,
             content_bytes_written: stats.content_bytes_written,
+            content_bytes_unpacked: stats.content_bytes_unpacked,
+            elapsed: started.elapsed(),
+            ..PullStats::default()
         })
     }
 

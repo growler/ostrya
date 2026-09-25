@@ -67,10 +67,10 @@ use ostrya::{
     Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
     FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
     FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
-    PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree, Result, Signer, Summary,
-    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
-    TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs,
-    base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
+    PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo, RepoMode, RepoTree,
+    Result, Signer, Summary, SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck,
+    Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy,
+    Xattrs, base64, from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
     validate_refspec,
 };
 #[cfg(feature = "gpg")]
@@ -1290,6 +1290,11 @@ struct PullArgs {
     /// default.
     #[arg(long, value_name = "N", allow_hyphen_values = true)]
     low_speed_time_seconds: Option<String>,
+    /// How often the progress line on a terminal is redrawn, in milliseconds
+    /// (default: 1000). 0 and a negative value keep the default. Output to
+    /// anything other than a terminal carries no progress line.
+    #[arg(long, value_name = "FREQUENCY", allow_hyphen_values = true)]
+    update_frequency: Option<String>,
     /// Require each fetched tip to be no older than the commit its ref names in
     /// this repository.
     #[arg(short = 'T', long)]
@@ -1545,8 +1550,13 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
                     "--low-speed-time-seconds",
                 ),
             };
+            // `--update-frequency` is read the same way and at the same step.
+            let redraw = update_interval(owner_id(
+                args.update_frequency.as_deref(),
+                "--update-frequency",
+            ));
             let (repo, _) = resolve_repo(repo, verbose, name).await;
-            pull(repo, name, args, low_speed).await
+            pull(repo, name, args, low_speed, redraw).await
         }
         Command::PullLocal(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
@@ -1742,8 +1752,27 @@ fn low_speed_value(value: Option<&str>, flag: &str) -> Option<u32> {
     owner_id(value, flag)
 }
 
+/// The redraw interval of the terminal progress line for an
+/// `--update-frequency` value: `None` and 0 are the default of 1000 ms.
+fn update_interval(frequency: Option<u32>) -> std::time::Duration {
+    match frequency {
+        None | Some(0) => std::time::Duration::from_millis(1000),
+        Some(ms) => std::time::Duration::from_millis(ms.into()),
+    }
+}
+
 /// Fetch refs and their objects from an HTTP remote.
-async fn pull(repo: Repo, name: &str, args: PullArgs, low_speed: LowSpeedArgs) -> Result<()> {
+///
+/// Standard output that is a terminal carries a progress line, redrawn every
+/// `redraw`, and the statistics line is drawn over it. Other standard output
+/// carries the statistics line alone.
+async fn pull(
+    repo: Repo,
+    name: &str,
+    args: PullArgs,
+    low_speed: LowSpeedArgs,
+    redraw: std::time::Duration,
+) -> Result<()> {
     let Some(remote) = args.remote.as_deref() else {
         exit_with_error(name, "REMOTE must be specified");
     };
@@ -1781,7 +1810,15 @@ async fn pull(repo: Repo, name: &str, args: PullArgs, low_speed: LowSpeedArgs) -
         None => TimestampCheck::Off,
     };
 
-    let stats = repo
+    let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let progress = terminal.then(PullProgress::new);
+    // The filter is read before the progress line starts, so its error leaves
+    // no thread drawing.
+    let detached_metadata_filter = detached_metadata_filter(&repo)?;
+    let line = progress
+        .clone()
+        .map(|progress| ProgressLine::start(progress, redraw));
+    let pulled = repo
         .pull(
             remote,
             PullOptions {
@@ -1814,13 +1851,152 @@ async fn pull(repo: Repo, name: &str, args: PullArgs, low_speed: LowSpeedArgs) -
                     sign: args.sign_verify,
                     sign_summary: args.sign_verify_summary,
                 },
-                detached_metadata_filter: detached_metadata_filter(&repo)?,
+                detached_metadata_filter,
+                progress,
                 ..PullOptions::default()
             },
         )
-        .await?;
-    report_pull(&stats);
+        .await;
+    let prefix = line.map_or("", ProgressLine::finish);
+    let stats = match pulled {
+        Ok(stats) => stats,
+        Err(e) => {
+            // The error goes to standard error, on a line of its own.
+            if terminal {
+                println!("{prefix}");
+            }
+            return Err(e);
+        }
+    };
+    let mut text = statistics_line(&stats, PullSource::Http);
+    if terminal {
+        // The statistics line is drawn over the progress line and padded as
+        // it is.
+        pad_line(&mut text, 0);
+        println!("{prefix}\x1b8{text}");
+    } else {
+        println!("{text}");
+    }
     Ok(())
+}
+
+/// The progress line of a pull on a terminal, redrawn on a thread of its own.
+///
+/// Each redraw restores the cursor position (`ESC 8`) and writes the line
+/// padded to [`PROGRESS_COLUMNS`] bytes. The first redraw saves the position
+/// (`ESC 7`) in the same write.
+struct ProgressLine {
+    /// Dropped to stop the thread.
+    stop: std::sync::mpsc::Sender<()>,
+    /// Ends with whether the thread wrote `ESC 7`.
+    thread: std::thread::JoinHandle<bool>,
+}
+
+impl ProgressLine {
+    /// Start redrawing the counters of `progress` every `redraw`.
+    fn start(progress: PullProgress, redraw: std::time::Duration) -> ProgressLine {
+        use std::io::Write;
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let thread = std::thread::spawn(move || {
+            let mut out = std::io::stdout();
+            // One buffer serves every redraw.
+            let mut line = String::new();
+            let mut saved = false;
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(redraw)
+            {
+                if !saved {
+                    line.push_str("\x1b7");
+                    saved = true;
+                }
+                line.push_str("\x1b8");
+                let from = line.len();
+                progress_text(&mut line, &progress.snapshot(), started.elapsed());
+                pad_line(&mut line, from);
+                let _ = out.write_all(line.as_bytes());
+                let _ = out.flush();
+                line.clear();
+            }
+            saved
+        });
+        ProgressLine { stop, thread }
+    }
+
+    /// Stop redrawing, wait for the thread to end, and return what the last
+    /// write has to begin with: `ESC 7` when no redraw has saved the cursor
+    /// position yet, as the tool saves it when the pull starts.
+    fn finish(self) -> &'static str {
+        drop(self.stop);
+        match self.thread.join() {
+            Ok(true) => "",
+            _ => "\x1b7",
+        }
+    }
+}
+
+/// The width a line on a terminal is padded to with spaces, in bytes: a
+/// terminal of 80 columns. The terminal's own width is not read, so a longer
+/// line is written whole and a wider terminal keeps the 80.
+const PROGRESS_COLUMNS: usize = 80;
+
+/// Pad the text of `line` from byte `from` on with spaces to
+/// [`PROGRESS_COLUMNS`] bytes. A longer text is not cut.
+fn pad_line(line: &mut String, from: usize) {
+    let width = line.len() - from;
+    line.extend(std::iter::repeat_n(
+        ' ',
+        PROGRESS_COLUMNS.saturating_sub(width),
+    ));
+}
+
+/// Append the progress text of a pull to `line`, from its counters, `elapsed`
+/// after it started.
+///
+/// Three forms: the delta parts while one is still to arrive, the metadata
+/// walk while a commit or a dirtree is queued, and the objects otherwise. The
+/// rate is the bytes transferred over the whole elapsed time, and reads `-`
+/// until a whole second has passed.
+fn progress_text(line: &mut String, s: &PullProgressSnapshot, elapsed: std::time::Duration) {
+    use std::fmt::Write;
+    let rate = (elapsed.as_secs() > 0)
+        .then(|| (s.bytes_transferred as f64 / elapsed.as_secs_f64()) as u64);
+    let rate_text = rate.map_or_else(|| "-".to_owned(), format_size);
+    if s.delta_parts_fetched < s.delta_parts_total {
+        let _ = write!(
+            line,
+            "Receiving delta parts: {}/{} {}/{} {rate_text}/s",
+            s.delta_parts_fetched,
+            s.delta_parts_total,
+            format_size(s.delta_bytes_fetched),
+            format_size(s.delta_bytes_total),
+        );
+        if let Some(rate) = rate.filter(|rate| *rate > 0) {
+            let left = s.delta_bytes_total.saturating_sub(s.delta_bytes_fetched) / rate;
+            let _ = write!(line, " {left} seconds remaining");
+        }
+        return;
+    }
+    if s.scanning {
+        let _ = write!(
+            line,
+            "Receiving metadata objects: {}/(estimating) {rate_text}/s {}",
+            s.metadata_fetched,
+            format_size(s.bytes_transferred)
+        );
+        return;
+    }
+    let percent = if s.objects_total == 0 {
+        0
+    } else {
+        u64::from(s.objects_done) * 100 / u64::from(s.objects_total)
+    };
+    let _ = write!(
+        line,
+        "Receiving objects: {percent}% ({}/{}) {rate_text}/s {}",
+        s.objects_done,
+        s.objects_total,
+        format_size(s.bytes_transferred)
+    );
 }
 /// Read a size option in decimal megabytes, as the tool reads it, into bytes.
 /// Only ASCII digits are taken. A value the tool reads leniently (`abc`,
@@ -1857,12 +2033,57 @@ fn detached_metadata_filter(repo: &Repo) -> Result<DetachedMetadataFilter> {
     Ok(DetachedMetadataFilter::excluding(excluded))
 }
 
-/// Print what a pull imported.
-fn report_pull(stats: &PullStats) {
-    println!(
-        "{} metadata, {} content objects imported; {} bytes content written",
-        stats.metadata_imported, stats.content_imported, stats.content_bytes_written
-    );
+/// Where a pull took its objects from, which decides the statistics line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullSource {
+    /// An HTTP remote.
+    Http,
+    /// Another local repository.
+    Local,
+}
+
+/// The line a pull prints when it succeeds, in the tool's wording
+/// (`docs/format-reference.md`, "CLI output formats", `pull`).
+fn statistics_line(stats: &PullStats, source: PullSource) -> String {
+    let written = format_size(stats.content_bytes_unpacked);
+    if source == PullSource::Local {
+        return format!(
+            "{} metadata, {} content objects imported; {written} content written",
+            stats.metadata_imported, stats.content_imported
+        );
+    }
+    let fetched = if stats.delta_parts > 0 {
+        format!(
+            "{} delta parts, {} loose fetched",
+            stats.delta_parts,
+            stats.metadata_fetched + stats.content_fetched
+        )
+    } else {
+        format!(
+            "{} metadata, {} content objects fetched",
+            stats.metadata_fetched, stats.content_fetched
+        )
+    };
+    // A pull that read no body byte after the summary and the config states
+    // no transfer at all, as the tool does.
+    if stats.bytes_transferred == 0 {
+        return format!("{fetched}; {written} content written");
+    }
+    format!(
+        "{fetched}; {} transferred in {} seconds; {written} content written",
+        format_transferred(stats.bytes_transferred),
+        stats.elapsed.as_secs()
+    )
+}
+
+/// A transferred byte count in the tool's wording: `N B` below 1024, and the
+/// whole KiB, rounded down, from there.
+fn format_transferred(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{} KiB", bytes / 1024)
+    }
 }
 
 /// Import refs and their objects from another local repository.
@@ -1911,7 +2132,7 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
             },
         )
         .await?;
-    report_pull(&stats);
+    println!("{}", statistics_line(&stats, PullSource::Local));
     Ok(())
 }
 
@@ -9362,5 +9583,164 @@ mod tests {
                 Err(format!("Invalid depth {depth}"))
             );
         }
+    }
+
+    /// The transferred figure is `N B` below 1024 and the whole KiB, rounded
+    /// down, from there, as the tool prints 3842 bytes as `3 KiB`.
+    #[test]
+    fn the_transferred_figure_rounds_down_to_whole_kib() {
+        for (bytes, text) in [
+            (0, "0 B"),
+            (1023, "1023 B"),
+            (1024, "1 KiB"),
+            (1535, "1 KiB"),
+            (3842, "3 KiB"),
+            (3_409_920, "3330 KiB"),
+        ] {
+            assert_eq!(format_transferred(bytes), text, "{bytes}");
+        }
+    }
+
+    /// The three statistics lines: a local pull, an HTTP pull with no delta
+    /// part, and one with a delta part, whose loose count adds the metadata
+    /// and the content fetched. The written figure is the tool's size wording.
+    #[test]
+    fn the_statistics_line_takes_the_tool_forms() {
+        let stats = PullStats {
+            metadata_imported: 4,
+            content_imported: 4,
+            content_bytes_written: 999,
+            content_bytes_unpacked: 3_400_000,
+            metadata_fetched: 6,
+            content_fetched: 4,
+            delta_parts: 0,
+            bytes_transferred: 1500,
+            elapsed: std::time::Duration::from_millis(10_900),
+        };
+        assert_eq!(
+            statistics_line(&stats, PullSource::Local),
+            "4 metadata, 4 content objects imported; 3.4\u{a0}MB content written"
+        );
+        assert_eq!(
+            statistics_line(&stats, PullSource::Http),
+            "6 metadata, 4 content objects fetched; 1 KiB transferred in 10 seconds; \
+             3.4\u{a0}MB content written"
+        );
+        let delta = PullStats {
+            delta_parts: 1,
+            metadata_fetched: 2,
+            content_fetched: 0,
+            content_bytes_unpacked: 0,
+            bytes_transferred: 3_409_920,
+            ..stats
+        };
+        assert_eq!(
+            statistics_line(&delta, PullSource::Http),
+            "1 delta parts, 2 loose fetched; 3330 KiB transferred in 10 seconds; \
+             0 bytes content written"
+        );
+        let one = PullStats {
+            content_bytes_unpacked: 1,
+            ..PullStats::default()
+        };
+        assert_eq!(
+            statistics_line(&one, PullSource::Local),
+            "0 metadata, 0 content objects imported; 1 byte content written"
+        );
+        // No byte transferred drops the transfer clause.
+        assert_eq!(
+            statistics_line(&PullStats::default(), PullSource::Http),
+            "0 metadata, 0 content objects fetched; 0 bytes content written"
+        );
+    }
+
+    /// The progress text appended to an empty line.
+    fn progress(s: &PullProgressSnapshot, elapsed: std::time::Duration) -> String {
+        let mut line = String::new();
+        progress_text(&mut line, s, elapsed);
+        line
+    }
+
+    /// The three progress forms, chosen by the delta parts still to arrive,
+    /// then by the scan, then the objects. The rate reads `-` until a whole
+    /// second has passed, as the tool writes it before its first sample.
+    #[test]
+    fn the_progress_text_takes_three_forms() {
+        let second = std::time::Duration::from_secs(1);
+        let delta = PullProgressSnapshot {
+            delta_parts_total: 1,
+            delta_bytes_total: 3_400_000,
+            bytes_transferred: 356_200,
+            ..PullProgressSnapshot::default()
+        };
+        assert_eq!(
+            progress(&delta, second),
+            "Receiving delta parts: 0/1 0 bytes/3.4\u{a0}MB 356.2\u{a0}kB/s 9 seconds remaining"
+        );
+        assert_eq!(
+            progress(&delta, std::time::Duration::from_millis(900)),
+            "Receiving delta parts: 0/1 0 bytes/3.4\u{a0}MB -/s"
+        );
+        let idle = PullProgressSnapshot {
+            delta_parts_total: 1,
+            ..PullProgressSnapshot::default()
+        };
+        assert_eq!(
+            progress(&idle, second),
+            "Receiving delta parts: 0/1 0 bytes/0 bytes 0 bytes/s"
+        );
+        let scan = PullProgressSnapshot {
+            metadata_fetched: 5,
+            bytes_transferred: 948,
+            scanning: true,
+            ..PullProgressSnapshot::default()
+        };
+        assert_eq!(
+            progress(&scan, std::time::Duration::from_secs(4)),
+            "Receiving metadata objects: 5/(estimating) 237 bytes/s 948 bytes"
+        );
+        assert_eq!(
+            progress(&scan, std::time::Duration::ZERO),
+            "Receiving metadata objects: 5/(estimating) -/s 948 bytes"
+        );
+        let objects = PullProgressSnapshot {
+            objects_done: 59,
+            objects_total: 155,
+            bytes_transferred: 1_400_000,
+            ..PullProgressSnapshot::default()
+        };
+        assert_eq!(
+            progress(&objects, std::time::Duration::from_secs(2)),
+            "Receiving objects: 38% (59/155) 700.0\u{a0}kB/s 1.4\u{a0}MB"
+        );
+    }
+
+    /// A line on a terminal is padded to 80 bytes, as the tool pads it to the
+    /// terminal width counted in bytes, so U+00A0 takes two. The padding
+    /// starts at the given byte, and a longer text is written whole.
+    #[test]
+    fn a_terminal_line_is_padded_to_80_bytes() {
+        let mut line = String::from("\x1b8Receiving objects: 1.4\u{a0}MB");
+        pad_line(&mut line, 2);
+        assert_eq!(line.len(), 2 + PROGRESS_COLUMNS);
+        assert_eq!(line.chars().count(), 2 + PROGRESS_COLUMNS - 1);
+        assert!(line.starts_with("\x1b8Receiving objects: 1.4\u{a0}MB "));
+        let long = "x".repeat(100);
+        let mut padded = long.clone();
+        pad_line(&mut padded, 0);
+        assert_eq!(padded, long);
+    }
+
+    /// `--update-frequency` of 0, a negative value, and none each keep the
+    /// 1000 ms default.
+    #[test]
+    fn the_update_frequency_defaults_to_a_second() {
+        let second = std::time::Duration::from_millis(1000);
+        assert_eq!(update_interval(None), second);
+        assert_eq!(update_interval(Some(0)), second);
+        assert_eq!(
+            update_interval(Some(250)),
+            std::time::Duration::from_millis(250)
+        );
     }
 }

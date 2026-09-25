@@ -304,7 +304,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1092,6 +1092,9 @@ struct Inner {
     gate: Arc<Gate>,
     h2_connection_window: u32,
     pool: Mutex<HashMap<PoolKey, PoolEntry>>,
+    /// The counters that each receive the bytes of every response body read
+    /// through this fetcher, retried and abandoned bodies included.
+    received: Vec<Arc<AtomicU64>>,
 }
 
 /// The HTTP/2 connection flow-control window for a fetcher admitting
@@ -1168,6 +1171,17 @@ impl Fetcher {
     /// all, so the constructor never yields and an empty host store is fatal
     /// for no mirror scheme.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher> {
+        Fetcher::with_counters(options, Vec::new()).await
+    }
+
+    /// A fetcher built as [`new`](Fetcher::new) builds one, which adds the
+    /// bytes of every response body it reads to each counter of `received`:
+    /// one relaxed atomic add per counter for each data frame. A pull reads
+    /// its transferred byte count from there.
+    pub(crate) async fn with_counters(
+        options: FetcherOptions,
+        received: Vec<Arc<AtomicU64>>,
+    ) -> Result<Fetcher> {
         // A limit of zero, or a time of zero, measures nothing: no rate is
         // below the first, and every transfer fails the second at once.
         if let Some(low) = options.low_speed
@@ -1273,6 +1287,7 @@ impl Fetcher {
                 gate: Arc::new(Gate::new(max_outstanding)),
                 h2_connection_window: h2_connection_window(max_outstanding),
                 pool: Mutex::new(HashMap::new()),
+                received,
             }),
         })
     }
@@ -2514,6 +2529,9 @@ impl AsyncRead for Body {
                     // Trailers carry no payload; keep polling for data.
                     if let Ok(data) = frame.into_data() {
                         me.received += data.len() as u64;
+                        for counter in &me.inner.received {
+                            counter.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        }
                         if let Some(limit) = me.max_size
                             && me.received > limit
                         {

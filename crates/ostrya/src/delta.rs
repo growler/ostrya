@@ -2359,7 +2359,7 @@ async fn open_object<'t>(
 ) -> Result<OpenState<'t>> {
     let sink = match &meta {
         Some(m) if m.mode & S_IFMT != S_IFLNK => Sink::Content {
-            writer: Box::new(txn.content_writer(Some(&csum), m).await?),
+            writer: Box::new(txn.content_writer(Some(&csum), m).await?.uncounted()),
             written: 0,
         },
         // A metadata object or a symlink target accumulates in a buffer.
@@ -2428,7 +2428,7 @@ async fn write_content_slice(
             .map_err(|_| op_error("symlink target is not valid UTF-8"))?;
         txn.write_symlink(target, &meta, Some(expected)).await?;
     } else {
-        let mut writer = txn.content_writer(Some(expected), &meta).await?;
+        let mut writer = txn.content_writer(Some(expected), &meta).await?.uncounted();
         for chunk in content.chunks(IO_CHUNK) {
             writer.write_all(chunk).await.map_err(Error::Io)?;
         }

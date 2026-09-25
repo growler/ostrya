@@ -1477,6 +1477,9 @@ fn a_shared_import_debits_no_free_space() {
         // The stats count the storage the imported objects occupy, which the
         // shared inodes hold whatever the budget said.
         assert!(stats.content_bytes_written > 0);
+        // A hardlinked object's payload is never written, so the figure the
+        // tool reports as the content written is zero.
+        assert_eq!(stats.content_bytes_unpacked, 0);
         assert!(!has_partial_marker(&dst_dir, &c2));
     });
 }
@@ -2921,10 +2924,14 @@ fn pull_local_durability_options_change_no_byte() {
                     )
                     .await
                     .unwrap();
+                // The elapsed time is the one figure a rerun changes.
                 let seen = (
                     file_inventory(&dst_dir, "objects"),
                     dst.list_refs(None).await.unwrap(),
-                    stats,
+                    ostrya::PullStats {
+                        elapsed: std::time::Duration::ZERO,
+                        ..stats
+                    },
                 );
                 match &answer {
                     None => answer = Some(seen),

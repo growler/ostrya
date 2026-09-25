@@ -733,11 +733,13 @@ fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
+        let progress = ostrya::PullProgress::new();
         let stats = dest
             .pull(
                 "origin",
                 PullOptions {
                     refs: vec!["test/main".to_owned()],
+                    progress: Some(progress.clone()),
                     ..PullOptions::default()
                 },
             )
@@ -769,18 +771,51 @@ fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
             );
         }
 
+        // The statistics: every object came loose off the remote, the delta
+        // index was asked for, and the transferred count is the served bytes
+        // after the summary and the config. The payloads of the three regular
+        // files are 6, 18, and 7 bytes; the symlink counts nothing.
+        let served: u64 = seen[3..]
+            .iter()
+            .filter_map(|path| std::fs::metadata(dir.path().join("remote").join(path)).ok())
+            .map(|meta| meta.len())
+            .sum();
+        assert_eq!(stats.bytes_transferred, served);
+        assert_eq!(stats.content_fetched, 4);
+        // The delta index request counts whatever the answer, which is a 404.
+        assert!(seen.iter().any(|path| path.starts_with("delta-indexes/")));
+        assert_eq!(stats.metadata_fetched, stats.metadata_imported + 1);
+        assert_eq!(stats.delta_parts, 0);
+        assert_eq!(stats.content_bytes_unpacked, 6 + 18 + 7);
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.bytes_transferred, stats.bytes_transferred);
+        assert_eq!(snapshot.metadata_fetched, stats.metadata_fetched);
+        assert_eq!(snapshot.content_fetched, stats.content_fetched);
+        assert_eq!(snapshot.objects_done, snapshot.objects_total);
+        assert!(!snapshot.scanning);
+
         // A repeat pull re-reads what may have changed and stops at the commit
         // it already holds: no object is fetched.
         server.forget();
-        dest.pull(
-            "origin",
-            PullOptions {
-                refs: vec!["test/main".to_owned()],
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
+        let repeated = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                repeated.metadata_fetched,
+                repeated.content_fetched,
+                repeated.bytes_transferred,
+                repeated.content_bytes_unpacked
+            ),
+            (0, 0, 0, 0)
+        );
         let repeat = server.seen();
         assert_eq!(
             repeat,
@@ -1384,6 +1419,96 @@ fn a_remote_with_no_summary_resolves_through_refs_heads() {
             Some(commit)
         );
         assert!(server.seen().contains(&"refs/heads/test/main".to_owned()));
+    });
+}
+
+/// A pull from a remote with no summary reads each ref from `refs/heads`
+/// before it counts the bytes it transfers, as it reads the summary and the
+/// config before: the transferred figure starts after the ref files.
+#[test]
+fn the_transferred_count_leaves_out_the_ref_files() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-no-summary-transferred");
+        build_remote(dir.path()).await;
+        std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let stats = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let seen = server.seen();
+        assert_eq!(
+            &seen[..4],
+            ["summary.sig", "summary", "config", "refs/heads/test/main"]
+        );
+        // The 404 answers carry empty bodies, so only the files served count.
+        let served: u64 = seen[4..]
+            .iter()
+            .filter_map(|path| std::fs::metadata(dir.path().join("remote").join(path)).ok())
+            .map(|meta| meta.len())
+            .sum();
+        assert!(served > 0);
+        assert_eq!(stats.bytes_transferred, served);
+    });
+}
+
+/// Two pulls that run at once and share one progress handle each report the
+/// statistics of their own work, and the handle shows the sum of both.
+#[test]
+fn concurrent_pulls_sharing_a_progress_handle_keep_their_own_statistics() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-shared-progress");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let mut dests = Vec::new();
+        for name in ["solo", "a", "b"] {
+            let sub = dir.path().join(name);
+            std::fs::create_dir(&sub).unwrap();
+            dests.push(build_dest(&sub, RepoMode::Archive, &server.url(), "").await);
+        }
+        let opts = |progress: Option<ostrya::PullProgress>| PullOptions {
+            refs: vec!["test/main".to_owned()],
+            progress,
+            ..PullOptions::default()
+        };
+        // The statistics of one pull alone, the elapsed time aside.
+        let solo = dests[0].pull("origin", opts(None)).await.unwrap();
+        let solo = PullStats {
+            elapsed: std::time::Duration::ZERO,
+            ..solo
+        };
+        assert_eq!(solo.content_fetched, 4);
+
+        let shared = ostrya::PullProgress::new();
+        let (a, b) = futures_lite::future::zip(
+            dests[1].pull("origin", opts(Some(shared.clone()))),
+            dests[2].pull("origin", opts(Some(shared.clone()))),
+        )
+        .await;
+        for stats in [a.unwrap(), b.unwrap()] {
+            assert_eq!(
+                PullStats {
+                    elapsed: std::time::Duration::ZERO,
+                    ..stats
+                },
+                solo
+            );
+        }
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.bytes_transferred, 2 * solo.bytes_transferred);
+        assert_eq!(snapshot.metadata_fetched, 2 * solo.metadata_fetched);
+        assert_eq!(snapshot.content_fetched, 2 * solo.content_fetched);
+        assert_eq!(snapshot.objects_done, snapshot.objects_total);
+        assert!(!snapshot.scanning);
     });
 }
 
@@ -3491,15 +3616,16 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
                 .unwrap();
 
             server.forget();
-            dest.pull(
-                "origin",
-                PullOptions {
-                    refs: vec!["test/main".to_owned()],
-                    ..PullOptions::default()
-                },
-            )
-            .await
-            .unwrap();
+            let stats = dest
+                .pull(
+                    "origin",
+                    PullOptions {
+                        refs: vec!["test/main".to_owned()],
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
 
             // The delta carried the content: the superblock was requested and no
             // content object was.
@@ -3512,6 +3638,23 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
                 !seen.iter().any(|path| path.ends_with(".filez")),
                 "{mode:?}: a content object was fetched loose: {seen:?}"
             );
+            // Each part file requested counts once, and what the delta wrote
+            // counts as no content written, which is the tool's figure.
+            let part_files = seen
+                .iter()
+                .filter(|path| {
+                    path.starts_with("deltas/")
+                        && path
+                            .rsplit('/')
+                            .next()
+                            .unwrap()
+                            .bytes()
+                            .all(|b| b.is_ascii_digit())
+                })
+                .count();
+            assert_eq!(stats.delta_parts as usize, part_files, "{mode:?}");
+            assert_eq!(stats.content_fetched, 0, "{mode:?}");
+            assert_eq!(stats.content_bytes_unpacked, 0, "{mode:?}");
 
             assert_eq!(
                 dest.resolve_rev("origin:test/main", true).await.unwrap(),
@@ -4469,6 +4612,11 @@ fn http_pull_durability_options_change_no_byte() {
                     let summary = std::fs::read(root.join("summary")).unwrap();
                     files.push(("summary".to_owned(), summary));
                 }
+                // The elapsed time is the one figure a rerun changes.
+                let stats = PullStats {
+                    elapsed: std::time::Duration::ZERO,
+                    ..stats
+                };
                 let seen = (files, stats);
                 match &answer {
                     None => answer = Some(seen),

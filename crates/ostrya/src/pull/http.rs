@@ -179,8 +179,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_compression::futures::bufread::DeflateDecoder;
 use futures_io::AsyncRead;
@@ -211,8 +212,8 @@ use super::drive::Slots;
 use super::subpath::{Scope, Subpaths};
 use super::verify::{Defaults, Verification};
 use super::{
-    DetachedMetadataFilter, ModeChecks, PullFlags, PullOptions, PullStats, READ_CHUNK,
-    TimestampCheck, apply_durability, check_ref_binding, refspec,
+    DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
+    READ_CHUNK, TimestampCheck, apply_durability, check_ref_binding, refspec,
 };
 
 /// How many fetches are in flight when the caller names no limit.
@@ -260,15 +261,19 @@ impl Repo {
     /// summary bytes to this repository's `summary`, and its `summary.sig` bytes
     /// where the remote holds them.
     pub async fn pull(&self, remote: &str, opts: PullOptions) -> Result<PullStats> {
+        let started = Instant::now();
         // A subpath the walk cannot read is refused before anything else, so it
         // costs no request and opens no transaction.
         let subpaths = Subpaths::parse(&opts.subpaths)?;
+        let counters = PullCounters::new(opts.progress.as_ref());
         // The fetcher is built first, so a remote the config does not describe
         // reports that before a policy is resolved for it. `remote_fetcher`
         // reads the config section, the URL, and the TLS material; it sends no
         // request, so a refused policy still stops the pull before its first
         // fetch.
-        let fetcher = self.remote_fetcher(remote, &opts).await?;
+        let fetcher = self
+            .remote_fetcher(remote, &opts, counters.transferred_sinks())
+            .await?;
         let verification =
             Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
         let (summary_bytes, signature) = fetch_summary(&fetcher).await?;
@@ -286,6 +291,10 @@ impl Repo {
         let targets = self
             .remote_targets(remote, &opts, summary.as_ref(), &fetcher)
             .await?;
+        // The transferred count starts after the summary, the config, and the
+        // ref files a pull reads where the remote has no summary, which is the
+        // count the tool reports.
+        counters.restart_transferred();
 
         let mirror = opts.flags.contains(PullFlags::MIRROR);
         let prefix = if mirror {
@@ -305,8 +314,13 @@ impl Repo {
             &opts,
             prefix,
             &verification,
+            &counters,
         )
         .await?;
+        for job in deltas.values() {
+            let (parts, bytes) = job.fetched_parts();
+            counters.parts_planned(parts, bytes);
+        }
 
         let mut txn = self.transaction().await?;
         apply_durability(&mut txn, &opts);
@@ -323,6 +337,7 @@ impl Repo {
                 &deltas,
                 &verification,
                 subpaths,
+                &counters,
                 &mut marked,
             )
             .await?;
@@ -372,6 +387,12 @@ impl Repo {
             metadata_imported: stats.metadata_written,
             content_imported: stats.content_written,
             content_bytes_written: stats.content_bytes_written,
+            content_bytes_unpacked: stats.content_bytes_unpacked,
+            metadata_fetched: counters.metadata(),
+            content_fetched: counters.content(),
+            delta_parts: counters.parts(),
+            bytes_transferred: counters.bytes(),
+            elapsed: started.elapsed(),
         })
     }
 
@@ -383,12 +404,20 @@ impl Repo {
         &self,
         remote: &str,
     ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-        let fetcher = self.remote_fetcher(remote, &PullOptions::default()).await?;
+        let fetcher = self
+            .remote_fetcher(remote, &PullOptions::default(), Vec::new())
+            .await?;
         fetch_summary(&fetcher).await
     }
 
-    /// Build the fetcher for one remote from its config section and `opts`.
-    async fn remote_fetcher(&self, remote: &str, opts: &PullOptions) -> Result<Fetcher> {
+    /// Build the fetcher for one remote from its config section and `opts`,
+    /// adding the bytes of each body it reads to each counter of `received`.
+    async fn remote_fetcher(
+        &self,
+        remote: &str,
+        opts: &PullOptions,
+        received: Vec<Arc<AtomicU64>>,
+    ) -> Result<Fetcher> {
         let section = self.config().remote(remote);
         let url = match &opts.url {
             Some(url) => url.clone(),
@@ -405,14 +434,17 @@ impl Repo {
             Some(section) => remote_tls(remote, section).await?,
             None => TlsOptions::default(),
         };
-        Fetcher::new(FetcherOptions {
-            headers: opts.http_headers.clone(),
-            tls,
-            max_retries: opts.n_network_retries.unwrap_or(DEFAULT_RETRIES),
-            max_outstanding: opts.max_outstanding_fetches.unwrap_or(DEFAULT_OUTSTANDING),
-            low_speed: low_speed(opts),
-            ..FetcherOptions::new(url)
-        })
+        Fetcher::with_counters(
+            FetcherOptions {
+                headers: opts.http_headers.clone(),
+                tls,
+                max_retries: opts.n_network_retries.unwrap_or(DEFAULT_RETRIES),
+                max_outstanding: opts.max_outstanding_fetches.unwrap_or(DEFAULT_OUTSTANDING),
+                low_speed: low_speed(opts),
+                ..FetcherOptions::new(url)
+            },
+            received,
+        )
         .await
     }
 
@@ -492,6 +524,7 @@ impl Repo {
         deltas: &HashMap<Checksum, DeltaJob>,
         verification: &Verification,
         subpaths: Option<Subpaths>,
+        progress: &PullCounters,
         marked: &mut Vec<Checksum>,
     ) -> Result<()> {
         // The refs each requested tip is the tip of. The binding and timestamp
@@ -515,6 +548,7 @@ impl Repo {
             deltas,
             verification,
             detached_filter: &opts.detached_metadata_filter,
+            progress,
         };
         let mut plan = Plan::new(subpaths);
         for (_, tip) in targets {
@@ -533,18 +567,23 @@ impl Repo {
         // holds one buffer per slot however many objects it stores. A step that
         // fails takes its buffer with it, which ends the pull anyway.
         let mut buffers: Vec<Vec<u8>> = Vec::new();
+        // The units of work handed to a slot, for the progress total.
+        let mut started: usize = 0;
         loop {
             while slots.has_room()
                 && let Some(item) = plan.next()
             {
                 let buffer = buffers.pop().unwrap_or_default();
                 slots.push(self.step(&ctx, item, buffer));
+                started += 1;
             }
+            plan.report(progress, started);
             let Some(outcome) = slots.next_ready().await else {
                 break;
             };
             let (step, buffer) = outcome?;
             buffers.push(buffer);
+            progress.object_done();
             plan.apply(step, marked);
         }
         Ok(())
@@ -573,7 +612,15 @@ impl Repo {
                     .deltas
                     .get(&part.commit)
                     .expect("a queued part belongs to a delta this pull found");
-                delta::fetch_part(ctx.txn, ctx.fetcher, job, part.index, ctx.checks).await?;
+                delta::fetch_part(
+                    ctx.txn,
+                    ctx.fetcher,
+                    job,
+                    part.index,
+                    ctx.checks,
+                    ctx.progress,
+                )
+                .await?;
                 Step::Part(part.commit)
             }
         };
@@ -623,6 +670,7 @@ impl Repo {
             let path = object_path(&checksum, ObjectType::Commit);
             match fetch_whole(ctx.fetcher, &path, Priority::High, MAX_METADATA_SIZE).await {
                 Ok(bytes) => {
+                    ctx.progress.metadata_fetched();
                     staging = CommitStaging::Write;
                     bytes
                 }
@@ -759,7 +807,11 @@ impl Repo {
             }
         }
         let path = object_path(commit, ObjectType::CommitMeta);
-        fetch_optional(ctx.fetcher, &path, Priority::High, MAX_METADATA_SIZE).await
+        let fetched = fetch_optional(ctx.fetcher, &path, Priority::High, MAX_METADATA_SIZE).await?;
+        if fetched.is_some() {
+            ctx.progress.metadata_fetched();
+        }
+        Ok(fetched)
     }
 
     /// Fetch one dirtree or dirmeta object and store it. A dirtree also reports
@@ -803,6 +855,7 @@ impl Repo {
         ctx.txn
             .write_metadata(name.ty, Some(&name.checksum), &bytes)
             .await?;
+        ctx.progress.metadata_fetched();
         match name.ty {
             ObjectType::DirTree => Ok(Step::DirTree(name.checksum, DirTree::parse(&bytes)?)),
             _ => Ok(Step::Done),
@@ -879,7 +932,10 @@ impl Repo {
                 .await;
             drop(permit);
             match stored {
-                Ok(()) => return Ok(Step::Done),
+                Ok(()) => {
+                    ctx.progress.content_fetched();
+                    return Ok(Step::Done);
+                }
                 Err(e) => refetch.retry(e).await?,
             }
         }
@@ -1024,6 +1080,8 @@ struct StepCtx<'a> {
     /// Which properties of a commit's detached metadata this pull stores,
     /// applied once the commit's checks have passed.
     detached_filter: &'a DetachedMetadataFilter,
+    /// The pull's live counters.
+    progress: &'a PullCounters,
 }
 
 /// One commit to fetch.
@@ -1286,6 +1344,14 @@ impl Plan {
             return Some(Item::Object(name));
         }
         self.content.pop_front().map(Item::Object)
+    }
+
+    /// Store the progress total and the scanning state: `started` units of
+    /// work handed to a slot, and what is still queued.
+    fn report(&self, progress: &PullCounters, started: usize) {
+        let queued = self.commits.len() + self.parts.len() + self.scan.len() + self.content.len();
+        let total = u32::try_from(started + queued).unwrap_or(u32::MAX);
+        progress.report(total, !self.commits.is_empty() || !self.scan.is_empty());
     }
 
     /// Fold one step's outcome back into the plan.

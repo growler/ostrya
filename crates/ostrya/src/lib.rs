@@ -281,8 +281,8 @@ pub use ostrya_core::{
 };
 pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 pub use pull::{
-    DetachedMetadataFilter, DetachedMetadataFilterFn, PullFlags, PullOptions, PullStats,
-    PullVerify, TimestampCheck,
+    DetachedMetadataFilter, DetachedMetadataFilterFn, PullFlags, PullOptions, PullProgress,
+    PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };
 pub use read::{CommitSizes, CommitState, MetadataReader};
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};

@@ -76,7 +76,7 @@ use crate::error::{Error, Result};
 use crate::fetch::{FetchRequest, Fetched, Fetcher, Priority};
 use crate::object::MAX_METADATA_SIZE;
 use crate::pull::verify::Verification;
-use crate::pull::{ModeChecks, PullFlags, PullOptions, refspec};
+use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, refspec};
 use crate::read::CommitState;
 use crate::repo::Repo;
 use crate::summary::{INDEXED_DELTAS_KEY, Summary};
@@ -148,6 +148,18 @@ impl DeltaJob {
     pub(crate) fn parts(&self) -> usize {
         self.meta_entries.len()
     }
+
+    /// How many parts the pull fetches as files, and the sizes the superblock
+    /// declares for them.
+    pub(crate) fn fetched_parts(&self) -> (u32, u64) {
+        self.meta_entries
+            .iter()
+            .zip(&self.inline)
+            .filter(|(_, inline)| inline.is_none())
+            .fold((0, 0), |(parts, bytes), (entry, _)| {
+                (parts + 1, bytes + entry.size)
+            })
+    }
 }
 
 /// Find the delta to pull each target commit with, keyed by that commit.
@@ -166,6 +178,11 @@ impl DeltaJob {
 /// once. The source commit is read from the ref this repository holds, so the
 /// refs are tried in the order they were requested and the first that yields a
 /// delta decides.
+///
+/// Each delta index request and each superblock request adds one to the
+/// metadata fetched in `progress`, whatever the remote answers, which is what
+/// the tool counts.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn discover(
     repo: &Repo,
     fetcher: &Fetcher,
@@ -174,6 +191,7 @@ pub(crate) async fn discover(
     opts: &PullOptions,
     ref_prefix: Option<&str>,
     verification: &Verification,
+    progress: &PullCounters,
 ) -> Result<HashMap<Checksum, DeltaJob>> {
     let mut jobs = HashMap::new();
     if opts.disable_static_deltas
@@ -189,8 +207,17 @@ pub(crate) async fn discover(
             continue;
         }
         let from = source_commit(repo, ref_name, to, ref_prefix).await?;
-        if let Some(job) =
-            discover_one(repo, fetcher, summary, from, *to, opts, verification).await?
+        if let Some(job) = discover_one(
+            repo,
+            fetcher,
+            summary,
+            from,
+            *to,
+            opts,
+            verification,
+            progress,
+        )
+        .await?
         {
             jobs.insert(*to, job);
         }
@@ -242,6 +269,7 @@ enum Advertisement {
 
 /// Find and read the delta from `from` to `to`, or `None` when the remote
 /// publishes none.
+#[allow(clippy::too_many_arguments)]
 async fn discover_one(
     repo: &Repo,
     fetcher: &Fetcher,
@@ -250,11 +278,12 @@ async fn discover_one(
     to: Checksum,
     opts: &PullOptions,
     verification: &Verification,
+    progress: &PullCounters,
 ) -> Result<Option<DeltaJob>> {
     let name = delta_name(from.as_ref(), &to);
     let advertised = match summary {
         None => Advertisement::Unlisted,
-        Some(summary) => match advertised_map(fetcher, summary, &to).await? {
+        Some(summary) => match advertised_map(fetcher, summary, &to, progress).await? {
             Some(map) => Advertisement::Map(map),
             None => Advertisement::Nothing,
         },
@@ -287,7 +316,9 @@ async fn discover_one(
     );
     // A superblock the remote no longer holds is a stale advertisement, which
     // leaves the objects to be fetched loose.
-    let Some(bytes) = fetch_optional(fetcher, &path, Priority::High, MAX_SUPERBLOCK).await? else {
+    let fetched = fetch_optional(fetcher, &path, Priority::High, MAX_SUPERBLOCK).await?;
+    progress.metadata_fetched();
+    let Some(bytes) = fetched else {
         return Ok(None);
     };
     if let Some(expected) = digest {
@@ -408,12 +439,13 @@ async fn advertised_map(
     fetcher: &Fetcher,
     summary: &Summary,
     to: &Checksum,
+    progress: &PullCounters,
 ) -> Result<Option<Value>> {
     if indexed_deltas(summary) {
         let path = delta_index_relative_path(to);
-        if let Some(bytes) =
-            fetch_optional(fetcher, &path, Priority::High, MAX_METADATA_SIZE).await?
-        {
+        let fetched = fetch_optional(fetcher, &path, Priority::High, MAX_METADATA_SIZE).await?;
+        progress.metadata_fetched();
+        if let Some(bytes) = fetched {
             let ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
             let dict = from_bytes(&ty, &bytes).map_err(ostrya_core::Error::from)?;
             let map = dict
@@ -473,13 +505,16 @@ fn map_digest(map: &Value, name: &str) -> Result<Option<Checksum>> {
 /// the superblock names, so a part that produces something else fails there.
 ///
 /// `checks` are the pull's mode checks, which every content object a part
-/// produces is held to exactly as a loose fetch of that object would be.
+/// produces is held to exactly as a loose fetch of that object would be. A
+/// part fetched as a file adds one part and its declared size to `progress`
+/// once its body has passed the checksum.
 pub(crate) async fn fetch_part(
     txn: &Transaction,
     fetcher: &Fetcher,
     job: &DeltaJob,
     index: usize,
     checks: ModeChecks,
+    progress: &PullCounters,
 ) -> Result<()> {
     let entry = job.meta_entries.get(index).ok_or_else(|| {
         Error::InvalidFormat(format!(
@@ -519,6 +554,7 @@ pub(crate) async fn fetch_part(
             Err(e) => refetch.retry(e).await?,
         }
     };
+    progress.part_fetched(entry.size);
     apply_part(txn, blob.as_slice(), &entry.objects, &staging, checks).await
 }
 

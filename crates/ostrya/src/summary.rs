@@ -20,9 +20,10 @@
 //! `ostree.static-deltas` maps each delta under `deltas/` to the SHA-256 of its
 //! `superblock`, which is what lets a pull find a delta and check the superblock
 //! it fetches. It is present only when the repository holds a delta, and its
-//! entries are ordered by delta name. The tool emits the same map in the order it
-//! walked `deltas/`, which is the order its filesystem returned, so the two
-//! writers agree on the entries and not on their order.
+//! entries are ordered by delta name. The tool emits the map in hash-table
+//! order, which follows the set of names and, for some names, the order they
+//! were read. The two writers agree on the entries, and on their order only
+//! where the tool's order is name order by chance.
 //!
 //! When the repository sets `[core] collection-id`, regeneration first refreshes
 //! the `ostree-metadata` anchor commit: an empty-tree commit bound to the

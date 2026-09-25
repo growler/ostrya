@@ -12288,14 +12288,21 @@ note: in the port, a `--keys-file` or a positional KEY-ID leaves `--keys-dir`
 # static-delta -- `show`, the superblock and part report, `list`, the listing
 # of the `deltas/` tree, `indexes`, the listing of the `delta-indexes/` cache,
 # `delete`, the removal of one delta, `verify`, the signature check of one
-# superblock, and `generate`, the writing of one delta.
+# superblock, `generate`, the writing of one delta, `apply-offline`, the
+# application of one delta, and `reindex`, the rewriting of the
+# `delta-indexes/` cache.
 #
 # `show`, `list`, `indexes`, and `verify` write nothing, so each cited test
 # runs both implementations over one repository and compares the exit status
 # and both streams. `delete` removes files, so its cited tests give each
 # implementation its own byte-identical copy of one repository and compare the
 # trees after each run. `generate` writes files, so its cited tests give each
-# implementation its own copy of one repository. A cell that needs a delta
+# implementation its own copy of one repository. `apply-offline` writes
+# objects, so its cited tests give each implementation a fresh destination
+# repository and compare the objects after each run. `reindex` rewrites index
+# files, so its cited tests give each implementation its own copy of one
+# repository and compare the `delta-indexes/` trees after each run. A cell
+# that needs a delta
 # cites a test: no setup generates one. A `verify` cell whose invocation needs
 # the tool's ed25519 engine cites `evidence:`.
 # ---------------------------------------------------------------------------
@@ -13039,3 +13046,307 @@ note: the port refuses an inline superblock that passes the 128 MiB ceiling
  128 MiB, so the first cited test drives the library generation with a
  smaller ceiling, over an earlier delta and into an empty output directory.
  The third holds the same outcome where the signer fails after the parts.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/apply-offline-superblock-file
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a delta directory, a symlink to it, a superblock file named
+ `superblock`, and a copy under another name beside the parts each apply in
+ both implementations: exit 0, both streams empty, the same objects, and no
+ ref. The parts of a superblock file are read from the directory that holds
+ it. Both fold PATH as text before it opens, so `<link>/../<dir>` names the
+ directory beside the link, `<dir>/superblock/..` names `<dir>`, and
+ `<dir>/superblock/` names the file. No setup generates a delta, so the cited
+ tests build the repositories.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/apply-offline-inline
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_apply_offline_reads_an_inline_delta,
+ ostrya_cli::cli::static_delta_generate_inline_matches_the_tool
+spec: format-reference.md#static-delta
+note: an inline delta applies from its delta directory and from a superblock
+ file written through --filename, with nothing printed. The trees agree with
+ the tool's own apply of the same delta, and each implementation applies the
+ other's inline delta.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/apply-offline-verify-wrong-key-no-objects
+setup: repo
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a signed delta under a key that did not sign it reports `error: ed25519:
+ Signature couldn't be verified with: key '<hex>'` at exit 1 with nothing on
+ standard output, and writes no object. A store whose trusted keys are all
+ revoked reports `error: ed25519: no signatures found`. The check runs before
+ any object is written, also for a delta from a source commit.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/apply-offline-unsigned-with-keys
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: an unsigned delta applies at exit 0 under a key source whose keys load,
+ a wrong key and a revoked store included. Under a key source that loads no
+ key, `--keys-dir` naming an absent directory, both refuse with `error:
+ signature: ed25519: no keys loaded`, and a key of the wrong length refuses,
+ also for an unsigned delta.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/apply-offline-positional-key
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_tools_deltas,
+ ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_ports_deltas
+spec: format-reference.md#static-delta
+note: a signed delta applies under the signing key given as a positional
+ KEY-ID, also after a wrong key. The last --keys-file wins, a --keys-file
+ leaves --keys-dir unread, and --keys-dir alone turns the check on.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/apply-offline-missing-path
+setup: repo
+run: static-delta --repo=$REPO apply-offline
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: PATH must be specified"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: PATH must be specified"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_apply_offline_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: no PATH refuses after the repository resolves and before the sign type
+ is read.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/apply-offline-dir-without-superblock
+setup: repo out-dir
+run: static-delta --repo=$REPO apply-offline $OUT
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: openat(superblock): No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: openat(superblock): No such file or directory"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_apply_offline_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: a directory that holds no `superblock` refuses and writes no object.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/apply-offline-absent-path
+setup: repo
+run: static-delta --repo=$REPO apply-offline 0000000000000000000000000000000000000000000000000000000000000000
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: openat(O_DIRECTORY): No such file or directory"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: openat(O_DIRECTORY): No such file or directory"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_apply_offline_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: PATH is a path in all forms, so a delta name that names no file in the
+ working directory refuses as an absent path.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/apply-offline-sign-type-unknown
+setup: repo out-dir
+run: static-delta --repo=$REPO apply-offline --sign-type=nosuch $OUT
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Requested signature type is not implemented"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Requested signature type is not implemented"
+oracle: exit-status stdout-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_apply_offline_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: the sign type is read with no key source and before the path. The tool
+ writes a GLib warning block on standard error before the line, so standard
+ error is not compared (`cli-surface.md`, "P2").
+
+family: M10
+subcommand: static-delta
+cell: static-delta/reindex-to-ref-refused
+setup: repo-with-commit
+run: static-delta --repo=$REPO reindex --to=$BRANCH
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid rev conformance"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Invalid rev conformance"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_reindex_to_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: REV is read by the rule of one half of a delta name, so a ref name
+ refuses after the repository resolves and before any file is read. A caret
+ revision refuses the same way.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/reindex-to-abbreviated-refused
+setup: repo-with-commit
+run: static-delta --repo=$REPO reindex --to=0000000000
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid rev 0000000000"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Invalid rev 0000000000"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_reindex_to_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: a value of the wrong length refuses with its first 64 bytes, so a delta
+ name `FROM-TO` names FROM alone, and an empty value names nothing.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/reindex-to-uppercase-refused
+setup: repo-with-commit
+run: static-delta --repo=$REPO reindex --to=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "error: Invalid character '65' in rev 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "error: Invalid character '65' in rev 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'"
+oracle: exit-status stdout-text stderr-text
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::static_delta_reindex_to_refusals_match_the_tool
+spec: format-reference.md#static-delta
+note: a value of 64 bytes names the decimal value of its first byte outside
+ `[0-9a-f]`.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/reindex-to-no-delta
+setup: repo-with-commit
+run: static-delta --repo=$REPO reindex --to=$REV
+expect-exit: 0
+expect-stdout: empty
+expect-stderr: empty
+ref-expect-exit: 0
+ref-expect-stdout: empty
+ref-expect-stderr: empty
+oracle: exit-status stdout-text stderr-text
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_reindex_to_matches_the_tool
+spec: format-reference.md#static-delta
+note: a target with no delta and no index file changes nothing, and neither
+ side creates `delta-indexes/`. REV is not checked for a commit object.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/reindex-to-one-target
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_reindex_to_matches_the_tool
+spec: format-reference.md#static-delta
+note: `--to=REV` rewrites the index file of REV from the deltas into REV and
+ leaves the index files of other targets byte for byte, stale ones included.
+ Given more than once, the last value wins. An index file removed by hand is
+ written again. The run exits 0 and writes nothing to either stream.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/reindex-to-removes-index
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::static_delta_reindex_to_matches_the_tool
+spec: format-reference.md#static-delta
+note: `--to=REV` with no delta into REV left removes the index file of REV and
+ keeps the fanout directory that the removal empties.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/reindex-positional-ignored
+setup: repo
+outcome: lossy
+severity: interop
+loss: a positional argument. `reindex` takes none, and the tool accepts one,
+ ignores it, and runs the full pass; the port refuses it with `clap`'s own
+ `error: unexpected argument '<value>' found` at exit 1 and writes nothing
+ (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::static_delta_reindex_argument_handling_parts_from_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+
+family: M10
+subcommand: static-delta
+cell: static-delta/reindex-index-entry-order
+setup: repo
+outcome: lossy
+severity: interop
+loss: the entry order of an index file that lists two or more deltas. The tool
+ writes the entries in hash-table order, which follows the set of delta names
+ and, for some names, the order it read them. The port writes them in name
+ order (`cli-surface.md`, "P2"). For some sets the tool's order is name order
+ by chance, and the two files then agree.
+evidence: ostrya_cli::cli::static_delta_index_entry_order_parts_from_the_tool,
+ ostrya_cli::cli::static_delta_reindex_to_matches_the_tool
+spec: format-reference.md#static-delta
+note: the two agree on the entries and on each digest, the SHA-256 of the
+ superblock. The first test cites a set of six deltas whose tool order is not
+ name order, and the tool pulls with `--require-static-deltas` from a
+ repository the port indexed. The second test cites an index file of one
+ entry, which is byte-identical.
+
+family: M10
+subcommand: summary
+cell: summary/static-deltas-entry-order
+setup: repo
+outcome: lossy
+severity: interop
+loss: the entry order of the `ostree.static-deltas` map of a summary that
+ lists two or more deltas. The tool writes the entries in hash-table order,
+ which follows the set of delta names and, for some names, the order it read
+ them, and which can differ from the order of an index file over the same
+ set. The port writes them in name order (`cli-surface.md`, "summary"). For
+ some sets the tool's order is name order by chance, and the two maps then
+ agree.
+evidence: ostrya_cli::cli::static_delta_index_entry_order_parts_from_the_tool
+spec: format-reference.md#summary
+note: the two agree on the entries and on each digest. The test cites a set of
+ six deltas whose tool order is not name order.

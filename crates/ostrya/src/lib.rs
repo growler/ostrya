@@ -114,6 +114,8 @@
 //! inline in the superblock, and the operation stream (splice, open/close,
 //! set-read-source, rollsum write, and bspatch) -- and
 //! produces the target commit's objects, asserting each checksum as written,
+//! [`Repo::apply_static_delta`] applies a superblock already read, with the
+//! parts in a directory the caller names,
 //! while [`Repo::generate_static_delta`] writes one, choosing per object
 //! between a splice, a rollsum copy-from-source stream, a bspatch stream, and
 //! a loose fallback, writes the parts to files or inline, in either byte
@@ -122,6 +124,7 @@
 //! signed envelope, [`Repo::verify_static_delta`] checks those signatures with
 //! the signing engines over the raw superblock bytes,
 //! [`Repo::reindex_static_deltas`] rebuilds the `delta-indexes/` cache,
+//! [`Repo::reindex_static_deltas_to`] rewrites the index of one target,
 //! [`Repo::list_static_delta_indexes`] lists it, and
 //! [`Repo::delete_static_delta`] removes one delta. [`DeltaSuperblock`] reads a
 //! superblock and what each part holds without applying the delta, and

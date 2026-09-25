@@ -3501,10 +3501,11 @@ Summary write side: `ostree.static-deltas` maps each delta under `deltas/` to th
 SHA-256 of its superblock, emitted between `ostree.summary.tombstone-commits` and
 `ostree.summary.collection-map` and present only when the repository holds a
 delta. The port emits the entries ordered by delta name. The tool emits them in
-the order it walked `deltas/`, which is the order its filesystem returned -- shown
-by four deltas of one target coming back in neither name order nor any other
-stable one -- so the two writers agree on the entries of the map and not on their
-order, and a summary carrying deltas is not byte-comparable against the tool's.
+a hash-table order, which follows the set of delta names and, for some names,
+the order it read `deltas/`, and which is stable across runs over one tree. The
+two writers agree on the entries of the map. Their orders agree only where the
+tool's order is name order by chance, so a summary carrying two or more deltas
+is not in general byte-comparable against the tool's.
 
 One capability difference: the tool refuses a delta-accelerated pull into an
 archive repository (`error: Can't use static deltas in an archive repo`). The port
@@ -6294,6 +6295,112 @@ tool writes one; and the part sweep at the repository location. The work adds
 repositories the tool operates on: `full` for `bare-user` and `archive`, and
 `unobserved` for `bare` and `bare-user-only`. The conformance run reports 1038
 cells and 422 passes (the M10 family 419).
+
+`static-delta apply-offline PATH [KEY-ID...]` takes a superblock file or a
+directory that holds `superblock`, and the key options of `verify`:
+`--sign-type`, `--keys-file`, and `--keys-dir`. It prints nothing and writes no
+ref. The library adds `Repo::apply_static_delta`, which applies a
+`DeltaSuperblock` already read, with the part files in a directory the caller
+names. `apply_static_delta_offline` reads `dir/superblock` and calls it. The
+CLI reads the superblock once, checks its signatures under a key source, and
+applies the same read, so the bytes that verify are the bytes that apply. A
+superblock file under any name applies, with its parts read from the directory
+that holds it. The success output is empty, as the tool's is, so a caller that
+read the target checksum from standard output reads it from the superblock
+through `show`.
+
+Observation added these rules. PATH is a path in all forms, and a delta name is
+read as a path. A directory, a symlink to one, a superblock file under any
+name, and a bare `superblock` from inside the delta directory each apply, and
+the tool reads the part files beside the superblock file. PATH is folded as
+text before it is opened: each `..` removes the component before it, also a
+symlink, so `<link>/../<dir>` names `<dir>` beside the link where the kernel
+would resolve the link's target, and a trailing `/` after a superblock file
+names the file. The port folds PATH the same way, and a superblock file that
+does not open is named by its last component, as in the tool. The checks run in
+this order: the path is present, the sign type, the keys, the path, the
+superblock, the signatures, then the parts. The sign type is read with no key
+source, and `ed25519` alone checks nothing. A key source is a positional
+KEY-ID, a `--keys-file`, or a `--keys-dir`, and `--keys-dir` alone turns the
+check on. With no key source no key file and no system key directory is read.
+Keys that do not load refuse the run also for an unsigned delta. The failure
+lines are those of `verify`, with no `Verification fails` line, and a failed
+check writes no object. The tool writes a GLib warning block before the
+unknown-sign-type error. The tool applies a delta that opens a source object
+into a bare repository alone, so the cross-tool cases over a delta from a
+source commit use `bare-user` destinations.
+
+Five decisions stand, each taken without the maintainer and open to reversal.
+An unsigned delta under a key source applies with no check, as in the tool:
+the bytes written are the same, a pull under sign verification accepts an
+unsigned delta on the same terms, and `verify` refuses an unsigned delta
+because its output is a verdict. Under a key source `apply-offline` thus
+authenticates a signed delta only. `--sign-type=dummy` is refused, as `verify`
+refuses it, where the tool applies. `spki` stays available in a build that
+carries the engine, where the tool refuses it. The check order is the tool's.
+The wording of each refusal matches the tool's where the port reaches the same
+condition at no extra cost, and the other refusals keep the port's wording.
+
+Five divergences are recorded in `cli-surface.md`, "P2", `static-delta`:
+`--sign-type=dummy`; `--sign-type=spki`; the GLib warning before the
+unknown-sign-type error; the wording of a part file that does not open; and a
+32-byte key that decodes to no curve point, which the tool takes over an
+unsigned delta and over a signed delta that another key verifies, and which
+the port refuses. The entry for the same key under `verify` states that the
+tool prints `Verification OK` where another key verifies the signature. The entry for a superblock
+that does not parse covers `apply-offline`. The work adds 9 `m10` cells, of
+which 4 are executable and all pass; the conformance run reports 1047 cells
+and 426 passes (the M10 family 423).
+
+`static-delta reindex --to=REV` rewrites the index file of one target, or
+removes it where no delta into REV is left. The library adds
+`Repo::reindex_static_deltas_to`, which scans `deltas/` by the rule of
+`reindex_static_deltas`, reads only the superblocks of REV, and writes or
+removes `delta-indexes/<fanout>/<rest>.index`. An absent file, fanout, or
+`delta-indexes/` is no error, and no directory is created for a removal. The
+two passes share one private writer for the index file of a target. The call
+takes no repository lock, as `reindex` takes none.
+
+Observation added these rules. The index files of other targets stay as they
+are, stale ones included, also one whose deltas are all gone. The fanout
+directory that a removal empties stays. A target with no delta and no index
+file changes nothing, and REV is not checked for a commit object. A
+repository with no `deltas/` gets no `delta-indexes/`. The file written has
+mode 0644 whatever the umask is, and is byte-identical to the file the full
+pass writes for REV. The tool gives the same mode to the superblock and the
+part files of `generate`, and the directories it creates follow the umask.
+The port's delta writer sets mode 0644 with `fchmod` after each file create,
+so its files take the tool's mode under any umask. The
+repository resolves before REV is read, and REV is read by the rule of one
+half of a delta name, so a ref, an abbreviated checksum, and uppercase hex
+refuse at exit 1 on standard error alone. The last `--to` wins. The tool takes
+a positional argument and ignores it. A directory at the index path refuses at
+exit 1 in both. For a target with no delta, a path component that is no
+directory, a regular file at the fanout or at `delta-indexes` for example,
+refuses at exit 1 in both, and a dangling symlink at the fanout exits 0. The entries of an index file and of the summary's
+`ostree.static-deltas` map are in a hash-table order in the tool: seven deltas
+into one target, made in three orders, gave two index orders and three
+summary orders, and removing two deltas swapped two others. The order is
+stable across runs over one tree, and the index and summary orders differ for
+one set. For some sets the order is name order by chance: an index of two
+entries came out byte-identical to the port's.
+
+Three decisions stand, each taken without the maintainer and open to reversal.
+The port keeps name order in the index files and in the summary map, since
+rebuilding a hash-table order is the engine rule 2 forbids; the entries and
+each digest agree, an index file of one entry is byte-identical, and the tool
+pulls with `--require-static-deltas` from a repository the port indexed. The
+positional argument stays refused by `clap`, the extra-positional class the
+other `static-delta` subcommands carry. REV is read by the delta-name-half
+rule, which gives the tool's refusal text byte for byte.
+
+Four divergences are recorded in `cli-surface.md`, "P2": the entry order of an
+index file and the wording of an index path that `reindex` cannot write or
+remove, under `static-delta`; the entry order of the summary map, under
+`summary`; and the extra positional argument, which the `static-delta` entry
+states for `reindex`. The work adds 9 `m10` cells, of which 4 are executable
+and all pass; the conformance run reports 1056 cells and 430 passes (the M10
+family 427).
 
 #### Phase 17g -- P3 commands with no matrix weight
 

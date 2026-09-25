@@ -3970,6 +3970,48 @@ fn only_delta_dir(repo: &Path) -> PathBuf {
         .unwrap_or_else(|| panic!("no delta directory under {}", deltas.display()))
 }
 
+/// Every file under `dir`, recursively, as paths relative to `dir`.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![dir.to_owned()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                out.push(path.strip_prefix(dir).unwrap().to_owned());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Assert that an `apply-offline` run exited 0 with both streams empty, that
+/// the commit object `commit` is in `dst`, and that `dst` holds no ref.
+fn assert_applied_without_ref(run: &Run, dst: &Path, commit: &str, label: &str) {
+    assert_eq!(
+        (
+            run.status.code(),
+            String::from_utf8_lossy(&run.stdout).into_owned(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        ),
+        (Some(0), String::new(), String::new()),
+        "{label}"
+    );
+    assert!(
+        loose_objects(dst).contains(&(commit.to_owned(), "commit".to_owned())),
+        "{label}: the commit is not in {}",
+        dst.display()
+    );
+    assert_eq!(
+        files_under(&dst.join("refs")),
+        [] as [PathBuf; 0],
+        "{label}"
+    );
+}
+
 #[test]
 fn static_delta_list_and_apply_offline() {
     if !ostree_available() {
@@ -4022,7 +4064,7 @@ fn static_delta_list_and_apply_offline() {
         None,
         &[],
     );
-    assert_eq!(applied.ok().stdout_trimmed(), COMMIT, "apply prints target");
+    assert_applied_without_ref(&applied, &dst, COMMIT, "apply");
 
     // The tool reads the tree the port produced.
     let ls = Command::new("ostree")
@@ -4120,7 +4162,7 @@ fn static_delta_generate_signs_and_indexes() {
         None,
         &[],
     );
-    assert_eq!(applied.ok().stdout_trimmed(), COMMIT);
+    assert_applied_without_ref(&applied, &dst, COMMIT, "apply");
 }
 
 #[test]
@@ -4184,7 +4226,7 @@ fn static_delta_generate_relative_output_dir() {
         None,
         &[],
     );
-    assert_eq!(applied.ok().stdout_trimmed(), COMMIT);
+    assert_applied_without_ref(&applied, &dst, COMMIT, "apply");
 }
 
 #[test]
@@ -26573,7 +26615,13 @@ const SHARED_LAYOUT: &[&str] = &[
 /// replaces itself with the binary. `Command::pre_exec` would do the same in
 /// one process, and this crate forbids unsafe code.
 fn ostrya_with_umask(mask: &str, args: &[&str]) -> Run {
-    let mut script = format!("umask {mask}; exec '{}'", env!("CARGO_BIN_EXE_ostrya"));
+    program_with_umask(env!("CARGO_BIN_EXE_ostrya"), mask, args)
+}
+
+/// Run `program` under an explicit file-creation mask, by the shell wrapper of
+/// [`ostrya_with_umask`].
+fn program_with_umask(program: &str, mask: &str, args: &[&str]) -> Run {
+    let mut script = format!("umask {mask}; exec '{program}'");
     for arg in args {
         assert!(
             !arg.contains('\''),
@@ -29904,7 +29952,7 @@ fn lay_delta_tree(
 
 /// The delta names and digests in the `Static Deltas` line of the tool's
 /// `summary --view` of `repo`, sorted, since the tool writes the map in the
-/// order it walked `deltas/`. Empty where the summary carries no delta.
+/// order of a hash table. Empty where the summary carries no delta.
 fn summary_delta_entries(repo: &Path) -> Vec<String> {
     let run = ostree(&["summary", &format!("--repo={}", repo.display()), "--view"]);
     assert!(
@@ -30692,7 +30740,8 @@ fn static_delta_verify_key_sources() {
 
 /// A key that is not a valid key refuses the run before standard output: a
 /// positional of the wrong length, a keys-file line of the wrong length beside
-/// a valid one, and 32 bytes that are no curve point.
+/// a valid one, and 32 bytes that are no curve point, also beside the key that
+/// verifies the delta.
 #[test]
 fn static_delta_verify_refuses_invalid_keys_before_output() {
     let tmp = TmpDir::new("delta-verify-invalid");
@@ -30724,9 +30773,15 @@ fn static_delta_verify_refuses_invalid_keys_before_output() {
         "error: Invalid ed25519 public key: Ill-formed input: expected 32 bytes, got 0 bytes\n",
         "a line that is not UTF-8 decodes to no byte",
     );
-    let run_point = run(&[COMMIT, ED25519_NOT_A_POINT_B64]);
-    assert_eq!(run_point.status.code(), Some(1));
-    assert!(run_point.stdout.is_empty());
+    for keys in [
+        &[ED25519_NOT_A_POINT_B64][..],
+        &[ED25519_PUBLIC_B64, ED25519_NOT_A_POINT_B64],
+        &[ED25519_NOT_A_POINT_B64, ED25519_PUBLIC_B64],
+    ] {
+        let run_point = run(&[&[COMMIT][..], keys].concat());
+        assert_eq!(run_point.status.code(), Some(1), "{keys:?}");
+        assert!(run_point.stdout.is_empty(), "{keys:?}");
+    }
 }
 
 /// The sign types: `ed25519` is the default, `dummy` refuses in its own words
@@ -31996,8 +32051,9 @@ fn static_delta_generate_invalid_endianness_is_refused() {
     );
 }
 
-/// The port's `apply-offline` reads the tool's inline delta, and the objects
-/// agree with the tool's own apply. Standard output is not compared.
+/// The port's `apply-offline` reads the tool's inline delta, from the delta
+/// directory and from a superblock file written through `--filename`, and the
+/// objects agree with the tool's own apply. Both print nothing.
 #[test]
 fn static_delta_apply_offline_reads_an_inline_delta() {
     if !ostree_available() {
@@ -32015,28 +32071,1361 @@ fn static_delta_apply_offline_reads_an_inline_delta() {
         &Checksum::from_hex(&c2).unwrap(),
     ));
     assert_eq!(entry_names(&dir), ["superblock"]);
-    let into_port = base.join("into-port");
-    let into_tool = base.join("into-tool");
-    ostree_ok(&into_port, &["init", "--mode=bare-user"]);
-    ostree_ok(&into_tool, &["init", "--mode=bare-user"]);
+    std::fs::create_dir_all(base.join("out")).unwrap();
+    let filename = format!("--filename={}", base.join("out/sb").display());
     ostree_ok(
-        &into_tool,
-        &["static-delta", "apply-offline", dir.to_str().unwrap()],
-    );
-    let into_port_arg = format!("--repo={}", into_port.display());
-    ostrya(
+        &repo,
         &[
             "static-delta",
-            &into_port_arg,
-            "apply-offline",
-            dir.to_str().unwrap(),
+            "generate",
+            "--inline",
+            "--empty",
+            "--to=m",
+            &filename,
+        ],
+    );
+    assert_eq!(entry_names(&base.join("out")), ["sb"]);
+    for (name, path) in [("dir", dir), ("file", base.join("out/sb"))] {
+        let into_port = base.join(format!("into-port-{name}"));
+        let into_tool = base.join(format!("into-tool-{name}"));
+        ostree_ok(&into_port, &["init", "--mode=bare-user"]);
+        ostree_ok(&into_tool, &["init", "--mode=bare-user"]);
+        let printed = ostree_ok(
+            &into_tool,
+            &["static-delta", "apply-offline", path.to_str().unwrap()],
+        );
+        assert_eq!(printed, "", "{name}");
+        let into_port_arg = format!("--repo={}", into_port.display());
+        let applied = ostrya(
+            &[
+                "static-delta",
+                &into_port_arg,
+                "apply-offline",
+                path.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        );
+        assert_applied_without_ref(&applied, &into_port, &c2, name);
+        ostree_ok(&into_port, &["fsck"]);
+        assert_eq!(tool_listing(&into_port, &c2), tool_listing(&into_tool, &c2));
+    }
+}
+
+/// Create a fresh archive repository at `base/<name>` with the port.
+fn fresh_archive(base: &Path, name: &str) -> PathBuf {
+    let repo = base.join(name);
+    block_on(async {
+        Repo::create(&repo, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+    });
+    repo
+}
+
+/// Run `static-delta apply-offline ARGS` from `cwd` into `dst`.
+fn run_apply_offline(cwd: &Path, dst: &Path, args: &[&str]) -> Run {
+    let repo_arg = format!("--repo={}", dst.display());
+    let all = [
+        &["static-delta", repo_arg.as_str(), "apply-offline"][..],
+        args,
+    ]
+    .concat();
+    ostrya_in(Some(cwd), &all, None, &[])
+}
+
+/// What an `apply-offline` run is expected to do.
+enum ApplyOutcome {
+    /// Exit 0 with both streams empty, the commit object present, no ref.
+    Applied,
+    /// Exit 1 with nothing on standard output, this standard error, and no
+    /// object written.
+    Refused(String),
+}
+
+/// Run each case from `cwd` into its own fresh archive repository under `cwd`
+/// and assert its outcome. `commit` is the commit an applied case delivers.
+fn assert_apply_cases(cwd: &Path, commit: &str, cases: &[(&[&str], ApplyOutcome)]) {
+    for (i, (args, outcome)) in cases.iter().enumerate() {
+        let label = args.join(" ");
+        let dst = fresh_archive(cwd, &format!("dst-{i}"));
+        let run = run_apply_offline(cwd, &dst, args);
+        match outcome {
+            ApplyOutcome::Applied => assert_applied_without_ref(&run, &dst, commit, &label),
+            ApplyOutcome::Refused(stderr) => {
+                assert_verify_run(&run, 1, "", stderr, &label);
+                assert_eq!(loose_objects(&dst), [], "{label}: objects were written");
+            }
+        }
+    }
+}
+
+/// `apply-offline` prints nothing and writes no ref, for each form of PATH: a
+/// delta directory, a superblock under another name beside its parts, a bare
+/// `superblock` from inside the delta directory, and an inline superblock
+/// written through `--filename`.
+#[test]
+fn static_delta_apply_offline_prints_nothing_and_writes_no_ref() {
+    let tmp = TmpDir::new("delta-apply-forms");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let signed = only_delta_dir(&repo);
+    std::fs::copy(base.join("unsigned/superblock"), base.join("unsigned/sb2")).unwrap();
+    std::fs::create_dir_all(base.join("out")).unwrap();
+    ostrya_in(
+        Some(base),
+        &[
+            "static-delta",
+            "--repo=repo",
+            "generate",
+            "--empty",
+            "--to",
+            COMMIT,
+            "--inline",
+            "--filename=out/sb",
         ],
         None,
         &[],
     )
     .ok();
-    ostree_ok(&into_port, &["fsck"]);
-    assert_eq!(tool_listing(&into_port, &c2), tool_listing(&into_tool, &c2));
+    assert_eq!(entry_names(&base.join("out")), ["sb"]);
+    assert_apply_cases(
+        base,
+        COMMIT,
+        &[
+            (&[signed.to_str().unwrap()], ApplyOutcome::Applied),
+            (&["unsigned"], ApplyOutcome::Applied),
+            (&["unsigned/sb2"], ApplyOutcome::Applied),
+            (&["out/sb"], ApplyOutcome::Applied),
+        ],
+    );
+    let dst = fresh_archive(base, "dst-inside");
+    let run = run_apply_offline(&base.join("unsigned"), &dst, &["superblock"]);
+    assert_applied_without_ref(&run, &dst, COMMIT, "superblock from inside");
+}
+
+/// The key sources: a positional KEY-ID, `--keys-file`, and `--keys-dir` each
+/// turn on the check of a signed delta, which runs before any object is
+/// written. An unsigned delta applies under any key source whose keys load.
+#[test]
+fn static_delta_apply_offline_key_sources() {
+    let tmp = TmpDir::new("delta-apply-keys");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let signed = only_delta_dir(&repo);
+    let signed = signed.to_str().unwrap();
+    std::fs::write(base.join("k1"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
+    std::fs::write(base.join("k2"), format!("{ED25519_PUBLIC2_B64}\n")).unwrap();
+    std::fs::create_dir_all(base.join("adir")).unwrap();
+    verify_key_store(base, "store1", &[ED25519_PUBLIC_B64], &[]);
+    verify_key_store(base, "store2", &[ED25519_PUBLIC2_B64], &[]);
+    verify_key_store(
+        base,
+        "revoked",
+        &[ED25519_PUBLIC_B64],
+        &[ED25519_PUBLIC_B64],
+    );
+    let refused = |text: &str| ApplyOutcome::Refused(format!("error: {text}\n"));
+    let no_keys = || refused("signature: ed25519: no keys loaded");
+    assert_apply_cases(
+        base,
+        COMMIT,
+        &[
+            (&[signed, ED25519_PUBLIC_B64], ApplyOutcome::Applied),
+            (&["--keys-file=k1", signed], ApplyOutcome::Applied),
+            (&["--keys-dir=store1", signed], ApplyOutcome::Applied),
+            (
+                &["--keys-file=k2", "--keys-file=k1", signed],
+                ApplyOutcome::Applied,
+            ),
+            (
+                &["--keys-dir=store2", "--keys-file=k1", signed],
+                ApplyOutcome::Applied,
+            ),
+            (&["--sign-type=ed25519", signed], ApplyOutcome::Applied),
+            (&["unsigned", ED25519_PUBLIC_B64], ApplyOutcome::Applied),
+            (&["unsigned", ED25519_PUBLIC2_B64], ApplyOutcome::Applied),
+            (&["--keys-dir=revoked", "unsigned"], ApplyOutcome::Applied),
+            (
+                &[signed, ED25519_PUBLIC2_B64],
+                ApplyOutcome::Refused(verify_key_list_error(&[ED25519_PUBLIC2_HEX])),
+            ),
+            (
+                &["--keys-dir=revoked", signed],
+                refused("ed25519: no signatures found"),
+            ),
+            (&["--keys-dir=nodir", signed], no_keys()),
+            (&["--keys-dir=nodir", "unsigned"], no_keys()),
+            (
+                &[signed, "AAAA"],
+                refused(
+                    "Invalid ed25519 public key: Ill-formed input: expected 32 bytes, got 3 bytes",
+                ),
+            ),
+            (
+                &["--keys-file=adir", "unsigned"],
+                refused("File object 'adir' is not a regular file"),
+            ),
+        ],
+    );
+}
+
+/// The sign type is read with or without a key source. A name the port does
+/// not carry refuses with nothing on standard output, `dummy` refuses in its
+/// own words, and the last `--sign-type` wins.
+#[test]
+fn static_delta_apply_offline_sign_types() {
+    let tmp = TmpDir::new("delta-apply-sign-types");
+    let base = tmp.path();
+    verify_fixture(base);
+    let not_implemented =
+        || ApplyOutcome::Refused("error: Requested signature type is not implemented\n".to_owned());
+    let dummy = || {
+        ApplyOutcome::Refused("error: dummy signature type is only for ostree testing\n".to_owned())
+    };
+    #[cfg_attr(not(feature = "spki"), allow(unused_mut))]
+    let mut cases: Vec<(&[&str], ApplyOutcome)> = vec![
+        (&["--sign-type=nosuch", "unsigned"], not_implemented()),
+        (
+            &["--sign-type=nosuch", "unsigned", ED25519_PUBLIC_B64],
+            not_implemented(),
+        ),
+        (&["--sign-type=gpg", "unsigned"], not_implemented()),
+        (&["--sign-type=", "unsigned"], not_implemented()),
+        (&["--sign-type=dummy", "unsigned"], dummy()),
+        (
+            &["--sign-type=dummy", "unsigned", ED25519_PUBLIC_B64],
+            dummy(),
+        ),
+        (
+            &[
+                "--sign-type=nosuch",
+                "--sign-type=ed25519",
+                "unsigned",
+                ED25519_PUBLIC_B64,
+            ],
+            ApplyOutcome::Applied,
+        ),
+        (
+            &["--sign-type=ed25519", "--sign-type=nosuch", "unsigned"],
+            not_implemented(),
+        ),
+    ];
+    #[cfg(feature = "spki")]
+    cases.push((&["--sign-type=spki", "unsigned"], ApplyOutcome::Applied));
+    assert_apply_cases(base, COMMIT, &cases);
+}
+
+/// The refusals of PATH: none given, a path that is absent, a delta name,
+/// which is read as a path, a directory with no `superblock`, and a
+/// superblock copied away from its parts. None writes an object.
+#[test]
+fn static_delta_apply_offline_path_forms() {
+    let tmp = TmpDir::new("delta-apply-paths");
+    let base = tmp.path();
+    verify_fixture(base);
+    std::fs::create_dir_all(base.join("lonely")).unwrap();
+    std::fs::copy(base.join("unsigned/superblock"), base.join("away")).unwrap();
+    let refused = |text: &str| ApplyOutcome::Refused(format!("error: {text}\n"));
+    let absent = || refused("openat(O_DIRECTORY): No such file or directory");
+    assert_apply_cases(
+        base,
+        COMMIT,
+        &[
+            (&[], refused("PATH must be specified")),
+            (&["nothere"], absent()),
+            (&[COMMIT], absent()),
+            (
+                &["lonely"],
+                refused("openat(superblock): No such file or directory"),
+            ),
+        ],
+    );
+    let dst = fresh_archive(base, "dst-away");
+    let run = run_apply_offline(base, &dst, &["away"]);
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "");
+    assert!(String::from_utf8_lossy(&run.stderr).starts_with("error: "));
+    assert_eq!(loose_objects(&dst), []);
+}
+
+/// The arguments of a command line as `&str`.
+fn str_args(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+/// Run `static-delta apply-offline ARGS` from `cwd` under both
+/// implementations, each into its own fresh repository the tool creates in
+/// `mode`, after `prep` is applied into both where given. Assert that the
+/// exit status and both streams agree, that both repositories hold the same
+/// objects, and that neither holds a ref.
+fn assert_apply_agrees(cwd: &Path, name: &str, mode: &str, prep: Option<&str>, args: &[&str]) {
+    let port_dst = cwd.join(format!("{name}-port"));
+    let tool_dst = cwd.join(format!("{name}-tool"));
+    let init = format!("--mode={mode}");
+    ostree_ok(&port_dst, &["init", &init]);
+    ostree_ok(&tool_dst, &["init", &init]);
+    let apply = |dst: &Path, args: &[&str]| {
+        let repo_arg = format!("--repo={}", dst.display());
+        [
+            &["static-delta", repo_arg.as_str(), "apply-offline"][..],
+            args,
+        ]
+        .concat()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    };
+    if let Some(prep) = prep {
+        ostrya_in(Some(cwd), &str_args(&apply(&port_dst, &[prep])), None, &[]).ok();
+        let tool = ostree_in(cwd, &str_args(&apply(&tool_dst, &[prep])));
+        assert!(tool.status.success(), "the tool did not apply {prep}");
+    }
+    let port_args = apply(&port_dst, args);
+    let tool_args = apply(&tool_dst, args);
+    let port = ostrya_in(Some(cwd), &str_args(&port_args), None, &[]);
+    let tool = ostree_in(cwd, &str_args(&tool_args));
+    let label = args.join(" ");
+    assert_runs_agree(&port, &tool, &format!("static-delta apply-offline {label}"));
+    assert_eq!(
+        loose_objects(&port_dst),
+        loose_objects(&tool_dst),
+        "{label}"
+    );
+    for dst in [&port_dst, &tool_dst] {
+        assert_eq!(
+            files_under(&dst.join("refs")),
+            [] as [PathBuf; 0],
+            "{label}"
+        );
+    }
+}
+
+/// The cases both cross-tool tests run from `base` over `base/repo`, which
+/// holds an unsigned delta to `c1`, a delta to `c2`, and a delta from `c1` to
+/// `c2`, both signed with the shared key.
+fn assert_apply_cases_agree(base: &Path, c1: &str, c2: &str) {
+    std::fs::write(base.join("k1"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
+    std::fs::write(base.join("k2"), format!("{ED25519_PUBLIC2_B64}\n")).unwrap();
+    verify_key_store(base, "store1", &[ED25519_PUBLIC_B64], &[]);
+    verify_key_store(base, "store2", &[ED25519_PUBLIC2_B64], &[]);
+    verify_key_store(
+        base,
+        "revoked",
+        &[ED25519_PUBLIC_B64],
+        &[ED25519_PUBLIC_B64],
+    );
+    std::fs::write(
+        base.join("trusted.ed25519"),
+        format!("{ED25519_PUBLIC_B64}\n"),
+    )
+    .unwrap();
+    let checksum = |hex: &str| Checksum::from_hex(hex).unwrap();
+    let unsigned = format!(
+        "repo/{}",
+        ostrya::static_delta_relative_dir(None, &checksum(c1))
+    );
+    let signed = format!(
+        "repo/{}",
+        ostrya::static_delta_relative_dir(None, &checksum(c2))
+    );
+    let from_to = format!(
+        "repo/{}",
+        ostrya::static_delta_relative_dir(Some(&checksum(c1)), &checksum(c2))
+    );
+    std::os::unix::fs::symlink(&signed, base.join("lnk")).unwrap();
+    std::fs::copy(
+        base.join(&signed).join("superblock"),
+        base.join(&signed).join("sb-other"),
+    )
+    .unwrap();
+    let signed_sb = format!("{signed}/superblock");
+    let signed_other = format!("{signed}/sb-other");
+    // `lnk/../<rest>` folds to `<rest>` beside the link, which holds a copy of
+    // the unsigned delta, where the kernel resolves it to the signed delta.
+    let rest = Path::new(&signed).file_name().unwrap().to_str().unwrap();
+    std::fs::create_dir_all(base.join(rest)).unwrap();
+    for entry in std::fs::read_dir(base.join(&unsigned)).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), base.join(rest).join(entry.file_name())).unwrap();
+    }
+    let lexical_dir = format!("lnk/../{rest}");
+    let lexical_sb = format!("lnk/../{rest}/superblock");
+    let sb_parent = format!("{signed_sb}/..");
+    let sb_slash = format!("{signed_sb}/");
+    let sb_dot = format!("{signed_sb}/.");
+
+    let cases: Vec<Vec<&str>> = vec![
+        vec![&signed],
+        vec![&signed_sb],
+        vec![&signed_other],
+        vec!["lnk"],
+        vec![&lexical_dir],
+        vec![&lexical_sb],
+        vec!["lnk/superblock/.."],
+        vec![&sb_parent],
+        vec![&sb_slash],
+        vec![&sb_dot],
+        vec![&lexical_dir, ED25519_PUBLIC2_B64],
+        vec![&unsigned],
+        vec![&signed, ED25519_PUBLIC_B64],
+        vec![&signed_sb, ED25519_PUBLIC_B64],
+        vec![&signed, ED25519_PUBLIC2_B64],
+        vec![&signed, ED25519_PUBLIC2_B64, ED25519_PUBLIC_B64],
+        vec![&unsigned, ED25519_PUBLIC2_B64],
+        vec!["--keys-file=k2", "--keys-file=k1", &signed],
+        vec!["--keys-file=k1", "--keys-file=k2", &signed],
+        vec!["--keys-dir=store1", "--keys-file=k2", &signed],
+        vec!["--keys-dir=store1", &signed],
+        vec!["--keys-dir=store2", &signed],
+        vec!["--keys-dir=revoked", &signed],
+        vec!["--keys-dir=revoked", &unsigned],
+        vec!["--keys-dir=nodir", &unsigned],
+        vec!["--keys-dir=", &signed],
+        vec![&unsigned, "AAAA"],
+        vec!["--sign-type=ed25519", &signed],
+        vec![
+            "--sign-type=nosuch",
+            "--sign-type=ed25519",
+            &signed,
+            ED25519_PUBLIC_B64,
+        ],
+    ];
+    for (i, case) in cases.iter().enumerate() {
+        assert_apply_agrees(base, &format!("dst-{i}"), "archive", None, case);
+    }
+    // The tool applies a delta that opens a source object into a bare
+    // repository alone.
+    assert_apply_agrees(
+        base,
+        "dst-from",
+        "bare-user",
+        Some(&unsigned),
+        &[&from_to, ED25519_PUBLIC_B64],
+    );
+    assert_apply_agrees(
+        base,
+        "dst-from-wrong",
+        "bare-user",
+        Some(&unsigned),
+        &[&from_to, ED25519_PUBLIC2_B64],
+    );
+}
+
+/// `apply-offline` agrees with the tool over the tool's deltas: the exit
+/// status, both streams, and the objects written. Carries
+/// `static-delta/apply-offline-{superblock-file,verify-wrong-key-no-objects,unsigned-with-keys,positional-key}`
+/// for the tool as the producer.
+#[test]
+fn static_delta_apply_offline_matches_the_tool_over_the_tools_deltas() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-apply-tool");
+    let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c1]);
+    for from in [&["--empty"][..], &["--from", &c1]] {
+        let args = [
+            &["static-delta", "generate"][..],
+            from,
+            &["--to", &c2, "--sign-type=ed25519", &sign],
+        ]
+        .concat();
+        ostree_ok(&repo, &args);
+    }
+    assert_apply_cases_agree(tmp.path(), &c1, &c2);
+}
+
+/// The same over the port's deltas. Carries the same cells as the test
+/// above, for the port as the producer.
+#[test]
+fn static_delta_apply_offline_matches_the_tool_over_the_ports_deltas() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-apply-port");
+    let (repo, c1, c2) = delta_show_repo(tmp.path(), "repo");
+    let repo_s = repo.to_str().unwrap();
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    let generate = |extra: &[&str]| {
+        let base = [
+            "static-delta",
+            "--repo",
+            repo_s,
+            "generate",
+            "--timestamp=1700000000",
+        ];
+        ostrya(&[&base[..], extra].concat(), None, &[]).ok();
+    };
+    generate(&["--empty", "--to", &c1]);
+    generate(&["--empty", "--to", &c2, &sign]);
+    generate(&["--from", &c1, "--to", &c2, &sign]);
+    assert_apply_cases_agree(tmp.path(), &c1, &c2);
+}
+
+/// The refusals agree: no PATH, an absent path, a delta name, a directory
+/// with no `superblock`, a superblock file that does not open, and keys that
+/// do not load. An unknown sign type
+/// agrees on the exit status, standard output, and the last line of standard
+/// error, where the tool writes a GLib warning before it.
+#[test]
+fn static_delta_apply_offline_refusals_match_the_tool() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-apply-refusals");
+    let base = tmp.path();
+    let (repo, _, c2) = delta_show_repo(base, "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c2]);
+    std::fs::create_dir_all(base.join("lonely")).unwrap();
+    let delta = format!(
+        "repo/{}",
+        ostrya::static_delta_relative_dir(None, &Checksum::from_hex(&c2).unwrap())
+    );
+    let cases: Vec<Vec<&str>> = vec![
+        vec![],
+        vec!["nothere"],
+        vec![&c2],
+        vec!["lonely"],
+        vec!["lonely", ED25519_PUBLIC_B64],
+        vec![&delta, "AAAA"],
+        vec!["--keys-dir=nodir", &delta],
+        vec!["--keys-file=nosuch", &delta],
+    ];
+    for (i, case) in cases.iter().enumerate() {
+        assert_apply_agrees(base, &format!("dst-{i}"), "archive", None, case);
+    }
+    // A superblock file that does not open is named by its last component. A
+    // file of mode 000 opens under root, where the case proves nothing.
+    std::fs::create_dir_all(base.join("perm")).unwrap();
+    let locked = base.join("perm/superblock");
+    std::fs::copy(base.join(&delta).join("superblock"), &locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&locked).is_err() {
+        for (i, case) in [
+            vec!["perm/superblock"],
+            vec!["perm/../perm/superblock"],
+            vec!["perm"],
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_apply_agrees(base, &format!("dst-perm-{i}"), "archive", None, case);
+        }
+    }
+    for (i, case) in [
+        vec!["--sign-type=nosuch", delta.as_str()],
+        vec!["--sign-type=nosuch", delta.as_str(), ED25519_PUBLIC_B64],
+        vec!["--sign-type=gpg", delta.as_str()],
+    ]
+    .iter()
+    .enumerate()
+    {
+        let dst = base.join(format!("sign-type-{i}"));
+        ostree_ok(&dst, &["init", "--mode=archive"]);
+        let repo_arg = format!("--repo={}", dst.display());
+        let all = [
+            &["static-delta", repo_arg.as_str(), "apply-offline"][..],
+            case,
+        ]
+        .concat();
+        let port = ostrya_in(Some(base), &all, None, &[]);
+        let tool = ostree_in(base, &all);
+        let last = |run: &Run| {
+            let text = String::from_utf8_lossy(&run.stderr).into_owned();
+            text.lines().last().unwrap_or_default().to_owned()
+        };
+        let label = case.join(" ");
+        assert_eq!(
+            (port.status.code(), &port.stdout, last(&port)),
+            (tool.status.code(), &tool.stdout, last(&tool)),
+            "{label}"
+        );
+        assert_eq!(
+            last(&port),
+            "error: Requested signature type is not implemented"
+        );
+        assert_eq!(loose_objects(&dst), [], "{label}");
+    }
+}
+
+/// The recorded divergences stand: the tool applies under `--sign-type=dummy`,
+/// and under a key that decodes to no curve point, over an unsigned delta and,
+/// beside a key that verifies it, in either order, over a signed delta; the
+/// port refuses each. The tool refuses `--sign-type=spki`, and the port applies
+/// under it in a build that carries the engine. A part that does not open and a
+/// superblock that does not parse refuse in both, in different words.
+#[test]
+fn static_delta_apply_offline_divergences_stand_as_recorded() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-apply-divergences");
+    let base = tmp.path();
+    let (repo, c1, c2) = delta_show_repo(base, "repo");
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", &c2]);
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    ostree_ok(
+        &repo,
+        &[
+            "static-delta",
+            "generate",
+            "--empty",
+            "--to",
+            &c1,
+            "--sign-type=ed25519",
+            &sign,
+        ],
+    );
+    let relative = |hex: &str| {
+        format!(
+            "repo/{}",
+            ostrya::static_delta_relative_dir(None, &Checksum::from_hex(hex).unwrap())
+        )
+    };
+    let delta = relative(&c2);
+    let signed = relative(&c1);
+    std::fs::copy(base.join(&delta).join("superblock"), base.join("away")).unwrap();
+    std::fs::write(base.join("garbage"), b"garbage\n").unwrap();
+    let run_both_into = |name: &str, args: &[&str]| {
+        let port_dst = base.join(format!("{name}-port"));
+        let tool_dst = base.join(format!("{name}-tool"));
+        ostree_ok(&port_dst, &["init", "--mode=archive"]);
+        ostree_ok(&tool_dst, &["init", "--mode=archive"]);
+        let all = |dst: &Path| {
+            let repo_arg = format!("--repo={}", dst.display());
+            let mut all = vec![
+                "static-delta".to_owned(),
+                repo_arg,
+                "apply-offline".to_owned(),
+            ];
+            all.extend(args.iter().map(|arg| (*arg).to_owned()));
+            all
+        };
+        let port_args = all(&port_dst);
+        let tool_args = all(&tool_dst);
+        let port = ostrya_in(Some(base), &str_args(&port_args), None, &[]);
+        let tool = ostree_in(base, &str_args(&tool_args));
+        (
+            port,
+            tool,
+            loose_objects(&port_dst),
+            loose_objects(&tool_dst),
+        )
+    };
+    let tool_applies = [
+        vec!["--sign-type=dummy", delta.as_str()],
+        vec![delta.as_str(), ED25519_NOT_A_POINT_B64],
+        vec![signed.as_str(), ED25519_PUBLIC_B64, ED25519_NOT_A_POINT_B64],
+        vec![signed.as_str(), ED25519_NOT_A_POINT_B64, ED25519_PUBLIC_B64],
+    ];
+    for (i, case) in tool_applies.iter().enumerate() {
+        let label = case.join(" ");
+        let (port, tool, port_objects, tool_objects) = run_both_into(&format!("dst-{i}"), case);
+        assert_eq!(tool.status.code(), Some(0), "{label}");
+        assert!(!tool_objects.is_empty(), "{label}");
+        assert_eq!(port.status.code(), Some(1), "{label}");
+        assert_eq!(port_objects, [], "{label}");
+    }
+    let (port, tool, port_objects, tool_objects) =
+        run_both_into("spki", &["--sign-type=spki", &delta]);
+    assert_eq!(tool.status.code(), Some(1));
+    assert_eq!(tool_objects, []);
+    #[cfg(feature = "spki")]
+    {
+        assert_eq!(port.status.code(), Some(0));
+        assert!(!port_objects.is_empty());
+    }
+    #[cfg(not(feature = "spki"))]
+    {
+        assert_eq!(port.status.code(), Some(1));
+        assert_eq!(port_objects, []);
+    }
+    for (i, case) in [["away"], ["garbage"]].iter().enumerate() {
+        let (port, tool, port_objects, tool_objects) =
+            run_both_into(&format!("both-refuse-{i}"), case);
+        assert_eq!(port.status.code(), Some(1), "{case:?}");
+        assert_eq!(tool.status.code(), Some(1), "{case:?}");
+        assert_ne!(port.stderr, tool.stderr, "{case:?}");
+        assert_eq!(port_objects, []);
+        assert_eq!(tool_objects, []);
+    }
+}
+
+/// The tool archive repository of [`delta_show_repo`] with `count` commits on
+/// `m` in all, each commit past the second editing the small file. Returns the
+/// path and the commits, oldest first.
+fn delta_chain_repo(base: &Path, name: &str, count: usize) -> (PathBuf, Vec<String>) {
+    let (repo, c1, c2) = delta_show_repo(base, name);
+    let tree_arg = format!("--tree=dir={}", base.join(format!("{name}-tree")).display());
+    let mut commits = vec![c1, c2];
+    for i in commits.len()..count {
+        std::fs::write(base.join(format!("{name}-tree/a")), format!("hello\n{i}\n")).unwrap();
+        let timestamp = format!("--timestamp=@{}", 1_700_000_000 + 100 * i);
+        commits.push(ostree_ok(
+            &repo,
+            &["commit", "-b", "m", "-s", "next", &timestamp, &tree_arg],
+        ));
+    }
+    (repo, commits)
+}
+
+/// The entries of the `ostree.static-deltas` map in `dict`, the `a{sv}` of an
+/// index file or the summary's metadata dict, in stored order: each delta name
+/// with its digest bytes.
+fn delta_map_entries(dict: &Value) -> Vec<(String, Vec<u8>)> {
+    let entries = dict.as_array().unwrap();
+    let map = entries
+        .iter()
+        .find_map(|entry| {
+            let [Value::Str(key), value] = entry.as_tuple().unwrap() else {
+                panic!("a dict entry is not (key, value)");
+            };
+            (key == "ostree.static-deltas").then(|| value.as_variant().unwrap().1)
+        })
+        .expect("the dict carries ostree.static-deltas");
+    map.as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            let [Value::Str(name), value] = entry.as_tuple().unwrap() else {
+                panic!("a delta map entry is not (name, digest)");
+            };
+            let digest = value.as_variant().unwrap().1.as_bytes().unwrap().to_vec();
+            (name.clone(), digest)
+        })
+        .collect()
+}
+
+/// The delta map entries of the index file at `path`, in stored order.
+fn index_entries(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let bytes = std::fs::read(path).unwrap();
+    let dict = ostrya::from_bytes(&Type::parse("a{sv}").unwrap(), &bytes).unwrap();
+    let entries = delta_map_entries(&dict);
+    assert_eq!(
+        dict.as_array().unwrap().len(),
+        1,
+        "{} holds more than the delta map",
+        path.display()
+    );
+    entries
+}
+
+/// The delta map entries of the summary of `repo`, in stored order.
+fn summary_static_delta_entries(repo: &Path) -> Vec<(String, Vec<u8>)> {
+    let bytes = std::fs::read(repo.join("summary")).unwrap();
+    delta_map_entries(&ostrya::Summary::parse(&bytes).unwrap().metadata)
+}
+
+/// Every file under `delta-indexes/` of `repo` with its bytes, keyed by its
+/// path relative to `delta-indexes/`. Empty where the directory is absent.
+fn index_file_bytes(repo: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let Ok(fanouts) = std::fs::read_dir(repo.join("delta-indexes")) else {
+        return out;
+    };
+    for fanout in fanouts {
+        let fanout = fanout.unwrap();
+        if !fanout.file_type().unwrap().is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(fanout.path()).unwrap() {
+            let file = file.unwrap();
+            if !file.file_type().unwrap().is_file() {
+                continue;
+            }
+            let rel = format!(
+                "{}/{}",
+                fanout.file_name().to_string_lossy(),
+                file.file_name().to_string_lossy()
+            );
+            out.insert(rel, std::fs::read(file.path()).unwrap());
+        }
+    }
+    out
+}
+
+/// The `delta-indexes/` trees of `port` and `tool` agree: the same paths,
+/// modes, and sizes, the same entries in each index file, the port's in name
+/// order, and a one-entry file byte for byte.
+fn assert_delta_indexes_agree(port: &Path, tool: &Path, label: &str) {
+    let describe = |repo: &Path| {
+        let dir = repo.join("delta-indexes");
+        dir.exists().then(|| describe_tree(&dir))
+    };
+    assert_eq!(describe(port), describe(tool), "{label}: the trees differ");
+    let port_files = index_file_bytes(port);
+    let tool_files = index_file_bytes(tool);
+    for (rel, port_bytes) in &port_files {
+        let path = |repo: &Path| repo.join("delta-indexes").join(rel);
+        let port_entries = index_entries(&path(port));
+        let mut tool_entries = index_entries(&path(tool));
+        let mut sorted = port_entries.clone();
+        sorted.sort();
+        assert_eq!(port_entries, sorted, "{label}: {rel} is not in name order");
+        tool_entries.sort();
+        assert_eq!(port_entries, tool_entries, "{label}: {rel} entries differ");
+        if port_entries.len() == 1 {
+            assert_eq!(port_bytes, &tool_files[rel], "{label}: {rel} bytes differ");
+        }
+    }
+}
+
+/// Remove the delta from `from` to `to` in `repo` by hand.
+fn remove_delta_dir(repo: &Path, from: Option<&str>, to: &str) {
+    let from = from.map(|from| Checksum::from_hex(from).unwrap());
+    let relative =
+        ostrya::static_delta_relative_dir(from.as_ref(), &Checksum::from_hex(to).unwrap());
+    std::fs::remove_dir_all(repo.join(relative)).unwrap();
+}
+
+/// A tool repository of three commits holding every delta into each of them,
+/// indexed by the tool's full pass: from scratch into each commit, from the
+/// first into the second and third, and from the second into the third.
+fn delta_reindex_repo(base: &Path, name: &str) -> (PathBuf, Vec<String>) {
+    let (repo, commits) = delta_chain_repo(base, name, 3);
+    let [c1, c2, c3] = [&commits[0], &commits[1], &commits[2]];
+    for (from, to) in [
+        (None, c1),
+        (None, c2),
+        (Some(c1), c2),
+        (None, c3),
+        (Some(c1), c3),
+        (Some(c2), c3),
+    ] {
+        let mut args = vec!["static-delta", "generate", "--to", to];
+        match from {
+            Some(from) => args.extend(["--from", from]),
+            None => args.push("--empty"),
+        }
+        ostree_ok(&repo, &args);
+    }
+    ostree_ok(&repo, &["static-delta", "reindex"]);
+    (repo, commits)
+}
+
+/// The index of target `to` under `delta-indexes/`, relative to it.
+fn index_rel(to: &str) -> String {
+    let b64 = Checksum::from_hex(to).unwrap().to_base64_modified();
+    let (fanout, rest) = b64.split_at(2);
+    format!("{fanout}/{rest}.index")
+}
+
+/// Run `static-delta ARGS` against `port` with the port and against `tool`
+/// with the tool, the repository named by a leading `--repo=`.
+fn run_reindex_both(port: &Path, tool: &Path, args: &[&str]) -> (Run, Run) {
+    let all = |repo: &Path| {
+        let repo_arg = format!("--repo={}", repo.display());
+        let mut all = vec!["static-delta".to_owned(), repo_arg];
+        all.extend(args.iter().map(|arg| (*arg).to_owned()));
+        all
+    };
+    let port_args = all(port);
+    let tool_args = all(tool);
+    let port = ostrya(
+        &port_args.iter().map(String::as_str).collect::<Vec<_>>(),
+        None,
+        &[],
+    );
+    let tool = ostree(&tool_args.iter().map(String::as_str).collect::<Vec<_>>());
+    (port, tool)
+}
+
+/// `static-delta reindex --to=REV` does what the tool does over one repository
+/// in six steps. A pass over one target rewrites its index file and leaves the
+/// others byte for byte, stale ones included. A pass over a target with no
+/// delta left removes its file and keeps the fanout directory. Given twice,
+/// the last value wins. An index file removed by hand is written again. A
+/// target with no delta and no index file changes nothing, and a repository
+/// with no `deltas/` gets no `delta-indexes/`. Each run exits 0 and writes
+/// nothing to either stream. After each step, an index file of one entry is
+/// byte-identical between the two.
+#[test]
+fn static_delta_reindex_to_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-reindex-to");
+    let base = tmp.path();
+    let (repo, commits) = delta_reindex_repo(base, "repo");
+    let [c1, c2, c3] = [&commits[0], &commits[1], &commits[2]];
+    let port = clone_repo(base, &repo, "port");
+    let tool = clone_repo(base, &repo, "tool");
+
+    let reindex = |args: &[&str], label: &str| {
+        let all = [&["reindex"][..], args].concat();
+        let (port_run, tool_run) = run_reindex_both(&port, &tool, &all);
+        assert_runs_agree(&port_run, &tool_run, label);
+        assert!(port_run.status.success(), "{label}: the port failed");
+        assert!(port_run.stdout.is_empty() && port_run.stderr.is_empty());
+        assert_delta_indexes_agree(&port, &tool, label);
+    };
+
+    // One target: c3 lists the two deltas left, and the other files stay.
+    let before = index_file_bytes(&port);
+    for side in [&port, &tool] {
+        remove_delta_dir(side, Some(c1), c3);
+    }
+    reindex(&[&format!("--to={c3}")], "--to=c3");
+    let after = index_file_bytes(&port);
+    assert_eq!(
+        index_entries(&port.join("delta-indexes").join(index_rel(c3))).len(),
+        2
+    );
+    for to in [c1, c2] {
+        assert_eq!(
+            after[&index_rel(to)],
+            before[&index_rel(to)],
+            "the index of {to} changed"
+        );
+    }
+
+    // No delta left: the index file goes, the fanout directory stays.
+    for side in [&port, &tool] {
+        remove_delta_dir(side, None, c1);
+    }
+    reindex(&[&format!("--to={c1}")], "--to=c1");
+    let c1_index = port.join("delta-indexes").join(index_rel(c1));
+    assert!(!c1_index.exists(), "the index of c1 stayed");
+    assert!(c1_index.parent().unwrap().is_dir(), "the fanout of c1 went");
+
+    // The last `--to` wins: the stale file of c2 still lists c1-c2.
+    for side in [&port, &tool] {
+        remove_delta_dir(side, Some(c1), c2);
+    }
+    reindex(
+        &[&format!("--to={c2}"), &format!("--to={c3}")],
+        "--to=c2 --to=c3",
+    );
+    let c2_index = port.join("delta-indexes").join(index_rel(c2));
+    assert_eq!(
+        index_entries(&c2_index).len(),
+        2,
+        "the stale index of c2 was rewritten"
+    );
+
+    // An index file removed by hand is written again.
+    for side in [&port, &tool] {
+        std::fs::remove_file(side.join("delta-indexes").join(index_rel(c2))).unwrap();
+    }
+    reindex(&[&format!("--to={c2}")], "--to=c2");
+    assert_eq!(index_entries(&c2_index).len(), 1);
+
+    // A target with no delta and no index changes nothing.
+    let before = index_file_bytes(&port);
+    reindex(&[&format!("--to={}", "0".repeat(64))], "--to=<zeros>");
+    assert_eq!(index_file_bytes(&port), before);
+
+    // A repository with no `deltas/` gets no `delta-indexes/`.
+    let (bare, bare_commits) = delta_chain_repo(base, "bare", 2);
+    let bare_port = clone_repo(base, &bare, "bare-port");
+    let label = "--to over no deltas/";
+    let to_arg = format!("--to={}", bare_commits[1]);
+    let (port_run, tool_run) = run_reindex_both(&bare_port, &bare, &["reindex", &to_arg]);
+    assert_runs_agree(&port_run, &tool_run, label);
+    assert!(port_run.status.success(), "{label}: the port failed");
+    for side in [&bare_port, &bare] {
+        assert!(
+            !side.join("delta-indexes").exists(),
+            "{label}: delta-indexes/ was created"
+        );
+    }
+}
+
+/// The refusals of `--to` agree on the exit status and both streams, and leave
+/// `delta-indexes/` as it was: a ref, a caret revision, an abbreviated
+/// checksum, uppercase hex, 63 and 65 characters, a delta name, an empty value,
+/// and a character past `f`. A `--to` with no value and a directory at the
+/// index path, of a target with a delta and of one with none, exit 1 in both,
+/// in different words.
+#[test]
+fn static_delta_reindex_to_refusals_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-reindex-to-refusals");
+    let base = tmp.path();
+    let (repo, commits) = delta_reindex_repo(base, "repo");
+    let [c1, c2, c3] = [&commits[0], &commits[1], &commits[2]];
+    let port = clone_repo(base, &repo, "port");
+    let tool = clone_repo(base, &repo, "tool");
+    let before = index_file_bytes(&port);
+
+    let upper = c1.to_uppercase();
+    let long = format!("{c1}0");
+    let pair = format!("{c1}-{c2}");
+    let bad_char = format!("{}g", &c1[..63]);
+    for (value, message) in [
+        ("m", "error: Invalid rev m\n".to_owned()),
+        ("^m", "error: Invalid rev ^m\n".to_owned()),
+        (&c1[..10], format!("error: Invalid rev {}\n", &c1[..10])),
+        (
+            upper.as_str(),
+            format!(
+                "error: Invalid character '{}' in rev '{upper}'\n",
+                upper.bytes().find(u8::is_ascii_uppercase).unwrap()
+            ),
+        ),
+        (&c1[..63], format!("error: Invalid rev {}\n", &c1[..63])),
+        (long.as_str(), format!("error: Invalid rev {c1}\n")),
+        (pair.as_str(), format!("error: Invalid rev {c1}\n")),
+        ("", "error: Invalid rev \n".to_owned()),
+        (
+            bad_char.as_str(),
+            format!("error: Invalid character '103' in rev '{bad_char}'\n"),
+        ),
+    ] {
+        let to_arg = format!("--to={value}");
+        let (port_run, tool_run) = run_reindex_both(&port, &tool, &["reindex", &to_arg]);
+        assert_runs_agree(&port_run, &tool_run, &to_arg);
+        assert_eq!(port_run.status.code(), Some(1), "{to_arg}");
+        assert!(port_run.stdout.is_empty(), "{to_arg}");
+        assert_eq!(
+            String::from_utf8_lossy(&port_run.stderr),
+            message,
+            "{to_arg}"
+        );
+        assert_eq!(index_file_bytes(&port), before, "{to_arg}: the port wrote");
+        assert_eq!(index_file_bytes(&tool), before, "{to_arg}: the tool wrote");
+    }
+
+    // `--to` with no value: the tool and clap word the refusal apart.
+    let (port_run, tool_run) = run_reindex_both(&port, &tool, &["reindex", "--to"]);
+    assert_eq!(
+        (port_run.status.code(), tool_run.status.code()),
+        (Some(1), Some(1))
+    );
+    assert!(String::from_utf8_lossy(&tool_run.stderr).contains("error: Missing argument for --to"));
+    assert!(
+        String::from_utf8_lossy(&port_run.stderr).contains("a value is required for '--to <REV>'")
+    );
+    assert_eq!(index_file_bytes(&port), before);
+
+    // A directory at the index path, of a target with no delta left and of a
+    // target with deltas.
+    for side in [&port, &tool] {
+        remove_delta_dir(side, None, c1);
+        for to in [c1, c3] {
+            let path = side.join("delta-indexes").join(index_rel(to));
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+        }
+    }
+    for (to, tool_word) in [(c1, "error: unlink("), (c3, "error: renameat(")] {
+        let to_arg = format!("--to={to}");
+        let (port_run, tool_run) = run_reindex_both(&port, &tool, &["reindex", &to_arg]);
+        assert_eq!(
+            (port_run.status.code(), tool_run.status.code()),
+            (Some(1), Some(1)),
+            "{to_arg}"
+        );
+        let tool_err = String::from_utf8_lossy(&tool_run.stderr);
+        assert!(
+            tool_err.starts_with(tool_word) && tool_err.contains("Is a directory"),
+            "{tool_err}"
+        );
+        let port_err = String::from_utf8_lossy(&port_run.stderr);
+        assert!(port_err.contains("Is a directory"), "{port_err}");
+        for side in [&port, &tool] {
+            assert!(
+                side.join("delta-indexes").join(index_rel(to)).is_dir(),
+                "{to_arg}"
+            );
+            let fanout = side.join("delta-indexes").join(&index_rel(to)[..2]);
+            let names: Vec<_> = std::fs::read_dir(&fanout)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(
+                names.len(),
+                1,
+                "{to_arg}: a temp file stayed in {}",
+                fanout.display()
+            );
+        }
+    }
+
+    // A path of the index of c1, which has no delta left, that goes through a
+    // component which is no directory: a regular file at the fanout, a symlink
+    // there to a regular file, and a regular file at `delta-indexes`. Both
+    // refuse at exit 1 in different words. A dangling symlink at the fanout is
+    // an absent file, and both exit 0.
+    let to_arg = format!("--to={c1}");
+    let fanout_rel = format!("delta-indexes/{}", &index_rel(c1)[..2]);
+    type Setup = fn(&Path, &str);
+    let cases: [(&str, Setup, bool); 4] = [
+        (
+            "a file at the fanout",
+            |side, fanout| std::fs::write(side.join(fanout), b"x").unwrap(),
+            false,
+        ),
+        (
+            "a symlink to a file at the fanout",
+            |side, fanout| {
+                std::fs::write(side.join("regular"), b"x").unwrap();
+                std::os::unix::fs::symlink("../regular", side.join(fanout)).unwrap();
+            },
+            false,
+        ),
+        (
+            "a dangling symlink at the fanout",
+            |side, fanout| std::os::unix::fs::symlink("../absent", side.join(fanout)).unwrap(),
+            true,
+        ),
+        (
+            "a file at delta-indexes",
+            |side, _| {
+                std::fs::remove_dir_all(side.join("delta-indexes")).unwrap();
+                std::fs::write(side.join("delta-indexes"), b"x").unwrap();
+            },
+            false,
+        ),
+    ];
+    for (label, setup, succeeds) in cases {
+        for side in [&port, &tool] {
+            let fanout = side.join(&fanout_rel);
+            match std::fs::symlink_metadata(&fanout) {
+                Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&fanout).unwrap(),
+                Ok(_) => std::fs::remove_file(&fanout).unwrap(),
+                Err(_) => {}
+            }
+            let _ = std::fs::remove_file(side.join("regular"));
+            setup(side, &fanout_rel);
+        }
+        let (port_run, tool_run) = run_reindex_both(&port, &tool, &["reindex", &to_arg]);
+        if succeeds {
+            assert_runs_agree(&port_run, &tool_run, label);
+            assert!(port_run.status.success(), "{label}: the port failed");
+            continue;
+        }
+        assert_eq!(
+            (port_run.status.code(), tool_run.status.code()),
+            (Some(1), Some(1)),
+            "{label}"
+        );
+        let tool_err = String::from_utf8_lossy(&tool_run.stderr);
+        assert!(
+            tool_err.starts_with("error: unlink(") && tool_err.contains("Not a directory"),
+            "{label}: {tool_err}"
+        );
+        let port_err = String::from_utf8_lossy(&port_run.stderr);
+        assert!(port_err.contains("Not a directory"), "{label}: {port_err}");
+    }
+}
+
+/// A positional after `reindex` parts from the tool: the tool ignores it and
+/// runs the full pass, and the port refuses it at exit 1 and writes nothing.
+#[test]
+fn static_delta_reindex_argument_handling_parts_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-reindex-positional");
+    let base = tmp.path();
+    let (repo, commits) = delta_reindex_repo(base, "repo");
+    let port = clone_repo(base, &repo, "port");
+    let tool = clone_repo(base, &repo, "tool");
+    for side in [&port, &tool] {
+        remove_delta_dir(side, None, &commits[0]);
+    }
+    let before = index_file_bytes(&port);
+
+    let (port_run, tool_run) = run_reindex_both(&port, &tool, &["reindex", &commits[1]]);
+    assert!(
+        tool_run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tool_run.stderr)
+    );
+    assert!(
+        !tool
+            .join("delta-indexes")
+            .join(index_rel(&commits[0]))
+            .exists(),
+        "the tool did not run the full pass"
+    );
+    assert_eq!(port_run.status.code(), Some(1));
+    assert!(port_run.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&port_run.stderr).contains(&format!(
+            "error: unexpected argument '{}' found",
+            commits[1]
+        )),
+        "{}",
+        String::from_utf8_lossy(&port_run.stderr)
+    );
+    assert_eq!(index_file_bytes(&port), before, "the port wrote");
+}
+
+/// The entry order of an index file and of the summary's
+/// `ostree.static-deltas` map parts from the tool. The tool writes both maps in
+/// hash-table order, which follows the set of names and, for some names, the
+/// order it read them. The port writes both in name order. Over six deltas
+/// into one target the two agree on the entries and on each digest, the
+/// SHA-256 of the superblock, and the tool's order of each map is not name
+/// order. The tool pulls with `--require-static-deltas` from the repository
+/// the port indexed.
+#[test]
+fn static_delta_index_entry_order_parts_from_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-index-order");
+    let base = tmp.path();
+    // The set is chosen so that the tool's order parts from name order in both
+    // maps. The fixed timestamps fix the commit checksums, and so the delta
+    // names, and the tool's order is stable over one set of names. Where the
+    // checksums differ, a set of six can come out in name order by chance, at
+    // about one in 720 for each map.
+    let (repo, commits) = delta_chain_repo(base, "repo", 6);
+    let to = &commits[5];
+    ostree_ok(&repo, &["static-delta", "generate", "--empty", "--to", to]);
+    for from in &commits[..5] {
+        ostree_ok(
+            &repo,
+            &["static-delta", "generate", "--from", from, "--to", to],
+        );
+    }
+    let port = clone_repo(base, &repo, "port");
+    let tool = clone_repo(base, &repo, "tool");
+    for args in [&["static-delta", "reindex"][..], &["summary", "-u"]] {
+        let run = ostrya(
+            &[args, &["--repo", port.to_str().unwrap()]].concat(),
+            None,
+            &[],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        ostree_ok(&tool, args);
+    }
+
+    let mut expected: Vec<(String, Vec<u8>)> = std::iter::once(None)
+        .chain(commits[..5].iter().map(Some))
+        .map(|from| {
+            let name = match from {
+                Some(from) => format!("{from}-{to}"),
+                None => to.clone(),
+            };
+            let from = from.map(|from| Checksum::from_hex(from).unwrap());
+            let dir =
+                ostrya::static_delta_relative_dir(from.as_ref(), &Checksum::from_hex(to).unwrap());
+            let superblock = std::fs::read(repo.join(dir).join("superblock")).unwrap();
+            (name, Checksum::sha256(&superblock).as_bytes().to_vec())
+        })
+        .collect();
+    expected.sort();
+
+    let index = |repo: &Path| index_entries(&repo.join("delta-indexes").join(index_rel(to)));
+    for (what, port_entries, mut tool_entries) in [
+        ("index", index(&port), index(&tool)),
+        (
+            "summary",
+            summary_static_delta_entries(&port),
+            summary_static_delta_entries(&tool),
+        ),
+    ] {
+        assert_eq!(port_entries, expected, "the port's {what} map");
+        assert_ne!(
+            tool_entries, expected,
+            "the tool's {what} map is in name order"
+        );
+        tool_entries.sort();
+        assert_eq!(tool_entries, expected, "the tool's {what} map");
+    }
+
+    let client = base.join("client");
+    ostree_ok(&client, &["init", "--mode=bare-user"]);
+    let url = format!("file://{}", port.display());
+    ostree_ok(
+        &client,
+        &["remote", "add", "--no-gpg-verify", "origin", &url],
+    );
+    ostree_ok(&client, &["pull", "--require-static-deltas", "origin", "m"]);
+    ostree_ok(&client, &["fsck"]);
+    assert_eq!(ostree_ok(&client, &["rev-parse", "origin:m"]), *to);
+}
+
+/// The files `static-delta generate` and `static-delta reindex` write take
+/// mode 0644 under umask 077 in both implementations: the superblock and the
+/// part files at the repository location and under `--filename`, and the index
+/// files of the full pass and of `--to`. The directories both create follow
+/// the umask, and their modes agree.
+#[test]
+fn static_delta_file_modes_do_not_follow_the_umask() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("delta-file-modes");
+    let base = tmp.path();
+    let (repo, commits) = delta_chain_repo(base, "repo", 2);
+    let [c1, c2] = [&commits[0], &commits[1]];
+    let port = clone_repo(base, &repo, "port");
+    let tool = clone_repo(base, &repo, "tool");
+    let modes = |side: &Path| {
+        let mut out = Vec::new();
+        for dir in ["deltas", "delta-indexes", "out"] {
+            for line in describe_tree(&side.join(dir)) {
+                let fields: Vec<&str> = line.split(' ').take(3).collect();
+                out.push(format!("{dir}/{}", fields.join(" ")));
+            }
+        }
+        out
+    };
+    for (program, side) in [(env!("CARGO_BIN_EXE_ostrya"), &port), ("ostree", &tool)] {
+        let repo_arg = format!("--repo={}", side.display());
+        let filename = format!("--filename={}", side.join("out/superblock").display());
+        std::fs::create_dir(side.join("out")).unwrap();
+        let to_c1 = format!("--to={c1}");
+        let to_c2 = format!("--to={c2}");
+        let from_c1 = format!("--from={c1}");
+        for args in [
+            &["static-delta", "generate", &repo_arg, "--empty", &to_c2][..],
+            &["static-delta", "generate", &repo_arg, &from_c1, &to_c2],
+            &[
+                "static-delta",
+                "generate",
+                &repo_arg,
+                "--empty",
+                &to_c1,
+                &filename,
+            ],
+            &["static-delta", "reindex", &repo_arg],
+        ] {
+            let run = program_with_umask(program, "077", args);
+            assert!(
+                run.status.success(),
+                "{program} {args:?}: {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+        }
+        std::fs::remove_file(side.join("delta-indexes").join(index_rel(c2))).unwrap();
+        let run = program_with_umask(
+            program,
+            "077",
+            &["static-delta", "reindex", &repo_arg, &to_c2],
+        );
+        assert!(run.status.success(), "{program} reindex --to");
+    }
+    let port_modes = modes(&port);
+    assert_eq!(port_modes, modes(&tool));
+    let files: Vec<&String> = port_modes
+        .iter()
+        .filter(|line| line.contains(" file "))
+        .collect();
+    assert!(
+        files.iter().any(|line| line.starts_with("out/")),
+        "{port_modes:?}"
+    );
+    assert!(
+        files.iter().any(|line| line.ends_with("/0 file 644")),
+        "no part file: {port_modes:?}"
+    );
+    for line in &files {
+        assert!(line.ends_with(" file 644"), "{line}");
+    }
 }
 
 /// Regenerating a delta at the repository location with `--inline`: the tool

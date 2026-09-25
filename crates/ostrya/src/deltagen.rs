@@ -126,8 +126,11 @@ const INDEX_SUFFIX: &str = ".index";
 /// The `a{sv}` key an index file (and the summary) stores the delta map under.
 pub(crate) const STATIC_DELTAS_KEY: &str = "ostree.static-deltas";
 
-/// The mode delta files and directories are created with, matching the tool.
+/// The mode of the delta files and index files, which the tool gives them
+/// whatever the umask is.
 const DELTA_FILE_MODE: u32 = 0o644;
+/// The mode delta directories are created with. The umask reduces it, as it
+/// does for the tool.
 const DELTA_DIR_MODE: u32 = 0o755;
 
 /// Knobs for [`Repo::generate_static_delta`].
@@ -461,7 +464,8 @@ impl Repo {
     /// that has no delta left, so a stale entry cannot advertise a delta that is
     /// gone; the fanout directory that removal empties stays, as it does for the
     /// tool. A delta whose superblock is missing is skipped, so a half-written
-    /// delta does not fail the pass.
+    /// delta does not fail the pass. The entries are in delta-name order, and
+    /// the tool writes them in hash-table order.
     pub async fn reindex_static_deltas(&self) -> Result<()> {
         let mut by_target: BTreeMap<Checksum, BTreeMap<String, Checksum>> = BTreeMap::new();
         for entry in self.static_delta_digests().await? {
@@ -474,19 +478,63 @@ impl Repo {
         let fsync = self.config().fsync()?;
         let mut written: BTreeSet<String> = BTreeSet::new();
         for (to, deltas) in &by_target {
+            self.write_delta_index(to, deltas, fsync).await?;
             let (fanout, name) = delta_index_parts(to);
-            let dir_fd = self
-                .open_repo_subdir(&format!("{DELTA_INDEXES_DIR}/{fanout}"))
-                .await?;
-            let index = index_value(deltas)?;
-            write_delta_file(&dir_fd, &name, &index, fsync).await?;
             written.insert(format!("{fanout}/{name}"));
         }
         self.prune_delta_indexes(written).await
     }
 
-    /// Every delta under `deltas/`, in delta-name order, with the SHA-256 of its
-    /// superblock.
+    /// Rewrite the index file of the target commit `to` alone,
+    /// `delta-indexes/<fanout>/<rest>.index`, from the deltas under `deltas/`
+    /// whose target is `to`.
+    ///
+    /// The deltas are found by the scan rule of
+    /// [`reindex_static_deltas`](Repo::reindex_static_deltas), and only the
+    /// superblocks of `to` are read. With no delta for `to` the index file is
+    /// removed. An absent file, fanout directory, or `delta-indexes/` is no
+    /// error, and no directory is created for it. A fanout or `delta-indexes`
+    /// that is no directory, a regular file for example, is an error. The fanout
+    /// directory that the removal empties stays. The index files of other targets stay as they
+    /// are, stale ones included. `to` is not checked for a commit object, so a
+    /// target that the repository does not hold is valid.
+    pub async fn reindex_static_deltas_to(&self, to: &Checksum) -> Result<()> {
+        let deltas: BTreeMap<String, Checksum> = self
+            .static_delta_digests_of(Some(to))
+            .await?
+            .into_iter()
+            .map(|entry| (entry.name, entry.digest))
+            .collect();
+        if deltas.is_empty() {
+            let repo = self.clone();
+            let relative = delta_index_relative_path(to);
+            return ostrya_rt::unblock(move || {
+                remove_delta_index_blocking(repo.repo_fd(), &relative)
+            })
+            .await;
+        }
+        let fsync = self.config().fsync()?;
+        self.write_delta_index(to, &deltas, fsync).await
+    }
+
+    /// Write the index file of the target commit `to` from its delta map,
+    /// creating the fanout directory and its parents.
+    async fn write_delta_index(
+        &self,
+        to: &Checksum,
+        deltas: &BTreeMap<String, Checksum>,
+        fsync: bool,
+    ) -> Result<()> {
+        let (fanout, name) = delta_index_parts(to);
+        let dir_fd = self
+            .open_repo_subdir(&format!("{DELTA_INDEXES_DIR}/{fanout}"))
+            .await?;
+        let index = index_value(deltas)?;
+        write_delta_file(&dir_fd, &name, &index, fsync).await
+    }
+
+    /// Every delta under `deltas/`, sorted by delta name, with the SHA-256 of
+    /// its superblock.
     ///
     /// This is what the `delta-indexes/` cache and the summary's
     /// `ostree.static-deltas` map both advertise, so both are built from it. The
@@ -494,24 +542,35 @@ impl Repo {
     /// delta stays unadvertised. A superblock that goes between the scan and
     /// the read is skipped too, and does not fail the caller.
     pub(crate) async fn static_delta_digests(&self) -> Result<Vec<DeltaDigest>> {
+        self.static_delta_digests_of(None).await
+    }
+
+    /// The deltas of [`static_delta_digests`](Repo::static_delta_digests),
+    /// limited to the target commit `to` when it is given. The limit applies
+    /// before a superblock is read, so a pass over one target reads only the
+    /// superblocks of that target.
+    async fn static_delta_digests_of(&self, to: Option<&Checksum>) -> Result<Vec<DeltaDigest>> {
         let mut out = Vec::new();
-        for (from, to) in self.list_static_delta_targets().await? {
+        for (from, target) in self.list_static_delta_targets().await? {
+            if to.is_some_and(|to| *to != target) {
+                continue;
+            }
             let relative = format!(
                 "{}/{SUPERBLOCK_FILE}",
-                delta_relative_dir(from.as_ref(), &to)
+                delta_relative_dir(from.as_ref(), &target)
             );
             let Some(bytes) = self.read_repo_file(&relative).await? else {
                 continue;
             };
             out.push(DeltaDigest {
-                name: delta_name(from.as_ref(), &to),
-                to,
+                name: delta_name(from.as_ref(), &target),
+                to: target,
                 digest: Checksum::sha256(&bytes),
             });
         }
-        // The `deltas/` tree is walked in directory order, which is the order the
-        // filesystem hands back. Sorting by name gives the index files and the
-        // summary map one order whatever that was.
+        // The tool writes the index files and the summary map in hash-table
+        // order, which the port does not rebuild. Sorting by name gives both one
+        // order whatever order the filesystem returns the `deltas/` tree in.
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
@@ -2000,6 +2059,20 @@ fn prune_delta_indexes_blocking(repo_fd: BorrowedFd<'_>, written: &BTreeSet<Stri
     Ok(())
 }
 
+/// Unlink the index file at `relative` under the repository root. An absent
+/// file, fanout directory, or `delta-indexes/` is no error, and a dangling
+/// symlink on the path is absent too. Any other failure is an error, as it is
+/// for the tool: a directory at the path, and a path component that is no
+/// directory, a regular file at the fanout or at `delta-indexes` included.
+fn remove_delta_index_blocking(repo_fd: BorrowedFd<'_>, relative: &str) -> Result<()> {
+    use rustix::fs::{AtFlags, unlinkat};
+
+    match unlinkat(repo_fd, relative, AtFlags::empty()) {
+        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+        Err(e) => Err(Error::Io(e.into())),
+    }
+}
+
 /// Walk `delta-indexes/<fanout>/` and collect the target of every index file,
 /// by the rule [`Repo::list_static_delta_indexes`] states.
 fn list_delta_indexes_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<Checksum>> {
@@ -2093,18 +2166,21 @@ fn is_temp_name(name: &str) -> bool {
     name.starts_with('.') && name.contains(".tmp-")
 }
 
-/// Create a file for writing, replacing any leftover of the same name.
+/// Create a file for writing, replacing any leftover of the same name, and
+/// set its mode to [`DELTA_FILE_MODE`] whatever the umask is, as the tool does.
 fn create_file_blocking(dir: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
-    use rustix::fs::{Mode, OFlags, openat};
+    use rustix::fs::{Mode, OFlags, fchmod, openat};
 
     let _ = rustix::fs::unlinkat(dir, name, rustix::fs::AtFlags::empty());
-    openat(
+    let fd = openat(
         dir,
         name,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::from_raw_mode(DELTA_FILE_MODE),
     )
-    .map_err(|e| Error::Io(e.into()))
+    .map_err(|e| Error::Io(e.into()))?;
+    fchmod(&fd, Mode::from_raw_mode(DELTA_FILE_MODE)).map_err(|e| Error::Io(e.into()))?;
+    Ok(fd)
 }
 
 /// Open a directory relative to `base`, creating each component that is absent.

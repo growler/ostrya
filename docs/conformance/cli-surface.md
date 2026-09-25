@@ -2054,7 +2054,7 @@ other subcommand, together with the top level, keeps `-v/--verbose`. `-m`,
 `--sign`, and `--gpg-sign` are read with `-u` alone, and both implementations
 check every one of them before the regeneration, so a refusal leaves `summary`
 and `summary.sig` as they stood (`../format-reference.md`, "CLI output
-formats", `summary`). Eleven differences stand.
+formats", `summary`). Twelve differences stand.
 
 - `-v` does not turn on the debug stream. The tool binds `-v` to `--view` and
   `--verbose` together and writes `OT: using fuse: 0` for a read-only view; the
@@ -2104,6 +2104,14 @@ formats", `summary`). Eleven differences stand.
   (`../port-plan.md`, Phase 17f, `F9`). The key set and every value agree, the
   report follows the stored order, and some key sets keep the standard order in
   the tool, where the two `summary` files agree byte for byte;
+- the entry order of the `ostree.static-deltas` map of a summary that lists two
+  or more deltas. The tool writes the entries in the order of a hash table,
+  which follows the set of delta names and, for some names, the order it read
+  them, and which can differ from the order of an index file over the same
+  set. The port writes them in name order, the rule 2 decision the
+  `static-delta` entry below records for the index files. The entries and each
+  digest agree. For some sets the tool's order is name order by chance, and
+  the two maps then agree;
 - `--sign-type` names an engine the port carries and this tool build does not,
   the rule `commit --sign-type` already records. The tool's build reports
   `error: Requested signature type is not implemented` for `spki` and `gpg`
@@ -2145,10 +2153,16 @@ renders in the host zone with that zone's offset and the port renders in UTC.
 a delta name or the path of a superblock file, `delete` takes a delta name
 alone, `list` lists the deltas under `deltas/`, and `indexes` lists the
 `delta-indexes/` cache (`../format-reference.md`, "CLI output formats",
-`static-delta`). `verify` takes `spki` in a build that carries the engine, the
-sign-type rule this section states for `commit --sign-type`. Twenty-seven
-differences stand on `show`, `delete`, `list`, `indexes`, `verify`, and
-`apply-offline`.
+`static-delta`). `apply-offline` takes a path, a superblock file or a
+directory that holds `superblock`, and the key options of `verify`. Both
+implementations fold the path as text before they open it. Each `..` removes
+the component before it, so `<link>/../<dir>` names `<dir>` beside the link
+and `<dir>/superblock/..` names `<dir>`. `verify` and `apply-offline` take
+`spki` in a build that carries the engine, the sign-type rule this section
+states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
+removes the index file of one target and reads REV by the rule of one half of a
+delta name; the last `--to` wins. Thirty-four differences stand on `show`,
+`delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
   `show`, `verify`, and `apply-offline`, and a pull refuses the fetched
@@ -2177,8 +2191,10 @@ differences stand on `show`, `delete`, `list`, `indexes`, `verify`, and
 - a superblock that does not parse. The tool prints the lines it read before
   the failure, for example `Delta:`, `Signed:`, and `From <scratch>`, and then
   `error: Invalid checksum of length 0 expected 32`. The port prints no line
-  and its own `error: invalid format:` sentence. Both exit 1. Only a write that
-  is neither implementation's makes such a superblock;
+  and its own `error: invalid format:` sentence. `apply-offline` over such a
+  file reports the same tool line, and the port's own `error: invalid format:`
+  or `error: gvariant:` sentence. Both exit 1 and write no object. Only a
+  write that is neither implementation's makes such a superblock;
 - an operation stream that both refuse, in a part that passes its checksum: an
   unknown opcode, a stream that ends inside an operation, an operand the port
   reads as past 64 bits, an `S` range past the data-source blob, and an `r`
@@ -2229,9 +2245,30 @@ differences stand on `show`, `delete`, `list`, `indexes`, `verify`, and
   the library's `error: i/o error:` sentence. Both exit 1, and both leave the
   entries the removal did not reach;
 - an extra positional argument. The tool ignores it on `show`, `delete`,
-  `list`, and `indexes`, and `clap` refuses it with
+  `list`, `indexes`, and `reindex`, and `clap` refuses it with
   `error: unexpected argument '<value>' found` at exit 1. For `delete` the port
-  removes nothing. This is the class already recorded for `diff`;
+  removes nothing. For `reindex` the tool runs the pass the options select,
+  the full pass with no `--to` and the pass over one target with it, and the
+  port writes nothing. This is the class already recorded for `diff`;
+- the entry order of an index file that lists two or more deltas. The tool
+  writes the entries in the order of a hash table, which follows the set of
+  delta names and, for some names, the order it read them. The port writes
+  them in name order. Rebuilding a hash-table order is the engine rule 2
+  forbids, so this is a difference in the repository bytes, the class
+  `summary -m` records. The entries and each digest agree, an index file of
+  one entry is byte-identical, and the tool pulls with
+  `--require-static-deltas` from a repository the port indexed. For some sets
+  the tool's order is name order by chance, and the two files are then
+  byte-identical;
+- a directory at the index path under `reindex`, or a path component that is
+  no directory. For a directory at the index path of a target with deltas the
+  tool reports `error: renameat(<temp>, <index>): Is a directory`, and for a
+  target with no delta `error: unlink(<index>): Is a directory`. The port
+  reports `error: i/o error: Is a directory (os error 21)` in both cases. For
+  a target with no delta, a regular file at the fanout or at `delta-indexes`,
+  or a symlink at the fanout to a regular file, makes the tool report `error:
+  unlink(<index>): Not a directory`, and the port reports `error: i/o error:
+  Not a directory (os error 20)`. Both exit 1 and leave no temp file;
 - `Endianness:` for a superblock with no `ostree.endianness` key, or a byte
   other than `l` and `B`. The port prints `little` and reads the size fields as
   little-endian in all three cases. With the key absent over a delta whose
@@ -2251,6 +2288,29 @@ differences stand on `show`, `delete`, `list`, `indexes`, `verify`, and
   static-delta superblock`, or `error: not implemented` where no key is given.
   Both exit 1. Under its test switch `OSTREE_DUMMY_SIGN_ENABLED=1` the tool
   verifies a dummy-signed delta, which only that switch lets it write;
+- `apply-offline --sign-type=dummy`. The port refuses at exit 1 with the same
+  line as for `verify` and writes no object. The tool applies the delta at
+  exit 0 with no key source, and applies an unsigned delta at exit 0 under a
+  key. Over a signed delta under a key, the tool reports `error: no signature
+  for 'ostree.sign.dummy' in static-delta superblock` at exit 1;
+- `apply-offline --sign-type=spki`. The port applies the delta in a build that
+  carries the engine and checks spki signatures under a key source. The tool
+  reports `error: Requested signature type is not implemented` at exit 1;
+- the GLib warning before the unknown-sign-type error of `apply-offline`. The
+  tool writes a GLib warning block on standard error and then `error:
+  Requested signature type is not implemented`. The port writes the last line
+  alone. Both exit 1 with nothing on standard output and write no object;
+- a part file that does not open under `apply-offline`, for example a
+  superblock copied away from its parts. The tool reports `error: Opening
+  deltapart '<i>': <reason>`. The port reports the library's `error: i/o
+  error:` sentence. Both exit 1 and write no object;
+- a 32-byte `apply-offline` key that decodes to no curve point. The port
+  refuses every run that carries such a key at exit 1 with the error it gives
+  for `verify` and writes no object. The tool applies an unsigned delta at
+  exit 0. Over a signed delta, the tool applies at exit 0 where another key
+  verifies the signature, in either order of the keys. Where no key verifies
+  it, the tool names each key in the failure line at exit 1 and writes no
+  object;
 - a `verify --keys-file` line of the wrong length beside a valid line. A line
   of two or more whitespace bytes is a key of 0 bytes and counts as such a
   line. The tool loads the valid lines, prints `Verification OK` or
@@ -2300,10 +2360,13 @@ differences stand on `show`, `delete`, `list`, `indexes`, `verify`, and
   key file '<path>/trusted.ed25519' cannot be opened: Not a directory (os
   error 20)`. Both
   exit 1 with nothing on standard output;
-- a 32-byte `verify` key that decodes to no curve point. The tool reports
-  `Verification fails` and names the key in the failure line. The port refuses
-  before standard output with `error: signature: ed25519 public key: signature
-  error: Cannot decompress Edwards point`. Both exit 1;
+- a 32-byte `verify` key that decodes to no curve point. The port refuses
+  every run that carries such a key before standard output with `error:
+  signature: ed25519 public key: signature error: Cannot decompress Edwards
+  point` at exit 1. Where another key verifies the signature, in either order
+  of the keys, the tool prints `Verification OK` at exit 0. Where no key
+  verifies it, the tool reports `Verification fails` and names each key in the
+  failure line at exit 1;
 - a superblock file that does not parse, given to `verify`. The tool reads the
   8-byte magic alone: a file with no magic, an empty file, and a truncated
   unsigned superblock report `no signatures in static-delta`, a truncated
@@ -2313,6 +2376,9 @@ differences stand on `show`, `delete`, `list`, `indexes`, `verify`, and
   each after `Verification fails` with its own `error: invalid format:` or
   `error: gvariant:` sentence at exit 1. Only a publisher's own bytes reach the last
   case.
+
+The key-file entries under `verify` also hold for `apply-offline`, and each
+refusal writes no object.
 
 `static-delta generate` accepts `--inline`, `--set-endianness=l|B`, and
 `--swap-endianness`, which take the tool's rules (`../format-reference.md`,

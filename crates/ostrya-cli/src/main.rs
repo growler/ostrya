@@ -1038,20 +1038,30 @@ struct StaticDeltaArgs {
     command: Option<StaticDeltaCommand>,
 }
 
+#[derive(Args)]
+struct DeltaReindexArgs {
+    /// Only rewrite, or remove, the index of target REV, a full lowercase
+    /// commit checksum. The other index files stay as they are. Given more
+    /// than once, the last value wins.
+    #[arg(long, value_name = "REV", overrides_with = "to")]
+    to: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum StaticDeltaCommand {
     /// List the repository's static deltas.
     List,
-    /// Apply a static delta from a directory offline, producing the target
-    /// commit's objects, and print the target commit checksum.
-    ApplyOffline {
-        /// The delta directory (holding `superblock` and numbered part files).
-        dir: PathBuf,
-    },
+    /// Apply a static delta offline from a superblock file or a directory that
+    /// holds `superblock`, producing the target commit's objects. Prints
+    /// nothing and writes no ref. With a key source, the signatures of a
+    /// signed delta are checked before any object is written; an unsigned
+    /// delta is applied with no check.
+    ApplyOffline(DeltaApplyArgs),
     /// Generate a static delta and print what it is generated from and to.
     Generate(DeltaGenerateArgs),
-    /// Rebuild the `delta-indexes/` cache from the deltas present.
-    Reindex,
+    /// Rebuild the `delta-indexes/` cache from the deltas present, or with
+    /// `--to` the index of one target alone.
+    Reindex(DeltaReindexArgs),
     /// Print a delta's superblock fields and what each of its parts holds.
     Show {
         /// A delta name, `TO` or `FROM-TO` in full lowercase hex, or the path
@@ -1095,6 +1105,30 @@ struct DeltaVerifyArgs {
     /// superblock file: any argument holding a `/`. Only the superblock is
     /// read. Required; checked after the repository resolves.
     delta: Option<String>,
+    /// base64 public keys.
+    key_id: Vec<String>,
+}
+
+#[derive(Args)]
+struct DeltaApplyArgs {
+    /// The signature engine (defaults to 'ed25519'), read also with no key
+    /// source. Given more than once, the last value wins.
+    #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
+    sign_type: Option<String>,
+    /// Read public keys from a file, one base64 key per line. Given more than
+    /// once, the last value wins. With this option or a KEY-ID, --keys-dir is
+    /// not read.
+    #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
+    keys_file: Option<std::ffi::OsString>,
+    /// Read trusted.<type> and revoked.<type> from this directory. Given more
+    /// than once, the last value wins. An empty value names the working
+    /// directory.
+    #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
+    keys_dir: Option<std::ffi::OsString>,
+    /// A superblock file under any name, whose parts are read from the
+    /// directory that holds it, or a directory that holds `superblock` and the
+    /// parts. Required; checked after the repository resolves.
+    path: Option<PathBuf>,
     /// base64 public keys.
     key_id: Vec<String>,
 }
@@ -1790,8 +1824,8 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
 }
 
 /// List the repository's static deltas, apply one offline, generate one,
-/// rebuild the index cache, show one delta, delete one, list the index cache,
-/// or verify one delta's signatures.
+/// rebuild the index cache or the index of one target, show one delta, delete
+/// one, list the index cache, or verify one delta's signatures.
 async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaCommand) -> Result<()> {
     match command {
         StaticDeltaCommand::List => {
@@ -1804,13 +1838,15 @@ async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaComman
             }
             Ok(())
         }
-        StaticDeltaCommand::ApplyOffline { dir } => {
-            let to = repo.apply_static_delta_offline(&dir).await?;
-            println!("{}", to.to_hex());
-            Ok(())
-        }
+        StaticDeltaCommand::ApplyOffline(apply) => delta_apply_offline(&repo, apply).await,
         StaticDeltaCommand::Generate(generate) => delta_generate(&repo, &repo_path, generate).await,
-        StaticDeltaCommand::Reindex => repo.reindex_static_deltas().await,
+        StaticDeltaCommand::Reindex(args) => match args.to {
+            None => repo.reindex_static_deltas().await,
+            Some(rev) => {
+                let to = delta_name_half(&rev).unwrap_or_else(|text| exit_error(&text));
+                repo.reindex_static_deltas_to(&to).await
+            }
+        },
         StaticDeltaCommand::Show { delta } => delta_show(&repo_path, delta).await,
         StaticDeltaCommand::Delete { delta } => delta_delete(&repo, delta).await,
         StaticDeltaCommand::Indexes => {
@@ -2037,8 +2073,7 @@ async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
     let Some(arg) = args.delta else {
         exit_error("DELTA must be specified");
     };
-    let engine = verify_sign_type(args.sign_type.as_deref().unwrap_or("ed25519"));
-    let name = sign_type_name(engine);
+    let engine = verify_sign_type(args.sign_type.as_deref().unwrap_or("ed25519"), true);
     let keys = load_verify_keys(
         engine,
         &args.key_id,
@@ -2066,12 +2101,28 @@ async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
             return Err(err);
         }
     };
-    if outcome.valid {
-        println!("Verification OK");
-        return Ok(());
+    match delta_verify_failure(engine, &keys, &outcome) {
+        None => {
+            println!("Verification OK");
+            Ok(())
+        }
+        Some(text) => verification_fails(&text),
     }
+}
+
+/// The failure text of a static-delta signature check, `None` where the
+/// outcome is valid.
+fn delta_verify_failure(
+    engine: SignType,
+    keys: &VerifyKeys,
+    outcome: &VerifyOutcome,
+) -> Option<String> {
+    if outcome.valid {
+        return None;
+    }
+    let name = sign_type_name(engine);
     if outcome.signatures.is_empty() {
-        verification_fails(&format!(
+        return Some(format!(
             "no signature for '{}' in static-delta superblock",
             sign_metadata_key(engine)
         ));
@@ -2087,7 +2138,7 @@ async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
         .filter(|key| !revoked.contains(key) && seen.insert(*key))
         .collect();
     if effective.is_empty() {
-        verification_fails(&format!("{name}: no signatures found"));
+        return Some(format!("{name}: no signatures found"));
     }
     let listed: Vec<String> = effective
         .iter()
@@ -2097,24 +2148,112 @@ async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
             format!("key '{hex}'")
         })
         .collect();
-    verification_fails(&format!(
+    Some(format!(
         "{name}: Signature couldn't be verified with: {}",
         listed.join("; ")
     ))
 }
 
-/// Read the `static-delta verify` sign type. `ed25519`, and `spki` in a build
-/// that carries it, proceed. `dummy` refuses in its own words with nothing on
-/// standard output. Every other name, `gpg` included, prints `Sign-type not
-/// supported` and refuses, as the tool does.
-fn verify_sign_type(name: &str) -> SignType {
+/// Read the sign type of `static-delta verify` and `static-delta
+/// apply-offline`. `ed25519`, and `spki` in a build that carries it, proceed.
+/// `dummy` refuses in its own words with nothing on standard output. Every
+/// other name, `gpg` included, refuses as not implemented, as the tool does;
+/// with `report_unsupported`, `Sign-type not supported` goes to standard
+/// output first, as `verify` prints it.
+fn verify_sign_type(name: &str, report_unsupported: bool) -> SignType {
     match sign_type_from_name(name) {
         Ok(engine @ (SignType::Ed25519 | SignType::Spki)) => engine,
         Err(text) if name == "dummy" => exit_error(&text),
         Ok(SignType::Gpg) | Err(_) => {
-            println!("Sign-type not supported");
+            if report_unsupported {
+                println!("Sign-type not supported");
+            }
             exit_error("Requested signature type is not implemented")
         }
+    }
+}
+
+/// Apply a static delta offline, in the tool's check order: the path is
+/// present, the sign type is carried, the keys load where a key source is
+/// given, the path folds lexically ([`lexical_path`]) and resolves and the
+/// superblock reads, the signatures of a signed delta verify, then the delta
+/// applies. The superblock is read once, so the bytes verified are the bytes
+/// applied. Nothing is printed on success.
+async fn delta_apply_offline(repo: &Repo, args: DeltaApplyArgs) -> Result<()> {
+    let Some(path) = args.path else {
+        exit_error("PATH must be specified");
+    };
+    let engine = verify_sign_type(args.sign_type.as_deref().unwrap_or("ed25519"), false);
+    let keys = if !args.key_id.is_empty() || args.keys_file.is_some() || args.keys_dir.is_some() {
+        Some(load_verify_keys(
+            engine,
+            &args.key_id,
+            args.keys_file.as_deref().map(Path::new),
+            args.keys_dir.as_deref().map(Path::new),
+        )?)
+    } else {
+        None
+    };
+    let path = lexical_path(&path);
+    let meta = std::fs::metadata(&path)
+        .unwrap_or_else(|err| exit_error(&format!("openat(O_DIRECTORY): {}", io_reason(&err))));
+    let (superblock, parts, shown) = if meta.is_dir() {
+        (
+            path.join("superblock"),
+            path.clone(),
+            "superblock".to_owned(),
+        )
+    } else {
+        let parts = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_owned();
+        let shown = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned();
+        (path, parts, shown)
+    };
+    let sb = DeltaSuperblock::read(&superblock)
+        .await
+        .map_err(|err| delta_read_error(err, &shown))?;
+    if let Some(keys) = keys.filter(|_| sb.is_signed()) {
+        let outcome = sb.verify(&[keys.verifier.as_ref()]).await?;
+        if let Some(text) = delta_verify_failure(engine, &keys, &outcome) {
+            exit_error(&text);
+        }
+    }
+    repo.apply_static_delta(sb, &parts).await?;
+    Ok(())
+}
+
+/// `path` with its `..` components folded before the kernel resolves it, as
+/// the tool reads the `apply-offline` PATH. Empty and `.` components and a
+/// trailing `/` are dropped, and each `..` removes the component before it. A
+/// `..` at the start of a relative path stays, and a `..` at the root of an
+/// absolute path stays at the root. A path that folds to nothing is `.`.
+fn lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut kept: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match kept.last() {
+                Some(Component::Normal(_)) => {
+                    kept.pop();
+                }
+                Some(Component::RootDir) => {}
+                _ => kept.push(component),
+            },
+            _ => kept.push(component),
+        }
+    }
+    if kept.is_empty() {
+        PathBuf::from(".")
+    } else {
+        kept.iter().collect()
     }
 }
 
@@ -8616,6 +8755,36 @@ fn stdout_file() -> Result<ostrya_rt::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `apply-offline` PATH folds as the tool folds it: `.`, empty
+    /// components, and a trailing `/` go, each `..` removes the component
+    /// before it, a leading `..` stays, and `..` at the root stays at the root.
+    #[test]
+    fn an_apply_offline_path_folds_lexically() {
+        for (given, folded) in [
+            (".", "."),
+            ("./", "."),
+            ("..", ".."),
+            ("a/..", "."),
+            ("a/b/../..", "."),
+            ("lnk/../x", "x"),
+            ("lnk/../x/superblock", "x/superblock"),
+            ("d/superblock/..", "d"),
+            ("d/superblock/", "d/superblock"),
+            ("d/superblock/.", "d/superblock"),
+            ("./d/./superblock", "d/superblock"),
+            ("d//superblock", "d/superblock"),
+            ("../x", "../x"),
+            ("../../x/..", "../.."),
+            ("a/../../x", "../x"),
+            ("/", "/"),
+            ("//", "/"),
+            ("/..", "/"),
+            ("/../../a/lnk/../x", "/a/x"),
+        ] {
+            assert_eq!(lexical_path(Path::new(given)), Path::new(folded), "{given}");
+        }
+    }
 
     /// The size wording below 1000, the U+00A0 before a unit, the unit chosen
     /// on the raw count, and the ties-to-even rounding of the exact double.

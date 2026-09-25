@@ -33,6 +33,10 @@
 //! Phase 13 signing engines over the raw superblock bytes, and
 //! [`DeltaSuperblock::verify`] does the same for a superblock file read under
 //! any name.
+//! [`Repo::apply_static_delta`] applies a superblock already read, with the
+//! parts in a directory the caller names, so a caller that verifies a
+//! superblock with [`DeltaSuperblock::verify`] applies the same read and not a
+//! second read of the file.
 //!
 //! An HTTP pull reads a delta through the same superblock parse and part
 //! application, over a fetched response body rather than a part file, and applies
@@ -331,11 +335,30 @@ impl Repo {
     /// references must already be present; offline application does not fetch
     /// them. The target commit's ref is not set: the caller decides that.
     pub async fn apply_static_delta_offline(&self, dir: &Path) -> Result<Checksum> {
-        let sb_bytes = read_capped(dir.join("superblock")).await?;
-        let mut sb = DeltaSuperblock::parse(sb_bytes)?;
+        let sb = DeltaSuperblock::read(&dir.join("superblock")).await?;
+        self.apply_static_delta(sb, dir).await
+    }
+
+    /// Apply a superblock already read, with the part files in `parts_dir`, and
+    /// return the target commit checksum.
+    ///
+    /// The superblock is not read again, so a caller that checks it with
+    /// [`DeltaSuperblock::verify`] first applies the bytes it verified. The
+    /// superblock file can have any name and can be in any directory. A part
+    /// the superblock carries inline is read from the superblock, and any other
+    /// part from the file `parts_dir/<index>`. The rules of
+    /// [`Repo::apply_static_delta_offline`] apply otherwise: no signature is
+    /// checked here, fallback objects must already be present, and no ref is
+    /// set.
+    pub async fn apply_static_delta(
+        &self,
+        mut sb: DeltaSuperblock,
+        parts_dir: &Path,
+    ) -> Result<Checksum> {
         // Nothing here checks a signature, so a signed superblock's payload
-        // goes before the parts are applied.
+        // and signatures go before the parts are applied.
         drop(std::mem::take(&mut sb.superblock_bytes));
+        sb.signatures = None;
 
         // Fallback objects the delta references but does not carry must already
         // be present; offline application does not fetch them. Checked up front,
@@ -372,7 +395,7 @@ impl Repo {
                     apply_part(&txn, payload.as_slice(), &entry.objects, &staging, checks).await?;
                 }
                 None => {
-                    let blob = decode_part(dir.join(i.to_string()), entry, &staging).await?;
+                    let blob = decode_part(parts_dir.join(i.to_string()), entry, &staging).await?;
                     apply_part(&txn, blob.as_slice(), &entry.objects, &staging, checks).await?;
                 }
             }
@@ -2510,7 +2533,9 @@ async fn load_source_blob(
 /// the superblock, which is bounded metadata.
 ///
 /// The read stops one byte past the ceiling, whatever the file is: a device or a
-/// FIFO states no length, so the ceiling is applied to the bytes read.
+/// FIFO states no length, so the ceiling is applied to the bytes read. For a
+/// regular file the buffer is sized from the length of the open file, up to the
+/// ceiling, so the file is read with no growth of the buffer.
 pub(crate) async fn read_capped(path: PathBuf) -> Result<Vec<u8>> {
     read_under(path, MAX_SUPERBLOCK).await
 }
@@ -2520,7 +2545,13 @@ async fn read_under(path: PathBuf, cap: u64) -> Result<Vec<u8>> {
     ostrya_rt::unblock(move || {
         use std::io::Read;
         let file = std::fs::File::open(&path)?;
-        let mut bytes = Vec::new();
+        let meta = file.metadata()?;
+        let hint = if meta.is_file() {
+            meta.len().min(cap) + 1
+        } else {
+            0
+        };
+        let mut bytes = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
         file.take(cap + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > cap {
             return Err(std::io::Error::other(format!(

@@ -746,6 +746,131 @@ fn reindexing_removes_the_index_of_a_deleted_delta() {
 }
 
 #[test]
+fn reindexing_one_target_leaves_the_others() {
+    let tmp = TmpDir::new("gen-reindex-to");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"first\n").unwrap();
+
+    let src = base.join("src");
+    block_on(async {
+        let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let c1 = commit_tree(&repo, &tree, None).await;
+        std::fs::write(tree.join("a.txt"), b"second\n").unwrap();
+        let c2 = commit_tree(&repo, &tree, Some(c1)).await;
+
+        let opts = DeltaOptions::default();
+        let c1_scratch = src.join(repo.generate_static_delta(None, &c1, &opts).await.unwrap());
+        repo.generate_static_delta(None, &c2, &opts).await.unwrap();
+        let c1_c2 = src.join(
+            repo.generate_static_delta(Some(&c1), &c2, &opts)
+                .await
+                .unwrap(),
+        );
+        repo.reindex_static_deltas().await.unwrap();
+        let c1_index = std::fs::read(index_path(&src, &c1)).unwrap();
+        let c2_index = std::fs::read(index_path(&src, &c2)).unwrap();
+
+        std::fs::remove_dir_all(&c1_scratch).unwrap();
+        std::fs::remove_dir_all(&c1_c2).unwrap();
+
+        // A pass over c2 rewrites its file to list the one delta left, and
+        // leaves the stale file of c1 as it was.
+        repo.reindex_static_deltas_to(&c2).await.unwrap();
+        let rewritten = std::fs::read(index_path(&src, &c2)).unwrap();
+        assert_ne!(rewritten, c2_index, "the index of c2 was not rewritten");
+        assert_eq!(
+            std::fs::read(index_path(&src, &c1)).unwrap(),
+            c1_index,
+            "the index of another target changed"
+        );
+
+        // A pass over c1, which has no delta left, removes its file and keeps
+        // the fanout directory.
+        repo.reindex_static_deltas_to(&c1).await.unwrap();
+        assert_eq!(index_files(&src), vec![index_path(&src, &c2)]);
+        assert!(
+            index_path(&src, &c1).parent().unwrap().exists(),
+            "the emptied fanout directory was removed"
+        );
+
+        // The one-target pass writes what the full pass writes.
+        repo.reindex_static_deltas().await.unwrap();
+        assert_eq!(std::fs::read(index_path(&src, &c2)).unwrap(), rewritten);
+    });
+
+    // A target with no delta and no `delta-indexes/` creates nothing.
+    let empty = base.join("empty");
+    block_on(async {
+        let repo = Repo::create(&empty, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let zero = Checksum::from_bytes([0; 32]);
+        repo.reindex_static_deltas_to(&zero).await.unwrap();
+    });
+    assert!(
+        !empty.join("delta-indexes").exists(),
+        "a pass with nothing to index created delta-indexes/"
+    );
+}
+
+#[test]
+fn reindexing_one_target_refuses_a_directory_at_the_index_path() {
+    let tmp = TmpDir::new("gen-reindex-to-dir");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"one\n").unwrap();
+
+    let src = base.join("src");
+    let commit = block_on(async {
+        let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, &tree, None).await;
+        std::fs::create_dir_all(index_path(&src, &commit)).unwrap();
+        let err = repo.reindex_static_deltas_to(&commit).await.unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "unexpected error: {err:?}");
+        commit
+    });
+    assert!(
+        index_path(&src, &commit).is_dir(),
+        "the directory at the index path was removed"
+    );
+}
+
+#[test]
+fn reindexing_one_target_refuses_a_file_at_the_fanout() {
+    let tmp = TmpDir::new("gen-reindex-to-fanout-file");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"one\n").unwrap();
+
+    let src = base.join("src");
+    let fanout = block_on(async {
+        let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, &tree, None).await;
+        let fanout = index_path(&src, &commit).parent().unwrap().to_owned();
+        std::fs::create_dir_all(fanout.parent().unwrap()).unwrap();
+        std::fs::write(&fanout, b"x").unwrap();
+        let err = repo.reindex_static_deltas_to(&commit).await.unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "unexpected error: {err:?}");
+        fanout
+    });
+    assert_eq!(
+        std::fs::read(&fanout).unwrap(),
+        b"x",
+        "the file at the fanout changed"
+    );
+}
+
+#[test]
 fn reindexing_skips_a_malformed_directory_without_a_superblock() {
     let tmp = TmpDir::new("gen-reindex-malformed");
     let base = tmp.path();
@@ -1346,6 +1471,73 @@ fn superblock_verify_reads_a_superblock_under_any_name() {
         let rejected = sb.verify(&[&other]).await.unwrap();
         assert!(!rejected.valid, "an untrusted key verifies the superblock");
         assert_eq!(rejected.signatures.len(), 1);
+    });
+}
+
+/// A fresh archive repository at `base/<name>`.
+async fn fresh_archive(base: &Path, name: &str) -> Repo {
+    Repo::create(&base.join(name), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap()
+}
+
+/// `Repo::apply_static_delta` applies a superblock read under another name in
+/// another directory, with the parts read from the directory the caller names.
+#[test]
+fn apply_static_delta_takes_a_superblock_read_under_any_name() {
+    let tmp = TmpDir::new("apply-any-name");
+    let delta = verify_fixture_delta(tmp.path(), true);
+    let away = tmp.path().join("away");
+    std::fs::create_dir_all(&away).unwrap();
+    let copy = away.join("sbcopy");
+    std::fs::copy(delta.join("superblock"), &copy).unwrap();
+    block_on(async {
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        let sb = DeltaSuperblock::read(&copy).await.unwrap();
+        let to = *sb.to_commit();
+        assert_eq!(dst.apply_static_delta(sb, &delta).await.unwrap(), to);
+        dst.load_commit(&to).await.unwrap();
+    });
+}
+
+/// A superblock verified and then applied from the same read applies the
+/// bytes that were verified: the file on disk is removed between the two, and
+/// the parts still apply.
+#[test]
+fn a_verified_superblock_applies_from_the_same_read() {
+    let tmp = TmpDir::new("apply-verified-read");
+    let delta = verify_fixture_delta(tmp.path(), true);
+    block_on(async {
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        std::fs::remove_file(delta.join("superblock")).unwrap();
+        let trusted =
+            Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
+                .unwrap();
+        assert!(sb.verify(&[&trusted]).await.unwrap().valid);
+        let to = *sb.to_commit();
+        assert_eq!(dst.apply_static_delta(sb, &delta).await.unwrap(), to);
+        dst.load_commit(&to).await.unwrap();
+    });
+}
+
+/// Neither apply call writes a ref.
+#[test]
+fn apply_static_delta_writes_no_ref() {
+    let tmp = TmpDir::new("apply-no-ref");
+    let delta = verify_fixture_delta(tmp.path(), false);
+    block_on(async {
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        dst.apply_static_delta(sb, &delta).await.unwrap();
+        assert_eq!(dst.list_refs(None).await.unwrap(), []);
+        let offline = fresh_archive(tmp.path(), "offline").await;
+        offline.apply_static_delta_offline(&delta).await.unwrap();
+        assert_eq!(offline.list_refs(None).await.unwrap(), []);
     });
 }
 

@@ -322,10 +322,14 @@ insertion order is the on-disk order):
   `ostree summary -u` on a repository holding one from-scratch and one from-to
   delta. Its order relative to `ostree.summary.collection-map` is not yet
   observed, since that needs a collection repository carrying deltas. The map's
-  own entry order is the order the writer walked `deltas/`, which is the order
-  the filesystem returned: a repository holding four deltas of one target lists
-  them in neither name order nor any other stable one, so the entries of a
-  summary carrying deltas are reproducible and their order is not. The digest is
+  own entry order is a hash-table order. It follows the set of delta names and,
+  for some names, the order the writer read `deltas/`. It is not a sort, and it
+  is stable across runs over one tree. For some sets it comes out in name order
+  by chance, and the port's map then has the same order. Seven deltas into one target, made in three orders, gave three summary
+  orders, and removing two deltas swapped the relative order of two others. An
+  index file lists the same set in an order of its own. The port writes the
+  entries in name order in the summary and in each index file
+  (`conformance/cli-surface.md`, "P2", static-delta and summary). The digest is
   the SHA-256 of the delta's `superblock` file, confirmed against `sha256sum`.
   `ostree summary -u` does not write or refresh `delta-indexes/`, so a repository
   can advertise deltas in its summary while serving no index at all.
@@ -885,6 +889,13 @@ object went to a fallback (`--min-fallback-size=1`). Fallback objects are
 fetched loose from the repository and add no file here. Indexes live at
 `delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index`.
 
+The `superblock`, each part file, and each index file have mode 0644 whatever
+the umask is. This applies at the repository location and in a `--filename`
+directory, and to `reindex` with and without `--to`. The directories the
+writer creates take mode 0755 reduced by the umask. Observed by running
+`static-delta generate` and `static-delta reindex` under umask 077: each file
+had mode 0644 and each directory mode 0700.
+
 An index file is an `a{sv}` holding one entry, `ostree.static-deltas`, whose
 variant is the `a{sv}` map the summary carries under the same key: delta name
 (`TO` or `FROM-TO`, in hex) to a 32-byte `ay`, the SHA-256 of that delta's
@@ -901,6 +912,21 @@ directories is deleted, the pass removes that target's `.index` file and
 removal empties stays in place. `static-delta delete` does not refresh the
 cache, so the target of a removed delta stays listed until the next
 `reindex`.
+
+The entries of an index file that lists two or more deltas are in a hash-table
+order, the same class of order as the summary map, and the two orders can
+differ for one set. The port writes the entries in name order. For some sets
+the tool's order is name order by chance, and the two files are then
+byte-identical. An index file of one entry is byte-identical between the two
+writers, and the tool pulls
+with `--require-static-deltas` from a repository whose index files and summary
+the port wrote.
+
+`reindex --to=REV` rewrites the index file of REV alone, from the deltas into
+REV that hold a `superblock`. With no such delta it removes the index file of
+REV, and the fanout directory the removal empties stays. The index files of
+other targets stay as they are, stale ones included. The file it writes is
+byte-identical to the file of REV that the full pass writes.
 
 ### HTTP pull surface
 
@@ -3054,7 +3080,9 @@ caller's responsibility. The port sets no group ownership.
 0644 relies on the directory to hold the boundary.
 
 The directories and the files under `deltas/` and `delta-indexes/` are outside
-this rule. They keep the umask-reduced modes they take in every other mode.
+this rule, and take the modes they take in every other mode. The directories
+keep the umask-reduced mode, and the files take 0644 whatever the umask is
+("Object store layout").
 
 Mode string. `[core] mode=bare-user-shared`. The distinct string is a safety
 fence: under a literal `bare-user` string the upstream tool would accept the
@@ -5760,8 +5788,15 @@ superblock and writes nothing. The repository resolves before the argument is
 read, so `Command requires a --repo argument` stands ahead of a missing
 `DELTA`. `static-delta generate [TO]` writes one delta, and the same rule puts
 `Command requires a --repo argument` ahead of a missing `TO`.
+`static-delta apply-offline PATH [KEY-ID...]` applies one delta into the
+repository and prints nothing. `static-delta reindex [--to=REV]` rewrites the
+`delta-indexes/` cache, or the index file of one target, and prints nothing.
 
 #### The arguments
+
+The rules in this section hold for `show`, `delete`, and `verify`.
+`apply-offline` takes a path alone, and its own section states how it reads
+the path.
 
 An argument that holds a `/` is the path of a superblock file, relative to the
 working directory or absolute. Any other argument is a delta name, also where a
@@ -6067,6 +6102,65 @@ port skips a line that is then empty and reads the file up to 1 MiB. A line of
 whitespace is a key of 0 bytes and refuses the run. A file with no key line
 reports `error: signature: <type>: no valid keys in file '<path>'`.
 
+#### `apply-offline`
+
+`apply-offline PATH [KEY-ID...]` applies one delta into the repository. PATH
+is a path in all forms, and a delta name is read as a path:
+
+- A directory, symlinks followed, holds `superblock` and the part files `0`,
+  `1`, and so on.
+- Any other file is a superblock under any name. The part files are read from
+  the directory that holds it, and from the working directory for a bare name.
+
+PATH is folded as text before it is opened. Empty components, `.`
+components, and a trailing `/` are removed. Each `..` removes the component
+before it, also where that component is a symlink or a file. A `..` at the
+start of a relative path stays, and a `..` directly after the root of an
+absolute path is removed. A PATH that folds to nothing names the working
+directory. Thus `<link>/../<dir>` names `<dir>` in the directory that holds
+the link, `<dir>/superblock/..` and `<dir>/superblock/.` name `<dir>`,
+`<dir>/superblock/` names the superblock file, and `/..` names `/`. The
+directory of the part files is taken from the folded PATH.
+
+A part the superblock carries inline is read from the superblock in both
+forms. The options are `--sign-type=NAME`, `--keys-file=PATH`, and
+`--keys-dir=PATH`, as for `verify`. Each keeps its last value when given more
+than once.
+
+On success, both streams are empty and the exit status is 0. The objects of
+the target commit are in the repository, and no ref is written. The checks run
+in this order, and each refusal writes no object and no ref:
+
+1. No PATH reports `error: PATH must be specified`. The repository resolves
+   before this check.
+2. The sign type, also with no key source. `ed25519` is the default, and
+   `ed25519` with no key source checks nothing. The port also takes `spki` in
+   a build that carries the engine. `gpg`, the empty name, and every name no
+   engine carries report `error: Requested signature type is not implemented`
+   with nothing on standard output. The tool writes a GLib warning block on
+   standard error before that line. The port refuses `dummy` with `error:
+   dummy signature type is only for ostree testing`.
+3. The keys load where a key source is given. A key source is a positional
+   KEY-ID, a `--keys-file`, or a `--keys-dir`. The keys load under the rules
+   of `verify`, and each refusal of `verify` step 3 refuses here with the same
+   text, also for an unsigned delta. With no key source, no key file and no
+   system key directory is read.
+4. The path resolves. A path that is absent reports `error:
+   openat(O_DIRECTORY): <reason>`. A directory with no `superblock` reports
+   `error: openat(superblock): <reason>`.
+5. The superblock reads and parses. A superblock file that does not open
+   reports `error: openat(<name>): <reason>`, where `<name>` is the last
+   component of the folded PATH.
+6. With a key source, the signatures of a signed superblock are checked
+   before any object is written. The failure lines are those of `verify` step
+   5 with no `Verification fails` line: `error: no signature for
+   'ostree.sign.<type>' in static-delta superblock`, `error: <type>:
+   Signature couldn't be verified with: key '<hex>'`, and `error: <type>: no
+   signatures found`. An unsigned superblock applies with no check, so under
+   a key source `apply-offline` authenticates a signed delta only.
+7. The delta applies. The superblock is read once, so the bytes that verify
+   are the bytes that apply. A part file that does not open refuses.
+
 #### `generate`
 
 `generate` writes the delta from FROM to TO. The options both implementations
@@ -6190,17 +6284,81 @@ at the repository's own location the earlier superblock is gone too, since the
 port unlinks it before the first part. Each `--sign` value signs. The key is
 decoded with the lenient base64 reader `commit --sign` uses.
 
+#### `reindex`
+
+`reindex` with no option runs the full pass that "Object store layout"
+states: one index file per target of the deltas under `deltas/`, and the
+index file of a target with no delta left removed. `reindex --to=REV` rewrites
+the index file of REV alone by the same scan rule. A delta directory that holds
+no `superblock` does not count. With no delta into REV, the index file of REV
+is removed, and the fanout directory the removal empties stays. The index files
+of other targets stay as they are, stale ones included, also one whose deltas
+are all gone. A target with no delta and no index file changes nothing. A
+repository with no `deltas/` gets no `delta-indexes/`. The file `--to` writes
+has mode 0644 whatever the umask is, and is byte-identical to the file of REV
+the full pass writes.
+
+On success, both streams are empty and the exit status is 0. The repository
+resolves first: an absent `--repo` path reports the error of the repository
+open, and no repository reports the usage text and `Command requires a --repo
+argument`. REV is read by the rule of one half of a delta name in "The
+arguments", on standard error alone at exit 1:
+
+- `--to=main` reports `error: Invalid rev main`, and `--to=^main` reports
+  `error: Invalid rev ^main`. A ref name is not resolved.
+- A value of 10 or 63 hex characters reports `error: Invalid rev <value>`. An
+  empty value reports `error: Invalid rev ` with nothing after the space. A
+  value of 65 characters and the delta name `C1-C2` report the first 64 bytes,
+  `error: Invalid rev <C1>`.
+- A value of 64 bytes with a byte outside `[0-9a-f]` reports `error: Invalid
+  character '<n>' in rev '<value>'`: `65` for 64 `A` characters, `103` for 63
+  hex characters and `g`.
+
+REV is not checked for a commit object, so the 64 zeros of a target the
+repository does not hold exit 0 and change nothing. Given more than once, the
+last `--to` wins: `--to=C2 --to=C3` touches the index file of C3 alone,
+`--to=bad --to=C2` exits 0, and `--to=C2 --to=bad` refuses with `error:
+Invalid rev bad`. A `--to` with no value refuses at exit 1: the tool reports
+`error: Missing argument for --to`, and the port reports the `clap` text `a
+value is required for '--to <REV>'`.
+
+The tool takes a positional argument after `reindex`, ignores it, and runs the
+pass the options select. The port refuses it at exit 1 with `error: unexpected
+argument '<value>' found` and writes nothing.
+
+A directory at the index path refuses at exit 1 and leaves no temp file. The
+tool reports one of two lines:
+
+- For a target with deltas, `error:
+  renameat(delta-indexes/<fanout>/tmp.<suffix>, delta-indexes/<fanout>/<rest>.index):
+  Is a directory`.
+- For a target with no delta, `error:
+  unlink(delta-indexes/<fanout>/<rest>.index): Is a directory`.
+
+The port reports `error: i/o error: Is a directory (os error 21)` in both
+cases, and in the full pass.
+
+For a target with no delta, a path to the index file through a component that
+is no directory also refuses at exit 1. This applies to a regular file at the
+fanout, a symlink at the fanout to a regular file, and a regular file at
+`delta-indexes`. The tool reports `error:
+unlink(delta-indexes/<fanout>/<rest>.index): Not a directory`, and the port
+reports `error: i/o error: Not a directory (os error 20)`. A dangling symlink
+at the fanout is an absent file, and both exit 0.
+
 #### Exit status
 
 - 0 -- the report or the listing was written, the delta was removed,
-  `verify` printed `Verification OK`, `generate` wrote the delta, or `-n`
-  found it.
+  `verify` printed `Verification OK`, `generate` wrote the delta, `-n`
+  found it, `apply-offline` applied the delta, or `reindex` rewrote or
+  removed the index files, `--to` included.
 - 1 -- no `DELTA` (`error: DELTA must be specified`, with no usage text), a
   name the parser refuses, an absent or unreadable superblock or part, a
   superblock that does not parse, a `delta-indexes/` that does not read, an
   absent delta for `delete`, a removal that fails, every `verify` outcome
-  other than `Verification OK`, and every `generate` refusal and failure the
-  section above states.
+  other than `Verification OK`, every `generate` refusal and failure the
+  section above states, every `apply-offline` refusal its section states, and
+  every `reindex` refusal its section states.
 
 A superblock that does not parse prints no line in the port. The tool prints
 the lines it read before the failure. Only a write that is neither

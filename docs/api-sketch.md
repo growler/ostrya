@@ -2013,12 +2013,22 @@ impl Repo {
     /// superblock carries inline is read from there, also where a part file of
     /// the same number is present.
     pub async fn apply_static_delta_offline(&self, dir: &Path) -> Result<Checksum>;
+    /// Apply a superblock already read, with the part files in `parts_dir`.
+    /// The superblock is not read again, so a caller that checks it with
+    /// `DeltaSuperblock::verify` first applies the bytes it verified.
+    pub async fn apply_static_delta(&self, superblock: DeltaSuperblock,
+        parts_dir: &Path) -> Result<Checksum>;
     pub async fn sign_static_delta(&self, dir: &Path, signer: &dyn Signer) -> Result<()>;
     pub async fn verify_static_delta(&self, dir: &Path, verifiers: &[&dyn Verifier])
         -> Result<VerifyOutcome>;
     /// Rebuild the `delta-indexes/` cache that advertises the stored deltas to
-    /// a fetcher.
+    /// a fetcher. Entries are in delta-name order; the tool's are in
+    /// hash-table order.
     pub async fn reindex_static_deltas(&self) -> Result<()>;
+    /// Rewrite the index file of target `to` alone from the deltas into it,
+    /// or remove the file where none is left. The index files of other
+    /// targets stay, and `to` is not checked for a commit object.
+    pub async fn reindex_static_deltas_to(&self, to: &Checksum) -> Result<()>;
     /// The stored deltas, sorted, each named as the tool names it: the target
     /// commit hex, or `<from-hex>-<to-hex>`. An entry counts only where its
     /// fanout and its delta path are directories, not symlinks, and its

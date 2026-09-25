@@ -241,7 +241,7 @@
 //! fewer bytes than it declared spends that window once, and the reads after it
 //! close their connections without waiting.
 //!
-//! Two deadlines bound one attempt against one destination:
+//! Three deadlines bound one attempt against one destination:
 //!
 //! - [`connect_timeout`](FetcherOptions::connect_timeout) covers opening a
 //!   connection -- the TCP connect, the TLS handshake, and the HTTP handshake
@@ -259,9 +259,19 @@
 //!   is not on the clock at all. A body that stalls fails the read with
 //!   [`io::ErrorKind::TimedOut`](std::io::ErrorKind::TimedOut), and keeps failing
 //!   it.
+//! - [`low_speed`](FetcherOptions::low_speed), where one is set, covers the rate
+//!   of the transfer. The rate is sampled once a second, as the bytes of the
+//!   last five seconds over those five seconds, and a transfer fails when the
+//!   rate stays at or below the limit for the rule's time without a break. A
+//!   head carries no bytes the rate could count, so the response head has to
+//!   arrive within the rule's time, in whole seconds, of the start of the
+//!   attempt, every hop included. The rate of a body is measured from its
+//!   first read. A body below the rate fails the read with
+//!   [`io::ErrorKind::TimedOut`](std::io::ErrorKind::TimedOut), and keeps
+//!   failing it.
 //!
-//! Both expire as transport failures, so they are retryable and the next
-//! destination is tried.
+//! All three expire as transport failures, so they are retryable and the next
+//! destination is tried. The first to expire is the one reported.
 //!
 //! [`fetch_timeout`](FetcherOptions::fetch_timeout) bounds the fetch as a whole:
 //! every round, every retry, and the delays between them, from admission to the
@@ -280,10 +290,21 @@
 //!
 //! Range requests are not used: an interrupted body is refetched from the
 //! start.
+//!
+//! A fetch's retries end at the response head, so [`Fetcher::fetch`] hands a
+//! body that fails in transit to its caller as a failed read. The pull inside
+//! this crate reads its bodies through a refetch instead: a body that fails in
+//! transit -- a transport failure, the progress window, or the low-speed rule --
+//! is fetched again from its first byte, starting again from the first
+//! destination, and each refetch spends one repeat of the same
+//! [`max_retries`](FetcherOptions::max_retries) count the rounds of the fetches
+//! spend. A body that outgrows its cap, or that its consumer refuses, is not
+//! fetched again.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -463,6 +484,39 @@ impl Validators {
     }
 }
 
+/// The slowest transfer a fetch accepts.
+///
+/// The rate of a transfer is sampled once a second. Each sample is the bytes
+/// the transfer carried over the last five seconds divided by five, or, in the
+/// first five seconds, the bytes so far divided by the whole seconds so far. A
+/// transfer fails, as a transport failure, when the rate stays at or below
+/// `limit` for `time` without a break. The transfer starts below the limit, as
+/// it has carried nothing, and a sample above the limit starts the count of
+/// `time` again. The count starts where the attempt starts for the response
+/// head, and at the first read for the body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LowSpeed {
+    /// The rate in bytes per second a transfer must keep. Not zero.
+    pub limit: u32,
+    /// How long the rate may stay below `limit`. Not zero. The rate is sampled
+    /// once a second, so a part of a second counts as a whole second.
+    pub time: Duration,
+}
+
+impl LowSpeed {
+    /// `time` rounded up to whole seconds, which saturates rather than wraps.
+    fn whole_seconds(&self) -> Duration {
+        let partial = u64::from(self.time.subsec_nanos() > 0);
+        Duration::from_secs(self.time.as_secs().saturating_add(partial))
+    }
+}
+
+/// How often the low-speed rule samples the rate of a body.
+const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
+
+/// How many samples back the low-speed rule measures the rate over.
+const RATE_SPAN: usize = 5;
+
 /// Which proxy a [`Fetcher`] reaches an origin through.
 ///
 /// The module documentation states the variables the two environment forms
@@ -571,6 +625,18 @@ pub struct FetcherOptions {
     /// silence since a read wanted bytes, so it caps silence and leaves transfer
     /// time unbounded.
     pub progress_timeout: Duration,
+    /// The slowest transfer an attempt accepts. [`LowSpeed`] states the rule.
+    /// The response head has to arrive within `time`, rounded up to whole
+    /// seconds, of the start of the attempt, redirects included. The rate of
+    /// the body is measured from its first read, so a body that waits for its
+    /// consumer is not measured before the consumer asks for bytes. The body
+    /// is sampled only while a read is outstanding: a gap between reads longer
+    /// than a second counts as one second, and the bytes that arrived in it
+    /// count at the next read. A transfer below the rate fails as a transport
+    /// failure: a head as a retryable failure of the attempt, and a body with
+    /// [`io::ErrorKind::TimedOut`](std::io::ErrorKind::TimedOut). `None` checks
+    /// no rate.
+    pub low_speed: Option<LowSpeed>,
     /// How long one fetch may spend reaching a response: every round, every
     /// retry, and the delays between them, from the moment the fetch is
     /// admitted until the response head arrives. The body that follows is
@@ -596,6 +662,7 @@ impl Default for FetcherOptions {
             max_outstanding: 8,
             connect_timeout: Duration::from_secs(30),
             progress_timeout: Duration::from_secs(60),
+            low_speed: None,
             fetch_timeout: Some(Duration::from_secs(300)),
         }
     }
@@ -1020,6 +1087,7 @@ struct Inner {
     max_redirects: u32,
     connect_timeout: Duration,
     progress_timeout: Duration,
+    low_speed: Option<LowSpeed>,
     fetch_timeout: Option<Duration>,
     gate: Arc<Gate>,
     h2_connection_window: u32,
@@ -1083,8 +1151,9 @@ impl Fetcher {
     /// layer sets is configured; when credentials are configured alongside a
     /// cleartext mirror; when credentials are configured alongside an
     /// `Authorization` header; when a proxy URL, from the options or from the
-    /// environment, is not `http://host[:port]`; or when the TLS material does
-    /// not parse.
+    /// environment, is not `http://host[:port]`; when a
+    /// [`low_speed`](FetcherOptions::low_speed) rule holds a zero; or when the
+    /// TLS material does not parse.
     ///
     /// This is async because [`TrustRoots::System`],
     /// the default, reads the host trust store, which goes to the blocking
@@ -1099,6 +1168,16 @@ impl Fetcher {
     /// all, so the constructor never yields and an empty host store is fatal
     /// for no mirror scheme.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher> {
+        // A limit of zero, or a time of zero, measures nothing: no rate is
+        // below the first, and every transfer fails the second at once.
+        if let Some(low) = options.low_speed
+            && (low.limit == 0 || low.time.is_zero())
+        {
+            return Err(Error::Fetch(format!(
+                "low-speed limit {} bytes per second over {:?}: neither may be zero",
+                low.limit, low.time
+            )));
+        }
         let mirrors = options
             .mirrors
             .iter()
@@ -1189,6 +1268,7 @@ impl Fetcher {
                 max_redirects: options.max_redirects,
                 connect_timeout: options.connect_timeout,
                 progress_timeout: options.progress_timeout,
+                low_speed: options.low_speed,
                 fetch_timeout: options.fetch_timeout,
                 gate: Arc::new(Gate::new(max_outstanding)),
                 h2_connection_window: h2_connection_window(max_outstanding),
@@ -1199,6 +1279,31 @@ impl Fetcher {
 
     /// Fetch `request`, trying every destination and retrying as configured.
     pub async fn fetch(&self, request: FetchRequest<'_>) -> Result<Fetched> {
+        let (fetched, _) = self
+            .fetch_budgeted(&request, self.inner.max_retries)
+            .await?;
+        Ok(fetched)
+    }
+
+    /// A fetch the body of which is fetched again from the start when it fails
+    /// in transit. [`Refetch`] states the budget it spends.
+    pub(crate) fn refetching<'r>(&self, request: FetchRequest<'r>) -> Refetch<'_, 'r> {
+        Refetch {
+            fetcher: self,
+            request,
+            left: self.inner.max_retries,
+            round: 0,
+            interrupted: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Fetch `request`, repeating a round at most `max_retries` times, and
+    /// report how many rounds were repeated before the response arrived.
+    async fn fetch_budgeted(
+        &self,
+        request: &FetchRequest<'_>,
+        max_retries: u32,
+    ) -> Result<(Fetched, u32)> {
         // What the request names, the headers it sends, the credentials they
         // carry, and the anchors a TLS destination verifies against are the
         // same whichever destination serves the request, so all of them are
@@ -1212,7 +1317,7 @@ impl Fetcher {
         }
         self.check_trust_anchors(&route)?;
         let permit = self.inner.gate.acquire(request.priority).await;
-        let rounds = self.rounds(&request, &route, &headers, permit);
+        let rounds = self.rounds(request, &route, &headers, permit, max_retries);
         let Some(limit) = self.inner.fetch_timeout else {
             return rounds.await;
         };
@@ -1317,15 +1422,18 @@ impl Fetcher {
     }
 
     /// Try every destination in turn, repeating the round while a destination
-    /// failed in a way another attempt may not. The permit moves into the body
-    /// a successful round produces, and is dropped with this future otherwise.
+    /// failed in a way another attempt may not, at most `max_retries` times.
+    /// The permit moves into the body a successful round produces, and is
+    /// dropped with this future otherwise. A success reports how many rounds
+    /// it repeated.
     async fn rounds(
         &self,
         request: &FetchRequest<'_>,
         route: &Route<'_>,
         headers: &[(HeaderName, HeaderValue)],
         permit: Permit,
-    ) -> Result<Fetched> {
+        max_retries: u32,
+    ) -> Result<(Fetched, u32)> {
         let destination_count = match route {
             Route::Mirrors(_) => self.inner.mirrors.len(),
             Route::One(_) => 1,
@@ -1361,9 +1469,9 @@ impl Fetcher {
                 let failure = match self.attempt(&destination, request, headers).await {
                     Ok(Attempted::Body(mut body)) => {
                         body.permit = Some(permit);
-                        return Ok(Fetched::Body(body));
+                        return Ok((Fetched::Body(body), round));
                     }
-                    Ok(Attempted::NotModified) => return Ok(Fetched::NotModified),
+                    Ok(Attempted::NotModified) => return Ok((Fetched::NotModified, round)),
                     Err(failure) => failure,
                 };
                 match failure {
@@ -1384,7 +1492,7 @@ impl Fetcher {
             }
             // At least one destination failed in a way a later attempt may not;
             // otherwise every destination has answered definitively.
-            if !retryable || round >= self.inner.max_retries {
+            if !retryable || round >= max_retries {
                 return Err(reported.expect("a failed round holds a failure"));
             }
             round += 1;
@@ -1421,6 +1529,14 @@ impl Fetcher {
         // waiting again. An attempt that follows no redirect drains once and
         // has the whole window for it.
         let drain_until = Instant::now() + progress_timeout;
+        // The response head has the rule's time, in whole seconds, from the
+        // start of the attempt, whatever the number of hops: a head carries no
+        // bytes the rate could count, so the rate stays below the limit from
+        // the start until the head arrives.
+        let head_until = self
+            .inner
+            .low_speed
+            .and_then(|low| Some((Instant::now().checked_add(low.whole_seconds())?, low)));
         loop {
             // The proxy decision is this hop's own, and a cleartext hop behind
             // a proxy is pooled under the proxy endpoint rather than under the
@@ -1436,7 +1552,18 @@ impl Fetcher {
                 proxied: matches!(via, Via::Absolute(_)),
             };
             let url = hop.url();
-            let (response, protocol, reuse) = self.send(&hop, &key, via, request, &headers).await?;
+            let (response, protocol, reuse) = match head_until {
+                None => self.send(&hop, &key, via, request, &headers).await?,
+                Some((until, low)) => {
+                    // The send is boxed under the window, so the attempt holds
+                    // one copy of its state inline and not two.
+                    let sent = Box::pin(self.send(&hop, &key, via, request, &headers));
+                    match within(until.saturating_duration_since(Instant::now()), sent).await {
+                        Some(result) => result?,
+                        None => return Err(Failure::Retry(too_slow(url, low))),
+                    }
+                }
+            };
             let status = response.status();
             if status == StatusCode::NOT_MODIFIED {
                 // A 304 carries no body, so the connection is immediately
@@ -1551,6 +1678,8 @@ impl Fetcher {
                 failed: None,
                 deadline: rt::Deadline::new(progress_timeout),
                 waiting: false,
+                low_speed: self.inner.low_speed.map(Monitor::new),
+                interrupted: None,
             }));
         }
     }
@@ -1579,8 +1708,8 @@ impl Fetcher {
                 // holds -- the TLS handshake and hyper's own -- and it is the
                 // rarest, taken only when the pool has nothing for this origin.
                 // Boxing it keeps that state off the fetch future, which every
-                // caller nests inside its own: a fetch measures 4912 bytes
-                // this way and 36048 without, and a pull that wraps several
+                // caller nests inside its own: a fetch measures 5048 bytes
+                // this way and 36184 without, and a pull that wraps several
                 // helpers around one multiplies what it saves.
                 let opened = within(connect_timeout, Box::pin(self.connect(key, via))).await;
                 match opened {
@@ -2058,6 +2187,63 @@ impl Inner {
     }
 }
 
+/// A fetch whose body is fetched again from the start when it fails in
+/// transit.
+///
+/// A body fails in transit when the connection reports an error, when the peer
+/// stays silent past the progress window, or when a window closes below the
+/// low-speed rate. Each refetch spends one repeat from the same count
+/// [`max_retries`](FetcherOptions::max_retries) states for the rounds of the
+/// fetch, so the rounds of every fetch and the refetches between them share
+/// one budget. A refetch asks for the whole body again and starts again from
+/// the first destination: Range requests are not used. A body that fails any
+/// other way -- the size cap, or a failure of the consumer's own, such as a
+/// checksum mismatch -- is not fetched again, since another fetch fails the
+/// same way.
+pub(crate) struct Refetch<'f, 'r> {
+    fetcher: &'f Fetcher,
+    request: FetchRequest<'r>,
+    /// The repeats left in the budget.
+    left: u32,
+    /// The repeats spent, which the next delay doubles from.
+    round: u32,
+    /// Set by the body of the latest fetch when it fails in transit.
+    interrupted: Arc<AtomicBool>,
+}
+
+impl Refetch<'_, '_> {
+    /// Fetch the request, with what is left of the budget for its rounds.
+    pub(crate) async fn fetch(&mut self) -> Result<Fetched> {
+        self.interrupted.store(false, Ordering::Relaxed);
+        let (mut fetched, used) = self
+            .fetcher
+            .fetch_budgeted(&self.request, self.left)
+            .await?;
+        self.left -= used;
+        self.round += used;
+        if let Fetched::Body(body) = &mut fetched {
+            body.interrupted = Some(self.interrupted.clone());
+        }
+        Ok(fetched)
+    }
+
+    /// Decide what `error`, which ended the consumer of the latest body, calls
+    /// for. A body that failed in transit, with a repeat left, spends that
+    /// repeat and waits the delay before the next [`fetch`](Refetch::fetch);
+    /// anything else is returned as it is. The consumer drops the body before
+    /// this is called, so the delay holds no connection and no admission
+    /// permit.
+    pub(crate) async fn retry(&mut self, error: Error) -> Result<()> {
+        if !self.interrupted.load(Ordering::Relaxed) || self.left == 0 {
+            return Err(error);
+        }
+        self.left -= 1;
+        self.round += 1;
+        rt::Timer::after(backoff(self.round)).await;
+        Ok(())
+    }
+}
+
 /// What one attempt produced.
 #[allow(clippy::large_enum_variant)]
 enum Attempted {
@@ -2118,6 +2304,80 @@ pub struct Body {
     /// outstanding, and a body no read has yet found empty is not on the clock at
     /// all.
     waiting: bool,
+    /// The low-speed rule the body is held to, where the fetcher has one.
+    low_speed: Option<Monitor>,
+    /// Where a failure in transit is reported to a [`Refetch`], which fetches
+    /// the body again. The size cap is no such failure: another fetch of the
+    /// same body outgrows the cap the same way.
+    interrupted: Option<Arc<AtomicBool>>,
+}
+
+/// The low-speed rule of one body: the bytes it has delivered, the last
+/// samples of that count, and how long the rate has stayed below the limit.
+struct Monitor {
+    rule: LowSpeed,
+    /// The bytes the body has delivered since its first read.
+    counted: u64,
+    /// `counted` at the last [`RATE_SPAN`] samples. The slot the next sample
+    /// goes to holds the oldest, and a slot no sample has filled holds the
+    /// count at the first read, which is zero.
+    samples: [u64; RATE_SPAN],
+    /// The samples taken since the first read.
+    taken: u64,
+    /// The whole seconds the rate has stayed at or below the limit, or `None`
+    /// while it is above it. A body starts below the limit, at zero.
+    below: Option<u64>,
+    /// The time to the next sample.
+    deadline: rt::Deadline,
+    /// Whether the measurement has started, which it does at the first read.
+    started: bool,
+}
+
+impl Monitor {
+    /// The monitor for `rule`, with the measurement not started yet.
+    fn new(rule: LowSpeed) -> Monitor {
+        Monitor {
+            rule,
+            counted: 0,
+            samples: [0; RATE_SPAN],
+            taken: 0,
+            below: Some(0),
+            deadline: rt::Deadline::new(SAMPLE_PERIOD),
+            started: false,
+        }
+    }
+
+    /// Whether the rate has stayed below the limit for the rule's time. Each
+    /// poll takes at most one sample, and the poll that finds the next sample
+    /// not yet due leaves the timer to wake the task when it is.
+    fn below_rate(&mut self, cx: &mut Context<'_>) -> bool {
+        while self.deadline.poll_expired(cx).is_ready() {
+            if self.sample() {
+                return true;
+            }
+            self.deadline.restart();
+        }
+        false
+    }
+
+    /// Take one sample, and report whether the rate has now stayed below the
+    /// limit for the rule's time.
+    fn sample(&mut self) -> bool {
+        self.taken += 1;
+        let slot = (self.taken % RATE_SPAN as u64) as usize;
+        let span = self.taken.min(RATE_SPAN as u64);
+        let carried = self.counted - self.samples[slot];
+        self.samples[slot] = self.counted;
+        // A sample of exactly the limit counts as below it, as it does in the
+        // tool, whose samples span a little more than their whole seconds.
+        if carried > u64::from(self.rule.limit) * span {
+            self.below = None;
+            return false;
+        }
+        let below = self.below.map_or(0, |seconds| seconds + 1);
+        self.below = Some(below);
+        Duration::from_secs(below) >= self.rule.time
+    }
 }
 
 impl std::fmt::Debug for Body {
@@ -2164,6 +2424,30 @@ impl Body {
         self.failed = Some(failed);
         error
     }
+
+    /// Latch a failure in transit, which a [`Refetch`] may repeat the fetch
+    /// for, and return it.
+    fn interrupt(&mut self, kind: std::io::ErrorKind, message: String) -> std::io::Error {
+        if let Some(interrupted) = &self.interrupted {
+            interrupted.store(true, Ordering::Relaxed);
+        }
+        self.fail(kind, message)
+    }
+
+    /// The failure the low-speed rule ends the body with once the rate has
+    /// stayed at or below the limit for the rule's time, or `None` while the
+    /// rate holds or no rule applies.
+    fn poll_low_speed(&mut self, cx: &mut Context<'_>) -> Option<std::io::Error> {
+        let monitor = self.low_speed.as_mut()?;
+        if !monitor.below_rate(cx) {
+            return None;
+        }
+        let LowSpeed { limit, time } = monitor.rule;
+        Some(self.interrupt(
+            std::io::ErrorKind::TimedOut,
+            format!("fetched body averaged below {limit} bytes per second for {time:?}"),
+        ))
+    }
 }
 
 impl AsyncRead for Body {
@@ -2179,6 +2463,14 @@ impl AsyncRead for Body {
         if let Some(failed) = &me.failed {
             return Poll::Ready(Err(failed.error()));
         }
+        // The low-speed measurement starts at the first read, so the time a
+        // body waits for its consumer before that is not measured.
+        if let Some(monitor) = &mut me.low_speed
+            && !monitor.started
+        {
+            monitor.deadline.restart();
+            monitor.started = true;
+        }
         loop {
             if !me.chunk.is_empty() {
                 let n = me.chunk.len().min(buf.len());
@@ -2193,7 +2485,11 @@ impl AsyncRead for Body {
                 Poll::Ready(frame) => frame,
                 Poll::Pending => {
                     // Nothing has arrived since the last frame, so the read
-                    // fails once the progress window is gone.
+                    // fails once the progress window is gone, or once the rate
+                    // has stayed below the low-speed limit for the rule's time.
+                    if let Some(error) = me.poll_low_speed(cx) {
+                        return Poll::Ready(Err(error));
+                    }
                     if !me.waiting {
                         me.deadline.restart();
                         me.waiting = true;
@@ -2201,7 +2497,7 @@ impl AsyncRead for Body {
                     return match me.deadline.poll_expired(cx) {
                         Poll::Ready(()) => {
                             let window = me.deadline.window();
-                            Poll::Ready(Err(me.fail(
+                            Poll::Ready(Err(me.interrupt(
                                 std::io::ErrorKind::TimedOut,
                                 format!("fetched body delivered nothing for {window:?}"),
                             )))
@@ -2226,7 +2522,13 @@ impl AsyncRead for Body {
                                 format!("fetched body exceeds the {limit}-byte cap"),
                             )));
                         }
+                        if let Some(monitor) = &mut me.low_speed {
+                            monitor.counted += data.len() as u64;
+                        }
                         me.chunk = data;
+                        if let Some(error) = me.poll_low_speed(cx) {
+                            return Poll::Ready(Err(error));
+                        }
                     }
                 }
                 Some(Err(e)) => {
@@ -2239,7 +2541,7 @@ impl AsyncRead for Body {
                         Some(cause) => format!("{e}: {cause}"),
                         None => e.to_string(),
                     };
-                    return Poll::Ready(Err(me.fail(std::io::ErrorKind::Other, message)));
+                    return Poll::Ready(Err(me.interrupt(std::io::ErrorKind::Other, message)));
                 }
                 None => {
                     me.done = true;
@@ -3013,6 +3315,14 @@ fn stalled(url: &str, limit: Duration) -> Error {
     Error::Fetch(format!("{url}: no response after {limit:?}"))
 }
 
+/// A response that did not deliver its head within the low-speed rule's time.
+fn too_slow(url: &str, rule: LowSpeed) -> Error {
+    let LowSpeed { limit, time } = rule;
+    Error::Fetch(format!(
+        "{url}: transfer below {limit} bytes per second for {time:?}"
+    ))
+}
+
 /// Run `future` under a deadline, resolving to `None` when `limit` expires
 /// first. The future is dropped on expiry, which cancels the work it holds.
 async fn within<F: Future>(limit: Duration, future: F) -> Option<F::Output> {
@@ -3154,6 +3464,88 @@ mod tests {
             });
             let err = Fetcher::new(options).await.unwrap_err();
             assert!(err.to_string().contains("pass one of them"), "{err}");
+
+            // A low-speed rule with a zero measures nothing, and is refused
+            // rather than read as no rule.
+            for low_speed in [
+                LowSpeed {
+                    limit: 0,
+                    time: Duration::from_secs(30),
+                },
+                LowSpeed {
+                    limit: 1000,
+                    time: Duration::ZERO,
+                },
+            ] {
+                let mut options = direct_options("http://example.com");
+                options.low_speed = Some(low_speed);
+                let err = Fetcher::new(options).await.unwrap_err();
+                assert!(err.to_string().contains("neither may be zero"), "{err}");
+            }
+        });
+    }
+
+    /// A low-speed time is rounded up to whole seconds, and saturates rather
+    /// than wraps.
+    #[test]
+    fn a_low_speed_time_rounds_up_to_whole_seconds() {
+        let rule = |time| LowSpeed { limit: 1000, time };
+        let secs = Duration::from_secs;
+        assert_eq!(rule(secs(30)).whole_seconds(), secs(30));
+        assert_eq!(rule(Duration::from_millis(200)).whole_seconds(), secs(1));
+        assert_eq!(rule(Duration::from_millis(1500)).whole_seconds(), secs(2));
+        assert_eq!(rule(Duration::MAX).whole_seconds(), secs(u64::MAX));
+    }
+
+    /// The second at which the low-speed rule fails a body that delivers
+    /// `bursts`, each a byte count at a whole second after the first read, or
+    /// `None` where the rule never fails it within `seconds`.
+    fn low_speed_failure(time: u64, bursts: &[(u64, u64)], seconds: u64) -> Option<u64> {
+        let mut monitor = Monitor::new(LowSpeed {
+            limit: 1000,
+            time: Duration::from_secs(time),
+        });
+        (1..=seconds).find(|&second| {
+            let arrived: u64 = bursts
+                .iter()
+                .filter(|(at, _)| *at == second - 1)
+                .map(|(_, bytes)| bytes)
+                .sum();
+            monitor.counted += arrived;
+            monitor.sample()
+        })
+    }
+
+    /// The low-speed rule fails a body at the second the `ostree` tool fails
+    /// the same transfer, with a limit of 1000 bytes per second and a time of
+    /// 2 seconds (`docs/format-reference.md`, "CLI output formats", `pull`).
+    #[test]
+    fn the_low_speed_rule_fails_where_the_tool_fails() {
+        rt::block_on(async {
+            // Nothing arrives: the rate is below the limit from the start.
+            assert_eq!(low_speed_failure(2, &[], 20), Some(2));
+            assert_eq!(low_speed_failure(3, &[], 20), Some(3));
+            // One burst and then nothing: the rate falls below the limit once
+            // the burst ages out of the five-second span, or once the burst
+            // over the seconds so far falls below it. A sample of exactly the
+            // limit counts as below it.
+            assert_eq!(low_speed_failure(2, &[(0, 1_000)], 20), Some(2));
+            assert_eq!(low_speed_failure(2, &[(0, 3_000)], 20), Some(5));
+            assert_eq!(low_speed_failure(2, &[(0, 5_000)], 20), Some(7));
+            assert_eq!(low_speed_failure(2, &[(0, 20_000)], 20), Some(8));
+            assert_eq!(low_speed_failure(2, &[(0, 8_000)], 20), Some(8));
+            assert_eq!(low_speed_failure(2, &[(0, 3_500)], 20), Some(6));
+            // A second burst that lands before the rate has stayed below the
+            // limit for 2 seconds starts the count again. The body ends with
+            // the second burst.
+            let second = |at| [(0, 6_000), (at, 6_000)];
+            assert_eq!(low_speed_failure(2, &second(6), 7), None);
+            assert_eq!(low_speed_failure(2, &second(7), 8), None);
+            assert_eq!(low_speed_failure(2, &second(8), 9), Some(8));
+            // Bursts whose average is above the limit pass, though some whole
+            // seconds carry nothing.
+            let bursts: Vec<(u64, u64)> = (0..20).step_by(2).map(|at| (at, 2_100)).collect();
+            assert_eq!(low_speed_failure(1, &bursts, 20), None);
         });
     }
 

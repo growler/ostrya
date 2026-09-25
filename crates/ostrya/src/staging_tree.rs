@@ -1492,9 +1492,8 @@ fn merge_into<'a>(
 /// at [`finish`](StagedFileWriter::finish). It shares the tree and writer count
 /// with its [`StagingTree`] through `Arc`, so it does not borrow the tree.
 /// Implements [`futures_io::AsyncWrite`] unconditionally and the tokio
-/// `AsyncWrite` under the `tokio` feature. Dropping it without `finish` abandons
-/// the staged temporary (reaped by the transaction) and releases its writer
-/// slot.
+/// `AsyncWrite` under the `tokio` feature. Dropping it without `finish` removes
+/// the staged temporary and releases its writer slot.
 pub struct StagedFileWriter<'txn> {
     tree: Arc<Mutex<MutableTree>>,
     writers: Arc<AtomicUsize>,
@@ -1527,8 +1526,8 @@ impl StagedFileWriter<'_> {
 impl Drop for StagedFileWriter<'_> {
     fn drop(&mut self) {
         // An abandoned writer (dropped without `finish`) still releases its slot,
-        // so `close` is never wedged; its staged temporary is reaped by the
-        // transaction.
+        // so `close` is never wedged; the content writer removes its staged
+        // temporary as it drops.
         if self.writer.is_some() {
             self.writers.fetch_sub(1, Ordering::AcqRel);
         }

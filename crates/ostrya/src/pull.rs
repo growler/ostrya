@@ -154,6 +154,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_lite::AsyncReadExt;
 use ostrya_core::{
@@ -462,8 +463,20 @@ pub struct PullOptions {
     /// How many fetches an HTTP pull keeps in flight. `None` is 8.
     pub max_outstanding_fetches: Option<usize>,
     /// How many times an HTTP pull repeats a round of mirrors after a retryable
-    /// failure. `None` is 5.
+    /// failure. `None` is 5. A body that fails in transit is fetched again from
+    /// the start, and each refetch spends one repeat from the same count.
     pub n_network_retries: Option<u32>,
+    /// The rate in bytes per second below which an HTTP pull abandons a
+    /// transfer, as a retryable failure, once the rate has stayed below it for
+    /// [`low_speed_time`](PullOptions::low_speed_time). [`LowSpeed`] states
+    /// how the rate is measured. `None` is 1000, and 0 turns the check off.
+    ///
+    /// [`LowSpeed`]: crate::LowSpeed
+    pub low_speed_limit_bytes: Option<u32>,
+    /// How long the rate may stay below
+    /// [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes). `None`
+    /// is 30 seconds, and a zero duration turns the check off.
+    pub low_speed_time: Option<Duration>,
     /// What a fetched tip's timestamp is required to be no older than.
     pub timestamp_check: TimestampCheck,
     /// Fetch every object loose, ignoring any static delta the remote

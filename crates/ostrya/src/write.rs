@@ -189,6 +189,39 @@ pub(crate) enum TempKind {
     Named(String),
 }
 
+/// An ingestion temp file not yet staged, which is removed when it is dropped:
+/// an anonymous inode goes with its descriptor, and a named temp is unlinked
+/// here. [`into_inner`](PendingTemp::into_inner) hands it on to be staged.
+struct PendingTemp<'a> {
+    staging_fd: BorrowedFd<'a>,
+    temp: Option<TempKind>,
+}
+
+impl<'a> PendingTemp<'a> {
+    fn new(staging_fd: BorrowedFd<'a>, temp: TempKind) -> PendingTemp<'a> {
+        PendingTemp {
+            staging_fd,
+            temp: Some(temp),
+        }
+    }
+
+    /// The temp, which is no longer removed on drop.
+    fn into_inner(mut self) -> TempKind {
+        self.temp
+            .take()
+            .expect("a pending temp holds its temp until handed on")
+    }
+}
+
+impl Drop for PendingTemp<'_> {
+    fn drop(&mut self) {
+        // One unlink of one name, which is what a dedup hit costs as well.
+        if let Some(temp) = &self.temp {
+            cleanup_temp(self.staging_fd, temp);
+        }
+    }
+}
+
 /// A writer that streams one regular file's payload into a transaction.
 ///
 /// Bytes written pass through a SHA-256 digester seeded with the framed
@@ -196,8 +229,8 @@ pub(crate) enum TempKind {
 /// [`finish`](ContentWriter::finish). In archive mode the same bytes feed a
 /// raw-DEFLATE encoder whose output, prefixed by the framed archive header,
 /// becomes the stored `.filez`; the uncompressed size is patched into the
-/// reserved header region at finish. Dropping a writer without `finish`
-/// abandons the staged temporary, which the transaction reaps.
+/// reserved header region at finish. Dropping a writer without `finish`, or a
+/// `finish` that fails before the object is staged, removes the temporary.
 ///
 /// Implements [`futures_io::AsyncWrite`] unconditionally and the tokio
 /// `AsyncWrite` under the `tokio` feature.
@@ -207,7 +240,7 @@ pub struct ContentWriter<'txn> {
     uncompressed: u64,
     header: FileHeader,
     expected: Option<Checksum>,
-    temp: TempKind,
+    temp: PendingTemp<'txn>,
     sink: Sink,
 }
 
@@ -264,7 +297,7 @@ impl ContentWriter<'_> {
         }
 
         let std_file = file.into_std().await;
-        txn.stage_regular(checksum, header, std_file, temp, uncompressed)
+        txn.stage_regular(checksum, header, std_file, temp.into_inner(), uncompressed)
             .await
     }
 }
@@ -344,6 +377,7 @@ impl Transaction {
 
         let staging = self.staging_fd().try_clone_to_owned()?;
         let (fd, temp) = ostrya_rt::unblock(move || open_temp(staging.as_fd())).await?;
+        let temp = PendingTemp::new(self.staging_fd(), temp);
         let mut file = RtFile::from(fd);
 
         let sink = if mode.is_archive() {
@@ -429,6 +463,7 @@ impl Transaction {
 
         let staging = self.staging_fd().try_clone_to_owned()?;
         let (fd, temp) = ostrya_rt::unblock(move || open_temp(staging.as_fd())).await?;
+        let temp = PendingTemp::new(self.staging_fd(), temp);
         let mut file = RtFile::from(fd);
         write_all(&mut file, framed_header).await?;
 
@@ -479,8 +514,14 @@ impl Transaction {
 
         flush(&mut file).await?;
         let std_file = file.into_std().await;
-        self.stage_regular(checksum, header.clone(), std_file, temp, declared)
-            .await
+        self.stage_regular(
+            checksum,
+            header.clone(),
+            std_file,
+            temp.into_inner(),
+            declared,
+        )
+        .await
     }
 
     /// Write a symlink content object. The identity is the framed header alone
@@ -1460,8 +1501,9 @@ fn stage_symlink_inode(
     }
 }
 
-/// Discard an ingestion temp file after a dedup hit: an anonymous inode
-/// vanishes when its fd closes, a named temp is unlinked.
+/// Discard an ingestion temp file after a dedup hit, or one abandoned before
+/// it was staged: an anonymous inode vanishes when its fd closes, a named temp
+/// is unlinked.
 fn cleanup_temp(staging_fd: BorrowedFd<'_>, temp: &TempKind) {
     if let TempKind::Named(name) = temp {
         let _ = rustix::fs::unlinkat(staging_fd, name.as_str(), AtFlags::empty());
@@ -1859,6 +1901,48 @@ mod verity_tests {
             }
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod temp_tests {
+    use std::os::fd::{AsFd, OwnedFd};
+
+    use super::{PendingTemp, TempKind, unique};
+
+    /// A named temp dropped before it is staged is unlinked, and one handed on
+    /// to be staged is left for the stager. Every filesystem the tests run on
+    /// takes `O_TMPFILE`, so the named form is made here by hand.
+    #[test]
+    fn a_pending_named_temp_is_removed_on_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-pending-temp-{}-{}",
+            std::process::id(),
+            unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_fd: OwnedFd = std::fs::File::open(&dir).unwrap().into();
+        for name in [".ostrya-tmp-dropped", ".ostrya-tmp-kept"] {
+            std::fs::write(dir.join(name), b"partial").unwrap();
+        }
+
+        drop(PendingTemp::new(
+            dir_fd.as_fd(),
+            TempKind::Named(".ostrya-tmp-dropped".to_owned()),
+        ));
+        assert!(!dir.join(".ostrya-tmp-dropped").exists());
+
+        let kept = PendingTemp::new(
+            dir_fd.as_fd(),
+            TempKind::Named(".ostrya-tmp-kept".to_owned()),
+        );
+        assert!(matches!(kept.into_inner(), TempKind::Named(_)));
+        assert!(dir.join(".ostrya-tmp-kept").exists());
+
+        // An anonymous temp names nothing, so its drop unlinks nothing.
+        drop(PendingTemp::new(dir_fd.as_fd(), TempKind::Anonymous));
+        assert!(dir.join(".ostrya-tmp-kept").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 

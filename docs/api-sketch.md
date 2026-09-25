@@ -958,8 +958,8 @@ pub fn reap_process_staging();
 /// `futures_io::AsyncWrite` unconditionally and `tokio::io::AsyncWrite`
 /// under the `tokio` feature. `finish` finalizes the digest, applies the
 /// per-mode object metadata, and stages the object under its id (a dedup
-/// hit returns the existing id). Dropping without `finish` abandons the
-/// staged temporary, which the transaction reaps.
+/// hit returns the existing id). Dropping without `finish`, or a `finish`
+/// that fails before the object is staged, removes the staged temporary.
 pub struct ContentWriter<'txn> { /* HashingWriter over a staging rt::File */ }
 impl ContentWriter<'_> {
     pub async fn finish(self) -> Result<Checksum>;
@@ -1532,8 +1532,17 @@ Protocol selection is the TLS handshake's -- ALPN offers `h2` and `http/1.1`.
 Two deadlines bound one attempt's cost: `connect_timeout` over opening a
 connection, and `progress_timeout` over a response delivering bytes, restarted
 whenever bytes arrive. A body that stalls fails the read with
-`io::ErrorKind::TimedOut`. `fetch_timeout` bounds the mirror rounds and the
-retries together, from admission to the response head, which is what caps how
+`io::ErrorKind::TimedOut`. `low_speed`, off by default, adds a third: the rate
+is sampled once a second as the bytes of the last five seconds divided by
+five, and a transfer fails when the rate stays at or below `limit` for `time`
+without a break. A response head has to arrive within `time` of the start of the
+attempt, and the rate of a body is measured from its first read. A body below
+the rate fails the read with `io::ErrorKind::TimedOut` as well. Inside the
+crate, a pull reads every body through a refetch: a body that fails in transit
+is fetched again from its first byte, starting again at the first mirror, and
+each refetch spends one repeat of `max_retries`. A body refused for its content
+is not fetched again. `fetch_timeout` bounds the mirror rounds and the retries
+together, from admission to the response head, which is what caps how
 long one fetch holds an admission permit. A credential is sent to every mirror,
 so `basic_auth` and an `Authorization`, `Proxy-Authorization`, or `Cookie` entry
 in `headers` require every mirror to be `https`; a cleartext mirror alongside one
@@ -1640,9 +1649,16 @@ pub struct FetcherOptions {
     pub max_outstanding: usize,           // default 8
     pub connect_timeout: Duration,        // default 30s: connect + TLS + handshake
     pub progress_timeout: Duration,       // default 60s: silence, not transfer time
+    pub low_speed: Option<LowSpeed>,      // default None; a zero in either
+                                          // field is rejected
     pub fetch_timeout: Option<Duration>,  // default 300s: mirrors and retries
                                           // together, up to the response head
 }
+
+/// The slowest transfer a fetch accepts: a rate, sampled once a second over
+/// the last five seconds, that stays below `limit` bytes per second for
+/// `time` fails the transfer.
+pub struct LowSpeed { pub limit: u32, pub time: Duration }
 
 #[non_exhaustive]
 pub enum TrustRoots {
@@ -1892,7 +1908,11 @@ pub struct PullOptions {
     pub url: Option<String>,              // overrides the remote's configured url
     pub http_headers: Vec<(String, String)>,
     pub max_outstanding_fetches: Option<usize>,  // None is 8
-    pub n_network_retries: Option<u32>,          // None is 5
+    pub n_network_retries: Option<u32>,          // None is 5; a body refetch
+                                                 // spends one as well
+    pub low_speed_limit_bytes: Option<u32>,      // None is 1000; 0 is off
+    pub low_speed_time: Option<Duration>,        // None is 30s below the
+                                                 // limit; zero is off
     pub timestamp_check: TimestampCheck,
     pub disable_static_deltas: bool,      // fetch every object loose
     pub require_static_deltas: bool,      // refuse a remote advertising none

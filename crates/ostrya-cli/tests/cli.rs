@@ -4291,8 +4291,70 @@ struct ServedRequest {
     headers: Vec<String>,
 }
 
+/// A fault a [`FileServer`] injects into its answers for one path.
+#[derive(Clone, Copy)]
+enum Fault {
+    /// Answer 503 with an empty body.
+    Unavailable { times: usize },
+    /// Declare the file's whole length, send half of it, and close the
+    /// connection.
+    Truncate { times: usize },
+    /// Send the file `bytes` bytes at a time, one piece every `interval`, on
+    /// every request.
+    Trickle {
+        bytes: usize,
+        interval: std::time::Duration,
+    },
+}
+
+/// A fault and the path it applies to, with the count of answers it has left.
+/// A count of `usize::MAX` never runs out.
+struct Injected {
+    target: String,
+    fault: Fault,
+    left: std::sync::atomic::AtomicUsize,
+}
+
+impl Injected {
+    /// Whether the fault applies to this answer for `path`, spending one from
+    /// the count where it does.
+    fn hits(&self, path: &str) -> bool {
+        if path != self.target {
+            return false;
+        }
+        self.left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| match left {
+                0 => None,
+                usize::MAX => Some(usize::MAX),
+                left => Some(left - 1),
+            })
+            .is_ok()
+    }
+}
+
 impl FileServer {
     fn start(root: &Path) -> FileServer {
+        FileServer::start_with(root, None)
+    }
+
+    /// A server that injects `fault` into its answers for `target`, and
+    /// answers every other path as [`FileServer::start`] does.
+    fn start_faulty(root: &Path, target: &str, fault: Fault) -> FileServer {
+        let times = match fault {
+            Fault::Unavailable { times } | Fault::Truncate { times } => times,
+            Fault::Trickle { .. } => usize::MAX,
+        };
+        FileServer::start_with(
+            root,
+            Some(Arc::new(Injected {
+                target: target.to_owned(),
+                fault,
+                left: std::sync::atomic::AtomicUsize::new(times),
+            })),
+        )
+    }
+
+    fn start_with(root: &Path, fault: Option<Arc<Injected>>) -> FileServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let port = listener.local_addr().unwrap().port();
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -4303,10 +4365,18 @@ impl FileServer {
                 let Ok(stream) = stream else { break };
                 let root = root.clone();
                 let log = Arc::clone(&thread_log);
-                std::thread::spawn(move || serve_connection(stream, &root, &log));
+                let fault = fault.clone();
+                std::thread::spawn(move || {
+                    serve_connection(stream, &root, &log, fault.as_deref());
+                });
             }
         });
         FileServer { port, log }
+    }
+
+    /// How many requests the server saw for `path`.
+    fn requests_for(&self, path: &str) -> usize {
+        self.seen().iter().filter(|seen| *seen == path).count()
     }
 
     fn url(&self) -> String {
@@ -4335,8 +4405,14 @@ impl FileServer {
     }
 }
 
-/// Answer requests on one connection until the client closes it.
-fn serve_connection(stream: TcpStream, root: &Path, log: &Mutex<Vec<ServedRequest>>) {
+/// Answer requests on one connection until the client closes it, injecting
+/// `fault` where one is given.
+fn serve_connection(
+    stream: TcpStream,
+    root: &Path,
+    log: &Mutex<Vec<ServedRequest>>,
+    fault: Option<&Injected>,
+) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone connection"));
     let mut writer = stream;
     loop {
@@ -4365,6 +4441,47 @@ fn serve_connection(stream: TcpStream, root: &Path, log: &Mutex<Vec<ServedReques
         });
 
         let body = served_path(root, &path).and_then(|p| std::fs::read(p).ok());
+        if let Some(injected) = fault
+            && let Some(bytes) = &body
+            && injected.hits(&path)
+        {
+            match injected.fault {
+                Fault::Unavailable { .. } => {
+                    let head = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n";
+                    if writer.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+                Fault::Truncate { .. } => {
+                    let head =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len());
+                    let _ = writer.write_all(head.as_bytes());
+                    let _ = writer.write_all(&bytes[..bytes.len() / 2]);
+                    let _ = writer.shutdown(std::net::Shutdown::Both);
+                    return;
+                }
+                Fault::Trickle {
+                    bytes: step,
+                    interval,
+                } => {
+                    let _ = writer.set_nodelay(true);
+                    let head =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len());
+                    if writer.write_all(head.as_bytes()).is_err() {
+                        return;
+                    }
+                    for piece in bytes.chunks(step) {
+                        // A client that gave up closes the connection, which
+                        // ends the trickle.
+                        if writer.write_all(piece).is_err() {
+                            return;
+                        }
+                        std::thread::sleep(interval);
+                    }
+                }
+            }
+            continue;
+        }
         let head = match &body {
             Some(bytes) => format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", bytes.len()),
             None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned(),
@@ -5027,6 +5144,474 @@ fn pull_sign_verify_switch_overrides_the_configuration() {
         resolve(&overridden, &format!("origin:{BRANCH}")).as_deref(),
         Some(COMMIT)
     );
+}
+
+// --- Phase 17f: `pull` network tuning against the tool -------------------------
+//
+// Each implementation pulls from a server of its own, which injects one fault
+// into its answers for one object and counts the requests for that object. The
+// counts are the oracle: the retry count, the switch that turns retries off,
+// and the low-speed rule each decide how many times an object is asked for.
+
+/// A remote for the network-tuning tests under `base/<name>`: the fixture tree
+/// and a file of `size` bytes that do not compress, and the request path of
+/// that file's object, which is the largest object the remote serves. With a
+/// `size` of 150, at one byte every 10 milliseconds, the object takes about two
+/// seconds to send.
+fn build_tuning_remote(base: &Path, name: &str, size: usize) -> (PathBuf, String) {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    build_fixture_source(&dir);
+    let mut state = 0x2545_f491_u32;
+    let noise: Vec<u8> = (0..size)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    std::fs::write(dir.join("src/noise.bin"), noise).unwrap();
+    let repo = create_repo(&dir, RepoMode::Archive);
+    let repo_s = repo.to_str().unwrap();
+    let src = dir.join("src");
+    ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo_s,
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            "--canonical-permissions",
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[("SOURCE_DATE_EPOCH", SOURCE_DATE_EPOCH)],
+    )
+    .ok();
+    ostrya(&["summary", "--repo", repo_s, "-u"], None, &[]).ok();
+    let (checksum, _) = loose_objects(&repo)
+        .into_iter()
+        .filter(|(_, ext)| ext == "filez")
+        .max_by_key(|(checksum, _)| {
+            let path = repo.join(format!(
+                "objects/{}/{}.filez",
+                &checksum[..2],
+                &checksum[2..]
+            ));
+            std::fs::metadata(path).unwrap().len()
+        })
+        .unwrap();
+    let target = format!("objects/{}/{}.filez", &checksum[..2], &checksum[2..]);
+    (repo, target)
+}
+
+/// One pull of `test/main` by one implementation, from a server of its own.
+struct FaultedPull {
+    run: Run,
+    dest: PathBuf,
+    /// How many requests the server saw for the faulted object.
+    requests: usize,
+    elapsed: std::time::Duration,
+}
+
+impl FaultedPull {
+    /// The exit status, the request count, and whether the ref landed, which is
+    /// what the two implementations are compared on.
+    fn outcome(&self) -> (Option<i32>, usize, bool) {
+        (
+            self.run.status.code(),
+            self.requests,
+            resolve(&self.dest, &format!("origin:{BRANCH}")).is_some(),
+        )
+    }
+}
+
+/// Pull `test/main` into a fresh archive repository under `base/<name>` with
+/// `args`, by the tool where `tool` is set and by the port otherwise, from a
+/// server injecting `fault` into its answers for `target`.
+fn faulted_pull(
+    base: &Path,
+    name: &str,
+    remote: &Path,
+    target: &str,
+    fault: Fault,
+    tool: bool,
+    args: &[&str],
+) -> FaultedPull {
+    let server = FileServer::start_faulty(remote, target, fault);
+    let dest = build_dest(base, name);
+    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+    let mut all = vec!["pull", "--repo", dest.to_str().unwrap()];
+    all.extend_from_slice(args);
+    all.extend_from_slice(&["origin", BRANCH]);
+    let started = std::time::Instant::now();
+    let run = if tool {
+        ostree(&all)
+    } else {
+        ostrya(&all, None, &[])
+    };
+    let elapsed = started.elapsed();
+    FaultedPull {
+        run,
+        requests: server.requests_for(target),
+        dest,
+        elapsed,
+    }
+}
+
+/// The same pull by the port and, where `tool` is set, by the tool, the two
+/// running at once.
+fn faulted_pulls(
+    base: &Path,
+    name: &str,
+    remote: &Path,
+    target: &str,
+    fault: Fault,
+    tool: bool,
+    args: &[&str],
+) -> (FaultedPull, Option<FaultedPull>) {
+    std::thread::scope(|scope| {
+        let theirs = tool.then(|| {
+            scope.spawn(|| {
+                faulted_pull(
+                    base,
+                    &format!("{name}-tool"),
+                    remote,
+                    target,
+                    fault,
+                    true,
+                    args,
+                )
+            })
+        });
+        let ours = faulted_pull(
+            base,
+            &format!("{name}-port"),
+            remote,
+            target,
+            fault,
+            false,
+            args,
+        );
+        (ours, theirs.map(|handle| handle.join().unwrap()))
+    })
+}
+
+/// Run `count` independent pulls at once, `pull(index)` each, and return their
+/// results in the order of the index.
+fn concurrent_pulls<T: Send>(count: usize, pull: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    std::thread::scope(|scope| {
+        let pull = &pull;
+        let handles: Vec<_> = (0..count)
+            .map(|index| scope.spawn(move || pull(index)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect()
+    })
+}
+
+/// Assert that the port's pull had `expected` as its outcome, and the tool's
+/// the same where it ran.
+fn assert_pull_outcome(
+    label: &str,
+    ours: &FaultedPull,
+    theirs: Option<&FaultedPull>,
+    expected: (Option<i32>, usize, bool),
+) {
+    let render = |pull: &FaultedPull| {
+        format!(
+            "{:?} after {:?}, stderr {:?}",
+            pull.outcome(),
+            pull.elapsed,
+            String::from_utf8_lossy(&pull.run.stderr)
+        )
+    };
+    assert_eq!(ours.outcome(), expected, "port, {label}: {}", render(ours));
+    if let Some(theirs) = theirs {
+        assert_eq!(
+            theirs.outcome(),
+            expected,
+            "tool, {label}: {}",
+            render(theirs)
+        );
+    }
+}
+
+#[test]
+fn pull_network_retries_against_a_503_server_match_the_tool() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-503");
+    let base = tmp.path();
+    let (remote, target) = build_tuning_remote(base, "remote", 150);
+    let always = Fault::Unavailable { times: usize::MAX };
+
+    // A 503 is retryable: the default makes one request and five repeats, a
+    // count makes one and that many, and the switch makes one whatever count
+    // stands beside it, in either order.
+    let cases: &[(&[&str], usize)] = &[
+        (&[], 6),
+        (&["--network-retries=2"], 3),
+        (&["--network-retries=0"], 1),
+        (&["--disable-retry-on-network-errors"], 1),
+        (
+            &["--disable-retry-on-network-errors", "--network-retries=3"],
+            1,
+        ),
+        (
+            &["--network-retries=3", "--disable-retry-on-network-errors"],
+            1,
+        ),
+    ];
+    let pulls = concurrent_pulls(cases.len(), |index| {
+        faulted_pulls(
+            base,
+            &format!("dest{index}"),
+            &remote,
+            &target,
+            always,
+            tool,
+            cases[index].0,
+        )
+    });
+    for ((args, requests), (ours, theirs)) in cases.iter().zip(&pulls) {
+        assert_pull_outcome(
+            &args.join(" "),
+            ours,
+            theirs.as_ref(),
+            (Some(1), *requests, false),
+        );
+    }
+
+    // The switch takes no value. The tool discards one and still turns retries
+    // off, and the port refuses it before a request is made.
+    let args = ["--disable-retry-on-network-errors=false"];
+    let (ours, theirs) = faulted_pulls(base, "suffix", &remote, &target, always, tool, &args);
+    assert_eq!(ours.outcome(), (Some(1), 0, false));
+    assert!(
+        String::from_utf8_lossy(&ours.run.stderr).contains("unexpected value 'false'"),
+        "{}",
+        String::from_utf8_lossy(&ours.run.stderr)
+    );
+    if let Some(theirs) = theirs {
+        assert_eq!(theirs.outcome(), (Some(1), 1, false));
+    }
+}
+
+#[test]
+fn pull_retries_a_truncated_body_as_the_tool_does() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-truncated");
+    let base = tmp.path();
+    let (remote, target) = build_tuning_remote(base, "remote", 150);
+
+    // A body cut once is fetched again, and the pull completes with the tree
+    // the remote holds.
+    let (ours, theirs) = faulted_pulls(
+        base,
+        "once",
+        &remote,
+        &target,
+        Fault::Truncate { times: 1 },
+        tool,
+        &[],
+    );
+    assert_pull_outcome("cut once", &ours, theirs.as_ref(), (Some(0), 2, true));
+    assert_eq!(loose_objects(&ours.dest), loose_objects(&remote));
+    if let Some(theirs) = &theirs {
+        assert_eq!(loose_objects(&theirs.dest), loose_objects(&ours.dest));
+    }
+
+    // A body cut every time spends the retry count and fails the pull.
+    let (ours, theirs) = faulted_pulls(
+        base,
+        "always",
+        &remote,
+        &target,
+        Fault::Truncate { times: usize::MAX },
+        tool,
+        &["--network-retries=1"],
+    );
+    assert_pull_outcome("cut always", &ours, theirs.as_ref(), (Some(1), 2, false));
+}
+
+/// The exit status, the request count, and whether the ref landed, as
+/// [`FaultedPull::outcome`] reports them.
+type PullOutcome = (Option<i32>, usize, bool);
+
+#[test]
+fn pull_low_speed_options_match_the_tool() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-low-speed");
+    let base = tmp.path();
+    let (remote, target) = build_tuning_remote(base, "remote", 150);
+    let (bursty_remote, bursty_target) = build_tuning_remote(base, "bursty-remote", 4096);
+    // About 100 bytes per second, which sends the object in about two seconds.
+    let trickle = Fault::Trickle {
+        bytes: 1,
+        interval: std::time::Duration::from_millis(10),
+    };
+    // 2600 bytes, then the rest of the object 2.5 seconds later. No byte
+    // arrives in the second whole second, but the rate over the seconds so
+    // far stays above 1000 bytes per second.
+    let bursts = Fault::Trickle {
+        bytes: 2600,
+        interval: std::time::Duration::from_millis(2500),
+    };
+    let one_second = ["--low-speed-limit-bytes=1000", "--low-speed-time-seconds=1"];
+
+    // Each case: the options, the fault, whether it pulls the bursty remote,
+    // and the outcome both implementations have.
+    let cases: &[(&[&str], Fault, bool, PullOutcome)] = &[
+        // Below 1000 bytes per second for one second, the transfer is
+        // abandoned, and the abandon is retryable. A negative limit keeps the
+        // default of 1000.
+        (
+            &[one_second[0], one_second[1], "--network-retries=1"],
+            trickle,
+            false,
+            (Some(1), 2, false),
+        ),
+        (
+            &[
+                "--low-speed-limit-bytes=-1",
+                "--low-speed-time-seconds=1",
+                "--network-retries=0",
+            ],
+            trickle,
+            false,
+            (Some(1), 1, false),
+        ),
+        // A zero in either option turns the check off, and the trickle
+        // completes.
+        (
+            &["--low-speed-limit-bytes=0", "--low-speed-time-seconds=1"],
+            trickle,
+            false,
+            (Some(0), 1, true),
+        ),
+        (
+            &["--low-speed-limit-bytes=1000", "--low-speed-time-seconds=0"],
+            trickle,
+            false,
+            (Some(0), 1, true),
+        ),
+        // Bursts whose rate stays above the limit complete, though a whole
+        // second carries no byte.
+        (
+            &[one_second[0], one_second[1], "--network-retries=0"],
+            bursts,
+            true,
+            (Some(0), 1, true),
+        ),
+    ];
+    let pulls = concurrent_pulls(cases.len(), |index| {
+        let (args, fault, bursty, _) = cases[index];
+        let (remote, target) = if bursty {
+            (&bursty_remote, &bursty_target)
+        } else {
+            (&remote, &target)
+        };
+        faulted_pulls(
+            base,
+            &format!("case{index}"),
+            remote,
+            target,
+            fault,
+            tool,
+            args,
+        )
+    });
+    for ((args, _, _, expected), (ours, theirs)) in cases.iter().zip(&pulls) {
+        assert_pull_outcome(&args.join(" "), ours, theirs.as_ref(), *expected);
+        // An abandoned transfer ends after about one second an attempt, well
+        // before the trickle would have sent the object.
+        if expected.0 == Some(1) {
+            assert!(
+                ours.elapsed < std::time::Duration::from_secs(10),
+                "{:?}",
+                ours.elapsed
+            );
+        }
+    }
+}
+
+#[test]
+fn pull_low_speed_values_are_read_as_the_tool_reads_them() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-low-speed-values");
+    let base = tmp.path();
+    let port_repo = build_dest(base, "port");
+    let tool_repo = build_dest(base, "tool");
+    // The values are read while the options are read, ahead of the remote, so
+    // a repository with no remote states the refusal.
+    for flag in ["--low-speed-limit-bytes", "--low-speed-time-seconds"] {
+        for value in ["abc", "99999999999", "5 ", ""] {
+            let arg = format!("{flag}={value}");
+            assert_agrees(&port_repo, &tool_repo, &["pull", &arg, "origin"]);
+        }
+    }
+}
+
+#[test]
+fn pull_stops_at_the_first_exhausted_object() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-exhausted");
+    let base = tmp.path();
+    let (remote, target) = build_tuning_remote(base, "remote", 150);
+    let (ours, theirs) = faulted_pulls(
+        base,
+        "dest",
+        &remote,
+        &target,
+        Fault::Unavailable { times: usize::MAX },
+        tool,
+        &["--network-retries=0"],
+    );
+    assert_pull_outcome("exhausted", &ours, theirs.as_ref(), (Some(1), 1, false));
+
+    let entries = |dir: &Path| -> Vec<String> {
+        match std::fs::read_dir(dir) {
+            Ok(read) => {
+                let mut names = read
+                    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+    let staging = |dest: &Path| {
+        entries(&dest.join("tmp"))
+            .into_iter()
+            .filter(|name| name.starts_with("staging-"))
+            .collect::<Vec<_>>()
+    };
+    // The port publishes no object and removes the partial marker. Its staging
+    // directory goes with the transaction; a removal that races a write still
+    // in flight leaves the directory for the next transaction to reap, so the
+    // test does not read it.
+    assert!(loose_objects(&ours.dest).is_empty());
+    assert!(entries(&ours.dest.join("state")).is_empty());
+    // The tool publishes no object either, and keeps what it fetched in a
+    // staging directory, with the commit marked partial.
+    if let Some(theirs) = &theirs {
+        assert!(loose_objects(&theirs.dest).is_empty());
+        let kept = staging(&theirs.dest);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let held = entries(&theirs.dest.join("tmp").join(&kept[0]));
+        assert!(!held.is_empty());
+        let markers = entries(&theirs.dest.join("state"));
+        assert_eq!(markers.len(), 1, "{markers:?}");
+        assert!(markers[0].ends_with(".commitpartial"), "{markers:?}");
+    }
 }
 
 // --- Phase 17b: refs, rev-parse, and cat against the tool ---------------------

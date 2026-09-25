@@ -13350,3 +13350,171 @@ evidence: ostrya_cli::cli::static_delta_index_entry_order_parts_from_the_tool
 spec: format-reference.md#summary
 note: the two agree on the entries and on each digest. The test cites a set of
  six deltas whose tool order is not name order.
+
+# ---------------------------------------------------------------------------
+# pull -- network tuning. The harness serves no remote, so each cell but the
+# two value refusals cites the `cli.rs` test that pulls with each
+# implementation from a standard-library server of its own, which injects one
+# fault into its answers for one object and counts the requests for it.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: pull
+cell: pull/network-retries-default-count
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_network_retries_against_a_503_server_match_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: an object the server answers 503 for on every request is asked for six
+ times, one request and five repeats, and the pull exits 1 with no ref. With
+ `--network-retries=2` it is asked for three times.
+
+family: M10
+subcommand: pull
+cell: pull/network-retries-zero
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_network_retries_against_a_503_server_match_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `--network-retries=0` asks for the object once.
+
+family: M10
+subcommand: pull
+cell: pull/disable-retry-on-network-errors
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_network_retries_against_a_503_server_match_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the switch asks for the object once.
+
+family: M10
+subcommand: pull
+cell: pull/disable-retry-wins-either-order
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_network_retries_against_a_503_server_match_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the switch beside `--network-retries=3` asks for the object once,
+ whichever of the two comes first.
+
+family: M10
+subcommand: pull
+cell: pull/retry-truncated-body
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_retries_a_truncated_body_as_the_tool_does
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a body cut once is asked for twice, and the pull exits 0 with the ref and
+ the object set the remote holds. A body cut on every request under
+ `--network-retries=1` is asked for twice, and the pull exits 1 with no ref.
+
+family: M10
+subcommand: pull
+cell: pull/low-speed-abort
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_low_speed_options_match_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: an object sent at about 100 bytes per second under
+ `--low-speed-limit-bytes=1000 --low-speed-time-seconds=1
+ --network-retries=1` is abandoned after one second on each attempt and asked
+ for twice, and the pull exits 1 with no ref.
+
+family: M10
+subcommand: pull
+cell: pull/low-speed-zero-disables
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_low_speed_options_match_the_tool
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a limit of 0, and a time of 0, each let the slow object complete in
+ one request, and the pull exits 0 with the ref.
+
+family: M10
+subcommand: pull
+cell: pull/low-speed-bursts
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_low_speed_options_match_the_tool
+spec: format-reference.md#pull
+note: an object sent as 2600 bytes and then the rest 2.5 seconds later, under
+ `--low-speed-limit-bytes=1000 --low-speed-time-seconds=1
+ --network-retries=0`, completes in one request, and the pull exits 0 with the
+ ref. No byte arrives in the second whole second, but the rate over the
+ seconds so far stays above the limit.
+
+family: M10
+subcommand: pull
+cell: pull/low-speed-negative-value
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_low_speed_options_match_the_tool
+spec: format-reference.md#pull
+note: a negative limit keeps the default of 1000 bytes per second, so
+ `--low-speed-limit-bytes=-1 --low-speed-time-seconds=1 --network-retries=0`
+ abandons the slow object after one second in one request. That a negative
+ time keeps the 30-second default was recovered by a run of 30 seconds,
+ which no test repeats (`format-reference.md`, "pull").
+
+family: M10
+subcommand: pull
+cell: pull/low-speed-parse-refusal
+setup: repo
+run: pull --repo=$REPO --low-speed-limit-bytes=abc origin
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Cannot parse integer value “abc” for --low-speed-limit-bytes"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Cannot parse integer value “abc” for --low-speed-limit-bytes"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#pull
+note: the value is read while the options are, ahead of the repository and
+ ahead of the remote, which this repository does not configure.
+
+family: M10
+subcommand: pull
+cell: pull/low-speed-out-of-range
+setup: repo
+run: pull --repo=$REPO --low-speed-time-seconds=99999999999 origin
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: equals "error: Integer value “99999999999” for --low-speed-time-seconds out of range"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: equals "error: Integer value “99999999999” for --low-speed-time-seconds out of range"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: format-reference.md#pull
+note: a value no C `int` holds is refused in the words `commit --owner-uid`
+ uses.
+
+family: M10
+subcommand: pull
+cell: pull/stop-at-first-exhausted-object
+setup: repo
+outcome: lossy
+severity: interop
+loss: what a pull keeps when one object exhausts its retries. The port ends the
+ pull at that object, drops the transfers in flight, removes the commit's
+ partial marker, and ends its staging directory with the transaction. The tool
+ lets the other transfers
+ finish and keeps what it fetched in a staging directory under `tmp/`, with
+ `state/<commit>.commitpartial` in place (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::pull_stops_at_the_first_exhausted_object
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: both exit 1 after one request for the object under
+ `--network-retries=0`, and neither writes an object under `objects/` or a
+ ref.

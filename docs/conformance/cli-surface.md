@@ -2491,10 +2491,80 @@ DIR, `--timestamp`, `--reindex`, `--gpg-homedir`, and `-s` for
 `commit --sign` uses.
 
 `pull` accepts a large set already. Missing: `--cache-dir`, `--disable-fsync`,
-`--per-object-fsync`, `--disable-retry-on-network-errors`, `--subpath`,
-`--untrusted`, `--http-trusted`, `--dry-run`, `--update-frequency=FREQUENCY`,
-`--low-speed-limit-bytes=N`, `--low-speed-time-seconds=N`. The port adds
-`--force-copy`, `--sign-verify`, and `--sign-verify-summary`.
+`--per-object-fsync`, `--subpath`, `--untrusted`, `--http-trusted`,
+`--dry-run`, `--update-frequency=FREQUENCY`. The port adds `--force-copy`,
+`--sign-verify`, and `--sign-verify-summary`. It also adds the valued forms
+`--gpg-verify[=BOOL]` and `--gpg-verify-summary[=BOOL]`, which the tool refuses
+with `error: Unknown option --gpg-verify` (or the option as written, value
+included) at exit 1. The port's fetcher serves `http` and `https` alone, so a
+`file://` remote, which the tool pulls from, reports `error: unsupported: fetch
+url scheme file: only http and https are fetched` at exit 1 and writes nothing.
+
+`--network-retries=N`, `--disable-retry-on-network-errors`,
+`--low-speed-limit-bytes=N`, and `--low-speed-time-seconds=N` make the requests
+the tool makes, counted per object against a server that answers 503, cuts a
+body, or sends a body slowly:
+
+- a retryable failure, a 503 among them, is repeated up to the
+  `--network-retries` count, 5 by default, so an object that keeps failing is
+  asked for six times. A 404 is not repeated;
+- a body that fails in transit is fetched again from its first byte, and each
+  refetch spends one repeat of the same count. A cut connection, a peer that
+  stays silent, and a transfer below the low-speed rate each fail a body in
+  transit. A body the port refuses for its content, a checksum mismatch among
+  them, is not fetched again;
+- `--disable-retry-on-network-errors` sets the count to zero, whatever
+  `--network-retries` says and in either order;
+- every transfer is held to a low-speed rule. The rate is sampled once a
+  second, as the bytes of the last five seconds divided by five, and a
+  transfer whose rate stays at or below the limit for the time without a break
+  fails, as a retryable failure. A sample above the limit starts the count
+  again, so bursts whose rate stays above the limit complete, though a
+  whole second carries no byte. The default is 1000 bytes per second for 30
+  seconds, and it applies to a pull that names neither option. A 0 in either
+  option turns the rule off, and a negative value keeps the default of that
+  option. `../format-reference.md`, "CLI output formats", `pull`, gives the
+  rule and the measurements.
+
+The two low-speed values are read as a C `int` with the reader of `commit
+--owner-uid`, and a value that reader refuses reports the same messages, ahead
+of the repository (`../format-reference.md`, "CLI output formats"). Four
+differences stand:
+
+- an object that exhausts its retries. The port ends the pull at the first such
+  object and drops the transfers still in flight. It writes no object and no
+  ref, and it removes the commit's `state/<commit>.commitpartial` marker. Its
+  staging directory goes with the transaction; where the removal races a write
+  still in flight, the directory stays for the next transaction to reap. The
+  tool lets the other transfers
+  finish. It writes no object and no ref either, and it keeps what it fetched
+  in a staging directory under `tmp/`, with the marker in place. A remote of
+  one commit and six content objects, with a 503 on one object and
+  `--network-retries=0`, shows this: the tool's staging directory holds the
+  commit, its dirtrees and dirmeta, and every other content object;
+- the timing of a repeat. The port waits 250 milliseconds before the first
+  repeat, and doubles the wait up to two seconds, where the tool repeats at
+  once. A refetch starts again at the first mirror. These change how long a
+  failing pull takes, and no byte the pull writes;
+- where the low-speed rule starts to measure a body. The tool measures one
+  rate from the start of the request, the wait for the response head included.
+  The port measures the head alone, with the same rule, and then measures the
+  body from its first read, from zero bytes. A head that arrives late thus
+  lowers the tool's rate of the body, and not the port's. A body slow enough
+  that the tool abandons it can complete in the port where its head took part
+  of the time. The port never abandons a transfer the tool completes for this
+  reason;
+- when the low-speed rule samples a body. The port takes a sample one second
+  after the previous one, and only while a read waits for bytes: a pause of the
+  consumer between two reads counts as one second, however long it is. The
+  pull reads each body without a pause other than its writes to disk. The
+  tool's samples fall at moments of its own. A burst that arrives within the
+  timing noise of a sample can thus count in different samples of the two,
+  and where that sample decides whether the rate is above the limit, the
+  outcome can differ. The measured cases in `../format-reference.md`, "CLI
+  output formats", `pull`, have bursts away from the sample moments, and the
+  port abandons each at the second the tool does, or completes each where the
+  tool does.
 
 `pull-local` accepts `--repo`, `--remote`, `--depth`, `--commit-metadata-only`,
 `--untrusted`, `--bareuseronly-files`, `--disable-verify-bindings`, and the port

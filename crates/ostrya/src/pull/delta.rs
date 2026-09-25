@@ -488,21 +488,28 @@ pub(crate) async fn fetch_part(
     // The superblock states the part file's size, so the fetcher refuses a
     // `Content-Length` above it before the body arrives and stops a body that
     // passes it as the bytes land.
-    let request = FetchRequest {
+    // A body that fails in transit is fetched again from the start, into a new
+    // blob, while the fetcher's retry count has a repeat left.
+    let mut refetch = fetcher.refetching(FetchRequest {
         priority: Priority::High,
         max_size: Some(entry.size),
         ..FetchRequest::path(&path)
-    };
-    let body = match fetcher.fetch(request).await? {
-        Fetched::Body(body) => body,
-        Fetched::NotModified => {
-            return Err(Error::Fetch(format!(
-                "{path}: the remote answered 304 to an unconditional request"
-            )));
+    });
+    let staging = txn.staging_fd().try_clone_to_owned()?;
+    let blob = loop {
+        let body = match refetch.fetch().await? {
+            Fetched::Body(body) => body,
+            Fetched::NotModified => {
+                return Err(Error::Fetch(format!(
+                    "{path}: the remote answered 304 to an unconditional request"
+                )));
+            }
+        };
+        match decode_part_stream(body, entry, &staging).await {
+            Ok(blob) => break blob,
+            Err(e) => refetch.retry(e).await?,
         }
     };
-    let staging = txn.staging_fd().try_clone_to_owned()?;
-    let blob = decode_part_stream(body, entry, &staging).await?;
     apply_part(txn, blob.as_slice(), &entry.objects, &staging, checks).await
 }
 

@@ -9,7 +9,7 @@
 //! [`Deadline`] is the same timer in a form a `poll_*` method can use: a window
 //! that is restarted when work makes progress and reports the window running
 //! out. The fetcher's response body holds one to bound how long a peer may stay
-//! silent mid-stream.
+//! silent mid-stream, and one to sample the rate of its low-speed rule.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -72,10 +72,13 @@ impl Deadline {
     /// Start the window again from now.
     pub fn restart(&mut self) {
         self.expired = false;
+        // A window whose end is past the clock's range takes a new sleep, the
+        // way `new` arms one, where adding the window to the clock would panic.
         #[cfg(feature = "tokio")]
-        self.sleep
-            .as_mut()
-            .reset(tokio::time::Instant::now() + self.window);
+        match tokio::time::Instant::now().checked_add(self.window) {
+            Some(end) => self.sleep.as_mut().reset(end),
+            None => self.sleep.set(tokio::time::sleep(self.window)),
+        }
         #[cfg(all(feature = "smol", not(feature = "tokio")))]
         self.timer.set_after(self.window);
     }
@@ -143,6 +146,21 @@ mod tests {
             // A restart after expiry opens a fresh window.
             deadline.restart();
             assert!(poll_once(&mut deadline).await.is_pending());
+        });
+    }
+
+    /// A window as long as a C `int` of seconds, and the longest duration, is
+    /// armed, restarted, and polled on either backend without a panic, and
+    /// stays open.
+    #[test]
+    fn a_window_of_the_largest_int_seconds_is_armed() {
+        block_on(async {
+            for window in [Duration::from_secs(i32::MAX as u64), Duration::MAX] {
+                let mut deadline = Deadline::new(window);
+                assert!(poll_once(&mut deadline).await.is_pending());
+                deadline.restart();
+                assert!(poll_once(&mut deadline).await.is_pending());
+            }
         });
     }
 }

@@ -167,6 +167,9 @@ struct Policy {
     /// Request paths answered with a body shorter than the length it declares,
     /// which cuts the connection mid-response.
     truncated: HashSet<String>,
+    /// Request paths cut the same way for as many requests as the count left,
+    /// and served whole after that.
+    truncate_first: HashMap<String, usize>,
 }
 
 /// Which server leaf a TLS [`RepoServer`] presents.
@@ -317,6 +320,20 @@ impl RepoServer {
             .insert(path.to_owned());
     }
 
+    /// Cut the next `times` responses for `path`, and serve it whole after.
+    fn truncate_times(&self, path: &str, times: usize) {
+        self.policy
+            .lock()
+            .unwrap()
+            .truncate_first
+            .insert(path.to_owned(), times);
+    }
+
+    /// How many requests the server saw for `path`.
+    fn requests_for(&self, path: &str) -> usize {
+        self.seen().iter().filter(|seen| *seen == path).count()
+    }
+
     fn forget(&self) {
         self.seen.lock().unwrap().clear();
     }
@@ -368,11 +385,18 @@ where
 /// The response for one request path.
 fn answer(root: &Path, path: &str, policy: &Mutex<Policy>) -> Response<FileBody> {
     let (hidden, replacement, truncated) = {
-        let policy = policy.lock().unwrap();
+        let mut policy = policy.lock().unwrap();
+        let cut_once = match policy.truncate_first.get_mut(path) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                true
+            }
+            _ => false,
+        };
         (
             policy.hidden.contains(path),
             policy.tampered.get(path).cloned(),
-            policy.truncated.contains(path),
+            cut_once || policy.truncated.contains(path),
         )
     };
     if hidden {
@@ -1264,6 +1288,10 @@ fn a_payload_underrunning_its_declared_size_fails_the_pull() {
         assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
         assert!(err.to_string().contains("inflates to 1 byte"), "{err}");
         assert_nothing_published(&dest).await;
+        // The body arrived whole, so the refusal is the object's own and a
+        // second fetch would be refused the same way: it is not asked again,
+        // whatever the retry count.
+        assert_eq!(server.requests_for(&path), 1);
     });
 }
 
@@ -2770,6 +2798,89 @@ fn a_connection_cut_mid_pull_fails_and_publishes_nothing() {
                 .await
                 .unwrap()
         );
+    });
+}
+
+/// A body cut in transit is fetched again from the start, which spends one
+/// repeat of the retry count, and the pull completes with every object intact
+/// and no staging file left behind.
+#[test]
+fn a_body_cut_once_is_fetched_again_and_the_pull_completes() {
+    block_on(async {
+        for mode in [RepoMode::Archive, RepoMode::BareUser] {
+            let dir = TmpDir::new("pull-http-cut-once");
+            let (remote, commit) = build_remote(dir.path()).await;
+            let server = RepoServer::start(&dir.path().join("remote"), false).await;
+            let dest = build_dest(dir.path(), mode, &server.url(), "").await;
+
+            let contents = content_checksums(&remote, &commit).await;
+            let cut = filez_path(&contents[0].to_hex());
+            server.truncate_times(&cut, 1);
+            // A metadata object is read whole, and is fetched again the same
+            // way.
+            let root = meta_path(&commit, "commit");
+            server.truncate_times(&root, 1);
+
+            dest.pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(server.requests_for(&cut), 2, "{mode:?}");
+            assert_eq!(server.requests_for(&root), 2, "{mode:?}");
+            assert_eq!(
+                dest.resolve_rev("origin:test/main", true).await.unwrap(),
+                Some(commit)
+            );
+            assert!(
+                dest.has_object(ostrya::ObjectType::File, &contents[0])
+                    .await
+                    .unwrap()
+            );
+            assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+            let staging = std::fs::read_dir(dir.path().join("dest/tmp"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("staging-"))
+                .collect::<Vec<_>>();
+            assert!(staging.is_empty(), "{staging:?}");
+        }
+    });
+}
+
+/// A body cut on every request spends the whole retry count, one request more
+/// than the count, and then fails the pull.
+#[test]
+fn a_body_cut_every_time_spends_the_retry_count() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-cut-always");
+        let (remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let contents = content_checksums(&remote, &commit).await;
+        let cut = filez_path(&contents[0].to_hex());
+        server.truncate(&cut);
+
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    max_outstanding_fetches: Some(1),
+                    n_network_retries: Some(2),
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(".filez"), "{err}");
+        assert_eq!(server.requests_for(&cut), 3);
+        assert_nothing_published(&dest).await;
     });
 }
 

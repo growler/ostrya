@@ -26,7 +26,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::{
     BasicAuth, Checksum, ClientIdentity, Error, FetchRequest, Fetched, Fetcher, FetcherOptions,
-    Priority, Protocol, Proxy, TlsOptions, TrustRoots, VerifyingReader,
+    LowSpeed, Priority, Protocol, Proxy, TlsOptions, TrustRoots, VerifyingReader,
 };
 use ostrya_rt::{TcpListener, TcpStream, Timer, block_on, spawn};
 use sha2::{Digest, Sha256};
@@ -783,6 +783,63 @@ async fn stalling_server(answer: &'static [u8]) -> SocketAddr {
         }
     }));
     addr
+}
+
+/// A peer that answers every request with a head declaring `body`, and then
+/// sends `body` a `step`-byte piece at a time, one piece every `interval`, on a
+/// connection of its own. With `head` false it answers nothing and holds the
+/// connection open. The counter reports how many requests the peer read.
+async fn trickling_server(
+    head: bool,
+    body: &'static [u8],
+    step: usize,
+    interval: Duration,
+) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = requests.clone();
+    drop(spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _peer)) = listener.accept().await {
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            counter.fetch_add(1, Ordering::SeqCst);
+            if !head {
+                held.push(stream);
+                continue;
+            }
+            drop(spawn(async move {
+                let answer = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                if stream.write_all(answer.as_bytes()).await.is_err() {
+                    return;
+                }
+                for piece in body.chunks(step) {
+                    // A client that gave up closes the connection, which ends
+                    // the trickle.
+                    if stream.write_all(piece).await.is_err() || stream.flush().await.is_err() {
+                        return;
+                    }
+                    Timer::after(interval).await;
+                }
+            }));
+        }
+    }));
+    (addr, requests)
+}
+
+/// The body the trickling tests send.
+static TRICKLED: [u8; 4096] = [b'x'; 4096];
+
+/// A low-speed rule of `limit` bytes per second, which the rate may stay below
+/// for `millis` milliseconds.
+fn low_speed(limit: u32, millis: u64) -> Option<LowSpeed> {
+    Some(LowSpeed {
+        limit,
+        time: Duration::from_millis(millis),
+    })
 }
 
 /// A peer that accepts a connection, reads what the client sent, answers with
@@ -3830,5 +3887,152 @@ fn a_connect_timeout_on_a_proxied_hop_names_the_proxy() {
         assert!(message.contains(&proxy), "{message}");
         assert!(message.contains("timed out"), "{message}");
         assert!(!message.contains("localhost:1"), "{message}");
+    });
+}
+
+/// A body that keeps delivering, but below the low-speed rate, fails the read
+/// once the rate has stayed below the limit for the rule's time: long before
+/// the progress window, which the trickle never lets run out, and long before
+/// the body could end.
+#[test]
+fn a_body_below_the_low_speed_rate_fails_the_read() {
+    block_on(async {
+        // 10 bytes every 50ms is 200 bytes per second, against a rule of 1000
+        // for one second.
+        let (addr, requests) =
+            trickling_server(true, &TRICKLED, 10, Duration::from_millis(50)).await;
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
+        options.low_speed = low_speed(1000, 1000);
+        options.max_retries = 0;
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::path("slow")).await.unwrap()
+        else {
+            panic!("unexpected 304");
+        };
+        let started = Instant::now();
+        let mut out = Vec::new();
+        let err = body.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            err.to_string()
+                .contains("averaged below 1000 bytes per second"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(out.len() < TRICKLED.len());
+        // The failure latches, as every failure of a body does.
+        let err = body.read(&mut [0u8; 8]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    });
+}
+
+/// A body that stays above the rate over several samples completes.
+#[test]
+fn a_body_above_the_low_speed_rate_completes() {
+    block_on(async {
+        // 100 bytes every 50ms is about 2000 bytes per second, against a rule
+        // of 1000 for one second, for about two samples.
+        let (addr, _) = trickling_server(true, &TRICKLED, 100, Duration::from_millis(50)).await;
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
+        options.low_speed = low_speed(1000, 1000);
+        options.max_retries = 0;
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        let started = Instant::now();
+        let (bytes, _) = fetch_bytes(&fetcher, "steady").await;
+        assert_eq!(bytes, TRICKLED);
+        assert!(started.elapsed() >= Duration::from_millis(1500));
+    });
+}
+
+/// A body that arrives in bursts completes while the rate over the samples so
+/// far stays above the limit, though a whole second passes with no byte. Held
+/// to the limit one second at a time, the body would fail.
+#[test]
+fn a_bursty_body_above_the_low_speed_rate_completes() {
+    block_on(async {
+        // 2600 bytes, and the other 1496 bytes 2.5 seconds later: the second
+        // second carries nothing, and the rate over two seconds is 1300 bytes
+        // per second, against a rule of 1000 for one second.
+        let (addr, requests) =
+            trickling_server(true, &TRICKLED, 2600, Duration::from_millis(2500)).await;
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
+        options.low_speed = low_speed(1000, 1000);
+        options.max_retries = 0;
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        let started = Instant::now();
+        let (bytes, _) = fetch_bytes(&fetcher, "bursty").await;
+        assert_eq!(bytes, TRICKLED);
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    });
+}
+
+/// A head that never arrives fails the attempt once the rule's time, rounded up
+/// to a whole second, has passed, well before the progress window, and the
+/// failure is retryable.
+#[test]
+fn a_head_that_never_arrives_fails_after_the_low_speed_time() {
+    block_on(async {
+        let (addr, requests) = trickling_server(false, &TRICKLED, 1, Duration::ZERO).await;
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
+        options.low_speed = low_speed(1000, 200);
+        options.progress_timeout = Duration::from_secs(30);
+        options.max_retries = 1;
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        let started = Instant::now();
+        let err = fetch_error(&fetcher, "summary").await;
+        assert!(
+            err.to_string()
+                .contains("transfer below 1000 bytes per second"),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    });
+}
+
+/// The low-speed rate of a body is measured from its first read, so a body its
+/// consumer leaves unread for longer than one sample is not failed for it.
+#[test]
+fn the_low_speed_rate_is_measured_from_the_first_read() {
+    block_on(async {
+        let (addr, _) = trickling_server(true, &TRICKLED, TRICKLED.len(), Duration::ZERO).await;
+        let mut options = direct_options(format!("http://127.0.0.1:{}", addr.port()));
+        // A limit above the whole body: a sample taken while the body is read
+        // fails it, so the body completes only if the reads end before the
+        // first sample is due, one second after the first read.
+        options.low_speed = low_speed(1_000_000, 1000);
+        options.max_retries = 0;
+        let fetcher = Fetcher::new(options).await.unwrap();
+
+        let fetched = fetcher.fetch(FetchRequest::path("parked")).await.unwrap();
+        Timer::after(Duration::from_millis(1500)).await;
+        assert_eq!(read_body(fetched).await, TRICKLED);
+    });
+}
+
+/// A low-speed rule holding a zero measures nothing, and is refused.
+#[test]
+fn a_low_speed_rule_with_a_zero_is_refused() {
+    block_on(async {
+        for rule in [low_speed(0, 100), low_speed(1000, 0)] {
+            let mut options = direct_options("http://127.0.0.1:1");
+            options.low_speed = rule;
+            let err = Fetcher::new(options).await.unwrap_err();
+            assert!(matches!(err, Error::Fetch(_)), "{err}");
+        }
     });
 }

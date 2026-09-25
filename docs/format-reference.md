@@ -6363,3 +6363,67 @@ at the fanout is an absent file, and both exit 0.
 A superblock that does not parse prints no line in the port. The tool prints
 the lines it read before the failure. Only a write that is neither
 implementation's makes such a superblock.
+
+### `pull`
+
+`--low-speed-limit-bytes=N` and `--low-speed-time-seconds=N` are read as a C
+`int` with the reader of `commit --owner-uid`, and a value that reader cannot
+hold is refused while the options are read, ahead of the repository and ahead
+of the remote, at exit 1, with the messages of `--owner-uid`: `error: Cannot
+parse integer value “<value>” for --low-speed-limit-bytes` for a syntax the
+reader cannot hold (`abc`, an empty value, a trailing space), and `error:
+Integer value “<value>” for --low-speed-time-seconds out of range` above
+`2147483647` or below `-2147483648`. Recovered by running the tool against a
+repository with no remote.
+
+A value of 0 in either option turns the low-speed rule off. A negative value
+keeps the default of its option: 1000 bytes per second for the limit, and 30
+seconds for the time. Recovered with a server that sends one object at about
+100 bytes per second: `--low-speed-limit-bytes=-1 --low-speed-time-seconds=1`
+fails after one second, as a limit of 1000 does, and the same limit at about
+2000 bytes per second completes. `--low-speed-limit-bytes=1000
+--low-speed-time-seconds=-1` fails after 30 seconds, as the default time
+does. `-2147483648` and `-5` read as `-1` does.
+
+The tool samples the rate of a transfer once a second. A sample is the bytes
+of the last five seconds divided by five, and in the first five seconds the
+bytes so far divided by the time so far. The transfer fails when the samples
+stay below the limit for the time without a break, and one sample above the
+limit starts the count again. The count starts at the start of the
+request: before the response head arrives no byte is counted, so the rate is
+below any limit. Recovered with a server that sends the head at once and then
+sends one object on a schedule, at a limit of 1000 bytes per second. The times
+are those of the server, from the head to the moment the tool closes the
+connection:
+
+- no byte after the head fails after 1.0, 2.0, and 3.0 seconds at a time of 1,
+  2, and 3 seconds;
+- a head sent after 1.5 seconds followed by no byte fails 0.5 seconds after the
+  head, at a time of 2 seconds. A head sent after 1.5 seconds followed by the
+  whole object completes. A head sent after 3 seconds fails before it is sent,
+  after 2 seconds;
+- one burst in the first half second followed by nothing, at a time of 2
+  seconds, fails after 2 seconds for 1000 bytes, 5 seconds for 3000, 6 seconds
+  for 3500, 7 seconds for 5000, and 8 seconds for 8000, 20000, and 60000. With
+  8000 bytes or more the rate stays above the limit until the burst leaves the
+  five seconds the sample spans;
+- 6000 bytes after 0.5 seconds and 6000 more after 6.5 or 7.5 seconds complete
+  at a time of 2 seconds, since the second burst lifts a sample above the
+  limit within 2 seconds of the first sample below it. The same second burst
+  after 8.5 seconds is too late: the transfer fails after 8 seconds;
+- 2100 bytes every 2 seconds completes at a time of 1 second, as does 2000
+  bytes every 1.9 seconds, though a whole second between two bursts carries no
+  byte.
+
+A sample of exactly the limit reads as below it: 1000 bytes in the first
+second, 3000 in three seconds, and 5000 in five seconds are each read as below
+the limit. The span of each sample is a little longer than its whole seconds.
+
+The port applies the same rule, a sample of exactly the limit included, with
+the differences `conformance/cli-surface.md`, "P2", `pull`, records.
+
+A transfer below the rule reports `error: While fetching <url>: [28] Timeout
+was reached` in the tool. The port reports `error: i/o error: fetched body
+averaged below <limit> bytes per second for <time>` for a body, and `error:
+fetch: <url>: transfer below <limit> bytes per second for <time>` for a
+response head. Both exit 1 and write no ref.

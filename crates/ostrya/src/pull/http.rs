@@ -131,6 +131,18 @@
 //! [`Error::InvalidFormat`], and a symlink's stored form is held to the same
 //! rule.
 //!
+//! Retries. A request that fails retryably is repeated up to
+//! [`n_network_retries`](PullOptions::n_network_retries) times, and a body that
+//! fails in transit -- a cut connection, a silent peer, or a transfer below the
+//! low-speed rule -- is fetched again from its first byte, each refetch spending
+//! one repeat of the same count. What the failed read had written stages nothing,
+//! and its temp file is removed before the refetch. A body refused for
+//! what it holds is not fetched again. Every transfer is held to the low-speed
+//! rule of [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes) and
+//! [`low_speed_time`](PullOptions::low_speed_time), a rate below 1000 bytes per
+//! second for 30 seconds unless the options say otherwise. An object that exhausts the
+//! count fails its step, and the first failed step ends the pull.
+//!
 //! Sources. A [`localcache_repos`](PullOptions::localcache_repos) repository is
 //! consulted before the network, per object, through the local pull's import
 //! path with its checksum verified.
@@ -157,6 +169,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use async_compression::futures::bufread::DeflateDecoder;
 use futures_io::AsyncRead;
@@ -170,8 +183,8 @@ use crate::delta::IO_CHUNK;
 use crate::error::{Error, Result};
 use crate::fetch::gate::Gate;
 use crate::fetch::{
-    Body, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, Priority, TlsOptions,
-    TrustRoots,
+    Body, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, LowSpeed, Priority,
+    TlsOptions, TrustRoots,
 };
 use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
@@ -194,6 +207,11 @@ use super::{
 const DEFAULT_OUTSTANDING: usize = 8;
 /// How many times a round of mirrors is repeated when the caller names no count.
 const DEFAULT_RETRIES: u32 = 5;
+/// The rate in bytes per second below which a transfer is abandoned when the
+/// caller names none.
+const DEFAULT_LOW_SPEED_LIMIT: u32 = 1000;
+/// How long the rate may stay below the limit when the caller names no time.
+const DEFAULT_LOW_SPEED_TIME: Duration = Duration::from_secs(30);
 /// How many fetched content objects stream into the object store at once.
 const WRITE_THROTTLE: usize = 3;
 
@@ -374,6 +392,7 @@ impl Repo {
             tls,
             max_retries: opts.n_network_retries.unwrap_or(DEFAULT_RETRIES),
             max_outstanding: opts.max_outstanding_fetches.unwrap_or(DEFAULT_OUTSTANDING),
+            low_speed: low_speed(opts),
             ..FetcherOptions::new(url)
         })
         .await
@@ -809,31 +828,40 @@ impl Repo {
         // on its own disk: the framed, deflated form is the one an HTTP client
         // can read.
         let path = object_path(&name.checksum, ObjectType::File);
-        let body = match ctx
-            .fetcher
-            .fetch(FetchRequest {
-                priority: Priority::Low,
-                ..FetchRequest::path(&path)
-            })
-            .await
-        {
-            Ok(Fetched::Body(body)) => body,
-            Ok(Fetched::NotModified) => {
-                return Err(Error::Fetch(format!(
-                    "{path}: the remote answered 304 to an unconditional request"
-                )));
+        // A body that fails in transit is fetched again from the start, which
+        // the fetcher's retry count pays for. The write that failed with it
+        // stages nothing, since an object is staged only once its checksum has
+        // been compared, and it removes its temp file as it fails.
+        let mut refetch = ctx.fetcher.refetching(FetchRequest {
+            priority: Priority::Low,
+            ..FetchRequest::path(&path)
+        });
+        loop {
+            let body = match refetch.fetch().await {
+                Ok(Fetched::Body(body)) => body,
+                Ok(Fetched::NotModified) => {
+                    return Err(Error::Fetch(format!(
+                        "{path}: the remote answered 304 to an unconditional request"
+                    )));
+                }
+                Err(e) => return Err(object_not_found(e, name)),
+            };
+            // The write permit is taken before the body is read: a step waiting
+            // for one has not yet asked the connection for bytes, so the
+            // fetcher's progress window is not running against it. It covers
+            // the whole body -- the header read and the end-of-stream read
+            // along with the payload -- and is released before a refetch waits
+            // out its delay.
+            let permit = ctx.writes.acquire(Priority::Normal).await;
+            let stored = self
+                .store_content(ctx, &name.checksum, body, read_buf)
+                .await;
+            drop(permit);
+            match stored {
+                Ok(()) => return Ok(Step::Done),
+                Err(e) => refetch.retry(e).await?,
             }
-            Err(e) => return Err(object_not_found(e, name)),
-        };
-        // The write permit is taken before the body is read: a step waiting for
-        // one has not yet asked the connection for bytes, so the fetcher's
-        // progress window is not running against it. It covers the whole body --
-        // the header read and the end-of-stream read along with the payload --
-        // and is released where the step returns.
-        let _permit = ctx.writes.acquire(Priority::Normal).await;
-        self.store_content(ctx, &name.checksum, body, read_buf)
-            .await?;
-        Ok(Step::Done)
+        }
     }
 
     /// Store one fetched content object under the name it was requested by.
@@ -1361,6 +1389,16 @@ fn ref_request_path(name: &str) -> String {
     out
 }
 
+/// The low-speed rule a pull's fetcher holds each transfer to. A field left
+/// `None` takes its default, and a zero in either field turns the rule off.
+fn low_speed(opts: &PullOptions) -> Option<LowSpeed> {
+    let limit = opts
+        .low_speed_limit_bytes
+        .unwrap_or(DEFAULT_LOW_SPEED_LIMIT);
+    let time = opts.low_speed_time.unwrap_or(DEFAULT_LOW_SPEED_TIME);
+    (limit != 0 && !time.is_zero()).then_some(LowSpeed { limit, time })
+}
+
 /// Fetch a path whole, or `None` when the remote answers 404.
 pub(crate) async fn fetch_optional(
     fetcher: &Fetcher,
@@ -1392,24 +1430,36 @@ pub(crate) async fn fetch_optional(
 /// final read, which finds the end of the stream, goes into the chunk, so a
 /// buffer filled to its declared length is not grown. A remote declaring no
 /// length grows its buffer as it reads, under the same cap.
+///
+/// A body that fails in transit is fetched again from the start, into a new
+/// buffer, while the fetcher's retry count has a repeat left.
 async fn fetch_whole(
     fetcher: &Fetcher,
     path: &str,
     priority: Priority,
     max_size: u64,
 ) -> Result<Vec<u8>> {
-    let fetched = fetcher
-        .fetch(FetchRequest {
-            priority,
-            max_size: Some(max_size),
-            ..FetchRequest::path(path)
-        })
-        .await?;
-    let Fetched::Body(mut body) = fetched else {
-        return Err(Error::Fetch(format!(
-            "{path}: the remote answered 304 to an unconditional request"
-        )));
-    };
+    let mut refetch = fetcher.refetching(FetchRequest {
+        priority,
+        max_size: Some(max_size),
+        ..FetchRequest::path(path)
+    });
+    loop {
+        let Fetched::Body(body) = refetch.fetch().await? else {
+            return Err(Error::Fetch(format!(
+                "{path}: the remote answered 304 to an unconditional request"
+            )));
+        };
+        match read_whole(body, max_size).await {
+            Ok(out) => return Ok(out),
+            Err(e) => refetch.retry(e.into()).await?,
+        }
+    }
+}
+
+/// Read `body` to its end into one buffer sized from its declared length,
+/// which the fetcher has held to `max_size`.
+async fn read_whole(mut body: Body, max_size: u64) -> std::io::Result<Vec<u8>> {
     let declared = usize::try_from(body.content_length().unwrap_or(0).min(max_size)).unwrap_or(0);
     let mut out = Vec::with_capacity(declared);
     let mut chunk = vec![0u8; declared.saturating_add(1).clamp(4096, IO_CHUNK)];
@@ -1684,6 +1734,33 @@ mod tests {
     use ostrya_rt::block_on;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    /// A pull holds each transfer to 1000 bytes per second over 30 seconds
+    /// unless told otherwise. A field left unset keeps its default, and a zero
+    /// in either field turns the rule off.
+    #[test]
+    fn the_low_speed_rule_defaults_and_turns_off_at_zero() {
+        let rule = |limit: Option<u32>, secs: Option<u64>| {
+            low_speed(&PullOptions {
+                low_speed_limit_bytes: limit,
+                low_speed_time: secs.map(Duration::from_secs),
+                ..PullOptions::default()
+            })
+        };
+        let low = |limit, secs| {
+            Some(LowSpeed {
+                limit,
+                time: Duration::from_secs(secs),
+            })
+        };
+        assert_eq!(rule(None, None), low(1000, 30));
+        assert_eq!(rule(Some(0), None), None);
+        assert_eq!(rule(None, Some(0)), None);
+        assert_eq!(rule(Some(0), Some(5)), None);
+        assert_eq!(rule(Some(50), None), low(50, 30));
+        assert_eq!(rule(None, Some(2)), low(1000, 2));
+        assert_eq!(rule(Some(50), Some(2)), low(50, 2));
+    }
 
     /// The archive stored form of a content object: the framed header, then the
     /// payload the caller supplies.

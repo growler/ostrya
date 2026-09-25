@@ -6402,6 +6402,73 @@ states for `reindex`. The work adds 9 `m10` cells, of which 4 are executable
 and all pass; the conformance run reports 1056 cells and 430 passes (the M10
 family 427).
 
+`pull` takes `--disable-retry-on-network-errors`, `--low-speed-limit-bytes=N`,
+and `--low-speed-time-seconds=N`. The switch sets `n_network_retries` to zero,
+whatever `--network-retries` says. The library adds `LowSpeed` and
+`FetcherOptions::low_speed`, the tool's rate rule over one `rt` timer. The
+rate is sampled once a second as the bytes of the last five seconds divided by
+five, from a ring of five byte counts, and a transfer fails when the rate stays
+at or below `limit` for `time` without a break. A sample above the limit starts
+the count again. The response head has to arrive within `time`, in whole
+seconds, of the start of an attempt, and the rate of a body is measured from
+its first read. A transfer below the rate is a retryable failure.
+`PullOptions` adds `low_speed_limit_bytes` and `low_speed_time`, below 1000
+bytes per second for 30 seconds by default, a zero in either turning the rule
+off. The pull reads each
+body through a crate-private refetch: a body that fails in transit is fetched
+again from its first byte, starting again from the first mirror, and each
+refetch spends one repeat of the same `n_network_retries` count. A body that
+outgrows its cap, or that the consumer refuses, is not fetched again.
+`Fetcher::fetch` keeps its meaning. A content writer dropped before its object
+is staged removes its temp file, so a refetch on a filesystem without
+`O_TMPFILE` leaves no named temp behind. `rt::Deadline::restart` under tokio
+makes a new sleep where the end of the window is past the clock's range, so
+such a window does not panic, and resets the sleep in place otherwise.
+
+Observation added these rules. The tool's default rule, below 1000 bytes per
+second for 30 seconds, applies to every pull: an object sent at about 100 bytes
+per second fails after 30 seconds. The tool samples the rate once a second
+over the last five seconds, and a transfer fails only when the rate stays below
+the limit for the time: bursts of 2000 bytes every 1.9 seconds complete under
+a limit of 1000 for one second, though no byte arrives in some whole seconds.
+`format-reference.md`, "CLI output formats", `pull`, gives the measurements.
+The tool retries a 503, a cut body, and a transfer below the rate from one
+count, and repeats at once: 6 requests by
+default, 2 with `--network-retries=1`, and 1 with `--network-retries=0` or the
+switch, whatever the order of the two. The two values are read with the C
+`int` reader of `--owner-uid` and refused with its messages, while the options
+are read and ahead of the repository. A value of 0 in either option turns the
+rule off, and a negative value keeps the default of its option: a limit of -1
+at about 2000 bytes per second with a time of one second completes, and a
+time of -1 at about 100 bytes per second fails after 30 seconds. The port
+maps a negative value to the default in the same way. After an object
+exhausts its retries, the tool keeps what it fetched in a staging directory
+under `tmp/`, with the commit's partial marker in place, and writes no object
+and no ref.
+
+Three decisions stand, each taken without the maintainer and open to reversal.
+The default rule is a `PullOptions` default, and `FetcherOptions` keeps no rule
+by default, so the general client changes nothing. A body that fails in
+transit is fetched again from the shared count, which the default rule needs:
+without it, one slow transfer would end the whole pull. A value on
+`--disable-retry-on-network-errors` stays refused by `clap`, which the open
+decision on a value given to a switch covers.
+
+Four divergences are recorded in `cli-surface.md`, "P2", `pull`: the pull stops
+at the first object that exhausts its retries and removes the partial marker,
+where the tool lets the other transfers finish and keeps what it fetched with
+the marker in place; the timing of a repeat; the low-speed rule measures a
+body from its first read, where the tool measures from the start of the
+request; and the rule samples a body only while a read waits for bytes, at
+moments of its own. The same entry now
+records the port's valued `--gpg-verify[=BOOL]` and `--gpg-verify-summary[=BOOL]`,
+which the tool refuses, and the port's refusal of a `file://` remote. The work
+adds 12 `m10` cells, of which 2 are executable and both pass; the conformance
+run reports 1068 cells and 432 passes (the M10 family 429). The boxed send
+under the head window keeps the fetch future at 5048 bytes, 136 more than
+before, and the pull step at 5848 bytes under smol, so no other future is
+boxed.
+
 #### Phase 17g -- P3 commands with no matrix weight
 
 `reset`, `checksum --ignore-xattrs`, `find-remotes`, `create-usb`, and

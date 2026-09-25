@@ -1252,9 +1252,24 @@ struct PullArgs {
     #[arg(long, value_name = "N")]
     max_outstanding_fetcher_requests: Option<usize>,
     /// How many times to repeat a round of mirrors after a retryable failure
-    /// (default: 5).
+    /// (default: 5). A body that fails in transit is fetched again from the
+    /// start, and each refetch spends one repeat.
     #[arg(long, value_name = "N")]
     network_retries: Option<u32>,
+    /// Retry nothing, whatever --network-retries says.
+    #[arg(long)]
+    disable_retry_on_network_errors: bool,
+    /// Abandon a transfer whose rate stays below N bytes per second for
+    /// --low-speed-time-seconds (default: 1000). The rate is sampled once a
+    /// second over the last five seconds. 0 turns the check off, and a
+    /// negative value keeps the default.
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    low_speed_limit_bytes: Option<String>,
+    /// How many seconds the rate may stay below --low-speed-limit-bytes
+    /// (default: 30). 0 turns the check off, and a negative value keeps the
+    /// default.
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    low_speed_time_seconds: Option<String>,
     /// Require each fetched tip to be no older than the commit its ref names in
     /// this repository.
     #[arg(short = 'T', long)]
@@ -1489,8 +1504,21 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             static_delta(repo, path, sub).await
         }
         Command::Pull(args) => {
+            // The low-speed values are read while the options are read, so a
+            // value the reader refuses stands ahead of the repository
+            // (`docs/format-reference.md`, "CLI output formats").
+            let low_speed = LowSpeedArgs {
+                limit: low_speed_value(
+                    args.low_speed_limit_bytes.as_deref(),
+                    "--low-speed-limit-bytes",
+                ),
+                seconds: low_speed_value(
+                    args.low_speed_time_seconds.as_deref(),
+                    "--low-speed-time-seconds",
+                ),
+            };
             let (repo, _) = resolve_repo(repo, verbose, name).await;
-            pull(repo, name, args).await
+            pull(repo, name, args, low_speed).await
         }
         Command::PullLocal(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
@@ -1670,8 +1698,24 @@ fn parse_init_mode(mode: &str) -> RepoMode {
     }
 }
 
+/// The low-speed rule a `pull` invocation names, a field `None` where its
+/// option is absent or negative.
+struct LowSpeedArgs {
+    limit: Option<u32>,
+    seconds: Option<u32>,
+}
+
+/// One `--low-speed-*` value, or `None` where the option is absent or its value
+/// is negative, which keeps the default in the tool as well. The value is read
+/// as a C `int` and refused in the words `--owner-uid` is refused in, as the
+/// tool reads and refuses both (`docs/format-reference.md`, "CLI output
+/// formats").
+fn low_speed_value(value: Option<&str>, flag: &str) -> Option<u32> {
+    owner_id(value, flag)
+}
+
 /// Fetch refs and their objects from an HTTP remote.
-async fn pull(repo: Repo, name: &str, args: PullArgs) -> Result<()> {
+async fn pull(repo: Repo, name: &str, args: PullArgs, low_speed: LowSpeedArgs) -> Result<()> {
     let Some(remote) = args.remote.as_deref() else {
         exit_with_error(name, "REMOTE must be specified");
     };
@@ -1714,7 +1758,16 @@ async fn pull(repo: Repo, name: &str, args: PullArgs) -> Result<()> {
                 url: args.url,
                 http_headers: args.http_header,
                 max_outstanding_fetches: args.max_outstanding_fetcher_requests,
-                n_network_retries: args.network_retries,
+                // The switch wins over --network-retries, in either order.
+                n_network_retries: if args.disable_retry_on_network_errors {
+                    Some(0)
+                } else {
+                    args.network_retries
+                },
+                low_speed_limit_bytes: low_speed.limit,
+                low_speed_time: low_speed
+                    .seconds
+                    .map(|seconds| std::time::Duration::from_secs(seconds.into())),
                 timestamp_check,
                 disable_static_deltas: args.disable_static_deltas,
                 require_static_deltas: args.require_static_deltas,

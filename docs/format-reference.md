@@ -815,8 +815,12 @@ completing the pull, which removes it; a pull that fails part way leaves the
 marker behind). A marker already present is not rewritten: a pull over a commit
 `fsck` marked keeps the one-byte state (observed by running `fsck` on a
 repository with a deleted referenced object, then `pull-local` from a source
-missing that same object, after which the marker still holds `0x66`). The marker
-is local state and does not enter any checksum.
+missing that same object, after which the marker still holds `0x66`). A pull
+with `--subpath` keeps the zero-length marker of every commit it reaches, since
+it fetched part of the tree, and a later pull of the commit without `--subpath`
+removes it (observed by running the tool's `pull --subpath=/sub`, which leaves a
+0-byte marker, and then a pull without the option). The marker is local state
+and does not enter any checksum.
 
 No writer syncs a marker or the `state/` directory. A pull creates every marker
 before its transaction stages an object, so the `syncfs` that opens publication
@@ -972,6 +976,10 @@ objects/<commit>.commitmeta
   holding the ref's commit against a remote advertising only the from-scratch
   delta fetches every object loose, and so does a fresh client against a remote
   advertising only the from-to delta.
+- A client that already holds the target commit object takes no delta for it,
+  partial or complete. After `--commit-metadata-only` or a `--subpath` pull, a
+  later pull of the same commit requests the delta index, takes no superblock,
+  and fetches the missing objects loose.
 - The index is requested whenever a summary is present. Where it answers 404 the
   pull reads the summary's own `ostree.static-deltas` map instead and fetches the
   superblock the map names. Where neither names the delta, no superblock is
@@ -992,7 +1000,8 @@ objects/<commit>.commitmeta
   delta index found`, which is what a remote serving no summary produces, and no
   delta probe is made in that case. A remote that advertises deltas satisfies it
   even where none of them produces the commit being pulled.
-- The destination has to be non-archive: an archive client refuses with `error:
+- An archive client takes no delta. A plain pull requests no delta index and
+  fetches every object loose, and `--require-static-deltas` refuses with `error:
   Can't use static deltas in an archive repo` before any request is made.
 - A content object is always requested as `objects/<..>.filez`, whatever mode the
   remote actually stores. Metadata keeps `.commit`, `.dirtree`, and `.dirmeta`.
@@ -1020,8 +1029,50 @@ objects/<commit>.commitmeta
 - `-T` fails only on a strictly older timestamp; an equal timestamp passes.
   `--timestamp-check-from-rev=REV` compares against REV and implies the check.
   The message names both revisions and both timestamps.
-- HTTP pulls always verify checksums. The tool's `--untrusted` help reads "Verify
-  checksums of local sources (always enabled for HTTP pulls)".
+- An HTTP pull verifies the checksum of every object it fetches by default. The
+  tool's `--untrusted` help reads "Verify checksums of local sources (always
+  enabled for HTTP pulls)", and over HTTP the switch changes nothing: a corrupt
+  `.filez` fails the pull with and without it.
+- `--http-trusted` (help: "Do not verify checksums of HTTP sources (mostly useful
+  when mirroring)") skips the check under `--mirror` into an `archive`
+  destination alone. There the tool stores a corrupt `.filez` verbatim, writes
+  the ref, and exits 0, and a later `fsck` fails with `Corrupted file object`.
+  Without `--mirror`, into a `bare-user` destination, or with `--untrusted`
+  beside it, the corrupt object fails the pull with `Writing content object:
+  Corrupted file object` and no ref is written. `pull-local` takes neither
+  `--subpath` nor `--http-trusted` (`Unknown option`). The port accepts
+  `--http-trusted` and verifies every object all the same, so under `--mirror`
+  into `archive` it refuses the corrupt object at exit 1 and writes no object
+  and no ref.
+- `--subpath=PATH`, repeatable, fetches part of each commit's tree. The value is
+  split on `/` after its leading `/`, each component kept, empty ones included.
+  The commit and the root dirtree and dirmeta are always fetched. A directory a
+  component names that is not the path's last is fetched as its dirtree and
+  dirmeta, and the walk goes on inside it; the entry the last component names is
+  fetched whole, a file or a directory with everything under it. Nothing else is
+  fetched: no sibling, no sibling's dirmeta, and no file of a directory the path
+  passes through. `/sub/f1/x` with `f1` a file fetches the `sub` dirtree and
+  dirmeta alone. `/nonexist`, `/`, `/a/` with `a` a file, `//sub`, and `/./sub`
+  fetch the root alone, since no entry holds an empty name, `.`, or `..`, and
+  `/sub/` fetches the `sub` dirtree and dirmeta with nothing in them. Several
+  values fetch the union. A dirtree reached at two positions is walked once, under
+  the first walk to reach it, so what the tool fetches then follows the order its
+  fetches complete in. Over `python3 -m http.server` it followed the directory
+  that sorts first in the tree, whatever the order of the values, and was stable
+  over repeated runs; over another server `/other/x/` beside `/sub/x` fetched
+  the file of `x`, where that rule fetches none. The port walks the dirtree under
+  both positions. The ref is
+  written, under `refs/heads` for `--mirror`. Every commit the pull reaches keeps
+  a zero-length `state/<checksum>.commitpartial`, under `--depth` each parent
+  too, and a later pull without `--subpath` completes the commit and removes the
+  marker. A subpath pull of a commit already complete writes no marker. With
+  `--commit-metadata-only` the commit alone is fetched. Into `bare-user` the
+  tool applies a delta whole, from-scratch or from-to, for a commit it does not
+  hold, and still leaves the marker; into `archive`, where it takes no delta, it
+  fetches the subpath loose, and so does the port. A value that does not
+  start with `/`, the empty value included, ends the tool on an assertion
+  (`SIGABRT`, exit 134 from a shell) with nothing written; the port refuses it
+  at exit 1 before the first request.
 
 ### Signature verification during a pull
 

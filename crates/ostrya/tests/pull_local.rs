@@ -2938,3 +2938,29 @@ fn pull_local_durability_options_change_no_byte() {
         }
     });
 }
+
+/// A local pull takes no subpath: it refuses the option before it reads the
+/// source, and imports nothing.
+#[test]
+fn a_local_pull_refuses_subpaths() {
+    let tmp = TmpDir::new("pull-subpath-refused");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    subpaths: vec!["/".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert!(dst.list_objects().await.unwrap().is_empty());
+    });
+}

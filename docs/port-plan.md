@@ -3468,8 +3468,8 @@ a summary with neither an index nor the delta map. A remote that advertises delt
 satisfies the requirement even where none of them produces the commit being
 pulled, and that pull fetches its objects loose; this is the tool's own rule,
 whose message names the same two sources ("no summary deltas or delta index
-found"). A tip this repository already holds complete is not looked for, so a pull
-with nothing to fetch is not refused, and `disable_static_deltas` wins over the
+found"). A tip whose commit object this repository already holds, complete or
+partial, is not looked for, so a pull with nothing to fetch is not refused, and `disable_static_deltas` wins over the
 requirement, since a pull that asks for no delta finds none to require.
 
 The plan grows a part class, drained after the commits and before the scan,
@@ -3507,8 +3507,9 @@ two writers agree on the entries of the map. Their orders agree only where the
 tool's order is name order by chance, so a summary carrying two or more deltas
 is not in general byte-comparable against the tool's.
 
-One capability difference: the tool refuses a delta-accelerated pull into an
-archive repository (`error: Can't use static deltas in an archive repo`). The port
+One capability difference: the tool takes no delta into an archive repository.
+A plain pull there fetches loose, and `--require-static-deltas` refuses with
+`error: Can't use static deltas in an archive repo` before any request. The port
 applies a delta into any destination mode, since its applier writes through the
 transaction's content writer, which stores what each mode requires.
 
@@ -6525,6 +6526,64 @@ Three divergences are recorded in `cli-surface.md`, "P2", `pull` and
 root, and the detached metadata), the refused value suffix, and the refused
 repeat. The work adds 15 `m10` cells, of which 7 are executable and all 7 pass;
 the conformance run reports 1083 cells and 439 passes (the M10 family 436).
+
+`pull` takes `--subpath=PATH`, repeatable, `--untrusted`, and `--http-trusted`.
+The library adds `PullOptions::subpaths`, which `Repo::pull` reads and
+`Repo::pull_local` refuses with `Error::Unsupported`, as the tool's
+`pull-local` refuses the option. A value that does not start with `/` is
+refused with `Error::Pull` before the first request. The walk splits each value
+on `/` after its leading `/` and keeps every component. A directory named by a
+component that is not the last is fetched as its dirtree and dirmeta, and the
+entry the last component names is fetched whole; nothing else is fetched, and
+a component no dirtree entry can hold -- empty, `.`, or `..` -- names nothing.
+The plan owns the parsed values and computes a dirtree's children when its step
+is applied, under the scope of every path position that reaches it, so a
+dirtree reached again under a wider scope while it is queued or in flight is
+walked once, under the union, and one reached again after its walk is queued
+again and read back from the transaction. A pull without subpaths walks every
+tree whole and keeps no scope. A pull with subpaths keeps the zero-length
+marker of every commit it reaches, as a commit-only pull does, and a later pull
+without them completes the commit and removes the marker. A delta found for a
+subpath pull is applied whole, as the tool applies one into `bare-user`. Into
+`archive` a subpath pull takes no delta and fetches the subpaths loose, as the
+tool does, unless `require_static_deltas` is set, where the port takes the
+delta and the tool refuses any delta into `archive`. Delta discovery skips a
+commit whose object the destination already holds, partial as well as complete,
+for every pull, with or without subpaths: the tool fetches what such a commit
+is missing loose, and so a pull without subpaths after a subpath pull or a
+commit-only pull fetches loose too, which changes the requests and no byte. The
+CLI maps `--untrusted` to `PullFlags::UNTRUSTED`, which an HTTP
+pull does not read, and reads `--http-trusted` and discards it.
+
+Observation added these rules. The walk rules above are the tool's, measured
+over a tree whose directories each carry a dirmeta of their own: a sibling and
+its dirmeta are not fetched, `/sub/f1/x` with `f1` a file fetches the `sub`
+dirtree and dirmeta, and `/sub/..` and `/sub//deeper` fetch the `sub` dirtree
+and dirmeta alone. A subpath pull of a commit already complete writes no marker.
+Into `archive` the tool takes no delta and fetches the subpath loose, and a
+destination holding the commit object partial takes no delta. A relative
+or empty value ends the tool on an assertion with nothing written.
+`--untrusted` restores the check `--http-trusted` skips. The tool discards an
+`=VALUE` suffix on both switches and takes a repeat of either.
+`format-reference.md`, "HTTP pull surface", gives the rules.
+
+Three decisions stand, each taken without the maintainer and open to reversal.
+`--http-trusted` is accepted and the check is kept, so the port writes no
+object whose bytes do not hash to its name; the pass-through the tool takes
+under `--mirror` into `archive` would need a write path that stores bytes
+unhashed. A dirtree reached at two positions is walked under both, where the
+tool walks it once, under the first walk to reach it, so what it fetches
+follows the order its fetches complete in: over one server it followed the
+directory that sorts first, whatever the order of the values, and over another
+it did not. The port's union is a fixed superset of either outcome. A subpath
+pull into `archive` under `require_static_deltas` takes the delta, which the
+capability difference recorded for delta pulls into `archive` covers.
+
+Four divergences are recorded in `cli-surface.md`, "P2", `pull`: the refusal of a
+relative or empty value, the shared dirtree, `--http-trusted`, and the refused
+value suffix and repeat of the two switches.
+The work adds 19 `m10` cells, of which 2 are executable and both pass; the
+conformance run reports 1102 cells and 441 passes (the M10 family 438).
 
 #### Phase 17g -- P3 commands with no matrix weight
 

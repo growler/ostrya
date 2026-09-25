@@ -1231,6 +1231,18 @@ struct PullArgs {
     /// Fetch only the commit objects, leaving each commit marked partial.
     #[arg(long)]
     commit_metadata_only: bool,
+    /// Fetch only the part of each commit's tree under this absolute path,
+    /// leaving each commit marked partial; repeatable, taking the union.
+    #[arg(long = "subpath", value_name = "PATH")]
+    subpath: Vec<String>,
+    /// Verify the checksum of every object. An HTTP pull does that either way,
+    /// so the switch changes nothing.
+    #[arg(long)]
+    untrusted: bool,
+    /// Accepted for the tool's command line. Every fetched object's checksum
+    /// is verified all the same, so a corrupt object fails the pull.
+    #[arg(long)]
+    http_trusted: bool,
     /// Reject regular files whose mode has bits outside 0775.
     #[arg(long)]
     bareuseronly_files: bool,
@@ -1747,6 +1759,12 @@ async fn pull(repo: Repo, name: &str, args: PullArgs, low_speed: LowSpeedArgs) -
     if args.commit_metadata_only {
         flags |= PullFlags::COMMIT_ONLY;
     }
+    if args.untrusted {
+        flags |= PullFlags::UNTRUSTED;
+    }
+    // --http-trusted asks the pull to store a fetched object without checking
+    // its checksum. The pull checks every object all the same.
+    let _ = args.http_trusted;
     if args.bareuseronly_files {
         flags |= PullFlags::BAREUSERONLY_FILES;
     }
@@ -1773,6 +1791,7 @@ async fn pull(repo: Repo, name: &str, args: PullArgs, low_speed: LowSpeedArgs) -
                 localcache_repos,
                 disable_fsync: args.disable_fsync,
                 per_object_fsync: args.per_object_fsync,
+                subpaths: args.subpath,
                 url: args.url,
                 http_headers: args.http_header,
                 max_outstanding_fetches: args.max_outstanding_fetcher_requests,

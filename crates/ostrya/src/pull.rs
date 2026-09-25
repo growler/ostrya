@@ -110,7 +110,9 @@
 //! `state/<commit>.commitpartial` marker before the commit object is stored,
 //! removed once its objects are published. An interrupted pull therefore leaves the
 //! commit marked partial, and a [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull
-//! leaves the marker in place, since the commit's content was never fetched.
+//! leaves the marker in place, since the commit's content was never fetched. An
+//! HTTP pull with [`PullOptions::subpaths`] leaves it in place too, since it
+//! fetched part of the content.
 //! Both match the markers the `ostree` tool leaves behind. A marker already
 //! present is left as it stands rather than rewritten, so the one-byte state
 //! fsck writes survives a pull over the commit it marked.
@@ -178,6 +180,7 @@ use crate::write::FileMeta;
 mod delta;
 mod drive;
 pub mod http;
+mod subpath;
 mod verify;
 
 /// The chunk size for streaming a content object's payload.
@@ -470,6 +473,16 @@ pub struct PullOptions {
     /// synced on their own. Under fsync off, from `[core] fsync` or
     /// [`disable_fsync`](PullOptions::disable_fsync), nothing is synced.
     pub per_object_fsync: bool,
+    /// The parts of each commit's tree an HTTP pull fetches, each an absolute
+    /// path. An empty list fetches the whole tree. A path through a directory
+    /// fetches that directory's dirtree and dirmeta and no sibling of it, and
+    /// the entry the path's last component names is fetched whole; several
+    /// paths fetch the union. `/` fetches the root dirtree and dirmeta and
+    /// nothing under them. A pull with
+    /// subpaths leaves every commit it marks partial, and a later pull without
+    /// them completes it. A value that does not start with `/` is refused, and
+    /// [`Repo::pull_local`] refuses the option.
+    pub subpaths: Vec<String>,
     /// The base URL an HTTP pull fetches from, overriding the remote's
     /// configured `url`. `None` uses the configuration.
     pub url: Option<String>,
@@ -558,6 +571,11 @@ impl Repo {
     /// source does not hold ends that chain without error, so a source with
     /// truncated history pulls what it has.
     pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<PullStats> {
+        // A local pull copies whole trees; the tool's `pull-local` takes no
+        // subpath either.
+        if !opts.subpaths.is_empty() {
+            return Err(Error::Unsupported("a local pull takes no subpath".into()));
+        }
         // The signature policy is built before the source is read: a check the
         // options ask for with no remote to take keys from is refused here,
         // rather than after a chain has been walked.

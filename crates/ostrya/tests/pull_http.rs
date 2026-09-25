@@ -4482,3 +4482,483 @@ fn http_pull_durability_options_change_no_byte() {
         }
     });
 }
+
+// --- subpaths ----------------------------------------------------------------
+
+/// A source tree with siblings of distinct content under `dir`: the files `top`
+/// and `a`, `sub/f1`, `sub/deeper/f2`, `other/g`, and one directory `x` of
+/// identical content under both `sub` and `other`.
+fn build_subpath_tree(dir: &Path) {
+    for d in ["sub/deeper", "sub/x", "other/x"] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    for (path, bytes) in [
+        ("top", &b"top\n"[..]),
+        ("a", b"a\n"),
+        ("sub/f1", b"f1\n"),
+        ("sub/deeper/f2", b"f2\n"),
+        ("other/g", b"g\n"),
+        ("sub/x/s", b"same\n"),
+        ("other/x/s", b"same\n"),
+    ] {
+        std::fs::write(dir.join(path), bytes).unwrap();
+    }
+}
+
+/// A remote under `dir/remote` holding `test/main` over the subpath tree, with
+/// no summary, so a delta is probed for by name.
+async fn build_subpath_remote(dir: &Path) -> (Repo, Checksum) {
+    build_subpath_tree(&dir.join("src"));
+    let repo = Repo::create(&dir.join("remote"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let commit = commit_tree(&repo, dir, "src", "test/main", None, FIXED_TS).await;
+    (repo, commit)
+}
+
+/// The objects of the entry at `path` in `commit`: a file object, or a
+/// directory's dirtree and dirmeta.
+async fn entry_objects(repo: &Repo, commit: &Checksum, path: &str) -> Vec<ostrya::ObjectName> {
+    use ostrya::{ObjectName, ObjectType};
+    let (commit, _) = repo.load_commit(commit).await.unwrap();
+    let mut tree = commit.root_dirtree;
+    let mut meta = commit.root_dirmeta;
+    let components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    for (i, name) in components.iter().enumerate() {
+        let dirtree = repo.load_dirtree(&tree).await.unwrap();
+        if let Some((_, file)) = dirtree.files.iter().find(|(n, _)| n == name) {
+            assert_eq!(i + 1, components.len(), "{path}: a file mid-path");
+            return vec![ObjectName::new(*file, ObjectType::File)];
+        }
+        let (_, t, m) = dirtree.dirs.iter().find(|(n, _, _)| n == name).unwrap();
+        tree = *t;
+        meta = *m;
+    }
+    vec![
+        ObjectName::new(tree, ObjectType::DirTree),
+        ObjectName::new(meta, ObjectType::DirMeta),
+    ]
+}
+
+/// Every object under the directory at `path` in `commit`, the directory's own
+/// dirtree and dirmeta included.
+async fn whole_objects(repo: &Repo, commit: &Checksum, path: &str) -> HashSet<ostrya::ObjectName> {
+    use ostrya::{ObjectName, ObjectType};
+    let own = entry_objects(repo, commit, path).await;
+    let mut out: HashSet<ObjectName> = own.iter().copied().collect();
+    let mut stack = vec![own[0].checksum];
+    while let Some(tree) = stack.pop() {
+        let dirtree = repo.load_dirtree(&tree).await.unwrap();
+        for (_, file) in &dirtree.files {
+            out.insert(ObjectName::new(*file, ObjectType::File));
+        }
+        for (_, t, m) in &dirtree.dirs {
+            out.insert(ObjectName::new(*t, ObjectType::DirTree));
+            out.insert(ObjectName::new(*m, ObjectType::DirMeta));
+            stack.push(*t);
+        }
+    }
+    out
+}
+
+/// The objects every subpath pull of `commit` fetches: the commit, and the root
+/// dirtree and dirmeta.
+async fn subpath_base(repo: &Repo, commit: &Checksum) -> HashSet<ostrya::ObjectName> {
+    use ostrya::{ObjectName, ObjectType};
+    let mut out: HashSet<ObjectName> = entry_objects(repo, commit, "/").await.into_iter().collect();
+    out.insert(ObjectName::new(*commit, ObjectType::Commit));
+    out
+}
+
+fn subpath_opts(values: &[&str]) -> PullOptions {
+    PullOptions {
+        refs: vec!["test/main".to_owned()],
+        subpaths: values.iter().map(|v| (*v).to_owned()).collect(),
+        ..PullOptions::default()
+    }
+}
+
+/// The zero-length marker a subpath pull leaves on `commit` in the destination
+/// at `dest`.
+fn assert_partial_marker(dest: &Path, commit: &Checksum) {
+    let marker = dest
+        .join("state")
+        .join(format!("{}.commitpartial", commit.to_hex()));
+    assert_eq!(std::fs::metadata(&marker).unwrap().len(), 0, "{marker:?}");
+}
+
+/// Each subpath form fetches the commit, the root dirtree and dirmeta, the
+/// directories on the path, and the entry the path names whole, and nothing
+/// else; the ref is written and the commit is left partial behind a
+/// zero-length marker.
+#[test]
+fn a_subpath_pull_fetches_the_path_and_leaves_the_commit_partial() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-subpath-forms");
+        let (remote, commit) = build_subpath_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let base = subpath_base(&remote, &commit).await;
+        let on_path = |paths: &[&str]| {
+            let paths: Vec<String> = paths.iter().map(|p| (*p).to_owned()).collect();
+            let remote = &remote;
+            async move {
+                let mut out = HashSet::new();
+                for p in &paths {
+                    out.extend(entry_objects(remote, &commit, p).await);
+                }
+                out
+            }
+        };
+        let cases: Vec<(Vec<&str>, HashSet<ostrya::ObjectName>)> = vec![
+            (vec!["/sub"], whole_objects(&remote, &commit, "/sub").await),
+            (vec!["/a"], on_path(&["/a"]).await),
+            (vec!["/nonexist"], HashSet::new()),
+            (vec!["/"], HashSet::new()),
+            (vec!["/sub/"], on_path(&["/sub"]).await),
+            (vec!["/a/", "//sub", "/./sub"], HashSet::new()),
+            (vec!["/sub/f1/x"], on_path(&["/sub"]).await),
+            (vec!["/sub/deeper"], {
+                let mut s = whole_objects(&remote, &commit, "/sub/deeper").await;
+                s.extend(on_path(&["/sub"]).await);
+                s
+            }),
+            (vec!["/sub/deeper", "/a"], {
+                let mut s = whole_objects(&remote, &commit, "/sub/deeper").await;
+                s.extend(on_path(&["/sub", "/a"]).await);
+                s
+            }),
+        ];
+        for (i, (values, extra)) in cases.into_iter().enumerate() {
+            let case = dir.path().join(i.to_string());
+            std::fs::create_dir(&case).unwrap();
+            let dest = build_dest(&case, RepoMode::Archive, &server.url(), "").await;
+            dest.pull("origin", subpath_opts(&values)).await.unwrap();
+            let mut expected = base.clone();
+            expected.extend(extra);
+            assert_eq!(dest.list_objects().await.unwrap(), expected, "{values:?}");
+            assert_eq!(
+                dest.resolve_rev("origin:test/main", true).await.unwrap(),
+                Some(commit),
+                "{values:?}"
+            );
+            assert_eq!(
+                dest.commit_state(&commit).await.unwrap(),
+                CommitState::Partial,
+                "{values:?}"
+            );
+            assert_partial_marker(&case.join("dest"), &commit);
+        }
+    });
+}
+
+/// A pull without subpaths completes a commit a subpath pull left partial and
+/// removes its marker, and a subpath pull of a commit already complete here
+/// leaves it complete.
+#[test]
+fn a_full_pull_completes_a_subpath_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-subpath-full");
+        let (_remote, commit) = build_subpath_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        dest.pull("origin", subpath_opts(&["/sub"])).await.unwrap();
+        assert_partial_marker(&dir.path().join("dest"), &commit);
+
+        dest.pull("origin", subpath_opts(&[])).await.unwrap();
+        assert_eq!(
+            dest.commit_state(&commit).await.unwrap(),
+            CommitState::Normal
+        );
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+
+        dest.pull("origin", subpath_opts(&["/sub"])).await.unwrap();
+        assert_eq!(
+            dest.commit_state(&commit).await.unwrap(),
+            CommitState::Normal
+        );
+    });
+}
+
+/// One dirtree reached at two subpath positions is walked under both: `x`
+/// named whole under `other` fetches its file whatever the order, and named as
+/// a directory alone at both positions fetches none.
+#[test]
+fn a_dirtree_at_two_subpath_positions_takes_the_union() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-subpath-shared");
+        let (remote, commit) = build_subpath_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let shared = entry_objects(&remote, &commit, "/sub/x/s").await[0];
+        for (i, (values, fetched)) in [
+            (["/sub/x/", "/other/x"], true),
+            (["/other/x", "/sub/x/"], true),
+            (["/other/x/", "/sub/x/"], false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let case = dir.path().join(i.to_string());
+            std::fs::create_dir(&case).unwrap();
+            let dest = build_dest(&case, RepoMode::Archive, &server.url(), "").await;
+            dest.pull("origin", subpath_opts(&values)).await.unwrap();
+            let objects = dest.list_objects().await.unwrap();
+            assert_eq!(objects.contains(&shared), fetched, "{values:?}");
+            for p in ["/sub/x", "/other/x"] {
+                for name in entry_objects(&remote, &commit, p).await {
+                    assert!(objects.contains(&name), "{values:?}: {p}");
+                }
+            }
+        }
+    });
+}
+
+/// Under `depth` every commit reached is walked under the same subpaths and
+/// left partial; under `COMMIT_ONLY` the commit alone is fetched; under
+/// `MIRROR` the ref is written as a local ref.
+#[test]
+fn subpaths_combine_with_depth_commit_only_and_mirror() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-subpath-combined");
+        let (remote, first) = build_subpath_remote(dir.path()).await;
+        std::fs::write(dir.path().join("src/sub/f3"), b"f3\n").unwrap();
+        let second = commit_tree(
+            &remote,
+            dir.path(),
+            "src",
+            "test/main",
+            Some(first),
+            FIXED_TS + 1,
+        )
+        .await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+
+        let case = dir.path().join("depth");
+        std::fs::create_dir(&case).unwrap();
+        let dest = build_dest(&case, RepoMode::Archive, &server.url(), "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                depth: 1,
+                ..subpath_opts(&["/sub/deeper"])
+            },
+        )
+        .await
+        .unwrap();
+        let objects = dest.list_objects().await.unwrap();
+        for commit in [first, second] {
+            assert_partial_marker(&case.join("dest"), &commit);
+            for name in whole_objects(&remote, &commit, "/sub/deeper").await {
+                assert!(objects.contains(&name));
+            }
+            for name in entry_objects(&remote, &commit, "/sub/f1").await {
+                assert!(!objects.contains(&name));
+            }
+        }
+
+        let case = dir.path().join("commit-only");
+        std::fs::create_dir(&case).unwrap();
+        let dest = build_dest(&case, RepoMode::Archive, &server.url(), "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                flags: PullFlags::COMMIT_ONLY,
+                ..subpath_opts(&["/sub"])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.list_objects().await.unwrap(),
+            HashSet::from([ostrya::ObjectName::new(second, ostrya::ObjectType::Commit)])
+        );
+        assert_partial_marker(&case.join("dest"), &second);
+
+        let case = dir.path().join("mirror");
+        std::fs::create_dir(&case).unwrap();
+        let dest = build_dest(&case, RepoMode::Archive, &server.url(), "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                flags: PullFlags::MIRROR,
+                ..subpath_opts(&["/sub"])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.resolve_rev("test/main", true).await.unwrap(),
+            Some(second)
+        );
+        assert_partial_marker(&case.join("dest"), &second);
+    });
+}
+
+/// A from-scratch delta is applied whole under subpaths, as the tool applies
+/// one, and the commit keeps its marker.
+#[test]
+fn a_subpath_pull_applies_a_delta_whole() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-subpath-delta");
+        let (remote, commit) = build_subpath_remote(dir.path()).await;
+        remote
+            .generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        dest.pull("origin", subpath_opts(&["/sub/deeper"]))
+            .await
+            .unwrap();
+        let everything = remote.traverse_commit(&commit, 0).await.unwrap();
+        assert_eq!(dest.list_objects().await.unwrap(), everything);
+        assert_partial_marker(&dir.path().join("dest"), &commit);
+        assert!(
+            !server.seen().iter().any(|p| p.ends_with(".filez")),
+            "{:?}",
+            server.seen()
+        );
+    });
+}
+
+/// Into an `archive` destination a subpath pull takes no delta: it fetches the
+/// subpath loose and requests no part.
+#[test]
+fn a_subpath_pull_into_an_archive_takes_no_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-subpath-delta-archive");
+        let (remote, commit) = build_subpath_remote(dir.path()).await;
+        remote
+            .generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        dest.pull("origin", subpath_opts(&["/sub/deeper"]))
+            .await
+            .unwrap();
+        let mut expected = subpath_base(&remote, &commit).await;
+        expected.extend(whole_objects(&remote, &commit, "/sub/deeper").await);
+        expected.extend(entry_objects(&remote, &commit, "/sub").await);
+        assert_eq!(dest.list_objects().await.unwrap(), expected);
+        assert_partial_marker(&dir.path().join("dest"), &commit);
+        assert!(
+            !server.seen().iter().any(|p| p.contains("deltas/")),
+            "{:?}",
+            server.seen()
+        );
+        // A pull that requires static deltas takes the delta all the same.
+        let required = dir.path().join("required");
+        std::fs::create_dir(&required).unwrap();
+        let dest = build_dest(&required, RepoMode::Archive, &server.url(), "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                require_static_deltas: true,
+                ..subpath_opts(&["/sub/deeper"])
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            server.seen().iter().any(|p| p.contains("deltas/")),
+            "{:?}",
+            server.seen()
+        );
+        assert_partial_marker(&required.join("dest"), &commit);
+    });
+}
+
+/// A commit whose object the destination already holds takes no delta, partial
+/// or not: a subpath pull after a commit-only pull, and a full pull after a
+/// subpath pull, each fetch what is missing loose.
+#[test]
+fn a_commit_held_partial_takes_no_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-subpath-delta-partial");
+        let (remote, commit) = build_subpath_remote(dir.path()).await;
+        remote
+            .generate_static_delta(
+                None,
+                &commit,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                flags: PullFlags::COMMIT_ONLY,
+                ..subpath_opts(&[])
+            },
+        )
+        .await
+        .unwrap();
+        dest.pull("origin", subpath_opts(&["/sub/deeper"]))
+            .await
+            .unwrap();
+        let mut expected = subpath_base(&remote, &commit).await;
+        expected.extend(whole_objects(&remote, &commit, "/sub/deeper").await);
+        expected.extend(entry_objects(&remote, &commit, "/sub").await);
+        assert_eq!(dest.list_objects().await.unwrap(), expected);
+        assert_partial_marker(&dir.path().join("dest"), &commit);
+        dest.pull("origin", subpath_opts(&[])).await.unwrap();
+        let everything = remote.traverse_commit(&commit, 0).await.unwrap();
+        assert_eq!(dest.list_objects().await.unwrap(), everything);
+        assert_eq!(
+            dest.commit_state(&commit).await.unwrap(),
+            CommitState::Normal
+        );
+        assert!(
+            !server.seen().iter().any(|p| p.contains("deltas/")),
+            "{:?}",
+            server.seen()
+        );
+    });
+}
+
+/// A relative or empty subpath is refused before the first request.
+#[test]
+fn a_relative_or_empty_subpath_is_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-subpath-relative");
+        build_subpath_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        for value in ["sub", ""] {
+            let err = dest
+                .pull("origin", subpath_opts(&[value]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Pull(_)), "{value:?}: {err}");
+        }
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_nothing_published(&dest).await;
+        assert!(dest.list_objects().await.unwrap().is_empty());
+    });
+}

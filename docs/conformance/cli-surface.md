@@ -2490,8 +2490,7 @@ DIR, `--timestamp`, `--reindex`, `--gpg-homedir`, and `-s` for
 `--output-dir`. The port reads a `--sign` key with the lenient base64 reader
 `commit --sign` uses.
 
-`pull` accepts a large set already. Missing: `--cache-dir`, `--subpath`,
-`--untrusted`, `--http-trusted`, `--dry-run`,
+`pull` accepts a large set already. Missing: `--cache-dir`, `--dry-run`,
 `--update-frequency=FREQUENCY`. The port adds `--force-copy`,
 `--sign-verify`, and `--sign-verify-summary`. It also adds the valued forms
 `--gpg-verify[=BOOL]` and `--gpg-verify-summary[=BOOL]`, which the tool refuses
@@ -2596,6 +2595,48 @@ differences stand:
   '<switch>' cannot be used multiple times` at exit 1. This is the
   repeated-boolean-flag class.
 
+`--subpath=PATH`, repeatable, fetches the part of each commit's tree the rules
+in `../format-reference.md`, "HTTP pull surface", state, and the port leaves
+the same objects, the same ref, and the same zero-length
+`state/<commit>.commitpartial` marker as the tool for each form: a directory,
+a file, a name the tree does not hold, `/`, a trailing `/`, an empty or a `.`
+or `..` component, several values, and each under `--depth`,
+`--commit-metadata-only`, and `--mirror`, into `archive` and `bare-user`. A
+later pull without the option completes the commit and removes the marker in
+both. Into `bare-user` both apply a delta whole for a commit the destination
+does not hold and keep the marker. Into `archive` both take no delta and fetch
+the subpath loose, and a destination holding the commit object partial takes
+no delta in either. `--untrusted` changes no byte of an HTTP pull in either, and
+a corrupt object fails the pull with and without it. Four differences stand:
+
+- a relative or an empty value. The tool ends on an assertion
+  (`ostree_repo_pull_with_options: assertion 'dir_to_pull[0] == '/'' failed`,
+  `SIGABRT`, exit 134 from a shell) and writes nothing. The port refuses the
+  value with `error: pull: subpath '<value>' is not an absolute path` at exit 1
+  before the first request, and writes nothing;
+- one dirtree reached at two positions, which is two directories of identical
+  content. The tool walks it once, under the first walk to reach it, so what
+  it fetches under the dirtree follows the order its fetches complete in: with
+  `/other/x/` beside `/sub/x` it fetched the file of `x` over one server and not
+  over another. The port walks it under every position that reaches it, so it
+  fetches what each value names whatever the order;
+- `--http-trusted`. The tool skips the checksum check under `--mirror` into an
+  `archive` destination: it stores a corrupt `.filez`, writes the ref, and
+  exits 0, and a later `fsck` fails. The port accepts the switch and checks
+  every object all the same, so it refuses that object at exit 1 and writes no
+  object and no ref. Elsewhere both refuse the object;
+- a value given to `--untrusted` or `--http-trusted`, and a repeat of either.
+  The tool reads and discards an `=VALUE` suffix and takes a repeat. `clap`
+  refuses both at exit 1, and the port writes no object and no ref. The open
+  decisions on a value given to a switch and on a repeated boolean flag cover
+  it.
+
+`--untrusted` over a `file://` remote changes what the tool does; the port
+fetches no `file://` remote. Under `--require-static-deltas` into `archive`
+the tool refuses with `error: Can't use static deltas in an archive repo`, and
+the port takes the delta, with or without `--subpath`, which is the capability
+difference `../port-plan.md`, Phase 16d, records.
+
 `pull-local` accepts `--repo`, `--remote`, `--depth`, `--commit-metadata-only`,
 `--untrusted`, `--bareuseronly-files`, `--disable-verify-bindings`,
 `--disable-fsync`, `--per-object-fsync`, and the port extensions `--force-copy`
@@ -2606,7 +2647,11 @@ the source is not synced, in both, so from `archive` into `archive`
 `--per-object-fsync` adds no call. The same three differences stand, with
 `refs/heads` in place of `refs/remotes/<remote>` and no summary: the count
 over corpus `C0` is 12 in the port and 11 in the tool, and 15 and 11 for a
-commit that carries detached metadata.
+commit that carries detached metadata. `pull-local` takes neither `--subpath`
+nor `--http-trusted` in either: the tool reports `error: Unknown option
+<option>` at exit 1, and `clap` refuses the option at exit 1. The library's
+local pull refuses a subpath with `unsupported: a local pull takes no
+subpath`.
 
 `sign` accepts the whole tool option set and adds `--gpg-homedir`,
 `--remote`, the `gpg` engine, and the `spki` engine. The tool build at hand,

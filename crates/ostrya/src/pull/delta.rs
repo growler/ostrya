@@ -63,7 +63,7 @@
 
 use std::collections::HashMap;
 
-use ostrya_core::{Checksum, ObjectName, ObjectType, Type, Value, from_bytes};
+use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, Type, Value, from_bytes};
 
 use crate::delta::{
     Blob, DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, concat_to_blob,
@@ -153,10 +153,14 @@ impl DeltaJob {
 /// Find the delta to pull each target commit with, keyed by that commit.
 ///
 /// A commit with no entry is pulled object by object. Discovery is skipped for a
-/// commit this repository already holds complete, for a
+/// commit whose object this repository already holds, complete or partial, since
+/// the walk then fetches only what is missing, for a
 /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull, whose plan is the commit objects
-/// alone, and when [`disable_static_deltas`](PullOptions::disable_static_deltas)
-/// is set.
+/// alone, for a pull held to [`subpaths`](PullOptions::subpaths) into an
+/// `archive` repository that does not
+/// [`require_static_deltas`](PullOptions::require_static_deltas), which fetches
+/// the subpaths loose, and when
+/// [`disable_static_deltas`](PullOptions::disable_static_deltas) is set.
 ///
 /// Two refs naming one commit share one delta, since the plan fetches that commit
 /// once. The source commit is read from the ref this repository holds, so the
@@ -172,11 +176,16 @@ pub(crate) async fn discover(
     verification: &Verification,
 ) -> Result<HashMap<Checksum, DeltaJob>> {
     let mut jobs = HashMap::new();
-    if opts.disable_static_deltas || opts.flags.contains(PullFlags::COMMIT_ONLY) {
+    if opts.disable_static_deltas
+        || opts.flags.contains(PullFlags::COMMIT_ONLY)
+        || (!opts.subpaths.is_empty()
+            && repo.mode() == RepoMode::Archive
+            && !opts.require_static_deltas)
+    {
         return Ok(jobs);
     }
     for (ref_name, to) in targets {
-        if jobs.contains_key(to) || complete_here(repo, to).await? {
+        if jobs.contains_key(to) || repo.has_object(ObjectType::Commit, to).await? {
             continue;
         }
         let from = source_commit(repo, ref_name, to, ref_prefix).await?;

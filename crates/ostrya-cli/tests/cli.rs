@@ -6297,6 +6297,629 @@ fn pull_fsync_switches_parse_as_switches() {
     }
 }
 
+// --- pull: scope and trust ---------------------------------------------------
+//
+// These tests are the `evidence:` the M10 records under "pull -- scope and
+// trust" cite: the harness serves no remote, so the object inventory, the ref,
+// and the partial marker each `--subpath` form leaves are compared here against
+// the tool wherever it is installed.
+
+/// A remote under `base/<name>` whose tree has siblings of distinct content and
+/// of distinct directory modes, so every dirtree and dirmeta the walk may skip
+/// is an object of its own: the files `top` and `a`, `sub/f1`, `sub/deeper/f2`,
+/// `other/g`, and one directory `x` of identical content under both `sub` and
+/// `other`. `test/main` holds two commits, the second adding `sub/f3`. A
+/// from-scratch delta of the tip is generated when `delta` is set.
+fn build_subpath_remote(base: &Path, name: &str, delta: bool) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = base.join(name);
+    let src = dir.join("src");
+    for d in ["sub/deeper", "sub/x", "other/x", "emptyd"] {
+        std::fs::create_dir_all(src.join(d)).unwrap();
+    }
+    for (path, bytes) in [
+        ("top", &b"top\n"[..]),
+        ("a", b"a\n"),
+        ("sub/f1", b"f1\n"),
+        ("sub/deeper/f2", b"f2\n"),
+        ("other/g", b"g\n"),
+        ("sub/x/s", b"same\n"),
+        ("other/x/s", b"same\n"),
+    ] {
+        std::fs::write(src.join(path), bytes).unwrap();
+    }
+    for (path, mode) in [
+        ("sub", 0o751),
+        ("sub/deeper", 0o711),
+        ("other", 0o700),
+        ("emptyd", 0o750),
+        ("sub/x", 0o705),
+        ("other/x", 0o705),
+    ] {
+        std::fs::set_permissions(src.join(path), std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let repo = create_repo(&dir, RepoMode::Archive);
+    let repo_s = repo.to_str().unwrap();
+    let commit = |subject: &str| {
+        ostrya(
+            &[
+                "commit",
+                "--repo",
+                repo_s,
+                "-b",
+                BRANCH,
+                "-s",
+                subject,
+                "--no-xattrs",
+                src.to_str().unwrap(),
+            ],
+            None,
+            &[("SOURCE_DATE_EPOCH", SOURCE_DATE_EPOCH)],
+        )
+        .ok();
+    };
+    commit("first");
+    std::fs::write(src.join("sub/f3"), b"f3\n").unwrap();
+    commit("second");
+    if delta {
+        ostrya(
+            &[
+                "static-delta",
+                "generate",
+                "--repo",
+                repo_s,
+                "--empty",
+                &format!("--to={BRANCH}"),
+            ],
+            None,
+            &[],
+        )
+        .ok();
+    }
+    ostrya(&["summary", "--repo", repo_s, "-u"], None, &[]).ok();
+    repo
+}
+
+/// What a pull left in the destination at `dest`: the loose objects, the ref
+/// files, and each `state/` entry with its length.
+type PullResult = (Vec<(String, String)>, Vec<PathBuf>, Vec<(String, u64)>);
+
+fn pull_result(dest: &Path) -> PullResult {
+    let refs = files_under(&dest.join("refs"));
+    let mut state: Vec<(String, u64)> = std::fs::read_dir(dest.join("state"))
+        .map(|read| {
+            read.map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.metadata().unwrap().len(),
+                )
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+    state.sort();
+    (loose_objects(dest), refs, state)
+}
+
+/// The port's exit code and what it left, and the tool's exit status and what
+/// it left where it ran.
+type SubpathPulls = (
+    (Option<i32>, PullResult),
+    Option<(std::process::ExitStatus, PullResult)>,
+);
+
+/// Pull `test/main` from `url` with `args` into a fresh destination of `mode`
+/// under `base/<tag>`, by the port and, where `tool` is set, by the tool into a
+/// destination of its own. Returns each side's exit status and what it left.
+fn subpath_pulls(
+    base: &Path,
+    tag: &str,
+    mode: RepoMode,
+    url: &str,
+    args: &[&str],
+    tool: bool,
+) -> SubpathPulls {
+    let run = |who: &str| {
+        let dir = base.join(tag).join(who);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = create_repo(&dir, mode);
+        configure_remote(&dest, url, "gpg-verify=false\n");
+        let repo_arg = format!("--repo={}", dest.display());
+        let mut argv = vec!["pull", repo_arg.as_str(), "origin", BRANCH];
+        argv.extend_from_slice(args);
+        let out = if who == "port" {
+            ostrya(&argv, None, &[])
+        } else {
+            ostree(&argv)
+        };
+        (out, pull_result(&dest))
+    };
+    let (ours, ours_left) = run("port");
+    let theirs = tool.then(|| {
+        let (out, left) = run("tool");
+        (out.status, left)
+    });
+    ((ours.status.code(), ours_left), theirs)
+}
+
+/// Pull with each row of `rows` into an archive and a bare-user destination,
+/// by the port and, where the tool is present, by the tool, and assert both
+/// leave the same objects, the same ref, and the same zero-length partial
+/// marker on each commit reached.
+fn assert_subpath_rows_match_the_tool(name: &str, rows: &[&[&str]]) {
+    let tool = ostree_available();
+    let tmp = TmpDir::new(name);
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    let server = FileServer::start(&remote);
+    for (i, args) in rows.iter().enumerate() {
+        for mode in [RepoMode::Archive, RepoMode::BareUser] {
+            let tag = format!("{i}-{}", mode.as_mode_str());
+            let ((code, ours), theirs) = subpath_pulls(base, &tag, mode, &server.url(), args, tool);
+            assert_eq!(code, Some(0), "{args:?} {mode:?}");
+            assert!(!ours.2.is_empty(), "{args:?} {mode:?}: no marker");
+            assert!(
+                ours.2
+                    .iter()
+                    .all(|(name, len)| name.ends_with(".commitpartial") && *len == 0)
+            );
+            if let Some((status, theirs)) = theirs {
+                assert!(status.success(), "{args:?} {mode:?}: the tool failed");
+                assert_eq!(ours, theirs, "{args:?} {mode:?}");
+            }
+        }
+    }
+}
+
+/// A directory, a file, a name the tree does not hold, `/`, and a trailing `/`
+/// each fetch what the tool fetches.
+#[test]
+fn pull_subpath_forms_match_the_tool() {
+    assert_subpath_rows_match_the_tool(
+        "pull-subpath-forms",
+        &[
+            &["--subpath=/sub"],
+            &["--subpath=/a"],
+            &["--subpath=/nonexist"],
+            &["--subpath=/"],
+            &["--subpath=/sub/"],
+            &["--subpath=/sub/deeper"],
+            &["--subpath=/sub/deeper/"],
+        ],
+    );
+}
+
+/// An empty, a `.`, or a `..` component, and a file passed mid-path, each fetch
+/// what the tool fetches.
+#[test]
+fn pull_subpath_unmatched_components_match_the_tool() {
+    assert_subpath_rows_match_the_tool(
+        "pull-subpath-components",
+        &[
+            &["--subpath=//sub"],
+            &["--subpath=/./sub"],
+            &["--subpath=/sub/.."],
+            &["--subpath=/sub//deeper"],
+            &["--subpath=/a/"],
+            &["--subpath=/sub/f1/x"],
+        ],
+    );
+}
+
+/// Several values fetch the union, as in the tool, a shared dirtree that no
+/// value names whole among them.
+#[test]
+fn pull_subpath_unions_match_the_tool() {
+    assert_subpath_rows_match_the_tool(
+        "pull-subpath-unions",
+        &[
+            &["--subpath=/sub/deeper", "--subpath=/a"],
+            &["--subpath=/other/x/", "--subpath=/sub/x/"],
+        ],
+    );
+}
+
+/// `--subpath` beside `--depth`, `--commit-metadata-only`, `--mirror`,
+/// `--untrusted`, and `--http-trusted` leaves what the tool leaves.
+#[test]
+fn pull_subpath_with_other_options_matches_the_tool() {
+    assert_subpath_rows_match_the_tool(
+        "pull-subpath-options",
+        &[
+            &["--subpath=/sub/deeper", "--depth=1"],
+            &["--subpath=/sub", "--commit-metadata-only"],
+            &["--subpath=/sub", "--mirror"],
+            &["--subpath=/sub", "--untrusted"],
+            &["--subpath=/sub", "--http-trusted"],
+        ],
+    );
+}
+
+/// One dirtree reached at two `--subpath` positions is walked under both: `x`
+/// is named whole under one directory and as a directory alone under the
+/// other, so its file is fetched whatever the order of the values. The tool
+/// walks such a dirtree once, under the first walk to reach it, so whether it
+/// fetches the file follows the order its fetches complete in; everything else
+/// it leaves agrees with the port.
+#[test]
+fn pull_subpath_walks_a_shared_dirtree_under_every_position() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-subpath-shared");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    let server = FileServer::start(&remote);
+    let shared = loose_objects(&remote)
+        .into_iter()
+        .filter(|(_, ext)| ext == "filez")
+        .collect::<std::collections::HashSet<_>>();
+    for (i, args) in [
+        ["--subpath=/sub/x/", "--subpath=/other/x"],
+        ["--subpath=/other/x", "--subpath=/sub/x/"],
+        ["--subpath=/other/x/", "--subpath=/sub/x"],
+        ["--subpath=/sub/x", "--subpath=/other/x/"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ((code, ours), theirs) = subpath_pulls(
+            base,
+            &i.to_string(),
+            RepoMode::Archive,
+            &server.url(),
+            &args,
+            tool,
+        );
+        assert_eq!(code, Some(0), "{args:?}");
+        // The one content object fetched is `s`, which both copies of `x` hold.
+        let fetched: Vec<_> = ours.0.iter().filter(|(_, ext)| ext == "filez").collect();
+        assert_eq!(fetched.len(), 1, "{args:?}");
+        assert!(shared.contains(fetched[0]), "{args:?}");
+        if let Some((status, theirs)) = theirs {
+            assert!(status.success(), "{args:?}");
+            let without_s: Vec<_> = ours
+                .0
+                .iter()
+                .filter(|object| !shared.contains(object))
+                .cloned()
+                .collect();
+            assert!(
+                theirs.0 == ours.0 || theirs.0 == without_s,
+                "{args:?}: {:?}",
+                theirs.0
+            );
+            assert_eq!((&ours.1, &ours.2), (&theirs.1, &theirs.2), "{args:?}");
+        }
+    }
+}
+
+/// A later pull without `--subpath` completes the commit and removes the
+/// marker, and a `--subpath` pull of a commit already complete writes none, as
+/// in the tool.
+#[test]
+fn pull_after_a_subpath_pull_clears_the_marker() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-subpath-full");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    let server = FileServer::start(&remote);
+    let whole = subpath_pulls(base, "whole", RepoMode::BareUser, &server.url(), &[], false)
+        .0
+        .1;
+    for who in ["port", "tool"] {
+        if who == "tool" && !tool {
+            continue;
+        }
+        let dir = base.join(who);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = create_repo(&dir, RepoMode::BareUser);
+        configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+        let repo_arg = format!("--repo={}", dest.display());
+        let pull = |extra: &[&str]| {
+            let mut argv = vec!["pull", repo_arg.as_str(), "origin", BRANCH];
+            argv.extend_from_slice(extra);
+            let out = if who == "port" {
+                ostrya(&argv, None, &[])
+            } else {
+                ostree(&argv)
+            };
+            assert!(out.status.success(), "{who} {extra:?}");
+        };
+        pull(&["--subpath=/sub"]);
+        assert_eq!(pull_result(&dest).2.len(), 1, "{who}");
+        pull(&[]);
+        assert_eq!(pull_result(&dest), whole, "{who}");
+        pull(&["--subpath=/sub"]);
+        assert_eq!(pull_result(&dest), whole, "{who}");
+    }
+}
+
+/// A from-scratch delta is applied whole under `--subpath` into a bare-user
+/// destination, and the commit keeps its marker, as in the tool.
+#[test]
+fn pull_subpath_applies_a_delta_whole_as_the_tool_does() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-subpath-delta");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", true);
+    let server = FileServer::start(&remote);
+    let ((code, ours), theirs) = subpath_pulls(
+        base,
+        "delta",
+        RepoMode::BareUser,
+        &server.url(),
+        &["--subpath=/sub/deeper"],
+        tool,
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(ours.2.len(), 1, "{:?}", ours.2);
+    assert!(server.seen().iter().any(|p| p.starts_with("deltas/")));
+    assert!(!server.seen().iter().any(|p| p.ends_with(".filez")));
+    let whole = subpath_pulls(
+        base,
+        "whole",
+        RepoMode::BareUser,
+        &server.url(),
+        &["--disable-static-deltas"],
+        false,
+    )
+    .0
+    .1;
+    assert_eq!(ours.0, whole.0);
+    if let Some((status, theirs)) = theirs {
+        assert!(status.success());
+        assert_eq!(ours, theirs);
+    }
+}
+
+/// Into an archive destination a `--subpath` pull takes no delta and fetches
+/// the subpath loose, as in the tool.
+#[test]
+fn pull_subpath_into_an_archive_takes_no_delta() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-subpath-delta-archive");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", true);
+    let server = FileServer::start(&remote);
+    let ((code, ours), theirs) = subpath_pulls(
+        base,
+        "delta",
+        RepoMode::Archive,
+        &server.url(),
+        &["--subpath=/sub/deeper"],
+        tool,
+    );
+    assert_eq!(code, Some(0));
+    assert_eq!(ours.2.len(), 1, "{:?}", ours.2);
+    assert!(
+        !server.seen().iter().any(|p| p.starts_with("deltas/")),
+        "{:?}",
+        server.seen()
+    );
+    let loose = subpath_pulls(
+        base,
+        "loose",
+        RepoMode::Archive,
+        &server.url(),
+        &["--subpath=/sub/deeper", "--disable-static-deltas"],
+        false,
+    )
+    .0
+    .1;
+    assert_eq!(ours, loose);
+    if let Some((status, theirs)) = theirs {
+        assert!(status.success());
+        assert_eq!(ours, theirs);
+    }
+}
+
+/// A commit whose object the destination holds takes no delta, partial or not:
+/// a `--subpath` pull after a `--commit-metadata-only` pull, and a full pull
+/// after that, each fetch what is missing loose and leave what the tool leaves.
+#[test]
+fn pull_of_a_commit_held_partial_takes_no_delta() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-subpath-delta-partial");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", true);
+    let server = FileServer::start(&remote);
+    let mut left = Vec::new();
+    for who in ["port", "tool"] {
+        if who == "tool" && !tool {
+            continue;
+        }
+        let dir = base.join(who);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = create_repo(&dir, RepoMode::BareUser);
+        configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+        let repo_arg = format!("--repo={}", dest.display());
+        let pull = |extra: &[&str]| {
+            let mut argv = vec!["pull", repo_arg.as_str(), "origin", BRANCH];
+            argv.extend_from_slice(extra);
+            let out = if who == "port" {
+                ostrya(&argv, None, &[])
+            } else {
+                ostree(&argv)
+            };
+            assert!(out.status.success(), "{who} {extra:?}");
+            pull_result(&dest)
+        };
+        pull(&["--commit-metadata-only"]);
+        let partial = pull(&["--subpath=/sub/deeper"]);
+        assert_eq!(partial.2.len(), 1, "{who}: {:?}", partial.2);
+        let whole = pull(&[]);
+        assert!(whole.2.is_empty(), "{who}: {:?}", whole.2);
+        left.push((partial, whole));
+    }
+    assert!(
+        !server.seen().iter().any(|p| p.starts_with("deltas/")),
+        "{:?}",
+        server.seen()
+    );
+    if let [ours, theirs] = &left[..] {
+        assert_eq!(ours, theirs);
+    }
+}
+
+/// A relative and an empty `--subpath` are refused at exit 1 with nothing
+/// written. The tool ends on an assertion (`SIGABRT`, exit 134 from a shell)
+/// and writes nothing either.
+#[test]
+fn pull_refuses_a_relative_or_empty_subpath() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-subpath-relative");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    let server = FileServer::start(&remote);
+    for (i, value) in ["--subpath=sub", "--subpath="].into_iter().enumerate() {
+        let ((code, ours), theirs) = subpath_pulls(
+            base,
+            &i.to_string(),
+            RepoMode::Archive,
+            &server.url(),
+            &[value],
+            tool,
+        );
+        assert_eq!(code, Some(1), "{value}");
+        let nothing: PullResult = (Vec::new(), Vec::new(), Vec::new());
+        assert_eq!(ours, nothing, "{value}");
+        if let Some((status, theirs)) = theirs {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(6), "{value}");
+            assert_eq!(theirs, nothing, "{value}");
+        }
+    }
+}
+
+/// `--http-trusted` keeps the checksum check: under `--mirror` into an archive
+/// destination a corrupt `.filez` fails the port's pull with nothing written,
+/// where the tool stores it, exits 0, and fails a later `fsck`. Without
+/// `--mirror`, and under `--untrusted`, both refuse it.
+#[test]
+fn pull_http_trusted_keeps_the_checksum_check() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-http-trusted");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    // One content object's payload is flipped in place, so its bytes no
+    // longer hash to its name.
+    let (victim, _) = loose_objects(&remote)
+        .into_iter()
+        .find(|(_, ext)| ext == "filez")
+        .unwrap();
+    let path = remote.join(format!("objects/{}/{}.filez", &victim[..2], &victim[2..]));
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = bytes.len() - 6;
+    bytes[at] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    let server = FileServer::start(&remote);
+    let nothing: PullResult = (Vec::new(), Vec::new(), Vec::new());
+    for (i, (args, tool_ok)) in [
+        (&["--mirror", "--http-trusted"][..], true),
+        (&["--http-trusted"][..], false),
+        (&["--mirror", "--http-trusted", "--untrusted"][..], false),
+        (&["--mirror"][..], false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ((code, ours), theirs) = subpath_pulls(
+            base,
+            &i.to_string(),
+            RepoMode::Archive,
+            &server.url(),
+            args,
+            tool,
+        );
+        assert_eq!(code, Some(1), "{args:?}");
+        assert_eq!(ours, nothing, "{args:?}");
+        if let Some((status, theirs)) = theirs {
+            assert_eq!(status.success(), tool_ok, "{args:?}");
+            if tool_ok {
+                assert!(theirs.0.iter().any(|(c, _)| *c == victim), "{args:?}");
+                let dest = base.join(i.to_string()).join("tool/repo");
+                let fsck = ostree(&["fsck", &format!("--repo={}", dest.display())]);
+                assert!(!fsck.status.success(), "{args:?}");
+            } else {
+                assert!(theirs.1.is_empty(), "{args:?}");
+            }
+        }
+    }
+}
+
+/// `--untrusted` and `--http-trusted` are switches: `clap` refuses a value and a
+/// repeat of either at exit 1 with nothing written, where the tool discards the
+/// value, takes the repeat, and pulls.
+#[test]
+fn pull_trust_switches_parse_as_switches() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-trust-switches");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    let server = FileServer::start(&remote);
+    let nothing: PullResult = (Vec::new(), Vec::new(), Vec::new());
+    for (i, args) in [
+        &["--untrusted=bogus"][..],
+        &["--untrusted", "--untrusted"][..],
+        &["--http-trusted=false"][..],
+        &["--http-trusted", "--http-trusted"][..],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ((code, ours), theirs) = subpath_pulls(
+            base,
+            &i.to_string(),
+            RepoMode::Archive,
+            &server.url(),
+            args,
+            tool,
+        );
+        assert_eq!(code, Some(1), "{args:?}");
+        assert_eq!(ours, nothing, "{args:?}");
+        if let Some((status, theirs)) = theirs {
+            assert!(status.success(), "{args:?}");
+            assert!(!theirs.0.is_empty(), "{args:?}");
+        }
+    }
+}
+
+/// `pull-local` takes neither `--subpath` nor `--http-trusted`, in the port or
+/// in the tool, and imports nothing.
+#[test]
+fn pull_local_refuses_subpath_and_http_trusted() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-local-subpath");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    for (i, arg) in ["--subpath=/sub", "--http-trusted"].into_iter().enumerate() {
+        for who in ["port", "tool"] {
+            if who == "tool" && !tool {
+                continue;
+            }
+            let dir = base.join(format!("{i}-{who}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dest = create_repo(&dir, RepoMode::Archive);
+            let repo_arg = format!("--repo={}", dest.display());
+            let argv = [
+                "pull-local",
+                repo_arg.as_str(),
+                arg,
+                remote.to_str().unwrap(),
+                BRANCH,
+            ];
+            let out = if who == "port" {
+                ostrya(&argv, None, &[])
+            } else {
+                ostree(&argv)
+            };
+            assert!(!out.status.success(), "{who} {arg}");
+            assert!(loose_objects(&dest).is_empty(), "{who} {arg}");
+        }
+    }
+}
+
 // --- Phase 17b: refs, rev-parse, and cat against the tool ---------------------
 //
 // These five tests are the `evidence:` the M10 records

@@ -13779,3 +13779,268 @@ note: from `archive` into `archive` every object is hardlinked, so no row syncs
  content object: tool 15 and port 16. `--disable-fsync` and `[core]
  fsync=false` make 0 in both. The port also syncs `refs/heads`, which the tool
  does not.
+
+# ---------------------------------------------------------------------------
+# pull -- scope and trust (Phase 17f). The harness serves no remote, so each
+# `pull` cell cites the `cli.rs` test that pulls with each implementation from
+# a standard-library server of its own. The `pull-local` cells commit corpus
+# C0 into `$SRC` on `conformance`.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: pull
+cell: pull/subpath-directory
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_forms_match_the_tool
+spec: format-reference.md#http-pull-surface
+note: `--subpath=/sub` fetches the commit, the root dirtree and dirmeta, and
+ `sub` whole, and no sibling or sibling dirmeta; `/sub/deeper` adds the `sub`
+ dirtree and dirmeta on the way and no file of `sub`. The ref is written and a
+ zero-length `state/<commit>.commitpartial` stays, into `archive` and
+ `bare-user`, and the object inventory, the ref files, and the marker agree
+ with the tool.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-file
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_forms_match_the_tool
+spec: format-reference.md#http-pull-surface
+note: `--subpath=/a` naming a file fetches that file and the root. `/a/` and
+ `/sub/f1/x` pass a file mid-path and fetch nothing under it
+ (`ostrya_cli::cli::pull_subpath_unmatched_components_match_the_tool`). The
+ inventory, the ref, and the marker agree with the tool.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-names-nothing
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_unmatched_components_match_the_tool
+spec: format-reference.md#http-pull-surface
+note: `/nonexist`, `/`, `//sub`, `/./sub`, `/sub/..`, and `/sub//deeper` exit 0
+ and fetch what the components before the first unmatched one name: the root
+ alone for the first four, and the `sub` dirtree and dirmeta for the last two.
+ The inventory, the ref, and the marker agree with the tool. `/nonexist` and
+ `/` are rows of `ostrya_cli::cli::pull_subpath_forms_match_the_tool`.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-trailing-slash
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_forms_match_the_tool
+spec: format-reference.md#http-pull-surface
+note: `/sub/` and `/sub/deeper/` fetch the named dirtree and dirmeta and nothing
+ in them, as in the tool.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-union
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_unions_match_the_tool
+spec: format-reference.md#http-pull-surface
+note: two values fetch the union of what each fetches, `/sub/deeper` beside `/a`
+ among them, as in the tool.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-shared-dirtree
+setup: repo
+outcome: lossy
+severity: interop
+loss: one dirtree reached at two positions. The tool walks it once, under the
+ first walk to reach it, so under `/other/x/` beside `/sub/x`, where both `x`
+ hold the same tree, it fetches the file of `x` or not by the order its
+ fetches complete in, which over one server followed the directory that sorts
+ first and over another did not. The port walks the dirtree under both
+ positions and fetches the file in every order (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::pull_subpath_walks_a_shared_dirtree_under_every_position
+spec: format-reference.md#http-pull-surface
+note: everything else the two leave agrees in every order. `/other/x/` beside
+ `/sub/x/`, where no position names `x` whole, agrees with the tool
+ (`ostrya_cli::cli::pull_subpath_unions_match_the_tool`).
+
+family: M10
+subcommand: pull
+cell: pull/subpath-depth
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_with_other_options_matches_the_tool
+spec: format-reference.md#http-pull-surface
+note: under `--depth=1` the parent is walked under the same subpath and both
+ commits keep a zero-length marker, as in the tool.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-commit-metadata-only
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_with_other_options_matches_the_tool
+spec: format-reference.md#http-pull-surface
+note: beside `--commit-metadata-only` the commit alone is fetched and keeps its
+ marker, as in the tool.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-mirror
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_with_other_options_matches_the_tool
+spec: format-reference.md#http-pull-surface
+note: beside `--mirror` the ref is written under `refs/heads` and the marker
+ stays, as in the tool.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-delta-bare-user
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_applies_a_delta_whole_as_the_tool_does
+spec: format-reference.md#http-pull-surface
+note: into `bare-user` a from-scratch delta is applied whole, no `.filez` is
+ requested, and the marker stays, as in the tool.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-delta-archive
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_into_an_archive_takes_no_delta
+spec: format-reference.md#http-pull-surface
+note: into `archive` a subpath pull takes no delta: no superblock or part is
+ requested, the subpath is fetched loose, and the inventory, the ref, and the
+ marker agree with the tool and with the same pull under
+ `--disable-static-deltas`.
+
+family: M10
+subcommand: pull
+cell: pull/delta-commit-held-partial
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_of_a_commit_held_partial_takes_no_delta
+spec: format-reference.md#http-pull-surface
+note: into `bare-user`, after `--commit-metadata-only`, a `--subpath` pull and
+ then a pull without it take no delta and fetch what is missing loose. The
+ inventory, the ref, and the marker after each agree with the tool.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-full-pull-clears-marker
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_after_a_subpath_pull_clears_the_marker
+spec: format-reference.md#http-pull-surface
+note: a pull without `--subpath` completes the commit and removes the marker,
+ and a `--subpath` pull of the complete commit writes none, in both.
+
+family: M10
+subcommand: pull
+cell: pull/subpath-relative-refused
+setup: repo
+outcome: lossy
+severity: interop
+loss: a relative or empty value. The tool ends on an assertion (`SIGABRT`,
+ exit 134 from a shell); the port refuses it at exit 1 before the first
+ request. Neither writes an object, a ref, or a marker (`cli-surface.md`,
+ "P2").
+evidence: ostrya_cli::cli::pull_refuses_a_relative_or_empty_subpath
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `--subpath=sub` and `--subpath=` each.
+
+family: M10
+subcommand: pull
+cell: pull/untrusted-http-changes-nothing
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_subpath_with_other_options_matches_the_tool
+spec: format-reference.md#http-pull-surface
+note: `--untrusted` beside `--subpath` leaves what the pull without it leaves,
+ in both. A corrupt `.filez` fails the pull with and without it
+ (`ostrya_cli::cli::pull_http_trusted_keeps_the_checksum_check`).
+
+family: M10
+subcommand: pull
+cell: pull/http-trusted-keeps-check
+setup: repo
+outcome: lossy
+severity: interop
+loss: the checksum check `--http-trusted` skips. Under `--mirror` into an
+ `archive` destination the tool stores a corrupt `.filez`, writes the ref, and
+ exits 0, and a later `fsck` fails. The port checks every object, refuses that
+ one at exit 1, and writes no object and no ref (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::pull_http_trusted_keeps_the_checksum_check
+spec: format-reference.md#http-pull-surface
+note: without `--mirror`, and with `--untrusted` beside it, both refuse the
+ object. Over a remote with no corrupt object the switch changes nothing in
+ either (`ostrya_cli::cli::pull_subpath_with_other_options_matches_the_tool`).
+
+family: M10
+subcommand: pull
+cell: pull/trust-switch-value-suffix
+setup: repo
+outcome: lossy
+severity: interop
+loss: a value given to a switch, and a repeated boolean flag. The tool reads
+ and discards `=VALUE` on `--untrusted` and on `--http-trusted`, and takes a
+ repeat of either; the port refuses both at exit 1 and writes no object and no
+ ref (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::pull_trust_switches_parse_as_switches
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/subpath-refused
+src-mode: archive
+dst-mode: archive
+setup: src-dst
+run: pull-local --repo=$DST --subpath=/sub $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "unexpected argument '--subpath' found"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --subpath=/sub"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `pull-local` has no `--subpath` in either implementation. The words
+ differ, and neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/http-trusted-refused
+src-mode: archive
+dst-mode: archive
+setup: src-dst
+run: pull-local --repo=$DST --http-trusted $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "unexpected argument '--http-trusted' found"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --http-trusted"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `pull-local` has no `--http-trusted` in either implementation. The words
+ differ, and neither side writes an object or a ref.

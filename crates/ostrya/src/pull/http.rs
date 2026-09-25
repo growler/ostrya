@@ -64,6 +64,17 @@
 //! 404 for. The file is outside the transaction, so a pull that fails after a
 //! commit object landed leaves the copy it wrote, which prune sweeps.
 //!
+//! Subpaths. [`PullOptions::subpaths`](super::PullOptions::subpaths) holds the
+//! walk of each commit's tree to the parts the values name, by the rules in
+//! `subpath`; a value that is not absolute is refused before the first request.
+//! The plan walks a dirtree when its step is applied, under every position that
+//! has reached it by then, and walks it again from the transaction when a later
+//! position widens that scope. Each commit a subpath pull reaches keeps its
+//! marker, since part of its tree was fetched. Into an `archive` repository a
+//! subpath pull takes no delta and fetches the subpaths loose, unless it
+//! requires static deltas. Otherwise a delta found is applied whole, and the
+//! walk after its last part finds the subpaths present.
+//!
 //! Above one slot the request order is not fixed: which queued object a freed
 //! slot takes depends on which step finished. What is fixed is the set of
 //! requests and the class order between them.
@@ -197,6 +208,7 @@ use crate::write::FileMeta;
 
 use super::delta::{self, DeltaJob, PART_CAP};
 use super::drive::Slots;
+use super::subpath::{Scope, Subpaths};
 use super::verify::{Defaults, Verification};
 use super::{
     DetachedMetadataFilter, ModeChecks, PullFlags, PullOptions, PullStats, READ_CHUNK,
@@ -248,6 +260,9 @@ impl Repo {
     /// summary bytes to this repository's `summary`, and its `summary.sig` bytes
     /// where the remote holds them.
     pub async fn pull(&self, remote: &str, opts: PullOptions) -> Result<PullStats> {
+        // A subpath the walk cannot read is refused before anything else, so it
+        // costs no request and opens no transaction.
+        let subpaths = Subpaths::parse(&opts.subpaths)?;
         // The fetcher is built first, so a remote the config does not describe
         // reports that before a policy is resolved for it. `remote_fetcher`
         // reads the config section, the URL, and the TLS material; it sends no
@@ -307,6 +322,7 @@ impl Repo {
                 &targets,
                 &deltas,
                 &verification,
+                subpaths,
                 &mut marked,
             )
             .await?;
@@ -324,9 +340,10 @@ impl Repo {
             }
         };
 
-        // The content a marker guarded is published; a commit-only pull keeps
-        // its markers, since the trees were never fetched.
-        if !opts.flags.contains(PullFlags::COMMIT_ONLY) {
+        // The content a marker guarded is published. A commit-only pull keeps
+        // its markers, since the trees were never fetched, and so does a pull
+        // with subpaths, which fetched part of each tree.
+        if !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty() {
             for commit in &marked {
                 self.remove_partial_marker(commit).await?;
             }
@@ -474,6 +491,7 @@ impl Repo {
         targets: &[(String, Checksum)],
         deltas: &HashMap<Checksum, DeltaJob>,
         verification: &Verification,
+        subpaths: Option<Subpaths>,
         marked: &mut Vec<Checksum>,
     ) -> Result<()> {
         // The refs each requested tip is the tip of. The binding and timestamp
@@ -498,7 +516,7 @@ impl Repo {
             verification,
             detached_filter: &opts.detached_metadata_filter,
         };
-        let mut plan = Plan::default();
+        let mut plan = Plan::new(subpaths);
         for (_, tip) in targets {
             plan.push_commit(CommitItem {
                 checksum: *tip,
@@ -786,14 +804,14 @@ impl Repo {
             .write_metadata(name.ty, Some(&name.checksum), &bytes)
             .await?;
         match name.ty {
-            ObjectType::DirTree => Ok(Step::DirTree(children_of(&DirTree::parse(&bytes)?))),
+            ObjectType::DirTree => Ok(Step::DirTree(name.checksum, DirTree::parse(&bytes)?)),
             _ => Ok(Step::Done),
         }
     }
 
-    /// The step a stored metadata object produces: a dirtree reports what it
-    /// references, and anything else is a leaf, so `load` is called only for a
-    /// dirtree.
+    /// The step a stored metadata object produces: a dirtree reports itself, for
+    /// the plan to walk on from, and anything else is a leaf, so `load` is called
+    /// only for a dirtree.
     async fn walked<F>(&self, name: ObjectName, load: impl FnOnce() -> F) -> Result<Step>
     where
         F: Future<Output = Result<DirTree>>,
@@ -801,7 +819,7 @@ impl Repo {
         if name.ty != ObjectType::DirTree {
             return Ok(Step::Done);
         }
-        Ok(Step::DirTree(children_of(&load().await?)))
+        Ok(Step::DirTree(name.checksum, load().await?))
     }
 
     /// Fetch one content object and store it.
@@ -1038,8 +1056,9 @@ enum Item {
 enum Step {
     /// A commit object arrived, or was already here.
     Commit(CommitOutcome),
-    /// A dirtree is stored; these are the objects it references.
-    DirTree(Vec<ObjectName>),
+    /// A dirtree is stored: its checksum and its entries, which the plan walks
+    /// on from.
+    DirTree(Checksum, DirTree),
     /// A delta part is applied; this is the commit it belongs to.
     Part(Checksum),
     /// Nothing follows: a dirmeta or content object is stored, or a parent the
@@ -1109,6 +1128,18 @@ struct Plan {
     /// The objects this pull has queued, so an object several commits reach is
     /// fetched once.
     queued: HashSet<ObjectName>,
+    /// The subpaths the walk is held to, `None` walking every tree whole.
+    subpaths: Option<Subpaths>,
+    /// The scope each commit's root dirtree is walked under.
+    root: Scope,
+    /// The dirtrees queued under a scope short of the whole tree, with the scope
+    /// they are walked under and whether that walk has been applied.
+    ///
+    /// A dirtree reached again under a scope its own does not cover has its
+    /// scope widened. One still queued or in flight is walked under the wider
+    /// scope when its step is applied; one already walked is queued again, and
+    /// that second step reads the dirtree this pull stored.
+    partial_trees: HashMap<Checksum, PartialTree>,
     /// The remaining depth each commit was reached at, which is what decides
     /// whether a chain arriving at it again walks on from it.
     seen: HashMap<Checksum, i32>,
@@ -1117,7 +1148,22 @@ struct Plan {
     parents: HashMap<Checksum, Option<Checksum>>,
 }
 
+/// A dirtree walked under a scope short of the whole tree.
+struct PartialTree {
+    scope: Scope,
+    walked: bool,
+}
+
 impl Plan {
+    /// A plan whose walk is held to `subpaths`.
+    fn new(subpaths: Option<Subpaths>) -> Plan {
+        Plan {
+            root: subpaths.as_ref().map(Subpaths::root).unwrap_or_default(),
+            subpaths,
+            ..Plan::default()
+        }
+    }
+
     /// Queue a commit unless it has already been reached at least this deep.
     ///
     /// A commit reached again with further to go is not fetched again: the walk
@@ -1150,14 +1196,71 @@ impl Plan {
         }
     }
 
-    /// Queue an object this pull has not queued already.
-    fn push_object(&mut self, name: ObjectName) {
-        if !self.queued.insert(name) {
+    /// Queue an object this pull has not queued already, and a dirtree it has
+    /// queued under a scope that does not cover `scope`.
+    fn push_object(&mut self, name: ObjectName, scope: Scope) {
+        if self.queued.insert(name) {
+            if name.ty == ObjectType::DirTree && scope != Scope::All {
+                self.partial_trees.insert(
+                    name.checksum,
+                    PartialTree {
+                        scope,
+                        walked: false,
+                    },
+                );
+            }
+            match name.ty {
+                ObjectType::File => self.content.push_back(name),
+                _ => self.scan.push_back(name),
+            }
             return;
         }
-        match name.ty {
-            ObjectType::File => self.content.push_back(name),
-            _ => self.scan.push_back(name),
+        if name.ty != ObjectType::DirTree {
+            return;
+        }
+        // A dirtree with no entry here was queued whole.
+        let Some(tree) = self.partial_trees.get_mut(&name.checksum) else {
+            return;
+        };
+        if tree.scope.covers(&scope) {
+            return;
+        }
+        tree.scope.widen(&scope);
+        if tree.walked {
+            tree.walked = false;
+            self.scan.push_back(name);
+        }
+    }
+
+    /// Queue one object of a commit's tree: the root dirtree under the root
+    /// scope, and the root dirmeta.
+    fn push_root(&mut self, name: ObjectName) {
+        let scope = if name.ty == ObjectType::DirTree {
+            self.root.clone()
+        } else {
+            Scope::All
+        };
+        self.push_object(name, scope);
+    }
+
+    /// Queue what a stored dirtree references under the scope it is walked
+    /// under.
+    fn apply_dirtree(&mut self, checksum: Checksum, dirtree: &DirTree) {
+        let Some(subpaths) = &self.subpaths else {
+            for name in children_of(dirtree) {
+                self.push_object(name, Scope::All);
+            }
+            return;
+        };
+        let scope = match self.partial_trees.get_mut(&checksum) {
+            Some(tree) => {
+                tree.walked = true;
+                tree.scope.clone()
+            }
+            None => Scope::All,
+        };
+        for (name, scope) in subpaths.children(dirtree, &scope) {
+            self.push_object(name, scope);
         }
     }
 
@@ -1189,11 +1292,7 @@ impl Plan {
     fn apply(&mut self, step: Step, marked: &mut Vec<Checksum>) {
         match step {
             Step::Commit(outcome) => self.apply_commit(outcome, marked),
-            Step::DirTree(children) => {
-                for child in children {
-                    self.push_object(child);
-                }
-            }
+            Step::DirTree(checksum, dirtree) => self.apply_dirtree(checksum, &dirtree),
             Step::Part(commit) => self.apply_part(commit),
             Step::Done => {}
         }
@@ -1215,7 +1314,7 @@ impl Plan {
         // Every object the delta carries is staged now, so the walk reads what is
         // here and asks the network only for what the delta left out.
         for name in self.delta_trees.remove(&commit).unwrap_or_default() {
-            self.push_object(name);
+            self.push_root(name);
         }
     }
 
@@ -1229,7 +1328,7 @@ impl Plan {
             CommitNext::Nothing => {}
             CommitNext::Scan(tree) => {
                 for name in tree {
-                    self.push_object(name);
+                    self.push_root(name);
                 }
             }
             CommitNext::Delta {
@@ -1240,12 +1339,12 @@ impl Plan {
                 // The objects the delta hands over loose are queued at once, so
                 // they travel alongside the parts rather than after them.
                 for name in fallbacks {
-                    self.push_object(name);
+                    self.push_object(name, Scope::All);
                 }
                 if parts == 0 {
                     // A delta of fallbacks alone has no part to wait for.
                     for name in tree {
-                        self.push_object(name);
+                        self.push_root(name);
                     }
                 } else {
                     self.delta_parts.insert(outcome.checksum, parts);
@@ -2140,7 +2239,9 @@ mod tests {
     fn drain(plan: &mut Plan, marked: &mut Vec<Checksum>) {
         while let Some(item) = plan.next() {
             let step = match item {
-                Item::Object(name) if name.ty == ObjectType::DirTree => Step::DirTree(Vec::new()),
+                Item::Object(name) if name.ty == ObjectType::DirTree => {
+                    Step::DirTree(name.checksum, DirTree::default())
+                }
                 Item::Object(_) => Step::Done,
                 Item::Part(part) => Step::Part(part.commit),
                 Item::Commit(_) => panic!("the test queues no further commits"),
@@ -2335,6 +2436,78 @@ mod tests {
         let tls = block_on(remote_tls("origin", &section)).unwrap();
         assert_eq!(tls.roots, TrustRoots::DangerousAcceptAnyChain);
         assert!(tls.client_identity.is_none());
+    }
+
+    /// Pop the next item, which must be the dirtree `byte`.
+    fn pop_dirtree(plan: &mut Plan, byte: u8) {
+        loop {
+            match plan.next() {
+                Some(Item::Object(name)) if name.ty == ObjectType::DirMeta => continue,
+                Some(Item::Object(name)) => {
+                    assert_eq!(name, object(byte, ObjectType::DirTree));
+                    return;
+                }
+                _ => panic!("dirtree {byte} was not queued"),
+            }
+        }
+    }
+
+    /// A dirtree reached at two subpath positions is walked under both, even
+    /// when the second reaches it after its first walk: it is queued again, and
+    /// the second walk fetches what the first left out.
+    #[test]
+    fn a_dirtree_reached_again_under_a_wider_scope_is_walked_again() {
+        let values = ["/p/x/".to_owned(), "/q/x".to_owned()];
+        let mut plan = Plan::new(Subpaths::parse(&values).unwrap());
+        let mut marked = Vec::new();
+        // The root (1) holds `p` (10) and `q` (11), and both hold `x`, the one
+        // dirtree 20, which holds the file 30.
+        let root = DirTree {
+            files: Vec::new(),
+            dirs: vec![
+                ("p".into(), csum(10), csum(2)),
+                ("q".into(), csum(11), csum(2)),
+            ],
+        };
+        let parent = DirTree {
+            files: Vec::new(),
+            dirs: vec![("x".into(), csum(20), csum(2))],
+        };
+        let x = DirTree {
+            files: vec![("f".into(), csum(30))],
+            dirs: Vec::new(),
+        };
+        plan.apply(
+            fetched(
+                csum(1),
+                vec![
+                    object(2, ObjectType::DirMeta),
+                    object(1, ObjectType::DirTree),
+                ],
+                None,
+            ),
+            &mut marked,
+        );
+        pop_dirtree(&mut plan, 1);
+        plan.apply(Step::DirTree(csum(1), root), &mut marked);
+        pop_dirtree(&mut plan, 10);
+        pop_dirtree(&mut plan, 11);
+        plan.apply(Step::DirTree(csum(10), parent.clone()), &mut marked);
+        // `x` is walked under `/p/x/` alone, which fetches nothing in it.
+        pop_dirtree(&mut plan, 20);
+        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked);
+        assert!(plan.content.is_empty());
+        // `/q/x` reaches it again and names it whole.
+        plan.apply(Step::DirTree(csum(11), parent), &mut marked);
+        pop_dirtree(&mut plan, 20);
+        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked);
+        assert_eq!(
+            plan.content.iter().copied().collect::<Vec<_>>(),
+            [object(30, ObjectType::File)]
+        );
+        // A third reach is covered, so nothing is queued again.
+        plan.push_object(object(20, ObjectType::DirTree), Scope::All);
+        assert!(plan.scan.is_empty());
     }
 
     /// A delta whose objects all went to fallbacks has no part to wait for, so

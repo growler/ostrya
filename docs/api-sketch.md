@@ -1912,6 +1912,9 @@ pub struct PullOptions {
     pub disable_fsync: bool,              // every sync off; never turns one on
     pub per_object_fsync: bool,           // sync each content object as staged
     // The rest are the HTTP pull's; each defaults to what a local pull does.
+    pub subpaths: Vec<String>,            // absolute paths; empty is the whole
+                                          // tree; a local pull refuses them;
+                                          // leaves each commit partial
     pub url: Option<String>,              // overrides the remote's configured url
     pub http_headers: Vec<(String, String)>,
     pub max_outstanding_fetches: Option<usize>,  // None is 8

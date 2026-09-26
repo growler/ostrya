@@ -769,13 +769,17 @@ fn place_whiteout_device_blocking(plan: PlaceWhiteoutDevice) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     if plan.effective == CheckoutMode::None {
-        // The order is the one `apply_regular_metadata` takes, and the tool's:
-        // the attributes, then the ownership, then the mode. `chown` on a device
-        // node clears the setuid and setgid bits for an unprivileged caller even
-        // where the ids do not change, so the recorded mode is applied after the
-        // ownership. The attributes come first, so a marker whose attribute the
-        // kernel refuses leaves the device at the mode `mknod` gave it, which is
-        // the tool's own outcome (`format-reference.md`, "Checkout").
+        // The order is the tool's recorded order for the marker: the
+        // attributes, then the ownership, then the mode. `chown` on a device
+        // node clears the setuid bit, and the setgid bit when group execute is
+        // set, also for root and also where the ids do not change, so the
+        // recorded mode is applied after the ownership. The attributes come
+        // first, so a marker whose attribute the kernel refuses leaves the
+        // device at the mode `mknod` gave it, which is the tool's own outcome
+        // (`format-reference.md`, "Checkout").
+        // `apply_regular_metadata` applies the ownership first, so a regular
+        // file keeps its `security.capability`. The chown here removes that
+        // xattr from the device, which gets no use from a file capability.
         for (name, value) in plan.xattrs.iter() {
             crate::write::set_link_xattr(plan.dir.as_fd(), &plan.name, name, value).map_err(
                 |err| {
@@ -1395,13 +1399,17 @@ fn apply_regular_metadata(
 ) -> Result<()> {
     match effective {
         CheckoutMode::None => {
-            // The xattrs go on before the mode: the kernel checks a `user.*`
-            // xattr against the inode's write permission, which a logical mode
-            // without an owner-write bit (0444, 0555) does not grant.
+            // The owner goes on first: a chown of a regular file removes
+            // `security.capability` and clears the set-user-ID bit, and the
+            // set-group-ID bit when group execute is set, also when the ids do
+            // not change. The xattrs go on before the mode: the kernel checks
+            // a `user.*` xattr against the inode's write permission, which a
+            // logical mode without an owner-write bit (0444, 0555) does not
+            // grant.
+            rustix::fs::fchown(fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
             for (name, value) in xattrs.iter() {
                 crate::write::set_inode_xattr(fd, name, value)?;
             }
-            rustix::fs::fchown(fd, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
             rustix::fs::fchmod(fd, Mode::from_raw_mode(mode & PERM_MASK))?;
         }
         CheckoutMode::User => {
@@ -1414,7 +1422,8 @@ fn apply_regular_metadata(
 /// Apply a directory's checkout-mode metadata to its fd. The full logical mode
 /// (`mode & 0o7777`, special bits kept) is applied under both checkout modes;
 /// only the chown and xattrs differ. The mode is applied last, since a `user.*`
-/// xattr needs write permission on the inode.
+/// xattr needs write permission on the inode. A chown of a directory removes no
+/// xattr and keeps the special bits, so the xattrs can go on before the owner.
 ///
 /// `bareuseronly_dirs` reduces the mode to [`BAREUSERONLY_DIR_MASK`] instead.
 /// This function has one call site, the fresh arm of the directory walk, so the

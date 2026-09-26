@@ -1238,11 +1238,18 @@ Loose-object inode permission bits, by object class and repository mode:
   other metadata types) carry mode 0644 in every repository mode.
 - `archive`: every content object (`.filez`) is 0644.
 - `bare`: a content object's inode carries the full logical uid, gid, mode, and
-  xattrs; a symlink is a real symlink owned by the logical uid/gid. The xattrs
-  are written before the chown and the mode: the kernel checks a `user.*` xattr
-  against the inode's write permission, which a logical mode with no owner-write
-  bit (0444, 0555) does not grant, and a chown to another uid takes the ability
-  away as well.
+  xattrs; a symlink is a real symlink owned by the logical uid/gid. The port
+  applies the owner first, then the xattrs, then the mode. A chown of a regular
+  file removes `security.capability` and clears the setuid bit, and the setgid
+  bit when group execute is set, also when the ids do not change. A mode change
+  keeps `security.capability`. The kernel checks a `user.*` xattr against the
+  inode's write permission, which a logical mode with no owner-write bit (0444,
+  0555) does not grant, so the mode goes on last. The tool keeps `security.capability` on a bare object. This was
+  observed on btrfs, kernel 6.18.52, ostree 2026.1, as root in a user
+  namespace: a file with `cap_net_raw=ep` committed into bare, with its own
+  owner and with `--owner-uid=1234 --owner-gid=5678`, gives a `.file` object
+  with the same `security.capability` value, and the port's commit gives the
+  same commit checksum.
 - `bare-user`: a regular-file content object's inode mode is
   `(logical_perm & 0o775) | 0o400` -- owner bits and the group/other read and
   execute bits are kept, owner-read is forced on, and other-write is dropped
@@ -1393,6 +1400,18 @@ Semantics.
 - `yes`: required. An enable failure fails the write, matching the tool, which
   reports that fsverity is required but the filesystem does not support it.
 
+`FS_IOC_ENABLE_VERITY` requires write permission on the inode, also when the
+descriptor is read-only. Without it the kernel returns `EACCES`. A caller with
+`CAP_DAC_OVERRIDE` passes the check. The tool applies the logical mode before
+the seal, so an unprivileged writer to a `fsverity=yes` repository gets this
+error for a content object with the logical mode 0444, 0555, or 0400:
+
+```
+error: Writing content object: fsverity: ioctl(FS_IOC_ENABLE_VERITY): Permission denied
+```
+
+Observed on btrfs, kernel 6.18.52, with `ostree` 2026.1.
+
 Digest parameters. SHA-256, 4096-byte blocks, and a zero-length salt. The
 enable argument is `fsverity_enable_arg { version 1, hash_algorithm 1 (SHA-256),
 block_size 4096, salt_size 0 }`, a 128-byte struct with the remaining fields
@@ -1402,8 +1421,8 @@ the composefs export records per backing file. For a bare-user or
 bare-user-shared `.file`, whose on-disk bytes are the raw payload, that digest
 is the fs-verity digest of the payload.
 
-Write-path order, per object, while the inode is still an anonymous `O_TMPFILE`
-staging file:
+Write-path order of the tool, per object, while the inode is still an anonymous
+`O_TMPFILE` staging file:
 
 1. open `O_TMPFILE|O_WRONLY` in the staging directory,
 2. write or reflink the payload,
@@ -1418,6 +1437,16 @@ A named temp file (used where the filesystem refuses `O_TMPFILE`, and for the
 small caller-held bodies of symlink and metadata objects) follows the same
 close-reopen-seal ordering and is then renamed into place rather than linked.
 Publication into `objects/` is unchanged.
+
+The port uses a different order for a regular-file content object. Before the
+seal, it applies `user.ostreemeta` in bare-user, the fixed mode 0644 in archive,
+and the fixed mode 0644 and `user.ostreemeta` in bare-user-shared. In bare,
+bare-user, and bare-user-only, when the temp's create mode lacks owner read or
+owner write, it first sets the temp to 0600. After the seal, on the read-only
+descriptor and before the link, it applies the owner, then the logical xattrs,
+then the logical mode in bare, and the canonical mode in bare-user and
+bare-user-only. The stored object is the object the tool writes when its write
+succeeds. See `port-plan.md`, Phase pre13.
 
 Closing the writable descriptor is not by itself enough to guarantee the enable
 succeeds: `fork` copies the file descriptor table, so a child process carries a
@@ -1609,7 +1638,16 @@ xattrs.
   full logical permission bits (`mode & 0o7777`), and given the logical xattrs. A
   symlink is a real symlink lchowned to the logical uid/gid with the logical link
   xattrs. A directory is chowned to the logical uid/gid, chmodded to the full
-  logical mode (`mode & 0o7777`), and given the logical xattrs.
+  logical mode (`mode & 0o7777`), and given the logical xattrs. For a regular
+  file it writes, the port applies the owner, then the xattrs, then the mode,
+  because a chown of a regular file removes `security.capability` and clears
+  the setuid bit, and the setgid bit when group execute is set. A chown of a
+  directory removes no xattr and keeps the special bits. The tool's checkout
+  keeps `security.capability` on a file it writes. This was observed on btrfs, kernel 6.18.52, ostree 2026.1, as root
+  in a user namespace: a checkout from an archive repository and a `-C`
+  checkout from a bare repository both keep a `cap_net_raw=ep` value, and a
+  file recorded at 04755, owner 1234:5678, with a capability and a `user.*`
+  xattr, keeps its mode, owner, and both xattrs.
 - Unprivileged: no chown and no xattrs. A regular file the checkout writes takes
   `mode & 0o1777`, so the setuid and setgid bits are dropped, and the sticky bit
   and the rwx bits including group- and other-write are kept (`4755` and `6755`
@@ -1914,11 +1952,13 @@ The whiteout device takes the marker's permission bits. The bits reach `mknod`,
 so the process umask reduces them; a checkout outside `-U` then applies the
 recorded mode in full, together with the marker's ownership and its extended
 attributes. The order is the attributes, then the ownership, then the mode. A
-`chown` on a device node clears the setuid and setgid bits for an unprivileged
-caller even where the ids do not change, so a marker recorded at 04755 or 02755
-carries its bits only where the mode is applied after the ownership. Creating a
-character device with device number 0:0 needs no capability, so the whole
-mechanism runs unprivileged. A `user.*` extended attribute on a marker is a
+`chown` on a device node clears the setuid bit, and the setgid bit when group
+execute is set, also for root and also where the ids do not change, so a marker
+recorded at 04755 or 02755 carries its bits only where the mode is applied after
+the ownership. The chown after the attributes also removes `security.capability`
+from the device, which gets no use from a file capability. Creating a character
+device with device number 0:0 needs no capability, so the whole mechanism runs
+unprivileged. A `user.*` extended attribute on a marker is a
 refusal on every kernel outside `-U`, since the `user.` namespace is not
 permitted on a device node. The device then stands where it was created at the
 mode `mknod` gave it, the umask included and the recorded mode not yet applied,

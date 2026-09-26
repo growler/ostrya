@@ -1140,7 +1140,9 @@ devino cache; whiteout handling; per-file/dir metadata finalize and
 optional fsync.
 Verify: checkout of a tool-created commit matches the tool's checkout (mode,
 perms, xattrs, hardlink counts); round-trip commit -> checkout is stable; on
-a reflink-capable filesystem the copy path clones instead of copying bytes.
+a reflink-capable filesystem the copy path clones instead of copying bytes;
+a faithful copy keeps a `security.capability` value (root-gated,
+`a_faithful_checkout_keeps_a_file_capability_as_root`).
 
 ### Phase 9 -- composefs / EROFS export
 
@@ -1406,6 +1408,23 @@ was cross-checked against the port's `FsVerityHasher`. The recovered contract:
   close the writable descriptor, call `ioctl(ro_fd, FS_IOC_ENABLE_VERITY)`, then
   `linkat` the read-only descriptor into the staging directory. Publication
   (rename into `objects/`) is unchanged.
+- Divergence: the port seals a regular-file content object before it applies
+  the logical mode and owner. `FS_IOC_ENABLE_VERITY` requires write permission
+  on the inode, and a logical mode without owner write (0444, 0555, 0400) gives
+  none. A writer without `CAP_DAC_OVERRIDE` thus gets a sealed object where the
+  tool refuses the write with `EACCES`. The object on disk is the object the
+  tool writes when it runs as root: the same bytes, inode mode, owner, and
+  xattrs. The rule "refuse rather than reinterpret" does not apply, because the
+  port gives no value a meaning of its own. With verity on, the port sets the
+  temp to 0600 before the seal in bare, bare-user, and bare-user-only when the
+  create mode lacks owner read or owner write, so a umask that clears owner
+  write does not block the xattr or the seal. Under a umask that keeps both
+  bits, the write makes no extra syscall. With verity off, the umask case is
+  unchanged. With `maybe`, these objects are sealed. In bare, every owner change
+  on a regular file removes `security.capability`, and a mode change keeps it.
+  After the seal the port applies the owner, then the logical xattrs, then the
+  mode, so each xattr is written once. The tool keeps the capability on a bare
+  object.
 
 Plan:
 
@@ -1426,8 +1445,12 @@ Plan:
   accessors applying the default rule above.
 - The staging context carries the effective `Tristate`. The content, metadata,
   and regular-file symlink staging paths seal each fresh object in the recovered
-  order; real-symlink paths skip it; dedup hits are untouched. With `fsverity`
-  off, the staging path is unchanged.
+  order; real-symlink paths skip it; dedup hits are untouched. A content object
+  in bare takes its xattrs after the seal, after the owner and before the mode;
+  in bare-user and bare-user-shared `user.ostreemeta` goes on before the seal.
+  The logical or canonical mode goes on after the seal, per the divergence
+  above. With `fsverity` off, the staging path writes the same inode as with
+  `fsverity` on.
 - An `ETXTBSY` enable is retried for up to 50 ms, 1 ms apart. Closing the
   writable descriptor before the ioctl is necessary but not sufficient: `fork`
   copies the file descriptor table, so a child process holds a copy of the
@@ -1447,7 +1470,21 @@ regular-file object and each object's kernel-measured digest equals the port's
 reads the tool's; `maybe` on a filesystem without verity succeeds while `yes`
 fails; the digest the kernel measures matches the value the composefs export
 stores. Tests are gated on filesystem verity support so the suite passes
-elsewhere. The suite passes under both runtime backends.
+elsewhere. The suite passes under both runtime backends. The seal-order tests
+in `file.rs`, module `sealed_verity_tests`, write each logical mode with verity
+on and off and compare the checksum, inode mode, owner, and xattrs:
+`a_bare_user_object_without_owner_write_is_sealed`,
+`a_bare_user_only_object_without_owner_write_is_sealed` (0200 included),
+`maybe_seals_a_bare_user_object_without_owner_write`,
+`an_owner_writable_object_is_sealed_with_an_unchanged_inode`,
+`a_bare_object_with_a_foreign_owner_is_sealed_as_root` (skips when not root),
+`a_bare_object_owned_by_the_writer_without_owner_write_is_sealed`,
+`a_bare_object_keeps_its_file_capability_as_root` (skips when not root), which
+writes a `security.capability` value with verity off and on, for the writer's
+own owner and for a foreign owner with a setuid mode and a `user.*` xattr, and
+reads back the value, mode, owner, and xattr unchanged, and
+`an_object_written_under_a_umask_without_owner_write_is_sealed`, which runs the
+write in a child process under umask 0222.
 
 ### Phase 13 -- Signing
 

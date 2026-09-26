@@ -19,6 +19,10 @@
 //! umask, reproducing the modes recovered from the `ostree` tool (see
 //! `format-reference.md`, "Write path: loose-object inode modes and
 //! durability").
+//! A regular-file content object is sealed with fs-verity before its logical
+//! mode and owner are applied, because `FS_IOC_ENABLE_VERITY` needs write
+//! permission on the inode (see `port-plan.md`, Phase pre13). In bare mode the
+//! logical xattrs go on after the seal, between the owner and the mode.
 
 use std::future::poll_fn;
 use std::io::{self, SeekFrom};
@@ -770,6 +774,14 @@ pub(crate) struct StageOutcome {
 
 /// Apply per-mode metadata to a content object's inode and materialize it into
 /// the staging directory under its flat loose name. Runs synchronous syscalls.
+///
+/// The metadata that needs write permission on the inode goes on first, on the
+/// writable descriptor. The inode is then sealed per `ctx.verity`, and its mode
+/// and owner go on after the seal, on the descriptor that is linked. In bare
+/// mode the logical xattrs also go on after the seal, between the owner and
+/// the mode. The per-object sync follows, then the link. The inode is still an
+/// anonymous or staging temp until the link, so no reader sees the intermediate
+/// mode. Every failure after the dedup check removes a named temp.
 pub(crate) fn stage_content_blocking(
     ctx: &StageCtx<'_>,
     checksum: &Checksum,
@@ -784,28 +796,34 @@ pub(crate) fn stage_content_blocking(
         return Ok(dedup(dest));
     }
 
-    apply_content_metadata(file.as_fd(), ctx.mode, header)?;
-    if ctx.fsync && ctx.per_object_fsync {
-        rustix::fs::fsync(file.as_fd())?;
-    }
-    let on_disk_size = size_of(file.as_fd())?;
     let staging_name = flat_name(checksum, ObjectType::File, ctx.mode);
-    // Seal with fs-verity while the inode is still anonymous, then link it from
-    // the descriptor that owns it: with verity off, the writable one; with
-    // verity on, a fresh read-only reopen after the writable descriptor closes.
-    let link_fd = if ctx.verity == Tristate::No {
-        OwnedFd::from(file)
-    } else {
-        let ro = reopen_ro(file.as_fd())?;
-        drop(file);
-        if let Err(e) = seal_regular(ro.as_fd(), ctx.verity) {
-            cleanup_temp(ctx.staging_fd, &temp);
-            return Err(e);
+    let stage = |file: std::fs::File| -> Result<u64> {
+        // The size does not change with the mode, owner, or xattrs, so one
+        // stat gives the create mode and the on-disk size.
+        let stat = rustix::fs::fstat(file.as_fd())?;
+        apply_content_pre_seal(file.as_fd(), ctx.mode, ctx.verity, stat.st_mode, header)?;
+        let on_disk_size = stat.st_size.max(0) as u64;
+        // Seal with fs-verity while the inode is still anonymous, then link it
+        // from the descriptor that owns it: with verity off, the writable one;
+        // with verity on, a fresh read-only reopen after the writable
+        // descriptor closes. The mode and owner, and in bare mode the xattrs,
+        // go on after the seal, on the descriptor that is linked.
+        let link_fd = if ctx.verity == Tristate::No {
+            OwnedFd::from(file)
+        } else {
+            let ro = reopen_ro(file.as_fd())?;
+            drop(file);
+            seal_regular(ro.as_fd(), ctx.verity)?;
+            ro
+        };
+        apply_content_post_seal(link_fd.as_fd(), ctx.mode, header)?;
+        if ctx.fsync && ctx.per_object_fsync {
+            rustix::fs::fsync(link_fd.as_fd())?;
         }
-        ro
+        materialize(ctx.staging_fd, link_fd.as_fd(), &temp, &staging_name)?;
+        Ok(on_disk_size)
     };
-    materialize(ctx.staging_fd, link_fd.as_fd(), &temp, &staging_name)?;
-    drop(link_fd);
+    let on_disk_size = stage(file).inspect_err(|_| cleanup_temp(ctx.staging_fd, &temp))?;
     Ok(StageOutcome {
         deduped: false,
         on_disk_size,
@@ -1301,41 +1319,90 @@ pub(crate) fn flat_name(checksum: &Checksum, ty: ObjectType, mode: RepoMode) -> 
     format!("{}.{}", checksum.to_hex(), ty.extension(mode))
 }
 
-/// Apply the per-mode inode metadata of a regular-file content object.
-fn apply_content_metadata(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHeader) -> Result<()> {
-    let perm = header.mode & PERM_MASK;
+/// Apply the parts of a regular-file content object's inode metadata that need
+/// write permission on the inode, on the writable descriptor, before the seal.
+///
+/// `FS_IOC_ENABLE_VERITY` and a `user.*` xattr both need write permission on
+/// the inode. When `verity` is on and `create_mode`, the inode mode the temp
+/// has, lacks owner read or owner write, the modes that store the logical mode
+/// first set the inode to 0600, so a umask without owner write does not block
+/// the seal, the reopen, or the xattrs. [`apply_content_post_seal`] sets the
+/// final mode, and in bare mode the xattrs.
+fn apply_content_pre_seal(
+    fd: BorrowedFd<'_>,
+    mode: RepoMode,
+    verity: Tristate,
+    create_mode: u32,
+    header: &FileHeader,
+) -> Result<()> {
+    if verity != Tristate::No
+        && create_mode & 0o600 != 0o600
+        && matches!(
+            mode,
+            RepoMode::Bare | RepoMode::BareUser | RepoMode::BareUserOnly
+        )
+    {
+        // Owner write for the seal and the xattrs, owner read for the
+        // read-only reopen. In bare mode the xattrs go on after the seal.
+        rustix::fs::fchmod(fd, Mode::from_raw_mode(0o600))?;
+    }
     match mode {
-        RepoMode::Bare => {
-            // The xattrs go on before the chown and the mode: the kernel checks
-            // a `user.*` xattr against the inode's write permission, which a
-            // logical mode without an owner-write bit (0444, 0555) does not
-            // grant, and a chown to another uid takes the ability away as well.
-            for (name, value) in header.xattrs.iter() {
-                set_inode_xattr(fd, name, value)?;
-            }
-            rustix::fs::fchown(fd, Some(uid(header.uid)), Some(gid(header.gid)))?;
-            rustix::fs::fchmod(fd, Mode::from_raw_mode(perm))?;
-        }
+        RepoMode::Bare => {}
         RepoMode::BareUser => {
             // The xattr goes on before the mode: the kernel checks a `user.*`
             // xattr against the inode's write permission, and this mode's
             // canonical inode mode leaves no owner-write bit for a logical mode
             // that has none (0444, 0555).
             set_ostreemeta(fd, header)?;
-            rustix::fs::fchmod(fd, Mode::from_raw_mode((perm & 0o775) | 0o400))?;
         }
         RepoMode::BareUserShared => {
             rustix::fs::fchmod(fd, Mode::from_raw_mode(FIXED_MODE))?;
             set_ostreemeta(fd, header)?;
+        }
+        RepoMode::BareUserOnly => {}
+        RepoMode::Archive => {
+            rustix::fs::fchmod(fd, Mode::from_raw_mode(FIXED_MODE))?;
+        }
+        RepoMode::BareSplitXattrs => {
+            return Err(Error::Unsupported(
+                "bare-split-xattrs is read-only; the port does not write it".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Apply the inode mode and owner of a regular-file content object, and in bare
+/// mode its logical xattrs, after the seal, on the descriptor that is linked:
+/// the read-only one when verity is on. The kernel checks the inode owner for
+/// `fchmod` and `fchown`, and the inode permission for an xattr, and not the
+/// access mode of the descriptor. A sealed inode takes xattr changes.
+fn apply_content_post_seal(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHeader) -> Result<()> {
+    let perm = header.mode & PERM_MASK;
+    match mode {
+        RepoMode::Bare => {
+            // The owner goes on first: a chown of a regular file removes
+            // `security.capability` and clears the set-user-ID bit, and the
+            // set-group-ID bit when group execute is set, also when the ids do
+            // not change. The xattrs go on before the mode: the kernel checks
+            // a `user.*` xattr against the inode's write permission, which a
+            // logical mode without an owner-write bit (0444, 0555) does not
+            // grant.
+            rustix::fs::fchown(fd, Some(uid(header.uid)), Some(gid(header.gid)))?;
+            for (name, value) in header.xattrs.iter() {
+                set_inode_xattr(fd, name, value)?;
+            }
+            rustix::fs::fchmod(fd, Mode::from_raw_mode(perm))?;
+        }
+        RepoMode::BareUser => {
+            rustix::fs::fchmod(fd, Mode::from_raw_mode((perm & 0o775) | 0o400))?;
         }
         RepoMode::BareUserOnly => {
             // Canonical mode: owner bits preserved, group- and other-write
             // dropped (recovered by observation, see format-reference.md).
             rustix::fs::fchmod(fd, Mode::from_raw_mode(perm & 0o755))?;
         }
-        RepoMode::Archive => {
-            rustix::fs::fchmod(fd, Mode::from_raw_mode(FIXED_MODE))?;
-        }
+        RepoMode::BareUserShared | RepoMode::Archive => {}
         RepoMode::BareSplitXattrs => {
             return Err(Error::Unsupported(
                 "bare-split-xattrs is read-only; the port does not write it".into(),

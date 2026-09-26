@@ -1131,4 +1131,444 @@ mod sealed_verity_tests {
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Create a `mode` repository under `dir` as [`repo_in`] does, write
+    /// [`payload`] with `meta` as one committed content object, and return the
+    /// repository and the object's checksum, or the error of the write.
+    async fn write_one(
+        dir: &Path,
+        mode: RepoMode,
+        fsverity: &str,
+        meta: &FileMeta,
+    ) -> crate::Result<(Repo, Checksum)> {
+        std::fs::create_dir_all(dir).unwrap();
+        let repo = repo_in(dir, mode, fsverity).await;
+        let txn = repo.transaction().await?;
+        let checksum = txn.write_regfile_inline(None, meta, &payload()).await?;
+        txn.commit().await?;
+        Ok((repo, checksum))
+    }
+
+    /// The name of the logical xattr the bare-mode test gives its objects.
+    const SEAL_XATTR: &str = "user.ostrya-seal";
+
+    /// The inode fields of one stored content object that the seal-order tests
+    /// compare.
+    #[derive(Debug)]
+    struct Inode {
+        /// The permission bits of the inode mode.
+        perm: u32,
+        uid: u32,
+        gid: u32,
+        /// Whether `statx` reports the inode as sealed.
+        sealed: bool,
+        /// The `user.ostreemeta` value, or `None` when the object has none or
+        /// the owner cannot open it.
+        ostreemeta: Option<Vec<u8>>,
+        /// The [`SEAL_XATTR`] value, read the same way.
+        seal_xattr: Option<Vec<u8>>,
+    }
+
+    /// The stored inode of `checksum`'s content object.
+    fn inode_of(repo: &Repo, checksum: &Checksum) -> Inode {
+        use rustix::fs::{Mode, OFlags};
+
+        let path = loose_path(checksum, ObjectType::File, repo.mode());
+        let stat = stat_object(repo.objects_fd(), &path, checksum, ObjectType::File).unwrap();
+        let fd = rustix::fs::openat(
+            repo.objects_fd(),
+            path.as_str(),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .ok();
+        let xattr = |name: &str| {
+            fd.as_ref()
+                .and_then(|fd| crate::object::read_xattr(fd.as_fd(), name).unwrap())
+        };
+        Inode {
+            perm: u32::from(stat.stx_mode) & 0o7777,
+            uid: stat.stx_uid,
+            gid: stat.stx_gid,
+            sealed: is_sealed(&stat),
+            ostreemeta: xattr("user.ostreemeta"),
+            seal_xattr: xattr(SEAL_XATTR),
+        }
+    }
+
+    /// Write each of `metas` into a `mode` repository with `[ex-integrity]
+    /// fsverity` set to `fsverity`, and into a second repository with verity
+    /// off. Check that each write succeeds, that the two objects have the same
+    /// checksum, inode mode, owner, and xattrs, that only the first is sealed,
+    /// and that the first gives the kernel digest where the loader can read
+    /// it. Returns the inodes of the sealed side, or `None` when the
+    /// filesystem lacks fs-verity.
+    fn check_like_unsealed(
+        tag: &str,
+        mode: RepoMode,
+        fsverity: &str,
+        metas: &[FileMeta],
+    ) -> Option<Vec<Inode>> {
+        let dir = scratch(tag);
+        if !verity_supported(&dir) {
+            eprintln!("skipping {tag} seal-order check: filesystem lacks fs-verity");
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
+        let mut failures = Vec::new();
+        let mut sealed_side = Vec::new();
+        block_on(async {
+            for meta in metas {
+                let name = format!("{:o}", meta.mode);
+                let on = write_one(&dir.join(format!("on-{name}")), mode, fsverity, meta).await;
+                let (on_repo, on_sum) = match on {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        failures.push(format!("{name} with fsverity={fsverity}: {e}"));
+                        continue;
+                    }
+                };
+                let (off_repo, off_sum) =
+                    write_one(&dir.join(format!("off-{name}")), mode, "no", meta)
+                        .await
+                        .unwrap();
+                assert_eq!(on_sum, off_sum, "{name}: the checksums agree");
+                let on = inode_of(&on_repo, &on_sum);
+                let off = inode_of(&off_repo, &off_sum);
+                assert_eq!(on.perm, off.perm, "{name}: the inode modes agree");
+                assert_eq!(
+                    (on.uid, on.gid),
+                    (off.uid, off.gid),
+                    "{name}: the owners agree"
+                );
+                assert_eq!(
+                    on.ostreemeta, off.ostreemeta,
+                    "{name}: user.ostreemeta agrees"
+                );
+                assert_eq!(on.seal_xattr, off.seal_xattr, "{name}: {SEAL_XATTR} agrees");
+                assert!(
+                    !off.sealed,
+                    "{name}: the object with verity off is unsealed"
+                );
+                if !on.sealed {
+                    failures.push(format!("{name} with fsverity={fsverity}: object unsealed"));
+                    continue;
+                }
+                if mode != RepoMode::Archive && on.perm & 0o400 != 0 {
+                    let file = on_repo.load_file_with(&on_sum, true).await.unwrap();
+                    assert_eq!(
+                        file.kernel_fs_verity(),
+                        Some(FsVerityHasher::hash(&payload())),
+                        "{name}: the kernel digest equals the computed digest"
+                    );
+                }
+                sealed_side.push(on);
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failures.is_empty(), "{tag}: {failures:#?}");
+        Some(sealed_side)
+    }
+
+    /// Regular-file metadata owned by root for each of `perms`.
+    fn metas(perms: &[u32]) -> Vec<FileMeta> {
+        perms.iter().map(|&p| FileMeta::regular(0, 0, p)).collect()
+    }
+
+    /// A bare-user object whose logical mode has no owner-write bit is sealed
+    /// in a repository with `fsverity=yes`, and it is otherwise the object the
+    /// same write stores with verity off.
+    #[test]
+    fn a_bare_user_object_without_owner_write_is_sealed() {
+        check_like_unsealed(
+            "bu-nowrite",
+            RepoMode::BareUser,
+            "yes",
+            &metas(&[0o444, 0o555, 0o400]),
+        );
+    }
+
+    /// A bare-user-only object whose logical mode has no owner-write bit is
+    /// sealed, and so is one with no owner-read bit (0200), whose stored inode
+    /// the owner cannot open.
+    #[test]
+    fn a_bare_user_only_object_without_owner_write_is_sealed() {
+        check_like_unsealed(
+            "buo-nowrite",
+            RepoMode::BareUserOnly,
+            "yes",
+            &metas(&[0o444, 0o555, 0o400, 0o200]),
+        );
+    }
+
+    /// With `fsverity=maybe`, a bare-user object whose logical mode has no
+    /// owner-write bit is sealed and not left unsealed without a report.
+    #[test]
+    fn maybe_seals_a_bare_user_object_without_owner_write() {
+        check_like_unsealed("bu-maybe", RepoMode::BareUser, "maybe", &metas(&[0o444]));
+    }
+
+    /// An owner-writable object is sealed, and its inode is the one the write
+    /// path stores with verity off: in bare-user the logical mode with the
+    /// owner-read bit and the logical `user.ostreemeta`, in archive 0644.
+    #[test]
+    fn an_owner_writable_object_is_sealed_with_an_unchanged_inode() {
+        let perms = [0o644, 0o755];
+        let Some(inodes) =
+            check_like_unsealed("bu-write", RepoMode::BareUser, "yes", &metas(&perms))
+        else {
+            return;
+        };
+        for (inode, (perm, meta)) in inodes.iter().zip(perms.iter().zip(metas(&perms))) {
+            assert_eq!(inode.perm, perm | 0o400);
+            let expected = meta.regular_header().serialize_stat_metadata().unwrap();
+            assert_eq!(inode.ostreemeta.as_deref(), Some(&expected[..]));
+        }
+        let inodes = check_like_unsealed("ar-write", RepoMode::Archive, "yes", &metas(&perms))
+            .expect("the archive check runs where the bare-user check ran");
+        for inode in inodes {
+            assert_eq!(inode.perm, 0o644);
+        }
+    }
+
+    /// A bare object with an owner other than the writer, a logical mode
+    /// without owner write, and a logical xattr is sealed and carries the
+    /// logical owner, mode, and xattr. A set-user-ID mode survives the owner
+    /// change. Changing the owner of a file needs root.
+    #[test]
+    fn a_bare_object_with_a_foreign_owner_is_sealed_as_root() {
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipping bare foreign-owner seal check: not running as root");
+            return;
+        }
+        let xattrs =
+            ostrya_core::Xattrs::new([(format!("{SEAL_XATTR}\0").into_bytes(), b"v".to_vec())])
+                .unwrap();
+        let metas: Vec<FileMeta> = [0o100444, 0o104555]
+            .into_iter()
+            .map(|mode| FileMeta {
+                uid: 1234,
+                gid: 5678,
+                mode,
+                xattrs: xattrs.clone(),
+            })
+            .collect();
+        let Some(inodes) = check_like_unsealed("bare-owner", RepoMode::Bare, "yes", &metas) else {
+            return;
+        };
+        for (inode, perm) in inodes.iter().zip([0o444, 0o4555]) {
+            assert_eq!((inode.uid, inode.gid), (1234, 5678));
+            assert_eq!(inode.perm, perm);
+            assert_eq!(inode.seal_xattr.as_deref(), Some(&b"v"[..]));
+        }
+    }
+
+    /// A bare object owned by the writer, with a logical mode without owner
+    /// write and a logical `user.*` xattr, is sealed and carries the logical
+    /// mode and xattr. The writer needs no privilege for this owner.
+    #[test]
+    fn a_bare_object_owned_by_the_writer_without_owner_write_is_sealed() {
+        let uid = rustix::process::geteuid().as_raw();
+        let gid = rustix::process::getegid().as_raw();
+        let xattrs =
+            ostrya_core::Xattrs::new([(format!("{SEAL_XATTR}\0").into_bytes(), b"v".to_vec())])
+                .unwrap();
+        let metas: Vec<FileMeta> = [0o100444, 0o100555, 0o100400]
+            .into_iter()
+            .map(|mode| FileMeta {
+                uid,
+                gid,
+                mode,
+                xattrs: xattrs.clone(),
+            })
+            .collect();
+        let Some(inodes) = check_like_unsealed("bare-self", RepoMode::Bare, "yes", &metas) else {
+            return;
+        };
+        for (inode, perm) in inodes.iter().zip([0o444, 0o555, 0o400]) {
+            assert_eq!((inode.uid, inode.gid), (uid, gid));
+            assert_eq!(inode.perm, perm);
+            assert_eq!(inode.seal_xattr.as_deref(), Some(&b"v"[..]));
+        }
+    }
+
+    /// A bare object whose logical xattrs hold a `security.capability` value
+    /// stores that value unchanged, with verity off and with verity on, for an
+    /// owner that is the writer and for a foreign owner with a set-user-ID mode
+    /// and a `user.*` xattr. The kernel removes `security.capability` when the
+    /// owner of a regular file changes, so the write sets the xattrs after the
+    /// owner. Setting the xattr and changing the owner need root.
+    #[test]
+    fn a_bare_object_keeps_its_file_capability_as_root() {
+        use rustix::fs::{Mode, OFlags};
+
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipping bare file-capability check: not running as root");
+            return;
+        }
+        // A VFS_CAP_REVISION_2 value: the revision with the effective bit,
+        // then the permitted and inheritable low words, then the high words.
+        // The permitted set holds cap_net_raw (bit 13).
+        let cap: Vec<u8> = [0x0200_0001u32, 1 << 13, 0, 0, 0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let cap_xattr = (b"security.capability\0".to_vec(), cap.clone());
+        let seal_xattr = (format!("{SEAL_XATTR}\0").into_bytes(), b"v".to_vec());
+        // Each case: the tag, the logical metadata, the expected inode
+        // permission bits, and the expected SEAL_XATTR value.
+        let cases = [
+            (
+                "self",
+                FileMeta {
+                    uid: rustix::process::geteuid().as_raw(),
+                    gid: rustix::process::getegid().as_raw(),
+                    mode: 0o100755,
+                    xattrs: ostrya_core::Xattrs::new([cap_xattr.clone()]).unwrap(),
+                },
+                0o755,
+                None,
+            ),
+            (
+                "foreign",
+                FileMeta {
+                    uid: 1234,
+                    gid: 5678,
+                    mode: 0o104755,
+                    xattrs: ostrya_core::Xattrs::new([cap_xattr, seal_xattr]).unwrap(),
+                },
+                0o4755,
+                Some(b"v".to_vec()),
+            ),
+        ];
+        let dir = scratch("bare-cap");
+        let verity = verity_supported(&dir);
+        let mut failures = Vec::new();
+        block_on(async {
+            for fsverity in ["no", "yes"] {
+                if fsverity == "yes" && !verity {
+                    eprintln!("skipping the verity side: filesystem lacks fs-verity");
+                    continue;
+                }
+                for (tag, meta, perm, seal) in &cases {
+                    let (repo, checksum) = write_one(
+                        &dir.join(format!("{fsverity}-{tag}")),
+                        RepoMode::Bare,
+                        fsverity,
+                        meta,
+                    )
+                    .await
+                    .unwrap();
+                    let path = loose_path(&checksum, ObjectType::File, repo.mode());
+                    let fd = rustix::fs::openat(
+                        repo.objects_fd(),
+                        path.as_str(),
+                        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                        Mode::empty(),
+                    )
+                    .unwrap();
+                    let stored =
+                        crate::object::read_xattr(fd.as_fd(), "security.capability").unwrap();
+                    if stored.as_deref() != Some(&cap[..]) {
+                        failures.push(format!(
+                            "fsverity={fsverity} {tag}: security.capability is {stored:02x?}"
+                        ));
+                    }
+                    let inode = inode_of(&repo, &checksum);
+                    let what = format!("fsverity={fsverity} {tag}");
+                    assert_eq!(inode.perm, *perm, "{what}: the inode mode");
+                    assert_eq!(
+                        (inode.uid, inode.gid),
+                        (meta.uid, meta.gid),
+                        "{what}: owner"
+                    );
+                    assert_eq!(&inode.seal_xattr, seal, "{what}: {SEAL_XATTR}");
+                    assert_eq!(inode.sealed, fsverity == "yes", "{what}: the seal");
+                }
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Marks the re-executed child of
+    /// [`an_object_written_under_a_umask_without_owner_write_is_sealed`], and
+    /// names the file the child writes to record that the write ran.
+    const SEAL_UMASK_CHILD: &str = "OSTRYA_SEAL_UMASK_CHILD";
+
+    /// An object written while the process umask clears the owner-write bit is
+    /// sealed and stored with its logical mode.
+    ///
+    /// The umask is a property of the process and the tests of this binary run
+    /// in parallel threads, so the write goes to a child: this test binary
+    /// re-executed for this test alone. The child sets the umask only around
+    /// the write, because the staging and fanout directories the transaction
+    /// creates need owner write.
+    #[test]
+    fn an_object_written_under_a_umask_without_owner_write_is_sealed() {
+        if let Some(marker) = std::env::var_os(SEAL_UMASK_CHILD) {
+            // The child writes in the parent's scratch directory, so the parent
+            // removes it also when the child panics.
+            let marker = PathBuf::from(marker);
+            write_under_umask(&marker.with_file_name("child"));
+            std::fs::write(marker, b"written").expect("record that the write ran");
+            return;
+        }
+        let dir = scratch("umask");
+        if !verity_supported(&dir) {
+            eprintln!("skipping umask seal check: filesystem lacks fs-verity");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let marker = dir.join("written");
+        let exe = std::env::current_exe().expect("the path of the running test binary");
+        let status = std::process::Command::new(&exe)
+            .arg("--exact")
+            .arg("file::sealed_verity_tests::an_object_written_under_a_umask_without_owner_write_is_sealed")
+            .arg("--nocapture")
+            .env(SEAL_UMASK_CHILD, &marker)
+            .status()
+            .expect("re-run the test binary for the umask write");
+        let written = marker.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            status.success(),
+            "the write under umask 0222 failed: {status}"
+        );
+        // A name the child's filter does not match runs nothing and still
+        // exits 0, so the marker is what proves the write ran.
+        assert!(
+            written,
+            "the child ran no write: the test name the filter names is stale"
+        );
+    }
+
+    /// The child half of
+    /// [`an_object_written_under_a_umask_without_owner_write_is_sealed`],
+    /// writing under `dir`.
+    fn write_under_umask(dir: &Path) {
+        use rustix::fs::Mode;
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(dir).unwrap();
+        let meta = FileMeta::regular(0, 0, 0o644);
+        block_on(async {
+            let repo = repo_in(dir, RepoMode::BareUser, "yes").await;
+            let txn = repo.transaction().await.unwrap();
+            let old = rustix::process::umask(Mode::from_raw_mode(0o222));
+            let probe = dir.join("umask-probe");
+            std::fs::write(&probe, b"probe").unwrap();
+            let probe_mode = std::fs::metadata(&probe).unwrap().permissions().mode() & 0o7777;
+            let written = txn.write_regfile_inline(None, &meta, &payload()).await;
+            rustix::process::umask(old);
+            assert_eq!(probe_mode, 0o444, "umask 0222 clears the owner-write bit");
+            let checksum = written.unwrap();
+            txn.commit().await.unwrap();
+            let inode = inode_of(&repo, &checksum);
+            assert!(inode.sealed, "the object is sealed");
+            assert_eq!(inode.perm, 0o644);
+            let expected = meta.regular_header().serialize_stat_metadata().unwrap();
+            assert_eq!(inode.ostreemeta.as_deref(), Some(&expected[..]));
+        });
+    }
 }

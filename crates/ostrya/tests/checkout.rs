@@ -660,6 +660,127 @@ fn checkout_applies_xattrs_to_read_only_entries() {
     });
 }
 
+/// A faithful checkout that writes a regular file keeps its logical
+/// `security.capability` value, for an owner that is the writer and for a
+/// foreign owner with a set-user-ID mode and a `user.*` xattr. The kernel
+/// removes `security.capability` when the owner of a regular file changes, so
+/// the checkout sets the xattrs after the owner. An archive repository always
+/// writes the file, and a bare repository writes it under `force_copy`.
+/// Setting the xattr and changing the owner need root.
+#[test]
+fn a_faithful_checkout_keeps_a_file_capability_as_root() {
+    if !rustix::process::geteuid().is_root() {
+        eprintln!("skipping faithful file-capability checkout: not running as root");
+        return;
+    }
+    // A VFS_CAP_REVISION_2 value: the revision with the effective bit, then the
+    // permitted and inheritable low words, then the high words. The permitted
+    // set holds cap_net_raw (bit 13).
+    let cap: Vec<u8> = [0x0200_0001u32, 1 << 13, 0, 0, 0]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let tmp = TmpDir::new("co-cap");
+    let base = tmp.path();
+    let (uid, gid) = self_owner(base);
+    let cap_xattr = (b"security.capability\0".to_vec(), cap.clone());
+    // Each file: the name, the logical metadata, and whether it has user.demo.
+    let files = [
+        (
+            "cap.bin",
+            FileMeta {
+                uid,
+                gid,
+                mode: S_IFREG | 0o755,
+                xattrs: Xattrs::new([cap_xattr.clone()]).unwrap(),
+            },
+            false,
+        ),
+        (
+            "suid-cap.bin",
+            FileMeta {
+                uid: 1234,
+                gid: 5678,
+                mode: S_IFREG | 0o4755,
+                xattrs: Xattrs::new([cap_xattr, (b"user.demo\0".to_vec(), b"value".to_vec())])
+                    .unwrap(),
+            },
+            true,
+        ),
+    ];
+
+    for repo_mode in [RepoMode::Archive, RepoMode::Bare] {
+        let repo_dir = base.join(format!("repo-{repo_mode:?}"));
+        let destination = format!("co-{repo_mode:?}");
+        block_on(async {
+            let repo = Repo::create(&repo_dir, CreateOptions::new(repo_mode))
+                .await
+                .unwrap();
+            let commit = {
+                let txn = repo.transaction().await.unwrap();
+                let mut mtree = MutableTree::new();
+                for (name, meta, _) in &files {
+                    let file = txn
+                        .write_regfile_inline(None, meta, b"capable\n")
+                        .await
+                        .unwrap();
+                    mtree.replace_file(name, file).unwrap();
+                }
+                let dirmeta = DirMeta {
+                    uid,
+                    gid,
+                    mode: S_IFDIR | 0o755,
+                    xattrs: Xattrs::default(),
+                };
+                let dm = txn
+                    .write_metadata(ObjectType::DirMeta, None, &dirmeta.serialize().unwrap())
+                    .await
+                    .unwrap();
+                mtree.set_metadata_checksum(dm);
+                let root = txn.write_mtree(&mut mtree).await.unwrap();
+                let commit = txn
+                    .write_commit(CommitOptions::default(), &root)
+                    .await
+                    .unwrap();
+                txn.commit().await.unwrap();
+                commit
+            };
+
+            let mut opts = CheckoutOptions::new(CheckoutMode::None);
+            opts.force_copy = true;
+            let base_fd = std::fs::File::open(base).unwrap();
+            repo.checkout_at(&mut opts, base_fd.as_fd(), Path::new(&destination), &commit)
+                .await
+                .unwrap();
+
+            let out = base.join(&destination);
+            for (name, meta, demo) in &files {
+                let path = out.join(name);
+                let what = format!("{repo_mode:?} {name}");
+                let mut buf = [0u8; 256];
+                let stored = rustix::fs::getxattr(&path, "security.capability", &mut buf)
+                    .ok()
+                    .map(|n| buf[..n].to_vec());
+                assert_eq!(
+                    stored.as_deref(),
+                    Some(&cap[..]),
+                    "{what}: security.capability"
+                );
+                assert_eq!(mode_of(&path), meta.mode & 0o7777, "{what}: mode");
+                let stat = std::fs::symlink_metadata(&path).unwrap();
+                assert_eq!(
+                    (stat.uid(), stat.gid()),
+                    (meta.uid, meta.gid),
+                    "{what}: owner"
+                );
+                if *demo {
+                    assert_eq!(xattr_of(&path, "user.demo"), b"value", "{what}: user.demo");
+                }
+            }
+        });
+    }
+}
+
 /// A [`User`](CheckoutMode::User) checkout writes a regular file at
 /// `mode & 0o1777`: the setuid and setgid bits go, the sticky bit stays. A
 /// directory keeps all three. This is the tool's own rule for the file it writes

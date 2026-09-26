@@ -2227,7 +2227,12 @@ pub struct Image { pub bytes: Vec<u8>, pub fs_verity: [u8; 32] }
 
 /// Whether an exported image carries the backing objects' fs-verity digests.
 /// `Computed` is the default: each backed file takes the 36-byte metacopy
-/// record holding the digest of its content. `Disabled` gives the metacopy
+/// record holding the digest of its content. A backing object that is the raw
+/// payload and is sealed with SHA-256, 4096-byte blocks, and no salt gives the
+/// digest the kernel holds, and no payload byte is read, so damage to a sealed
+/// object is not found there; `fsck` is the check for object integrity. Every
+/// other backing object, and every `archive` object, streams its payload to
+/// compute it. `Disabled` gives the metacopy
 /// xattr an empty value and reads no payload; the image it produces has its own
 /// fs-verity digest, distinct from the `ostree.composefs.digest.v0` value a
 /// commit records.

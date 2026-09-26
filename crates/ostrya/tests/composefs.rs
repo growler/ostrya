@@ -285,6 +285,85 @@ fn transaction_digest_matches_recorded_digest() {
     });
 }
 
+/// Seal every regular `.file` object under `repo_dir/objects` with the
+/// parameters ostree uses, and return how many were sealed. Returns `None`
+/// when the filesystem refuses the first seal, so the caller skips.
+fn seal_file_objects(repo_dir: &Path) -> Option<usize> {
+    let mut sealed = 0;
+    for fanout in std::fs::read_dir(repo_dir.join("objects")).unwrap() {
+        let fanout = fanout.unwrap().path();
+        if !fanout.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&fanout).unwrap() {
+            let path = entry.unwrap().path();
+            let is_file_object = path.extension().is_some_and(|e| e == "file");
+            if !is_file_object || !std::fs::symlink_metadata(&path).unwrap().is_file() {
+                continue;
+            }
+            let ro = std::fs::File::open(&path).unwrap();
+            match ostrya_sys::enable_verity(ro.as_fd()) {
+                Ok(()) => sealed += 1,
+                Err(e) if sealed == 0 => {
+                    eprintln!("filesystem lacks fs-verity ({e})");
+                    return None;
+                }
+                Err(e) => panic!("seal {}: {e}", path.display()),
+            }
+        }
+    }
+    Some(sealed)
+}
+
+/// `Transaction::composefs_digest` over the fixture tree in a bare-user
+/// repository whose objects are sealed reaches the digest of the same tree in
+/// the unsealed fixture and the digest the tool recorded. In the sealed copy
+/// the digest of each backing object comes from the kernel; the unit test
+/// `every_sealed_fixture_object_yields_the_kernel_digest` in `src/file.rs`
+/// shows that each sealed fixture object gives it. Skips when the fixture is
+/// absent or the filesystem lacks fs-verity.
+#[test]
+fn sealed_repository_digest_matches_recorded_digest() {
+    let Some(digest) = manifest_digest("composefs_digest") else {
+        eprintln!("composefs fixture absent; skipping");
+        return;
+    };
+
+    let scratch = TmpDir::new("composefs-sealed");
+    let sealed_dir = scratch_fixture_repo(&scratch, "bare-user");
+    let cfg = sealed_dir.join("config");
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("[ex-integrity]\nfsverity=yes\n");
+    std::fs::write(&cfg, text).unwrap();
+    let Some(sealed) = seal_file_objects(&sealed_dir) else {
+        eprintln!("skipping sealed-repository digest check");
+        return;
+    };
+    assert!(sealed > 0, "the fixture holds content objects to seal");
+
+    let digest_of = |repo_dir: PathBuf| async move {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (tree, _) = repo.read_commit(COMMIT).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let value = txn.composefs_digest(&tree).await.unwrap();
+        txn.abort().await.unwrap();
+        value
+    };
+    block_on(async {
+        let from_sealed = digest_of(sealed_dir.clone()).await;
+        let from_unsealed = digest_of(fixture_repo("bare-user")).await;
+        assert_eq!(
+            from_sealed, from_unsealed,
+            "the sealed repository reaches the unsealed digest"
+        );
+        assert_eq!(
+            to_hex(&from_sealed),
+            digest,
+            "the sealed repository reaches the tool's recorded digest"
+        );
+    });
+}
+
 /// A content object's payload decides the `Computed` image and nothing in the
 /// `Disabled` one. Rewriting it in place at its existing length keeps every
 /// inode's metadata, so the object still loads under both policies and the two

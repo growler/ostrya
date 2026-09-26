@@ -1243,7 +1243,19 @@ images. Always compiled, not feature-gated. Split into sub-phases:
   the commit's `ostree.composefs.digest.v0` metadata. Ownership is presented
   through composefs uid mapping at mount. Backing objects stream through
   `rt::unblock` so no unconstrained blob is buffered, and the in-memory image
-  build is offloaded to the blocking pool.
+  build is offloaded to the blocking pool. A backing object whose file is the
+  raw payload and that the kernel seals with SHA-256, 4096-byte blocks, no
+  salt, and the payload size gives its digest through
+  `FS_IOC_MEASURE_VERITY`, after `FS_IOC_READ_VERITY_METADATA` shows those
+  parameters. The object loader issues the two ioctls on the descriptor and
+  in the blocking-pool call of the metadata load, and only when the `statx`
+  it makes sets `STATX_ATTR_VERITY`, so an unsealed object costs no extra
+  syscall. The attribute mask is not read, because btrfs sets the attribute
+  and leaves it out of the mask. This path reads no payload byte, so it does
+  not find damage to a sealed object's data or verity metadata; `fsck` is the
+  check for object integrity. An `archive` object never takes this path,
+  because the digest of a `.filez` file is not the digest of its content. Any
+  other seal, and any failed ioctl, falls back to the streamed digest.
   Verify: the fs-verity digest matches what the tool (built with composefs)
   produces for the same commit; the generated `.ostree.cfs` mounts and
   verifies; the digest the port stores in `ostree.composefs.digest.v0` equals
@@ -1404,7 +1416,12 @@ Plan:
   It exposes `enable_verity(fd)`, issuing the ioctl through `rustix::ioctl`
   (`opcode::write::<FsverityEnableArg>(b'f', 133)` fed to a `Setter`) over a
   `#[repr(C)]` 128-byte `fsverity_enable_arg`. Its only dependency is `rustix`,
-  already a foundation crate, so no new external dependency is added.
+  already a foundation crate, so no new external dependency is added. The
+  composefs export reads a sealed object's digest through its
+  `measure_verity(fd)`, which refuses a digest other than 32-byte SHA-256, and
+  its `read_verity_descriptor(fd)`, which issues `FS_IOC_READ_VERITY_METADATA`
+  (`opcode::read_write::<FsverityReadMetadataArg>(b'f', 135)`, metadata type 2)
+  through an audited `Ioctl` implementation that returns the byte count.
 - `RepoConfig` gains a `Tristate` type and `fsverity()` and `composefs()`
   accessors applying the default rule above.
 - The staging context carries the effective `Tristate`. The content, metadata,

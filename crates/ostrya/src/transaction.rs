@@ -380,10 +380,22 @@ impl Transaction {
         &self,
         checksum: &Checksum,
     ) -> Result<crate::file::FileObject> {
+        self.load_file_staged_first_with(checksum, false).await
+    }
+
+    /// [`load_file_staged_first`], with the `measure` flag of
+    /// [`Repo::load_file_with`].
+    ///
+    /// [`load_file_staged_first`]: Transaction::load_file_staged_first
+    pub(crate) async fn load_file_staged_first_with(
+        &self,
+        checksum: &Checksum,
+        measure: bool,
+    ) -> Result<crate::file::FileObject> {
         if self.is_staged(checksum, ObjectType::File) {
-            crate::file::load_staged_file(&self.repo, self.staging_fd(), checksum).await
+            crate::file::load_staged_file(&self.repo, self.staging_fd(), checksum, measure).await
         } else {
-            self.repo.load_file(checksum).await
+            self.repo.load_file_with(checksum, measure).await
         }
     }
 

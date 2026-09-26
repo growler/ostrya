@@ -6,10 +6,19 @@
 //! injects the five top-level directories the tool adds (`boot`, `etc`,
 //! `sysroot`, `usr`, `var`), and drives the writer. Each regular file with
 //! content redirects to its `.file` loose path and, under the default verity
-//! policy, carries the fs-verity digest of that content; the digest is computed
-//! by streaming the object's payload through the fs-verity primitive in bounded
-//! chunks, so no unconstrained blob is buffered. The synchronous image
-//! assembly runs on the blocking pool.
+//! policy, carries the fs-verity digest of that content. When the object file
+//! is the raw payload and `statx` reports its inode as sealed, the export reads
+//! that digest from the kernel in the same blocking-pool call that loads the
+//! object's metadata. The seal must name SHA-256, 4096-byte blocks, no salt,
+//! and the payload size, the parameters a repository with `[ex-integrity]
+//! fsverity` seals with. The kernel read takes no payload byte, so it does not
+//! find damage to a sealed object's data or verity metadata; `fsck` is the
+//! check for object integrity. An `archive` object is never read this way,
+//! because the digest of a `.filez` file is not the digest of its content. In
+//! all other cases, and when a kernel read fails, the digest is computed by
+//! streaming the object's payload through the fs-verity primitive in bounded
+//! chunks, so no unconstrained blob is buffered. The synchronous image assembly
+//! runs on the blocking pool.
 //!
 //! [`Repo::export_composefs_to`] writes the same image through a file
 //! descriptor and returns its fs-verity digest. Emission is append-only, so
@@ -145,10 +154,12 @@ impl ObjectSource<'_> {
         }
     }
 
-    async fn file(&self, checksum: &Checksum) -> Result<FileObject> {
+    /// Load a file object. `measure` also reads the kernel's fs-verity digest
+    /// of a sealed raw-payload object in the same load.
+    async fn file(&self, checksum: &Checksum, measure: bool) -> Result<FileObject> {
         match self {
-            ObjectSource::Repo(repo) => repo.load_file(checksum).await,
-            ObjectSource::Staged(txn) => txn.load_file_staged_first(checksum).await,
+            ObjectSource::Repo(repo) => repo.load_file_with(checksum, measure).await,
+            ObjectSource::Staged(txn) => txn.load_file_staged_first_with(checksum, measure).await,
         }
     }
 }
@@ -157,8 +168,9 @@ impl ObjectSource<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VerityPolicy {
     /// Each backed file carries the 36-byte metacopy record holding the
-    /// fs-verity digest of its content. The payload of every backing object is
-    /// streamed to compute it.
+    /// fs-verity digest of its content. A backing object sealed with the
+    /// parameters ostree uses gives the digest the kernel holds. The payload of
+    /// every other backing object is streamed to compute it.
     #[default]
     Computed,
     /// Each backed file carries the metacopy xattr with an empty value. No
@@ -381,7 +393,9 @@ async fn file_node(
     checksum: &Checksum,
     verity: VerityPolicy,
 ) -> Result<Node> {
-    let file = source.file(checksum).await?;
+    let file = source
+        .file(checksum, verity == VerityPolicy::Computed)
+        .await?;
     let meta = file_to_metadata(&file)?;
     match &file.kind {
         FileKind::Symlink { target } => Ok(Node::Symlink(Symlink {
@@ -407,13 +421,18 @@ async fn file_node(
     }
 }
 
-/// Compute the fs-verity digest of a regular file's content by streaming the
-/// object's payload through the digester in bounded chunks. The content is what
-/// the digest covers, so a repository storing the object compressed reaches the
-/// same value as one storing it raw.
+/// The fs-verity digest of a regular file's content. When the object file is
+/// the raw payload and is sealed with SHA-256, 4096-byte blocks, and no salt,
+/// the digest the kernel gave at load is the value, and no payload byte is
+/// read. Otherwise the object's payload is streamed through the digester in
+/// bounded chunks. The content is what the digest covers, so a repository
+/// storing the object compressed reaches the same value as one storing it raw.
 async fn content_fs_verity(file: &FileObject) -> Result<[u8; 32]> {
     use futures_lite::AsyncReadExt;
 
+    if let Some(digest) = file.kernel_fs_verity() {
+        return Ok(digest);
+    }
     let mut reader = file.reader().await?;
     let mut hasher = FsVerityHasher::new();
     let mut buf = vec![0u8; DIGEST_CHUNK];

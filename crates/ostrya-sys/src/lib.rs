@@ -10,17 +10,20 @@
 //! stays confined. Its only dependency is `rustix`.
 //!
 //! The fs-verity entry points target the parameters ostree uses: SHA-256,
-//! 4096-byte blocks, and a zero-length salt. [`Mmap`] backs the static-delta
+//! 4096-byte blocks, and a zero-length salt. [`read_verity_descriptor`]
+//! reports the parameters a sealed file carries, so a caller can accept the
+//! kernel's digest only for a file sealed with those parameters. [`Mmap`] backs the static-delta
 //! reader, giving it random access to a decompressed part or source object that
 //! lives in a temp file rather than on the heap.
 
 mod imp {
     #![allow(unsafe_code)]
 
+    use std::marker::PhantomData;
     use std::os::fd::AsFd;
 
-    use rustix::io::Result;
-    use rustix::ioctl::{Opcode, Setter, Updater, ioctl, opcode};
+    use rustix::io::{Errno, Result};
+    use rustix::ioctl::{Ioctl, IoctlOutput, Opcode, Setter, Updater, ioctl, opcode};
 
     /// The SHA-256 fs-verity hash-algorithm identifier.
     const FS_VERITY_HASH_ALG_SHA256: u32 = 1;
@@ -81,12 +84,33 @@ mod imp {
     /// to the inode is open, so `fd` must be a read-only descriptor and the
     /// sole open descriptor to the inode.
     pub fn enable_verity(fd: impl AsFd) -> Result<()> {
+        enable(fd, &[])
+    }
+
+    /// Enable fs-verity on `fd` with SHA-256, 4096-byte blocks, and `salt`.
+    ///
+    /// The tests use this to make a file sealed with parameters other than the
+    /// ones ostree uses. The kernel refuses a salt longer than 32 bytes. The
+    /// descriptor rules of [`enable_verity`] apply.
+    #[doc(hidden)]
+    pub fn enable_verity_with_salt(fd: impl AsFd, salt: &[u8]) -> Result<()> {
+        enable(fd, salt)
+    }
+
+    /// Enable fs-verity on `fd` with SHA-256, 4096-byte blocks, and `salt`. An
+    /// empty salt passes a null salt pointer.
+    fn enable(fd: impl AsFd, salt: &[u8]) -> Result<()> {
+        let salt_size = u32::try_from(salt.len()).map_err(|_| Errno::INVAL)?;
         let arg = FsverityEnableArg {
             version: 1,
             hash_algorithm: FS_VERITY_HASH_ALG_SHA256,
             block_size: FS_VERITY_BLOCK_SIZE,
-            salt_size: 0,
-            salt_ptr: 0,
+            salt_size,
+            salt_ptr: if salt.is_empty() {
+                0
+            } else {
+                salt.as_ptr() as u64
+            },
             sig_size: 0,
             reserved1: 0,
             sig_ptr: 0,
@@ -97,7 +121,10 @@ mod imp {
         // `#[repr(C)]` struct and the opcode is computed from the same type, so
         // the pointed-to region has the size and layout the kernel reads. The
         // kernel only reads the argument, matching `Setter`, rustix's
-        // read-only-pointer pattern for `_IOW` ioctls.
+        // read-only-pointer pattern for `_IOW` ioctls. A nonzero `salt_ptr`
+        // addresses `salt`, which is borrowed for this whole call, and
+        // `salt_size` is its length, so the kernel reads only live bytes. The
+        // ioctl is synchronous, so the kernel holds no pointer after it returns.
         unsafe {
             let call: Setter<{ FS_IOC_ENABLE_VERITY }, FsverityEnableArg> = Setter::new(arg);
             ioctl(fd, call)
@@ -126,11 +153,142 @@ mod imp {
                 Updater::new(&mut digest);
             ioctl(fd, call)?;
         }
+        // A file sealed with another algorithm reports that algorithm. The
+        // bytes returned are an ostree digest only for SHA-256 with 32 bytes.
+        if u32::from(digest.digest_algorithm) != FS_VERITY_HASH_ALG_SHA256
+            || digest.digest_size != 32
+        {
+            return Err(Errno::INVAL);
+        }
         Ok(digest.digest)
+    }
+
+    /// The `FS_IOC_READ_VERITY_METADATA` metadata type that selects the
+    /// fs-verity descriptor.
+    const FS_VERITY_METADATA_TYPE_DESCRIPTOR: u64 = 2;
+    /// The size of `struct fsverity_descriptor`, in bytes.
+    const DESCRIPTOR_SIZE: usize = 256;
+
+    /// The `fsverity_read_metadata_arg` passed to
+    /// `FS_IOC_READ_VERITY_METADATA`, matching the 40-byte `#[repr(C)]` kernel
+    /// UAPI struct. The kernel reads every field and writes none of them back.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct FsverityReadMetadataArg {
+        metadata_type: u64,
+        offset: u64,
+        length: u64,
+        buf_ptr: u64,
+        reserved: u64,
+    }
+
+    /// `FS_IOC_READ_VERITY_METADATA = _IOWR('f', 135, struct
+    /// fsverity_read_metadata_arg)`. The opcode encodes the 40-byte argument
+    /// size.
+    const FS_IOC_READ_VERITY_METADATA: Opcode =
+        opcode::read_write::<FsverityReadMetadataArg>(b'f', 135);
+
+    /// The `FS_IOC_READ_VERITY_METADATA` call. The kernel writes into the
+    /// buffer `buf_ptr` addresses and returns the number of bytes it wrote,
+    /// which no rustix pattern returns. The lifetime ties the call to the
+    /// mutable borrow of that buffer, so the buffer outlives the call.
+    struct ReadMetadata<'a> {
+        arg: FsverityReadMetadataArg,
+        buf: PhantomData<&'a mut [u8]>,
+    }
+
+    impl<'a> ReadMetadata<'a> {
+        /// A request for the file's descriptor into `buf`, from offset 0. The
+        /// pointer and length come from the one slice, so the length the
+        /// kernel honors is the length of the memory behind the pointer.
+        fn descriptor(buf: &'a mut [u8]) -> Self {
+            ReadMetadata {
+                arg: FsverityReadMetadataArg {
+                    metadata_type: FS_VERITY_METADATA_TYPE_DESCRIPTOR,
+                    offset: 0,
+                    length: buf.len() as u64,
+                    buf_ptr: buf.as_mut_ptr() as u64,
+                    reserved: 0,
+                },
+                buf: PhantomData,
+            }
+        }
+    }
+
+    // SAFETY: the opcode is the `_IOWR` number computed from the argument type
+    // the kernel expects, and `as_ptr` points at that argument. The kernel
+    // writes into the user buffer the argument names, so the call mutates user
+    // memory and `IS_MUTATING` is true. `output_from_ptr` reads nothing
+    // through the pointer; it converts the non-negative byte count a
+    // successful call returns.
+    unsafe impl Ioctl for ReadMetadata<'_> {
+        type Output = usize;
+
+        const IS_MUTATING: bool = true;
+
+        fn opcode(&self) -> Opcode {
+            FS_IOC_READ_VERITY_METADATA
+        }
+
+        fn as_ptr(&mut self) -> *mut core::ffi::c_void {
+            (&mut self.arg as *mut FsverityReadMetadataArg).cast()
+        }
+
+        unsafe fn output_from_ptr(
+            out: IoctlOutput,
+            _: *mut core::ffi::c_void,
+        ) -> Result<Self::Output> {
+            usize::try_from(out).map_err(|_| Errno::INVAL)
+        }
+    }
+
+    /// The fields of a file's `fsverity_descriptor` that name the parameters
+    /// the file was sealed with.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct VerityDescriptor {
+        /// The descriptor format version. The kernel writes 1.
+        pub version: u8,
+        /// The hash-algorithm identifier. SHA-256 is 1.
+        pub hash_algorithm: u8,
+        /// The base-2 logarithm of the Merkle-tree block size. 4096 bytes is 12.
+        pub log_blocksize: u8,
+        /// The salt length in bytes. Zero when the file has no salt.
+        pub salt_size: u8,
+        /// The size of the file's data in bytes when it was sealed.
+        pub data_size: u64,
+    }
+
+    /// Read the fs-verity descriptor the kernel holds for `fd`.
+    ///
+    /// `fd` must refer to a file with fs-verity enabled. A file without
+    /// fs-verity returns `ENODATA`, and a kernel without the ioctl returns
+    /// `ENOTTY`. A descriptor shorter than the 256-byte struct returns `EIO`.
+    pub fn read_verity_descriptor(fd: impl AsFd) -> Result<VerityDescriptor> {
+        let mut buf = [0u8; DESCRIPTOR_SIZE];
+        // SAFETY: `ReadMetadata::descriptor` takes `buf_ptr` and `length` from
+        // the one mutable borrow of `buf`, a local that lives past this call,
+        // so the kernel writes at most `buf.len()` bytes into memory this
+        // function owns. The borrow ends when `ioctl` consumes the request.
+        // The ioctl is synchronous, so the kernel holds no pointer after it
+        // returns, and `buf` is read only after the call.
+        let n = unsafe { ioctl(fd, ReadMetadata::descriptor(&mut buf))? };
+        if n < DESCRIPTOR_SIZE {
+            return Err(Errno::IO);
+        }
+        Ok(VerityDescriptor {
+            version: buf[0],
+            hash_algorithm: buf[1],
+            log_blocksize: buf[2],
+            salt_size: buf[3],
+            data_size: u64::from_le_bytes(buf[8..16].try_into().expect("8-byte field")),
+        })
     }
 }
 
-pub use imp::{enable_verity, measure_verity};
+pub use imp::{
+    VerityDescriptor, enable_verity, enable_verity_with_salt, measure_verity,
+    read_verity_descriptor,
+};
 pub use mmap::Mmap;
 
 mod mmap {
@@ -241,7 +399,9 @@ mod mmap {
 
 #[cfg(test)]
 mod tests {
-    use super::{Mmap, enable_verity, measure_verity};
+    use super::{
+        Mmap, enable_verity, enable_verity_with_salt, measure_verity, read_verity_descriptor,
+    };
     use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::os::fd::AsFd;
@@ -309,6 +469,79 @@ mod tests {
             OpenOptions::new().write(true).open(&path).is_err(),
             "a verity-sealed file rejects write-open"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Write `body` to a fresh file named for `tag` and open it read-only, the
+    /// descriptor the enable ioctl needs.
+    fn read_only_file(tag: &str, body: &[u8]) -> (std::path::PathBuf, File) {
+        let path = std::env::temp_dir().join(format!("ostrya-sys-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(body).unwrap();
+            f.sync_all().unwrap();
+        }
+        let ro = File::open(&path).unwrap();
+        (path, ro)
+    }
+
+    /// The descriptor of a file [`enable_verity`] sealed names SHA-256,
+    /// 4096-byte blocks, no salt, and the file's size. Skips where the
+    /// filesystem lacks verity.
+    #[test]
+    fn descriptor_reports_the_ostree_parameters() {
+        let body = b"ostrya verity descriptor".repeat(300);
+        let (path, ro) = read_only_file("verity-descriptor", &body);
+        if let Err(e) = enable_verity(ro.as_fd()) {
+            eprintln!("skipping descriptor check: filesystem lacks fs-verity ({e})");
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+
+        let desc = read_verity_descriptor(ro.as_fd()).unwrap();
+        assert_eq!(desc.version, 1);
+        assert_eq!(desc.hash_algorithm, 1, "SHA-256");
+        assert_eq!(desc.log_blocksize, 12, "4096-byte blocks");
+        assert_eq!(desc.salt_size, 0);
+        assert_eq!(desc.data_size, body.len() as u64);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file sealed with a salt reports the salt length, and its digest
+    /// differs from the digest of the same bytes sealed without a salt. Skips
+    /// where the filesystem lacks verity.
+    #[test]
+    fn descriptor_reports_a_salt() {
+        let body = b"ostrya salted verity";
+        let (plain_path, plain) = read_only_file("verity-unsalted", body);
+        if let Err(e) = enable_verity(plain.as_fd()) {
+            eprintln!("skipping salt check: filesystem lacks fs-verity ({e})");
+            let _ = std::fs::remove_file(&plain_path);
+            return;
+        }
+        let (path, ro) = read_only_file("verity-salted", body);
+        enable_verity_with_salt(ro.as_fd(), &[0x5a; 8]).unwrap();
+
+        let desc = read_verity_descriptor(ro.as_fd()).unwrap();
+        assert_eq!(desc.hash_algorithm, 1);
+        assert_eq!(desc.log_blocksize, 12);
+        assert_eq!(desc.salt_size, 8);
+        assert_ne!(
+            measure_verity(ro.as_fd()).unwrap(),
+            measure_verity(plain.as_fd()).unwrap(),
+            "the salt changes the digest"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&plain_path);
+    }
+
+    /// A file without fs-verity has no descriptor to read.
+    #[test]
+    fn descriptor_of_an_unsealed_file_is_an_error() {
+        let (path, ro) = read_only_file("verity-unsealed", b"not sealed");
+        assert!(read_verity_descriptor(ro.as_fd()).is_err());
+        assert!(measure_verity(ro.as_fd()).is_err());
         let _ = std::fs::remove_file(&path);
     }
 }

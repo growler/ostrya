@@ -8,6 +8,7 @@
 //! for tokio-native callers.
 
 use std::io;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -19,10 +20,10 @@ type Backend = tokio::fs::File;
 
 /// An async file over an already-open descriptor.
 ///
-/// Constructed from a `std::fs::File` or an `OwnedFd`; both take ownership of
-/// the descriptor. The current descriptor offset is preserved, so a caller
-/// that seeked before wrapping (past a framed header, for instance) streams
-/// from that offset.
+/// Constructed from a `std::fs::File` or, on Unix, an `OwnedFd`; both take
+/// ownership of the descriptor. The current descriptor offset is preserved, so
+/// a caller that seeked before wrapping (past a framed header, for instance)
+/// streams from that offset.
 pub struct File {
     inner: Backend,
     /// The `futures-io` seek shim under the tokio backend must remember that a
@@ -50,6 +51,7 @@ impl From<std::fs::File> for File {
     }
 }
 
+#[cfg(unix)]
 impl From<OwnedFd> for File {
     fn from(fd: OwnedFd) -> File {
         File::from(std::fs::File::from(fd))
@@ -94,8 +96,8 @@ impl File {
     ///
     /// Under the tokio backend this returns the file tokio was driving. Under
     /// the smol backend the async file holds its descriptor behind an `Arc`,
-    /// so this flushes and then duplicates the descriptor; the returned file
-    /// shares the same open file description.
+    /// so this flushes and then duplicates the descriptor (the handle on
+    /// Windows); the returned file shares the same open file description.
     pub async fn into_std(self) -> std::fs::File {
         #[cfg(feature = "tokio")]
         {
@@ -104,15 +106,20 @@ impl File {
         #[cfg(all(feature = "smol", not(feature = "tokio")))]
         {
             use smol::io::AsyncWriteExt;
-            use std::os::fd::AsFd;
 
             let mut inner = self.inner;
             let _ = inner.flush().await;
-            let fd = inner
-                .as_fd()
-                .try_clone_to_owned()
-                .expect("duplicate descriptor for into_std");
-            std::fs::File::from(fd)
+            #[cfg(unix)]
+            let owned = {
+                use std::os::fd::AsFd;
+                inner.as_fd().try_clone_to_owned()
+            };
+            #[cfg(windows)]
+            let owned = {
+                use std::os::windows::io::AsHandle;
+                inner.as_handle().try_clone_to_owned()
+            };
+            std::fs::File::from(owned.expect("duplicate descriptor for into_std"))
         }
     }
 }

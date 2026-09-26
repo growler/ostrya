@@ -84,8 +84,8 @@ The project is a Cargo workspace of focused crates:
 
 Feature flags on `ostrya`: the runtime selectors `smol` (default) and `tokio`,
 and `lzma-static` for the static xz build; later phases add `pull`,
-`verify-gpg`, `sign-gpg` (which turns on `verify-gpg`), `deltas`, `s3`, and
-`ssh`.
+`verify-gpg`, `sign-gpg` (which turns on `verify-gpg`), `deltas`, `s3`,
+`push`, `receive`, and `serve`.
 
 ## Clean-room provenance and licensing
 

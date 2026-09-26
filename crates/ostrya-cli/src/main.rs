@@ -8544,10 +8544,6 @@ fn report_resolution_failure(err: Error) -> Error {
     }
 }
 
-/// The metadata key holding the ref names a commit is bound to.
-const REF_BINDING_KEY: &str = "ostree.ref-binding";
-/// The metadata key holding the collection id a commit is bound to.
-const COLLECTION_BINDING_KEY: &str = "ostree.collection-binding";
 /// The metadata key `--bootable` fills with the kernel directory's name.
 const LINUX_KEY: &str = "ostree.linux";
 /// The metadata key `--bootable` sets to true.
@@ -8645,28 +8641,6 @@ fn set_metadata_entry(metadata: &mut Value, key: &str, entry: Value) -> Result<(
     Ok(())
 }
 
-/// The `ostree.ref-binding` value: the branch `-b` named together with every
-/// `--bind-ref` value, sorted byte-wise ascending with duplicates kept. A commit
-/// that names neither carries the empty `as` array, which is the value the tool
-/// writes under `--orphan` alone
-/// (`docs/format-reference.md`, "CLI output formats").
-fn ref_binding(branch: Option<&str>, bind_refs: &[String]) -> Value {
-    let mut names: Vec<&str> = branch
-        .into_iter()
-        .chain(bind_refs.iter().map(String::as_str))
-        .collect();
-    names.sort_unstable();
-    Value::variant(
-        Type::parse("as").expect("\"as\" is a valid gvariant type"),
-        Value::Array(
-            names
-                .into_iter()
-                .map(|name| Value::Str(name.to_owned()))
-                .collect(),
-        ),
-    )
-}
-
 /// A string-valued metadata entry, the form `--add-metadata-string` and
 /// `--add-detached-metadata-string` write.
 fn string_entry(key: &str, value: &str) -> Value {
@@ -8762,7 +8736,10 @@ async fn kept_metadata(
 /// `--add-metadata-string` in command-line order, then every `--add-metadata`,
 /// then every `--keep-metadata`, then the binding keys. Duplicate keys are kept
 /// as duplicates. An empty key is refused here, after the tree and the
-/// timestamp.
+/// timestamp. The order and the binding keys come from the shared rule of
+/// `ostrya-core`: the binding keys name the branch `-b` gives together with
+/// every `--bind-ref` value, and a commit that names neither carries the empty
+/// `as` array, which is the value the tool writes under `--orphan` alone.
 fn commit_metadata_dict(
     repo: &Repo,
     args: &CommitArgs,
@@ -8770,37 +8747,36 @@ fn commit_metadata_dict(
     added_variants: &[(&str, Value)],
     kept: &[(String, Value)],
 ) -> std::result::Result<Value, String> {
-    let mut entries = Vec::new();
+    let mut entries = Vec::with_capacity(added_strings.len() + added_variants.len() + kept.len());
     for (key, value) in added_strings {
         if key.is_empty() {
             return Err("Empty metadata key".to_owned());
         }
-        entries.push(string_entry(key, value));
+        entries.push((
+            (*key).to_owned(),
+            Value::variant(Type::Str, Value::Str((*value).to_owned())),
+        ));
     }
     for (key, value) in added_variants {
         if key.is_empty() {
             return Err("Empty metadata key".to_owned());
         }
-        entries.push(Value::Tuple(vec![
-            Value::Str((*key).to_owned()),
-            value.clone(),
-        ]));
+        entries.push(((*key).to_owned(), value.clone()));
     }
-    for (key, value) in kept {
-        entries.push(Value::Tuple(vec![Value::Str(key.clone()), value.clone()]));
-    }
+    entries.extend(kept.iter().cloned());
+    let refs: Vec<&str> = args
+        .branch
+        .as_deref()
+        .into_iter()
+        .chain(args.bind_ref.iter().map(String::as_str))
+        .collect();
     // `--no-bindings` writes neither binding key, so the dict of a commit that
     // adds nothing of its own comes out empty.
-    if !args.no_bindings {
-        entries.push(Value::Tuple(vec![
-            Value::Str(REF_BINDING_KEY.to_owned()),
-            ref_binding(args.branch.as_deref(), &args.bind_ref),
-        ]));
-        if let Some(collection) = repo.config().collection_id() {
-            entries.push(string_entry(COLLECTION_BINDING_KEY, collection));
-        }
-    }
-    Ok(Value::Array(entries))
+    Ok(ostrya::commit::commit_metadata(
+        entries,
+        (!args.no_bindings).then_some(refs.as_slice()),
+        repo.config().collection_id(),
+    ))
 }
 
 /// The detached metadata dict `--add-detached-metadata-string` writes, or `None`

@@ -1656,7 +1656,6 @@ dependencies = [
  "futures-rustls",
  "hyper",
  "liblzma",
- "miniz_oxide",
  "ostrya-composefs",
  "ostrya-core",
  "ostrya-rt",
@@ -1705,6 +1704,9 @@ dependencies = [
 name = "ostrya-core"
 version = "0.2.8"
 dependencies = [
+ "futures-io",
+ "futures-lite",
+ "miniz_oxide",
  "ostrya-gvariant",
  "sha2",
 ]

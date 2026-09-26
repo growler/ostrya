@@ -45,6 +45,8 @@ use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
 
+pub use ostrya_core::commit_metadata;
+
 /// The metadata dict type string for detached commit metadata and, wrapped in
 /// the commit tuple, the commit metadata dict.
 const METADATA_SIGNATURE: &str = "a{sv}";
@@ -93,7 +95,8 @@ impl Transaction {
             ));
         }
 
-        let timestamp = resolve_timestamp(opts.timestamp)?;
+        let timestamp = ostrya_core::commit_timestamp(opts.timestamp)
+            .map_err(|e| Error::InvalidFormat(e.to_string()))?;
         let mut metadata = opts.metadata.unwrap_or_else(|| Value::Array(Vec::new()));
 
         if self.generate_sizes() && self.repo().mode().is_archive() {
@@ -391,26 +394,6 @@ impl Repo {
         })
         .await
     }
-}
-
-/// Resolve a commit timestamp: an explicit value, else `SOURCE_DATE_EPOCH`,
-/// else the current time. A malformed `SOURCE_DATE_EPOCH` is an error rather
-/// than a silent fallback, matching the reproducible-build convention.
-fn resolve_timestamp(explicit: Option<u64>) -> Result<u64> {
-    if let Some(timestamp) = explicit {
-        return Ok(timestamp);
-    }
-    if let Ok(raw) = std::env::var("SOURCE_DATE_EPOCH") {
-        return raw.trim().parse::<u64>().map_err(|_| {
-            Error::InvalidFormat(format!(
-                "SOURCE_DATE_EPOCH is not a Unix timestamp: {raw:?}"
-            ))
-        });
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| Error::InvalidFormat("the system clock is before the Unix epoch".into()))?;
-    Ok(now.as_secs())
 }
 
 /// Append one entry to an `a{sv}` dict value, preserving insertion order.

@@ -7,6 +7,12 @@
 //! varint, loose-path derivation, `ostree.sizes` packing, and xattr
 //! canonicalization.
 //!
+//! The crate also holds the rules a new commit is built by: the raw-DEFLATE
+//! encoder of archive-mode content objects ([`DeflateSink`]), the commit
+//! metadata rule ([`commit_metadata`]), the commit timestamp rule
+//! ([`commit_timestamp`]), and the metadata size cap ([`MAX_METADATA_SIZE`]).
+//! It compiles on Linux, macOS, and Windows.
+//!
 //! This crate covers phases 2 and 3 of the port plan (see
 //! `docs/port-plan.md`): the format primitives (checksum, varint, loose
 //! paths, sizes, xattrs, keyfile) and the typed object structs (commit,
@@ -16,6 +22,7 @@ pub mod base64;
 mod be;
 mod checksum;
 mod commit;
+mod deflate;
 mod dirmeta;
 mod dirtree;
 mod error;
@@ -31,7 +38,8 @@ pub mod varint;
 mod xattr;
 
 pub use checksum::Checksum;
-pub use commit::Commit;
+pub use commit::{Commit, TimestampError, commit_metadata, commit_timestamp, ref_binding};
+pub use deflate::DeflateSink;
 pub use dirmeta::{DirMeta, DirMetaRef};
 pub use dirtree::{DirTree, DirTreeRef};
 pub use error::{Error, Result};
@@ -51,6 +59,11 @@ pub use ostrya_gvariant::{
     from_bytes, from_text, offset_size_for, to_bytes, to_text, to_text_unannotated,
     tuple_field_from_bytes, write_offset,
 };
+
+/// The largest metadata object the port loads: 128 MiB, the metadata cap of
+/// the format. A metadata object is read whole, so every reader of one holds
+/// this bound.
+pub const MAX_METADATA_SIZE: u64 = 128 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {

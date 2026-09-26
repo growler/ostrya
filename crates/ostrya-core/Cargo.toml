@@ -11,3 +11,18 @@ readme.workspace = true
 [dependencies]
 ostrya-gvariant = { workspace = true }
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
+futures-io = "0.3"
+# The raw-DEFLATE encoder behind archive-mode content objects. The direct
+# dependency on the compressor holds the stored `.filez` bytes for a given
+# `[archive] zlib-level` the same under every feature set the build enables.
+# The requirement is a minimum bound. The encoder output is the bytes stored
+# in every archive-mode content object. The gate on that output is the golden
+# vectors in `src/deflate.rs` together with
+# `archive_objects_are_byte_identical_to_the_fixture` in
+# `crates/ostrya/tests/write.rs`. A resolved version whose output differs from
+# those records fails the test suite. `Cargo.lock` records the version a build
+# resolves.
+miniz_oxide = "0.8.9"
+
+[dev-dependencies]
+futures-lite = "2"

@@ -189,6 +189,115 @@ impl GvEncode for Commit {
     }
 }
 
+/// The metadata key that holds the ref names a commit is bound to.
+const REF_BINDING_KEY: &str = "ostree.ref-binding";
+/// The metadata key that holds the collection id a commit is bound to.
+const COLLECTION_BINDING_KEY: &str = "ostree.collection-binding";
+
+/// The `ostree.ref-binding` value for `refs`: the names sorted byte-wise
+/// ascending, duplicates kept, as a variant of type `as`. An empty list gives
+/// the empty array, which is the value of a commit bound to no ref
+/// (`docs/format-reference.md`, "CLI output formats").
+pub fn ref_binding(refs: &[&str]) -> Value {
+    let mut names = refs.to_vec();
+    names.sort_unstable();
+    Value::variant(
+        Type::parse("as").expect("\"as\" is a valid gvariant type"),
+        Value::Array(
+            names
+                .into_iter()
+                .map(|name| Value::Str(name.to_owned()))
+                .collect(),
+        ),
+    )
+}
+
+/// The `a{sv}` metadata dict of a new commit.
+///
+/// The entry order is part of the commit checksum: `entries` in the order
+/// given, with duplicate keys kept, then `ostree.ref-binding` for `refs`, then
+/// `ostree.collection-binding` when `collection_id` is set. With `refs` set to
+/// `None` the dict holds neither binding key, and `collection_id` is not used.
+/// Each value in `entries` is a variant.
+pub fn commit_metadata(
+    entries: impl IntoIterator<Item = (String, Value)>,
+    refs: Option<&[&str]>,
+    collection_id: Option<&str>,
+) -> Value {
+    let mut dict: Vec<Value> = entries
+        .into_iter()
+        .map(|(key, value)| Value::Tuple(vec![Value::Str(key), value]))
+        .collect();
+    if let Some(refs) = refs {
+        dict.push(Value::Tuple(vec![
+            Value::Str(REF_BINDING_KEY.to_owned()),
+            ref_binding(refs),
+        ]));
+        if let Some(collection) = collection_id {
+            dict.push(Value::Tuple(vec![
+                Value::Str(COLLECTION_BINDING_KEY.to_owned()),
+                Value::variant(Type::Str, Value::Str(collection.to_owned())),
+            ]));
+        }
+    }
+    Value::Array(dict)
+}
+
+/// Why [`commit_timestamp`] gave no timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimestampError {
+    /// `SOURCE_DATE_EPOCH` is set and is not a count of seconds. Holds the
+    /// value.
+    SourceDateEpoch(String),
+    /// The system clock is before the Unix epoch.
+    ClockBeforeEpoch,
+}
+
+impl std::fmt::Display for TimestampError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimestampError::SourceDateEpoch(raw) => {
+                write!(f, "SOURCE_DATE_EPOCH is not a Unix timestamp: {raw:?}")
+            }
+            TimestampError::ClockBeforeEpoch => {
+                f.write_str("the system clock is before the Unix epoch")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TimestampError {}
+
+/// The timestamp of a new commit, in seconds since the Unix epoch, UTC:
+/// `explicit` when given, else `SOURCE_DATE_EPOCH`, else the current time.
+///
+/// A malformed `SOURCE_DATE_EPOCH` is an error and not a fallback, as the
+/// reproducible-build convention requires. The value is trimmed before it is
+/// parsed. A `SOURCE_DATE_EPOCH` that is not valid Unicode counts as unset.
+pub fn commit_timestamp(explicit: Option<u64>) -> std::result::Result<u64, TimestampError> {
+    timestamp_from(explicit, std::env::var("SOURCE_DATE_EPOCH").ok())
+}
+
+/// [`commit_timestamp`] over a given `SOURCE_DATE_EPOCH` value.
+fn timestamp_from(
+    explicit: Option<u64>,
+    source_date_epoch: Option<String>,
+) -> std::result::Result<u64, TimestampError> {
+    if let Some(timestamp) = explicit {
+        return Ok(timestamp);
+    }
+    if let Some(raw) = source_date_epoch {
+        return raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| TimestampError::SourceDateEpoch(raw));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| TimestampError::ClockBeforeEpoch)?;
+    Ok(now.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +384,72 @@ mod tests {
         buf.extend_from_slice(csum(1).as_bytes());
         buf.extend_from_slice(csum(2).as_bytes());
         assert_eq!(commit.content_checksum(), Checksum::sha256(&buf));
+    }
+
+    fn entry(key: &str, value: &str) -> (String, Value) {
+        (
+            key.to_owned(),
+            Value::variant(Type::Str, Value::Str(value.to_owned())),
+        )
+    }
+
+    fn text(value: &Value) -> String {
+        ostrya_gvariant::to_text(&METADATA_TYPE, value).unwrap()
+    }
+
+    #[test]
+    fn commit_metadata_orders_entries_then_bindings() {
+        let dict = commit_metadata(
+            [entry("b", "1"), entry("a", "2"), entry("b", "3")],
+            Some(&["zeta", "alpha", "mid", "alpha"]),
+            Some("org.example.C"),
+        );
+        assert_eq!(
+            text(&dict),
+            "{'b': <'1'>, 'a': <'2'>, 'b': <'3'>, \
+             'ostree.ref-binding': <['alpha', 'alpha', 'mid', 'zeta']>, \
+             'ostree.collection-binding': <'org.example.C'>}"
+        );
+    }
+
+    #[test]
+    fn commit_metadata_without_refs_holds_no_binding_key() {
+        let dict = commit_metadata([entry("k", "v")], None, Some("org.example.C"));
+        assert_eq!(text(&dict), "{'k': <'v'>}");
+        assert_eq!(commit_metadata([], None, None), Value::Array(Vec::new()));
+    }
+
+    #[test]
+    fn empty_ref_list_writes_the_empty_array() {
+        let dict = commit_metadata([], Some(&[]), None);
+        assert_eq!(text(&dict), "{'ostree.ref-binding': <@as []>}");
+        assert_eq!(
+            dict,
+            Value::Array(vec![Value::Tuple(vec![
+                Value::Str("ostree.ref-binding".to_owned()),
+                ref_binding(&[]),
+            ])])
+        );
+    }
+
+    #[test]
+    fn timestamp_prefers_explicit_then_source_date_epoch() {
+        assert_eq!(timestamp_from(Some(5), Some("abc".to_owned())), Ok(5));
+        assert_eq!(
+            timestamp_from(None, Some(" 1700000000\n".to_owned())),
+            Ok(1_700_000_000)
+        );
+        let err = timestamp_from(None, Some("abc".to_owned())).unwrap_err();
+        assert_eq!(err, TimestampError::SourceDateEpoch("abc".to_owned()));
+        assert_eq!(
+            err.to_string(),
+            "SOURCE_DATE_EPOCH is not a Unix timestamp: \"abc\""
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let got = timestamp_from(None, None).unwrap();
+        assert!(got.abs_diff(now) <= 5, "{got} is near {now}");
     }
 }

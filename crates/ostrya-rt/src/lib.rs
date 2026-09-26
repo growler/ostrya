@@ -7,11 +7,14 @@
 //! (an async file over an already-open descriptor), [`Timer`] (a one-shot
 //! async delay for retry loops) with [`Deadline`] (a restartable window a
 //! `poll_*` method can check), [`Command`] (a short-lived helper process
-//! with piped standard streams), [`spawn`] (concurrent tasks, with the
-//! [`JoinHandle`] they return), [`TcpStream`] and [`TcpListener`] (async TCP),
-//! and [`block_on`] (a convenience driver used by tests and doctests). The
-//! wider library is written against these plus the `futures-io` traits, so it
-//! stays runtime-neutral.
+//! with piped standard streams; [`Command::spawn`] starts a long-lived
+//! [`Child`] with piped standard input and standard output), [`spawn`]
+//! (concurrent tasks, with the [`JoinHandle`] they return), [`TcpStream`] and
+//! [`TcpListener`] (async TCP), and [`block_on`] (a convenience driver used by
+//! tests and doctests). The wider library is written against these plus the
+//! `futures-io` traits, so it stays runtime-neutral.
+//!
+//! The crate compiles on Unix and Windows. `File::from(OwnedFd)` is Unix-only.
 //!
 //! Backend selection is feature-gated and additive-safe:
 //!
@@ -35,7 +38,7 @@ mod timer;
 pub use file::File;
 pub use net::{TcpListener, TcpStream};
 pub use pool::{block_on, unblock};
-pub use process::Command;
+pub use process::{Child, ChildStdin, ChildStdout, Command};
 pub use task::{JoinHandle, spawn};
 pub use timer::{Deadline, Timer};
 

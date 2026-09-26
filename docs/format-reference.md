@@ -1349,11 +1349,13 @@ Archive `.filez` layout (extends "File content object header"):
   interoperability.
 - Golden SHA-256 vectors pin the bytes the port's encoder emits, one vector per
   level 1-9, over a payload of one and a half output chunks
-  (`crates/ostrya/src/write.rs`, `deflate_tests`). The nine vectors differ, so a
+  (`crates/ostrya-core/src/deflate.rs`, `tests`). The nine vectors differ, so a
   change to the map from `[archive] zlib-level` to the encoder's parameters
   fails the gate. A tenth vector holds the stream a caller who flushes in the
   middle of a payload writes: a flush ends the DEFLATE block, which changes the
-  stored bytes and leaves the object checksum the same.
+  stored bytes and leaves the object checksum the same. The same vectors hold
+  for a sink that `reset` started on a new stream, so a caller that reuses one
+  sink for many objects stores the same bytes.
 - Observed at level 1 on a 160 KiB payload: one write of the whole payload
   produces different bytes than 64 KiB writes of the same payload. The ingest
   path streams through a 64 KiB copy buffer, so the stored bytes follow the

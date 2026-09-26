@@ -39,24 +39,10 @@ pub struct DirTree {
     pub dirs: Vec<(String, Checksum, Checksum)>,
 }
 
-/// The path-traversal defense for one entry name.
-fn check_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(Error::InvalidDirTree("empty entry name"));
-    }
-    if name == "." || name == ".." {
-        return Err(Error::InvalidDirTree("entry name is a directory traversal"));
-    }
-    if name.contains('/') {
-        return Err(Error::InvalidDirTree("entry name contains a slash"));
-    }
-    Ok(())
-}
-
 /// Validate one visited name against the previous one: valid component,
 /// byte-wise strictly increasing (which rejects duplicates).
 fn check_entry<'a>(prev: &mut Option<&'a str>, name: &'a str) -> Result<()> {
-    check_name(name)?;
+    DirTree::check_name(name)?;
     if let Some(prev) = prev
         && *prev >= name
     {
@@ -71,6 +57,21 @@ fn entry_checksum(bytes: &[u8]) -> Result<Checksum> {
 }
 
 impl DirTree {
+    /// Check that `name` is one path component: not empty, not `.` or `..`,
+    /// and with no `/`. This is the path-traversal defense of a dirtree entry.
+    pub fn check_name(name: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(Error::InvalidDirTree("empty entry name"));
+        }
+        if name == "." || name == ".." {
+            return Err(Error::InvalidDirTree("entry name is a directory traversal"));
+        }
+        if name.contains('/') {
+            return Err(Error::InvalidDirTree("entry name contains a slash"));
+        }
+        Ok(())
+    }
+
     /// Parse a serialized dirtree object into an owned, structurally sound
     /// tree: the per-list checks run as entries are collected, then the
     /// cross-list duplicate-name check runs over the materialized lists.
@@ -202,6 +203,16 @@ mod tests {
         DirTree {
             files: vec![("a.txt".to_owned(), csum(1)), ("b.txt".to_owned(), csum(2))],
             dirs: vec![("sub".to_owned(), csum(3), csum(4))],
+        }
+    }
+
+    #[test]
+    fn check_name_refuses_what_is_not_one_component() {
+        for name in ["", ".", "..", "a/b", "/"] {
+            assert!(DirTree::check_name(name).is_err(), "{name:?}");
+        }
+        for name in ["a", "...", ".a", "a."] {
+            assert!(DirTree::check_name(name).is_ok(), "{name:?}");
         }
     }
 

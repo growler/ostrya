@@ -46,6 +46,15 @@
             "rust-src"
           ];
 
+          # The portable crates are checked for macOS and Windows. The toolchain
+          # carries the standard library of each of those targets, so
+          # `cargo check --target` needs no other setup.
+          rustExtensions.targets = [
+            "x86_64-pc-windows-gnu"
+            "x86_64-apple-darwin"
+            "aarch64-apple-darwin"
+          ];
+
           # The binaries the test suite and the CI guards run. Each test that
           # needs one of these skips where it is absent, so the shell carries
           # them to run the whole suite rather than a subset.

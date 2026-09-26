@@ -69,6 +69,28 @@ pub enum RepoMode {
 /// `ostrya-core`.
 pub fn loose_path(checksum: &Checksum, ty: ObjectType, mode: RepoMode) -> String;
 
+// ostrya-core -- the rules a new commit is built by.
+
+/// Raw-DEFLATE encoder over a futures-io writer, the stored form of an
+/// archive-mode content object. `reset` starts a new stream in the same
+/// compressor and output buffer and returns the old writer.
+pub struct DeflateSink<W>;
+impl<W> DeflateSink<W> {
+    pub fn new(inner: W, level: u8) -> Self;          // level 1-9
+    pub fn reset(&mut self, inner: W, level: u8) -> W;
+    pub fn into_inner(self) -> W;
+}
+/// The commit metadata dict: entries in order, then ostree.ref-binding
+/// (sorted refs), then ostree.collection-binding. `refs: None` writes no
+/// binding key. `ostrya` re-exports it as `ostrya::commit::commit_metadata`.
+pub fn commit_metadata(entries: impl IntoIterator<Item = (String, Value)>,
+    refs: Option<&[&str]>, collection_id: Option<&str>) -> Value;
+pub fn ref_binding(refs: &[&str]) -> Value;
+/// explicit, else SOURCE_DATE_EPOCH, else now.
+pub fn commit_timestamp(explicit: Option<u64>) -> Result<u64, TimestampError>;
+impl DirTree { pub fn check_name(name: &str) -> Result<()>; }
+pub const MAX_METADATA_SIZE: u64;       // also at ostrya::MAX_METADATA_SIZE
+
 pub struct CollectionRef { pub collection_id: Option<String>, pub ref_name: String }
 
 /// Sorted xattr set, canonicalized on construction.
@@ -687,7 +709,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output; // test/doctest driver
 /// `openat`); this type only streams. Presents the `futures-io` traits
 /// under both backends; the tokio traits additionally under the `tokio`
 /// feature.
-pub struct File;    // From<std::fs::File> / From<OwnedFd>;
+pub struct File;    // From<std::fs::File> / From<OwnedFd> (Unix only);
                     // AsyncRead + AsyncWrite + AsyncSeek + Send + Sync
 impl File {
     pub async fn sync_all(&mut self) -> std::io::Result<()>;
@@ -698,7 +720,14 @@ impl File {
 pub struct Timer;                       // Timer::after(Duration)
 pub struct Deadline;                    // a restartable inactivity window
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>;
-pub struct Command;                     // subprocess, for gpg signing
+pub struct Command;                     // helper process: output() for gpg signing,
+impl Command {                          //   spawn() for a long-lived child
+    pub async fn output(&self, input: &[u8]) -> std::io::Result<std::process::Output>;
+    pub fn spawn(&self) -> std::io::Result<Child>;  // stdin/stdout piped, stderr inherited
+}
+pub struct Child;                       // take_stdin(), take_stdout(), async wait()
+pub struct ChildStdin;                  // futures_io::AsyncWrite; close() gives EOF
+pub struct ChildStdout;                 // futures_io::AsyncRead
 pub struct TcpListener;  pub struct TcpStream;
 ```
 

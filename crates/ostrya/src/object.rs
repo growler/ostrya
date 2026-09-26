@@ -15,14 +15,11 @@ use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 
-/// The maximum size of a metadata object the reader will load, matching the
-/// format's 128 MiB metadata cap.
-///
 /// Both metadata reading paths hold the bound: [`crate::Repo::load_object_bytes`]
 /// refuses an object above it, and [`crate::MetadataReader`] refuses one at the
 /// open and again once it has handed over this many bytes and the object still
 /// holds a further one.
-pub const MAX_METADATA_SIZE: u64 = 128 * 1024 * 1024;
+pub use ostrya_core::MAX_METADATA_SIZE;
 
 /// The maximum size of a content object's framed file header the reader will
 /// load, for the archive form on disk and for the same framing received over

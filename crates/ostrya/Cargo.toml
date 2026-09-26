@@ -54,16 +54,6 @@ liblzma = { version = "0.4" }
 # unsafe, and its output is the interleaved control/diff/extra layout
 # `bspatch.rs` reads.
 bsdiff = "0.2.1"
-# The raw-DEFLATE encoder behind archive-mode content objects. The direct
-# dependency on the compressor holds the stored `.filez` bytes for a given
-# `[archive] zlib-level` the same under every feature set the build enables.
-# The requirement is a minimum bound. The encoder output is the bytes stored
-# in every archive-mode content object. The gate on that output is the golden
-# vectors in `src/write.rs` together with
-# `archive_objects_are_byte_identical_to_the_fixture` in `tests/write.rs`. A
-# resolved version whose output differs from those records fails the test
-# suite. `Cargo.lock` records the version a build resolves.
-miniz_oxide = "0.8.9"
 pin-project-lite = "0.2"
 futures-io = "0.3"
 futures-lite = "2"

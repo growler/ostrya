@@ -82,12 +82,15 @@ all pure Rust:
   content objects (over `flate2`) and streaming xz for static-delta parts (over
   `liblzma`, statically linked under the `lzma-static` feature).
 - `miniz_oxide` (MIT OR Zlib OR Apache-2.0) -- the raw-DEFLATE encoder behind
-  archive-mode content objects. A direct dependency on the compressor holds the
-  stored `.filez` bytes for a given `[archive] zlib-level` the same under every
-  feature set the build enables. The requirement is a minimum bound, `0.8.9`,
-  and `Cargo.lock` records the version a build resolves. The encoder output is
+  archive-mode content objects. A direct dependency of `ostrya-core` on the
+  compressor holds the stored `.filez` bytes for a given `[archive]
+  zlib-level` the same under every feature set the build enables. The
+  requirement is a minimum bound, `0.8.9`, and `Cargo.lock` records the
+  version a build resolves. The encoder output is
   the bytes the repository stores. Golden SHA-256 vectors over the encoder
-  output, one per level 1-9, hold that surface in `crates/ostrya/src/write.rs`.
+  output, one per level 1-9, hold that surface in
+  `crates/ostrya-core/src/deflate.rs`. The vectors also run through a sink that
+  was reset after an earlier stream.
   `archive_objects_are_byte_identical_to_the_fixture` in
   `crates/ostrya/tests/write.rs` holds it against a fixture the `ostree` tool
   wrote. A resolved version whose output differs from those records fails the
@@ -127,12 +130,21 @@ bounded:
 
 - `ostrya-gvariant` -- the byte-exact GVariant codec. No ostree knowledge.
 - `ostrya-core` -- object model, checksums, varint, loose paths, xattr
-  canonicalization, format (de)serialization. Depends on `ostrya-gvariant`.
+  canonicalization, format (de)serialization, the raw-DEFLATE encoder of
+  archive-mode content objects (`DeflateSink`), the commit metadata dict rule,
+  the ref-binding rule (`ref_binding`), the commit timestamp rule, the dirtree
+  entry-name rule (`DirTree::check_name`), and `MAX_METADATA_SIZE`. Depends on
+  `ostrya-gvariant`, `sha2`, `futures-io`, and `miniz_oxide`. Compiles on
+  Linux, macOS, and Windows.
 - `ostrya-rt` -- internal runtime abstraction: `rt::unblock`, `rt::File`
   (over an already-open fd; `smol::fs::File` or `tokio::fs::File`),
   `rt::Timer`, `rt::Command` (a short-lived helper process with piped
-  standard streams), later `rt::spawn` and networking. The only crate that
-  knows which backend is compiled. No ostree knowledge.
+  standard streams) and `rt::Child` (a long-lived child process whose
+  standard input and standard output are async streams), `rt::spawn` (a
+  concurrent task and its `rt::JoinHandle`), and `rt::TcpStream` and
+  `rt::TcpListener` (async TCP). The only crate that knows which backend is
+  compiled. No ostree knowledge. Compiles on Linux, macOS, and Windows;
+  `rt::File::from(OwnedFd)` is Unix-only.
 - `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the
   fs-verity digest. Standalone and free of ostree and repository knowledge,
   like `ostrya-gvariant`: it takes a tree model and emits the image bytes and
@@ -152,11 +164,11 @@ bounded:
   design is `conformance/harness.md`.
 
 Feature flags on `ostrya`: `pull`, `sign-spki`, `verify-gpg`, `sign-gpg`,
-`deltas`, `s3`, `ssh`, `lzma-static` for the static xz build, plus the runtime
-backend selectors `smol` (default) and `tokio`, forwarded to `ostrya-rt`. Each
-heavier or riskier subsystem is opt-in so the core stays small. Tar
-import/export (built on `smol-tar`) and composefs export are always
-compiled, not feature-gated.
+`deltas`, `s3`, `push`, `receive`, `serve`, `lzma-static` for the static xz
+build, plus the runtime backend selectors `smol` (default) and `tokio`,
+forwarded to `ostrya-rt`. Each heavier or riskier subsystem is opt-in so the
+core stays small. Tar import/export (built on `smol-tar`) and composefs export
+are always compiled, not feature-gated.
 
 ### Async model
 
@@ -6826,18 +6838,52 @@ SigV4 signer versus hand-rolled signing) is settled at phase start.
 Verify: push a fixture repository to an S3-compatible test server and pull
 it back intact; the tool pulls the pushed bucket over plain HTTP.
 
-### Phase 19 -- SSH push/pull extension
+### Phase 19 -- Push extension (ssh and HTTP)
 
-Feature-gated (`ssh`). Git-style transport: the client spawns the system
-`ssh` as a subprocess (a child process, not a linked library, so the no-C
-constraint holds) and runs `ostrya` on the remote side; the two ends speak
-a pack protocol over stdin/stdout. Push uploads missing objects and updates
-refs inside a normal transaction on the remote repository; pull is the
-reverse. The remote end is the Phase 11 binary grown a serve subcommand.
-Protocol framing and the object-negotiation design are specified at phase
-start.
-Verify: push and pull between two port repositories over ssh to localhost;
-the receiving repository passes `ostree fsck` and resolves the pushed refs.
+The tool has no push, so the whole phase is a port extension. A repository
+that receives a push stays a normal repository: the tool reads it, checks it
+with `ostree fsck`, and pulls from it.
+
+The extension serves two scenarios:
+
+- Tree push -- a client program pushes a directory tree. The client builds the
+  commit object with `ostrya-core` and signs it with its own keys. With the
+  same inputs, the commit is byte-identical to the commit `ostree commit`
+  builds from the same directory. The client library compiles on Linux,
+  macOS, and Windows. `ostrya push-tree` is the command form.
+- Commit push -- `ostrya push` sends one or more commits from a local
+  repository and updates refs on the remote.
+
+The two scenarios use one protocol over two transports:
+
+- ssh -- the client runs the system `ssh` binary as a subprocess (a child
+  process, not a linked library, so the no-C constraint holds), and the remote
+  side runs `ostrya receive`. The two ends exchange framed GVariant messages
+  over standard input and standard output.
+- HTTP and HTTPS -- the client talks to `ostrya serve`, which also serves the
+  repository for pull as an archive repository.
+
+A ref update is a compare-and-swap against the state of the ref that the
+client expects. By default the server accepts a fast-forward alone. The
+server receives into a normal transaction and reports success only after the
+transaction committed and the refs point at the commit.
+
+Features on `ostrya`: `push` (the commit push from a repository), `receive`
+(the server side of the protocol), and `serve` (the HTTP server, which turns
+on `receive`). The client code that must compile on macOS and Windows goes
+into portable workspace crates: `ostrya-fetch` (the fetcher), `ostrya-sign`
+(the signing engines), and `ostrya-push` (the protocol, the client session,
+the transports, and the tree model). `ostrya` re-exports their public items.
+`ostrya-gvariant`, `ostrya-core`, and `ostrya-rt` compile on those targets
+as well. CI checks the portable crates for `x86_64-pc-windows-gnu`,
+`x86_64-apple-darwin`, and `aarch64-apple-darwin`.
+
+Pull over ssh follows push as separate work.
+
+Verify: push between two port repositories over ssh to localhost and over
+HTTP. The receiving repository passes `ostree fsck` and resolves the pushed
+refs. A tree push with one target ref gives the commit checksum that
+`ostree commit` gives for the same tree and inputs.
 
 ### Phase 20 -- Sysroot / deployment (optional, separate track)
 

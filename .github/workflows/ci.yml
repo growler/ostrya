@@ -156,6 +156,19 @@ jobs:
       - name: A build without a GPG feature compiles
         run: cargo check -p ostrya --no-default-features --features smol
 
+      # The portable crates compile for macOS and Windows as well as Linux.
+      # `cargo check` needs the standard library of each target and no linker,
+      # so the Linux runner checks all three targets.
+      - name: Install the non-Linux targets
+        run: rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: The portable crates check on the non-Linux targets
+        run: |
+          for target in x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo check --target "$target" -p ostrya-gvariant -p ostrya-core -p ostrya-rt
+            cargo check --target "$target" -p ostrya-rt --no-default-features --features tokio
+          done
+
       # The local-pull ownership-gate tests need the process to belong to more
       # than one group. The GPG cases need `gpg` to build their fixtures, and
       # the agreement gate needs `gpgv` as its reference. Each skips itself

@@ -10,10 +10,11 @@
 //! directory, materialized with `linkat`) where the filesystem allows it, and a
 //! named temp file otherwise. A regular file's payload streams through an
 //! `rt::File` in bounded chunks and is hashed on the way down; in archive mode
-//! the same pass feeds a raw-DEFLATE encoder over `miniz_oxide` at
-//! `[archive] zlib-level`. The object identity is the SHA-256 of the framed
-//! uncompressed header followed by the raw payload, so it is complete when the
-//! stream ends regardless of how the bytes are stored.
+//! the same pass feeds the raw-DEFLATE encoder of `ostrya-core`
+//! (`ostrya_core::DeflateSink`) at `[archive] zlib-level`. The object identity
+//! is the SHA-256 of the framed uncompressed header followed by the raw
+//! payload, so it is complete when the stream ends regardless of how the bytes
+//! are stored.
 //!
 //! Per-mode inode application is always by explicit `fchmod`/`fchown`, never the
 //! umask, reproducing the modes recovered from the `ostree` tool (see
@@ -32,12 +33,10 @@ use std::task::{Context, Poll};
 
 use async_compression::futures::write::DeflateDecoder;
 use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
-use miniz_oxide::deflate::core::CompressorOxide;
-use miniz_oxide::deflate::stream::deflate;
-use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
 use ostrya_core::filehdr::frame;
 use ostrya_core::{
-    Checksum, ContentHasher, DirMeta, FileHeader, ObjectType, RepoMode, Xattrs, loose_path,
+    Checksum, ContentHasher, DeflateSink, DirMeta, FileHeader, ObjectType, RepoMode, Xattrs,
+    loose_path,
 };
 use ostrya_rt::File as RtFile;
 use rustix::fs::{AtFlags, Gid, Mode, OFlags, Uid, XattrFlags};
@@ -66,9 +65,6 @@ const FIXED_MODE: u32 = 0o644;
 /// The chunk size for a streaming pass over a content object's payload: the
 /// copy in [`Transaction::write_content`] and the hash `Repo::fsck` takes.
 pub(crate) const COPY_CHUNK: usize = 64 * 1024;
-/// The size of the output buffer [`DeflateSink`] compresses into before it
-/// writes the compressed bytes through to the file under it.
-const DEFLATE_CHUNK: usize = 64 * 1024;
 /// Attempts made at an `ETXTBSY` fs-verity enable before it is reported. The
 /// kernel refuses to seal an inode any writable descriptor still holds, and
 /// `fork` copies the file descriptor table, so a child carries a copy of the
@@ -1615,169 +1611,6 @@ fn gid(value: u32) -> Gid {
     Gid::from_raw(value)
 }
 
-/// A streaming raw-DEFLATE encoder over an async writer.
-///
-/// Each `poll_write` compresses the caller's chunk into a bounded output
-/// buffer and passes that buffer on to the writer under it, so a payload of
-/// any size goes through in fixed-size pieces. `poll_flush` ends the current
-/// DEFLATE block with a sync flush. `poll_close` ends the stream and leaves
-/// the writer under it open, which the header size-patch in
-/// [`ContentWriter::finish`] needs.
-struct DeflateSink<W> {
-    inner: W,
-    compressor: Box<CompressorOxide>,
-    /// The compressed bytes the compressor has produced.
-    out: Vec<u8>,
-    /// How many bytes of `out` have reached `inner`.
-    sent: usize,
-    /// How many bytes of `out` the compressor filled.
-    filled: usize,
-    /// Whether a sync flush is under way, so the sequence resumes with the
-    /// drain steps that follow the sync step rather than a second sync step.
-    syncing: bool,
-    /// Whether the current DEFLATE block is closed and no input has arrived
-    /// since.
-    flushed: bool,
-    /// Whether the compressor has reached the end of the stream.
-    done: bool,
-}
-
-impl<W> DeflateSink<W> {
-    /// A raw-DEFLATE encoder over `inner` at `level`, which the format holds to
-    /// 1 through 9.
-    fn new(inner: W, level: u8) -> DeflateSink<W> {
-        let mut compressor = Box::<CompressorOxide>::default();
-        compressor.set_format_and_level(DataFormat::Raw, level);
-        DeflateSink {
-            inner,
-            compressor,
-            out: vec![0u8; DEFLATE_CHUNK],
-            sent: 0,
-            filled: 0,
-            syncing: false,
-            flushed: true,
-            done: false,
-        }
-    }
-
-    /// The writer under the encoder.
-    fn into_inner(self) -> W {
-        self.inner
-    }
-}
-
-impl<W: AsyncWrite + Unpin> DeflateSink<W> {
-    /// Pass the compressed bytes held in `out` on to `inner`.
-    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while self.sent < self.filled {
-            let n = std::task::ready!(
-                Pin::new(&mut self.inner).poll_write(cx, &self.out[self.sent..self.filled])
-            )?;
-            if n == 0 {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "write returned zero",
-                )));
-            }
-            self.sent += n;
-        }
-        self.sent = 0;
-        self.filled = 0;
-        Poll::Ready(Ok(()))
-    }
-
-    /// Run the compressor once over `input` under `flush`, into an empty output
-    /// buffer. The step drains first, so a `Pending` return leaves the
-    /// compressor untouched and the caller repeats the same step.
-    ///
-    /// Returns the bytes of `input` the compressor took, the bytes it produced,
-    /// and whether it reached the end of the stream. A `Buf` result reports
-    /// that the compressor made no progress, which the flush and close
-    /// sequences read as the end of the output they wait for.
-    fn poll_step(
-        &mut self,
-        cx: &mut Context<'_>,
-        input: &[u8],
-        flush: MZFlush,
-    ) -> Poll<io::Result<(usize, usize, bool)>> {
-        std::task::ready!(self.poll_drain(cx))?;
-        let res = deflate(&mut self.compressor, input, &mut self.out, flush);
-        self.filled = res.bytes_written;
-        let end = match res.status {
-            Ok(MZStatus::StreamEnd) => true,
-            Ok(_) | Err(MZError::Buf) => false,
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::other(format!(
-                    "the DEFLATE encoder failed: {e:?}"
-                ))));
-            }
-        };
-        Poll::Ready(Ok((res.bytes_consumed, res.bytes_written, end)))
-    }
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for DeflateSink<W> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        let me = self.get_mut();
-        loop {
-            let (taken, produced, _) = std::task::ready!(me.poll_step(cx, buf, MZFlush::None))?;
-            // The compressor has now run over the caller's chunk, so the block
-            // is open and a flush sequence that was under way is abandoned. A
-            // `Pending` return above leaves both flags as they stood.
-            me.flushed = false;
-            me.syncing = false;
-            if taken > 0 {
-                return Poll::Ready(Ok(taken));
-            }
-            if produced == 0 {
-                return Poll::Ready(Err(io::Error::other(
-                    "the DEFLATE encoder took no input and produced no output",
-                )));
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let me = self.get_mut();
-        // End the block with a sync step, then take the rest of the output the
-        // compressor still holds until a step produces nothing.
-        while !me.flushed {
-            let flush = if me.syncing {
-                MZFlush::None
-            } else {
-                MZFlush::Sync
-            };
-            let (_, produced, _) = std::task::ready!(me.poll_step(cx, &[], flush))?;
-            me.syncing = true;
-            if produced == 0 {
-                me.flushed = true;
-                me.syncing = false;
-            }
-        }
-        std::task::ready!(me.poll_drain(cx))?;
-        Pin::new(&mut me.inner).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let me = self.get_mut();
-        while !me.done {
-            let (_, _, end) = std::task::ready!(me.poll_step(cx, &[], MZFlush::Finish))?;
-            me.done = end;
-        }
-        std::task::ready!(me.poll_drain(cx))?;
-        // The stream ends here; the file under the encoder stays open for the
-        // header size-patch.
-        Pin::new(&mut me.inner).poll_flush(cx)
-    }
-}
-
 /// The write-side sink an archive pass-through's payload is inflated into: it
 /// hashes and counts the inflated bytes without storing them, refusing once
 /// the count passes `declared` so a payload built to inflate past what its
@@ -2035,157 +1868,5 @@ mod temp_tests {
         drop(PendingTemp::new(dir_fd.as_fd(), TempKind::Anonymous));
         assert!(dir.join(".ostrya-tmp-kept").exists());
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod deflate_tests {
-    use std::collections::BTreeSet;
-
-    use super::{Checksum, DEFLATE_CHUNK, DeflateSink, archive_level, close, flush, write_all};
-    use ostrya_rt::block_on;
-    use sha2::{Digest, Sha256};
-
-    /// The SHA-256 of the encoder output over [`golden_payload`], one entry
-    /// per `[archive] zlib-level`: index 0 holds level 1, index 8 holds level
-    /// 9. The nine entries differ, because `miniz_oxide` gives each level its
-    /// own match-search depth and its own choice of greedy or lazy parsing.
-    ///
-    /// A mismatch states that the encoder output changed, which changes the
-    /// bytes stored in every archive-mode content object at that level. Find
-    /// the cause -- a `miniz_oxide` release, or an edit to [`DeflateSink`].
-    /// Then check the stored bytes against the tool's own with
-    /// `archive_objects_are_byte_identical_to_the_fixture` in
-    /// `crates/ostrya/tests/write.rs` before you record a constant here
-    /// again.
-    const GOLDEN: [&str; 9] = [
-        "a1fd96479b110a51c3b9c333da0ff6879cd295fc27a98b48c88b70a0ea558bb4",
-        "7964fd5c5e4ffb18bf953852b31704681eaf7a4590d488a01be5f213978c0876",
-        "e5ff230c2f7715f8883cbd5c19ee1255f165c7e25fc886516c290b0d246954a0",
-        "7ae743a6aa5027a1ef08604f6c0a4e6062d39f73879dd0789780aca2e8027932",
-        "95b7d927a18b71b941598bf6411029653910307881528355a5b18cccfd3dea0a",
-        "b9b31232e8e4458ff831e1de64ba695c0c07b630215e2ce01d372fa2fd8bbcc3",
-        "8436585ce3c3eea757ab9d5020de4b41c3f32ac29fdd8b5c02ec8ec51df9067d",
-        "c1bc0d4abcb002a3e15241b86c7f200ddc4c71ff30752a7ce933755433ceb88c",
-        "b6ddd39fc7e629dfcc81b42ba9706eb6e4e46cd4f90527d3e1ccda0d072faca7",
-    ];
-
-    /// The SHA-256 of the encoder output over [`golden_payload`] at the
-    /// default level 6 when the caller flushes once, at the halfway point of
-    /// the payload. [`super::ContentWriter`] passes a flush on to the encoder,
-    /// which ends the DEFLATE block with a sync flush, so a caller that
-    /// flushes stores different bytes for the same content. The identity of the object is over
-    /// the uncompressed bytes, so both forms carry the same checksum and the
-    /// tool reads both. The ingest paths
-    /// [`write_content`](super::Transaction::write_content) and
-    /// [`write_regfile_inline`](super::Transaction::write_regfile_inline)
-    /// write straight through and reach [`GOLDEN`] instead.
-    const GOLDEN_FLUSHED: &str = "009e2fd466deb6af8f1828281fccd0a7be5fef1356215f1eaa10708a86caa4b3";
-
-    /// One xorshift32 step.
-    fn xorshift(state: &mut u32) -> u32 {
-        *state ^= *state << 13;
-        *state ^= *state >> 17;
-        *state ^= *state << 5;
-        *state
-    }
-
-    /// A payload of one and a half [`DEFLATE_CHUNK`] in three half-chunk
-    /// blocks: one block over a four-symbol alphabet, whose long match chains
-    /// let the search depth of a level change the output, then two blocks of
-    /// an xorshift32 stream the encoder cannot compress. The output holds
-    /// literal and match coding, spans more than one [`DEFLATE_CHUNK`], and
-    /// takes nine distinct forms over the nine levels.
-    fn golden_payload() -> Vec<u8> {
-        const BLOCK: usize = DEFLATE_CHUNK / 2;
-        let mut out = Vec::with_capacity(3 * BLOCK);
-        let mut state: u32 = 0x1234_5678;
-        // Two bits per byte, sixteen bytes per step, over `A` to `D`.
-        for _ in 0..BLOCK / 16 {
-            let word = xorshift(&mut state);
-            for k in 0..16 {
-                out.push(b'A' + ((word >> (2 * k)) & 3) as u8);
-            }
-        }
-        for _ in 0..2 * BLOCK {
-            out.push((xorshift(&mut state) >> 24) as u8);
-        }
-        out
-    }
-
-    /// The encoder output over `data` at the level an `[archive] zlib-level`
-    /// value of `zlib_level` selects, driven in `chunk`-byte writes and ended
-    /// the way [`super::ContentWriter::finish`] ends it.
-    fn encode(data: &[u8], zlib_level: i64, chunk: usize) -> Vec<u8> {
-        block_on(async {
-            let mut sink = DeflateSink::new(Vec::new(), archive_level(zlib_level));
-            for part in data.chunks(chunk) {
-                write_all(&mut sink, part).await.unwrap();
-            }
-            close(&mut sink).await.unwrap();
-            sink.into_inner()
-        })
-    }
-
-    /// The encoder output over `data` at the default level when the caller
-    /// flushes once, at the halfway point of the payload.
-    fn encode_with_a_flush(data: &[u8]) -> Vec<u8> {
-        block_on(async {
-            let mut sink = DeflateSink::new(Vec::new(), archive_level(6));
-            let (head, tail) = data.split_at(data.len() / 2);
-            write_all(&mut sink, head).await.unwrap();
-            flush(&mut sink).await.unwrap();
-            write_all(&mut sink, tail).await.unwrap();
-            close(&mut sink).await.unwrap();
-            sink.into_inner()
-        })
-    }
-
-    fn hash(bytes: &[u8]) -> String {
-        Checksum::from_bytes(Sha256::digest(bytes).into()).to_hex()
-    }
-
-    #[test]
-    fn deflate_output_matches_the_golden_hashes() {
-        let data = golden_payload();
-        assert!(
-            data.len() > DEFLATE_CHUNK,
-            "the payload spans more than one chunk"
-        );
-        assert_eq!(
-            GOLDEN.iter().collect::<BTreeSet<_>>().len(),
-            GOLDEN.len(),
-            "each level reaches its own bytes"
-        );
-        for (i, &want) in GOLDEN.iter().enumerate() {
-            let level = i as i64 + 1;
-            let out = encode(&data, level, 1);
-            assert!(
-                out.len() > DEFLATE_CHUNK,
-                "level {level}: output spans more than one chunk"
-            );
-            // The write sizes the ingest path gives the encoder do not change
-            // its output: one byte at a time, an odd size that divides neither
-            // the payload nor the chunk, and the whole payload in one write
-            // all agree.
-            for chunk in [4093, data.len()] {
-                assert_eq!(
-                    encode(&data, level, chunk),
-                    out,
-                    "level {level}, {chunk}-byte writes"
-                );
-            }
-            assert_eq!(hash(&out), want, "DEFLATE level {level} output hash");
-        }
-
-        let flushed = hash(&encode_with_a_flush(&data));
-        assert_eq!(
-            flushed, GOLDEN_FLUSHED,
-            "DEFLATE level 6 output hash after a flush"
-        );
-        assert_ne!(
-            flushed, GOLDEN[5],
-            "a flush ends the DEFLATE block, so it reaches the output"
-        );
     }
 }

@@ -6846,8 +6846,9 @@ fn pull_subpath_into_an_archive_takes_no_delta() {
     }
 }
 
-/// A commit whose object the destination holds takes no delta, partial or not:
-/// a `--subpath` pull after a `--commit-metadata-only` pull, and a full pull
+/// A commit the destination holds partial, under a ref naming it, takes no
+/// delta from a remote whose summary names the from-scratch delta alone: a
+/// `--subpath` pull after a `--commit-metadata-only` pull, and a full pull
 /// after that, each fetch what is missing loose and leave what the tool leaves.
 #[test]
 fn pull_of_a_commit_held_partial_takes_no_delta() {
@@ -36007,4 +36008,451 @@ fn commit_reaps_aged_tmp_entries_as_the_tool_does() {
         "the port and the tool leave the same tmp/"
     );
     assert!(outside.join("keep").exists(), "the symlink target stays");
+}
+
+// --- pull-local: verification and static deltas -------------------------
+//
+// These tests are the `evidence:` the M10 records under "pull-local --
+// verification and static deltas" cite where a setup of the harness cannot
+// hold the source a case needs.
+
+/// A tool archive repository at `base/<name>` holding two commits on `main`,
+/// the second over the first, with the deltas `deltas` names -- `scratch` for
+/// the from-scratch delta to the second commit and `from-to` for the delta
+/// between the two -- and, where `summary` is set, the summary. Returns the
+/// path and both commits.
+fn pull_local_delta_source(
+    base: &Path,
+    name: &str,
+    deltas: &[&str],
+    summary: bool,
+) -> (PathBuf, String, String) {
+    let repo = base.join(name);
+    ostree_ok(&repo, &["init", "--mode=archive"]);
+    let tree = base.join(format!("{name}-tree"));
+    std::fs::create_dir_all(tree.join("d")).unwrap();
+    std::fs::write(tree.join("a"), b"hello\n").unwrap();
+    std::fs::write(tree.join("big"), delta_noise(300_000, 1)).unwrap();
+    std::fs::write(tree.join("d/b"), b"x\n").unwrap();
+    let tree_arg = format!("--tree=dir={}", tree.display());
+    let commit = |subject: &str, ts: &str| {
+        ostree_ok(
+            &repo,
+            &[
+                "commit",
+                "-b",
+                "main",
+                "-s",
+                subject,
+                "--no-xattrs",
+                ts,
+                &tree_arg,
+            ],
+        )
+    };
+    let c1 = commit("one", "--timestamp=@1700000000");
+    std::fs::write(tree.join("c"), b"more\n").unwrap();
+    let c2 = commit("two", "--timestamp=@1700000100");
+    for delta in deltas {
+        let to = format!("--to={c2}");
+        match *delta {
+            "scratch" => ostree_ok(&repo, &["static-delta", "generate", "--empty", &to]),
+            "from-to" => ostree_ok(&repo, &["static-delta", "generate", &to, "main^"]),
+            other => panic!("no delta {other}"),
+        };
+    }
+    if summary {
+        ostree_ok(&repo, &["summary", "-u"]);
+    }
+    (repo, c1, c2)
+}
+
+/// One `pull-local` case: a name, the setup of the destination, and the
+/// arguments after `--repo`.
+type PullLocalRow<'a> = (&'a str, &'a dyn Fn(&Path), Vec<String>);
+
+/// A [`PullLocalRow`] and the statistics line the port prints, `<..>` where
+/// the line is compared with the tool's alone.
+type PullLocalLineRow<'a> = (&'a str, &'a dyn Fn(&Path), Vec<String>, &'a str);
+
+/// Run `pull-local` with `args` into a new repository of `mode` under
+/// `base/<name>-<who>`, after `setup` has run with the repository path. Returns
+/// the run, the refs, and the loose objects.
+fn pull_local_case(
+    base: &Path,
+    name: &str,
+    who: &str,
+    mode: RepoMode,
+    setup: &dyn Fn(&Path),
+    args: &[&str],
+) -> (Run, Vec<String>, Vec<(String, String)>) {
+    let dir = base.join(format!("{name}-{who}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = create_repo(&dir, mode);
+    setup(&dest);
+    let repo_arg = format!("--repo={}", dest.display());
+    let mut argv = vec!["pull-local", repo_arg.as_str()];
+    argv.extend_from_slice(args);
+    let run = if who == "port" {
+        ostrya(&argv, None, &[])
+    } else {
+        ostree(&argv)
+    };
+    let refs = block_on(async {
+        let repo = Repo::open(&dest).await.unwrap();
+        let mut refs: Vec<String> = repo
+            .list_refs(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        refs.sort();
+        refs
+    });
+    (run, refs, loose_objects(&dest))
+}
+
+/// The two delta switches of `pull-local` give the port the tool's outcome,
+/// refs, objects, and statistics line: the from-scratch delta, a from-to delta
+/// from a commit held under no ref, a from-scratch delta the ref's commit
+/// declines, a source with no delta for the commit, a source with no summary,
+/// a source outside archive mode, a commit-only pull, and deltas disabled over
+/// a source whose superblock is corrupt. Standard error is worded per
+/// implementation.
+#[test]
+fn pull_local_static_delta_switches_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-delta-switches");
+    let base = tmp.path();
+    let (both, c1, c2) = pull_local_delta_source(base, "both", &["scratch", "from-to"], true);
+    let (from_to, _, _) = pull_local_delta_source(base, "from-to", &["from-to"], true);
+    let (unlisted, _, _) = pull_local_delta_source(base, "unlisted", &["scratch"], false);
+    let (corrupt, _, _) = pull_local_delta_source(base, "corrupt", &["scratch"], true);
+    for leaf in std::fs::read_dir(corrupt.join("deltas")).unwrap() {
+        for dir in std::fs::read_dir(leaf.unwrap().path()).unwrap() {
+            std::fs::write(dir.unwrap().path().join("superblock"), b"junk").unwrap();
+        }
+    }
+    let bare = base.join("bare-source");
+    ostree_ok(&bare, &["init", "--mode=bare-user"]);
+    ostree_ok(&bare, &["pull-local", both.to_str().unwrap(), "main"]);
+    ostree_ok(&bare, &["summary", "-u"]);
+
+    let s = |path: &Path| path.to_str().unwrap().to_owned();
+    let hold = |commit: String, src: PathBuf, reference: bool| {
+        move |dest: &Path| {
+            ostree_ok(dest, &["pull-local", src.to_str().unwrap(), &commit]);
+            if reference {
+                ostree_ok(dest, &["refs", "--create=main", &commit]);
+            }
+        }
+    };
+    let nothing = |_: &Path| {};
+    let hold_c1 = hold(c1.clone(), both.clone(), false);
+    let hold_c1_ref = hold(c1.clone(), both.clone(), true);
+    let rows: Vec<PullLocalLineRow> = vec![
+        (
+            "scratch",
+            &nothing,
+            vec!["--require-static-deltas".into(), s(&both), "main".into()],
+            "1 delta parts, 2 loose fetched; 294 KiB transferred in <n> seconds; \
+             0 bytes content written\n",
+        ),
+        (
+            "from-to",
+            &hold_c1,
+            vec!["--require-static-deltas".into(), s(&both), "main".into()],
+            "1 delta parts, 2 loose fetched; 991 B transferred in <n> seconds; \
+             0 bytes content written\n",
+        ),
+        (
+            "declined",
+            &hold_c1_ref,
+            vec!["--require-static-deltas".into(), s(&both), "main".into()],
+            "<declined>",
+        ),
+        (
+            "none-found",
+            &nothing,
+            vec!["--require-static-deltas".into(), s(&from_to), "main".into()],
+            "",
+        ),
+        (
+            "no-summary",
+            &nothing,
+            vec![
+                "--require-static-deltas".into(),
+                s(&unlisted),
+                "main".into(),
+            ],
+            "",
+        ),
+        (
+            "bare-source",
+            &nothing,
+            vec!["--require-static-deltas".into(), s(&bare), "main".into()],
+            "",
+        ),
+        (
+            "commit-only",
+            &nothing,
+            vec![
+                "--commit-metadata-only".into(),
+                "--require-static-deltas".into(),
+                s(&from_to),
+                "main".into(),
+            ],
+            "<commit-only>",
+        ),
+        (
+            "disabled",
+            &nothing,
+            vec!["--disable-static-deltas".into(), s(&corrupt), "main".into()],
+            "4 metadata, 4 content objects imported; 300.0\u{a0}kB content written\n",
+        ),
+    ];
+    for (name, setup, args, expected) in rows {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (ours, our_refs, our_objects) =
+            pull_local_case(base, name, "port", RepoMode::BareUser, setup, &args);
+        let (theirs, their_refs, their_objects) =
+            pull_local_case(base, name, "tool", RepoMode::BareUser, setup, &args);
+        assert_eq!(ours.status.code(), theirs.status.code(), "{name}");
+        assert_eq!(our_refs, their_refs, "{name}");
+        assert_eq!(our_objects, their_objects, "{name}");
+        let line = normalized_statistics(&ours.stdout);
+        assert_eq!(line, normalized_statistics(&theirs.stdout), "{name}");
+        if !expected.starts_with('<') {
+            assert_eq!(line, expected, "{name}");
+        }
+        if ours.status.success() {
+            assert!(ours.stderr.is_empty(), "{name}");
+        } else {
+            assert!(our_objects.is_empty() && our_refs.is_empty(), "{name}");
+        }
+        if name == "none-found" {
+            assert_eq!(
+                String::from_utf8_lossy(&ours.stderr),
+                format!("error: pull: Static deltas required, but none found for main to {c2}\n")
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&theirs.stderr),
+                format!("error: Static deltas required, but none found for main to {c2}\n")
+            );
+        }
+    }
+}
+
+/// Where the delta switches of `pull-local` part from the tool: into an
+/// `archive` destination the tool refuses a required delta and the port
+/// applies it, and the tool's `fsck` accepts what the port wrote; both switches
+/// together end the tool on an assertion at exit 134, and `clap` refuses them
+/// at exit 1, on `pull-local` and on `pull`. Neither refusal writes an object
+/// or a ref.
+#[test]
+fn pull_local_static_delta_divergences() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-delta-divergences");
+    let base = tmp.path();
+    let (src, _c1, c2) = pull_local_delta_source(base, "src", &["scratch"], true);
+    let s = src.to_str().unwrap();
+    let nothing = |_: &Path| {};
+    let args = ["--require-static-deltas", s, "main"];
+    let (ours, our_refs, _) =
+        pull_local_case(base, "archive", "port", RepoMode::Archive, &nothing, &args);
+    let (theirs, their_refs, their_objects) =
+        pull_local_case(base, "archive", "tool", RepoMode::Archive, &nothing, &args);
+    assert!(ours.status.success());
+    assert_eq!(our_refs, vec!["main".to_owned()]);
+    assert_eq!(theirs.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&theirs.stderr),
+        "error: Can't use static deltas in an archive repo\n"
+    );
+    assert!(their_refs.is_empty() && their_objects.is_empty());
+    let port_dest = base.join("archive-port/repo");
+    ostree_ok(&port_dest, &["fsck"]);
+    assert_eq!(resolve(&port_dest, "main").as_deref(), Some(c2.as_str()));
+
+    let both = [
+        "--require-static-deltas",
+        "--disable-static-deltas",
+        s,
+        "main",
+    ];
+    let (ours, our_refs, our_objects) =
+        pull_local_case(base, "both", "port", RepoMode::BareUser, &nothing, &both);
+    let (theirs, their_refs, their_objects) =
+        pull_local_case(base, "both", "tool", RepoMode::BareUser, &nothing, &both);
+    assert_eq!(ours.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&ours.stderr).contains(
+            "the argument '--require-static-deltas' cannot be used with \
+             '--disable-static-deltas'"
+        ),
+        "{}",
+        String::from_utf8_lossy(&ours.stderr)
+    );
+    assert_eq!(theirs.status.code(), None, "the tool ended on a signal");
+    for (refs, objects) in [(our_refs, our_objects), (their_refs, their_objects)] {
+        assert!(refs.is_empty() && objects.is_empty());
+    }
+
+    std::fs::create_dir_all(base.join("pull-both")).unwrap();
+    let dest = create_repo(&base.join("pull-both"), RepoMode::BareUser);
+    let repo_arg = format!("--repo={}", dest.display());
+    let run = ostrya(
+        &[
+            "pull",
+            &repo_arg,
+            "--require-static-deltas",
+            "--disable-static-deltas",
+            "origin",
+            "main",
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("cannot be used with"),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(loose_objects(&dest).is_empty());
+}
+
+/// The GPG switches of `pull-local` refuse where the tool refuses and write no
+/// object and no ref: with no `--remote`, over an unsigned commit whether the
+/// remote is configured or not, over a source with no `summary.sig` and one
+/// with no summary, and `--gpg-verify=false`, which `clap` refuses and the
+/// tool reads as `--gpg-verify` with no remote. The words differ.
+#[test]
+fn pull_local_gpg_switches_refuse_where_the_tool_refuses() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-gpg-switches");
+    let base = tmp.path();
+    let (signed_summary, _, _) = pull_local_delta_source(base, "summary", &[], true);
+    let (no_summary, _, _) = pull_local_delta_source(base, "no-summary", &[], false);
+    let s = |path: &Path| path.to_str().unwrap().to_owned();
+    let nothing = |_: &Path| {};
+    let remote = |dest: &Path| {
+        ostree_ok(dest, &["remote", "add", "o", "file:///nonexistent"]);
+    };
+    let rows: Vec<PullLocalRow> = vec![
+        (
+            "no-remote",
+            &nothing,
+            vec!["--gpg-verify".into(), s(&no_summary), "main".into()],
+        ),
+        (
+            "summary-no-remote",
+            &nothing,
+            vec![
+                "--gpg-verify-summary".into(),
+                s(&signed_summary),
+                "main".into(),
+            ],
+        ),
+        (
+            "unsigned",
+            &remote,
+            vec![
+                "--gpg-verify".into(),
+                "--remote=o".into(),
+                s(&no_summary),
+                "main".into(),
+            ],
+        ),
+        (
+            "unconfigured",
+            &nothing,
+            vec![
+                "--gpg-verify".into(),
+                "--remote=nosuch".into(),
+                s(&no_summary),
+                "main".into(),
+            ],
+        ),
+        (
+            "no-summary-sig",
+            &remote,
+            vec![
+                "--gpg-verify-summary".into(),
+                "--remote=o".into(),
+                s(&signed_summary),
+                "main".into(),
+            ],
+        ),
+        (
+            "no-summary",
+            &remote,
+            vec![
+                "--gpg-verify-summary".into(),
+                "--remote=o".into(),
+                s(&no_summary),
+                "main".into(),
+            ],
+        ),
+        (
+            "value",
+            &nothing,
+            vec!["--gpg-verify=false".into(), s(&no_summary), "main".into()],
+        ),
+    ];
+    for (name, setup, args) in rows {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        for who in ["port", "tool"] {
+            let (run, refs, objects) =
+                pull_local_case(base, name, who, RepoMode::BareUser, setup, &args);
+            assert_eq!(run.status.code(), Some(1), "{name} {who}");
+            assert!(refs.is_empty(), "{name} {who}");
+            assert!(objects.is_empty(), "{name} {who}");
+        }
+    }
+}
+
+/// `pull-local` against a source holding a ref named by 64 lowercase hex
+/// digits: the tool reads the name as a checksum and fails, with the ref named
+/// and with no ref named, where the port reads the name as a checksum when it
+/// is named and copies the ref when every ref is pulled.
+#[test]
+fn pull_local_checksum_shaped_ref() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-checksum-ref");
+    let base = tmp.path();
+    let (src, _, c2) = pull_local_delta_source(base, "src", &[], false);
+    let name = "a".repeat(64);
+    std::fs::write(src.join("refs/heads").join(&name), format!("{c2}\n")).unwrap();
+    let s = src.to_str().unwrap();
+    let nothing = |_: &Path| {};
+    let expected = format!("error: Importing {name}.commit: linkat: No such file or directory\n");
+    for (case, args) in [
+        ("named", vec!["--disable-verify-bindings", s, name.as_str()]),
+        ("all", vec!["--disable-verify-bindings", s]),
+    ] {
+        let (theirs, their_refs, _) =
+            pull_local_case(base, case, "tool", RepoMode::BareUser, &nothing, &args);
+        assert_eq!(theirs.status.code(), Some(1), "{case}");
+        assert_eq!(String::from_utf8_lossy(&theirs.stderr), expected, "{case}");
+        assert!(their_refs.is_empty(), "{case}");
+        let (ours, our_refs, _) =
+            pull_local_case(base, case, "port", RepoMode::BareUser, &nothing, &args);
+        if case == "named" {
+            assert_eq!(ours.status.code(), Some(1), "{case}");
+            assert!(our_refs.is_empty(), "{case}");
+        } else {
+            assert!(ours.status.success(), "{case}");
+            assert!(our_refs.contains(&name), "{case}: {our_refs:?}");
+        }
+    }
 }

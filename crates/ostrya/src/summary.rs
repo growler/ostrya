@@ -716,7 +716,7 @@ fn resolve_last_modified(explicit: Option<u64>) -> Result<u64> {
 /// The largest summary the reader loads whole. The summary scales with the ref
 /// and delta count and is loaded whole by every consumer; this bound guards
 /// against a corrupt or hostile file.
-const SUMMARY_READ_CAP: u64 = 64 * 1024 * 1024;
+pub(crate) const SUMMARY_READ_CAP: u64 = 64 * 1024 * 1024;
 
 /// Read a whole file relative to `repo_fd`, or `None` when it does not exist.
 fn read_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<Option<Vec<u8>>> {

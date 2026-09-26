@@ -171,12 +171,14 @@
 //! `summary` and `summary.sig` on their own, and [`Summary`] parses one. A pull
 //! also takes a static delta where the remote publishes one (Phase 16d): the
 //! delta index, or the summary's `ostree.static-deltas` map, names the delta from
-//! the commit the ref holds here (or from scratch), its superblock is checked
+//! a commit held here (or from scratch), its superblock is checked
 //! against the advertised digest, its parts are fetched two at a time and applied
 //! into the pull's transaction, and the objects it hands over loose are fetched as
 //! ordinary content objects;
 //! [`disable_static_deltas`](PullOptions::disable_static_deltas) and
-//! [`require_static_deltas`](PullOptions::require_static_deltas) control it, and
+//! [`require_static_deltas`](PullOptions::require_static_deltas) control it, the
+//! second also for a local pull, which reads a delta from the source directory
+//! under it alone, and
 //! [`Repo::regenerate_summary`] writes the map that advertises this repository's
 //! own deltas. Either pull checks signatures (Phase 16e): the remote's
 //! `gpg-verify`, `gpg-verify-summary`, `sign-verify`, and `sign-verify-summary`

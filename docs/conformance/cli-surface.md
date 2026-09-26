@@ -1077,8 +1077,10 @@ the commit's `ostree.ref-binding` metadata at exit 0, so the tool guards the ref
 it writes and not the name it records, and `pull-local` reaches no name rule at
 all -- against a source holding a ref of that shape it reports `error: Importing
 <name>.commit: linkat: No such file or directory`, reading the ref name as a
-checksum, where the port copies the ref. Such a source arrives by an out-of-band
-write alone once the guard is in place.
+checksum, with the ref named and with every ref pulled. The port reads a named
+ref of that shape as a checksum and refuses it at exit 1, and copies the ref
+when every ref is pulled. Such a source arrives by an out-of-band write alone
+once the guard is in place.
 
 A third `commit` divergence sits at that guard's second arm, the branch name
 ending in `^` which resolution reads as ancestry (`../format-reference.md`,
@@ -2604,8 +2606,10 @@ or `..` component, several values, and each under `--depth`,
 later pull without the option completes the commit and removes the marker in
 both. Into `bare-user` both apply a delta whole for a commit the destination
 does not hold and keep the marker. Into `archive` both take no delta and fetch
-the subpath loose, and a destination holding the commit object partial takes
-no delta in either. `--untrusted` changes no byte of an HTTP pull in either, and
+the subpath loose. Into `bare-user` a destination whose ref names the commit it
+holds partial leaves an advertised from-scratch delta alone and fetches loose,
+and where the remote serves no summary both ask for that delta by name and
+apply it whole. `--untrusted` changes no byte of an HTTP pull in either, and
 a corrupt object fails the pull with and without it. Four differences stand:
 
 - a relative or an empty value. The tool ends on an assertion
@@ -2636,6 +2640,23 @@ the tool refuses with `error: Can't use static deltas in an archive repo`, and
 the port takes the delta, with or without `--subpath`, which is the capability
 difference `../port-plan.md`, Phase 16d, records.
 
+`--require-static-deltas` refuses where the tool refuses
+(`../format-reference.md`, "HTTP pull surface"): a remote with no summary, and
+a commit the destination does not hold for which no advertised delta can be
+taken, with the tool's words behind `pull: `. Both take a from-to delta from
+any commit the destination holds complete, under a ref or not. Two
+differences stand:
+
+- both delta switches together. The tool ends on an assertion (`SIGABRT`,
+  exit 134 from a shell) and writes nothing. `clap` refuses the pair with
+  `error: the argument '--require-static-deltas' cannot be used with
+  '--disable-static-deltas'` at exit 1, and the port writes nothing. The
+  library keeps `disable_static_deltas` in charge where a caller sets both;
+- a ref naming a commit other than the target that the destination holds
+  partial, or a commit it does not hold. The tool leaves an advertised
+  from-scratch delta alone and fetches loose, and the port takes the delta.
+  Both land the same objects, and neither refuses.
+
 The statistics line a pull prints to a pipe takes the tool's forms, words, and
 counts (`../format-reference.md`, "CLI output formats", `pull`), and
 `--update-frequency=FREQUENCY` is read with the reader and the messages of the
@@ -2653,9 +2674,9 @@ differences stand:
   capability difference above states, and prints the delta form where the
   tool prints the loose form and a nonzero written figure;
 - the delta index on a repeat pull. Into a destination other than `archive`,
-  the tool asks for the delta index again for a commit it holds, and counts
-  it: `1 metadata, 0 content objects fetched`. The port asks for no delta for
-  a commit it holds and prints `0 metadata`;
+  the tool asks for the delta index again for a commit it holds complete, and
+  counts it: `1 metadata, 0 content objects fetched`. The port asks for no
+  delta for a commit it holds complete and prints `0 metadata`;
 - the body of an error answer. The tool adds the body of a 404 to `T`, and
   the port adds the bodies of successful answers alone. Against a server that
   answers 404 with an empty body the two agree;
@@ -2682,9 +2703,9 @@ differences stand:
 
 `pull-local` accepts `--repo`, `--remote`, `--depth`, `--commit-metadata-only`,
 `--untrusted`, `--bareuseronly-files`, `--disable-verify-bindings`,
-`--disable-fsync`, `--per-object-fsync`, and the port extensions `--force-copy`
-and `-L/--localcache-repo`. Missing: `--require-static-deltas`,
-`--disable-static-deltas`, `--gpg-verify`, `--gpg-verify-summary`. The two
+`--disable-fsync`, `--per-object-fsync`, `--gpg-verify`,
+`--gpg-verify-summary`, `--require-static-deltas`, `--disable-static-deltas`,
+and the port extensions `--force-copy` and `-L/--localcache-repo`. The two
 durability switches follow the `pull` paragraph above. An object hardlinked from
 the source is not synced, in both, so from `archive` into `archive`
 `--per-object-fsync` adds no call. The same three differences stand, with
@@ -2695,6 +2716,29 @@ nor `--http-trusted` in either: the tool reports `error: Unknown option
 <option>` at exit 1, and `clap` refuses the option at exit 1. The library's
 local pull refuses a subpath with `unsupported: a local pull takes no
 subpath`.
+
+The two GPG switches check what the tool checks and refuse where it refuses
+(`../format-reference.md`, "Signature verification during a pull"), with the
+port's own words. `--require-static-deltas` applies the delta the source's
+summary advertises, with the objects, the refs, and the statistics line of the
+tool, and refuses where the tool refuses (`../format-reference.md`, "HTTP pull
+surface"). `--disable-static-deltas` changes nothing, since `pull-local` reads
+no delta by default. Five differences stand:
+
+- a value given to a GPG switch. The tool reads and discards the value, so
+  `--gpg-verify=false` turns the check on. The port's `pull-local` takes both
+  switches with no value, and `clap` refuses the suffix at exit 1. The port
+  writes no object and no ref. The valued form stays on `pull`, where it reads
+  the value;
+- a delta into `archive`. The tool refuses with `error: Can't use static
+  deltas in an archive repo`, and the port applies the delta, as it does over
+  HTTP. The tool's `fsck` accepts what the port wrote;
+- both delta switches together, as on `pull`;
+- the delta index on a repeat pull, as on `pull`;
+- the parents `--depth` reaches, as a loose walk and a delta part reaching
+  the same objects on `pull`. With the from-scratch delta of a commit and its
+  parent at `--depth=1`, the tool printed `6 loose fetched` and the port
+  prints `4 loose fetched`.
 
 `sign` accepts the whole tool option set and adds `--gpg-homedir`,
 `--remote`, the `gpg` engine, and the `spki` engine. The tool build at hand,

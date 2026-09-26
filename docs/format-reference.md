@@ -971,15 +971,23 @@ deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/0
 objects/<commit>.commitmeta
 ```
 
-- The delta name is `<from>-<to>` when the client holds a commit for the ref being
-  pulled, and `<to>` when it holds none. Exactly one name is tried: a client
-  holding the ref's commit against a remote advertising only the from-scratch
-  delta fetches every object loose, and so does a fresh client against a remote
-  advertising only the from-to delta.
-- A client that already holds the target commit object takes no delta for it,
-  partial or complete. After `--commit-metadata-only` or a `--subpath` pull, a
-  later pull of the same commit requests the delta index, takes no superblock,
-  and fetches the missing objects loose.
+- The delta taken is `<from>-<to>` for a commit `from` the client holds
+  complete, whether a ref names that commit or not, and the from-scratch `<to>`
+  where the client holds no ref for the branch being pulled. A client whose ref
+  names a commit, against a remote advertising the from-scratch delta and no
+  from-to delta from a commit the client holds, fetches every object loose, and
+  so does a fresh client against a remote advertising only a from-to delta. The
+  tool reads the ref alone there: a ref naming a commit the client holds
+  partial, or does not hold, also leaves the from-scratch delta alone.
+- A client that holds the target commit complete takes no delta for it. A
+  client that holds the target commit object partial looks for a delta as for
+  a commit it does not hold. After `--commit-metadata-only` or a `--subpath`
+  pull the ref names that commit, so a later pull of the same commit requests
+  the delta index, takes no superblock where the index names only the
+  from-scratch delta, and fetches the missing objects loose. It takes a from-to
+  delta from another commit it holds complete. From a remote with no summary it
+  requests the from-scratch superblock by name and applies the delta, also
+  under `--subpath` into `bare-user`, which keeps the marker.
 - The index is requested whenever a summary is present. Where it answers 404 the
   pull reads the summary's own `ostree.static-deltas` map instead and fetches the
   superblock the map names. Where neither names the delta, no superblock is
@@ -994,12 +1002,19 @@ objects/<commit>.commitmeta
 - A superblock whose bytes do not hash to the digest the summary advertised fails
   the pull: `error: Invalid checksum for static delta <name>`, with no part
   requested. A superblock the remote does not hold answers 404 and the pull
-  continues with loose objects, with no error.
-- `--require-static-deltas` fails only where the remote advertises no delta at
-  all: `error: Fetch configured to require static deltas, but no summary deltas or
-  delta index found`, which is what a remote serving no summary produces, and no
-  delta probe is made in that case. A remote that advertises deltas satisfies it
-  even where none of them produces the commit being pulled.
+  continues with loose objects, with no error, unless the pull requires static
+  deltas.
+- `--require-static-deltas` refuses a remote that serves no summary: `error:
+  Fetch configured to require static deltas, but no summary deltas or delta
+  index found`, with no delta probe, also where the client holds the commit and
+  under `--commit-metadata-only`. With a summary, it refuses a commit the client
+  does not hold complete where no delta the index or the summary names can be
+  taken, and where the superblock of the delta taken is absent: `error: Static
+  deltas required, but none found for <ref> to <commit>`. The tool writes `(null)` for
+  `<ref>` in the second case. A remote naming a from-scratch delta that the
+  pull leaves alone, because the client's ref names a commit, satisfies the
+  switch, and that pull fetches loose. A commit the client already holds
+  complete is not refused.
 - An archive client takes no delta. A plain pull requests no delta index and
   fetches every object loose, and `--require-static-deltas` refuses with `error:
   Can't use static deltas in an archive repo` before any request is made.
@@ -1074,6 +1089,26 @@ objects/<commit>.commitmeta
   (`SIGABRT`, exit 134 from a shell) with nothing written; the port refuses it
   at exit 1 before the first request.
 
+`pull-local` reads no delta by default: a source whose `deltas/` directory is
+corrupt or unreadable pulls as it does with `--disable-static-deltas`. With
+`--require-static-deltas` it reads the source as a fetch reads a remote, and
+the rules above hold, the file of each request read from the source directory.
+The source must be an `archive` repository with a summary. With no summary it
+refuses with `error: Fetch configured to require static deltas, but no summary
+deltas or delta index found`, and a source in another mode, with a summary,
+refuses with `error: Can't pull from archives with mode "<mode>"`. Where
+several refusals apply, the tool refuses in this order, and the port refuses
+in the same order: the summary signature checks, a source with no summary, a
+source in another mode, a ref the source does not hold (`error: No such branch
+'<ref>' in repository summary`), the none-found refusal, and then the commit
+signature checks. The delta taken is applied, the objects it produces equal those a plain `pull-local`
+imports, and the objects and `.commitmeta` it leaves out are imported loose.
+The parents `--depth` reaches are imported loose. `--require-static-deltas`
+and `--disable-static-deltas` together end the tool on an assertion
+(`ostree_repo_pull_with_options: assertion '!(pull_data->disable_static_deltas
+&& pull_data->require_static_deltas)' failed`, `SIGABRT`, exit 134 from a
+shell) with nothing written, on `pull-local` and on `pull`.
+
 ### Signature verification during a pull
 
 Recovered by running `ostree` 2026.1 against a static HTTP server over a
@@ -1139,8 +1174,18 @@ Behavior common to the axes:
 - `pull-local` makes no check unless asked: it has `--gpg-verify` and
   `--gpg-verify-summary` flags, each needing `--remote` (`error: Must specify
   remote name to enable gpg verification`), and the named remote's own
-  `gpg-verify=true` does not turn a check on by itself. The summary check reads
-  the source repository's `summary` and `summary.sig`.
+  `gpg-verify=true` does not turn a check on by itself. A remote the
+  configuration does not describe holds no key, so its name satisfies the
+  switch and every signature is refused. The summary check reads the source
+  repository's `summary` and `summary.sig`. The refusals are `error: Commit
+  <c>: GPG verification enabled, but no signatures found (use gpg-verify=false
+  in remote config to disable)` for an unsigned commit, `Can't check
+  signature: public key not found` for a signature from a key the remote does
+  not hold, and `error: GPG verification enabled, but no summary.sig found
+  (use gpg-verify-summary=false in remote config to disable)` and `... but no
+  summary found ...` for a source missing either file. The tool reads and
+  discards a value given to either switch, so `--gpg-verify=false` turns the
+  check on. Each refusal writes no object and no ref.
 - A static delta carries a copy of the target commit's detached metadata in its
   superblock metadata dict, under the key `deltas/<fanout>/<rest>/commitmeta`
   holding the same `a{sv}` the `.commitmeta` file holds. A delta pull checks the
@@ -6630,7 +6675,8 @@ pull that fails prints no statistics line. The line takes one of four forms:
   the ref files;
 - `M metadata, C content objects imported; W content written`, for
   `pull-local`, and in the tool for a `file://` remote, which the port
-  refuses.
+  refuses. `pull-local --require-static-deltas` prints the forms of an HTTP
+  pull instead, with the rules below.
 
 The words `delta parts` and `content objects` stay plural for a count of 1.
 The figures are these:
@@ -6678,7 +6724,28 @@ bytes content written`. Into `bare-user` the tool asks for the delta index
 again on a repeat pull and prints `1 metadata`. From a remote with no summary,
 a loose pull of one ref into `archive`, whose five objects total 233 bytes,
 prints `4 metadata, 1 content objects fetched; 233 B transferred`, so the
-65-byte `refs/heads` body does not count. `pull-local` from `archive` prints `0 bytes content written` into
+65-byte `refs/heads` body does not count.
+
+`pull-local --require-static-deltas` reads the source as a fetch reads a
+remote, and counts each file it reads from the source directory as the
+response body of that file: `M` counts the delta index read and the superblock
+read of each delta taken, whether the file is there or not, each loose
+metadata object and each `.commitmeta` read from the source, and `C` each
+content object read loose. `T` adds the sizes of those files as the source
+stores them and of each part file, and leaves out the summary. From an
+`archive` source holding a from-scratch delta of one part into `bare-user` the
+tool prints `1 delta parts, 2 loose fetched; 294 KiB transferred in 0 seconds;
+0 bytes content written`, the 294 KiB being the index, the superblock, and the
+part. A delta with a fallback object and a `.commitmeta` prints `4 loose
+fetched` and counts the payload of the fallback in `W`, the same delta
+generated with `--inline` prints `3 metadata, 0 content objects fetched`, and a
+commit-only pull prints `1 metadata, 0 content objects fetched; 150 B
+transferred`, 150 bytes being the commit object. A repeat pull of a commit the
+destination holds reads the index again and prints `1 metadata` in the tool.
+The port reads no delta for a commit the destination holds complete and prints `0
+metadata`, as it does over HTTP.
+
+`pull-local` from `archive` prints `0 bytes content written` into
 `archive` and `3.0 kB content written` into `bare-user`, and from `bare-user`
 it prints `0 bytes content written` into `bare-user` and `3.0 kB content
 written` into `bare` and into `archive`.

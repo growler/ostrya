@@ -5037,56 +5037,84 @@ fn a_subpath_pull_into_an_archive_takes_no_delta() {
     });
 }
 
-/// A commit whose object the destination already holds takes no delta, partial
-/// or not: a subpath pull after a commit-only pull, and a full pull after a
-/// subpath pull, each fetch what is missing loose.
+/// A commit whose object the destination holds partial, under a ref naming it,
+/// is looked for a delta for. With a summary the pull leaves the from-scratch
+/// delta alone: a subpath pull after a commit-only pull, and a full pull after
+/// a subpath pull, each fetch what is missing loose. With no summary the
+/// subpath pull asks for the from-scratch delta by name and applies it whole,
+/// and keeps the marker.
 #[test]
-fn a_commit_held_partial_takes_no_delta() {
+fn a_commit_held_partial_under_its_ref_takes_a_delta_only_by_name() {
     block_on(async {
-        let dir = TmpDir::new("pull-http-subpath-delta-partial");
-        let (remote, commit) = build_subpath_remote(dir.path()).await;
-        remote
-            .generate_static_delta(
-                None,
-                &commit,
-                &DeltaOptions {
-                    timestamp: Some(FIXED_TS),
-                    ..DeltaOptions::default()
+        let tmp = TmpDir::new("pull-http-subpath-delta-partial");
+        for summary in [true, false] {
+            let dir = tmp.path().join(if summary { "summary" } else { "bare" });
+            std::fs::create_dir(&dir).unwrap();
+            let (remote, commit) = build_subpath_remote(&dir).await;
+            remote
+                .generate_static_delta(
+                    None,
+                    &commit,
+                    &DeltaOptions {
+                        timestamp: Some(FIXED_TS),
+                        ..DeltaOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            if summary {
+                remote
+                    .regenerate_summary(&SummaryOptions {
+                        last_modified: Some(FIXED_TS),
+                        ..SummaryOptions::default()
+                    })
+                    .await
+                    .unwrap();
+            }
+            let server = RepoServer::start(&dir.join("remote"), false).await;
+            let dest = build_dest(&dir, RepoMode::BareUser, &server.url(), "").await;
+            dest.pull(
+                "origin",
+                PullOptions {
+                    flags: PullFlags::COMMIT_ONLY,
+                    ..subpath_opts(&[])
                 },
             )
             .await
             .unwrap();
-        let server = RepoServer::start(&dir.path().join("remote"), false).await;
-        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
-        dest.pull(
-            "origin",
-            PullOptions {
-                flags: PullFlags::COMMIT_ONLY,
-                ..subpath_opts(&[])
-            },
-        )
-        .await
-        .unwrap();
-        dest.pull("origin", subpath_opts(&["/sub/deeper"]))
-            .await
-            .unwrap();
-        let mut expected = subpath_base(&remote, &commit).await;
-        expected.extend(whole_objects(&remote, &commit, "/sub/deeper").await);
-        expected.extend(entry_objects(&remote, &commit, "/sub").await);
-        assert_eq!(dest.list_objects().await.unwrap(), expected);
-        assert_partial_marker(&dir.path().join("dest"), &commit);
-        dest.pull("origin", subpath_opts(&[])).await.unwrap();
-        let everything = remote.traverse_commit(&commit, 0).await.unwrap();
-        assert_eq!(dest.list_objects().await.unwrap(), everything);
-        assert_eq!(
-            dest.commit_state(&commit).await.unwrap(),
-            CommitState::Normal
-        );
-        assert!(
-            !server.seen().iter().any(|p| p.contains("deltas/")),
-            "{:?}",
-            server.seen()
-        );
+            dest.pull("origin", subpath_opts(&["/sub/deeper"]))
+                .await
+                .unwrap();
+            let everything = remote.traverse_commit(&commit, 0).await.unwrap();
+            if summary {
+                let mut expected = subpath_base(&remote, &commit).await;
+                expected.extend(whole_objects(&remote, &commit, "/sub/deeper").await);
+                expected.extend(entry_objects(&remote, &commit, "/sub").await);
+                assert_eq!(dest.list_objects().await.unwrap(), expected);
+            } else {
+                assert_eq!(dest.list_objects().await.unwrap(), everything);
+            }
+            assert_partial_marker(&dir.join("dest"), &commit);
+            let superblocks = server
+                .seen()
+                .iter()
+                .filter(|p| p.ends_with("/superblock"))
+                .count();
+            assert_eq!(superblocks, usize::from(!summary), "{:?}", server.seen());
+            dest.pull("origin", subpath_opts(&[])).await.unwrap();
+            assert_eq!(dest.list_objects().await.unwrap(), everything);
+            assert_eq!(
+                dest.commit_state(&commit).await.unwrap(),
+                CommitState::Normal
+            );
+            if summary {
+                assert!(
+                    !server.seen().iter().any(|p| p.ends_with("/superblock")),
+                    "{:?}",
+                    server.seen()
+                );
+            }
+        }
     });
 }
 
@@ -5108,5 +5136,326 @@ fn a_relative_or_empty_subpath_is_refused() {
         assert!(server.seen().is_empty(), "{:?}", server.seen());
         assert_nothing_published(&dest).await;
         assert!(dest.list_objects().await.unwrap().is_empty());
+    });
+}
+
+/// A remote archive repository under `dir/remote` holding `test/main` at a
+/// second commit over the first, both over the small tree with a different
+/// marker. Returns the remote and the two commits, the first one first. The
+/// remote holds no delta and no summary.
+async fn build_remote_two_commits(dir: &Path) -> (Repo, Checksum, Checksum) {
+    build_tree(&dir.join("one"), b"one\n");
+    build_tree(&dir.join("two"), b"two\n");
+    let repo = Repo::create(&dir.join("remote"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let first = commit_tree(&repo, dir, "one", "test/main", None, FIXED_TS).await;
+    let second = commit_tree(&repo, dir, "two", "test/main", Some(first), FIXED_TS + 1).await;
+    (repo, first, second)
+}
+
+/// Generate a delta in `repo` with a fixed timestamp, then its summary.
+async fn publish_delta(repo: &Repo, from: Option<&Checksum>, to: &Checksum) {
+    repo.generate_static_delta(
+        from,
+        to,
+        &DeltaOptions {
+            timestamp: Some(FIXED_TS),
+            ..DeltaOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    repo.regenerate_summary(&SummaryOptions {
+        last_modified: Some(FIXED_TS),
+        ..SummaryOptions::default()
+    })
+    .await
+    .unwrap();
+}
+
+/// The options of a pull of `test/main` that requires static deltas.
+fn required_delta_opts() -> PullOptions {
+    PullOptions {
+        refs: vec!["test/main".to_owned()],
+        require_static_deltas: true,
+        ..PullOptions::default()
+    }
+}
+
+/// A destination under `dir/dest` holding `commit` complete, imported from
+/// `dir/remote`, with no ref.
+async fn dest_holding(dir: &Path, url: &str, commit: &Checksum) -> Repo {
+    let dest = build_dest(dir, RepoMode::BareUser, url, "").await;
+    let remote = Repo::open(&dir.join("remote")).await.unwrap();
+    dest.pull_local(
+        &remote,
+        PullOptions {
+            refs: vec![commit.to_hex()],
+            flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+            ..PullOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    // A local pull of a checksum writes a ref of that name, which this
+    // destination does not keep.
+    let txn = dest.transaction().await.unwrap();
+    txn.set_ref(&commit.to_hex(), None);
+    txn.commit().await.unwrap();
+    assert!(dest.list_refs(None).await.unwrap().is_empty());
+    dest
+}
+
+/// A pull that requires static deltas into a destination holding no source of
+/// any advertised delta is refused, although the summary advertises a delta
+/// from another commit. Nothing is published and no object is asked for.
+#[test]
+fn required_deltas_refuse_a_summary_naming_no_usable_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-require-none-usable");
+        let (remote, first, second) = build_remote_two_commits(dir.path()).await;
+        publish_delta(&remote, Some(&first), &second).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+
+        let err = dest
+            .pull("origin", required_delta_opts())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("pull: Static deltas required, but none found for test/main to {second}")
+        );
+        assert_nothing_published(&dest).await;
+        assert!(dest.list_objects().await.unwrap().is_empty());
+        assert!(
+            !server
+                .seen()
+                .iter()
+                .any(|p| p.starts_with("objects/") || p.ends_with("/superblock")),
+            "{:?}",
+            server.seen()
+        );
+    });
+}
+
+/// A pull that requires static deltas from a summary that lists no delta is
+/// refused with the same words.
+#[test]
+fn required_deltas_refuse_a_summary_listing_no_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-require-no-delta");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+
+        let err = dest
+            .pull("origin", required_delta_opts())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("pull: Static deltas required, but none found for test/main to {commit}")
+        );
+        assert_nothing_published(&dest).await;
+        assert!(dest.list_objects().await.unwrap().is_empty());
+    });
+}
+
+/// A pull that requires static deltas from a remote with no summary is refused
+/// before any delta is asked for by name.
+#[test]
+fn required_deltas_refuse_a_remote_with_no_summary() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-require-no-summary");
+        let (remote, _first, second) = build_remote_two_commits(dir.path()).await;
+        remote
+            .generate_static_delta(
+                None,
+                &second,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+
+        let err = dest
+            .pull("origin", required_delta_opts())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "pull: Fetch configured to require static deltas, but no summary deltas or \
+             delta index found"
+        );
+        assert_nothing_published(&dest).await;
+        assert!(
+            !server.seen().iter().any(|p| p.contains("deltas/")),
+            "{:?}",
+            server.seen()
+        );
+    });
+}
+
+/// A superblock the summary advertises and the remote does not hold fails a
+/// pull that requires static deltas, and leaves a pull that does not to fetch
+/// the objects loose.
+#[test]
+fn required_deltas_refuse_a_stale_advertisement() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-require-stale");
+        let (remote, _first, second) = build_remote_two_commits(dir.path()).await;
+        publish_delta(&remote, None, &second).await;
+        std::fs::remove_dir_all(dir.path().join("remote/deltas")).unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+
+        let err = dest
+            .pull("origin", required_delta_opts())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("pull: Static deltas required, but none found for test/main to {second}")
+        );
+        assert_nothing_published(&dest).await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.commit_state(&second).await.unwrap(),
+            CommitState::Normal
+        );
+    });
+}
+
+/// A destination holding the source of a from-to delta takes that delta,
+/// whatever its own ref names: here it holds the source commit under no ref.
+#[test]
+fn a_from_to_delta_is_taken_from_any_commit_held_complete() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-delta-held-source");
+        let (remote, first, second) = build_remote_two_commits(dir.path()).await;
+        publish_delta(&remote, Some(&first), &second).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &first).await;
+        assert!(
+            dest.list_refs(Some("refs/remotes"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        server.forget();
+
+        dest.pull("origin", required_delta_opts()).await.unwrap();
+        assert_eq!(
+            dest.commit_state(&second).await.unwrap(),
+            CommitState::Normal
+        );
+        let seen = server.seen();
+        assert!(seen.iter().any(|p| p.ends_with("/superblock")), "{seen:?}");
+        assert!(!seen.iter().any(|p| p.ends_with(".filez")), "{seen:?}");
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// A destination whose ref names a commit it holds leaves an advertised
+/// from-scratch delta alone, also when static deltas are required: that pull
+/// fetches the objects loose and is not refused.
+#[test]
+fn required_deltas_pass_a_declined_from_scratch_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-require-declined-scratch");
+        let (remote, first, second) = build_remote_two_commits(dir.path()).await;
+        publish_delta(&remote, None, &second).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &first).await;
+        let txn = dest.transaction().await.unwrap();
+        txn.set_ref("origin:test/main", Some(&first));
+        txn.commit().await.unwrap();
+        server.forget();
+
+        dest.pull("origin", required_delta_opts()).await.unwrap();
+        assert_eq!(
+            dest.commit_state(&second).await.unwrap(),
+            CommitState::Normal
+        );
+        let seen = server.seen();
+        assert!(!seen.iter().any(|p| p.ends_with("/superblock")), "{seen:?}");
+        assert!(seen.iter().any(|p| p.ends_with(".filez")), "{seen:?}");
+    });
+}
+
+/// A destination that holds the commit object partial is looked for a delta
+/// for. Where the summary advertises none, a pull that requires static deltas
+/// is refused and fetches no object. Where it advertises the from-scratch
+/// delta, the ref names that commit, so the pull asks for the delta index,
+/// leaves the delta alone, fetches the objects loose, and is not refused.
+#[test]
+fn required_deltas_look_for_a_delta_for_a_commit_held_partial() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-require-partial");
+        let (remote, _first, second) = build_remote_two_commits(dir.path()).await;
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let commit_only = PullOptions {
+            refs: vec!["test/main".to_owned()],
+            flags: PullFlags::COMMIT_ONLY,
+            ..PullOptions::default()
+        };
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        dest.pull("origin", commit_only.clone()).await.unwrap();
+        let held = dest.list_objects().await.unwrap();
+        server.forget();
+
+        let err = dest
+            .pull("origin", required_delta_opts())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("pull: Static deltas required, but none found for test/main to {second}")
+        );
+        assert_eq!(dest.list_objects().await.unwrap(), held);
+        assert_eq!(
+            dest.commit_state(&second).await.unwrap(),
+            CommitState::Partial
+        );
+        let seen = server.seen();
+        assert!(!seen.iter().any(|p| p.starts_with("objects/")), "{seen:?}");
+
+        drop(dest);
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        publish_delta(&remote, None, &second).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        dest.pull("origin", commit_only).await.unwrap();
+        server.forget();
+
+        dest.pull("origin", required_delta_opts()).await.unwrap();
+        assert_eq!(
+            dest.commit_state(&second).await.unwrap(),
+            CommitState::Normal
+        );
+        let seen = server.seen();
+        assert!(seen.iter().any(|p| p.ends_with(".index")), "{seen:?}");
+        assert!(!seen.iter().any(|p| p.ends_with("/superblock")), "{seen:?}");
+        assert!(seen.iter().any(|p| p.ends_with(".filez")), "{seen:?}");
     });
 }

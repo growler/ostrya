@@ -15,8 +15,9 @@ use std::process::Command;
 use common::{TmpDir, file_inventory, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState, CreateOptions,
-    DetachedMetadataFilter, DetachedMetadataFilterFn, Ed25519Signer, Error, FilterResult,
-    MutableTree, PullFlags, PullOptions, PullVerify, Repo, RepoMode, Type, Value,
+    DeltaOptions, DetachedMetadataFilter, DetachedMetadataFilterFn, Ed25519Signer, Error,
+    FilterResult, FsckOptions, MutableTree, PullFlags, PullOptions, PullStats, PullVerify, Repo,
+    RepoMode, SummaryOptions, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -2969,5 +2970,593 @@ fn a_local_pull_refuses_subpaths() {
         assert!(matches!(err, Error::Unsupported(_)), "{err}");
         assert!(dst.list_refs(None).await.unwrap().is_empty());
         assert!(dst.list_objects().await.unwrap().is_empty());
+    });
+}
+
+// --- static deltas -------------------------------------------------------
+
+/// Generate a delta in `repo` with a fixed timestamp under `opts`, and return
+/// its directory.
+async fn delta_with(
+    repo: &Repo,
+    from: Option<&Checksum>,
+    to: &Checksum,
+    opts: DeltaOptions,
+) -> PathBuf {
+    let dir = repo
+        .generate_static_delta(
+            from,
+            to,
+            &DeltaOptions {
+                timestamp: Some(FIXED_TS),
+                ..opts
+            },
+        )
+        .await
+        .unwrap();
+    repo.path().join(dir)
+}
+
+/// Regenerate the summary of `repo` with a fixed timestamp.
+async fn summarize(repo: &Repo) {
+    repo.regenerate_summary(&SummaryOptions {
+        last_modified: Some(FIXED_TS),
+        ..SummaryOptions::default()
+    })
+    .await
+    .unwrap();
+}
+
+/// An archive source as [`source_repo`] holding the from-scratch delta to the
+/// second commit, its index, and a summary. Returns what [`source_repo`]
+/// returns and the delta's directory.
+async fn delta_source(base: &Path) -> (PathBuf, Repo, Checksum, Checksum, PathBuf) {
+    let (path, repo, c1, c2) = source_repo(base, RepoMode::Archive).await;
+    let dir = delta_with(&repo, None, &c2, DeltaOptions::default()).await;
+    repo.reindex_static_deltas().await.unwrap();
+    summarize(&repo).await;
+    (path, repo, c1, c2, dir)
+}
+
+/// The options of a pull of `main` that requires static deltas.
+fn required(flags: PullFlags) -> PullOptions {
+    PullOptions {
+        refs: vec!["main".to_owned()],
+        flags,
+        require_static_deltas: true,
+        ..PullOptions::default()
+    }
+}
+
+/// A destination under `base/<name>` holding `commit` of `src` complete, with
+/// no ref.
+async fn dst_holding(base: &Path, name: &str, src: &Repo, commit: &Checksum) -> (PathBuf, Repo) {
+    let (path, dst) = make_repo(base, name, RepoMode::BareUser).await;
+    dst.pull_local(
+        src,
+        PullOptions {
+            refs: vec![commit.to_hex()],
+            flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+            ..PullOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let txn = dst.transaction().await.unwrap();
+    txn.set_ref(&commit.to_hex(), None);
+    txn.commit().await.unwrap();
+    assert!(dst.list_refs(None).await.unwrap().is_empty());
+    (path, dst)
+}
+
+/// The size of each file under `dir`, added up.
+fn tree_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let meta = entry.metadata().unwrap();
+        total += if meta.is_dir() {
+            tree_size(&entry.path())
+        } else {
+            meta.len()
+        };
+    }
+    total
+}
+
+/// Assert that a failed pull left `dst` with no ref, no object, and no marker
+/// for `commit`.
+async fn assert_nothing_left(dst_dir: &Path, dst: &Repo, commit: &Checksum) {
+    assert!(dst.list_refs(None).await.unwrap().is_empty());
+    assert!(dst.list_objects().await.unwrap().is_empty());
+    assert!(!has_partial_marker(dst_dir, commit));
+}
+
+/// By default a local pull reads no delta: a source whose delta tree is corrupt
+/// and unreadable pulls as it does with deltas disabled.
+#[test]
+fn a_local_pull_reads_no_delta_by_default() {
+    let tmp = TmpDir::new("pull-delta-default");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2, dir) = delta_source(base).await;
+        std::fs::write(dir.join("superblock"), b"not a superblock").unwrap();
+        let deltas = src_dir.join("deltas");
+        std::fs::set_permissions(&deltas, std::fs::Permissions::from_mode(0o000)).unwrap();
+        for (name, disable_static_deltas) in [("plain", false), ("disabled", true)] {
+            let (_dst_dir, dst) = make_repo(base, name, RepoMode::BareUser).await;
+            let stats = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        refs: vec!["main".to_owned()],
+                        disable_static_deltas,
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(stats.delta_parts, 0, "{name}");
+            assert_eq!(stats.metadata_fetched, 0, "{name}");
+            assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        }
+        std::fs::set_permissions(&deltas, std::fs::Permissions::from_mode(0o755)).unwrap();
+    });
+}
+
+/// A pull that requires static deltas applies the source's from-scratch delta:
+/// it lands the objects a plain import lands, the commit is complete, and the
+/// counts are those of a fetch.
+#[test]
+fn a_required_delta_applies_from_scratch() {
+    let tmp = TmpDir::new("pull-delta-scratch");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2, dir) = delta_source(base).await;
+        let (_plain_dir, plain) = make_repo(base, "plain", RepoMode::BareUser).await;
+        pull_main(&plain, &src, PullFlags::empty()).await;
+
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let stats = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.list_objects().await.unwrap(),
+            plain.list_objects().await.unwrap()
+        );
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c2));
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        let index_dir = src_dir.join("delta-indexes");
+        assert_eq!(
+            PullStats {
+                elapsed: std::time::Duration::ZERO,
+                ..stats
+            },
+            PullStats {
+                metadata_imported: stats.metadata_imported,
+                content_imported: stats.content_imported,
+                content_bytes_written: stats.content_bytes_written,
+                metadata_fetched: 2,
+                content_fetched: 0,
+                delta_parts: 1,
+                bytes_transferred: tree_size(&dir) + tree_size(&index_dir),
+                ..PullStats::default()
+            }
+        );
+    });
+}
+
+/// A destination holding the source of a from-to delta takes that delta, with
+/// or without a remote name, whatever ref it holds.
+#[test]
+fn a_required_from_to_delta_applies() {
+    let tmp = TmpDir::new("pull-delta-from-to");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let dir = delta_with(&src, Some(&c1), &c2, DeltaOptions::default()).await;
+        summarize(&src).await;
+        for remote in [None, Some("origin")] {
+            let name = format!("dst-{}", remote.unwrap_or("local"));
+            let (_dst_dir, dst) = dst_holding(base, &name, &src, &c1).await;
+            let stats = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        remote: remote.map(str::to_owned),
+                        ..required(PullFlags::empty())
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(stats.delta_parts, 1, "{remote:?}");
+            // The summary lists the delta and no index is published, so the
+            // index read finds nothing and still counts.
+            assert_eq!(stats.metadata_fetched, 2, "{remote:?}");
+            assert_eq!(stats.bytes_transferred, tree_size(&dir), "{remote:?}");
+            assert_eq!(stats.content_bytes_unpacked, 0, "{remote:?}");
+            assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+            assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        }
+    });
+}
+
+/// A pull that requires static deltas is refused where no advertised delta
+/// produces the commit from what the destination holds, and writes nothing.
+#[test]
+fn a_required_delta_that_is_not_published_is_refused() {
+    let tmp = TmpDir::new("pull-delta-none-found");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        delta_with(&src, Some(&c1), &c2, DeltaOptions::default()).await;
+        summarize(&src).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let err = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("pull: Static deltas required, but none found for main to {c2}")
+        );
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+    });
+}
+
+/// A pull that requires static deltas from a source with no summary is
+/// refused, although the source holds a delta and its index.
+#[test]
+fn a_required_delta_needs_a_summary() {
+    let tmp = TmpDir::new("pull-delta-no-summary");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        delta_with(&src, None, &c2, DeltaOptions::default()).await;
+        src.reindex_static_deltas().await.unwrap();
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let err = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "pull: Fetch configured to require static deltas, but no summary deltas or \
+             delta index found"
+        );
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+    });
+}
+
+/// A pull that requires static deltas reads an archive source alone.
+#[test]
+fn a_required_delta_refuses_a_source_outside_archive_mode() {
+    let tmp = TmpDir::new("pull-delta-bare-source");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::BareUser).await;
+        delta_with(&src, None, &c2, DeltaOptions::default()).await;
+        summarize(&src).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let err = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+        assert!(err.to_string().contains("bare-user"), "{err}");
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+    });
+}
+
+/// A superblock off the digest the summary advertises fails the pull, and a
+/// part file off its checksum fails it too. Neither publishes anything.
+#[test]
+fn a_tampered_delta_fails_and_publishes_nothing() {
+    let tmp = TmpDir::new("pull-delta-tampered");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2, dir) = delta_source(base).await;
+
+        let superblock = dir.join("superblock");
+        let original = std::fs::read(&superblock).unwrap();
+        let mut changed = original.clone();
+        *changed.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&superblock, &changed).unwrap();
+        let (dst_dir, dst) = make_repo(base, "sb", RepoMode::BareUser).await;
+        let err = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ChecksumMismatch { .. }), "{err}");
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+        std::fs::write(&superblock, &original).unwrap();
+
+        let part = dir.join("0");
+        let mut bytes = std::fs::read(&part).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        std::fs::write(&part, &bytes).unwrap();
+        let (dst_dir, dst) = make_repo(base, "part", RepoMode::BareUser).await;
+        let err = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+    });
+}
+
+/// A destination that already holds the commit is not refused, although no
+/// delta produces the commit from what it holds.
+#[test]
+fn a_required_delta_pull_of_a_held_commit_is_not_refused() {
+    let tmp = TmpDir::new("pull-delta-held");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        delta_with(&src, Some(&c1), &c2, DeltaOptions::default()).await;
+        summarize(&src).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        pull_main(&dst, &src, PullFlags::empty()).await;
+        let stats = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap();
+        assert_eq!(stats.delta_parts, 0);
+        assert_eq!(stats.metadata_fetched, 0);
+    });
+}
+
+/// A commit-only pull that requires static deltas looks for none and is not
+/// refused; it counts the commit object as fetched.
+#[test]
+fn a_required_delta_commit_only_pull_takes_the_commit_loose() {
+    let tmp = TmpDir::new("pull-delta-commit-only");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        summarize(&src).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let stats = dst
+            .pull_local(&src, required(PullFlags::COMMIT_ONLY))
+            .await
+            .unwrap();
+        let hex = c2.to_hex();
+        let commit_file = src_dir
+            .join("objects")
+            .join(&hex[..2])
+            .join(format!("{}.commit", &hex[2..]));
+        assert_eq!(stats.metadata_fetched, 1);
+        assert_eq!(
+            stats.bytes_transferred,
+            std::fs::metadata(commit_file).unwrap().len()
+        );
+        assert!(has_partial_marker(&dst_dir, &c2));
+    });
+}
+
+/// Into an `archive` destination a pull that requires static deltas applies
+/// the delta, and the destination passes its fsck.
+#[test]
+fn a_required_delta_applies_into_archive() {
+    let tmp = TmpDir::new("pull-delta-archive");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2, _dir) = delta_source(base).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let stats = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap();
+        assert_eq!(stats.delta_parts, 1);
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// `BAREUSERONLY_FILES` reaches an object a local delta delivers, and the
+/// refusal publishes nothing.
+#[test]
+fn bareuseronly_files_rejects_a_local_delta_object_outside_0775() {
+    let tmp = TmpDir::new("pull-delta-mode-bits");
+    block_on(async {
+        let base = tmp.path();
+        build_tree(&base.join("v1"), b"hello\n");
+        std::fs::set_permissions(
+            base.join("v1/exec.sh"),
+            std::fs::Permissions::from_mode(0o4755),
+        )
+        .unwrap();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let c1 = commit_tree_with(
+            &src,
+            base,
+            "v1",
+            "main",
+            None,
+            CommitModifierFlags::SKIP_XATTRS,
+            None,
+        )
+        .await;
+        delta_with(&src, None, &c1, DeltaOptions::default()).await;
+        summarize(&src).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let err = dst
+            .pull_local(&src, required(PullFlags::BAREUSERONLY_FILES))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid mode"), "{err}");
+        assert_nothing_left(&dst_dir, &dst, &c1).await;
+    });
+}
+
+/// A delta of several parts, one of them carrying a 256 KiB file, and a delta
+/// whose parts ride inline in the superblock each land the commit whole. Only
+/// a part read as a file counts.
+#[test]
+fn multi_part_and_inline_deltas_apply() {
+    let tmp = TmpDir::new("pull-delta-parts");
+    block_on(async {
+        let base = tmp.path();
+        build_tree(&base.join("v1"), b"hello\n");
+        let mut big = Vec::with_capacity(256 * 1024);
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        while big.len() < 256 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            big.extend_from_slice(&state.to_le_bytes());
+        }
+        std::fs::write(base.join("v1/big"), &big).unwrap();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let c1 = commit_tree(&src, base, "v1", "main", None).await;
+        summarize(&src).await;
+        for (name, inline) in [("parts", false), ("inline", true)] {
+            delta_with(
+                &src,
+                None,
+                &c1,
+                DeltaOptions {
+                    max_chunk_size: 1,
+                    inline,
+                    ..DeltaOptions::default()
+                },
+            )
+            .await;
+            summarize(&src).await;
+            let (_dst_dir, dst) = make_repo(base, name, RepoMode::BareUser).await;
+            let stats = dst
+                .pull_local(&src, required(PullFlags::empty()))
+                .await
+                .unwrap();
+            if inline {
+                assert_eq!(stats.delta_parts, 0, "{name}");
+            } else {
+                assert!(stats.delta_parts > 1, "{name}: {stats:?}");
+            }
+            assert_eq!(dst.commit_state(&c1).await.unwrap(), CommitState::Normal);
+            assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+            assert_eq!(
+                dst.list_objects().await.unwrap(),
+                src.traverse_commit(&c1, 0).await.unwrap()
+            );
+        }
+    });
+}
+
+/// A destination that holds the commit object partial is looked for a delta
+/// for. Where the source advertises none, a pull that requires static deltas
+/// is refused and leaves the commit partial. Where the source advertises the
+/// from-scratch delta, the ref names that commit, so the pull leaves the delta
+/// alone, fetches the objects loose, and is not refused.
+#[test]
+fn a_required_delta_pull_of_a_partial_commit_looks_for_a_delta() {
+    let tmp = TmpDir::new("pull-delta-partial");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        summarize(&src).await;
+        let (dst_dir, dst) = make_repo(base, "none", RepoMode::BareUser).await;
+        pull_main(&dst, &src, PullFlags::COMMIT_ONLY).await;
+        let held = dst.list_objects().await.unwrap();
+        let err = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("pull: Static deltas required, but none found for main to {c2}")
+        );
+        assert_eq!(dst.list_objects().await.unwrap(), held);
+        assert!(has_partial_marker(&dst_dir, &c2));
+
+        delta_with(&src, None, &c2, DeltaOptions::default()).await;
+        src.reindex_static_deltas().await.unwrap();
+        summarize(&src).await;
+        let (dst_dir, dst) = make_repo(base, "scratch", RepoMode::BareUser).await;
+        pull_main(&dst, &src, PullFlags::COMMIT_ONLY).await;
+        let stats = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap();
+        assert_eq!(stats.delta_parts, 0);
+        assert!(stats.content_fetched > 0, "{stats:?}");
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert!(!has_partial_marker(&dst_dir, &c2));
+    });
+}
+
+/// A pull that requires static deltas refuses a source with no summary before
+/// it reads the source's mode, and a source outside archive mode before it
+/// resolves a ref, which is the order the tool refuses in.
+#[test]
+fn a_required_delta_pull_refuses_in_the_tool_order() {
+    let tmp = TmpDir::new("pull-delta-refusal-order");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::BareUser).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let absent = PullOptions {
+            refs: vec!["absent".to_owned()],
+            ..required(PullFlags::empty())
+        };
+        let err = dst.pull_local(&src, absent.clone()).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "pull: Fetch configured to require static deltas, but no summary deltas or \
+             delta index found"
+        );
+        summarize(&src).await;
+        let err = dst.pull_local(&src, absent).await.unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+    });
+}
+
+/// A FIFO at the source's summary is refused, and the read does not wait on
+/// a writer.
+#[test]
+fn a_required_delta_pull_refuses_a_summary_that_is_not_a_regular_file() {
+    let tmp = TmpDir::new("pull-delta-summary-fifo");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let status = Command::new("mkfifo")
+            .arg(src_dir.join("summary"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let err = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
+    });
+}
+
+/// A part file longer than the superblock declares is refused, and the pull
+/// publishes nothing.
+#[test]
+fn a_part_file_past_its_declared_size_is_refused() {
+    let tmp = TmpDir::new("pull-delta-grown-part");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2, dir) = delta_source(base).await;
+        let mut part = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("0"))
+            .unwrap();
+        std::io::Write::write_all(&mut part, &[0u8; 4096]).unwrap();
+        drop(part);
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        let err = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("declared for it"), "{err}");
+        assert_nothing_left(&dst_dir, &dst, &c2).await;
     });
 }

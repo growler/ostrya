@@ -1829,7 +1829,8 @@ took every ref.
 
 A remote that publishes static deltas delivers a commit as one delta instead of
 one request per object. A pull looks for one delta per tip: `<from>-<to>`, where
-`from` is the commit the ref names in this repository and holds complete, and the
+`from` is the commit the ref names in this repository and holds complete, then
+`<from>-<to>` for any other commit this repository holds complete, and the
 from-scratch `<to>` where the ref names none. The delta index for the target
 commit is read first and the summary's own `ostree.static-deltas` map where the
 remote serves no index; a remote serving no summary is asked for the superblock by
@@ -1840,7 +1841,12 @@ once whatever `max_outstanding_fetches` is. The objects the delta hands over loo
 are fetched as ordinary content objects, and the commit's tree is walked once the
 last part is applied, so an object no part delivered is fetched loose and a
 published commit is whole. `disable_static_deltas` asks for no delta;
-`require_static_deltas` refuses a remote that advertises none.
+`require_static_deltas` refuses a remote that serves no summary, and a commit
+this repository does not hold complete for which no advertised delta can be
+taken.
+`pull_local` reads no delta unless `require_static_deltas` is set; with it set,
+it reads the summary, the index, the superblock, and the parts from the source
+directory, which must be an archive repository, and applies the delta.
 
 A pull checks the signatures on the commits it carries and on the remote's
 summary. `verify` holds four switches, each overriding the remote configuration
@@ -1938,7 +1944,7 @@ pub struct PullOptions {
                                                  // limit; zero is off
     pub timestamp_check: TimestampCheck,
     pub disable_static_deltas: bool,      // fetch every object loose
-    pub require_static_deltas: bool,      // refuse a remote advertising none
+    pub require_static_deltas: bool,      // refuse where no delta can be taken
     pub verify: PullVerify,               // the signature checks to make
     pub detached_metadata_filter: DetachedMetadataFilter,  // what to store
     pub progress: Option<PullProgress>,   // live counters for the caller

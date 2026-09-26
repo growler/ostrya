@@ -13935,7 +13935,8 @@ severity: interop
 evidence: ostrya_cli::cli::pull_of_a_commit_held_partial_takes_no_delta
 spec: format-reference.md#http-pull-surface
 note: into `bare-user`, after `--commit-metadata-only`, a `--subpath` pull and
- then a pull without it take no delta and fetch what is missing loose. The
+ then a pull without it leave the from-scratch delta the summary names alone,
+ since the ref names the commit, and fetch what is missing loose. The
  inventory, the ref, and the marker after each agree with the tool.
 
 family: M10
@@ -14224,3 +14225,265 @@ severity: interop
 spec: format-reference.md#pull
 note: across the archive boundary each regular file is written afresh, and
  its uncompressed payload counts.
+
+# ---------------------------------------------------------------------------
+# pull-local -- verification and static deltas (Phase 17f). The setup commits
+# corpus C0 into `$SRC` on `conformance`, and `$SRC` holds no summary, no
+# `summary.sig`, and no delta. `$DST` configures no remote. A cell that needs a
+# source the setup does not build cites the `cli.rs` test that builds it with
+# the tool and pulls with each implementation.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: pull-local
+cell: pull-local/gpg-verify-no-remote
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --gpg-verify $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "so the pull has to name a remote"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Must specify remote name to enable gpg verification"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_gpg_switches_refuse_where_the_tool_refuses
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a check takes its keys from the remote `--remote` names, so with no
+ `--remote` both refuse before they read the source. `--gpg-verify-summary`
+ is refused in the same way. The words differ, and neither side writes an
+ object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/gpg-verify-unsigned
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --gpg-verify --remote=origin $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "GPG verification is enabled, but it carries no signature"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "GPG verification enabled, but no signatures found"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_gpg_switches_refuse_where_the_tool_refuses
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the setup commit carries no signature. `$DST` configures no remote
+ `origin`, and a remote the configuration does not describe holds no key; a
+ configured remote with no key is refused in the same way in the cited test.
+ A signature from a key the remote does not hold is refused in both
+ (`ostrya::pull_verify_gpg::the_repository_keyring_is_what_a_remote_trusts`
+ for the port).
+
+family: M10
+subcommand: pull-local
+cell: pull-local/gpg-verify-value-suffix
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --gpg-verify=false --remote=origin $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "unexpected value 'false' for '--gpg-verify'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "GPG verification enabled, but no signatures found"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the tool reads and discards the value and turns the check on, so it
+ refuses the unsigned commit. The port's `pull-local` takes the two GPG
+ switches with no value, and `clap` refuses the suffix. Neither side writes an
+ object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/gpg-verify-summary-no-summary
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --gpg-verify-summary --remote=origin $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "summary verification is enabled, but no summary is published"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "GPG verification enabled, but no summary found"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `$SRC` publishes no summary. The words differ, and neither side writes
+ an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/gpg-verify-summary-no-sig
+setup: src-dst
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_gpg_switches_refuse_where_the_tool_refuses
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a source with a summary and no `summary.sig` is refused in both: the
+ tool reports `GPG verification enabled, but no summary.sig found`, and the
+ port reports `summary verification is enabled, but no summary.sig is
+ published`. Neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/require-static-deltas-no-summary
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --require-static-deltas $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "Fetch configured to require static deltas, but no summary deltas or delta index found"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Fetch configured to require static deltas, but no summary deltas or delta index found"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_static_delta_switches_match_the_tool
+spec: format-reference.md#http-pull-surface
+note: with no summary nothing advertises a delta, so both refuse, also where
+ the source holds a delta and its index, and also under
+ `--commit-metadata-only`. The port writes `pull: ` ahead of the tool's words.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/require-static-deltas-none-found
+setup: src-dst
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_static_delta_switches_match_the_tool,
+ ostrya::pull_local::a_required_delta_that_is_not_published_is_refused
+spec: format-reference.md#http-pull-surface
+note: a summary that names no delta the destination can apply is refused in
+ both with `Static deltas required, but none found for main to <commit>`, and
+ neither side writes an object or a ref. A superblock the summary names and
+ the source does not hold is refused in the same words; the tool names the ref
+ as `(null)` there.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/require-static-deltas-applied
+setup: src-dst
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_local_static_delta_switches_match_the_tool,
+ ostrya::pull_local::a_required_delta_applies_from_scratch
+spec: format-reference.md#pull
+note: the from-scratch delta, a from-to delta from a commit the destination
+ holds under no ref, and a from-scratch delta the destination's ref declines,
+ which pulls loose, each leave the tool's refs and objects, and print the
+ tool's statistics line: `1 delta parts, 2 loose fetched; 294 KiB transferred
+ in 0 seconds; 0 bytes content written` for the first. A source outside archive
+ mode is refused in both, and a commit-only pull takes the commit loose in
+ both.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/require-static-deltas-into-archive
+setup: src-dst
+outcome: lossy
+severity: interop
+loss: a static delta into an `archive` destination. The tool refuses it with
+ `Can't use static deltas in an archive repo` at exit 1 and writes nothing; the
+ port applies the delta, and the tool's `fsck` accepts what it wrote
+ (`port-plan.md`, Phase 16d).
+evidence: ostrya_cli::cli::pull_local_static_delta_divergences
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the two reach different exit statuses, so no oracle reads the pair.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/disable-static-deltas
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --disable-static-deltas $SRC conformance
+expect-exit: 0
+expect-stderr: empty
+expect-stdout: equals "4 metadata, 4 content objects imported; 45 bytes content written"
+oracle: exit-status stdout-text stderr-text refs-bytes inventory
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_local_static_delta_switches_match_the_tool
+spec: format-reference.md#pull
+note: `pull-local` reads no delta by default, so the switch changes nothing. The
+ cited test pulls with it from a source whose superblock is corrupt.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/both-delta-switches
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --require-static-deltas --disable-static-deltas $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "the argument '--require-static-deltas' cannot be used with '--disable-static-deltas'"
+ref-expect-exit: 1
+ref-may-abort: 6
+oracle: exit-status refs-bytes inventory
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::pull_local_static_delta_divergences
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port refuses the pair at exit 1 and writes nothing. The reference
+ build dies on SIGABRT: it prints `ostree_repo_pull_with_options: assertion
+ '!(pull_data->disable_static_deltas && pull_data->require_static_deltas)'
+ failed` and then `ostree_run: assertion failed: (success || error)` and a
+ `Bail out!` line, and writes no object and no ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/checksum-shaped-ref
+setup: src-dst
+outcome: lossy
+severity: interop
+loss: a source ref named by 64 lowercase hex digits. The tool reads the name as
+ a checksum and fails with `Importing <name>.commit: linkat: No such file or
+ directory`, with the ref named and with every ref pulled. The port reads a
+ named one as a checksum and refuses it too, and copies the ref when every ref
+ is pulled (`cli-surface.md`, "P2", `commit`).
+evidence: ostrya_cli::cli::pull_local_checksum_shaped_ref
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: such a source ref arrives by an out-of-band write alone.
+
+family: M10
+subcommand: pull
+cell: pull/both-delta-switches
+setup: repo
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::pull_local_static_delta_divergences
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `clap` refuses `--require-static-deltas` beside `--disable-static-deltas`
+ at exit 1, and the port writes nothing. The tool ends on the assertion the
+ `pull-local` cell above records.
+
+family: M10
+subcommand: pull
+cell: pull/require-static-deltas-none-found
+setup: repo
+outcome: refused-both
+severity: interop
+evidence: ostrya::pull_http::required_deltas_refuse_a_summary_naming_no_usable_delta,
+ ostrya::pull_http::required_deltas_refuse_a_summary_listing_no_delta,
+ ostrya::pull_http::required_deltas_pass_a_declined_from_scratch_delta
+spec: format-reference.md#http-pull-surface
+note: a summary that lists no delta, or lists none the destination can apply,
+ is refused in both with `Static deltas required, but none found for <ref> to
+ <commit>`, and no object is fetched. A from-scratch delta the destination's
+ ref declines pulls loose in both.

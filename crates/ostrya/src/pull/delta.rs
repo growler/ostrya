@@ -1,5 +1,6 @@
-//! Delta-accelerated pull: finding a static delta on a remote, fetching it, and
-//! applying it into the pull's transaction.
+//! Delta-accelerated pull: finding a static delta on a remote, or in the source
+//! directory of a local pull, reading it, and applying it into the pull's
+//! transaction.
 //!
 //! A remote that publishes static deltas can deliver a commit as one delta
 //! instead of one request per object. What a pull asks for, in order: the delta
@@ -9,15 +10,20 @@
 //! follows. A part the superblock carries inline, in its metadata dict, is
 //! applied from there, and no request is made for it.
 //!
-//! Which delta. A pull looks for exactly one: `<from>-<to>` where `from` is the
-//! commit the ref being pulled names in this repository, and the from-scratch
-//! `<to>` where the ref names none. A from-to delta patches against the source
-//! commit's objects, so the source commit has to be here complete for the delta
-//! to apply; a ref whose commit is absent or partial is treated as naming none. A
-//! repository that holds the ref's commit does not take a from-scratch delta,
-//! which would re-deliver every object of the target including the ones it
-//! already holds -- the objects it is missing are fetched loose instead. This is
-//! what the tool was observed to do.
+//! Which delta. A pull takes one per target commit, the first the advertised
+//! map names of: `<from>-<to>` where `from` is the commit the ref being pulled
+//! names in this repository, `<c>-<to>` for any other commit `c` held here
+//! complete, and the from-scratch `<to>` where the ref names none. A from-to
+//! delta patches against the source commit's objects, so the source commit has
+//! to be here complete for the delta to apply; a ref whose commit is absent or
+//! partial is treated as naming none. A repository whose ref names a commit it
+//! holds does not take a from-scratch delta, which would re-deliver every object
+//! of the target including the ones it already holds -- the objects it is
+//! missing are fetched loose instead. A ref that names the target commit itself,
+//! held here partial, leaves the from-scratch delta alone in the same way. This
+//! is what the tool was observed to do. A remote with no summary has no map, and
+//! the ref's delta is asked for by name. A target commit held here complete is
+//! not looked for, and one held partial is looked for as one not held.
 //!
 //! Where the delta is advertised. With a summary present, the remote's
 //! `delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index` is fetched first; a remote
@@ -45,7 +51,21 @@
 //! superblock states. A superblock the remote does not hold (a stale
 //! advertisement) is a 404, which leaves the pull to fetch the objects loose.
 //!
-//! Concurrency. Two part fetches are in flight at once ([`PART_CAP`]), whatever
+//! The requirement. A pull that
+//! [requires static deltas](PullOptions::require_static_deltas) refuses a
+//! source with no summary, and a target commit it looks for a delta for and
+//! takes none: the map names none it can take, or the superblock of the one
+//! taken is absent. A from-scratch delta the map names and the pull leaves
+//! alone satisfies the requirement.
+//!
+//! The source. A [`DeltaSource`] is the pull's fetcher or the directory of the
+//! source repository of a local pull. The same paths are read from either, under
+//! the same size caps, and a local read of a file that is not a regular file is
+//! refused, so no read waits on a FIFO. A local pull reads the source's summary
+//! and its signature in the same way, under the summary's own size cap.
+//!
+//! Concurrency. A local pull applies one part at a time. Over HTTP two part
+//! fetches are in flight at once ([`PART_CAP`]), whatever
 //! the pull's slot count is: a part is decompressed into a random-access blob to
 //! be applied, so each one in flight costs an xz decoder, the verified body, and
 //! the payload, each blob spilling to a temp file past its heap threshold. Parts
@@ -62,8 +82,12 @@
 //! invariant that a published commit is whole.
 
 use std::collections::HashMap;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, Type, Value, from_bytes};
+use ostrya_rt::File as RtFile;
+use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
 use crate::delta::{
     Blob, DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, concat_to_blob,
@@ -165,8 +189,8 @@ impl DeltaJob {
 /// Find the delta to pull each target commit with, keyed by that commit.
 ///
 /// A commit with no entry is pulled object by object. Discovery is skipped for a
-/// commit whose object this repository already holds, complete or partial, since
-/// the walk then fetches only what is missing, for a
+/// commit this repository already holds complete, since the walk then fetches
+/// nothing, for a
 /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull, whose plan is the commit objects
 /// alone, for a pull held to [`subpaths`](PullOptions::subpaths) into an
 /// `archive` repository that does not
@@ -174,18 +198,22 @@ impl DeltaJob {
 /// the subpaths loose, and when
 /// [`disable_static_deltas`](PullOptions::disable_static_deltas) is set.
 ///
+/// A pull that requires static deltas from a source with no summary is refused
+/// before any of these skips, and one that finds no delta for a commit it looks
+/// for is refused as [`discover_one`] states.
+///
 /// Two refs naming one commit share one delta, since the plan fetches that commit
 /// once. The source commit is read from the ref this repository holds, so the
 /// refs are tried in the order they were requested and the first that yields a
 /// delta decides.
 ///
 /// Each delta index request and each superblock request adds one to the
-/// metadata fetched in `progress`, whatever the remote answers, which is what
+/// metadata fetched in `progress`, whatever the source answers, which is what
 /// the tool counts.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn discover(
     repo: &Repo,
-    fetcher: &Fetcher,
+    source: &DeltaSource<'_>,
     summary: Option<&Summary>,
     targets: &[(String, Checksum)],
     opts: &PullOptions,
@@ -194,8 +222,15 @@ pub(crate) async fn discover(
     progress: &PullCounters,
 ) -> Result<HashMap<Checksum, DeltaJob>> {
     let mut jobs = HashMap::new();
-    if opts.disable_static_deltas
-        || opts.flags.contains(PullFlags::COMMIT_ONLY)
+    if opts.disable_static_deltas {
+        return Ok(jobs);
+    }
+    // With no summary nothing advertises a delta, so a pull that requires one
+    // is refused whatever it would look for.
+    if opts.require_static_deltas && summary.is_none() {
+        return Err(no_summary_error());
+    }
+    if opts.flags.contains(PullFlags::COMMIT_ONLY)
         || (!opts.subpaths.is_empty()
             && repo.mode() == RepoMode::Archive
             && !opts.require_static_deltas)
@@ -203,15 +238,21 @@ pub(crate) async fn discover(
         return Ok(jobs);
     }
     for (ref_name, to) in targets {
-        if jobs.contains_key(to) || repo.has_object(ObjectType::Commit, to).await? {
+        if jobs.contains_key(to) || complete_here(repo, to).await? {
             continue;
         }
-        let from = source_commit(repo, ref_name, to, ref_prefix).await?;
+        let tip = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await?;
+        let from = source_commit(repo, tip, to).await?;
+        // A ref that names the target, which is here partial, leaves the
+        // from-scratch delta alone as a ref naming a complete commit does.
+        let scratch = from.is_none() && tip != Some(*to);
         if let Some(job) = discover_one(
             repo,
-            fetcher,
+            source,
             summary,
+            ref_name,
             from,
+            scratch,
             *to,
             opts,
             verification,
@@ -231,8 +272,9 @@ async fn complete_here(repo: &Repo, commit: &Checksum) -> Result<bool> {
         && repo.commit_state(commit).await? == CommitState::Normal)
 }
 
-/// The commit a from-to delta would patch against: the one the ref being pulled
-/// names in this repository, when this repository holds it complete.
+/// The commit a from-to delta would patch against: `tip`, the commit the ref
+/// being pulled names in this repository, when this repository holds it
+/// complete.
 ///
 /// A ref that names nothing, or names a commit whose objects are not all here,
 /// yields `None`, and the pull looks for a from-scratch delta instead: a delta
@@ -242,17 +284,188 @@ async fn complete_here(repo: &Repo, commit: &Checksum) -> Result<bool> {
 /// nothing.
 async fn source_commit(
     repo: &Repo,
-    ref_name: &str,
+    tip: Option<Checksum>,
     to: &Checksum,
-    ref_prefix: Option<&str>,
 ) -> Result<Option<Checksum>> {
-    let Some(current) = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await? else {
+    let Some(current) = tip else {
         return Ok(None);
     };
     if current == *to || !complete_here(repo, &current).await? {
         return Ok(None);
     }
     Ok(Some(current))
+}
+
+/// Where a pull reads a delta from.
+pub(crate) enum DeltaSource<'a> {
+    /// An HTTP remote, through the pull's fetcher.
+    Remote(&'a Fetcher),
+    /// Another local repository, read from its directory.
+    Local(&'a Repo),
+}
+
+impl DeltaSource<'_> {
+    /// Read a delta index or a superblock whole, under `cap`, or `None` when
+    /// the source does not hold it.
+    ///
+    /// The fetcher adds the bytes of a fetched body to the transferred count
+    /// itself. A local read adds its bytes to `progress` here.
+    async fn read(&self, path: &str, cap: u64, progress: &PullCounters) -> Result<Option<Vec<u8>>> {
+        match self {
+            DeltaSource::Remote(fetcher) => {
+                fetch_optional(fetcher, path, Priority::High, cap).await
+            }
+            DeltaSource::Local(repo) => {
+                let bytes = read_local(repo, path, cap).await?;
+                if let Some(bytes) = &bytes {
+                    progress.add_transferred(bytes.len() as u64);
+                }
+                Ok(bytes)
+            }
+        }
+    }
+}
+
+/// Open a regular file at `path` under `repo_fd`, and return it with its
+/// length, or `None` when it does not exist.
+///
+/// The open does not block, so a FIFO at the path is refused with every other
+/// file that is not a regular file, and no read waits on a writer.
+fn open_local_blocking(
+    repo_fd: BorrowedFd<'_>,
+    path: &str,
+) -> Result<Option<(std::fs::File, u64)>> {
+    let fd = match rustix::fs::openat(
+        repo_fd,
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(Error::from(e)),
+    };
+    let file = std::fs::File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::InvalidFormat(format!(
+            "{path} in the source repository is not a regular file"
+        )));
+    }
+    Ok(Some((file, meta.len())))
+}
+
+/// Open a regular file at `path` under the directory of `repo`, as
+/// [`open_local_blocking`] states.
+async fn open_local(repo: &Repo, path: &str) -> Result<Option<(std::fs::File, u64)>> {
+    let repo_fd = repo.repo_fd().try_clone_to_owned()?;
+    let path = path.to_owned();
+    ostrya_rt::unblock(move || open_local_blocking(repo_fd.as_fd(), &path)).await
+}
+
+/// Read a regular file at `path` under the directory of `repo` whole, under
+/// `cap`, or `None` when it does not exist. A file longer than `cap` is
+/// refused having read `cap` bytes and one more, and a file that is not a
+/// regular file is refused as [`open_local_blocking`] states.
+pub(crate) async fn read_local(repo: &Repo, path: &str, cap: u64) -> Result<Option<Vec<u8>>> {
+    let repo_fd = repo.repo_fd().try_clone_to_owned()?;
+    let path = path.to_owned();
+    ostrya_rt::unblock(move || {
+        use std::io::Read;
+        let Some((file, len)) = open_local_blocking(repo_fd.as_fd(), &path)? else {
+            return Ok(None);
+        };
+        let hint = len.min(cap) + 1;
+        let mut bytes = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
+        file.take(cap + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > cap {
+            return Err(Error::InvalidFormat(format!(
+                "{path} in the source repository exceeds the size ceiling of {cap} bytes"
+            )));
+        }
+        Ok(Some(bytes))
+    })
+    .await
+}
+
+/// The refusal of a pull that requires a static delta from a source that
+/// serves no summary, in the tool's words.
+pub(crate) fn no_summary_error() -> Error {
+    Error::Pull(
+        "Fetch configured to require static deltas, but no summary deltas or delta index \
+         found"
+            .into(),
+    )
+}
+
+/// The refusal of a pull that requires a static delta and finds none that
+/// produces `to` for `ref_name`, in the tool's words.
+fn none_found_error(ref_name: &str, to: &Checksum) -> Error {
+    Error::Pull(format!(
+        "Static deltas required, but none found for {ref_name} to {to}"
+    ))
+}
+
+/// Which delta an advertised map offers for one target commit.
+#[derive(Debug, PartialEq, Eq)]
+enum Choice {
+    /// Take the delta from `from`, `None` for the from-scratch delta, whose
+    /// superblock hashes to `digest`.
+    Take {
+        from: Option<Checksum>,
+        digest: Checksum,
+    },
+    /// The map names a from-scratch delta, which the pull leaves alone because
+    /// the ref names a commit held here.
+    Declined,
+    /// The map names no delta that produces the commit from what is here.
+    None,
+}
+
+/// Choose the delta to `to` that `map` offers, with `from` the commit the ref
+/// names here when this repository holds it complete, and `scratch` whether
+/// the from-scratch delta may be taken. [`discover_one`] states the order.
+async fn choose_delta(
+    repo: &Repo,
+    map: &Value,
+    from: Option<Checksum>,
+    scratch: bool,
+    to: &Checksum,
+) -> Result<Choice> {
+    if let Some(from) = from
+        && let Some(digest) = map_digest(map, &delta_name(Some(&from), to))?
+    {
+        return Ok(Choice::Take {
+            from: Some(from),
+            digest,
+        });
+    }
+    let suffix = format!("-{}", to.to_hex());
+    for entry in map.as_array().unwrap_or_default() {
+        let Some([key, value]) = entry.as_tuple() else {
+            continue;
+        };
+        let Some(name) = key.as_str() else {
+            continue;
+        };
+        let Some(candidate) = name
+            .strip_suffix(&suffix)
+            .and_then(|hex| Checksum::from_hex(hex).ok())
+        else {
+            continue;
+        };
+        if Some(candidate) != from && complete_here(repo, &candidate).await? {
+            return Ok(Choice::Take {
+                from: Some(candidate),
+                digest: entry_digest(name, value)?,
+            });
+        }
+    }
+    Ok(match map_digest(map, &delta_name(None, to))? {
+        Some(digest) if scratch => Choice::Take { from: None, digest },
+        Some(_) => Choice::Declined,
+        None => Choice::None,
+    })
 }
 
 /// What a remote states about the deltas it holds.
@@ -267,59 +480,79 @@ enum Advertisement {
     Nothing,
 }
 
-/// Find and read the delta from `from` to `to`, or `None` when the remote
-/// publishes none.
+/// Find and read the delta that produces `to`, or `None` when the pull fetches
+/// the objects loose.
+///
+/// `from` is the commit the pulled ref names here, when this repository holds it
+/// complete. `scratch` is set where the ref names no commit held complete and
+/// does not name `to`. Where the remote advertises a map, the delta taken is
+/// the first of these that the map names: `<from>-<to>`, then `<c>-<to>` for
+/// any commit `c` this repository holds complete, in map order, then the
+/// from-scratch `<to>` where `scratch` is set. The tool was observed to take a
+/// from-to delta from a commit it holds under no ref in the same way. Where
+/// nothing advertises a map, the delta from `from`, or from scratch where
+/// `from` is `None`, is asked for by name.
+///
+/// A pull that [requires](PullOptions::require_static_deltas) a delta and finds
+/// none is refused. A from-scratch delta the map names and the pull leaves
+/// alone, because the ref names a commit held here, complete or partial, counts
+/// as found, so that pull fetches loose. A superblock the map names and the
+/// remote does not hold counts as none.
 #[allow(clippy::too_many_arguments)]
 async fn discover_one(
     repo: &Repo,
-    fetcher: &Fetcher,
+    source: &DeltaSource<'_>,
     summary: Option<&Summary>,
+    ref_name: &str,
     from: Option<Checksum>,
+    scratch: bool,
     to: Checksum,
     opts: &PullOptions,
     verification: &Verification,
     progress: &PullCounters,
 ) -> Result<Option<DeltaJob>> {
-    let name = delta_name(from.as_ref(), &to);
     let advertised = match summary {
         None => Advertisement::Unlisted,
-        Some(summary) => match advertised_map(fetcher, summary, &to, progress).await? {
+        Some(summary) => match advertised_map(source, summary, &to, progress).await? {
             Some(map) => Advertisement::Map(map),
             None => Advertisement::Nothing,
         },
     };
-    if opts.require_static_deltas && !matches!(advertised, Advertisement::Map(_)) {
-        return Err(Error::Pull(format!(
-            "a static delta was required to pull {to}, but the remote advertises \
-             neither a delta index nor summary deltas"
-        )));
-    }
+    let none_found = || -> Result<Option<DeltaJob>> {
+        if opts.require_static_deltas {
+            return Err(none_found_error(ref_name, &to));
+        }
+        Ok(None)
+    };
 
-    let digest = match &advertised {
-        // A map that does not name this delta ends the search: the remote
-        // publishes deltas and none of them produces this commit from what is
-        // here, so the objects are fetched loose.
-        Advertisement::Map(map) => match map_digest(map, &name)? {
-            Some(digest) => Some(digest),
-            None => return Ok(None),
+    let (from, digest) = match &advertised {
+        Advertisement::Map(map) => match choose_delta(repo, map, from, scratch, &to).await? {
+            Choice::Take { from, digest } => (from, Some(digest)),
+            // A remote that publishes a from-scratch delta for this commit
+            // satisfies a requirement the pull does not act on: the objects
+            // the ref's commit already supplies are fetched loose instead.
+            Choice::Declined => return Ok(None),
+            Choice::None => return none_found(),
         },
         // Nothing states a digest, so the delta is asked for by name and its
         // superblock arrives unchecked against an advertisement. What it produces
         // is still checked object by object as the parts are applied.
-        Advertisement::Unlisted => None,
-        Advertisement::Nothing => return Ok(None),
+        Advertisement::Unlisted => (from, None),
+        Advertisement::Nothing => return none_found(),
     };
+    let name = delta_name(from.as_ref(), &to);
 
     let path = format!(
         "{}/{SUPERBLOCK_FILE}",
         delta_relative_dir(from.as_ref(), &to)
     );
     // A superblock the remote no longer holds is a stale advertisement, which
-    // leaves the objects to be fetched loose.
-    let fetched = fetch_optional(fetcher, &path, Priority::High, MAX_SUPERBLOCK).await?;
+    // leaves the objects to be fetched loose, unless the pull requires static
+    // deltas.
+    let fetched = source.read(&path, MAX_SUPERBLOCK, progress).await?;
     progress.metadata_fetched();
     let Some(bytes) = fetched else {
-        return Ok(None);
+        return none_found();
     };
     if let Some(expected) = digest {
         let actual = Checksum::sha256(&bytes);
@@ -436,14 +669,14 @@ async fn verify_fetched_delta(
 /// holds deltas but has never been reindexed answers 404 there and is read
 /// through the summary map instead.
 async fn advertised_map(
-    fetcher: &Fetcher,
+    source: &DeltaSource<'_>,
     summary: &Summary,
     to: &Checksum,
     progress: &PullCounters,
 ) -> Result<Option<Value>> {
     if indexed_deltas(summary) {
         let path = delta_index_relative_path(to);
-        let fetched = fetch_optional(fetcher, &path, Priority::High, MAX_METADATA_SIZE).await?;
+        let fetched = source.read(&path, MAX_METADATA_SIZE, progress).await?;
         progress.metadata_fetched();
         if let Some(bytes) = fetched {
             let ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
@@ -478,6 +711,11 @@ fn map_digest(map: &Value, name: &str) -> Result<Option<Checksum>> {
     let Some(entry) = map.dict_get(name) else {
         return Ok(None);
     };
+    entry_digest(name, entry).map(Some)
+}
+
+/// The superblock digest of the map entry `entry` for the delta `name`.
+fn entry_digest(name: &str, entry: &Value) -> Result<Checksum> {
     let bytes = entry
         .as_variant()
         .map(|(_, value)| value)
@@ -487,30 +725,34 @@ fn map_digest(map: &Value, name: &str) -> Result<Option<Checksum>> {
                 "the remote advertises static delta {name} with no superblock digest"
             ))
         })?;
-    Ok(Some(Checksum::from_ay(bytes)?))
+    Ok(Checksum::from_ay(bytes)?)
 }
 
-/// Fetch one part of a delta and apply it into the pull's transaction.
+/// Read one part of a delta from `source` and apply it into the pull's
+/// transaction.
 ///
 /// A part the superblock carries inline was checked at discovery, so it is
 /// decompressed and applied with no request.
 ///
-/// The part streams off the connection under the size the superblock declares for
-/// it and is hashed against the superblock's checksum for it; the verified body
-/// then decompresses into the random-access blob the operations read, which is on
-/// the heap while it is small and a mapped temp file when it is not. A remote that
-/// answers a part request with more than the part is, or with other bytes
-/// altogether, therefore writes at most the declared size before the refusal.
-/// Applying the blob produces the part's objects, each written under the checksum
-/// the superblock names, so a part that produces something else fails there.
+/// The part streams off the connection, or out of the source repository's part
+/// file, under the size the superblock declares for it and is hashed against
+/// the superblock's checksum for it; the verified body then decompresses into
+/// the random-access blob the operations read, which is on the heap while it is
+/// small and a mapped temp file when it is not. A remote that answers a part
+/// request with more than the part is, or with other bytes altogether, and a
+/// part file that grew or changed, therefore write at most the declared size
+/// before the refusal. Applying the blob produces the part's objects, each
+/// written under the checksum the superblock names, so a part that produces
+/// something else fails there.
 ///
 /// `checks` are the pull's mode checks, which every content object a part
 /// produces is held to exactly as a loose fetch of that object would be. A
-/// part fetched as a file adds one part and its declared size to `progress`
-/// once its body has passed the checksum.
-pub(crate) async fn fetch_part(
+/// part read as a file adds one part and its declared size to `progress`
+/// once its body has passed the checksum, and a part read from a local
+/// source adds that size to the transferred count as well.
+pub(crate) async fn apply_job_part(
     txn: &Transaction,
-    fetcher: &Fetcher,
+    source: &DeltaSource<'_>,
     job: &DeltaJob,
     index: usize,
     checks: ModeChecks,
@@ -529,6 +771,42 @@ pub(crate) async fn fetch_part(
         return apply_part(txn, payload.as_slice(), &entry.objects, &staging, checks).await;
     }
     let path = format!("{}/{index}", job.dir);
+    let staging = txn.staging_fd().try_clone_to_owned()?;
+    let blob = match source {
+        DeltaSource::Remote(fetcher) => fetch_part_blob(fetcher, &path, entry, &staging).await?,
+        DeltaSource::Local(repo) => {
+            let (file, len) = open_local(repo, &path).await?.ok_or_else(|| {
+                Error::InvalidFormat(format!(
+                    "static delta {}: the source repository holds no part {index}",
+                    job.name
+                ))
+            })?;
+            // A part file longer than the superblock declares is refused
+            // before any read, since the async reader reads ahead of what
+            // the declared-size limit lets it write.
+            if len > entry.size {
+                return Err(Error::InvalidFormat(format!(
+                    "static delta {}: part {index} holds {len} byte(s), past the {} \
+                     declared for it",
+                    job.name, entry.size
+                )));
+            }
+            let blob = decode_part_stream(RtFile::from(file), entry, &staging).await?;
+            progress.add_transferred(entry.size);
+            blob
+        }
+    };
+    progress.part_fetched(entry.size);
+    apply_part(txn, blob.as_slice(), &entry.objects, &staging, checks).await
+}
+
+/// Fetch the part file at `path` into a verified, decompressed blob.
+async fn fetch_part_blob(
+    fetcher: &Fetcher,
+    path: &str,
+    entry: &DeltaPart,
+    staging: &OwnedFd,
+) -> Result<Blob> {
     // The superblock states the part file's size, so the fetcher refuses a
     // `Content-Length` above it before the body arrives and stops a body that
     // passes it as the bytes land.
@@ -537,10 +815,9 @@ pub(crate) async fn fetch_part(
     let mut refetch = fetcher.refetching(FetchRequest {
         priority: Priority::High,
         max_size: Some(entry.size),
-        ..FetchRequest::path(&path)
+        ..FetchRequest::path(path)
     });
-    let staging = txn.staging_fd().try_clone_to_owned()?;
-    let blob = loop {
+    loop {
         let body = match refetch.fetch().await? {
             Fetched::Body(body) => body,
             Fetched::NotModified => {
@@ -549,13 +826,11 @@ pub(crate) async fn fetch_part(
                 )));
             }
         };
-        match decode_part_stream(body, entry, &staging).await {
-            Ok(blob) => break blob,
+        match decode_part_stream(body, entry, staging).await {
+            Ok(blob) => return Ok(blob),
             Err(e) => refetch.retry(e).await?,
         }
-    };
-    progress.part_fetched(entry.size);
-    apply_part(txn, blob.as_slice(), &entry.objects, &staging, checks).await
+    }
 }
 
 #[cfg(test)]

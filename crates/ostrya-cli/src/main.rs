@@ -1304,11 +1304,12 @@ struct PullArgs {
     #[arg(long, value_name = "REV", conflicts_with = "timestamp_check")]
     timestamp_check_from_rev: Option<String>,
     /// Fetch every object loose, ignoring any static delta the remote
-    /// advertises. This wins over --require-static-deltas.
+    /// advertises.
     #[arg(long)]
     disable_static_deltas: bool,
-    /// Refuse a remote that advertises no static delta at all.
-    #[arg(long)]
+    /// Refuse the pull when the remote serves no summary, or advertises no
+    /// static delta that produces a commit this repository does not hold.
+    #[arg(long, conflicts_with = "disable_static_deltas")]
     require_static_deltas: bool,
     /// Require a GPG signature on every commit the pull carries. Absent, the
     /// remote's `gpg-verify` applies (default true); `--gpg-verify` requires
@@ -1381,6 +1382,22 @@ struct PullLocalArgs {
     /// win over it.
     #[arg(long)]
     per_object_fsync: bool,
+    /// Require a GPG signature on every commit the pull carries, with the keys
+    /// of the remote --remote names.
+    #[arg(long)]
+    gpg_verify: bool,
+    /// Require a GPG signature on the summary of the source, with the keys of
+    /// the remote --remote names.
+    #[arg(long)]
+    gpg_verify_summary: bool,
+    /// Apply the static delta the summary of the source advertises for each
+    /// commit, and refuse the pull when there is none. The source must be an
+    /// archive repository with a summary.
+    #[arg(long, conflicts_with = "disable_static_deltas")]
+    require_static_deltas: bool,
+    /// Read no static delta. The pull reads none by default.
+    #[arg(long)]
+    disable_static_deltas: bool,
     /// The repository to pull from. Required; checked after the repository
     /// resolves, matching the tool's error-ordering
     /// (`docs/conformance/cli-surface.md`, "Global conventions").
@@ -2036,7 +2053,8 @@ fn detached_metadata_filter(repo: &Repo) -> Result<DetachedMetadataFilter> {
 /// Where a pull took its objects from, which decides the statistics line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullSource {
-    /// An HTTP remote.
+    /// An HTTP remote, or another local repository read as a fetch because the
+    /// pull requires static deltas.
     Http,
     /// Another local repository.
     Local,
@@ -2127,12 +2145,26 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
                 localcache_repos,
                 disable_fsync: args.disable_fsync,
                 per_object_fsync: args.per_object_fsync,
+                require_static_deltas: args.require_static_deltas,
+                disable_static_deltas: args.disable_static_deltas,
+                verify: PullVerify {
+                    gpg: args.gpg_verify.then_some(true),
+                    gpg_summary: args.gpg_verify_summary.then_some(true),
+                    ..PullVerify::default()
+                },
                 detached_metadata_filter: detached_metadata_filter(&repo)?,
                 ..PullOptions::default()
             },
         )
         .await?;
-    println!("{}", statistics_line(&stats, PullSource::Local));
+    // A pull that requires static deltas reads the source as a fetch, and the
+    // tool reports it in the words of a fetch.
+    let source = if args.require_static_deltas {
+        PullSource::Http
+    } else {
+        PullSource::Local
+    };
+    println!("{}", statistics_line(&stats, source));
     Ok(())
 }
 

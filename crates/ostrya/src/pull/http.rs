@@ -162,15 +162,17 @@
 //! instead of one request per object, which a pull looks for before it asks for
 //! the first object: the delta index for the target commit, then the summary's own
 //! `ostree.static-deltas` map where the remote serves no index. One delta is
-//! considered per tip -- from the commit the ref names in this repository, or from
-//! scratch where it names none -- and the superblock is checked against the digest
-//! the advertisement carried. The target commit rides in that superblock, so no
-//! `.commit` is requested; the objects the delta hands over loose are queued at
-//! once, two part fetches run at a time, and the commit's tree is walked once the
-//! last part is applied, so an object no part delivered is fetched loose.
+//! taken per tip -- from the commit the ref names in this repository, else from
+//! another commit held here complete, or from scratch where the ref names none --
+//! and the superblock is checked against the digest the advertisement carried.
+//! The target commit rides in that superblock, so no `.commit` is requested; the
+//! objects the delta hands over loose are queued at once, two part fetches run at
+//! a time, and the commit's tree is walked once the last part is applied, so an
+//! object no part delivered is fetched loose.
 //! [`disable_static_deltas`](PullOptions::disable_static_deltas) asks for no
 //! delta, and [`require_static_deltas`](PullOptions::require_static_deltas)
-//! refuses a remote that advertises none. What a delta costs in memory per part
+//! refuses a remote with no summary and a tip for which no advertised delta can
+//! be taken. What a delta costs in memory per part
 //! in flight is one xz decoder and two blobs: the verified part body, which is
 //! hashed against the superblock's entry for it before the decoder runs, and the
 //! payload it decompresses to. Each blob is on the heap while it is small and a
@@ -207,7 +209,7 @@ use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
-use super::delta::{self, DeltaJob, PART_CAP};
+use super::delta::{self, DeltaJob, DeltaSource, PART_CAP};
 use super::drive::Slots;
 use super::subpath::{Scope, Subpaths};
 use super::verify::{Defaults, Verification};
@@ -308,7 +310,7 @@ impl Repo {
         // request of its own.
         let deltas = delta::discover(
             self,
-            &fetcher,
+            &DeltaSource::Remote(&fetcher),
             summary.as_ref(),
             &targets,
             &opts,
@@ -612,9 +614,9 @@ impl Repo {
                     .deltas
                     .get(&part.commit)
                     .expect("a queued part belongs to a delta this pull found");
-                delta::fetch_part(
+                delta::apply_job_part(
                     ctx.txn,
-                    ctx.fetcher,
+                    &DeltaSource::Remote(ctx.fetcher),
                     job,
                     part.index,
                     ctx.checks,

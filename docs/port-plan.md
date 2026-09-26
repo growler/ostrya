@@ -2848,7 +2848,9 @@ transaction, so a failure publishes none of them and writes no ref. A commit's
 detached metadata is written as its objects are imported, ahead of the ref that
 names it, so a verifier never sees a commit whose signatures have not arrived;
 a failed pull can leave a `.commitmeta` for a commit it did not publish, which
-prune sweeps.
+prune sweeps. The local pull reads no static delta unless `require_static_deltas`
+is set, and then applies the deltas the source's summary advertises (Phase 17f,
+`pull-local`).
 
 The order is: resolve every requested ref in the source, check each tip's ref
 binding, follow each tip's parents to `depth`, write the commitpartial markers,
@@ -3433,17 +3435,27 @@ falls back to loose objects wherever a delta is not to be had. The write side of
 the advertisement lands here too: the summary's `ostree.static-deltas` map,
 deferred from 15b.
 
-Which delta a pull takes. Exactly one candidate per tip: `<from>-<to>`, where
-`from` is the commit the ref being pulled names in this repository, and the
-from-scratch `<to>` where the ref names none. A from-to delta patches against the
-source commit's objects, so the source commit has to be here complete; a ref
-whose commit is absent or partial, or which already names the target, is read as
-naming none. A repository holding the ref's commit therefore does not take a
-from-scratch delta, which would re-deliver every object of the target including
-the ones it holds -- what it is missing arrives loose instead. The tool was
-observed to make the same single choice: a client holding the ref's commit
-against a remote advertising only the from-scratch delta fetches loose, and a
-fresh client against a remote advertising only the from-to delta does the same.
+Which delta a pull takes. One delta per tip, the first of these the
+advertised map names: `<from>-<to>`, where `from` is the commit the ref being
+pulled names in this repository, then `<c>-<to>` for any other commit `c` this
+repository holds complete, in map order, then the from-scratch `<to>` where the
+ref names none. A from-to delta patches against the source commit's objects, so
+the source commit has to be here complete; a ref whose commit is absent or
+partial, or which already names the target, is read as naming none for a
+from-to delta. A repository whose ref names a commit it holds complete, or
+names the target it holds partial, does not take a from-scratch delta, which
+would re-deliver every object of the target including the ones it holds --
+what it is missing arrives loose instead. The tool was
+observed to choose the same way: a client holding a commit under no ref takes
+the from-to delta from it, a client whose ref names a commit against a remote
+advertising only the from-scratch delta fetches loose, and a fresh client
+against a remote advertising only a from-to delta finds none. The tool reads
+the ref alone for the from-scratch rule, so a ref naming another commit the
+client holds partial, or a commit it does not hold, also leaves the
+from-scratch delta alone there, where the port takes it. A remote serving no
+summary has no map, and the superblock of the ref's delta is asked for by name.
+A tip held complete is not looked for, and a tip held partial is looked for as
+one not held.
 
 Where a delta is advertised, in the order a pull reads them:
 `delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index` whenever the summary states
@@ -3517,14 +3529,20 @@ bare-user-only refusal in the destination's own terms rather than as the checksu
 mismatch the canonicalized write would produce.
 
 `PullOptions` grows `disable_static_deltas`, which asks for no delta at all, and
-`require_static_deltas`, which refuses a remote advertising none -- no summary, or
-a summary with neither an index nor the delta map. A remote that advertises deltas
-satisfies the requirement even where none of them produces the commit being
-pulled, and that pull fetches its objects loose; this is the tool's own rule,
-whose message names the same two sources ("no summary deltas or delta index
-found"). A tip whose commit object this repository already holds, complete or
-partial, is not looked for, so a pull with nothing to fetch is not refused, and `disable_static_deltas` wins over the
-requirement, since a pull that asks for no delta finds none to require.
+`require_static_deltas`. The requirement refuses a remote serving no summary,
+with the tool's `Fetch configured to require static deltas, but no summary
+deltas or delta index found`, before anything else is looked for. With a
+summary it refuses a tip for which the map names no delta the pull can take,
+and a tip whose delta's superblock the remote does not hold, with the tool's
+`Static deltas required, but none found for <ref> to <commit>`. A summary that
+lists no delta is refused in the same words. A from-scratch delta the map names
+and the pull leaves alone, because the ref names a commit held here, satisfies
+the requirement, and that pull fetches loose, as the tool does. A tip whose
+commit this repository already holds complete is not looked for, so a pull
+with nothing to fetch is not refused, and a tip it holds partial is looked for
+as one it does not hold. `disable_static_deltas` wins over the requirement,
+since a pull that asks for no delta finds none to require. The CLI refuses the
+two switches together.
 
 The plan grows a part class, drained after the commits and before the scan,
 fetched at high priority, and held to two in flight whatever
@@ -3580,8 +3598,11 @@ leaves an advertised from-scratch delta alone and fetches loose; a remote with n
 index falls back to the summary map; a remote with no summary is probed by name; a
 stale advertisement falls back to loose objects; a superblock that misses its
 advertised digest fails with `ChecksumMismatch`, leaves the ref where it was, and
-fetches no part; `require_static_deltas` refuses a remote advertising none and
-accepts one advertising a delta that does not cover the commit; `disable_static_deltas`
+fetches no part; `require_static_deltas` refuses a remote with no summary, a
+summary listing no delta, a summary naming no delta the destination can take,
+and a stale advertisement, and accepts a from-scratch delta the destination's
+ref declines, which pulls loose; a destination holding a commit under no ref
+takes the from-to delta from it; `disable_static_deltas`
 asks for neither the index nor a superblock; a multi-part delta (`max_chunk_size`
 of one byte, one object per part) has every part fetched and applied; a delta
 whose largest object went to a fallback has that object fetched loose; two
@@ -6602,10 +6623,12 @@ subpath pull is applied whole, as the tool applies one into `bare-user`. Into
 `archive` a subpath pull takes no delta and fetches the subpaths loose, as the
 tool does, unless `require_static_deltas` is set, where the port takes the
 delta and the tool refuses any delta into `archive`. Delta discovery skips a
-commit whose object the destination already holds, partial as well as complete,
-for every pull, with or without subpaths: the tool fetches what such a commit
-is missing loose, and so a pull without subpaths after a subpath pull or a
-commit-only pull fetches loose too, which changes the requests and no byte. The
+commit the destination already holds complete, for every pull, with or without
+subpaths. A commit it holds partial is looked for as one it does not hold, as
+the tool does: after a subpath pull or a commit-only pull the ref names that
+commit, so a later pull leaves an advertised from-scratch delta alone and
+fetches what is missing loose, and from a remote with no summary it asks for
+the from-scratch delta by name and applies it whole. The
 CLI maps `--untrusted` to `PullFlags::UNTRUSTED`, which an HTTP
 pull does not read, and reads `--http-trusted` and discards it.
 
@@ -6706,6 +6729,68 @@ into `bare-user-only`; and the terminal progress line. The work adds 11 `m10`
 cells, of which 4 are executable and all pass, and makes three `pull-local`
 cells compare the whole line; the conformance run reports 1113 cells and 445
 passes (the M10 family 442).
+
+`pull-local` takes `--gpg-verify`, `--gpg-verify-summary`,
+`--require-static-deltas`, and `--disable-static-deltas`. The GPG pair sets
+`PullVerify::gpg` and `PullVerify::gpg_summary`, which the local pull already
+read. The delta pair needs the library: `Repo::pull_local` reads no delta by
+default, and under `require_static_deltas` it reads the source the way an HTTP
+pull reads a remote. It reads the source's summary and checks its signature,
+refuses a source with no summary and then a source outside archive mode,
+resolves the refs, and finds each delta with the selection of the HTTP pull.
+All of this comes before it walks the commit chains and checks their
+signatures, which is the order the tool refuses in, and before the
+transaction opens, so a refusal writes no object, no ref, and no marker. `pull/delta.rs` reads the index, the
+superblock, and each part through a `DeltaSource`, which is the pull's
+fetcher or the source repository's directory. A local read opens the file
+with `O_NONBLOCK` and refuses a file that is not a regular file, and it reads a
+part under the size the superblock declares, as the fetch does, and refuses a
+part file longer than that size before it reads it. The local pull reads
+`summary` and `summary.sig` in the same way, under the 64 MiB summary cap.
+After a delta is applied, the import walk reads each dirtree the delta staged
+from the transaction's staging directory. Inside the
+transaction each delta is applied one part at a time, its commit is staged
+from the superblock, and the import walk then imports what no part produced
+and each `.commitmeta`. The statistics of such a pull are those of a fetch,
+counted from the files the pull read, and the CLI prints the HTTP forms of the
+line, which agree with the tool for the from-scratch delta, a from-to delta,
+an inline delta, a delta with a fallback object, a declined from-scratch
+delta, and a commit-only pull.
+
+Observation corrected the `require_static_deltas` rule the HTTP pull carried.
+The tool refuses a commit it does not hold where no advertised delta can be
+taken, and a summary that lists no delta, with `Static deltas required, but
+none found for <ref> to <commit>`; only a remote with no summary gets `Fetch
+configured to require static deltas, but no summary deltas or delta index
+found`. The same observation showed that the tool takes a from-to delta from
+any commit the destination holds complete, under a ref or not, so the port's
+delta selection reads the whole map for such a commit, over HTTP and from a
+local source. A from-scratch delta the ref's commit declines still satisfies
+the switch and the pull fetches loose, in both. The failing tests landed first
+(`required_deltas_refuse_a_summary_naming_no_usable_delta` and four more in
+`pull_http.rs`). Observation also showed that the tool looks for a delta for a
+commit the destination holds partial as for one it does not hold, so both
+pulls skip discovery only for a commit held complete
+(`a_required_delta_pull_of_a_partial_commit_looks_for_a_delta` in
+`pull_local.rs` and `required_deltas_look_for_a_delta_for_a_commit_held_partial`
+in `pull_http.rs`).
+
+Five decisions were taken without the maintainer and are open to reversal: the
+GPG switches of `pull-local` take no value, since the valued form of `pull`
+would read `--gpg-verify=false` as off where the tool turns the check on; a
+delta into `archive` is applied, as over HTTP, where the tool refuses; the two
+delta switches together are refused through `clap` on `pull` and `pull-local`,
+where the tool ends on an assertion; a superblock the summary names and the
+source does not hold is refused with the none-found words; and the refusals
+keep the port's words, with the tool's delta words behind `pull: `. A source
+outside archive mode is refused, as the tool refuses it, with the port's
+words. Five divergences are recorded in `cli-surface.md`, "P2", `pull-local`:
+the value suffix, a delta into `archive`, both switches, the delta index on a
+repeat pull, and the loose count under `--depth`; and two in "P2", `pull`:
+both switches, and the from-scratch rule for a ref naming another commit held
+partial, or a commit not held. The work adds 14 `m10` cells, of which 7 are executable
+and 6 pass; the seventh, both switches, skips where the tool aborts. The
+conformance run reports 1127 cells and 451 passes (the M10 family 448).
 
 #### Phase 17g -- P3 commands with no matrix weight
 

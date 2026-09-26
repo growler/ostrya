@@ -510,15 +510,12 @@ fn sign_key_store_refuses_a_fifo_by_name() {
 /// cannot decide an allocation.
 #[test]
 fn sign_key_store_refuses_an_oversized_file_by_name() {
-    /// The ceiling `sign.rs` holds every key file to.
-    const MAX_KEY_FILE: u64 = 1024 * 1024;
-
     let tmp = TmpDir::new("ed25519-store-size");
     let root = tmp.path();
 
     std::fs::File::create(root.join("revoked.ed25519"))
         .unwrap()
-        .set_len(MAX_KEY_FILE + 1)
+        .set_len(ostrya::sign::MAX_KEY_FILE + 1)
         .unwrap();
 
     let err = load_sign_keys_from(&[root], "ed25519").unwrap_err();

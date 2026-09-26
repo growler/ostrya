@@ -8043,7 +8043,9 @@ async fn summary_extension_signers(
         SignType::Ed25519 => summary_secret_keys(args)?
             .iter()
             .map(|key| {
-                Ed25519Signer::from_base64(key).map(|signer| Box::new(signer) as Box<dyn Signer>)
+                Ed25519Signer::from_base64(key)
+                    .map(|signer| Box::new(signer) as Box<dyn Signer>)
+                    .map_err(Error::from)
             })
             .collect(),
         SignType::Spki => summary_signers_spki(args),
@@ -8055,7 +8057,11 @@ async fn summary_extension_signers(
 fn summary_signers_spki(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
     summary_secret_keys(args)?
         .iter()
-        .map(|key| SpkiSigner::from_base64(key).map(|signer| Box::new(signer) as Box<dyn Signer>))
+        .map(|key| {
+            SpkiSigner::from_base64(key)
+                .map(|signer| Box::new(signer) as Box<dyn Signer>)
+                .map_err(Error::from)
+        })
         .collect()
 }
 

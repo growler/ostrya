@@ -55,7 +55,8 @@ use pgp::crypto::public_key::PublicKeyAlgorithm;
 use pgp::packet::{PublicKey, Signature, SignatureType, SubpacketData};
 use pgp::types::{Fingerprint, KeyDetails, SignedUser, Tag, Timestamp};
 
-use crate::error::{Error, Result};
+use ostrya_sign::{Error, Result};
+
 use crate::sign::{SignatureInfo, VerifyOutcome};
 
 /// The ceiling on one stored signature blob, whose whole content is parsed in

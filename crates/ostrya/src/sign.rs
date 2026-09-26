@@ -1,5 +1,11 @@
 //! Commit signing framework and the dummy test engine (Phase 13a).
 //!
+//! The engines, the [`Signer`] and [`Verifier`] traits, [`SignKeys`], and the
+//! key reader are items of the `ostrya-sign` crate, re-exported here with its
+//! [`Error`] and [`Result`]. This module adds the repository side: the
+//! `impl Repo` entry points, the system key store readers
+//! ([`load_sign_keys`], [`load_sign_keys_from`]), and [`FromSystemKeys`].
+//!
 //! [`Signer`] and [`Verifier`] are the engine-agnostic surface: a signer names
 //! its engine and its detached-metadata key and signs an opaque byte payload; a
 //! verifier checks a set of signature blobs against a payload and reports a
@@ -34,105 +40,19 @@
 //! a system search path -- parameterized by sign-type name so the spki engine
 //! reuses it; a verifier trusts the loaded set minus the revoked set.
 
-use std::collections::HashSet;
-use std::future::Future;
-use std::io::Read;
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 
-use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
-use ostrya_core::{Checksum, ObjectType, Type, Value, base64};
-use rustix::fs::{FileType, Mode, OFlags};
+use ostrya_core::{Checksum, ObjectType, Value, base64};
+use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::error::{Error, Result};
 use crate::repo::Repo;
 
-/// The GVariant type of a per-engine signature array in the detached-metadata
-/// dict: an array of signature blobs.
-const SIGNATURE_ARRAY_SIGNATURE: &str = "aay";
-
-/// The future returned by [`Signer::sign`]. A boxed future keeps `Signer`
-/// dyn-compatible, so [`Repo::sign_commit`] can take `&dyn Signer`; each engine
-/// decides internally whether to offload heavy work to the blocking pool.
-pub type SignFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
-
-/// The future returned by [`Verifier::verify`]. A boxed future keeps `Verifier`
-/// dyn-compatible, so [`Repo::verify_commit`] can take `&dyn Verifier`; an
-/// engine that delegates to an external helper awaits it internally, while the
-/// in-process engines resolve immediately.
-pub type VerifyFuture<'a> = Pin<Box<dyn Future<Output = Result<VerifyOutcome>> + Send + 'a>>;
-
-/// An engine that produces a detached signature over an opaque payload.
-pub trait Signer: Send + Sync {
-    /// The engine's short name (`"ed25519"`, `"spki"`, `"gpg"`, `"dummy"`).
-    fn name(&self) -> &str;
-
-    /// The detached-metadata dict key the engine's signatures accumulate under
-    /// (for example `"ostree.sign.dummy"`).
-    fn metadata_key(&self) -> &str;
-
-    /// Sign `data`, yielding one signature blob.
-    fn sign<'a>(&'a self, data: &'a [u8]) -> SignFuture<'a>;
-}
-
-/// An engine that checks detached signatures over an opaque payload.
-pub trait Verifier: Send + Sync {
-    /// The detached-metadata dict key whose `aay` value holds the blobs this
-    /// verifier consumes.
-    fn metadata_key(&self) -> &str;
-
-    /// Verify `signatures` against `data`. The outcome is valid when at least
-    /// one blob verifies; the per-signature detail is reported in
-    /// [`VerifyOutcome::signatures`].
-    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a>;
-}
-
-/// The result of verifying a payload against one or more engines.
-#[derive(Debug, Clone, Default)]
-pub struct VerifyOutcome {
-    /// Whether at least one signature verified.
-    pub valid: bool,
-    /// One entry per signature blob examined, in the order examined.
-    pub signatures: Vec<SignatureInfo>,
-}
-
-/// Per-signature detail. The fields mirror the documented GPG verify result;
-/// engines without a notion of a field leave it unset.
-#[derive(Debug, Clone, Default)]
-pub struct SignatureInfo {
-    /// Whether this signature verified.
-    pub valid: bool,
-    /// The signing key fingerprint, when the engine exposes one.
-    pub fingerprint: Option<String>,
-    /// The primary-key fingerprint of the signer's certificate, when the
-    /// signing key is a subkey (GPG). Equal to [`fingerprint`](Self::fingerprint)
-    /// when the primary key signed.
-    pub primary_fingerprint: Option<String>,
-    /// The signature creation time (seconds since the Unix epoch), when known.
-    pub created: Option<u64>,
-    /// The signature expiry time (seconds since the Unix epoch), when the
-    /// signature carries one.
-    pub expires: Option<u64>,
-    /// The signing key's expiry time (seconds since the Unix epoch), when the
-    /// key carries one and it has passed.
-    pub key_expires: Option<u64>,
-    /// Whether the signing key had expired.
-    pub expired: bool,
-    /// Whether the signing key was revoked.
-    pub revoked: bool,
-    /// Whether the signing key was absent from the trusted set.
-    pub key_missing: bool,
-    /// The public-key algorithm name, when the engine exposes one (GPG).
-    pub pubkey_algorithm: Option<String>,
-    /// The digest algorithm name, when the engine exposes one (GPG).
-    pub hash_algorithm: Option<String>,
-    /// The signer's user name, when the engine exposes one.
-    pub user_name: Option<String>,
-    /// The signer's user email, when the engine exposes one.
-    pub user_email: Option<String>,
-}
+pub use ostrya_sign::{
+    DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, Error, MAX_KEY_FILE, Result,
+    SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome,
+    append_signature, key_text, read_key_file, read_key_source,
+};
 
 impl Repo {
     /// Sign the commit `checksum` with `signer` and append the signature to the
@@ -149,7 +69,7 @@ impl Repo {
     /// under, so signing one commit from several tasks at a time keeps every
     /// signature. The guard reaches this process alone: two processes signing
     /// one commit at the same time can drop a signature.
-    pub async fn sign_commit(&self, checksum: &Checksum, signer: &dyn Signer) -> Result<()> {
+    pub async fn sign_commit(&self, checksum: &Checksum, signer: &dyn Signer) -> crate::Result<()> {
         let data = self.load_object_bytes(ObjectType::Commit, checksum).await?;
         let signature = signer.sign(&data).await?;
         let fsync = self.config().fsync()?;
@@ -173,7 +93,7 @@ impl Repo {
         &self,
         checksum: &Checksum,
         verifiers: &[&dyn Verifier],
-    ) -> Result<VerifyOutcome> {
+    ) -> crate::Result<VerifyOutcome> {
         let data = self.load_object_bytes(ObjectType::Commit, checksum).await?;
         let dict = self.read_commit_detached_metadata(checksum).await?;
         let mut outcome = VerifyOutcome::default();
@@ -216,7 +136,7 @@ impl Repo {
         checksum: &Checksum,
         metadata_key: &str,
         remove: impl FnMut(&[u8], &[u8]) -> bool + Send + 'static,
-    ) -> Result<usize> {
+    ) -> crate::Result<usize> {
         let payload = self.load_object_bytes(ObjectType::Commit, checksum).await?;
         let fsync = self.config().fsync()?;
         self.prune_commit_detached_signatures(
@@ -227,57 +147,6 @@ impl Repo {
             fsync,
         )
         .await
-    }
-}
-
-/// Append `signature` to the `metadata_key` engine's `aay` array in the `a{sv}`
-/// dict `dict`, creating the entry when absent and preserving insertion order.
-/// Other entries, including other engines' signature arrays, are left in place.
-pub(crate) fn append_signature(
-    dict: &mut Value,
-    metadata_key: &str,
-    signature: Vec<u8>,
-) -> Result<()> {
-    let entries = match dict {
-        Value::Array(entries) => entries,
-        _ => {
-            return Err(Error::InvalidFormat(
-                "detached metadata must be an a{sv} dict".into(),
-            ));
-        }
-    };
-    for entry in entries.iter_mut() {
-        if let Value::Tuple(fields) = entry
-            && let [key, value] = fields.as_mut_slice()
-            && key.as_str() == Some(metadata_key)
-        {
-            return push_blob(value, signature);
-        }
-    }
-    let array_type = Type::parse(SIGNATURE_ARRAY_SIGNATURE).map_err(ostrya_core::Error::from)?;
-    let value = Value::variant(array_type, Value::Array(vec![Value::Bytes(signature)]));
-    entries.push(Value::Tuple(vec![
-        Value::Str(metadata_key.to_owned()),
-        value,
-    ]));
-    Ok(())
-}
-
-/// Push a signature blob onto an existing engine value, an `aay` wrapped in the
-/// `a{sv}` variant.
-fn push_blob(value: &mut Value, signature: Vec<u8>) -> Result<()> {
-    let array = match value {
-        Value::Variant(inner) => &mut inner.1,
-        other => other,
-    };
-    match array {
-        Value::Array(blobs) => {
-            blobs.push(Value::Bytes(signature));
-            Ok(())
-        }
-        _ => Err(Error::InvalidFormat(
-            "detached-metadata signature value is not an array".into(),
-        )),
     }
 }
 
@@ -310,11 +179,11 @@ pub(crate) fn remove_signatures(
     metadata_key: &str,
     payload: &[u8],
     remove: &mut dyn FnMut(&[u8], &[u8]) -> bool,
-) -> Result<usize> {
+) -> crate::Result<usize> {
     let entries = match dict {
         Value::Array(entries) => entries,
         _ => {
-            return Err(Error::InvalidFormat(
+            return Err(crate::Error::InvalidFormat(
                 "detached metadata must be an a{sv} dict".into(),
             ));
         }
@@ -331,7 +200,7 @@ pub(crate) fn remove_signatures(
                 other => other,
             };
             let Value::Array(blobs) = array else {
-                return Err(Error::InvalidFormat(
+                return Err(crate::Error::InvalidFormat(
                     "detached-metadata signature value is not an array".into(),
                 ));
             };
@@ -357,250 +226,50 @@ pub(crate) fn remove_signatures(
     Ok(removed)
 }
 
-/// The test-only dummy signer. Its signature is the raw bytes of its key
-/// identifier and does not depend on the payload; the secret and public key are
-/// the same byte string (`format-reference.md`, "Signing details").
-#[derive(Debug, Clone)]
-pub struct DummySigner {
-    key: Vec<u8>,
-}
-
-impl DummySigner {
-    /// A dummy signer whose signature is the bytes of `key`.
-    pub fn new(key: impl Into<Vec<u8>>) -> DummySigner {
-        DummySigner { key: key.into() }
-    }
-}
-
-impl Signer for DummySigner {
-    fn name(&self) -> &str {
-        "dummy"
-    }
-
-    fn metadata_key(&self) -> &str {
-        "ostree.sign.dummy"
-    }
-
-    fn sign<'a>(&'a self, _data: &'a [u8]) -> SignFuture<'a> {
-        let signature = self.key.clone();
-        Box::pin(async move { Ok(signature) })
-    }
-}
-
-/// The test-only dummy verifier. A signature verifies when its bytes equal one
-/// of the trusted key byte strings.
-#[derive(Debug, Clone)]
-pub struct DummyVerifier {
-    trusted: Vec<Vec<u8>>,
-}
-
-impl DummyVerifier {
-    /// A dummy verifier trusting each key in `keys`.
-    pub fn new<K, I>(keys: I) -> DummyVerifier
-    where
-        K: Into<Vec<u8>>,
-        I: IntoIterator<Item = K>,
-    {
-        DummyVerifier {
-            trusted: keys.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-impl Verifier for DummyVerifier {
-    fn metadata_key(&self) -> &str {
-        "ostree.sign.dummy"
-    }
-
-    fn verify<'a>(&'a self, _data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
-        let mut outcome = VerifyOutcome::default();
-        for signature in signatures {
-            let valid = self.trusted.iter().any(|key| key == signature);
-            outcome.valid |= valid;
-            outcome.signatures.push(SignatureInfo {
-                valid,
-                key_missing: !valid,
-                ..SignatureInfo::default()
-            });
-        }
-        Box::pin(async move { Ok(outcome) })
-    }
-}
-
-/// The ed25519 sign-type name, used both as the engine name and as the base
-/// name of its key-store files (`trusted.ed25519`, `revoked.ed25519`).
-const ED25519_SIGN_TYPE: &str = "ed25519";
-/// The ed25519 engine's detached-metadata dict key.
-const ED25519_METADATA_KEY: &str = "ostree.sign.ed25519";
-/// The raw byte length of an ed25519 public key.
-const ED25519_PUBLIC_KEY_LEN: usize = 32;
-/// The raw byte length of an ed25519 secret key (seed followed by public key).
-const ED25519_SECRET_KEY_LEN: usize = 64;
-
-/// The ed25519 commit-signing engine.
-///
-/// The secret key is the 64-byte seed-plus-public-key form the tool uses;
-/// [`from_keypair_bytes`](SigningKey::from_keypair_bytes) checks that the stored
-/// public half matches the seed. Signing is deterministic (RFC 8032), so it
-/// needs no RNG and completes in-task without offloading to the blocking pool.
-#[derive(Debug, Clone)]
-pub struct Ed25519Signer {
-    signing_key: SigningKey,
-}
-
-impl Ed25519Signer {
-    /// Build a signer from a 64-byte secret key (32-byte seed followed by the
-    /// 32-byte public key). Accepts the raw bytes or an `ay` payload.
-    pub fn from_secret_key(secret: &[u8]) -> Result<Ed25519Signer> {
-        let bytes: [u8; ED25519_SECRET_KEY_LEN] = secret.try_into().map_err(|_| {
-            Error::Signature(format!(
-                "ed25519 secret key must be {ED25519_SECRET_KEY_LEN} bytes, got {}",
-                secret.len()
-            ))
-        })?;
-        let signing_key = SigningKey::from_keypair_bytes(&bytes)
-            .map_err(|e| Error::Signature(format!("ed25519 secret key: {e}")))?;
-        Ok(Ed25519Signer { signing_key })
-    }
-
-    /// Build a signer from a base64-encoded 64-byte secret key. Surrounding
-    /// whitespace (a trailing newline from a key file) is ignored.
-    pub fn from_base64(secret_b64: &str) -> Result<Ed25519Signer> {
-        Ed25519Signer::from_secret_key(&base64::decode(secret_b64.trim())?)
-    }
-}
-
-impl Signer for Ed25519Signer {
-    fn name(&self) -> &str {
-        ED25519_SIGN_TYPE
-    }
-
-    fn metadata_key(&self) -> &str {
-        ED25519_METADATA_KEY
-    }
-
-    fn sign<'a>(&'a self, data: &'a [u8]) -> SignFuture<'a> {
-        let signature = self.signing_key.sign(data).to_bytes().to_vec();
-        Box::pin(async move { Ok(signature) })
-    }
-}
-
-/// The ed25519 commit-verifying engine, holding the effective trusted key set.
-///
-/// A signature verifies when any trusted key accepts it. Verification uses the
-/// lenient (cofactored) equation, matching the acceptance the tool's libsodium
-/// backend applies, so a valid signature written by either side verifies on the
-/// other.
-#[derive(Debug, Clone)]
-pub struct Ed25519Verifier {
-    trusted: Vec<VerifyingKey>,
-}
-
-impl Ed25519Verifier {
-    /// Build a verifier trusting each key in `trusted` except those also in
-    /// `revoked`. Keys are 32-byte public keys, as raw bytes or `ay` payloads.
-    /// A trusted key that is not a valid curve point is an error; a revoked key
-    /// need only match by bytes and is not validated as a point.
-    pub fn new<T, R>(trusted: T, revoked: R) -> Result<Ed25519Verifier>
-    where
-        T: IntoIterator,
-        T::Item: AsRef<[u8]>,
-        R: IntoIterator,
-        R::Item: AsRef<[u8]>,
-    {
-        let revoked: HashSet<[u8; ED25519_PUBLIC_KEY_LEN]> = revoked
-            .into_iter()
-            .map(|k| ed25519_public_bytes(k.as_ref()))
-            .collect::<Result<_>>()?;
-        let mut keys = Vec::new();
-        for key in trusted {
-            let raw = ed25519_public_bytes(key.as_ref())?;
-            if revoked.contains(&raw) {
-                continue;
-            }
-            let vk = VerifyingKey::from_bytes(&raw)
-                .map_err(|e| Error::Signature(format!("ed25519 public key: {e}")))?;
-            keys.push(vk);
-        }
-        Ok(Ed25519Verifier { trusted: keys })
-    }
-
-    /// Build a verifier from a loaded [`SignKeys`] set (trusted minus revoked).
-    pub fn from_sign_keys(keys: SignKeys) -> Result<Ed25519Verifier> {
-        Ed25519Verifier::new(keys.trusted, keys.revoked)
-    }
-
-    /// Build a verifier from the system sign-api key store: `trusted.ed25519`
-    /// and `revoked.ed25519` and their `.d` directories under the system search
-    /// path (see [`load_sign_keys`]).
-    pub fn from_system_keys() -> Result<Ed25519Verifier> {
-        Ed25519Verifier::from_sign_keys(load_sign_keys(ED25519_SIGN_TYPE)?)
-    }
-
-    /// Whether the effective trusted set is empty: no key was given, or the
-    /// revoked set removed every one. Such a verifier refuses every signature.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.trusted.is_empty()
-    }
-}
-
-impl Verifier for Ed25519Verifier {
-    fn metadata_key(&self) -> &str {
-        ED25519_METADATA_KEY
-    }
-
-    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
-        let mut outcome = VerifyOutcome::default();
-        for blob in signatures {
-            let valid = match <[u8; 64]>::try_from(blob.as_slice()) {
-                Ok(sig_bytes) => {
-                    let sig = Signature::from_bytes(&sig_bytes);
-                    self.trusted.iter().any(|k| k.verify(data, &sig).is_ok())
-                }
-                // A blob that is not 64 bytes cannot be an ed25519 signature.
-                Err(_) => false,
-            };
-            outcome.valid |= valid;
-            outcome.signatures.push(SignatureInfo {
-                valid,
-                key_missing: !valid,
-                ..SignatureInfo::default()
-            });
-        }
-        Box::pin(async move { Ok(outcome) })
-    }
-}
-
-/// Interpret a byte slice as a 32-byte ed25519 public key.
-fn ed25519_public_bytes(key: &[u8]) -> Result<[u8; ED25519_PUBLIC_KEY_LEN]> {
-    key.try_into().map_err(|_| {
-        Error::Signature(format!(
-            "ed25519 public key must be {ED25519_PUBLIC_KEY_LEN} bytes, got {}",
-            key.len()
-        ))
-    })
-}
-
-/// The trusted and revoked key sets loaded from a sign-api key store, as raw
-/// decoded key bytes. The engine that consumes them validates their length.
-#[derive(Debug, Clone, Default)]
-pub struct SignKeys {
-    /// Keys from the `trusted.<type>` files and directories.
-    pub trusted: Vec<Vec<u8>>,
-    /// Keys from the `revoked.<type>` files and directories.
-    pub revoked: Vec<Vec<u8>>,
-}
-
 /// The system directories searched for sign-api keys, in order. The second is
 /// `<datadir>/ostree`.
 const SYSTEM_KEY_ROOTS: [&str; 2] = ["/etc/ostree", "/usr/share/ostree"];
 
 /// Load the sign-api key store for `sign_type` from the system search path
 /// (`/etc/ostree` and `/usr/share/ostree`).
-pub fn load_sign_keys(sign_type: &str) -> Result<SignKeys> {
+pub fn load_sign_keys(sign_type: &str) -> crate::Result<SignKeys> {
     let roots: Vec<PathBuf> = SYSTEM_KEY_ROOTS.iter().map(PathBuf::from).collect();
     let refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
     load_sign_keys_from(&refs, sign_type)
+}
+
+/// A verifier built from the system sign-api key store.
+///
+/// The engines come from `ostrya-sign`, which holds no system search path, so
+/// the constructor is an extension trait here. A caller brings the trait into
+/// scope to call it.
+pub trait FromSystemKeys: Sized {
+    /// Build a verifier from the system sign-api key store: `trusted.<type>`
+    /// and `revoked.<type>` and their `.d` directories under the system search
+    /// path (see [`load_sign_keys`]), where `<type>` is the sign-type name of
+    /// the engine.
+    fn from_system_keys() -> crate::Result<Self>;
+}
+
+impl FromSystemKeys for Ed25519Verifier {
+    /// Build a verifier from the system sign-api key store: `trusted.ed25519`
+    /// and `revoked.ed25519` and their `.d` directories under the system search
+    /// path (see [`load_sign_keys`]).
+    fn from_system_keys() -> crate::Result<Ed25519Verifier> {
+        Ok(Ed25519Verifier::from_sign_keys(load_sign_keys("ed25519")?)?)
+    }
+}
+
+#[cfg(feature = "sign-spki")]
+impl FromSystemKeys for crate::spki::SpkiVerifier {
+    /// Build a verifier from the system sign-api key store: `trusted.spki` and
+    /// `revoked.spki` and their `.d` directories under the system search path
+    /// (see [`load_sign_keys`]).
+    fn from_system_keys() -> crate::Result<crate::spki::SpkiVerifier> {
+        Ok(crate::spki::SpkiVerifier::from_sign_keys(load_sign_keys(
+            "spki",
+        )?)?)
+    }
 }
 
 /// Load the sign-api key store for `sign_type` from the given search roots.
@@ -614,7 +283,7 @@ pub fn load_sign_keys(sign_type: &str) -> Result<SignKeys> {
 /// Every file is read under the rule `read_key_source` states: only a regular
 /// file, and only up to `MAX_KEY_FILE`. A path of another kind and a file over
 /// the ceiling are each refused by that file's own name.
-pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> Result<SignKeys> {
+pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> crate::Result<SignKeys> {
     let mut keys = SignKeys::default();
     for root in roots {
         collect_keys(root, &format!("trusted.{sign_type}"), &mut keys.trusted)?;
@@ -624,7 +293,7 @@ pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> Result<SignKeys>
 }
 
 /// Read `<root>/<base>` and every file in `<root>/<base>.d/` into `out`.
-fn collect_keys(root: &Path, base: &str, out: &mut Vec<Vec<u8>>) -> Result<()> {
+fn collect_keys(root: &Path, base: &str, out: &mut Vec<Vec<u8>>) -> crate::Result<()> {
     read_key_lines(&root.join(base), out)?;
     let dir = root.join(format!("{base}.d"));
     let entries = match std::fs::read_dir(&dir) {
@@ -648,7 +317,7 @@ fn collect_keys(root: &Path, base: &str, out: &mut Vec<Vec<u8>>) -> Result<()> {
 
 /// Read one base64-per-line key file of the store into `out`, under the rule
 /// [`read_key_source`] states. A missing file is not an error.
-fn read_key_lines(path: &Path, out: &mut Vec<Vec<u8>>) -> Result<()> {
+fn read_key_lines(path: &Path, out: &mut Vec<Vec<u8>>) -> crate::Result<()> {
     let subject = format!("the key file '{}'", path.display());
     let Some(bytes) = read_key_path(path, &subject, MAX_KEY_FILE)? else {
         return Ok(());
@@ -663,14 +332,14 @@ fn read_key_lines(path: &Path, out: &mut Vec<Vec<u8>>) -> Result<()> {
     Ok(())
 }
 
-/// The ceiling on one key file, whose whole content is read into memory. A
-/// mebibyte holds some twenty thousand base64 ed25519 keys.
-pub(crate) const MAX_KEY_FILE: u64 = 1024 * 1024;
-
 /// Read the key source at `path` whole, up to `ceiling`, or `None` where no file
 /// is there. `subject` is what a refusal names the source by, so an operator can
 /// find the entry that named it.
-pub(crate) fn read_key_path(path: &Path, subject: &str, ceiling: u64) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_key_path(
+    path: &Path,
+    subject: &str,
+    ceiling: u64,
+) -> crate::Result<Option<Vec<u8>>> {
     // `NONBLOCK` so a fifo answers the open rather than waiting for a writer.
     // On a regular file the flag has no effect on the read below.
     let fd = match rustix::fs::open(
@@ -680,55 +349,15 @@ pub(crate) fn read_key_path(path: &Path, subject: &str, ceiling: u64) -> Result<
     ) {
         Ok(fd) => fd,
         Err(Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(Error::Signature(format!("{subject} cannot be opened: {e}"))),
+        Err(e) => {
+            return Err(crate::Error::Signature(format!(
+                "{subject} cannot be opened: {e}"
+            )));
+        }
     };
-    read_key_source(fd, subject, ceiling).map(Some)
+    Ok(Some(read_key_source(
+        std::fs::File::from(fd),
+        subject,
+        ceiling,
+    )?))
 }
-
-/// Read an opened key source whole, holding it to its kind and to `ceiling`.
-/// This is the reader every keyring and every key file reaches a trusted set
-/// through, whichever source names it.
-///
-/// A source over the ceiling is refused by its own name: reading the part the
-/// ceiling admits would leave the trusted set smaller than the one the operator
-/// placed there, with nothing said about it. Only a regular file is read: what a
-/// fifo answers a read with is what its writers sent, which for key material is
-/// a trusted set of their own making, and an open fifo holds the reading thread
-/// until a writer arrives.
-pub(crate) fn read_key_source(fd: OwnedFd, subject: &str, ceiling: u64) -> Result<Vec<u8>> {
-    let refuse = |what: &str| Error::Signature(format!("{subject} {what}"));
-    let stat = rustix::fs::fstat(&fd).map_err(|e| refuse(&format!("cannot be read: {e}")))?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Err(refuse("is not a regular file"));
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::from(fd)
-        .take(ceiling + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| refuse(&format!("cannot be read: {e}")))?;
-    if bytes.len() as u64 > ceiling {
-        return Err(refuse(&format!("is over the {ceiling}-byte ceiling")));
-    }
-    Ok(bytes)
-}
-
-/// The text of a key source read under [`read_key_source`], for a source whose
-/// keys are base64 lines.
-pub(crate) fn key_text(bytes: Vec<u8>, subject: &str) -> Result<String> {
-    String::from_utf8(bytes).map_err(|_| Error::Signature(format!("{subject} is not valid UTF-8")))
-}
-
-/// The signing public types move freely across tasks and threads. The trait
-/// objects the `Repo` entry points accept are `Send + Sync` through the
-/// supertrait bounds; their dyn-compatibility is enforced by the `&dyn Signer`
-/// and `&dyn Verifier` arguments on [`Repo::sign_commit`] and
-/// [`Repo::verify_commit`].
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<DummySigner>();
-    assert_send_sync::<DummyVerifier>();
-    assert_send_sync::<Ed25519Signer>();
-    assert_send_sync::<Ed25519Verifier>();
-    assert_send_sync::<VerifyOutcome>();
-    assert_send_sync::<SignatureInfo>();
-};

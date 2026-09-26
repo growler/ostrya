@@ -76,6 +76,8 @@ The project is a Cargo workspace of focused crates:
   canonicalization, and format serialization. Depends on `ostrya-gvariant`.
 - `ostrya-rt` -- internal async-runtime abstraction (`smol` or `tokio`
   backend). The only crate that knows which backend is compiled.
+- `ostrya-sign` -- the signing engines: dummy, ed25519, spki, and the GPG
+  signer through the `gpg` binary. Portable, with no repository knowledge.
 - `ostrya-composefs` -- standalone, synchronous EROFS/composefs image writer
   and fs-verity digest. Takes a tree model and emits image bytes.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs,

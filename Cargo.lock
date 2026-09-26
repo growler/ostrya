@@ -1650,7 +1650,6 @@ version = "0.2.8"
 dependencies = [
  "async-compression",
  "bsdiff",
- "ed25519-dalek",
  "futures-io",
  "futures-lite",
  "futures-rustls",
@@ -1659,8 +1658,8 @@ dependencies = [
  "ostrya-composefs",
  "ostrya-core",
  "ostrya-rt",
+ "ostrya-sign",
  "ostrya-sys",
- "p256",
  "pgp",
  "pin-project-lite",
  "pkcs8",
@@ -1723,6 +1722,19 @@ dependencies = [
  "futures-lite",
  "smol",
  "tokio",
+]
+
+[[package]]
+name = "ostrya-sign"
+version = "0.2.8"
+dependencies = [
+ "ed25519-dalek",
+ "futures-lite",
+ "libc",
+ "ostrya-core",
+ "ostrya-rt",
+ "p256",
+ "thiserror",
 ]
 
 [[package]]

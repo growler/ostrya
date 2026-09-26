@@ -231,7 +231,10 @@ pub mod repo;
 mod rollsum;
 pub mod sign;
 #[cfg(feature = "sign-spki")]
-pub mod spki;
+pub mod spki {
+    //! The spki (ECDSA over SubjectPublicKeyInfo) engine of `ostrya-sign`.
+    pub use ostrya_sign::{SpkiSigner, SpkiVerifier};
+}
 mod staging;
 pub mod staging_tree;
 pub mod summary;
@@ -290,8 +293,8 @@ pub use read::{CommitSizes, CommitState, MetadataReader};
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};
 pub use sign::{
-    DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, SignFuture, SignKeys,
-    SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, load_sign_keys,
+    DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, FromSystemKeys, SignFuture,
+    SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, load_sign_keys,
     load_sign_keys_from,
 };
 #[cfg(feature = "sign-spki")]

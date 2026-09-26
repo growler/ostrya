@@ -16,10 +16,10 @@
 //! - Secret keys are base64; the decoded bytes are a PKCS#8 `PrivateKeyInfo`
 //!   DER, a SEC1 `ECPrivateKey` DER, or a raw 32-byte P-256 scalar.
 //!
-//! The key store is the sign-api store shared with ed25519: [`SpkiVerifier`]
-//! loads `trusted.spki` and `revoked.spki` and their `.d` directories through
-//! [`load_sign_keys`], each line the base64 of a SubjectPublicKeyInfo, and
-//! trusts the loaded set minus the revoked set.
+//! The key store is the sign-api store shared with ed25519, each line the
+//! base64 of a SubjectPublicKeyInfo. [`SpkiVerifier::from_sign_keys`] takes a
+//! loaded key set and trusts the loaded set minus the revoked set. The
+//! `FromSystemKeys` trait of `ostrya` loads the set from the system store.
 //!
 //! Signing uses deterministic ECDSA (RFC 6979), so it needs no RNG and completes
 //! in-task. The tool signs with a random nonce, so spki `.commitmeta` bytes are
@@ -32,10 +32,9 @@ use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePublicKey};
 use p256::{EncodedPoint, SecretKey};
 
-use crate::error::{Error, Result};
-use crate::sign::{
-    SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome,
-    load_sign_keys,
+use crate::{
+    Error, Result, SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture,
+    VerifyOutcome,
 };
 
 /// The spki sign-type name, used both as the engine name and as the base name of
@@ -148,13 +147,6 @@ impl SpkiVerifier {
         SpkiVerifier::new(keys.trusted, keys.revoked)
     }
 
-    /// Build a verifier from the system sign-api key store: `trusted.spki` and
-    /// `revoked.spki` and their `.d` directories under the system search path
-    /// (see [`load_sign_keys`]).
-    pub fn from_system_keys() -> Result<SpkiVerifier> {
-        SpkiVerifier::from_sign_keys(load_sign_keys(SPKI_SIGN_TYPE)?)
-    }
-
     /// Build a verifier trusting a single PEM `PUBLIC KEY`
     /// (`-----BEGIN PUBLIC KEY-----`).
     pub fn from_pem(pem: &str) -> Result<SpkiVerifier> {
@@ -165,7 +157,7 @@ impl SpkiVerifier {
 
     /// Whether the effective trusted set is empty: no key was given, or the
     /// revoked set removed every one. Such a verifier refuses every signature.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.trusted.is_empty()
     }
 }
@@ -228,10 +220,3 @@ fn decode_verifying_key(bytes: &[u8]) -> Result<VerifyingKey> {
         "spki public key: expected SubjectPublicKeyInfo DER or a SEC1 point".into(),
     ))
 }
-
-/// The spki public types move freely across tasks and threads.
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<SpkiSigner>();
-    assert_send_sync::<SpkiVerifier>();
-};

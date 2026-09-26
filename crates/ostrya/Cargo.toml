@@ -10,11 +10,11 @@ readme.workspace = true
 
 [features]
 default = ["smol"]
-smol = ["ostrya-rt/smol"]
-tokio = ["ostrya-rt/tokio"]
-sign-spki = ["dep:p256"]
+smol = ["ostrya-rt/smol", "ostrya-sign/smol"]
+tokio = ["ostrya-rt/tokio", "ostrya-sign/tokio"]
+sign-spki = ["ostrya-sign/sign-spki"]
 verify-gpg = ["dep:pgp"]
-sign-gpg = ["verify-gpg"]
+sign-gpg = ["verify-gpg", "ostrya-sign/sign-gpg"]
 # Builds xz from source and links it statically, so the build needs no
 # runtime liblzma. The feature is off by default, and a build without it
 # takes the system liblzma.
@@ -31,6 +31,7 @@ features = ["sign-spki", "verify-gpg", "sign-gpg"]
 ostrya-core = { workspace = true }
 ostrya-composefs = { workspace = true }
 ostrya-rt = { workspace = true }
+ostrya-sign = { workspace = true }
 ostrya-sys = { workspace = true }
 thiserror = "2"
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
@@ -96,16 +97,6 @@ pkcs8 = { version = "0.10.2", default-features = false, features = [
     "std",
 ] }
 smol-tar = { version = "0.1.7", default-features = false, features = ["smol"] }
-ed25519-dalek = { version = "2", default-features = false, features = [
-    "std",
-    "zeroize",
-] }
-p256 = { version = "0.13.2", default-features = false, features = [
-    "ecdsa",
-    "pem",
-    "pkcs8",
-    "std",
-], optional = true }
 # rPGP reads OpenPGP keyrings and signatures in the process. `default-features
 # = false` is mandatory: the `default` feature reaches `bzip2` and the C
 # library behind it, and the `asm` feature turns on assembly paths. A detached

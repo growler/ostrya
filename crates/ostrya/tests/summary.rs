@@ -581,7 +581,7 @@ impl ostrya::Signer for RefusingSigner {
     }
 
     fn sign<'a>(&'a self, _: &'a [u8]) -> ostrya::SignFuture<'a> {
-        Box::pin(async { Err(ostrya::Error::Signature("refused".into())) })
+        Box::pin(async { Err(ostrya::sign::Error::Signature("refused".into())) })
     }
 }
 

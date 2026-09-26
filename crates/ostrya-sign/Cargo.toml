@@ -1,0 +1,47 @@
+[package]
+name = "ostrya-sign"
+description = "Signing and verifying engines for ostrya: dummy, ed25519, spki, and GPG through gpg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[features]
+default = ["smol"]
+# The runtime selectors matter only under `sign-gpg`, which runs gpg through
+# ostrya-rt. A build without `sign-gpg` holds no runtime.
+smol = ["ostrya-rt?/smol"]
+tokio = ["ostrya-rt?/tokio"]
+sign-spki = ["dep:p256"]
+sign-gpg = ["dep:ostrya-rt"]
+
+# The crate documentation links items that a feature gates. docs.rs adds
+# these two features to the default set, and the links then resolve.
+[package.metadata.docs.rs]
+features = ["sign-spki", "sign-gpg"]
+
+[dependencies]
+ostrya-core = { workspace = true }
+ostrya-rt = { workspace = true, optional = true }
+thiserror = "2"
+ed25519-dalek = { version = "2", default-features = false, features = [
+    "std",
+    "zeroize",
+] }
+p256 = { version = "0.13.2", default-features = false, features = [
+    "ecdsa",
+    "pem",
+    "pkcs8",
+    "std",
+], optional = true }
+
+# The key file reader opens with `O_NONBLOCK` on Unix, so a fifo answers the
+# open rather than waiting for a writer. `std` does not supply the value of
+# the flag.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+futures-lite = "2"

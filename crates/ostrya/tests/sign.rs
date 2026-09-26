@@ -615,3 +615,59 @@ fn concurrent_signatures_are_not_lost() {
         }
     });
 }
+
+/// The signing items resolve at their public paths in `ostrya`: the module
+/// paths under `ostrya::sign` and the root paths name the same items, and the
+/// error of an engine converts into the repository error.
+#[test]
+fn signing_items_resolve_at_their_public_paths() {
+    use ostrya::sign::{
+        Error, FromSystemKeys, MAX_KEY_FILE, Result, SignFuture, SignKeys, Signer, VerifyFuture,
+        append_signature,
+    };
+    use ostrya::{DummySigner, Ed25519Signer, Ed25519Verifier};
+
+    fn from_system_keys<T: FromSystemKeys + ostrya::FromSystemKeys>() {}
+    from_system_keys::<Ed25519Verifier>();
+    #[cfg(feature = "sign-spki")]
+    from_system_keys::<ostrya::spki::SpkiVerifier>();
+
+    let signer: Box<dyn ostrya::Signer> = Box::new(DummySigner::new("key"));
+    let signer: &dyn Signer = &*signer;
+    let signed: SignFuture<'_> = signer.sign(b"payload");
+    let signature: Result<Vec<u8>> = block_on(signed);
+    let signature = signature.unwrap();
+    assert_eq!(signature, b"key");
+
+    let verifier = DummyVerifier::new([b"key".to_vec()]);
+    let signatures = [signature.clone()];
+    let verified: VerifyFuture<'_> = ostrya::Verifier::verify(&verifier, b"payload", &signatures);
+    assert!(block_on(verified).unwrap().valid);
+
+    let mut dict = Value::Array(Vec::new());
+    append_signature(&mut dict, signer.metadata_key(), signature).unwrap();
+    assert!(dict.dict_get("ostree.sign.dummy").is_some());
+
+    assert_eq!(MAX_KEY_FILE, 1024 * 1024);
+    let verifier = Ed25519Verifier::from_sign_keys(SignKeys::default()).unwrap();
+    assert!(verifier.is_empty());
+    assert!(Ed25519Signer::from_secret_key(&[0u8; 63]).is_err());
+
+    let err: ostrya::Error = Error::Signature("refused".into()).into();
+    assert!(
+        matches!(&err, ostrya::Error::Signature(m) if m == "refused"),
+        "{err}"
+    );
+
+    #[cfg(feature = "sign-spki")]
+    {
+        let signer = ostrya::spki::SpkiSigner::from_secret_key(&[1u8; 32]).unwrap();
+        assert_eq!(Signer::name(&signer), "spki");
+    }
+    #[cfg(feature = "sign-gpg")]
+    {
+        let signer = ostrya::gpg::GpgSigner::new("key").with_homedir("/nonexistent");
+        assert_eq!(Signer::name(&signer), "gpg");
+        assert_eq!(signer.homedir(), Some(Path::new("/nonexistent")));
+    }
+}

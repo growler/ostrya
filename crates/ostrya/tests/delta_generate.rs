@@ -2039,7 +2039,11 @@ impl Signer for FailingSigner {
     }
 
     fn sign<'a>(&'a self, _data: &'a [u8]) -> SignFuture<'a> {
-        Box::pin(async { Err(Error::Signature("the test signer fails".to_owned())) })
+        Box::pin(async {
+            Err(ostrya::sign::Error::Signature(
+                "the test signer fails".to_owned(),
+            ))
+        })
     }
 }
 

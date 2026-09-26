@@ -156,6 +156,12 @@ jobs:
       - name: A build without a GPG feature compiles
         run: cargo check -p ostrya --no-default-features --features smol
 
+      # `ostrya-sign` holds a runtime only under `sign-gpg`. This compiles the
+      # crate with no runtime backend, so a runtime item placed outside that
+      # feature fails here.
+      - name: ostrya-sign without a runtime compiles
+        run: cargo check -p ostrya-sign --no-default-features --features sign-spki
+
       # The portable crates compile for macOS and Windows as well as Linux.
       # `cargo check` needs the standard library of each target and no linker,
       # so the Linux runner checks all three targets.
@@ -167,6 +173,8 @@ jobs:
           for target in x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin; do
             cargo check --target "$target" -p ostrya-gvariant -p ostrya-core -p ostrya-rt
             cargo check --target "$target" -p ostrya-rt --no-default-features --features tokio
+            cargo check --target "$target" -p ostrya-sign --features sign-spki,sign-gpg
+            cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,sign-gpg
           done
 
       # The local-pull ownership-gate tests need the process to belong to more

@@ -212,6 +212,12 @@ pub enum Error {
     /// A signing engine rejected its key material or a signature blob: a
     /// wrong-length key, a public key that is not a valid curve point, or a
     /// malformed secret key.
+    ///
+    /// An [`ostrya_sign::Error::Signature`] converts to this variant with the
+    /// same message, and so does a variant of `ostrya_sign::Error` that this
+    /// conversion does not name. The library also builds this variant itself:
+    /// the verification policy of a pull, the keyring readers, and the
+    /// signature check of a static delta.
     #[error("signature: {0}")]
     Signature(String),
     /// A pull refused an object or a commit: a commit whose
@@ -299,6 +305,20 @@ pub enum Error {
 impl From<rustix::io::Errno> for Error {
     fn from(errno: rustix::io::Errno) -> Error {
         Error::Io(errno.into())
+    }
+}
+
+impl From<ostrya_sign::Error> for Error {
+    /// Map a signing-engine error onto the variant of the same name. A variant
+    /// this conversion does not name maps to [`Error::Signature`] with the
+    /// message of the error.
+    fn from(err: ostrya_sign::Error) -> Error {
+        match err {
+            ostrya_sign::Error::Signature(message) => Error::Signature(message),
+            ostrya_sign::Error::InvalidFormat(message) => Error::InvalidFormat(message),
+            ostrya_sign::Error::Core(e) => Error::Core(e),
+            other => Error::Signature(other.to_string()),
+        }
     }
 }
 
@@ -498,6 +518,34 @@ mod tests {
         let io: std::io::Error = err.into();
         assert_eq!(io.kind(), ErrorKind::PermissionDenied);
         assert_eq!(io.to_string(), "nope");
+    }
+
+    #[test]
+    fn a_signing_error_maps_to_its_namesake() {
+        let err = Error::from(ostrya_sign::Error::Signature("refused".into()));
+        assert!(
+            matches!(&err, Error::Signature(m) if m == "refused"),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            ostrya_sign::Error::Signature("refused".into()).to_string()
+        );
+
+        let err = Error::from(ostrya_sign::Error::InvalidFormat("not a dict".into()));
+        assert!(
+            matches!(&err, Error::InvalidFormat(m) if m == "not a dict"),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            ostrya_sign::Error::InvalidFormat("not a dict".into()).to_string()
+        );
+
+        let core = ostrya_core::Error::InvalidBase64("truncated group");
+        let err = Error::from(ostrya_sign::Error::Core(core.clone()));
+        assert!(matches!(&err, Error::Core(e) if *e == core), "{err}");
+        assert_eq!(err.to_string(), ostrya_sign::Error::Core(core).to_string());
     }
 
     #[test]

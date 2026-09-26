@@ -95,7 +95,7 @@ all pure Rust:
   `crates/ostrya/tests/write.rs` holds it against a fixture the `ostree` tool
   wrote. A resolved version whose output differs from those records fails the
   test suite.
-- `ed25519-dalek` -- the ed25519 sign engine.
+- `ed25519-dalek` -- the ed25519 sign engine, in `ostrya-sign`.
 - `bsdiff` (BSD-2-Clause, no dependencies of its own) -- bspatch stream
   generation for static deltas. Its output is the interleaved
   control/diff/extra layout the port's own bspatch reads.
@@ -145,6 +145,13 @@ bounded:
   `rt::TcpListener` (async TCP). The only crate that knows which backend is
   compiled. No ostree knowledge. Compiles on Linux, macOS, and Windows;
   `rt::File::from(OwnedFd)` is Unix-only.
+- `ostrya-sign` -- the signing engines: the `Signer` and `Verifier` traits,
+  the dummy, ed25519, and spki engines, the GPG signer through the `gpg`
+  binary, `SignKeys`, the key file reader over `std::fs`, and
+  `append_signature`. No repository knowledge. Depends on `ostrya-core`,
+  `thiserror`, `ed25519-dalek`, `p256` (under `sign-spki`), `ostrya-rt`
+  (under `sign-gpg`), and `libc` on Unix, for the `O_NONBLOCK` value of the
+  key file open. Compiles on Linux, macOS, and Windows.
 - `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the
   fs-verity digest. Standalone and free of ostree and repository knowledge,
   like `ostrya-gvariant`: it takes a tree model and emits the image bytes and
@@ -152,7 +159,9 @@ bounded:
   uses, with no EROFS compression. Synchronous, with no runtime dependency.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs, read,
   prune, fsck, sign, summary, deltas, pull, tar, composefs export over
-  `ostrya-composefs`. Feature-gated.
+  `ostrya-composefs`. Feature-gated. The signing engines come from
+  `ostrya-sign` and are re-exported. GPG verification over the `pgp` crate
+  and the system key store readers are part of `ostrya`.
 - `ostrya-cli` -- the CLI crate, building the `ostrya` binary: a minimal
   command set once the ingest and checkout paths land (Phase 11), grown
   incrementally; the `ostree`-compatible surface arrives with the port's own
@@ -6874,8 +6883,8 @@ on `receive`). The client code that must compile on macOS and Windows goes
 into portable workspace crates: `ostrya-fetch` (the fetcher), `ostrya-sign`
 (the signing engines), and `ostrya-push` (the protocol, the client session,
 the transports, and the tree model). `ostrya` re-exports their public items.
-`ostrya-gvariant`, `ostrya-core`, and `ostrya-rt` compile on those targets
-as well. CI checks the portable crates for `x86_64-pc-windows-gnu`,
+`ostrya-gvariant`, `ostrya-core`, `ostrya-rt`, and `ostrya-sign` compile on
+those targets as well. CI checks the portable crates for `x86_64-pc-windows-gnu`,
 `x86_64-apple-darwin`, and `aarch64-apple-darwin`.
 
 Pull over ssh follows push as separate work.

@@ -670,7 +670,10 @@ fn read_verification_file(engine: &str, path: &str) -> Result<String> {
         Mode::empty(),
     )
     .map_err(|e| Error::Signature(format!("{subject} cannot be read: {e}")))?;
-    key_text(read_key_source(fd, &subject, MAX_KEY_FILE)?, &subject)
+    Ok(key_text(
+        read_key_source(std::fs::File::from(fd), &subject, MAX_KEY_FILE)?,
+        &subject,
+    )?)
 }
 
 #[cfg(test)]

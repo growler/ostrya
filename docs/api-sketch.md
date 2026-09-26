@@ -1396,10 +1396,34 @@ pub struct CheckoutOptions {
 
 ## Signing
 
+The signing engines are items of the `ostrya-sign` crate: the two traits and
+their futures, `VerifyOutcome`, `SignatureInfo`, the dummy, ed25519, and spki
+engines, `GpgSigner`, `SignKeys`, the key reader, `append_signature`, and the
+crate's `Error` and `Result`. `ostrya` re-exports each one except the spki
+engines and `GpgSigner` at its path under `ostrya::sign`. The spki engines are
+at `ostrya::spki` and `GpgSigner` at `ostrya::gpg`. The engines and traits are
+also at the crate root. `GpgVerifier` and
+the system key store readers are items of `ostrya`.
+
 Both traits are object-safe and taken as `&dyn`, so the asynchronous method
-returns a boxed future rather than being an `async fn`.
+returns a boxed future rather than being an `async fn`. The two futures give
+`ostrya_sign::Result`, so a `Signer` or a `Verifier` of another crate fails
+with `ostrya_sign::Error`.
 
 ```rust
+// ostrya-sign
+#[non_exhaustive]
+pub enum Error {
+    Signature(String),                  // a signer or a verifier failed
+    InvalidFormat(String),              // append_signature over a bad dict
+    Core(ostrya_core::Error),
+}
+pub type Result<T> = std::result::Result<T, Error>;
+
+// ostrya: each variant maps to the variant of the same name; a variant the
+// conversion does not name maps to ostrya::Error::Signature with its message.
+impl From<ostrya_sign::Error> for ostrya::Error;
+
 pub type SignFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 pub type VerifyFuture<'a> =
     Pin<Box<dyn Future<Output = Result<VerifyOutcome>> + Send + 'a>>;
@@ -1417,6 +1441,14 @@ pub trait Verifier: Send + Sync {
 
 pub struct Ed25519Signer { /* 64-byte secret */ }
 pub struct Ed25519Verifier { /* trusted + revoked 32-byte keys */ }
+impl Ed25519Verifier {
+    pub fn new(trusted: impl IntoIterator<..>, revoked: impl IntoIterator<..>)
+        -> Result<Ed25519Verifier>;
+    pub fn from_sign_keys(keys: SignKeys) -> Result<Ed25519Verifier>;
+    /// No key was given, or the revoked set removed every one.
+    pub fn is_empty(&self) -> bool;
+}
+// SpkiVerifier also has these three methods.
 pub struct GpgSigner { /* key id/fingerprint + optional GNUPGHOME; signs via gpg */ }
 pub struct GpgVerifier { /* parsed certificates; verifies in the process */ }
 pub struct SpkiSigner;   pub struct SpkiVerifier;    // optional
@@ -1459,8 +1491,13 @@ impl GpgSigner {
     /// that cannot be read, and one holding no matching key all answer an empty
     /// list. More than one fingerprint means the selector is ambiguous, and a
     /// caller that needs a single signing key refuses it.
-    pub async fn secret_key_fingerprints(&self) -> Result<Vec<String>>;
+    pub async fn secret_key_fingerprints(&self) -> ostrya_sign::Result<Vec<String>>;
 }
+
+/// Append `signature` to the engine's `aay` array in an `a{sv}` dict, and
+/// create the entry when it is absent.
+pub fn append_signature(dict: &mut Value, metadata_key: &str, signature: Vec<u8>)
+    -> ostrya_sign::Result<()>;
 
 /// One key of a remote's trusted keyring, as its certificate states it.
 pub struct GpgKey {
@@ -1495,10 +1532,28 @@ impl Repo {                                   // feature = "verify-gpg"
 }
 ```
 
-Key loading helpers (ed25519 base64-per-line files and the
-`trusted.ed25519[.d]` / `revoked.ed25519[.d]` directory convention; GPG keyring
-files binary and armored) are free functions or `impl` on the concrete signer
-types.
+The key reader of `ostrya-sign` reads over `std::fs`. `read_key_file` opens
+a path, and gives `None` where no file is there. `read_key_source` reads an
+open file. Both read only a regular file and only up to the ceiling the caller
+gives, `MAX_KEY_FILE` (one mebibyte) for a key file, and refuse a source over
+the ceiling by its own name. On Unix the open carries `O_NONBLOCK`, so a fifo
+does not hold the open and the type check refuses it. `key_text` reads the
+bytes as UTF-8 text. `SignKeys` holds the trusted and the revoked keys as
+bytes.
+
+The system key store readers are items of `ostrya`. `load_sign_keys` and
+`load_sign_keys_from` read the ed25519 base64-per-line files and the
+`trusted.<type>[.d]` / `revoked.<type>[.d]` directory convention. GPG keyring
+files, binary and armored, load through the constructors of `GpgVerifier`.
+The extension trait `FromSystemKeys` builds a verifier from the system store:
+
+```rust
+pub trait FromSystemKeys: Sized {
+    fn from_system_keys() -> ostrya::Result<Self>;
+}
+impl FromSystemKeys for Ed25519Verifier;     // trusted.ed25519, revoked.ed25519
+impl FromSystemKeys for SpkiVerifier;        // feature = "sign-spki"
+```
 
 `GpgVerifier` is behind the `verify-gpg` feature, together with `GpgKey`,
 `Repo::gpg_import_keys`, and `Repo::gpg_list_keys`, which manage the

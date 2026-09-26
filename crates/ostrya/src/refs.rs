@@ -1053,7 +1053,7 @@ fn sync_dir_present(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
 }
 
 /// `fsync` one directory named relative to the repository root.
-fn sync_dir(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
+pub(crate) fn sync_dir(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
     let dir = rustix::fs::openat(
         repo_fd,
         path,

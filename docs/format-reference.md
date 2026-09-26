@@ -6220,7 +6220,11 @@ The same rule selects the deltas that `reindex`, a summary's
 that holds no superblock, also where its commit is the one the prune deletes,
 and it leaves the deltas behind a symlink at `<fanout>` or at `<rest>`, which
 is what the tool's prune leaves. A prune follows a symlink at `deltas` and
-removes the deltas behind it that it selects. The link stays.
+removes the deltas behind it that it selects. The link stays. The port's prune
+skips a name that does not decode, also where the entry holds a superblock, and
+leaves the entry. Where it is not a `--static-deltas-only` run, it also selects
+each delta whose target commit is absent from the store. Both are port
+behaviors (`port-plan.md`, "Prune sweep order").
 
 #### `delete`
 

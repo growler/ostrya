@@ -51,6 +51,33 @@
 //! - Every run removes the static delta of each commit it deleted, the delta
 //!   directory whole and its fanout parent in place. A delta whose source
 //!   commit the run deleted is kept.
+//! - Every run that is neither a [`no_prune`](PruneOptions::no_prune) dry run
+//!   nor a [`static_deltas_only`](PruneOptions::static_deltas_only) run also
+//!   removes each static delta whose target commit is absent from the store
+//!   after the sweep, and each `state/<commit>.commitpartial` marker whose
+//!   commit is absent. This is how the marker of each commit the run removes
+//!   goes. A run that stops part way through leaves these behind, and the next
+//!   run removes them. The run holds the repository lock exclusive, so no pull
+//!   stands between writing a marker and storing its commit. This is a port
+//!   behavior: the tool's handling of these leftovers is not observed.
+//! - Every delta sweep, the one a
+//!   [`static_deltas_only`](PruneOptions::static_deltas_only) run makes
+//!   included, skips a delta name that does not decode and leaves that entry in
+//!   place.
+//! - Warning: where the repository config sets `[core] locking` false, no lock
+//!   excludes a concurrent writer. A commit another writer stores after the run
+//!   lists the store reads as absent, so the run can remove its marker and its
+//!   static delta.
+//! - The sweep removes the doomed commits first and their content after them.
+//!   For each commit it writes the tombstone, then unlinks the commit object
+//!   and then its detached metadata. Detached metadata whose commit is absent
+//!   goes next. Where `[core] fsync` is true, the `objects/` directories those
+//!   removals changed are synced before the first dirtree, dirmeta, or file
+//!   object goes, so a run that stops at an error or a crash leaves no commit
+//!   object whose tree it started to remove. Where `[core] fsync` is false, a
+//!   crash gives no guarantee of the order in which the removals reach the
+//!   disk. A [`delete_commit`](PruneOptions::delete_commit) run removes and
+//!   syncs the named commit the same way before the sweep.
 //! - A run writes a `.tombstone-commit` for every commit it removes where
 //!   [`delete_commit`](PruneOptions::delete_commit) is given or the repository
 //!   config sets `[core] tombstone-commits`.
@@ -99,7 +126,7 @@
 //! the behavior that stands without it, so a prune that leaves all three at
 //! their defaults is the tool's.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
@@ -474,7 +501,9 @@ struct Sweep {
     no_prune: bool,
     /// Write a `.tombstone-commit` for each commit removed.
     tombstones: bool,
-    /// Place each tombstone on stable storage before it is linked into place.
+    /// Place each tombstone on stable storage before it is linked into place,
+    /// and sync the directories the commit removals changed before any
+    /// content object goes.
     fsync: bool,
     /// Count commit objects alone.
     commit_only: bool,
@@ -529,8 +558,11 @@ impl Repo {
                 .count_objects(move |ty| counted(ty, commit_only))
                 .await?;
             if !opts.no_prune {
-                self.sweep_static_deltas(&HashSet::from([delta_target]))
-                    .await?;
+                let repo = self.clone();
+                ostrya_rt::unblock(move || {
+                    crate::delta::prune_delta_dirs(repo.repo_fd(), |to| *to == delta_target)
+                })
+                .await?;
             }
             return Ok(PruneStats {
                 total_objects,
@@ -731,18 +763,42 @@ impl Repo {
             self.delete_commit_object(&commit, &sweep).await?;
         }
 
+        // The commits the store holds once the sweep has run: the listed ones
+        // the walk kept, because every listed commit the walk did not keep is
+        // doomed. The listing already leaves out the commit `delete_commit`
+        // names. The set is taken from the listing in memory, so the leftover
+        // sweep below reads no object to learn it.
+        let present_commits: HashSet<Checksum> = if opts.no_prune {
+            HashSet::new()
+        } else {
+            all_objects
+                .iter()
+                .filter(|o| o.ty == ObjectType::Commit && keep.contains(o))
+                .map(|o| o.checksum)
+                .collect()
+        };
+        drop(all_objects);
+        drop(keep);
+
         let repo = self.clone();
-        let doomed_deltas: HashSet<Checksum> = doomed
-            .iter()
-            .filter(|o| o.ty == ObjectType::Commit)
-            .map(|o| o.checksum)
-            .chain(opts.delete_commit)
-            .collect();
         let (pruned_objects, freed_bytes) =
             ostrya_rt::unblock(move || sweep_blocking(&repo, &sweep, &doomed)).await?;
 
+        // Remove what refers to an absent commit: each static delta whose
+        // target commit is absent and each `.commitpartial` marker whose commit
+        // is absent. That covers the commits this run removed, whose markers
+        // the object sweep leaves for this pass, and also the commits a run
+        // that stopped part way through removed, which no later walk finds.
+        // The repository lock is held exclusive, so no pull stands between
+        // writing a marker and storing its commit.
         if !opts.no_prune {
-            self.sweep_static_deltas(&doomed_deltas).await?;
+            let repo = self.clone();
+            ostrya_rt::unblock(move || {
+                let repo_fd = repo.repo_fd();
+                crate::delta::prune_delta_dirs(repo_fd, |to| !present_commits.contains(to))?;
+                sweep_orphan_markers_blocking(repo_fd, &present_commits)
+            })
+            .await?;
         }
 
         Ok(PruneStats {
@@ -765,49 +821,27 @@ impl Repo {
         Ok(())
     }
 
-    /// Remove a named commit's object, its detached metadata, and its partial
-    /// marker, writing its tombstone first where the run writes tombstones.
+    /// Remove a named commit's object and its detached metadata, writing its
+    /// tombstone first where the run writes tombstones.
     ///
     /// The ref check runs again next to the unlink, so a ref published while
-    /// the prune walked the store still refuses the deletion.
+    /// the prune walked the store still refuses the deletion. Where the run
+    /// syncs, the directory that held the removed entries is synced before
+    /// the call returns, so the removal is durable before the sweep removes
+    /// any object the commit reached. The commit's partial marker stays: the
+    /// run removes it with the orphan markers after the sweep, because the
+    /// commit is absent from the listing that pass reads.
     async fn delete_commit_object(&self, commit: &Checksum, sweep: &Sweep) -> Result<()> {
         self.refuse_referenced_commit(commit).await?;
-        let mode = self.mode();
         let commit = *commit;
         let sweep = *sweep;
         let repo = self.clone();
         ostrya_rt::unblock(move || {
-            if sweep.tombstones {
-                write_tombstone(repo.objects_fd(), &commit, sweep.mode, sweep.fsync)?;
-            }
-            let commit_path = loose_path(&commit, ObjectType::Commit, mode);
-            unlink_optional(repo.objects_fd(), &commit_path)?;
-            let meta_path = loose_path(&commit, ObjectType::CommitMeta, mode);
-            unlink_optional(repo.objects_fd(), &meta_path)?;
-            let partial = crate::pull::partial_path(&commit);
-            unlink_optional(repo.repo_fd(), &partial)?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Remove the static delta of every commit in `targets`.
-    ///
-    /// A delta is keyed by the commit it produces, so a delta whose source
-    /// commit the run deleted is left where it stands. The `delta-indexes/`
-    /// cache is not touched, which is what the `ostree` tool's prune leaves.
-    async fn sweep_static_deltas(&self, targets: &HashSet<Checksum>) -> Result<()> {
-        if targets.is_empty() {
-            return Ok(());
-        }
-        let targets = targets.clone();
-        let repo = self.clone();
-        ostrya_rt::unblock(move || {
-            let repo_fd = repo.repo_fd();
-            for dir in crate::delta::list_delta_dirs(repo_fd)? {
-                if targets.contains(&dir.to) {
-                    crate::delta::remove_delta_dir(repo_fd, &dir)?;
-                }
+            let objects_fd = repo.objects_fd();
+            let mut touched = BTreeSet::new();
+            remove_commit(objects_fd, &sweep, &commit, true, &mut touched)?;
+            if sweep.fsync {
+                sync_dirs(objects_fd, &touched)?;
             }
             Ok(())
         })
@@ -815,45 +849,205 @@ impl Repo {
     }
 }
 
+/// Remove each `state/<commit>.commitpartial` marker whose commit is not in
+/// `present`.
+///
+/// A name that is not a marker name in lowercase hex is left in place, and so
+/// is a directory. A repository with no `state/` has nothing to remove.
+fn sweep_orphan_markers_blocking(
+    repo_fd: BorrowedFd<'_>,
+    present: &HashSet<Checksum>,
+) -> Result<()> {
+    use rustix::fs::{Dir, Mode, OFlags, openat};
+
+    let io_err = |e: Errno| Error::Io(e.into());
+    let state = match openat(
+        repo_fd,
+        "state",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(io_err(e)),
+    };
+    let mut orphans = Vec::new();
+    for entry in Dir::new(state).map_err(io_err)? {
+        let entry = entry.map_err(io_err)?;
+        let Ok(name) = entry.file_name().to_str() else {
+            continue;
+        };
+        let Some(hex) = name.strip_suffix(".commitpartial") else {
+            continue;
+        };
+        let Ok(commit) = Checksum::from_hex_lower(hex) else {
+            continue;
+        };
+        if !present.contains(&commit) {
+            orphans.push(commit);
+        }
+    }
+    for commit in orphans {
+        let partial = crate::pull::partial_path(&commit);
+        match rustix::fs::unlinkat(repo_fd, partial.as_str(), AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT | Errno::ISDIR) => {}
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Remove one commit: write its tombstone where the run writes tombstones,
+/// then unlink the commit object and, where `meta` is true, its detached
+/// metadata, in that order. Each `objects/` fanout directory in which an entry
+/// was unlinked is added to `touched`, named relative to `objects/`.
+///
+/// The commit's `state/<commit>.commitpartial` marker stays. The commit can
+/// already be partial, and a crash that made the marker unlink durable and not
+/// the commit unlink would make a partial commit look complete. The run
+/// removes the marker after the object sweep, with the markers whose commit is
+/// absent, and a marker a failed or crashed run leaves goes in the next run.
+///
+/// The commit goes before its detached metadata, because detached metadata
+/// with no commit is unreachable and the next prune removes it, while the
+/// reverse order leaves a commit with no signatures.
+fn remove_commit(
+    objects_fd: BorrowedFd<'_>,
+    sweep: &Sweep,
+    commit: &Checksum,
+    meta: bool,
+    touched: &mut BTreeSet<String>,
+) -> Result<()> {
+    if sweep.tombstones {
+        write_tombstone(objects_fd, commit, sweep.mode, sweep.fsync)?;
+    }
+    let commit_path = loose_path(commit, ObjectType::Commit, sweep.mode);
+    let mut unlinked = unlink_optional(objects_fd, &commit_path)?;
+    if meta {
+        let meta_path = loose_path(commit, ObjectType::CommitMeta, sweep.mode);
+        unlinked |= unlink_optional(objects_fd, &meta_path)?;
+    }
+    if unlinked {
+        touched.insert(objects_fanout(commit));
+    }
+    Ok(())
+}
+
+/// The `objects/` fanout directory name of an object.
+fn objects_fanout(checksum: &Checksum) -> String {
+    checksum.to_hex()[..2].to_owned()
+}
+
+/// `fsync` each directory in `dirs`, each named relative to `objects_fd`.
+fn sync_dirs(objects_fd: BorrowedFd<'_>, dirs: &BTreeSet<String>) -> Result<()> {
+    for dir in dirs {
+        crate::refs::sync_dir(objects_fd, dir)?;
+    }
+    Ok(())
+}
+
+/// The on-disk size of a loose object, or `None` where it is absent.
+fn object_size(objects_fd: BorrowedFd<'_>, path: &str) -> Result<Option<u64>> {
+    match rustix::fs::statat(objects_fd, path, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(stat.st_size.max(0) as u64)),
+        // Raced away already, or never present; nothing to free.
+        Err(Errno::NOENT) => Ok(None),
+        Err(e) => Err(Error::Io(e.into())),
+    }
+}
+
 /// Stat and (unless `no_prune`) unlink each doomed object, summing the bytes
-/// freed. A pruned commit also loses its `state/<commit>.commitpartial` marker
-/// and, where the run writes tombstones, gains a `.tombstone-commit` written
-/// before the unlink.
+/// freed.
+///
+/// The sweep runs in two phases. The commit phase removes each doomed commit
+/// with [`remove_commit`], together with its detached metadata where that is
+/// doomed too, and then each doomed detached metadata whose commit the phase
+/// did not remove. The content phase removes every other doomed object, in any
+/// order. Where the run syncs, the `objects/` directories the commit phase
+/// changed are synced between the two phases. A sweep that stops part way
+/// through, at an error or a crash, then leaves no commit object whose tree it
+/// started to remove. Where the run does not sync, a crash gives no guarantee
+/// of which removals reached the disk, in which order. The sweep removes no
+/// `.commitpartial` marker.
+///
+/// Each doomed object is stat-ed before its unlink, except the detached
+/// metadata the commit phase removes with its commit, which neither number
+/// counts. An object already absent at its stat is skipped and counted in
+/// neither number.
 fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(usize, u64)> {
     let objects_fd = repo.objects_fd();
     let mut count = 0usize;
     let mut freed = 0u64;
-    for name in doomed {
-        let path = name.loose_path(sweep.mode);
-        let size = match rustix::fs::statat(objects_fd, path.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => stat.st_size.max(0) as u64,
-            // Raced away already, or never present; nothing to free.
-            Err(Errno::NOENT) => continue,
-            Err(e) => return Err(Error::Io(e.into())),
+    let mut tally = |ty: ObjectType, size: u64| {
+        if counted(ty, sweep.commit_only) {
+            count += 1;
+            freed += size;
+        }
+    };
+
+    // The commit phase.
+    let doomed_meta: HashSet<Checksum> = doomed
+        .iter()
+        .filter(|o| o.ty == ObjectType::CommitMeta)
+        .map(|o| o.checksum)
+        .collect();
+    let mut touched = BTreeSet::new();
+    let mut removed_commits = HashSet::new();
+    for name in doomed.iter().filter(|o| o.ty == ObjectType::Commit) {
+        let Some(size) = object_size(objects_fd, &name.loose_path(sweep.mode))? else {
+            continue;
         };
         if !sweep.no_prune {
-            if sweep.tombstones && name.ty == ObjectType::Commit {
-                write_tombstone(objects_fd, &name.checksum, sweep.mode, sweep.fsync)?;
-            }
-            unlink_optional(objects_fd, &path)?;
-            if name.ty == ObjectType::Commit {
-                let partial = crate::pull::partial_path(&name.checksum);
-                unlink_optional(repo.repo_fd(), &partial)?;
-            }
+            let meta = doomed_meta.contains(&name.checksum);
+            remove_commit(objects_fd, sweep, &name.checksum, meta, &mut touched)?;
         }
-        if !counted(name.ty, sweep.commit_only) {
+        removed_commits.insert(name.checksum);
+        tally(name.ty, size);
+    }
+    // Detached metadata whose commit is absent, which no commit above took
+    // with it.
+    for name in doomed
+        .iter()
+        .filter(|o| o.ty == ObjectType::CommitMeta && !removed_commits.contains(&o.checksum))
+    {
+        let path = name.loose_path(sweep.mode);
+        let Some(size) = object_size(objects_fd, &path)? else {
             continue;
+        };
+        if !sweep.no_prune && unlink_optional(objects_fd, &path)? {
+            touched.insert(objects_fanout(&name.checksum));
         }
-        count += 1;
-        freed += size;
+        tally(name.ty, size);
+    }
+
+    // The barrier: the commit removals are durable before any content goes.
+    if sweep.fsync && !sweep.no_prune {
+        sync_dirs(objects_fd, &touched)?;
+    }
+
+    // The content phase.
+    for name in doomed
+        .iter()
+        .filter(|o| !matches!(o.ty, ObjectType::Commit | ObjectType::CommitMeta))
+    {
+        let path = name.loose_path(sweep.mode);
+        let Some(size) = object_size(objects_fd, &path)? else {
+            continue;
+        };
+        if !sweep.no_prune {
+            unlink_optional(objects_fd, &path)?;
+        }
+        tally(name.ty, size);
     }
     Ok((count, freed))
 }
 
 /// Unlink a path relative to `dir`, treating an already-absent file as success.
-fn unlink_optional(dir: BorrowedFd<'_>, path: &str) -> Result<()> {
+/// Returns whether an entry was unlinked.
+fn unlink_optional(dir: BorrowedFd<'_>, path: &str) -> Result<bool> {
     match rustix::fs::unlinkat(dir, path, AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Ok(()) => Ok(true),
+        Err(Errno::NOENT) => Ok(false),
         Err(e) => Err(Error::Io(e.into())),
     }
 }

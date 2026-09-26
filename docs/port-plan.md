@@ -3045,8 +3045,9 @@ A pull that returns an error removes the markers it wrote for commits this
 repository does not hold, leaving the destination as it stood. The objects of a
 pull are published by its one transaction or by nothing at all, so a marker over
 an absent commit guards nothing and nothing else reaches it: prune removes a
-marker for a commit it prunes, and a commit that was never written is in no
-doomed set. A commit this repository does hold keeps its marker -- that one was
+marker for a commit it prunes, and every prune that is neither a dry run nor a
+delta-only run also removes each marker whose commit is absent from the store
+(see "Prune sweep order"). A commit this repository does hold keeps its marker -- that one was
 partial before the pull ran, and fsck's state byte is in that file. The removal
 is best-effort: a marker that cannot be unlinked stays, so the error the pull
 reports is the one that ended it. Both pull paths do this, the HTTP path over
@@ -5576,8 +5577,7 @@ at the fanout or at the delta path that is not a directory is left, as the tool
 leaves it; a delta whose source
 commit the run deleted is kept, and the `delta-indexes/` cache is left alone,
 as the tool leaves it.
-`delta.rs` carries the two helpers that reach it, `list_delta_dirs` and
-`remove_delta_dir`.
+`delta.rs` carries the helper that reaches it, `prune_delta_dirs`.
 
 The `.tombstone-commit` write path lands with the item. A run writes the marker
 for every commit it removes where the command line carries `--delete-commit` or
@@ -6085,7 +6085,7 @@ tree, so a lock would make `delete` wait behind every open transaction for no
 gain. A concurrent generation of the same delta can fail or leave a partial
 directory.
 
-The prune sweep, `remove_delta_dir`, opens the delta path with no symlink
+The prune sweep, `prune_delta_dirs`, opens the delta path with no symlink
 followed. It leaves an entry there that is not a directory, a symlink included,
 as the tool's prune does, and it removes a directory whole, nested directories
 included, through the same removal loop as `delete`.
@@ -7684,6 +7684,76 @@ Six decisions the phase carries:
   rule can delete the commits of a surviving ref's own history.
 - The out-of-tree consumer loses its own missing-edge warning when it drops its
   walk. This is the maintainer's decision.
+
+### Prune sweep order (DONE)
+
+`Repo::prune` removes what it dooms in two phases, so a run that stops part way
+through leaves no commit object whose tree it started to remove. Pull reads a
+commit with no `.commitpartial` marker as complete, so such a commit would be
+damage that no reader reports.
+
+- The commit phase removes each doomed commit. It writes the tombstone where the
+  run writes tombstones, then unlinks the commit object, and then its
+  `.commitmeta` where that is doomed too. Then it unlinks each doomed
+  `.commitmeta` whose commit is absent.
+- The commit goes before its `.commitmeta`, because a `.commitmeta` with no
+  commit is unreachable and the next prune removes it. The reverse order leaves
+  a commit with no signatures.
+- The barrier: where `[core] fsync` is true, the run syncs each `objects/`
+  fanout directory in which the commit phase unlinked an entry, each directory
+  once, through the `objects/` descriptor the unlinks went through. Where
+  `[core] fsync` is false, no barrier stands, and a crash gives no guarantee of
+  the order in which the removals reach the disk.
+- The content phase removes every other doomed object, in any order.
+- A `delete_commit` run removes the named commit in the order of the commit
+  phase and syncs its fanout directory before the sweep starts.
+- Neither phase removes a `state/<commit>.commitpartial` marker. The commit can
+  already be partial, and a crash that made the marker unlink durable and not
+  the commit unlink would make a partial commit look complete. The marker of a
+  removed commit goes in the orphan-marker sweep below, after the object sweep.
+  A marker that a failed or crashed run leaves over an absent commit guards
+  nothing, and the next run removes it.
+
+The order changes no statistic. Each doomed object is stat-ed before its
+unlink and counted once, except a `.commitmeta` the commit phase removes with
+its commit, which no number counts. An object already absent at its stat is
+skipped and counted in neither number. A `no_prune` dry run walks the same
+phases, removes nothing, and reports the numbers the removal would give.
+
+An interrupted run leaves two leftovers that no later walk finds: the static
+deltas of the commits it removed, and the markers of those commits. Every run
+that is neither a `no_prune` dry run nor a `static_deltas_only` run removes
+both after the object sweep:
+
+- each static delta whose target commit is absent from the store. The set of
+  present commits is the commits in the store listing the walk read that the
+  walk kept, so the sweep reads no object to learn it. A delta whose source
+  commit is absent and whose target is present stays. The sweep decodes each
+  delta name and tests its target before it checks for a superblock, so only a
+  delta it removes costs a `statat`. A name that does not decode names no
+  commit, and the sweep skips it and leaves the entry in place. The
+  `static-delta list` reading of the same entry refuses the listing.
+- each `state/<commit>.commitpartial` marker whose commit is absent from the
+  store. A name that is not a marker name in lowercase hex stays.
+
+A `static_deltas_only` run removes the deltas of the commit it names and
+nothing else, and it removes no marker. It skips a delta name that does not
+decode too.
+
+The marker sweep rests on the repository lock. Both pull paths write a marker
+inside their one transaction, which holds the lock shared until the
+transaction publishes the commit, and prune holds the lock exclusive, so no
+pull stands between writing a marker and storing its commit while the sweep
+runs. `fsck` writes a marker with no lock, but only for a commit it has read
+from the store, and it stores no commit. A repository whose config sets
+`[core] locking` false has no such exclusion. A prune there can remove the
+marker a concurrent pull just wrote. A commit that another writer stores after
+the prune lists the store reads as absent too, so the prune can remove the
+static delta of that commit.
+
+The removal of these leftovers is a port behavior. The tool's handling of a
+delta whose target is absent, and of a marker whose commit is absent, is not
+observed.
 
 ## Risk register
 

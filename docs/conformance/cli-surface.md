@@ -1744,6 +1744,15 @@ one the prune deletes. A symlink at `deltas` itself is followed in both, and
 the deltas behind it that the sweep selects are removed. A dangling symlink at
 `deltas` holds no delta, and the run exits 0 in both.
 
+The port's prune also removes, on every run without `--no-prune` and without
+`--static-deltas-only`, each static delta whose target commit is absent from
+the store and each `state/<commit>.commitpartial` marker whose commit is
+absent. These are the leftovers of a run that stopped part way through. Every
+prune skips a delta name that does not decode and leaves that entry in place.
+This is a port behavior. The tool's handling of the two leftovers is not
+observed. `../port-plan.md`, "Prune sweep order", states the rule and the order
+in which the port's prune removes a commit and its content.
+
 Both implementations hold the repository lock for the whole of a prune, and
 both take it exclusive. Measured against `ostree` 2026.1 on an archive
 repository holding one commit, with a helper process holding a POSIX record

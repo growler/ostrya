@@ -448,6 +448,7 @@ impl Repo {
             received,
         )
         .await
+        .map_err(Error::from)
     }
 
     /// Resolve what to pull: the requested refs, the remote's summary refs under
@@ -920,7 +921,7 @@ impl Repo {
                         "{path}: the remote answered 304 to an unconditional request"
                     )));
                 }
-                Err(e) => return Err(object_not_found(e, name)),
+                Err(e) => return Err(object_not_found(e.into(), name)),
             };
             // The write permit is taken before the body is read: a step waiting
             // for one has not yet asked the connection for bytes, so the
@@ -1622,7 +1623,7 @@ async fn fetch_whole(
         };
         match read_whole(body, max_size).await {
             Ok(out) => return Ok(out),
-            Err(e) => refetch.retry(e.into()).await?,
+            Err(e) => refetch.retry(Error::from(e)).await?,
         }
     }
 }

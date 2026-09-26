@@ -319,11 +319,12 @@ use std::pin::Pin;
 use std::task::ready;
 use std::task::{Context, Poll};
 
-use crate::error::{Error, Result};
-
+mod error;
 pub(crate) mod gate;
 mod io;
 mod tls;
+
+pub use self::error::{Error, Result};
 
 use gate::{Gate, Permit};
 use io::{FuturesIo, RtExecutor, RtTimer, WriteVectored};
@@ -2247,8 +2248,8 @@ impl Refetch<'_, '_> {
     /// repeat and waits the delay before the next [`fetch`](Refetch::fetch);
     /// anything else is returned as it is. The consumer drops the body before
     /// this is called, so the delay holds no connection and no admission
-    /// permit.
-    pub(crate) async fn retry(&mut self, error: Error) -> Result<()> {
+    /// permit. `error` is the caller's own error type and is returned as it is.
+    pub(crate) async fn retry<E>(&mut self, error: E) -> std::result::Result<(), E> {
         if !self.interrupted.load(Ordering::Relaxed) || self.left == 0 {
             return Err(error);
         }

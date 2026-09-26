@@ -161,7 +161,8 @@ bounded:
   prune, fsck, sign, summary, deltas, pull, tar, composefs export over
   `ostrya-composefs`. Feature-gated. The signing engines come from
   `ostrya-sign` and are re-exported. GPG verification over the `pgp` crate
-  and the system key store readers are part of `ostrya`.
+  and the system key store readers are part of `ostrya`. The fetcher has its
+  own error type, `ostrya::fetch::Error`, which converts into `ostrya::Error`.
 - `ostrya-cli` -- the CLI crate, building the `ostrya` binary: a minimal
   command set once the ingest and checkout paths land (Phase 11), grown
   incrementally; the `ostree`-compatible surface arrives with the port's own
@@ -7134,6 +7135,11 @@ The request surface:
   `PermissionDenied`, and `FetchTooLarge` maps to `FileTooLarge`, the kind a
   body that outgrows the cap mid-stream already fails its read with. Every
   other status stays `Other`.
+- The fetcher fails with its own type, `ostrya::fetch::Error`. Each of its
+  variants converts into the `ostrya::Error` variant of the same name, with the
+  same fields and the same message, so the `io::ErrorKind` mapping above
+  applies to a fetch failure after the conversion. A body that fails while it
+  streams fails its read with an `io::Error`.
 
 Encrypted client keys:
 

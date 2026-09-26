@@ -24,9 +24,10 @@ use hyper::body::{Body as _, Bytes, Frame, SizeHint};
 use hyper::header::{HeaderMap, HeaderName};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
+use ostrya::fetch::Error;
 use ostrya::{
-    BasicAuth, Checksum, ClientIdentity, Error, FetchRequest, Fetched, Fetcher, FetcherOptions,
-    LowSpeed, Priority, Protocol, Proxy, TlsOptions, TrustRoots, VerifyingReader,
+    BasicAuth, Checksum, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, LowSpeed,
+    Priority, Protocol, Proxy, TlsOptions, TrustRoots, VerifyingReader,
 };
 use ostrya_rt::{TcpListener, TcpStream, Timer, block_on, spawn};
 use sha2::{Digest, Sha256};
@@ -1991,6 +1992,64 @@ fn a_declared_length_over_the_cap_fails_before_streaming() {
         let err = fetcher.fetch(request).await.unwrap_err();
         assert!(matches!(err, Error::FetchTooLarge { limit: 1024 }), "{err}");
         assert_eq!(body.len(), 4096);
+    });
+}
+
+#[test]
+fn a_fetch_error_converts_into_the_library_error() {
+    block_on(async {
+        for (status, kind) in [
+            (404, io::ErrorKind::NotFound),
+            (401, io::ErrorKind::PermissionDenied),
+            (403, io::ErrorKind::PermissionDenied),
+        ] {
+            let server = TestServer::start(Transport::Cleartext, always_status(status)).await;
+            let fetcher = Fetcher::new(FetcherOptions {
+                max_retries: 0,
+                ..direct_options(server.url(false))
+            })
+            .await
+            .unwrap();
+
+            let err = fetch_error(&fetcher, "summary").await;
+            let rendered = err.to_string();
+            let err = ostrya::Error::from(err);
+            assert!(
+                matches!(err, ostrya::Error::HttpStatus { status: s, .. } if s == status),
+                "{err}"
+            );
+            assert_eq!(err.to_string(), rendered);
+            let io = io::Error::from(err);
+            assert_eq!(io.kind(), kind, "{rendered}");
+            assert_eq!(io.to_string(), rendered);
+        }
+
+        let handler: Handler = Arc::new(|_seen, _count| {
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(TestBody::measured(&vec![b'x'; 4096]))
+                .unwrap()
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            max_retries: 0,
+            ..direct_options(server.url(false))
+        })
+        .await
+        .unwrap();
+        let mut request = FetchRequest::path("summary");
+        request.max_size = Some(1024);
+        let err = fetcher.fetch(request).await.unwrap_err();
+        let rendered = err.to_string();
+        let err = ostrya::Error::from(err);
+        assert!(
+            matches!(err, ostrya::Error::FetchTooLarge { limit: 1024 }),
+            "{err}"
+        );
+        assert_eq!(err.to_string(), rendered);
+        let io = io::Error::from(err);
+        assert_eq!(io.kind(), io::ErrorKind::FileTooLarge);
+        assert_eq!(io.to_string(), rendered);
     });
 }
 

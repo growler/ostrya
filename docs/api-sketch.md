@@ -1610,7 +1610,9 @@ carries no field of its own.
 
 ## Fetcher
 
-The HTTP client pull is built on. One `Fetcher` serves one remote: it holds the
+The HTTP client pull is built on. The fetcher has its own error type,
+`ostrya::fetch::Error`, and every `Error::` item this section names is a
+variant of that type. One `Fetcher` serves one remote: it holds the
 mirrors, headers, credentials, and TLS configuration, pools connections per
 endpoint, and admits a bounded number of requests at a time in priority order. A
 request names a `Target`: a path under every mirror's base URL, or an absolute
@@ -1860,7 +1862,28 @@ impl Fetcher {
     pub async fn new(options: FetcherOptions) -> Result<Fetcher>;
     pub async fn fetch(&self, request: FetchRequest<'_>) -> Result<Fetched>;
 }
+
+// ostrya::fetch
+#[non_exhaustive]
+pub enum Error {
+    Fetch(String),                              // setup or transport failure
+    HttpStatus { status: u16, url: String },    // every mirror refused
+    RedirectLimit { url: String, hops: u32 },   // max_redirects reached
+    FetchTooLarge { limit: u64 },               // declared length over the cap
+    ContentEncoded { url: String, encoding: String },
+    Unsupported(String),                        // unusable proxy or URL scheme
+}
+pub type Result<T> = std::result::Result<T, Error>;
+
+// ostrya: each variant maps to the variant of the same name, with the same
+// fields and the same message, so the io::ErrorKind mapping is the same.
+impl From<ostrya::fetch::Error> for ostrya::Error;
 ```
+
+`Fetcher::new` and `Fetcher::fetch` return `ostrya::fetch::Result`. A read of a
+`Body` fails with `std::io::Error`. `Repo::pull` and the other repository
+operations return `ostrya::Error`, and a fetch failure reaches them through the
+conversion.
 
 ## Pull
 

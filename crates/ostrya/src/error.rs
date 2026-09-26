@@ -3,7 +3,9 @@
 //! One `Error` enum for the whole crate, deriving `Display` and
 //! `std::error::Error` via `thiserror`. The enum is `#[non_exhaustive]` because
 //! later phases add variants (object not-found, checksum mismatch, signature,
-//! lock, and so on).
+//! lock, and so on). The signing engines and the fetcher have their own error
+//! types, [`ostrya_sign::Error`] and [`fetch::Error`](crate::fetch::Error),
+//! which convert into this one.
 
 use ostrya_core::{Checksum, ObjectType};
 use thiserror::Error;
@@ -51,6 +53,9 @@ pub enum Error {
     #[error("invalid format: {0}")]
     InvalidFormat(String),
     /// A requested operation or repository feature is not supported.
+    ///
+    /// A [`fetch::Error::Unsupported`](crate::fetch::Error::Unsupported)
+    /// converts to this variant.
     #[error("unsupported: {0}")]
     Unsupported(String),
     /// Acquiring the repository lock timed out under contention.
@@ -228,6 +233,9 @@ pub enum Error {
     /// A fetch could not be set up or carried out: an unusable mirror URL,
     /// header, or TLS configuration, or a transport failure that outlived its
     /// retries.
+    ///
+    /// A [`fetch::Error::Fetch`](crate::fetch::Error::Fetch) converts to this
+    /// variant. The pull also builds this variant itself.
     #[error("fetch: {0}")]
     Fetch(String),
     /// Every mirror answered the request with an unsuccessful HTTP status. A
@@ -237,6 +245,9 @@ pub enum Error {
     /// One mirror's answer is reported: the first status received that is not
     /// retried, from whichever round it came, unless the rounds ran out with a
     /// retryable status outstanding, in which case the last mirror to give one.
+    ///
+    /// A [`fetch::Error::HttpStatus`](crate::fetch::Error::HttpStatus) converts
+    /// to this variant.
     #[error("http status {status} for {url}")]
     HttpStatus {
         /// The status that mirror returned.
@@ -249,6 +260,9 @@ pub enum Error {
     /// response at the end of it named another URL to follow. One attempt
     /// against one destination counts its own hops, so a repeated round counts
     /// again from the destination the route named.
+    ///
+    /// A [`fetch::Error::RedirectLimit`](crate::fetch::Error::RedirectLimit)
+    /// converts to this variant.
     #[error("redirect from {url} exceeds the {hops}-redirect limit")]
     RedirectLimit {
         /// The last hop the attempt reached, which is the URL whose `Location`
@@ -262,6 +276,9 @@ pub enum Error {
     /// outgrows the cap while streaming fails the read with the same
     /// [`FileTooLarge`](std::io::ErrorKind::FileTooLarge) kind, under a
     /// message payload that downcasts to no library error.
+    ///
+    /// A [`fetch::Error::FetchTooLarge`](crate::fetch::Error::FetchTooLarge)
+    /// converts to this variant.
     #[error("fetched object exceeds the {limit}-byte cap")]
     FetchTooLarge {
         /// The cap the caller set on the request.
@@ -270,6 +287,9 @@ pub enum Error {
     /// A response declared a coding, in `Content-Encoding` or in
     /// `Transfer-Encoding`, so its body holds bytes other than the ones the
     /// remote stores.
+    ///
+    /// A [`fetch::Error::ContentEncoded`](crate::fetch::Error::ContentEncoded)
+    /// converts to this variant.
     #[error("response for {url} carries the coding {encoding}")]
     ContentEncoded {
         /// The URL that answered.
@@ -318,6 +338,25 @@ impl From<ostrya_sign::Error> for Error {
             ostrya_sign::Error::InvalidFormat(message) => Error::InvalidFormat(message),
             ostrya_sign::Error::Core(e) => Error::Core(e),
             other => Error::Signature(other.to_string()),
+        }
+    }
+}
+
+impl From<crate::fetch::Error> for Error {
+    /// Map a fetcher error onto the variant of the same name, with the same
+    /// fields and so the same message.
+    fn from(err: crate::fetch::Error) -> Error {
+        use crate::fetch::Error as F;
+
+        // The fetcher type lives in this crate, so the match is exhaustive. A
+        // wildcard arm is needed once the type lives in another crate.
+        match err {
+            F::Fetch(message) => Error::Fetch(message),
+            F::HttpStatus { status, url } => Error::HttpStatus { status, url },
+            F::RedirectLimit { url, hops } => Error::RedirectLimit { url, hops },
+            F::FetchTooLarge { limit } => Error::FetchTooLarge { limit },
+            F::ContentEncoded { url, encoding } => Error::ContentEncoded { url, encoding },
+            F::Unsupported(message) => Error::Unsupported(message),
         }
     }
 }
@@ -546,6 +585,88 @@ mod tests {
         let err = Error::from(ostrya_sign::Error::Core(core.clone()));
         assert!(matches!(&err, Error::Core(e) if *e == core), "{err}");
         assert_eq!(err.to_string(), ostrya_sign::Error::Core(core).to_string());
+    }
+
+    #[test]
+    fn a_fetch_error_maps_to_its_namesake() {
+        use crate::fetch::Error as F;
+        use std::io::ErrorKind;
+
+        let url = || "https://example.invalid/objects/ab.commit".to_owned();
+        let cases: Vec<(F, ErrorKind)> = vec![
+            (F::Fetch("connection reset".into()), ErrorKind::Other),
+            (
+                F::HttpStatus {
+                    status: 404,
+                    url: url(),
+                },
+                ErrorKind::NotFound,
+            ),
+            (
+                F::HttpStatus {
+                    status: 401,
+                    url: url(),
+                },
+                ErrorKind::PermissionDenied,
+            ),
+            (
+                F::HttpStatus {
+                    status: 403,
+                    url: url(),
+                },
+                ErrorKind::PermissionDenied,
+            ),
+            (
+                F::HttpStatus {
+                    status: 500,
+                    url: url(),
+                },
+                ErrorKind::Other,
+            ),
+            (
+                F::RedirectLimit {
+                    url: url(),
+                    hops: 10,
+                },
+                ErrorKind::Other,
+            ),
+            (F::FetchTooLarge { limit: 4096 }, ErrorKind::FileTooLarge),
+            (
+                F::ContentEncoded {
+                    url: url(),
+                    encoding: "gzip".into(),
+                },
+                ErrorKind::Other,
+            ),
+            (F::Unsupported("proxy url".into()), ErrorKind::Other),
+        ];
+
+        for (fetch, expected) in cases {
+            let rendered = fetch.to_string();
+            let namesake = match &fetch {
+                F::Fetch(m) => Error::Fetch(m.clone()),
+                F::HttpStatus { status, url } => Error::HttpStatus {
+                    status: *status,
+                    url: url.clone(),
+                },
+                F::RedirectLimit { url, hops } => Error::RedirectLimit {
+                    url: url.clone(),
+                    hops: *hops,
+                },
+                F::FetchTooLarge { limit } => Error::FetchTooLarge { limit: *limit },
+                F::ContentEncoded { url, encoding } => Error::ContentEncoded {
+                    url: url.clone(),
+                    encoding: encoding.clone(),
+                },
+                F::Unsupported(m) => Error::Unsupported(m.clone()),
+            };
+            let err = Error::from(fetch);
+            assert_eq!(format!("{err:?}"), format!("{namesake:?}"));
+            assert_eq!(err.to_string(), rendered);
+            let io = std::io::Error::from(err);
+            assert_eq!(io.kind(), expected, "kind for {rendered}");
+            assert_eq!(io.to_string(), rendered);
+        }
     }
 
     #[test]

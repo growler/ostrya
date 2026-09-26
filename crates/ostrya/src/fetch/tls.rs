@@ -85,7 +85,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 
-use crate::error::{Error, Result};
+use super::{Error, Result};
 
 /// Which certificate authorities the fetcher trusts.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

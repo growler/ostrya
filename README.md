@@ -80,6 +80,9 @@ The project is a Cargo workspace of focused crates:
   signer through the `gpg` binary. Portable, with no repository knowledge.
 - `ostrya-fetch` -- the async HTTP/1.1 and HTTP/2 fetcher, with TLS over
   `rustls`. Portable, with no repository knowledge.
+- `ostrya-push` -- the push wire protocol: the messages and their GVariant
+  encoding, the frame codec, and the chunked object stream. Portable, with
+  no repository knowledge and no runtime.
 - `ostrya-composefs` -- standalone, synchronous EROFS/composefs image writer
   and fs-verity digest. Takes a tree model and emits image bytes.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs,

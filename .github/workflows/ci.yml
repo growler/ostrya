@@ -164,16 +164,17 @@ jobs:
 
       # The portable crates compile for macOS and Windows as well as Linux.
       # `cargo check` needs the standard library of each target and no linker,
-      # so the Linux runner checks all three targets. Each portable crate is
-      # checked with each runtime backend. `ostrya-fetch` is checked by the
-      # build step that follows, because a build also type-checks the crate.
+      # so the Linux runner checks all three targets. Each portable crate that
+      # holds a runtime is checked with each runtime backend. `ostrya-fetch` is
+      # checked by the build step that follows, because a build also
+      # type-checks the crate.
       - name: Install the non-Linux targets
         run: rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin
 
       - name: The portable crates check on the non-Linux targets
         run: |
           for target in x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-            cargo check --target "$target" -p ostrya-gvariant -p ostrya-core -p ostrya-rt
+            cargo check --target "$target" -p ostrya-gvariant -p ostrya-core -p ostrya-rt -p ostrya-push
             cargo check --target "$target" -p ostrya-rt --no-default-features --features tokio
             cargo check --target "$target" -p ostrya-sign --features sign-spki,sign-gpg
             cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,sign-gpg

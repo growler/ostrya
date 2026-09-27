@@ -162,6 +162,11 @@ bounded:
   Compiles on Linux, macOS, and Windows. On macOS and Windows,
   `rustls-native-certs` links system libraries of the operating system trust
   store.
+- `ostrya-push` -- the push wire protocol: the messages and their GVariant
+  encoding, the frame codec with its limit, and the chunked object stream
+  with its abandon marker. No repository knowledge and no runtime. Depends
+  on `ostrya-gvariant`, `ostrya-core`, `thiserror`, `futures-io`, and
+  `futures-lite`. Compiles on Linux, macOS, and Windows.
 - `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the
   fs-verity digest. Standalone and free of ostree and repository knowledge,
   like `ostrya-gvariant`: it takes a tree model and emits the image bytes and
@@ -6898,9 +6903,9 @@ on `receive`). The client code that must compile on macOS and Windows goes
 into portable workspace crates: `ostrya-fetch` (the fetcher), `ostrya-sign`
 (the signing engines), and `ostrya-push` (the protocol, the client session,
 the transports, and the tree model). `ostrya` re-exports their public items.
-`ostrya-gvariant`, `ostrya-core`, `ostrya-rt`, `ostrya-sign`, and
-`ostrya-fetch` compile on those targets as well. CI checks the portable
-crates for `x86_64-pc-windows-gnu`, `x86_64-apple-darwin`, and
+`ostrya-gvariant`, `ostrya-core`, `ostrya-rt`, `ostrya-sign`,
+`ostrya-fetch`, and `ostrya-push` compile on those targets as well. CI checks
+the portable crates for `x86_64-pc-windows-gnu`, `x86_64-apple-darwin`, and
 `aarch64-apple-darwin`, and builds the rlib of `ostrya-fetch` for each of
 them.
 

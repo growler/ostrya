@@ -1732,6 +1732,17 @@ name = "ostrya-gvariant"
 version = "0.2.8"
 
 [[package]]
+name = "ostrya-push"
+version = "0.2.8"
+dependencies = [
+ "futures-io",
+ "futures-lite",
+ "ostrya-core",
+ "ostrya-gvariant",
+ "thiserror",
+]
+
+[[package]]
 name = "ostrya-rt"
 version = "0.2.8"
 dependencies = [

@@ -8023,7 +8023,10 @@ Resolved:
     stays there. `Verifier::verify` is async so a verifying engine can await
     work on the blocking pool. Subprocesses go through `rt::Command`
     (`smol::process` / `tokio::process`); the `gpg` binary is a runtime tool
-    dependency of signing alone.
+    dependency of signing alone. Under the `receive` and `sign-gpg` features,
+    a server signing key is resolved with `gpg --list-secret-keys` and its
+    public certificate is read with `gpg --export`, so the receive path can
+    tell whether that key already signed a commit.
 
     Keyring parsing and signature verification are in the process, over the
     `pgp` crate (rPGP) behind the `verify-gpg` feature. rPGP is

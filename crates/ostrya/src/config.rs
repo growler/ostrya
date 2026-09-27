@@ -3,8 +3,14 @@
 //! [`RepoConfig`] wraps the [`KeyFile`] parsed from `<repo>/config` and applies
 //! the value-level conventions the `ostree` tool uses: the `[core]` group with
 //! `repo_version` and `mode`, the documented `[core]` tunables with their
-//! defaults, the `[archive]` group, and `[remote "<name>"]` sections. The
-//! `[ex-ostrya]` group carries the two keys that are ostrya extensions.
+//! defaults, the `[archive]` group, and `[remote "<name>"]` sections.
+//!
+//! The `[ex-ostrya]` group carries the keys that are ostrya extensions:
+//! `gc-root-metadata-keys` for a prune, `detached-metadata-exclude` for what a
+//! repository stores and sends, and the `receive-*` keys, which state the
+//! policy a repository applies to the commits it receives. Under the `receive`
+//! feature, `ReceivePolicy::from_config` reads the `receive-*` keys through
+//! the crate-private readers of this module.
 //!
 //! The `repo_version` and `mode` keys are validated when the config is loaded,
 //! matching the tool, which refuses to open a repository whose version is not
@@ -343,8 +349,8 @@ impl RepoConfig {
     /// [`PullOptions::detached_metadata_filter`](crate::PullOptions::detached_metadata_filter)
     /// through
     /// [`DetachedMetadataFilter::excluding`](crate::DetachedMetadataFilter::excluding).
-    /// Push is not implemented, so today the key acts on the receiving side
-    /// alone.
+    /// Under the `receive` feature, `ReceivePolicy::from_config` reads it into
+    /// the filter the receive path applies.
     ///
     /// This list is never derived from
     /// [`gc_root_metadata_keys`](RepoConfig::gc_root_metadata_keys), even when
@@ -357,6 +363,41 @@ impl RepoConfig {
     /// key and pulling again does not remove a copy an earlier pull stored.
     pub fn detached_metadata_exclude(&self) -> Result<Vec<String>> {
         self.string_list(EX_OSTRYA, "detached-metadata-exclude")
+    }
+
+    /// Whether the summary is regenerated after a ref changes: `[core]
+    /// auto-update-summary`, or its deprecated alias `commit-update-summary`.
+    /// Default `false`.
+    ///
+    /// The two keys are read together, and either one set to true turns the
+    /// regeneration on, which is what the tool was observed to do: with one key
+    /// true and the other false, in either order, `ostree commit` writes a
+    /// summary. A malformed value in either key is an error, also when the
+    /// other key is true, as the tool refuses it.
+    pub fn auto_update_summary(&self) -> Result<bool> {
+        let canonical = self.keyfile.get_bool(CORE, "auto-update-summary")?;
+        let alias = self.keyfile.get_bool(CORE, "commit-update-summary")?;
+        Ok(canonical.unwrap_or(false) || alias.unwrap_or(false))
+    }
+
+    /// The string value of one `[ex-ostrya]` key, `None` when it is absent.
+    #[cfg(feature = "receive")]
+    pub(crate) fn ex_ostrya_string(&self, key: &str) -> Result<Option<String>> {
+        self.keyfile.get_string(EX_OSTRYA, key).map_err(Error::from)
+    }
+
+    /// The boolean value of one `[ex-ostrya]` key, `false` when it is absent. A
+    /// value other than `true`, `false`, `1`, or `0` is an error.
+    #[cfg(feature = "receive")]
+    pub(crate) fn ex_ostrya_bool(&self, key: &str) -> Result<bool> {
+        Ok(self.keyfile.get_bool(EX_OSTRYA, key)?.unwrap_or(false))
+    }
+
+    /// The `;`-separated list value of one `[ex-ostrya]` key, empty when it is
+    /// absent.
+    #[cfg(feature = "receive")]
+    pub(crate) fn ex_ostrya_list(&self, key: &str) -> Result<Vec<String>> {
+        self.string_list(EX_OSTRYA, key)
     }
 
     /// Read a `;`-separated list key, empty when the key is absent. A value the
@@ -852,6 +893,45 @@ mod tests {
                     detached-metadata-exclude=app.roots\\\n";
         let cfg = RepoConfig::parse(text).unwrap();
         assert!(cfg.detached_metadata_exclude().is_err());
+    }
+
+    /// Summary regeneration is off by default, each key alone turns it on, and
+    /// either key true wins over the other key false.
+    #[test]
+    fn auto_update_summary_reads_both_keys() {
+        let read = |extra: &str| {
+            RepoConfig::parse(&format!("[core]\nrepo_version=1\nmode=archive\n{extra}"))
+                .unwrap()
+                .auto_update_summary()
+        };
+        assert!(!read("").unwrap());
+        assert!(read("auto-update-summary=true\n").unwrap());
+        assert!(read("commit-update-summary=1\n").unwrap());
+        assert!(!read("auto-update-summary=false\ncommit-update-summary=0\n").unwrap());
+        assert!(read("auto-update-summary=true\ncommit-update-summary=false\n").unwrap());
+        assert!(read("auto-update-summary=false\ncommit-update-summary=true\n").unwrap());
+    }
+
+    /// A malformed value in either key is an error, also when the other key is
+    /// true.
+    #[test]
+    fn a_malformed_auto_update_summary_is_an_error() {
+        for extra in [
+            "auto-update-summary=yes\n",
+            "commit-update-summary=yes\n",
+            "auto-update-summary=true\ncommit-update-summary=yes\n",
+            "auto-update-summary=yes\ncommit-update-summary=true\n",
+        ] {
+            let cfg = RepoConfig::parse(&format!("[core]\nrepo_version=1\nmode=archive\n{extra}"))
+                .unwrap();
+            assert!(
+                matches!(
+                    cfg.auto_update_summary(),
+                    Err(Error::Core(ostrya_core::Error::KeyFile(_)))
+                ),
+                "{extra:?}"
+            );
+        }
     }
 
     #[test]

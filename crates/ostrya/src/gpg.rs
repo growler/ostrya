@@ -5,8 +5,11 @@
 //! `pgp` crate (rPGP). The `sign-gpg` feature adds signing through
 //! `gpg --detach-sign` and turns on `verify-gpg` with it. The signer is
 //! [`GpgSigner`] of the `ostrya-sign` crate, re-exported here. Its signing run
-//! is the one `gpg` run the library makes. The private key stays with GnuPG and
-//! its agent and never passes through the library.
+//! and its secret-key listing are the `gpg` runs the library makes, with one
+//! more under the `receive` feature: a server signing key's public certificate
+//! is read with `gpg --export`, so the receive path can recognize a signature
+//! that key already made. The private key stays with GnuPG and its agent and
+//! never passes through the library.
 //!
 //! Format (`format-reference.md`, "Signing details -- GPG"):
 //!
@@ -219,22 +222,33 @@ impl GpgVerifier {
         let mut paths: Vec<PathBuf> = Vec::new();
         paths.push(Path::new(SYSTEM_REMOTES_D).join(format!("{remote}.trustedkeys.gpg")));
         paths.extend(keyring_files_in(&global_trusted_dir())?);
-        for entry in keypath {
-            let path = Path::new(entry);
-            let meta = std::fs::metadata(path).map_err(|e| {
-                Error::Signature(format!("gpgkeypath entry '{entry}' cannot be read: {e}"))
-            })?;
-            if meta.is_dir() {
-                paths.extend(keyring_files_in(path)?);
-            } else {
-                paths.push(path.to_owned());
-            }
-        }
+        paths.extend(keypath_files("gpgkeypath", keypath)?);
         let mut verifier = GpgVerifier::default();
         if let Some(bytes) = repo_keyring {
             verifier.add_keyring(&bytes, &format!("the keyring '{remote}.trustedkeys.gpg'"))?;
         }
         verifier.add_keyring_files(paths)?;
+        Ok(verifier)
+    }
+
+    /// Build a verifier from the keyrings `keypath` names, and from nothing
+    /// else: no per-remote keyring and no global trusted set take part.
+    ///
+    /// Each entry is a keyring file or a directory of `*.gpg` keyrings, and an
+    /// entry that names neither fails the build. Keyrings that hold no
+    /// certificate among them, such as an empty file or a directory with no
+    /// `*.gpg` keyring, fail the build as [`Error::Signature`]: a verifier with
+    /// no trusted key would refuse every commit. `key` is the configuration key
+    /// the entries come from, which a refusal names.
+    #[cfg(feature = "receive")]
+    pub(crate) fn from_keypath(key: &str, keypath: &[String]) -> Result<GpgVerifier> {
+        let mut verifier = GpgVerifier::default();
+        verifier.add_keyring_files(keypath_files(key, keypath)?)?;
+        if verifier.certs.is_empty() {
+            return Err(Error::Signature(format!(
+                "{key} names no key: the keyrings it names hold no certificate"
+            )));
+        }
         Ok(verifier)
     }
 
@@ -1018,6 +1032,87 @@ fn keyring_files_in(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// The keyring files the entries of a keyring path name, in entry order: an
+/// entry naming a file gives that file, and an entry naming a directory gives
+/// the `*.gpg` keyrings in it, sorted by name. An entry that cannot be read is
+/// refused by `key`, the configuration key it comes from, and by its own text.
+fn keypath_files(key: &str, keypath: &[String]) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in keypath {
+        let path = Path::new(entry);
+        let meta = std::fs::metadata(path)
+            .map_err(|e| Error::Signature(format!("{key} entry '{entry}' cannot be read: {e}")))?;
+        if meta.is_dir() {
+            paths.extend(keyring_files_in(path)?);
+        } else {
+            paths.push(path.to_owned());
+        }
+    }
+    Ok(paths)
+}
+
+/// The public certificate of the key `fingerprint` names, as `gpg --export`
+/// writes it from the GnuPG home `homedir`, or from gpg's own default home
+/// where `homedir` is `None`.
+///
+/// The receive path trusts this certificate to recognize a signature its own
+/// server key made. The export is held to [`MAX_KEYRING`]: the read stops one
+/// byte past the ceiling and refuses the export, so the size of what `gpg`
+/// writes cannot decide an allocation. An export that fails or writes nothing
+/// is refused.
+///
+/// `gpg` writes its standard error to the standard error of this process: the
+/// call does not capture it. A refused export names the exit status of `gpg`
+/// and does not carry the text `gpg` wrote.
+///
+/// The fingerprint stands after `--`, so gpg reads it as a key name alone.
+#[cfg(all(feature = "receive", feature = "sign-gpg"))]
+pub(crate) async fn export_public_key(
+    homedir: Option<&Path>,
+    fingerprint: &str,
+) -> Result<Vec<u8>> {
+    use futures_lite::AsyncReadExt;
+
+    let mut cmd = ostrya_rt::Command::new("gpg");
+    if let Some(dir) = homedir {
+        cmd.arg("--homedir").arg(dir);
+    }
+    cmd.arg("--batch")
+        .arg("--quiet")
+        .arg("--export")
+        .arg("--")
+        .arg(fingerprint);
+    let mut child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Error::Signature("gpg: program not found in PATH".into())
+        } else {
+            Error::Signature(format!("gpg: {e}"))
+        }
+    })?;
+    let mut exported = Vec::new();
+    let read = match child.take_stdout() {
+        Some(stdout) => stdout
+            .take(MAX_KEYRING + 1)
+            .read_to_end(&mut exported)
+            .await
+            .map(|_| ()),
+        None => Ok(()),
+    };
+    let status = child.wait().await?;
+    read?;
+    if exported.len() as u64 > MAX_KEYRING {
+        return Err(Error::Signature(format!(
+            "gpg --export of '{fingerprint}' is over the {MAX_KEYRING}-byte ceiling"
+        )));
+    }
+    if !status.success() || exported.is_empty() {
+        return Err(Error::Signature(format!(
+            "gpg --export of '{fingerprint}' gave no certificate: exit status {status}"
+        )));
+    }
+    Ok(exported)
+}
+
 /// Read the keyring at `path`, up to [`MAX_KEYRING`], or `None` where no file
 /// is there. This is how every keyring source reaches the trusted set.
 fn read_keyring_path(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -1075,7 +1170,7 @@ const _: fn() = || {
 };
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The signer of `ostrya-sign` writes under the key this module reads.
@@ -1139,7 +1234,7 @@ IHdvcmxk\n\
 
     /// Whether the `gpg` binary answers. The keyring cases below build their
     /// fixtures with it, so an absent binary skips them and never passes one.
-    fn gpg_available() -> bool {
+    pub(crate) fn gpg_available() -> bool {
         std::process::Command::new("gpg")
             .arg("--version")
             .output()
@@ -1151,15 +1246,15 @@ IHdvcmxk\n\
     /// directory with `--homedir`, so the invoking user's GnuPG home and any
     /// agent of theirs take no part. Dropping the fixture kills the agent
     /// GnuPG auto-started for the directory and removes the directory.
-    struct KeyFixture {
-        dir: PathBuf,
+    pub(crate) struct KeyFixture {
+        pub(crate) dir: PathBuf,
         /// Whether every `gpg` run in this home stands at [`FAKED_CLOCK`].
         faked: bool,
     }
 
     impl KeyFixture {
         /// A new home directory holding one key for `uid` that never expires.
-        fn new(uid: &str) -> KeyFixture {
+        pub(crate) fn new(uid: &str) -> KeyFixture {
             let fixture = KeyFixture {
                 dir: KeyFixture::make_dir(),
                 faked: false,
@@ -1193,7 +1288,7 @@ IHdvcmxk\n\
         }
 
         /// Generate one more key, for `uid`, in the same home directory.
-        fn add_key(&self, uid: &str) {
+        pub(crate) fn add_key(&self, uid: &str) {
             self.generate(uid, "never");
         }
 
@@ -1228,7 +1323,7 @@ IHdvcmxk\n\
         }
 
         /// One detached signature over `payload` by the home's first key.
-        fn sign(&self, payload: &[u8]) -> Vec<u8> {
+        pub(crate) fn sign(&self, payload: &[u8]) -> Vec<u8> {
             let file = self.dir.join("payload");
             std::fs::write(&file, payload).unwrap();
             let out = self
@@ -1256,7 +1351,7 @@ IHdvcmxk\n\
         }
 
         /// The fingerprint of the home's first key, uppercase hex.
-        fn fingerprint(&self) -> String {
+        pub(crate) fn fingerprint(&self) -> String {
             let out = self
                 .gpg()
                 .args(["--with-colons", "--list-keys"])

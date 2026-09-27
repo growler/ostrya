@@ -156,6 +156,11 @@ jobs:
       - name: A build without a GPG feature compiles
         run: cargo check -p ostrya --no-default-features --features smol
 
+      # The receive policy refuses a GPG axis and a GPG signing key where the
+      # build holds no GPG engine. This compiles those arms.
+      - name: The receive feature without a GPG feature compiles
+        run: cargo check -p ostrya --no-default-features --features smol,receive
+
       # `ostrya-sign` holds a runtime only under `sign-gpg`. This compiles the
       # crate with no runtime backend, so a runtime item placed outside that
       # feature fails here.

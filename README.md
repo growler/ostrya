@@ -89,10 +89,16 @@ The project is a Cargo workspace of focused crates:
   reading, and the paths listed under Status. Feature-gated.
 - `ostrya-cli` -- the command-line front-end (builds the `ostrya` binary).
 
-Feature flags on `ostrya`: the runtime selectors `smol` (default) and `tokio`,
-and `lzma-static` for the static xz build; later phases add `pull`,
-`verify-gpg`, `sign-gpg` (which turns on `verify-gpg`), `deltas`, `s3`,
-`push`, `receive`, and `serve`.
+Feature flags on `ostrya`:
+
+- `smol` (default) and `tokio` -- the runtime selectors.
+- `sign-spki` -- the spki signature engine.
+- `verify-gpg` -- GPG signature verification.
+- `sign-gpg` -- GPG signing. It turns on `verify-gpg`.
+- `receive` -- the receive policy of a push.
+- `lzma-static` -- the static xz build.
+
+Later phases add `s3`, `push`, and `serve`.
 
 ## Clean-room provenance and licensing
 

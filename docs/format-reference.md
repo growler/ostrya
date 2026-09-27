@@ -1207,7 +1207,8 @@ Created with `[core]` `repo_version=1`, `mode=<mode>`, optional
 `per-object-fsync` (default false), `locking` (default true),
 `lock-timeout-secs` (default 300), `tmp-expiry-secs` (default 86400),
 `disable-xattrs`, `collection-id`, `parent`, `default-repo-finders` (default
-`config;mount`). `[archive] zlib-level` (1-9, default 6). Remote sections are
+`config;mount`), `auto-update-summary` and its deprecated alias
+`commit-update-summary` (both default false). `[archive] zlib-level` (1-9, default 6). Remote sections are
 `[remote "<name>"]` with keys `url`, `contenturl`, `metalink`, `gpg-verify`
 (default true), `gpg-verify-summary` (default false), `gpgkeypath`, TLS keys,
 `collection-id`, `sign-verify`, `sign-verify-summary` (both default off),
@@ -1241,6 +1242,20 @@ the bytes `ostree config set` writes:
   surrounding space and tab. In the value, leading space and tab are removed
   and trailing whitespace is kept. A `#` inside a value is literal; there are
   no inline comments. A repeated key takes the last value.
+- `auto-update-summary` and `commit-update-summary` are read together, and
+  either one true regenerates the summary after a ref changes. Observed with
+  `ostree` 2026.1 through `ostree commit -b x` into an archive repository, for
+  each of the nine combinations of each key absent, `true`, and `false`: the
+  commit writes `summary` exactly when one of the two keys is `true`, so
+  `auto-update-summary=false` with `commit-update-summary=true` writes it, and
+  so does the reverse. A value that is not a boolean in either key, `yes` for
+  example, makes the commit exit 1 with `error: Key file contains key
+  “auto-update-summary” which has a value that cannot be interpreted.`, also
+  when the other key is `true`; the ref is written and the summary is not.
+  `RepoConfig::auto_update_summary` reads the two keys by the same rule and
+  refuses a malformed value in either one. `ReceivePolicy::from_config` is
+  its one caller in the port: `ostrya commit` and `ostrya pull` do not
+  regenerate the summary.
 - A boolean is one of `true`, `false`, `1`, `0`. Any other spelling (`yes`,
   `no`, `on`, `off`, mixed case such as `True`, an out-of-range number such as
   `2`, or the empty string) is rejected with a "value that cannot be
@@ -1510,21 +1525,74 @@ syscalls in the write path that require `unsafe`; they live in the audited
 ## Port extension: the ex-ostrya config group
 
 The `[ex-ostrya]` group is an ostrya extension. The `ostree` tool defines no key
-in it and reads none. The group holds two keys, each a `;`-separated list that
-is empty when the key is absent:
+in it and reads none. A list key is split on `;` by the key-file list rule, is
+empty when the key is absent, and takes a trailing `;` with no empty element. A
+boolean key takes `true`, `false`, `1`, or `0`, and is false when absent.
 
-- `gc-root-metadata-keys` -- the metadata keys a prune reads for further
-  reachable commits. The value of each key, in a commit's own metadata and in
-  its detached metadata, is an `aay` of 32-byte commit checksums, and each
-  checksum is a root of the walk. See `port-plan.md`, Phase 22.
-- `detached-metadata-exclude` -- the detached-metadata keys the repository does
-  not store when it receives a commit, and does not send when it serves one. A
-  pull drops each key the list names from the `.commitmeta` it stores.
+The prune and transfer keys:
+
+- `gc-root-metadata-keys` -- a list: the metadata keys a prune reads for
+  further reachable commits. The value of each key, in a commit's own metadata
+  and in its detached metadata, is an `aay` of 32-byte commit checksums, and
+  each checksum is a root of the walk. See `port-plan.md`, Phase 22.
+- `detached-metadata-exclude` -- a list: the detached-metadata keys the
+  repository does not store when it receives a commit, and does not send when
+  it serves one. A pull drops each key the list names from the `.commitmeta` it
+  stores. `ReceivePolicy::from_config` puts the list into the filter of the
+  receive policy.
+
+The receive keys state the policy a repository applies to the commits and ref
+updates it receives:
+
+- `receive-allow-non-fast-forward` -- boolean: accept a ref update whose new
+  commit does not descend from the current one.
+- `receive-allow-delete` -- boolean: accept a ref delete.
+- `receive-allow-privileged` -- boolean: accept a setuid or setgid mode bit,
+  and the `security.capability` and `security.selinux` extended attributes, in
+  a `bare` repository.
+- `receive-allow-remote-refs` -- boolean: accept a ref update that names a
+  remote ref, `REMOTE:NAME`.
+- `receive-verify` -- `off` (the default), or a list of `gpg`, `ed25519`, and
+  `spki`. `gpg` turns on the GPG axis. Each engine name adds that engine to the
+  sign-api axis. A commit has to pass each axis, and one engine of the
+  sign-api axis is enough. A name given twice counts once. An empty value, an
+  empty element, `off` beside a name, `true`, `false`, `dummy`, and any other
+  name are refused.
+- `receive-gpgkeypath` -- the keyrings the GPG axis trusts: `;`-separated
+  keyring files and directories of `*.gpg` keyrings. The GPG axis needs at
+  least one entry, and an entry that names neither a file nor a directory is
+  refused. The keyrings have to hold at least one certificate among them, so
+  an empty keyring file, or a directory with no `*.gpg` keyring, as the only
+  entry is refused.
+- `receive-verification-ENGINE-key` and `receive-verification-ENGINE-file` --
+  the keys the sign-api axis trusts for one engine. The forms are those of the
+  remote keys `verification-ENGINE-key` (one base64 key) and
+  `verification-ENGINE-file` (a file of one base64 key per line). Each engine
+  that `receive-verify` names needs a key.
+- `receive-sign-type` and `receive-sign-key-file` -- one sign-api key the
+  server signs with. The type is `ed25519`, the default when only the file is
+  set, or `spki`. The file holds one base64 secret key: for `ed25519` the
+  64-byte seed and public key, for `spki` the key forms `ostree sign` takes. A
+  type with no file is refused, and `gpg` as a type is refused in favor of
+  `receive-gpg-sign`.
+- `receive-gpg-sign` and `receive-gpg-homedir` -- a list of GPG key selectors
+  the server signs with, and the GnuPG home directory `gpg` resolves them in.
+  Each selector has to name exactly one secret key.
+- `receive-sign-summary` -- boolean: sign the regenerated summary with the
+  server keys.
+
+The receive path trusts only the keys these entries name. No system sign-api
+key store, no revoked set, no per-remote keyring, and no global trusted
+keyring directory takes part. `ReceivePolicy::from_config` reads the receive
+keys, `detached-metadata-exclude`, and `[core] auto-update-summary` (see
+"Config file").
 
 The group carries no repository fact. Detached metadata sits outside the commit
-checksum, so a repository that sets either key holds the same object bytes and
-the same checksums as one that sets neither. The `ostrya` CLI is the one reader:
-the library acts on the options its caller supplies.
+checksum, so a repository that sets any of these keys holds the same object
+bytes and the same checksums as one that sets none. The library reads
+`gc-root-metadata-keys` nowhere and reads `detached-metadata-exclude` for a
+pull nowhere: the `ostrya` CLI puts them into the options it supplies. The
+receive path reads its keys through `ReceivePolicy::from_config`.
 
 The tool tolerates the group. Observed with `ostree` 2026.1 against an archive
 repository whose `config` holds these two lines:
@@ -1540,6 +1608,31 @@ gc-root-metadata-keys=app.roots;app.other;
   `app.roots;app.other;` and exits 0;
 - `ostree config set core.mode archive-z2` rewrites `config` and preserves the
   group and its key verbatim.
+
+Observed with `ostree` 2026.1 against an archive repository with one commit
+on `x` whose `config` holds every receive key, each set to a value of its
+type. The paths the keys name do not exist:
+
+```
+[ex-ostrya]
+detached-metadata-exclude=app.x
+receive-allow-non-fast-forward=true
+receive-allow-delete=true
+receive-allow-privileged=true
+receive-allow-remote-refs=true
+receive-verify=gpg;ed25519
+receive-gpgkeypath=/nonexistent/keys.gpg
+receive-verification-ed25519-key=AAAA
+receive-verification-ed25519-file=/nonexistent/keys.ed25519
+receive-sign-type=ed25519
+receive-sign-key-file=/nonexistent/secret.ed25519
+receive-gpg-sign=0123456789ABCDEF
+receive-gpg-homedir=/nonexistent/gnupg
+receive-sign-summary=true
+```
+
+- `ostree refs`, `ostree fsck`, and `ostree summary -u` each exit 0 and write
+  nothing to standard error. `summary -u` writes `summary`.
 
 ## Commit modifier: canonical permissions, consume, and devino
 

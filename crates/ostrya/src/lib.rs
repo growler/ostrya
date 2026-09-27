@@ -198,6 +198,14 @@
 //! [`BootableMetadata`] adds `ostree.linux` and `ostree.bootable` to a
 //! [`DictBuilder`] in the order they hold on disk (see the [`bootable`]
 //! module).
+//!
+//! Under the `receive` feature it also covers the policy the server side of a
+//! push applies (see the `receive` module): `ReceivePolicy` states which ref
+//! updates a repository accepts, the signatures a received commit must carry,
+//! the keys the server signs with, and whether it regenerates its summary, and
+//! `ReceivePolicy::from_config` reads that policy from the `receive-*` keys of
+//! the `[ex-ostrya]` group. A received commit is held to the same signature
+//! checks a pull makes, over the keys the receive policy names.
 
 pub mod bootable;
 mod bspatch;
@@ -226,6 +234,8 @@ mod perm;
 pub mod prune;
 pub mod pull;
 pub mod read;
+#[cfg(feature = "receive")]
+pub mod receive;
 pub mod refs;
 pub mod repo;
 mod rollsum;
@@ -243,6 +253,7 @@ mod tombstone;
 pub mod transaction;
 pub mod traverse;
 pub mod tree;
+mod verify;
 mod write;
 
 pub use bootable::{BootableMetadata, BootableRefusal};
@@ -290,6 +301,8 @@ pub use pull::{
     PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };
 pub use read::{CommitSizes, CommitState, MetadataReader};
+#[cfg(feature = "receive")]
+pub use receive::{ReceivePolicy, ReceiveVerify, ServerSigner};
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};
 pub use sign::{

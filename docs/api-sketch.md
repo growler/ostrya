@@ -2166,6 +2166,61 @@ impl Repo {
 }
 ```
 
+## Receive policy (feature `receive`)
+
+The policy the server side of a push applies. `ReceivePolicy::from_config`
+reads it from the `receive-*` keys of the `[ex-ostrya]` group, `[core]
+auto-update-summary` and its alias, and `[ex-ostrya]
+detached-metadata-exclude` (`format-reference.md`, "Port extension: the
+ex-ostrya config group"). It reads the trusted keys once, so a key source the
+policy cannot use fails the call. The option structs are exhaustive, as the
+other option structs of the crate are.
+
+```rust
+#[derive(Debug, Default)]
+pub struct ReceivePolicy {
+    pub allow_non_fast_forward: bool,
+    pub allow_delete: bool,
+    pub allow_privileged: bool,
+    pub allow_remote_refs: bool,
+    pub require_signature: ReceiveVerify,
+    pub signers: Vec<ServerSigner>,   // sign-api key first, then GPG keys
+    pub sign_summary: bool,
+    pub update_summary: bool,
+    pub detached_metadata_filter: Option<DetachedMetadataFilter>,
+}
+
+/// The two axes are ANDed, the engines of `sign` are ORed. `gpg` false and
+/// an empty `sign` require no signature.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReceiveVerify {
+    pub gpg: bool,                    // keyrings of receive-gpgkeypath
+    pub sign: Vec<String>,            // "ed25519", "spki"; each once
+}
+
+impl ReceivePolicy {
+    pub async fn from_config(repo: &Repo) -> Result<ReceivePolicy>;
+}
+
+/// One server signing key, paired with a verifier that trusts that key
+/// alone. The pair tells whether a signature on a commit, stored or
+/// incoming, was made with the key already.
+pub struct ServerSigner { /* private */ }
+impl ServerSigner {
+    /// The two halves must read one detached-metadata key.
+    pub fn new(signer: Box<dyn Signer>, verifier: Box<dyn Verifier>)
+        -> Result<ServerSigner>;
+    pub fn ed25519(secret: &[u8]) -> Result<ServerSigner>;
+    #[cfg(feature = "sign-spki")]
+    pub fn spki(signer: SpkiSigner) -> Result<ServerSigner>;
+    /// The selector names exactly one secret key. The certificate the
+    /// verifier trusts comes from `gpg --export` in the same home.
+    #[cfg(feature = "sign-gpg")]
+    pub async fn gpg(signer: GpgSigner) -> Result<ServerSigner>;
+    pub fn signer(&self) -> &dyn Signer;
+}
+```
+
 ## Static deltas
 
 The three size thresholds are in bytes, where the tool's options take decimal

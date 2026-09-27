@@ -15,17 +15,21 @@ tokio = ["ostrya-rt/tokio", "ostrya-sign/tokio", "ostrya-fetch/tokio"]
 sign-spki = ["ostrya-sign/sign-spki"]
 verify-gpg = ["dep:pgp"]
 sign-gpg = ["verify-gpg", "ostrya-sign/sign-gpg"]
+# The server side of a push: the receive policy and the checks it makes. The
+# feature adds no dependency.
+receive = []
 # Builds xz from source and links it statically, so the build needs no
 # runtime liblzma. The feature is off by default, and a build without it
 # takes the system liblzma.
 lzma-static = ["liblzma/static"]
 
 # The crate documentation links items of the signing and verification
-# engines, and a feature gates each item. docs.rs adds these three features
-# to the default set, and the links then resolve. The `tokio` and
-# `lzma-static` features change no documented item, so the list omits them.
+# engines and of the receive policy, and a feature gates each item. docs.rs
+# adds these four features to the default set, and the links then resolve.
+# The `tokio` and `lzma-static` features change no documented item, so the
+# list omits them.
 [package.metadata.docs.rs]
-features = ["sign-spki", "verify-gpg", "sign-gpg"]
+features = ["sign-spki", "verify-gpg", "sign-gpg", "receive"]
 
 [dependencies]
 ostrya-core = { workspace = true }

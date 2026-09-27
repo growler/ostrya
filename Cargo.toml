@@ -6,6 +6,7 @@ members = [
     "crates/ostrya-composefs",
     "crates/ostrya-rt",
     "crates/ostrya-sign",
+    "crates/ostrya-fetch",
     "crates/ostrya-sys",
     "crates/ostrya",
     "crates/ostrya-cli",
@@ -26,4 +27,5 @@ ostrya-core = { path = "crates/ostrya-core", version = "0.2.8" }
 ostrya-composefs = { path = "crates/ostrya-composefs", version = "0.2.8" }
 ostrya-rt = { path = "crates/ostrya-rt", version = "0.2.8", default-features = false }
 ostrya-sign = { path = "crates/ostrya-sign", version = "0.2.8", default-features = false }
+ostrya-fetch = { path = "crates/ostrya-fetch", version = "0.2.8", default-features = false }
 ostrya-sys = { path = "crates/ostrya-sys", version = "0.2.8" }

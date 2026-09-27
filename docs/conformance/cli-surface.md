@@ -3186,9 +3186,9 @@ port's fetcher serves `http` and `https` alone, where the tool also reads a
 and https are fetched` (`../port-plan.md`, Phase 16a).
 
 `remote add-cookie`, `remote delete-cookie`, and `remote list-cookies` stay out.
-`fetch.rs` refuses any `Cookie` header at construction whenever a mirror is
-cleartext `http`, a deliberate choice, and cookie-jar support needs its own design
-pass against that refusal.
+`crates/ostrya-fetch/src/lib.rs` refuses any `Cookie` header at construction
+whenever a mirror is cleartext `http`, a deliberate choice, and cookie-jar
+support needs its own design pass against that refusal.
 
 ## Global conventions
 

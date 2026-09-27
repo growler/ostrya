@@ -89,7 +89,9 @@ reference, or reading material.
    `commit --tar-pathname-filter` expression the tool also compiles with
    PCRE2; that crate sets `publish = false`, so no published crate links it,
    and CI holds the rule that no other manifest may name `pcre2`. Nothing
-   else links C.
+   else links C. A macOS or Windows build of the portable crates also links
+   system libraries of the operating system (see "Exception: system
+   libraries of macOS and Windows").
    `rustix` handles the syscalls a portable async file API cannot express
    (fd-relative opens and metadata, xattrs, statx, FICLONE reflink, O_TMPFILE +
    linkat, OFD locks); streaming file I/O goes through the runtime's async file.
@@ -125,6 +127,33 @@ phase adds such an operation.
 
 RUSTSEC-2024-0447 against `pgp` is patched at 0.14.1. The tree takes 0.20.0,
 so the advisory is closed for the version in the graph.
+
+## Exception: system libraries of macOS and Windows
+
+A macOS or Windows build of the portable crates links system libraries of the
+operating system:
+
+- On macOS, `ostrya-fetch` reads the trust store of the operating system
+  through `rustls-native-certs`. `security-framework`,
+  `security-framework-sys`, `core-foundation`, and `core-foundation-sys` link
+  Security.framework and CoreFoundation.
+- On Windows, `ostrya-rt` reaches `windows-sys` under both runtime backends:
+  through `async-io`, `polling`, and `rustix` under `smol`, and through `mio`,
+  `socket2`, and `tokio` under `tokio`. `ostrya-fetch` adds `schannel`, which
+  `rustls-native-certs` uses to read the trust store, and `getrandom`, which
+  `graviola` reaches. `windows-sys` gets its link attributes from
+  `windows-link`, which emits them in the `raw-dylib` form. These crates link
+  `ws2_32`, `crypt32`, and other system libraries. `getrandom` links
+  `bcryptprimitives` in the `raw-dylib` form itself.
+
+These libraries are part of the operating system. The build compiles no C
+source for them, and the port ships no copy of them. No crate in the list
+declares a `links` key, so the CI no-C guard passes them. A Linux build links
+none of them.
+
+The exception covers these system libraries on macOS and Windows alone. Any
+other system library needs the confirmation of the maintainer before it
+enters the graph.
 
 ## Authoritative design docs
 
@@ -193,12 +222,12 @@ measured on the resolved dependency graph.
 
 ### Authorized: the `url` crate
 
-`url` 2.5.8 is authorized for `crates/ostrya` alone. It supplies the one
-`Url::parse().join()` call in `fetch.rs`, which resolves the `Location` of a
-redirect against the URL of the response that carried it. That is the only call
-the library makes into the crate: a mirror URL, a request URL, and a proxy URL
-are read by the `hyper::Uri` parse. Each term below is measured on the resolved
-dependency graph.
+`url` 2.5.8 is authorized for `crates/ostrya-fetch` alone. It supplies the
+one `Url::parse().join()` call in `crates/ostrya-fetch/src/lib.rs`, which
+resolves the `Location` of a redirect against the URL of the response that
+carried it. That is the only call the fetcher makes into the crate: a mirror
+URL, a request URL, and a proxy URL are read by the `hyper::Uri` parse. Each
+term below is measured on the resolved dependency graph.
 
 - License `MIT OR Apache-2.0`.
 - The default feature set is taken. `idna` is a mandatory dependency, so
@@ -230,9 +259,9 @@ dependency graph.
 
 ### Authorized: the `pkcs8` crate
 
-`pkcs8` 0.10.2 is authorized for `crates/ostrya` alone. It decrypts an
-encrypted PKCS#8 client key in `fetch/tls.rs` alone. Each term below is
-measured on the resolved dependency graph.
+`pkcs8` 0.10.2 is authorized for `crates/ostrya-fetch` alone. It decrypts an
+encrypted PKCS#8 client key in `crates/ostrya-fetch/src/tls.rs` alone. Each
+term below is measured on the resolved dependency graph.
 
 - License `Apache-2.0 OR MIT`.
 - `default-features = false` is mandatory, with the features `encryption`,

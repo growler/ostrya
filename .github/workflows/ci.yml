@@ -164,7 +164,9 @@ jobs:
 
       # The portable crates compile for macOS and Windows as well as Linux.
       # `cargo check` needs the standard library of each target and no linker,
-      # so the Linux runner checks all three targets.
+      # so the Linux runner checks all three targets. Each portable crate is
+      # checked with each runtime backend. `ostrya-fetch` is checked by the
+      # build step that follows, because a build also type-checks the crate.
       - name: Install the non-Linux targets
         run: rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin
 
@@ -176,6 +178,44 @@ jobs:
             cargo check --target "$target" -p ostrya-sign --features sign-spki,sign-gpg
             cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,sign-gpg
           done
+
+      # `cargo check` does no code generation, so it does not assemble the
+      # inline assembly of `graviola`, the crypto code under the TLS provider
+      # of `ostrya-fetch`. This builds the rlib of the crate for each target,
+      # once with the default `smol` backend and once with the `tokio`
+      # backend, and rustc then assembles it. The build needs no linker. On
+      # Windows, `getrandom` and `windows-link`, which gives `windows-sys` its
+      # link attributes, use `raw-dylib` import libraries, which need an
+      # import-library tool. The `llvm` package supplies `llvm-dlltool`, and
+      # the rustflags name it.
+      - name: ostrya-fetch builds for the non-Linux targets
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: "-C dlltool=llvm-dlltool"
+        run: |
+          sudo apt-get install -y llvm
+          for target in x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --lib --target "$target" -p ostrya-fetch
+            cargo build --lib --target "$target" -p ostrya-fetch --no-default-features --features tokio
+          done
+
+      # The workspace entries of the runtime-dependent crates carry
+      # `default-features = false`, and each dependent forwards `smol` and
+      # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, and this
+      # fails when one path turns the smol backend on. `cargo tree -i` exits
+      # non-zero both when the package is absent and on any other failure, so
+      # the step also reads the error text.
+      - name: A tokio build holds no smol
+        run: |
+          if out=$(cargo tree -p ostrya --no-default-features --features tokio -i smol 2>&1); then
+            echo "a tokio build of ostrya holds smol:"
+            echo "$out"
+            exit 1
+          fi
+          if ! grep -q 'package ID specification `smol` did not match any packages' <<<"$out"; then
+            echo "cargo tree failed with an unexpected error:"
+            echo "$out"
+            exit 1
+          fi
 
       # The local-pull ownership-gate tests need the process to belong to more
       # than one group. The GPG cases need `gpg` to build their fixtures, and

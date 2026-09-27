@@ -78,6 +78,8 @@ The project is a Cargo workspace of focused crates:
   backend). The only crate that knows which backend is compiled.
 - `ostrya-sign` -- the signing engines: dummy, ed25519, spki, and the GPG
   signer through the `gpg` binary. Portable, with no repository knowledge.
+- `ostrya-fetch` -- the async HTTP/1.1 and HTTP/2 fetcher, with TLS over
+  `rustls`. Portable, with no repository knowledge.
 - `ostrya-composefs` -- standalone, synchronous EROFS/composefs image writer
   and fs-verity digest. Takes a tree model and emits image bytes.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs,

@@ -46,9 +46,11 @@
             "rust-src"
           ];
 
-          # The portable crates are checked for macOS and Windows. The toolchain
-          # carries the standard library of each of those targets, so
-          # `cargo check --target` needs no other setup.
+          # The portable crates are checked for macOS and Windows, and the rlib
+          # of `ostrya-fetch` is built for them. The toolchain carries the
+          # standard library of each of those targets, so `cargo check
+          # --target` and `cargo build --lib --target` need no other setup,
+          # except the import-library tool of the Windows build below.
           rustExtensions.targets = [
             "x86_64-pc-windows-gnu"
             "x86_64-apple-darwin"
@@ -91,6 +93,11 @@
             toolchain:
             pkgs.mkShell {
               packages = [ toolchain ] ++ devPackages;
+              # The Windows build of `ostrya-fetch` compiles `raw-dylib` import
+              # libraries for `getrandom` and `windows-sys`, and rustc needs an
+              # import-library tool for them. This names `llvm-dlltool` by its
+              # store path, so no other LLVM binary enters the PATH.
+              CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS = "-C dlltool=${lib.getBin pkgs.llvmPackages.llvm}/bin/llvm-dlltool";
               shellHook = ''
                 export RUST_BACKTRACE=1
               '';

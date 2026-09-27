@@ -10,8 +10,8 @@ readme.workspace = true
 
 [features]
 default = ["smol"]
-smol = ["ostrya-rt/smol", "ostrya-sign/smol"]
-tokio = ["ostrya-rt/tokio", "ostrya-sign/tokio"]
+smol = ["ostrya-rt/smol", "ostrya-sign/smol", "ostrya-fetch/smol"]
+tokio = ["ostrya-rt/tokio", "ostrya-sign/tokio", "ostrya-fetch/tokio"]
 sign-spki = ["ostrya-sign/sign-spki"]
 verify-gpg = ["dep:pgp"]
 sign-gpg = ["verify-gpg", "ostrya-sign/sign-gpg"]
@@ -32,6 +32,7 @@ ostrya-core = { workspace = true }
 ostrya-composefs = { workspace = true }
 ostrya-rt = { workspace = true }
 ostrya-sign = { workspace = true }
+ostrya-fetch = { workspace = true }
 ostrya-sys = { workspace = true }
 thiserror = "2"
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
@@ -58,44 +59,6 @@ bsdiff = "0.2.1"
 pin-project-lite = "0.2"
 futures-io = "0.3"
 futures-lite = "2"
-# The HTTP engine behind the fetcher. `http1` and `http2` both compile: ALPN
-# picks the version per connection. The `http` and `bytes` types come from
-# hyper's re-exports, so neither needs a manifest entry of its own.
-hyper = { version = "1.11", default-features = false, features = [
-    "client",
-    "http1",
-    "http2",
-] }
-# URL parsing for the fetcher. `Url::join` resolves the `Location` of a
-# redirect against the URL of the response, which is the one call the
-# library makes into this crate; a mirror URL, a request URL, and a proxy
-# URL are read by the `hyper::Uri` parse. The default feature set is taken
-# because `idna` is a mandatory dependency: `default-features = false`
-# drops neither it nor the Unicode tables it carries.
-url = "2.5.8"
-# TLS for the fetcher. `rustls-graviola` supplies the crypto provider: Rust
-# plus formally-verified assembly, so the provider adds no C to the build and
-# carries no `cc` build dependency.
-rustls = { version = "0.23", default-features = false, features = [
-    "logging",
-    "std",
-    "tls12",
-] }
-rustls-graviola = "0.4"
-futures-rustls = { version = "0.26", default-features = false }
-rustls-native-certs = "0.8"
-rustls-pemfile = "2"
-# Reads an encrypted PKCS#8 client key for the fetcher and decrypts it.
-# `default-features = false` with `encryption`, `pem` and `std` is the
-# minimum for that job: `pem` reads the PEM armor, `encryption` supplies
-# the PBES2 decryption path, and `std` supplies the standard error trait.
-# The `3des` and `des-insecure` features stay off, so no DES or 3DES
-# cipher enters the build.
-pkcs8 = { version = "0.10.2", default-features = false, features = [
-    "encryption",
-    "pem",
-    "std",
-] }
 smol-tar = { version = "0.1.7", default-features = false, features = ["smol"] }
 # rPGP reads OpenPGP keyrings and signatures in the process. `default-features
 # = false` is mandatory: the `default` feature reaches `bzip2` and the C
@@ -108,9 +71,24 @@ pgp = { version = "0.20.0", default-features = false, optional = true }
 ostrya-rt = { workspace = true }
 futures-lite = "2"
 smol-tar = { version = "0.1.7", default-features = false, features = ["smol"] }
-# The fetcher tests serve requests from an in-process HTTP/1.1 and HTTP/2
-# server, so the test build adds hyper's server half.
-hyper = { version = "1.11", default-features = false, features = ["server"] }
+# The fetcher tests and the HTTP pull tests serve requests from an in-process
+# HTTP/1.1 and HTTP/2 server, over cleartext and over TLS, and one fetcher
+# test sends a request through a hyper client. The fetcher and its TLS stack
+# are in ostrya-fetch, so the test build names these crates itself.
+hyper = { version = "1.11", default-features = false, features = [
+    "client",
+    "http1",
+    "http2",
+    "server",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "logging",
+    "std",
+    "tls12",
+] }
+rustls-graviola = "0.4"
+futures-rustls = { version = "0.26", default-features = false }
+rustls-pemfile = "2"
 # The root-dependent tests call `process::geteuid`. The smol backend reaches
 # rustix's `process` feature through its own dependencies and the tokio
 # backend does not, so the test build asks for it here.

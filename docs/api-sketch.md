@@ -1610,8 +1610,10 @@ carries no field of its own.
 
 ## Fetcher
 
-The HTTP client pull is built on. The fetcher has its own error type,
-`ostrya::fetch::Error`, and every `Error::` item this section names is a
+The HTTP client pull is built on. The fetcher is the `ostrya-fetch` crate.
+`ostrya` re-exports the crate as `ostrya::fetch`, and its public request and
+response types at the crate root of `ostrya`. The fetcher has its own error
+type, `ostrya::fetch::Error`, and every `Error::` item this section names is a
 variant of that type. One `Fetcher` serves one remote: it holds the
 mirrors, headers, credentials, and TLS configuration, pools connections per
 endpoint, and admits a bounded number of requests at a time in priority order. A
@@ -1863,7 +1865,7 @@ impl Fetcher {
     pub async fn fetch(&self, request: FetchRequest<'_>) -> Result<Fetched>;
 }
 
-// ostrya::fetch
+// ostrya-fetch, re-exported as ostrya::fetch
 #[non_exhaustive]
 pub enum Error {
     Fetch(String),                              // setup or transport failure
@@ -1876,9 +1878,19 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 // ostrya: each variant maps to the variant of the same name, with the same
-// fields and the same message, so the io::ErrorKind mapping is the same.
+// fields and the same message, so the io::ErrorKind mapping is the same. A
+// variant the conversion does not name maps to ostrya::Error::Fetch with its
+// message.
 impl From<ostrya::fetch::Error> for ostrya::Error;
 ```
+
+The pull uses four items of `ostrya-fetch` that are public for it and that
+`ostrya` does not re-export at its crate root: `Fetcher::with_counters`, which
+adds the bytes of each response body to a set of counters;
+`Fetcher::refetching`, which gives a `Refetch` that fetches a body again from
+its first byte when it fails in transit; the `fetch` and `retry` methods of
+`Refetch`; and `fetch::gate::Gate`, the priority admission gate, with its
+`Acquire` future and its `Permit`.
 
 `Fetcher::new` and `Fetcher::fetch` return `ostrya::fetch::Result`. A read of a
 `Body` fails with `std::io::Error`. `Repo::pull` and the other repository

@@ -60,13 +60,13 @@ impl State {
 }
 
 /// A bounded, priority-ordered admission gate.
-pub(crate) struct Gate {
+pub struct Gate {
     state: Mutex<State>,
 }
 
 impl Gate {
     /// A gate admitting `limit` holders at a time.
-    pub(crate) fn new(limit: usize) -> Gate {
+    pub fn new(limit: usize) -> Gate {
         Gate {
             state: Mutex::new(State {
                 free: limit,
@@ -78,7 +78,7 @@ impl Gate {
     }
 
     /// Wait for a permit at `priority`.
-    pub(crate) fn acquire(self: &Arc<Gate>, priority: Priority) -> Acquire {
+    pub fn acquire(self: &Arc<Gate>, priority: Priority) -> Acquire {
         Acquire {
             gate: self.clone(),
             priority,
@@ -98,7 +98,7 @@ impl Gate {
 }
 
 /// The future returned by [`Gate::acquire`].
-pub(crate) struct Acquire {
+pub struct Acquire {
     gate: Arc<Gate>,
     priority: Priority,
     /// This waiter's queue position, once it has queued.
@@ -167,7 +167,7 @@ impl Drop for Acquire {
 }
 
 /// Admission to run one fetch, released on drop.
-pub(crate) struct Permit {
+pub struct Permit {
     gate: Arc<Gate>,
 }
 

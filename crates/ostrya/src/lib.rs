@@ -209,7 +209,7 @@ mod delta;
 mod deltagen;
 pub mod diff;
 pub mod error;
-pub mod fetch;
+pub use ostrya_fetch as fetch;
 pub mod file;
 pub mod fsck;
 #[cfg(feature = "verify-gpg")]

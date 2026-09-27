@@ -608,18 +608,18 @@ mod tests {
     use super::*;
     use ostrya_rt::block_on;
 
-    const CA_PEM: &[u8] = include_bytes!("../../../../tests/fixtures/tls/ca.pem");
-    const CLIENT_CERT_PEM: &[u8] = include_bytes!("../../../../tests/fixtures/tls/client.pem");
-    const CLIENT_KEY_PEM: &[u8] = include_bytes!("../../../../tests/fixtures/tls/client.key.pem");
+    const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
+    const CLIENT_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.pem");
+    const CLIENT_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/client.key.pem");
     /// The same key, in PKCS#8 under PBES2 with AES-256-CBC.
     const CLIENT_KEY_ENC_PEM: &[u8] =
-        include_bytes!("../../../../tests/fixtures/tls/client.key.enc.pem");
+        include_bytes!("../../../tests/fixtures/tls/client.key.enc.pem");
     /// The same key, in the legacy OpenSSL traditional encrypted PEM.
     const CLIENT_KEY_LEGACY_PEM: &[u8] =
-        include_bytes!("../../../../tests/fixtures/tls/client.key.legacy.pem");
+        include_bytes!("../../../tests/fixtures/tls/client.key.legacy.pem");
     /// The same key, in PKCS#8 under PBES1 with pbeWithMD5AndDES-CBC.
     const CLIENT_KEY_PBES1_PEM: &[u8] =
-        include_bytes!("../../../../tests/fixtures/tls/client.key.pbes1.pem");
+        include_bytes!("../../../tests/fixtures/tls/client.key.pbes1.pem");
     /// The passphrase `tests/fixtures/tls/generate.sh` encrypted all three
     /// with.
     const KEY_PASSPHRASE: &str = "ostrya test passphrase";

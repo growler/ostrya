@@ -103,7 +103,8 @@ all pure Rust:
   OpenPGP keyring parsing and signature verification behind the `verify-gpg`
   feature. GPG signing runs the system `gpg` binary as a subprocess (see
   Decisions).
-- `rustls` plus `webpki-roots` / `rustls-native-certs` -- TLS for pull.
+- `rustls` plus `webpki-roots` / `rustls-native-certs` -- TLS for pull, in
+  `ostrya-fetch`.
 - `smol-tar` -- async tar import/export in the smol ecosystem.
 - `clap` -- command-line argument parsing for the `ostrya` binary
   (`ostrya-cli` only).
@@ -152,6 +153,15 @@ bounded:
   `thiserror`, `ed25519-dalek`, `p256` (under `sign-spki`), `ostrya-rt`
   (under `sign-gpg`), and `libc` on Unix, for the `O_NONBLOCK` value of the
   key file open. Compiles on Linux, macOS, and Windows.
+- `ostrya-fetch` -- the async HTTP/1.1 and HTTP/2 fetcher: `Fetcher`, its
+  requests and response bodies, the admission gate, the `hyper` adapters over
+  `ostrya-rt`, and the TLS configuration over `rustls`. No repository
+  knowledge. Depends on `ostrya-core`, `ostrya-rt`, `thiserror`,
+  `futures-io`, `futures-lite`, `hyper`, `url`, `rustls`, `rustls-graviola`,
+  `futures-rustls`, `rustls-native-certs`, `rustls-pemfile`, and `pkcs8`.
+  Compiles on Linux, macOS, and Windows. On macOS and Windows,
+  `rustls-native-certs` links system libraries of the operating system trust
+  store.
 - `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the
   fs-verity digest. Standalone and free of ostree and repository knowledge,
   like `ostrya-gvariant`: it takes a tree model and emits the image bytes and
@@ -161,8 +171,9 @@ bounded:
   prune, fsck, sign, summary, deltas, pull, tar, composefs export over
   `ostrya-composefs`. Feature-gated. The signing engines come from
   `ostrya-sign` and are re-exported. GPG verification over the `pgp` crate
-  and the system key store readers are part of `ostrya`. The fetcher has its
-  own error type, `ostrya::fetch::Error`, which converts into `ostrya::Error`.
+  and the system key store readers are part of `ostrya`. The fetcher is the
+  `ostrya-fetch` crate, re-exported as `ostrya::fetch`. Its error type,
+  `ostrya::fetch::Error`, converts into `ostrya::Error`.
 - `ostrya-cli` -- the CLI crate, building the `ostrya` binary: a minimal
   command set once the ingest and checkout paths land (Phase 11), grown
   incrementally; the `ostree`-compatible surface arrives with the port's own
@@ -480,16 +491,19 @@ present. If the fixture is absent, the test fails instead of skipping:
   `crates/ostrya-gvariant/tests/`, which read the same
   `tests/fixtures/generated/` objects.
 - the TLS-backed fetcher tests (`crates/ostrya/tests/fetch.rs`,
-  `crates/ostrya/tests/pull_http.rs`, and the unit tests in `src/fetch.rs`
-  and `src/fetch/tls.rs`), which compile `tests/fixtures/tls/` in with
-  `include_bytes!` and so fail to build, not just to run, without it.
+  `crates/ostrya/tests/pull_http.rs`, and the unit tests in
+  `crates/ostrya-fetch/src/lib.rs` and `crates/ostrya-fetch/src/tls.rs`),
+  which compile `tests/fixtures/tls/` in with `include_bytes!` and so fail
+  to build, not just to run, without it.
 
 This distinction is invisible from a checkout, where every fixture is
 present. It distinguishes the two crates' published packages:
 `ostrya-composefs` carries only the guarded `tests/golden.rs`, so its
 published test run stays green without the fixtures. `ostrya`'s published
 package also carries the unguarded tests, so its published test run does
-not stay green without them.
+not stay green without them. The unit tests of `ostrya-fetch` include the
+TLS fixtures from the workspace root, outside the package, so its published
+test run does not build. Its library build includes no fixture.
 
 ## Phased roadmap
 
@@ -6884,9 +6898,11 @@ on `receive`). The client code that must compile on macOS and Windows goes
 into portable workspace crates: `ostrya-fetch` (the fetcher), `ostrya-sign`
 (the signing engines), and `ostrya-push` (the protocol, the client session,
 the transports, and the tree model). `ostrya` re-exports their public items.
-`ostrya-gvariant`, `ostrya-core`, `ostrya-rt`, and `ostrya-sign` compile on
-those targets as well. CI checks the portable crates for `x86_64-pc-windows-gnu`,
-`x86_64-apple-darwin`, and `aarch64-apple-darwin`.
+`ostrya-gvariant`, `ostrya-core`, `ostrya-rt`, `ostrya-sign`, and
+`ostrya-fetch` compile on those targets as well. CI checks the portable
+crates for `x86_64-pc-windows-gnu`, `x86_64-apple-darwin`, and
+`aarch64-apple-darwin`, and builds the rlib of `ostrya-fetch` for each of
+them.
 
 Pull over ssh follows push as separate work.
 
@@ -7842,7 +7858,7 @@ observed.
   provider is `rustls-graviola`, which keeps the no-C rule intact and limits
   supported architectures to x86_64 and aarch64 -- a Linux target outside those
   two needs a provider swap, which is a `ClientConfig` change confined to
-  `fetch/tls.rs`.
+  `crates/ostrya-fetch/src/tls.rs`.
 - GPG signing rides on the installed GnuPG: the signer drives `gpg` through
   the documented, stable `--status-fd` interface and pins no version; a
   vocabulary change in a future GnuPG would surface in the round-trip tests.

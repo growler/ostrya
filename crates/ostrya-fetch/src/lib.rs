@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! The async HTTP fetcher pull is built on.
 //!
 //! A [`Fetcher`] holds the mirrors, headers, credentials, and TLS
@@ -320,7 +322,7 @@ use std::task::ready;
 use std::task::{Context, Poll};
 
 mod error;
-pub(crate) mod gate;
+pub mod gate;
 mod io;
 mod tls;
 
@@ -520,7 +522,7 @@ const RATE_SPAN: usize = 5;
 
 /// Which proxy a [`Fetcher`] reaches an origin through.
 ///
-/// The module documentation states the variables the two environment forms
+/// The crate documentation states the variables the two environment forms
 /// read, the shape of a proxy URL, and the exemptions `no_proxy` lists. Every
 /// form is resolved once, by [`Fetcher::new`], which is what refuses a proxy
 /// URL the fetcher cannot connect through.
@@ -1179,7 +1181,7 @@ impl Fetcher {
     /// bytes of every response body it reads to each counter of `received`:
     /// one relaxed atomic add per counter for each data frame. A pull reads
     /// its transferred byte count from there.
-    pub(crate) async fn with_counters(
+    pub async fn with_counters(
         options: FetcherOptions,
         received: Vec<Arc<AtomicU64>>,
     ) -> Result<Fetcher> {
@@ -1303,7 +1305,7 @@ impl Fetcher {
 
     /// A fetch the body of which is fetched again from the start when it fails
     /// in transit. [`Refetch`] states the budget it spends.
-    pub(crate) fn refetching<'r>(&self, request: FetchRequest<'r>) -> Refetch<'_, 'r> {
+    pub fn refetching<'r>(&self, request: FetchRequest<'r>) -> Refetch<'_, 'r> {
         Refetch {
             fetcher: self,
             request,
@@ -2216,7 +2218,7 @@ impl Inner {
 /// other way -- the size cap, or a failure of the consumer's own, such as a
 /// checksum mismatch -- is not fetched again, since another fetch fails the
 /// same way.
-pub(crate) struct Refetch<'f, 'r> {
+pub struct Refetch<'f, 'r> {
     fetcher: &'f Fetcher,
     request: FetchRequest<'r>,
     /// The repeats left in the budget.
@@ -2229,7 +2231,7 @@ pub(crate) struct Refetch<'f, 'r> {
 
 impl Refetch<'_, '_> {
     /// Fetch the request, with what is left of the budget for its rounds.
-    pub(crate) async fn fetch(&mut self) -> Result<Fetched> {
+    pub async fn fetch(&mut self) -> Result<Fetched> {
         self.interrupted.store(false, Ordering::Relaxed);
         let (mut fetched, used) = self
             .fetcher
@@ -2249,7 +2251,7 @@ impl Refetch<'_, '_> {
     /// anything else is returned as it is. The consumer drops the body before
     /// this is called, so the delay holds no connection and no admission
     /// permit. `error` is the caller's own error type and is returned as it is.
-    pub(crate) async fn retry<E>(&mut self, error: E) -> std::result::Result<(), E> {
+    pub async fn retry<E>(&mut self, error: E) -> std::result::Result<(), E> {
         if !self.interrupted.load(Ordering::Relaxed) || self.left == 0 {
             return Err(error);
         }

@@ -235,7 +235,9 @@ pub enum Error {
     /// retries.
     ///
     /// A [`fetch::Error::Fetch`](crate::fetch::Error::Fetch) converts to this
-    /// variant. The pull also builds this variant itself.
+    /// variant with the same message, and so does a variant of
+    /// `fetch::Error` that this conversion does not name. The pull also builds
+    /// this variant itself.
     #[error("fetch: {0}")]
     Fetch(String),
     /// Every mirror answered the request with an unsuccessful HTTP status. A
@@ -344,12 +346,11 @@ impl From<ostrya_sign::Error> for Error {
 
 impl From<crate::fetch::Error> for Error {
     /// Map a fetcher error onto the variant of the same name, with the same
-    /// fields and so the same message.
+    /// fields and so the same message. A variant this conversion does not name
+    /// maps to [`Error::Fetch`] with the message of the error.
     fn from(err: crate::fetch::Error) -> Error {
         use crate::fetch::Error as F;
 
-        // The fetcher type lives in this crate, so the match is exhaustive. A
-        // wildcard arm is needed once the type lives in another crate.
         match err {
             F::Fetch(message) => Error::Fetch(message),
             F::HttpStatus { status, url } => Error::HttpStatus { status, url },
@@ -357,6 +358,7 @@ impl From<crate::fetch::Error> for Error {
             F::FetchTooLarge { limit } => Error::FetchTooLarge { limit },
             F::ContentEncoded { url, encoding } => Error::ContentEncoded { url, encoding },
             F::Unsupported(message) => Error::Unsupported(message),
+            other => Error::Fetch(other.to_string()),
         }
     }
 }
@@ -659,6 +661,7 @@ mod tests {
                     encoding: encoding.clone(),
                 },
                 F::Unsupported(m) => Error::Unsupported(m.clone()),
+                other => panic!("no namesake for {other:?}"),
             };
             let err = Error::from(fetch);
             assert_eq!(format!("{err:?}"), format!("{namesake:?}"));

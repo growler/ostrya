@@ -1657,21 +1657,19 @@ dependencies = [
  "liblzma",
  "ostrya-composefs",
  "ostrya-core",
+ "ostrya-fetch",
  "ostrya-rt",
  "ostrya-sign",
  "ostrya-sys",
  "pgp",
  "pin-project-lite",
- "pkcs8",
  "rustix",
  "rustls",
  "rustls-graviola",
- "rustls-native-certs",
  "rustls-pemfile",
  "sha2",
  "smol-tar",
  "thiserror",
- "url",
 ]
 
 [[package]]
@@ -1708,6 +1706,25 @@ dependencies = [
  "miniz_oxide",
  "ostrya-gvariant",
  "sha2",
+]
+
+[[package]]
+name = "ostrya-fetch"
+version = "0.2.8"
+dependencies = [
+ "futures-io",
+ "futures-lite",
+ "futures-rustls",
+ "hyper",
+ "ostrya-core",
+ "ostrya-rt",
+ "pkcs8",
+ "rustls",
+ "rustls-graviola",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "thiserror",
+ "url",
 ]
 
 [[package]]

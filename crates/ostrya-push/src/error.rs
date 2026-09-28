@@ -67,10 +67,11 @@ pub enum Error {
     /// A ref name the port refuses.
     #[error("invalid-ref: {0}")]
     InvalidRef(String),
-    /// A ref update names a remote ref, and the policy does not allow remote
-    /// refs.
-    #[error("remote-ref-denied: {0}")]
-    RemoteRefDenied(String),
+    /// A ref update that no rule of the policy accepts: the rule that
+    /// matches it has `accept=false`, or it names a remote ref that no rule
+    /// matches.
+    #[error("ref-denied: {0}")]
+    RefDenied(String),
     /// The policy requires a trusted signature, and the commit carries none
     /// that verifies.
     #[error("signature-required: {0}")]
@@ -118,8 +119,8 @@ pub enum ErrorCode {
     DeleteDenied,
     /// `invalid-ref`.
     InvalidRef,
-    /// `remote-ref-denied`.
-    RemoteRefDenied,
+    /// `ref-denied`.
+    RefDenied,
     /// `signature-required`.
     SignatureRequired,
     /// `binding-mismatch`.
@@ -143,7 +144,7 @@ impl ErrorCode {
         ErrorCode::NonFastForward,
         ErrorCode::DeleteDenied,
         ErrorCode::InvalidRef,
-        ErrorCode::RemoteRefDenied,
+        ErrorCode::RefDenied,
         ErrorCode::SignatureRequired,
         ErrorCode::BindingMismatch,
         ErrorCode::Internal,
@@ -164,7 +165,7 @@ impl ErrorCode {
             ErrorCode::NonFastForward => "non-fast-forward",
             ErrorCode::DeleteDenied => "delete-denied",
             ErrorCode::InvalidRef => "invalid-ref",
-            ErrorCode::RemoteRefDenied => "remote-ref-denied",
+            ErrorCode::RefDenied => "ref-denied",
             ErrorCode::SignatureRequired => "signature-required",
             ErrorCode::BindingMismatch => "binding-mismatch",
             ErrorCode::Internal => "internal",
@@ -193,7 +194,7 @@ impl Error {
             Error::NonFastForward(_) => ErrorCode::NonFastForward,
             Error::DeleteDenied(_) => ErrorCode::DeleteDenied,
             Error::InvalidRef(_) => ErrorCode::InvalidRef,
-            Error::RemoteRefDenied(_) => ErrorCode::RemoteRefDenied,
+            Error::RefDenied(_) => ErrorCode::RefDenied,
             Error::SignatureRequired(_) => ErrorCode::SignatureRequired,
             Error::BindingMismatch(_) => ErrorCode::BindingMismatch,
             Error::Internal(_) => ErrorCode::Internal,
@@ -239,7 +240,7 @@ impl Error {
             | Error::NonFastForward(m)
             | Error::DeleteDenied(m)
             | Error::InvalidRef(m)
-            | Error::RemoteRefDenied(m)
+            | Error::RefDenied(m)
             | Error::SignatureRequired(m)
             | Error::BindingMismatch(m)
             | Error::Internal(m) => (self.code().expect("not Io"), m.clone()),
@@ -286,7 +287,7 @@ impl From<ErrorMessage> for Error {
             ErrorCode::NonFastForward => Error::NonFastForward(m),
             ErrorCode::DeleteDenied => Error::DeleteDenied(m),
             ErrorCode::InvalidRef => Error::InvalidRef(m),
-            ErrorCode::RemoteRefDenied => Error::RemoteRefDenied(m),
+            ErrorCode::RefDenied => Error::RefDenied(m),
             ErrorCode::SignatureRequired => Error::SignatureRequired(m),
             ErrorCode::BindingMismatch => Error::BindingMismatch(m),
             ErrorCode::Internal => Error::Internal(m),

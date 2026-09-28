@@ -214,6 +214,7 @@ fn every_message_round_trips() {
     for code in ErrorCode::ALL {
         round_trip(Message::Error(sample_error(code, code.as_str())));
     }
+    round_trip(Message::Error(error(ErrorCode::RefDenied, "main")));
     let mut e = error(ErrorCode::MissingObjects, "2 missing");
     e.missing = vec![name(File, 1), name(Commit, 2)];
     round_trip(Message::Error(e));
@@ -258,6 +259,15 @@ fn error_conversions() {
         assert_eq!(err.to_message(), msg);
     }
     assert_eq!(ErrorCode::from_name("no-such-code"), None);
+    assert_eq!(
+        ErrorCode::from_name("ref-denied"),
+        Some(ErrorCode::RefDenied)
+    );
+    assert_eq!(ErrorCode::from_name("remote-ref-denied"), None);
+    let err = Error::RefDenied("main".into());
+    assert_eq!(err.code(), Some(ErrorCode::RefDenied));
+    assert_eq!(err.to_string(), "ref-denied: main");
+    assert!(matches!(Error::from(err.to_message()), Error::RefDenied(m) if m == "main"));
 
     let mut msg = error(ErrorCode::MissingObjects, "x");
     msg.missing = vec![name(ObjectType::DirMeta, 5)];
@@ -332,6 +342,10 @@ fn golden_bytes_pin_the_frame_layout() {
     golden(
         Message::Error(error(ErrorCode::Protocol, "bad")),
         hex("00 00 00 13 0a 70 72 6f 74 6f 63 6f 6c 00 62 61 64 00 00 00 00 0d 09"),
+    );
+    golden(
+        Message::Error(error(ErrorCode::RefDenied, "main")),
+        hex("00 00 00 13 0a 72 65 66 2d 64 65 6e 69 65 64 00 6d 61 69 6e 00 10 0b"),
     );
 }
 
@@ -530,12 +544,16 @@ fn malformed_bodies_decode_to_protocol() {
         frame(2, &reply_body(MAX_FRAME, 0, bare(), "", vec![])),
         frame(2, &reply_body(MAX_FRAME, 1, Value::U32(7), "", vec![])),
         frame(10, &error_body("no-such-code", opts(&[]))),
+        frame(10, &error_body("remote-ref-denied", opts(&[]))),
         frame(10, &error_body("ref-mismatch", ref_only)),
         frame(10, &error_body("ref-mismatch", opts(&[]))),
     ];
     for bytes in cases {
         assert_protocol(read_one(&bytes));
     }
+    assert_protocol(read_one(&hex(
+        "00 00 00 1b 0a 72 65 6d 6f 74 65 2d 72 65 66 2d 64 65 6e 69 65 64 00 6d 00 00 00 00 00 14 12",
+    )));
     // The valid body that the HelloReply cases above alter decodes.
     let valid = frame(2, &reply_body(MAX_FRAME, 1, bare(), "", vec![]));
     assert!(read_one(&valid).unwrap().is_some());

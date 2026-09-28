@@ -752,8 +752,13 @@ pub(crate) struct StageCtx<'a> {
     /// Whether durability syncs run at all.
     pub(crate) fsync: bool,
     /// Whether the file of each content object is synced at ingest. Metadata
-    /// objects are not.
+    /// objects are not, unless `sync_metadata` is set.
     pub(crate) per_object_fsync: bool,
+    /// Whether the file of a metadata object is synced at ingest, with fsync
+    /// on. A transaction sets it for an object it stages after a `syncfs` made
+    /// the earlier objects durable, so the publication step needs no second
+    /// `syncfs`.
+    pub(crate) sync_metadata: bool,
     /// The effective `[ex-integrity] fsverity` setting. Each freshly staged
     /// regular-file object is sealed with fs-verity unless this is
     /// [`Tristate::No`].
@@ -970,9 +975,10 @@ pub(crate) fn stage_metadata_blocking(
         FIXED_MODE,
         None,
         // A metadata object is made durable by the `syncfs` that opens
-        // publication; the per-object sync covers content objects alone
-        // (`docs/format-reference.md`, "Durability and staging").
-        false,
+        // publication; the per-object sync covers content objects alone. An
+        // object staged after the transaction ran that `syncfs` ahead of
+        // publication is synced here instead.
+        ctx.fsync && ctx.sync_metadata,
         ctx.verity,
     )?;
     Ok(StageOutcome {
@@ -1277,17 +1283,20 @@ fn clone_metadata(
 }
 
 /// Publish staged objects into `objects/` per the durability contract: with
-/// fsync on, `syncfs` the repository, rename each object into `objects/<xx>/`,
-/// then `fsync` each touched fanout directory and `objects/` itself.
+/// `syncfs`, `syncfs` the repository, then rename each object into
+/// `objects/<xx>/`, and with fsync on `fsync` each touched fanout directory and
+/// `objects/` itself. A caller clears `syncfs` with fsync on only where a
+/// `syncfs` after the last object was staged already made them durable.
 pub(crate) fn publish_blocking(
     repo_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
     staging_fd: BorrowedFd<'_>,
     objects: &[(String, String)],
+    syncfs: bool,
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
-    if fsync {
+    if syncfs {
         rustix::fs::syncfs(repo_fd)?;
     }
     let mut fanouts: Vec<String> = Vec::new();

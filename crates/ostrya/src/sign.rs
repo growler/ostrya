@@ -76,6 +76,7 @@ impl Repo {
         self.merge_commit_detached_metadata(
             checksum,
             None,
+            None,
             vec![(signer.metadata_key().to_owned(), signature)],
             fsync,
         )

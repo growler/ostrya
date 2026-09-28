@@ -334,7 +334,8 @@ syscalls): `syncfs(repo)` then rename staged objects into `objects/xx/` then
 fsync each `objects/xx/` and `objects/` then write refs. Objects are durable
 before any ref points at them. Ref writes are individually atomic (tmpfile +
 fdatasync + rename + fsync of the directory holding the ref) but not atomic as a
-set. Honor `fsync=false` (all fsync becomes no-op) and `per-object-fsync`.
+set. A transaction renames all its refs first and then fsyncs each directory
+that changed once, deepest first, before its commit returns. Honor `fsync=false` (all fsync becomes no-op) and `per-object-fsync`.
 
 ## New repository mode: bare-user-shared
 

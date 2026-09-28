@@ -25,7 +25,9 @@
 //! `None` checksum removes the ref file. A transaction queues its ref writes
 //! with [`Transaction::set_ref`] and applies them at commit after object
 //! publication, under the fsync policy the transaction resolved for its object
-//! writes; [`Repo::set_ref_immediate`](Repo::set_ref_immediate) writes one
+//! writes. It writes every queued ref first and then `fsync`s each directory
+//! that changed once, deepest first, before the commit returns;
+//! [`Repo::set_ref_immediate`](Repo::set_ref_immediate) writes one
 //! outside a transaction and reads `[core] fsync` itself.
 
 use std::collections::HashSet;
@@ -113,6 +115,21 @@ impl QueuedRef {
     }
 }
 
+/// The state of one ref path, as the receive path reads it under its lock.
+#[cfg(feature = "receive")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefFileState {
+    /// No file stands at the path.
+    Absent,
+    /// A ref file, and the commit it names.
+    Commit(Checksum),
+    /// A symlink: an alias of another ref.
+    Alias,
+    /// Something a ref write cannot replace: a directory, a path that passes
+    /// through a file, or a special file.
+    NotARef,
+}
+
 /// One queued ref write: a target and the checksum to point it at (`None`
 /// removes the ref).
 pub(crate) struct RefWrite {
@@ -157,6 +174,14 @@ impl Transaction {
     /// transaction's resolved fsync policy, so the whole transaction -- the
     /// per-object writes, the publication step, and the ref writes -- reads one
     /// value.
+    ///
+    /// The durability invariant: with fsync on, every ref file is
+    /// `fdatasync`-ed before its rename, and every directory that gained or
+    /// lost a name is `fsync`-ed once after the last rename, deepest first,
+    /// before the call returns. The caller made the objects and the detached
+    /// metadata the refs name durable before the call, so no ref is durable
+    /// ahead of what it names. A write that fails still syncs the directories
+    /// of the refs written before it.
     pub(crate) async fn write_resolved_refs(
         &self,
         refs: &[(String, Option<Checksum>)],
@@ -169,10 +194,22 @@ impl Transaction {
         let repo_fd = self.repo().repo_fd().try_clone_to_owned()?;
         let refs = refs.to_vec();
         ostrya_rt::unblock(move || {
-            for (relpath, checksum) in &refs {
-                write_ref_blocking(repo_fd.as_fd(), relpath, *checksum, fsync, repo_mode)?;
+            let mut dirs = Vec::new();
+            let written = refs.iter().try_for_each(|(relpath, checksum)| {
+                put_ref_blocking(
+                    repo_fd.as_fd(),
+                    relpath,
+                    *checksum,
+                    fsync,
+                    repo_mode,
+                    &mut dirs,
+                )
+            });
+            if !fsync {
+                return written;
             }
-            Ok(())
+            let synced = sync_ref_dirs(repo_fd.as_fd(), dirs);
+            written.and(synced)
         })
         .await
     }
@@ -290,6 +327,42 @@ impl Repo {
             .into_iter()
             .map(|bytes| bytes.map(|b| parse_ref_content(&b)).transpose())
             .collect()
+    }
+
+    /// The state of each of several refspecs, and the commit of `tip`, in one
+    /// pass on the blocking pool. The result holds one state for each
+    /// refspec, in order.
+    ///
+    /// Each ref path is read with `lstat` first. A regular file is then opened
+    /// with `O_NOFOLLOW` and parsed, and a ref that does not parse fails the
+    /// call. `tip`, where given, is read as
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it, and its failure
+    /// is given apart, so the caller decides whether it needs the value.
+    #[cfg(feature = "receive")]
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn read_ref_states(
+        &self,
+        refspecs: &[String],
+        tip: Option<&str>,
+    ) -> Result<(Vec<RefFileState>, Option<Result<Option<Checksum>>>)> {
+        let relpaths = refspecs
+            .iter()
+            .map(|r| refspec_to_relpath(r))
+            .collect::<Result<Vec<_>>>()?;
+        let tip = tip.map(refspec_to_relpath);
+        let repo = self.clone();
+        ostrya_rt::unblock(move || {
+            let states = relpaths
+                .iter()
+                .map(|p| ref_file_state(repo.repo_fd(), p))
+                .collect::<Result<Vec<_>>>()?;
+            let tip = tip.map(|relpath| match read_ref_file(repo.repo_fd(), &relpath?)? {
+                Some(bytes) => Ok(Some(parse_ref_content(&bytes)?)),
+                None => Ok(None),
+            });
+            Ok((states, tip))
+        })
+        .await
     }
 
     /// List local refs (under `refs/heads`) as (name, commit) pairs, sorted by
@@ -784,6 +857,40 @@ fn read_ref_file(
     Ok(Some(buf))
 }
 
+/// The state of the ref path `relpath`, read with `lstat` and then an
+/// `O_NOFOLLOW` open of a regular file. A path that passes through a file
+/// (`ENOTDIR`) is [`RefFileState::NotARef`].
+#[cfg(feature = "receive")]
+fn ref_file_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
+    let stat = match rustix::fs::statat(dir, relpath, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(RefFileState::Absent),
+        Err(Errno::NOTDIR) => return Ok(RefFileState::NotARef),
+        Err(e) => return Err(e.into()),
+    };
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Symlink => return Ok(RefFileState::Alias),
+        FileType::RegularFile => {}
+        _ => return Ok(RefFileState::NotARef),
+    }
+    let fd = match rustix::fs::openat(
+        dir,
+        relpath,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(RefFileState::Absent),
+        Err(Errno::LOOP) => return Ok(RefFileState::Alias),
+        Err(e) => return Err(e.into()),
+    };
+    let mut buf = Vec::new();
+    std::fs::File::from(fd)
+        .take(REF_READ_CAP)
+        .read_to_end(&mut buf)?;
+    Ok(RefFileState::Commit(parse_ref_content(&buf)?))
+}
+
 /// Parse a ref file's content: a hex checksum with trailing whitespace.
 fn parse_ref_content(bytes: &[u8]) -> Result<Checksum> {
     let text = std::str::from_utf8(bytes)
@@ -800,7 +907,7 @@ pub fn validate_refspec(refspec: &str) -> Result<()> {
 
 /// Map a refspec to its path under `refs/`, rejecting anything that would
 /// escape the tree.
-fn refspec_to_relpath(refspec: &str) -> Result<String> {
+pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
     if let Some((remote, name)) = refspec.split_once(':') {
         if !is_component(remote) || !is_ref_path(name) {
             return Err(Error::InvalidRefspec(refspec.to_owned()));
@@ -920,8 +1027,8 @@ const REF_DIR_MODE: u32 = 0o777;
 /// treating an already-absent file as success. Under `fsync` the directory
 /// holding the ref is `fsync`-ed after the rename or the unlink, so the name
 /// the operation created or removed is durable and not only the file's content,
-/// and [`sync_created_ref_parents`] then makes durable the name of every parent
-/// directory this write created.
+/// and the name of every parent directory this write created is made durable
+/// too, deepest first.
 fn write_ref_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -929,11 +1036,28 @@ fn write_ref_blocking(
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
+    let mut dirs = Vec::new();
+    put_ref_blocking(repo_fd, relpath, checksum, fsync, repo_mode, &mut dirs)?;
+    sync_ref_dirs(repo_fd, dirs)
+}
+
+/// The body of [`write_ref_blocking`], with the directory syncs left to the
+/// caller: under `fsync`, each directory that gained or lost a name is added to
+/// `dirs`, for [`sync_ref_dirs`]. Those are the directory holding the ref, and
+/// the directory holding each parent this write created.
+fn put_ref_blocking(
+    repo_fd: BorrowedFd<'_>,
+    relpath: &str,
+    checksum: Option<Checksum>,
+    fsync: bool,
+    repo_mode: RepoMode,
+    dirs: &mut Vec<String>,
+) -> Result<()> {
     let Some(checksum) = checksum else {
         return match rustix::fs::unlinkat(repo_fd, relpath, AtFlags::empty()) {
             Ok(()) => {
                 if fsync {
-                    sync_ref_parent(repo_fd, relpath)?;
+                    dirs.push(ref_parent(relpath).to_owned());
                 }
                 Ok(())
             }
@@ -965,15 +1089,40 @@ fn write_ref_blocking(
         }
         drop(file);
         rustix::fs::renameat(repo_fd, tmp.as_str(), repo_fd, relpath)?;
-        if fsync {
-            sync_ref_parent(repo_fd, relpath)?;
-            sync_created_ref_parents(repo_fd, &created)?;
-        }
         Ok(())
     };
     write_and_rename().inspect_err(|_| {
         let _ = rustix::fs::unlinkat(repo_fd, tmp.as_str(), AtFlags::empty());
-    })
+    })?;
+    if fsync {
+        dirs.push(ref_parent(relpath).to_owned());
+        dirs.extend(created.iter().map(|dir| ref_parent(dir).to_owned()));
+    }
+    Ok(())
+}
+
+/// `fsync` each distinct directory of `dirs` once, named relative to the
+/// repository root, deepest first.
+///
+/// A deeper directory is synced before the directory above it: the ref
+/// file's own name, then the name of the directory holding it, then the name
+/// of the directory above that, the order the object fanout uses. A crash
+/// part way through therefore leaves a prefix of each path recorded and never
+/// a directory entry naming a directory whose own contents are unrecorded.
+fn sync_ref_dirs(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> Result<()> {
+    let depth = |dir: &str| {
+        if dir == "." {
+            0
+        } else {
+            dir.split('/').count()
+        }
+    };
+    dirs.sort_by(|a, b| depth(b).cmp(&depth(a)).then_with(|| a.cmp(b)));
+    dirs.dedup();
+    for dir in &dirs {
+        sync_dir(repo_fd, dir)?;
+    }
+    Ok(())
 }
 
 /// Write one alias symlink relative to `repo_fd`, atomically.

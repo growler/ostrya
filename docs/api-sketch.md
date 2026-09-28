@@ -2280,8 +2280,58 @@ protocol crate, so a caller names its error codes and messages through
   dropped. A detached metadata object is kept in the session, and a second one
   for one commit is `protocol`. `ObjectsReply` counts the objects staged and
   the detached metadata objects kept, and the bytes they took on the wire.
-- The receive side does not update refs yet: `Commit` ends the session with
-  `internal`, and nothing is published.
+- `Commit` runs the checks of the ref updates in order, and the first
+  failure ends the session with nothing published. Each ref name is valid
+  (`invalid-ref`). The message holds one update at least, and each update
+  names a ref of `Hello` once (`protocol`). Each detached metadata object
+  belongs to a commit of the session: a staged commit, or the new commit of
+  an update (`protocol`). The rule of
+  each update accepts it, and no update names `ostree-metadata` in a
+  repository with a collection id (`ref-denied`). Each new commit is staged
+  or present, and the tree of each commit of the session is complete
+  (`missing-objects`). The bindings of each new commit name its refs and the
+  collection id (`binding-mismatch`). Each new commit passes the `verify` of
+  each of its rules, over the stored and the incoming signatures
+  (`signature-required`).
+- The commits of the session are the commits the session staged and the new
+  commits of the updates. A commit the client sends that the repository
+  holds is not staged, so it is a commit of the session only where an update
+  names it.
+- The server then makes the staged objects durable with one `syncfs`. At
+  the same time it signs each new commit with each key of the `signers` of
+  the rules of its updates, each key once. A key with a verifying signature
+  in the merge of the filtered incoming dict into the stored dict makes no
+  signature.
+- The server then takes the ref-update lock. Under the lock it reads each
+  ref again with `lstat`. An alias, and a path that a ref write cannot
+  replace, are `ref-denied`: a directory, a path below a ref file, and two
+  updates of which one writes below the other. It then checks the expected
+  state (`ref-mismatch`), a delete (`delete-denied`), and a fast-forward
+  (`non-fast-forward`). It reads each stored detached metadata dict again,
+  and queues a merge of each incoming dict, filtered, into it. Where the
+  stored dict changed since the read before the lock, it drops each prepared
+  server signature whose key has a verifying signature in the new merged
+  dict. It queues the kept signatures after the merge. The merged dict with
+  those signatures is `limit-exceeded` over `MAX_METADATA_SIZE`. The server
+  queues each ref that changes and commits the transaction. A delete of an
+  absent ref and an update to the current commit write nothing.
+- With `update_summary`, when a ref changes, a repository with a collection
+  id also writes the refreshed anchor commit on `ostree-metadata` in the
+  session transaction, with the anchor read under the lock as its parent.
+  A failure there is `internal`, and nothing is published. Staged after the
+  `syncfs`, the anchor objects are synced one by one, and the commit runs no
+  second `syncfs`.
+- After the commit the server removes the `.commitpartial` marker of each
+  commit of the session. With `update_summary`, when a ref changed, it
+  builds the summary, signs the built bytes with each of `summary_signers`,
+  GPG keys first, and then removes `summary.sig`, writes `summary`, and
+  writes the new `summary.sig`, still under the lock. With no summary signer
+  it writes no `summary.sig`. The server then
+  releases the lock and replies `CommitReply`. The call returns the report.
+  A step after the commit that fails does not undo it: it adds a
+  `ReceiveWarning` to the report, and the client is not told. A summary
+  failure is such a step, and so is a `CommitReply` that cannot be sent, so
+  the call returns `Ok` also when the client did not get the reply.
 - A failure with a wire code goes to the peer and returns as `Error::Push`. A
   server-side failure goes to the peer as `internal` and returns as the error
   it is. An `Abort`, an abandoned object, and an error or end of file of the
@@ -2294,6 +2344,22 @@ protocol crate, so a caller names its error codes and messages through
 pub struct ReceiveReport {
     pub refs: Vec<push::RefOutcome>,
     pub stats: TransactionStats,
+    pub warnings: Vec<ReceiveWarning>,     // steps after the commit that failed
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveWarning {
+    pub step: ReceiveStep,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiveStep {
+    SummaryBuild,
+    SummarySign,
+    SummaryWrite,
+    PartialMarker,                         // one for each commit
+    ReplyNotDelivered,
 }
 
 impl Repo {

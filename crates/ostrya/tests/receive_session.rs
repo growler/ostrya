@@ -3,314 +3,33 @@
 //! each failure sends, and the repository lock the session holds.
 //!
 //! A test client drives the session over two in-process pipes with the frame
-//! codec of `ostrya::push::proto`. The receive side does not update refs, so
-//! every session ends in an error, and no case publishes an object.
+//! codec of `ostrya::push::proto`. No case sends `Commit`, so every session
+//! ends in an error, and no case publishes an object. The tests of `Commit`
+//! are in `receive_commit.rs`.
 
 #![cfg(feature = "receive")]
 
 mod common;
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
-use std::path::Path;
 use std::pin::Pin;
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use common::receive::{
+    Client, deflate_object, foreign_holder, header, is_root, lock_holder_main, new_repo,
+    raw_object, returned_code, session, sha, staging_entries,
+};
 use common::{TmpDir, file_inventory};
-use futures_io::{AsyncRead, AsyncWrite};
 use ostrya::push::proto::{
-    ErrorMessage, FrameReader, FrameWriter, Hello, HelloReply, MAX_FRAME, MAX_HAVE, Message,
-    ObjectHeader, ObjectsReply,
+    ErrorMessage, FrameWriter, Hello, MAX_FRAME, MAX_HAVE, Message, ObjectHeader, ObjectsReply,
 };
 use ostrya::push::{self, Encoding, ErrorCode};
 use ostrya::{
-    Checksum, CreateOptions, DirMeta, Error, ObjectName, ObjectType, ReceivePolicy, Repo, RepoMode,
-    Xattrs,
+    Checksum, DirMeta, Error, ObjectName, ObjectType, ReceivePolicy, Repo, RepoMode, Xattrs,
 };
-use ostrya_core::DeflateSink;
-use ostrya_core::FileHeader;
 use ostrya_core::filehdr::frame;
 use ostrya_rt::block_on;
-use sha2::{Digest, Sha256};
-
-// ---------------------------------------------------------------------------
-// The in-process pipe.
-// ---------------------------------------------------------------------------
-
-struct PipeState {
-    buf: VecDeque<u8>,
-    cap: usize,
-    writer_closed: bool,
-    reader_closed: bool,
-    read_waker: Option<Waker>,
-    write_waker: Option<Waker>,
-}
-
-/// The write half of a bounded in-process byte pipe. Dropping it gives the
-/// reader end of file.
-struct PipeWriter(Arc<Mutex<PipeState>>);
-
-/// The read half of a bounded in-process byte pipe. Dropping it fails each
-/// later write with `BrokenPipe`.
-struct PipeReader(Arc<Mutex<PipeState>>);
-
-fn pipe(cap: usize) -> (PipeWriter, PipeReader) {
-    let state = Arc::new(Mutex::new(PipeState {
-        buf: VecDeque::new(),
-        cap,
-        writer_closed: false,
-        reader_closed: false,
-        read_waker: None,
-        write_waker: None,
-    }));
-    (PipeWriter(state.clone()), PipeReader(state))
-}
-
-impl AsyncWrite for PipeWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let mut st = self.0.lock().unwrap();
-        if st.reader_closed {
-            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-        }
-        let room = st.cap - st.buf.len();
-        if room == 0 {
-            st.write_waker = Some(cx.waker().clone());
-            return Poll::Pending;
-        }
-        let n = room.min(buf.len());
-        st.buf.extend(&buf[..n]);
-        if let Some(w) = st.read_waker.take() {
-            w.wake();
-        }
-        Poll::Ready(Ok(n))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl Drop for PipeWriter {
-    fn drop(&mut self) {
-        let mut st = self.0.lock().unwrap();
-        st.writer_closed = true;
-        if let Some(w) = st.read_waker.take() {
-            w.wake();
-        }
-    }
-}
-
-impl AsyncRead for PipeReader {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        let mut st = self.0.lock().unwrap();
-        if st.buf.is_empty() {
-            if st.writer_closed {
-                return Poll::Ready(Ok(0));
-            }
-            st.read_waker = Some(cx.waker().clone());
-            return Poll::Pending;
-        }
-        let n = buf.len().min(st.buf.len());
-        for (dst, src) in buf[..n].iter_mut().zip(st.buf.drain(..n)) {
-            *dst = src;
-        }
-        if let Some(w) = st.write_waker.take() {
-            w.wake();
-        }
-        Poll::Ready(Ok(n))
-    }
-}
-
-impl Drop for PipeReader {
-    fn drop(&mut self) {
-        let mut st = self.0.lock().unwrap();
-        st.reader_closed = true;
-        if let Some(w) = st.write_waker.take() {
-            w.wake();
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The test client.
-// ---------------------------------------------------------------------------
-
-/// The capacity of each pipe. A small capacity makes each object of more than
-/// a few chunks wait for the server to read.
-const PIPE_CAP: usize = 64 * 1024;
-
-/// The client end of a session.
-struct Client {
-    writer: FrameWriter<PipeWriter>,
-    reader: FrameReader<PipeReader>,
-}
-
-impl Client {
-    /// Send one message. A write error is returned, because the server can
-    /// already be gone.
-    async fn send(&mut self, msg: &Message) -> push::Result<()> {
-        self.writer.write_message(msg).await?;
-        self.writer.flush().await
-    }
-
-    async fn hello(&mut self, refs: &[&str]) -> push::Result<()> {
-        self.send(&Message::Hello(Hello {
-            version: 1,
-            agent: None,
-            refs: refs.iter().map(|r| r.to_string()).collect(),
-        }))
-        .await
-    }
-
-    async fn recv(&mut self) -> Option<Message> {
-        self.reader
-            .read_message()
-            .await
-            .expect("a well-formed frame")
-    }
-
-    async fn hello_reply(&mut self, refs: &[&str]) -> HelloReply {
-        self.hello(refs).await.unwrap();
-        match self.recv().await {
-            Some(Message::HelloReply(reply)) => reply,
-            other => panic!("expected HelloReply, got {other:?}"),
-        }
-    }
-
-    /// Send one object: its header, its bytes in pieces of 40 KiB, and the end
-    /// chunk.
-    async fn object(
-        &mut self,
-        ty: ObjectType,
-        checksum: Checksum,
-        encoding: Encoding,
-        bytes: &[u8],
-    ) -> push::Result<()> {
-        self.writer
-            .write_message(&Message::ObjectHeader(ObjectHeader {
-                name: ObjectName::new(checksum, ty),
-                encoding,
-            }))
-            .await?;
-        for piece in bytes.chunks(40 * 1024) {
-            self.writer.write_object_data(piece).await?;
-        }
-        self.writer.end_object().await?;
-        self.writer.flush().await
-    }
-
-    async fn objects_end(&mut self) -> ObjectsReply {
-        self.send(&Message::ObjectsEnd).await.unwrap();
-        match self.recv().await {
-            Some(Message::ObjectsReply(reply)) => reply,
-            other => panic!("expected ObjectsReply, got {other:?}"),
-        }
-    }
-
-    /// Read until the `Error` message, which is the last message of the
-    /// session.
-    async fn error(&mut self) -> ErrorMessage {
-        loop {
-            match self.recv().await {
-                Some(Message::Error(e)) => {
-                    assert_eq!(self.recv().await, None, "the session ends after Error");
-                    return e;
-                }
-                Some(_) => continue,
-                None => panic!("the session ended with no Error"),
-            }
-        }
-    }
-}
-
-/// Run a session of `repo` under `policy` against the client `script`.
-fn session<F, Fut, T>(
-    repo: &Repo,
-    policy: &ReceivePolicy,
-    script: F,
-) -> (ostrya::Result<ostrya::ReceiveReport>, T)
-where
-    F: FnOnce(Client) -> Fut,
-    Fut: Future<Output = T>,
-{
-    let (client_out, server_in) = pipe(PIPE_CAP);
-    let (server_out, client_in) = pipe(PIPE_CAP);
-    let client = Client {
-        writer: FrameWriter::new(client_out),
-        reader: FrameReader::new(client_in),
-    };
-    block_on(futures_lite::future::zip(
-        repo.receive(server_in, server_out, policy),
-        script(client),
-    ))
-}
-
-/// The wire code a failed session returned to its caller.
-fn returned_code(result: &ostrya::Result<ostrya::ReceiveReport>) -> Option<ErrorCode> {
-    match result {
-        Err(Error::Push(e)) => e.code(),
-        other => panic!("expected a push error, got {other:?}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Objects.
-// ---------------------------------------------------------------------------
-
-fn sha(bytes: &[u8]) -> Checksum {
-    Checksum::from_bytes(Sha256::digest(bytes).into())
-}
-
-fn header(uid: u32, gid: u32, mode: u32) -> FileHeader {
-    FileHeader {
-        uid,
-        gid,
-        mode,
-        symlink_target: String::new(),
-        xattrs: Xattrs::empty(),
-    }
-}
-
-/// A content object in the `raw` encoding, and its checksum.
-fn raw_object(header: &FileHeader, payload: &[u8]) -> (Checksum, Vec<u8>) {
-    let mut bytes = frame(&header.serialize().unwrap()).unwrap();
-    bytes.extend_from_slice(payload);
-    (sha(&bytes), bytes)
-}
-
-/// A content object in the `deflate` encoding, and its checksum. A symlink
-/// carries no payload, so its object is the framed header alone.
-fn deflate_object(header: &FileHeader, payload: &[u8]) -> (Checksum, Vec<u8>) {
-    let (checksum, _) = raw_object(header, payload);
-    let mut bytes = frame(&header.serialize_archive(payload.len() as u64).unwrap()).unwrap();
-    if header.is_symlink() {
-        return (checksum, bytes);
-    }
-    let mut sink = DeflateSink::new(Vec::new(), 6);
-    block_on(async {
-        use futures_lite::io::AsyncWriteExt;
-        sink.write_all(payload).await.unwrap();
-        sink.close().await.unwrap();
-    });
-    bytes.extend(sink.into_inner());
-    (checksum, bytes)
-}
 
 /// A payload of `len` bytes that does not compress to nothing.
 fn payload(len: usize) -> Vec<u8> {
@@ -338,32 +57,6 @@ fn detached_meta() -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // Repositories.
 // ---------------------------------------------------------------------------
-
-fn new_repo(tmp: &TmpDir, mode: RepoMode, core: &str) -> Repo {
-    let root = tmp.path().join("repo");
-    block_on(Repo::create(&root, CreateOptions::new(mode))).unwrap();
-    if !core.is_empty() {
-        let config = root.join("config");
-        let mut text = std::fs::read_to_string(&config).unwrap();
-        text.push_str(core);
-        std::fs::write(&config, text).unwrap();
-    }
-    block_on(Repo::open(&root)).unwrap()
-}
-
-fn is_root() -> bool {
-    rustix::process::geteuid().is_root()
-}
-
-/// The staging entries left under `tmp/`.
-fn staging_entries(root: &Path) -> Vec<String> {
-    std::fs::read_dir(root.join("tmp"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("staging-"))
-        .collect()
-}
 
 /// Assert that the session published nothing and left no staging entry.
 fn assert_nothing_published(repo: &Repo, before: &[(String, Vec<u8>)]) {
@@ -1194,108 +887,21 @@ fn a_second_commit_meta_for_one_commit_is_protocol() {
     assert_eq!(returned_code(&result), Some(ErrorCode::Protocol));
 }
 
-#[test]
-fn a_commit_message_is_internal() {
-    let tmp = TmpDir::new("recv-commit");
-    let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let before = file_inventory(repo.path(), "objects");
-    let (sum, raw) = raw_object(&header(0, 0, 0o100644), b"x");
-    let (result, error) = session(&repo, &policy(), |mut c| async move {
-        c.hello_reply(&["main"]).await;
-        c.object(ObjectType::File, sum, Encoding::Raw, &raw)
-            .await
-            .unwrap();
-        c.objects_end().await;
-        c.send(&Message::Commit(push::proto::CommitRequest {
-            updates: vec![],
-            force: false,
-        }))
-        .await
-        .unwrap();
-        c.error().await
-    });
-    assert_eq!(error.code, ErrorCode::Internal);
-    assert_eq!(returned_code(&result), Some(ErrorCode::Internal));
-    assert_nothing_published(&repo, &before);
-}
-
 // ---------------------------------------------------------------------------
 // The repository lock.
 // ---------------------------------------------------------------------------
 
-/// The environment variable that names the repository of the lock helper.
-const FOREIGN_LOCK_REPO: &str = "OSTRYA_RECEIVE_FOREIGN_LOCK_REPO";
-
-/// The file the lock helper writes once it holds the lock.
-const FOREIGN_LOCK_MARKER: &str = ".foreign-held";
-
-/// A spawned child, killed and reaped when the guard drops.
-struct ChildGuard(std::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Start this test binary again as a process that holds `<repo>/.lock`
-/// exclusive until it is killed.
-fn foreign_holder(repo: &Path) -> ChildGuard {
-    let holder = ChildGuard(
-        Command::new(std::env::current_exe().unwrap())
-            .args([
-                "receive_lock_holder_subprocess",
-                "--exact",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(FOREIGN_LOCK_REPO, repo)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the lock holder"),
-    );
-    let marker = repo.join(FOREIGN_LOCK_MARKER);
-    let started = Instant::now();
-    while !marker.exists() {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the holder never took the lock"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    holder
-}
-
 #[test]
 #[ignore = "helper process for the receive lock tests"]
 fn receive_lock_holder_subprocess() {
-    use rustix::fs::{FlockOperation, Mode, OFlags};
-    use std::io::Read;
-
-    let Ok(repo) = std::env::var(FOREIGN_LOCK_REPO) else {
-        return;
-    };
-    let repo = Path::new(&repo);
-    let fd = rustix::fs::open(
-        repo.join(".lock"),
-        OFlags::RDWR | OFlags::CREATE,
-        Mode::from_raw_mode(0o660),
-    )
-    .expect("open the lock file");
-    rustix::fs::fcntl_lock(&fd, FlockOperation::LockExclusive).expect("take the record lock");
-    std::fs::write(repo.join(FOREIGN_LOCK_MARKER), b"1").expect("write the readiness marker");
-    let mut sink = Vec::new();
-    let _ = std::io::stdin().read_to_end(&mut sink);
+    lock_holder_main();
 }
 
 #[test]
 fn hello_under_a_foreign_lock_times_out_as_internal() {
     let tmp = TmpDir::new("recv-lock-timeout");
     let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=1\n");
-    let holder = foreign_holder(repo.path());
+    let holder = foreign_holder(repo.path(), ".lock");
     let started = Instant::now();
     let (result, error) = session(&repo, &policy(), |mut c| async move {
         c.hello(&[]).await.unwrap();
@@ -1324,7 +930,7 @@ fn hello_under_a_foreign_lock_times_out_as_internal() {
 fn hello_with_minus_one_waits_for_the_lock_with_no_limit() {
     let tmp = TmpDir::new("recv-lock-nolimit");
     let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=-1\n");
-    let holder = foreign_holder(repo.path());
+    let holder = foreign_holder(repo.path(), ".lock");
     let release = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(1500));
         drop(holder);

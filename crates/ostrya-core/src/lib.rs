@@ -55,9 +55,9 @@ pub use xattr::{Xattrs, XattrsRef};
 // is a `Value`, so consuming crates need these to inspect, load, and serialize
 // arbitrary metadata dicts without depending on `ostrya-gvariant` directly.
 pub use ostrya_gvariant::{
-    ArrayIter, DictBuilder, GvDecode, GvType, Span, TextError, Type, Value, choose_offset_size,
-    from_bytes, from_text, offset_size_for, to_bytes, to_text, to_text_unannotated,
-    tuple_field_from_bytes, validate, write_offset,
+    ArrayIter, DictBuilder, GvDecode, GvType, Span, TextError, Type, Value, VariantBytes,
+    choose_offset_size, from_bytes, from_text, offset_size_for, to_bytes, to_text,
+    to_text_unannotated, tuple_field_from_bytes, validate, write_offset,
 };
 
 /// The largest metadata object the port loads: 128 MiB, the metadata cap of

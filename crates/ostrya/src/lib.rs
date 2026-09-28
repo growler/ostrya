@@ -307,7 +307,8 @@ pub use pull::{
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 pub use receive::{
-    ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveVerify, RefPattern, ServerSigner, TrustedKeys,
+    ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveStep, ReceiveVerify, ReceiveWarning,
+    RefPattern, ServerSigner, TrustedKeys,
 };
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};

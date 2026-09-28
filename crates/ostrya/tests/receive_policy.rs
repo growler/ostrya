@@ -14,6 +14,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use common::TmpDir;
+#[cfg(feature = "verify-gpg")]
+use common::receive::GnupgHome;
 use ostrya::{
     CreateOptions, Error, ReceivePolicy, ReceiveRule, ReceiveVerify, RefPattern, Repo, RepoMode,
     ServerSigner, TrustedKeys, base64,
@@ -1000,55 +1002,6 @@ fn the_tool_tolerates_the_receive_groups() {
         );
     }
     assert!(repo.join("summary").exists());
-}
-
-/// A private GnuPG home holding one fresh, passphrase-free signing key.
-/// Dropping it stops the GnuPG daemons of the home and removes their socket
-/// directory.
-#[cfg(feature = "verify-gpg")]
-struct GnupgHome {
-    dir: std::path::PathBuf,
-}
-
-#[cfg(feature = "verify-gpg")]
-impl GnupgHome {
-    fn new(dir: &Path, uid: &str) -> GnupgHome {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
-        let status = std::process::Command::new("gpg")
-            .arg("--homedir")
-            .arg(dir)
-            .args(["--batch", "--pinentry-mode", "loopback", "--passphrase", ""])
-            .args(["--quick-gen-key", uid, "ed25519", "sign", "never"])
-            .status()
-            .unwrap();
-        assert!(status.success(), "gpg --quick-gen-key failed");
-        GnupgHome {
-            dir: dir.to_owned(),
-        }
-    }
-
-    /// The public certificates of the home, as `gpg --export` writes them.
-    fn export(&self) -> Vec<u8> {
-        let out = std::process::Command::new("gpg")
-            .arg("--homedir")
-            .arg(&self.dir)
-            .args(["--batch", "--export"])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success() && !out.stdout.is_empty(),
-            "gpg --export failed"
-        );
-        out.stdout
-    }
-}
-
-#[cfg(feature = "verify-gpg")]
-impl Drop for GnupgHome {
-    fn drop(&mut self) {
-        common::remove_gnupg_sockets(&self.dir);
-    }
 }
 
 /// The policy moves across tasks and threads.

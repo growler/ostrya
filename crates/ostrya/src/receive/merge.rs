@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ostrya_core::{Type, Value};
+use ostrya_core::{ArrayIter, GvDecode, Type, Value, VariantBytes};
 
 use crate::error::{Error, Result};
 
@@ -14,7 +14,6 @@ use crate::error::{Error, Result};
 /// The list does not depend on the engines this build has, so a build without
 /// `sign-spki` keeps the stored `ostree.sign.spki` signatures and adds the
 /// incoming ones.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SIGNATURE_KEYS: [&str; 4] = [
     "ostree.gpgsigs",
     "ostree.sign.ed25519",
@@ -59,7 +58,6 @@ const STORED: &str = "the stored detached metadata";
 /// The merge moves the entries and the blobs of both inputs into the merged
 /// dict and copies no blob. Its time is linear in the number of keys and
 /// blobs of the two inputs.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn merge_detached(stored: Option<Value>, incoming: Value) -> Result<Value> {
     let incoming = dict_entries(incoming, INCOMING)?;
     let mut seen = HashSet::with_capacity(incoming.len());
@@ -104,6 +102,82 @@ pub(crate) fn merge_detached(stored: Option<Value>, incoming: Value) -> Result<V
             .map(|(key, value)| Value::Tuple(vec![Value::Str(key), value]))
             .collect(),
     ))
+}
+
+/// Check, building no value, that [`merge_detached`] takes the serialized
+/// dict `bytes` as its incoming dict: an `a{sv}` in normal form that holds
+/// each key once, with an `aay` under each key of [`SIGNATURE_KEYS`].
+///
+/// The check applies the limits of the parser, and its memory grows with the
+/// number of keys alone. Refused as [`Error::InvalidFormat`].
+pub(crate) fn check_incoming(bytes: &[u8]) -> Result<()> {
+    let mut seen = HashSet::new();
+    for entry in entries_in_place(bytes, INCOMING)? {
+        let (key, value) = entry.map_err(|e| not_a_dict(INCOMING, e))?;
+        if !seen.insert(key) {
+            return Err(Error::InvalidFormat(format!(
+                "the incoming detached metadata holds the key '{key}' more than once"
+            )));
+        }
+        if SIGNATURE_KEYS.contains(&key) && value.signature() != SIGNATURE_ARRAY {
+            return Err(not_aay(key, INCOMING));
+        }
+    }
+    Ok(())
+}
+
+/// The keys of [`SIGNATURE_KEYS`] that `bytes`, a serialized incoming dict,
+/// holds, as one flag for each key, in the order of the list. A dict that is
+/// not an `a{sv}` in normal form is refused as [`Error::InvalidFormat`].
+pub(crate) fn signature_keys_in(bytes: &[u8]) -> Result<[bool; SIGNATURE_KEYS.len()]> {
+    let mut held = [false; SIGNATURE_KEYS.len()];
+    for entry in entries_in_place(bytes, INCOMING)? {
+        let (key, _) = entry.map_err(|e| not_a_dict(INCOMING, e))?;
+        if let Some(i) = SIGNATURE_KEYS.iter().position(|k| *k == key) {
+            held[i] = true;
+        }
+    }
+    Ok(held)
+}
+
+/// Check, building no value, that an edit accepts `stored`, the serialized
+/// dict the repository holds: an `a{sv}` in normal form whose first entry
+/// under each key of [`SIGNATURE_KEYS`] that `touched` flags holds an `aay`.
+/// A key is touched when the incoming dict holds it or a signature is
+/// appended under it, which are the two steps that extend the stored list.
+///
+/// This is the refusal of [`merge_detached`] and of the signature append for
+/// the stored dict, so an edit that passes the check does not fail on the
+/// stored dict at the write. Refused as [`Error::InvalidFormat`].
+pub(crate) fn check_stored(stored: &[u8], touched: [bool; SIGNATURE_KEYS.len()]) -> Result<()> {
+    let mut checked = [false; SIGNATURE_KEYS.len()];
+    for entry in entries_in_place(stored, STORED)? {
+        let (key, value) = entry.map_err(|e| not_a_dict(STORED, e))?;
+        if let Some(i) = SIGNATURE_KEYS.iter().position(|k| *k == key)
+            && touched[i]
+            && !std::mem::replace(&mut checked[i], true)
+            && value.signature() != SIGNATURE_ARRAY
+        {
+            return Err(not_aay(key, STORED));
+        }
+    }
+    Ok(())
+}
+
+/// The `{sv}` entries of the serialized dict `bytes`, read in place after a
+/// check of the whole dict. `subject` names the dict in a refusal.
+fn entries_in_place<'a>(
+    bytes: &'a [u8],
+    subject: &str,
+) -> Result<ArrayIter<'a, (&'a str, VariantBytes<'a>)>> {
+    let ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
+    ostrya_core::validate(&ty, bytes).map_err(|e| not_a_dict(subject, e))?;
+    ArrayIter::decode(bytes).map_err(|e| not_a_dict(subject, e))
+}
+
+/// The refusal of a dict that is not an `a{sv}` in normal form.
+fn not_a_dict(subject: &str, e: impl std::fmt::Display) -> Error {
+    Error::InvalidFormat(format!("{subject} is not a dict `a{{sv}}`: {e}"))
 }
 
 /// The `{sv}` entries of an `a{sv}` dict, each as its key and its variant,

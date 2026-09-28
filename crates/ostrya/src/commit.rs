@@ -292,9 +292,11 @@ impl Repo {
     ///
     /// `replace` is the dict that stands in for whatever the file holds; with
     /// `None` the edit starts from the file's own dict, or from an empty dict
-    /// where the file is absent or is the zero-length marker. Each entry of
-    /// `appends` then appends one signature to its engine's `aay` array, in
-    /// order, and the result replaces the file atomically.
+    /// where the file is absent or is the zero-length marker. `merge`, where
+    /// given, is the serialized `a{sv}` dict merged into that dict with a union
+    /// of each signature list. Each entry of `appends` then appends one
+    /// signature to its engine's `aay` array, in order, and the result replaces
+    /// the file atomically.
     ///
     /// The read, the merge and the replacing write run as one step under
     /// [`DETACHED_MERGE`], a guard the whole process shares, so two signers of
@@ -308,23 +310,23 @@ impl Repo {
         &self,
         checksum: &Checksum,
         replace: Option<Value>,
+        merge: Option<Vec<u8>>,
         appends: Vec<(String, Vec<u8>)>,
         fsync: bool,
     ) -> Result<()> {
         let repo_mode = self.mode();
-        let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
+        let checksum = *checksum;
         let objects_fd = self.objects_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || {
-            edit_detached_blocking(objects_fd.as_fd(), &dest, fsync, repo_mode, |read| {
-                let mut dict = match replace {
-                    Some(dict) => dict,
-                    None => read()?.unwrap_or_else(|| Value::Array(Vec::new())),
-                };
-                for (key, signature) in appends {
-                    crate::sign::append_signature(&mut dict, &key, signature)?;
-                }
-                Ok((DetachedWrite::Dict(dict), ()))
-            })
+            merge_detached_blocking(
+                objects_fd.as_fd(),
+                &checksum,
+                replace,
+                merge,
+                appends,
+                fsync,
+                repo_mode,
+            )
         })
         .await
     }
@@ -407,6 +409,41 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
             "commit metadata must be an a{sv} dict".into(),
         )),
     }
+}
+
+/// The blocking body of
+/// [`merge_commit_detached_metadata`](Repo::merge_commit_detached_metadata),
+/// for a caller that applies several edits in one trip to the blocking pool.
+/// Each call takes [`DETACHED_MERGE`] for its own edit alone.
+pub(crate) fn merge_detached_blocking(
+    objects_fd: BorrowedFd<'_>,
+    checksum: &Checksum,
+    replace: Option<Value>,
+    merge: Option<Vec<u8>>,
+    appends: Vec<(String, Vec<u8>)>,
+    fsync: bool,
+    repo_mode: RepoMode,
+) -> Result<()> {
+    let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
+    edit_detached_blocking(objects_fd, &dest, fsync, repo_mode, |read| {
+        let base = match replace {
+            Some(dict) => Some(dict),
+            None => read()?,
+        };
+        // Only a receiving session queues a merge.
+        let mut dict = match merge {
+            #[cfg(feature = "receive")]
+            Some(incoming) => match crate::summary::parse_signature_dict(&incoming)? {
+                Some(incoming) => crate::receive::merge_detached(base, incoming)?,
+                None => base.unwrap_or_else(|| Value::Array(Vec::new())),
+            },
+            _ => base.unwrap_or_else(|| Value::Array(Vec::new())),
+        };
+        for (key, signature) in appends {
+            crate::sign::append_signature(&mut dict, &key, signature)?;
+        }
+        Ok((DetachedWrite::Dict(dict), ()))
+    })
 }
 
 /// Serializes the read-modify-write cycle behind

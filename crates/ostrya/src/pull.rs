@@ -1314,6 +1314,31 @@ impl Repo {
         .await
     }
 
+    /// Remove the `.commitpartial` marker of each of `commits` in one trip to
+    /// the blocking pool, as [`remove_partial_marker`](Repo::remove_partial_marker)
+    /// removes one. Gives each commit whose marker stays, with the error, in
+    /// the order of `commits`.
+    #[cfg(feature = "receive")]
+    pub(crate) async fn remove_partial_markers(
+        &self,
+        commits: Vec<Checksum>,
+    ) -> Vec<(Checksum, Error)> {
+        let repo = self.clone();
+        ostrya_rt::unblock(move || {
+            commits
+                .into_iter()
+                .filter_map(|commit| {
+                    let path = partial_path(&commit);
+                    match rustix::fs::unlinkat(repo.repo_fd(), path.as_str(), AtFlags::empty()) {
+                        Ok(()) | Err(rustix::io::Errno::NOENT) => None,
+                        Err(e) => Some((commit, Error::from(e))),
+                    }
+                })
+                .collect()
+        })
+        .await
+    }
+
     /// Remove the markers a failed pull wrote for commits this repository does
     /// not hold, taking `marked` as the list the pull wrote.
     ///

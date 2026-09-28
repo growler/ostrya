@@ -29,10 +29,14 @@
 //! each object stream in the session transaction after the checksum and the
 //! content checks of the repository mode.
 //!
-//! The module also holds two steps of the commit that ends a session: the
-//! union merge of an incoming detached-metadata dict into the dict the server
-//! holds, and the check whether a server key already signed a commit.
+//! `Commit` ends the session: the checks of each ref update, the ref writes,
+//! and the transaction commit under the ref-update lock. The commit merges
+//! each incoming detached-metadata dict into the dict the server holds with a
+//! union of the signature lists. The module also holds the check whether a
+//! server key already signed a commit.
 
+mod ancestry;
+mod finish;
 mod ingest;
 mod merge;
 mod pattern;
@@ -41,12 +45,15 @@ mod reader;
 mod session;
 mod signer;
 mod trust;
+mod walk;
 
 pub use pattern::RefPattern;
 pub use policy::{ReceivePolicy, ReceiveRule, ReceiveVerify};
-pub use session::ReceiveReport;
+pub use session::{ReceiveReport, ReceiveStep, ReceiveWarning};
 pub use signer::ServerSigner;
 pub use trust::TrustedKeys;
+
+pub(crate) use merge::merge_detached;
 
 /// The receive types move freely across tasks and threads, so one policy can
 /// serve every session of a server.
@@ -59,4 +66,5 @@ const _: fn() = || {
     assert_send_sync::<TrustedKeys>();
     assert_send_sync::<ServerSigner>();
     assert_send_sync::<ReceiveReport>();
+    assert_send_sync::<ReceiveWarning>();
 };

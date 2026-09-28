@@ -37,7 +37,7 @@ mod ty;
 mod value;
 
 pub use codec::{
-    ArrayIter, GvDecode, GvEncode, GvType, Slice, Variant, encode_to_vec, write_array,
+    ArrayIter, GvDecode, GvEncode, GvType, Slice, Variant, VariantBytes, encode_to_vec, write_array,
 };
 pub use de::{from_bytes, offset_size_for, tuple_field_from_bytes, validate};
 pub use dict::DictBuilder;

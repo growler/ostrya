@@ -784,6 +784,13 @@ already durable. A single-component name creates no directory and issues this
 `fsync` not at all, so the count of directory syncs a ref write makes is one
 plus the number of directories it created.
 
+A transaction that writes several refs renames every ref file first and then
+`fsync`s each directory that gained or lost a name once, deepest first, before
+its commit returns. Two refs in one directory therefore share one directory
+sync. Each ref file is `fdatasync`-ed before its rename, and the objects and
+the detached metadata the refs name are durable before the first rename, so
+the order guarantee is the same as for one ref.
+
 `fsync=false` turns all of that into a no-op. The syscall sequence carries no
 byte-exact requirement, and the ref bytes are identical either way.
 
@@ -1420,8 +1427,11 @@ no metadata object, and otherwise a single `syncfs` precedes the renames with
 directory `fsync`s after. A content object the port stores as a symlink inode
 (a symlink in `bare` and `bare-user-only`) and an object it hardlinks from
 another repository are not synced at ingest. The `syncfs` that opens
-publication makes every staged object durable, metadata included. The staging
-directory layout is transient and is not part of the on-disk format.
+publication makes every staged object durable, metadata included. A receiving
+push session runs that `syncfs` before it takes the ref-update lock. With fsync
+on, it then `fsync`s the file of each metadata object it stages under the lock,
+and its publication runs no second `syncfs`. The staging directory layout is
+transient and is not part of the on-disk format.
 
 ## Write path: fs-verity (ex-integrity)
 

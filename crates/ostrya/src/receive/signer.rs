@@ -24,14 +24,12 @@ pub struct ServerSigner {
     signer: Box<dyn Signer>,
     /// A verifier that trusts the public half of `signer`'s key and no other
     /// key.
-    #[cfg_attr(not(test), allow(dead_code))]
     verifier: Arc<dyn Verifier>,
     /// Whether `verifier` does its work in the call to
     /// [`Verifier::verify`], on the thread that calls it. This is true for the
     /// keys [`ed25519`](Self::ed25519) and [`spki`](Self::spki) give.
     /// [`has_signed`](Self::has_signed) then runs the check on the blocking
     /// pool, so the check does not hold the async executor.
-    #[cfg_attr(not(test), allow(dead_code))]
     verifies_in_call: bool,
 }
 
@@ -145,7 +143,6 @@ impl ServerSigner {
     /// their work in the calling thread. The GPG verifier moves its own work to
     /// the blocking pool. A pair from [`new`](Self::new) is checked in the
     /// calling task.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn has_signed(&self, payload: &[u8], dict: Option<&Value>) -> bool {
         let Some(dict) = dict else {
             return false;
@@ -169,7 +166,6 @@ impl ServerSigner {
 /// Whether one of `blobs` verifies over `payload` under `verifier`. Each blob is
 /// verified on its own, a blob the verifier refuses counts as not valid, and
 /// the check stops at the first blob that verifies.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn any_verifies(verifier: &dyn Verifier, payload: &[u8], blobs: &[Vec<u8>]) -> bool {
     for blob in blobs {
         if let Ok(outcome) = verifier.verify(payload, std::slice::from_ref(blob)).await

@@ -8,6 +8,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(feature = "receive")]
+pub mod receive;
+
 /// Root of the tool-generated fixture repositories, one subdirectory per mode.
 pub fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/generated")

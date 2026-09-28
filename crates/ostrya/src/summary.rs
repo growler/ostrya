@@ -81,7 +81,7 @@ pub(crate) const SUMMARY_SIG_FILE: &str = "summary.sig";
 const SUMMARY_MODE: u32 = 0o644;
 
 /// The ref the collection anchor commit is written to.
-const OSTREE_METADATA_REF: &str = "ostree-metadata";
+pub(crate) const OSTREE_METADATA_REF: &str = "ostree-metadata";
 /// The mode of the anchor commit's empty root directory: `S_IFDIR | 0755`.
 const ANCHOR_DIR_MODE: u32 = 0o40755;
 
@@ -329,6 +329,21 @@ impl Repo {
             self.refresh_anchor_commit(cid, opts).await?;
         }
 
+        let bytes = self.build_summary(opts).await?;
+        let fsync = self.config().fsync()?;
+        self.write_root_file(SUMMARY_FILE, bytes, fsync).await?;
+        self.remove_root_file(SUMMARY_SIG_FILE).await
+    }
+
+    /// The bytes of the summary of the refs the repository holds now, as
+    /// [`regenerate_summary`](Repo::regenerate_summary) writes them. The call
+    /// writes nothing and does not refresh the anchor commit of a repository
+    /// with a collection id: the summary lists the anchor that
+    /// `ostree-metadata` names. The caller checks the values of
+    /// [`SummaryOptions::additional_metadata`].
+    pub(crate) async fn build_summary(&self, opts: &SummaryOptions) -> Result<Vec<u8>> {
+        let collection_id = self.config().collection_id().map(str::to_owned);
+
         // Field 0: the local refs, byte-wise sorted by name.
         let mut heads = self.list_refs(None).await?;
         heads.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
@@ -382,11 +397,7 @@ impl Repo {
 
         let summary = Value::Tuple(vec![Value::Array(ref_entries), metadata]);
         let ty = Type::parse(SUMMARY_SIGNATURE).map_err(ostrya_core::Error::from)?;
-        let bytes = to_bytes(&ty, &summary).map_err(ostrya_core::Error::from)?;
-
-        let fsync = self.config().fsync()?;
-        self.write_root_file(SUMMARY_FILE, bytes, fsync).await?;
-        self.remove_root_file(SUMMARY_SIG_FILE).await
+        Ok(to_bytes(&ty, &summary).map_err(ostrya_core::Error::from)?)
     }
 
     /// The read side of the summary: its raw bytes, or `None` when absent.
@@ -530,8 +541,25 @@ impl Repo {
         opts: &SummaryOptions,
     ) -> Result<Checksum> {
         let parent = self.resolve_ref_tip(OSTREE_METADATA_REF).await?;
-
         let txn = self.transaction().await?;
+        let commit = self
+            .stage_anchor_commit(&txn, collection_id, parent, opts.metadata_commit_timestamp)
+            .await?;
+        txn.commit().await?;
+        Ok(commit)
+    }
+
+    /// Stage the collection anchor commit in `txn`, with `parent` as its
+    /// parent and `timestamp` as its timestamp, and queue its write to
+    /// `refs/heads/ostree-metadata`. A `timestamp` of `None` resolves as for
+    /// any commit. Nothing is published until `txn` commits.
+    pub(crate) async fn stage_anchor_commit(
+        &self,
+        txn: &crate::Transaction,
+        collection_id: &str,
+        parent: Option<Checksum>,
+        timestamp: Option<u64>,
+    ) -> Result<Checksum> {
         let dirmeta = DirMeta {
             uid: 0,
             gid: 0,
@@ -566,14 +594,13 @@ impl Repo {
                     parent,
                     subject: None,
                     body: None,
-                    timestamp: opts.metadata_commit_timestamp,
+                    timestamp,
                     metadata: Some(metadata),
                 },
                 &root,
             )
             .await?;
         txn.set_ref(OSTREE_METADATA_REF, Some(&commit));
-        txn.commit().await?;
         Ok(commit)
     }
 
@@ -912,5 +939,40 @@ mod tests {
         let err = Summary::parse(&bytes).unwrap_err();
         assert!(err.to_string().contains("'short'"), "{err}");
         assert!(err.to_string().contains("16-byte"), "{err}");
+    }
+
+    /// `build_summary` gives the bytes `regenerate_summary` writes, for a
+    /// repository with a collection id, whose anchor commit the regeneration
+    /// refreshed, and it writes nothing.
+    #[test]
+    fn build_summary_gives_the_bytes_regenerate_summary_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-build-summary-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            let mut create = crate::CreateOptions::new(ostrya_core::RepoMode::Archive);
+            create.collection_id = Some("org.example.C".into());
+            let repo = Repo::create(&dir, create).await.unwrap();
+            let opts = SummaryOptions {
+                last_modified: Some(1_700_000_000),
+                metadata_commit_timestamp: Some(1_700_000_000),
+                ..SummaryOptions::default()
+            };
+            repo.regenerate_summary(&opts).await.unwrap();
+            let written = repo.read_summary().await.unwrap().unwrap();
+            let anchor = repo.resolve_ref_tip(OSTREE_METADATA_REF).await.unwrap();
+            assert!(anchor.is_some(), "the regeneration wrote the anchor");
+            assert_eq!(repo.build_summary(&opts).await.unwrap(), written);
+            assert_eq!(
+                repo.resolve_ref_tip(OSTREE_METADATA_REF).await.unwrap(),
+                anchor,
+                "the build refreshes no anchor"
+            );
+            assert_eq!(repo.read_summary().await.unwrap().unwrap(), written);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

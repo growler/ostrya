@@ -313,7 +313,6 @@ impl Repo {
     /// Against other processes the lock has no order: a waiter can lose every
     /// retry to another process until the timeout elapses.
     #[cfg(feature = "receive")]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn lock_ref_update(&self) -> Result<RefUpdateGuard> {
         let timeout_secs = self.inner.config.lock_timeout_secs()?;
         // A cached lock is read on the calling task, so the call joins the

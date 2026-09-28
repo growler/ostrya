@@ -6,15 +6,17 @@ use std::io;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{BufReader, BufWriter};
-use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, Type, loose_path};
+use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, loose_path};
 
 use super::ReceivePolicy;
+use super::finish::finish;
 use super::ingest::{self, Counted, ModeRules};
+use super::merge::check_incoming;
 use crate::error::{Error, Result};
 use crate::object::object_exists;
 use crate::push::proto::{
-    FrameReader, FrameWriter, HaveReply, Hello, HelloReply, MAX_FRAME, MAX_HAVE, Message,
-    ObjectHeader, ObjectsReply, PROTOCOL_VERSION, RefState,
+    CommitRequest, FrameReader, FrameWriter, HaveReply, Hello, HelloReply, MAX_FRAME, MAX_HAVE,
+    Message, ObjectHeader, ObjectsReply, PROTOCOL_VERSION, RefState,
 };
 use crate::push::{self, Encoding, RefOutcome};
 use crate::repo::Repo;
@@ -31,6 +33,35 @@ pub struct ReceiveReport {
     pub refs: Vec<RefOutcome>,
     /// The statistics of the session transaction.
     pub stats: TransactionStats,
+    /// The steps after the transaction commit that failed. The refs are
+    /// written, and the client is not told of these failures.
+    pub warnings: Vec<ReceiveWarning>,
+}
+
+/// A step after the transaction commit of a session that failed. The step
+/// does not undo the commit or the ref writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveWarning {
+    /// The step that failed.
+    pub step: ReceiveStep,
+    /// What failed, for a human.
+    pub message: String,
+}
+
+/// The steps after the transaction commit of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiveStep {
+    /// The build of the regenerated summary.
+    SummaryBuild,
+    /// The signature of the regenerated summary with a key of the policy.
+    SummarySign,
+    /// The write of the regenerated summary and of its signatures.
+    SummaryWrite,
+    /// The removal of the partial marker of one commit of the session. Each
+    /// commit whose marker stays gets one warning.
+    PartialMarker,
+    /// The send of `CommitReply` to the client.
+    ReplyNotDelivered,
 }
 
 /// How a session failed.
@@ -85,9 +116,38 @@ impl Repo {
     /// already holds is read, checked, and dropped. A detached metadata object
     /// is kept in the session.
     ///
-    /// The receive side does not yet update refs: a `Commit` message ends the
-    /// session with the code `internal`. So every session returns an error, and
-    /// the transaction aborts with nothing published.
+    /// `Commit` runs the checks of the ref updates: the name, the rule, and the
+    /// bindings of each update, the completeness of the tree of each commit of
+    /// the session, and the signature check of each rule. A detached metadata
+    /// object for a commit that is not a commit of the session is `protocol`.
+    /// It then makes the staged objects durable, and at the same time it signs
+    /// each new commit with each server key of the rules of its updates, each
+    /// key once. A key that already signed the commit makes no signature. It
+    /// takes the ref-update lock and reads the refs again. A ref that is an
+    /// alias, and a ref path that a ref write cannot replace, are `ref-denied`.
+    /// It checks each update against the state it expects, for a delete, and
+    /// for a fast-forward. It merges the incoming detached metadata into the
+    /// stored dicts. Where a stored dict changed since the read before the
+    /// lock, it drops each server signature whose key already signed the
+    /// commit in the new merged dict. It writes the refs that change, and
+    /// commits the transaction under the lock. Where the policy regenerates the summary and a ref changes,
+    /// the transaction of a repository with a collection id also writes the
+    /// refreshed anchor commit on `ostree-metadata`. The first failed check
+    /// ends the session, and nothing is published. The commits of the session
+    /// are the commits the session staged and the new commits of the updates.
+    /// A commit the client sends that the repository holds already is not
+    /// staged, so it is a commit of the session only where an update names it.
+    ///
+    /// After the commit the partial marker of each commit of the session is
+    /// removed. Where the policy regenerates the summary and a ref changed, the
+    /// summary is built, signed from the bytes just built with each summary
+    /// key, and written, still under the lock. The lock is then released, and
+    /// `CommitReply` goes to the client. The call then returns the report. A
+    /// step after the commit that fails does not undo the commit: it adds a
+    /// [`ReceiveWarning`] to the report, and the client is not told. A
+    /// `CommitReply` that cannot be sent is such a step,
+    /// [`ReceiveStep::ReplyNotDelivered`], so the call returns `Ok` also when
+    /// the client did not get the reply.
     ///
     /// Each failure is sent to the peer as an `Error` message and returned. A
     /// failure with a wire code returns as [`Error::Push`]. A failure on the
@@ -114,10 +174,14 @@ impl Repo {
             writer: FrameWriter::new(BufWriter::with_capacity(STREAM_BUFFER, output)),
             txn: None,
             rules: None,
+            named: Vec::new(),
             commit_meta: HashMap::new(),
             buf: Vec::new(),
         };
-        let failure = session.run().await;
+        let failure = match session.run().await {
+            Ok(report) => return Ok(report),
+            Err(failure) => failure,
+        };
         let error = match failure {
             Failure::Wire(e) => {
                 session.send_error(e.to_message()).await;
@@ -145,6 +209,8 @@ struct Session<'a, R, W> {
     /// The session transaction, open from `Hello` on.
     txn: Option<Transaction>,
     rules: Option<ModeRules>,
+    /// The refs `Hello` named.
+    named: Vec<String>,
     /// The detached metadata dicts of the session, by commit, as they arrived.
     commit_meta: HashMap<Checksum, Vec<u8>>,
     /// The chunk buffer of the object stream, shared by every object.
@@ -156,15 +222,8 @@ where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    /// Run the session until it fails.
-    async fn run(&mut self) -> Failure {
-        match self.run_inner().await {
-            Ok(never) => match never {},
-            Err(failure) => failure,
-        }
-    }
-
-    async fn run_inner(&mut self) -> std::result::Result<std::convert::Infallible, Failure> {
+    /// Run the session until it commits or fails.
+    async fn run(&mut self) -> std::result::Result<ReceiveReport, Failure> {
         match self.next().await? {
             Message::Hello(hello) => self.hello(hello).await?,
             other => return Err(out_of_order(&other)),
@@ -174,11 +233,7 @@ where
                 Message::Have(names) => self.have(names).await?,
                 Message::ObjectHeader(header) => self.objects(header).await?,
                 Message::ObjectsEnd => self.reply_objects(0, 0).await?,
-                Message::Commit(_) => {
-                    return Err(Failure::Wire(push::Error::Internal(
-                        "the receive side does not update refs".into(),
-                    )));
-                }
+                Message::Commit(request) => return self.commit(request).await,
                 Message::Abort => return Err(aborted()),
                 other => return Err(out_of_order(&other)),
             }
@@ -275,6 +330,7 @@ where
         }
         self.txn = Some(txn);
         self.rules = Some(ModeRules::new(mode, self.policy.allow_privileged));
+        self.named = hello.refs.clone();
         let tips = self
             .repo
             .resolve_ref_tips(&hello.refs)
@@ -297,6 +353,40 @@ where
             refs,
         };
         self.reply(&Message::HelloReply(reply)).await
+    }
+
+    /// Commit the session and reply `CommitReply`. A reply that cannot be
+    /// sent is a warning of the report.
+    async fn commit(
+        &mut self,
+        request: CommitRequest,
+    ) -> std::result::Result<ReceiveReport, Failure> {
+        let txn = self
+            .txn
+            .take()
+            .expect("the transaction is open after Hello");
+        let commit_meta = std::mem::take(&mut self.commit_meta);
+        let mut report = finish(
+            self.repo,
+            self.policy,
+            txn,
+            &self.named,
+            commit_meta,
+            request,
+        )
+        .await?;
+        let reply = Message::CommitReply(report.refs.clone());
+        let sent = match self.writer.write_message(&reply).await {
+            Ok(()) => self.writer.flush().await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = sent {
+            report.warnings.push(ReceiveWarning {
+                step: ReceiveStep::ReplyNotDelivered,
+                message: e.to_string(),
+            });
+        }
+        Ok(report)
     }
 
     /// Answer a `Have`: one bit for each object the repository and the session
@@ -429,7 +519,9 @@ where
 }
 
 /// Keep one detached metadata object: a dict `a{sv}` for the commit
-/// `checksum`. A second one for the same commit is `protocol`.
+/// `checksum`. A second one for the same commit is `protocol`, and so is a dict
+/// that the merge into the stored dict refuses: one that holds a key twice, or
+/// a signature key whose value is not `aay`.
 async fn commit_meta_object<B: AsyncRead + Unpin>(
     commit_meta: &mut HashMap<Checksum, Vec<u8>>,
     checksum: &Checksum,
@@ -441,10 +533,16 @@ async fn commit_meta_object<B: AsyncRead + Unpin>(
         ))));
     }
     let bytes = ingest::read_capped(body, "detached metadata of commit", checksum).await?;
-    let dict = Type::parse("a{sv}").expect("valid signature");
-    ostrya_core::validate(&dict, &bytes).map_err(|e| {
+    // The dict is checked in place on the blocking pool, and no value tree is
+    // built: the session keeps its bytes until the merge.
+    let (bytes, checked) = ostrya_rt::unblock(move || {
+        let checked = check_incoming(&bytes);
+        (bytes, checked)
+    })
+    .await;
+    checked.map_err(|e| {
         Failure::Wire(push::Error::Protocol(format!(
-            "the detached metadata of commit {checksum} is not a dict a{{sv}}: {e}"
+            "the detached metadata of commit {checksum}: {e}"
         )))
     })?;
     commit_meta.insert(*checksum, bytes);

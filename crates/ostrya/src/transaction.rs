@@ -114,6 +114,12 @@ struct Staged {
     free_budget: u64,
     /// Accumulated statistics.
     stats: TransactionStats,
+    /// The number of staged objects that are durable before publication: the
+    /// objects the last [`sync_staged`](Transaction::sync_staged) made durable,
+    /// and each metadata object synced on its own after it. The publication
+    /// step skips its `syncfs` while this equals the number of staged objects,
+    /// so another object staged after the sync gets the `syncfs` it needs.
+    presynced: Option<usize>,
 }
 
 /// One commit's queued detached-metadata edit.
@@ -122,13 +128,18 @@ struct Staged {
 /// what the repository already stores happens once, at the write, under the
 /// guard that serializes it. `replace` is the dict
 /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
-/// put in place of the stored one; `appends` are the signatures
+/// put in place of the stored one; `merge` is the dict a receiving session
+/// merges into it; `appends` are the signatures
 /// [`sign_commit`](Transaction::sign_commit) produced after it, in call order.
 #[derive(Default)]
 struct DetachedEdit {
     /// The dict that replaces whatever the repository stores, when a caller
     /// queued one. `None` starts the edit from the stored dict.
     replace: Option<Value>,
+    /// The serialized `a{sv}` dict merged into the dict the edit starts
+    /// from, before the appends: each signature list gets the union of the
+    /// two lists, and each other key takes the value of this dict.
+    merge: Option<Vec<u8>>,
     /// Signatures to append, each an engine metadata key and one signature.
     appends: Vec<(String, Vec<u8>)>,
 }
@@ -204,6 +215,7 @@ impl Transaction {
                 size_scope: None,
                 free_budget,
                 stats: TransactionStats::default(),
+                presynced: None,
             }),
             refs: Mutex::new(Vec::new()),
             detached: Mutex::new(Vec::new()),
@@ -373,6 +385,19 @@ impl Transaction {
             .contains_key(&(*checksum, ty))
     }
 
+    /// The checksums of the objects of type `ty` staged in this transaction.
+    #[cfg(feature = "receive")]
+    pub(crate) fn staged_of_type(&self, ty: ObjectType) -> Vec<Checksum> {
+        self.staged
+            .lock()
+            .unwrap()
+            .objects
+            .keys()
+            .filter(|(_, t)| *t == ty)
+            .map(|(checksum, _)| *checksum)
+            .collect()
+    }
+
     /// Load a file object, checking this transaction's staged set before the
     /// repository's `objects/`. Used by the staging-tree read and merge paths so
     /// content staged in the current transaction is visible before it publishes.
@@ -495,7 +520,38 @@ impl Transaction {
         let mut queue = self.detached.lock().unwrap();
         let edit = Self::edit_for(&mut queue, checksum);
         edit.replace = Some(meta);
+        edit.merge = None;
         edit.appends.clear();
+    }
+
+    /// Queue a merge of `incoming`, the bytes of an `a{sv}` dict, into the
+    /// detached metadata of `checksum`.
+    ///
+    /// At [`commit`](Transaction::commit) the write reads the stored dict,
+    /// parses `incoming`, and merges it into the stored dict under the guard
+    /// the whole process shares for
+    /// detached-metadata edits: each signature list gets the union of the
+    /// stored and the incoming list, and each other key takes the incoming
+    /// value. The signatures
+    /// [`append_signature`](Transaction::append_signature) queues follow the
+    /// merge. Queueing twice for one checksum keeps the last dict.
+    #[cfg(feature = "receive")]
+    pub(crate) fn merge_commit_detached(&self, checksum: &Checksum, incoming: Vec<u8>) {
+        let mut queue = self.detached.lock().unwrap();
+        Self::edit_for(&mut queue, checksum).merge = Some(incoming);
+    }
+
+    /// Queue `signature`, a signature made before this call, for the engine
+    /// metadata key `key` of the detached metadata of `checksum`. The write at
+    /// [`commit`](Transaction::commit) appends it as
+    /// [`sign_commit`](Transaction::sign_commit) appends the signature it
+    /// makes.
+    #[cfg(feature = "receive")]
+    pub(crate) fn append_signature(&self, checksum: &Checksum, key: &str, signature: Vec<u8>) {
+        let mut queue = self.detached.lock().unwrap();
+        Self::edit_for(&mut queue, checksum)
+            .appends
+            .push((key.to_owned(), signature));
     }
 
     /// Sign a commit this transaction wrote, appending the signature to the
@@ -550,7 +606,10 @@ impl Transaction {
     /// Load a commit object's canonical bytes, checking this transaction's
     /// staged set before the repository's `objects/`, the way the other
     /// staged-first readers do.
-    async fn load_commit_bytes_staged_first(&self, checksum: &Checksum) -> Result<Vec<u8>> {
+    pub(crate) async fn load_commit_bytes_staged_first(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<Vec<u8>> {
         if !self.is_staged(checksum, ObjectType::Commit) {
             return self
                 .repo
@@ -570,8 +629,11 @@ impl Transaction {
         .map_err(Error::Io)
     }
 
-    /// Apply the queued detached-metadata edits. Called between publication and
-    /// the ref writes, under the transaction's own fsync policy.
+    /// Apply the queued detached-metadata edits, in one trip to the blocking
+    /// pool. Called between publication and the ref writes, under the
+    /// transaction's own fsync policy. Each edit is written and, with fsync
+    /// on, made durable before the next one starts, and each takes the
+    /// process-wide guard of detached-metadata edits for itself alone.
     async fn write_detached(&self) -> Result<()> {
         let queued: Vec<(Checksum, DetachedEdit)> =
             std::mem::take(&mut *self.detached.lock().unwrap());
@@ -579,12 +641,23 @@ impl Transaction {
             return Ok(());
         }
         let (fsync, _) = self.fsync_flags()?;
-        for (checksum, edit) in queued {
-            self.repo
-                .merge_commit_detached_metadata(&checksum, edit.replace, edit.appends, fsync)
-                .await?;
-        }
-        Ok(())
+        let repo_mode = self.repo.mode();
+        let objects_fd = self.repo.objects_fd().try_clone_to_owned()?;
+        ostrya_rt::unblock(move || {
+            for (checksum, edit) in queued {
+                crate::commit::merge_detached_blocking(
+                    objects_fd.as_fd(),
+                    &checksum,
+                    edit.replace,
+                    edit.merge,
+                    edit.appends,
+                    fsync,
+                    repo_mode,
+                )?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Stage a regular-file content object whose payload is already written to
@@ -613,6 +686,7 @@ impl Transaction {
                 mode,
                 fsync,
                 per_object_fsync,
+                sync_metadata: false,
                 verity,
             };
             stage_content_blocking(&ctx, &key, &header, file, temp, unpacked)
@@ -641,6 +715,7 @@ impl Transaction {
                 mode,
                 fsync,
                 per_object_fsync,
+                sync_metadata: false,
                 verity,
             };
             stage_symlink_blocking(&ctx, &key, &header)
@@ -674,6 +749,9 @@ impl Transaction {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
         let verity = self.verity()?;
+        // After `sync_staged` each metadata object is synced on its own, so the
+        // `syncfs` that already ran still covers every staged object.
+        let sync_metadata = fsync && self.staged.lock().unwrap().presynced.is_some();
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
         let key = checksum;
@@ -684,13 +762,14 @@ impl Transaction {
                 mode,
                 fsync,
                 per_object_fsync,
+                sync_metadata,
                 verity,
             };
             stage_metadata_blocking(&ctx, &key, ty, &bytes)
         })
         .await?;
         let written = !outcome.deduped;
-        self.record(checksum, ty, mode, outcome, false)?;
+        self.record_object(checksum, ty, mode, outcome, true, false, sync_metadata)?;
         Ok(written)
     }
 
@@ -732,6 +811,7 @@ impl Transaction {
                 mode,
                 fsync,
                 per_object_fsync,
+                sync_metadata: false,
                 verity,
             };
             stage_import_blocking(&ctx, source.as_fd(), &checksum, ty, src_mode, link_owner)
@@ -743,7 +823,7 @@ impl Transaction {
         // An imported object carries no size record: a pull writes no commit, so
         // `ostree.sizes` is never emitted from this transaction, and the payload
         // is never read, so its unpacked length is unknown anyway.
-        self.record_object(checksum, ty, mode, outcome, false, false)?;
+        self.record_object(checksum, ty, mode, outcome, false, false, false)?;
         Ok(true)
     }
 
@@ -772,6 +852,7 @@ impl Transaction {
                 mode,
                 fsync,
                 per_object_fsync,
+                sync_metadata: false,
                 verity,
             };
             stage_clone_content_blocking(
@@ -786,7 +867,15 @@ impl Transaction {
         .await?;
         // An imported object carries no size record: a pull writes no commit, so
         // `ostree.sizes` is never emitted from this transaction.
-        self.record_object(checksum, ObjectType::File, mode, outcome, false, true)?;
+        self.record_object(
+            checksum,
+            ObjectType::File,
+            mode,
+            outcome,
+            false,
+            true,
+            false,
+        )?;
         Ok(())
     }
 
@@ -802,7 +891,7 @@ impl Transaction {
         outcome: StageOutcome,
         payload: bool,
     ) -> Result<Checksum> {
-        self.record_object(checksum, ty, mode, outcome, true, payload)
+        self.record_object(checksum, ty, mode, outcome, true, payload, false)
     }
 
     /// The body of [`record`](Transaction::record). `with_size` chooses whether
@@ -810,7 +899,11 @@ impl Transaction {
     /// since the pull that imports it writes no commit to carry one. `payload`
     /// marks a regular-file content object, whose unpacked length is what
     /// [`content_bytes_unpacked`](TransactionStats::content_bytes_unpacked)
-    /// sums; a symlink and a metadata object carry none.
+    /// sums; a symlink and a metadata object carry none. `synced` marks an
+    /// object whose file was synced on its own after
+    /// [`sync_staged`](Transaction::sync_staged), which the count of durable
+    /// objects then includes.
+    #[allow(clippy::too_many_arguments)]
     fn record_object(
         &self,
         checksum: Checksum,
@@ -819,6 +912,7 @@ impl Transaction {
         outcome: StageOutcome,
         with_size: bool,
         payload: bool,
+        synced: bool,
     ) -> Result<Checksum> {
         let mut staged = self.staged.lock().unwrap();
         // The totals count every object offered, dedup hits included, which is
@@ -864,6 +958,9 @@ impl Transaction {
                 dest: outcome.dest,
             },
         );
+        if synced && let Some(durable) = &mut staged.presynced {
+            *durable += 1;
+        }
         // In archive mode every staged object -- content and metadata alike --
         // contributes an `ostree.sizes` record. A metadata object is stored
         // raw, so its unpacked size equals its on-disk size.
@@ -931,11 +1028,13 @@ impl Transaction {
     /// the repository config: with fsync on, the repository is `syncfs`-ed
     /// before the staged objects are renamed into `objects/<xx>/`, and each
     /// touched fanout directory and `objects/` is `fsync`-ed afterward. The
-    /// queued detached-metadata dicts are written next, so a commit and its
-    /// `.commitmeta` are both durable before a ref names them. Only
-    /// then are the queued refs written, each individually atomic (tmpfile,
-    /// rename, with the tmpfile `fdatasync`-ed and the holding directory
-    /// `fsync`-ed under the same policy), so every object a ref names is
+    /// queued detached-metadata dicts are written next, in one trip to the
+    /// blocking pool, so a commit and its `.commitmeta` are both durable before
+    /// a ref names them. Only then are the queued refs written, each
+    /// individually atomic (tmpfile, rename, with the tmpfile `fdatasync`-ed
+    /// under the same policy). After the last rename each directory that
+    /// gained or lost a ref name is `fsync`-ed once, deepest first, so every
+    /// ref is durable when the call returns and every object a ref names is
     /// durable before the ref points at it; the set of ref writes is not atomic
     /// as a whole. With fsync off no step of the sequence syncs. Queued
     /// refspecs are validated up front, before any object is published, so a
@@ -949,6 +1048,34 @@ impl Transaction {
         let stats = self.staged.lock().unwrap().stats;
         self.reap_staging().await;
         Ok(stats)
+    }
+
+    /// Make the objects staged so far durable ahead of
+    /// [`commit`](Transaction::commit): with fsync on, run one `syncfs` of the
+    /// repository. The publication step of `commit` then runs no `syncfs` of
+    /// its own, unless an object was staged after this call. With fsync off the
+    /// call does nothing.
+    #[cfg(feature = "receive")]
+    pub(crate) async fn sync_staged(&self) -> Result<()> {
+        let (fsync, _) = self.fsync_flags()?;
+        if !fsync {
+            return Ok(());
+        }
+        // Each object in the count is in the staging directory before the
+        // `syncfs` starts, because an object is recorded after its write.
+        let count = self.staged.lock().unwrap().objects.len();
+        let repo_fd = self.repo.repo_fd().try_clone_to_owned()?;
+        ostrya_rt::unblock(move || rustix::fs::syncfs(repo_fd.as_fd())).await?;
+        self.staged.lock().unwrap().presynced = Some(count);
+        Ok(())
+    }
+
+    /// Whether the publication step runs its `syncfs`: with fsync on, unless
+    /// [`sync_staged`](Transaction::sync_staged) made every staged object
+    /// durable already.
+    fn syncfs_at_publish(&self, fsync: bool) -> bool {
+        let staged = self.staged.lock().unwrap();
+        fsync && staged.presynced != Some(staged.objects.len())
     }
 
     /// Discard the transaction and its staged objects, releasing the lock.
@@ -971,6 +1098,7 @@ impl Transaction {
             return Ok(());
         }
         let (fsync, _) = self.fsync_flags()?;
+        let syncfs = self.syncfs_at_publish(fsync);
         let repo_mode = self.repo.mode();
         let repo_fd = self.repo.repo_fd().try_clone_to_owned()?;
         let objects_fd = self.repo.objects_fd().try_clone_to_owned()?;
@@ -981,6 +1109,7 @@ impl Transaction {
                 objects_fd.as_fd(),
                 staging_fd.as_fd(),
                 &objects,
+                syncfs,
                 fsync,
                 repo_mode,
             )
@@ -1073,6 +1202,179 @@ mod tests {
                 record.compressed,
                 record.unpacked,
             );
+            txn.abort().await.unwrap();
+        });
+    }
+
+    /// `sync_staged` makes the objects staged so far durable, so the
+    /// publication step runs no `syncfs` of its own. An object staged after the
+    /// call brings the `syncfs` back, an object staged a second time does not,
+    /// and the commit publishes every object.
+    #[cfg(feature = "receive")]
+    #[test]
+    fn sync_staged_skips_the_publication_syncfs_until_a_later_stage() {
+        let scratch = Scratch::new("presynced");
+        block_on(async {
+            let repo = crate::Repo::create(
+                &scratch.0.join("repo"),
+                CreateOptions::new(RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            let mut txn = repo.transaction().await.unwrap();
+            txn.set_fsync(true);
+            let meta = FileMeta::regular(0, 0, 0o644);
+            let first = txn.write_regfile_inline(None, &meta, b"one").await.unwrap();
+            assert!(txn.syncfs_at_publish(true));
+            txn.sync_staged().await.unwrap();
+            assert!(!txn.syncfs_at_publish(true));
+            txn.write_regfile_inline(None, &meta, b"one").await.unwrap();
+            assert!(
+                !txn.syncfs_at_publish(true),
+                "a second stage adds no object"
+            );
+            let second = txn.write_regfile_inline(None, &meta, b"two").await.unwrap();
+            assert!(
+                txn.syncfs_at_publish(true),
+                "a later object needs the syncfs"
+            );
+            txn.sync_staged().await.unwrap();
+            assert!(!txn.syncfs_at_publish(true));
+            txn.commit().await.unwrap();
+            for checksum in [first, second] {
+                assert!(repo.has_object(ObjectType::File, &checksum).await.unwrap());
+            }
+        });
+    }
+
+    /// Metadata objects staged after `sync_staged` are synced one by one and
+    /// counted as durable, so the anchor commit a receiving session stages
+    /// under its lock brings no `syncfs` back at publication.
+    #[cfg(feature = "receive")]
+    #[test]
+    fn metadata_staged_after_sync_staged_needs_no_second_syncfs() {
+        let scratch = Scratch::new("presynced-anchor");
+        block_on(async {
+            let repo = crate::Repo::create(
+                &scratch.0.join("repo"),
+                CreateOptions::new(RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            let mut txn = repo.transaction().await.unwrap();
+            txn.set_fsync(true);
+            let meta = FileMeta::regular(0, 0, 0o644);
+            txn.write_regfile_inline(None, &meta, b"one").await.unwrap();
+            txn.sync_staged().await.unwrap();
+            let anchor = repo
+                .stage_anchor_commit(&txn, "org.example.C", None, Some(1_700_000_000))
+                .await
+                .unwrap();
+            {
+                let staged = txn.staged.lock().unwrap();
+                assert_eq!(
+                    staged.objects.len(),
+                    4,
+                    "the file, dirmeta, dirtree, commit"
+                );
+                assert_eq!(staged.presynced, Some(staged.objects.len()));
+            }
+            assert!(!txn.syncfs_at_publish(true));
+            txn.commit().await.unwrap();
+            assert_eq!(
+                repo.resolve_ref_tip(crate::summary::OSTREE_METADATA_REF)
+                    .await
+                    .unwrap(),
+                Some(anchor)
+            );
+        });
+    }
+
+    /// A queued merge runs on the stored dict before the queued signatures:
+    /// the signature lists get the union, another key takes the incoming
+    /// value, and a stored key the incoming dict does not hold stays.
+    #[cfg(feature = "receive")]
+    #[test]
+    fn a_queued_merge_applies_before_the_appended_signatures() {
+        use crate::sign::append_signature;
+
+        const KEY: &str = "ostree.sign.ed25519";
+        let scratch = Scratch::new("merge-edit");
+        block_on(async {
+            let repo = crate::Repo::create(
+                &scratch.0.join("repo"),
+                CreateOptions::new(RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            let commit = Checksum::from_bytes([0x22; 32]);
+            let str_variant = |text: &str| {
+                Value::variant(
+                    ostrya_core::Type::parse("s").unwrap(),
+                    Value::Str(text.into()),
+                )
+            };
+            let mut stored = Value::Array(Vec::new());
+            append_signature(&mut stored, KEY, b"A".to_vec()).unwrap();
+            crate::commit::append_dict_entry(&mut stored, "kept", str_variant("stored")).unwrap();
+            crate::commit::append_dict_entry(&mut stored, "other", str_variant("stored")).unwrap();
+            repo.write_commit_detached_metadata(&commit, Some(&stored))
+                .await
+                .unwrap();
+
+            let mut incoming = Value::Array(Vec::new());
+            append_signature(&mut incoming, KEY, b"A".to_vec()).unwrap();
+            append_signature(&mut incoming, KEY, b"B".to_vec()).unwrap();
+            crate::commit::append_dict_entry(&mut incoming, "other", str_variant("incoming"))
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.append_signature(&commit, KEY, b"C".to_vec());
+            txn.merge_commit_detached(
+                &commit,
+                crate::summary::serialize_signature_dict(&incoming).unwrap(),
+            );
+            txn.commit().await.unwrap();
+
+            let dict = repo
+                .read_commit_detached_metadata(&commit)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crate::sign::signatures_for(&dict, KEY),
+                vec![b"A".to_vec(), b"B".to_vec(), b"C".to_vec()]
+            );
+            let text = |key: &str| {
+                dict.dict_get(key)
+                    .and_then(Value::as_variant)
+                    .and_then(|(_, value)| value.as_str().map(str::to_owned))
+            };
+            assert_eq!(text("kept").as_deref(), Some("stored"));
+            assert_eq!(text("other").as_deref(), Some("incoming"));
+        });
+    }
+
+    /// With fsync off `sync_staged` does nothing, and the publication step runs
+    /// no `syncfs` either way.
+    #[cfg(feature = "receive")]
+    #[test]
+    fn sync_staged_with_fsync_off_does_nothing() {
+        let scratch = Scratch::new("presynced-off");
+        block_on(async {
+            let repo = crate::Repo::create(
+                &scratch.0.join("repo"),
+                CreateOptions::new(RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            let mut txn = repo.transaction().await.unwrap();
+            txn.set_fsync(false);
+            txn.write_regfile_inline(None, &FileMeta::regular(0, 0, 0o644), b"one")
+                .await
+                .unwrap();
+            txn.sync_staged().await.unwrap();
+            assert_eq!(txn.staged.lock().unwrap().presynced, None);
+            assert!(!txn.syncfs_at_publish(false));
             txn.abort().await.unwrap();
         });
     }

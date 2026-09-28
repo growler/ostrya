@@ -508,6 +508,51 @@ impl<'a> GvEncode for Variant<'a> {
     }
 }
 
+/// A variant read in place: the borrowed child bytes and the borrowed child
+/// type signature.
+///
+/// [`decode`](GvDecode::decode) splits the variant at its type separator and
+/// checks that the signature is UTF-8. It parses neither the signature nor the
+/// child, so it allocates nothing. A caller that needs the child checked runs
+/// [`validate`](crate::validate) over the whole document first.
+#[derive(Clone, Copy)]
+pub struct VariantBytes<'a> {
+    child: &'a [u8],
+    signature: &'a str,
+}
+
+impl<'a> VariantBytes<'a> {
+    /// The serialized child.
+    pub fn child(&self) -> &'a [u8] {
+        self.child
+    }
+
+    /// The type signature of the child, as the variant spells it.
+    pub fn signature(&self) -> &'a str {
+        self.signature
+    }
+}
+
+impl<'a> GvType for VariantBytes<'a> {
+    const SIGNATURE: &'static str = "v";
+    const ALIGNMENT: usize = 8;
+    const FIXED_SIZE: Option<usize> = None;
+}
+
+impl<'a> GvDecode<'a> for VariantBytes<'a> {
+    fn decode(data: &'a [u8]) -> Result<Self> {
+        let Some(sep) = data.iter().rposition(|&b| b == 0) else {
+            return Err(Error::NotNormal("variant lacks a type separator"));
+        };
+        let signature = std::str::from_utf8(&data[sep + 1..])
+            .map_err(|_| Error::NotNormal("variant type signature is not UTF-8"))?;
+        Ok(VariantBytes {
+            child: &data[..sep],
+            signature,
+        })
+    }
+}
+
 // -- tuples ----------------------------------------------------------------
 
 /// The alignment of a container: the greatest member alignment, at least 1.
@@ -886,6 +931,43 @@ mod tests {
         assert_eq!(
             encode_to_vec(&entry).unwrap(),
             to_bytes(&ty, &expected).unwrap()
+        );
+    }
+
+    /// An `a{sv}` read as `(&str, VariantBytes)` entries gives each key, the
+    /// child bytes, and the child signature of each value, in order.
+    #[test]
+    fn variant_bytes_read_a_dict_in_place() {
+        let ty = Type::parse("a{sv}").unwrap();
+        let dict = Value::Array(vec![
+            Value::Tuple(vec!["a".into(), Value::variant(Type::Str, "text".into())]),
+            Value::Tuple(vec![
+                "b".into(),
+                Value::variant(
+                    Type::parse("aay").unwrap(),
+                    Value::Array(vec![Value::Bytes(b"xy".to_vec())]),
+                ),
+            ]),
+        ]);
+        let bytes = to_bytes(&ty, &dict).unwrap();
+        let entries: Vec<(&str, VariantBytes)> =
+            <ArrayIter<(&str, VariantBytes)> as GvDecode>::decode(&bytes)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "a");
+        assert_eq!(entries[0].1.signature(), "s");
+        assert_eq!(entries[0].1.child(), b"text\0");
+        assert_eq!(entries[1].0, "b");
+        assert_eq!(entries[1].1.signature(), "aay");
+        assert_eq!(
+            from_bytes(&Type::parse("aay").unwrap(), entries[1].1.child()).unwrap(),
+            Value::Array(vec![Value::Bytes(b"xy".to_vec())])
+        );
+        assert_eq!(
+            VariantBytes::decode(b"no separator").err(),
+            Some(Error::NotNormal("variant lacks a type separator"))
         );
     }
 

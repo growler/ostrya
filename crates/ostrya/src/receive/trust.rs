@@ -125,7 +125,6 @@ impl TrustedKeys {
     /// Hold `payload` to every axis of this set. `detached` is the
     /// detached-metadata dict the signatures live in, absent when the payload
     /// carries none. `subject` names the payload in a message.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn check(
         &self,
         subject: &str,

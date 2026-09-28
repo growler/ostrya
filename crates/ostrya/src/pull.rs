@@ -1716,7 +1716,7 @@ impl ModeChecks {
 /// arrives under, which it can do only where that name already covers the
 /// canonical header; anything else would land under a name its stored form does
 /// not hash to. A symlink's mode is fixed by the object model and is exempt.
-fn check_canonical(checksum: &Checksum, meta: &FileMeta) -> Result<()> {
+pub(crate) fn check_canonical(checksum: &Checksum, meta: &FileMeta) -> Result<()> {
     let extra = if meta.is_symlink() {
         0
     } else {

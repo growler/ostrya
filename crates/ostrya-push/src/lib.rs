@@ -10,7 +10,8 @@
 //! wire format in full.
 //!
 //! [`Error`] is the error type of the crate. Each of its variants except
-//! [`Error::Io`] is one wire code, and [`ErrorCode`] names the codes.
+//! [`Error::Aborted`] and [`Error::Io`] is one wire code, and [`ErrorCode`]
+//! names the codes.
 //!
 //! The codec is generic over the `futures-io` traits `AsyncRead` and
 //! `AsyncWrite`, so it needs no async runtime. The crate has no repository
@@ -28,5 +29,6 @@ const _: fn() = || {
     assert_send_sync::<Error>();
     assert_send_sync::<proto::Message>();
     assert_send_sync::<proto::FrameReader<&[u8]>>();
+    assert_send_sync::<proto::ObjectBody<'static, &[u8]>>();
     assert_send_sync::<proto::FrameWriter<Vec<u8>>>();
 };

@@ -470,7 +470,7 @@ impl Transaction {
         header: &FileHeader,
         framed_header: &[u8],
         declared: u64,
-        mut payload: R,
+        payload: R,
         buf: &mut Vec<u8>,
     ) -> Result<Checksum> {
         if !self.repo().mode().is_archive() {
@@ -487,55 +487,12 @@ impl Transaction {
         let mut file = RtFile::from(fd);
         write_all(&mut file, framed_header).await?;
 
-        let mut inflate = DeflateDecoder::new(InflatedDigest::new(header, *expected, declared)?);
-        if buf.len() < COPY_CHUNK {
-            buf.resize(COPY_CHUNK, 0);
-        }
-        // Once the decoder reports a short write, its DEFLATE stream has ended
-        // within this chunk: it takes no more input, so nothing after that
-        // point is fed to it, only drained to return the connection to the
-        // pool. Anything left unconsumed, here or later in the stream, is
-        // bytes trailing the object. A write error is not a short write: it
-        // means the sink itself refused the payload (an inflated-size
-        // overrun), and `?` lets that failure's own message reach the caller.
-        let mut trailing = false;
-        loop {
-            let n = read_some(&mut payload, buf).await?;
-            if n == 0 {
-                break;
-            }
-            write_all(&mut file, &buf[..n]).await?;
-            if !trailing && write_up_to(&mut inflate, &buf[..n]).await? < n {
-                trailing = true;
-            }
-        }
-        if trailing {
-            return Err(Error::InvalidFormat(format!(
-                "content object {expected}: bytes follow the deflated payload"
-            )));
-        }
-        close(&mut inflate).await?;
-
-        let digest = inflate.into_inner();
-        if digest.seen != declared {
-            return Err(Error::InvalidFormat(format!(
-                "content object {expected}: the payload inflates to {} byte(s), not the \
-                 {declared} its header declares",
-                digest.seen
-            )));
-        }
-        let checksum = digest.hasher.finish();
-        if checksum != *expected {
-            return Err(Error::ChecksumMismatch {
-                expected: *expected,
-                actual: checksum,
-            });
-        }
+        feed_archive_payload(expected, header, declared, payload, buf, Some(&mut file)).await?;
 
         flush(&mut file).await?;
         let std_file = file.into_std().await;
         self.stage_regular(
-            checksum,
+            *expected,
             header.clone(),
             std_file,
             temp.into_inner(),
@@ -640,6 +597,82 @@ impl Transaction {
         }
         self.stage_metadata(checksum, ty, bytes.to_vec()).await
     }
+}
+
+/// Read a content object's archive-form payload to its end and check it,
+/// storing nothing: the payload must inflate to exactly `declared` bytes, with
+/// nothing after its DEFLATE end, and hash to `expected` under `header`. The
+/// check of an object whose bytes are dropped because the repository already
+/// holds it.
+#[cfg(feature = "receive")]
+pub(crate) async fn check_archive_payload<R: AsyncRead + Unpin>(
+    expected: &Checksum,
+    header: &FileHeader,
+    declared: u64,
+    payload: R,
+    buf: &mut Vec<u8>,
+) -> Result<()> {
+    feed_archive_payload(expected, header, declared, payload, buf, None).await
+}
+
+/// Read an archive-form payload to its end, inflating it on a discarded branch
+/// to check its size and its checksum, and write the compressed bytes to
+/// `file` where one is given.
+async fn feed_archive_payload<R: AsyncRead + Unpin>(
+    expected: &Checksum,
+    header: &FileHeader,
+    declared: u64,
+    mut payload: R,
+    buf: &mut Vec<u8>,
+    mut file: Option<&mut RtFile>,
+) -> Result<()> {
+    let mut inflate = DeflateDecoder::new(InflatedDigest::new(header, *expected, declared)?);
+    if buf.len() < COPY_CHUNK {
+        buf.resize(COPY_CHUNK, 0);
+    }
+    // Once the decoder reports a short write, its DEFLATE stream has ended
+    // within this chunk: it takes no more input, so nothing after that
+    // point is fed to it, only drained to return the connection to the
+    // pool. Anything left unconsumed, here or later in the stream, is
+    // bytes trailing the object. A write error is not a short write: it
+    // means the sink itself refused the payload (an inflated-size
+    // overrun), and `?` lets that failure's own message reach the caller.
+    let mut trailing = false;
+    loop {
+        let n = read_some(&mut payload, buf).await?;
+        if n == 0 {
+            break;
+        }
+        if let Some(file) = file.as_deref_mut() {
+            write_all(file, &buf[..n]).await?;
+        }
+        if !trailing && write_up_to(&mut inflate, &buf[..n]).await? < n {
+            trailing = true;
+        }
+    }
+    if trailing {
+        return Err(Error::InvalidFormat(format!(
+            "content object {expected}: bytes follow the deflated payload"
+        )));
+    }
+    close(&mut inflate).await?;
+
+    let digest = inflate.into_inner();
+    if digest.seen != declared {
+        return Err(Error::InvalidFormat(format!(
+            "content object {expected}: the payload inflates to {} byte(s), not the \
+             {declared} its header declares",
+            digest.seen
+        )));
+    }
+    let checksum = digest.hasher.finish();
+    if checksum != *expected {
+        return Err(Error::ChecksumMismatch {
+            expected: *expected,
+            actual: checksum,
+        });
+    }
+    Ok(())
 }
 
 /// The raw-DEFLATE encoder level for an `[archive] zlib-level` value, clamped to

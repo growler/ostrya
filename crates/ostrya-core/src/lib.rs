@@ -57,7 +57,7 @@ pub use xattr::{Xattrs, XattrsRef};
 pub use ostrya_gvariant::{
     ArrayIter, DictBuilder, GvDecode, GvType, Span, TextError, Type, Value, choose_offset_size,
     from_bytes, from_text, offset_size_for, to_bytes, to_text, to_text_unannotated,
-    tuple_field_from_bytes, write_offset,
+    tuple_field_from_bytes, validate, write_offset,
 };
 
 /// The largest metadata object the port loads: 128 MiB, the metadata cap of

@@ -255,6 +255,43 @@ impl Repo {
         }
     }
 
+    /// The commits of several refspecs, as [`resolve_ref_tip`](Repo::resolve_ref_tip)
+    /// reads each, in one pass on the blocking pool. The result holds one entry
+    /// for each refspec, in order. A ref path that names a directory, or that
+    /// passes through a file, holds no ref and reads as absent.
+    #[cfg(feature = "receive")]
+    pub(crate) async fn resolve_ref_tips(
+        &self,
+        refspecs: &[String],
+    ) -> Result<Vec<Option<Checksum>>> {
+        let relpaths = refspecs
+            .iter()
+            .map(|r| refspec_to_relpath(r))
+            .collect::<Result<Vec<_>>>()?;
+        let repo = self.clone();
+        let contents = ostrya_rt::unblock(move || {
+            relpaths
+                .iter()
+                .map(|p| match read_ref_file(repo.repo_fd(), p) {
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        Ok(None)
+                    }
+                    other => other,
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+        })
+        .await?;
+        contents
+            .into_iter()
+            .map(|bytes| bytes.map(|b| parse_ref_content(&b)).transpose())
+            .collect()
+    }
+
     /// List local refs (under `refs/heads`) as (name, commit) pairs, sorted by
     /// name. `prefix`, when given, keeps only the ref equal to it or nested
     /// under it.

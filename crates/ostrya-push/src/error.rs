@@ -9,7 +9,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The error a push session fails with.
 ///
-/// Each variant except [`Error::Io`] is one wire code of the `Error` message.
+/// Each variant except [`Error::Aborted`] and [`Error::Io`] is one wire code
+/// of the `Error` message.
 /// The enum is `#[non_exhaustive]`, so a match outside the crate needs a
 /// wildcard arm.
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +84,11 @@ pub enum Error {
     /// A server-side failure, for example an I/O error.
     #[error("internal: {0}")]
     Internal(String),
+    /// The client ended the session with `Abort`, or abandoned an object with
+    /// the abandon marker. No wire code carries it, because the server sends
+    /// no `Error` in reply.
+    #[error("the client aborted the session")]
+    Aborted,
     /// An I/O error of the underlying stream. An end of file inside a frame
     /// or an object has the kind `UnexpectedEof`.
     #[error(transparent)]
@@ -179,7 +185,8 @@ impl ErrorCode {
 }
 
 impl Error {
-    /// The wire code of the error, or `None` for [`Error::Io`].
+    /// The wire code of the error, or `None` for [`Error::Aborted`] and
+    /// [`Error::Io`].
     pub fn code(&self) -> Option<ErrorCode> {
         Some(match self {
             Error::VersionUnsupported(_) => ErrorCode::VersionUnsupported,
@@ -198,12 +205,13 @@ impl Error {
             Error::SignatureRequired(_) => ErrorCode::SignatureRequired,
             Error::BindingMismatch(_) => ErrorCode::BindingMismatch,
             Error::Internal(_) => ErrorCode::Internal,
-            Error::Io(_) => return None,
+            Error::Aborted | Error::Io(_) => return None,
         })
     }
 
     /// The `Error` message that reports this error to the peer. An
-    /// [`Error::Io`] reports as `internal` with its display text.
+    /// [`Error::Aborted`] and an [`Error::Io`] report as `internal` with their
+    /// display text.
     pub fn to_message(&self) -> ErrorMessage {
         let (code, message) = match self {
             Error::MissingObjects { message, missing } => {
@@ -229,7 +237,7 @@ impl Error {
                     }),
                 };
             }
-            Error::Io(e) => (ErrorCode::Internal, e.to_string()),
+            Error::Aborted | Error::Io(_) => (ErrorCode::Internal, self.to_string()),
             Error::VersionUnsupported(m)
             | Error::LockingDisabled(m)
             | Error::Unauthorized(m)

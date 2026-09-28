@@ -236,12 +236,19 @@ impl RepoConfig {
         Ok(self.keyfile.get_bool(CORE, "locking")?.unwrap_or(true))
     }
 
-    /// The lock-acquisition timeout in seconds. Default `300`.
+    /// The lock-acquisition timeout in seconds. Default `300`. `-1` means no
+    /// limit, and a value below `-1` is refused.
     pub fn lock_timeout_secs(&self) -> Result<i64> {
-        Ok(self
+        let secs = self
             .keyfile
             .get_integer(CORE, "lock-timeout-secs")?
-            .unwrap_or(300))
+            .unwrap_or(300);
+        if secs < -1 {
+            return Err(Error::InvalidFormat(format!(
+                "lock-timeout-secs {secs} is below -1"
+            )));
+        }
+        Ok(secs)
     }
 
     /// The staging-directory expiry in seconds. Default `86400`.
@@ -743,6 +750,20 @@ mod tests {
         assert_eq!(cfg.lock_timeout_secs().unwrap(), 30);
         assert_eq!(cfg.min_free_space().unwrap(), MinFreeSpace::Percent(5));
         assert_eq!(cfg.zlib_level().unwrap(), 9);
+    }
+
+    #[test]
+    fn lock_timeout_secs_takes_minus_one_and_refuses_below() {
+        let with = |v: &str| {
+            RepoConfig::parse(&format!(
+                "[core]\nrepo_version=1\nmode=bare\nlock-timeout-secs={v}\n"
+            ))
+            .unwrap()
+        };
+        assert_eq!(with("-1").lock_timeout_secs().unwrap(), -1);
+        assert_eq!(with("0").lock_timeout_secs().unwrap(), 0);
+        let err = with("-2").lock_timeout_secs().unwrap_err();
+        assert!(err.to_string().contains("lock-timeout-secs -2 is below -1"));
     }
 
     #[test]

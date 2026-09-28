@@ -156,8 +156,9 @@ pub type WeakRefFilterFn = Arc<dyn Fn(&str, &Checksum) -> bool + Send + Sync>;
 ///
 /// The callback runs on the executor thread while the run holds the repository
 /// lock exclusive, so it must call no [`Repo`] method. [`Repo::transaction`]
-/// from inside it waits out `[core] lock-timeout-secs` and then fails, and
-/// `ostrya_rt::block_on` inside it re-enters the runtime. The callback must be
+/// from inside it waits out `[core] lock-timeout-secs` and then fails, or
+/// waits with no end where the value is `-1`, and `ostrya_rt::block_on` inside
+/// it re-enters the runtime. The callback must be
 /// pure over its two arguments and over the state the caller captured before
 /// the call.
 ///

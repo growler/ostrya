@@ -797,3 +797,200 @@ fn a_frame_of_exactly_the_limit_passes() {
     assert_limit(block_on(w.write_message(&over)));
     assert!(w.into_inner().is_empty());
 }
+
+/// A stream that returns one byte for each read and `Pending` before each
+/// byte, so every chunk length and every chunk arrives split.
+struct Trickle<'a> {
+    bytes: &'a [u8],
+    pending: bool,
+}
+
+impl futures_io::AsyncRead for Trickle<'_> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if self.pending {
+            self.pending = false;
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        self.pending = true;
+        let n = buf.len().min(self.bytes.len()).min(1);
+        buf[..n].copy_from_slice(&self.bytes[..n]);
+        self.bytes = &self.bytes[n..];
+        std::task::Poll::Ready(Ok(n))
+    }
+}
+
+fn object_stream(tail: &[u8]) -> Vec<u8> {
+    let mut bytes = header_frame();
+    bytes.extend(tail);
+    bytes
+}
+
+#[test]
+fn object_body_reads_split_chunks_to_the_end() {
+    use futures_lite::io::AsyncReadExt;
+
+    let mut tail = hex("00 00 00 03 61 62 63 00 00 00 02 64 65 00 00 00 00");
+    tail.extend(encode(&Message::ObjectsEnd));
+    let bytes = object_stream(&tail);
+    let mut r = FrameReader::new(Trickle {
+        bytes: &bytes,
+        pending: false,
+    });
+    block_on(async {
+        assert_eq!(r.read_message().await.unwrap(), Some(file_header()));
+        let mut body = r.object_body();
+        let mut data = Vec::new();
+        body.read_to_end(&mut data).await.unwrap();
+        assert_eq!(data, b"abcde");
+        assert!(body.is_finished());
+        assert!(!body.is_abandoned());
+        assert!(body.take_error().is_none());
+        assert_eq!(body.read(&mut [0; 4]).await.unwrap(), 0);
+        assert_eq!(r.read_message().await.unwrap(), Some(Message::ObjectsEnd));
+    });
+}
+
+/// One read takes as many ready chunks as fit, so tiny chunks do not make
+/// tiny reads. Bytes read before the marker or an error arrive first.
+#[test]
+fn object_body_fills_the_buffer_across_chunks() {
+    use futures_lite::io::AsyncReadExt;
+
+    let mut tail = Vec::new();
+    for i in 0..1000u32 {
+        tail.extend([0, 0, 0, 1, i as u8]);
+    }
+    tail.extend([0, 0, 0, 0]);
+    tail.extend(encode(&Message::ObjectsEnd));
+    let bytes = object_stream(&tail);
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let mut body = r.object_body();
+        let mut buf = [0u8; 4096];
+        assert_eq!(body.read(&mut buf[..600]).await.unwrap(), 600);
+        assert_eq!(body.read(&mut buf).await.unwrap(), 400);
+        assert_eq!(buf[399], 999u32 as u8);
+        assert!(body.is_finished());
+        assert_eq!(body.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(r.read_message().await.unwrap(), Some(Message::ObjectsEnd));
+    });
+
+    let mut tail = hex("00 00 00 01 61 00 00 00 01 62 ff ff ff ff");
+    tail.extend(encode(&Message::Abort));
+    let bytes = object_stream(&tail);
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let mut body = r.object_body();
+        let mut buf = [0u8; 16];
+        assert_eq!(body.read(&mut buf).await.unwrap(), 2);
+        assert_eq!(&buf[..2], b"ab");
+        assert!(body.is_abandoned());
+        assert!(body.read(&mut buf).await.is_err());
+        body.finish_abandon().await.unwrap();
+    });
+
+    let mut tail = hex("00 00 00 01 61");
+    tail.extend((MIN_FRAME_LIMIT + 1).to_be_bytes());
+    let bytes = object_stream(&tail);
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let mut body = r.object_body();
+        let mut buf = [0u8; 16];
+        assert_eq!(body.read(&mut buf).await.unwrap(), 1);
+        assert!(body.read(&mut buf).await.is_err());
+        assert_limit(Err::<(), _>(body.take_error().unwrap()));
+    });
+}
+
+#[test]
+fn object_body_reports_the_abandon_marker() {
+    use futures_lite::io::AsyncReadExt;
+
+    let mut tail = hex("00 00 00 01 61 ff ff ff ff");
+    tail.extend(encode(&Message::Abort));
+    let bytes = object_stream(&tail);
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let mut body = r.object_body();
+        let mut data = Vec::new();
+        assert!(body.read_to_end(&mut data).await.is_err());
+        assert!(body.is_abandoned());
+        assert!(body.take_error().is_none());
+        assert!(body.read(&mut [0; 4]).await.is_err());
+        body.finish_abandon().await.unwrap();
+        assert_eq!(r.read_message().await.unwrap(), None);
+    });
+
+    let mut tail = hex("ff ff ff ff");
+    tail.extend(encode(&Message::ObjectsEnd));
+    let bytes = object_stream(&tail);
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let mut body = r.object_body();
+        assert!(body.read(&mut [0; 4]).await.is_err());
+        assert_protocol(body.finish_abandon().await);
+    });
+
+    let bytes = object_stream(&hex("00 00 00 00"));
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let mut body = r.object_body();
+        assert_eq!(body.read(&mut [0; 4]).await.unwrap(), 0);
+        assert_protocol(body.finish_abandon().await);
+    });
+}
+
+#[test]
+fn object_body_keeps_the_codec_error() {
+    use futures_lite::io::AsyncReadExt;
+
+    let over = (MIN_FRAME_LIMIT + 1).to_be_bytes();
+    let bytes = object_stream(&over);
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let mut body = r.object_body();
+        assert!(body.read(&mut [0; 4]).await.is_err());
+        assert!(body.read(&mut [0; 4]).await.is_err());
+        assert_limit(Err::<(), _>(body.take_error().unwrap()));
+        assert!(body.take_error().is_none());
+    });
+
+    let bytes = object_stream(&hex("00 00 00 05 61 62"));
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let mut body = r.object_body();
+        let mut data = Vec::new();
+        let err = body.read_to_end(&mut data).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eof(Err::<(), _>(body.take_error().unwrap()));
+    });
+
+    let bytes = encode(&Message::ObjectsEnd);
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        let mut body = r.object_body();
+        assert!(body.read(&mut [0; 4]).await.is_err());
+        assert_protocol(Err::<(), _>(body.take_error().unwrap()));
+    });
+}
+
+#[test]
+fn aborted_has_no_wire_code() {
+    assert_eq!(Error::Aborted.code(), None);
+    let msg = Error::Aborted.to_message();
+    assert_eq!(msg.code, ErrorCode::Internal);
+    assert_eq!(msg.message, "the client aborted the session");
+}

@@ -26,7 +26,9 @@
 //!
 //! Cross-process contention is resolved by a non-blocking attempt followed by an
 //! [`ostrya_rt::Timer`] retry loop bounded by `lock-timeout-secs`, matching the
-//! tool's retry-until-timeout behavior.
+//! tool's retry-until-timeout behavior. A loop with no deadline stands for the
+//! value `-1`, which the tool reads as no limit. No attempt blocks in the
+//! kernel, so a dropped wait leaves no lock request behind.
 
 use std::collections::HashMap;
 use std::os::fd::{BorrowedFd, OwnedFd};
@@ -278,29 +280,38 @@ impl Drop for LockGuard {
     }
 }
 
-/// Acquire `kind` on `lock`, retrying until `timeout` elapses.
+/// Acquire `kind` on `lock`, retrying until `timeout` elapses. `None` retries
+/// with no deadline.
+///
+/// Each attempt runs on the calling task: it takes the state mutex and makes one
+/// non-blocking lock request, so it returns at once. An attempt that ran on the
+/// blocking pool could complete after the caller dropped this future and leave
+/// a hold that no guard releases.
 pub(crate) async fn acquire(
     lock: Arc<RepoLock>,
     kind: LockKind,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<LockGuard> {
-    let deadline = Instant::now() + timeout;
+    // A timeout past the range of `Instant` has no deadline.
+    let deadline = timeout.and_then(|t| Some((Instant::now().checked_add(t)?, t.as_secs() as i64)));
     loop {
-        let probe = lock.clone();
-        match ostrya_rt::unblock(move || probe.try_acquire(kind)).await? {
+        match lock.try_acquire(kind)? {
             TryOutcome::Acquired => {
                 return Ok(LockGuard {
                     hold: Some((lock, kind)),
                 });
             }
             TryOutcome::WouldBlock => {
-                let now = Instant::now();
-                if now >= deadline {
-                    return Err(Error::LockTimeout {
-                        secs: timeout.as_secs() as i64,
-                    });
-                }
-                let wait = POLL_INTERVAL.min(deadline - now);
+                let wait = match deadline {
+                    Some((deadline, secs)) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err(Error::LockTimeout { secs });
+                        }
+                        POLL_INTERVAL.min(deadline - now)
+                    }
+                    None => POLL_INTERVAL,
+                };
                 ostrya_rt::Timer::after(wait).await;
             }
         }

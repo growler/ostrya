@@ -1658,6 +1658,7 @@ dependencies = [
  "ostrya-composefs",
  "ostrya-core",
  "ostrya-fetch",
+ "ostrya-push",
  "ostrya-rt",
  "ostrya-sign",
  "ostrya-sys",

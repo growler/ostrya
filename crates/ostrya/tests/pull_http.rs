@@ -1330,6 +1330,51 @@ fn a_payload_underrunning_its_declared_size_fails_the_pull() {
     });
 }
 
+/// A bare-family destination holds the declared size to equality too: a
+/// payload that inflates to fewer bytes than its header declares is refused,
+/// even when the bytes it holds hash to the object's name.
+#[test]
+fn a_bare_family_destination_refuses_a_payload_under_its_declared_size() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-declared-size-under-bare");
+        let (remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+
+        // Raise a payload-bearing object's declared size by 100 and keep its
+        // compressed bytes, so the content still hashes to the object's name.
+        let mut victim = None;
+        for checksum in content_checksums(&remote, &commit).await {
+            let path = filez_path(&checksum.to_hex());
+            let stored = std::fs::read(dir.path().join("remote").join(&path)).unwrap();
+            let declared = u64::from_be_bytes(stored[8..16].try_into().unwrap());
+            if declared > 0 {
+                victim = Some((path, stored, declared));
+                break;
+            }
+        }
+        let (path, mut tampered, declared) =
+            victim.expect("the fixture tree holds a payload-bearing file");
+        tampered[8..16].copy_from_slice(&(declared + 100).to_be_bytes());
+        server.tamper(&path, tampered);
+
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
+        assert!(err.to_string().contains("inflates to"), "{err}");
+        assert_nothing_published(&dest).await;
+        assert_eq!(server.requests_for(&path), 1);
+    });
+}
+
 /// The overrun check reports its own message even when the compressed payload
 /// is long enough to arrive over more than one read (Phase 16g): the
 /// pass-through path decodes into a decoder that buffers decoded bytes and

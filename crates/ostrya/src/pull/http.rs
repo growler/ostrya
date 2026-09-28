@@ -955,13 +955,12 @@ impl Repo {
         body: Body,
         read_buf: &mut Vec<u8>,
     ) -> Result<()> {
-        let (header, declared, framed_header, mut body) = read_archive_header(body).await?;
-        let symlink = header.is_symlink();
+        let (header, declared, framed_header, body) = read_archive_header(body).await?;
         let FileHeader {
             uid,
             gid,
             mode,
-            symlink_target,
+            symlink_target: _,
             xattrs,
         } = header.clone();
         let meta = FileMeta {
@@ -973,47 +972,17 @@ impl Repo {
         // The same mode checks a local pull makes, over the metadata the object
         // arrives with rather than the one a source repository stored.
         ctx.checks.check(expected, &meta)?;
-        if symlink {
-            check_stream_end(expected, "symlink header", &mut body).await?;
-            ctx.txn
-                .write_symlink(&symlink_target, &meta, Some(expected))
-                .await?;
-            return Ok(());
-        }
-        // The declared size bounds both sides of the payload: what it may
-        // decompress to, and what may come off the connection to produce that.
-        let source = BoundedInput::new(body, *expected, compressed_bound(declared));
-        if ctx.txn.repo().mode().is_archive() {
-            // The remote already stores this object deflated in the same wire
-            // form this destination writes: store the fetched bytes verbatim
-            // instead of inflating and recompressing them.
-            ctx.txn
-                .write_archive_payload(
-                    expected,
-                    &header,
-                    &framed_header,
-                    declared,
-                    source,
-                    read_buf,
-                )
-                .await
-                .map_err(payload_refusal)?;
-            return Ok(());
-        }
-        let mut writer = ctx.txn.content_writer(Some(expected), &meta).await?;
-        let mut payload = DeflateDecoder::new(BufSource::new(source));
-        copy_bounded(&mut payload, &mut writer, read_buf, expected, declared)
-            .await
-            .map_err(payload_refusal)?;
-        writer.finish().await?;
-        // The decoder stops at the DEFLATE end-of-stream marker and asks its
-        // input for nothing more, so the response has to be read to its end
-        // here: that read is what returns the connection to the pool for the
-        // next object.
-        check_stream_end(expected, "deflated payload", payload.into_inner())
-            .await
-            .map_err(payload_refusal)?;
-        Ok(())
+        store_filez_payload(
+            ctx.txn,
+            expected,
+            &header,
+            &meta,
+            declared,
+            &framed_header,
+            body,
+            read_buf,
+        )
+        .await
     }
 
     /// Refuse a fetched tip that is older than what it is checked against.
@@ -1682,8 +1651,74 @@ async fn read_archive_header<R: AsyncRead + Unpin>(
     Ok((header, uncompressed, framed, stream))
 }
 
+/// Store one content object that arrives in the archive wire form, from the
+/// stream that follows its framed header.
+///
+/// `header` and `declared` come from [`read_archive_header`], `framed_header`
+/// is the framing it read, and `meta` is the logical metadata of `header`,
+/// which the caller has already checked against the destination mode. A
+/// symlink carries no payload, so its stream must end there. An archive
+/// destination stores the compressed bytes as they arrive, and every other
+/// mode inflates them into a content writer. Both sides of the payload are
+/// held to `declared`. The stream is read to its end.
+///
+/// Every destination refuses a payload that inflates to fewer bytes than
+/// `declared`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_filez_payload<R: AsyncRead + Unpin>(
+    txn: &Transaction,
+    expected: &Checksum,
+    header: &FileHeader,
+    meta: &FileMeta,
+    declared: u64,
+    framed_header: &[u8],
+    mut body: R,
+    read_buf: &mut Vec<u8>,
+) -> Result<()> {
+    if header.is_symlink() {
+        check_stream_end(expected, "symlink header", &mut body).await?;
+        txn.write_symlink(&header.symlink_target, meta, Some(expected))
+            .await?;
+        return Ok(());
+    }
+    // The declared size bounds both sides of the payload: what it may
+    // decompress to, and what may come off the connection to produce that.
+    let source = BoundedInput::new(body, *expected, compressed_bound(declared));
+    if txn.repo().mode().is_archive() {
+        // The remote already stores this object deflated in the same wire
+        // form this destination writes: store the fetched bytes verbatim
+        // instead of inflating and recompressing them.
+        txn.write_archive_payload(expected, header, framed_header, declared, source, read_buf)
+            .await
+            .map_err(payload_refusal)?;
+        return Ok(());
+    }
+    let mut writer = txn.content_writer(Some(expected), meta).await?;
+    let mut payload = DeflateDecoder::new(BufSource::new(source));
+    let short = copy_bounded(&mut payload, &mut writer, read_buf, expected, declared)
+        .await
+        .map_err(payload_refusal)?;
+    if short != 0 {
+        return Err(Error::InvalidFormat(format!(
+            "content object {expected}: the payload inflates to {} byte(s), not the \
+             {declared} its header declares",
+            declared - short
+        )));
+    }
+    writer.finish().await?;
+    // The decoder stops at the DEFLATE end-of-stream marker and asks its
+    // input for nothing more, so the response has to be read to its end
+    // here: that read is what returns the connection to the pool for the
+    // next object.
+    check_stream_end(expected, "deflated payload", payload.into_inner())
+        .await
+        .map_err(payload_refusal)?;
+    Ok(())
+}
+
 /// Stream a content object's payload into `writer`, stopping if it outgrows the
-/// size its header declared.
+/// size its header declared. Returns how many of the declared bytes the
+/// payload did not hold.
 ///
 /// A correct object decompresses to exactly `declared`, so a stream that passes
 /// it is corrupt or built to expand, and either way there is nothing to be gained
@@ -1704,7 +1739,7 @@ async fn copy_bounded<R, W>(
     buf: &mut Vec<u8>,
     expected: &Checksum,
     declared: u64,
-) -> Result<()>
+) -> Result<u64>
 where
     R: AsyncRead + Unpin,
     W: futures_io::AsyncWrite + Unpin,
@@ -1721,7 +1756,7 @@ where
         );
         let n = reader.read(&mut buf[..window]).await?;
         if n == 0 {
-            return Ok(());
+            return Ok(left);
         }
         if n as u64 > left {
             return Err(Error::InvalidFormat(format!(
@@ -1743,7 +1778,7 @@ where
 /// The fixed 64 KiB covers a small object, whose framing outweighs its content.
 /// A stream past this bound is not a compressed form of what the header declares,
 /// whatever it decompresses to.
-fn compressed_bound(declared: u64) -> u64 {
+pub(crate) fn compressed_bound(declared: u64) -> u64 {
     declared
         .saturating_add(declared / 1024)
         .saturating_add(64 * 1024)
@@ -1764,7 +1799,7 @@ fn compressed_bound(declared: u64) -> u64 {
 /// decoder passes up, which [`payload_refusal`] takes back out: the bound comes
 /// from the object's own declaration, so the refusal names the object as the
 /// decompressed-size refusal does.
-struct BoundedInput<R> {
+pub(crate) struct BoundedInput<R> {
     inner: R,
     /// The object the bound is stated for.
     checksum: Checksum,
@@ -1775,7 +1810,7 @@ struct BoundedInput<R> {
 }
 
 impl<R> BoundedInput<R> {
-    fn new(inner: R, checksum: Checksum, bound: u64) -> BoundedInput<R> {
+    pub(crate) fn new(inner: R, checksum: Checksum, bound: u64) -> BoundedInput<R> {
         BoundedInput {
             inner,
             checksum,
@@ -1811,7 +1846,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedInput<R> {
 /// enforced arrives here inside an `io::Error`. Unwrapping it puts that refusal on
 /// the footing of one [`copy_bounded`] raises itself. Any other failure stands as
 /// it is.
-fn payload_refusal(error: Error) -> Error {
+pub(crate) fn payload_refusal(error: Error) -> Error {
     match error {
         Error::Io(io) => io.downcast::<Error>().unwrap_or_else(Error::Io),
         other => other,
@@ -1830,7 +1865,7 @@ fn payload_refusal(error: Error) -> Error {
 /// The payload's stream is the decoder's input buffer, which hands back
 /// read-ahead the decoder left before it asks the body for more. A correct
 /// object leaves none: nothing follows its final DEFLATE block.
-async fn check_stream_end<R: AsyncRead + Unpin>(
+pub(crate) async fn check_stream_end<R: AsyncRead + Unpin>(
     expected: &Checksum,
     after: &str,
     mut stream: R,

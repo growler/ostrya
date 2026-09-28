@@ -164,7 +164,8 @@ bounded:
   store.
 - `ostrya-push` -- the push wire protocol: the messages and their GVariant
   encoding, the frame codec with its limit, and the chunked object stream
-  with its abandon marker. No repository knowledge and no runtime. Depends
+  with its abandon marker. `ObjectBody` reads the bytes of one object as an
+  `AsyncRead`. No repository knowledge and no runtime. Depends
   on `ostrya-gvariant`, `ostrya-core`, `thiserror`, `futures-io`, and
   `futures-lite`. Compiles on Linux, macOS, and Windows.
 - `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the
@@ -178,7 +179,9 @@ bounded:
   `ostrya-sign` and are re-exported. GPG verification over the `pgp` crate
   and the system key store readers are part of `ostrya`. The fetcher is the
   `ostrya-fetch` crate, re-exported as `ostrya::fetch`. Its error type,
-  `ostrya::fetch::Error`, converts into `ostrya::Error`.
+  `ostrya::fetch::Error`, converts into `ostrya::Error`. The `receive`
+  feature turns on the dependency on `ostrya-push`, re-exported as
+  `ostrya::push`, and `ostrya::Error::Push` carries its error type.
 - `ostrya-cli` -- the CLI crate, building the `ostrya` binary: a minimal
   command set once the ingest and checkout paths land (Phase 11), grown
   incrementally; the `ostree`-compatible surface arrives with the port's own
@@ -287,7 +290,12 @@ process holds on it. A process-global registry keyed by the lock file's
 opens alike -- the same descriptor and reference count, so exactly one `.lock`
 descriptor exists per repository per process. The reference tool's roughly
 one-second lock-acquisition retry spin becomes an `rt::Timer` retry loop bounded
-by `lock-timeout-secs`.
+by `lock-timeout-secs`. Each attempt is a non-blocking lock request on the
+calling task, so a dropped wait leaves no request and no hold behind.
+`lock-timeout-secs=-1` runs the loop with no deadline, where the tool blocks in
+`F_OFD_SETLKW` until the holder releases the lock. The port makes no blocking
+lock request. A value below `-1` is refused: the tool then takes no lock at
+all (`format-reference.md`, "Repository lock and staging").
 
 ### Durability contract
 
@@ -561,7 +569,10 @@ commit, file headers) implement these traits in Phase 3, which is also where
 the value-level conventions (big-endian scalar fields, empty `ay` as an
 absent parent, checksum length and sort-order validation) are applied. The
 `Value` tree stays as the representation for dynamic `a{sv}` content and for
-fixtures and tests; `from_bytes` and `to_bytes` are unchanged.
+fixtures and tests; `from_bytes` and `to_bytes` are unchanged. `validate`
+applies the checks of `from_bytes` to bytes of any type and builds no value,
+so a check of a large dynamic document does not allocate one entry for each
+element. The receive path checks each detached metadata dict with it.
 
 All codec impls are written by hand; the object type set is small and fixed.
 A derive macro is out of scope (see Decisions).
@@ -3969,9 +3980,9 @@ Two points of design:
 - `ContentWriter` digests and compresses one stream. The pass-through needs a
   sink that writes one stream and digests another.
 - The header is stored as the remote wrote it, including the uncompressed size it
-  declares, rather than patched at `finish`. The receive path treats that
-  declaration as a ceiling, so the pass-through has to hold it to equality.
-  Otherwise a stored header can declare a size its own payload does not have.
+  declares, rather than patched at `finish`, so the pass-through holds that
+  declaration to equality. Otherwise a stored header can declare a size its
+  own payload does not have. The inflating path holds it to equality too.
 
 Verify: an archive remote pulled into an archive destination reproduces every
 `.filez` byte for byte, against a remote the port built and a remote the `ostree`

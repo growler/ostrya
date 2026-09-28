@@ -17,6 +17,15 @@ pub fn from_bytes(ty: &Type, data: &[u8]) -> Result<Value> {
     parse(ty, data, 0)
 }
 
+/// Check that `data` is normal-form GVariant bytes of `ty`, building no value.
+///
+/// The check accepts exactly the input [`from_bytes`] accepts and applies the
+/// same limits, but keeps no decoded value, so its memory does not grow with
+/// the element count of the input.
+pub fn validate(ty: &Type, data: &[u8]) -> Result<()> {
+    check(ty, data, 0)
+}
+
 /// Deserialize one member of a tuple, leaving the other members undecoded.
 ///
 /// `ty` is the type of the whole tuple and `index` names the member to decode,
@@ -83,6 +92,79 @@ fn parse(ty: &Type, data: &[u8], depth: usize) -> Result<Value> {
             Ok(Value::variant(child_ty, value))
         }
     }
+}
+
+/// The checks of [`parse`], with no value built.
+fn check(ty: &Type, data: &[u8], depth: usize) -> Result<()> {
+    if depth > MAX_VALUE_DEPTH {
+        return Err(Error::DepthExceeded);
+    }
+    match ty {
+        Type::Bool => bool::decode(data).map(drop),
+        Type::Byte => u8::decode(data).map(drop),
+        Type::I16 | Type::U16 => exact::<2>(data).map(drop),
+        Type::I32 | Type::Handle | Type::U32 => exact::<4>(data).map(drop),
+        Type::I64 | Type::U64 | Type::Double => exact::<8>(data).map(drop),
+        Type::Str | Type::ObjectPath | Type::Signature => <&str>::decode(data).map(drop),
+        Type::Maybe(elem) => {
+            if data.is_empty() {
+                return Ok(());
+            }
+            let child = if elem.fixed_size().is_some() {
+                data
+            } else {
+                match data.split_last() {
+                    Some((0, rest)) => rest,
+                    _ => return Err(Error::NotNormal("maybe lacks its terminating zero byte")),
+                }
+            };
+            check(elem, child, depth + 1)
+        }
+        Type::Array(elem) if **elem == Type::Byte => Ok(()),
+        Type::Array(elem) => {
+            let mut reader = ArrayReader::new(data, elem.alignment(), elem.fixed_size())?;
+            while let Some(slice) = reader.next_slice() {
+                check(elem, slice?, depth + 1)?;
+            }
+            Ok(())
+        }
+        Type::Tuple(members) => check_struct(ty, members.iter(), data, depth),
+        Type::DictEntry(key, value) => {
+            check_struct(ty, [&**key, &**value].into_iter(), data, depth)
+        }
+        Type::Variant => {
+            let (child, _, child_ty) = split_variant(data)?;
+            check(&child_ty, child, depth + 1)
+        }
+    }
+}
+
+/// The checks of [`parse_struct`], with no value built.
+fn check_struct<'t>(
+    whole: &Type,
+    members: impl ExactSizeIterator<Item = &'t Type> + Clone,
+    data: &[u8],
+    depth: usize,
+) -> Result<()> {
+    let n = members.len();
+    if n == 0 {
+        if data != [0] {
+            return Err(Error::NotNormal("empty tuple is not a single zero byte"));
+        }
+        return Ok(());
+    }
+    let n_offsets = members
+        .clone()
+        .take(n - 1)
+        .filter(|m| m.fixed_size().is_none())
+        .count();
+    let mut reader = TupleReader::new(data, n_offsets, whole.fixed_size())?;
+    let last = n - 1;
+    for (i, member_ty) in members.enumerate() {
+        let slice = reader.field(member_ty.alignment(), member_ty.fixed_size(), i == last)?;
+        check(member_ty, slice, depth + 1)?;
+    }
+    reader.finish()
 }
 
 /// Upper bound on the element count preallocated for an array before any
@@ -439,6 +521,68 @@ mod tests {
             from_bytes(&Type::parse("ab").unwrap(), &data),
             Err(Error::NotNormal("boolean is not 0 or 1"))
         );
+    }
+
+    /// `validate` accepts exactly what `from_bytes` accepts, with the same
+    /// error, over valid and malformed inputs of every shape.
+    #[test]
+    fn validate_agrees_with_from_bytes() {
+        let dict = Value::Array(vec![
+            Value::Tuple(vec![
+                "a".into(),
+                Value::variant(Type::parse("ab").unwrap(), Value::Array(vec![true.into()])),
+            ]),
+            Value::Tuple(vec![
+                "b".into(),
+                Value::variant(Type::parse("ms").unwrap(), Value::Maybe(None)),
+            ]),
+            Value::Tuple(vec![
+                "c".into(),
+                Value::variant(
+                    Type::parse("(sid)").unwrap(),
+                    Value::Tuple(vec!["x".into(), Value::I32(-1), Value::double(0.5)]),
+                ),
+            ]),
+        ]);
+        let asv = Type::parse("a{sv}").unwrap();
+        let good = to_bytes(&asv, &dict).unwrap();
+        let mut cases: Vec<(&str, Vec<u8>)> = vec![("a{sv}", good.clone())];
+        for i in 0..good.len() {
+            let mut torn = good.clone();
+            torn[i] ^= 0xff;
+            cases.push(("a{sv}", torn));
+            cases.push(("a{sv}", good[..i].to_vec()));
+        }
+        let mut deep = vec![1u8, 0, b'y'];
+        for _ in 0..128 {
+            deep.extend_from_slice(&[0, b'v']);
+        }
+        cases.extend([
+            ("v", deep),
+            ("ab", vec![0xff; 64]),
+            ("ab", vec![0, 1, 1]),
+            ("ms", vec![1]),
+            ("ms", vec![0, 0]),
+            ("mi", vec![1, 2, 3, 4]),
+            ("()", vec![0]),
+            ("()", vec![1]),
+            ("(uuu)", vec![0; 13]),
+            ("(su)", b"a\0\0\0\x05\0\0\0\0\0\x02".to_vec()),
+            ("as", vec![b'a', 0, 1, 2]),
+            ("au", vec![0; 6]),
+            ("s", vec![0xff, 0xfe, 0]),
+            ("v", b"a\0d".to_vec()),
+            ("ay", vec![1, 2, 3]),
+            ("aay", vec![1, 2, 0]),
+        ]);
+        for (sig, bytes) in &cases {
+            let ty = Type::parse(sig).unwrap();
+            assert_eq!(
+                validate(&ty, bytes),
+                from_bytes(&ty, bytes).map(drop),
+                "{sig} {bytes:?}"
+            );
+        }
     }
 
     #[test]

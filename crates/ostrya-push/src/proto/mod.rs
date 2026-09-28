@@ -76,11 +76,12 @@
 //! [`FrameReader`] and [`FrameWriter`] implement the frames and the object
 //! stream over the `futures-io` traits. Object bytes pass through a buffer
 //! of the caller in bounded pieces, so no call holds a whole object.
+//! [`ObjectBody`] presents the bytes of one object as an `AsyncRead`.
 
 mod frame;
 mod message;
 
-pub use frame::{FrameReader, FrameWriter, ObjectRead};
+pub use frame::{FrameReader, FrameWriter, ObjectBody, ObjectRead};
 pub use message::{
     CommitRequest, ErrorMessage, HaveReply, Hello, HelloReply, Message, ObjectHeader, ObjectsReply,
 };

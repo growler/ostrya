@@ -24,19 +24,27 @@
 //! global trusted keyring takes part. A rule that takes the pull trust of a
 //! remote trusts what a pull from that remote trusts.
 //!
+//! [`Repo::receive`](crate::Repo::receive) runs one push session over a pair
+//! of streams: it answers `Hello` and `Have`, and it stages the objects of
+//! each object stream in the session transaction after the checksum and the
+//! content checks of the repository mode.
+//!
 //! The module also holds two steps of the commit that ends a session: the
 //! union merge of an incoming detached-metadata dict into the dict the server
 //! holds, and the check whether a server key already signed a commit.
 
+mod ingest;
 mod merge;
 mod pattern;
 mod policy;
 mod reader;
+mod session;
 mod signer;
 mod trust;
 
 pub use pattern::RefPattern;
 pub use policy::{ReceivePolicy, ReceiveRule, ReceiveVerify};
+pub use session::ReceiveReport;
 pub use signer::ServerSigner;
 pub use trust::TrustedKeys;
 
@@ -50,4 +58,5 @@ const _: fn() = || {
     assert_send_sync::<RefPattern>();
     assert_send_sync::<TrustedKeys>();
     assert_send_sync::<ServerSigner>();
+    assert_send_sync::<ReceiveReport>();
 };

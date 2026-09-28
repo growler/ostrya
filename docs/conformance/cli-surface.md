@@ -1777,7 +1777,10 @@ not on a shared one, and the tool blocks on both. The port takes the lock
 exclusive over the whole run, a `--no-prune` dry run and a
 `--static-deltas-only` run included, reads `[core] locking` and
 `[core] lock-timeout-secs` as the tool does, and proceeds under a held foreign
-lock where `[core] locking` is false. At the timeout the port exits 1 with its
+lock where `[core] locking` is false. With `lock-timeout-secs=-1` the port
+waits with no limit, as the tool does, through a non-blocking retry loop in
+place of the blocking request of the tool. A value below `-1` makes the tool
+take no lock, and the port refuses it. At the timeout the port exits 1 with its
 own wording, `error: timed out acquiring repository lock after <N>s`, which is
 the diagnostic carve-out of "Scope of CLI compatibility" above.
 

@@ -206,7 +206,8 @@
 //! `ReceivePolicy::from_config` reads that policy from the receive groups of
 //! the repository config, `[ex-ostrya receive]` and the groups it names. A
 //! received commit is held to the same signature checks a pull makes, over the
-//! keys the receive policy names.
+//! keys the receive policy names. `Repo::receive` runs one push session over a
+//! pair of streams, and `ostrya::push` re-exports the wire protocol crate.
 
 pub mod bootable;
 mod bspatch;
@@ -219,6 +220,8 @@ mod deltagen;
 pub mod diff;
 pub mod error;
 pub use ostrya_fetch as fetch;
+#[cfg(feature = "receive")]
+pub use ostrya_push as push;
 pub mod file;
 pub mod fsck;
 #[cfg(feature = "verify-gpg")]
@@ -304,7 +307,7 @@ pub use pull::{
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 pub use receive::{
-    ReceivePolicy, ReceiveRule, ReceiveVerify, RefPattern, ServerSigner, TrustedKeys,
+    ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveVerify, RefPattern, ServerSigner, TrustedKeys,
 };
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};

@@ -213,7 +213,8 @@ impl Repo {
     /// Begin a transaction that holds the repository lock in `kind`.
     ///
     /// Acquisition retries until `lock-timeout-secs` elapses, then fails with
-    /// [`Error::LockTimeout`]. With `[core] locking` disabled the transaction
+    /// [`Error::LockTimeout`]. With `lock-timeout-secs=-1` it retries with no
+    /// limit. With `[core] locking` disabled the transaction
     /// takes no repository lock. A fresh staging directory is allocated under
     /// `tmp/`, and stale staging directories left by dead transactions are
     /// reaped first, together with the other `tmp/` entries older than
@@ -245,9 +246,10 @@ impl Repo {
     ///
     /// The call reads `[core] locking` and `[core] lock-timeout-secs`. Where
     /// `locking` is true the acquisition retries until the timeout elapses and
-    /// then fails with [`Error::LockTimeout`]; where it is false the guard
-    /// holds no lock. `lock-timeout-secs` is read in both cases, so a value the
-    /// config cannot carry refuses the call.
+    /// then fails with [`Error::LockTimeout`]; with `lock-timeout-secs=-1` it
+    /// retries with no limit. Where `locking` is false the guard holds no lock.
+    /// `lock-timeout-secs` is read in both cases, so a value the config cannot
+    /// carry refuses the call.
     pub(crate) async fn lock_repo(&self, kind: LockKind) -> Result<LockGuard> {
         let locking = self.inner.config.locking()?;
         let timeout_secs = self.inner.config.lock_timeout_secs()?;
@@ -256,7 +258,9 @@ impl Repo {
         }
         let repo = self.clone();
         let lock = ostrya_rt::unblock(move || repo.inner.repo_lock()).await?;
-        let timeout = Duration::from_secs(timeout_secs.max(0) as u64);
+        // The config reader refuses a value below -1, so a negative value
+        // here is -1: no limit.
+        let timeout = u64::try_from(timeout_secs).ok().map(Duration::from_secs);
         lock::acquire(lock, kind, timeout).await
     }
 

@@ -796,7 +796,18 @@ six-character `mkdtemp` suffix. A sibling file `tmp/staging-<bootid>-XXXXXX-lock
 (mode `0600`) is held with an exclusive OFD lock while the staging directory is
 in use, so a later transaction can tell a live staging directory from one left
 by a dead transaction. These locks are advisory and cross-process; the checksums
-and object bytes do not depend on them. The port removes its staging directory
+and object bytes do not depend on them.
+
+`[core] lock-timeout-secs` bounds the wait for `.lock`. Observed with `ostree`
+2026.1 on `prune --refs-only` while another process holds `.lock` with an
+exclusive record lock: with a positive value the tool requests the lock with
+`F_OFD_SETLK` about once each second and fails at the timeout; with `0` it makes
+one attempt; with `-1` it requests the lock with `F_OFD_SETLKW`, which blocks
+until the holder releases the lock; with `-2`, `-3`, or `-100` it does not open
+`.lock`, takes no lock, and completes while the holder still holds the lock. The
+port reads `-1` as no limit and retries a non-blocking request every 100 ms with
+no deadline. It never makes a blocking lock request. The port refuses a value
+below `-1`, because it does not run a repository write with no lock. The port removes its staging directory
 and the lock sibling on every path out of a transaction, the refusals included,
 so a run that exits non-zero leaves `tmp/` holding no `staging-` entry
 (`conformance/cli-surface.md`, "P2"). A transaction that commits, aborts, or
@@ -1603,7 +1614,9 @@ The session keys are valid in `[ex-ostrya receive]` alone:
 
 - `allow-privileged` -- boolean: accept a setuid or setgid mode bit, and the
   `security.capability` and `security.selinux` extended attributes, in a
-  `bare` repository.
+  `bare` repository. The rule applies to each content object and each dirmeta
+  object a session receives, also to one the repository already holds. A
+  session on a `bare` repository needs a server that runs as root.
 - `sign-summary` -- a list of key group names: the keys that sign the
   regenerated summary.
 

@@ -122,6 +122,8 @@ pub enum Error {
     Staging(String),
     MergeConflict(String),
     StaticDeltaNotFound { from: Option<Checksum>, to: Checksum },
+    #[cfg(feature = "receive")]
+    Push(ostrya_push::Error),          // a push session: wire code, abort, stream
     // ... one variant per class of refusal the library reports
 }
 
@@ -386,10 +388,11 @@ impl Repo {
     /// `no_prune` dry run and a `static_deltas_only` run included. It reads
     /// `[core] locking` and `[core] lock-timeout-secs`, and it fails with
     /// `Error::LockTimeout` where another holder keeps the lock past the
-    /// timeout. The hold excludes every other writer, in this process and in
-    /// another: a caller holding a transaction of its own open across the call
-    /// waits out the timeout and then fails, and a transaction the process
-    /// opens while the run stands waits for the run to finish.
+    /// timeout. With `lock-timeout-secs=-1` the wait has no limit. The hold
+    /// excludes every other writer, in this process and in another: a caller
+    /// holding a transaction of its own open across the call waits out the
+    /// timeout and then fails, and a transaction the process opens while the
+    /// run stands waits for the run to finish.
     pub async fn prune(&self, opts: &PruneOptions) -> Result<PruneStats>;
     pub async fn fsck(&self, opts: &FsckOptions) -> Result<FsckReport>;
     pub async fn traverse_commit(&self, c: &Checksum, depth: i32)
@@ -498,7 +501,8 @@ pub struct PruneOptions {
     ///
     /// The callback runs while the run holds the repository lock exclusive, so
     /// it must call no `Repo` method: a transaction from inside it waits out
-    /// `[core] lock-timeout-secs` and then fails.
+    /// `[core] lock-timeout-secs` and then fails, or waits with no end where
+    /// the value is `-1`.
     pub weak_ref_filter: WeakRefFilter,
 }
 impl PruneOptions {
@@ -2254,6 +2258,50 @@ impl ServerSigner {
     #[cfg(feature = "sign-gpg")]
     pub async fn gpg(signer: GpgSigner) -> Result<ServerSigner>;
     pub fn signer(&self) -> &dyn Signer;
+}
+```
+
+`Repo::receive` runs one push session over a pair of streams, with the
+policy the caller lends it. `ostrya::push` re-exports `ostrya-push`, the wire
+protocol crate, so a caller names its error codes and messages through
+`ostrya`.
+
+- `Hello` opens the session transaction, which holds the repository lock
+  shared under `[core] lock-timeout-secs`. A repository with `[core]
+  locking=false` refuses the session with `locking-disabled`. A
+  `bare-split-xattrs` repository refuses it with `mode-refused`, and so does
+  a `bare` repository when the process does not run as root. A ref name of
+  `Hello` that `validate_refspec` refuses is `invalid-ref`.
+- `Have` gets one bit for each object that neither the repository nor the
+  session holds. More than `max-have` entries is `limit-exceeded`.
+- The object stream checks the checksum of each object and the content rules
+  of the repository mode and of `allow_privileged`, and stages the object. An
+  object the repository or the session already holds is read, checked, and
+  dropped. A detached metadata object is kept in the session, and a second one
+  for one commit is `protocol`. `ObjectsReply` counts the objects staged and
+  the detached metadata objects kept, and the bytes they took on the wire.
+- The receive side does not update refs yet: `Commit` ends the session with
+  `internal`, and nothing is published.
+- A failure with a wire code goes to the peer and returns as `Error::Push`. A
+  server-side failure goes to the peer as `internal` and returns as the error
+  it is. An `Abort`, an abandoned object, and an error or end of file of the
+  input send nothing: the first two return `push::Error::Aborted`, and an end
+  of file at a frame boundary returns an `Error::Io` of kind
+  `UnexpectedEof`.
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveReport {
+    pub refs: Vec<push::RefOutcome>,
+    pub stats: TransactionStats,
+}
+
+impl Repo {
+    pub async fn receive<R, W>(&self, input: R, output: W, policy: &ReceivePolicy)
+        -> Result<ReceiveReport>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send;
 }
 ```
 

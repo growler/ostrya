@@ -657,6 +657,20 @@ impl Transaction {
         ty: ObjectType,
         bytes: Vec<u8>,
     ) -> Result<Checksum> {
+        self.stage_metadata_outcome(checksum, ty, bytes)
+            .await
+            .map(|_| checksum)
+    }
+
+    /// Stage a metadata object as [`stage_metadata`](Transaction::stage_metadata)
+    /// does, and return whether it was written: `false` where the repository
+    /// already holds it.
+    pub(crate) async fn stage_metadata_outcome(
+        &self,
+        checksum: Checksum,
+        ty: ObjectType,
+        bytes: Vec<u8>,
+    ) -> Result<bool> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
         let verity = self.verity()?;
@@ -675,7 +689,9 @@ impl Transaction {
             stage_metadata_blocking(&ctx, &key, ty, &bytes)
         })
         .await?;
-        self.record(checksum, ty, mode, outcome, false)
+        let written = !outcome.deduped;
+        self.record(checksum, ty, mode, outcome, false)?;
+        Ok(written)
     }
 
     /// Import one object from another local repository's `objects/` directory by

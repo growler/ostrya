@@ -1,6 +1,9 @@
 //! The frame codec and the chunked object stream.
 
+use std::future::poll_fn;
 use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,7 +26,32 @@ fn limit_exceeded(what: &str, len: u32, limit: u32) -> Error {
 #[derive(Debug)]
 enum ReadState {
     Frames,
-    Object { remaining: u32 },
+    /// Inside an object. `remaining` is what is left of the current chunk.
+    /// At 0 the next chunk length is read, and `prefix` holds the `got`
+    /// bytes of it already read.
+    Object {
+        remaining: u32,
+        prefix: [u8; 4],
+        got: u8,
+    },
+}
+
+impl ReadState {
+    fn object() -> ReadState {
+        ReadState::Object {
+            remaining: 0,
+            prefix: [0; 4],
+            got: 0,
+        }
+    }
+}
+
+/// One step of the object stream.
+enum Step {
+    Data(usize),
+    End,
+    /// The abandon marker. The `Abort` frame that must follow is not read.
+    Marker,
 }
 
 /// The result of one [`FrameReader::read_object_data`] call.
@@ -115,9 +143,18 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         self.inner.read_exact(&mut body).await?;
         let msg = Message::decode(kind, &body)?;
         if let Message::ObjectHeader(_) = msg {
-            self.state = ReadState::Object { remaining: 0 };
+            self.state = ReadState::object();
         }
         Ok(Some(msg))
+    }
+
+    /// The bytes of the current object as an `AsyncRead`. See [`ObjectBody`].
+    pub fn object_body(&mut self) -> ObjectBody<'_, R> {
+        ObjectBody {
+            reader: self,
+            state: BodyState::Reading,
+            error: None,
+        }
     }
 
     /// Read object bytes into `buf`. A chunk longer than `buf` arrives over
@@ -125,58 +162,210 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// nothing and returns `Data(0)`. Outside an object the call is the error
     /// `protocol`.
     pub async fn read_object_data(&mut self, buf: &mut [u8]) -> Result<ObjectRead> {
-        let ReadState::Object { remaining } = self.state else {
-            return Err(protocol("no object to read"));
+        match poll_fn(|cx| self.poll_step(cx, buf)).await? {
+            Step::Data(n) => Ok(ObjectRead::Data(n)),
+            Step::End => Ok(ObjectRead::End),
+            Step::Marker => self.read_abort().await.map(|()| ObjectRead::Abandoned),
+        }
+    }
+
+    /// Read the frame that must follow the abandon marker: `Abort`, or the
+    /// error `protocol`.
+    async fn read_abort(&mut self) -> Result<()> {
+        match self.read_message().await? {
+            Some(Message::Abort) => Ok(()),
+            Some(other) => {
+                // An ObjectHeader sets the object state. The error leaves the
+                // reader between frames.
+                self.state = ReadState::Frames;
+                Err(protocol(format!(
+                    "{:?} after the abandon marker",
+                    other.kind()
+                )))
+            }
+            None => Err(eof()),
+        }
+    }
+
+    /// Read the next step of the object stream into `buf`. A partial chunk
+    /// length is kept in the state, so a pending read loses no byte.
+    fn poll_step(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<Step>> {
+        let FrameReader {
+            inner,
+            limit,
+            state,
+        } = self;
+        let ReadState::Object {
+            remaining,
+            prefix,
+            got,
+        } = state
+        else {
+            return Poll::Ready(Err(protocol("no object to read")));
         };
         if buf.is_empty() {
-            return Ok(ObjectRead::Data(0));
+            return Poll::Ready(Ok(Step::Data(0)));
         }
-        let remaining = if remaining == 0 {
-            let mut prefix = [0u8; 4];
-            self.inner.read_exact(&mut prefix).await?;
-            match u32::from_be_bytes(prefix) {
+        if *remaining == 0 {
+            while usize::from(*got) < prefix.len() {
+                let n =
+                    ready!(Pin::new(&mut *inner).poll_read(cx, &mut prefix[usize::from(*got)..]))?;
+                if n == 0 {
+                    return Poll::Ready(Err(eof()));
+                }
+                *got += n as u8;
+            }
+            *got = 0;
+            match u32::from_be_bytes(*prefix) {
                 0 => {
-                    self.state = ReadState::Frames;
-                    return Ok(ObjectRead::End);
+                    *state = ReadState::Frames;
+                    return Poll::Ready(Ok(Step::End));
                 }
                 ABANDON => {
-                    self.state = ReadState::Frames;
-                    return match self.read_message().await? {
-                        Some(Message::Abort) => Ok(ObjectRead::Abandoned),
-                        Some(other) => {
-                            // An ObjectHeader sets the object state. The
-                            // error leaves the reader between frames.
-                            self.state = ReadState::Frames;
-                            Err(protocol(format!(
-                                "{:?} after the abandon marker",
-                                other.kind()
-                            )))
-                        }
-                        None => Err(eof()),
-                    };
+                    *state = ReadState::Frames;
+                    return Poll::Ready(Ok(Step::Marker));
                 }
-                len if len > self.limit => {
-                    return Err(limit_exceeded("chunk", len, self.limit));
+                len if len > *limit => {
+                    return Poll::Ready(Err(limit_exceeded("chunk", len, *limit)));
                 }
-                len => len,
+                len => *remaining = len,
             }
-        } else {
-            remaining
-        };
-        let want = buf.len().min(remaining as usize);
-        let n = self.inner.read(&mut buf[..want]).await?;
-        if n == 0 {
-            return Err(eof());
         }
-        self.state = ReadState::Object {
-            remaining: remaining - n as u32,
-        };
-        Ok(ObjectRead::Data(n))
+        let want = buf.len().min(*remaining as usize);
+        let n = ready!(Pin::new(&mut *inner).poll_read(cx, &mut buf[..want]))?;
+        if n == 0 {
+            return Poll::Ready(Err(eof()));
+        }
+        *remaining -= n as u32;
+        Poll::Ready(Ok(Step::Data(n)))
     }
 
     /// The underlying stream.
     pub fn into_inner(self) -> R {
         self.inner
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyState {
+    Reading,
+    Finished,
+    Abandoned,
+    /// A read failed with an error of this kind, which every later read
+    /// repeats.
+    Failed(io::ErrorKind),
+}
+
+/// The bytes of one object, read from a [`FrameReader`] as an `AsyncRead`.
+///
+/// A read returns object bytes until the chunk of length 0, and then end of
+/// file. A read that meets the abandon marker, a codec error, or an error of
+/// the stream fails with an `io::Error`, and every later read fails too.
+/// After the abandon marker, [`is_abandoned`](Self::is_abandoned) is true, and
+/// [`finish_abandon`](Self::finish_abandon) reads the `Abort` frame that must
+/// follow. After another failure, [`take_error`](Self::take_error) gives the
+/// error of the reader, with its wire code.
+///
+/// The body keeps a partial chunk length in the reader, so a read that returns
+/// `Pending` loses no byte. A read that is dropped before it completes leaves
+/// the reader in a consistent state.
+#[derive(Debug)]
+pub struct ObjectBody<'a, R> {
+    reader: &'a mut FrameReader<R>,
+    state: BodyState,
+    error: Option<Error>,
+}
+
+impl<R: AsyncRead + Unpin> ObjectBody<'_, R> {
+    /// Whether the object ended with the chunk of length 0.
+    pub fn is_finished(&self) -> bool {
+        self.state == BodyState::Finished
+    }
+
+    /// Whether the sender abandoned the object with the abandon marker.
+    pub fn is_abandoned(&self) -> bool {
+        self.state == BodyState::Abandoned
+    }
+
+    /// The error of the reader that failed a read: a codec error, such as
+    /// `limit-exceeded` for a chunk over the limit, or [`Error::Io`] for an
+    /// error of the stream. `None` when no read failed that way.
+    pub fn take_error(&mut self) -> Option<Error> {
+        self.error.take()
+    }
+
+    /// After the abandon marker, read the frame that must follow it. `Abort`
+    /// gives `Ok`, and any other frame is the error `protocol`. Before the
+    /// marker the call is the error `protocol`.
+    pub async fn finish_abandon(self) -> Result<()> {
+        if self.state != BodyState::Abandoned {
+            return Err(protocol("the object was not abandoned"));
+        }
+        self.reader.read_abort().await
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for ObjectBody<'_, R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        match me.state {
+            BodyState::Reading => {}
+            BodyState::Finished => return Poll::Ready(Ok(0)),
+            BodyState::Abandoned => return Poll::Ready(Err(io::Error::other("object abandoned"))),
+            BodyState::Failed(kind) => {
+                return Poll::Ready(Err(io::Error::new(kind, "object stream failed")));
+            }
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        // Fill `buf` across chunk boundaries while the stream has bytes ready,
+        // so small chunks do not make small reads. Bytes already in `buf` are
+        // returned before a pending read, the end, the marker, or an error,
+        // which the next read then reports.
+        let mut filled = 0;
+        loop {
+            let step = match me.reader.poll_step(cx, &mut buf[filled..]) {
+                Poll::Ready(step) => step,
+                Poll::Pending if filled > 0 => return Poll::Ready(Ok(filled)),
+                Poll::Pending => return Poll::Pending,
+            };
+            match step {
+                Ok(Step::Data(n)) => {
+                    filled += n;
+                    if filled == buf.len() {
+                        return Poll::Ready(Ok(filled));
+                    }
+                }
+                Ok(Step::End) => {
+                    me.state = BodyState::Finished;
+                    return Poll::Ready(Ok(filled));
+                }
+                Ok(Step::Marker) => {
+                    me.state = BodyState::Abandoned;
+                    if filled > 0 {
+                        return Poll::Ready(Ok(filled));
+                    }
+                    return Poll::Ready(Err(io::Error::other("object abandoned")));
+                }
+                Err(e) => {
+                    let io = match &e {
+                        Error::Io(io) => io::Error::new(io.kind(), io.to_string()),
+                        other => io::Error::other(other.to_string()),
+                    };
+                    me.error = Some(e);
+                    me.state = BodyState::Failed(io.kind());
+                    if filled > 0 {
+                        return Poll::Ready(Ok(filled));
+                    }
+                    return Poll::Ready(Err(io));
+                }
+            }
+        }
     }
 }
 

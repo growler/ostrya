@@ -312,6 +312,13 @@ pub enum Error {
         /// What the value holds instead.
         reason: String,
     },
+    /// A push session failed: the error the receive side sent to the peer
+    /// with its wire code, an `Abort` of the client
+    /// ([`Aborted`](crate::push::Error::Aborted)), or an error of the session
+    /// stream.
+    #[cfg(feature = "receive")]
+    #[error(transparent)]
+    Push(#[from] crate::push::Error),
     /// The repository holds no static delta from `from` to `to`: nothing
     /// resolves at its `deltas/<fanout>/<rest>` path. The message names the
     /// delta the way the tool names it.

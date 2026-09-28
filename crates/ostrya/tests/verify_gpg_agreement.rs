@@ -88,7 +88,8 @@ fn tools_available() -> bool {
 ///
 /// Every `gpg` and `gpgv` run names a directory inside it, so the invoking
 /// user's GnuPG home and any agent of theirs take no part. Dropping the home
-/// kills the agent GnuPG auto-started for the directory.
+/// stops the GnuPG daemons of the directory and removes their socket
+/// directory.
 struct Home {
     dir: PathBuf,
     /// The primary key fingerprint, uppercase hex.
@@ -285,6 +286,7 @@ impl Home {
             .arg(path)
             .output()
             .unwrap();
+        common::remove_gnupg_sockets(&home);
         String::from_utf8_lossy(&out.stderr).into_owned()
     }
 
@@ -345,11 +347,7 @@ impl Home {
 
 impl Drop for Home {
     fn drop(&mut self) {
-        let _ = Command::new("gpgconf")
-            .arg("--homedir")
-            .arg(&self.dir)
-            .args(["--kill", "gpg-agent"])
-            .status();
+        common::remove_gnupg_sockets(&self.dir);
     }
 }
 
@@ -1359,6 +1357,7 @@ fn gnupg_keyring(home: &Home) -> Vec<u8> {
         .arg(&source)
         .status()
         .unwrap();
+    common::remove_gnupg_sockets(&dir);
     assert!(status.success(), "gpg --import into a keyring failed");
     std::fs::read(&ring).unwrap()
 }

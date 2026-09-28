@@ -50,9 +50,10 @@ fn gpg_available() -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-/// A private GnuPG home directory holding one freshly generated,
-/// passphrase-free ed25519 signing key. Dropping the fixture kills the
-/// gpg-agent GnuPG auto-started for the directory.
+/// A private GnuPG home directory. A home that `create` or `expiring` makes
+/// holds one freshly generated, passphrase-free ed25519 signing key. Dropping
+/// the fixture stops the GnuPG daemons of the directory and removes their
+/// socket directory.
 #[cfg(feature = "gpg")]
 struct GpgHome {
     dir: PathBuf,
@@ -302,13 +303,26 @@ fn merged_export(dir: &Path, key: &str, streams: &[&Path], out: &Path) {
         gpg().arg("--import").arg(stream).status().unwrap();
     }
     let export = gpg().arg("--export").arg("--").arg(key).output().unwrap();
+    remove_gnupg_sockets(dir);
     assert!(export.status.success() && !export.stdout.is_empty());
     std::fs::write(out, export.stdout).unwrap();
-    let _ = Command::new("gpgconf")
-        .arg("--homedir")
-        .arg(dir)
-        .args(["--kill", "gpg-agent"])
-        .status();
+}
+
+/// Stop every GnuPG daemon of the home directory `dir` and remove the socket
+/// directory GnuPG made for it under the user runtime directory. GnuPG names
+/// that directory from the path string of `dir`, so the call also works after
+/// `dir` is removed. Failures are ignored.
+#[cfg(feature = "gpg")]
+fn remove_gnupg_sockets(dir: &Path) {
+    for action in [&["--kill", "all"][..], &["--remove-socketdir"][..]] {
+        let _ = Command::new("gpgconf")
+            .arg("--homedir")
+            .arg(dir)
+            .args(action)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// Run `cmd`, writing `answers` to its standard input, and assert that it
@@ -332,11 +346,7 @@ fn answer(mut cmd: Command, answers: &[u8], what: &str) {
 #[cfg(feature = "gpg")]
 impl Drop for GpgHome {
     fn drop(&mut self) {
-        let _ = Command::new("gpgconf")
-            .arg("--homedir")
-            .arg(&self.dir)
-            .args(["--kill", "gpg-agent"])
-            .status();
+        remove_gnupg_sockets(&self.dir);
     }
 }
 
@@ -19798,10 +19808,15 @@ fn commit_gpg_sign_matches_the_tool() {
     let home = GpgHome::create(base, "Ostrya Commit Test <cli-commit@ostrya.example>");
     let fpr = home.fingerprint();
     let home_s = home.dir.to_str().unwrap().to_owned();
-    let empty_home = base.join("emptyhome");
-    std::fs::create_dir(&empty_home).unwrap();
-    std::fs::set_permissions(&empty_home, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let empty_home = empty_home.to_str().unwrap().to_owned();
+    // Both implementations run `gpg` in the empty home, so it is held as a
+    // fixture whose drop stops the GnuPG daemons of the home and removes
+    // their socket directory.
+    let empty = GpgHome {
+        dir: base.join("emptyhome"),
+    };
+    std::fs::create_dir(&empty.dir).unwrap();
+    std::fs::set_permissions(&empty.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let empty_home = empty.dir.to_str().unwrap().to_owned();
     let absent_home = base.join("no-such-home");
     let absent_home = absent_home.to_str().unwrap().to_owned();
 

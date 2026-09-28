@@ -190,6 +190,22 @@ pub fn gnupg_available(programs: &[&str]) -> bool {
     true
 }
 
+/// Stop every GnuPG daemon of the home directory `dir` and remove the socket
+/// directory GnuPG made for it under the user runtime directory. GnuPG names
+/// that directory from the path string of `dir`, so the call also works after
+/// `dir` is removed. Failures are ignored.
+pub fn remove_gnupg_sockets(dir: &Path) {
+    for action in [&["--kill", "all"][..], &["--remove-socketdir"][..]] {
+        let _ = Command::new("gpgconf")
+            .arg("--homedir")
+            .arg(dir)
+            .args(action)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
 /// Every regular file and symlink under `root/sub`, as its path relative to
 /// `root` and its bytes (a symlink's target), sorted by path.
 pub fn file_inventory(root: &Path, sub: &str) -> Vec<(String, Vec<u8>)> {

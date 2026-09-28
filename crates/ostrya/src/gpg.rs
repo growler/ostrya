@@ -1192,6 +1192,26 @@ fn scratch_dir() -> PathBuf {
     ))
 }
 
+/// Stop every GnuPG daemon of the home directory `dir` and remove the socket
+/// directory GnuPG made for it under the user runtime directory. GnuPG names
+/// that directory from the path string of `dir`, so the call also works after
+/// `dir` is removed. The fixtures of this module and of [`verify`] call it
+/// before they remove their home. Failures are ignored.
+#[cfg(test)]
+fn remove_home_sockets(dir: &Path) {
+    use std::process::{Command, Stdio};
+
+    for action in [&["--kill", "all"][..], &["--remove-socketdir"][..]] {
+        let _ = Command::new("gpgconf")
+            .arg("--homedir")
+            .arg(dir)
+            .args(action)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 /// Parse a status-line epoch field, treating `0` as absent. The reference
 /// reader the differential cases in [`verify`] compare against reads the
 /// `gpgv` status stream through it.
@@ -1306,8 +1326,9 @@ IHdvcmxk\n\
     /// A private GnuPG home holding freshly generated, passphrase-free ed25519
     /// signing keys, under the test scratch tree. Every `gpg` run names this
     /// directory with `--homedir`, so the invoking user's GnuPG home and any
-    /// agent of theirs take no part. Dropping the fixture kills the agent
-    /// GnuPG auto-started for the directory and removes the directory.
+    /// agent of theirs take no part. Dropping the fixture stops the GnuPG
+    /// daemons of the directory, removes their socket directory, and removes
+    /// the directory.
     struct KeyFixture {
         dir: PathBuf,
         /// Whether every `gpg` run in this home stands at [`FAKED_CLOCK`].
@@ -1583,6 +1604,7 @@ IHdvcmxk\n\
                     .arg(&source)
                     .status()
                     .unwrap();
+                remove_home_sockets(&home);
                 assert!(status.success(), "gpg --import into a keyring failed");
             }
             std::fs::read(&ring).unwrap()
@@ -1713,11 +1735,7 @@ IHdvcmxk\n\
 
     impl Drop for KeyFixture {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("gpgconf")
-                .arg("--homedir")
-                .arg(&self.dir)
-                .args(["--kill", "gpg-agent"])
-                .status();
+            remove_home_sockets(&self.dir);
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }

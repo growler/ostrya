@@ -1003,7 +1003,8 @@ fn the_tool_tolerates_the_receive_groups() {
 }
 
 /// A private GnuPG home holding one fresh, passphrase-free signing key.
-/// Dropping it stops the agent GnuPG started for the home.
+/// Dropping it stops the GnuPG daemons of the home and removes their socket
+/// directory.
 #[cfg(feature = "verify-gpg")]
 struct GnupgHome {
     dir: std::path::PathBuf,
@@ -1046,11 +1047,7 @@ impl GnupgHome {
 #[cfg(feature = "verify-gpg")]
 impl Drop for GnupgHome {
     fn drop(&mut self) {
-        let _ = std::process::Command::new("gpgconf")
-            .arg("--homedir")
-            .arg(&self.dir)
-            .args(["--kill", "gpg-agent"])
-            .status();
+        common::remove_gnupg_sockets(&self.dir);
     }
 }
 

@@ -1125,7 +1125,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::gpg::{GpgVerifier, STATUS_PREFIX, parse_epoch, scratch_dir};
+    use crate::gpg::{GpgVerifier, STATUS_PREFIX, parse_epoch, remove_home_sockets, scratch_dir};
 
     /// The payload every fixture signs.
     const PAYLOAD: &[u8] = b"ostrya commit payload";
@@ -1145,8 +1145,9 @@ mod tests {
     /// A private GnuPG home holding one freshly generated, passphrase-free
     /// ed25519 signing key, under the test scratch tree. Every `gpg` and
     /// `gpgv` run names a directory inside it, so the invoking user's GnuPG
-    /// home and any agent of theirs take no part. Dropping the fixture kills
-    /// the agent GnuPG auto-started for the directory and removes the tree.
+    /// home and any agent of theirs take no part. Dropping the fixture stops
+    /// the GnuPG daemons of the directory, removes their socket directory, and
+    /// removes the tree.
     struct Fixture {
         dir: PathBuf,
         /// The primary key fingerprint, uppercase hex.
@@ -1556,11 +1557,7 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = Command::new("gpgconf")
-                .arg("--homedir")
-                .arg(&self.dir)
-                .args(["--kill", "gpg-agent"])
-                .status();
+            remove_home_sockets(&self.dir);
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }

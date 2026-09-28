@@ -37,8 +37,8 @@ fn gpg_available() -> bool {
 }
 
 /// A private GnuPG home directory holding one freshly generated,
-/// passphrase-free ed25519 signing key. Dropping the fixture kills the
-/// gpg-agent GnuPG auto-started for the directory.
+/// passphrase-free ed25519 signing key. Dropping the fixture stops the
+/// GnuPG daemons of the directory and removes their socket directory.
 struct GpgHome {
     dir: PathBuf,
 }
@@ -124,11 +124,7 @@ impl GpgHome {
 
 impl Drop for GpgHome {
     fn drop(&mut self) {
-        let _ = Command::new("gpgconf")
-            .arg("--homedir")
-            .arg(&self.dir)
-            .args(["--kill", "gpg-agent"])
-            .status();
+        common::remove_gnupg_sockets(&self.dir);
     }
 }
 

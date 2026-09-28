@@ -6,11 +6,12 @@
 //! defaults, the `[archive]` group, and `[remote "<name>"]` sections.
 //!
 //! The `[ex-ostrya]` group carries the keys that are ostrya extensions:
-//! `gc-root-metadata-keys` for a prune, `detached-metadata-exclude` for what a
-//! repository stores and sends, and the `receive-*` keys, which state the
-//! policy a repository applies to the commits it receives. Under the `receive`
-//! feature, `ReceivePolicy::from_config` reads the `receive-*` keys through
-//! the crate-private readers of this module.
+//! `gc-root-metadata-keys` for a prune, and `detached-metadata-exclude` for
+//! what a repository stores and sends. The groups whose names start with
+//! `ex-ostrya ` state the policy a repository applies to the commits it
+//! receives. Under the `receive` feature, `ReceivePolicy::from_config` reads
+//! them, and reads a trust group through the [`Remote`] accessors, because a
+//! trust group takes the key names of a remote section.
 //!
 //! The `repo_version` and `mode` keys are validated when the config is loaded,
 //! matching the tool, which refuses to open a repository whose version is not
@@ -213,11 +214,7 @@ impl RepoConfig {
 
     /// A typed accessor for one remote, or `None` if no such section exists.
     pub fn remote(&self, name: &str) -> Option<Remote<'_>> {
-        let group = remote_group(name);
-        self.keyfile.has_group(&group).then_some(Remote {
-            keyfile: &self.keyfile,
-            group,
-        })
+        Remote::in_keyfile(&self.keyfile, name)
     }
 
     /// Whether `fsync` durability is enabled. Default `true`.
@@ -380,26 +377,6 @@ impl RepoConfig {
         Ok(canonical.unwrap_or(false) || alias.unwrap_or(false))
     }
 
-    /// The string value of one `[ex-ostrya]` key, `None` when it is absent.
-    #[cfg(feature = "receive")]
-    pub(crate) fn ex_ostrya_string(&self, key: &str) -> Result<Option<String>> {
-        self.keyfile.get_string(EX_OSTRYA, key).map_err(Error::from)
-    }
-
-    /// The boolean value of one `[ex-ostrya]` key, `false` when it is absent. A
-    /// value other than `true`, `false`, `1`, or `0` is an error.
-    #[cfg(feature = "receive")]
-    pub(crate) fn ex_ostrya_bool(&self, key: &str) -> Result<bool> {
-        Ok(self.keyfile.get_bool(EX_OSTRYA, key)?.unwrap_or(false))
-    }
-
-    /// The `;`-separated list value of one `[ex-ostrya]` key, empty when it is
-    /// absent.
-    #[cfg(feature = "receive")]
-    pub(crate) fn ex_ostrya_list(&self, key: &str) -> Result<Vec<String>> {
-        self.string_list(EX_OSTRYA, key)
-    }
-
     /// Read a `;`-separated list key, empty when the key is absent. A value the
     /// key-file syntax cannot split is reported as an error.
     fn string_list(&self, group: &str, key: &str) -> Result<Vec<String>> {
@@ -496,6 +473,24 @@ pub(crate) fn remote_keyring_name(remote: &str) -> String {
 pub struct Remote<'a> {
     keyfile: &'a KeyFile,
     group: String,
+}
+
+impl<'a> Remote<'a> {
+    /// The `[remote "<name>"]` section of `keyfile`, or `None` if no such
+    /// section exists.
+    pub(crate) fn in_keyfile(keyfile: &'a KeyFile, name: &str) -> Option<Remote<'a>> {
+        let group = remote_group(name);
+        keyfile
+            .has_group(&group)
+            .then_some(Remote { keyfile, group })
+    }
+
+    /// The accessors of a remote section over another group of `keyfile`,
+    /// which takes the key names and the value forms of a remote section.
+    #[cfg(feature = "receive")]
+    pub(crate) fn view(keyfile: &'a KeyFile, group: String) -> Remote<'a> {
+        Remote { keyfile, group }
+    }
 }
 
 impl Remote<'_> {
@@ -653,7 +648,7 @@ fn remote_group(name: &str) -> String {
 
 /// The remote name in a `remote "<name>"` group header, or `None` for any other
 /// group.
-fn remote_group_name(group: &str) -> Option<&str> {
+pub(crate) fn remote_group_name(group: &str) -> Option<&str> {
     group
         .strip_prefix("remote \"")
         .and_then(|rest| rest.strip_suffix('"'))

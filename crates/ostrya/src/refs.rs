@@ -830,12 +830,12 @@ pub(crate) fn check_ref_path(name: &str) -> Result<()> {
 
 /// A ref name may contain `/` but no empty, `.`, or `..` components, and no
 /// interior NUL.
-fn is_ref_path(name: &str) -> bool {
+pub(crate) fn is_ref_path(name: &str) -> bool {
     !name.is_empty() && name.split('/').all(is_component)
 }
 
 /// A single path component: non-empty, not a traversal, no slash or NUL.
-fn is_component(component: &str) -> bool {
+pub(crate) fn is_component(component: &str) -> bool {
     !(component.is_empty()
         || component == "."
         || component == ".."

@@ -22,13 +22,34 @@
 //! not touch, in the order it read them, and drops the comment and blank lines
 //! the input carried, which is what the tool's own rewrite does.
 
+use std::collections::HashMap;
+
 use crate::error::{Error, Result};
 
 /// A parsed key file: an ordered list of groups, each an ordered list of
 /// (key, raw value) entries.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct KeyFile {
     groups: Vec<Group>,
+    /// The position in `groups` of each group, by name, so a lookup does not
+    /// scan every group.
+    index: HashMap<String, usize>,
+}
+
+impl PartialEq for KeyFile {
+    fn eq(&self, other: &KeyFile) -> bool {
+        self.groups == other.groups
+    }
+}
+
+impl Eq for KeyFile {}
+
+impl std::fmt::Debug for KeyFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyFile")
+            .field("groups", &self.groups)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,8 +61,11 @@ struct Group {
 impl KeyFile {
     /// Parse a key file from text.
     pub fn parse(input: &str) -> Result<KeyFile> {
-        let mut groups: Vec<Group> = Vec::new();
+        let mut keyfile = KeyFile::default();
         let mut current: Option<usize> = None;
+        // The position of each key within its group, by group position and
+        // key, so a repeated key does not scan the group's entries.
+        let mut keys: HashMap<(usize, String), usize> = HashMap::new();
 
         // Split on '\n'; a trailing newline leaves a final empty segment that
         // is not a line. One trailing carriage return is stripped per raw
@@ -78,16 +102,7 @@ impl KeyFile {
                         "line {lineno}: group name '{name}' contains '[' or ']'"
                     )));
                 }
-                current = Some(match groups.iter().position(|g| g.name == name) {
-                    Some(i) => i,
-                    None => {
-                        groups.push(Group {
-                            name: name.to_string(),
-                            entries: Vec::new(),
-                        });
-                        groups.len() - 1
-                    }
-                });
+                current = Some(keyfile.group_index_or_insert(name));
                 continue;
             }
             let Some(eq) = line.find('=') else {
@@ -107,18 +122,39 @@ impl KeyFile {
                     "line {lineno}: key '{key}' precedes any group"
                 )));
             };
-            let entries = &mut groups[idx].entries;
-            match entries.iter_mut().find(|(k, _)| k == key) {
-                Some(entry) => entry.1 = value.to_string(),
-                None => entries.push((key.to_string(), value.to_string())),
+            let entries = &mut keyfile.groups[idx].entries;
+            match keys.get(&(idx, key.to_string())) {
+                Some(&at) => entries[at].1 = value.to_string(),
+                None => {
+                    keys.insert((idx, key.to_string()), entries.len());
+                    entries.push((key.to_string(), value.to_string()));
+                }
             }
         }
-        Ok(KeyFile { groups })
+        Ok(keyfile)
+    }
+
+    /// The position of `name` in `groups`, a new empty group at the end where
+    /// it is absent.
+    fn group_index_or_insert(&mut self, name: &str) -> usize {
+        if let Some(&i) = self.index.get(name) {
+            return i;
+        }
+        self.groups.push(Group {
+            name: name.to_string(),
+            entries: Vec::new(),
+        });
+        self.index.insert(name.to_string(), self.groups.len() - 1);
+        self.groups.len() - 1
+    }
+
+    fn group(&self, name: &str) -> Option<&Group> {
+        self.index.get(name).map(|&i| &self.groups[i])
     }
 
     /// Whether a group is present.
     pub fn has_group(&self, group: &str) -> bool {
-        self.groups.iter().any(|g| g.name == group)
+        self.index.contains_key(group)
     }
 
     /// Iterate group names in file order.
@@ -126,10 +162,16 @@ impl KeyFile {
         self.groups.iter().map(|g| g.name.as_str())
     }
 
+    /// Iterate the keys of one group in file order. An absent group has no
+    /// keys.
+    pub fn keys(&self, group: &str) -> impl Iterator<Item = &str> {
+        self.group(group)
+            .into_iter()
+            .flat_map(|g| g.entries.iter().map(|(k, _)| k.as_str()))
+    }
+
     fn find(&self, group: &str, key: &str) -> Option<&str> {
-        self.groups
-            .iter()
-            .find(|g| g.name == group)?
+        self.group(group)?
             .entries
             .iter()
             .find(|(k, _)| k == key)
@@ -189,16 +231,7 @@ impl KeyFile {
         validate_group(group)?;
         validate_key(key)?;
         validate_value(value)?;
-        let idx = match self.groups.iter().position(|g| g.name == group) {
-            Some(i) => i,
-            None => {
-                self.groups.push(Group {
-                    name: group.to_string(),
-                    entries: Vec::new(),
-                });
-                self.groups.len() - 1
-            }
-        };
+        let idx = self.group_index_or_insert(group);
         let entries = &mut self.groups[idx].entries;
         match entries.iter_mut().find(|(k, _)| k == key) {
             Some(entry) => entry.1 = value.to_string(),
@@ -222,12 +255,7 @@ impl KeyFile {
     /// the header of an emptied group in place, and
     /// [`Display`](std::fmt::Display) writes it back with no entries.
     pub fn remove_key(&mut self, group: &str, key: &str) -> bool {
-        let Some(entries) = self
-            .groups
-            .iter_mut()
-            .find(|g| g.name == group)
-            .map(|g| &mut g.entries)
-        else {
+        let Some(entries) = self.index.get(group).map(|&i| &mut self.groups[i].entries) else {
             return false;
         };
         let Some(index) = entries.iter().position(|(k, _)| k == key) else {
@@ -241,10 +269,15 @@ impl KeyFile {
     ///
     /// The remaining groups keep their order.
     pub fn remove_group(&mut self, group: &str) -> bool {
-        let Some(index) = self.groups.iter().position(|g| g.name == group) else {
+        let Some(index) = self.index.remove(group) else {
             return false;
         };
         self.groups.remove(index);
+        for i in self.index.values_mut() {
+            if *i > index {
+                *i -= 1;
+            }
+        }
         true
     }
 }
@@ -486,6 +519,17 @@ mod tests {
         assert!(KeyFile::parse("[]\nk=v\n").is_err());
         // A line starting with `;` is not a comment; with no `=` it is an error.
         assert!(KeyFile::parse("[core]\n;not a comment\nk=v\n").is_err());
+    }
+
+    #[test]
+    fn keys_lists_one_group_in_file_order() {
+        // A repeated header merges into the first group, and a repeated key
+        // keeps its first position.
+        let text = "[a]\nz=1\ny=2\n[b]\nx=3\n[a]\nw=4\nz=5\n";
+        let kf = KeyFile::parse(text).unwrap();
+        assert_eq!(kf.keys("a").collect::<Vec<_>>(), ["z", "y", "w"]);
+        assert_eq!(kf.keys("b").collect::<Vec<_>>(), ["x"]);
+        assert_eq!(kf.keys("absent").count(), 0);
     }
 
     #[test]

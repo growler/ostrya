@@ -203,9 +203,10 @@
 //! push applies (see the `receive` module): `ReceivePolicy` states which ref
 //! updates a repository accepts, the signatures a received commit must carry,
 //! the keys the server signs with, and whether it regenerates its summary, and
-//! `ReceivePolicy::from_config` reads that policy from the `receive-*` keys of
-//! the `[ex-ostrya]` group. A received commit is held to the same signature
-//! checks a pull makes, over the keys the receive policy names.
+//! `ReceivePolicy::from_config` reads that policy from the receive groups of
+//! the repository config, `[ex-ostrya receive]` and the groups it names. A
+//! received commit is held to the same signature checks a pull makes, over the
+//! keys the receive policy names.
 
 pub mod bootable;
 mod bspatch;
@@ -302,7 +303,9 @@ pub use pull::{
 };
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
-pub use receive::{ReceivePolicy, ReceiveVerify, ServerSigner};
+pub use receive::{
+    ReceivePolicy, ReceiveRule, ReceiveVerify, RefPattern, ServerSigner, TrustedKeys,
+};
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};
 pub use sign::{

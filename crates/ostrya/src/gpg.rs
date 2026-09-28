@@ -1377,7 +1377,7 @@ IHdvcmxk\n\
         }
 
         /// The exported public keyring, binary or ASCII-armored.
-        fn export(&self, armored: bool) -> Vec<u8> {
+        pub(crate) fn export(&self, armored: bool) -> Vec<u8> {
             let mut cmd = self.gpg();
             cmd.arg("--export");
             if armored {

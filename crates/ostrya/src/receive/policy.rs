@@ -1,43 +1,39 @@
-//! The receive policy and its configuration keys.
+//! The receive policy and its rules.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use crate::config::RepoConfig;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::pull::DetachedMetadataFilter;
 use crate::repo::Repo;
-use crate::sign::{MAX_KEY_FILE, key_text, read_key_path};
 
-use super::ServerSigner;
+use super::reader::{self, Origin};
+use super::{RefPattern, ServerSigner, TrustedKeys};
 
 /// What a receiving repository accepts, and what it does after it accepts a
 /// session.
 ///
-/// [`Default`] is the strictest policy: fast-forward updates only, no delete,
-/// no privileged content, no remote ref, no signature required, no server key,
-/// no summary regeneration, and no detached-metadata filter.
-/// [`ReceivePolicy::from_config`] reads the policy a repository's
-/// configuration states.
+/// [`Default`] is the policy of a repository with no receive group: the
+/// default rule with its defaults, which accepts fast-forward updates of
+/// plain refs with no signature check and no server signature, no pattern
+/// rule, so every remote ref is refused, no privileged content, no summary
+/// signer, no summary regeneration, and no detached-metadata filter.
+/// [`ReceivePolicy::from_config`] and [`ReceivePolicy::from_file`] read the
+/// policy that key-file groups state.
 #[derive(Debug, Default)]
 pub struct ReceivePolicy {
-    /// Accept a ref update whose new commit does not descend from the current
-    /// one, where the client asks for it.
-    pub allow_non_fast_forward: bool,
-    /// Accept a ref delete.
-    pub allow_delete: bool,
+    /// The rule of each plain ref that no pattern of
+    /// [`rules`](ReceivePolicy::rules) matches.
+    pub default_rule: ReceiveRule,
+    /// The rules of the refs their patterns match. [`ReceivePolicy::rule_for`]
+    /// selects one.
+    pub rules: Vec<(RefPattern, ReceiveRule)>,
     /// Accept privileged content in a `bare` repository: a setuid or setgid
     /// mode bit, and the `security.capability` and `security.selinux`
     /// extended attributes.
     pub allow_privileged: bool,
-    /// Accept a ref update that names a remote ref, `REMOTE:NAME`.
-    pub allow_remote_refs: bool,
-    /// The signatures each commit that becomes the new value of a ref must
-    /// carry.
-    pub require_signature: ReceiveVerify,
-    /// The keys the server signs each such commit with, in order.
-    pub signers: Vec<ServerSigner>,
-    /// Sign the regenerated summary with [`signers`](ReceivePolicy::signers).
-    pub sign_summary: bool,
+    /// The keys the server signs the regenerated summary with, in order.
+    pub summary_signers: Vec<Arc<ServerSigner>>,
     /// Regenerate the summary after a session that writes a ref.
     pub update_summary: bool,
     /// The detached-metadata keys the repository does not store, `None` to
@@ -45,267 +41,212 @@ pub struct ReceivePolicy {
     pub detached_metadata_filter: Option<DetachedMetadataFilter>,
 }
 
-/// The signatures a received commit must carry.
+/// The rule of the refs one pattern matches.
 ///
-/// The two axes are ANDed: with `gpg` true and `sign` not empty, a commit needs
-/// a valid GPG signature and a valid sign-api signature. The engines of `sign`
-/// are ORed: one valid signature from one of them is enough. `gpg` false with
-/// an empty `sign` requires no signature.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReceiveVerify {
-    /// Require a GPG signature from a key of `[ex-ostrya] receive-gpgkeypath`.
-    pub gpg: bool,
-    /// Require a signature from one of these sign-api engines, each named once,
-    /// from a key of its `receive-verification-<engine>-key` or
-    /// `receive-verification-<engine>-file`.
-    pub sign: Vec<String>,
+/// [`Default`] accepts fast-forward updates with no signature check and no
+/// server signature.
+#[derive(Debug, Clone)]
+pub struct ReceiveRule {
+    /// Accept an update of a matching ref. `false` refuses each one.
+    pub accept: bool,
+    /// The signatures each commit that becomes the new value of a matching
+    /// ref must carry.
+    pub verify: ReceiveVerify,
+    /// Accept an update whose new commit does not descend from the current
+    /// one, where the client asks for it.
+    pub allow_non_fast_forward: bool,
+    /// Accept a delete of a matching ref.
+    pub allow_delete: bool,
+    /// The keys the server signs each commit that becomes the new value of a
+    /// matching ref with, in order.
+    pub signers: Vec<Arc<ServerSigner>>,
+}
+
+impl Default for ReceiveRule {
+    fn default() -> ReceiveRule {
+        ReceiveRule {
+            accept: true,
+            verify: ReceiveVerify::Off,
+            allow_non_fast_forward: false,
+            allow_delete: false,
+            signers: Vec::new(),
+        }
+    }
+}
+
+/// The signatures a received commit must carry.
+#[derive(Debug, Clone, Default)]
+pub enum ReceiveVerify {
+    /// No signature check.
+    #[default]
+    Off,
+    /// A valid signature on each axis of the trusted keys.
+    Keys(Arc<TrustedKeys>),
 }
 
 impl ReceivePolicy {
-    /// The policy the configuration of `repo` states.
+    /// The policy that the receive groups of the configuration of `repo`
+    /// state: `[ex-ostrya receive]` for the default rule and the session keys,
+    /// `[ex-ostrya receive "PATTERN"]` for the rule of each pattern,
+    /// `[ex-ostrya trust "NAME"]` for each set of trusted keys, and
+    /// `[ex-ostrya key "NAME"]` for each server signing key.
+    /// `update_summary` comes from `[core] auto-update-summary` and its alias
+    /// (see [`RepoConfig::auto_update_summary`](crate::RepoConfig::auto_update_summary)),
+    /// and the filter from `[ex-ostrya] detached-metadata-exclude`.
     ///
-    /// The keys, all in the `[ex-ostrya]` group unless stated:
+    /// The groups are parsed strictly. Each of these is refused as
+    /// [`Error::InvalidFormat`](crate::Error::InvalidFormat): a group name that
+    /// starts with `ex-ostrya ` and has no shape of the list above, a key a
+    /// group does not take, a session key in a pattern group, a pattern
+    /// outside the syntax of [`RefPattern`], a malformed `verify` value, a
+    /// reference to a trust group, a key group, or a remote section that does
+    /// not exist, a key that has no effect, and a trust group or a `remote:`
+    /// reference that turns on no signature check. A malformed boolean is the
+    /// key-file error [`Error::Core`](crate::Error::Core). An engine this build
+    /// does not have is [`Error::Unsupported`](crate::Error::Unsupported).
     ///
-    /// - `receive-allow-non-fast-forward`, `receive-allow-delete`,
-    ///   `receive-allow-privileged`, `receive-allow-remote-refs`, and
-    ///   `receive-sign-summary`: booleans, default false.
-    /// - `receive-verify`: `off` (the default), or a `;`-separated list of
-    ///   `gpg`, `ed25519`, and `spki`. A name given twice counts once.
-    /// - `receive-gpgkeypath`: the keyrings the GPG axis trusts, a
-    ///   `;`-separated list of keyring files and directories of `*.gpg`
-    ///   keyrings.
-    /// - `receive-verification-<engine>-key` and
-    ///   `receive-verification-<engine>-file`: the keys the sign-api axis
-    ///   trusts for one engine, in the forms of the remote keys
-    ///   `verification-<engine>-key` and `verification-<engine>-file`.
-    /// - `receive-sign-type` and `receive-sign-key-file`: one sign-api key the
-    ///   server signs with. The type is `ed25519` (the default when only the
-    ///   file is set) or `spki`. The file holds one base64 secret key.
-    /// - `receive-gpg-sign` and `receive-gpg-homedir`: the `;`-separated GPG
-    ///   key selectors the server signs with, and the GnuPG home they are
-    ///   resolved in. Each selector has to name exactly one secret key.
-    /// - `detached-metadata-exclude`: the detached-metadata keys the
-    ///   repository does not store.
-    /// - `[core] auto-update-summary` and its alias `commit-update-summary`:
-    ///   whether the summary is regenerated (see
-    ///   [`RepoConfig::auto_update_summary`]).
-    ///
-    /// The sign-api signing key comes before the GPG keys in
-    /// [`signers`](ReceivePolicy::signers).
-    ///
-    /// The trusted keys are read here once, so a key source the policy cannot
-    /// use is refused here and not at the first session. The errors:
-    ///
-    /// - A malformed value is [`Error::InvalidFormat`].
-    /// - A malformed boolean is the key-file error [`Error::Core`].
-    /// - A key, a line of a key file, or a secret key that is not valid base64
-    ///   is the base64 error [`Error::Core`], as it is for the keys of a
-    ///   remote in a pull.
-    /// - An engine this build does not have is [`Error::Unsupported`].
-    /// - These are [`Error::Signature`]: a key source that cannot be read, a
-    ///   key the engine refuses, an engine with no trusted key, a
-    ///   `receive-gpgkeypath` that names no keyring, keyrings that hold no
-    ///   certificate, and a GPG selector that names no secret key or more than
-    ///   one.
+    /// Each key group and each trust group is built here once, also one that
+    /// no rule names, and the rules share it, so a key source the policy
+    /// cannot use fails the call. A key source that cannot be read, a key the
+    /// engine refuses, and a GPG selector that names no secret key or more
+    /// than one are [`Error::Signature`](crate::Error::Signature). A key that is
+    /// not valid base64 is the base64 error [`Error::Core`](crate::Error::Core).
     pub async fn from_config(repo: &Repo) -> Result<ReceivePolicy> {
-        let config = repo.config();
-        let require_signature = parse_receive_verify(config)?;
-        crate::verify::receive_policy(repo, &require_signature).await?;
-
-        let mut signers = Vec::new();
-        if let Some(signer) = sign_api_signer(config).await? {
-            signers.push(signer);
-        }
-        signers.extend(gpg_signers(config).await?);
-
-        let exclude = config.detached_metadata_exclude()?;
-        let detached_metadata_filter =
-            (!exclude.is_empty()).then(|| DetachedMetadataFilter::excluding(exclude));
-
-        Ok(ReceivePolicy {
-            allow_non_fast_forward: config.ex_ostrya_bool("receive-allow-non-fast-forward")?,
-            allow_delete: config.ex_ostrya_bool("receive-allow-delete")?,
-            allow_privileged: config.ex_ostrya_bool("receive-allow-privileged")?,
-            allow_remote_refs: config.ex_ostrya_bool("receive-allow-remote-refs")?,
-            require_signature,
-            signers,
-            sign_summary: config.ex_ostrya_bool("receive-sign-summary")?,
-            update_summary: config.auto_update_summary()?,
-            detached_metadata_filter,
-        })
+        reader::read(repo, repo.config().keyfile(), Origin::Config).await
     }
-}
 
-/// Read `[ex-ostrya] receive-verify`.
-///
-/// The value is absent or `off` for no check, or a list the key-file syntax
-/// splits on `;`, whose trailing separator adds no element. Each element is
-/// `gpg`, `ed25519`, or `spki`, taken as written. An empty value, an empty
-/// element, `off` beside a name, and any other name are refused, `true` and
-/// `false` among them, so a value that reads as a boolean elsewhere does not
-/// turn a check on or off here. The dummy engine is refused by name: its
-/// signature is its key.
-fn parse_receive_verify(config: &RepoConfig) -> Result<ReceiveVerify> {
-    const KEY: &str = "receive-verify";
-    let Some(raw) = config.ex_ostrya_string(KEY)? else {
-        return Ok(ReceiveVerify::default());
-    };
-    if raw == "off" {
-        return Ok(ReceiveVerify::default());
+    /// The same as [`from_config`](ReceivePolicy::from_config), with the
+    /// receive groups and the remote sections read from the file at `path`
+    /// alone. A remote section in the file can be one that no rule names. The receive groups of the repository config
+    /// are not read. A `remote:` reference reads no keyring inside the
+    /// repository: `<repo>/NAME.trustedkeys.gpg` does not take part.
+    /// `update_summary` and the filter still come from the repository config.
+    ///
+    /// The file is read as a regular file alone, up to 1 MiB, in UTF-8. A
+    /// group in it that is not a receive group or a remote section is
+    /// refused as [`Error::InvalidFormat`](crate::Error::InvalidFormat), and
+    /// so is a file that cannot be read.
+    pub async fn from_file(repo: &Repo, path: &Path) -> Result<ReceivePolicy> {
+        let keyfile = reader::read_policy_file(path).await?;
+        reader::read(repo, &keyfile, Origin::File).await
     }
-    let malformed = |why: &str| {
-        Error::InvalidFormat(format!("malformed [ex-ostrya] {KEY} value '{raw}': {why}"))
-    };
-    let names = config.ex_ostrya_list(KEY)?;
-    if names.is_empty() {
-        return Err(malformed("the value names nothing; write off for no check"));
-    }
-    let mut verify = ReceiveVerify::default();
-    for name in &names {
-        match name.as_str() {
-            "" => return Err(malformed("an element is empty")),
-            "off" => return Err(malformed("off stands alone")),
-            "gpg" => {
-                if cfg!(not(feature = "verify-gpg")) {
-                    return Err(Error::Unsupported(format!(
-                        "[ex-ostrya] {KEY} names gpg, which this build has no engine \
-                         for; build with the verify-gpg feature"
-                    )));
-                }
-                verify.gpg = true;
-            }
-            "ed25519" | "spki" => {
-                if name == "spki" && cfg!(not(feature = "sign-spki")) {
-                    return Err(Error::Unsupported(format!(
-                        "[ex-ostrya] {KEY} names spki, which this build has no engine \
-                         for; build with the sign-spki feature"
-                    )));
-                }
-                if !verify.sign.contains(name) {
-                    verify.sign.push(name.clone());
-                }
-            }
-            "dummy" => {
-                return Err(malformed(
-                    "the dummy engine is not a check: its signature is its key",
-                ));
-            }
-            other => {
-                return Err(malformed(&format!(
-                    "'{other}' is not gpg, ed25519, or spki"
-                )));
-            }
-        }
-    }
-    Ok(verify)
-}
 
-/// The sign-api signing key of `[ex-ostrya] receive-sign-type` and
-/// `receive-sign-key-file`, `None` where neither is set.
-async fn sign_api_signer(config: &RepoConfig) -> Result<Option<ServerSigner>> {
-    let kind = config.ex_ostrya_string("receive-sign-type")?;
-    let Some(path) = config.ex_ostrya_string("receive-sign-key-file")? else {
-        return match kind {
-            None => Ok(None),
-            Some(kind) => Err(Error::InvalidFormat(format!(
-                "[ex-ostrya] receive-sign-type is '{kind}', but receive-sign-key-file \
-                 names no key file"
-            ))),
+    /// The rule of an update of `refspec`, a plain ref `NAME` or a remote ref
+    /// `REMOTE:NAME`, or `None` where the update is refused because no rule
+    /// covers it.
+    ///
+    /// A remote ref matches only a pattern with a remote part, and a plain ref
+    /// only a pattern without one. Among the patterns that match, a literal
+    /// remote part wins over `*:`, then an exact name wins over a prefix, and
+    /// a longer prefix wins over a shorter one. Where two entries of
+    /// [`rules`](ReceivePolicy::rules) tie, which only a repeated pattern can
+    /// do, the first one wins. A plain ref that no pattern matches gets
+    /// [`default_rule`](ReceivePolicy::default_rule), and a remote ref that no
+    /// pattern matches gets `None`.
+    pub fn rule_for(&self, refspec: &str) -> Option<&ReceiveRule> {
+        let (remote, name) = match refspec.split_once(':') {
+            Some((remote, name)) => (Some(remote), name),
+            None => (None, refspec),
         };
-    };
-    let kind = kind.unwrap_or_else(|| "ed25519".to_owned());
-    match kind.as_str() {
-        "ed25519" => {}
-        #[cfg(feature = "sign-spki")]
-        "spki" => {}
-        #[cfg(not(feature = "sign-spki"))]
-        "spki" => {
-            return Err(Error::Unsupported(
-                "[ex-ostrya] receive-sign-type is spki, which this build has no \
-                 engine for; build with the sign-spki feature"
-                    .into(),
-            ));
+        let mut best = None;
+        for (pattern, rule) in &self.rules {
+            if let Some(found) = pattern.specificity(remote, name)
+                && best.is_none_or(|(held, _)| found > held)
+            {
+                best = Some((found, rule));
+            }
         }
-        "gpg" => {
-            return Err(Error::InvalidFormat(
-                "malformed [ex-ostrya] receive-sign-type value 'gpg': name GPG \
-                 keys with receive-gpg-sign"
-                    .into(),
-            ));
+        match best {
+            Some((_, rule)) => Some(rule),
+            None => remote.is_none().then_some(&self.default_rule),
         }
-        other => {
-            return Err(Error::InvalidFormat(format!(
-                "malformed [ex-ostrya] receive-sign-type value '{other}': the type is \
-                 ed25519 or spki"
-            )));
-        }
-    }
-    let line = ostrya_rt::unblock(move || read_secret_key_line(&path)).await?;
-    let signer = match kind.as_str() {
-        #[cfg(feature = "sign-spki")]
-        "spki" => ServerSigner::spki(crate::spki::SpkiSigner::from_base64(&line)?)?,
-        _ => ServerSigner::ed25519(&ostrya_core::base64::decode(&line)?)?,
-    };
-    Ok(Some(signer))
-}
-
-/// The one secret key the file at `path` holds, as its base64 line.
-///
-/// The file is read under the rule every key source is read under: a regular
-/// file alone, up to [`MAX_KEY_FILE`]. Blank lines are skipped, and the file
-/// has to hold exactly one other line.
-fn read_secret_key_line(path: &str) -> Result<String> {
-    let subject = format!("the receive signing key file '{path}'");
-    let Some(bytes) = read_key_path(Path::new(path), &subject, MAX_KEY_FILE)? else {
-        return Err(Error::Signature(format!("{subject} does not exist")));
-    };
-    let text = key_text(bytes, &subject)?;
-    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-    match (lines.next(), lines.next()) {
-        (Some(line), None) => Ok(line.to_owned()),
-        (None, _) => Err(Error::Signature(format!("{subject} holds no key"))),
-        (Some(_), Some(_)) => Err(Error::Signature(format!(
-            "{subject} holds more than one key"
-        ))),
     }
 }
 
-/// The GPG signing keys of `[ex-ostrya] receive-gpg-sign`, resolved in
-/// `receive-gpg-homedir` where it is set.
-#[cfg(feature = "sign-gpg")]
-async fn gpg_signers(config: &RepoConfig) -> Result<Vec<ServerSigner>> {
-    let homedir = config.ex_ostrya_string("receive-gpg-homedir")?;
-    let mut signers = Vec::new();
-    for selector in config.ex_ostrya_list("receive-gpg-sign")? {
-        if selector.is_empty() {
-            continue;
-        }
-        let mut signer = crate::gpg::GpgSigner::new(selector.as_str());
-        if let Some(dir) = &homedir {
-            signer = signer.with_homedir(dir);
-        }
-        let signer = ServerSigner::gpg(signer).await.map_err(|e| match e {
-            Error::Signature(message) => Error::Signature(format!(
-                "[ex-ostrya] receive-gpg-sign entry '{selector}': {message}"
-            )),
-            other => other,
-        })?;
-        signers.push(signer);
-    }
-    Ok(signers)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// A build without GPG signing refuses a configuration that names a GPG key,
-/// rather than accept a session it would not sign.
-#[cfg(not(feature = "sign-gpg"))]
-async fn gpg_signers(config: &RepoConfig) -> Result<Vec<ServerSigner>> {
-    let selectors = config.ex_ostrya_list("receive-gpg-sign")?;
-    if selectors.iter().any(|selector| !selector.is_empty()) {
-        return Err(Error::Unsupported(
-            "[ex-ostrya] receive-gpg-sign names a GPG key, which this build cannot \
-             sign with; build with the sign-gpg feature"
-                .into(),
-        ));
+    /// A policy with one default rule for each of `patterns`, in order.
+    fn policy(patterns: &[&str]) -> ReceivePolicy {
+        ReceivePolicy {
+            rules: patterns
+                .iter()
+                .map(|pattern| (RefPattern::parse(pattern).unwrap(), ReceiveRule::default()))
+                .collect(),
+            ..ReceivePolicy::default()
+        }
     }
-    Ok(Vec::new())
+
+    /// The pattern of the rule `rule_for` selects for `refspec`, `Some("")`
+    /// for the default rule, and `None` for a refusal.
+    fn selected<'a>(policy: &'a ReceivePolicy, refspec: &str) -> Option<&'a str> {
+        let rule = policy.rule_for(refspec)?;
+        if std::ptr::eq(rule, &policy.default_rule) {
+            return Some("");
+        }
+        policy
+            .rules
+            .iter()
+            .find(|(_, held)| std::ptr::eq(held, rule))
+            .map(|(pattern, _)| pattern.as_str())
+    }
+
+    /// A plain ref never takes a remote rule, and a remote ref never takes a
+    /// plain one.
+    #[test]
+    fn the_remote_part_decides_first() {
+        let policy = policy(&["main", "*:*"]);
+        assert_eq!(selected(&policy, "main"), Some("main"));
+        assert_eq!(selected(&policy, "origin:main"), Some("*:*"));
+        assert_eq!(selected(&policy, "other"), Some(""));
+    }
+
+    /// A literal remote part wins over `*:`, before the name is compared.
+    #[test]
+    fn a_literal_remote_wins_over_any_remote() {
+        let policy = policy(&["*:apps/x", "origin:*"]);
+        assert_eq!(selected(&policy, "origin:apps/x"), Some("origin:*"));
+        assert_eq!(selected(&policy, "other:apps/x"), Some("*:apps/x"));
+        assert_eq!(selected(&policy, "other:apps/y"), None);
+    }
+
+    /// An exact name wins over a prefix, and a longer prefix wins over a
+    /// shorter one, in the order the rules come in and the reverse.
+    #[test]
+    fn an_exact_name_and_a_longer_prefix_win() {
+        for patterns in [
+            ["apps/*", "apps/x/*", "apps/x/main"],
+            ["apps/x/main", "apps/x/*", "apps/*"],
+        ] {
+            let policy = policy(&patterns);
+            assert_eq!(selected(&policy, "apps/x/main"), Some("apps/x/main"));
+            assert_eq!(selected(&policy, "apps/x/other"), Some("apps/x/*"));
+            assert_eq!(selected(&policy, "apps/y"), Some("apps/*"));
+            assert_eq!(selected(&policy, "apps"), Some(""));
+        }
+        let policy = policy(&["origin:*", "origin:a/*", "origin:a/b"]);
+        assert_eq!(selected(&policy, "origin:a/b"), Some("origin:a/b"));
+        assert_eq!(selected(&policy, "origin:a/c"), Some("origin:a/*"));
+        assert_eq!(selected(&policy, "origin:b"), Some("origin:*"));
+    }
+
+    /// A plain ref that no pattern matches gets the default rule, and a remote
+    /// ref that no pattern matches is refused.
+    #[test]
+    fn an_unmatched_ref_takes_the_default_or_is_refused() {
+        let policy = ReceivePolicy::default();
+        assert_eq!(selected(&policy, "main"), Some(""));
+        assert_eq!(selected(&policy, "origin:main"), None);
+        let policy = self::policy(&["other:*"]);
+        assert_eq!(selected(&policy, "origin:main"), None);
+    }
+
+    /// Where a hand-built policy repeats a pattern, the first entry wins.
+    #[test]
+    fn the_first_of_two_equal_patterns_wins() {
+        let policy = policy(&["main", "main"]);
+        let rule = policy.rule_for("main").unwrap();
+        assert!(std::ptr::eq(rule, &policy.rules[0].1));
+    }
 }

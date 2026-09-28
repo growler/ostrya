@@ -1538,61 +1538,133 @@ The prune and transfer keys:
 - `detached-metadata-exclude` -- a list: the detached-metadata keys the
   repository does not store when it receives a commit, and does not send when
   it serves one. A pull drops each key the list names from the `.commitmeta` it
-  stores. `ReceivePolicy::from_config` puts the list into the filter of the
+  stores. The receive policy readers put the list into the filter of the
   receive policy.
 
-The receive keys state the policy a repository applies to the commits and ref
-updates it receives:
+The receive groups state the policy a repository applies to the commits and
+ref updates it receives. They are key-file groups of their own, beside
+`[ex-ostrya]`, and `ReceivePolicy::from_config` reads them. The groups are
+parsed strictly: an unknown key, a group name that starts with `ex-ostrya `
+and has no shape of this list, a reference to a group that does not exist,
+and a key that has no effect are each refused.
 
-- `receive-allow-non-fast-forward` -- boolean: accept a ref update whose new
-  commit does not descend from the current one.
-- `receive-allow-delete` -- boolean: accept a ref delete.
-- `receive-allow-privileged` -- boolean: accept a setuid or setgid mode bit,
-  and the `security.capability` and `security.selinux` extended attributes, in
-  a `bare` repository.
-- `receive-allow-remote-refs` -- boolean: accept a ref update that names a
-  remote ref, `REMOTE:NAME`.
-- `receive-verify` -- `off` (the default), or a list of `gpg`, `ed25519`, and
-  `spki`. `gpg` turns on the GPG axis. Each engine name adds that engine to the
-  sign-api axis. A commit has to pass each axis, and one engine of the
-  sign-api axis is enough. A name given twice counts once. An empty value, an
-  empty element, `off` beside a name, `true`, `false`, `dummy`, and any other
-  name are refused.
-- `receive-gpgkeypath` -- the keyrings the GPG axis trusts: `;`-separated
-  keyring files and directories of `*.gpg` keyrings. The GPG axis needs at
-  least one entry, and an entry that names neither a file nor a directory is
-  refused. The keyrings have to hold at least one certificate among them, so
-  an empty keyring file, or a directory with no `*.gpg` keyring, as the only
-  entry is refused.
-- `receive-verification-ENGINE-key` and `receive-verification-ENGINE-file` --
-  the keys the sign-api axis trusts for one engine. The forms are those of the
-  remote keys `verification-ENGINE-key` (one base64 key) and
-  `verification-ENGINE-file` (a file of one base64 key per line). Each engine
-  that `receive-verify` names needs a key.
-- `receive-sign-type` and `receive-sign-key-file` -- one sign-api key the
-  server signs with. The type is `ed25519`, the default when only the file is
-  set, or `spki`. The file holds one base64 secret key: for `ed25519` the
-  64-byte seed and public key, for `spki` the key forms `ostree sign` takes. A
-  type with no file is refused, and `gpg` as a type is refused in favor of
-  `receive-gpg-sign`.
-- `receive-gpg-sign` and `receive-gpg-homedir` -- a list of GPG key selectors
-  the server signs with, and the GnuPG home directory `gpg` resolves them in.
-  Each selector has to name exactly one secret key.
-- `receive-sign-summary` -- boolean: sign the regenerated summary with the
-  server keys.
+- `[ex-ostrya receive]` -- the default rule, and the session keys.
+- `[ex-ostrya receive "PATTERN"]` -- the rule of the refs `PATTERN` matches.
+- `[ex-ostrya trust "NAME"]` -- a set of trusted keys and the axes it
+  requires.
+- `[ex-ostrya key "NAME"]` -- one signing key that the server holds.
 
-The receive path trusts only the keys these entries name. No system sign-api
-key store, no revoked set, no per-remote keyring, and no global trusted
-keyring directory takes part. `ReceivePolicy::from_config` reads the receive
-keys, `detached-metadata-exclude`, and `[core] auto-update-summary` (see
-"Config file").
+The tool gives quotes no meaning in a group name, so the port splits the name
+itself. `ex-ostrya receive`, `ex-ostrya trust "`, and `ex-ostrya key "` are
+literal prefixes with one space between the words. The quoted part ends the
+name, is not empty, and holds no `"` and no control character.
+
+`PATTERN` is one of these forms:
+
+- `NAME` -- the plain ref `NAME`.
+- `PREFIX/*` -- every plain ref under `PREFIX/`, at any depth. It does not
+  match `PREFIX`.
+- `REMOTE:NAME`, `REMOTE:PREFIX/*`, and `REMOTE:*` -- the same, and every
+  ref, for the remote refs of the remote `REMOTE`.
+- `*:NAME`, `*:PREFIX/*`, and `*:*` -- the same, for the remote refs of every
+  remote.
+
+`NAME` and `PREFIX` are ref names, and `REMOTE` is one component of a ref
+path. Another `*`, and a `*` in another place, are refused. The server selects
+one rule for each ref update:
+
+1. A remote ref matches only a pattern with a remote part, and a plain ref
+   only a pattern without one.
+2. A literal remote part wins over `*:`.
+3. An exact name wins over a prefix, and a longer prefix wins over a shorter
+   one. `REMOTE:*` and `*:*` are prefixes of length zero.
+4. A plain ref that no pattern matches gets the default rule. A remote ref
+   that no pattern matches is refused.
+
+The rule keys are valid in each receive group. A pattern rule takes no key
+from the default rule:
+
+- `accept` -- boolean, default true. `false` refuses each update of a
+  matching ref. A rule with `accept=false` that states `verify`, `sign`,
+  `allow-non-fast-forward`, or `allow-delete` is refused, because the key has
+  no effect.
+- `verify` -- `off` (the default), `trust:NAME` for the keys of
+  `[ex-ostrya trust "NAME"]`, or `remote:NAME` for the keys a pull from
+  `[remote "NAME"]` trusts for a commit. The `NAME` of `remote:NAME` is one
+  path component: it is not `.` or `..`, and it holds no `/` and no control
+  character.
+- `allow-non-fast-forward` -- boolean: accept a ref update whose new commit
+  does not descend from the current one.
+- `allow-delete` -- boolean: accept a ref delete.
+- `sign` -- a list of key group names: the keys the server signs each new
+  commit of a matching ref with. A name given twice counts once.
+
+The session keys are valid in `[ex-ostrya receive]` alone:
+
+- `allow-privileged` -- boolean: accept a setuid or setgid mode bit, and the
+  `security.capability` and `security.selinux` extended attributes, in a
+  `bare` repository.
+- `sign-summary` -- a list of key group names: the keys that sign the
+  regenerated summary.
+
+A trust group takes the key names and the value forms of a remote section:
+
+- `gpg-verify` -- boolean, default false. It turns on the GPG axis.
+- `gpgkeypath` -- `;`-separated keyring files and directories of `*.gpg`
+  keyrings. The GPG axis needs one entry at least. An entry that names
+  neither a file nor a directory is refused, and so are keyrings that hold no
+  certificate among them.
+- `sign-verify` -- a list of engine names, split on `,` and `;`, or a
+  boolean. The engines are `ed25519` and `spki`. `true` takes every engine
+  of the build that has a key, and skips an engine that has none, as a pull
+  does. A list of engine names needs a key for each engine it names.
+- `verification-ENGINE-key` and `verification-ENGINE-file` -- the trusted
+  keys of one engine, in the forms of the remote keys.
+
+A trust group that turns on no axis is refused. A key that no axis reads is
+refused: `gpgkeypath` without `gpg-verify=true`, and a `verification-*` key of
+an engine that `sign-verify` does not select. `gpg-verify-summary` and
+`sign-verify-summary` are refused. A trust group trusts the keys it names
+alone: no system sign-api key store, no revoked set, no per-remote keyring,
+and no global trusted keyring directory takes part.
+
+`remote:NAME` reads the remote section as a pull reads it, and trusts what a
+pull from the remote trusts for a commit: `gpg-verify` (default true),
+`gpgkeypath`, `<repo>/NAME.trustedkeys.gpg`,
+`/etc/ostree/remotes.d/NAME.trustedkeys.gpg`, the global trusted keyring
+directory, `sign-verify`, the `verification-*` keys, and the system sign-api
+key store minus its revoked set. A remote section that turns on no axis is
+refused.
+
+A key group holds one signing key:
+
+- `type` -- `ed25519`, `spki`, or `gpg`. Required. `dummy` is refused.
+- `secret-key-file` -- for `ed25519` and `spki`: a regular file of at most
+  1 MiB that holds exactly one non-empty line, a base64 secret key. For
+  `ed25519` the key is the 64-byte seed and public key, and for `spki` it is
+  a key form `ostree sign` takes.
+- `gpg-key` -- for `gpg`: one selector that names exactly one secret key.
+- `gpg-homedir` -- for `gpg`, optional: the GnuPG home directory.
+
+A key that does not belong to the type is refused. The reader builds each key
+group and each trust group once, also one that no rule names, so a key source
+that cannot be read fails the read of the policy.
+
+`ReceivePolicy::from_file` reads the receive groups and the remote sections
+from a policy file alone. A remote section in the file can be one that no
+rule names. The file holds no other group.
+The receive groups of `<repo>/config` are then not read, and a `remote:`
+reference does not read `<repo>/NAME.trustedkeys.gpg`. Both readers take
+`detached-metadata-exclude` and `[core] auto-update-summary` (see "Config
+file") from `<repo>/config`.
 
 The group carries no repository fact. Detached metadata sits outside the commit
 checksum, so a repository that sets any of these keys holds the same object
 bytes and the same checksums as one that sets none. The library reads
 `gc-root-metadata-keys` nowhere and reads `detached-metadata-exclude` for a
 pull nowhere: the `ostrya` CLI puts them into the options it supplies. The
-receive path reads its keys through `ReceivePolicy::from_config`.
+receive path reads its groups through `ReceivePolicy::from_config` and
+`ReceivePolicy::from_file`.
 
 The tool tolerates the group. Observed with `ostree` 2026.1 against an archive
 repository whose `config` holds these two lines:
@@ -1610,29 +1682,42 @@ gc-root-metadata-keys=app.roots;app.other;
   group and its key verbatim.
 
 Observed with `ostree` 2026.1 against an archive repository with one commit
-on `x` whose `config` holds every receive key, each set to a value of its
-type. The paths the keys name do not exist:
+on `x` whose `config` holds a group of each receive shape, with patterns that
+hold `/`, `*`, `:`, and `.`. The paths the keys name do not exist:
 
 ```
-[ex-ostrya]
-detached-metadata-exclude=app.x
-receive-allow-non-fast-forward=true
-receive-allow-delete=true
-receive-allow-privileged=true
-receive-allow-remote-refs=true
-receive-verify=gpg;ed25519
-receive-gpgkeypath=/nonexistent/keys.gpg
-receive-verification-ed25519-key=AAAA
-receive-verification-ed25519-file=/nonexistent/keys.ed25519
-receive-sign-type=ed25519
-receive-sign-key-file=/nonexistent/secret.ed25519
-receive-gpg-sign=0123456789ABCDEF
-receive-gpg-homedir=/nonexistent/gnupg
-receive-sign-summary=true
+[ex-ostrya receive]
+accept=false
+sign-summary=central-ed
+
+[ex-ostrya receive "apps/*"]
+verify=trust:release
+sign=central-ed
+
+[ex-ostrya receive "central:*"]
+verify=remote:central
+
+[ex-ostrya receive "*:apps/x.y"]
+allow-delete=true
+
+[ex-ostrya trust "release"]
+sign-verify=ed25519
+verification-ed25519-key=AAAA
+
+[ex-ostrya key "central-ed"]
+type=ed25519
+secret-key-file=/nonexistent/central.ed25519.key
 ```
 
 - `ostree refs`, `ostree fsck`, and `ostree summary -u` each exit 0 and write
   nothing to standard error. `summary -u` writes `summary`.
+- `config get` (dotted and with `--group`), `remote list`, and
+  `remote list -u` exit 0, `config set` keeps each group header and its keys
+  in order, and no receive group is listed as a remote. Dotted `config get`
+  splits `GROUP.KEY` at the first `.`, so a group whose pattern holds a `.` is
+  read with `config --group=GROUP get KEY`.
+- A group name with a control character fails the whole file with
+  `Invalid group name: <name>`.
 
 ## Commit modifier: canonical permissions, consume, and devino
 

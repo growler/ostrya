@@ -21,13 +21,14 @@
 //! the tool was observed to do.
 //!
 //! [`KeySource`] names where the keys come from. A pull reads them from a
-//! remote's configuration section. The receive path reads them from the
-//! `receive-*` keys of the `[ex-ostrya]` group: `receive-gpgkeypath` for the
-//! GPG axis, and `receive-verification-<engine>-key` and
-//! `receive-verification-<engine>-file` for the sign api. The receive path
-//! trusts these keys alone. It reads no system key store, no revoked set, no
-//! per-remote keyring, and no global trusted directory, so the keys a server
-//! holds commits to are the keys its own configuration names.
+//! remote's configuration section. The receive path reads them from a remote
+//! section in the same way, for a rule that takes the pull trust of a remote,
+//! or from a trust group, `[ex-ostrya trust "NAME"]`, which takes the key names
+//! of a remote section: `gpgkeypath` for the GPG axis, and
+//! `verification-<engine>-key` and `verification-<engine>-file` for the sign
+//! api. A trust group trusts these keys alone. It reads no system key store,
+//! no revoked set, no per-remote keyring, and no global trusted directory, so
+//! the keys a server holds commits to are the keys the group names.
 //!
 //! The pull's own rules, where the checks run and what a pull without a remote
 //! may ask for, are in the `pull::verify` module.
@@ -41,8 +42,6 @@ use rustix::fs::{Mode, OFlags};
 #[cfg(feature = "verify-gpg")]
 use rustix::io::Errno;
 
-#[cfg(feature = "receive")]
-use crate::config::RepoConfig;
 use crate::config::{Remote, SignVerify};
 use crate::error::{Error, Result};
 #[cfg(feature = "verify-gpg")]
@@ -88,6 +87,21 @@ impl Policy {
     /// apply.
     pub(crate) fn sign_axis(&self) -> Option<&[Arc<dyn Verifier>]> {
         self.sign.as_deref()
+    }
+
+    /// A policy over the axes given, each present where it applies.
+    #[cfg(feature = "receive")]
+    pub(crate) fn from_axes(
+        gpg: Option<Arc<dyn Verifier>>,
+        sign: Option<Vec<Arc<dyn Verifier>>>,
+    ) -> Policy {
+        Policy { gpg, sign }
+    }
+
+    /// Whether the GPG axis applies.
+    #[cfg(feature = "receive")]
+    pub(crate) fn gpg_axis(&self) -> bool {
+        self.gpg.is_some()
     }
 
     /// Hold `payload` to every axis of this policy. `signatures` is the
@@ -180,14 +194,24 @@ pub(crate) enum KeySource<'a> {
     /// A remote's configuration section, as a pull reads it. `section` is
     /// `None` for a remote the configuration does not describe.
     Remote {
-        /// The remote's name, which names its repository keyring.
+        /// The remote's name, which names its keyrings.
         name: &'a str,
         /// The remote's configuration section.
         section: Option<&'a Remote<'a>>,
+        /// Whether the repository's own `<remote>.trustedkeys.gpg` adds to the
+        /// GPG trusted set.
+        #[cfg_attr(not(feature = "verify-gpg"), allow(dead_code))]
+        repo_keyring: bool,
     },
-    /// The receive keys of the `[ex-ostrya]` group.
+    /// A trust group, `[ex-ostrya trust "NAME"]`, read through the accessors
+    /// of a remote section.
     #[cfg(feature = "receive")]
-    Receive(&'a RepoConfig),
+    Trust {
+        /// The group's name, which a refusal names.
+        name: &'a str,
+        /// The group, read as a remote section.
+        section: &'a Remote<'a>,
+    },
 }
 
 impl KeySource<'_> {
@@ -199,9 +223,7 @@ impl KeySource<'_> {
                 None => Ok(None),
             },
             #[cfg(feature = "receive")]
-            KeySource::Receive(config) => {
-                config.ex_ostrya_string(&format!("receive-verification-{engine}-key"))
-            }
+            KeySource::Trust { section, .. } => section.verification_key(engine),
         }
     }
 
@@ -213,9 +235,7 @@ impl KeySource<'_> {
                 None => Ok(None),
             },
             #[cfg(feature = "receive")]
-            KeySource::Receive(config) => {
-                config.ex_ostrya_string(&format!("receive-verification-{engine}-file"))
-            }
+            KeySource::Trust { section, .. } => section.verification_file(engine),
         }
     }
 
@@ -225,7 +245,7 @@ impl KeySource<'_> {
         match self {
             KeySource::Remote { .. } => true,
             #[cfg(feature = "receive")]
-            KeySource::Receive(_) => false,
+            KeySource::Trust { .. } => false,
         }
     }
 }
@@ -325,32 +345,6 @@ pub(crate) async fn build_policy(
     Ok(policy)
 }
 
-/// The policy the receive path holds a commit to, from the receive keys of
-/// `repo`'s configuration.
-///
-/// `verify` is the parsed `receive-verify` value. The GPG axis applies when it
-/// names `gpg`, and the sign-api axis holds the engines it names, each of which
-/// has to have a key.
-#[cfg(feature = "receive")]
-pub(crate) async fn receive_policy(
-    repo: &Repo,
-    verify: &crate::receive::ReceiveVerify,
-) -> Result<Policy> {
-    let sign = if verify.sign.is_empty() {
-        SignVerify::Off
-    } else {
-        SignVerify::Engines(verify.sign.clone())
-    };
-    build_policy(
-        repo,
-        &KeySource::Receive(repo.config()),
-        &mut Verifiers::default(),
-        verify.gpg,
-        &sign,
-    )
-    .await
-}
-
 /// The engine names of a `sign-verify` value, each kept where the value first
 /// names it. `remote add` writes `sign-verify=ed25519,ed25519` for an engine
 /// given twice, and one verifier per name would hold every signature to that
@@ -368,14 +362,22 @@ fn each_engine_once(names: &[String]) -> Vec<String> {
 /// The GPG verifier for a key source.
 ///
 /// For a remote: the repository's own keyring for it, read through the
-/// repository descriptor, plus the system trusted set and whatever
-/// `gpgkeypath` names. For the receive path: the keyrings
-/// `receive-gpgkeypath` names, and nothing else.
+/// repository descriptor where the source asks for it, plus the system trusted
+/// set and whatever `gpgkeypath` names. For a trust group: the keyrings its
+/// `gpgkeypath` names, and nothing else.
 #[cfg(feature = "verify-gpg")]
 async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Verifier>> {
     let verifier = match source {
-        KeySource::Remote { name, section } => {
-            let keyring = read_repo_keyring(repo, name).await?;
+        KeySource::Remote {
+            name,
+            section,
+            repo_keyring,
+        } => {
+            let keyring = if *repo_keyring {
+                read_repo_keyring(repo, name).await?
+            } else {
+                None
+            };
             let keypath = match section {
                 Some(section) => section.gpgkeypath()?,
                 None => Vec::new(),
@@ -387,27 +389,11 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
             .await?
         }
         #[cfg(feature = "receive")]
-        KeySource::Receive(config) => {
-            let keypath: Vec<String> = config
-                .ex_ostrya_string("receive-gpgkeypath")?
-                .map(|raw| {
-                    raw.split(';')
-                        .filter(|entry| !entry.is_empty())
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            if keypath.is_empty() {
-                return Err(Error::Signature(
-                    "GPG verification is enabled for received commits, but \
-                     [ex-ostrya] receive-gpgkeypath names no keyring"
-                        .into(),
-                ));
-            }
-            ostrya_rt::unblock(move || {
-                crate::gpg::GpgVerifier::from_keypath("receive-gpgkeypath", &keypath)
-            })
-            .await?
+        KeySource::Trust { name, section } => {
+            let keypath = section.gpgkeypath()?;
+            let key = format!("[ex-ostrya trust \"{name}\"] gpgkeypath");
+            ostrya_rt::unblock(move || crate::gpg::GpgVerifier::from_keypath(&key, &keypath))
+                .await?
         }
     };
     Ok(Arc::new(verifier))
@@ -423,11 +409,10 @@ async fn gpg_verifier(_repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ve
              engine for; build with the verify-gpg feature or set gpg-verify=false"
         ))),
         #[cfg(feature = "receive")]
-        KeySource::Receive(_) => Err(Error::Unsupported(
-            "[ex-ostrya] receive-verify asks for GPG verification, which this \
+        KeySource::Trust { name, .. } => Err(Error::Unsupported(format!(
+            "[ex-ostrya trust \"{name}\"] asks for GPG verification, which this \
              build has no engine for; build with the verify-gpg feature"
-                .into(),
-        )),
+        ))),
     }
 }
 
@@ -603,6 +588,7 @@ mod tests {
     const NO_SECTION: KeySource<'static> = KeySource::Remote {
         name: "origin",
         section: None,
+        repo_keyring: true,
     };
 
     /// `sign-verify=true` names the engines this build has, and never the dummy
@@ -725,6 +711,7 @@ mod tests {
             let source = KeySource::Remote {
                 name: "origin",
                 section: section.as_ref(),
+                repo_keyring: true,
             };
             build_policy(&repo, &source, &mut cache, false, &sign).await
         });
@@ -751,6 +738,7 @@ mod tests {
             let source = KeySource::Remote {
                 name: "origin",
                 section: section.as_ref(),
+                repo_keyring: true,
             };
             let mut cache = Verifiers::default();
             let first = cache.sign("ed25519", &source).await.unwrap();
@@ -892,43 +880,23 @@ mod tests {
         );
     }
 
-    /// A repository created in a fresh scratch directory with `ex_ostrya`
-    /// appended to its config as the `[ex-ostrya]` group, and the directory,
-    /// which the caller removes.
-    #[cfg(feature = "receive")]
-    async fn receive_repo(name: &str, ex_ostrya: &str) -> (Repo, std::path::PathBuf) {
-        use crate::{CreateOptions, RepoMode};
-
-        let dir = std::env::temp_dir().join(format!(
-            "ostrya-verify-{name}-{}-{}",
-            std::process::id(),
-            crate::write::unique()
-        ));
-        let root = dir.join("repo");
-        std::fs::create_dir_all(&dir).unwrap();
-        Repo::create(&root, CreateOptions::new(RepoMode::Archive))
-            .await
-            .unwrap();
-        let mut config = std::fs::read_to_string(root.join("config")).unwrap();
-        config.push_str(&format!("\n[ex-ostrya]\n{ex_ostrya}"));
-        std::fs::write(root.join("config"), config).unwrap();
-        (Repo::open(&root).await.unwrap(), dir)
-    }
-
-    /// The receive source reads the `receive-verification-*` keys of the
-    /// `[ex-ostrya]` group, and the remote keys of the same name do not reach
-    /// it. It reads no system key store.
+    /// The trust source reads the `verification-*` keys of its group, and the
+    /// remote keys of the same name do not reach it. It reads no system key
+    /// store, where a remote does.
     #[cfg(feature = "receive")]
     #[test]
-    fn receive_source_reads_receive_keys() {
-        let config = crate::config::RepoConfig::parse(
-            "[core]\nrepo_version=1\nmode=archive\n\
-             [remote \"origin\"]\nurl=http://localhost/\nverification-ed25519-key=REMOTE\n\
-             [ex-ostrya]\nreceive-verification-ed25519-key=INLINE\n\
-             receive-verification-ed25519-file=/keys.ed25519\n",
+    fn trust_source_reads_its_own_group() {
+        let keyfile = ostrya_core::KeyFile::parse(
+            "[remote \"t\"]\nverification-ed25519-key=REMOTE\n\
+             [ex-ostrya trust \"t\"]\nverification-ed25519-key=INLINE\n\
+             verification-ed25519-file=/keys.ed25519\n",
         )
         .unwrap();
-        let source = KeySource::Receive(&config);
+        let section = Remote::view(&keyfile, "ex-ostrya trust \"t\"".to_owned());
+        let source = KeySource::Trust {
+            name: "t",
+            section: &section,
+        };
         assert_eq!(
             source.verification_key("ed25519").unwrap().as_deref(),
             Some("INLINE")
@@ -942,138 +910,46 @@ mod tests {
         assert!(NO_SECTION.system_store());
     }
 
-    /// The receive policy holds a commit to the configured key: a signature
-    /// from it passes, a commit with no signature and a signature from another
-    /// key are each refused.
-    #[cfg(feature = "receive")]
+    /// A remote source that leaves the repository keyring out does not open
+    /// `<repo>/<remote>.trustedkeys.gpg`: a keyring there over the ceiling,
+    /// which the pull refuses, does not reach the build.
+    #[cfg(feature = "verify-gpg")]
     #[test]
-    fn receive_policy_checks_a_commit() {
-        use crate::receive::ReceiveVerify;
-        use crate::sign::{Ed25519Signer, Signer, append_signature};
+    fn a_source_without_the_repository_keyring_does_not_read_it() {
+        use crate::gpg::MAX_KEYRING;
+        use crate::{CreateOptions, RepoMode};
 
-        const SECRET_B64: &str = "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
-        const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
-        const OTHER_SECRET_B64: &str = "5ILWxT+l9G/u3h0BptRpmSi35C9uog7YDdD+Fp1Xk+Hz52p0NlYh6xBA73kJEJKhKbbnjcE0rsWA5XA/K5Sq5Q==";
-        const PAYLOAD: &[u8] = b"the commit bytes";
-
-        let signed = |secret: &str| {
-            let signer = Ed25519Signer::from_base64(secret).unwrap();
-            let blob = ostrya_rt::block_on(signer.sign(PAYLOAD)).unwrap();
-            let mut dict = Value::Array(Vec::new());
-            append_signature(&mut dict, signer.metadata_key(), blob).unwrap();
-            dict
-        };
-        let verify = ReceiveVerify {
-            gpg: false,
-            sign: vec!["ed25519".to_owned()],
-        };
-        let own = signed(SECRET_B64);
-        let other = signed(OTHER_SECRET_B64);
-        let (outcome, dir) = ostrya_rt::block_on(async {
-            let (repo, dir) = receive_repo(
-                "receive-policy",
-                &format!("receive-verification-ed25519-key={PUBLIC_B64}\n"),
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-verify-nokeyring-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outcome = ostrya_rt::block_on(async {
+            let repo = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            std::fs::File::create(root.join("origin.trustedkeys.gpg"))
+                .unwrap()
+                .set_len(MAX_KEYRING + 1)
+                .unwrap();
+            let without = KeySource::Remote {
+                name: "origin",
+                section: None,
+                repo_keyring: false,
+            };
+            (
+                gpg_verifier(&repo, &without).await.map(|_| ()),
+                gpg_verifier(&repo, &NO_SECTION).await.map(|_| ()),
             )
-            .await;
-            let policy = receive_policy(&repo, &verify).await.unwrap();
-            assert!(policy.applies());
-            let outcome = (
-                policy.check("commit", PAYLOAD, Some(&own)).await,
-                policy.check("commit", PAYLOAD, None).await,
-                policy.check("commit", PAYLOAD, Some(&other)).await,
-            );
-            (outcome, dir)
         });
         std::fs::remove_dir_all(&dir).unwrap();
-        let (valid, unsigned, untrusted) = outcome;
-        valid.expect("a signature from the configured key passes");
-        let err = unsigned.unwrap_err();
-        assert!(err.to_string().contains("carries no signature"), "{err}");
-        let err = untrusted.unwrap_err();
+        let (without, with) = outcome;
+        without.expect("the repository keyring is not read");
+        let err = with.expect_err("the repository keyring is read, and refused");
         assert!(
-            err.to_string()
-                .contains("no sign-api signature is from a trusted key"),
-            "{err}"
-        );
-    }
-
-    /// An engine the receive policy names with no key of its own is refused,
-    /// and the system key store does not stand in for one.
-    #[cfg(feature = "receive")]
-    #[test]
-    fn receive_policy_refuses_an_engine_without_a_key() {
-        use crate::receive::ReceiveVerify;
-
-        let verify = ReceiveVerify {
-            gpg: false,
-            sign: vec!["ed25519".to_owned()],
-        };
-        let (outcome, dir) = ostrya_rt::block_on(async {
-            let (repo, dir) = receive_repo("receive-nokey", "").await;
-            (receive_policy(&repo, &verify).await.map(|_| ()), dir)
-        });
-        std::fs::remove_dir_all(&dir).unwrap();
-        let err = outcome.unwrap_err();
-        assert!(
-            matches!(&err, Error::Signature(m) if m.contains("no trusted key for signature engine 'ed25519'")),
-            "{err}"
-        );
-    }
-
-    /// The GPG axis of the receive policy needs `receive-gpgkeypath`: with no
-    /// keyring named, the policy is refused, and a build without the GPG
-    /// engine refuses the axis itself.
-    #[cfg(feature = "receive")]
-    #[test]
-    fn receive_policy_refuses_gpg_without_keypath() {
-        use crate::receive::ReceiveVerify;
-
-        let verify = ReceiveVerify {
-            gpg: true,
-            sign: Vec::new(),
-        };
-        let (outcome, dir) = ostrya_rt::block_on(async {
-            let (repo, dir) = receive_repo("receive-gpg", "receive-gpgkeypath=;\n").await;
-            (receive_policy(&repo, &verify).await.map(|_| ()), dir)
-        });
-        std::fs::remove_dir_all(&dir).unwrap();
-        let err = outcome.unwrap_err();
-        #[cfg(feature = "verify-gpg")]
-        assert!(
-            matches!(&err, Error::Signature(m) if m.contains("receive-gpgkeypath names no keyring")),
-            "{err}"
-        );
-        #[cfg(not(feature = "verify-gpg"))]
-        assert!(
-            matches!(&err, Error::Unsupported(m) if m.contains("verify-gpg feature")),
-            "{err}"
-        );
-    }
-
-    /// A `receive-gpgkeypath` entry that names nothing is refused by the key
-    /// and the entry.
-    #[cfg(all(feature = "receive", feature = "verify-gpg"))]
-    #[test]
-    fn receive_policy_refuses_a_missing_keypath_entry() {
-        use crate::receive::ReceiveVerify;
-
-        let verify = ReceiveVerify {
-            gpg: true,
-            sign: Vec::new(),
-        };
-        let (outcome, dir) = ostrya_rt::block_on(async {
-            let (repo, dir) = receive_repo(
-                "receive-gpgmissing",
-                "receive-gpgkeypath=/nonexistent/ostrya/keys.gpg\n",
-            )
-            .await;
-            (receive_policy(&repo, &verify).await.map(|_| ()), dir)
-        });
-        std::fs::remove_dir_all(&dir).unwrap();
-        let err = outcome.unwrap_err();
-        assert!(
-            matches!(&err, Error::Signature(m)
-                if m.contains("receive-gpgkeypath entry '/nonexistent/ostrya/keys.gpg'")),
+            matches!(&err, Error::Signature(m) if m.contains("origin.trustedkeys.gpg")),
             "{err}"
         );
     }

@@ -2169,37 +2169,73 @@ impl Repo {
 ## Receive policy (feature `receive`)
 
 The policy the server side of a push applies. `ReceivePolicy::from_config`
-reads it from the `receive-*` keys of the `[ex-ostrya]` group, `[core]
+reads it from the receive groups of the repository config,
+`[ex-ostrya receive]`, `[ex-ostrya receive "PATTERN"]`,
+`[ex-ostrya trust "NAME"]`, and `[ex-ostrya key "NAME"]`, with `[core]
 auto-update-summary` and its alias, and `[ex-ostrya]
 detached-metadata-exclude` (`format-reference.md`, "Port extension: the
-ex-ostrya config group"). It reads the trusted keys once, so a key source the
-policy cannot use fails the call. The option structs are exhaustive, as the
-other option structs of the crate are.
+ex-ostrya config group"). `ReceivePolicy::from_file` reads the same groups
+from a policy file alone. Both build each trust group and each key group once,
+so a key source the policy cannot use fails the call, and the rules share
+what they build. The structs are exhaustive, as the other option structs of
+the crate are.
 
 ```rust
 #[derive(Debug, Default)]
 pub struct ReceivePolicy {
-    pub allow_non_fast_forward: bool,
-    pub allow_delete: bool,
+    pub default_rule: ReceiveRule,              // [ex-ostrya receive]
+    pub rules: Vec<(RefPattern, ReceiveRule)>,  // [ex-ostrya receive "P"]
     pub allow_privileged: bool,
-    pub allow_remote_refs: bool,
-    pub require_signature: ReceiveVerify,
-    pub signers: Vec<ServerSigner>,   // sign-api key first, then GPG keys
-    pub sign_summary: bool,
+    pub summary_signers: Vec<Arc<ServerSigner>>,
     pub update_summary: bool,
     pub detached_metadata_filter: Option<DetachedMetadataFilter>,
 }
 
-/// The two axes are ANDed, the engines of `sign` are ORed. `gpg` false and
-/// an empty `sign` require no signature.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReceiveVerify {
-    pub gpg: bool,                    // keyrings of receive-gpgkeypath
-    pub sign: Vec<String>,            // "ed25519", "spki"; each once
+/// `Default` accepts fast-forward updates with no signature check and no
+/// server signature.
+#[derive(Debug, Clone)]
+pub struct ReceiveRule {
+    pub accept: bool,                           // default true
+    pub verify: ReceiveVerify,
+    pub allow_non_fast_forward: bool,
+    pub allow_delete: bool,
+    pub signers: Vec<Arc<ServerSigner>>,
+}
+
+/// `NAME`, `PREFIX/*`, and either one after `REMOTE:` or `*:`, and
+/// `REMOTE:*` and `*:*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefPattern { /* private */ }
+impl RefPattern {
+    pub fn parse(pattern: &str) -> Result<RefPattern>;
+    pub fn as_str(&self) -> &str;
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum ReceiveVerify {
+    #[default]
+    Off,
+    Keys(Arc<TrustedKeys>),
+}
+
+/// The axes are ANDed, the sign-api engines are ORed.
+pub struct TrustedKeys { /* private: the built verifiers */ }
+impl TrustedKeys {
+    /// The keys a pull from the remote trusts for a commit.
+    pub async fn for_remote(repo: &Repo, remote: &str) -> Result<TrustedKeys>;
+    /// A sign-api axis; an empty list and a dummy verifier are refused.
+    pub fn new(sign: Vec<Arc<dyn Verifier>>) -> Result<TrustedKeys>;
+    /// A GPG axis, and a sign-api axis where `sign` is not empty; a dummy
+    /// verifier is refused.
+    #[cfg(feature = "verify-gpg")]
+    pub fn with_gpg(gpg: GpgVerifier, sign: Vec<Arc<dyn Verifier>>) -> Result<TrustedKeys>;
 }
 
 impl ReceivePolicy {
     pub async fn from_config(repo: &Repo) -> Result<ReceivePolicy>;
+    pub async fn from_file(repo: &Repo, path: &Path) -> Result<ReceivePolicy>;
+    /// The rule of `NAME` or `REMOTE:NAME`; `None` refuses the update.
+    pub fn rule_for(&self, refspec: &str) -> Option<&ReceiveRule>;
 }
 
 /// One server signing key, paired with a verifier that trusts that key

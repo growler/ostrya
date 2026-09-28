@@ -103,6 +103,7 @@ impl Verification {
         let source = KeySource::Remote {
             name,
             section: section.as_ref(),
+            repo_keyring: true,
         };
         let mut cache = Verifiers::default();
         let commit = build_policy(repo, &source, &mut cache, gpg_commit, &sign_commit).await?;

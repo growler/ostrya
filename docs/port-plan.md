@@ -288,14 +288,44 @@ conflict, and closing any one descriptor to the file drops every lock the
 process holds on it. A process-global registry keyed by the lock file's
 `(device, inode)` gives every handle to one repository -- clones and independent
 opens alike -- the same descriptor and reference count, so exactly one `.lock`
-descriptor exists per repository per process. The reference tool's roughly
-one-second lock-acquisition retry spin becomes an `rt::Timer` retry loop bounded
-by `lock-timeout-secs`. Each attempt is a non-blocking lock request on the
-calling task, so a dropped wait leaves no request and no hold behind.
+descriptor exists per repository per process. A dropped lock closes its
+descriptor and removes its registry entry under the registry mutex. No call
+opens a new descriptor to an inode while the registry holds an entry for it, and
+a descriptor that an open returns for an inode the registry already holds stays
+open until that entry goes. The registry mutex stays held across the open on the
+first use of a lock file, which keeps these rules simple. The reference tool's
+roughly one-second lock-acquisition retry spin becomes an `rt::Timer` retry loop
+bounded by `lock-timeout-secs`. Each attempt is a non-blocking lock request on
+the calling task, so a dropped wait leaves no request and no hold behind.
 `lock-timeout-secs=-1` runs the loop with no deadline, where the tool blocks in
 `F_OFD_SETLKW` until the holder releases the lock. The port makes no blocking
-lock request. A value below `-1` is refused: the tool then takes no lock at
-all (`format-reference.md`, "Repository lock and staging").
+lock request. A value below `-1` is refused: the tool then takes no lock at all
+(`format-reference.md`, "Repository lock and staging").
+
+With the `receive` feature, a second lock serializes the ref updates of the
+receive path: an exclusive `fcntl` record lock (`F_SETLK`) on
+`<repo>/.ref-update.lock`, beside `.lock`. The lock is port-only: the tool never
+opens the file. The port opens and creates the file by the rules of `.lock`, on
+the first acquire, and never unlinks it. The same process-global registry holds
+both locks, so the process keeps one descriptor for each lock file. A lock file
+that shares its inode with the other lock file, as a hard link makes, is
+refused: a second descriptor to that inode would drop the other lock when it
+closes. Inside the process the lock is exclusive. Its waiters queue in FIFO
+order from the first poll of the acquire, and only the head of the queue makes
+lock requests. The first acquire on a handle opens the lock file on the blocking
+pool and joins the queue when the open completes. Each later acquire on the
+handle reads the cached lock on the calling task. A release always drops the
+record lock, so another process can take the lock between two holders of this
+process. Against other processes the head runs the non-blocking retry loop of
+`.lock`, with no order among processes, so a waiter can lose every retry until
+the timeout. The port makes no `F_SETLKW` request for this lock either. The wait
+reads `lock-timeout-secs`, which covers the wait in the queue and the retries,
+and fails with the `LockTimeout` error of `.lock`. The timeout does not cover
+the open of the first acquire on a handle. `-1` waits with no limit, and `0`
+makes one attempt. The lock ignores `[core] locking=false` and always takes the
+record lock. A caller takes the repository lock before the ref-update lock,
+never the reverse. The repository lock stays shared while the ref-update lock is
+held.
 
 ### Durability contract
 
@@ -7993,6 +8023,10 @@ Resolved:
    `rt::Timer` retry loop bounded by `lock-timeout-secs`. No new external
    crates: `rt::Timer` wraps the existing backends (`smol::Timer`,
    `tokio::time`) and the in-process coordination uses `std::sync::Mutex`.
+   The ref-update lock on `<repo>/.ref-update.lock` uses the same record lock,
+   the same registry, and the same retry loop, with a FIFO queue of in-process
+   waiters built from `std::sync::Mutex` and `Waker`. It ignores `[core]
+   locking=false`.
 
 9. Repo finders: the config and mount finders land with the phase that brings
    collection refs, which a finder resolves and which is not yet scheduled; they

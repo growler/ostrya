@@ -480,6 +480,7 @@ which the tool refuses every write ("Not allowed due to repo mode").
 <repo>/
   config                          GKeyFile INI, repo root
   .lock                           repository lock file (advisory)
+  .ref-update.lock                port-only ref-update lock file (lazy)
   objects/<c0c1>/<c2..c63>.<ext>[z]   loose objects
   refs/heads/<ref>                local refs (ref may contain '/')
   refs/remotes/<remote>/<ref>     remote refs
@@ -796,7 +797,9 @@ six-character `mkdtemp` suffix. A sibling file `tmp/staging-<bootid>-XXXXXX-lock
 (mode `0600`) is held with an exclusive OFD lock while the staging directory is
 in use, so a later transaction can tell a live staging directory from one left
 by a dead transaction. These locks are advisory and cross-process; the checksums
-and object bytes do not depend on them.
+and object bytes do not depend on them. The file `<repo>/.ref-update.lock`
+holds the ref-update lock of the port's receive path. The tool never opens this
+file, so the lock excludes port processes alone.
 
 `[core] lock-timeout-secs` bounds the wait for `.lock`. Observed with `ostree`
 2026.1 on `prune --refs-only` while another process holds `.lock` with an
@@ -3402,9 +3405,9 @@ process file-creation mask does not reach them:
   so the group descends to each directory created below. The sticky bit stays
   off, because the stale-staging reaper removes staging trees that other
   members own.
-- `.lock` and each per-transaction staging sibling lock take 0660, so every
-  group member opens them `O_RDWR`, takes the repository lock, and reaps a
-  staging tree whose owner has died.
+- `.lock`, `.ref-update.lock`, and each per-transaction staging sibling lock
+  take 0660, so every group member opens them `O_RDWR`, takes the repository
+  lock and the ref-update lock, and reaps a staging tree whose owner has died.
 - The `state/<commit>.commitpartial` marker takes 0644.
 
 Forcing applies on the arm of a create where the port made the entry. An entry

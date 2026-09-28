@@ -37,6 +37,8 @@ use rustix::io::Errno;
 use crate::config::{MinFreeSpace, RepoConfig};
 use crate::error::{Error, Result};
 use crate::lock::{self, LockGuard, LockKind, RepoLock};
+#[cfg(feature = "receive")]
+use crate::lock::{RefUpdateGuard, RefUpdateLock};
 use crate::perm;
 use crate::staging::StagingDir;
 use crate::transaction::Transaction;
@@ -114,6 +116,11 @@ struct RepoInner {
     // handle's lifetime so every clone of this handle shares one `.lock`
     // descriptor and one in-process hold count.
     lock: Mutex<Option<Arc<RepoLock>>>,
+    // The ref-update lock, created on the first ref-update acquire and held
+    // for the handle's lifetime beside `lock`, so every clone of this handle
+    // shares one `.ref-update.lock` descriptor and one waiter queue.
+    #[cfg(feature = "receive")]
+    ref_update_lock: Mutex<Option<Arc<RefUpdateLock>>>,
 }
 
 impl RepoInner {
@@ -125,6 +132,20 @@ impl RepoInner {
             return Ok(existing.clone());
         }
         let lock = RepoLock::get_or_create(self.repo_fd.as_fd(), self.config.mode())?;
+        *slot = Some(lock.clone());
+        Ok(lock)
+    }
+
+    /// The shared [`RefUpdateLock`] for this repository, creating and
+    /// registering `<repo>/.ref-update.lock` on first use. Runs synchronous
+    /// filesystem calls.
+    #[cfg(feature = "receive")]
+    fn ref_update_lock(&self) -> std::io::Result<Arc<RefUpdateLock>> {
+        let mut slot = self.ref_update_lock.lock().unwrap();
+        if let Some(existing) = slot.as_ref() {
+            return Ok(existing.clone());
+        }
+        let lock = RefUpdateLock::get_or_create(self.repo_fd.as_fd(), self.config.mode())?;
         *slot = Some(lock.clone());
         Ok(lock)
     }
@@ -256,12 +277,57 @@ impl Repo {
         if !locking {
             return Ok(LockGuard::disabled());
         }
-        let repo = self.clone();
-        let lock = ostrya_rt::unblock(move || repo.inner.repo_lock()).await?;
-        // The config reader refuses a value below -1, so a negative value
-        // here is -1: no limit.
-        let timeout = u64::try_from(timeout_secs).ok().map(Duration::from_secs);
-        lock::acquire(lock, kind, timeout).await
+        // A cached lock is read on the calling task. Only the first use of the
+        // handle opens the lock file on the blocking pool.
+        let cached = self.inner.lock.lock().unwrap().clone();
+        let lock = match cached {
+            Some(lock) => lock,
+            None => {
+                let repo = self.clone();
+                ostrya_rt::unblock(move || repo.inner.repo_lock()).await?
+            }
+        };
+        lock::acquire(lock, kind, lock_timeout(timeout_secs)).await
+    }
+
+    /// Take the ref-update lock, held until the guard drops.
+    ///
+    /// The lock is exclusive across processes and inside the process. The
+    /// waiters of one process take it in the order of the first poll of their
+    /// calls, and only the first of them makes lock requests. The call reads
+    /// `[core] lock-timeout-secs`, and the timeout covers the wait in the
+    /// queue and the retries against other processes. It then fails with
+    /// [`Error::LockTimeout`]; with `lock-timeout-secs=-1` it waits with no
+    /// limit, and with `0` it makes one attempt. The call ignores `[core]
+    /// locking` and always takes the lock.
+    ///
+    /// The first call on a handle opens the lock file on the blocking pool
+    /// before it joins the queue. That call joins the queue when the open
+    /// completes, and the timeout does not cover the open. Each later call on
+    /// the handle, or on a clone of it, joins the queue on its first poll.
+    ///
+    /// A release always drops the record lock, so another process can take
+    /// the lock between two holders of this process.
+    ///
+    /// Take the repository lock before the ref-update lock, never the reverse.
+    /// Against other processes the lock has no order: a waiter can lose every
+    /// retry to another process until the timeout elapses.
+    #[cfg(feature = "receive")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn lock_ref_update(&self) -> Result<RefUpdateGuard> {
+        let timeout_secs = self.inner.config.lock_timeout_secs()?;
+        // A cached lock is read on the calling task, so the call joins the
+        // queue on its first poll. Only the first use of the handle opens the
+        // lock file on the blocking pool.
+        let cached = self.inner.ref_update_lock.lock().unwrap().clone();
+        let lock = match cached {
+            Some(lock) => lock,
+            None => {
+                let repo = self.clone();
+                ostrya_rt::unblock(move || repo.inner.ref_update_lock()).await?
+            }
+        };
+        lock::acquire_ref_update(lock, lock_timeout(timeout_secs)).await
     }
 
     /// The repository root directory fd, anchoring fd-relative access to
@@ -289,9 +355,17 @@ impl Repo {
                 config,
                 path,
                 lock: Mutex::new(None),
+                #[cfg(feature = "receive")]
+                ref_update_lock: Mutex::new(None),
             }),
         })
     }
+}
+
+/// The lock wait of a `lock-timeout-secs` value. The config reader refuses a
+/// value below -1, so a negative value here is -1: no limit.
+fn lock_timeout(secs: i64) -> Option<Duration> {
+    u64::try_from(secs).ok().map(Duration::from_secs)
 }
 
 /// Compute a transaction's initial free-space budget: the bytes free on the
@@ -408,4 +482,16 @@ fn initial_config_text(opts: &CreateOptions) -> String {
 fn assert_send_sync() {
     fn is_send_sync<T: Send + Sync>() {}
     is_send_sync::<Repo>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_timeout_maps_the_config_value() {
+        assert_eq!(lock_timeout(-1), None);
+        assert_eq!(lock_timeout(0), Some(Duration::ZERO));
+        assert_eq!(lock_timeout(5), Some(Duration::from_secs(5)));
+    }
 }

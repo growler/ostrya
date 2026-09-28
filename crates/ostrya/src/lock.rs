@@ -17,6 +17,11 @@
 //! one descriptor lock, touching the descriptor only at the transitions that
 //! change the effective lock.
 //!
+//! A dropped lock closes its descriptor and removes its registry entry under
+//! the registry mutex, and no call opens a new descriptor to an inode while
+//! the registry holds an entry for it. So the descriptor of a dropped lock
+//! never closes after a new lock on the same inode is taken.
+//!
 //! A shared acquire and an exclusive acquire exclude each other inside the
 //! process: an exclusive acquire waits while any shared holder stands, and a
 //! shared acquire waits while an exclusive holder stands. An exclusive acquire
@@ -29,10 +34,16 @@
 //! tool's retry-until-timeout behavior. A loop with no deadline stands for the
 //! value `-1`, which the tool reads as no limit. No attempt blocks in the
 //! kernel, so a dropped wait leaves no lock request behind.
+//!
+//! With the `receive` feature a second lock file, `<repo>/.ref-update.lock`,
+//! serializes the ref updates of the receive path (see [`ref_update`]). The
+//! same registry holds both locks, so one inode is never open through two
+//! live descriptors in the process, and a lock file that shares its inode with
+//! the other lock file is refused.
 
 use std::collections::HashMap;
 use std::os::fd::{BorrowedFd, OwnedFd};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use ostrya_core::RepoMode;
@@ -42,10 +53,15 @@ use rustix::io::Errno;
 use crate::error::{Error, Result};
 use crate::perm;
 
+#[cfg(feature = "receive")]
+mod ref_update;
+#[cfg(feature = "receive")]
+pub(crate) use ref_update::{RefUpdateGuard, RefUpdateLock, acquire_ref_update};
+
 /// The repository lock file, relative to the repository root.
 const LOCK_FILE: &str = ".lock";
 
-/// The mode a created `.lock` file is requested with, matching the tool. The
+/// The mode a created lock file is requested with, matching the tool. The
 /// process umask reduces it. In a `bare-user-shared` repository an `fchmod`
 /// after the create restores [`perm::SHARED_LOCK_MODE`].
 const LOCK_MODE: u32 = 0o660;
@@ -93,17 +109,212 @@ enum TryOutcome {
 #[derive(Debug)]
 pub(crate) struct RepoLock {
     key: (u64, u64),
-    fd: OwnedFd,
+    /// The `.lock` descriptor. It is `Some` until the drop closes it under the
+    /// registry mutex.
+    fd: Option<OwnedFd>,
     state: Mutex<LockState>,
 }
 
-/// The process-global registry mapping a lock file's `(device, inode)` to its
-/// live [`RepoLock`].
-type LockRegistry = HashMap<(u64, u64), Weak<RepoLock>>;
+/// A lock the registry holds for one lock file.
+#[derive(Debug)]
+enum Registered {
+    Repo(Weak<RepoLock>),
+    #[cfg(feature = "receive")]
+    RefUpdate(Weak<RefUpdateLock>),
+}
 
-fn registry() -> &'static Mutex<LockRegistry> {
-    static REGISTRY: OnceLock<Mutex<LockRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+impl Registered {
+    /// The repository lock of this entry, or `None` for another kind of lock.
+    fn repo(&self) -> Option<&Weak<RepoLock>> {
+        match self {
+            Registered::Repo(weak) => Some(weak),
+            #[cfg(feature = "receive")]
+            _ => None,
+        }
+    }
+
+    /// The ref-update lock of this entry, or `None` for another kind of lock.
+    #[cfg(feature = "receive")]
+    fn ref_update(&self) -> Option<&Weak<RefUpdateLock>> {
+        match self {
+            Registered::RefUpdate(weak) => Some(weak),
+            _ => None,
+        }
+    }
+}
+
+/// The registry entry of one lock file.
+#[derive(Debug)]
+struct Entry {
+    lock: Registered,
+    /// Descriptors to the same inode that an open made after the entry was
+    /// registered. Closing one would drop the record locks of `lock`, so each
+    /// stays open until the entry is removed.
+    parked: Vec<OwnedFd>,
+}
+
+/// The process-global registry mapping a lock file's `(device, inode)` to its
+/// lock.
+type LockRegistry = HashMap<(u64, u64), Entry>;
+
+/// The registry, with the condition variable that a dropped lock signals
+/// after it removes its entry.
+struct Registry {
+    map: Mutex<LockRegistry>,
+    gone: Condvar,
+}
+
+fn registry() -> &'static Registry {
+    static REGISTRY: OnceLock<Registry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Registry {
+        map: Mutex::new(HashMap::new()),
+        gone: Condvar::new(),
+    })
+}
+
+/// The registry entry for the file `name` under `repo_fd`, found without
+/// opening the file: opening and closing another descriptor to a lock file
+/// would drop the live lock.
+fn probe<'r>(reg: &'r LockRegistry, repo_fd: BorrowedFd<'_>, name: &str) -> Option<&'r Entry> {
+    let stat = rustix::fs::statat(repo_fd, name, AtFlags::empty()).ok()?;
+    reg.get(&(stat.st_dev, stat.st_ino))
+}
+
+/// What a registry entry holds for a lock of type `T`.
+enum Found<T> {
+    /// A live lock of type `T`.
+    Live(Arc<T>),
+    /// A lock of type `T` whose last reference is gone and whose drop has not
+    /// yet closed its descriptor.
+    Dying,
+    /// A lock of another type.
+    Other,
+}
+
+fn find<T>(entry: &Entry, view: fn(&Registered) -> Option<&Weak<T>>) -> Found<T> {
+    match view(&entry.lock) {
+        Some(weak) => weak.upgrade().map_or(Found::Dying, Found::Live),
+        None => Found::Other,
+    }
+}
+
+/// Return the live lock of type `T` for the file `name` under `repo_fd`, or
+/// open the file by the rules of [`open_lock_file`] and register the lock that
+/// `make` builds from the descriptor and the `(device, inode)`.
+///
+/// Two rules keep one open descriptor for each lock inode in the process:
+///
+/// - A new descriptor is opened only while the registry holds no entry for
+///   the inode. A dying entry still owns an open descriptor, so the call waits
+///   until the drop of that lock closes it and removes the entry.
+/// - A descriptor the open returns for an inode the registry already holds,
+///   as a link or a rename made between the probe and the open makes, is never
+///   closed here. It is parked in the entry and closes when the entry goes.
+///
+/// The registry mutex stays held across the open, so no other call registers
+/// the inode between the probe and the insert. This serializes the first
+/// opens in the process and keeps both rules simple.
+fn get_or_register<T>(
+    repo_fd: BorrowedFd<'_>,
+    name: &str,
+    repo_mode: RepoMode,
+    view: fn(&Registered) -> Option<&Weak<T>>,
+    make: impl FnOnce(OwnedFd, (u64, u64)) -> (Arc<T>, Registered),
+) -> std::io::Result<Arc<T>> {
+    let registry = registry();
+    let mut reg = registry.map.lock().unwrap();
+    loop {
+        match probe(&reg, repo_fd, name).map(|entry| find(entry, view)) {
+            Some(Found::Live(existing)) => return Ok(existing),
+            Some(Found::Other) => return Err(shared_inode(name)),
+            Some(Found::Dying) => {
+                reg = registry.gone.wait(reg).unwrap();
+                continue;
+            }
+            None => {}
+        }
+
+        let (fd, key) = open_lock_file(repo_fd, name, repo_mode)?;
+        let Some(entry) = reg.get_mut(&key) else {
+            let (lock, registered) = make(fd, key);
+            reg.insert(
+                key,
+                Entry {
+                    lock: registered,
+                    parked: Vec::new(),
+                },
+            );
+            return Ok(lock);
+        };
+        // The probe finds a link that stood before the open. This arm catches
+        // one made between the probe and the open.
+        let found = find(entry, view);
+        entry.parked.push(fd);
+        match found {
+            Found::Live(existing) => return Ok(existing),
+            Found::Other => return Err(shared_inode(name)),
+            Found::Dying => reg = registry.gone.wait(reg).unwrap(),
+        }
+    }
+}
+
+/// Close the descriptor `fd` of a dropped lock and then remove its entry at
+/// `key`, with the parked descriptors, under the registry mutex. Then wake the
+/// calls that wait for the entry to go.
+///
+/// No call replaces an entry, so the entry at `key` is the one of the dropped
+/// lock.
+fn unregister(key: (u64, u64), fd: Option<OwnedFd>) {
+    let registry = registry();
+    // A poisoned mutex still guards a whole map. A drop that skipped the
+    // removal would leave the waiters for this inode waiting with no end.
+    let mut reg = registry.map.lock().unwrap_or_else(PoisonError::into_inner);
+    drop(fd);
+    drop(reg.remove(&key));
+    drop(reg);
+    registry.gone.notify_all();
+}
+
+/// Open the lock file `name` under `repo_fd`, creating it with [`LOCK_MODE`]
+/// on first use, and return the descriptor with the file's `(device, inode)`.
+///
+/// A file this call creates in a `bare-user-shared` repository is forced to
+/// [`perm::SHARED_LOCK_MODE`], so every member of the repository group opens
+/// it `O_RDWR` and takes the lock. The create attempt therefore carries
+/// `O_EXCL`, which separates the arm that made the file from the arm that
+/// found one: a file another member owns keeps the mode it has.
+fn open_lock_file(
+    repo_fd: BorrowedFd<'_>,
+    name: &str,
+    repo_mode: RepoMode,
+) -> std::io::Result<(OwnedFd, (u64, u64))> {
+    let fd = match rustix::fs::openat(
+        repo_fd,
+        name,
+        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
+        Mode::from_raw_mode(LOCK_MODE),
+    ) {
+        Ok(fd) => {
+            perm::force_created_mode(&fd, repo_mode, perm::SHARED_LOCK_MODE)?;
+            fd
+        }
+        Err(Errno::EXIST) => {
+            rustix::fs::openat(repo_fd, name, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let stat = rustix::fs::fstat(&fd)?;
+    Ok((fd, (stat.st_dev, stat.st_ino)))
+}
+
+/// The refusal of a lock file whose inode the registry holds for another kind
+/// of lock, as a hard link between the two lock files makes. A second
+/// descriptor to that inode would drop the other lock when it closes, and the
+/// two locks would not exclude each other inside the process.
+fn shared_inode(name: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "lock file {name} shares its inode with another lock file of the repository"
+    ))
 }
 
 impl RepoLock {
@@ -111,58 +322,37 @@ impl RepoLock {
     /// `<repo>/.lock` and registering it on first use. Runs synchronous
     /// filesystem calls and is meant to be offloaded to the blocking pool.
     ///
-    /// A `.lock` this call creates in a `bare-user-shared` repository is forced
-    /// to [`perm::SHARED_LOCK_MODE`], so every member of the repository group
-    /// opens it `O_RDWR` and takes the lock. The create attempt therefore
-    /// carries `O_EXCL`, which separates the arm that made the file from the
-    /// arm that found one: a `.lock` another member owns keeps the mode it has.
+    /// The file is opened by the rules of [`open_lock_file`], through
+    /// [`get_or_register`].
     pub(crate) fn get_or_create(
         repo_fd: BorrowedFd<'_>,
         repo_mode: RepoMode,
     ) -> std::io::Result<Arc<RepoLock>> {
-        let mut reg = registry().lock().unwrap();
-
-        // Probe an existing entry without opening a second descriptor: opening
-        // and closing another descriptor to `.lock` would drop the live lock.
-        if let Ok(stat) = rustix::fs::statat(repo_fd, LOCK_FILE, AtFlags::empty()) {
-            let key = (stat.st_dev, stat.st_ino);
-            if let Some(existing) = reg.get(&key).and_then(Weak::upgrade) {
-                return Ok(existing);
-            }
-        }
-
-        let fd = match rustix::fs::openat(
+        get_or_register(
             repo_fd,
             LOCK_FILE,
-            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-            Mode::from_raw_mode(LOCK_MODE),
-        ) {
-            Ok(fd) => {
-                perm::force_created_mode(&fd, repo_mode, perm::SHARED_LOCK_MODE)?;
-                fd
-            }
-            Err(Errno::EXIST) => rustix::fs::openat(
-                repo_fd,
-                LOCK_FILE,
-                OFlags::RDWR | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?,
-            Err(e) => return Err(e.into()),
-        };
-        let stat = rustix::fs::fstat(&fd)?;
-        let key = (stat.st_dev, stat.st_ino);
+            repo_mode,
+            Registered::repo,
+            |fd, key| {
+                let lock = Arc::new(RepoLock {
+                    key,
+                    fd: Some(fd),
+                    state: Mutex::new(LockState {
+                        shared: 0,
+                        exclusive: 0,
+                        os: OsLock::Unlocked,
+                    }),
+                });
+                let registered = Registered::Repo(Arc::downgrade(&lock));
+                (lock, registered)
+            },
+        )
+    }
 
-        let lock = Arc::new(RepoLock {
-            key,
-            fd,
-            state: Mutex::new(LockState {
-                shared: 0,
-                exclusive: 0,
-                os: OsLock::Unlocked,
-            }),
-        });
-        reg.insert(key, Arc::downgrade(&lock));
-        Ok(lock)
+    fn fd(&self) -> &OwnedFd {
+        self.fd
+            .as_ref()
+            .expect("the descriptor stays open until the drop")
     }
 
     /// Add one holder of `kind` without blocking.
@@ -184,7 +374,7 @@ impl RepoLock {
                     st.shared += 1;
                     return Ok(TryOutcome::Acquired);
                 }
-                match rustix::fs::fcntl_lock(&self.fd, FlockOperation::NonBlockingLockShared) {
+                match rustix::fs::fcntl_lock(self.fd(), FlockOperation::NonBlockingLockShared) {
                     Ok(()) => {
                         st.os = OsLock::Shared;
                         st.shared += 1;
@@ -201,7 +391,7 @@ impl RepoLock {
                 if st.shared > 0 || st.exclusive > 0 {
                     return Ok(TryOutcome::WouldBlock);
                 }
-                match rustix::fs::fcntl_lock(&self.fd, FlockOperation::NonBlockingLockExclusive) {
+                match rustix::fs::fcntl_lock(self.fd(), FlockOperation::NonBlockingLockExclusive) {
                     Ok(()) => {
                         st.os = OsLock::Exclusive;
                         st.exclusive += 1;
@@ -235,22 +425,15 @@ impl RepoLock {
         // A shared holder and an exclusive holder exclude each other, so one of
         // the two counts is zero and the target reached here is `Unlocked`.
         // Errors are ignored so a release (including Drop) never fails.
-        let _ = rustix::fs::fcntl_lock(&self.fd, FlockOperation::Unlock);
+        let _ = rustix::fs::fcntl_lock(self.fd(), FlockOperation::Unlock);
         st.os = target;
     }
 }
 
 impl Drop for RepoLock {
     fn drop(&mut self) {
-        // Remove our now-dead registry entry, unless it was already replaced by
-        // a newer lock over the same inode.
-        if let Ok(mut reg) = registry().lock()
-            && let Some(weak) = reg.get(&self.key)
-            && weak.strong_count() == 0
-        {
-            reg.remove(&self.key);
-        }
-        // Closing `self.fd` releases any residual record lock.
+        // Closing the descriptor releases any residual record lock.
+        unregister(self.key, self.fd.take());
     }
 }
 
@@ -500,8 +683,58 @@ mod tests {
         drop(a);
         drop(b);
         assert!(
-            !registry().lock().unwrap().contains_key(&key),
+            !registry().map.lock().unwrap().contains_key(&key),
             "registry entry is reclaimed once the last handle drops"
         );
+    }
+
+    /// Whether the kernel records an exclusive record lock of this process on
+    /// the inode `ino`.
+    fn holds_write_lock(ino: u64) -> bool {
+        let pid = std::process::id().to_string();
+        let locks = std::fs::read_to_string("/proc/locks").unwrap();
+        locks.lines().any(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.len() > 5
+                && fields[1] == "POSIX"
+                && fields[3] == "WRITE"
+                && fields[4] == pid
+                && fields[5].rsplit(':').next() == Some(&ino.to_string())
+        })
+    }
+
+    /// A lock dropped on another thread closes its descriptor before a new
+    /// lock on the same inode is created, so the close does not drop the
+    /// record lock of the new one.
+    #[test]
+    fn a_new_lock_survives_the_close_of_a_dropped_one() {
+        use std::os::unix::fs::MetadataExt;
+
+        for _ in 0..20 {
+            let scratch = Scratch::new("redrop");
+            let old = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+            let ino = std::fs::metadata(scratch._dir.join(LOCK_FILE))
+                .unwrap()
+                .ino();
+            let weak = Arc::downgrade(&old);
+
+            // The held registry mutex stops the drop of `old` before it
+            // closes the descriptor. The new lock is then asked for at once.
+            let reg = registry().map.lock().unwrap();
+            let dropper = std::thread::spawn(move || drop(old));
+            while weak.strong_count() > 0 {
+                std::thread::yield_now();
+            }
+            drop(reg);
+            let new = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+            assert!(matches!(
+                new.try_acquire(LockKind::Exclusive).unwrap(),
+                TryOutcome::Acquired
+            ));
+            dropper.join().unwrap();
+
+            assert!(holds_write_lock(ino), "the close dropped the new lock");
+            new.release(LockKind::Exclusive);
+        }
     }
 }

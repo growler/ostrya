@@ -10,8 +10,18 @@ readme.workspace = true
 
 [features]
 default = ["smol"]
-smol = ["ostrya-rt/smol", "ostrya-sign/smol", "ostrya-fetch/smol"]
-tokio = ["ostrya-rt/tokio", "ostrya-sign/tokio", "ostrya-fetch/tokio"]
+smol = [
+    "ostrya-rt/smol",
+    "ostrya-sign/smol",
+    "ostrya-fetch/smol",
+    "ostrya-push?/smol",
+]
+tokio = [
+    "ostrya-rt/tokio",
+    "ostrya-sign/tokio",
+    "ostrya-fetch/tokio",
+    "ostrya-push?/tokio",
+]
 sign-spki = ["ostrya-sign/sign-spki"]
 verify-gpg = ["dep:pgp"]
 sign-gpg = ["verify-gpg", "ostrya-sign/sign-gpg"]

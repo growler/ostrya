@@ -80,9 +80,9 @@ The project is a Cargo workspace of focused crates:
   signer through the `gpg` binary. Portable, with no repository knowledge.
 - `ostrya-fetch` -- the async HTTP/1.1 and HTTP/2 fetcher, with TLS over
   `rustls`. Portable, with no repository knowledge.
-- `ostrya-push` -- the push wire protocol: the messages and their GVariant
-  encoding, the frame codec, and the chunked object stream. Portable, with
-  no repository knowledge and no runtime.
+- `ostrya-push` -- the push protocol: the messages and their GVariant
+  encoding, the frame codec, the chunked object stream, the client session,
+  and the ssh transport. Portable, with no repository knowledge.
 - `ostrya-composefs` -- standalone, synchronous EROFS/composefs image writer
   and fs-verity digest. Takes a tree model and emits image bytes.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs,
@@ -95,7 +95,9 @@ Feature flags on `ostrya`:
 - `sign-spki` -- the spki signature engine.
 - `verify-gpg` -- GPG signature verification.
 - `sign-gpg` -- GPG signing. It turns on `verify-gpg`.
-- `receive` -- the receive policy of a push.
+- `receive` -- the server side of a push: the receive policy and
+  `Repo::receive`. The `receive` feature of `ostrya-cli`, in its default set,
+  builds `ostrya receive` on it.
 - `lzma-static` -- the static xz build.
 
 Later phases add `s3`, `push`, and `serve`.

@@ -1740,6 +1740,7 @@ dependencies = [
  "futures-lite",
  "ostrya-core",
  "ostrya-gvariant",
+ "ostrya-rt",
  "thiserror",
 ]
 

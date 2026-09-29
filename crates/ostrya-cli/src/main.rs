@@ -44,6 +44,8 @@
 //! - `pull` -- fetch refs and their objects from an HTTP remote.
 //! - `pull-local` -- import refs and their objects from another local
 //!   repository.
+//! - `receive` -- the server side of a push over ssh: one session over
+//!   standard input and standard output. The `receive` feature builds it.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams to and from stdin/stdout flow through
@@ -153,6 +155,9 @@ enum Command {
     /// Import refs and their objects from another local repository.
     #[command(name = "pull-local")]
     PullLocal(PullLocalArgs),
+    /// Receive one push session over standard input and standard output.
+    #[cfg(feature = "receive")]
+    Receive(ReceiveArgs),
 }
 
 impl Command {
@@ -182,6 +187,8 @@ impl Command {
         "static-delta",
         "pull",
         "pull-local",
+        #[cfg(feature = "receive")]
+        "receive",
     ];
 
     /// The name `clap` registered this subcommand under, which the error paths
@@ -208,6 +215,8 @@ impl Command {
             Command::StaticDelta(_) => "static-delta",
             Command::Pull(_) => "pull",
             Command::PullLocal(_) => "pull-local",
+            #[cfg(feature = "receive")]
+            Command::Receive(_) => "receive",
         }
     }
 }
@@ -1344,6 +1353,15 @@ struct PullArgs {
     refs: Vec<String>,
 }
 
+#[cfg(feature = "receive")]
+#[derive(Args)]
+struct ReceiveArgs {
+    /// Read the receive, trust, and key groups, and the remotes they name,
+    /// from FILE alone, in place of the repository config.
+    #[arg(long, value_name = "FILE")]
+    policy: Option<PathBuf>,
+}
+
 #[derive(Args)]
 struct PullLocalArgs {
     /// Write the pulled refs under this remote (`refs/remotes/<remote>/<ref>`)
@@ -1579,6 +1597,53 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             pull_local(repo, name, args).await
         }
+        #[cfg(feature = "receive")]
+        Command::Receive(args) => {
+            // `receive` writes nothing on success, also under `--verbose`, so
+            // the repository line of `--verbose` is not written.
+            let (repo, _) = resolve_repo(repo, false, name).await;
+            receive(repo, args).await
+        }
+    }
+}
+
+/// Run one push session over standard input and standard output with the
+/// receive policy of the repository config, or of `--policy`.
+///
+/// Standard output carries the frames of the session alone. Each warning of
+/// the report goes to standard error as one line, and a failure goes there
+/// as the error line of `main`. The command writes nothing else, also under
+/// `--verbose`.
+#[cfg(feature = "receive")]
+async fn receive(repo: Repo, args: ReceiveArgs) -> Result<()> {
+    let policy = match &args.policy {
+        Some(path) => ostrya::ReceivePolicy::from_file(&repo, path).await?,
+        None => ostrya::ReceivePolicy::from_config(&repo).await?,
+    };
+    // Under the smol backend, each of the two streams goes through a
+    // blocking-pool pipe of 8 MiB, so the input can be read up to 8 MiB ahead
+    // of the session. That costs memory on a large push, and it can help the
+    // throughput on a fast link.
+    let report = repo.receive(stdin_file()?, stdout_file()?, &policy).await?;
+    for warning in &report.warnings {
+        eprintln!(
+            "warning: {}: {}",
+            receive_step(warning.step),
+            warning.message
+        );
+    }
+    Ok(())
+}
+
+/// The name of a step of the receive report, as its warning line gives it.
+#[cfg(feature = "receive")]
+fn receive_step(step: ostrya::ReceiveStep) -> &'static str {
+    match step {
+        ostrya::ReceiveStep::SummaryBuild => "summary-build",
+        ostrya::ReceiveStep::SummarySign => "summary-sign",
+        ostrya::ReceiveStep::SummaryWrite => "summary-write",
+        ostrya::ReceiveStep::PartialMarker => "partial-marker",
+        ostrya::ReceiveStep::ReplyNotDelivered => "reply-not-delivered",
     }
 }
 

@@ -10,8 +10,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The error a push session fails with.
 ///
 /// Each variant except [`Error::Aborted`], [`Error::CommitOutcomeUnknown`],
-/// [`Error::Source`], [`Error::InvalidInput`], and [`Error::Io`] is one wire
-/// code of the `Error` message.
+/// [`Error::Source`], [`Error::InvalidInput`], [`Error::Transport`], and
+/// [`Error::Io`] is one wire code of the `Error` message.
 /// The enum is `#[non_exhaustive]`, so a match outside the crate needs a
 /// wildcard arm.
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +109,11 @@ pub enum Error {
     /// broken session.
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// The transport under the session failed: the ssh client could not be
+    /// started, or it exited with a failure status while the session failed
+    /// with an I/O error. The message names the program.
+    #[error("transport: {0}")]
+    Transport(String),
     /// An I/O error of the underlying stream. An end of file inside a frame
     /// or an object has the kind `UnexpectedEof`.
     #[error(transparent)]
@@ -207,7 +212,7 @@ impl ErrorCode {
 impl Error {
     /// The wire code of the error, or `None` for [`Error::Aborted`],
     /// [`Error::CommitOutcomeUnknown`], [`Error::Source`],
-    /// [`Error::InvalidInput`], and [`Error::Io`].
+    /// [`Error::InvalidInput`], [`Error::Transport`], and [`Error::Io`].
     pub fn code(&self) -> Option<ErrorCode> {
         Some(match self {
             Error::VersionUnsupported(_) => ErrorCode::VersionUnsupported,
@@ -230,6 +235,7 @@ impl Error {
             | Error::CommitOutcomeUnknown { .. }
             | Error::Source(_)
             | Error::InvalidInput(_)
+            | Error::Transport(_)
             | Error::Io(_) => return None,
         })
     }
@@ -265,6 +271,7 @@ impl Error {
             | Error::CommitOutcomeUnknown { .. }
             | Error::Source(_)
             | Error::InvalidInput(_)
+            | Error::Transport(_)
             | Error::Io(_) => (ErrorCode::Internal, self.to_string()),
             Error::VersionUnsupported(m)
             | Error::LockingDisabled(m)

@@ -20,13 +20,14 @@
 //! broken, and each later call fails with [`Error::InvalidInput`].
 
 mod progress;
-mod stream;
+pub(crate) mod stream;
 
 use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use ostrya_core::{Checksum, FileHeader, ObjectName};
@@ -41,6 +42,7 @@ use crate::proto::{
     CommitRequest, Encoding, Hello, Message, PROTOCOL_VERSION, RefOutcome, RefState, RefUpdate,
     have_entries_within, have_type, protocol,
 };
+use crate::transport::Transport;
 
 /// A boxed future that is `Send`, the return type of the [`ObjectSource`]
 /// methods.
@@ -205,6 +207,9 @@ struct SessionInner {
     counters: Arc<Counters>,
     /// The commits whose detached metadata the session has sent.
     sent_meta: Mutex<HashSet<Checksum>>,
+    /// The child process the streams of the session belong to, for a session
+    /// that [`PushSession::connect`] opened.
+    transport: Option<Transport>,
 }
 
 enum Slot {
@@ -283,15 +288,17 @@ impl SessionInner {
         }
     }
 
-    fn into_stream(self) -> Result<Box<Stream>> {
-        match self
+    /// The stream of an idle session, and the transport of the session.
+    fn into_parts(self) -> (Result<Box<Stream>>, Option<Transport>) {
+        let stream = match self
             .slot
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
         {
             Slot::Idle(stream) => Ok(stream),
             Slot::Busy | Slot::Poisoned => Err(broken()),
-        }
+        };
+        (stream, self.transport)
     }
 }
 
@@ -303,6 +310,10 @@ impl PushSession {
     /// An `Error` from the server is returned as its error. A reply whose
     /// version is not the version of the session, or whose refs are not the
     /// refs of `Hello` in order, is [`Error::Protocol`].
+    ///
+    /// The caller owns the liveness of the two streams. The session puts no
+    /// time limit on a read: a peer that stays silent keeps a call waiting
+    /// until the caller drops its future or closes the streams.
     pub async fn over_stream<R, W>(
         input: R,
         output: W,
@@ -313,9 +324,24 @@ impl PushSession {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        PushSession::open(Box::new(input), Box::new(output), refs, opts, None).await
+    }
+
+    /// Open a session over `input` and `output`. `pending_limit` bounds the
+    /// wait for a pending message after a failed write.
+    pub(crate) async fn open(
+        input: stream::Input,
+        output: stream::Output,
+        refs: &[String],
+        opts: SessionOptions,
+        pending_limit: Option<Duration>,
+    ) -> Result<PushSession> {
         let counters = Arc::new(Counters::new(opts.progress.as_ref()));
         counters.phase(PushPhase::Negotiating);
-        let mut stream = Stream::new(Box::new(input), Box::new(output), Arc::clone(&counters));
+        let mut stream = Stream::new(input, output, Arc::clone(&counters));
+        if let Some(limit) = pending_limit {
+            stream.set_pending_limit(limit);
+        }
         let agent = opts
             .agent
             .unwrap_or_else(|| format!("ostrya/{}", env!("CARGO_PKG_VERSION")));
@@ -358,8 +384,15 @@ impl PushSession {
                 server,
                 counters,
                 sent_meta: Mutex::new(HashSet::new()),
+                transport: None,
             },
         })
+    }
+
+    /// Attach the child process the streams of the session belong to.
+    pub(crate) fn with_transport(mut self, transport: Transport) -> PushSession {
+        self.inner.transport = Some(transport);
+        self
     }
 
     /// The facts of the server.
@@ -471,6 +504,10 @@ impl PushSession {
     /// limit, is returned as its error, and nothing is written. Each other
     /// end of the session after the session wrote `Commit` is
     /// [`Error::CommitOutcomeUnknown`]: the server may have written the refs.
+    ///
+    /// A session that [`connect`](PushSession::connect) opened then waits a
+    /// bounded time for the ssh client to exit. A session that committed
+    /// returns its outcome whatever the exit status.
     pub async fn commit(self, updates: &[RefUpdate], force: bool) -> Result<PushOutcome> {
         if updates.is_empty() {
             return Err(invalid("a commit needs at least one ref update"));
@@ -488,51 +525,76 @@ impl PushSession {
             }
         }
         let counters = Arc::clone(&self.inner.counters);
-        let mut stream = self.inner.into_stream()?;
-        counters.phase(PushPhase::Committing);
-        let names = || updates.iter().map(|u| u.name.clone()).collect::<Vec<_>>();
-        let unknown = |message: String| Error::CommitOutcomeUnknown {
-            refs: names(),
-            message,
-        };
-        let request = Message::Commit(CommitRequest {
-            updates: updates.to_vec(),
-            force,
-        });
-        let reply = match stream.write_raw(&request).await {
-            Ok(()) => stream.read_raw().await,
-            Err(e @ Error::Io(_)) => match stream.pending_message(&e).await {
-                Some(msg @ (Message::Error(_) | Message::CommitReply(_))) => Ok(Some(msg)),
-                _ => return Err(unknown(format!("the write of Commit failed: {e}"))),
-            },
-            Err(e) => return Err(e),
-        };
-        let refs = match reply {
-            Ok(Some(Message::CommitReply(refs))) => refs,
-            Ok(Some(Message::Error(e))) => return Err(e.into()),
-            Ok(Some(other)) => {
-                return Err(unknown(format!("{:?} in reply to Commit", other.kind())));
-            }
-            Ok(None) => return Err(unknown("the session ended before CommitReply".into())),
-            Err(e) => return Err(unknown(format!("the reply to Commit failed: {e}"))),
-        };
-        if refs.len() != updates.len() || refs.iter().zip(updates).any(|(o, u)| o.name != u.name) {
-            return Err(unknown(
-                "the server replied to Commit for other refs than the refs of Commit".into(),
-            ));
+        let (stream, transport) = self.inner.into_parts();
+        let result = commit_on(stream?, updates, force, &counters).await;
+        match transport {
+            Some(transport) => transport.finish(result).await,
+            None => result,
         }
-        // The refs are written. A failure to close the stream changes nothing.
-        let _ = stream.close().await;
-        Ok(PushOutcome {
-            commit: None,
-            refs,
-            stats: counters.stats(),
-        })
     }
 
     /// End the session with `Abort`. The server aborts its transaction.
+    ///
+    /// The session then closes its output. A session that
+    /// [`connect`](PushSession::connect) opened waits a bounded time for the
+    /// ssh client to exit.
     pub async fn abort(self) -> Result<()> {
-        let mut stream = self.inner.into_stream()?;
-        stream.write_raw(&Message::Abort).await
+        let (stream, transport) = self.inner.into_parts();
+        let mut stream = stream?;
+        let result = stream.write_raw(&Message::Abort).await;
+        let _ = stream.close().await;
+        match transport {
+            Some(transport) => transport.finish(result).await,
+            None => result,
+        }
     }
+}
+
+/// Send `Commit` over `stream` and read the reply. The stream is closed or
+/// dropped when the call returns.
+async fn commit_on(
+    mut stream: Box<Stream>,
+    updates: &[RefUpdate],
+    force: bool,
+    counters: &Counters,
+) -> Result<PushOutcome> {
+    counters.phase(PushPhase::Committing);
+    let names = || updates.iter().map(|u| u.name.clone()).collect::<Vec<_>>();
+    let unknown = |message: String| Error::CommitOutcomeUnknown {
+        refs: names(),
+        message,
+    };
+    let request = Message::Commit(CommitRequest {
+        updates: updates.to_vec(),
+        force,
+    });
+    let reply = match stream.write_raw(&request).await {
+        Ok(()) => stream.read_raw().await,
+        Err(e @ Error::Io(_)) => match stream.pending_message(&e).await {
+            Some(msg @ (Message::Error(_) | Message::CommitReply(_))) => Ok(Some(msg)),
+            _ => return Err(unknown(format!("the write of Commit failed: {e}"))),
+        },
+        Err(e) => return Err(e),
+    };
+    let refs = match reply {
+        Ok(Some(Message::CommitReply(refs))) => refs,
+        Ok(Some(Message::Error(e))) => return Err(e.into()),
+        Ok(Some(other)) => {
+            return Err(unknown(format!("{:?} in reply to Commit", other.kind())));
+        }
+        Ok(None) => return Err(unknown("the session ended before CommitReply".into())),
+        Err(e) => return Err(unknown(format!("the reply to Commit failed: {e}"))),
+    };
+    if refs.len() != updates.len() || refs.iter().zip(updates).any(|(o, u)| o.name != u.name) {
+        return Err(unknown(
+            "the server replied to Commit for other refs than the refs of Commit".into(),
+        ));
+    }
+    // The refs are written. A failure to close the stream changes nothing.
+    let _ = stream.close().await;
+    Ok(PushOutcome {
+        commit: None,
+        refs,
+        stats: counters.stats(),
+    })
 }

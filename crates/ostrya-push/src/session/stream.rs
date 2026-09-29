@@ -6,6 +6,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -29,8 +30,8 @@ const STREAM_BUFFER: usize = 64 * 1024;
 /// alone.
 const WRITE_BUFFER: usize = STREAM_BUFFER + 4;
 
-pub(super) type Input = Box<dyn AsyncRead + Unpin + Send>;
-pub(super) type Output = Box<dyn AsyncWrite + Unpin + Send>;
+pub(crate) type Input = Box<dyn AsyncRead + Unpin + Send>;
+pub(crate) type Output = Box<dyn AsyncWrite + Unpin + Send>;
 
 /// The writer under the buffer of the stream. It counts each byte the stream
 /// takes as a byte sent.
@@ -203,6 +204,9 @@ pub(super) struct Stream {
     /// The buffer object bytes are copied through.
     buf: Vec<u8>,
     counters: Arc<Counters>,
+    /// The longest wait for a pending message after a failed write. `None`
+    /// waits with no limit.
+    pending_limit: Option<Duration>,
 }
 
 impl Stream {
@@ -217,7 +221,13 @@ impl Stream {
             deflate: None,
             buf: Vec::new(),
             counters,
+            pending_limit: None,
         }
+    }
+
+    /// Wait at most `limit` for a pending message after a failed write.
+    pub(super) fn set_pending_limit(&mut self, limit: Duration) {
+        self.pending_limit = Some(limit);
     }
 
     /// Set the frame and chunk limit of the writer to the `max-frame` of the
@@ -251,12 +261,23 @@ impl Stream {
     }
 
     /// Read one message after the write failure `e`, when `e` is an I/O
-    /// error. A read that fails gives `None`.
+    /// error. A read that fails gives `None`, and so does a read that takes
+    /// longer than the pending limit of the stream.
     pub(super) async fn pending_message(&mut self, e: &Error) -> Option<Message> {
         if !matches!(e, Error::Io(_)) {
             return None;
         }
-        self.reader.read_message().await.ok().flatten()
+        let read = async { self.reader.read_message().await.ok().flatten() };
+        match self.pending_limit {
+            None => read.await,
+            Some(limit) => {
+                let timeout = async {
+                    ostrya_rt::Timer::after(limit).await;
+                    None
+                };
+                futures_lite::future::or(read, timeout).await
+            }
+        }
     }
 
     /// Read the next message. An end of file is an [`Error::Io`] of kind

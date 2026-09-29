@@ -16,18 +16,26 @@
 //! session while it runs, and [`PushOutcome`] gives the ref outcomes and the
 //! [`PushStats`] of a session that committed.
 //!
+//! The [`transport`] module holds the transports. [`PushRemote`] parses a
+//! push address, and [`PushSession::connect`] opens a session over ssh: it
+//! runs the ssh client as a child process, and the remote side runs the
+//! receive command.
+//!
 //! [`Error`] is the error type of the crate. Each of its variants except
 //! [`Error::Aborted`], [`Error::CommitOutcomeUnknown`], [`Error::Source`],
-//! [`Error::InvalidInput`], and [`Error::Io`] is one wire code, and
-//! [`ErrorCode`] names the codes.
+//! [`Error::InvalidInput`], [`Error::Transport`], and [`Error::Io`] is one
+//! wire code, and [`ErrorCode`] names the codes.
 //!
-//! The codec and the session are generic over the `futures-io` traits
-//! `AsyncRead` and `AsyncWrite`, so they need no async runtime. The crate has
-//! no repository knowledge. It compiles on Linux, macOS, and Windows.
+//! The codec and [`PushSession::over_stream`] are generic over the
+//! `futures-io` traits `AsyncRead` and `AsyncWrite`, so they need no async
+//! runtime. The ssh transport runs on the runtime backend that the `smol`
+//! (default) or the `tokio` feature selects. The crate has no repository
+//! knowledge. It compiles on Linux, macOS, and Windows.
 
 mod error;
 pub mod proto;
 pub mod session;
+pub mod transport;
 
 pub use error::{Error, ErrorCode, Result};
 pub use proto::{Encoding, Expected, RefOutcome, RefState, RefUpdate};
@@ -35,6 +43,7 @@ pub use session::{
     BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PushOutcome, PushPhase,
     PushProgress, PushProgressSnapshot, PushSession, PushStats, ServerInfo, SessionOptions,
 };
+pub use transport::{ConnectOptions, PushRemote};
 
 /// The public types of the protocol move freely across tasks and threads.
 const _: fn() = || {
@@ -51,6 +60,8 @@ const _: fn() = || {
     assert_send_sync::<ServerInfo>();
     assert_send_sync::<ObjectData>();
     assert_send_sync::<Box<dyn ObjectReader>>();
+    assert_send_sync::<PushRemote>();
+    assert_send_sync::<ConnectOptions>();
 };
 
 /// The futures of the session calls can run on a multi-threaded executor.
@@ -67,4 +78,16 @@ fn session_futures_are_send(
     assert_send(&session.missing(names));
     assert_send(&session.send(source, names, commits, Compression::None));
     assert_send(&owned.commit(updates, false));
+}
+
+/// The future of a connect can run on a multi-threaded executor.
+#[allow(dead_code)]
+fn connect_future_is_send(remote: &PushRemote, refs: &[String]) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&PushSession::connect(
+        remote,
+        ConnectOptions::default(),
+        refs,
+        SessionOptions::default(),
+    ));
 }

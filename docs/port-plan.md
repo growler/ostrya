@@ -168,10 +168,13 @@ bounded:
   with its abandon marker. `ObjectBody` reads the bytes of one object as an
   `AsyncRead`. The client session: `PushSession` over a pair of byte
   streams, the `ObjectSource` trait it reads objects through, and
-  `PushProgress`, `PushStats`, and `PushOutcome`. No repository knowledge
-  and no runtime. Depends
-  on `ostrya-gvariant`, `ostrya-core`, `thiserror`, `futures-io`, and
-  `futures-lite`. Compiles on Linux, macOS, and Windows.
+  `PushProgress`, `PushStats`, and `PushOutcome`. The ssh transport:
+  `PushRemote`, `ConnectOptions`, and `PushSession::connect`, which runs the
+  ssh client as a child process through `ostrya-rt`. No repository
+  knowledge. Depends on `ostrya-gvariant`, `ostrya-core`, `ostrya-rt`,
+  `thiserror`, `futures-io`, and `futures-lite`, with the `smol` (default)
+  and `tokio` features that select the backend of `ostrya-rt`. Compiles on
+  Linux, macOS, and Windows.
 - `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the
   fs-verity digest. Standalone and free of ostree and repository knowledge,
   like `ostrya-gvariant`: it takes a tree model and emits the image bytes and

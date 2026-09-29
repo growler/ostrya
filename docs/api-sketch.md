@@ -2486,7 +2486,8 @@ impl Repo {
 
 `ostrya-push` holds the client side of a push, re-exported as
 `ostrya::push`. A `PushSession` runs one session over a pair of byte
-streams. It needs no runtime.
+streams. `over_stream` needs no runtime. `connect` opens a session over
+ssh, on the runtime backend that the `smol` or the `tokio` feature selects.
 
 - `over_stream` sends `Hello` with the refs the session updates and reads
   `HelloReply`. `server()` gives its facts.
@@ -2563,6 +2564,88 @@ pub struct PushOutcome {
                            // bytes_sent, payload_bytes, elapsed
 }
 ```
+
+## Push transports
+
+`PushRemote::parse` reads a push address, and `PushSession::connect` opens
+a session to it. The ssh transport runs the ssh client as a child process
+with the command line
+`SSH_COMMAND... [-p PORT] [USER@]HOST 'RECEIVE_COMMAND --repo=QUOTED_PATH'`,
+and the remote side runs `ostrya receive`.
+
+- The addresses are `ssh://[USER@]HOST[:PORT]/PATH`,
+  `ssh://[USER@]HOST[:PORT]/~/PATH`, and the scp form `[USER@]HOST:PATH`. A
+  `/~/` or a scp-form `~/` prefix is removed, and so is each `/` that
+  follows it, so the path is relative to the remote home directory. The
+  path is quoted with POSIX single quotes.
+- In the scp form the first `:` ends the host, as git reads the form:
+  `u:p@host:path` gives the host `u`, so the scp form cannot give a user
+  with `:`. An IPv6 host needs brackets: `fe80::1:repo` gives the host
+  `fe80`, and `[fe80::1]:repo` gives `fe80::1`.
+- A user holds ASCII letters, digits, `.`, `-`, and `_`. A host holds the
+  same, or it is a bracketed IPv6 address of hex digits, `:`, and `.`, with
+  an optional `%ZONE` of ASCII letters and digits. The parser refuses every
+  other character, which includes control characters, whitespace, and shell
+  metacharacters.
+- The parser also refuses a user or a host that starts with `-`, an empty
+  part, a bad port, more than one `@`, a `~USER` path, and a scheme other
+  than `ssh`, `http`, and `https`. In the `ssh://` form it refuses a
+  `USER:PASSWORD@` user.
+- On Windows it refuses a scp-form address that names a local path: a host
+  of one ASCII letter, and a `\` before the first `:`.
+- `SSH_COMMAND` is `ConnectOptions::ssh_command`, then the
+  `OSTRYA_SSH_COMMAND` environment variable, then
+  `ConnectOptions::remote_ssh_command`, then `ssh`. The two strings are
+  split at ASCII whitespace. An empty command and a value that is not UTF-8
+  are `Error::InvalidInput`.
+- `connect` parses an `http://` or `https://` address and refuses it with
+  `Error::InvalidInput`.
+- On a session that `connect` opened, the read of a pending message after a
+  failed write waits at most 5 seconds. `commit` and `abort` close the
+  standard input of the ssh client and wait at most 5 seconds for it to
+  exit. An open that fails waits in the same way. A session that failed
+  with an I/O error while the ssh client exited with a failure status is
+  `Error::Transport`. A session that committed gives its outcome whatever
+  the exit status. `over_stream` puts no time limit on a read: its caller
+  owns the liveness of the streams.
+- Under the tokio backend, `connect` runs within a runtime that has the IO
+  driver and the time driver enabled, and the session runs on the runtime
+  that opened it.
+- Memory: under the smol backend, `ostrya_rt::File` reads and writes
+  through a blocking-pool pipe of 8 MiB in each direction. The standard
+  input and standard output of `ostrya receive`, and an object reader over
+  an `ostrya_rt::File`, can read up to 8 MiB ahead of the session. A large
+  push costs about 8 to 12 MiB of resident memory for it on each side. The
+  read-ahead can also help the throughput on a fast link. The tokio backend
+  has one read or write of at most 2 MiB in flight for each file.
+
+```rust
+pub struct PushRemote { inner: RemoteAddr }
+
+impl PushRemote {
+    pub fn parse(address: &str) -> Result<PushRemote>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectOptions {
+    pub ssh_command: Option<Vec<String>>,     // wins over OSTRYA_SSH_COMMAND
+    pub receive_command: Option<String>,      // default "ostrya receive"
+    pub remote_ssh_command: Option<String>,   // the remote key, lowest
+}
+
+impl PushSession {
+    pub async fn connect(remote: &PushRemote, connect: ConnectOptions,
+                         refs: &[String], opts: SessionOptions)
+        -> Result<PushSession>;
+}
+```
+
+`ostrya receive [--repo=PATH] [--policy=FILE]`, under the `receive` feature
+of `ostrya-cli`, runs one `Repo::receive` session over standard input and
+standard output with `ReceivePolicy::from_config`, or with
+`ReceivePolicy::from_file` under `--policy`. It writes one
+`warning: STEP: MESSAGE` line to standard error for each warning of the
+report, and the error line on failure. It exits 0 after a committed session.
 
 ## Static deltas
 

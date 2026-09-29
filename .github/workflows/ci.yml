@@ -181,6 +181,7 @@ jobs:
           for target in x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin; do
             cargo check --target "$target" -p ostrya-gvariant -p ostrya-core -p ostrya-rt -p ostrya-push
             cargo check --target "$target" -p ostrya-rt --no-default-features --features tokio
+            cargo check --target "$target" -p ostrya-push --no-default-features --features tokio
             cargo check --target "$target" -p ostrya-sign --features sign-spki,sign-gpg
             cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,sign-gpg
           done
@@ -206,22 +207,25 @@ jobs:
 
       # The workspace entries of the runtime-dependent crates carry
       # `default-features = false`, and each dependent forwards `smol` and
-      # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, and this
+      # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
+      # without the `receive` feature, which brings in `ostrya-push`, and this
       # fails when one path turns the smol backend on. `cargo tree -i` exits
       # non-zero both when the package is absent and on any other failure, so
       # the step also reads the error text.
       - name: A tokio build holds no smol
         run: |
-          if out=$(cargo tree -p ostrya --no-default-features --features tokio -i smol 2>&1); then
-            echo "a tokio build of ostrya holds smol:"
-            echo "$out"
-            exit 1
-          fi
-          if ! grep -q 'package ID specification `smol` did not match any packages' <<<"$out"; then
-            echo "cargo tree failed with an unexpected error:"
-            echo "$out"
-            exit 1
-          fi
+          for features in tokio tokio,receive; do
+            if out=$(cargo tree -p ostrya --no-default-features --features "$features" -i smol 2>&1); then
+              echo "a build of ostrya with $features holds smol:"
+              echo "$out"
+              exit 1
+            fi
+            if ! grep -q 'package ID specification `smol` did not match any packages' <<<"$out"; then
+              echo "cargo tree failed with an unexpected error:"
+              echo "$out"
+              exit 1
+            fi
+          done
 
       # The local-pull ownership-gate tests need the process to belong to more
       # than one group. The GPG cases need `gpg` to build their fixtures, and

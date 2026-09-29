@@ -489,10 +489,8 @@ impl Repo {
     /// The signed payload is the exact `summary` bytes. The signature is added to
     /// the engine's `aay` array in the `summary.sig` `a{sv}` dict, created if
     /// absent, leaving other engines' arrays in place; `summary.sig` is replaced
-    /// atomically. Like [`sign_commit`](Repo::sign_commit), the read-modify-write
-    /// is not serialized across calls; sign a summary from one task at a time.
-    /// [`sign_summary_all`](Repo::sign_summary_all) signs with several signers
-    /// in one write.
+    /// atomically. [`sign_summary_all`](Repo::sign_summary_all) signs with
+    /// several signers in one write, and it states the locks the call takes.
     pub async fn sign_summary(&self, signer: &dyn Signer) -> Result<()> {
         self.sign_summary_all(&[signer]).await
     }
@@ -505,11 +503,24 @@ impl Repo {
     /// `summary.sig` once, makes every signature, and then replaces
     /// `summary.sig` atomically in one write. A signer that fails stops the
     /// batch before the write, so `summary.sig` stays as it stood. An empty
-    /// slice reads and writes nothing.
+    /// slice reads and writes nothing and takes no lock.
+    ///
+    /// The call takes the repository lock shared and then the update lock, as
+    /// [`Repo::begin_update`] does, before it reads `summary`, and it holds
+    /// both until `summary.sig` is written. So a signature always covers the
+    /// `summary` it is stored beside, and the batches of several tasks or
+    /// processes and [`Repo::regenerate_summary`] run one at a time, with no
+    /// signature lost. Each of the two waits fails with
+    /// [`Error::LockTimeout`] after `lock-timeout-secs`. A caller that holds an
+    /// [`UpdateGuard`](crate::UpdateGuard) of this repository waits for its
+    /// own guard until the timeout, and with `lock-timeout-secs=-1` it waits
+    /// forever.
     pub async fn sign_summary_all(&self, signers: &[&dyn Signer]) -> Result<()> {
         if signers.is_empty() {
             return Ok(());
         }
+        let fsync = self.config().fsync()?;
+        let locks = self.lock_for_update().await?;
         let data = self.read_summary().await?.ok_or_else(|| {
             Error::InvalidFormat("no summary to sign; regenerate it first".into())
         })?;
@@ -523,8 +534,10 @@ impl Repo {
         }
         let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
         let bytes = to_bytes(&ty, &dict).map_err(ostrya_core::Error::from)?;
-        let fsync = self.config().fsync()?;
-        self.write_root_file(SUMMARY_SIG_FILE, bytes, fsync).await
+        self.write_holding(locks, move |repo| {
+            write_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE, &bytes, fsync)
+        })
+        .await
     }
 
     /// Verify the summary against `verifiers`.
@@ -718,13 +731,7 @@ impl Repo {
     pub(crate) async fn remove_root_file(&self, name: &str) -> Result<()> {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         let name = name.to_owned();
-        ostrya_rt::unblock(move || {
-            match rustix::fs::unlinkat(repo_fd.as_fd(), name.as_str(), AtFlags::empty()) {
-                Ok(()) | Err(Errno::NOENT) => Ok(()),
-                Err(e) => Err(e.into()),
-            }
-        })
-        .await
+        ostrya_rt::unblock(move || remove_root_file_blocking(repo_fd.as_fd(), &name)).await
     }
 }
 
@@ -842,7 +849,10 @@ fn resolve_last_modified(explicit: Option<u64>) -> Result<u64> {
 pub(crate) const SUMMARY_READ_CAP: u64 = 64 * 1024 * 1024;
 
 /// Read a whole file relative to `repo_fd`, or `None` when it does not exist.
-fn read_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_root_file_blocking(
+    repo_fd: BorrowedFd<'_>,
+    name: &str,
+) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
 
     let fd = match rustix::fs::openat(
@@ -870,7 +880,7 @@ fn read_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<Option
 /// Write `bytes` to `name` at the repository root atomically: a fresh temp file
 /// (`fchmod` 0644, `fdatasync` when `fsync` is set) renamed over the target,
 /// then the root directory fsynced so the rename survives a crash.
-fn write_root_file_blocking(
+pub(crate) fn write_root_file_blocking(
     repo_fd: BorrowedFd<'_>,
     name: &str,
     bytes: &[u8],
@@ -881,6 +891,14 @@ fn write_root_file_blocking(
         rustix::fs::fsync(repo_fd)?;
     }
     Ok(())
+}
+
+/// Remove `name` at the repository root; an already-absent file is success.
+pub(crate) fn remove_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<()> {
+    match rustix::fs::unlinkat(repo_fd, name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The body of [`write_root_file_blocking`], with the sync of the root

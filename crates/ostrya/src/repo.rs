@@ -239,6 +239,12 @@ impl Repo {
     /// `tmp/`, and stale staging directories left by dead transactions are
     /// reaped first, together with the other `tmp/` entries older than
     /// `tmp-expiry-secs`.
+    ///
+    /// A writer outside a transaction takes the repository lock shared, as
+    /// [`Repo::set_ref_immediate`] and [`Repo::write_config`] do. So when
+    /// `[core] locking` is on, a caller that holds a transaction in
+    /// [`LockKind::Exclusive`] and calls such a writer waits for its own lock
+    /// until `lock-timeout-secs`, and with `-1` it waits forever.
     pub async fn transaction_with_lock(&self, kind: LockKind) -> Result<Transaction> {
         // Every `[core]` key the open reads is parsed before the lock, so a
         // value the config cannot carry refuses the call at once instead of
@@ -341,6 +347,39 @@ impl Repo {
         let repo = self.lock_repo(LockKind::Shared).await?;
         let update = self.lock_update().await?;
         Ok(UpdateLocks { update, repo })
+    }
+
+    /// Take the repository lock shared, then the update lock, as
+    /// [`lock_for_update`](Repo::lock_for_update) does, and run `write` on the
+    /// blocking pool under both.
+    ///
+    /// The locks move into the blocking closure and drop at its end, so a
+    /// caller that drops the returned future cannot release them while
+    /// `write` still runs.
+    pub(crate) async fn write_locked<T, F>(&self, write: F) -> Result<T>
+    where
+        F: FnOnce(&Repo) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let locks = self.lock_for_update().await?;
+        self.write_holding(locks, write).await
+    }
+
+    /// Run `write` on the blocking pool under `locks`, and release them when
+    /// `write` ends, as [`write_locked`](Repo::write_locked) does. A caller
+    /// that must read under the locks before its write takes them first.
+    pub(crate) async fn write_holding<T, F>(&self, locks: UpdateLocks, write: F) -> Result<T>
+    where
+        F: FnOnce(&Repo) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let repo = self.clone();
+        ostrya_rt::unblock(move || {
+            let written = write(&repo);
+            drop(locks);
+            written
+        })
+        .await
     }
 
     /// Whether `held` is a hold of the update lock of this repository.

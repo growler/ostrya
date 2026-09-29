@@ -3815,6 +3815,89 @@ fn sign_verify_delete_ed25519() {
     );
 }
 
+/// Each command that writes refs, `config`, a remote keyring, `summary`, or
+/// detached metadata takes the update lock once. With `lock-timeout-secs=0` a
+/// command that waited for a lock of its own would fail at once, so each of
+/// them completing proves that none waits for itself.
+#[test]
+fn writers_take_the_update_lock_once() {
+    let tmp = TmpDir::new("writers-update-lock");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let config = repo.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("lock-timeout-secs=0\n");
+    std::fs::write(&config, text).unwrap();
+    let repo_arg = format!("--repo={}", repo.display());
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    let src = base.join("src");
+
+    let runs: Vec<Vec<&str>> = vec![
+        vec!["sign", COMMIT, ED25519_SECRET_B64, ED25519_SECRET2_B64],
+        vec!["sign", "-d", "-s", "ed25519", COMMIT, ED25519_PUBLIC_B64],
+        vec!["summary", "-u", &sign],
+        vec!["refs", "--create=other", BRANCH],
+        vec!["refs", "-A", "--create=alias", BRANCH],
+        vec!["refs", "--delete", "other"],
+        vec!["config", "set", "core.newkey", "value"],
+        vec!["config", "unset", "core.newkey"],
+        vec!["remote", "add", "origin", "https://example.invalid/repo"],
+        vec!["remote", "delete", "origin"],
+        vec![
+            "commit",
+            "-b",
+            BRANCH,
+            "-s",
+            "signed",
+            &sign,
+            src.to_str().unwrap(),
+        ],
+    ];
+    // A remote whose keyring the command imports, and its removal, which
+    // removes the keyring.
+    #[cfg(feature = "gpg")]
+    let (_home, import) = if gpg_available() {
+        let home = GpgHome::create(base, "Writers <writers@example.invalid>");
+        let keyring = base.join("export.gpg");
+        home.export_to(&keyring);
+        (Some(home), format!("--gpg-import={}", keyring.display()))
+    } else {
+        (None, String::new())
+    };
+    #[cfg(feature = "gpg")]
+    let keyed: Vec<Vec<&str>> = if import.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            vec![
+                "remote",
+                "add",
+                &import,
+                "keyed",
+                "https://example.invalid/repo",
+            ],
+            vec!["remote", "delete", "keyed"],
+        ]
+    };
+    #[cfg(not(feature = "gpg"))]
+    let keyed: Vec<Vec<&str>> = Vec::new();
+    for args in runs.iter().chain(&keyed) {
+        let mut full = vec![repo_arg.as_str()];
+        full.extend_from_slice(args);
+        let run = ostrya(&full, None, &[]);
+        assert!(
+            run.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+    assert!(!repo.join("keyed.trustedkeys.gpg").exists());
+    assert_eq!(
+        resolve(&repo, "alias").as_deref(),
+        resolve(&repo, BRANCH).as_deref()
+    );
+}
+
 #[cfg(feature = "spki")]
 #[test]
 fn sign_verify_spki_selects_the_engine() {
@@ -6156,8 +6239,9 @@ fn pull_mirror_disable_fsync_syncs_nothing() {
 /// makes a sync call on `pull-local`, on an HTTP `pull`, or on a `--mirror`
 /// pull, and both store the source's `.commitmeta`. By default the tool makes
 /// no sync call for the `.commitmeta` (11 calls on each pull), and the port
-/// makes three: an `fdatasync` of its temporary file, an `fsync` of its fanout
-/// directory, and an `fsync` of `objects/` (15, 16, and 17 calls).
+/// makes none on the file it stages, whose data the `syncfs` of the
+/// publication step makes durable, and one more `fsync` of its fanout
+/// directory after the rename into `objects/` (13, 14, and 15 calls).
 #[test]
 fn pull_disable_fsync_syncs_no_detached_metadata() {
     if !strace_available() {
@@ -6177,9 +6261,9 @@ fn pull_disable_fsync_syncs_no_detached_metadata() {
     assert_eq!(commitmeta(&remote), 1, "the source holds detached metadata");
     // (tag, command, the port's default call count)
     let pulls: [(&str, &[&str], usize); 3] = [
-        ("pull-local", &["pull-local", src, "main"], 15),
-        ("pull", &["pull", "origin", "main"], 16),
-        ("mirror", &["pull", "--mirror", "origin"], 17),
+        ("pull-local", &["pull-local", src, "main"], 13),
+        ("pull", &["pull", "origin", "main"], 14),
+        ("mirror", &["pull", "--mirror", "origin"], 15),
     ];
     for (who, binary) in &durability_binaries() {
         for (tag, command, port_total) in pulls {
@@ -6214,12 +6298,8 @@ fn pull_disable_fsync_syncs_no_detached_metadata() {
                     .iter()
                     .filter(|(_, path)| path.contains(".commitmeta"))
                     .count();
-                let (expected_meta, total) = if *who == "port" {
-                    (1, port_total)
-                } else {
-                    (0, 11)
-                };
-                assert_eq!(on_commitmeta, expected_meta, "{label}: {calls:?}");
+                let total = if *who == "port" { port_total } else { 11 };
+                assert_eq!(on_commitmeta, 0, "{label}: {calls:?}");
                 assert_eq!(calls.len(), total, "{label}: {calls:?}");
             }
         }

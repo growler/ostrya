@@ -271,6 +271,13 @@ impl Repo {
     /// Write (or clear) a commit's detached metadata at its `.commitmeta` loose
     /// path, replaced atomically. `Some(meta)` serializes the `a{sv}` dict;
     /// `None` writes the documented zero-length file.
+    ///
+    /// The call takes the repository lock shared and then the update lock, as
+    /// [`Repo::begin_update`] does, and writes under both. Each of the two
+    /// waits fails with [`Error::LockTimeout`] after `lock-timeout-secs`. A
+    /// caller that holds an [`UpdateGuard`](crate::UpdateGuard) of this
+    /// repository waits for its own guard until the timeout, and with
+    /// `lock-timeout-secs=-1` it waits forever.
     pub async fn write_commit_detached_metadata(
         &self,
         checksum: &Checksum,
@@ -284,115 +291,10 @@ impl Repo {
             None => Vec::new(),
         };
         let fsync = self.config().fsync()?;
-        self.write_commit_detached_bytes(checksum, bytes, fsync)
-            .await
-    }
-
-    /// Apply one detached-metadata edit at a commit's `.commitmeta` loose path.
-    ///
-    /// `replace` is the dict that stands in for whatever the file holds; with
-    /// `None` the edit starts from the file's own dict, or from an empty dict
-    /// where the file is absent or is the zero-length marker. `merge`, where
-    /// given, is the serialized `a{sv}` dict merged into that dict with a union
-    /// of each signature list. Each entry of `appends` then appends one
-    /// signature to its engine's `aay` array, in order, and the result replaces
-    /// the file atomically.
-    ///
-    /// The read, the merge and the replacing write run as one step under
-    /// [`DETACHED_MERGE`], a guard the whole process shares, so two signers of
-    /// one commit both reach the file whichever transactions they belong to.
-    /// The same guard covers the other read-modify-write paths of this crate,
-    /// [`Repo::sign_commit`] and [`Repo::delete_signatures`]. Two writers stand
-    /// outside it: a caller that replaces the file through
-    /// [`write_commit_detached_metadata`](Repo::write_commit_detached_metadata),
-    /// and a second process, since the guard lives in this process alone.
-    pub(crate) async fn merge_commit_detached_metadata(
-        &self,
-        checksum: &Checksum,
-        replace: Option<Value>,
-        merge: Option<Vec<u8>>,
-        appends: Vec<(String, Vec<u8>)>,
-        fsync: bool,
-    ) -> Result<()> {
-        let repo_mode = self.mode();
-        let checksum = *checksum;
-        let objects_fd = self.objects_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || {
-            merge_detached_blocking(
-                objects_fd.as_fd(),
-                &checksum,
-                replace,
-                merge,
-                appends,
-                fsync,
-                repo_mode,
-            )
-        })
-        .await
-    }
-
-    /// Remove signatures at a commit's `.commitmeta` loose path.
-    ///
-    /// `remove(payload, blob)` decides each blob stored under `metadata_key`,
-    /// where `payload` is the commit's canonical bytes. The read, the removal
-    /// and the replacing write run as one step under [`DETACHED_MERGE`], the
-    /// guard [`merge_commit_detached_metadata`](Repo::merge_commit_detached_metadata)
-    /// takes, so a signer that runs at the same time in this process keeps its
-    /// signature. Returns the number of blobs removed: zero leaves the file as
-    /// it stands, and a dict the removal empties is written as the zero-length
-    /// "no metadata" marker.
-    pub(crate) async fn prune_commit_detached_signatures(
-        &self,
-        checksum: &Checksum,
-        metadata_key: String,
-        payload: Vec<u8>,
-        mut remove: impl FnMut(&[u8], &[u8]) -> bool + Send + 'static,
-        fsync: bool,
-    ) -> Result<usize> {
         let repo_mode = self.mode();
         let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
-        let objects_fd = self.objects_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || {
-            edit_detached_blocking(objects_fd.as_fd(), &dest, fsync, repo_mode, |read| {
-                let Some(mut dict) = read()? else {
-                    return Ok((DetachedWrite::Keep, 0));
-                };
-                let removed = crate::sign::remove_signatures(
-                    &mut dict,
-                    &metadata_key,
-                    &payload,
-                    &mut remove,
-                )?;
-                if removed == 0 {
-                    return Ok((DetachedWrite::Keep, 0));
-                }
-                let empty = matches!(&dict, Value::Array(entries) if entries.is_empty());
-                let write = if empty {
-                    DetachedWrite::Marker
-                } else {
-                    DetachedWrite::Dict(dict)
-                };
-                Ok((write, removed))
-            })
-        })
-        .await
-    }
-
-    /// Write a commit's detached metadata from its serialized bytes, replaced
-    /// atomically, syncing it where `fsync` is set. Used by the pull path,
-    /// which copies a source repository's `.commitmeta` verbatim rather than
-    /// re-serializing a decoded dict, under its transaction's fsync policy.
-    pub(crate) async fn write_commit_detached_bytes(
-        &self,
-        checksum: &Checksum,
-        bytes: Vec<u8>,
-        fsync: bool,
-    ) -> Result<()> {
-        let repo_mode = self.mode();
-        let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
-        let objects_fd = self.objects_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || {
-            write_detached_blocking(objects_fd.as_fd(), &dest, &bytes, fsync, repo_mode)
+        self.write_locked(move |repo| {
+            write_detached_blocking(repo.objects_fd(), &dest, &bytes, fsync, repo_mode)
         })
         .await
     }
@@ -411,10 +313,20 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
     }
 }
 
-/// The blocking body of
-/// [`merge_commit_detached_metadata`](Repo::merge_commit_detached_metadata),
-/// for a caller that applies several edits in one trip to the blocking pool.
-/// Each call takes [`DETACHED_MERGE`] for its own edit alone.
+/// Apply one detached-metadata edit at a commit's `.commitmeta` loose path,
+/// on the blocking pool.
+///
+/// `replace` is the dict that stands in for whatever the file holds; with
+/// `None` the edit starts from the file's own dict, or from an empty dict
+/// where the file is absent or is the zero-length marker. `merge`, where
+/// given, is the serialized `a{sv}` dict merged into that dict with a union
+/// of each signature list. Each entry of `appends` then appends one signature
+/// to its engine's `aay` array, in order, and the result replaces the file
+/// atomically.
+///
+/// The read, the merge and the replacing write run as one step under
+/// [`DETACHED_MERGE`], for this edit alone, so a caller can apply several
+/// edits in one trip to the blocking pool. The caller holds the update lock.
 pub(crate) fn merge_detached_blocking(
     objects_fd: BorrowedFd<'_>,
     checksum: &Checksum,
@@ -446,12 +358,114 @@ pub(crate) fn merge_detached_blocking(
     })
 }
 
+/// Remove signatures at a commit's `.commitmeta` loose path, on the blocking
+/// pool.
+///
+/// `remove(payload, blob)` decides each blob stored under `metadata_key`,
+/// where `payload` is the commit's canonical bytes. The read, the removal and
+/// the replacing write run as one step under [`DETACHED_MERGE`], as the edit
+/// of [`merge_detached_blocking`] does. Returns the number of blobs removed:
+/// zero leaves the file as it stands, and a dict the removal empties is
+/// written as the zero-length "no metadata" marker. The caller holds the
+/// update lock.
+pub(crate) fn prune_detached_signatures_blocking(
+    objects_fd: BorrowedFd<'_>,
+    checksum: &Checksum,
+    metadata_key: &str,
+    payload: &[u8],
+    remove: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    fsync: bool,
+    repo_mode: RepoMode,
+) -> Result<usize> {
+    let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
+    edit_detached_blocking(objects_fd, &dest, fsync, repo_mode, |read| {
+        let Some(mut dict) = read()? else {
+            return Ok((DetachedWrite::Keep, 0));
+        };
+        let removed = crate::sign::remove_signatures(&mut dict, metadata_key, payload, remove)?;
+        if removed == 0 {
+            return Ok((DetachedWrite::Keep, 0));
+        }
+        let empty = matches!(&dict, Value::Array(entries) if entries.is_empty());
+        let write = if empty {
+            DetachedWrite::Marker
+        } else {
+            DetachedWrite::Dict(dict)
+        };
+        Ok((write, removed))
+    })
+}
+
+/// Write the bytes of a commit's detached metadata to the file `name` in a
+/// transaction's staging directory, for
+/// [`install_detached_blocking`] to move into `objects/` at the commit. The
+/// file takes the `0644` of every metadata object. A file already at `name`
+/// is replaced. The call syncs nothing: the commit makes the file durable
+/// before the install.
+pub(crate) fn stage_detached_blocking(
+    staging_fd: BorrowedFd<'_>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    use std::io::Write;
+
+    let fd = rustix::fs::openat(
+        staging_fd,
+        name,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::from_raw_mode(COMMITMETA_MODE),
+    )?;
+    let mut file = std::fs::File::from(fd);
+    file.write_all(bytes)?;
+    file.flush()?;
+    rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(COMMITMETA_MODE))?;
+    Ok(())
+}
+
+/// Rename each file of a transaction's staging directory in `staged` over
+/// the `.commitmeta` loose path of its commit, under [`DETACHED_MERGE`]. Each
+/// fanout directory is created on demand as [`write_detached_blocking`]
+/// creates it. With fsync on, after the last rename each fanout directory
+/// that gained a file is `fsync`-ed once, and `objects/` is `fsync`-ed once
+/// when a fanout directory was newly created. The caller holds the update
+/// lock, and with fsync on the staged files are durable before the call.
+pub(crate) fn install_detached_blocking(
+    staging_fd: BorrowedFd<'_>,
+    staged: &[(&Checksum, &str)],
+    objects_fd: BorrowedFd<'_>,
+    fsync: bool,
+    repo_mode: RepoMode,
+) -> Result<()> {
+    let _guard = DETACHED_MERGE.lock().unwrap_or_else(|err| err.into_inner());
+    // Each fanout directory that gained a file, and whether this call
+    // created it.
+    let mut fanouts = std::collections::BTreeMap::<String, bool>::new();
+    for (checksum, name) in staged {
+        let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
+        let fanout = &dest[..2];
+        let created = create_fanout(objects_fd, fanout, repo_mode)?;
+        rustix::fs::renameat(staging_fd, *name, objects_fd, dest.as_str())?;
+        *fanouts.entry(fanout.to_owned()).or_default() |= created;
+    }
+    if fsync {
+        for fanout in fanouts.keys() {
+            sync_fanout(objects_fd, fanout, false)?;
+        }
+        if fanouts.values().any(|&created| created) {
+            rustix::fs::fsync(objects_fd)?;
+        }
+    }
+    Ok(())
+}
+
 /// Serializes the read-modify-write cycle behind
-/// [`edit_detached_blocking`] across the whole process. The section holds one
-/// small read, one serialize and one atomic rename, and it holds no await, so
-/// it cannot block a task. It reaches this process alone: two processes that
-/// sign one commit at the same time can still lose a signature, which is what
-/// the `ostree` tool does.
+/// [`edit_detached_blocking`], and the install of a staged file, across the
+/// whole process. The section holds one small read, one serialize and one
+/// atomic rename, and it holds no await, so it cannot block a task. Every
+/// edit of a `.commitmeta` also runs under the update lock, which excludes
+/// other processes and the other writers of this process, so two processes
+/// that sign one commit at the same time keep both signatures. The mutex
+/// guards only a caller of this process that edits without the update lock.
 static DETACHED_MERGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// What one guarded edit leaves at a `.commitmeta` loose path.
@@ -534,14 +548,7 @@ pub(crate) fn write_detached_blocking(
     use std::io::Write;
 
     let fanout = &dest[..2];
-    let fanout_created = match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(0o777)) {
-        Ok(()) => {
-            perm::force_created_dir(objects_fd, fanout, repo_mode)?;
-            true
-        }
-        Err(Errno::EXIST) => false,
-        Err(e) => return Err(e.into()),
-    };
+    let fanout_created = create_fanout(objects_fd, fanout, repo_mode)?;
 
     let tmp = format!(
         "{dest}.tmp-{}-{}",
@@ -565,22 +572,42 @@ pub(crate) fn write_detached_blocking(
         drop(file);
         rustix::fs::renameat(objects_fd, tmp.as_str(), objects_fd, dest)?;
         if fsync {
-            // Make the renamed-in directory entry durable: fsync the fanout
-            // directory, and `objects/` too when the fanout was newly created.
-            let dir = rustix::fs::openat(
-                objects_fd,
-                fanout,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?;
-            rustix::fs::fsync(&dir)?;
-            if fanout_created {
-                rustix::fs::fsync(objects_fd)?;
-            }
+            sync_fanout(objects_fd, fanout, fanout_created)?;
         }
         Ok(())
     };
     write_and_rename().inspect_err(|_| {
         let _ = rustix::fs::unlinkat(objects_fd, tmp.as_str(), AtFlags::empty());
     })
+}
+
+/// Create the fanout directory `fanout` under `objects/` where it is absent
+/// (`0777` reduced by the umask, and forced to [`perm::SHARED_DIR_MODE`] in a
+/// `bare-user-shared` repository), and return whether this call created it.
+fn create_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, repo_mode: RepoMode) -> Result<bool> {
+    match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(0o777)) {
+        Ok(()) => {
+            perm::force_created_dir(objects_fd, fanout, repo_mode)?;
+            Ok(true)
+        }
+        Err(Errno::EXIST) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Make a directory entry renamed into `fanout` durable: `fsync` the fanout
+/// directory, and `objects/` too when `created` says the fanout was newly
+/// created.
+fn sync_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, created: bool) -> Result<()> {
+    let dir = rustix::fs::openat(
+        objects_fd,
+        fanout,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    rustix::fs::fsync(&dir)?;
+    if created {
+        rustix::fs::fsync(objects_fd)?;
+    }
+    Ok(())
 }

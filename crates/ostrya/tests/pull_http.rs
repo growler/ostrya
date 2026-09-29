@@ -893,6 +893,70 @@ fn a_filter_shapes_the_detached_metadata_an_http_pull_stores() {
     });
 }
 
+/// An HTTP pull whose commit fails at the step that writes detached metadata
+/// and refs, because a guard holds the update lock, keeps the marker of the
+/// commit it published and writes no `.commitmeta` and no ref. The next pull
+/// completes the commit, its detached metadata included.
+#[test]
+fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-ref-step-timeout");
+        let (remote, commit) = build_remote(dir.path()).await;
+        remote
+            .write_commit_detached_metadata(&commit, Some(&detached_dict()))
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        drop(build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await);
+        let dest_dir = dir.path().join("dest");
+        let config = dest_dir.join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            text.replacen("[core]\n", "[core]\nlock-timeout-secs=0\n", 1),
+        )
+        .unwrap();
+        let dest = Repo::open(&dest_dir).await.unwrap();
+        let commitmeta = |root: &Path| root.join(meta_path(&commit, "commitmeta"));
+        let opts = || PullOptions {
+            refs: vec!["test/main".to_owned()],
+            ..PullOptions::default()
+        };
+
+        let guard = dest.begin_update().await.unwrap();
+        let err = dest.pull("origin", opts()).await.unwrap_err();
+        assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
+        assert!(
+            dest.has_object(ostrya::ObjectType::Commit, &commit)
+                .await
+                .unwrap()
+        );
+        assert_partial_marker(&dest_dir, &commit);
+        assert!(!commitmeta(&dest_dir).exists(), "no detached metadata");
+        assert_eq!(
+            dest.resolve_ref_tip("origin:test/main").await.unwrap(),
+            None
+        );
+        guard.finish().await.unwrap();
+
+        dest.pull("origin", opts()).await.unwrap();
+        assert!(
+            !dest_dir
+                .join("state")
+                .join(format!("{}.commitpartial", commit.to_hex()))
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(commitmeta(&dest_dir)).unwrap(),
+            std::fs::read(commitmeta(&dir.path().join("remote"))).unwrap()
+        );
+        assert_eq!(
+            dest.resolve_ref_tip("origin:test/main").await.unwrap(),
+            Some(commit)
+        );
+    });
+}
+
 /// The same pull over TLS, where ALPN selects HTTP/2 and every object travels
 /// over one multiplexed connection.
 #[test]

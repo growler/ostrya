@@ -169,50 +169,35 @@ impl Transaction {
             .map(|w| Ok((w.target.relpath()?, w.checksum)))
             .collect()
     }
+}
 
-    /// Write the resolved refs on the blocking pool, each atomically, under the
-    /// transaction's resolved fsync policy, so the whole transaction -- the
-    /// per-object writes, the publication step, and the ref writes -- reads one
-    /// value.
-    ///
-    /// The durability invariant: with fsync on, every ref file is
-    /// `fdatasync`-ed before its rename, and every directory that gained or
-    /// lost a name is `fsync`-ed once after the last rename, deepest first,
-    /// before the call returns. The caller made the objects and the detached
-    /// metadata the refs name durable before the call, so no ref is durable
-    /// ahead of what it names. A write that fails still syncs the directories
-    /// of the refs written before it.
-    pub(crate) async fn write_resolved_refs(
-        &self,
-        refs: &[(String, Option<Checksum>)],
-    ) -> Result<()> {
-        if refs.is_empty() {
-            return Ok(());
-        }
-        let (fsync, _) = self.fsync_flags()?;
-        let repo_mode = self.repo().mode();
-        let repo_fd = self.repo().repo_fd().try_clone_to_owned()?;
-        let refs = refs.to_vec();
-        ostrya_rt::unblock(move || {
-            let mut dirs = Vec::new();
-            let written = refs.iter().try_for_each(|(relpath, checksum)| {
-                put_ref_blocking(
-                    repo_fd.as_fd(),
-                    relpath,
-                    *checksum,
-                    fsync,
-                    repo_mode,
-                    &mut dirs,
-                )
-            });
-            if !fsync {
-                return written;
-            }
-            let synced = sync_ref_dirs(repo_fd.as_fd(), dirs);
-            written.and(synced)
-        })
-        .await
+/// Write the resolved refs of a transaction, each atomically, under the
+/// transaction's resolved fsync policy, so the whole transaction -- the
+/// per-object writes, the publication step, and the ref writes -- reads one
+/// value. Runs on the blocking pool.
+///
+/// The durability invariant: with fsync on, every ref file is `fdatasync`-ed
+/// before its rename, and every directory that gained or lost a name is
+/// `fsync`-ed once after the last rename, deepest first, before the call
+/// returns. The caller made the objects and the detached metadata the refs
+/// name durable before the call, so no ref is durable ahead of what it names.
+/// A write that fails still syncs the directories of the refs written before
+/// it.
+pub(crate) fn write_resolved_refs_blocking(
+    repo_fd: BorrowedFd<'_>,
+    refs: &[(String, Option<Checksum>)],
+    fsync: bool,
+    repo_mode: RepoMode,
+) -> Result<()> {
+    let mut dirs = Vec::new();
+    let written = refs.iter().try_for_each(|(relpath, checksum)| {
+        put_ref_blocking(repo_fd, relpath, *checksum, fsync, repo_mode, &mut dirs)
+    });
+    if !fsync {
+        return written;
     }
+    let synced = sync_ref_dirs(repo_fd, dirs);
+    written.and(synced)
 }
 
 /// The largest ref file the reader will load; a ref is 65 bytes.
@@ -485,6 +470,15 @@ impl Repo {
     /// removes the ref file. The write follows the same tmpfile, `fdatasync`,
     /// rename, directory `fsync` sequence a transaction uses, honoring
     /// `[core] fsync`.
+    ///
+    /// The call takes the repository lock shared and then the update lock, as
+    /// [`Repo::begin_update`] does, and writes under both. Each of the two
+    /// waits fails with [`Error::LockTimeout`] after `lock-timeout-secs`. A
+    /// caller that holds an [`UpdateGuard`](crate::UpdateGuard) of this
+    /// repository waits for its own guard until the timeout, and with
+    /// `lock-timeout-secs=-1` it waits forever: write through the guard
+    /// instead. When `[core] locking` is on, a caller that holds the
+    /// repository lock exclusive waits for its own lock the same way.
     pub async fn set_ref_immediate(
         &self,
         refspec: &str,
@@ -496,7 +490,8 @@ impl Repo {
 
     /// Write one collection ref outside a transaction, atomically, the way
     /// [`set_ref_immediate`](Repo::set_ref_immediate) writes a refspec. A
-    /// `None` checksum removes the ref file.
+    /// `None` checksum removes the ref file. The call takes the locks
+    /// `set_ref_immediate` takes and waits for them the same way.
     pub async fn set_collection_ref_immediate(
         &self,
         cref: &CollectionRef,
@@ -510,9 +505,8 @@ impl Repo {
         let fsync = self.config().fsync()?;
         let repo_mode = self.mode();
         let checksum = checksum.copied();
-        let repo_fd = self.repo_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || {
-            write_ref_blocking(repo_fd.as_fd(), &relpath, checksum, fsync, repo_mode)
+        self.write_locked(move |repo| {
+            write_ref_blocking(repo.repo_fd(), &relpath, checksum, fsync, repo_mode)
         })
         .await
     }
@@ -522,14 +516,16 @@ impl Repo {
     /// before. Both refspecs are validated; neither ref need already exist,
     /// since the link records a name and not a checksum. The write honors
     /// `[core] fsync`, which for a symlink reaches the directory holding it.
+    /// The call takes the locks
+    /// [`set_ref_immediate`](Repo::set_ref_immediate) takes and waits for them
+    /// the same way.
     pub async fn set_ref_alias_immediate(&self, refspec: &str, target: &str) -> Result<()> {
         let fsync = self.config().fsync()?;
         let repo_mode = self.mode();
         let relpath = refspec_to_relpath(refspec)?;
         let link = relative_link(&relpath, &refspec_to_relpath(target)?);
-        let repo_fd = self.repo_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || {
-            write_alias_blocking(repo_fd.as_fd(), &relpath, &link, fsync, repo_mode)
+        self.write_locked(move |repo| {
+            write_alias_blocking(repo.repo_fd(), &relpath, &link, fsync, repo_mode)
         })
         .await
     }

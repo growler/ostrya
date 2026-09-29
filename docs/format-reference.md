@@ -808,9 +808,14 @@ and object bytes do not depend on them.
 
 The file `<repo>/.update.lock` holds the update lock of the port. The port
 takes an exclusive `fcntl` record lock on it, after it takes the repository
-lock shared. The lock serializes the ref, ref alias, and `config` writes of
-an update guard (`Repo::begin_update`), the transaction commit of a receive
-session, and summary regeneration. The port creates the file on the first
+lock shared. The lock serializes every port write of refs and ref aliases,
+`config` and the remote keyrings, `summary` and `summary.sig`, and
+`.commitmeta` files: the writes of an update guard (`Repo::begin_update`),
+the step of a transaction commit that writes detached metadata and refs, and
+each writer outside a transaction. A transaction publishes its objects before
+it takes the lock, and a transaction that writes no ref and no detached
+metadata takes no lock. Two port processes that sign one commit at the same
+time therefore keep both signatures. The port creates the file on the first
 acquire with the rules of `.lock` and never unlinks it. A file that already
 exists keeps its mode. The update lock ignores `[core] locking=false`. The tool
 never opens this file, so the lock excludes port processes alone.
@@ -1437,7 +1442,15 @@ another repository are not synced at ingest. The `syncfs` that opens
 publication makes every staged object durable, metadata included. A receiving
 push session runs that `syncfs` before it takes the update lock. With fsync
 on, it then `fsync`s the file of each metadata object it stages under the lock,
-and its publication runs no second `syncfs`. The staging directory layout is
+and its publication runs no second `syncfs`. Any other transaction publishes
+before it takes the update lock. It takes the lock only to write detached
+metadata and refs, after the directory `fsync`s of publication. A pull stages
+the `.commitmeta` it copies as a file in the staging directory, with no sync of
+its own, and renames it into `objects/<xx>/` at that step. With fsync on, the
+`syncfs` that opens publication makes the staged file durable, and where
+publication runs no `syncfs` the step runs one before the rename. After the
+renames the step `fsync`s each fanout directory that gained a `.commitmeta`
+once, and `objects/` once when it created a fanout directory. The staging directory layout is
 transient and is not part of the on-disk format.
 
 ## Write path: fs-verity (ex-integrity)
@@ -3408,7 +3421,9 @@ Storage. Identical to `bare-user` in every byte that carries identity:
 
 The single behavioral difference from `bare-user`: the logical mode is never
 applied to the inode. Objects are written with a fixed mode 0644 via explicit
-`fchmod` (never trusting umask).
+`fchmod` (never trusting umask). A `.commitmeta` takes 0644 the same way,
+also one a pull stages in the staging directory before the rename into
+`objects/`.
 
 The port forces the permission bits of every directory and every lock file it
 creates inside the repository, with an `fchmod` after the create, so the
@@ -3712,10 +3727,13 @@ Under `--disable-fsync` both make 0.
 A pulled commit that carries detached metadata adds a `.commitmeta` to the
 pull. The tool makes no sync call for it, and its counts stay 11 on
 `pull-local`, on `pull`, and on a `--mirror` pull of `C0` committed with
-`--add-detached-metadata-string` into `archive`. The port writes the
-`.commitmeta` before publication with an `fdatasync` of its temp file, an
-`fsync` of its fanout directory, and an `fsync` of `objects/`, so it makes 15,
-16, and 17 calls. Under `--disable-fsync` both make 0.
+`--add-detached-metadata-string` into `archive`. The port stages the
+`.commitmeta` before publication with no sync call of its own: the `syncfs`
+that opens publication makes the staged file durable. After publication it
+renames the file into `objects/<xx>/` with an `fsync` of the fanout directory.
+Publication created that fanout directory for the commit object and synced
+`objects/`, so the rename adds no `fsync` of `objects/`. The port makes 13, 14,
+and 15 calls. Under `--disable-fsync` both make 0.
 
 Over `pull-local` of the same commit out of an `archive` source:
 

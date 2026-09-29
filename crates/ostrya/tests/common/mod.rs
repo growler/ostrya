@@ -278,6 +278,82 @@ pub fn guard_holder_main() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// A writer in another process.
+// ---------------------------------------------------------------------------
+
+/// The environment variable that names the repository of the writer helper.
+const WRITER_CHILD_REPO: &str = "OSTRYA_TEST_WRITER_CHILD_REPO";
+
+/// The environment variable that carries the argument of the writer helper.
+const WRITER_CHILD_ARG: &str = "OSTRYA_TEST_WRITER_CHILD_ARG";
+
+/// The name of the ignored test each test binary that starts a writer helper
+/// defines, which calls [`writer_child_main`].
+pub const WRITER_CHILD_TEST: &str = "writer_child_subprocess";
+
+/// A child process that runs one write on one repository.
+pub struct WriterChild {
+    child: Option<std::process::Child>,
+}
+
+impl WriterChild {
+    /// Wait for the child to exit. Fails when the write failed.
+    pub fn wait(mut self) {
+        let child = self.child.take().unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the writer reported {}:\n{stdout}",
+            output.status
+        );
+    }
+
+    /// Whether the child has exited.
+    pub fn finished(&mut self) -> bool {
+        let child = self.child.as_mut().unwrap();
+        child.try_wait().unwrap().is_some()
+    }
+}
+
+impl Drop for WriterChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Start this test binary again as a process that runs the write of the test
+/// binary on the repository at `repo`, with the argument `arg`. The call
+/// returns at once.
+pub fn writer_child(repo: &Path, arg: &str) -> WriterChild {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([WRITER_CHILD_TEST, "--exact", "--ignored", "--nocapture"])
+        .env(WRITER_CHILD_REPO, repo)
+        .env(WRITER_CHILD_ARG, arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn the writer");
+    WriterChild { child: Some(child) }
+}
+
+/// The body of the writer helper: run `write` on the repository and the
+/// argument the environment names. Outside a helper process it does nothing.
+pub fn writer_child_main(write: impl FnOnce(&Path, &str)) {
+    let (Some(path), Ok(arg)) = (
+        std::env::var_os(WRITER_CHILD_REPO).map(PathBuf::from),
+        std::env::var(WRITER_CHILD_ARG),
+    ) else {
+        return;
+    };
+    write(&path, &arg);
+}
+
 /// The environment variable that turns the reference-absent skip into a
 /// failure. A harness setting it declares that `ostree` is installed, so a run
 /// where it is not is a broken harness rather than a test to pass over.

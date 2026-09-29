@@ -126,13 +126,18 @@ struct Staged {
 ///
 /// The edit is held as a plan rather than as a finished dict, so the read of
 /// what the repository already stores happens once, at the write, under the
-/// guard that serializes it. `replace` is the dict
+/// guard that serializes it. `staged` names the file a pull staged in place of
+/// the stored one; `replace` is the dict
 /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
 /// put in place of the stored one; `merge` is the dict a receiving session
 /// merges into it; `appends` are the signatures
 /// [`sign_commit`](Transaction::sign_commit) produced after it, in call order.
 #[derive(Default)]
 struct DetachedEdit {
+    /// The file in the staging directory whose bytes replace whatever the
+    /// repository stores, when a pull staged one. The write installs it
+    /// first, and the other parts of the edit then apply to it.
+    staged: Option<String>,
     /// The dict that replaces whatever the repository stores, when a caller
     /// queued one. `None` starts the edit from the stored dict.
     replace: Option<Value>,
@@ -142,6 +147,15 @@ struct DetachedEdit {
     merge: Option<Vec<u8>>,
     /// Signatures to append, each an engine metadata key and one signature.
     appends: Vec<(String, Vec<u8>)>,
+}
+
+/// The queued detached-metadata edits of a transaction, one per commit in the
+/// order of the first edit of each, with an index from each commit to the
+/// position of its edit.
+#[derive(Default)]
+struct DetachedQueue {
+    edits: Vec<(Checksum, DetachedEdit)>,
+    index: HashMap<Checksum, usize>,
 }
 
 /// An owned transaction over a repository.
@@ -183,14 +197,14 @@ pub struct Transaction {
     /// and by [`sign_commit`](Transaction::sign_commit), applied at
     /// [`commit`](Transaction::commit) after object publication and before the
     /// queued ref writes, so a commit a ref names carries its signatures.
-    detached: Mutex<Vec<(Checksum, DetachedEdit)>>,
+    detached: Mutex<DetachedQueue>,
     /// The uid and gid an object freshly staged in this transaction takes,
     /// measured once on first use by [`fresh_owner`](Transaction::fresh_owner).
     fresh_owner: OnceLock<(u32, u32)>,
     staging: Option<StagingDir>,
     /// The repository lock hold, kept for the transaction's lifetime and
-    /// released when this field drops. Never read.
-    #[allow(dead_code)]
+    /// released when this field drops. A commit that writes a ref or detached
+    /// metadata moves it into the blocking closure of that write.
     lock: LockGuard,
 }
 
@@ -218,7 +232,7 @@ impl Transaction {
                 presynced: None,
             }),
             refs: Mutex::new(Vec::new()),
-            detached: Mutex::new(Vec::new()),
+            detached: Mutex::new(DetachedQueue::default()),
             fresh_owner: OnceLock::new(),
             staging: Some(staging),
             lock,
@@ -519,9 +533,46 @@ impl Transaction {
     pub fn set_commit_detached_metadata(&self, checksum: &Checksum, meta: Value) {
         let mut queue = self.detached.lock().unwrap();
         let edit = Self::edit_for(&mut queue, checksum);
+        edit.staged = None;
         edit.replace = Some(meta);
         edit.merge = None;
         edit.appends.clear();
+    }
+
+    /// Stage `bytes`, the serialized detached metadata of `checksum`, in
+    /// place of whatever the repository stores. A pull copies a source's
+    /// `.commitmeta` verbatim through this call.
+    ///
+    /// The bytes go to a file in the staging directory at once, so the queue
+    /// holds no copy of them. At [`commit`](Transaction::commit) the write
+    /// renames the file over the `.commitmeta` of `checksum`, after the staged
+    /// objects publish and before the queued refs are written. With fsync on,
+    /// the file is durable before the rename: the `syncfs` of the publication
+    /// step covers it, and where that step runs no `syncfs` the write runs
+    /// one of its own. A transaction that does not
+    /// commit leaves the stored file as it stands. Staging again for one
+    /// checksum replaces the file, and like
+    /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
+    /// the call drops the edits queued for `checksum` before it.
+    pub(crate) async fn stage_commit_detached_bytes(
+        &self,
+        checksum: &Checksum,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        let name = crate::write::flat_name(checksum, ObjectType::CommitMeta, self.repo.mode());
+        let staging = self.staging_fd().try_clone_to_owned()?;
+        let staged = name.clone();
+        ostrya_rt::unblock(move || {
+            crate::commit::stage_detached_blocking(staging.as_fd(), &staged, &bytes)
+        })
+        .await?;
+        let mut queue = self.detached.lock().unwrap();
+        let edit = Self::edit_for(&mut queue, checksum);
+        edit.staged = Some(name);
+        edit.replace = None;
+        edit.merge = None;
+        edit.appends.clear();
+        Ok(())
     }
 
     /// Queue a merge of `incoming`, the bytes of an `a{sv}` dict, into the
@@ -565,14 +616,13 @@ impl Transaction {
     /// queued, else in the dict the repository stores at the moment of the
     /// write, else in an empty one.
     ///
-    /// The queueing takes one lock and holds no await, and the write reads,
-    /// merges and replaces the file under a guard the whole process shares, so
-    /// signatures several tasks produce for one commit all reach it -- from one
-    /// transaction, from concurrent transactions, and from
-    /// [`Repo::sign_commit`](crate::Repo::sign_commit) alike. The guard covers
-    /// this process alone, and the repository lock a transaction takes is
-    /// shared, so two processes that sign one commit at the same time can lose
-    /// a signature. The `ostree` tool loses one the same way.
+    /// The queueing takes one lock and holds no await. The signature is made
+    /// here, before any lock of the commit. The write at `commit` reads,
+    /// merges and replaces the file under the update lock, so signatures that
+    /// several tasks or processes produce for one commit all reach it -- from
+    /// one transaction, from concurrent transactions, and from
+    /// [`Repo::sign_commit`](crate::Repo::sign_commit) alike. The `ostree`
+    /// tool can lose a signature in that case.
     ///
     /// Nothing reaches the filesystem here: the whole signing step precedes
     /// object publication and the ref writes, so a signature that cannot be
@@ -589,18 +639,13 @@ impl Transaction {
     }
 
     /// The queued edit for `checksum`, added empty when the queue holds none.
-    fn edit_for<'a>(
-        queue: &'a mut Vec<(Checksum, DetachedEdit)>,
-        checksum: &Checksum,
-    ) -> &'a mut DetachedEdit {
-        let index = match queue.iter().position(|(c, _)| c == checksum) {
-            Some(index) => index,
-            None => {
-                queue.push((*checksum, DetachedEdit::default()));
-                queue.len() - 1
-            }
-        };
-        &mut queue[index].1
+    fn edit_for<'a>(queue: &'a mut DetachedQueue, checksum: &Checksum) -> &'a mut DetachedEdit {
+        let edits = &mut queue.edits;
+        let index = *queue.index.entry(*checksum).or_insert_with(|| {
+            edits.push((*checksum, DetachedEdit::default()));
+            edits.len() - 1
+        });
+        &mut edits[index].1
     }
 
     /// Load a commit object's canonical bytes, checking this transaction's
@@ -629,35 +674,23 @@ impl Transaction {
         .map_err(Error::Io)
     }
 
-    /// Apply the queued detached-metadata edits, in one trip to the blocking
-    /// pool. Called between publication and the ref writes, under the
-    /// transaction's own fsync policy. Each edit is written and, with fsync
-    /// on, made durable before the next one starts, and each takes the
-    /// process-wide guard of detached-metadata edits for itself alone.
-    async fn write_detached(&self) -> Result<()> {
-        let queued: Vec<(Checksum, DetachedEdit)> =
-            std::mem::take(&mut *self.detached.lock().unwrap());
-        if queued.is_empty() {
-            return Ok(());
-        }
+    /// Take the queued detached-metadata edits, for
+    /// [`DetachedJob::run`] to apply between publication and the ref writes,
+    /// under the transaction's own fsync policy.
+    ///
+    /// `synced` tells whether the publication step ran its `syncfs`, which
+    /// makes the staged files durable too.
+    fn detached_job(&self, synced: bool) -> Result<DetachedJob> {
+        let queued = std::mem::take(&mut self.detached.lock().unwrap().edits);
         let (fsync, _) = self.fsync_flags()?;
-        let repo_mode = self.repo.mode();
-        let objects_fd = self.repo.objects_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || {
-            for (checksum, edit) in queued {
-                crate::commit::merge_detached_blocking(
-                    objects_fd.as_fd(),
-                    &checksum,
-                    edit.replace,
-                    edit.merge,
-                    edit.appends,
-                    fsync,
-                    repo_mode,
-                )?;
-            }
-            Ok(())
+        Ok(DetachedJob {
+            queued,
+            fsync,
+            staged_durable: synced,
+            repo_mode: self.repo.mode(),
+            objects_fd: self.repo.objects_fd().try_clone_to_owned()?,
+            staging_fd: self.staging_fd().try_clone_to_owned()?,
         })
-        .await
     }
 
     /// Stage a regular-file content object whose payload is already written to
@@ -1028,10 +1061,10 @@ impl Transaction {
     /// the repository config: with fsync on, the repository is `syncfs`-ed
     /// before the staged objects are renamed into `objects/<xx>/`, and each
     /// touched fanout directory and `objects/` is `fsync`-ed afterward. The
-    /// queued detached-metadata dicts are written next, in one trip to the
-    /// blocking pool, so a commit and its `.commitmeta` are both durable before
-    /// a ref names them. Only then are the queued refs written, each
-    /// individually atomic (tmpfile, rename, with the tmpfile `fdatasync`-ed
+    /// queued detached-metadata edits are written next, and then the queued
+    /// refs, in one trip to the blocking pool, so a commit and its
+    /// `.commitmeta` are both durable before a ref names them. Each ref is
+    /// written atomically (tmpfile, rename, with the tmpfile `fdatasync`-ed
     /// under the same policy). After the last rename each directory that
     /// gained or lost a ref name is `fsync`-ed once, deepest first, so every
     /// ref is durable when the call returns and every object a ref names is
@@ -1040,8 +1073,35 @@ impl Transaction {
     /// refspecs are validated up front, before any object is published, so a
     /// malformed refspec fails the commit with nothing written. The staging
     /// directory is then reaped and the lock released.
-    pub async fn commit(self) -> Result<TransactionStats> {
-        self.commit_steps().await
+    ///
+    /// The objects publish with no update lock held. When the transaction
+    /// writes a ref, a ref removal included, or detached metadata, the call
+    /// then takes the update lock, which excludes the other writers of refs
+    /// and detached metadata, and writes the detached metadata and the refs
+    /// under it. A transaction that writes neither takes no update lock. The
+    /// transaction holds the repository lock already, so the wait is for the
+    /// update lock alone. It fails with [`Error::LockTimeout`] after
+    /// `lock-timeout-secs`, and the commit then leaves its published objects
+    /// with no detached metadata and no ref written. A caller that holds an
+    /// [`UpdateGuard`](crate::UpdateGuard) of this repository and commits a
+    /// transaction that writes a ref waits for its own guard until the
+    /// timeout, and with `lock-timeout-secs=-1` it waits forever.
+    ///
+    /// The update lock, the repository lock, and the staging directory move
+    /// into the blocking closure that writes the detached metadata and the
+    /// refs, and the closure releases them when those writes end. So a caller
+    /// that drops the returned future cannot release a lock or lose a staged
+    /// file while those writes still run, and the writes complete.
+    pub async fn commit(mut self) -> Result<TransactionStats> {
+        let refs = self.resolve_ref_queue()?;
+        let synced = self.publish().await?;
+        if refs.is_empty() && self.detached.lock().unwrap().edits.is_empty() {
+            let stats = self.staged.lock().unwrap().stats;
+            self.reap_staging().await;
+            return Ok(stats);
+        }
+        let held = self.repo.lock_update().await?;
+        self.write_tail(refs, synced, Some(held)).await
     }
 
     /// Commit the transaction as [`commit`](Transaction::commit) does, under
@@ -1053,17 +1113,46 @@ impl Transaction {
             self.repo.holds_update_lock(held),
             "the hold is not the update lock of this repository"
         );
-        self.commit_steps().await
+        let refs = self.resolve_ref_queue()?;
+        let synced = self.publish().await?;
+        self.write_tail(refs, synced, None).await
     }
 
-    /// The steps of [`commit`](Transaction::commit).
-    async fn commit_steps(mut self) -> Result<TransactionStats> {
-        let refs = self.resolve_ref_queue()?;
-        self.publish().await?;
-        self.write_detached().await?;
-        self.write_resolved_refs(&refs).await?;
+    /// Write the queued detached metadata and then `refs`, reap the staging
+    /// directory, and release the locks, in one trip to the blocking pool.
+    /// `synced` tells whether the publication step ran its `syncfs`.
+    ///
+    /// The staging directory, the repository lock, and `held`, where given,
+    /// move into the blocking closure. The closure releases the update lock
+    /// after the last ref write, then reaps the staging directory, then
+    /// releases the repository lock. So a caller that drops the returned
+    /// future cannot release a lock or remove a staged file while the writes
+    /// still run.
+    async fn write_tail(
+        mut self,
+        refs: Vec<(String, Option<Checksum>)>,
+        synced: bool,
+        held: Option<UpdateLockHeld>,
+    ) -> Result<TransactionStats> {
+        let detached = self.detached_job(synced)?;
+        let (fsync, _) = self.fsync_flags()?;
+        let repo_mode = self.repo.mode();
+        let repo_fd = self.repo.repo_fd().try_clone_to_owned()?;
         let stats = self.staged.lock().unwrap().stats;
-        self.reap_staging().await;
+        let staging = self.staging.take();
+        let lock = self.lock;
+        ostrya_rt::unblock(move || {
+            #[cfg(test)]
+            test_tail::pass(repo_fd.as_fd());
+            let written = detached.run().and_then(|()| {
+                crate::refs::write_resolved_refs_blocking(repo_fd.as_fd(), &refs, fsync, repo_mode)
+            });
+            drop(held);
+            drop(staging);
+            drop(lock);
+            written
+        })
+        .await?;
         Ok(stats)
     }
 
@@ -1101,8 +1190,9 @@ impl Transaction {
         Ok(())
     }
 
-    /// Rename every staged object into `objects/` on the blocking pool.
-    async fn publish(&self) -> Result<()> {
+    /// Rename every staged object into `objects/` on the blocking pool, and
+    /// return whether the step ran its `syncfs`.
+    async fn publish(&self) -> Result<bool> {
         let objects: Vec<(String, String)> = {
             let staged = self.staged.lock().unwrap();
             staged
@@ -1112,7 +1202,7 @@ impl Transaction {
                 .collect()
         };
         if objects.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let (fsync, _) = self.fsync_flags()?;
         let syncfs = self.syncfs_at_publish(fsync);
@@ -1131,7 +1221,8 @@ impl Transaction {
                 repo_mode,
             )
         })
-        .await
+        .await?;
+        Ok(syncfs)
     }
 
     /// Remove the staging directory on the blocking pool, if still present.
@@ -1142,11 +1233,119 @@ impl Transaction {
     }
 }
 
+/// The queued detached-metadata edits of a commit, taken from the
+/// transaction for one trip to the blocking pool.
+struct DetachedJob {
+    queued: Vec<(Checksum, DetachedEdit)>,
+    fsync: bool,
+    /// Whether the staged files are durable already, from the `syncfs` of
+    /// the publication step.
+    staged_durable: bool,
+    repo_mode: RepoMode,
+    objects_fd: std::os::fd::OwnedFd,
+    staging_fd: std::os::fd::OwnedFd,
+}
+
+impl DetachedJob {
+    /// Apply the edits. The staged files are installed first, in one step,
+    /// and the rest of the edit of each commit then applies to its installed
+    /// file. With fsync on, a `syncfs` makes the staged files durable before
+    /// the install where the publication step ran none. Each other edit is
+    /// written and, with fsync on, made durable before the next one starts,
+    /// and each takes the process-wide guard of detached-metadata edits for
+    /// itself alone. The caller holds the update lock.
+    fn run(self) -> Result<()> {
+        let staged: Vec<(&Checksum, &str)> = self
+            .queued
+            .iter()
+            .filter_map(|(checksum, edit)| Some((checksum, edit.staged.as_deref()?)))
+            .collect();
+        if !staged.is_empty() {
+            if self.fsync && !self.staged_durable {
+                rustix::fs::syncfs(self.staging_fd.as_fd())?;
+            }
+            crate::commit::install_detached_blocking(
+                self.staging_fd.as_fd(),
+                &staged,
+                self.objects_fd.as_fd(),
+                self.fsync,
+                self.repo_mode,
+            )?;
+        }
+        for (checksum, edit) in self.queued {
+            if edit.staged.is_some()
+                && edit.replace.is_none()
+                && edit.merge.is_none()
+                && edit.appends.is_empty()
+            {
+                continue;
+            }
+            crate::commit::merge_detached_blocking(
+                self.objects_fd.as_fd(),
+                &checksum,
+                edit.replace,
+                edit.merge,
+                edit.appends,
+                self.fsync,
+                self.repo_mode,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// A transaction moves freely across tasks and threads.
 const _: fn() = || {
     fn is_send_sync<T: Send + Sync>() {}
     is_send_sync::<Transaction>();
 };
+
+/// A gate that the step of a commit that writes detached metadata and refs
+/// passes, for the unit tests. A test arms it for one repository root. The
+/// next such step of a commit of that repository then reports that it started
+/// and waits until the test opens the gate.
+#[cfg(test)]
+mod test_tail {
+    use std::os::fd::BorrowedFd;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+
+    type Gate = ((u64, u64), Sender<()>, Receiver<()>);
+
+    static GATES: Mutex<Vec<Gate>> = Mutex::new(Vec::new());
+
+    /// Arm the gate for the repository root `root`, and return the receiver
+    /// of the start report and the sender that opens the gate.
+    pub(super) fn arm(root: &std::path::Path) -> (Receiver<()>, Sender<()>) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(root).unwrap();
+        let (started_tx, started_rx) = channel();
+        let (go_tx, go_rx) = channel();
+        GATES
+            .lock()
+            .unwrap()
+            .push(((meta.dev(), meta.ino()), started_tx, go_rx));
+        (started_rx, go_tx)
+    }
+
+    /// Report the start and wait for the gate, when a gate is armed for the
+    /// repository root `repo_fd`.
+    pub(super) fn pass(repo_fd: BorrowedFd<'_>) {
+        let Ok(stat) = rustix::fs::fstat(repo_fd) else {
+            return;
+        };
+        let key = (stat.st_dev, stat.st_ino);
+        let gate = {
+            let mut gates = GATES.lock().unwrap();
+            let index = gates.iter().position(|gate| gate.0 == key);
+            index.map(|index| gates.remove(index))
+        };
+        if let Some((_, started, go)) = gate {
+            let _ = started.send(());
+            let _ = go.recv();
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1436,6 +1635,306 @@ mod tests {
                 "unexpected error: {err}"
             );
             txn.abort().await.unwrap();
+        });
+    }
+
+    /// Create an archive repository under `scratch`, with `lock-timeout-secs=0`
+    /// in its `[core]` group, and open it again so the handle reads the value.
+    async fn no_wait_repo(scratch: &Scratch) -> crate::Repo {
+        let root = scratch.0.join("repo");
+        drop(
+            crate::Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap(),
+        );
+        let config = root.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("lock-timeout-secs=0\n");
+        std::fs::write(&config, text).unwrap();
+        crate::Repo::open(&root).await.unwrap()
+    }
+
+    /// The `.commitmeta` path of `commit` under the archive repository at
+    /// `root`.
+    fn commitmeta(root: &std::path::Path, commit: &Checksum) -> std::path::PathBuf {
+        root.join("objects").join(ostrya_core::loose_path(
+            commit,
+            ObjectType::CommitMeta,
+            RepoMode::Archive,
+        ))
+    }
+
+    /// An `a{sv}` dict of one string entry.
+    fn string_dict(key: &str, text: &str) -> Value {
+        Value::Array(vec![Value::Tuple(vec![
+            Value::Str(key.into()),
+            Value::variant(
+                ostrya_core::Type::parse("s").unwrap(),
+                Value::Str(text.into()),
+            ),
+        ])])
+    }
+
+    /// Staged bytes reach `objects/` verbatim at the commit, at mode 0644, and
+    /// the signatures queued after the stage append to them.
+    #[test]
+    fn a_staged_file_is_installed_at_the_commit_and_takes_later_appends() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const KEY: &str = "ostree.sign.ed25519";
+        let scratch = Scratch::new("staged-detached");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let commit = Checksum::from_bytes([0x31; 32]);
+            let staged = crate::summary::serialize_signature_dict(&string_dict("a", "x")).unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            txn.stage_commit_detached_bytes(&commit, b"first".to_vec())
+                .await
+                .unwrap();
+            txn.stage_commit_detached_bytes(&commit, staged.clone())
+                .await
+                .unwrap();
+            assert!(
+                !commitmeta(&root, &commit).exists(),
+                "nothing before commit"
+            );
+            txn.commit().await.unwrap();
+            assert_eq!(std::fs::read(commitmeta(&root, &commit)).unwrap(), staged);
+            let mode = std::fs::metadata(commitmeta(&root, &commit))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o7777, 0o644);
+
+            let txn = repo.transaction().await.unwrap();
+            txn.stage_commit_detached_bytes(&commit, staged.clone())
+                .await
+                .unwrap();
+            Transaction::edit_for(&mut txn.detached.lock().unwrap(), &commit)
+                .appends
+                .push((KEY.to_owned(), vec![9; 64]));
+            txn.commit().await.unwrap();
+            let stored = repo
+                .read_commit_detached_metadata(&commit)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.dict_get("a").is_some(), "the staged key stays");
+            assert_eq!(crate::sign::signatures_for(&stored, KEY), vec![vec![9; 64]]);
+        });
+    }
+
+    /// A dict queued after a stage replaces it, and a stage after a queued
+    /// dict replaces the dict.
+    #[test]
+    fn the_last_of_a_stage_and_a_queued_dict_wins() {
+        let scratch = Scratch::new("staged-replace");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let commit = Checksum::from_bytes([0x32; 32]);
+            let staged = crate::summary::serialize_signature_dict(&string_dict("a", "x")).unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            txn.stage_commit_detached_bytes(&commit, staged.clone())
+                .await
+                .unwrap();
+            txn.set_commit_detached_metadata(&commit, string_dict("b", "y"));
+            txn.commit().await.unwrap();
+            assert_eq!(
+                repo.read_commit_detached_metadata(&commit).await.unwrap(),
+                Some(string_dict("b", "y"))
+            );
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_commit_detached_metadata(&commit, string_dict("b", "z"));
+            txn.stage_commit_detached_bytes(&commit, staged)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            assert_eq!(
+                repo.read_commit_detached_metadata(&commit).await.unwrap(),
+                Some(string_dict("a", "x"))
+            );
+        });
+    }
+
+    /// A transaction that does not commit leaves the stored file as it
+    /// stands.
+    #[test]
+    fn an_aborted_transaction_installs_no_staged_file() {
+        let scratch = Scratch::new("staged-abort");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let commit = Checksum::from_bytes([0x33; 32]);
+
+            let txn = repo.transaction().await.unwrap();
+            txn.stage_commit_detached_bytes(&commit, b"staged".to_vec())
+                .await
+                .unwrap();
+            txn.abort().await.unwrap();
+            assert!(!commitmeta(&root, &commit).exists());
+
+            repo.write_commit_detached_metadata(&commit, Some(&string_dict("a", "x")))
+                .await
+                .unwrap();
+            let before = std::fs::read(commitmeta(&root, &commit)).unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.stage_commit_detached_bytes(&commit, b"staged".to_vec())
+                .await
+                .unwrap();
+            drop(txn);
+            assert_eq!(std::fs::read(commitmeta(&root, &commit)).unwrap(), before);
+        });
+    }
+
+    /// The update lock is taken only by a commit that writes a ref, a ref
+    /// removal included, or detached metadata. A commit that waits in vain
+    /// leaves its published objects, no ref, and no detached metadata.
+    #[test]
+    fn only_a_commit_that_writes_a_ref_or_detached_metadata_takes_the_update_lock() {
+        let scratch = Scratch::new("lock-condition");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let meta = FileMeta::regular(0, 0, 0o644);
+            let held = repo.lock_update().await.unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            let object = txn.write_regfile_inline(None, &meta, b"one").await.unwrap();
+            txn.commit().await.unwrap();
+            assert!(repo.has_object(ObjectType::File, &object).await.unwrap());
+
+            let commit = Checksum::from_bytes([0x34; 32]);
+            let refused: [&dyn Fn(&Transaction); 3] = [
+                &|txn| txn.set_ref("main", Some(&commit)),
+                &|txn| txn.set_ref("main", None),
+                &|txn| txn.set_commit_detached_metadata(&commit, string_dict("a", "x")),
+            ];
+            for queue in refused {
+                let txn = repo.transaction().await.unwrap();
+                let object = txn.write_regfile_inline(None, &meta, b"two").await.unwrap();
+                queue(&txn);
+                let err = txn.commit().await.unwrap_err();
+                assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
+                assert!(repo.has_object(ObjectType::File, &object).await.unwrap());
+                assert_eq!(repo.resolve_ref_tip("main").await.unwrap(), None);
+                assert!(!commitmeta(&root, &commit).exists());
+            }
+            drop(held);
+        });
+    }
+
+    /// Poll the commit of `txn` until its ref step reports the start through
+    /// `started`, and then drop the commit future.
+    async fn drop_commit_at_the_tail(txn: Transaction, started: &std::sync::mpsc::Receiver<()>) {
+        use futures_lite::future::poll_once;
+        use std::time::{Duration, Instant};
+
+        let mut committing = Box::pin(txn.commit());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while started.try_recv().is_err() {
+            assert!(Instant::now() < deadline, "the ref step never started");
+            assert!(poll_once(&mut committing).await.is_none());
+            ostrya_rt::Timer::after(Duration::from_millis(10)).await;
+        }
+        drop(committing);
+    }
+
+    /// Retry `attempt` every 10 ms until it no longer fails with
+    /// [`Error::LockTimeout`], for at most 10 s.
+    async fn retry_lock<T, F: std::future::Future<Output = Result<T>>>(
+        mut attempt: impl FnMut() -> F,
+    ) -> T {
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match attempt().await {
+                Ok(held) => return held,
+                Err(Error::LockTimeout { .. }) => {
+                    assert!(Instant::now() < deadline, "the lock was never released");
+                    ostrya_rt::Timer::after(Duration::from_millis(10)).await;
+                }
+                Err(err) => panic!("{err:?}"),
+            }
+        }
+    }
+
+    /// A commit future dropped while its ref step runs on the blocking pool
+    /// keeps the update lock until that step ends, and the step completes.
+    #[test]
+    fn a_dropped_commit_holds_the_update_lock_until_its_ref_step_ends() {
+        let scratch = Scratch::new("dropped-commit");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let commit = Checksum::from_bytes([0x35; 32]);
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref("main", Some(&commit));
+            let (started, go) = test_tail::arm(&root);
+            drop_commit_at_the_tail(txn, &started).await;
+
+            assert!(crate::lock::update_lock_held_in_process(repo.repo_fd()));
+            let err = repo.lock_update().await.unwrap_err();
+            assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
+
+            go.send(()).unwrap();
+            drop(retry_lock(|| repo.lock_update()).await);
+            assert_eq!(repo.resolve_ref_tip("main").await.unwrap(), Some(commit));
+        });
+    }
+
+    /// A commit future dropped while its ref step runs on the blocking pool
+    /// keeps the repository lock until that step ends, so an exclusive holder
+    /// such as a prune cannot start before the ref is written.
+    #[test]
+    fn a_dropped_commit_holds_the_repository_lock_until_its_ref_step_ends() {
+        use crate::LockKind;
+
+        let scratch = Scratch::new("dropped-commit-repo-lock");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let commit = Checksum::from_bytes([0x36; 32]);
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref("main", Some(&commit));
+            let (started, go) = test_tail::arm(&root);
+            drop_commit_at_the_tail(txn, &started).await;
+
+            let err = repo.lock_repo(LockKind::Exclusive).await.unwrap_err();
+            assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
+
+            go.send(()).unwrap();
+            drop(retry_lock(|| repo.lock_repo(LockKind::Exclusive)).await);
+            assert_eq!(repo.resolve_ref_tip("main").await.unwrap(), Some(commit));
+        });
+    }
+
+    /// A commit future dropped while its ref step runs on the blocking pool
+    /// still installs the staged detached metadata and writes the ref.
+    #[test]
+    fn a_dropped_commit_installs_its_staged_file_and_writes_its_ref() {
+        let scratch = Scratch::new("dropped-commit-staged");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let commit = Checksum::from_bytes([0x37; 32]);
+            let staged = crate::summary::serialize_signature_dict(&string_dict("a", "x")).unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.stage_commit_detached_bytes(&commit, staged.clone())
+                .await
+                .unwrap();
+            txn.set_ref("main", Some(&commit));
+            let (started, go) = test_tail::arm(&root);
+            drop_commit_at_the_tail(txn, &started).await;
+
+            go.send(()).unwrap();
+            drop(retry_lock(|| repo.lock_update()).await);
+            assert_eq!(repo.resolve_ref_tip("main").await.unwrap(), Some(commit));
+            assert_eq!(std::fs::read(commitmeta(&root, &commit)).unwrap(), staged);
         });
     }
 }

@@ -2191,6 +2191,57 @@ fn a_filter_that_skips_everything_stores_nothing() {
     });
 }
 
+/// A pull whose commit fails at the step that writes detached metadata and
+/// refs, because a guard holds the update lock, keeps the marker of the
+/// commit it published and writes no `.commitmeta` and no ref. The next pull
+/// completes the commit, its detached metadata included.
+#[test]
+fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
+    let tmp = TmpDir::new("pull-ref-step-timeout");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        drop(dst);
+        let config = dst_dir.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("lock-timeout-secs=0\n");
+        std::fs::write(&config, text).unwrap();
+        let dst = Repo::open(&dst_dir).await.unwrap();
+
+        let guard = dst.begin_update().await.unwrap();
+        let opts = || PullOptions {
+            refs: vec!["main".to_owned()],
+            ..PullOptions::default()
+        };
+        let err = dst.pull_local(&src, opts()).await.unwrap_err();
+        assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
+        assert!(
+            dst.has_object(ostrya::ObjectType::Commit, &c2)
+                .await
+                .unwrap()
+        );
+        assert!(has_partial_marker(&dst_dir, &c2), "the marker stays");
+        assert!(
+            !commitmeta_path(&dst_dir, &c2).exists(),
+            "no detached metadata"
+        );
+        assert_eq!(dst.resolve_ref_tip("main").await.unwrap(), None);
+        guard.finish().await.unwrap();
+
+        dst.pull_local(&src, opts()).await.unwrap();
+        assert!(!has_partial_marker(&dst_dir, &c2));
+        assert_eq!(
+            std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
+            std::fs::read(commitmeta_path(&src_dir, &c2)).unwrap()
+        );
+        assert_eq!(dst.resolve_ref_tip("main").await.unwrap(), Some(c2));
+    });
+}
+
 /// `DetachedMetadataFilter::excluding` is the constructor the `ostrya` CLI
 /// builds from `[ex-ostrya] detached-metadata-exclude`. It drops the properties
 /// the list names and keeps every other one.

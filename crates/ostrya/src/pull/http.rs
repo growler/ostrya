@@ -58,11 +58,17 @@
 //! object of its tree queued, since what it references is present; its parent is
 //! followed all the same, so a pull extends the history a shallower pull left.
 //!
-//! A commit's `.commitmeta` is requested ahead of the commit object and written
-//! once that object is here, which keeps the detached metadata ahead of the ref
-//! that names its commit and leaves none behind for a parent the remote answers
-//! 404 for. The file is outside the transaction, so a pull that fails after a
-//! commit object landed leaves the copy it wrote, which prune sweeps.
+//! A commit's `.commitmeta` is requested ahead of the commit object and staged
+//! in the transaction once that object is here, which leaves none behind for a
+//! parent the remote answers 404 for. The transaction writes it at its commit,
+//! after the objects publish and ahead of the ref that names its commit. So a
+//! pull that fails before the ref step of its commit leaves no `.commitmeta`
+//! of its own and no ref, and a `LockTimeout` at the ref step is such a
+//! failure. A pull that fails in the ref step itself, at the install of a
+//! later `.commitmeta` or at a ref write, keeps the `.commitmeta` files the
+//! step installed before the failure. A `--mirror` pull of every ref writes
+//! the summary after the commit, and a failure there leaves the refs and the
+//! `.commitmeta` files of the commit in place.
 //!
 //! Subpaths. [`PullOptions::subpaths`](super::PullOptions::subpaths) holds the
 //! walk of each commit's tree to the parts the values name, by the rules in
@@ -204,7 +210,7 @@ use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::CommitState;
 use crate::repo::Repo;
-use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary};
+use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
@@ -375,14 +381,28 @@ impl Repo {
             && let Some(bytes) = summary_bytes
         {
             let fsync = self.config().fsync()? && !opts.disable_fsync;
-            self.write_root_file(SUMMARY_FILE, bytes, fsync).await?;
-            // The signature covers those bytes, so it is copied with them: a
-            // client pulling from this repository with `gpg-verify-summary=true`
-            // reads the pair. A remote holding no `summary.sig` leaves this
-            // repository's own file as it stands, which is what the tool does.
-            if let Some(sig) = signature {
-                self.write_root_file(SUMMARY_SIG_FILE, sig, fsync).await?;
-            }
+            // Both files are written under one hold of the update lock, taken
+            // after the commit released its own, so no other writer of the
+            // summary lands between them. The hold can time out after the
+            // commit wrote the refs and the `.commitmeta` files, and the pull
+            // then fails with those in place and the summary as it stood.
+            self.write_locked(move |repo| {
+                put_root_file_blocking(repo.repo_fd(), SUMMARY_FILE, &bytes, fsync)?;
+                // The signature covers those bytes, so it is copied with them:
+                // a client pulling from this repository with
+                // `gpg-verify-summary=true` reads the pair. A remote holding no
+                // `summary.sig` leaves this repository's own file as it
+                // stands, which is what the tool does.
+                if let Some(sig) = signature {
+                    put_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE, &sig, fsync)?;
+                }
+                // One sync of the root directory makes both renames durable.
+                if fsync {
+                    rustix::fs::fsync(repo.repo_fd())?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         Ok(PullStats {
@@ -746,21 +766,20 @@ impl Repo {
                     .await?;
             }
         }
-        // The commit object is here, so its detached metadata is written now,
-        // ahead of the ref that names it, which is what a verifier reading the
-        // signatures alongside the commit requires. A commit this repository
-        // already holds has the remote's copy written over its own, which is
-        // what re-reading a mutable file on every pull is for. The filter runs
-        // here, after the checks above read the metadata as the remote holds it,
-        // so what a filter drops is dropped from what is stored and not from
-        // what was verified. A filter that allows no property writes nothing,
-        // which leaves the copy this repository holds as it stands.
+        // The commit object is here, so its detached metadata is staged now,
+        // and the commit of the transaction writes it ahead of the ref that
+        // names it, which is what a verifier reading the signatures alongside
+        // the commit requires. A commit this repository already holds has the
+        // remote's copy written over its own, which is what re-reading a
+        // mutable file on every pull is for. The filter runs here, after the
+        // checks above read the metadata as the remote holds it, so what a
+        // filter drops is dropped from what is stored and not from what was
+        // verified. A filter that allows no property stages nothing, which
+        // leaves the copy this repository holds as it stands.
         if let Some(meta) = detached
             && let Some(meta) = ctx.detached_filter.apply(&checksum, meta)?
         {
-            let (fsync, _) = ctx.txn.fsync_flags()?;
-            self.write_commit_detached_bytes(&checksum, meta, fsync)
-                .await?;
+            ctx.txn.stage_commit_detached_bytes(&checksum, meta).await?;
         }
         // Where the commit's objects come from. A commit already complete here
         // needs none of them: what it references is present. Its parent is a

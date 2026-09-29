@@ -98,6 +98,7 @@ use crate::config::remote_keyring_name;
 use crate::error::{Error, Result};
 use crate::repo::Repo;
 use crate::sign::{Verifier, VerifyFuture, VerifyOutcome, read_key_path, read_key_source};
+use crate::summary::{read_root_file_blocking, write_root_file_blocking};
 
 mod verify;
 
@@ -495,7 +496,7 @@ impl Repo {
     /// The keyring is replaced atomically at the repository root. It keeps the
     /// packet stream it already held and carries the packets of each added
     /// certificate as `keys` wrote them, with the Trust packets dropped (see
-    /// `merge_keyring`). It is written in the binary form, so an armored
+    /// `merge_offered`). It is written in the binary form, so an armored
     /// keyring keeps its packets and loses its armor.
     ///
     /// A certificate for a key the keyring already holds is left as the keyring
@@ -512,7 +513,7 @@ impl Repo {
     /// the held one states, an absent expiry counting as later than any instant,
     /// replaces it as well, so a key whose owner has extended its life speaks
     /// again. Each replacement rewrites the keyring and drops the Trust packets
-    /// it carried (see `merge_keyring`), and the key is still counted as one
+    /// it carried (see `merge_offered`), and the key is still counted as one
     /// the keyring already held. The offered stream and the keyring the remote
     /// already holds reach one keyring reader, so a keyring carrying bytes past
     /// its last framed packet is refused by the name of the keyring, which
@@ -521,6 +522,15 @@ impl Repo {
     /// A bare revocation certificate carries no public-key packet
     /// and holds no certificate, so it is refused; the re-export of the revoked
     /// key is the stream that carries a revocation in.
+    ///
+    /// The call takes the repository lock shared and then the update lock, as
+    /// [`Repo::begin_update`] does, and reads, merges, and writes the keyring
+    /// under both, so two imports into one keyring keep the keys of both. Each
+    /// of the two waits fails with [`Error::LockTimeout`] after
+    /// `lock-timeout-secs`. A caller that holds an
+    /// [`UpdateGuard`](crate::UpdateGuard) of this repository waits for its own
+    /// guard until the timeout, and with `lock-timeout-secs=-1` it waits
+    /// forever.
     pub async fn gpg_import_keys(
         &self,
         remote: &str,
@@ -528,17 +538,23 @@ impl Repo {
         key_ids: &[String],
     ) -> Result<usize> {
         let name = remote_keyring_name(remote);
-        let existing = self.read_root_file(&name).await?.unwrap_or_default();
+        let fsync = self.config().fsync()?;
+        let subject = format!("the keyring '{name}'");
         // Parsing untrusted certificate streams is CPU work over owned copies
-        // of its inputs, so it runs on the blocking pool.
+        // of its inputs, so it runs on the blocking pool. The offered stream
+        // is read before the locks, and only the read of the keyring, the
+        // merge, and the write run under them.
         let offered = keys.to_vec();
         let ids = key_ids.to_vec();
-        let subject = format!("the keyring '{name}'");
-        let (imported, keyring) =
-            ostrya_rt::unblock(move || merge_keyring(&existing, &offered, &ids, &subject)).await?;
-        let fsync = self.config().fsync()?;
-        self.write_root_file(&name, keyring, fsync).await?;
-        Ok(imported)
+        let read_subject = subject.clone();
+        let offered = ostrya_rt::unblock(move || read_offered(&offered, &ids, &read_subject)).await;
+        self.write_locked(move |repo| {
+            let existing = read_root_file_blocking(repo.repo_fd(), &name)?.unwrap_or_default();
+            let (imported, keyring) = merge_offered(&existing, offered, &subject)?;
+            write_root_file_blocking(repo.repo_fd(), &name, &keyring, fsync)?;
+            Ok(imported)
+        })
+        .await
     }
 
     /// The keys `remote`'s trusted keyring holds. An absent keyring holds none.
@@ -553,7 +569,63 @@ impl Repo {
 }
 
 /// Merge the certificates `offered` holds into the keyring `existing` holds and
-/// report how many certificates the keyring did not already hold.
+/// report how many certificates the keyring did not already hold, as one
+/// import does: [`read_offered`] and then [`merge_offered`].
+#[cfg(test)]
+fn merge_keyring(
+    existing: &[u8],
+    offered: &[u8],
+    key_ids: &[String],
+    subject: &str,
+) -> Result<(usize, Vec<u8>)> {
+    merge_offered(existing, read_offered(offered, key_ids, subject), subject)
+}
+
+/// The offered stream of an import, read by [`read_offered`] before the
+/// keyring under edit is read.
+enum OfferedKeys {
+    /// The stream is refused before its packets are read: it is over
+    /// [`MAX_KEYRING`], it does not dearmor, or it is a keybox.
+    Refused(Error),
+    /// The packets of the stream: each certificate with its packets, and the
+    /// indices of the certificates the selectors take. `Err` holds the
+    /// refusal of the read, of a stream that holds no certificate, or of a
+    /// selector.
+    Read(Result<OfferedCerts>),
+}
+
+/// Each certificate of an offered stream with its packets, and the indices
+/// of the certificates the selectors take, in selection order.
+type OfferedCerts = (Vec<(SignedPublicKey, Vec<u8>)>, Vec<usize>);
+
+/// Read the offered stream of an import into the keyring `subject` names,
+/// and select the certificates `key_ids` name. The call needs no byte of the
+/// keyring, so an import runs it before it takes the locks.
+/// [`merge_offered`] reports each refusal at the point where the merge of
+/// the two streams reaches it, so the result of an import does not depend on
+/// where the stream was read.
+fn read_offered(offered: &[u8], key_ids: &[String], subject: &str) -> OfferedKeys {
+    let source = "the keyring to import";
+    let stream = match keyring_stream(offered, source) {
+        Ok(stream) => stream,
+        Err(err) => return OfferedKeys::Refused(err),
+    };
+    let refusal = format!("{source} cannot be merged into {subject}: the parser panicked");
+    OfferedKeys::Read(contained(&refusal, || {
+        let offered = parse_keyring(&stream, source)?;
+        if offered.is_empty() {
+            return Err(Error::Signature(format!(
+                "{source} holds no OpenPGP certificate"
+            )));
+        }
+        let selected = select_keys(&offered, key_ids)?;
+        Ok((offered, selected))
+    }))
+}
+
+/// Merge the certificates of `offered`, which [`read_offered`] read, into the
+/// keyring `existing` holds and report how many certificates the keyring did
+/// not already hold.
 ///
 /// The packet stream `existing` carries is kept as it stands and the packets of
 /// each certificate the keyring does not hold are appended, so a keyring another
@@ -591,15 +663,13 @@ impl Repo {
 /// [`MAX_KEYRING_CERTS`], a keybox is refused, and every packet read runs inside
 /// [`contained`]. `subject` names the keyring the repository holds, so a refusal
 /// over it states which file was read.
-fn merge_keyring(
-    existing: &[u8],
-    offered: &[u8],
-    key_ids: &[String],
-    subject: &str,
-) -> Result<(usize, Vec<u8>)> {
+fn merge_offered(existing: &[u8], offered: OfferedKeys, subject: &str) -> Result<(usize, Vec<u8>)> {
     let source = "the keyring to import";
     let mut keyring = keyring_stream(existing, subject)?;
-    let stream = keyring_stream(offered, source)?;
+    let offered = match offered {
+        OfferedKeys::Refused(err) => return Err(err),
+        OfferedKeys::Read(read) => read,
+    };
     let refusal = format!("{source} cannot be merged into {subject}: the parser panicked");
     let (imported, rewritten, appended) = contained(&refusal, || {
         // The certificate runs the keyring holds, in the order they stand in,
@@ -613,12 +683,7 @@ fn merge_keyring(
             runs.push((fingerprint.clone(), packets));
             copies.entry(fingerprint).or_default().push(cert);
         }
-        let offered = parse_keyring(&stream, source)?;
-        if offered.is_empty() {
-            return Err(Error::Signature(format!(
-                "{source} holds no OpenPGP certificate"
-            )));
-        }
+        let (offered, selected) = offered?;
         // The set a designated revoker is resolved among: every certificate the
         // two streams hold, whatever key each of them states and whether or not
         // the selector names it (see [`KeyState`]).
@@ -636,7 +701,7 @@ fn merge_keyring(
         let mut added: Vec<(String, KeyState, Vec<u8>)> = Vec::new();
         let mut replaced: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut imported = 0;
-        for index in select_keys(&offered, key_ids)? {
+        for index in selected {
             let (cert, packets) = &offered[index];
             let fingerprint = fingerprint_hex(cert);
             let state = KeyState::of(cert, &known);

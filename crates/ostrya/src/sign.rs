@@ -62,24 +62,38 @@ impl Repo {
     /// is appended to the engine's `aay` array in the `.commitmeta` `a{sv}`
     /// dict, which is created if absent; other engines' arrays are untouched.
     ///
-    /// Appending is a read-modify-write: the dict is loaded, the signature is
-    /// added, and the `.commitmeta` file is replaced atomically. The three
-    /// steps run under the guard the whole process shares, the one
-    /// [`Transaction::sign_commit`](crate::Transaction::sign_commit) writes
-    /// under, so signing one commit from several tasks at a time keeps every
-    /// signature. The guard reaches this process alone: two processes signing
-    /// one commit at the same time can drop a signature.
+    /// The signature is made first, with no lock held. The call then takes
+    /// the repository lock shared and the update lock, as
+    /// [`Repo::begin_update`] does, and under both it loads the dict, adds the
+    /// signature, and replaces the `.commitmeta` file atomically. So signers
+    /// of one commit keep every signature, whether they run in several tasks
+    /// of this process or in several processes, and whether they sign here or
+    /// through [`Transaction::sign_commit`](crate::Transaction::sign_commit).
+    /// The `ostree` tool can lose a signature in that case.
+    ///
+    /// Each of the two waits fails with [`Error::LockTimeout`](crate::Error::LockTimeout)
+    /// after `lock-timeout-secs`, and the signature is then dropped. A caller
+    /// that holds an [`UpdateGuard`](crate::UpdateGuard) of this repository
+    /// waits for its own guard until the timeout, and with
+    /// `lock-timeout-secs=-1` it waits forever.
     pub async fn sign_commit(&self, checksum: &Checksum, signer: &dyn Signer) -> crate::Result<()> {
         let data = self.load_object_bytes(ObjectType::Commit, checksum).await?;
         let signature = signer.sign(&data).await?;
         let fsync = self.config().fsync()?;
-        self.merge_commit_detached_metadata(
-            checksum,
-            None,
-            None,
-            vec![(signer.metadata_key().to_owned(), signature)],
-            fsync,
-        )
+        let repo_mode = self.mode();
+        let checksum = *checksum;
+        let appends = vec![(signer.metadata_key().to_owned(), signature)];
+        self.write_locked(move |repo| {
+            crate::commit::merge_detached_blocking(
+                repo.objects_fd(),
+                &checksum,
+                None,
+                None,
+                appends,
+                fsync,
+                repo_mode,
+            )
+        })
         .await
     }
 
@@ -127,26 +141,35 @@ impl Repo {
     /// removed.
     ///
     /// Like [`sign_commit`](Self::sign_commit), this is a read-modify-write
-    /// under the guard the whole process shares: `remove` runs on the dict the
-    /// file holds at that moment, and a signer of the same commit in another
-    /// task reaches the file before or after the removal, never inside it. The
-    /// guard reaches this process alone. `remove` runs on the blocking pool, so
-    /// it must be `Send` and own what it matches against.
+    /// under the locks `sign_commit` takes, which the call takes after it
+    /// loads the payload: `remove` runs on the dict the file holds at that
+    /// moment, and a signer of the same commit, in this process or in another
+    /// one, reaches the file before or after the removal, never inside it. The
+    /// waits fail with [`Error::LockTimeout`](crate::Error::LockTimeout) as the
+    /// waits of `sign_commit` do. `remove` runs on the blocking pool, so it
+    /// must be `Send` and own what it matches against.
     pub async fn delete_signatures(
         &self,
         checksum: &Checksum,
         metadata_key: &str,
-        remove: impl FnMut(&[u8], &[u8]) -> bool + Send + 'static,
+        mut remove: impl FnMut(&[u8], &[u8]) -> bool + Send + 'static,
     ) -> crate::Result<usize> {
         let payload = self.load_object_bytes(ObjectType::Commit, checksum).await?;
         let fsync = self.config().fsync()?;
-        self.prune_commit_detached_signatures(
-            checksum,
-            metadata_key.to_owned(),
-            payload,
-            remove,
-            fsync,
-        )
+        let repo_mode = self.mode();
+        let checksum = *checksum;
+        let metadata_key = metadata_key.to_owned();
+        self.write_locked(move |repo| {
+            crate::commit::prune_detached_signatures_blocking(
+                repo.objects_fd(),
+                &checksum,
+                &metadata_key,
+                &payload,
+                &mut remove,
+                fsync,
+                repo_mode,
+            )
+        })
         .await
     }
 }

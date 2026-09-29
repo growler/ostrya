@@ -8,10 +8,14 @@
 //! [`Repo::pull_local`] copies a set of refs, the commits they name, and every
 //! object those commits reach out of a source repository and into this one. The
 //! objects are imported in one transaction, so a failure publishes none of them
-//! and writes no ref. A commit's detached metadata is written as its objects are
-//! imported, before the ref that names it, which is what a verifier reading the
-//! signatures alongside the commit requires; a failed pull can therefore leave a
-//! `.commitmeta` for a commit it did not publish, which prune sweeps.
+//! and writes no ref. A commit's detached metadata is staged in the same
+//! transaction and written at its commit, after the objects publish and before
+//! the ref that names the commit, which is what a verifier reading the
+//! signatures alongside the commit requires. A pull that fails before the ref
+//! step of its commit, a `LockTimeout` at that step included, leaves no
+//! `.commitmeta` of its own. A failure in the ref step itself, at the install
+//! of a later `.commitmeta` or at a ref write, keeps the `.commitmeta` files
+//! the step installed before it.
 //!
 //! How an object is imported depends on how much of it the two repositories
 //! store the same way.
@@ -1233,11 +1237,11 @@ impl Repo {
         Ok(())
     }
 
-    /// Copy a commit's detached metadata from the first source holding it,
-    /// through `filter`, under the fsync policy of `txn`. The stored bytes are
-    /// the source's verbatim where the filter keeps every property. A source
-    /// with no `.commitmeta`, and a filter that allows no property, each leave
-    /// the destination's alone.
+    /// Stage a commit's detached metadata in `txn`, copied from the first
+    /// source holding it, through `filter`. The stored bytes are the source's
+    /// verbatim where the filter keeps every property, and they reach
+    /// `objects/` when `txn` commits. A source with no `.commitmeta`, and a
+    /// filter that allows no property, each leave the destination's alone.
     async fn import_detached_metadata(
         &self,
         txn: &Transaction,
@@ -1248,9 +1252,7 @@ impl Repo {
         if let Some(bytes) = detached_bytes_from(sources, commit).await?
             && let Some(bytes) = filter.apply(commit, bytes)?
         {
-            let (fsync, _) = txn.fsync_flags()?;
-            self.write_commit_detached_bytes(commit, bytes, fsync)
-                .await?;
+            txn.stage_commit_detached_bytes(commit, bytes).await?;
         }
         Ok(())
     }

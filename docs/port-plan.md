@@ -302,9 +302,9 @@ the calling task, so a dropped wait leaves no request and no hold behind.
 lock request. A value below `-1` is refused: the tool then takes no lock at all
 (`format-reference.md`, "Repository lock and staging").
 
-A second lock, the update lock, serializes the writes of refs, ref aliases,
-and `config` that go through the update guard, the transaction commit of the
-receive path, and summary regeneration: an exclusive `fcntl` record lock
+A second lock, the update lock, serializes every port write of refs and ref
+aliases, `config` and the remote keyrings, `summary` and `summary.sig`, and
+detached metadata: an exclusive `fcntl` record lock
 (`F_SETLK`) on `<repo>/.update.lock`, beside `.lock`. The lock builds in the
 base crate, with no feature. The lock is port-only: the tool never opens the
 file. The port opens and creates the file by the rules of `.lock`, on
@@ -347,18 +347,58 @@ count of writes in flight, and the recorded directories. A write or a `finish`
 in flight owns a reference to it, so the locks are released only after the
 syncs, also when the future of a call drops.
 
-The writers that wait for the update lock are the receive commit and
-`Repo::regenerate_summary`. Each commits its transaction through the
-crate-private `Transaction::commit_under`, which takes a reference to the held
-lock and does not take it again. `regenerate_summary` holds the lock from the
-read of the previous anchor commit to the removal of `summary.sig`. It takes
+Each port writer of that state takes the update lock once, at its outermost
+entry, for its own write step. A writer outside a transaction takes the
+repository lock shared first:
+
+- `Transaction::commit` publishes its objects with no update lock held. When
+  it writes a ref, a ref removal included, or detached metadata, it then takes
+  the update lock and writes the detached metadata and the refs under it. A
+  transaction that writes neither takes no update lock. The hold, the
+  repository lock, and the staging directory move into the blocking closure of
+  that step, so a dropped commit future cannot release a lock or remove a
+  staged file while the writes run, and the writes complete. A pull stages
+  the `.commitmeta` bytes it copies as a file in its staging directory, and
+  the commit renames the file into `objects/` at the same step. So a pull
+  that fails before that step, a `LockTimeout` at the step included, leaves
+  no `.commitmeta` and no ref. A failure in the step itself, at the install
+  of a later `.commitmeta` or at a ref write, keeps the `.commitmeta` files
+  the step installed before it. A mirror pull that fails at its hold for
+  `summary` and `summary.sig` keeps the refs and the `.commitmeta` files its
+  commit wrote. The `.commitpartial` markers of a pull stay outside the lock. A
+  `LockTimeout` at the step leaves the published objects and the markers of
+  their commits, with no detached metadata and no ref, and the next pull
+  completes the commit.
+- `Repo::set_ref_immediate`, `Repo::set_collection_ref_immediate`,
+  `Repo::set_ref_alias_immediate`, `Repo::write_config`,
+  `Repo::remove_remote_keyring`, `Repo::gpg_import_keys`, and
+  `Repo::write_commit_detached_metadata` run their write on the blocking pool
+  in one closure that owns both locks.
+- `Repo::sign_commit` signs with no lock held, and then reads, merges, and
+  writes the `.commitmeta` under the locks. `Repo::delete_signatures` loads
+  the commit payload first and then removes the signatures under the locks.
+  So two processes that sign one commit keep both signatures.
+- `Repo::sign_summary` and `Repo::sign_summary_all` take the locks before
+  the read of `summary` and hold them until `summary.sig` is written. A mirror
+  pull writes `summary` and `summary.sig` under a second hold, after its
+  commit.
+- The receive commit and `Repo::regenerate_summary` commit their
+  transactions through the crate-private `Transaction::commit_under`, which
+  takes a reference to the held lock and does not take it again.
+  `regenerate_summary` holds the lock from the read of the previous anchor
+  commit to the removal of `summary.sig`.
+
+A prune takes no update lock for its ref deletions, and a static delta write
+takes none. `Repo::regenerate_summary` takes
 the repository lock shared also in a repository with no collection id, so, when
 `[core] locking` is on, it waits for an exclusive holder of the repository
 lock, a caller that holds one itself included. When `[core] locking` is on, a
 prune takes the repository lock exclusive, so it waits for a held guard, and
 `begin_update` waits for a running prune. No call detects a re-acquire: a
 holder of the guard that calls one of these writers waits for its own guard
-until `lock-timeout-secs`, and with `-1` it waits forever.
+until `lock-timeout-secs`, and with `-1` it waits forever. When `[core]
+locking` is on, a holder of the repository lock exclusive that calls a writer
+outside a transaction waits for its own lock the same way.
 
 ### Durability contract
 
@@ -2961,10 +3001,12 @@ every object those commits reach out of another local repository, and returns a
 source's `refs/heads`), an optional remote name, a `PullFlags` bitset, the
 parent depth, and the localcache repositories. The objects are imported in one
 transaction, so a failure publishes none of them and writes no ref. A commit's
-detached metadata is written as its objects are imported, ahead of the ref that
-names it, so a verifier never sees a commit whose signatures have not arrived;
-a failed pull can leave a `.commitmeta` for a commit it did not publish, which
-prune sweeps. The local pull reads no static delta unless `require_static_deltas`
+detached metadata is staged in the same transaction as its objects are
+imported, and the commit writes it ahead of the ref that names the commit, so a
+verifier never sees a commit whose signatures have not arrived. A pull that
+fails before that ref step, a `LockTimeout` at the step included, leaves no
+`.commitmeta` of its own; a failure in the step itself keeps the `.commitmeta`
+files the step installed before it. The local pull reads no static delta unless `require_static_deltas`
 is set, and then applies the deltas the source's summary advertises (Phase 17f,
 `pull-local`).
 
@@ -6697,12 +6739,12 @@ only on a pull, since the tool gives the key and the switch one scope; this
 changes the port's calls under the key for `commit` too. The syncs the port
 makes by default and the tool does not -- the ref directories of "Ref
 durability", the summary file and the repository root of a mirror pull, and
-the `.commitmeta` temp file, its fanout directory, and `objects/` for a pulled
-commit that carries detached metadata -- stay, and are recorded as a
+the fanout directory of the `.commitmeta` of a pulled commit that carries
+detached metadata -- stay, and are recorded as a
 divergence; the changes on that path are that the mirror summary write and
 the detached-metadata write obey `--disable-fsync`. Over `C0` committed with
 `--add-detached-metadata-string`, the tool makes 11 calls by default on
-`pull-local`, `pull`, and a `--mirror` pull, and the port makes 15, 16, and 17.
+`pull-local`, `pull`, and a `--mirror` pull, and the port makes 13, 14, and 15.
 Under `--disable-fsync` both make 0. A value on either switch is
 refused by `clap` at exit 1, which the open decision on a value given to a
 switch covers; the tool reads `--disable-fsync=false` as "disable", so
@@ -8061,7 +8103,10 @@ Resolved:
    same registry, and the same retry loop, with a FIFO queue of in-process
    waiters built from `std::sync::Mutex` and `Waker`. It ignores `[core]
    locking=false`. `Repo::begin_update` takes the repository lock shared and
-   then the update lock, and returns the public `UpdateGuard`.
+   then the update lock, and returns the public `UpdateGuard`. Every port
+   writer of refs, `config`, `summary`, and detached metadata takes the update
+   lock for its write step, and `Transaction::commit` takes it after it
+   publishes its objects, only when it writes a ref or detached metadata.
 
 9. Repo finders: the config and mount finders land with the phase that brings
    collection refs, which a finder resolves and which is not yet scheduled; they

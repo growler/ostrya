@@ -41,17 +41,28 @@ const ROOT_DIR: &str = ".";
 /// it, passes it, and stores it. It is `Send + Sync`.
 ///
 /// While you hold the guard, write through the guard. The writers that wait
-/// for the guard are the transaction commit of a receive session and
-/// [`Repo::regenerate_summary`]. When `[core] locking` is on,
-/// [`Repo::prune`] waits for it through the repository lock. No call detects
-/// a holder that waits for its own guard: a task that holds the guard and
-/// calls one of those writers, or waits for a task that calls one, waits
-/// until `lock-timeout-secs` and then fails with
-/// [`Error::LockTimeout`](crate::Error::LockTimeout). With
-/// `lock-timeout-secs=-1` it waits forever. Do not commit a
-/// [`Transaction`](crate::Transaction) that writes refs while you hold the
-/// guard: its refs are not written through the guard, so the guard does not
-/// exclude them.
+/// for the guard are:
+///
+/// - [`Transaction::commit`](crate::Transaction::commit) of a transaction
+///   that writes a ref or detached metadata, at the step that writes them.
+///   So a pull waits there, and so does the transaction commit of a receive
+///   session;
+/// - [`Repo::set_ref_immediate`], [`Repo::set_collection_ref_immediate`],
+///   and [`Repo::set_ref_alias_immediate`];
+/// - [`Repo::write_config`], [`Repo::remove_remote_keyring`], and, under the
+///   `verify-gpg` feature, `Repo::gpg_import_keys`;
+/// - [`Repo::regenerate_summary`], [`Repo::sign_summary`],
+///   [`Repo::sign_summary_all`], and the `summary` and `summary.sig` writes
+///   of a mirror pull;
+/// - [`Repo::write_commit_detached_metadata`], [`Repo::sign_commit`], and
+///   [`Repo::delete_signatures`].
+///
+/// When `[core] locking` is on, [`Repo::prune`] waits for the guard through
+/// the repository lock. No call detects a holder that waits for its own
+/// guard: a task that holds the guard and calls one of those writers, or
+/// waits for a task that calls one, waits until `lock-timeout-secs` and then
+/// fails with [`Error::LockTimeout`](crate::Error::LockTimeout). With
+/// `lock-timeout-secs=-1` it waits forever.
 ///
 /// Call [`finish`](UpdateGuard::finish) to release the guard. A guard that
 /// drops without `finish` runs the directory syncs of `finish`
@@ -184,12 +195,15 @@ impl Repo {
     ///
     /// A caller can hold the guard for minutes. While it holds it:
     ///
-    /// - the transaction commit of a receive session and
-    ///   [`Repo::regenerate_summary`] wait under `lock-timeout-secs` and then
-    ///   fail with `Error::LockTimeout`. A push then fails at `Commit` with
-    ///   `internal`;
+    /// - every other writer that [`UpdateGuard`] lists waits under
+    ///   `lock-timeout-secs` and then fails with `Error::LockTimeout`. A pull
+    ///   fails at the step of its commit that writes detached metadata and
+    ///   refs. A push fails at `Commit` with `internal`;
     /// - when `[core] locking` is on, a prune waits for the whole hold;
-    /// - a transaction opens, stages, and commits in parallel with the hold.
+    /// - a transaction opens, stages, and publishes its objects in parallel
+    ///   with the hold, and waits only at the step that writes detached
+    ///   metadata and refs. A transaction that writes neither commits in
+    ///   parallel with the hold.
     ///
     /// While you hold the guard, write through the guard. A holder that waits
     /// for its own guard is not detected (see [`UpdateGuard`]).

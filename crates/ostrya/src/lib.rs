@@ -200,8 +200,10 @@
 //! module). It also covers the update guard: [`Repo::begin_update`] takes the
 //! repository lock shared and then the update lock on `<repo>/.update.lock`,
 //! and the [`UpdateGuard`] it returns reads and writes refs, ref aliases, and
-//! `config` while no other holder of the update lock runs (see the [`update`]
-//! module).
+//! `config` while no other holder of the update lock runs. Each other writer of
+//! refs, `config` and the remote keyrings, `summary` and `summary.sig`, and
+//! detached metadata takes the update lock for its write step, so it waits for
+//! a held guard (see the [`update`] module).
 //!
 //! Under the `receive` feature it also covers the policy the server side of a
 //! push applies (see the `receive` module): `ReceivePolicy` states which ref

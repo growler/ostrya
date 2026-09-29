@@ -314,9 +314,15 @@ impl Repo {
     /// setters and removers: a temporary file at mode 0644, `fdatasync`ed when
     /// `[core] fsync` is set, renamed over the target, with the repository
     /// directory synced. This handle keeps the configuration it was opened with.
+    /// The write runs under the repository lock shared and the update lock, as
+    /// every writer below that states "update lock" does: each of the two
+    /// waits fails with `LockTimeout` after `lock-timeout-secs`, and a holder
+    /// of an `UpdateGuard` of this repository that calls the writer waits for
+    /// its own guard. The locks cover the write alone, so a read-modify-write
+    /// that must see the file as it stands goes through an `UpdateGuard`.
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()>;
     /// Remove a remote's trusted keyring, `<remote>.trustedkeys.gpg`. An
-    /// already-absent keyring is success.
+    /// already-absent keyring is success. Update lock.
     pub async fn remove_remote_keyring(&self, remote: &str) -> Result<()>;
 
     // --- reading ---
@@ -362,6 +368,7 @@ impl Repo {
 
     // --- detached metadata / signing (see Signing) ---
     pub async fn read_commit_detached_metadata(&self, c: &Checksum) -> Result<Option<Value>>;
+    /// Update lock.
     pub async fn write_commit_detached_metadata(&self, c: &Checksum, meta: Option<&Value>) -> Result<()>;
 
     // --- transactions ---
@@ -381,10 +388,16 @@ impl Repo {
     /// update lock in the order of the first poll of their wait for it.
     /// `[core] locking=false` leaves the repository lock out, and the update
     /// lock is taken all the same. The guard keeps the `[core] fsync` and
-    /// lock values this handle was opened with. A long hold makes the receive
-    /// commit and `regenerate_summary` wait under `lock-timeout-secs` and
-    /// fail with `LockTimeout`, and, when `[core] locking` is on, a prune
-    /// wait for the whole hold.
+    /// lock values this handle was opened with. A long hold makes every
+    /// writer that states "update lock" wait under `lock-timeout-secs` and
+    /// fail with `LockTimeout`: the immediate ref writes, `write_config`,
+    /// `remove_remote_keyring`, `gpg_import_keys`, `regenerate_summary`,
+    /// `sign_summary`, `sign_summary_all`, the summary writes of a mirror
+    /// pull, `write_commit_detached_metadata`, `sign_commit`,
+    /// `delete_signatures`, and the step of `Transaction::commit` that writes
+    /// detached metadata and refs, which a pull and the receive commit reach.
+    /// When `[core] locking` is on, a prune waits for the whole hold. A
+    /// transaction publishes its objects in parallel with the hold.
     pub async fn begin_update(&self) -> Result<UpdateGuard>;
 
     // --- checkout ---
@@ -396,6 +409,7 @@ impl Repo {
     // --- immediate ref writes (outside a transaction) ---
     // Each honors `[core] fsync`: the ref file is `fdatasync`-ed and the
     // directory holding it is `fsync`-ed after the rename or the unlink.
+    // Each writes under the update lock.
     pub async fn set_ref_immediate(&self, refspec: &str, checksum: Option<&Checksum>) -> Result<()>;
     pub async fn set_collection_ref_immediate(&self, cref: &CollectionRef,
         checksum: Option<&Checksum>) -> Result<()>;
@@ -1032,7 +1046,9 @@ impl Transaction {
 
     // detached metadata and signatures, written at `commit` after the staged
     // objects publish and before the queued refs, so a commit and its
-    // `.commitmeta` are both durable before a ref names them.
+    // `.commitmeta` are both durable before a ref names them. A pull stages
+    // the `.commitmeta` bytes it copies as a file in the staging directory,
+    // and `commit` renames the file into `objects/` at the same step.
 
     /// Queues the `a{sv}` dict a commit's `.commitmeta` holds, replacing what
     /// the repository stores. The last dict queued for a checksum wins.
@@ -1045,6 +1061,15 @@ impl Transaction {
     /// ref moved.
     pub async fn sign_commit(&self, c: &Checksum, signer: &dyn Signer) -> Result<()>;
 
+    /// Publishes the staged objects with no update lock held. When the
+    /// transaction writes a ref, a removal included, or detached metadata, it
+    /// then takes the update lock and writes the detached metadata and the
+    /// refs under it, in one blocking closure that owns the hold, the
+    /// repository lock, and the staging directory. So a dropped future cannot
+    /// release a lock or remove a staged file while those writes run, and the
+    /// writes complete. A transaction
+    /// that writes neither takes no update lock. A `LockTimeout` at that step
+    /// leaves the published objects, no detached metadata, and no ref.
     pub async fn commit(self) -> Result<TransactionStats>;
     pub async fn abort(self) -> Result<()>;
 }
@@ -1535,16 +1560,21 @@ pub struct SignatureInfo {
 }
 
 impl Repo {
+    /// Signs with no lock held, then reads, merges, and writes the
+    /// `.commitmeta` under the update lock, so two processes that sign one
+    /// commit keep both signatures.
     pub async fn sign_commit(&self, c: &Checksum, signer: &dyn Signer) -> Result<()>;
     pub async fn verify_commit(&self, c: &Checksum, verifiers: &[&dyn Verifier])
         -> Result<VerifyOutcome>;
     /// Append a signature over the repository's `summary` bytes to
     /// `summary.sig`. The batch of one signer.
     pub async fn sign_summary(&self, signer: &dyn Signer) -> Result<()>;
+    /// The batch takes the update lock before it reads `summary` and holds it
+    /// until `summary.sig` is written.
     /// Append one signature per signer, in slice order, reading `summary` and
     /// `summary.sig` once and replacing `summary.sig` in one write. A signer
     /// that fails stops the batch before the write. An empty slice writes
-    /// nothing.
+    /// nothing and takes no lock.
     pub async fn sign_summary_all(&self, signers: &[&dyn Signer]) -> Result<()>;
     pub async fn verify_summary(&self, verifiers: &[&dyn Verifier])
         -> Result<VerifyOutcome>;
@@ -1593,7 +1623,8 @@ impl Repo {                                   // feature = "verify-gpg"
     /// keyring already held. `keys` and the keyring the remote already holds
     /// reach one keyring reader, so a keyring carrying bytes past its last
     /// framed packet takes no import, and such an import is refused by the
-    /// name of the keyring.
+    /// name of the keyring. The read, the merge, and the write of the keyring
+    /// run under the update lock.
     pub async fn gpg_import_keys(&self, remote: &str, keys: &[u8], key_ids: &[String])
         -> Result<usize>;
     /// The keys that keyring holds. An absent keyring holds none.
@@ -2378,8 +2409,12 @@ protocol crate, so a caller names its error codes and messages through
   server signature whose key has a verifying signature in the new merged
   dict. It queues the kept signatures after the merge. The merged dict with
   those signatures is `limit-exceeded` over `MAX_METADATA_SIZE`. The server
-  queues each ref that changes and commits the transaction. A delete of an
-  absent ref and an update to the current commit write nothing.
+  queues each ref that changes and commits the transaction under the lock it
+  holds, through an internal commit step that does not take the lock again.
+  That step renames the staged objects into `objects/` under the lock, where
+  a `Transaction::commit` outside the receive path publishes them before it
+  takes the lock. A delete of an absent ref and an update to the current
+  commit write nothing.
 - With `update_summary`, when a ref changes, a repository with a collection
   id also writes the refreshed anchor commit on `ostree-metadata` in the
   session transaction, with the anchor read under the lock as its parent.

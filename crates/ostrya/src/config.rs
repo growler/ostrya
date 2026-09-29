@@ -30,6 +30,7 @@ use ostrya_core::{KeyFile, RepoMode};
 
 use crate::error::{Error, Result};
 use crate::repo::Repo;
+use crate::summary::{remove_root_file_blocking, write_root_file_blocking};
 
 const CORE: &str = "core";
 const ARCHIVE: &str = "archive";
@@ -454,19 +455,36 @@ impl Repo {
     ///
     /// This handle keeps the configuration it was opened with; reopen the
     /// repository to read the new values.
+    ///
+    /// The call takes the repository lock shared and then the update lock, as
+    /// [`Repo::begin_update`] does, and writes under both. Each of the two
+    /// waits fails with [`Error::LockTimeout`] after `lock-timeout-secs`. The
+    /// locks cover the write alone: a document read from this handle before
+    /// the call can miss a write another writer made in between. A
+    /// read-modify-write that must see the file as it stands reads and writes
+    /// it through an [`UpdateGuard`](crate::UpdateGuard). A caller that holds
+    /// a guard of this repository and calls this waits for its own guard until
+    /// the timeout, and with `lock-timeout-secs=-1` it waits forever.
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
         let fsync = self.config().fsync()?;
-        self.write_root_file(CONFIG_FILE, keyfile.to_string().into_bytes(), fsync)
-            .await
+        let bytes = keyfile.to_string().into_bytes();
+        self.write_locked(move |repo| {
+            write_root_file_blocking(repo.repo_fd(), CONFIG_FILE, &bytes, fsync)
+        })
+        .await
     }
 
     /// Remove a remote's trusted GPG keyring, `<remote>.trustedkeys.gpg`, at the
     /// repository root. An already-absent keyring is success.
     ///
     /// A remote's keyring belongs to its configuration section, so deleting the
-    /// section deletes this file with it.
+    /// section deletes this file with it. The call takes the locks
+    /// [`write_config`](Repo::write_config) takes and waits for them the same
+    /// way.
     pub async fn remove_remote_keyring(&self, remote: &str) -> Result<()> {
-        self.remove_root_file(&remote_keyring_name(remote)).await
+        let name = remote_keyring_name(remote);
+        self.write_locked(move |repo| remove_root_file_blocking(repo.repo_fd(), &name))
+            .await
     }
 }
 

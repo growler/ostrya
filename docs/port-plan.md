@@ -132,7 +132,8 @@ bounded:
 - `ostrya-gvariant` -- the byte-exact GVariant codec. No ostree knowledge.
 - `ostrya-core` -- object model, checksums, varint, loose paths, xattr
   canonicalization, format (de)serialization, the raw-DEFLATE encoder of
-  archive-mode content objects (`DeflateSink`), the commit metadata dict rule,
+  archive-mode content objects (`DeflateSink`, and `DeflateReader`, which
+  reads its output from a source), the commit metadata dict rule,
   the ref-binding rule (`ref_binding`), the commit timestamp rule, the dirtree
   entry-name rule (`DirTree::check_name`), and `MAX_METADATA_SIZE`. Depends on
   `ostrya-gvariant`, `sha2`, `futures-io`, and `miniz_oxide`. Compiles on
@@ -165,7 +166,10 @@ bounded:
 - `ostrya-push` -- the push wire protocol: the messages and their GVariant
   encoding, the frame codec with its limit, and the chunked object stream
   with its abandon marker. `ObjectBody` reads the bytes of one object as an
-  `AsyncRead`. No repository knowledge and no runtime. Depends
+  `AsyncRead`. The client session: `PushSession` over a pair of byte
+  streams, the `ObjectSource` trait it reads objects through, and
+  `PushProgress`, `PushStats`, and `PushOutcome`. No repository knowledge
+  and no runtime. Depends
   on `ostrya-gvariant`, `ostrya-core`, `thiserror`, `futures-io`, and
   `futures-lite`. Compiles on Linux, macOS, and Windows.
 - `ostrya-composefs` -- the byte-exact EROFS/composefs image writer and the

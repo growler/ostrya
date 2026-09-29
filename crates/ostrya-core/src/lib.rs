@@ -8,9 +8,10 @@
 //! canonicalization.
 //!
 //! The crate also holds the rules a new commit is built by: the raw-DEFLATE
-//! encoder of archive-mode content objects ([`DeflateSink`]), the commit
-//! metadata rule ([`commit_metadata`]), the commit timestamp rule
-//! ([`commit_timestamp`]), and the metadata size cap ([`MAX_METADATA_SIZE`]).
+//! encoder of archive-mode content objects ([`DeflateSink`], and
+//! [`DeflateReader`] over a source), the commit metadata rule
+//! ([`commit_metadata`]), the commit timestamp rule ([`commit_timestamp`]),
+//! and the metadata size cap ([`MAX_METADATA_SIZE`]).
 //! It compiles on Linux, macOS, and Windows.
 //!
 //! This crate covers phases 2 and 3 of the port plan (see
@@ -39,7 +40,7 @@ mod xattr;
 
 pub use checksum::Checksum;
 pub use commit::{Commit, TimestampError, commit_metadata, commit_timestamp, ref_binding};
-pub use deflate::DeflateSink;
+pub use deflate::{DeflateReader, DeflateSink};
 pub use dirmeta::{DirMeta, DirMetaRef};
 pub use dirtree::{DirTree, DirTreeRef};
 pub use error::{Error, Result};

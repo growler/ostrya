@@ -80,6 +80,17 @@ impl<W> DeflateSink<W> {
     pub fn reset(&mut self, inner: W, level: u8) -> W;
     pub fn into_inner(self) -> W;
 }
+/// The pull form of DeflateSink: reads uncompressed bytes from a futures-io
+/// source and gives the bytes DeflateSink writes at the same level. It never
+/// flushes the stream before its end. Implements AsyncRead and AsyncBufRead.
+pub struct DeflateReader<R>;
+impl<R> DeflateReader<R> {
+    pub fn new(source: R, level: u8) -> Self;         // level 1-9
+    pub fn reset(&mut self, source: R, level: u8) -> R;
+    pub fn get_ref(&self) -> &R;
+    pub fn get_mut(&mut self) -> &mut R;
+    pub fn into_inner(self) -> R;
+}
 /// The commit metadata dict: entries in order, then ostree.ref-binding
 /// (sorted refs), then ostree.collection-binding. `refs: None` writes no
 /// binding key. `ostrya` re-exports it as `ostrya::commit::commit_metadata`.
@@ -2468,6 +2479,88 @@ impl Repo {
     where
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send;
+}
+```
+
+## Push client session
+
+`ostrya-push` holds the client side of a push, re-exported as
+`ostrya::push`. A `PushSession` runs one session over a pair of byte
+streams. It needs no runtime.
+
+- `over_stream` sends `Hello` with the refs the session updates and reads
+  `HelloReply`. `server()` gives its facts.
+- `missing` sends `Have` messages of at most `max-have` names, and of at
+  most the names whose frame fits in `max-frame`, and gives the names the
+  server needs. A name of a type other than file, dirtree, dirmeta, or
+  commit is `Error::InvalidInput` in `missing` and in `send`, and the
+  session stays usable.
+- `send` sends objects from an `ObjectSource`, then one `CommitMeta` for
+  each commit of `commits` with detached metadata that the session has not
+  sent yet. The session builds the wire bytes of `ObjectData::Content`, raw
+  or through its own `DeflateReader`, and copies `ObjectData::Encoded`. It
+  does not hash or measure an object, because the server verifies each one.
+  A source that fails ends the session with the abandon marker and `Abort`,
+  and the call returns `Error::Source`.
+- `commit` sends `Commit` and gives the `CommitReply` as a `PushOutcome`.
+  An `Error` from the server is definite. When the write of `Commit` fails,
+  the session reads one pending message: an `Error` is that error, and a
+  `CommitReply` is the reply. Every other end of the session after
+  `Commit`, and a `CommitReply` for other refs than the refs of the
+  updates, is `Error::CommitOutcomeUnknown`, because the server may have
+  written the refs.
+- On a stream transport one call runs at a time. An overlapping call fails
+  at once with `Error::InvalidInput`. A failed or dropped call leaves the
+  session broken.
+
+```rust
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Default)]
+pub enum Compression { #[default] None, Deflate { level: u8 } }
+
+pub trait ObjectReader: AsyncRead + Send + Sync + Unpin {}
+
+pub enum ObjectData {
+    Content { header: FileHeader, size: u64, payload: Option<Box<dyn ObjectReader>> },
+    Encoded { encoding: Encoding, reader: Box<dyn ObjectReader> },
+}
+
+pub trait ObjectSource: Send + Sync {
+    fn objects<'a>(&'a self, commit: &'a Checksum)
+        -> BoxFuture<'a, Result<Vec<ObjectName>>>;
+    fn open<'a>(&'a self, name: &'a ObjectName, encoding: Encoding)
+        -> BoxFuture<'a, Result<ObjectData>>;
+    fn detached_metadata<'a>(&'a self, commit: &'a Checksum)
+        -> BoxFuture<'a, Result<Option<Value>>>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionOptions {
+    pub agent: Option<String>,             // default "ostrya/<version>"
+    pub progress: Option<PushProgress>,
+}
+
+impl PushSession {
+    pub async fn over_stream<R, W>(input: R, output: W, refs: &[String],
+                                   opts: SessionOptions) -> Result<PushSession>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static;
+    pub fn server(&self) -> &ServerInfo;
+    pub async fn missing(&self, names: &[ObjectName]) -> Result<Vec<ObjectName>>;
+    pub async fn send(&self, source: &dyn ObjectSource, names: &[ObjectName],
+                      commits: &[Checksum], compression: Compression) -> Result<()>;
+    pub async fn commit(self, updates: &[RefUpdate], force: bool)
+        -> Result<PushOutcome>;
+    pub async fn abort(self) -> Result<()>;
+}
+
+pub struct PushOutcome {
+    pub commit: Option<Checksum>,
+    pub refs: Vec<RefOutcome>,
+    pub stats: PushStats,  // objects_total, objects_needed, objects_sent,
+                           // bytes_sent, payload_bytes, elapsed
 }
 ```
 

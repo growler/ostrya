@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use futures_io::{AsyncRead, AsyncWrite};
+use futures_lite::io::AsyncReadExt;
 use ostrya::push::proto::{
     CommitRequest, ErrorMessage, FrameReader, FrameWriter, Hello, HelloReply, Message,
     ObjectHeader, ObjectsReply,
@@ -25,7 +26,7 @@ use ostrya_core::filehdr::frame;
 use ostrya_rt::block_on;
 use sha2::{Digest, Sha256};
 
-use super::TmpDir;
+use super::{COMMIT, TmpDir, fixture_repo};
 
 // ---------------------------------------------------------------------------
 // The in-process pipe.
@@ -325,6 +326,61 @@ pub fn deflate_object(header: &FileHeader, payload: &[u8]) -> (Checksum, Vec<u8>
     });
     bytes.extend(sink.into_inner());
     (checksum, bytes)
+}
+
+/// One object a client sends.
+#[derive(Clone)]
+pub struct Obj {
+    pub ty: ObjectType,
+    pub checksum: Checksum,
+    pub encoding: Encoding,
+    pub bytes: Vec<u8>,
+}
+
+/// Every object of the fixture commit, content objects in `encoding`. The
+/// `deflate` form of a content object is the `.filez` file of the archive
+/// fixture, and the `raw` form is its header and payload.
+pub fn fixture_objects(encoding: Encoding) -> Vec<Obj> {
+    let root = fixture_repo("archive");
+    let repo = block_on(Repo::open(&root)).unwrap();
+    let commit = Checksum::from_hex(COMMIT).unwrap();
+    let names = block_on(repo.traverse_commit(&commit, 0)).unwrap();
+    let mut names: Vec<ObjectName> = names.into_iter().collect();
+    names.sort_by_key(|n| (n.ty as u8, n.checksum));
+    names
+        .into_iter()
+        .map(|name| {
+            let bytes = match (name.ty, encoding) {
+                (ObjectType::File, Encoding::Deflate) => std::fs::read(root.join("objects").join(
+                    ostrya::loose_path(&name.checksum, ObjectType::File, RepoMode::Archive),
+                ))
+                .unwrap(),
+                (ObjectType::File, _) => block_on(async {
+                    let file = repo.load_file(&name.checksum).await.unwrap();
+                    let mut bytes = frame(&file.header().serialize().unwrap()).unwrap();
+                    file.reader()
+                        .await
+                        .unwrap()
+                        .read_to_end(&mut bytes)
+                        .await
+                        .unwrap();
+                    bytes
+                }),
+                (ty, _) => block_on(repo.load_object_bytes(ty, &name.checksum)).unwrap(),
+            };
+            let encoding = if name.ty == ObjectType::File {
+                encoding
+            } else {
+                Encoding::Raw
+            };
+            Obj {
+                ty: name.ty,
+                checksum: name.checksum,
+                encoding,
+                bytes,
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

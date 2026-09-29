@@ -9,19 +9,32 @@
 //! stream with its abandon marker. The module docs of [`proto`] state the
 //! wire format in full.
 //!
-//! [`Error`] is the error type of the crate. Each of its variants except
-//! [`Error::Aborted`] and [`Error::Io`] is one wire code, and [`ErrorCode`]
-//! names the codes.
+//! The [`session`] module holds the client side. [`PushSession`] runs one
+//! session over a pair of byte streams: it opens with `Hello`, asks which
+//! objects the server needs, sends them from an [`ObjectSource`], and asks
+//! the server to update its refs. [`PushProgress`] shows the counters of a
+//! session while it runs, and [`PushOutcome`] gives the ref outcomes and the
+//! [`PushStats`] of a session that committed.
 //!
-//! The codec is generic over the `futures-io` traits `AsyncRead` and
-//! `AsyncWrite`, so it needs no async runtime. The crate has no repository
-//! knowledge. It compiles on Linux, macOS, and Windows.
+//! [`Error`] is the error type of the crate. Each of its variants except
+//! [`Error::Aborted`], [`Error::CommitOutcomeUnknown`], [`Error::Source`],
+//! [`Error::InvalidInput`], and [`Error::Io`] is one wire code, and
+//! [`ErrorCode`] names the codes.
+//!
+//! The codec and the session are generic over the `futures-io` traits
+//! `AsyncRead` and `AsyncWrite`, so they need no async runtime. The crate has
+//! no repository knowledge. It compiles on Linux, macOS, and Windows.
 
 mod error;
 pub mod proto;
+pub mod session;
 
 pub use error::{Error, ErrorCode, Result};
-pub use proto::{Encoding, Expected, RefOutcome, RefUpdate};
+pub use proto::{Encoding, Expected, RefOutcome, RefState, RefUpdate};
+pub use session::{
+    BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PushOutcome, PushPhase,
+    PushProgress, PushProgressSnapshot, PushSession, PushStats, ServerInfo, SessionOptions,
+};
 
 /// The public types of the protocol move freely across tasks and threads.
 const _: fn() = || {
@@ -31,4 +44,27 @@ const _: fn() = || {
     assert_send_sync::<proto::FrameReader<&[u8]>>();
     assert_send_sync::<proto::ObjectBody<'static, &[u8]>>();
     assert_send_sync::<proto::FrameWriter<Vec<u8>>>();
+    assert_send_sync::<PushSession>();
+    assert_send_sync::<PushProgress>();
+    assert_send_sync::<PushStats>();
+    assert_send_sync::<PushOutcome>();
+    assert_send_sync::<ServerInfo>();
+    assert_send_sync::<ObjectData>();
+    assert_send_sync::<Box<dyn ObjectReader>>();
 };
+
+/// The futures of the session calls can run on a multi-threaded executor.
+#[allow(dead_code)]
+fn session_futures_are_send(
+    session: &PushSession,
+    owned: PushSession,
+    source: &dyn ObjectSource,
+    names: &[ostrya_core::ObjectName],
+    commits: &[ostrya_core::Checksum],
+    updates: &[RefUpdate],
+) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&session.missing(names));
+    assert_send(&session.send(source, names, commits, Compression::None));
+    assert_send(&owned.commit(updates, false));
+}

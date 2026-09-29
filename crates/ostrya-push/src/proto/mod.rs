@@ -308,8 +308,20 @@ fn object_name_value(name: &ObjectName) -> Value {
     ])
 }
 
+/// The length of one `Have` entry in a body of 65,536 bytes or more: the
+/// type byte, the 32 bytes of the checksum, and an offset of 4 bytes. A
+/// shorter body has offsets of 1 or 2 bytes.
+const HAVE_ENTRY_LEN: u32 = 37;
+
+/// The most entries of a `Have` whose frame fits in `limit`. The frame
+/// length counts the kind byte and the body. Fewer entries make a shorter
+/// frame.
+pub(crate) fn have_entries_within(limit: u32) -> u32 {
+    (limit - 1) / HAVE_ENTRY_LEN
+}
+
 /// The types a `Have` entry or a `missing` entry may name: 1 to 4.
-fn have_type(ty: ObjectType) -> bool {
+pub(crate) fn have_type(ty: ObjectType) -> bool {
     matches!(
         ty,
         ObjectType::File | ObjectType::DirTree | ObjectType::DirMeta | ObjectType::Commit

@@ -14,12 +14,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use common::receive::{connect, new_repo, returned_code, session, sha, staging_entries};
+use common::receive::{
+    Obj, connect, fixture_objects, new_repo, returned_code, session, sha, staging_entries,
+};
 use common::{
     COMMIT, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory,
-    fixture_repo, foreign_holder, guard_holder, guard_holder_main, lock_holder_main,
+    foreign_holder, guard_holder, guard_holder_main, lock_holder_main,
 };
-use futures_lite::io::AsyncReadExt;
 use ostrya::push::proto::ErrorMessage;
 use ostrya::push::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::sign::append_signature;
@@ -29,7 +30,6 @@ use ostrya::{
     Repo, RepoMode, ServerSigner, Signer, Summary, SummaryOptions, TrustedKeys, Type, Value,
     Verifier,
 };
-use ostrya_core::filehdr::frame;
 use ostrya_rt::block_on;
 
 /// The base64 of a 64-byte ed25519 secret key (seed, then public key).
@@ -63,66 +63,12 @@ fn guard_holder_subprocess() {
 // Objects.
 // ---------------------------------------------------------------------------
 
-/// One object a client sends.
-#[derive(Clone)]
-struct Obj {
-    ty: ObjectType,
-    checksum: Checksum,
-    encoding: Encoding,
-    bytes: Vec<u8>,
-}
-
 fn checksum(hex: &str) -> Checksum {
     Checksum::from_hex(hex).unwrap()
 }
 
 fn fixture_commit() -> Checksum {
     checksum(COMMIT)
-}
-
-/// Every object of the fixture commit, content objects in `encoding`. The
-/// `deflate` form of a content object is the `.filez` file of the archive
-/// fixture, and the `raw` form is its header and payload.
-fn fixture_objects(encoding: Encoding) -> Vec<Obj> {
-    let root = fixture_repo("archive");
-    let repo = block_on(Repo::open(&root)).unwrap();
-    let names = block_on(repo.traverse_commit(&fixture_commit(), 0)).unwrap();
-    let mut names: Vec<ObjectName> = names.into_iter().collect();
-    names.sort_by_key(|n| (n.ty as u8, n.checksum));
-    names
-        .into_iter()
-        .map(|name| {
-            let bytes = match (name.ty, encoding) {
-                (ObjectType::File, Encoding::Deflate) => std::fs::read(root.join("objects").join(
-                    ostrya::loose_path(&name.checksum, ObjectType::File, RepoMode::Archive),
-                ))
-                .unwrap(),
-                (ObjectType::File, _) => block_on(async {
-                    let file = repo.load_file(&name.checksum).await.unwrap();
-                    let mut bytes = frame(&file.header().serialize().unwrap()).unwrap();
-                    file.reader()
-                        .await
-                        .unwrap()
-                        .read_to_end(&mut bytes)
-                        .await
-                        .unwrap();
-                    bytes
-                }),
-                (ty, _) => block_on(repo.load_object_bytes(ty, &name.checksum)).unwrap(),
-            };
-            let encoding = if name.ty == ObjectType::File {
-                encoding
-            } else {
-                Encoding::Raw
-            };
-            Obj {
-                ty: name.ty,
-                checksum: name.checksum,
-                encoding,
-                bytes,
-            }
-        })
-        .collect()
 }
 
 /// The objects of the fixture tree, without the fixture commit.

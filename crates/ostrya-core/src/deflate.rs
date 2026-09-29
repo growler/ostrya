@@ -1,16 +1,20 @@
-//! A streaming raw-DEFLATE encoder over an async writer.
+//! A streaming raw-DEFLATE encoder over an async writer, and the same encoder
+//! over an async reader.
 //!
 //! [`DeflateSink`] is the encoder behind archive-mode content objects: the
 //! stored `.filez` payload is its output. It compresses into one output
 //! buffer of a fixed size, so a payload of any size goes through in bounded
 //! pieces. [`DeflateSink::reset`] starts a new stream in the same compressor
 //! and buffer.
+//!
+//! [`DeflateReader`] reads uncompressed bytes from a source and gives the
+//! bytes a [`DeflateSink`] writes for the same input at the same level.
 
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use futures_io::AsyncWrite;
+use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use miniz_oxide::deflate::core::CompressorOxide;
 use miniz_oxide::deflate::stream::deflate;
 use miniz_oxide::{DataFormat, MZError, MZFlush, MZStatus};
@@ -53,11 +57,9 @@ impl<W> DeflateSink<W> {
     /// A raw-DEFLATE encoder over `inner` at `level`, which the format holds to
     /// 1 through 9.
     pub fn new(inner: W, level: u8) -> DeflateSink<W> {
-        let mut compressor = Box::<CompressorOxide>::default();
-        compressor.set_format_and_level(DataFormat::Raw, level);
         DeflateSink {
             inner,
-            compressor,
+            compressor: compressor(level),
             out: vec![0u8; DEFLATE_CHUNK],
             sent: 0,
             filled: 0,
@@ -76,8 +78,7 @@ impl<W> DeflateSink<W> {
     /// has not written to the old writer are discarded: a caller that needs
     /// the whole old stream closes the sink before the reset.
     pub fn reset(&mut self, inner: W, level: u8) -> W {
-        self.compressor.reset();
-        self.compressor.set_format_and_level(DataFormat::Raw, level);
+        restart(&mut self.compressor, level);
         self.sent = 0;
         self.filled = 0;
         self.syncing = false;
@@ -127,19 +128,47 @@ impl<W: AsyncWrite + Unpin> DeflateSink<W> {
         flush: MZFlush,
     ) -> Poll<io::Result<(usize, usize, bool)>> {
         std::task::ready!(self.poll_drain(cx))?;
-        let res = deflate(&mut self.compressor, input, &mut self.out, flush);
-        self.filled = res.bytes_written;
-        let end = match res.status {
-            Ok(MZStatus::StreamEnd) => true,
-            Ok(_) | Err(MZError::Buf) => false,
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::other(format!(
-                    "the DEFLATE encoder failed: {e:?}"
-                ))));
-            }
-        };
-        Poll::Ready(Ok((res.bytes_consumed, res.bytes_written, end)))
+        let step = compress(&mut self.compressor, input, &mut self.out, flush)?;
+        self.filled = step.1;
+        Poll::Ready(Ok(step))
     }
+}
+
+/// A raw-DEFLATE compressor at `level`.
+fn compressor(level: u8) -> Box<CompressorOxide> {
+    let mut compressor = Box::<CompressorOxide>::default();
+    compressor.set_format_and_level(DataFormat::Raw, level);
+    compressor
+}
+
+/// Start a new stream in `compressor` at `level`.
+fn restart(compressor: &mut CompressorOxide, level: u8) {
+    compressor.reset();
+    compressor.set_format_and_level(DataFormat::Raw, level);
+}
+
+/// Run `compressor` once over `input` under `flush` into `out`.
+///
+/// Returns the bytes of `input` the compressor took, the bytes it wrote to
+/// `out`, and whether it reached the end of the stream. A `Buf` result
+/// reports that the compressor made no progress.
+fn compress(
+    compressor: &mut CompressorOxide,
+    input: &[u8],
+    out: &mut [u8],
+    flush: MZFlush,
+) -> io::Result<(usize, usize, bool)> {
+    let res = deflate(compressor, input, out, flush);
+    let end = match res.status {
+        Ok(MZStatus::StreamEnd) => true,
+        Ok(_) | Err(MZError::Buf) => false,
+        Err(e) => {
+            return Err(io::Error::other(format!(
+                "the DEFLATE encoder failed: {e:?}"
+            )));
+        }
+    };
+    Ok((res.bytes_consumed, res.bytes_written, end))
 }
 
 impl<W: AsyncWrite + Unpin> AsyncWrite for DeflateSink<W> {
@@ -204,6 +233,173 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for DeflateSink<W> {
     }
 }
 
+fn stalled() -> io::Error {
+    io::Error::other("the DEFLATE encoder stalled with no output")
+}
+
+/// A raw-DEFLATE encoder that reads uncompressed bytes from a source.
+///
+/// A read gives the compressed form of the source bytes, and end of file
+/// follows the end of the stream. The output is the bytes a [`DeflateSink`]
+/// writes for the same input at the same level: the reader runs the
+/// compressor in the same sequence of steps, each into an empty output
+/// buffer. The reader never flushes the stream before its end, because a
+/// flush changes the bytes.
+///
+/// The reader holds one compressor, an input buffer of 64 KiB, and an output
+/// buffer of 64 KiB, so a source of any size goes through in bounded memory.
+/// It gives the compressed bytes it holds before it reads the source again.
+/// [`reset`](DeflateReader::reset) starts a new stream in the same compressor
+/// and buffers, so one reader can encode many objects in turn.
+///
+/// The reader implements `AsyncBufRead`. A caller that reads through
+/// `poll_fill_buf` and `consume` takes the compressed bytes from the output
+/// buffer with no copy.
+pub struct DeflateReader<R> {
+    source: R,
+    compressor: Box<CompressorOxide>,
+    /// The source bytes read and not yet compressed: `input[pos..len]`.
+    input: Box<[u8]>,
+    pos: usize,
+    len: usize,
+    /// The compressed bytes not yet read: `out[out_pos..out_len]`.
+    out: Box<[u8]>,
+    out_pos: usize,
+    out_len: usize,
+    /// Whether the source has reached end of file.
+    eof: bool,
+    /// Whether the compressor has reached the end of the stream.
+    done: bool,
+}
+
+impl<R> DeflateReader<R> {
+    /// A raw-DEFLATE encoder over `source` at `level`, which the format holds
+    /// to 1 through 9.
+    pub fn new(source: R, level: u8) -> DeflateReader<R> {
+        DeflateReader {
+            source,
+            compressor: compressor(level),
+            input: vec![0u8; DEFLATE_CHUNK].into_boxed_slice(),
+            pos: 0,
+            len: 0,
+            out: vec![0u8; DEFLATE_CHUNK].into_boxed_slice(),
+            out_pos: 0,
+            out_len: 0,
+            eof: false,
+            done: false,
+        }
+    }
+
+    /// Start a new stream over `source` at `level`, and return the source the
+    /// reader held until now.
+    ///
+    /// The compressor is reset in place and takes `level`, and the buffers
+    /// are kept. Source bytes and compressed bytes of the old stream that the
+    /// reader holds are discarded.
+    pub fn reset(&mut self, source: R, level: u8) -> R {
+        restart(&mut self.compressor, level);
+        self.pos = 0;
+        self.len = 0;
+        self.out_pos = 0;
+        self.out_len = 0;
+        self.eof = false;
+        self.done = false;
+        std::mem::replace(&mut self.source, source)
+    }
+
+    /// The source.
+    pub fn get_ref(&self) -> &R {
+        &self.source
+    }
+
+    /// The source. Bytes read from it here do not reach the stream.
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.source
+    }
+
+    /// The source.
+    pub fn into_inner(self) -> R {
+        self.source
+    }
+}
+
+impl<R: AsyncRead + Unpin> DeflateReader<R> {
+    /// Run the encoder until the output buffer holds unread bytes or the
+    /// stream has ended.
+    fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            if self.out_pos < self.out_len || self.done {
+                return Poll::Ready(Ok(()));
+            }
+            self.out_pos = 0;
+            self.out_len = 0;
+            if self.pos < self.len {
+                let (taken, written, _) = compress(
+                    &mut self.compressor,
+                    &self.input[self.pos..self.len],
+                    &mut self.out,
+                    MZFlush::None,
+                )?;
+                if taken == 0 && written == 0 {
+                    return Poll::Ready(Err(stalled()));
+                }
+                self.pos += taken;
+                self.out_len = written;
+                continue;
+            }
+            if !self.eof {
+                let n =
+                    std::task::ready!(Pin::new(&mut self.source).poll_read(cx, &mut self.input))?;
+                if n == 0 {
+                    self.eof = true;
+                } else {
+                    self.pos = 0;
+                    self.len = n;
+                }
+                continue;
+            }
+            let (_, written, end) =
+                compress(&mut self.compressor, &[], &mut self.out, MZFlush::Finish)?;
+            if !end && written == 0 {
+                return Poll::Ready(Err(stalled()));
+            }
+            self.out_len = written;
+            self.done = end;
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncBufRead for DeflateReader<R> {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let me = self.get_mut();
+        std::task::ready!(me.poll_fill(cx))?;
+        Poll::Ready(Ok(&me.out[me.out_pos..me.out_len]))
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let me = self.get_mut();
+        me.out_pos = (me.out_pos + amt).min(me.out_len);
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for DeflateReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let me = self.get_mut();
+        std::task::ready!(me.poll_fill(cx))?;
+        let n = buf.len().min(me.out_len - me.out_pos);
+        buf[..n].copy_from_slice(&me.out[me.out_pos..me.out_pos + n]);
+        me.out_pos += n;
+        Poll::Ready(Ok(n))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -215,7 +411,7 @@ mod tests {
     use futures_lite::io::AsyncWriteExt;
     use sha2::{Digest, Sha256};
 
-    use super::{DEFLATE_CHUNK, DeflateSink};
+    use super::{DEFLATE_CHUNK, DeflateReader, DeflateSink};
     use crate::Checksum;
 
     /// The SHA-256 of the encoder output over [`golden_payload`], one entry
@@ -481,5 +677,219 @@ mod tests {
             GOLDEN_FLUSHED,
             "DEFLATE level 6 output hash after a reset and a flush"
         );
+    }
+
+    /// A source that gives one byte for each read and is `Pending` before
+    /// each byte.
+    struct Trickle<'a> {
+        data: &'a [u8],
+        ready: bool,
+    }
+
+    impl futures_io::AsyncRead for Trickle<'_> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let me = self.get_mut();
+            if !me.ready {
+                me.ready = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            me.ready = false;
+            let n = buf.len().min(me.data.len()).min(1);
+            buf[..n].copy_from_slice(&me.data[..n]);
+            me.data = &me.data[n..];
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    /// The rest of the stream of `reader`, in reads of `size` bytes.
+    fn read_all<R: futures_io::AsyncRead + Unpin>(
+        reader: &mut DeflateReader<R>,
+        size: usize,
+    ) -> Vec<u8> {
+        block_on(async {
+            use futures_lite::io::AsyncReadExt;
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; size];
+            loop {
+                let n = reader.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return out;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+        })
+    }
+
+    /// The rest of the stream of `reader`, through `fill_buf` and `consume`.
+    fn read_buffered<R: futures_io::AsyncRead + Unpin>(reader: &mut DeflateReader<R>) -> Vec<u8> {
+        block_on(async {
+            use futures_lite::io::AsyncBufReadExt;
+            let mut out = Vec::new();
+            loop {
+                let chunk = reader.fill_buf().await.unwrap();
+                if chunk.is_empty() {
+                    return out;
+                }
+                assert!(chunk.len() <= DEFLATE_CHUNK, "a chunk fits one buffer");
+                let n = chunk.len();
+                out.extend_from_slice(chunk);
+                reader.consume(n);
+            }
+        })
+    }
+
+    #[test]
+    fn deflate_reader_output_matches_the_golden_hashes() {
+        let data = golden_payload();
+        for (i, &want) in GOLDEN.iter().enumerate() {
+            let level = i as u8 + 1;
+            let out = read_all(&mut DeflateReader::new(&data[..], level), 4093);
+            assert_eq!(hash(&out), want, "level {level}: reader output hash");
+            assert_eq!(out, encode(&data, level, 4093), "level {level}: sink bytes");
+            for size in [1, DEFLATE_CHUNK + 7, 4 * data.len()] {
+                assert_eq!(
+                    read_all(&mut DeflateReader::new(&data[..], level), size),
+                    out,
+                    "level {level}, {size}-byte reads"
+                );
+            }
+            assert_eq!(
+                read_buffered(&mut DeflateReader::new(&data[..], level)),
+                out,
+                "level {level}, buffered reads"
+            );
+            let trickle = Trickle {
+                data: &data,
+                ready: false,
+            };
+            assert_eq!(
+                read_all(&mut DeflateReader::new(trickle, level), 4093),
+                out,
+                "level {level}, a source of one byte after each Pending"
+            );
+
+            // A reset after a complete stream, and after a stream read
+            // halfway, gives the bytes of a new reader.
+            let mut reader = DeflateReader::new(&data[..data.len() / 3], level % 9 + 1);
+            assert!(!read_all(&mut reader, 4093).is_empty());
+            let old = reader.reset(&data[..], level);
+            assert!(
+                old.is_empty(),
+                "reset returns the old source, read to its end"
+            );
+            assert_eq!(
+                read_all(&mut reader, 4093),
+                out,
+                "level {level}, reset after the end"
+            );
+
+            let mut reader = DeflateReader::new(&data[..], level % 9 + 1);
+            block_on(async {
+                use futures_lite::io::AsyncReadExt;
+                let mut buf = vec![0u8; 1000];
+                reader.read_exact(&mut buf).await.unwrap();
+            });
+            reader.reset(&data[..], level);
+            assert_eq!(
+                read_buffered(&mut reader),
+                out,
+                "level {level}, reset mid-stream"
+            );
+
+            // An empty source gives the empty stream of the sink.
+            let empty = read_all(&mut DeflateReader::new(&[][..], level), 4093);
+            assert_eq!(empty, encode(&[], level, 1), "level {level}, empty input");
+            assert!(!empty.is_empty(), "the empty stream still ends");
+            assert_eq!(
+                read_all(&mut reader, 4093),
+                Vec::<u8>::new(),
+                "end of file after the end of the stream"
+            );
+        }
+    }
+
+    /// A source that gives its data, then is `Pending` with no wake until
+    /// `open` is set, and then reaches end of file.
+    struct Held<'a> {
+        data: &'a [u8],
+        open: bool,
+    }
+
+    impl futures_io::AsyncRead for Held<'_> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let me = self.get_mut();
+            if me.data.is_empty() && !me.open {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(me.data.len());
+            buf[..n].copy_from_slice(&me.data[..n]);
+            me.data = &me.data[n..];
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    #[test]
+    fn deflate_reader_gives_its_output_before_it_waits_on_the_source() {
+        use futures_io::AsyncBufRead;
+        use miniz_oxide::deflate::core::CompressorOxide;
+        use miniz_oxide::deflate::stream::deflate;
+        use miniz_oxide::{DataFormat, MZFlush};
+
+        let mut state = 7;
+        let data: Vec<u8> = (0..4 * DEFLATE_CHUNK)
+            .map(|_| xorshift(&mut state) as u8)
+            .collect();
+        // The bytes the compressor gives for the whole input with no flush,
+        // run over the input in pieces of the reader's input buffer.
+        let mut compressor = Box::<CompressorOxide>::default();
+        compressor.set_format_and_level(DataFormat::Raw, 1);
+        let mut out = vec![0u8; DEFLATE_CHUNK];
+        let mut ready = 0;
+        for piece in data.chunks(DEFLATE_CHUNK) {
+            let mut pos = 0;
+            while pos < piece.len() {
+                let res = deflate(&mut compressor, &piece[pos..], &mut out, MZFlush::None);
+                pos += res.bytes_consumed;
+                ready += res.bytes_written;
+            }
+        }
+        assert!(ready > 0);
+
+        let mut reader = DeflateReader::new(
+            Held {
+                data: &data,
+                open: false,
+            },
+            1,
+        );
+        let mut got = Vec::new();
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        while let Poll::Ready(chunk) = Pin::new(&mut reader).poll_fill_buf(&mut cx) {
+            let chunk = chunk.unwrap();
+            assert!(!chunk.is_empty(), "no end of file while the source waits");
+            let n = chunk.len();
+            got.extend_from_slice(chunk);
+            Pin::new(&mut reader).consume(n);
+        }
+        assert_eq!(got.len(), ready, "every compressed byte before the wait");
+        reader.get_mut().open = true;
+        got.extend(read_all(&mut reader, 4093));
+        assert_eq!(got, encode(&data, 1, 4093));
+    }
+
+    #[test]
+    fn deflate_reader_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DeflateReader<&[u8]>>();
     }
 }

@@ -9,8 +9,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// The error a push session fails with.
 ///
-/// Each variant except [`Error::Aborted`] and [`Error::Io`] is one wire code
-/// of the `Error` message.
+/// Each variant except [`Error::Aborted`], [`Error::CommitOutcomeUnknown`],
+/// [`Error::Source`], [`Error::InvalidInput`], and [`Error::Io`] is one wire
+/// code of the `Error` message.
 /// The enum is `#[non_exhaustive]`, so a match outside the crate needs a
 /// wildcard arm.
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +90,25 @@ pub enum Error {
     /// no `Error` in reply.
     #[error("the client aborted the session")]
     Aborted,
+    /// The client sent `Commit`, and the session ended with no reply the
+    /// client could read. The server may have written the refs, or none of
+    /// them. `refs` names the refs of the ref updates.
+    #[error("the outcome of the commit of {refs:?} is unknown: {message}")]
+    CommitOutcomeUnknown {
+        /// The refs of the ref updates.
+        refs: Vec<String>,
+        /// What ended the session, for a human.
+        message: String,
+    },
+    /// The object source of a client failed while the session sent its
+    /// objects. The session ended with `Abort`.
+    #[error("the object source failed: {0}")]
+    Source(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// A call of the client that the session refuses: an argument or source
+    /// data it cannot send, a call while another one runs, or a call on a
+    /// broken session.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     /// An I/O error of the underlying stream. An end of file inside a frame
     /// or an object has the kind `UnexpectedEof`.
     #[error(transparent)]
@@ -185,8 +205,9 @@ impl ErrorCode {
 }
 
 impl Error {
-    /// The wire code of the error, or `None` for [`Error::Aborted`] and
-    /// [`Error::Io`].
+    /// The wire code of the error, or `None` for [`Error::Aborted`],
+    /// [`Error::CommitOutcomeUnknown`], [`Error::Source`],
+    /// [`Error::InvalidInput`], and [`Error::Io`].
     pub fn code(&self) -> Option<ErrorCode> {
         Some(match self {
             Error::VersionUnsupported(_) => ErrorCode::VersionUnsupported,
@@ -205,13 +226,16 @@ impl Error {
             Error::SignatureRequired(_) => ErrorCode::SignatureRequired,
             Error::BindingMismatch(_) => ErrorCode::BindingMismatch,
             Error::Internal(_) => ErrorCode::Internal,
-            Error::Aborted | Error::Io(_) => return None,
+            Error::Aborted
+            | Error::CommitOutcomeUnknown { .. }
+            | Error::Source(_)
+            | Error::InvalidInput(_)
+            | Error::Io(_) => return None,
         })
     }
 
-    /// The `Error` message that reports this error to the peer. An
-    /// [`Error::Aborted`] and an [`Error::Io`] report as `internal` with their
-    /// display text.
+    /// The `Error` message that reports this error to the peer. An error with
+    /// no wire code reports as `internal` with its display text.
     pub fn to_message(&self) -> ErrorMessage {
         let (code, message) = match self {
             Error::MissingObjects { message, missing } => {
@@ -237,7 +261,11 @@ impl Error {
                     }),
                 };
             }
-            Error::Aborted | Error::Io(_) => (ErrorCode::Internal, self.to_string()),
+            Error::Aborted
+            | Error::CommitOutcomeUnknown { .. }
+            | Error::Source(_)
+            | Error::InvalidInput(_)
+            | Error::Io(_) => (ErrorCode::Internal, self.to_string()),
             Error::VersionUnsupported(m)
             | Error::LockingDisabled(m)
             | Error::Unauthorized(m)

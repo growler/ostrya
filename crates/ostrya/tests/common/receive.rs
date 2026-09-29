@@ -7,10 +7,8 @@ use std::future::Future;
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
 
 use futures_io::{AsyncRead, AsyncWrite};
 use ostrya::push::proto::{
@@ -359,86 +357,6 @@ pub fn staging_entries(root: &Path) -> Vec<String> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("staging-"))
         .collect()
-}
-
-// ---------------------------------------------------------------------------
-// A lock that another process holds.
-// ---------------------------------------------------------------------------
-
-/// The environment variable that names the repository of the lock helper.
-const FOREIGN_LOCK_REPO: &str = "OSTRYA_RECEIVE_FOREIGN_LOCK_REPO";
-
-/// The environment variable that names the lock file of the lock helper,
-/// relative to the repository.
-const FOREIGN_LOCK_FILE: &str = "OSTRYA_RECEIVE_FOREIGN_LOCK_FILE";
-
-/// The file the lock helper writes once it holds the lock.
-const FOREIGN_LOCK_MARKER: &str = ".foreign-held";
-
-/// The name of the ignored test each receive test binary defines, which calls
-/// [`lock_holder_main`].
-pub const LOCK_HOLDER_TEST: &str = "receive_lock_holder_subprocess";
-
-/// A spawned child, killed and reaped when the guard drops.
-pub struct ChildGuard(std::process::Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Start this test binary again as a process that holds `<repo>/<lock_file>`
-/// exclusive until it is killed.
-pub fn foreign_holder(repo: &Path, lock_file: &str) -> ChildGuard {
-    let holder = ChildGuard(
-        Command::new(std::env::current_exe().unwrap())
-            .args([LOCK_HOLDER_TEST, "--exact", "--ignored", "--nocapture"])
-            .env(FOREIGN_LOCK_REPO, repo)
-            .env(FOREIGN_LOCK_FILE, lock_file)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn the lock holder"),
-    );
-    let marker = repo.join(FOREIGN_LOCK_MARKER);
-    let started = Instant::now();
-    while !marker.exists() {
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "the holder never took the lock"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    holder
-}
-
-/// The body of the lock helper: take the record lock the environment names,
-/// write the readiness marker, and wait until standard input closes. Outside
-/// a helper process it does nothing.
-pub fn lock_holder_main() {
-    use rustix::fs::{FlockOperation, Mode, OFlags};
-    use std::io::Read;
-
-    let (Ok(repo), Ok(lock_file)) = (
-        std::env::var(FOREIGN_LOCK_REPO),
-        std::env::var(FOREIGN_LOCK_FILE),
-    ) else {
-        return;
-    };
-    let repo = Path::new(&repo);
-    let fd = rustix::fs::open(
-        repo.join(lock_file),
-        OFlags::RDWR | OFlags::CREATE,
-        Mode::from_raw_mode(0o660),
-    )
-    .expect("open the lock file");
-    rustix::fs::fcntl_lock(&fd, FlockOperation::LockExclusive).expect("take the record lock");
-    std::fs::write(repo.join(FOREIGN_LOCK_MARKER), b"1").expect("write the readiness marker");
-    let mut sink = Vec::new();
-    let _ = std::io::stdin().read_to_end(&mut sink);
 }
 
 // ---------------------------------------------------------------------------

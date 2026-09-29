@@ -1,8 +1,13 @@
-//! The ref-update lock: the lock the receive path holds while it reads the
-//! state of its target refs, checks it, and commits.
+//! The update lock: the lock that serializes the writes of refs and of the
+//! other repository state outside the object store.
+//!
+//! A holder of [`crate::UpdateGuard`] holds it, the receive path holds it while
+//! it reads the state of its target refs, checks it, and commits, and summary
+//! regeneration holds it while it refreshes the anchor commit and writes the
+//! summary.
 //!
 //! The lock is an exclusive `fcntl` record lock (`F_SETLK`) on
-//! `<repo>/.ref-update.lock`, beside `.lock`. The file is opened by the rules of
+//! `<repo>/.update.lock`, beside `.lock`. The file is opened by the rules of
 //! `.lock` and is held through the same process-global registry, so the process
 //! keeps one descriptor to it. The tool never opens this file, so the lock
 //! excludes port processes alone.
@@ -30,12 +35,12 @@ use rustix::fs::FlockOperation;
 use super::{POLL_INTERVAL, Registered, get_or_register, unregister, would_block};
 use crate::error::{Error, Result};
 
-/// The ref-update lock file, relative to the repository root.
-const REF_UPDATE_LOCK_FILE: &str = ".ref-update.lock";
+/// The update lock file, relative to the repository root.
+const UPDATE_LOCK_FILE: &str = ".update.lock";
 
 /// The in-process holder and the queue of waiters.
 #[derive(Debug)]
-struct RefState {
+struct UpdateState {
     /// Whether a guard holds the lock.
     held: bool,
     /// The ticket the next waiter takes.
@@ -45,20 +50,20 @@ struct RefState {
     queue: VecDeque<(u64, Option<Waker>)>,
 }
 
-/// The per-repository ref-update lock, shared by every handle to one repository
+/// The per-repository update lock, shared by every handle to one repository
 /// in a process.
 #[derive(Debug)]
-pub(crate) struct RefUpdateLock {
+pub(crate) struct UpdateLock {
     key: (u64, u64),
-    /// The `.ref-update.lock` descriptor. It is `Some` until the drop closes
+    /// The `.update.lock` descriptor. It is `Some` until the drop closes
     /// it under the registry mutex.
     fd: Option<OwnedFd>,
-    state: Mutex<RefState>,
+    state: Mutex<UpdateState>,
 }
 
-impl RefUpdateLock {
-    /// Return the [`RefUpdateLock`] for the repository rooted at `repo_fd`,
-    /// creating `<repo>/.ref-update.lock` and registering it on first use. Runs
+impl UpdateLock {
+    /// Return the [`UpdateLock`] for the repository rooted at `repo_fd`,
+    /// creating `<repo>/.update.lock` and registering it on first use. Runs
     /// synchronous filesystem calls and is meant to be offloaded to the
     /// blocking pool.
     ///
@@ -68,23 +73,23 @@ impl RefUpdateLock {
     pub(crate) fn get_or_create(
         repo_fd: BorrowedFd<'_>,
         repo_mode: RepoMode,
-    ) -> std::io::Result<Arc<RefUpdateLock>> {
+    ) -> std::io::Result<Arc<UpdateLock>> {
         get_or_register(
             repo_fd,
-            REF_UPDATE_LOCK_FILE,
+            UPDATE_LOCK_FILE,
             repo_mode,
-            Registered::ref_update,
+            Registered::update,
             |fd, key| {
-                let lock = Arc::new(RefUpdateLock {
+                let lock = Arc::new(UpdateLock {
                     key,
                     fd: Some(fd),
-                    state: Mutex::new(RefState {
+                    state: Mutex::new(UpdateState {
                         held: false,
                         next_ticket: 0,
                         queue: VecDeque::new(),
                     }),
                 });
-                let registered = Registered::RefUpdate(Arc::downgrade(&lock));
+                let registered = Registered::Update(Arc::downgrade(&lock));
                 (lock, registered)
             },
         )
@@ -97,7 +102,7 @@ impl RefUpdateLock {
     }
 }
 
-impl Drop for RefUpdateLock {
+impl Drop for UpdateLock {
     fn drop(&mut self) {
         // Closing the descriptor releases any residual record lock.
         unregister(self.key, self.fd.take());
@@ -106,17 +111,24 @@ impl Drop for RefUpdateLock {
 
 /// Take the waker the head of the queue left, if any, for a wake after the
 /// state mutex is released. Call this only while no guard holds the lock.
-fn wake_head(st: &mut RefState) -> Option<Waker> {
+fn wake_head(st: &mut UpdateState) -> Option<Waker> {
     st.queue.front_mut().and_then(|(_, waker)| waker.take())
 }
 
-/// An acquired ref-update lock. Releasing happens on drop.
+/// An acquired update lock. Releasing happens on drop.
 #[derive(Debug)]
-pub(crate) struct RefUpdateGuard {
-    lock: Arc<RefUpdateLock>,
+pub(crate) struct UpdateLockHeld {
+    lock: Arc<UpdateLock>,
 }
 
-impl Drop for RefUpdateGuard {
+impl UpdateLockHeld {
+    /// Whether this hold is a hold of `lock`.
+    pub(crate) fn is_of(&self, lock: &Arc<UpdateLock>) -> bool {
+        Arc::ptr_eq(&self.lock, lock)
+    }
+}
+
+impl Drop for UpdateLockHeld {
     fn drop(&mut self) {
         // The record lock goes first: no waiter makes a request while `held`
         // stands. Errors are ignored so a release never fails.
@@ -147,14 +159,14 @@ enum Turn {
 /// One waiter's place in the queue. Dropping a place that was not granted
 /// removes it from the queue.
 struct Place {
-    lock: Arc<RefUpdateLock>,
+    lock: Arc<UpdateLock>,
     ticket: u64,
     granted: bool,
 }
 
 impl Place {
     /// Take a ticket at the tail of the queue.
-    fn enqueue(lock: Arc<RefUpdateLock>) -> Place {
+    fn enqueue(lock: Arc<UpdateLock>) -> Place {
         let ticket = {
             let mut st = lock.state.lock().unwrap();
             let ticket = st.next_ticket;
@@ -224,16 +236,16 @@ impl Drop for Place {
     }
 }
 
-/// Acquire the ref-update lock, waiting until `timeout` elapses. `None` waits
+/// Acquire the update lock, waiting until `timeout` elapses. `None` waits
 /// with no deadline, and `Some(Duration::ZERO)` makes one attempt.
 ///
 /// The waiter takes its place in the queue on the first poll of the returned
 /// future. The timeout covers the whole wait: the wait in the queue and the
 /// retries against other processes.
-pub(crate) async fn acquire_ref_update(
-    lock: Arc<RefUpdateLock>,
+pub(crate) async fn acquire_update(
+    lock: Arc<UpdateLock>,
     timeout: Option<Duration>,
-) -> Result<RefUpdateGuard> {
+) -> Result<UpdateLockHeld> {
     // A timeout past the range of `Instant` has no deadline.
     let deadline = timeout.and_then(|t| Some((Instant::now().checked_add(t)?, t.as_secs() as i64)));
     let mut place = Place::enqueue(lock);
@@ -252,7 +264,7 @@ pub(crate) async fn acquire_ref_update(
         };
         let wait = match turn {
             Turn::Granted => {
-                return Ok(RefUpdateGuard {
+                return Ok(UpdateLockHeld {
                     lock: place.lock.clone(),
                 });
             }
@@ -273,13 +285,31 @@ pub(crate) async fn acquire_ref_update(
     }
 }
 
-/// The ref-update lock moves freely across tasks and threads.
+/// Whether a guard of this process holds the update lock of the repository
+/// at `repo_fd`, for the unit tests. The registry is read without opening the
+/// lock file, and a repository whose lock is not registered reads as free.
+#[cfg(test)]
+pub(crate) fn held_in_process(repo_fd: BorrowedFd<'_>) -> bool {
+    let found = {
+        let reg = super::registry().map.lock().unwrap();
+        super::probe(&reg, repo_fd, UPDATE_LOCK_FILE)
+            .map(|entry| super::find(entry, Registered::update))
+    };
+    // The registry mutex is released before the lock can drop: the drop of
+    // the last reference takes it again.
+    match found {
+        Some(super::Found::Live(lock)) => lock.state.lock().unwrap().held,
+        _ => false,
+    }
+}
+
+/// The update lock moves freely across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_send<T: Send>(_: &T) {}
-    assert_send_sync::<RefUpdateLock>();
-    assert_send_sync::<RefUpdateGuard>();
-    let _ = |repo: &crate::Repo| assert_send(&repo.lock_ref_update());
+    assert_send_sync::<UpdateLock>();
+    assert_send_sync::<UpdateLockHeld>();
+    let _ = |repo: &crate::Repo| assert_send(&repo.lock_update());
 };
 
 #[cfg(test)]
@@ -294,10 +324,10 @@ mod tests {
 
     /// The environment variable that names the repository of the lock-holder
     /// helper process.
-    const HOLDER_ENV: &str = "OSTRYA_REF_UPDATE_HOLDER";
+    const HOLDER_ENV: &str = "OSTRYA_UPDATE_HOLDER";
 
     /// The environment variable that names the marker file of the umask child.
-    const UMASK_ENV: &str = "OSTRYA_REF_UPDATE_UMASK_CHILD";
+    const UMASK_ENV: &str = "OSTRYA_UPDATE_UMASK_CHILD";
 
     /// A scratch directory holding a repository at `repo`, removed when the
     /// guard drops.
@@ -308,7 +338,7 @@ mod tests {
     impl Scratch {
         fn new(label: &str) -> Scratch {
             let dir = std::env::temp_dir().join(format!(
-                "ostrya-ref-update-{label}-{}-{}",
+                "ostrya-update-lock-{label}-{}-{}",
                 std::process::id(),
                 crate::write::unique()
             ));
@@ -347,18 +377,18 @@ mod tests {
     }
 
     /// The lock of `repo`, from the registry the handle's cached lock is in.
-    fn lock_of(repo: &Repo) -> Arc<RefUpdateLock> {
-        RefUpdateLock::get_or_create(repo.repo_fd(), RepoMode::BareUser).unwrap()
+    fn lock_of(repo: &Repo) -> Arc<UpdateLock> {
+        UpdateLock::get_or_create(repo.repo_fd(), RepoMode::BareUser).unwrap()
     }
 
     /// The number of waiters in the queue of `lock`.
-    fn waiters(lock: &RefUpdateLock) -> usize {
+    fn waiters(lock: &UpdateLock) -> usize {
         lock.state.lock().unwrap().queue.len()
     }
 
     /// Wait until the queue of `lock` holds `n` waiters. The wait yields to
     /// the executor, so a task spawned on a single-threaded runtime can run.
-    async fn wait_for_waiters(lock: &RefUpdateLock, n: usize) {
+    async fn wait_for_waiters(lock: &UpdateLock, n: usize) {
         for _ in 0..500 {
             if waiters(lock) == n {
                 return;
@@ -368,10 +398,10 @@ mod tests {
         panic!("the queue never held {n} waiters");
     }
 
-    type Pending = Pin<Box<dyn Future<Output = Result<RefUpdateGuard>> + Send>>;
+    type Pending = Pin<Box<dyn Future<Output = Result<UpdateLockHeld>> + Send>>;
 
-    fn waiter(lock: &Arc<RefUpdateLock>, timeout: Option<Duration>) -> Pending {
-        Box::pin(acquire_ref_update(lock.clone(), timeout))
+    fn waiter(lock: &Arc<UpdateLock>, timeout: Option<Duration>) -> Pending {
+        Box::pin(acquire_update(lock.clone(), timeout))
     }
 
     fn mode_of(path: &Path) -> u32 {
@@ -396,10 +426,10 @@ mod tests {
     fn the_lock_file_sits_at_the_repository_root_and_stays() {
         let scratch = Scratch::new("file");
         let repo = scratch.create(RepoMode::BareUser);
-        let file = scratch.path().join(REF_UPDATE_LOCK_FILE);
+        let file = scratch.path().join(UPDATE_LOCK_FILE);
         assert!(!file.exists(), "the file is created on the first acquire");
 
-        let guard = ostrya_rt::block_on(repo.lock_ref_update()).unwrap();
+        let guard = ostrya_rt::block_on(repo.lock_update()).unwrap();
         let meta = std::fs::symlink_metadata(&file).unwrap();
         assert!(
             meta.file_type().is_file(),
@@ -431,9 +461,9 @@ mod tests {
                 let repo = Repo::create(&path, CreateOptions::new(RepoMode::BareUserShared))
                     .await
                     .unwrap();
-                drop(repo.lock_ref_update().await.unwrap());
+                drop(repo.lock_update().await.unwrap());
             });
-            assert_eq!(mode_of(&path.join(REF_UPDATE_LOCK_FILE)), 0o660);
+            assert_eq!(mode_of(&path.join(UPDATE_LOCK_FILE)), 0o660);
             std::fs::write(marker, b"ran").unwrap();
             return;
         }
@@ -441,7 +471,7 @@ mod tests {
         let marker = scratch.dir.join("ran");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "lock::ref_update::tests::a_shared_repository_forces_the_lock_mode",
+                "lock::update::tests::a_shared_repository_forces_the_lock_mode",
                 "--exact",
                 "--nocapture",
             ])
@@ -458,11 +488,11 @@ mod tests {
     fn an_existing_lock_file_keeps_its_mode() {
         let scratch = Scratch::new("existing");
         let repo = scratch.create(RepoMode::BareUserShared);
-        let file = scratch.path().join(REF_UPDATE_LOCK_FILE);
+        let file = scratch.path().join(UPDATE_LOCK_FILE);
         std::fs::write(&file, b"").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        drop(ostrya_rt::block_on(repo.lock_ref_update()).unwrap());
+        drop(ostrya_rt::block_on(repo.lock_update()).unwrap());
         assert_eq!(mode_of(&file), 0o600);
     }
 
@@ -472,10 +502,10 @@ mod tests {
         let repo = scratch.create(RepoMode::BareUser);
         let lock = lock_of(&repo);
         ostrya_rt::block_on(async {
-            let first = repo.lock_ref_update().await.unwrap();
+            let first = repo.lock_update().await.unwrap();
             let mut second = waiter(&lock, None);
             assert!(poll_once(&mut second).await.is_none(), "the second waits");
-            let err = acquire_ref_update(lock.clone(), Some(Duration::ZERO))
+            let err = acquire_update(lock.clone(), Some(Duration::ZERO))
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
@@ -491,11 +521,11 @@ mod tests {
         drop(scratch.create(RepoMode::BareUser));
         let (a, b) = (scratch.open(), scratch.open());
         ostrya_rt::block_on(async {
-            let first = a.lock_ref_update().await.unwrap();
+            let first = a.lock_update().await.unwrap();
             let lock = lock_of(&b);
             // The first call on `b` opens the lock file on the blocking pool,
             // so it joins the queue only when the open completes.
-            let mut second = Box::pin(b.lock_ref_update());
+            let mut second = Box::pin(b.lock_update());
             for _ in 0..500 {
                 assert!(poll_once(&mut second).await.is_none(), "the second waits");
                 if waiters(&lock) == 1 {
@@ -519,7 +549,7 @@ mod tests {
         let repo = scratch.create(RepoMode::BareUser);
         let lock = lock_of(&repo);
         ostrya_rt::block_on(async {
-            let holder = repo.lock_ref_update().await.unwrap();
+            let holder = repo.lock_update().await.unwrap();
             let mut pending = Vec::new();
             for label in ["B", "C", "D"] {
                 let mut w = waiter(&lock, None);
@@ -551,9 +581,9 @@ mod tests {
         let repo = scratch.create(RepoMode::BareUser);
         let lock = lock_of(&repo);
         ostrya_rt::block_on(async {
-            let holder = repo.lock_ref_update().await.unwrap();
-            let mut x = Box::pin(repo.lock_ref_update());
-            let mut y = Box::pin(repo.lock_ref_update());
+            let holder = repo.lock_update().await.unwrap();
+            let mut x = Box::pin(repo.lock_update());
+            let mut y = Box::pin(repo.lock_update());
             assert!(poll_once(&mut x).await.is_none());
             assert!(poll_once(&mut y).await.is_none());
             assert_eq!(waiters(&lock), 2, "both calls joined the queue");
@@ -576,13 +606,12 @@ mod tests {
         let lock = lock_of(&repo);
         let order = Arc::new(Mutex::new(Vec::new()));
         ostrya_rt::block_on(async {
-            let holder = repo.lock_ref_update().await.unwrap();
+            let holder = repo.lock_update().await.unwrap();
             let mut tasks = Vec::new();
             for (n, label) in ["B", "C", "D"].into_iter().enumerate() {
                 let (task_lock, order) = (lock.clone(), order.clone());
                 tasks.push(ostrya_rt::spawn(async move {
-                    let guard =
-                        acquire_ref_update(task_lock, Some(Duration::from_secs(10))).await?;
+                    let guard = acquire_update(task_lock, Some(Duration::from_secs(10))).await?;
                     order.lock().unwrap().push(label);
                     ostrya_rt::Timer::after(Duration::from_millis(10)).await;
                     drop(guard);
@@ -606,10 +635,10 @@ mod tests {
         let long = Some(Duration::from_secs(10));
         ostrya_rt::block_on(async {
             // A head dropped after the release woke it hands the turn on.
-            let holder = repo.lock_ref_update().await.unwrap();
+            let holder = repo.lock_update().await.unwrap();
             let mut head = waiter(&lock, None);
             assert!(poll_once(&mut head).await.is_none());
-            let next = ostrya_rt::spawn(acquire_ref_update(lock.clone(), long));
+            let next = ostrya_rt::spawn(acquire_update(lock.clone(), long));
             wait_for_waiters(&lock, 2).await;
             drop(holder);
             drop(head);
@@ -618,10 +647,10 @@ mod tests {
 
             // A head that times out leaves the queue, and the next waiter takes
             // the lock on the release.
-            let head = acquire_ref_update(lock.clone(), Some(Duration::from_millis(50)));
+            let head = acquire_update(lock.clone(), Some(Duration::from_millis(50)));
             let mut head = Box::pin(head);
             assert!(poll_once(&mut head).await.is_none());
-            let next = ostrya_rt::spawn(acquire_ref_update(lock.clone(), long));
+            let next = ostrya_rt::spawn(acquire_update(lock.clone(), long));
             wait_for_waiters(&lock, 2).await;
             let err = head.await.unwrap_err();
             assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
@@ -637,7 +666,7 @@ mod tests {
         let scratch = Scratch::new("repo-lock");
         let repo = scratch.create_with_timeout(0);
         ostrya_rt::block_on(async {
-            let _ref_update = repo.lock_ref_update().await.unwrap();
+            let _update = repo.lock_update().await.unwrap();
             let first = repo.lock_repo(LockKind::Shared).await.unwrap();
             let second = repo.lock_repo(LockKind::Shared).await.unwrap();
             drop((first, second));
@@ -651,7 +680,7 @@ mod tests {
         let scratch = Scratch::new("no-limit");
         let repo = scratch.create_with_timeout(-1);
         let lock = lock_of(&repo);
-        let holder = ostrya_rt::block_on(repo.lock_ref_update()).unwrap();
+        let holder = ostrya_rt::block_on(repo.lock_update()).unwrap();
         let release = std::thread::spawn(move || {
             for _ in 0..5000 {
                 if waiters(&lock) == 1 {
@@ -662,7 +691,7 @@ mod tests {
             }
             panic!("the waiter never joined the queue");
         });
-        drop(ostrya_rt::block_on(repo.lock_ref_update()).unwrap());
+        drop(ostrya_rt::block_on(repo.lock_update()).unwrap());
         release.join().unwrap();
     }
 
@@ -677,7 +706,7 @@ mod tests {
         let releasing = scratch.path().join(".releasing");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
-                "lock::ref_update::tests::ref_update_holder_subprocess",
+                "lock::update::tests::update_lock_holder_subprocess",
                 "--exact",
                 "--ignored",
                 "--nocapture",
@@ -697,20 +726,20 @@ mod tests {
         assert!(held.exists(), "the child never took the lock");
 
         ostrya_rt::block_on(async {
-            let err = acquire_ref_update(lock.clone(), Some(Duration::ZERO))
+            let err = acquire_update(lock.clone(), Some(Duration::ZERO))
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
             // A wait of three poll intervals makes several requests, all of
             // which fail. The error states the whole seconds of the wait.
             let start = Instant::now();
-            let err = acquire_ref_update(lock.clone(), Some(Duration::from_millis(300)))
+            let err = acquire_update(lock.clone(), Some(Duration::from_millis(300)))
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
             assert!(start.elapsed() >= Duration::from_millis(300));
 
-            let waiting = ostrya_rt::spawn(acquire_ref_update(lock.clone(), None));
+            let waiting = ostrya_rt::spawn(acquire_update(lock.clone(), None));
             wait_for_waiters(&lock, 1).await;
             drop(child.stdin.take());
             let guard = waiting.await.unwrap();
@@ -728,18 +757,18 @@ mod tests {
 
     /// The lock-holder half of [`two_processes_serialize`], run only when this
     /// test binary is re-executed with the environment set. It takes the
-    /// ref-update lock, states that it holds it, and keeps it until its
+    /// update lock, states that it holds it, and keeps it until its
     /// standard input closes.
     #[test]
     #[ignore = "helper process for two_processes_serialize"]
-    fn ref_update_holder_subprocess() {
+    fn update_lock_holder_subprocess() {
         use std::io::Read;
 
         let Some(path) = std::env::var_os(HOLDER_ENV).map(PathBuf::from) else {
             return;
         };
         let repo = ostrya_rt::block_on(Repo::open(&path)).unwrap();
-        let guard = ostrya_rt::block_on(repo.lock_ref_update()).unwrap();
+        let guard = ostrya_rt::block_on(repo.lock_update()).unwrap();
         std::fs::write(path.join(".held"), b"1").unwrap();
         let mut sink = Vec::new();
         let _ = std::io::stdin().read_to_end(&mut sink);
@@ -756,9 +785,9 @@ mod tests {
         ostrya_rt::block_on(async {
             let _held = repo.lock_repo(LockKind::Shared).await.unwrap();
             let lock_file = scratch.path().join(".lock");
-            std::fs::hard_link(&lock_file, scratch.path().join(REF_UPDATE_LOCK_FILE)).unwrap();
+            std::fs::hard_link(&lock_file, scratch.path().join(UPDATE_LOCK_FILE)).unwrap();
 
-            let err = repo.lock_ref_update().await.unwrap_err();
+            let err = repo.lock_update().await.unwrap_err();
             assert!(matches!(err, Error::Io(_)), "{err:?}");
 
             // The kernel still records the shared lock of this process on the

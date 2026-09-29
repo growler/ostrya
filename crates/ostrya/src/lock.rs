@@ -35,11 +35,11 @@
 //! value `-1`, which the tool reads as no limit. No attempt blocks in the
 //! kernel, so a dropped wait leaves no lock request behind.
 //!
-//! With the `receive` feature a second lock file, `<repo>/.ref-update.lock`,
-//! serializes the ref updates of the receive path (see [`ref_update`]). The
-//! same registry holds both locks, so one inode is never open through two
-//! live descriptors in the process, and a lock file that shares its inode with
-//! the other lock file is refused.
+//! A second lock file, `<repo>/.update.lock`, holds the update lock, which
+//! serializes the writes of refs and of the other repository state outside
+//! the object store (see [`update`]). The same registry holds both locks, so
+//! one inode is never open through two live descriptors in the process, and a
+//! lock file that shares its inode with the other lock file is refused.
 
 use std::collections::HashMap;
 use std::os::fd::{BorrowedFd, OwnedFd};
@@ -53,10 +53,10 @@ use rustix::io::Errno;
 use crate::error::{Error, Result};
 use crate::perm;
 
-#[cfg(feature = "receive")]
-mod ref_update;
-#[cfg(feature = "receive")]
-pub(crate) use ref_update::{RefUpdateGuard, RefUpdateLock, acquire_ref_update};
+mod update;
+#[cfg(test)]
+pub(crate) use update::held_in_process as update_lock_held_in_process;
+pub(crate) use update::{UpdateLock, UpdateLockHeld, acquire_update};
 
 /// The repository lock file, relative to the repository root.
 const LOCK_FILE: &str = ".lock";
@@ -119,8 +119,7 @@ pub(crate) struct RepoLock {
 #[derive(Debug)]
 enum Registered {
     Repo(Weak<RepoLock>),
-    #[cfg(feature = "receive")]
-    RefUpdate(Weak<RefUpdateLock>),
+    Update(Weak<UpdateLock>),
 }
 
 impl Registered {
@@ -128,17 +127,15 @@ impl Registered {
     fn repo(&self) -> Option<&Weak<RepoLock>> {
         match self {
             Registered::Repo(weak) => Some(weak),
-            #[cfg(feature = "receive")]
-            _ => None,
+            Registered::Update(_) => None,
         }
     }
 
-    /// The ref-update lock of this entry, or `None` for another kind of lock.
-    #[cfg(feature = "receive")]
-    fn ref_update(&self) -> Option<&Weak<RefUpdateLock>> {
+    /// The update lock of this entry, or `None` for another kind of lock.
+    fn update(&self) -> Option<&Weak<UpdateLock>> {
         match self {
-            Registered::RefUpdate(weak) => Some(weak),
-            _ => None,
+            Registered::Update(weak) => Some(weak),
+            Registered::Repo(_) => None,
         }
     }
 }
@@ -461,6 +458,18 @@ impl Drop for LockGuard {
             lock.release(*kind);
         }
     }
+}
+
+/// The two locks a writer of the state the update lock covers holds: the
+/// update lock and the repository lock, held shared. The fields drop in
+/// declaration order, so the update lock is released first.
+#[derive(Debug)]
+pub(crate) struct UpdateLocks {
+    // Both holds are kept for their drop alone. Never read.
+    #[allow(dead_code)]
+    pub(crate) update: UpdateLockHeld,
+    #[allow(dead_code)]
+    pub(crate) repo: LockGuard,
 }
 
 /// Acquire `kind` on `lock`, retrying until `timeout` elapses. `None` retries

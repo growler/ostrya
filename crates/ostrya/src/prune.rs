@@ -521,7 +521,10 @@ impl Repo {
     /// timeout. The hold excludes every other writer, in this process and in
     /// another: a caller that holds a transaction of its own open across the
     /// call waits out the timeout and then fails, and a transaction the process
-    /// opens while the run stands waits for the run to finish.
+    /// opens while the run stands waits for the run to finish. When `[core]
+    /// locking` is on, a held [`UpdateGuard`](crate::UpdateGuard) holds the
+    /// repository lock shared, so the run waits for it, and
+    /// [`Repo::begin_update`] waits for the run.
     pub async fn prune(&self, opts: &PruneOptions) -> Result<PruneStats> {
         let mode = self.mode();
 

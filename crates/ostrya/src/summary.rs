@@ -32,6 +32,12 @@
 //! refs (`refs/mirrors/<collection>/<ref>`) belonging to other collections are
 //! grouped by collection into `ostree.summary.collection-map`.
 //!
+//! Regeneration holds the repository lock shared and then the update lock from
+//! the read of the previous anchor to the removal of `summary.sig`, so two
+//! regenerations never chain their anchors onto one parent, and a regeneration
+//! waits for a held [`UpdateGuard`](crate::UpdateGuard). The anchor commit
+//! commits under that hold and does not take the update lock again.
+//!
 //! The summary's `last-modified` is wall-clock and is not pinned by
 //! `SOURCE_DATE_EPOCH`; [`SummaryOptions::last_modified`] overrides it for
 //! reproducible output. The anchor commit's timestamp resolves like any commit
@@ -51,7 +57,7 @@ use std::collections::hash_map::Entry;
 use std::os::fd::{AsFd, BorrowedFd};
 
 use ostrya_core::{
-    Checksum, Commit, DirMeta, ObjectType, Type, Value, from_bytes, to_bytes,
+    Checksum, Commit, DirMeta, ObjectType, Type, Value, from_bytes, loose_path, to_bytes,
     tuple_field_from_bytes,
 };
 use rustix::fs::{AtFlags, Mode, OFlags};
@@ -60,6 +66,7 @@ use rustix::io::Errno;
 use crate::commit::{CommitOptions, append_dict_entry};
 use crate::deltagen::STATIC_DELTAS_KEY;
 use crate::error::{Error, Result};
+use crate::lock::{LockKind, UpdateLockHeld};
 use crate::mtree::MutableTree;
 use crate::repo::Repo;
 use crate::sign::{Signer, Verifier, VerifyOutcome, append_signature, signatures_for};
@@ -295,9 +302,21 @@ impl Repo {
     /// written, the anchor commit included. In a repository with a collection
     /// id, any caller key fails with [`Error::Unsupported`] at the same point.
     ///
-    /// The write honors `[core] fsync`. Concurrent regeneration is not
-    /// serialized beyond each file's atomic replace; run at most one regeneration
-    /// per repository at a time.
+    /// The write honors `[core] fsync`.
+    ///
+    /// The call takes the repository lock shared and then the update lock, as
+    /// [`Repo::begin_update`] does, and holds both from the read of the
+    /// anchor commit to the removal of `summary.sig`. So regenerations run one
+    /// at a time, in this process and across processes, and a regeneration
+    /// waits for each holder of an [`UpdateGuard`](crate::UpdateGuard). Each
+    /// of the two waits fails with [`Error::LockTimeout`] after
+    /// `lock-timeout-secs`. A caller that holds an `UpdateGuard` of this
+    /// repository and calls this waits for its own guard until the timeout,
+    /// and with `lock-timeout-secs=-1` it waits forever. The call also takes
+    /// the repository lock shared in a repository with no collection id, so
+    /// when `[core] locking` is on it waits for each exclusive holder of the
+    /// repository lock, a caller that holds one itself included. The refusals
+    /// above come before any lock.
     pub async fn regenerate_summary(&self, opts: &SummaryOptions) -> Result<()> {
         // A caller value the dict cannot hold is refused before the anchor
         // commit advances, so a refusal leaves the repository as it stood.
@@ -322,17 +341,31 @@ impl Repo {
             ));
         }
 
+        let fsync = self.config().fsync()?;
+
+        // The repository lock comes before the update lock. The anchor
+        // transaction takes the repository lock shared too, before the update
+        // lock, so its staging directory is made outside the update lock.
+        let repo_lock = self.lock_repo(LockKind::Shared).await?;
+        let txn = match &collection_id {
+            Some(_) => Some(self.transaction().await?),
+            None => None,
+        };
+        let held = self.lock_update().await?;
+
         // A collection repository advertises a fresh anchor commit, so refresh
         // it before enumerating refs -- it lands on refs/heads/ostree-metadata
         // and must appear in the summary with its new checksum.
-        if let Some(cid) = &collection_id {
-            self.refresh_anchor_commit(cid, opts).await?;
+        if let (Some(cid), Some(txn)) = (&collection_id, txn) {
+            self.refresh_anchor_commit(txn, cid, opts, &held).await?;
         }
 
         let bytes = self.build_summary(opts).await?;
-        let fsync = self.config().fsync()?;
         self.write_root_file(SUMMARY_FILE, bytes, fsync).await?;
-        self.remove_root_file(SUMMARY_SIG_FILE).await
+        self.remove_root_file(SUMMARY_SIG_FILE).await?;
+        drop(held);
+        drop(repo_lock);
+        Ok(())
     }
 
     /// The bytes of the summary of the refs the repository holds now, as
@@ -347,12 +380,49 @@ impl Repo {
         // Field 0: the local refs, byte-wise sorted by name.
         let mut heads = self.list_refs(None).await?;
         heads.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        let mut ref_entries = Vec::with_capacity(heads.len());
-        for (name, commit) in &heads {
-            ref_entries.push(self.summary_ref_entry(name, commit).await?);
-        }
+        let mirrors = self.mirror_refs_by_collection().await?;
 
-        let collection_map = self.collection_map_value().await?;
+        // The commits of the local refs and then of the mirror refs, loaded
+        // in one pass on the blocking pool.
+        let commits = heads
+            .iter()
+            .chain(mirrors.values().flatten())
+            .map(|(_, commit)| *commit)
+            .collect();
+        let mut facts = self.summary_commit_facts(commits).await?.into_iter();
+        let mut entry = |name: &str, commit: &Checksum| {
+            let fact = facts.next().expect("one fact for each commit of the pass");
+            ref_entry(
+                name,
+                fact.size,
+                commit,
+                fact.version.as_deref(),
+                fact.timestamp,
+            )
+        };
+        let ref_entries = heads
+            .iter()
+            .map(|(name, commit)| entry(name, commit))
+            .collect::<Result<Vec<_>>>()?;
+        let collection_map = if mirrors.is_empty() {
+            None
+        } else {
+            let mut collections = Vec::with_capacity(mirrors.len());
+            for (collection, refs) in &mirrors {
+                let ref_values = refs
+                    .iter()
+                    .map(|(name, commit)| entry(name, commit))
+                    .collect::<Result<Vec<_>>>()?;
+                collections.push(Value::Tuple(vec![
+                    Value::Str(collection.clone()),
+                    Value::Array(ref_values),
+                ]));
+            }
+            Some(variant(
+                COLLECTION_MAP_SIGNATURE,
+                Value::Array(collections),
+            )?)
+        };
 
         let last_modified = resolve_last_modified(opts.last_modified)?;
         let mut metadata = Value::Array(Vec::new());
@@ -482,51 +552,65 @@ impl Repo {
         Ok(outcome)
     }
 
-    /// Build one field-0 ref entry `(name, (size, checksum, refmeta))`.
-    async fn summary_ref_entry(&self, name: &str, commit: &Checksum) -> Result<Value> {
-        let bytes = self.load_object_bytes(ObjectType::Commit, commit).await?;
-        // Commit objects are stored uncompressed, so the on-disk size equals the
-        // serialized byte length the tool reports.
-        let size = bytes.len() as u64;
-        let parsed = Commit::parse(&bytes)?;
-        ref_entry(name, size, commit, parsed.version(), parsed.timestamp)
+    /// The size, the version, and the timestamp of each commit of `commits`,
+    /// in order, read in one pass on the blocking pool. Each commit object is
+    /// read under the size cap of a metadata object, and only one commit is in
+    /// memory at a time.
+    async fn summary_commit_facts(&self, commits: Vec<Checksum>) -> Result<Vec<CommitFacts>> {
+        let repo = self.clone();
+        let mode = self.mode();
+        ostrya_rt::unblock(move || {
+            commits
+                .iter()
+                .map(|commit| {
+                    let path = loose_path(commit, ObjectType::Commit, mode);
+                    let bytes = crate::object::read_meta_object(
+                        repo.objects_fd(),
+                        &path,
+                        crate::object::MAX_METADATA_SIZE,
+                    )
+                    .map_err(|e| match e.kind() {
+                        std::io::ErrorKind::NotFound => Error::ObjectNotFound {
+                            checksum: *commit,
+                            ty: ObjectType::Commit,
+                        },
+                        _ => Error::Io(e),
+                    })?;
+                    let parsed = Commit::parse(&bytes)?;
+                    Ok(CommitFacts {
+                        // Commit objects are stored uncompressed, so the
+                        // on-disk size equals the serialized byte length the
+                        // tool reports.
+                        size: bytes.len() as u64,
+                        version: parsed.version().map(str::to_owned),
+                        timestamp: parsed.timestamp,
+                    })
+                })
+                .collect()
+        })
+        .await
     }
 
-    /// Assemble `ostree.summary.collection-map` from the mirror refs, or `None`
-    /// when the repository holds none. Collections and refs are byte-wise sorted.
-    /// A `BTreeMap` keyed by the UTF-8 collection id orders collections by byte
-    /// value, and each collection's refs are sorted by name the same way.
-    async fn collection_map_value(&self) -> Result<Option<Value>> {
-        use std::collections::BTreeMap;
-
-        let mirrors = self.list_mirror_refs().await?;
-        if mirrors.is_empty() {
-            return Ok(None);
-        }
-        let mut by_collection: BTreeMap<String, Vec<(String, Checksum)>> = BTreeMap::new();
-        for (collection, name, commit) in mirrors {
+    /// The mirror refs, grouped by collection, for
+    /// `ostree.summary.collection-map`. Collections and refs are byte-wise
+    /// sorted: a `BTreeMap` keyed by the UTF-8 collection id orders
+    /// collections by byte value, and each collection's refs are sorted by
+    /// name the same way.
+    async fn mirror_refs_by_collection(
+        &self,
+    ) -> Result<std::collections::BTreeMap<String, Vec<(String, Checksum)>>> {
+        let mut by_collection: std::collections::BTreeMap<String, Vec<(String, Checksum)>> =
+            std::collections::BTreeMap::new();
+        for (collection, name, commit) in self.list_mirror_refs().await? {
             by_collection
                 .entry(collection)
                 .or_default()
                 .push((name, commit));
         }
-
-        let mut entries = Vec::with_capacity(by_collection.len());
-        for (collection, mut refs) in by_collection {
+        for refs in by_collection.values_mut() {
             refs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-            let mut ref_values = Vec::with_capacity(refs.len());
-            for (name, commit) in &refs {
-                ref_values.push(self.summary_ref_entry(name, commit).await?);
-            }
-            entries.push(Value::Tuple(vec![
-                Value::Str(collection),
-                Value::Array(ref_values),
-            ]));
         }
-        Ok(Some(variant(
-            COLLECTION_MAP_SIGNATURE,
-            Value::Array(entries),
-        )?))
+        Ok(by_collection)
     }
 
     /// Refresh the collection anchor commit onto `refs/heads/ostree-metadata`.
@@ -535,17 +619,22 @@ impl Repo {
     /// current anchor (if any) as parent, so each regeneration extends the chain
     /// and yields a fresh checksum. The empty tree carries a `(0, 0, 0o40755)`
     /// root dirmeta and no entries.
+    ///
+    /// The anchor is staged in `txn`, and `txn` commits under `held`, the
+    /// update lock the caller holds, so the read of the parent and the ref
+    /// write run under one hold.
     async fn refresh_anchor_commit(
         &self,
+        txn: crate::Transaction,
         collection_id: &str,
         opts: &SummaryOptions,
+        held: &UpdateLockHeld,
     ) -> Result<Checksum> {
         let parent = self.resolve_ref_tip(OSTREE_METADATA_REF).await?;
-        let txn = self.transaction().await?;
         let commit = self
             .stage_anchor_commit(&txn, collection_id, parent, opts.metadata_commit_timestamp)
             .await?;
-        txn.commit().await?;
+        txn.commit_under(held).await?;
         Ok(commit)
     }
 
@@ -656,6 +745,13 @@ pub(crate) fn parse_signature_dict(bytes: &[u8]) -> Result<Option<Value>> {
 pub(crate) fn serialize_signature_dict(dict: &Value) -> Result<Vec<u8>> {
     let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
     Ok(to_bytes(&ty, dict).map_err(ostrya_core::Error::from)?)
+}
+
+/// What a summary ref entry carries of one commit object.
+struct CommitFacts {
+    size: u64,
+    version: Option<String>,
+    timestamp: u64,
 }
 
 /// Build one ref-array entry `(s, (t, ay, a{sv}))`: the ref name, the commit
@@ -780,6 +876,21 @@ fn write_root_file_blocking(
     bytes: &[u8],
     fsync: bool,
 ) -> Result<()> {
+    put_root_file_blocking(repo_fd, name, bytes, fsync)?;
+    if fsync {
+        rustix::fs::fsync(repo_fd)?;
+    }
+    Ok(())
+}
+
+/// The body of [`write_root_file_blocking`], with the sync of the root
+/// directory left to the caller.
+pub(crate) fn put_root_file_blocking(
+    repo_fd: BorrowedFd<'_>,
+    name: &str,
+    bytes: &[u8],
+    fsync: bool,
+) -> Result<()> {
     use std::io::Write;
 
     let tmp = format!(
@@ -803,9 +914,6 @@ fn write_root_file_blocking(
         }
         drop(file);
         rustix::fs::renameat(repo_fd, tmp.as_str(), repo_fd, name)?;
-        if fsync {
-            rustix::fs::fsync(repo_fd)?;
-        }
         Ok(())
     };
     write_and_rename().inspect_err(|_| {

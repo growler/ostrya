@@ -283,7 +283,13 @@ impl Repo {
     /// the CLI's alias-target check, an alias recording a name. `None` says the
     /// store carries no such ref.
     pub async fn resolve_ref_tip(&self, refspec: &str) -> Result<Option<Checksum>> {
-        let relpath = refspec_to_relpath(refspec)?;
+        self.resolve_relpath_tip(refspec_to_relpath(refspec)?).await
+    }
+
+    /// The commit the ref file at `relpath` names, read as
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a refspec: an alias
+    /// is followed, and `None` says no file stands at the path.
+    pub(crate) async fn resolve_relpath_tip(&self, relpath: String) -> Result<Option<Checksum>> {
         let repo = self.clone();
         let bytes = ostrya_rt::unblock(move || read_ref_file(repo.repo_fd(), &relpath)).await?;
         match bytes {
@@ -642,7 +648,7 @@ fn matching_commit(fanout: &str, entry: &str, within: &str) -> Option<Checksum> 
 /// `to_relpath`, both relative to the repository root: the shared leading
 /// components are dropped, one `..` is emitted per component the alias's own
 /// directory holds beyond them, and the target's remaining components follow.
-fn relative_link(from_relpath: &str, to_relpath: &str) -> String {
+pub(crate) fn relative_link(from_relpath: &str, to_relpath: &str) -> String {
     let from: Vec<&str> = from_relpath.split('/').collect();
     let to: Vec<&str> = to_relpath.split('/').collect();
     // The alias's own name is not part of the directory the link is read in,
@@ -991,7 +997,7 @@ pub(crate) fn is_component(component: &str) -> bool {
 /// ref under `refs/mirrors/<collection>/`; a `None` id is a local
 /// `refs/heads/` ref. The collection id is a single component (dots allowed, no
 /// slash or traversal).
-fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> {
+pub(crate) fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> {
     let name = &cref.ref_name;
     match &cref.collection_id {
         Some(collection_id) => {
@@ -1028,7 +1034,8 @@ const REF_DIR_MODE: u32 = 0o777;
 /// holding the ref is `fsync`-ed after the rename or the unlink, so the name
 /// the operation created or removed is durable and not only the file's content,
 /// and the name of every parent directory this write created is made durable
-/// too, deepest first.
+/// too, deepest first. A write that fails still syncs the directories it
+/// changed before the failure.
 fn write_ref_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -1037,15 +1044,16 @@ fn write_ref_blocking(
     repo_mode: RepoMode,
 ) -> Result<()> {
     let mut dirs = Vec::new();
-    put_ref_blocking(repo_fd, relpath, checksum, fsync, repo_mode, &mut dirs)?;
-    sync_ref_dirs(repo_fd, dirs)
+    let written = put_ref_blocking(repo_fd, relpath, checksum, fsync, repo_mode, &mut dirs);
+    written.and(sync_ref_dirs(repo_fd, dirs))
 }
 
 /// The body of [`write_ref_blocking`], with the directory syncs left to the
 /// caller: under `fsync`, each directory that gained or lost a name is added to
 /// `dirs`, for [`sync_ref_dirs`]. Those are the directory holding the ref, and
-/// the directory holding each parent this write created.
-fn put_ref_blocking(
+/// the directory holding each parent this write created. A created parent is
+/// added when it is created, so a write that fails after it still adds it.
+pub(crate) fn put_ref_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
     checksum: Option<Checksum>,
@@ -1066,7 +1074,7 @@ fn put_ref_blocking(
         };
     };
 
-    let created = create_ref_parents(repo_fd, relpath, repo_mode)?;
+    create_ref_parents(repo_fd, relpath, repo_mode, fsync, dirs)?;
     let content = format!("{}\n", checksum.to_hex());
     let tmp = format!(
         "{relpath}.tmp-{}-{}",
@@ -1096,9 +1104,21 @@ fn put_ref_blocking(
     })?;
     if fsync {
         dirs.push(ref_parent(relpath).to_owned());
-        dirs.extend(created.iter().map(|dir| ref_parent(dir).to_owned()));
     }
     Ok(())
+}
+
+/// Sort `dirs` deepest first, then by name, and drop the repeats.
+fn sort_dirs_deepest_first(dirs: &mut Vec<String>) {
+    let depth = |dir: &str| {
+        if dir == "." {
+            0
+        } else {
+            dir.split('/').count()
+        }
+    };
+    dirs.sort_by(|a, b| depth(b).cmp(&depth(a)).then_with(|| a.cmp(b)));
+    dirs.dedup();
 }
 
 /// `fsync` each distinct directory of `dirs` once, named relative to the
@@ -1110,19 +1130,75 @@ fn put_ref_blocking(
 /// part way through therefore leaves a prefix of each path recorded and never
 /// a directory entry naming a directory whose own contents are unrecorded.
 fn sync_ref_dirs(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> Result<()> {
-    let depth = |dir: &str| {
-        if dir == "." {
-            0
-        } else {
-            dir.split('/').count()
-        }
-    };
-    dirs.sort_by(|a, b| depth(b).cmp(&depth(a)).then_with(|| a.cmp(b)));
-    dirs.dedup();
+    sort_dirs_deepest_first(&mut dirs);
     for dir in &dirs {
         sync_dir(repo_fd, dir)?;
     }
     Ok(())
+}
+
+/// `fsync` each distinct directory of `dirs` once, in the order of
+/// [`sync_ref_dirs`], and return the first error. A failed sync does not stop
+/// the syncs after it.
+pub(crate) fn sync_dirs_all(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> Result<()> {
+    sort_dirs_deepest_first(&mut dirs);
+    let mut first = Ok(());
+    for dir in &dirs {
+        let synced = sync_dir(repo_fd, dir);
+        #[cfg(test)]
+        test_syncs::record(repo_fd);
+        if first.is_ok() {
+            first = synced;
+        }
+    }
+    first
+}
+
+/// The directory syncs [`sync_dirs_all`] made, for the unit tests: one entry
+/// for each sync, naming the `(device, inode)` of the repository root and
+/// whether a guard of this process held the update lock of that repository
+/// when the sync ran.
+#[cfg(test)]
+pub(crate) mod test_syncs {
+    use std::os::fd::BorrowedFd;
+    use std::sync::Mutex;
+
+    type Record = ((u64, u64), bool);
+
+    static SYNCS: Mutex<Vec<Record>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(repo_fd: BorrowedFd<'_>) {
+        let held = crate::lock::update_lock_held_in_process(repo_fd);
+        if let Ok(stat) = rustix::fs::fstat(repo_fd) {
+            SYNCS
+                .lock()
+                .unwrap()
+                .push(((stat.st_dev, stat.st_ino), held));
+        }
+    }
+
+    fn syncs(root: &std::path::Path) -> Vec<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(root).unwrap();
+        let key = (meta.dev(), meta.ino());
+        let syncs = SYNCS.lock().unwrap();
+        syncs
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, held)| *held)
+            .collect()
+    }
+
+    /// The number of syncs made under the repository root `root`.
+    pub(crate) fn count(root: &std::path::Path) -> usize {
+        syncs(root).len()
+    }
+
+    /// The number of syncs made under the repository root `root` while no
+    /// guard of this process held its update lock.
+    pub(crate) fn unlocked(root: &std::path::Path) -> usize {
+        syncs(root).into_iter().filter(|held| !held).count()
+    }
 }
 
 /// Write one alias symlink relative to `repo_fd`, atomically.
@@ -1131,7 +1207,8 @@ fn sync_ref_dirs(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> Result<()> {
 /// directory, then renamed over the target, so an existing ref file or an
 /// existing alias is replaced in one step. A symlink carries no content of its
 /// own to sync, so `fsync` reaches the directory holding the link and the
-/// directory holding each parent this write created.
+/// directory holding each parent this write created. A write that fails still
+/// syncs the directories it changed before the failure.
 fn write_alias_blocking(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
@@ -1139,7 +1216,24 @@ fn write_alias_blocking(
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
-    let created = create_ref_parents(repo_fd, relpath, repo_mode)?;
+    let mut dirs = Vec::new();
+    let written = put_alias_blocking(repo_fd, relpath, link, fsync, repo_mode, &mut dirs);
+    written.and(sync_ref_dirs(repo_fd, dirs))
+}
+
+/// The body of [`write_alias_blocking`], with the directory syncs left to the
+/// caller: under `fsync`, the directory holding the link and the directory
+/// holding each parent this write created are added to `dirs`, each parent
+/// when it is created.
+pub(crate) fn put_alias_blocking(
+    repo_fd: BorrowedFd<'_>,
+    relpath: &str,
+    link: &str,
+    fsync: bool,
+    repo_mode: RepoMode,
+    dirs: &mut Vec<String>,
+) -> Result<()> {
+    create_ref_parents(repo_fd, relpath, repo_mode, fsync, dirs)?;
     let tmp = format!(
         "{relpath}.tmp-{}-{}",
         std::process::id(),
@@ -1150,8 +1244,7 @@ fn write_alias_blocking(
         let _ = rustix::fs::unlinkat(repo_fd, tmp.as_str(), AtFlags::empty());
     })?;
     if fsync {
-        sync_ref_parent(repo_fd, relpath)?;
-        sync_created_ref_parents(repo_fd, &created)?;
+        dirs.push(ref_parent(relpath).to_owned());
     }
     Ok(())
 }
@@ -1222,12 +1315,6 @@ fn ref_parent(relpath: &str) -> &str {
     relpath.rsplit_once('/').map_or(".", |(dir, _)| dir)
 }
 
-/// `fsync` the directory holding the ref at `relpath`, making a rename or an
-/// unlink of that name durable.
-fn sync_ref_parent(repo_fd: BorrowedFd<'_>, relpath: &str) -> Result<()> {
-    sync_dir(repo_fd, ref_parent(relpath))
-}
-
 /// `fsync` one directory named relative to the repository root, where it still
 /// stands. A directory that is gone carries no entry to make durable, so its
 /// absence is success.
@@ -1251,9 +1338,16 @@ pub(crate) fn sync_dir(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
 }
 
 /// Create the parent directories of a ref path, idempotently. Every component
-/// but the last is created; existing directories are left in place. Returns the
-/// paths this call created, shallowest first, for
-/// [`sync_created_ref_parents`] to make durable.
+/// but the last is created; existing directories are left in place. Under
+/// `fsync`, the directory that holds each created directory is added to
+/// `dirs` as soon as the `mkdirat` returns, before any step that can fail, so
+/// a write that fails later still leaves the new name to a sync.
+///
+/// A `mkdirat` adds a name to the directory it is called in, so the directory
+/// a caller syncs to make a created `refs/heads/deep/nest` durable is
+/// `refs/heads/deep`, the one that holds the `nest` entry: the
+/// [`ref_parent`] of the created path. A directory the call found already in
+/// place needs no sync; its name is already durable.
 ///
 /// In a `bare-user-shared` repository each directory this call creates is
 /// forced to [`perm::SHARED_DIR_MODE`]. A directory that already stands keeps
@@ -1262,8 +1356,9 @@ fn create_ref_parents(
     repo_fd: BorrowedFd<'_>,
     relpath: &str,
     repo_mode: RepoMode,
-) -> Result<Vec<String>> {
-    let mut created = Vec::new();
+    fsync: bool,
+    dirs: &mut Vec<String>,
+) -> Result<()> {
     let mut acc = String::new();
     let mut components: Vec<&str> = relpath.split('/').collect();
     components.pop(); // the final component is the ref file itself
@@ -1274,35 +1369,14 @@ fn create_ref_parents(
         acc.push_str(component);
         match rustix::fs::mkdirat(repo_fd, acc.as_str(), Mode::from_raw_mode(REF_DIR_MODE)) {
             Ok(()) => {
+                if fsync {
+                    dirs.push(ref_parent(&acc).to_owned());
+                }
                 perm::force_created_dir(repo_fd, acc.as_str(), repo_mode)?;
-                created.push(acc.clone());
             }
             Err(Errno::EXIST) => {}
             Err(e) => return Err(e.into()),
         }
-    }
-    Ok(created)
-}
-
-/// `fsync` the directory that holds each entry [`create_ref_parents`] created,
-/// deepest first.
-///
-/// A `mkdirat` adds a name to the directory it is called in, so the directory
-/// made durable for a created `refs/heads/deep/nest` is `refs/heads/deep`, the
-/// one that holds the `nest` entry. Syncing the created directory's own file
-/// descriptor makes its contents durable and leaves its name unrecorded.
-///
-/// The order is child before parent, the order the object fanout uses: the ref
-/// file's own name, which [`sync_ref_parent`] makes durable, then the name of
-/// the directory holding it, then the name of the directory above that. A crash
-/// part way through therefore leaves a prefix of the path recorded and never a
-/// directory entry naming a directory whose own contents are unrecorded.
-///
-/// A directory the call found already in place is not synced; its name is
-/// already durable.
-fn sync_created_ref_parents(repo_fd: BorrowedFd<'_>, created: &[String]) -> Result<()> {
-    for dir in created.iter().rev() {
-        sync_ref_parent(repo_fd, dir)?;
     }
     Ok(())
 }
@@ -1465,5 +1539,96 @@ mod tests {
         let checksum = parse_ref_content(format!("{hex}\n").as_bytes()).unwrap();
         assert_eq!(checksum.to_hex(), hex);
         assert!(parse_ref_content(b"not-a-checksum\n").is_err());
+    }
+
+    /// A scratch directory with `refs/heads` in it, removed when the value
+    /// drops.
+    struct Root {
+        dir: std::path::PathBuf,
+        fd: std::os::fd::OwnedFd,
+    }
+
+    impl Root {
+        fn new(label: &str) -> Root {
+            let dir = std::env::temp_dir().join(format!(
+                "ostrya-refs-{label}-{}-{}",
+                std::process::id(),
+                crate::write::unique()
+            ));
+            std::fs::create_dir_all(dir.join("refs/heads")).unwrap();
+            let fd = std::fs::File::open(&dir).unwrap().into();
+            Root { dir, fd }
+        }
+
+        fn fd(&self) -> BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+    }
+
+    impl Drop for Root {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn sync_dirs_all_runs_each_sync_past_a_failure() {
+        let root = Root::new("sync-all");
+        // The deepest entry sorts first, and it is a file, so its sync fails.
+        std::fs::create_dir_all(root.dir.join("refs/heads/a")).unwrap();
+        std::fs::write(root.dir.join("refs/heads/a/file"), b"").unwrap();
+        let dirs = vec![
+            ".".to_owned(),
+            "refs/heads".to_owned(),
+            "refs/heads/a/file".to_owned(),
+            "refs/heads/a".to_owned(),
+        ];
+        let before = test_syncs::count(&root.dir);
+        let err = sync_dirs_all(root.fd(), dirs).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.raw_os_error() == Some(Errno::NOTDIR.raw_os_error())),
+            "{err:?}"
+        );
+        assert_eq!(test_syncs::count(&root.dir), before + 4);
+    }
+
+    /// A write that fails after it created parent directories still records
+    /// the directories that hold them.
+    #[test]
+    fn a_failed_write_records_the_parents_it_created() {
+        let root = Root::new("created");
+        // The temp name of a ref whose name is 250 bytes long is longer than
+        // a file name can be, so the open of the temp file fails.
+        let long = "r".repeat(250);
+        let mut dirs = Vec::new();
+        let relpath = format!("refs/heads/new/deep/{long}");
+        let checksum = Some(Checksum::from_bytes([7; 32]));
+        put_ref_blocking(
+            root.fd(),
+            &relpath,
+            checksum,
+            true,
+            RepoMode::BareUser,
+            &mut dirs,
+        )
+        .unwrap_err();
+        dirs.sort();
+        assert_eq!(dirs, ["refs/heads", "refs/heads/new"]);
+
+        // A link body longer than a path can be fails the `symlinkat`.
+        let mut dirs = Vec::new();
+        let link = "x".repeat(5000);
+        let relpath = "refs/heads/other/deep/alias";
+        put_alias_blocking(
+            root.fd(),
+            relpath,
+            &link,
+            true,
+            RepoMode::BareUser,
+            &mut dirs,
+        )
+        .unwrap_err();
+        dirs.sort();
+        assert_eq!(dirs, ["refs/heads", "refs/heads/other"]);
     }
 }

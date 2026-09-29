@@ -633,3 +633,80 @@ fn sign_summary_all_writes_nothing_when_a_signer_fails() {
         assert_eq!(std::fs::read(repo_dir.join("summary.sig")).unwrap(), before);
     });
 }
+
+/// A copy of the collection fixture whose config sets `lock-timeout-secs=0`.
+fn collection_fixture_with_no_wait(tag: &str) -> (TmpDir, std::path::PathBuf) {
+    let (tmp, repo_dir) = writable_fixture("summary-collection", tag);
+    let config = repo_dir.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("lock-timeout-secs=0\n");
+    std::fs::write(&config, text).unwrap();
+    (tmp, repo_dir)
+}
+
+/// With no guard held, a regeneration at `lock-timeout-secs=0` takes both
+/// locks at the first attempt and refreshes the anchor.
+#[test]
+fn a_regeneration_with_no_guard_takes_its_locks_at_once() {
+    let (_tmp, repo_dir) = collection_fixture_with_no_wait("summary-no-wait");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        let anchor = repo.resolve_ref_tip("ostree-metadata").await.unwrap();
+        assert!(anchor.is_some(), "the anchor was written");
+        assert!(repo_dir.join("summary").exists());
+    });
+}
+
+/// A regeneration waits for a held `UpdateGuard`. At `lock-timeout-secs=0` it
+/// fails with `LockTimeout` and writes no summary, no anchor, and no ref.
+#[test]
+fn a_regeneration_waits_for_a_held_guard() {
+    let (_tmp, repo_dir) = collection_fixture_with_no_wait("summary-guard");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let refs = common::file_inventory(&repo_dir, "refs");
+        let objects = common::file_inventory(&repo_dir, "objects");
+        let guard = repo.begin_update().await.unwrap();
+
+        let err = repo
+            .regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ostrya::Error::LockTimeout { secs: 0 }),
+            "{err}"
+        );
+        assert!(!repo_dir.join("summary").exists(), "no summary written");
+        assert_eq!(common::file_inventory(&repo_dir, "refs"), refs);
+        assert_eq!(common::file_inventory(&repo_dir, "objects"), objects);
+
+        guard.finish().await.unwrap();
+        repo.regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        assert!(repo_dir.join("summary").exists());
+    });
+}
+
+/// A caller value the dict cannot hold is refused before any lock, so a held
+/// guard does not delay the refusal.
+#[test]
+fn a_refusal_comes_before_the_locks() {
+    let (_tmp, repo_dir) = collection_fixture_with_no_wait("summary-guard-refusal");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let guard = repo.begin_update().await.unwrap();
+        let err = repo
+            .regenerate_summary(&SummaryOptions {
+                additional_metadata: vec![("bare".to_owned(), Value::U32(1))],
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ostrya::Error::InvalidFormat(_)), "{err}");
+        guard.finish().await.unwrap();
+    });
+}

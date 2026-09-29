@@ -23,7 +23,7 @@ use ostrya_core::{Checksum, ObjectType, RepoMode, Value};
 
 use crate::config::Tristate;
 use crate::error::{Error, Result};
-use crate::lock::LockGuard;
+use crate::lock::{LockGuard, UpdateLockHeld};
 use crate::repo::Repo;
 use crate::staging::StagingDir;
 use crate::write::{
@@ -1040,7 +1040,24 @@ impl Transaction {
     /// refspecs are validated up front, before any object is published, so a
     /// malformed refspec fails the commit with nothing written. The staging
     /// directory is then reaped and the lock released.
-    pub async fn commit(mut self) -> Result<TransactionStats> {
+    pub async fn commit(self) -> Result<TransactionStats> {
+        self.commit_steps().await
+    }
+
+    /// Commit the transaction as [`commit`](Transaction::commit) does, under
+    /// the update lock the caller holds. The reference to the hold makes a
+    /// call without the lock a type error, and the call does not take the
+    /// lock again.
+    pub(crate) async fn commit_under(self, held: &UpdateLockHeld) -> Result<TransactionStats> {
+        debug_assert!(
+            self.repo.holds_update_lock(held),
+            "the hold is not the update lock of this repository"
+        );
+        self.commit_steps().await
+    }
+
+    /// The steps of [`commit`](Transaction::commit).
+    async fn commit_steps(mut self) -> Result<TransactionStats> {
         let refs = self.resolve_ref_queue()?;
         self.publish().await?;
         self.write_detached().await?;

@@ -17,10 +17,10 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use common::receive::{
-    Client, deflate_object, foreign_holder, header, is_root, lock_holder_main, new_repo,
-    raw_object, returned_code, session, sha, staging_entries,
+    Client, deflate_object, header, is_root, new_repo, raw_object, returned_code, session, sha,
+    staging_entries,
 };
-use common::{TmpDir, file_inventory};
+use common::{TmpDir, file_inventory, foreign_holder, lock_holder_main};
 use ostrya::push::proto::{
     ErrorMessage, FrameWriter, Hello, MAX_FRAME, MAX_HAVE, Message, ObjectHeader, ObjectsReply,
 };
@@ -893,7 +893,7 @@ fn a_second_commit_meta_for_one_commit_is_protocol() {
 
 #[test]
 #[ignore = "helper process for the receive lock tests"]
-fn receive_lock_holder_subprocess() {
+fn lock_holder_subprocess() {
     lock_holder_main();
 }
 

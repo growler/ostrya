@@ -4,9 +4,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "receive")]
 pub mod receive;
@@ -97,6 +98,184 @@ impl Drop for TmpDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// A lock that another process holds.
+// ---------------------------------------------------------------------------
+
+/// The environment variable that names the repository of the lock helper.
+const FOREIGN_LOCK_REPO: &str = "OSTRYA_TEST_FOREIGN_LOCK_REPO";
+
+/// The environment variable that names the lock file of the lock helper,
+/// relative to the repository.
+const FOREIGN_LOCK_FILE: &str = "OSTRYA_TEST_FOREIGN_LOCK_FILE";
+
+/// The file the lock helper writes once it holds the lock.
+const FOREIGN_LOCK_MARKER: &str = ".foreign-held";
+
+/// The name of the ignored test each test binary that starts a lock helper
+/// defines, which calls [`lock_holder_main`].
+pub const LOCK_HOLDER_TEST: &str = "lock_holder_subprocess";
+
+/// A spawned child, killed and reaped when the guard drops.
+pub struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Wait until `marker` exists, for at most ten seconds.
+fn wait_for_marker(marker: &Path, what: &str) {
+    let started = Instant::now();
+    while !marker.exists() {
+        assert!(started.elapsed() < Duration::from_secs(10), "{what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Start this test binary again as a process that holds `<repo>/<lock_file>`
+/// exclusive, with a raw record lock, until it is killed.
+pub fn foreign_holder(repo: &Path, lock_file: &str) -> ChildGuard {
+    let holder = ChildGuard(
+        Command::new(std::env::current_exe().unwrap())
+            .args([LOCK_HOLDER_TEST, "--exact", "--ignored", "--nocapture"])
+            .env(FOREIGN_LOCK_REPO, repo)
+            .env(FOREIGN_LOCK_FILE, lock_file)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the lock holder"),
+    );
+    wait_for_marker(
+        &repo.join(FOREIGN_LOCK_MARKER),
+        "the holder never took the lock",
+    );
+    holder
+}
+
+/// The body of the lock helper: take the record lock the environment names,
+/// write the readiness marker, and wait until standard input closes. Outside
+/// a helper process it does nothing.
+pub fn lock_holder_main() {
+    use rustix::fs::{FlockOperation, Mode, OFlags};
+    use std::io::Read;
+
+    let (Ok(repo), Ok(lock_file)) = (
+        std::env::var(FOREIGN_LOCK_REPO),
+        std::env::var(FOREIGN_LOCK_FILE),
+    ) else {
+        return;
+    };
+    let repo = Path::new(&repo);
+    let fd = rustix::fs::open(
+        repo.join(lock_file),
+        OFlags::RDWR | OFlags::CREATE,
+        Mode::from_raw_mode(0o660),
+    )
+    .expect("open the lock file");
+    rustix::fs::fcntl_lock(&fd, FlockOperation::LockExclusive).expect("take the record lock");
+    std::fs::write(repo.join(FOREIGN_LOCK_MARKER), b"1").expect("write the readiness marker");
+    let mut sink = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut sink);
+}
+
+// ---------------------------------------------------------------------------
+// An update guard that another process holds.
+// ---------------------------------------------------------------------------
+
+/// The environment variable that names the repository of the guard helper.
+const GUARD_HOLDER_REPO: &str = "OSTRYA_TEST_GUARD_HOLDER_REPO";
+
+/// The file the guard helper writes once it holds the guard.
+pub const GUARD_HELD_MARKER: &str = ".guard-held";
+
+/// The file the guard helper writes after its standard input closed and
+/// before it releases the guard.
+pub const GUARD_RELEASING_MARKER: &str = ".guard-releasing";
+
+/// The name of the ignored test each test binary that starts a guard helper
+/// defines, which calls [`guard_holder_main`].
+pub const GUARD_HOLDER_TEST: &str = "guard_holder_subprocess";
+
+/// A child process that holds an `UpdateGuard` of one repository.
+pub struct GuardHolder {
+    child: Option<std::process::Child>,
+}
+
+impl GuardHolder {
+    /// Close the standard input of the child, so it releases the guard, and
+    /// wait for it to exit. Fails when the child failed.
+    pub fn release(mut self) {
+        let mut child = self.child.take().unwrap();
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the guard holder reported {}:\n{stdout}",
+            output.status
+        );
+    }
+
+    /// The process id of the child.
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
+    }
+}
+
+impl Drop for GuardHolder {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Start this test binary again as a process that opens the repository at
+/// `repo`, takes an `UpdateGuard`, and holds it until its standard input
+/// closes. The call returns once the child holds the guard.
+pub fn guard_holder(repo: &Path) -> GuardHolder {
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([GUARD_HOLDER_TEST, "--exact", "--ignored", "--nocapture"])
+        .env(GUARD_HOLDER_REPO, repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn the guard holder");
+    let holder = GuardHolder { child: Some(child) };
+    wait_for_marker(
+        &repo.join(GUARD_HELD_MARKER),
+        "the holder never took the guard",
+    );
+    holder
+}
+
+/// The body of the guard helper: take an `UpdateGuard` of the repository
+/// the environment names, write the readiness marker, wait until standard
+/// input closes, write the releasing marker, and finish the guard. Outside a
+/// helper process it does nothing.
+pub fn guard_holder_main() {
+    use std::io::Read;
+
+    let Some(path) = std::env::var_os(GUARD_HOLDER_REPO).map(PathBuf::from) else {
+        return;
+    };
+    ostrya_rt::block_on(async {
+        let repo = ostrya::Repo::open(&path).await.unwrap();
+        let guard = repo.begin_update().await.unwrap();
+        std::fs::write(path.join(GUARD_HELD_MARKER), b"1").unwrap();
+        let mut sink = Vec::new();
+        let _ = std::io::stdin().read_to_end(&mut sink);
+        std::fs::write(path.join(GUARD_RELEASING_MARKER), b"1").unwrap();
+        guard.finish().await.unwrap();
+    });
 }
 
 /// The environment variable that turns the reference-absent skip into a

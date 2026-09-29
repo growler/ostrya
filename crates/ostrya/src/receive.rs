@@ -30,7 +30,7 @@
 //! content checks of the repository mode.
 //!
 //! `Commit` ends the session: the checks of each ref update, the ref writes,
-//! and the transaction commit under the ref-update lock. The commit merges
+//! and the transaction commit under the update lock. The commit merges
 //! each incoming detached-metadata dict into the dict the server holds with a
 //! union of the signature lists. The module also holds the check whether a
 //! server key already signed a commit.

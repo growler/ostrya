@@ -197,6 +197,10 @@
 //! answering the shapes that name no kernel with a [`BootableRefusal`], and
 //! [`BootableMetadata`] adds `ostree.linux` and `ostree.bootable` to a
 //! [`DictBuilder`] in the order they hold on disk (see the [`bootable`]
+//! module). It also covers the update guard: [`Repo::begin_update`] takes the
+//! repository lock shared and then the update lock on `<repo>/.update.lock`,
+//! and the [`UpdateGuard`] it returns reads and writes refs, ref aliases, and
+//! `config` while no other holder of the update lock runs (see the [`update`]
 //! module).
 //!
 //! Under the `receive` feature it also covers the policy the server side of a
@@ -257,6 +261,7 @@ mod tombstone;
 pub mod transaction;
 pub mod traverse;
 pub mod tree;
+pub mod update;
 mod verify;
 mod write;
 
@@ -326,6 +331,7 @@ pub use summary::{Summary, SummaryOptions, SummaryRef};
 pub use tar::{TarExportOptions, TarImportOptions, TarRename};
 pub use transaction::{ContentWriter, FileMeta, Transaction, TransactionStats};
 pub use tree::{RepoTree, TreeEntry};
+pub use update::UpdateGuard;
 
 /// Remove the staging directories the live transactions of this process own.
 ///

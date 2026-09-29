@@ -480,7 +480,7 @@ which the tool refuses every write ("Not allowed due to repo mode").
 <repo>/
   config                          GKeyFile INI, repo root
   .lock                           repository lock file (advisory)
-  .ref-update.lock                port-only ref-update lock file (lazy)
+  .update.lock                    port-only update lock file (lazy)
   objects/<c0c1>/<c2..c63>.<ext>[z]   loose objects
   refs/heads/<ref>                local refs (ref may contain '/')
   refs/remotes/<remote>/<ref>     remote refs
@@ -804,9 +804,16 @@ six-character `mkdtemp` suffix. A sibling file `tmp/staging-<bootid>-XXXXXX-lock
 (mode `0600`) is held with an exclusive OFD lock while the staging directory is
 in use, so a later transaction can tell a live staging directory from one left
 by a dead transaction. These locks are advisory and cross-process; the checksums
-and object bytes do not depend on them. The file `<repo>/.ref-update.lock`
-holds the ref-update lock of the port's receive path. The tool never opens this
-file, so the lock excludes port processes alone.
+and object bytes do not depend on them.
+
+The file `<repo>/.update.lock` holds the update lock of the port. The port
+takes an exclusive `fcntl` record lock on it, after it takes the repository
+lock shared. The lock serializes the ref, ref alias, and `config` writes of
+an update guard (`Repo::begin_update`), the transaction commit of a receive
+session, and summary regeneration. The port creates the file on the first
+acquire with the rules of `.lock` and never unlinks it. A file that already
+exists keeps its mode. The update lock ignores `[core] locking=false`. The tool
+never opens this file, so the lock excludes port processes alone.
 
 `[core] lock-timeout-secs` bounds the wait for `.lock`. Observed with `ostree`
 2026.1 on `prune --refs-only` while another process holds `.lock` with an
@@ -1428,7 +1435,7 @@ directory `fsync`s after. A content object the port stores as a symlink inode
 (a symlink in `bare` and `bare-user-only`) and an object it hardlinks from
 another repository are not synced at ingest. The `syncfs` that opens
 publication makes every staged object durable, metadata included. A receiving
-push session runs that `syncfs` before it takes the ref-update lock. With fsync
+push session runs that `syncfs` before it takes the update lock. With fsync
 on, it then `fsync`s the file of each metadata object it stages under the lock,
 and its publication runs no second `syncfs`. The staging directory layout is
 transient and is not part of the on-disk format.
@@ -3415,9 +3422,9 @@ process file-creation mask does not reach them:
   so the group descends to each directory created below. The sticky bit stays
   off, because the stale-staging reaper removes staging trees that other
   members own.
-- `.lock`, `.ref-update.lock`, and each per-transaction staging sibling lock
+- `.lock`, `.update.lock`, and each per-transaction staging sibling lock
   take 0660, so every group member opens them `O_RDWR`, takes the repository
-  lock and the ref-update lock, and reaps a staging tree whose owner has died.
+  lock and the update lock, and reaps a staging tree whose owner has died.
 - The `state/<commit>.commitpartial` marker takes 0644.
 
 Forcing applies on the arm of a create where the port made the entry. An entry

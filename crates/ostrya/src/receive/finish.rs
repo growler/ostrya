@@ -1,5 +1,5 @@
 //! The `Commit` message that ends a push session: the checks of the ref
-//! updates, the server signatures, the ref-update lock, the ref writes, the
+//! updates, the server signatures, the update lock, the ref writes, the
 //! transaction commit, and the summary.
 
 use std::collections::hash_map::Entry;
@@ -57,14 +57,14 @@ struct Target {
 }
 
 /// A server signature over the bytes of a new commit, made before the
-/// ref-update lock.
+/// update lock.
 struct Prepared<'a> {
     signer: &'a ServerSigner,
     signature: Vec<u8>,
 }
 
 /// The detached-metadata edit of one commit of the session, planned before
-/// the ref-update lock and checked again under it.
+/// the update lock and checked again under it.
 struct Edit<'a> {
     commit: Checksum,
     /// The commit bytes, the payload of its signatures. A commit that no
@@ -87,7 +87,7 @@ struct Edit<'a> {
 }
 
 /// Run the checks of the ref updates of `request`, then write the refs and
-/// commit `txn` under the ref-update lock.
+/// commit `txn` under the update lock.
 ///
 /// `named` holds the refs of `Hello`, and `commit_meta` the detached metadata
 /// dicts of the session. The checks run in this order, and the first failure
@@ -184,7 +184,7 @@ pub(super) async fn finish(
         });
     }
 
-    let guard = repo.lock_ref_update().await.map_err(Failure::Internal)?;
+    let held = repo.lock_update().await.map_err(Failure::Internal)?;
     let anchor = policy.update_summary && repo.config().collection_id().is_some();
     let (states, anchor_parent) = repo
         .read_ref_states(&names, anchor.then_some(OSTREE_METADATA_REF))
@@ -215,7 +215,7 @@ pub(super) async fn finish(
             .await
             .map_err(Failure::Internal)?;
     }
-    let stats = txn.commit().await.map_err(Failure::Internal)?;
+    let stats = txn.commit_under(&held).await.map_err(Failure::Internal)?;
     let mut warnings: Vec<ReceiveWarning> = repo
         .remove_partial_markers(session_commits)
         .await
@@ -228,7 +228,7 @@ pub(super) async fn finish(
     if summary && let Err(warning) = write_summary(repo, &policy.summary_signers).await {
         warnings.push(warning);
     }
-    drop(guard);
+    drop(held);
 
     let refs = updates
         .into_iter()
@@ -965,7 +965,7 @@ async fn oversize(edit: &Edit<'_>, written: Option<Value>) -> Checked<Option<u64
 }
 
 /// Sign each new commit with each server key of its rules, before the
-/// ref-update lock. A key that already signed the commit in the merge of the
+/// update lock. A key that already signed the commit in the merge of the
 /// filtered incoming dict into the stored dict, or in a signature made before
 /// it, makes no signature, so two keys that hold one secret sign once. The
 /// size of the dict each edit writes is then found.
@@ -1004,7 +1004,7 @@ async fn prepare_signatures(mut edits: Vec<Edit<'_>>) -> Checked<Vec<Edit<'_>>> 
     Ok(edits)
 }
 
-/// Queue the detached metadata of the session under the ref-update lock.
+/// Queue the detached metadata of the session under the update lock.
 ///
 /// The stored dict of each edit is read again, in one trip to the blocking
 /// pool. Where it holds the bytes the plan read, the plan stands: the kept

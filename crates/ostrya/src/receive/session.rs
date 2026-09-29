@@ -123,7 +123,7 @@ impl Repo {
     /// It then makes the staged objects durable, and at the same time it signs
     /// each new commit with each server key of the rules of its updates, each
     /// key once. A key that already signed the commit makes no signature. It
-    /// takes the ref-update lock and reads the refs again. A ref that is an
+    /// takes the update lock and reads the refs again. A ref that is an
     /// alias, and a ref path that a ref write cannot replace, are `ref-denied`.
     /// It checks each update against the state it expects, for a delete, and
     /// for a fast-forward. It merges the incoming detached metadata into the

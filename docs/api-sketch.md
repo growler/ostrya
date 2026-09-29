@@ -365,8 +365,27 @@ impl Repo {
     pub async fn write_commit_detached_metadata(&self, c: &Checksum, meta: Option<&Value>) -> Result<()>;
 
     // --- transactions ---
+    /// A held `UpdateGuard` holds the repository lock shared too when
+    /// `[core] locking` is on, so a transaction opens and stages objects
+    /// while a guard is held.
     pub async fn transaction(&self) -> Result<Transaction>;
     pub async fn transaction_with_lock(&self, lock: LockKind) -> Result<Transaction>;
+
+    // --- update guard ---
+    /// Take the repository lock shared, then the update lock on
+    /// `<repo>/.update.lock` exclusive. The call never waits for a pull, and
+    /// when `[core] locking` is on it waits for a prune. Each of the two
+    /// waits gets the whole of `lock-timeout-secs` and then fails with
+    /// `LockTimeout`; `-1` has no limit, `0` makes one attempt, and there is
+    /// no variant that fails at once. The waiters of one process take the
+    /// update lock in the order of the first poll of their wait for it.
+    /// `[core] locking=false` leaves the repository lock out, and the update
+    /// lock is taken all the same. The guard keeps the `[core] fsync` and
+    /// lock values this handle was opened with. A long hold makes the receive
+    /// commit and `regenerate_summary` wait under `lock-timeout-secs` and
+    /// fail with `LockTimeout`, and, when `[core] locking` is on, a prune
+    /// wait for the whole hold.
+    pub async fn begin_update(&self) -> Result<UpdateGuard>;
 
     // --- checkout ---
     // The options arrive by `&mut`: the filter callback runs through an
@@ -392,13 +411,59 @@ impl Repo {
     /// excludes every other writer, in this process and in another: a caller
     /// holding a transaction of its own open across the call waits out the
     /// timeout and then fails, and a transaction the process opens while the
-    /// run stands waits for the run to finish.
+    /// run stands waits for the run to finish. When `[core] locking` is on, a
+    /// held `UpdateGuard` holds the repository lock shared, so the run waits
+    /// for it, and `begin_update` waits for the run.
     pub async fn prune(&self, opts: &PruneOptions) -> Result<PruneStats>;
     pub async fn fsck(&self, opts: &FsckOptions) -> Result<FsckReport>;
     pub async fn traverse_commit(&self, c: &Checksum, depth: i32)
         -> Result<HashSet<ObjectName>>;
+    /// Takes the repository lock shared and then the update lock, and holds
+    /// both from the read of the previous anchor commit to the removal of
+    /// `summary.sig`, so regenerations run one at a time. The anchor commit
+    /// commits under that hold. A holder of an `UpdateGuard` that calls this
+    /// waits for its own guard until `lock-timeout-secs`. The call takes the
+    /// repository lock shared also with no collection id, so, when `[core]
+    /// locking` is on, it waits for an exclusive holder of the repository
+    /// lock, a caller that holds one itself included. A caller value the dict cannot hold is refused before
+    /// any lock.
     pub async fn regenerate_summary(&self, opts: &SummaryOptions) -> Result<()>;
 }
+
+/// Held by one caller at a time, across processes and inside the process.
+/// `Send + Sync`. While you hold it, write through it: the receive commit and
+/// `Repo::regenerate_summary` wait for the guard, and a holder that calls one
+/// of them waits for its own guard until `lock-timeout-secs`. Do not commit a
+/// ref-writing `Transaction` while you hold it.
+pub struct UpdateGuard { /* Arc<the Repo, the locks, the writes in flight, the changed directories> */ }
+
+impl UpdateGuard {
+    /// Follows a ref stored as an alias, as `Repo::resolve_ref_tip` does.
+    pub async fn read_ref(&self, refspec: &str) -> Result<Option<Checksum>>;
+    pub async fn read_collection_ref(&self, cref: &CollectionRef)
+        -> Result<Option<Checksum>>;
+    /// Each write is atomic and visible when it returns: a tmpfile,
+    /// `fdatasync` under `[core] fsync`, and a rename. The guard records each
+    /// directory that changed, and `finish` syncs it.
+    pub async fn set_ref(&self, refspec: &str, checksum: Option<&Checksum>)
+        -> Result<()>;
+    pub async fn set_collection_ref(&self, cref: &CollectionRef,
+        checksum: Option<&Checksum>) -> Result<()>;
+    pub async fn set_ref_alias(&self, refspec: &str, target: &str) -> Result<()>;
+    /// The `config` file as it is on disk now. The handle keeps the config it
+    /// was opened with.
+    pub async fn read_config(&self) -> Result<RepoConfig>;
+    pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()>;
+    /// Wait until each write of the guard has ended, also a write whose
+    /// future was dropped, then run `fsync` on each directory that changed,
+    /// once, deepest first, then release both locks. Returns the first error
+    /// of the syncs, and both locks are free when it returns. A dropped
+    /// `finish` future releases the locks after the syncs.
+    pub async fn finish(self) -> Result<()>;
+}
+// A guard that drops without `finish` runs the syncs synchronously on the
+// thread that drops the last reference to its state, hides every error, and
+// then releases both locks.
 
 /// Knobs for [`Repo::regenerate_summary`]. Both timestamps default to the
 /// current time; setting them makes the output reproducible.
@@ -2302,7 +2367,7 @@ protocol crate, so a caller names its error codes and messages through
   the rules of its updates, each key once. A key with a verifying signature
   in the merge of the filtered incoming dict into the stored dict makes no
   signature.
-- The server then takes the ref-update lock. Under the lock it reads each
+- The server then takes the update lock. Under the lock it reads each
   ref again with `lstat`. An alias, and a path that a ref write cannot
   replace, are `ref-denied`: a directory, a path below a ref file, and two
   updates of which one writes below the other. It then checks the expected

@@ -36,9 +36,7 @@ use rustix::io::Errno;
 
 use crate::config::{MinFreeSpace, RepoConfig};
 use crate::error::{Error, Result};
-use crate::lock::{self, LockGuard, LockKind, RepoLock};
-#[cfg(feature = "receive")]
-use crate::lock::{RefUpdateGuard, RefUpdateLock};
+use crate::lock::{self, LockGuard, LockKind, RepoLock, UpdateLock, UpdateLockHeld, UpdateLocks};
 use crate::perm;
 use crate::staging::StagingDir;
 use crate::transaction::Transaction;
@@ -116,11 +114,10 @@ struct RepoInner {
     // handle's lifetime so every clone of this handle shares one `.lock`
     // descriptor and one in-process hold count.
     lock: Mutex<Option<Arc<RepoLock>>>,
-    // The ref-update lock, created on the first ref-update acquire and held
-    // for the handle's lifetime beside `lock`, so every clone of this handle
-    // shares one `.ref-update.lock` descriptor and one waiter queue.
-    #[cfg(feature = "receive")]
-    ref_update_lock: Mutex<Option<Arc<RefUpdateLock>>>,
+    // The update lock, created on the first update-lock acquire and held for
+    // the handle's lifetime beside `lock`, so every clone of this handle
+    // shares one `.update.lock` descriptor and one waiter queue.
+    update_lock: Mutex<Option<Arc<UpdateLock>>>,
 }
 
 impl RepoInner {
@@ -136,16 +133,15 @@ impl RepoInner {
         Ok(lock)
     }
 
-    /// The shared [`RefUpdateLock`] for this repository, creating and
-    /// registering `<repo>/.ref-update.lock` on first use. Runs synchronous
+    /// The shared [`UpdateLock`] for this repository, creating and
+    /// registering `<repo>/.update.lock` on first use. Runs synchronous
     /// filesystem calls.
-    #[cfg(feature = "receive")]
-    fn ref_update_lock(&self) -> std::io::Result<Arc<RefUpdateLock>> {
-        let mut slot = self.ref_update_lock.lock().unwrap();
+    fn update_lock(&self) -> std::io::Result<Arc<UpdateLock>> {
+        let mut slot = self.update_lock.lock().unwrap();
         if let Some(existing) = slot.as_ref() {
             return Ok(existing.clone());
         }
-        let lock = RefUpdateLock::get_or_create(self.repo_fd.as_fd(), self.config.mode())?;
+        let lock = UpdateLock::get_or_create(self.repo_fd.as_fd(), self.config.mode())?;
         *slot = Some(lock.clone());
         Ok(lock)
     }
@@ -227,6 +223,9 @@ impl Repo {
     ///
     /// A shared lock matches the read lock the tool holds during a commit, so
     /// many transactions commit at once, in this process and across processes.
+    /// A held [`UpdateGuard`](crate::UpdateGuard) holds the repository lock
+    /// shared too when `[core] locking` is on, so a transaction opens and
+    /// stages objects while a guard is held.
     pub async fn transaction(&self) -> Result<Transaction> {
         self.transaction_with_lock(LockKind::Shared).await
     }
@@ -290,7 +289,7 @@ impl Repo {
         lock::acquire(lock, kind, lock_timeout(timeout_secs)).await
     }
 
-    /// Take the ref-update lock, held until the guard drops.
+    /// Take the update lock, held until the guard drops.
     ///
     /// The lock is exclusive across processes and inside the process. The
     /// waiters of one process take it in the order of the first poll of their
@@ -309,24 +308,57 @@ impl Repo {
     /// A release always drops the record lock, so another process can take
     /// the lock between two holders of this process.
     ///
-    /// Take the repository lock before the ref-update lock, never the reverse.
+    /// Take the repository lock before the update lock, never the reverse.
     /// Against other processes the lock has no order: a waiter can lose every
     /// retry to another process until the timeout elapses.
-    #[cfg(feature = "receive")]
-    pub(crate) async fn lock_ref_update(&self) -> Result<RefUpdateGuard> {
+    pub(crate) async fn lock_update(&self) -> Result<UpdateLockHeld> {
         let timeout_secs = self.inner.config.lock_timeout_secs()?;
         // A cached lock is read on the calling task, so the call joins the
         // queue on its first poll. Only the first use of the handle opens the
         // lock file on the blocking pool.
-        let cached = self.inner.ref_update_lock.lock().unwrap().clone();
+        let cached = self.inner.update_lock.lock().unwrap().clone();
         let lock = match cached {
             Some(lock) => lock,
             None => {
                 let repo = self.clone();
-                ostrya_rt::unblock(move || repo.inner.ref_update_lock()).await?
+                ostrya_rt::unblock(move || repo.inner.update_lock()).await?
             }
         };
-        lock::acquire_ref_update(lock, lock_timeout(timeout_secs)).await
+        lock::acquire_update(lock, lock_timeout(timeout_secs)).await
+    }
+
+    /// Take the repository lock shared, then the update lock, held until the
+    /// returned value drops.
+    ///
+    /// The call reads `[core] locking` and `[core] lock-timeout-secs` before
+    /// it waits, so a value the config cannot carry refuses the call at once.
+    /// Each of the two waits gets the whole timeout. With `locking` false the
+    /// repository lock is not taken, and the update lock is taken all the
+    /// same.
+    pub(crate) async fn lock_for_update(&self) -> Result<UpdateLocks> {
+        self.inner.config.locking()?;
+        self.inner.config.lock_timeout_secs()?;
+        let repo = self.lock_repo(LockKind::Shared).await?;
+        let update = self.lock_update().await?;
+        Ok(UpdateLocks { update, repo })
+    }
+
+    /// Whether `held` is a hold of the update lock of this repository.
+    pub(crate) fn holds_update_lock(&self, held: &UpdateLockHeld) -> bool {
+        self.inner
+            .update_lock
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|lock| held.is_of(lock))
+    }
+
+    /// Read `config` from disk and parse it, as the open of a handle does.
+    /// The handle keeps the configuration it was opened with.
+    pub(crate) async fn read_config_file(&self) -> Result<RepoConfig> {
+        let repo = self.clone();
+        let bytes = ostrya_rt::unblock(move || read_file(repo.repo_fd(), CONFIG)).await?;
+        parse_config(&bytes)
     }
 
     /// The repository root directory fd, anchoring fd-relative access to
@@ -344,9 +376,7 @@ impl Repo {
     /// `path` is the argument the caller gave the constructor, stored as is for
     /// [`Repo::path`].
     fn assemble(materials: Materials, path: PathBuf) -> Result<Repo> {
-        let text = std::str::from_utf8(&materials.config)
-            .map_err(|_| Error::InvalidFormat("config is not valid UTF-8".into()))?;
-        let config = RepoConfig::parse(text)?;
+        let config = parse_config(&materials.config)?;
         Ok(Repo {
             inner: Arc::new(RepoInner {
                 repo_fd: materials.repo_fd,
@@ -354,11 +384,17 @@ impl Repo {
                 config,
                 path,
                 lock: Mutex::new(None),
-                #[cfg(feature = "receive")]
-                ref_update_lock: Mutex::new(None),
+                update_lock: Mutex::new(None),
             }),
         })
     }
+}
+
+/// Parse the bytes of `config`. This step is CPU-only.
+fn parse_config(bytes: &[u8]) -> Result<RepoConfig> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Error::InvalidFormat("config is not valid UTF-8".into()))?;
+    RepoConfig::parse(text)
 }
 
 /// The lock wait of a `lock-timeout-secs` value. The config reader refuses a

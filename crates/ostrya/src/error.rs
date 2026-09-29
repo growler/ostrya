@@ -58,9 +58,8 @@ pub enum Error {
     /// converts to this variant.
     #[error("unsupported: {0}")]
     Unsupported(String),
-    /// Acquiring the repository lock, or the ref-update lock of the receive
-    /// path, timed out under contention. The message names the repository
-    /// lock in both cases.
+    /// Acquiring the repository lock or the update lock timed out under
+    /// contention. The message names the repository lock in both cases.
     #[error("timed out acquiring repository lock after {secs}s")]
     LockTimeout {
         /// The configured lock-acquisition timeout, in seconds.

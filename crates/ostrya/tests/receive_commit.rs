@@ -1,4 +1,4 @@
-//! `Repo::receive` at `Commit`: the checks of each ref update, the ref-update
+//! `Repo::receive` at `Commit`: the checks of each ref update, the update
 //! lock, the ref writes, the transaction commit, and `CommitReply`.
 //!
 //! A test client drives the session over two in-process pipes with the frame
@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use common::receive::{
-    connect, foreign_holder, lock_holder_main, new_repo, returned_code, session, sha,
-    staging_entries,
+use common::receive::{connect, new_repo, returned_code, session, sha, staging_entries};
+use common::{
+    COMMIT, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory,
+    fixture_repo, foreign_holder, guard_holder, guard_holder_main, lock_holder_main,
 };
-use common::{COMMIT, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory, fixture_repo};
 use futures_lite::io::AsyncReadExt;
 use ostrya::push::proto::ErrorMessage;
 use ostrya::push::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
@@ -26,7 +26,8 @@ use ostrya::sign::append_signature;
 use ostrya::{
     Checksum, Commit, DictBuilder, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, ObjectName,
     ObjectType, ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveStep, ReceiveVerify, RefPattern,
-    Repo, RepoMode, ServerSigner, Signer, Summary, TrustedKeys, Type, Value, Verifier,
+    Repo, RepoMode, ServerSigner, Signer, Summary, SummaryOptions, TrustedKeys, Type, Value,
+    Verifier,
 };
 use ostrya_core::filehdr::frame;
 use ostrya_rt::block_on;
@@ -48,8 +49,14 @@ const ED25519_KEY: &str = "ostree.sign.ed25519";
 
 #[test]
 #[ignore = "helper process for the receive lock tests"]
-fn receive_lock_holder_subprocess() {
+fn lock_holder_subprocess() {
     lock_holder_main();
+}
+
+#[test]
+#[ignore = "helper process for the update guard tests"]
+fn guard_holder_subprocess() {
+    guard_holder_main();
 }
 
 // ---------------------------------------------------------------------------
@@ -532,7 +539,7 @@ fn regular_objects(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Two sessions that create one ref at the same time: the ref-update lock
+/// Two sessions that create one ref at the same time: the update lock
 /// orders them, and the second one finds the ref present.
 #[test]
 fn two_sessions_from_absent_give_one_success_and_one_ref_mismatch() {
@@ -1714,14 +1721,14 @@ fn a_ref_path_that_a_write_cannot_replace_is_ref_denied() {
 // Faults of the server.
 // ---------------------------------------------------------------------------
 
-/// A ref-update lock that another process holds past `lock-timeout-secs` is
+/// An update lock that another process holds past `lock-timeout-secs` is
 /// `internal`, with the text of the timeout.
 #[test]
-fn a_held_ref_update_lock_is_internal() {
-    let tmp = TmpDir::new("recv-ref-lock");
+fn a_held_update_lock_is_internal() {
+    let tmp = TmpDir::new("recv-update-lock");
     let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=0\n");
     let before = snapshot(&repo);
-    let holder = foreign_holder(repo.path(), ".ref-update.lock");
+    let holder = foreign_holder(repo.path(), ".update.lock");
     let (result, reply) = push(
         &repo,
         &policy(),
@@ -1743,6 +1750,174 @@ fn a_held_ref_update_lock_is_internal() {
         "{result:?}"
     );
     assert_unchanged(&repo, &before);
+}
+
+/// An `UpdateGuard` that another process holds makes the session wait at
+/// `Commit`. The session completes once the holder releases the guard.
+#[test]
+fn a_session_waits_for_a_guard_of_another_process() {
+    let tmp = TmpDir::new("recv-guard-wait");
+    let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=30\n");
+    let holder = guard_holder(repo.path());
+    let releasing = repo.path().join(GUARD_RELEASING_MARKER);
+    let root = repo.path().to_path_buf();
+    // The releasing marker proves the order. The release waits only until the
+    // session made its staging directory, so the session runs before it.
+    let release = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while staging_entries(&root).is_empty() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the session never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        holder.release();
+    });
+    let report = committed(push(
+        &repo,
+        &policy(),
+        &fixture_objects(Encoding::Raw),
+        &[],
+        vec![update(
+            "test/main",
+            Expected::Absent,
+            Some(fixture_commit()),
+        )],
+        false,
+    ));
+    assert!(
+        releasing.exists(),
+        "the session committed before the release"
+    );
+    release.join().unwrap();
+    assert_eq!(report.refs.len(), 1);
+    assert_eq!(
+        ref_file(&repo, "refs/heads/test/main"),
+        Some(format!("{COMMIT}\n"))
+    );
+}
+
+/// A policy that regenerates the summary, for the tests of the summary
+/// step.
+fn summary_policy() -> ReceivePolicy {
+    ReceivePolicy {
+        update_summary: true,
+        ..ReceivePolicy::default()
+    }
+}
+
+/// In a repository with a collection id and `lock-timeout-secs=0`, a session
+/// that regenerates the summary and a later `regenerate_summary` both
+/// complete: neither waits for a lock it holds itself.
+#[test]
+fn a_session_and_a_regeneration_complete_with_no_self_wait() {
+    let tmp = TmpDir::new("recv-no-self-wait");
+    let repo = new_repo(
+        &tmp,
+        RepoMode::Archive,
+        "collection-id=org.example.C\nlock-timeout-secs=0\n",
+    );
+    let report = committed(push(
+        &repo,
+        &summary_policy(),
+        &fixture_objects(Encoding::Raw),
+        &[],
+        vec![update(
+            "test/main",
+            Expected::Absent,
+            Some(fixture_commit()),
+        )],
+        false,
+    ));
+    assert_eq!(report.warnings, vec![]);
+    let first = block_on(repo.resolve_ref_tip("ostree-metadata"))
+        .unwrap()
+        .unwrap();
+    block_on(repo.regenerate_summary(&SummaryOptions::default())).unwrap();
+    let second = block_on(repo.resolve_ref_tip("ostree-metadata"))
+        .unwrap()
+        .unwrap();
+    assert_ne!(first, second, "the regeneration refreshed the anchor");
+    let summary = Summary::parse(&block_on(repo.read_summary()).unwrap().unwrap()).unwrap();
+    assert_eq!(summary.lookup("ostree-metadata"), Some(second));
+    assert_eq!(summary.lookup("test/main"), Some(fixture_commit()));
+}
+
+/// The anchor commits that `ostree-metadata` chains, from the tip back to the
+/// root anchor.
+fn anchor_chain(repo: &Repo) -> Vec<Checksum> {
+    let mut chain = Vec::new();
+    let mut next = block_on(repo.resolve_ref_tip("ostree-metadata")).unwrap();
+    while let Some(anchor) = next {
+        chain.push(anchor);
+        let bytes = block_on(repo.load_object_bytes(ObjectType::Commit, &anchor)).unwrap();
+        next = Commit::parse(&bytes).unwrap().parent;
+    }
+    chain
+}
+
+/// A session and two `regenerate_summary` calls that wait for one guard in a
+/// repository with a collection id all complete once the guard goes, and
+/// the three anchor commits chain: each one's parent is the anchor before
+/// it. Each writer reads the parent of its anchor under the update lock, so
+/// a writer that read it before its wait would chain onto an anchor another
+/// writer replaced.
+#[test]
+fn a_session_and_concurrent_regenerations_chain_their_anchors() {
+    let tmp = TmpDir::new("recv-concurrent-regen");
+    let repo = new_repo(
+        &tmp,
+        RepoMode::Archive,
+        "collection-id=org.example.C\nlock-timeout-secs=30\n",
+    );
+    let objects = fixture_objects(Encoding::Raw);
+    let names = vec!["test/main".to_string()];
+    let updates = vec![update(
+        "test/main",
+        Expected::Absent,
+        Some(fixture_commit()),
+    )];
+    let policy = summary_policy();
+    let opts = SummaryOptions::default();
+    let holder = guard_holder(repo.path());
+    let root = repo.path().to_path_buf();
+    // The session and each regeneration make their staging directory before
+    // they wait for the update lock. The settle time covers the step between
+    // that and the wait.
+    let release = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while staging_entries(&root).len() < 3 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(20),
+                "the writers never reached the lock"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        holder.release();
+    });
+    let (c, input, output) = connect();
+    let (((result, reply), first), second) = block_on(futures_lite::future::zip(
+        futures_lite::future::zip(
+            futures_lite::future::zip(
+                repo.receive(input, output, &policy),
+                script(c, &names, &objects, &[], updates, false),
+            ),
+            repo.regenerate_summary(&opts),
+        ),
+        repo.regenerate_summary(&opts),
+    ));
+    release.join().unwrap();
+    first.unwrap();
+    second.unwrap();
+    let report = committed((result, reply));
+    assert_eq!(report.warnings, vec![]);
+    assert_eq!(anchor_chain(&repo).len(), 3, "the three anchors chain");
+    assert_eq!(
+        ref_file(&repo, "refs/heads/test/main"),
+        Some(format!("{COMMIT}\n"))
+    );
 }
 
 /// Detached metadata that the repository stores and that does not parse fails

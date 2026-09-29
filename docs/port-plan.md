@@ -302,10 +302,12 @@ the calling task, so a dropped wait leaves no request and no hold behind.
 lock request. A value below `-1` is refused: the tool then takes no lock at all
 (`format-reference.md`, "Repository lock and staging").
 
-With the `receive` feature, a second lock serializes the ref updates of the
-receive path: an exclusive `fcntl` record lock (`F_SETLK`) on
-`<repo>/.ref-update.lock`, beside `.lock`. The lock is port-only: the tool never
-opens the file. The port opens and creates the file by the rules of `.lock`, on
+A second lock, the update lock, serializes the writes of refs, ref aliases,
+and `config` that go through the update guard, the transaction commit of the
+receive path, and summary regeneration: an exclusive `fcntl` record lock
+(`F_SETLK`) on `<repo>/.update.lock`, beside `.lock`. The lock builds in the
+base crate, with no feature. The lock is port-only: the tool never opens the
+file. The port opens and creates the file by the rules of `.lock`, on
 the first acquire, and never unlinks it. The same process-global registry holds
 both locks, so the process keeps one descriptor for each lock file. A lock file
 that shares its inode with the other lock file, as a hard link makes, is
@@ -323,9 +325,40 @@ reads `lock-timeout-secs`, which covers the wait in the queue and the retries,
 and fails with the `LockTimeout` error of `.lock`. The timeout does not cover
 the open of the first acquire on a handle. `-1` waits with no limit, and `0`
 makes one attempt. The lock ignores `[core] locking=false` and always takes the
-record lock. A caller takes the repository lock before the ref-update lock,
-never the reverse. The repository lock stays shared while the ref-update lock is
-held.
+record lock. A caller takes the repository lock before the update lock, never
+the reverse. The repository lock stays shared while the update lock is held.
+
+`Repo::begin_update` takes the repository lock shared and then the update lock,
+and returns an `UpdateGuard`. A transaction holds the repository lock shared
+too, so a holder never waits for a pull. When `[core] locking` is on, a holder
+waits for a prune. Each of the two waits gets the whole of `lock-timeout-secs`.
+With `[core] locking=false` the repository lock is not taken, and the update
+lock is taken all the same. The guard reads and writes refs, collection refs,
+and ref aliases, reads `config` from disk, and writes `config`. It stages no
+object. Each write is atomic and visible when it returns. With fsync on, the
+guard records each directory that a write changed, once for each directory.
+`UpdateGuard::finish` waits until no write of the guard runs, also a write
+whose future was dropped, runs `fsync` on each recorded directory once, deepest
+first, returns the first error, and then releases both locks. So `finish` syncs
+the directories of every write, and both locks are free when it returns. A
+guard that drops without `finish` runs the same syncs synchronously and hides
+the errors. One private struct holds the repository handle, both locks, the
+count of writes in flight, and the recorded directories. A write or a `finish`
+in flight owns a reference to it, so the locks are released only after the
+syncs, also when the future of a call drops.
+
+The writers that wait for the update lock are the receive commit and
+`Repo::regenerate_summary`. Each commits its transaction through the
+crate-private `Transaction::commit_under`, which takes a reference to the held
+lock and does not take it again. `regenerate_summary` holds the lock from the
+read of the previous anchor commit to the removal of `summary.sig`. It takes
+the repository lock shared also in a repository with no collection id, so, when
+`[core] locking` is on, it waits for an exclusive holder of the repository
+lock, a caller that holds one itself included. When `[core] locking` is on, a
+prune takes the repository lock exclusive, so it waits for a held guard, and
+`begin_update` waits for a running prune. No call detects a re-acquire: a
+holder of the guard that calls one of these writers waits for its own guard
+until `lock-timeout-secs`, and with `-1` it waits forever.
 
 ### Durability contract
 
@@ -8024,10 +8057,11 @@ Resolved:
    `rt::Timer` retry loop bounded by `lock-timeout-secs`. No new external
    crates: `rt::Timer` wraps the existing backends (`smol::Timer`,
    `tokio::time`) and the in-process coordination uses `std::sync::Mutex`.
-   The ref-update lock on `<repo>/.ref-update.lock` uses the same record lock,
-   the same registry, and the same retry loop, with a FIFO queue of in-process
+   The update lock on `<repo>/.update.lock` uses the same record lock, the
+   same registry, and the same retry loop, with a FIFO queue of in-process
    waiters built from `std::sync::Mutex` and `Waker`. It ignores `[core]
-   locking=false`.
+   locking=false`. `Repo::begin_update` takes the repository lock shared and
+   then the update lock, and returns the public `UpdateGuard`.
 
 9. Repo finders: the config and mount finders land with the phase that brings
    collection refs, which a finder resolves and which is not yet scheduled; they

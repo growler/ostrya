@@ -5248,6 +5248,33 @@ fn a_relative_or_empty_subpath_is_refused() {
     });
 }
 
+/// A depth below -1 is refused before the first request.
+#[test]
+fn a_depth_below_minus_one_is_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-depth-refused");
+        build_subpath_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        for depth in [-2, -3, i32::MIN] {
+            let opts = PullOptions {
+                depth,
+                ..subpath_opts(&[])
+            };
+            let err = dest.pull("origin", opts).await.unwrap_err();
+            match &err {
+                Error::InvalidInput(msg) => {
+                    assert!(msg.contains(&format!("depth {depth} is below -1")), "{msg}")
+                }
+                other => panic!("{depth}: {other:?}"),
+            }
+        }
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_nothing_published(&dest).await;
+        assert!(dest.list_objects().await.unwrap().is_empty());
+    });
+}
+
 /// A remote archive repository under `dir/remote` holding `test/main` at a
 /// second commit over the first, both over the small tree with a different
 /// marker. Returns the remote and the two commits, the first one first. The

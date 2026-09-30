@@ -506,7 +506,8 @@ pub struct PullOptions {
     /// How many parents of each pulled commit to follow: `0` for the named
     /// commit alone, `-1` for the whole ancestry the source holds. Each ref's
     /// chain is followed to this depth on its own, so the commits a pull collects
-    /// do not depend on the order the refs are listed.
+    /// do not depend on the order the refs are listed. A value below `-1` is
+    /// [`Error::InvalidInput`], and the pull writes no object and no ref.
     pub depth: i32,
     /// Extra local repositories consulted for an object the source does not
     /// hold, in order.
@@ -897,6 +898,9 @@ impl Repo {
     /// objects are published, so no ref in this repository ever names a commit
     /// whose objects are not yet durable.
     ///
+    /// A [`depth`](PullOptions::depth) below `-1` fails the pull with
+    /// [`Error::InvalidInput`] before it reads a ref or an object of `src`.
+    ///
     /// A ref the source does not hold fails the pull with
     /// [`Error::RefNotFound`] before anything is imported. A parent commit the
     /// source does not hold ends that chain without error, so a source with
@@ -917,6 +921,7 @@ impl Repo {
         if !opts.subpaths.is_empty() {
             return Err(Error::Unsupported("a local pull takes no subpath".into()));
         }
+        check_depth(opts.depth)?;
         // The signature policy is built before the source is read: a check the
         // options ask for with no remote to take keys from is refused here,
         // rather than after a chain has been walked.
@@ -1663,6 +1668,14 @@ async fn load_dirtree_from(sources: &[&Repo], checksum: &Checksum) -> Result<Opt
         }
     }
     Ok(None)
+}
+
+/// Refuse a depth below -1.
+fn check_depth(depth: i32) -> Result<()> {
+    if depth < -1 {
+        return Err(Error::InvalidInput(format!("depth {depth} is below -1")));
+    }
+    Ok(())
 }
 
 /// Check that a commit's `ostree.ref-binding` names the ref it is being pulled

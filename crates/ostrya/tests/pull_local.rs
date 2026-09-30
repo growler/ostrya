@@ -3024,6 +3024,39 @@ fn a_local_pull_refuses_subpaths() {
     });
 }
 
+/// A depth below -1 is refused before the source is read, and nothing is
+/// imported.
+#[test]
+fn a_local_pull_refuses_a_depth_below_minus_one() {
+    let tmp = TmpDir::new("pull-depth-refused");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        for depth in [-2, -3, i32::MIN] {
+            let err = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        refs: vec!["main".to_owned()],
+                        depth,
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            match &err {
+                Error::InvalidInput(msg) => {
+                    assert!(msg.contains(&format!("depth {depth} is below -1")), "{msg}")
+                }
+                other => panic!("{depth}: {other:?}"),
+            }
+        }
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert!(dst.list_objects().await.unwrap().is_empty());
+    });
+}
+
 // --- static deltas -------------------------------------------------------
 
 /// Generate a delta in `repo` with a fixed timestamp under `opts`, and return

@@ -2646,6 +2646,13 @@ a corrupt object fails the pull with and without it. Four differences stand:
   decisions on a value given to a switch and on a repeated boolean flag cover
   it.
 
+A `--depth` below `-1` is refused in both, by different exit paths. The tool
+ends on an assertion (`ostree_repo_pull_with_options: assertion
+'pull_data->maxdepth >= -1' failed`, `SIGABRT`, exit 134 from a shell). The
+port refuses the value with `error: invalid input: depth <depth> is below -1`
+at exit 1. Both stop before the first request, and neither writes an object
+or a ref (`../format-reference.md`, "HTTP pull surface").
+
 `--untrusted` over a `file://` remote changes what the tool does; the port
 fetches no `file://` remote. Under `--require-static-deltas` into `archive`
 the tool refuses with `error: Can't use static deltas in an archive repo`, and
@@ -2727,7 +2734,11 @@ commit that carries detached metadata. `pull-local` takes neither `--subpath`
 nor `--http-trusted` in either: the tool reports `error: Unknown option
 <option>` at exit 1, and `clap` refuses the option at exit 1. The library's
 local pull refuses a subpath with `unsupported: a local pull takes no
-subpath`.
+subpath`. A `--depth` below `-1` is refused in both, as on `pull`: the tool
+ends on the same assertion (`SIGABRT`, exit 134 from a shell), and the port
+refuses the value at exit 1. The port opens the source repository and each
+`--localcache-repo` first, and refuses the value before it reads a ref or an
+object of the source. Neither writes an object or a ref.
 
 The two GPG switches check what the tool checks and refuse where it refuses
 (`../format-reference.md`, "Signature verification during a pull"), with the

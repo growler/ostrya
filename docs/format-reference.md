@@ -1142,6 +1142,18 @@ and `--disable-static-deltas` together end the tool on an assertion
 && pull_data->require_static_deltas)' failed`, `SIGABRT`, exit 134 from a
 shell) with nothing written, on `pull-local` and on `pull`.
 
+A `--depth` below `-1` ends the tool on an assertion
+(`ostree_repo_pull_with_options: assertion 'pull_data->maxdepth >= -1'
+failed`, then `ostree_run: assertion failed: (success || error)`, `SIGABRT`,
+exit 134 from a shell), on `pull-local` and on `pull`. The tool sends no
+request and writes no object and no ref. A remote that the repository does
+not configure gives the same abort. Observed with `ostree` 2026.1 on
+2026-09-30 with `--depth=-2`. The port refuses the value with `error: invalid
+input: depth <depth> is below -1` at exit 1, and writes no object and no ref.
+`pull` refuses it before it sends a request. `pull-local` opens the source
+repository and each `--localcache-repo` first, and then refuses the value
+before it reads a ref or an object of the source.
+
 ### Signature verification during a pull
 
 Recovered by running `ostree` 2026.1 against a static HTTP server over a

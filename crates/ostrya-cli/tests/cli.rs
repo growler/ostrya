@@ -7143,6 +7143,83 @@ fn pull_local_refuses_subpath_and_http_trusted() {
     }
 }
 
+/// A `--depth` below -1 is refused at exit 1 with nothing written. The tool
+/// ends on an assertion (`SIGABRT`, exit 134 from a shell) and writes nothing
+/// either.
+#[test]
+fn pull_local_refuses_a_depth_below_minus_one() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-local-depth");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    let nothing: PullResult = (Vec::new(), Vec::new(), Vec::new());
+    for who in ["port", "tool"] {
+        if who == "tool" && !tool {
+            continue;
+        }
+        let dir = base.join(who);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = create_repo(&dir, RepoMode::Archive);
+        let repo_arg = format!("--repo={}", dest.display());
+        let argv = [
+            "pull-local",
+            repo_arg.as_str(),
+            "--depth=-2",
+            remote.to_str().unwrap(),
+            BRANCH,
+        ];
+        if who == "port" {
+            let out = ostrya(&argv, None, &[]);
+            assert_eq!(out.status.code(), Some(1));
+            assert!(out.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("depth -2 is below -1"), "{stderr}");
+        } else {
+            use std::os::unix::process::ExitStatusExt;
+            let out = ostree(&argv);
+            assert_eq!(out.status.signal(), Some(6), "the tool did not abort");
+        }
+        assert_eq!(pull_result(&dest), nothing, "{who}");
+    }
+}
+
+/// A `--depth` below -1 is refused at exit 1 before the first request, with
+/// nothing written. The tool ends on the same assertion as `pull-local`,
+/// sends no request, and writes nothing either.
+#[test]
+fn pull_refuses_a_depth_below_minus_one() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-depth");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    let server = FileServer::start(&remote);
+    let nothing: PullResult = (Vec::new(), Vec::new(), Vec::new());
+    for who in ["port", "tool"] {
+        if who == "tool" && !tool {
+            continue;
+        }
+        let dir = base.join(who);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = create_repo(&dir, RepoMode::Archive);
+        configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+        let repo_arg = format!("--repo={}", dest.display());
+        let argv = ["pull", repo_arg.as_str(), "origin", BRANCH, "--depth=-2"];
+        if who == "port" {
+            let out = ostrya(&argv, None, &[]);
+            assert_eq!(out.status.code(), Some(1));
+            assert!(out.stdout.is_empty());
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("depth -2 is below -1"), "{stderr}");
+        } else {
+            use std::os::unix::process::ExitStatusExt;
+            let out = ostree(&argv);
+            assert_eq!(out.status.signal(), Some(6), "the tool did not abort");
+        }
+        assert_eq!(pull_result(&dest), nothing, "{who}");
+    }
+    assert!(server.seen().is_empty(), "{:?}", server.seen());
+}
+
 // --- Phase 17b: refs, rev-parse, and cat against the tool ---------------------
 //
 // These five tests are the `evidence:` the M10 records

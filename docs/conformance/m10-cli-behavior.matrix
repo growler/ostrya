@@ -14046,12 +14046,41 @@ spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: `pull-local` has no `--http-trusted` in either implementation. The words
  differ, and neither side writes an object or a ref.
 
+family: M10
+subcommand: pull-local
+cell: pull-local/depth-below-minus-one
+src-mode: archive
+dst-mode: archive
+setup: src-dst
+run: pull-local --repo=$DST --depth=-2 $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "depth -2 is below -1"
+ref-expect-exit: 1
+ref-may-abort: 6
+oracle: exit-status refs-bytes inventory
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::pull_local_refuses_a_depth_below_minus_one
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: a depth below -1 names no parent count. The port opens the source
+ repository first, refuses the value at exit 1 before it reads a ref or an
+ object of the source, and writes no object and no ref. The reference
+ build dies on SIGABRT: it prints `ostree_repo_pull_with_options: assertion
+ 'pull_data->maxdepth >= -1' failed` and `ostree_run: assertion failed:
+ (success || error)` on standard error, a `Bail out!` line carrying the second
+ text on standard output, and writes no object and no ref. `ref-may-abort: 6`
+ records the crash; `ref-expect-exit: 1` states the status a build that stops
+ crashing would have to reach, a refusal being the only outcome the port
+ accepts here.
+
 # ---------------------------------------------------------------------------
 # pull -- progress and the statistics line (Phase 17f). The harness serves no
-# remote, so each `pull` cell but the two value refusals cites the `cli.rs`
-# test that pulls with each implementation from a standard-library server of
-# its own, with standard output a pipe. The `pull-local` cells commit corpus
-# C0 into `$SRC` on `conformance`.
+# remote. The two `--update-frequency` refusals stop ahead of the remote and
+# cite no test. Each other `pull` cell cites a unit test of the CLI or the
+# `cli.rs` test that pulls with each implementation from a standard-library
+# server of its own, with standard output a pipe. The `pull-local` cells
+# commit corpus C0 into `$SRC` on `conformance`.
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -14090,6 +14119,32 @@ severity: interop
 spec: format-reference.md#pull
 note: a value no C `int` holds is refused in the words `commit --owner-uid`
  uses.
+
+family: M10
+subcommand: pull
+cell: pull/depth-below-minus-one
+setup: repo
+run: pull --repo=$REPO --depth=-2 origin conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "depth -2 is below -1"
+ref-expect-exit: 1
+ref-may-abort: 6
+oracle: exit-status refs-bytes inventory
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::pull_refuses_a_depth_below_minus_one
+spec: format-reference.md#http-pull-surface
+note: a depth below -1 names no parent count. Both sides stop on it ahead of
+ the remote, which this repository does not configure. The port refuses it at
+ exit 1 before the first request, and writes no object and no ref. The
+ reference build dies on SIGABRT: it prints `ostree_repo_pull_with_options:
+ assertion 'pull_data->maxdepth >= -1' failed` and `ostree_run: assertion
+ failed: (success || error)` on standard error, a `Bail out!` line carrying the
+ second text on standard output, and writes no object and no ref. The cited
+ test states the same over a configured remote, where neither side sends a
+ request. `ref-may-abort: 6` records the crash; `ref-expect-exit: 1` states
+ the status a build that stops crashing would have to reach.
 
 family: M10
 subcommand: pull

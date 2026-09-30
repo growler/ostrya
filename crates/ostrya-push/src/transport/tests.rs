@@ -331,6 +331,7 @@ mod standin {
     use std::time::{Duration, Instant};
 
     use ostrya_core::{Checksum, ObjectName, ObjectType};
+    use ostrya_gvariant::Value;
 
     use super::super::connect_with;
     use super::*;
@@ -338,9 +339,17 @@ mod standin {
         CommitRequest, ErrorMessage, FrameWriter, Hello, HelloReply, MIN_FRAME_LIMIT, Message,
         PROTOCOL_VERSION,
     };
-    use crate::{Encoding, ErrorCode, Expected, RefOutcome, RefState, RefUpdate};
+    use crate::{
+        BoxFuture, Compression, Encoding, ErrorCode, Expected, ObjectData, ObjectSource,
+        RefOutcome, RefState, RefUpdate,
+    };
 
     const LIMIT: Duration = Duration::from_millis(300);
+    /// The time limit of a session in a test that checks that a call waits
+    /// for the exit of the stand-in. A call that waits returns when the
+    /// stand-in exits, so the limit costs no time, and a loaded host cannot
+    /// end the wait before the stand-in exits.
+    const EXIT_LIMIT: Duration = Duration::from_secs(5);
     const AGENT: &str = "transport-test";
 
     struct Dir(PathBuf);
@@ -444,6 +453,11 @@ mod standin {
     /// belong to the runtime that opens them, so each test opens and drives
     /// its session in one `block_on`.
     async fn open(script: &str) -> Result<PushSession> {
+        open_with_limit(script, LIMIT).await
+    }
+
+    /// As [`open`], with `limit` as the time limit of the session.
+    async fn open_with_limit(script: &str, limit: Duration) -> Result<PushSession> {
         let remote = PushRemote::parse("ssh://me@host:2222/srv/it's repo").unwrap();
         connect_with(
             &remote,
@@ -454,7 +468,7 @@ mod standin {
                 agent: Some(AGENT.into()),
                 ..Default::default()
             },
-            LIMIT,
+            limit,
         )
         .await
     }
@@ -719,6 +733,156 @@ mod standin {
         // The stand-in read the `Have` of `missing` alone: no `Abort`.
         let have = encode(&[Message::Have(names(1))]);
         assert_eq!(std::fs::read(&seen).unwrap(), have);
+    }
+
+    /// A source whose each open fails.
+    struct FailingSource;
+
+    impl ObjectSource for FailingSource {
+        fn objects<'a>(&'a self, _commit: &'a Checksum) -> BoxFuture<'a, Result<Vec<ObjectName>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn open<'a>(
+            &'a self,
+            _name: &'a ObjectName,
+            _encoding: Encoding,
+        ) -> BoxFuture<'a, Result<ObjectData>> {
+            Box::pin(async { Err(Error::InvalidInput("gone".into())) })
+        }
+
+        fn detached_metadata<'a>(
+            &'a self,
+            _commit: &'a Checksum,
+        ) -> BoxFuture<'a, Result<Option<Value>>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// A server that replies with `HelloReply` from `reply`, copies its
+    /// input to `seen` until end of file, and creates `exited` a moment
+    /// later, just before it exits with a failure status.
+    fn reads_to_eof(reply: &Path, seen: &Path, exited: &Path) -> String {
+        format!(
+            "{}; {}; cat > {}; sleep 0.1; {}; exit 3",
+            skip(hello_len()),
+            cat(reply),
+            quote_posix(seen.to_str().unwrap()),
+            touch(exited)
+        )
+    }
+
+    fn assert_broken<T: std::fmt::Debug>(r: Result<T>) {
+        match r {
+            Err(Error::InvalidInput(msg)) => assert!(msg.contains("broken"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_after_a_failed_send_writes_nothing_and_waits_for_the_exit() {
+        let dir = Dir::new();
+        let reply = dir.file("reply", &hello_reply());
+        let seen = dir.0.join("seen");
+        let exited = dir.0.join("exited");
+        let script = reads_to_eof(&reply, &seen, &exited);
+        let (sent, committed) = ostrya_rt::block_on(async {
+            let session = open_with_limit(&script, EXIT_LIMIT).await.unwrap();
+            let sent = session
+                .send(&FailingSource, &names(1), &[], Compression::None)
+                .await;
+            (sent, session.commit(&[update()], false).await)
+        });
+        match sent {
+            Err(Error::Source(_)) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_broken(committed);
+        assert!(exited.exists(), "commit did not wait for the stand-in");
+        // The stand-in read the `Abort` of the failed `send` alone: no
+        // `Commit`.
+        assert_eq!(std::fs::read(&seen).unwrap(), encode(&[Message::Abort]));
+    }
+
+    #[test]
+    fn commit_after_a_failed_missing_writes_nothing_and_waits_for_the_exit() {
+        let dir = Dir::new();
+        let reply = dir.file("reply", &hello_reply());
+        let seen = dir.0.join("seen");
+        let exited = dir.0.join("exited");
+        // The stand-in closes its output after the reply, so `missing` reads
+        // end of file and leaves the session broken.
+        let script = format!(
+            "{}; {}; exec 1>&-; cat > {}; sleep 0.1; {}; exit 3",
+            skip(hello_len()),
+            cat(&reply),
+            quote_posix(seen.to_str().unwrap()),
+            touch(&exited)
+        );
+        let (missing, committed) = ostrya_rt::block_on(async {
+            let session = open_with_limit(&script, EXIT_LIMIT).await.unwrap();
+            let missing = session.missing(&names(1)).await;
+            (missing, session.commit(&[update()], false).await)
+        });
+        match missing {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("{other:?}"),
+        }
+        assert_broken(committed);
+        assert!(exited.exists(), "commit did not wait for the stand-in");
+        let have = encode(&[Message::Have(names(1))]);
+        assert_eq!(std::fs::read(&seen).unwrap(), have);
+    }
+
+    #[test]
+    fn commit_after_a_failed_send_gives_up_after_the_limit() {
+        let dir = Dir::new();
+        let reply = dir.file("reply", &hello_reply());
+        let script = silent_after_reply(&reply, LIMIT + Duration::from_secs(1));
+        let (committed, elapsed) = ostrya_rt::block_on(async {
+            let session = open(&script).await.unwrap();
+            let sent = session
+                .send(&FailingSource, &names(1), &[], Compression::None)
+                .await;
+            assert!(matches!(sent, Err(Error::Source(_))), "{sent:?}");
+            let start = Instant::now();
+            let r = session.commit(&[update()], false).await;
+            (r, start.elapsed())
+        });
+        assert_broken(committed);
+        assert!(elapsed >= LIMIT, "{elapsed:?}");
+        assert!(elapsed < LIMIT + Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_refused_commit_writes_nothing_and_waits_for_the_exit() {
+        let dir = Dir::new();
+        let reply = dir.file("reply", &hello_reply());
+        let other = RefUpdate {
+            name: "other".into(),
+            ..update()
+        };
+        let cases: [(&[RefUpdate], &str); 3] = [
+            (&[], "at least one ref update"),
+            (std::slice::from_ref(&other), "was not named"),
+            (&[update(), update()], "updated twice"),
+        ];
+        for (updates, wanted) in cases {
+            let seen = dir.0.join("seen");
+            let exited = dir.0.join("exited");
+            let _ = std::fs::remove_file(&exited);
+            let script = reads_to_eof(&reply, &seen, &exited);
+            let r = ostrya_rt::block_on(async {
+                let session = open_with_limit(&script, EXIT_LIMIT).await.unwrap();
+                session.commit(updates, false).await
+            });
+            match r {
+                Err(Error::InvalidInput(msg)) => assert!(msg.contains(wanted), "{msg}"),
+                other => panic!("{wanted}: {other:?}"),
+            }
+            assert!(exited.exists(), "{wanted}: commit did not wait");
+            assert_eq!(std::fs::read(&seen).unwrap(), b"", "{wanted}");
+        }
     }
 
     #[test]

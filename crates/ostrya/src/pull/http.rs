@@ -221,7 +221,7 @@ use super::subpath::{Scope, Subpaths};
 use super::verify::{Defaults, Verification};
 use super::{
     DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats,
-    READ_CHUNK, TimestampCheck, apply_durability, check_ref_binding, refspec,
+    READ_CHUNK, TimestampCheck, apply_durability, check_depth, check_ref_binding, refspec,
 };
 
 /// How many fetches are in flight when the caller names no limit.
@@ -256,7 +256,9 @@ impl Repo {
     ///
     /// Every requested ref is resolved against the remote's summary and then
     /// against `refs/heads/<ref>`; a ref neither yields fails with
-    /// [`Error::RefNotFound`] before anything is fetched. An empty
+    /// [`Error::RefNotFound`] before anything is fetched. A
+    /// [`depth`](PullOptions::depth) below `-1` fails with
+    /// [`Error::InvalidInput`] before the first request. An empty
     /// [`refs`](PullOptions::refs) list takes every ref the summary lists under
     /// [`MIRROR`](PullFlags::MIRROR), and the remote's configured `branches`
     /// otherwise; neither being available fails with [`Error::Pull`].
@@ -273,6 +275,7 @@ impl Repo {
         // A subpath the walk cannot read is refused before anything else, so it
         // costs no request and opens no transaction.
         let subpaths = Subpaths::parse(&opts.subpaths)?;
+        check_depth(opts.depth)?;
         let counters = PullCounters::new(opts.progress.as_ref());
         // The fetcher is built first, so a remote the config does not describe
         // reports that before a policy is resolved for it. `remote_fetcher`

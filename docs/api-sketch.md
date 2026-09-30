@@ -119,6 +119,7 @@ pub enum Error {
     NoParentCommit(Checksum),
     InvalidFormat(String),
     Unsupported(String),
+    InvalidInput(String),              // an argument outside the accepted values
     LockTimeout { secs: i64 },
     ChecksumMismatch { expected: Checksum, actual: Checksum },
     InsufficientFreeSpace { shortfall: u64 },
@@ -149,7 +150,7 @@ The `io::ErrorKind` an error converts to:
   `RefNotFound`, `StaticDeltaNotFound`, `HttpStatus` with status 404.
 - `NotADirectory`: `NotADirectory`, `ReplaceFileWithDir`.
 - `AlreadyExists`: `EntryExists`, `MergeConflict`, `ReplaceDirWithFile`.
-- `InvalidInput`: `MutableTree`.
+- `InvalidInput`: `MutableTree`, `InvalidInput`.
 - `PermissionDenied`: `HttpStatus` with status 401 or 403.
 - `FileTooLarge`: `FetchTooLarge`, the same kind a body that outgrows the cap
   while streaming fails its read with.
@@ -2165,7 +2166,8 @@ pub struct PullOptions {
                                           // or the summary / `branches` remotely
     pub remote: Option<String>,           // refs/remotes/<remote>/<ref>
     pub flags: PullFlags,
-    pub depth: i32,                       // 0 = the commit alone, -1 = all
+    pub depth: i32,                       // 0 = the commit alone, -1 = all;
+                                          // below -1: InvalidInput, nothing written
     pub localcache_repos: Vec<Repo>,
     pub disable_fsync: bool,              // every sync off; never turns one on
     pub per_object_fsync: bool,           // sync each content object as staged
@@ -2518,7 +2520,9 @@ ssh, on the runtime backend that the `smol` or the `tokio` feature selects.
   `CommitReply` is the reply. Every other end of the session after
   `Commit`, and a `CommitReply` for other refs than the refs of the
   updates, is `Error::CommitOutcomeUnknown`, because the server may have
-  written the refs.
+  written the refs. Empty updates, a ref that `Hello` did not name, and a
+  ref named twice are `Error::InvalidInput`. On a broken session `commit`
+  returns `Error::InvalidInput`. In these cases `commit` writes nothing.
 - On a stream transport one call runs at a time. An overlapping call fails
   at once with `Error::InvalidInput`. A failed or dropped call leaves the
   session broken.
@@ -2615,7 +2619,8 @@ and the remote side runs `ostrya receive`.
 - On a session that `connect` opened, the read of a pending message after a
   failed write waits at most 5 seconds. `commit` and `abort` close the
   standard input of the ssh client and wait at most 5 seconds for it to
-  exit. `abort` also waits on a broken session. An open that fails waits in
+  exit. `commit` and `abort` also wait on a broken session, and `commit`
+  also waits when it refuses its updates. An open that fails waits in
   the same way. A session that failed
   with an I/O error while the ssh client exited with a failure status is
   `Error::Transport`. A session that committed gives its outcome whatever

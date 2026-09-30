@@ -58,6 +58,10 @@ pub enum Error {
     /// converts to this variant.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// An argument of the caller is outside the values the operation
+    /// accepts, for example a pull depth below -1.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     /// Acquiring the repository lock or the update lock timed out under
     /// contention. The message names the repository lock in both cases.
     #[error("timed out acquiring repository lock after {secs}s")]
@@ -414,7 +418,7 @@ impl From<Error> for std::io::Error {
             Error::EntryExists { .. } | Error::MergeConflict(_) | Error::ReplaceDirWithFile(_) => {
                 ErrorKind::AlreadyExists
             }
-            Error::MutableTree(_) => ErrorKind::InvalidInput,
+            Error::MutableTree(_) | Error::InvalidInput(_) => ErrorKind::InvalidInput,
             _ => ErrorKind::Other,
         };
         std::io::Error::new(kind, err)
@@ -486,6 +490,10 @@ mod tests {
             ),
             (
                 Error::MutableTree("bad name".into()),
+                ErrorKind::InvalidInput,
+            ),
+            (
+                Error::InvalidInput("depth -2 is below -1".into()),
                 ErrorKind::InvalidInput,
             ),
             (Error::SymlinkLoop { path: path() }, ErrorKind::Other),

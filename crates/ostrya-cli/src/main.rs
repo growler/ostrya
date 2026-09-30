@@ -1234,7 +1234,7 @@ struct PullArgs {
     #[arg(long)]
     mirror: bool,
     /// Parents of each pulled commit to follow: 0 for the commit alone, -1 for
-    /// the whole ancestry the remote holds.
+    /// the whole ancestry the remote holds. A value below -1 is refused.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     depth: i32,
     /// Fetch only the commit objects, leaving each commit marked partial.
@@ -1369,7 +1369,7 @@ struct PullLocalArgs {
     #[arg(long)]
     remote: Option<String>,
     /// Parents of each pulled commit to follow: 0 for the commit alone, -1 for
-    /// the whole ancestry the source holds.
+    /// the whole ancestry the source holds. A value below -1 is refused.
     #[arg(long, default_value_t = 0, allow_negative_numbers = true)]
     depth: i32,
     /// Import only the commit objects, leaving each commit marked partial.

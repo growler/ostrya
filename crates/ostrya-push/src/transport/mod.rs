@@ -72,12 +72,17 @@
 //!
 //! [`commit`](PushSession::commit) and [`abort`](PushSession::abort) close the
 //! standard input of the ssh client and then wait for it to exit, for at most
-//! the same time. An open that fails waits in the same way. When the session
+//! the same time, also when the stream is broken and when `commit` refuses
+//! its updates. An open that fails waits in the same way. When the session
 //! failed with an I/O error and the ssh client exited with a failure status,
 //! the call returns [`Error::Transport`] with the status. A session that
-//! committed returns its outcome, whatever the exit status. On every other
-//! failure, the session drops the child without a wait: the child reads end
-//! of file on its standard input and ends.
+//! committed returns its outcome, whatever the exit status.
+//!
+//! The session drops the child without a wait in three cases: the session
+//! is dropped without `commit` or `abort`, the future of `commit` or `abort`
+//! is dropped before it completes, and the ssh client does not exit within
+//! the limit. The standard input of the child is then closed, so the child
+//! reads end of file on it.
 //!
 //! # HTTP
 //!

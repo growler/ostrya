@@ -493,7 +493,9 @@ impl PushSession {
     ///
     /// Empty `updates`, a ref that `Hello` did not name, and a ref named
     /// twice are [`Error::InvalidInput`]. The call consumes the session and
-    /// sends nothing, so the server reads the end of the stream.
+    /// sends nothing, so the server reads the end of the stream. A call that
+    /// failed, or whose future was dropped, left the stream broken: the call
+    /// then sends nothing too, and returns [`Error::InvalidInput`].
     ///
     /// An `Error` from the server is returned as its error, and the server
     /// changed no ref. A `CommitReply` whose refs are not the refs of
@@ -506,31 +508,23 @@ impl PushSession {
     /// [`Error::CommitOutcomeUnknown`]: the server may have written the refs.
     ///
     /// A session that [`connect`](PushSession::connect) opened then waits a
-    /// bounded time for the ssh client to exit. A session that committed
+    /// bounded time for the ssh client to exit, also when the call refuses
+    /// `updates` and when the stream is broken. A session that committed
     /// returns its outcome whatever the exit status.
     pub async fn commit(self, updates: &[RefUpdate], force: bool) -> Result<PushOutcome> {
-        if updates.is_empty() {
-            return Err(invalid("a commit needs at least one ref update"));
-        }
-        let mut seen = HashSet::new();
-        for u in updates {
-            if !self.inner.server.refs.iter().any(|r| r.name == u.name) {
-                return Err(invalid(format!(
-                    "ref '{}' was not named when the session opened",
-                    u.name
-                )));
-            }
-            if !seen.insert(u.name.as_str()) {
-                return Err(invalid(format!("ref '{}' is updated twice", u.name)));
-            }
-        }
+        let checked = check_updates(&self.inner.server.refs, updates);
         let counters = Arc::clone(&self.inner.counters);
         let (stream, transport) = self.inner.into_parts();
-        let result = commit_on(stream?, updates, force, &counters).await;
-        match transport {
-            Some(transport) => transport.finish(result).await,
-            None => result,
-        }
+        let result = match (checked, stream) {
+            (Ok(()), Ok(stream)) => commit_on(stream, updates, force, &counters).await,
+            (Ok(()), Err(e)) => Err(e),
+            (Err(e), stream) => {
+                // The server reads the end of the stream.
+                drop(stream);
+                Err(e)
+            }
+        };
+        finish(transport, result).await
     }
 
     /// End the session. The server aborts its transaction.
@@ -555,10 +549,37 @@ impl PushSession {
             }
             Err(e) => Err(e),
         };
-        match transport {
-            Some(transport) => transport.finish(result).await,
-            None => result,
+        finish(transport, result).await
+    }
+}
+
+/// Refuse empty `updates`, a ref that is not in `refs`, and a ref named
+/// twice.
+fn check_updates(refs: &[RefState], updates: &[RefUpdate]) -> Result<()> {
+    if updates.is_empty() {
+        return Err(invalid("a commit needs at least one ref update"));
+    }
+    let mut seen = HashSet::new();
+    for u in updates {
+        if !refs.iter().any(|r| r.name == u.name) {
+            return Err(invalid(format!(
+                "ref '{}' was not named when the session opened",
+                u.name
+            )));
         }
+        if !seen.insert(u.name.as_str()) {
+            return Err(invalid(format!("ref '{}' is updated twice", u.name)));
+        }
+    }
+    Ok(())
+}
+
+/// End a session with `result`. A session with a transport waits for it to
+/// finish. The stream of the session must be closed or dropped first.
+async fn finish<T>(transport: Option<Transport>, result: Result<T>) -> Result<T> {
+    match transport {
+        Some(transport) => transport.finish(result).await,
+        None => result,
     }
 }
 

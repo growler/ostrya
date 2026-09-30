@@ -214,19 +214,34 @@ impl Repo {
     /// than one commit carries is [`Error::AmbiguousRefspec`] whatever
     /// `allow_noent` says, since neither is an absent name.
     pub async fn resolve_rev(&self, rev: &str, allow_noent: bool) -> Result<Option<Checksum>> {
+        Ok(self
+            .resolve_rev_kind(rev, allow_noent)
+            .await?
+            .map(|(checksum, _)| checksum))
+    }
+
+    /// [`resolve_rev`](Repo::resolve_rev), which also gives the kind of name
+    /// the base of `rev` resolved as: a full or an abbreviated checksum, or a
+    /// ref.
+    pub(crate) async fn resolve_rev_kind(
+        &self,
+        rev: &str,
+        allow_noent: bool,
+    ) -> Result<Option<(Checksum, RevKind)>> {
         let (base, generations) = split_ancestry(rev);
-        let Some(mut checksum) = self.resolve_base_rev(base, allow_noent).await? else {
+        let Some((mut checksum, kind)) = self.resolve_base_rev(base, allow_noent).await? else {
             return Ok(None);
         };
         for _ in 0..generations {
             let (commit, _) = self.load_commit(&checksum).await?;
             checksum = commit.parent.ok_or(Error::NoParentCommit(checksum))?;
         }
-        Ok(Some(checksum))
+        Ok(Some((checksum, kind)))
     }
 
     /// Resolve a revision with no ancestry suffix: a bare checksum, an
-    /// abbreviated checksum, or a refspec, tried in that order.
+    /// abbreviated checksum, or a refspec, tried in that order. The result
+    /// holds the kind the revision resolved as.
     ///
     /// A 64-character name is a checksum in lowercase hex alone, so an
     /// uppercase or mixed-case name of that length is read as a refspec
@@ -239,23 +254,27 @@ impl Repo {
     /// commit it prefixes rather than to that ref's target. A prefix no commit
     /// object carries falls through to the ref store, so a hex name is a ref
     /// name for as long as no commit begins with it.
-    async fn resolve_base_rev(&self, rev: &str, allow_noent: bool) -> Result<Option<Checksum>> {
+    async fn resolve_base_rev(
+        &self,
+        rev: &str,
+        allow_noent: bool,
+    ) -> Result<Option<(Checksum, RevKind)>> {
         if let Ok(checksum) = Checksum::from_hex_lower(rev) {
-            return Ok(Some(checksum));
+            return Ok(Some((checksum, RevKind::Checksum)));
         }
 
         if is_abbreviated_checksum(rev) {
             let repo = self.clone();
             let prefix = rev.to_owned();
             match ostrya_rt::unblock(move || match_abbreviated(repo.objects_fd(), &prefix)).await? {
-                AbbrevMatch::One(checksum) => return Ok(Some(checksum)),
+                AbbrevMatch::One(checksum) => return Ok(Some((checksum, RevKind::Checksum))),
                 AbbrevMatch::Ambiguous => return Err(Error::AmbiguousRefspec(rev.to_owned())),
                 AbbrevMatch::None => {}
             }
         }
 
         match self.resolve_ref_tip(rev).await? {
-            Some(checksum) => Ok(Some(checksum)),
+            Some(checksum) => Ok(Some((checksum, RevKind::Ref))),
             None if allow_noent => Ok(None),
             None => Err(Error::RefNotFound(rev.to_owned())),
         }
@@ -529,6 +548,15 @@ impl Repo {
         })
         .await
     }
+}
+
+/// The kind of name the base of a revision resolved as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevKind {
+    /// A full checksum, or an abbreviated checksum of a commit object.
+    Checksum,
+    /// A ref of the ref store.
+    Ref,
 }
 
 /// Split a revision string into its base and the number of trailing `^`

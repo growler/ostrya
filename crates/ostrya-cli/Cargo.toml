@@ -12,13 +12,15 @@ name = "ostrya"
 path = "src/main.rs"
 
 [features]
-default = ["smol", "spki", "gpg", "receive", "lzma-static"]
+default = ["smol", "spki", "gpg", "receive", "push", "lzma-static"]
 smol = ["ostrya/smol", "ostrya-rt/smol"]
 tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
 spki = ["ostrya/sign-spki"]
 gpg = ["ostrya/sign-gpg"]
 # `ostrya receive`, the server side of a push over ssh.
 receive = ["ostrya/receive"]
+# The client side of a push from a repository.
+push = ["ostrya/push"]
 # The shipped binary links xz statically, so it needs no runtime liblzma.
 lzma-static = ["ostrya/lzma-static"]
 

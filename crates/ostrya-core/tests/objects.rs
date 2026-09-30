@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use ostrya_core::{
-    Checksum, Commit, ContentHasher, DirMeta, DirMetaRef, DirTreeRef, FileHeader, Xattrs, filehdr,
+    Checksum, Commit, CommitLink, ContentHasher, DirMeta, DirMetaRef, DirTreeRef, FileHeader,
+    Xattrs, filehdr,
 };
 
 #[path = "../../../tests/support.rs"]
@@ -103,6 +104,21 @@ fn commit_objects_parse_reserialize_and_hash_to_their_names() {
         assert_eq!(commit.ref_bindings(), ["test/main"]);
         assert_eq!(commit.version(), None);
         assert_eq!(commit.collection_binding(), None);
+    }
+}
+
+#[test]
+fn commit_links_agree_with_the_full_parse() {
+    for (_, bytes) in objects("commit") {
+        let commit = Commit::parse(&bytes).unwrap();
+        assert_eq!(
+            Commit::parse_link(&bytes).unwrap(),
+            CommitLink {
+                parent: commit.parent,
+                root_dirtree: commit.root_dirtree,
+                root_dirmeta: commit.root_dirmeta,
+            }
+        );
     }
 }
 

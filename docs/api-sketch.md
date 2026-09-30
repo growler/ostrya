@@ -728,6 +728,15 @@ impl Commit {
     pub fn ref_bindings(&self) -> Vec<&str>;
     pub fn collection_binding(&self) -> Option<&str>;
     pub fn content_checksum(&self) -> Checksum;   // sha256(dirtree||dirmeta)
+    /// The parent and the root checksums alone, with the checks of `parse`
+    /// for those fields. The metadata, subject, and body are not parsed.
+    pub fn parse_link(data: &[u8]) -> Result<CommitLink>;
+}
+
+pub struct CommitLink {
+    pub parent: Option<Checksum>,
+    pub root_dirtree: Checksum,
+    pub root_dirmeta: Checksum,
 }
 
 pub struct DirMeta { pub uid: u32, pub gid: u32, pub mode: u32, pub xattrs: Xattrs }
@@ -2513,6 +2522,9 @@ ssh, on the runtime backend that the `smol` or the `tokio` feature selects.
 - On a stream transport one call runs at a time. An overlapping call fails
   at once with `Error::InvalidInput`. A failed or dropped call leaves the
   session broken.
+- `abort` writes `Abort` and closes the output when the stream is still
+  usable. On a broken session it writes nothing and returns
+  `Error::InvalidInput`.
 
 ```rust
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -2603,7 +2615,8 @@ and the remote side runs `ostrya receive`.
 - On a session that `connect` opened, the read of a pending message after a
   failed write waits at most 5 seconds. `commit` and `abort` close the
   standard input of the ssh client and wait at most 5 seconds for it to
-  exit. An open that fails waits in the same way. A session that failed
+  exit. `abort` also waits on a broken session. An open that fails waits in
+  the same way. A session that failed
   with an I/O error while the ssh client exited with a failure status is
   `Error::Transport`. A session that committed gives its outcome whatever
   the exit status. `over_stream` puts no time limit on a read: its caller
@@ -2646,6 +2659,157 @@ standard output with `ReceivePolicy::from_config`, or with
 `ReceivePolicy::from_file` under `--policy`. It writes one
 `warning: STEP: MESSAGE` line to standard error for each warning of the
 report, and the error line on failure. It exits 0 after a committed session.
+
+## Push remotes
+
+A remote section of the repository config can hold the push keys
+`push-url`, `ssh-command`, and `receive-command`. `Remote` reads each one as
+written, in every build.
+
+`resolve_push_remote`, under the `push` feature, gives the push address and
+the connect options of a push:
+
+- A value that holds a `:` or a `/` is an address, which
+  `PushRemote::parse` reads. No configuration is read for it.
+- Any other value is the name of a remote section. The address is its
+  `push-url`. When `push-url` is absent, a `url` that starts with `http://`
+  or `https://` is the address. A `url` of another form, for example
+  `file://`, `metalink=`, or `mirrorlist=`, is no push address.
+- `ssh-command` fills `ConnectOptions::remote_ssh_command`, and
+  `receive-command` fills `ConnectOptions::receive_command`, each only when
+  the caller left that field `None`. A field that the caller set wins.
+- A name with no section, and a section with no push address, are
+  `Error::Push` with `push::Error::InvalidInput`. A `config` of `None` holds
+  no section. So a caller that has no repository must give an address.
+
+```rust
+impl Remote<'_> {
+    pub fn push_url(&self) -> Result<Option<String>>;
+    pub fn ssh_command(&self) -> Result<Option<String>>;
+    pub fn receive_command(&self) -> Result<Option<String>>;
+}
+
+pub fn resolve_push_remote(config: Option<&RepoConfig>, remote: &str,
+                           connect: ConnectOptions)
+    -> Result<(PushRemote, ConnectOptions)>;
+```
+
+## Push from a repository
+
+`Repo::push`, under the `push` feature, pushes the commits that a set of
+refspecs name to a remote. The server updates its refs in one transaction.
+`remote` is a remote name or an address, and
+`resolve_push_remote` reads it with the config of the repository and
+`RepoPushOptions::connect`. The push then opens a session with
+`PushSession::connect`. `Repo::push_over_stream` runs the same push over a
+pair of byte streams, the mirror of `PushSession::over_stream`, and does not
+read `connect`. Under the tokio backend, `Repo::push` needs a runtime with
+the IO driver and the time driver, as `PushSession::connect` does.
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub struct RepoPushOptions {
+    pub refspecs: Vec<String>,     // SRC[:DST], split at the last ':'
+    pub depth: Option<i32>,        // None: the chain to the server tip
+    pub compression: Compression,
+    pub force: bool,
+    pub connect: ConnectOptions,
+    pub detached_metadata_filter: DetachedMetadataFilter,
+    pub progress: Option<PushProgress>,
+}
+
+impl Repo {
+    pub async fn push(&self, remote: &str, opts: RepoPushOptions)
+        -> Result<PushOutcome>;
+
+    pub async fn push_over_stream<R, W>(&self, input: R, output: W,
+                                        opts: RepoPushOptions)
+        -> Result<PushOutcome>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static;
+}
+```
+
+The struct carries no `#[non_exhaustive]`, and a caller builds it with
+`..Default::default()`. `RepoPushOptions` is re-exported at the crate root.
+
+The push holds the lock of the local repository shared from the start of the
+call to its end. A prune of the local repository takes the lock exclusive, so
+it waits for the push, and it fails with `Error::LockTimeout` after
+`[core] lock-timeout-secs`.
+
+Before it writes a byte, the push refuses:
+
+- a `depth` below `-1`, as `Error::Push` with `InvalidInput`;
+- an empty list of refspecs, an empty refspec, `:`, an empty `DST`, and a
+  `DST` that two refspecs name, as `Error::Push` with `InvalidInput`;
+- a checksum `SRC` and a `SRC` with a `^` suffix, each with no `DST`, as
+  `Error::Push` with `InvalidInput`;
+- a `DST` that `validate_refspec` refuses or that holds a `^`, as
+  `Error::InvalidRefspec` with the `DST`;
+- a `SRC` that does not resolve, with the error of `Repo::resolve_rev`;
+- a source commit that the local repository marks partial, as `Error::Push`
+  with `InvalidInput`;
+- a source commit whose `ostree.ref-binding` is a list that does not hold its
+  `DST`, as `Error::Push` with `BindingMismatch`. The message names the
+  binding. A commit with no binding, or with an empty list, passes, as on the
+  server.
+
+The push reads commit objects alone before it opens the session:
+
+- `depth` `None` (the default): the parent chain of each source commit to the
+  root.
+- `Some(0)`: each source commit alone. `Some(n)`: `n` parents more.
+  `Some(-1)`: the whole chain.
+- Each chain stops at the first commit that the local repository does not
+  hold. It also stops at the first commit that the local repository marks
+  partial. With `Some(n)`, the chain stops before that commit. With `None`,
+  that commit is the last commit of the chain, so the cut can find the
+  server tip there. The push does not walk the tree of a partial commit.
+- The push reads each commit once, also when two chains share it.
+
+The session opens with the `DST` of each refspec, in the order of the
+refspecs. After `HelloReply`:
+
+1. The push checks the `ostree.collection-binding` of each source commit.
+   When the server has a collection id and a binding differs from it, the
+   push sends no object. It ends the session with `Abort` and fails with
+   `Error::Push` with `BindingMismatch`.
+2. With `depth` `None`, the push cuts each chain at the server tip of its
+   `DST`, the tip excluded. A chain that does not hold the tip keeps the
+   source commit alone. This occurs when the server does not hold the
+   `DST`. It also occurs when an absent or a partial commit stands between
+   the source commit and the tip. When the tip is the partial commit that
+   ends the chain, the cut is a normal cut. The server decides whether the
+   update is a fast-forward. With `Some(n)`, the chains stay as the push
+   read them.
+3. The first `Have` round offers the commits: each source commit and each
+   commit of the chains, each once.
+4. The push walks the tree of each source commit, also when the server holds
+   that commit. The server checks the tree of each commit of the session.
+   The push also walks the tree of each history commit that the server
+   lacks. It does not walk the tree of a history commit that the server
+   holds. Each dirtree is walked once, and the walk loads up to 8 dirtrees
+   at the same time. A dirtree or a dirmeta that the local repository lacks
+   ends the session with `Abort`, and the push fails with
+   `Error::ObjectNotFound`.
+5. The second `Have` round offers the objects of those trees.
+6. The push sends the commits and the tree objects that the server lacks.
+   It sends the detached metadata of each commit that it sends, after
+   `detached_metadata_filter`. It also sends the detached metadata of each
+   source commit that the server holds. It sends no
+   detached metadata for a history commit that the server holds.
+7. Each ref update expects the state of `HelloReply`: `Commit(tip)`, or
+   `Absent` when the server does not hold the ref. With `force`, each update
+   expects `Any`, and `Commit` carries `force`. `:DST` is an update with no
+   new commit.
+
+A push whose refspecs are all deletes runs no `Have` round and sends no
+object. A failure of the push after the session opened and before `Commit`
+ends the session and returns that failure. The push writes `Abort` when the
+stream is still usable. A refusal of the server is `Error::Push` with the error of the server. `opts.progress` goes to
+the session, so its counters show the push while it runs.
 
 ## Static deltas
 

@@ -1247,7 +1247,9 @@ Created with `[core]` `repo_version=1`, `mode=<mode>`, optional
 `collection-id`, `sign-verify`, `sign-verify-summary` (both default off),
 `verification-<engine>-key` / `verification-<engine>-file`. What the
 verification keys select, and how each value is spelled, is in "Signature
-verification during a pull".
+verification during a pull". A remote section can also hold the push keys of
+the port, `push-url`, `ssh-command`, and `receive-command` (see "Port
+extension: the push keys of a remote").
 
 Parsing rules, recovered by feeding crafted config files to the tool, reading
 back with `ostree config get` and commands that consume config, and inspecting
@@ -1764,6 +1766,47 @@ secret-key-file=/nonexistent/central.ed25519.key
   read with `config --group=GROUP get KEY`.
 - A group name with a control character fails the whole file with
   `Invalid group name: <name>`.
+
+## Port extension: the push keys of a remote
+
+A `[remote "NAME"]` section can hold three keys that a push of the port reads.
+The `ostree` tool defines none of them and reads none.
+
+- `push-url` -- the push address: `ssh://[USER@]HOST[:PORT]/PATH`, the scp
+  form `[USER@]HOST:PATH`, or an `http://` or `https://` URL. When the key is
+  absent, a `url` that starts with `http://` or `https://` is the push address.
+  A `url` of another form, for example `file://`, `metalink=`, or
+  `mirrorlist=`, is no push address. Without `push-url`, a push to such a
+  remote fails.
+- `ssh-command` -- the ssh command line of a push. The push splits it at ASCII
+  whitespace, with no quoting rule. The `OSTRYA_SSH_COMMAND` environment
+  variable and the ssh command of the push options have precedence over it.
+- `receive-command` -- the command that the remote side runs. The remote shell
+  parses it. The default is `ostrya receive`. The receive command of the push
+  options has precedence over it.
+
+The push reads the three keys as strings, as written. The tool reads `url` to
+pull, so an `ssh://` address stands in `push-url` alone.
+
+The keys carry no repository fact. The tool tolerates them. Observed with
+`ostree` 2026.1 against an archive repository whose `[remote "origin"]`
+section holds `url=https://example.com/repo` and these three lines:
+
+```
+push-url=ssh://user@host/srv/repo
+ssh-command=ssh -o BatchMode=yes
+receive-command=/usr/local/bin/ostrya receive
+```
+
+- `ostree remote list -u` prints `origin  https://example.com/repo` and exits
+  0.
+- `ostree remote show-url origin` prints `https://example.com/repo` and exits
+  0.
+- `ostree config get 'remote "origin".push-url'`, and `config
+  --group='remote "origin"' get` of `ssh-command` and of `receive-command`,
+  print each value as written and exit 0.
+- `ostree config set core.fsync true` rewrites `config` and keeps the three
+  keys in order.
 
 ## Commit modifier: canonical permissions, consume, and devino
 

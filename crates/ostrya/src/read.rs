@@ -62,18 +62,24 @@ impl Repo {
     /// Load the raw serialized bytes of a metadata object. Views borrow this
     /// buffer. Intended for metadata objects, whose size the format caps.
     pub async fn load_object_bytes(&self, ty: ObjectType, checksum: &Checksum) -> Result<Vec<u8>> {
-        let path = loose_path(checksum, ty, self.mode());
         let repo = self.clone();
         let key = *checksum;
-        let res = ostrya_rt::unblock(move || {
-            object::read_meta_object(repo.objects_fd(), &path, MAX_METADATA_SIZE)
-        })
-        .await;
-        match res {
+        ostrya_rt::unblock(move || repo.load_object_bytes_blocking(ty, &key)).await
+    }
+
+    /// [`load_object_bytes`](Repo::load_object_bytes) on the calling thread.
+    pub(crate) fn load_object_bytes_blocking(
+        &self,
+        ty: ObjectType,
+        checksum: &Checksum,
+    ) -> Result<Vec<u8>> {
+        let path = loose_path(checksum, ty, self.mode());
+        match object::read_meta_object(self.objects_fd(), &path, MAX_METADATA_SIZE) {
             Ok(bytes) => Ok(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::ObjectNotFound { checksum: key, ty })
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::ObjectNotFound {
+                checksum: *checksum,
+                ty,
+            }),
             Err(e) => Err(Error::Io(e)),
         }
     }
@@ -229,11 +235,15 @@ impl Repo {
     /// when a `.commitpartial` marker is present, else
     /// [`Normal`](CommitState::Normal).
     pub async fn commit_state(&self, checksum: &Checksum) -> Result<CommitState> {
-        let path = crate::pull::partial_path(checksum);
         let repo = self.clone();
-        let partial =
-            ostrya_rt::unblock(move || object::object_exists(repo.repo_fd(), &path)).await?;
-        Ok(if partial {
+        let key = *checksum;
+        ostrya_rt::unblock(move || repo.commit_state_blocking(&key)).await
+    }
+
+    /// [`commit_state`](Repo::commit_state) on the calling thread.
+    pub(crate) fn commit_state_blocking(&self, checksum: &Checksum) -> Result<CommitState> {
+        let path = crate::pull::partial_path(checksum);
+        Ok(if object::object_exists(self.repo_fd(), &path)? {
             CommitState::Partial
         } else {
             CommitState::Normal

@@ -73,6 +73,22 @@ enum ReaderSource {
     Archive { payload_offset: u64 },
 }
 
+impl ReaderSource {
+    /// The reader over `file`, an object file positioned at its payload. An
+    /// archive payload is inflated. A source with no payload, or no `file`,
+    /// gives a reader that yields no bytes.
+    fn reader_over(&self, file: Option<RtFile>) -> ContentReader {
+        let inner = match (self, file) {
+            (ReaderSource::Plain, Some(file)) => ContentReaderInner::Plain(file),
+            (ReaderSource::Archive { .. }, Some(file)) => {
+                ContentReaderInner::Inflate(Box::new(archive_decoder(file)))
+            }
+            _ => ContentReaderInner::Empty,
+        };
+        ContentReader { inner }
+    }
+}
+
 /// Where a file object's bytes live, so [`FileObject::reader`] can open a fresh
 /// stream on demand from either the repository's `objects/` or a transaction's
 /// staging directory.
@@ -154,15 +170,14 @@ impl FileObject {
     /// Open an async reader over the file's payload, streaming it in bounded
     /// chunks. A symlink has no payload, so its reader yields no bytes.
     pub async fn reader(&self) -> Result<ContentReader> {
-        let inner = match &self.source {
-            ReaderSource::None => ContentReaderInner::Empty,
-            ReaderSource::Plain => ContentReaderInner::Plain(self.open_payload(0).await?),
+        let file = match &self.source {
+            ReaderSource::None => None,
+            ReaderSource::Plain => Some(self.open_payload(0).await?),
             ReaderSource::Archive { payload_offset } => {
-                let file = self.open_payload(*payload_offset).await?;
-                ContentReaderInner::Inflate(Box::new(archive_decoder(file)))
+                Some(self.open_payload(*payload_offset).await?)
             }
         };
-        Ok(ContentReader { inner })
+        Ok(self.source.reader_over(file))
     }
 
     /// Stream the file's payload into `writer` in bounded chunks, buffering no
@@ -242,9 +257,10 @@ impl Repo {
         let path = loose_path(checksum, ObjectType::File, mode);
         let repo = self.clone();
         let key = *checksum;
-        let loaded =
-            ostrya_rt::unblock(move || load_by_mode(repo.objects_fd(), &path, &key, mode, measure))
-                .await?;
+        let loaded = ostrya_rt::unblock(move || {
+            load_by_mode(repo.objects_fd(), &path, &key, mode, measure, false)
+        })
+        .await?;
         Ok(FileObject {
             repo: self.clone(),
             checksum: *checksum,
@@ -257,6 +273,38 @@ impl Repo {
             store: ObjectStore::Repo,
             kernel_verity: loaded.kernel_verity,
         })
+    }
+
+    /// [`Repo::load_file`], and a reader over the payload of the object. The
+    /// reader is the one [`FileObject::reader`] gives. It streams from the
+    /// descriptor the load opened, so the object is opened once.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    pub(crate) async fn open_file(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<(FileObject, ContentReader)> {
+        let mode = self.mode();
+        let path = loose_path(checksum, ObjectType::File, mode);
+        let repo = self.clone();
+        let key = *checksum;
+        let loaded = ostrya_rt::unblock(move || {
+            load_by_mode(repo.objects_fd(), &path, &key, mode, false, true)
+        })
+        .await?;
+        let reader = loaded.source.reader_over(loaded.payload.map(RtFile::from));
+        let file = FileObject {
+            repo: self.clone(),
+            checksum: *checksum,
+            uid: loaded.uid,
+            gid: loaded.gid,
+            mode: loaded.mode,
+            xattrs: loaded.xattrs,
+            kind: loaded.kind,
+            source: loaded.source,
+            store: ObjectStore::Repo,
+            kernel_verity: loaded.kernel_verity,
+        };
+        Ok((file, reader))
     }
 }
 
@@ -277,9 +325,10 @@ pub(crate) async fn load_staged_file(
     let key = *checksum;
     let load_dir = dir.clone();
     let load_name = name.clone();
-    let loaded =
-        ostrya_rt::unblock(move || load_by_mode(load_dir.as_fd(), &load_name, &key, mode, measure))
-            .await?;
+    let loaded = ostrya_rt::unblock(move || {
+        load_by_mode(load_dir.as_fd(), &load_name, &key, mode, measure, false)
+    })
+    .await?;
     Ok(FileObject {
         repo: repo.clone(),
         checksum: *checksum,
@@ -303,27 +352,35 @@ struct Loaded {
     kind: FileKind,
     source: ReaderSource,
     kernel_verity: Option<[u8; 32]>,
+    /// The object file of a regular file, positioned at its payload, when the
+    /// load keeps it.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    payload: Option<std::fs::File>,
 }
 
 /// Dispatch to the loader for the repository mode. `object_path` locates the
 /// object relative to `dir_fd`: a loose path under `objects/`, or a flat name in
 /// a staging directory. `measure` asks a raw-payload loader for the kernel's
-/// fs-verity digest; an `archive` object never has one.
+/// fs-verity digest; an `archive` object never has one. `keep` asks the loader
+/// of a regular file to keep its object file open at the payload.
 fn load_by_mode(
     dir_fd: BorrowedFd<'_>,
     object_path: &str,
     checksum: &Checksum,
     mode: RepoMode,
     measure: bool,
+    keep: bool,
 ) -> Result<Loaded> {
     match mode {
-        RepoMode::Archive => load_archive(dir_fd, object_path, checksum),
+        RepoMode::Archive => load_archive(dir_fd, object_path, checksum, keep),
         RepoMode::BareUser | RepoMode::BareUserShared => {
-            load_bare_user(dir_fd, object_path, checksum, measure)
+            load_bare_user(dir_fd, object_path, checksum, measure, keep)
         }
-        RepoMode::Bare => load_bare(dir_fd, object_path, checksum, measure),
-        RepoMode::BareUserOnly => load_bare_user_only(dir_fd, object_path, checksum, measure),
-        RepoMode::BareSplitXattrs => load_bare_split_xattrs(dir_fd, object_path, checksum, measure),
+        RepoMode::Bare => load_bare(dir_fd, object_path, checksum, measure, keep),
+        RepoMode::BareUserOnly => load_bare_user_only(dir_fd, object_path, checksum, measure, keep),
+        RepoMode::BareSplitXattrs => {
+            load_bare_split_xattrs(dir_fd, object_path, checksum, measure, keep)
+        }
     }
 }
 
@@ -348,6 +405,37 @@ fn open_object(objects_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> R
         Mode::empty(),
     )
     .map_err(|e| map_object_error(e, checksum, ObjectType::File))
+}
+
+/// Open a regular-file object without following a symlink, mapping a missing
+/// object to `ObjectNotFound`.
+fn open_regular(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<OwnedFd> {
+    rustix::fs::openat(
+        dir_fd,
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| map_object_error(e, checksum, ObjectType::File))
+}
+
+/// The fs-verity digest of the regular-file object at `path`, as
+/// [`sealed_digest`] reads it, and the object file when `keep` is set. A kept
+/// file is opened once, and the digest is read on it.
+fn open_sealed_regular(
+    dir_fd: BorrowedFd<'_>,
+    path: &str,
+    checksum: &Checksum,
+    size: u64,
+    probe: bool,
+    keep: bool,
+) -> Result<(Option<[u8; 32]>, Option<std::fs::File>)> {
+    if !keep {
+        return Ok((sealed_digest_at(dir_fd, path, size, probe), None));
+    }
+    let fd = open_regular(dir_fd, path, checksum)?;
+    let digest = sealed_digest(fd.as_fd(), size, probe);
+    Ok((digest, Some(std::fs::File::from(fd))))
 }
 
 /// The `statx` fields the loaders read: the file type, mode, owner, and size.
@@ -438,7 +526,12 @@ fn symlink_target_from_content(content: &[u8]) -> Result<String> {
         .map_err(|_| Error::InvalidFormat("symlink target is not valid UTF-8".into()))
 }
 
-fn load_archive(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<Loaded> {
+fn load_archive(
+    dir_fd: BorrowedFd<'_>,
+    path: &str,
+    checksum: &Checksum,
+    keep: bool,
+) -> Result<Loaded> {
     use std::io::Read;
 
     let fd = open_object(dir_fd, path, checksum)?;
@@ -461,12 +554,15 @@ fn load_archive(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Resu
     file.read_exact(&mut header_bytes)?;
     let (header, uncompressed_size) = FileHeader::parse_archive(&header_bytes)?;
 
-    let (kind, source) = if header.is_symlink() {
+    // The reads above stop at the end of the header, so the file is
+    // positioned at the payload.
+    let (kind, source, payload) = if header.is_symlink() {
         (
             FileKind::Symlink {
                 target: header.symlink_target,
             },
             ReaderSource::None,
+            None,
         )
     } else {
         (
@@ -476,6 +572,7 @@ fn load_archive(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Resu
             ReaderSource::Archive {
                 payload_offset: 8 + header_len,
             },
+            keep.then_some(file),
         )
     };
     Ok(Loaded {
@@ -486,6 +583,7 @@ fn load_archive(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Resu
         kind,
         source,
         kernel_verity: None,
+        payload,
     })
 }
 
@@ -494,6 +592,7 @@ fn load_bare_user(
     path: &str,
     checksum: &Checksum,
     measure: bool,
+    keep: bool,
 ) -> Result<Loaded> {
     use std::io::Read;
 
@@ -506,7 +605,7 @@ fn load_bare_user(
     let header = FileHeader::parse_stat_metadata(&meta)?;
     let stat = rustix::fs::statx(&fd, "", AtFlags::EMPTY_PATH, StatxFlags::SIZE)?;
 
-    let (kind, source, kernel_verity) = if header.is_symlink() {
+    let (kind, source, kernel_verity, payload) = if header.is_symlink() {
         let mut content = Vec::new();
         std::fs::File::from(fd)
             .take(SYMLINK_READ_CAP)
@@ -517,6 +616,7 @@ fn load_bare_user(
             },
             ReaderSource::None,
             None,
+            None,
         )
     } else {
         let size = stat.stx_size;
@@ -525,6 +625,7 @@ fn load_bare_user(
             FileKind::Regular { size },
             ReaderSource::Plain,
             kernel_verity,
+            keep.then(|| std::fs::File::from(fd)),
         )
     };
     Ok(Loaded {
@@ -535,6 +636,7 @@ fn load_bare_user(
         kind,
         source,
         kernel_verity,
+        payload,
     })
 }
 
@@ -543,6 +645,7 @@ fn load_bare(
     path: &str,
     checksum: &Checksum,
     measure: bool,
+    keep: bool,
 ) -> Result<Loaded> {
     let stat = stat_object(dir_fd, path, checksum, ObjectType::File)?;
     let uid = stat.stx_uid;
@@ -560,15 +663,10 @@ fn load_bare(
             },
             source: ReaderSource::None,
             kernel_verity: None,
+            payload: None,
         }),
         FileType::RegularFile => {
-            let fd = rustix::fs::openat(
-                dir_fd,
-                path,
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|e| map_object_error(e, checksum, ObjectType::File))?;
+            let fd = open_regular(dir_fd, path, checksum)?;
             let xattrs = object::read_all_xattrs(fd.as_fd())?;
             let size = stat.stx_size;
             Ok(Loaded {
@@ -579,6 +677,7 @@ fn load_bare(
                 kind: FileKind::Regular { size },
                 source: ReaderSource::Plain,
                 kernel_verity: sealed_digest(fd.as_fd(), size, measure && is_sealed(&stat)),
+                payload: keep.then(|| std::fs::File::from(fd)),
             })
         }
         _ => Err(Error::InvalidFormat(
@@ -592,6 +691,7 @@ fn load_bare_user_only(
     path: &str,
     checksum: &Checksum,
     measure: bool,
+    keep: bool,
 ) -> Result<Loaded> {
     let stat = stat_object(dir_fd, path, checksum, ObjectType::File)?;
     // uid/gid are discarded in this mode and read back as 0; the mode is the
@@ -608,23 +708,30 @@ fn load_bare_user_only(
             },
             source: ReaderSource::None,
             kernel_verity: None,
+            payload: None,
         }),
-        FileType::RegularFile => Ok(Loaded {
-            uid: 0,
-            gid: 0,
-            mode,
-            xattrs: Xattrs::empty(),
-            kind: FileKind::Regular {
-                size: stat.stx_size,
-            },
-            source: ReaderSource::Plain,
-            kernel_verity: sealed_digest_at(
+        FileType::RegularFile => {
+            let (kernel_verity, payload) = open_sealed_regular(
                 dir_fd,
                 path,
+                checksum,
                 stat.stx_size,
                 measure && is_sealed(&stat),
-            ),
-        }),
+                keep,
+            )?;
+            Ok(Loaded {
+                uid: 0,
+                gid: 0,
+                mode,
+                xattrs: Xattrs::empty(),
+                kind: FileKind::Regular {
+                    size: stat.stx_size,
+                },
+                source: ReaderSource::Plain,
+                kernel_verity,
+                payload,
+            })
+        }
         _ => Err(Error::InvalidFormat(
             "bare-user-only object is neither a regular file nor a symlink".into(),
         )),
@@ -636,6 +743,7 @@ fn load_bare_split_xattrs(
     path: &str,
     checksum: &Checksum,
     measure: bool,
+    keep: bool,
 ) -> Result<Loaded> {
     // Storage is bare: the inode carries the logical uid/gid/mode, a regular
     // file holds the raw payload, and a symlink is a real symlink. The inode
@@ -661,23 +769,30 @@ fn load_bare_split_xattrs(
             },
             source: ReaderSource::None,
             kernel_verity: None,
+            payload: None,
         }),
-        FileType::RegularFile => Ok(Loaded {
-            uid,
-            gid,
-            mode,
-            xattrs,
-            kind: FileKind::Regular {
-                size: stat.stx_size,
-            },
-            source: ReaderSource::Plain,
-            kernel_verity: sealed_digest_at(
+        FileType::RegularFile => {
+            let (kernel_verity, payload) = open_sealed_regular(
                 dir_fd,
                 path,
+                checksum,
                 stat.stx_size,
                 measure && is_sealed(&stat),
-            ),
-        }),
+                keep,
+            )?;
+            Ok(Loaded {
+                uid,
+                gid,
+                mode,
+                xattrs,
+                kind: FileKind::Regular {
+                    size: stat.stx_size,
+                },
+                source: ReaderSource::Plain,
+                kernel_verity,
+                payload,
+            })
+        }
         _ => Err(Error::InvalidFormat(
             "bare-split-xattrs object is neither a regular file nor a symlink".into(),
         )),

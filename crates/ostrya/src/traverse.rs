@@ -597,6 +597,83 @@ impl Repo {
         Ok(())
     }
 
+    /// Collect the names of one tree: the root dirmeta, the root dirtree, and
+    /// every dirtree, dirmeta, and file object they reach.
+    ///
+    /// A name that `seen` holds is skipped, and so is the subtree below a
+    /// dirtree that `seen` holds, so several trees share one walk. Each new
+    /// name goes into `seen` and onto the end of `out`.
+    ///
+    /// The walk is strict: a dirtree or a dirmeta that the repository does
+    /// not hold is [`Error::ObjectNotFound`]. A file object is not looked up.
+    ///
+    /// The walk loads up to [`STRICT_TREE_LOADS`] dirtrees at the same time.
+    /// It takes them from its stack in order, and it reads their entries in
+    /// the same order. So the order of `out` does not depend on the loads.
+    #[cfg(feature = "push")]
+    pub(crate) async fn collect_tree_strict(
+        &self,
+        root_dirtree: Checksum,
+        root_dirmeta: Checksum,
+        seen: &mut HashSet<ObjectName>,
+        out: &mut Vec<ObjectName>,
+    ) -> Result<()> {
+        self.collect_dirmeta_strict(root_dirmeta, seen, out).await?;
+        let mut stack = vec![root_dirtree];
+        let mut batch = Vec::with_capacity(STRICT_TREE_LOADS);
+        while !stack.is_empty() {
+            batch.clear();
+            while batch.len() < STRICT_TREE_LOADS
+                && let Some(dirtree_checksum) = stack.pop()
+            {
+                let name = ObjectName::new(dirtree_checksum, ObjectType::DirTree);
+                if seen.insert(name) {
+                    out.push(name);
+                    batch.push(dirtree_checksum);
+                }
+            }
+            let dirtrees = join_all(batch.iter().map(|c| self.load_dirtree(c))).await;
+            for dirtree in dirtrees {
+                let dirtree = dirtree?;
+                for (_, file_checksum) in dirtree.files {
+                    let name = ObjectName::new(file_checksum, ObjectType::File);
+                    if seen.insert(name) {
+                        out.push(name);
+                    }
+                }
+                for (_, subtree, submeta) in dirtree.dirs {
+                    self.collect_dirmeta_strict(submeta, seen, out).await?;
+                    stack.push(subtree);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Add the dirmeta `checksum` to `seen` and `out` when `seen` does not
+    /// hold it. A dirmeta that the repository does not hold is
+    /// [`Error::ObjectNotFound`].
+    #[cfg(feature = "push")]
+    async fn collect_dirmeta_strict(
+        &self,
+        checksum: Checksum,
+        seen: &mut HashSet<ObjectName>,
+        out: &mut Vec<ObjectName>,
+    ) -> Result<()> {
+        let name = ObjectName::new(checksum, ObjectType::DirMeta);
+        if !seen.insert(name) {
+            return Ok(());
+        }
+        if !self.has_object(ObjectType::DirMeta, &checksum).await? {
+            return Err(Error::ObjectNotFound {
+                checksum,
+                ty: ObjectType::DirMeta,
+            });
+        }
+        out.push(name);
+        Ok(())
+    }
+
     /// Push every commit the configured metadata keys name onto the walk.
     ///
     /// Each key is read from `metadata`, the commit's own, and then from its
@@ -697,6 +774,44 @@ impl Repo {
 /// The value is the variant an `a{sv}` entry holds. It has to carry an `aay`
 /// whose every element is a 32-byte commit checksum; anything else is an
 /// [`Error::InvalidGcRoot`] naming the commit the value came from.
+/// The most dirtrees that [`Repo::collect_tree_strict`] loads at the same
+/// time. Each load holds one dirtree object, which the format caps in size,
+/// so the loads hold at most this many objects in memory.
+#[cfg(feature = "push")]
+const STRICT_TREE_LOADS: usize = 8;
+
+/// Run `futures` at the same time, and give their outputs in the order of
+/// `futures`.
+#[cfg(feature = "push")]
+async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Output> {
+    let mut futures: Vec<_> = futures.into_iter().map(|f| Some(Box::pin(f))).collect();
+    let mut outputs: Vec<Option<F::Output>> = futures.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, output) in futures.iter_mut().zip(outputs.iter_mut()) {
+            if let Some(running) = future {
+                match running.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => {
+                        *output = Some(value);
+                        *future = None;
+                    }
+                    std::task::Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    outputs
+        .into_iter()
+        .map(|output| output.expect("each future is ready"))
+        .collect()
+}
+
 fn metadata_key_targets(commit: &Checksum, key: &str, value: &Value) -> Result<Vec<Checksum>> {
     let invalid = |reason: String| Error::InvalidGcRoot {
         commit: *commit,

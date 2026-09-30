@@ -1,6 +1,6 @@
-//! `PushSession::connect` over a stand-in ssh client that runs the built
-//! `ostrya receive` locally, the way the remote shell of ssh runs the
-//! remote command.
+//! `PushSession::connect` and `Repo::push` over a stand-in ssh client that
+//! runs the built `ostrya receive` locally, the way the remote shell of ssh
+//! runs the remote command.
 
 #![cfg(feature = "receive")]
 
@@ -421,4 +421,101 @@ fn receive_refuses_a_policy_file_it_cannot_read() {
     assert!(out.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("absent"), "{stderr}");
+}
+
+/// `Repo::push` to a remote of the local config, over the stand-in.
+#[cfg(feature = "push")]
+mod repo_push {
+    use super::*;
+    use ostrya::{PullOptions, RepoPushOptions};
+
+    /// A local repository that holds the fixture commit on its branch, with
+    /// the remote `origin` whose `push-url` names `dest` and whose
+    /// `receive-command` runs the built `ostrya receive`.
+    fn client(base: &TmpDir, dest: &Path) -> Repo {
+        let path = base.0.join("client");
+        block_on(async {
+            let repo = Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            let fixture = Repo::open(&fixture()).await.unwrap();
+            repo.pull_local(
+                &fixture,
+                PullOptions {
+                    refs: vec![BRANCH.to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let config = path.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "\n[remote \"origin\"]\npush-url=ssh://localhost{}\nreceive-command={} -v receive\n",
+            dest.display(),
+            quote(env!("CARGO_BIN_EXE_ostrya")),
+        ));
+        std::fs::write(&config, text).unwrap();
+        block_on(Repo::open(&path)).unwrap()
+    }
+
+    /// The options of a push of `refspecs`, with the stand-in as the ssh
+    /// command and the receive command left to the remote section.
+    fn push_opts(status: &Path, refspecs: &[&str]) -> RepoPushOptions {
+        RepoPushOptions {
+            refspecs: refspecs.iter().map(|s| (*s).to_owned()).collect(),
+            compression: Compression::Deflate { level: 6 },
+            connect: ConnectOptions {
+                receive_command: None,
+                ..options(status, None)
+            },
+            ..RepoPushOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_push_to_a_configured_remote_writes_the_ref() {
+        let base = TmpDir::new("repo-push");
+        let dest = receiver(&base, RepoMode::Archive);
+        let local = client(&base, &dest);
+        let status = base.0.join("status");
+
+        let outcome = block_on(local.push("origin", push_opts(&status, &[BRANCH]))).unwrap();
+        assert_eq!(outcome.refs.len(), 1);
+        assert_eq!(outcome.refs[0].old, None);
+        assert_eq!(outcome.refs[0].new, Some(commit()));
+        assert!(outcome.stats.objects_sent > 0);
+        assert_eq!(tip(&dest), Some(commit()));
+        assert_eq!(exit_status(&status), "0");
+
+        // A repeat push finds every object on the server and sends none.
+        let outcome = block_on(local.push("origin", push_opts(&status, &[BRANCH]))).unwrap();
+        assert_eq!(outcome.refs[0].old, Some(commit()));
+        assert_eq!(outcome.refs[0].new, Some(commit()));
+        assert_eq!(outcome.stats.objects_needed, 0);
+        assert_eq!(outcome.stats.objects_sent, 0);
+        assert_eq!(tip(&dest), Some(commit()));
+        assert_eq!(exit_status(&status), "0");
+        tool_fsck(&dest);
+    }
+
+    #[test]
+    fn a_delete_of_a_present_ref_is_delete_denied() {
+        let base = TmpDir::new("repo-push-delete");
+        let dest = receiver(&base, RepoMode::Archive);
+        let local = client(&base, &dest);
+        let status = base.0.join("status");
+        block_on(local.push("origin", push_opts(&status, &[BRANCH]))).unwrap();
+
+        let delete = format!(":{BRANCH}");
+        match block_on(local.push("origin", push_opts(&status, &[&delete]))) {
+            Err(ostrya::Error::Push(Error::DeleteDenied(_))) => {}
+            other => panic!("expected DeleteDenied, got {other:?}"),
+        }
+        assert_eq!(tip(&dest), Some(commit()));
+        assert_ne!(exit_status(&status), "0");
+        let stderr = std::fs::read_to_string(stderr_of(&status)).unwrap();
+        assert!(stderr.starts_with("error: delete-denied: "), "{stderr}");
+    }
 }

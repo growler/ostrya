@@ -5,10 +5,11 @@
 //! (written empty, retained verbatim on parse), subject, body, the big-endian
 //! timestamp, and the root dirtree and dirmeta checksums.
 //!
-//! Commits are read a handful at a time and their fields are retained, so
-//! there is no borrowed view type: [`Commit::parse`] produces the owned
+//! There is no borrowed view type: [`Commit::parse`] produces the owned
 //! struct. The dynamic `a{sv}` metadata is held as a [`Value`] tree, which
 //! round-trips byte-identically because both codec paths emit normal form.
+//! A walk of a long parent chain reads [`Commit::parse_link`], which parses
+//! the parent and the root checksums alone.
 
 use std::sync::LazyLock;
 
@@ -49,6 +50,18 @@ pub struct Commit {
     pub root_dirmeta: Checksum,
 }
 
+/// The parent and the root checksums of a commit, as
+/// [`Commit::parse_link`] reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitLink {
+    /// Parent commit, `None` for a root commit.
+    pub parent: Option<Checksum>,
+    /// The checksum of the root directory's dirtree object.
+    pub root_dirtree: Checksum,
+    /// The checksum of the root directory's dirmeta object.
+    pub root_dirmeta: Checksum,
+}
+
 /// The commit shape with the metadata and checksum fields as raw slices; the
 /// value-level conventions are applied on top of this view.
 type CommitView<'a> = (
@@ -67,15 +80,7 @@ impl Commit {
     pub fn parse(data: &[u8]) -> Result<Commit> {
         let (metadata, parent, related, subject, body, timestamp, root_dirtree, root_dirmeta): CommitView = GvDecode::decode(data)?;
         let metadata = from_bytes(&METADATA_TYPE, metadata)?;
-        let parent = match parent.len() {
-            0 => None,
-            32 => Some(Checksum::from_ay(parent)?),
-            _ => {
-                return Err(Error::InvalidCommit(
-                    "parent checksum is neither empty nor 32 bytes",
-                ));
-            }
-        };
+        let parent = parse_parent(parent)?;
         let related = related
             .map(|item| item.map(|(name, bytes)| (name.to_owned(), bytes.to_vec())))
             .collect::<ostrya_gvariant::Result<Vec<_>>>()?;
@@ -86,10 +91,24 @@ impl Commit {
             subject: subject.to_owned(),
             body: body.to_owned(),
             timestamp: timestamp.0,
-            root_dirtree: Checksum::from_ay(root_dirtree)
-                .map_err(|_| Error::InvalidCommit("root dirtree checksum is not 32 bytes"))?,
-            root_dirmeta: Checksum::from_ay(root_dirmeta)
-                .map_err(|_| Error::InvalidCommit("root dirmeta checksum is not 32 bytes"))?,
+            root_dirtree: parse_root_dirtree(root_dirtree)?,
+            root_dirmeta: parse_root_dirmeta(root_dirmeta)?,
+        })
+    }
+
+    /// Parse the parent and the root checksums of a serialized commit
+    /// object. The metadata, the related objects, the subject, and the body
+    /// are not parsed.
+    ///
+    /// The frame of the object and the three checksums get the checks of
+    /// [`Commit::parse`], with the same errors.
+    pub fn parse_link(data: &[u8]) -> Result<CommitLink> {
+        let (_, parent, _, _, _, _, root_dirtree, root_dirmeta): CommitView =
+            GvDecode::decode(data)?;
+        Ok(CommitLink {
+            parent: parse_parent(parent)?,
+            root_dirtree: parse_root_dirtree(root_dirtree)?,
+            root_dirmeta: parse_root_dirmeta(root_dirmeta)?,
         })
     }
 
@@ -139,6 +158,29 @@ impl Commit {
     pub fn collection_binding(&self) -> Option<&str> {
         self.metadata_value("ostree.collection-binding")?.as_str()
     }
+}
+
+/// The parent checksum of a commit: an empty `ay` for a root commit.
+fn parse_parent(parent: &[u8]) -> Result<Option<Checksum>> {
+    match parent.len() {
+        0 => Ok(None),
+        32 => Ok(Some(Checksum::from_ay(parent)?)),
+        _ => Err(Error::InvalidCommit(
+            "parent checksum is neither empty nor 32 bytes",
+        )),
+    }
+}
+
+/// The root dirtree checksum of a commit.
+fn parse_root_dirtree(root_dirtree: &[u8]) -> Result<Checksum> {
+    Checksum::from_ay(root_dirtree)
+        .map_err(|_| Error::InvalidCommit("root dirtree checksum is not 32 bytes"))
+}
+
+/// The root dirmeta checksum of a commit.
+fn parse_root_dirmeta(root_dirmeta: &[u8]) -> Result<Checksum> {
+    Checksum::from_ay(root_dirmeta)
+        .map_err(|_| Error::InvalidCommit("root dirmeta checksum is not 32 bytes"))
 }
 
 /// A pre-serialized `a{sv}` spliced in as the first tuple member.
@@ -347,6 +389,11 @@ mod tests {
     /// Serialize a commit through the `Value` tree with an arbitrary parent
     /// and root checksum widths, bypassing the struct's validation.
     fn craft(parent: &[u8], root_dirtree: &[u8]) -> Vec<u8> {
+        craft_with(parent, root_dirtree, &[2; 32])
+    }
+
+    /// [`craft`] with an arbitrary root dirmeta width as well.
+    fn craft_with(parent: &[u8], root_dirtree: &[u8], root_dirmeta: &[u8]) -> Vec<u8> {
         let ty = Type::parse(<Commit as GvType>::SIGNATURE).unwrap();
         let value = Value::Tuple(vec![
             Value::Array(Vec::new()),
@@ -356,7 +403,7 @@ mod tests {
             Value::Str(String::new()),
             Value::U64(0),
             Value::Bytes(root_dirtree.to_vec()),
-            Value::Bytes(vec![2; 32]),
+            Value::Bytes(root_dirmeta.to_vec()),
         ]);
         to_bytes(&ty, &value).unwrap()
     }
@@ -375,6 +422,43 @@ mod tests {
                 "root dirtree checksum is not 32 bytes"
             ))
         );
+    }
+
+    #[test]
+    fn parse_link_agrees_with_parse() {
+        let root = Commit {
+            parent: None,
+            ..sample()
+        };
+        for commit in [sample(), root] {
+            let bytes = commit.serialize().unwrap();
+            let parsed = Commit::parse(&bytes).unwrap();
+            assert_eq!(
+                Commit::parse_link(&bytes).unwrap(),
+                CommitLink {
+                    parent: parsed.parent,
+                    root_dirtree: parsed.root_dirtree,
+                    root_dirmeta: parsed.root_dirmeta,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_link_refuses_what_parse_refuses_in_its_fields() {
+        let whole = sample().serialize().unwrap();
+        for bytes in [
+            craft_with(&[0xaa; 31], &[1; 32], &[2; 32]),
+            craft_with(&[0xaa; 33], &[1; 32], &[2; 32]),
+            craft_with(&[], &[1; 31], &[2; 32]),
+            craft_with(&[], &[1; 32], &[2; 33]),
+            craft_with(&[], &[1; 32], &[]),
+            whole[..whole.len() - 1].to_vec(),
+            Vec::new(),
+        ] {
+            let refused = Commit::parse(&bytes).expect_err("the full parse refuses the object");
+            assert_eq!(Commit::parse_link(&bytes), Err(refused));
+        }
     }
 
     #[test]

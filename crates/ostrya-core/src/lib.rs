@@ -39,7 +39,9 @@ pub mod varint;
 mod xattr;
 
 pub use checksum::Checksum;
-pub use commit::{Commit, TimestampError, commit_metadata, commit_timestamp, ref_binding};
+pub use commit::{
+    Commit, CommitLink, TimestampError, commit_metadata, commit_timestamp, ref_binding,
+};
 pub use deflate::{DeflateReader, DeflateSink};
 pub use dirmeta::{DirMeta, DirMetaRef};
 pub use dirtree::{DirTree, DirTreeRef};

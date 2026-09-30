@@ -316,8 +316,9 @@ pub enum Error {
     /// A push session failed: the error the receive side sent to the peer
     /// with its wire code, an `Abort` of the client
     /// ([`Aborted`](crate::push::Error::Aborted)), or an error of the session
-    /// stream.
-    #[cfg(feature = "receive")]
+    /// stream. On the client side it also carries a push request the client
+    /// refuses ([`InvalidInput`](crate::push::Error::InvalidInput)).
+    #[cfg(any(feature = "push", feature = "receive"))]
     #[error(transparent)]
     Push(#[from] crate::push::Error),
     /// The repository holds no static delta from `from` to `to`: nothing

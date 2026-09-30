@@ -632,6 +632,25 @@ impl Remote<'_> {
             .unwrap_or(false))
     }
 
+    /// The push address of this remote, `push-url`. A push to this remote
+    /// uses `url` when this key is absent and `url` is an `http://` or an
+    /// `https://` URL.
+    pub fn push_url(&self) -> Result<Option<String>> {
+        self.string("push-url")
+    }
+
+    /// The ssh command line a push to this remote runs, `ssh-command`. The
+    /// push transport splits it at ASCII whitespace, with no quoting rule.
+    pub fn ssh_command(&self) -> Result<Option<String>> {
+        self.string("ssh-command")
+    }
+
+    /// The command the remote side of a push to this remote runs,
+    /// `receive-command`. The remote shell parses it.
+    pub fn receive_command(&self) -> Result<Option<String>> {
+        self.string("receive-command")
+    }
+
     /// The raw value of an arbitrary key in this remote's section.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.keyfile.get_value(&self.group, key)
@@ -1091,5 +1110,36 @@ mod tests {
             Some("/etc/client.key")
         );
         assert!(remote.tls_permissive().unwrap());
+    }
+
+    /// The push keys of a remote section, each read as written, and absent
+    /// when the section does not set it.
+    #[test]
+    fn reads_remote_push_keys() {
+        let text = "[core]\nrepo_version=1\nmode=archive-z2\n\n\
+                    [remote \"central\"]\nurl=https://ex.com/r\n\
+                    push-url=ssh://pusher@ex.com/srv/repo\n\
+                    ssh-command=ssh -o BatchMode=yes\n\
+                    receive-command=/opt/bin/ostrya receive\n\n\
+                    [remote \"plain\"]\nurl=https://ex.com/r\n";
+        let cfg = RepoConfig::parse(text).unwrap();
+        let remote = cfg.remote("central").unwrap();
+        assert_eq!(
+            remote.push_url().unwrap().as_deref(),
+            Some("ssh://pusher@ex.com/srv/repo")
+        );
+        assert_eq!(
+            remote.ssh_command().unwrap().as_deref(),
+            Some("ssh -o BatchMode=yes")
+        );
+        assert_eq!(
+            remote.receive_command().unwrap().as_deref(),
+            Some("/opt/bin/ostrya receive")
+        );
+
+        let plain = cfg.remote("plain").unwrap();
+        assert_eq!(plain.push_url().unwrap(), None);
+        assert_eq!(plain.ssh_command().unwrap(), None);
+        assert_eq!(plain.receive_command().unwrap(), None);
     }
 }

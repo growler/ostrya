@@ -214,6 +214,16 @@
 //! received commit is held to the same signature checks a pull makes, over the
 //! keys the receive policy names. `Repo::receive` runs one push session over a
 //! pair of streams, and `ostrya::push` re-exports the wire protocol crate.
+//!
+//! Under the `push` feature it also covers the client side of a push from a
+//! repository. `Repo::push` pushes the commits of a set of refspecs to a
+//! remote over ssh. `Repo::push_over_stream` runs the same push over a pair
+//! of streams. Both take the options of `RepoPushOptions`.
+//! `resolve_push_remote` gives the push address and the connect options of a
+//! configured remote or of an address. `ostrya::push` re-exports the wire
+//! protocol crate. The push keys of a remote section,
+//! [`Remote::push_url`], [`Remote::ssh_command`], and
+//! [`Remote::receive_command`], are read in every build.
 
 pub mod bootable;
 mod bspatch;
@@ -226,7 +236,7 @@ mod deltagen;
 pub mod diff;
 pub mod error;
 pub use ostrya_fetch as fetch;
-#[cfg(feature = "receive")]
+#[cfg(any(feature = "push", feature = "receive"))]
 pub use ostrya_push as push;
 pub mod file;
 pub mod fsck;
@@ -243,6 +253,8 @@ mod overlay;
 mod perm;
 pub mod prune;
 pub mod pull;
+#[cfg(feature = "push")]
+mod push_repo;
 pub mod read;
 #[cfg(feature = "receive")]
 pub mod receive;
@@ -311,6 +323,8 @@ pub use pull::{
     DetachedMetadataFilter, DetachedMetadataFilterFn, PullFlags, PullOptions, PullProgress,
     PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };
+#[cfg(feature = "push")]
+pub use push_repo::{RepoPushOptions, resolve_push_remote};
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 pub use receive::{

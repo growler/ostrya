@@ -161,6 +161,10 @@ jobs:
       - name: The receive feature without a GPG feature compiles
         run: cargo check -p ostrya --no-default-features --features smol,receive
 
+      # The client side of a push compiles without the receive side.
+      - name: The push feature without the receive feature compiles
+        run: cargo check -p ostrya --no-default-features --features smol,push
+
       # `ostrya-sign` holds a runtime only under `sign-gpg`. This compiles the
       # crate with no runtime backend, so a runtime item placed outside that
       # feature fails here.
@@ -208,13 +212,13 @@ jobs:
       # The workspace entries of the runtime-dependent crates carry
       # `default-features = false`, and each dependent forwards `smol` and
       # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
-      # without the `receive` feature, which brings in `ostrya-push`, and this
-      # fails when one path turns the smol backend on. `cargo tree -i` exits
-      # non-zero both when the package is absent and on any other failure, so
-      # the step also reads the error text.
+      # without the `receive` and the `push` features, which bring in
+      # `ostrya-push`, and this fails when one path turns the smol backend on.
+      # `cargo tree -i` exits non-zero both when the package is absent and on
+      # any other failure, so the step also reads the error text.
       - name: A tokio build holds no smol
         run: |
-          for features in tokio tokio,receive; do
+          for features in tokio tokio,receive tokio,push; do
             if out=$(cargo tree -p ostrya --no-default-features --features "$features" -i smol 2>&1); then
               echo "a build of ostrya with $features holds smol:"
               echo "$out"

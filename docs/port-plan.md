@@ -7033,6 +7033,23 @@ the portable crates for `x86_64-pc-windows-gnu`, `x86_64-apple-darwin`, and
 `aarch64-apple-darwin`, and builds the rlib of `ostrya-fetch` for each of
 them.
 
+The `push` feature of `ostrya` is `push = ["dep:ostrya-push"]`. It turns on
+the optional dependency on `ostrya-push`, which the `receive` feature also
+turns on, and it adds no other dependency. Under it, `ostrya::push`
+re-exports `ostrya-push`, and `resolve_push_remote` gives the push address
+and the connect options of a configured remote or of an address.
+`Repo::push` pushes the commits of a set of refspecs to a remote over ssh.
+`Repo::push_over_stream` runs the same push over a pair of byte streams.
+Both take the options of `RepoPushOptions`. The push holds the lock of the
+local repository shared for the whole push. It reads the commits before the
+session opens, and it offers the commits first. It then offers the trees of
+the new values and of the history commits that the server lacks
+(`docs/api-sketch.md`, "Push from a repository"). The push
+keys of a remote section, `push-url`, `ssh-command`, and `receive-command`,
+are read through `Remote` in every build. `ostrya-cli` has the feature
+`push = ["ostrya/push"]` in its default set, beside
+`receive = ["ostrya/receive"]`, which builds `ostrya receive`.
+
 Pull over ssh follows push as separate work.
 
 Verify: push between two port repositories over ssh to localhost and over

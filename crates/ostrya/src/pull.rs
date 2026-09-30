@@ -401,34 +401,79 @@ impl DetachedMetadataFilter {
         let Some(dict) = crate::summary::parse_signature_dict(&bytes)? else {
             return Ok(Some(bytes));
         };
-        let entries = dict.as_array().ok_or_else(|| {
-            Error::InvalidFormat(format!("detached metadata of {commit} is not a dict"))
-        })?;
-        let mut kept: Vec<Value> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let (key, value) = entry
-                .as_tuple()
-                .and_then(|fields| match fields {
-                    [key, value] => key.as_str().map(|key| (key, value)),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    Error::InvalidFormat(format!(
-                        "detached metadata of {commit} holds an entry that is not `{{sv}}`"
-                    ))
-                })?;
-            if filter(commit, key, value) == FilterResult::Allow {
-                kept.push(entry.clone());
+        match kept_entries(filter, commit, dict)? {
+            Kept::All(_) => Ok(Some(bytes)),
+            Kept::Nothing => Ok(None),
+            Kept::Part(kept) => {
+                crate::summary::serialize_signature_dict(&Value::Array(kept)).map(Some)
             }
         }
-        if kept.len() == entries.len() {
-            return Ok(Some(bytes));
-        }
-        if kept.is_empty() {
-            return Ok(None);
-        }
-        crate::summary::serialize_signature_dict(&Value::Array(kept)).map(Some)
     }
+
+    /// The properties of the parsed detached metadata `dict` this filter
+    /// allows, and `None` where the caller writes nothing.
+    ///
+    /// An unset filter and a filter that allows every property give `dict`
+    /// back unchanged. A filter that allows no property gives `None`.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    pub(crate) fn apply_value(&self, commit: &Checksum, dict: Value) -> Result<Option<Value>> {
+        let Some(filter) = &self.0 else {
+            return Ok(Some(dict));
+        };
+        match kept_entries(filter, commit, dict)? {
+            Kept::All(dict) => Ok(Some(dict)),
+            Kept::Nothing => Ok(None),
+            Kept::Part(kept) => Ok(Some(Value::Array(kept))),
+        }
+    }
+}
+
+/// The properties of a detached metadata dict that a filter keeps.
+enum Kept {
+    /// Every property: the dict as it came in.
+    All(Value),
+    /// Some of the properties, in their order.
+    Part(Vec<Value>),
+    /// No property.
+    Nothing,
+}
+
+/// Run `filter` over each property of the detached metadata `dict` of
+/// `commit`. A value that is no dict, and an entry that is not `{sv}`, are
+/// [`Error::InvalidFormat`].
+fn kept_entries(filter: &DetachedMetadataFilterFn, commit: &Checksum, dict: Value) -> Result<Kept> {
+    let Value::Array(entries) = dict else {
+        return Err(Error::InvalidFormat(format!(
+            "detached metadata of {commit} is not a dict"
+        )));
+    };
+    let mut allowed = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let (key, value) = entry
+            .as_tuple()
+            .and_then(|fields| match fields {
+                [key, value] => key.as_str().map(|key| (key, value)),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                Error::InvalidFormat(format!(
+                    "detached metadata of {commit} holds an entry that is not `{{sv}}`"
+                ))
+            })?;
+        allowed.push(filter(commit, key, value) == FilterResult::Allow);
+    }
+    if allowed.iter().all(|allow| *allow) {
+        return Ok(Kept::All(Value::Array(entries)));
+    }
+    if !allowed.iter().any(|allow| *allow) {
+        return Ok(Kept::Nothing);
+    }
+    let kept = entries
+        .into_iter()
+        .zip(allowed)
+        .filter_map(|(entry, allow)| allow.then_some(entry))
+        .collect();
+    Ok(Kept::Part(kept))
 }
 
 impl std::fmt::Debug for DetachedMetadataFilter {

@@ -687,6 +687,41 @@ mod standin {
     }
 
     #[test]
+    fn abort_after_a_failed_call_writes_nothing_and_waits_for_the_exit() {
+        let dir = Dir::new();
+        let reply = dir.file("reply", &hello_reply());
+        let seen = dir.0.join("seen");
+        let exited = dir.0.join("exited");
+        // The stand-in closes its output after the reply, so `missing` reads
+        // end of file and leaves the session broken. The stand-in then reads
+        // its input to end of file, and exits a moment later.
+        let script = format!(
+            "{}; {}; exec 1>&-; cat > {}; sleep 0.1; {}; exit 3",
+            skip(hello_len()),
+            cat(&reply),
+            quote_posix(seen.to_str().unwrap()),
+            touch(&exited)
+        );
+        let (missing, aborted) = ostrya_rt::block_on(async {
+            let session = open(&script).await.unwrap();
+            let missing = session.missing(&names(1)).await;
+            (missing, session.abort().await)
+        });
+        match missing {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+            other => panic!("{other:?}"),
+        }
+        match aborted {
+            Err(Error::InvalidInput(msg)) => assert!(msg.contains("broken"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(exited.exists(), "abort returned before the stand-in exited");
+        // The stand-in read the `Have` of `missing` alone: no `Abort`.
+        let have = encode(&[Message::Have(names(1))]);
+        assert_eq!(std::fs::read(&seen).unwrap(), have);
+    }
+
+    #[test]
     fn a_server_that_closes_its_input_and_stays_silent_ends_a_failed_write_in_time() {
         let dir = Dir::new();
         let reply = dir.file("reply", &hello_reply());

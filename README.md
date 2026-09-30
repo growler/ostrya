@@ -98,9 +98,13 @@ Feature flags on `ostrya`:
 - `receive` -- the server side of a push: the receive policy and
   `Repo::receive`. The `receive` feature of `ostrya-cli`, in its default set,
   builds `ostrya receive` on it.
+- `push` -- the client side of a push from a repository: `Repo::push`,
+  `Repo::push_over_stream`, and the push address and the connect options of
+  a configured remote or of an address. The `push` feature of `ostrya-cli`,
+  in its default set, turns it on.
 - `lzma-static` -- the static xz build.
 
-Later phases add `s3`, `push`, and `serve`.
+Later phases add `s3` and `serve`.
 
 ## Clean-room provenance and licensing
 

@@ -533,16 +533,28 @@ impl PushSession {
         }
     }
 
-    /// End the session with `Abort`. The server aborts its transaction.
+    /// End the session. The server aborts its transaction.
     ///
-    /// The session then closes its output. A session that
-    /// [`connect`](PushSession::connect) opened waits a bounded time for the
-    /// ssh client to exit.
+    /// When the stream is still usable, the session writes `Abort` and
+    /// closes its output. A call that failed, or whose future was dropped,
+    /// left the stream broken and dropped it. The session then writes
+    /// nothing, and the call returns [`Error::InvalidInput`].
+    ///
+    /// A session that [`connect`](PushSession::connect) opened then waits a
+    /// bounded time for the ssh client to exit, also when the stream is
+    /// broken. When the write of `Abort` fails with an I/O error and the
+    /// client exited with a failure status, the call returns
+    /// [`Error::Transport`] with the status.
     pub async fn abort(self) -> Result<()> {
         let (stream, transport) = self.inner.into_parts();
-        let mut stream = stream?;
-        let result = stream.write_raw(&Message::Abort).await;
-        let _ = stream.close().await;
+        let result = match stream {
+            Ok(mut stream) => {
+                let result = stream.write_raw(&Message::Abort).await;
+                let _ = stream.close().await;
+                result
+            }
+            Err(e) => Err(e),
+        };
         match transport {
             Some(transport) => transport.finish(result).await,
             None => result,

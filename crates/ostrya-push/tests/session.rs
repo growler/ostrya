@@ -621,6 +621,41 @@ fn a_full_chunk_goes_out_with_its_length() {
     }
 }
 
+/// A large object reaches the transport in writes of at most 64 KiB, and no
+/// write carries a chunk length alone. Raw, each write after the first and
+/// before the last is a full buffer of 64 KiB.
+#[test]
+fn a_large_object_goes_out_in_writes_of_at_most_64_kib() {
+    // Bytes that do not compress, so the compressor fills its output buffer.
+    let mut state = 0x9E37_79B9u32;
+    let data: Vec<u8> = (0..64 * 65536)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        })
+        .collect();
+    let source = Source::default().with(file(1), Item::Content(regular(0o644), Some(data)));
+    for compression in [Compression::None, Compression::Deflate { level: 1 }] {
+        let (session, out) = open(&["a"], BOTH, &[objects_reply()]);
+        let hello = out.writes().len();
+        block_on(session.send(&source, &[file(1)], &[], compression)).unwrap();
+        let writes = &out.writes()[hello..];
+        assert!(writes.len() > 64, "{compression:?}: {writes:?}");
+        assert!(
+            writes.iter().all(|n| *n <= 65536 && *n != 4),
+            "{compression:?}: {writes:?}"
+        );
+        if compression == Compression::None {
+            assert!(
+                writes[1..writes.len() - 1].iter().all(|n| *n == 65536),
+                "{writes:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn detached_metadata_over_the_frame_limit_goes_in_chunks() {
     let big = vec![7u8; MIN_FRAME_LIMIT as usize * 3 / 2];

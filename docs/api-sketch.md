@@ -2514,6 +2514,14 @@ ssh, on the runtime backend that the `smol` or the `tokio` feature selects.
   does not hash or measure an object, because the server verifies each one.
   A source that fails ends the session with the abandon marker and `Abort`,
   and the call returns `Error::Source`.
+- The frame of each `ObjectHeader` is a fixed array of 40 bytes, with no
+  allocation. The session writes the framed file header of each `Content`
+  object into one buffer that it keeps, with `FileHeader::write_framed`
+  (`raw`) or `FileHeader::write_framed_archive` (`deflate`) of
+  `ostrya-core`. Each gives the bytes of `filehdr::frame` over
+  `FileHeader::serialize` or `FileHeader::serialize_archive`. It clears the
+  buffer first, so the buffer grows only for a header longer than each
+  header before it.
 - `commit` sends `Commit` and gives the `CommitReply` as a `PushOutcome`.
   An `Error` from the server is definite. When the write of `Commit` fails,
   the session reads one pending message: an `Error` is that error, and a
@@ -2665,6 +2673,22 @@ standard output with `ReceivePolicy::from_config`, or with
 `warning: STEP: MESSAGE` line to standard error for each warning of the
 report, and the error line on failure. It exits 0 after a committed session.
 
+An `authorized_keys` entry restricts an ssh key to one repository:
+
+```text
+restrict,command="ostrya receive --repo=/srv/repo --policy=/etc/ostrya/receive.conf" ssh-ed25519 AAAA...
+```
+
+- sshd runs the forced command and ignores the command of the client. The
+  `ostrya receive --repo='PATH'` of the client reaches the server only in
+  the `SSH_ORIGINAL_COMMAND` environment variable. So the key pushes into
+  the forced repository, whatever path the address holds.
+- Give absolute paths to `--repo` and `--policy`. A policy that must hold
+  against the pusher is in a file that the pusher cannot write.
+- sshd runs the `command=` string through the login shell of the user, with
+  `-c`. The shell and its startup files must write nothing to standard
+  output, because standard output carries the frames of the session.
+
 ## Push remotes
 
 A remote section of the repository config can hold the push keys
@@ -2815,6 +2839,50 @@ object. A failure of the push after the session opened and before `Commit`
 ends the session and returns that failure. The push writes `Abort` when the
 stream is still usable. A refusal of the server is `Error::Push` with the error of the server. `opts.progress` goes to
 the session, so its counters show the push while it runs.
+
+`ostrya push`, under the `push` feature of `ostrya-cli`, is the command
+form of `Repo::push`:
+
+```text
+ostrya push [--repo=PATH] REMOTE SRC[:DST]...
+            [--depth=N] [--force] [--compress[=LEVEL]]
+            [--ssh-command=CMD] [--receive-command=CMD]
+```
+
+- `REMOTE` is the `remote` argument, and each `SRC[:DST]` is one of
+  `refspecs`.
+- `--depth=N` sets `depth` to `Some(N)`. Without it, `depth` is `None`.
+  When the server does not hold the ref, or the local chain does not hold
+  the server tip, the push then sends the source commit alone.
+  `--depth=-1` sends the whole local chain.
+- `--force` sets `force`.
+- `--compress` sets `compression` to `Compression::Deflate { level: 6 }`,
+  and `--compress=LEVEL` to the level, 1 to 9. The value needs the `=`
+  form. Without the option, `compression` is `Compression::None`.
+- `--ssh-command=CMD` sets `connect.ssh_command` to `CMD` split at ASCII
+  whitespace, and `--receive-command=CMD` sets `connect.receive_command`.
+- `detached_metadata_filter` comes from `[ex-ostrya]
+  detached-metadata-exclude` of the local repository. `progress` is `None`.
+- After the repository opens, a missing `REMOTE` gives the usage text and
+  `error: REMOTE must be specified`, and no refspec gives the usage text and
+  `error: REFSPEC must be specified`. Both exit 1 before an ssh client
+  starts.
+- On success the command writes one line for each `RefOutcome` to standard
+  output, in the order of the refspecs: the name, then the old commit or
+  `(new)` or `(absent)`, then the new commit or `(deleted)` or
+  `(unchanged)`. A commit is its full checksum. The forms are
+  `main (new) C1`, `main C1 C2`, `main C2 (unchanged)`,
+  `main C2 (deleted)`, and `main (absent) (unchanged)`, the last for a
+  delete of a ref that the server does not hold. It exits 0.
+- Under `-v` one line of `PushStats` goes to standard error: the objects
+  offered, needed, and sent, the bytes sent, and the elapsed time.
+- On failure the command writes `error: MESSAGE` to standard error and
+  nothing to standard output, and exits 1. After
+  `Error::CommitOutcomeUnknown` the refs of the server may have changed. A
+  repeat push is safe, because each update is a compare-and-swap.
+- When a ref line cannot go to standard output, the command writes
+  `error: MESSAGE` to standard error and exits 1. The refs of the server
+  have changed at that point.
 
 ## Static deltas
 

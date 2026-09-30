@@ -155,7 +155,37 @@ impl FileHeader {
     /// Serialize the archive header form `(tuuuusa(ayay))`.
     pub fn serialize_archive(&self, uncompressed_size: u64) -> Result<Vec<u8>> {
         self.validate()?;
-        Ok(ostrya_gvariant::encode_to_vec(&(
+        Ok(ostrya_gvariant::encode_to_vec(
+            &self.archive_fields(uncompressed_size),
+        )?)
+    }
+
+    /// Write the framed uncompressed form into `out`: the bytes of
+    /// `frame(&self.serialize()?)`. The call clears `out` first, so a caller
+    /// that uses one buffer for all its headers grows `out` only for a header
+    /// longer than each header before it. After an error the content of `out`
+    /// is unspecified.
+    pub fn write_framed(&self, out: &mut Vec<u8>) -> Result<()> {
+        self.validate()?;
+        write_framed_with(out, |out| self.encode(out))
+    }
+
+    /// Write the framed archive form into `out`: the bytes of
+    /// `frame(&self.serialize_archive(uncompressed_size)?)`, with the rules of
+    /// [`write_framed`](Self::write_framed).
+    pub fn write_framed_archive(&self, uncompressed_size: u64, out: &mut Vec<u8>) -> Result<()> {
+        self.validate()?;
+        write_framed_with(out, |out| {
+            self.archive_fields(uncompressed_size).encode(out)
+        })
+    }
+
+    /// The fields of the archive header form `(tuuuusa(ayay))`.
+    fn archive_fields(
+        &self,
+        uncompressed_size: u64,
+    ) -> (Be64, Be32, Be32, Be32, Be32, &str, &Xattrs) {
+        (
             Be64(uncompressed_size),
             Be32(self.uid),
             Be32(self.gid),
@@ -163,8 +193,24 @@ impl FileHeader {
             Be32(0),
             self.symlink_target.as_str(),
             &self.xattrs,
-        ))?)
+        )
     }
+}
+
+/// Clear `out`, write the framing prefix with a placeholder length, append the
+/// header variant that `encode` writes, and patch the length. The variant
+/// starts at offset 8, so its alignment in `out` is its own alignment.
+fn write_framed_with(
+    out: &mut Vec<u8>,
+    encode: impl FnOnce(&mut Vec<u8>) -> ostrya_gvariant::Result<()>,
+) -> Result<()> {
+    out.clear();
+    out.extend_from_slice(&[0u8; 8]);
+    encode(out)?;
+    let len = u32::try_from(out.len() - 8)
+        .map_err(|_| Error::InvalidFileHeader("header exceeds the framing length limit"))?;
+    out[..4].copy_from_slice(&len.to_be_bytes());
+    Ok(())
 }
 
 /// The uncompressed header form, `(uuuusa(ayay))`.
@@ -176,7 +222,7 @@ impl GvType for FileHeader {
 }
 
 /// The encode path is purely mechanical: domain validation runs in the
-/// `serialize*` entry points, which are the only callers.
+/// `serialize*` and `write_framed*` entry points, which are the only callers.
 impl GvEncode for FileHeader {
     fn encode(&self, out: &mut Vec<u8>) -> ostrya_gvariant::Result<()> {
         (
@@ -302,6 +348,40 @@ mod tests {
         let header = regular(0o100755);
         let bytes = header.serialize_archive(1234).unwrap();
         assert_eq!(FileHeader::parse_archive(&bytes).unwrap(), (header, 1234));
+    }
+
+    /// The framed forms equal the framing of the serialized forms, for a
+    /// regular file with xattrs and for a symlink, also into a buffer that
+    /// holds bytes of an earlier call. A header that fails validation is
+    /// refused.
+    #[test]
+    fn the_framed_forms_equal_the_framed_serialization() {
+        let with_xattrs = FileHeader {
+            xattrs: Xattrs::new([
+                (b"user.a\0".to_vec(), b"1".to_vec()),
+                (b"user.bb\0".to_vec(), vec![7; 300]),
+            ])
+            .unwrap(),
+            ..regular(0o100644)
+        };
+        let mut out = vec![0xaa; 1000];
+        for header in [regular(0o100755), with_xattrs, symlink("a/target")] {
+            header.write_framed(&mut out).unwrap();
+            assert_eq!(out, frame(&header.serialize().unwrap()).unwrap());
+            for size in [0, 1234, u64::MAX] {
+                header.write_framed_archive(size, &mut out).unwrap();
+                assert_eq!(
+                    out,
+                    frame(&header.serialize_archive(size).unwrap()).unwrap()
+                );
+            }
+        }
+        let bad = FileHeader {
+            symlink_target: "x".into(),
+            ..regular(0o100644)
+        };
+        assert!(bad.write_framed(&mut out).is_err());
+        assert!(bad.write_framed_archive(1, &mut out).is_err());
     }
 
     #[test]

@@ -7047,8 +7047,17 @@ the new values and of the history commits that the server lacks
 (`docs/api-sketch.md`, "Push from a repository"). The push
 keys of a remote section, `push-url`, `ssh-command`, and `receive-command`,
 are read through `Remote` in every build. `ostrya-cli` has the feature
-`push = ["ostrya/push"]` in its default set, beside
-`receive = ["ostrya/receive"]`, which builds `ostrya receive`.
+`push = ["ostrya/push"]` in its default set, which builds `ostrya push`,
+beside `receive = ["ostrya/receive"]`, which builds `ostrya receive`.
+
+Status: the ssh half is done. `ostrya push` pushes the commits of a set of
+refspecs over ssh and prints one line for each ref
+(`docs/conformance/cli-surface.md`, "Port extensions with no counterpart in
+the tool"). A push between two port repositories over ssh to localhost
+passes the ssh half of the verify step below: the receiving repository
+passes `ostree fsck`, `ostree rev-parse` resolves each pushed ref, and
+`ostree pull-local` from it succeeds. The HTTP transport, `ostrya serve`,
+and the tree push are still to come.
 
 Pull over ssh follows push as separate work.
 
@@ -7236,12 +7245,12 @@ Five properties hold over the two keys:
   a sender that drops it -- and neither configuration alone can see it. A key
   the sender strips is a key no commit holds, and a key no commit holds
   contributes no edge, so the receiver prunes wider and reports nothing.
-- Receive half only, for now. Push is not implemented, so
-  `detached-metadata-exclude` acts today where a repository receives: the
-  archive and production repositories that pull. The outbound half, a build
-  repository that strips a key as it serves, arrives with push. The key needs no
-  new name then, because its meaning is already stated over the repository and
-  not over one direction.
+- Both directions. `detached-metadata-exclude` acts where a repository
+  receives: the archive and production repositories that pull, and a
+  repository that `ostrya receive` writes into. It also acts where a
+  repository sends: `ostrya push` drops the keys it names from the detached
+  metadata it sends. The meaning of the key is stated over the repository and
+  not over one direction, so both directions take the one name.
 - What a pull stores, not what the repository holds. E3 writes nothing for a
   commit whose every property the filter drops, which leaves the copy the
   destination already holds where it stands. So a repository that stored a

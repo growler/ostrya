@@ -1887,8 +1887,9 @@ repository that sets one, and the divergence is by intent
   `.commitmeta` they write; the tool's pull writes what the source holds. The
   commit checksum does not cover detached metadata, so the objects both write
   stay identical. A commit whose every key the list names leaves the
-  `.commitmeta` the destination already holds where it stands. Push is not
-  implemented, so the sending half of the key does no work yet.
+  `.commitmeta` the destination already holds where it stands. `ostrya push`
+  drops them from the detached metadata it sends, and `ostrya receive` drops
+  them from the detached metadata it stores.
 
 Neither key is derived from the other, and no harness repository sets either
 (`harness.md`, "Constraints"), so every matrix cell reads the tool's own
@@ -3203,6 +3204,115 @@ and https are fetched` (`../port-plan.md`, Phase 16a).
 `crates/ostrya-fetch/src/lib.rs` refuses any `Cookie` header at construction
 whenever a mirror is cleartext `http`, a deliberate choice, and cookie-jar
 support needs its own design pass against that refusal.
+
+## Port extensions with no counterpart in the tool
+
+The tool has no push. `receive` and `push` are commands of the port alone,
+so no matrix cell compares them with the tool. The receiving repository
+stays a normal repository: the tool reads it, checks it with `ostree fsck`,
+and pulls from it with `ostree pull-local`.
+
+### `receive`
+
+```text
+ostrya receive [--repo=PATH] [--policy=FILE]
+```
+
+- The `receive` feature of `ostrya-cli` builds the command. It is in the
+  default set.
+- The command runs one push session over standard input and standard
+  output. It reads the receive groups, the trust groups, the key groups, and
+  the remote sections from the repository config, or from `FILE` alone under
+  `--policy`. `[core] auto-update-summary` and `[ex-ostrya]
+  detached-metadata-exclude` come from the repository config in both cases.
+- Standard output carries the frames of the session alone. The command
+  writes one `warning: STEP: MESSAGE` line to standard error for each
+  warning of the session, and `error: MESSAGE` on failure. It writes
+  nothing else, also under `-v`.
+- It exits 0 after a committed session, also with warnings, and 1
+  otherwise.
+
+### `push`
+
+```text
+ostrya push [--repo=PATH] REMOTE SRC[:DST]...
+            [--depth=N] [--force] [--compress[=LEVEL]]
+            [--ssh-command=CMD] [--receive-command=CMD]
+```
+
+- The `push` feature of `ostrya-cli` builds the command. It is in the
+  default set.
+- `REMOTE` is a remote of the repository config with a push address, or an
+  ssh address. The push runs the ssh client with the remote command
+  `ostrya receive --repo='PATH'`.
+- Each refspec is `SRC[:DST]`. `SRC` is a revision of the local repository.
+  `DST` is the ref of the server, and it defaults to `SRC` when `SRC` is a
+  ref. `:DST` deletes the ref `DST` of the server.
+- The command checks its operands after the repository opens. With no
+  `REMOTE` it writes the usage text and `error: REMOTE must be specified`.
+  With no refspec it writes the usage text and `error: REFSPEC must be
+  specified`. Both exit 1, and no ssh client starts.
+- `--depth=N` sends `N` parents of each source commit, and `-1` the whole
+  chain. Without it, the push sends the chain back to the commit of the ref
+  on the server. When the server does not hold the ref, or the local chain
+  does not hold the commit of the ref on the server, the push then sends the
+  source commit alone. `--depth=-1` sends the whole local chain. A value
+  below `-1` is refused before the ssh client starts.
+- `--force` sends each update with any expected state, and asks the server
+  to allow an update that is not a fast-forward. The receive policy of the
+  server refuses such an update unless it sets `allow-non-fast-forward`.
+- `--compress` sends content objects deflated at level 6, and
+  `--compress=LEVEL` at `LEVEL`, 1 to 9. The value needs the `=` form.
+  Without the option, the push sends them raw. An `archive` repository
+  sends each stored content object as it is, at the zlib level the
+  repository wrote it with, whatever `LEVEL` is.
+- `--ssh-command=CMD` is the ssh command, split at ASCII whitespace. It wins
+  over the `OSTRYA_SSH_COMMAND` environment variable, and that wins over
+  the `ssh-command` key of the remote. `--receive-command=CMD` is the
+  remote command, and it wins over the `receive-command` key of the remote.
+- The push drops the detached metadata keys that `[ex-ostrya]
+  detached-metadata-exclude` of the local repository names.
+- On success the command writes one line for each ref to standard output,
+  in the order of the refspecs, and exits 0. A line holds the `DST` name,
+  the old state, and the new state, separated by one space. A commit is its
+  full 64-character checksum:
+  - `main (new) C1` -- the server did not hold the ref;
+  - `main C1 C2` -- the ref moved from `C1` to `C2`;
+  - `main C2 (unchanged)` -- the ref was at `C2` already;
+  - `main C2 (deleted)` -- the push deleted the ref;
+  - `main (absent) (unchanged)` -- a delete of a ref that the server does
+    not hold.
+- Under `-v` the command writes one statistics line to standard error: the
+  objects offered, needed, and sent, the bytes sent, and the elapsed time.
+  It writes no progress line.
+- On failure the command writes `error: MESSAGE` to standard error and
+  nothing to standard output, and exits 1. A refusal of the server gives
+  its wire code first, for example `error: non-fast-forward: ...` or
+  `error: delete-denied: ...`. No ref changes. After an unknown outcome of
+  the commit, the refs of the server may have changed. A repeat push is
+  safe, because each ref update is a compare-and-swap.
+- When the command cannot write a ref line to standard output, it writes
+  `error: MESSAGE` to standard error and exits 1. The refs of the server
+  have changed at that point.
+
+### ssh access with `authorized_keys`
+
+An `authorized_keys` entry restricts an ssh key to push into one
+repository:
+
+```text
+restrict,command="ostrya receive --repo=/srv/repo --policy=/etc/ostrya/receive.conf" ssh-ed25519 AAAA...
+```
+
+- sshd runs the forced command and ignores the command of the client. The
+  `ostrya receive --repo='PATH'` of the client reaches the server only in
+  the `SSH_ORIGINAL_COMMAND` environment variable. So the key pushes into
+  the forced repository, whatever path the address holds.
+- Give absolute paths to `--repo` and `--policy`. A policy that must hold
+  against the pusher is in a file that the pusher cannot write.
+- sshd runs the `command=` string through the login shell of the user, with
+  `-c`. The shell and its startup files must write nothing to standard
+  output, because standard output carries the frames of the session.
 
 ## Global conventions
 

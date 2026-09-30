@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use ostrya_core::filehdr::frame;
 use ostrya_core::{Checksum, DeflateReader, MAX_METADATA_SIZE, ObjectName, ObjectType};
 use ostrya_gvariant::Type;
 
@@ -19,16 +18,18 @@ use super::{ObjectData, ObjectReader, ObjectSource, invalid};
 use crate::error::{Error, Result};
 use crate::proto::{Encoding, FrameReader, FrameWriter, Message, ObjectHeader, protocol};
 
-/// The buffer size of the input of the stream, and of the object bytes the
-/// session copies from a source. The compressor gives chunks of at most this
-/// size too.
+/// The buffer size of the input of the stream.
 const STREAM_BUFFER: usize = 64 * 1024;
 
-/// The buffer size of the output of the stream: the longest chunk and the
-/// length of the next one. The buffer then holds a full chunk and the length
-/// that follows it, so no write to the transport carries a chunk length
-/// alone.
-const WRITE_BUFFER: usize = STREAM_BUFFER + 4;
+/// The buffer size of the output of the stream: 64 KiB, the default capacity
+/// of a Linux pipe, so a full buffer goes into an empty pipe in one write.
+const WRITE_BUFFER: usize = 64 * 1024;
+
+/// The longest chunk the session writes: a full chunk and its 4-byte length
+/// fill the output buffer exactly. Each chunk is shorter than the buffer, so
+/// it goes through the buffer, and a chunk length is never the only content
+/// of a write to the transport.
+const CHUNK_PAYLOAD: usize = WRITE_BUFFER - 4;
 
 pub(crate) type Input = Box<dyn AsyncRead + Unpin + Send>;
 pub(crate) type Output = Box<dyn AsyncWrite + Unpin + Send>;
@@ -123,16 +124,33 @@ enum Body {
     Deflate(Box<dyn ObjectReader>, u8),
 }
 
+/// The object bytes before the body.
+enum Prefix {
+    /// No bytes.
+    None,
+    /// The framed file header in the header buffer of the stream.
+    Header,
+    /// These bytes.
+    Bytes(Vec<u8>),
+}
+
 /// What the session sends for one object.
 struct Plan {
     encoding: Encoding,
-    prefix: Vec<u8>,
+    prefix: Prefix,
     body: Body,
 }
 
 /// Check the data a source gave for `name`, and build what the session sends
 /// for it. `level` is the level of the session compressor, when it deflates.
-fn plan(name: &ObjectName, data: ObjectData, level: Option<u8>, deflate_ok: bool) -> Result<Plan> {
+/// The framed file header of a content object goes into `header_buf`.
+fn plan(
+    name: &ObjectName,
+    data: ObjectData,
+    level: Option<u8>,
+    deflate_ok: bool,
+    header_buf: &mut Vec<u8>,
+) -> Result<Plan> {
     let is_file = name.ty == ObjectType::File;
     match data {
         ObjectData::Encoded { encoding, reader } => {
@@ -144,7 +162,7 @@ fn plan(name: &ObjectName, data: ObjectData, level: Option<u8>, deflate_ok: bool
             }
             Ok(Plan {
                 encoding,
-                prefix: Vec::new(),
+                prefix: Prefix::None,
                 body: Body::Copy(reader),
             })
         }
@@ -178,17 +196,24 @@ fn plan(name: &ObjectName, data: ObjectData, level: Option<u8>, deflate_ok: bool
             let bad_header =
                 |e: ostrya_core::Error| invalid(format!("content object {}: {e}", name.checksum));
             match level {
-                Some(level) => Ok(Plan {
-                    encoding: Encoding::Deflate,
-                    prefix: frame(&header.serialize_archive(size).map_err(bad_header)?)
-                        .map_err(bad_header)?,
-                    body: body.map_or(Body::None, |r| Body::Deflate(r, level)),
-                }),
-                None => Ok(Plan {
-                    encoding: Encoding::Raw,
-                    prefix: frame(&header.serialize().map_err(bad_header)?).map_err(bad_header)?,
-                    body: body.map_or(Body::None, Body::Copy),
-                }),
+                Some(level) => {
+                    header
+                        .write_framed_archive(size, header_buf)
+                        .map_err(bad_header)?;
+                    Ok(Plan {
+                        encoding: Encoding::Deflate,
+                        prefix: Prefix::Header,
+                        body: body.map_or(Body::None, |r| Body::Deflate(r, level)),
+                    })
+                }
+                None => {
+                    header.write_framed(header_buf).map_err(bad_header)?;
+                    Ok(Plan {
+                        encoding: Encoding::Raw,
+                        prefix: Prefix::Header,
+                        body: body.map_or(Body::None, Body::Copy),
+                    })
+                }
             }
         }
     }
@@ -203,6 +228,8 @@ pub(super) struct Stream {
     deflate: Option<DeflateReader<Box<dyn ObjectReader>>>,
     /// The buffer object bytes are copied through.
     buf: Vec<u8>,
+    /// The buffer of the framed file header of each content object.
+    header_buf: Vec<u8>,
     counters: Arc<Counters>,
     /// The longest wait for a pending message after a failed write. `None`
     /// waits with no limit.
@@ -220,6 +247,7 @@ impl Stream {
             writer: FrameWriter::new(BufWriter::with_capacity(WRITE_BUFFER, counting)),
             deflate: None,
             buf: Vec::new(),
+            header_buf: Vec::new(),
             counters,
             pending_limit: None,
         }
@@ -347,7 +375,8 @@ impl Stream {
                 .await
                 .map_err(|e| refuse(source_error(e)))?;
             let level = up.level.filter(|_| name.ty == ObjectType::File);
-            let plan = plan(name, data, level, up.deflate_ok).map_err(refuse)?;
+            let plan =
+                plan(name, data, level, up.deflate_ok, &mut self.header_buf).map_err(refuse)?;
             *started = true;
             self.write_object(*name, plan).await?;
             self.counters.object_sent();
@@ -385,7 +414,7 @@ impl Stream {
             let name = ObjectName::new(*commit, ObjectType::CommitMeta);
             let plan = Plan {
                 encoding: Encoding::Raw,
-                prefix: bytes,
+                prefix: Prefix::Bytes(bytes),
                 body: Body::None,
             };
             self.write_object(name, plan).await?;
@@ -406,12 +435,22 @@ impl Stream {
         self.writer
             .write_message(&Message::ObjectHeader(header))
             .await?;
-        self.write_data(&plan.prefix).await?;
+        match &plan.prefix {
+            Prefix::None => {}
+            Prefix::Header => {
+                // The buffer goes back to the stream for the next header. A
+                // failed write drops it, and the stream ends.
+                let header = std::mem::take(&mut self.header_buf);
+                self.write_data(&header).await?;
+                self.header_buf = header;
+            }
+            Prefix::Bytes(bytes) => self.write_data(bytes).await?,
+        }
         match plan.body {
             Body::None => {}
             Body::Copy(mut reader) => {
                 if self.buf.is_empty() {
-                    self.buf = vec![0u8; STREAM_BUFFER];
+                    self.buf = vec![0u8; CHUNK_PAYLOAD];
                 }
                 loop {
                     let n = reader.read(&mut self.buf).await.map_err(read_failed)?;
@@ -441,8 +480,10 @@ impl Stream {
                     if chunk.is_empty() {
                         break;
                     }
-                    let n = chunk.len();
-                    self.writer.write_object_data(chunk).await?;
+                    // The compressor gives up to 64 KiB, 4 bytes more than a
+                    // chunk.
+                    let n = chunk.len().min(CHUNK_PAYLOAD);
+                    self.writer.write_object_data(&chunk[..n]).await?;
                     self.counters.payload(n as u64);
                     deflate.consume(n);
                 }
@@ -455,10 +496,9 @@ impl Stream {
     }
 
     async fn write_data(&mut self, data: &[u8]) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
+        for piece in data.chunks(CHUNK_PAYLOAD) {
+            self.writer.write_object_data(piece).await?;
         }
-        self.writer.write_object_data(data).await?;
         self.counters.payload(data.len() as u64);
         Ok(())
     }
@@ -468,4 +508,18 @@ fn sent(set: &Mutex<HashSet<Checksum>>, commit: &Checksum) -> bool {
     set.lock()
         .unwrap_or_else(PoisonError::into_inner)
         .contains(commit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CHUNK_PAYLOAD, WRITE_BUFFER};
+
+    /// A full chunk and its 4-byte length fill the output buffer, and the
+    /// buffer is 64 KiB.
+    #[test]
+    fn a_full_chunk_and_its_length_fill_the_output_buffer() {
+        assert_eq!(WRITE_BUFFER, 65_536);
+        assert_eq!(CHUNK_PAYLOAD, 65_532);
+        assert_eq!(CHUNK_PAYLOAD + 4, WRITE_BUFFER);
+    }
 }

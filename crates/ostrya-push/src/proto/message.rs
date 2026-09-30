@@ -541,6 +541,26 @@ fn check_header(name: &ObjectName, encoding: Encoding) -> Result<()> {
     Ok(())
 }
 
+/// The length of an `ObjectHeader` frame: the 4 length bytes, the kind, and
+/// the 35 bytes of the body.
+pub(super) const OBJECT_HEADER_FRAME: usize = 40;
+
+/// The frame of an `ObjectHeader`, with no allocation. The body `(yayy)` is
+/// the type, the 32 checksum bytes, the encoding, and one framing offset: the
+/// end of the checksum array, 33. The bytes equal the length, the kind, and
+/// the bytes of [`Message::encode_body`].
+pub(super) fn object_header_frame(h: &ObjectHeader) -> Result<[u8; OBJECT_HEADER_FRAME]> {
+    check_header(&h.name, h.encoding)?;
+    let mut frame = [0u8; OBJECT_HEADER_FRAME];
+    frame[..4].copy_from_slice(&(OBJECT_HEADER_FRAME as u32 - 4).to_be_bytes());
+    frame[4] = Kind::ObjectHeader.as_u8();
+    frame[5] = h.name.ty.as_u32() as u8;
+    frame[6..38].copy_from_slice(h.name.checksum.as_bytes());
+    frame[38] = h.encoding.as_u8();
+    frame[39] = 33;
+    Ok(frame)
+}
+
 fn object_names_value(names: &[ObjectName]) -> Result<Value> {
     if let Some(bad) = names.iter().find(|n| !have_type(n.ty)) {
         return Err(protocol(format!(

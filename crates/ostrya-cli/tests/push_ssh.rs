@@ -519,3 +519,544 @@ mod repo_push {
         assert!(stderr.starts_with("error: delete-denied: "), "{stderr}");
     }
 }
+
+/// `ostrya push` over the stand-in, and over ssh to localhost.
+#[cfg(feature = "push")]
+mod cli {
+    use super::*;
+    use std::process::Output;
+
+    /// Opts in to the test that pushes over ssh to localhost, with the value
+    /// `1` alone.
+    const SSH_LOCALHOST: &str = "OSTRYA_TEST_SSH_LOCALHOST";
+
+    /// A run of the built `ostrya` in `dir`, with no ssh command and no
+    /// repository from the environment.
+    fn ostrya(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ostrya"));
+        command
+            .args(args)
+            .current_dir(dir)
+            .env_remove("OSTRYA_SSH_COMMAND")
+            .env_remove("OSTREE_REPO")
+            .stdin(Stdio::null());
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().unwrap()
+    }
+
+    fn stdout(out: &Output) -> String {
+        String::from_utf8(out.stdout.clone()).unwrap()
+    }
+
+    fn stderr(out: &Output) -> String {
+        String::from_utf8(out.stderr.clone()).unwrap()
+    }
+
+    /// The paths of one test: the base, the client repository, the stand-in
+    /// script, and the status file of the stand-in.
+    struct Setup {
+        base: TmpDir,
+        client: PathBuf,
+        status: PathBuf,
+        standin: PathBuf,
+    }
+
+    impl Setup {
+        /// A client repository of `mode` and the stand-in script.
+        fn new(tag: &str, mode: &str) -> Setup {
+            let base = TmpDir::new(tag);
+            let client = base.0.join("client");
+            let arg = format!("--repo={}", client.display());
+            let out = ostrya(&base.0, &[&arg, "init", &format!("--mode={mode}")], &[]);
+            assert!(out.status.success(), "{}", stderr(&out));
+            let standin = base.0.join("standin");
+            std::fs::write(&standin, STANDIN).unwrap();
+            let status = base.0.join("status");
+            Setup {
+                base,
+                client,
+                status,
+                standin,
+            }
+        }
+
+        /// `--ssh-command` of the stand-in.
+        fn ssh_command(&self) -> String {
+            format!(
+                "--ssh-command=sh {} {} {}",
+                self.standin.display(),
+                self.status.display(),
+                stderr_of(&self.status).display()
+            )
+        }
+
+        /// Commit a tree of `files` to `branch` of the client, with `extra`
+        /// options, and return the commit.
+        fn commit(&self, branch: &str, files: &[(&str, &str)], extra: &[&str]) -> Checksum {
+            commit_to(&self.base, &self.client, branch, files, extra)
+        }
+
+        /// Run `ostrya push` on the client with `args`.
+        fn push(&self, args: &[&str], envs: &[(&str, &str)]) -> Output {
+            let repo = format!("--repo={}", self.client.display());
+            let mut all = vec![repo.as_str(), "push"];
+            all.extend_from_slice(args);
+            ostrya(&self.base.0, &all, envs)
+        }
+
+        /// Run `ostrya push` on the client over the stand-in to `dest`, with
+        /// the receive command of the built binary and `policy`.
+        fn push_to(&self, dest: &Path, policy: Option<&Path>, args: &[&str]) -> Output {
+            let ssh = self.ssh_command();
+            let receive = receive_command(policy);
+            let address = address(dest);
+            let mut all = vec![ssh.as_str(), receive.as_str(), address.as_str()];
+            all.extend_from_slice(args);
+            self.push(&all, &[])
+        }
+
+        fn ssh_started(&self) -> bool {
+            self.status.exists()
+        }
+    }
+
+    /// Commit a tree of `files` to `branch` of `repo` with `extra` options.
+    fn commit_to(
+        base: &TmpDir,
+        repo: &Path,
+        branch: &str,
+        files: &[(&str, &str)],
+        extra: &[&str],
+    ) -> Checksum {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let tree = base
+            .0
+            .join(format!("tree-{}", N.fetch_add(1, Ordering::Relaxed)));
+        for (path, content) in files {
+            let path = tree.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        std::os::unix::fs::symlink("a", tree.join("link")).unwrap();
+        let arg = format!("--repo={}", repo.display());
+        let branch = format!("--branch={branch}");
+        let tree_arg = tree.to_str().unwrap();
+        let mut all = vec![arg.as_str(), "commit", branch.as_str(), "-s", "subject"];
+        all.extend_from_slice(extra);
+        all.push(tree_arg);
+        let out = ostrya(&base.0, &all, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        Checksum::from_hex(stdout(&out).trim()).unwrap()
+    }
+
+    /// `--receive-command` with the built `ostrya -v receive`, and
+    /// `--policy` when `policy` is set.
+    fn receive_command(policy: Option<&Path>) -> String {
+        let mut receive = format!(
+            "--receive-command={} -v receive",
+            quote(env!("CARGO_BIN_EXE_ostrya"))
+        );
+        if let Some(policy) = policy {
+            receive.push_str(&format!(" --policy={}", quote(policy.to_str().unwrap())));
+        }
+        receive
+    }
+
+    fn address(dest: &Path) -> String {
+        format!("ssh://localhost{}", dest.display())
+    }
+
+    fn server_tip(dest: &Path, name: &str) -> Option<Checksum> {
+        block_on(async {
+            let repo = Repo::open(dest).await.unwrap();
+            repo.resolve_rev(name, true).await.unwrap()
+        })
+    }
+
+    fn server_has_commit(dest: &Path, commit: &Checksum) -> bool {
+        block_on(async {
+            let repo = Repo::open(dest).await.unwrap();
+            repo.has_object(ObjectType::Commit, commit).await.unwrap()
+        })
+    }
+
+    /// A policy file whose default rule holds `keys`.
+    fn policy(base: &TmpDir, keys: &str) -> PathBuf {
+        let path = base.0.join("receive.conf");
+        std::fs::write(&path, format!("[ex-ostrya receive]\n{keys}\n")).unwrap();
+        path
+    }
+
+    /// The failure shape of `push`: exit 1, nothing on standard output, and
+    /// standard error that starts with `prefix`.
+    fn assert_failed(out: &Output, prefix: &str) {
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(out));
+        assert_eq!(stdout(out), "");
+        assert!(stderr(out).starts_with(prefix), "{}", stderr(out));
+    }
+
+    const FILES: &[(&str, &str)] = &[("a", "alpha\n"), ("dir/b", "beta\n")];
+
+    /// Push `main` and `other:renamed` over ssh to localhost, into an
+    /// `archive` receiver with `--compress` and into a `bare-user` receiver
+    /// raw, and check each receiver with the tool.
+    #[test]
+    fn a_push_over_ssh_to_localhost_is_read_by_the_tool() {
+        if std::env::var(SSH_LOCALHOST).as_deref() != Ok("1") {
+            eprintln!(
+                "skipped: {SSH_LOCALHOST} is not 1; set it to 1 to push over ssh to localhost"
+            );
+            return;
+        }
+        for (client_mode, mode, compress) in [
+            ("archive", RepoMode::Archive, Some("--compress")),
+            ("bare-user", RepoMode::BareUser, None),
+        ] {
+            let setup = Setup::new("ssh-localhost", client_mode);
+            let main = setup.commit("main", FILES, &[]);
+            // A commit bound to `other` cannot go to `renamed`.
+            let other = setup.commit("other", &[("c", "gamma\n")], &["--no-bindings"]);
+            let dest = receiver(&setup.base, mode);
+            let known_hosts = setup.base.0.join("known_hosts");
+            let ssh = format!(
+                "--ssh-command=ssh -o UserKnownHostsFile={} -o StrictHostKeyChecking=accept-new \
+                 -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10",
+                known_hosts.display()
+            );
+            let receive = format!(
+                "--receive-command={} receive",
+                quote(env!("CARGO_BIN_EXE_ostrya"))
+            );
+            let address = address(&dest);
+            let mut args = vec![ssh.as_str(), receive.as_str()];
+            args.extend(compress);
+            args.extend([address.as_str(), "main", "other:renamed"]);
+
+            let out = setup.push(&args, &[]);
+            assert!(out.status.success(), "{mode:?}: {}", stderr(&out));
+            assert_eq!(
+                stdout(&out),
+                format!("main (new) {main}\nrenamed (new) {other}\n")
+            );
+            assert_eq!(server_tip(&dest, "main"), Some(main));
+            assert_eq!(server_tip(&dest, "renamed"), Some(other));
+            tool_checks(&setup.base, &dest, &[("main", main), ("renamed", other)]);
+
+            let out = setup.push(&args, &[]);
+            assert!(out.status.success(), "{mode:?}: {}", stderr(&out));
+            assert_eq!(
+                stdout(&out),
+                format!("main {main} (unchanged)\nrenamed {other} (unchanged)\n")
+            );
+        }
+    }
+
+    /// `ostree` resolves `refs` in `recv`, checks it, and pulls them into a
+    /// new `archive` repository, which it also checks.
+    fn tool_checks(base: &TmpDir, recv: &Path, refs: &[(&str, Checksum)]) {
+        if !ostree_available() {
+            return;
+        }
+        tool_fsck(recv);
+        let tool = |args: &[&str]| {
+            let out = Command::new("ostree").args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "ostree {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let recv_arg = format!("--repo={}", recv.display());
+        for (name, commit) in refs {
+            assert_eq!(
+                tool(&[&recv_arg, "rev-parse", name]).trim(),
+                commit.to_hex()
+            );
+        }
+        let copy = base.0.join("copy");
+        let copy_arg = format!("--repo={}", copy.display());
+        tool(&[&copy_arg, "init", "--mode=archive"]);
+        let mut pull = vec![copy_arg.as_str(), "pull-local", recv.to_str().unwrap()];
+        pull.extend(refs.iter().map(|(name, _)| *name));
+        tool(&pull);
+        for (name, commit) in refs {
+            assert_eq!(
+                tool(&[&copy_arg, "rev-parse", name]).trim(),
+                commit.to_hex()
+            );
+        }
+        tool_fsck(&copy);
+    }
+
+    /// A push to an address, with no remote section in the client config,
+    /// writes the ref, and a repeat push reports it unchanged.
+    #[test]
+    fn a_repeat_push_to_an_address_reports_the_ref_unchanged() {
+        let setup = Setup::new("cli-repeat", "archive");
+        let config = std::fs::read_to_string(setup.client.join("config")).unwrap();
+        assert!(!config.contains("[remote"), "{config}");
+        let c = setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+
+        let out = setup.push_to(&dest, None, &["main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {c}\n"));
+        assert_eq!(stderr(&out), "");
+        assert_eq!(exit_status(&setup.status), "0");
+
+        let out = setup.push_to(&dest, None, &["main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main {c} (unchanged)\n"));
+        assert_eq!(server_tip(&dest, "main"), Some(c));
+        tool_fsck(&dest);
+    }
+
+    /// Under `--verbose`, one statistics line goes to standard error after
+    /// the repository line, and standard output keeps the ref lines alone.
+    #[test]
+    fn a_verbose_push_writes_the_statistics_to_standard_error() {
+        let setup = Setup::new("cli-verbose", "archive");
+        let c = setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let out = setup.push_to(&dest, None, &["-v", "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {c}\n"));
+        let err = stderr(&out);
+        let last = err.lines().last().unwrap();
+        assert!(last.contains(" objects offered, "), "{err}");
+        assert!(last.contains(" bytes sent in "), "{err}");
+    }
+
+    /// The server holds `D` on `C1` from another writer, and the client
+    /// pushes `C2` on `C1`: the server refuses the update that is not a
+    /// fast-forward, keeps `D`, and does not store `C2`.
+    #[test]
+    fn a_push_onto_a_moved_ref_fails_and_changes_no_ref() {
+        let setup = Setup::new("cli-moved", "archive");
+        let c1 = setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let out = setup.push_to(&dest, None, &["main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let d = commit_to(&setup.base, &dest, "main", &[("d", "delta\n")], &[]);
+        let c2 = setup.commit("main", &[("e", "epsilon\n")], &[]);
+
+        let out = setup.push_to(&dest, None, &["main"]);
+        assert_failed(&out, "error: non-fast-forward: ");
+        assert_eq!(server_tip(&dest, "main"), Some(d));
+        assert!(server_has_commit(&dest, &c1));
+        assert!(!server_has_commit(&dest, &c2));
+    }
+
+    /// `--force` expects any state of the ref. The default policy still
+    /// refuses the update that is not a fast-forward, and a policy with
+    /// `allow-non-fast-forward=true` takes it.
+    #[test]
+    fn a_forced_push_needs_a_policy_that_allows_a_non_fast_forward() {
+        let setup = Setup::new("cli-force", "archive");
+        setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let out = setup.push_to(&dest, None, &["main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let d = commit_to(&setup.base, &dest, "main", &[("d", "delta\n")], &[]);
+        let c2 = setup.commit("main", &[("e", "epsilon\n")], &[]);
+
+        let out = setup.push_to(&dest, None, &["--force", "main"]);
+        assert_failed(&out, "error: non-fast-forward: ");
+        assert_eq!(server_tip(&dest, "main"), Some(d));
+
+        let policy = policy(&setup.base, "allow-non-fast-forward=true");
+        let out = setup.push_to(&dest, Some(&policy), &["--force", "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main {d} {c2}\n"));
+        assert_eq!(server_tip(&dest, "main"), Some(c2));
+    }
+
+    /// With no refspec the push fails with the usage text before it starts
+    /// ssh.
+    #[test]
+    fn a_push_with_no_refspec_fails_before_ssh_starts() {
+        let setup = Setup::new("cli-norefspec", "archive");
+        setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let out = setup.push_to(&dest, None, &[]);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(stdout(&out), "");
+        let err = stderr(&out);
+        assert!(err.starts_with("Push commits to a remote"), "{err}");
+        assert!(
+            err.contains("Usage: push [OPTIONS] [REMOTE] [REFSPECS]..."),
+            "{err}"
+        );
+        assert!(err.ends_with("error: REFSPEC must be specified\n"), "{err}");
+        assert!(!setup.ssh_started());
+        assert_eq!(server_tip(&dest, "main"), None);
+    }
+
+    /// With no remote the push fails with the usage text before it starts
+    /// ssh.
+    #[test]
+    fn a_push_with_no_remote_fails_before_ssh_starts() {
+        let setup = Setup::new("cli-noremote", "archive");
+        let ssh = setup.ssh_command();
+        let out = setup.push(&[&ssh], &[]);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(stdout(&out), "");
+        let err = stderr(&out);
+        assert!(
+            err.contains("Usage: push [OPTIONS] [REMOTE] [REFSPECS]..."),
+            "{err}"
+        );
+        assert!(err.ends_with("error: REMOTE must be specified\n"), "{err}");
+        assert!(!setup.ssh_started());
+    }
+
+    /// A depth below -1 fails before ssh starts, and `--compress` takes the
+    /// levels 1 to 9 alone.
+    #[test]
+    fn a_depth_below_minus_one_and_a_bad_level_are_refused() {
+        let setup = Setup::new("cli-refused", "archive");
+        setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let out = setup.push_to(&dest, None, &["--depth=-2", "main"]);
+        assert_failed(&out, "error: invalid input: depth -2 is below -1");
+        assert!(!setup.ssh_started());
+        for level in ["--compress=0", "--compress=10"] {
+            let out = setup.push_to(&dest, None, &[level, "main"]);
+            assert_eq!(out.status.code(), Some(1), "{level}");
+            assert_eq!(stdout(&out), "");
+            assert!(stderr(&out).contains("--compress"), "{}", stderr(&out));
+            assert!(!setup.ssh_started());
+        }
+        let out = setup.push_to(&dest, None, &["--compress=9", "--depth=0", "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(setup.ssh_started());
+    }
+
+    /// A ref line that standard output cannot take, here on `/dev/full`,
+    /// gives the error line and exit 1. The ref of the server has moved.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_write_of_the_ref_lines_exits_one() {
+        let setup = Setup::new("cli-dev-full", "archive");
+        let main = setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let ssh = setup.ssh_command();
+        let receive = receive_command(None);
+        let address = address(&dest);
+        let repo = format!("--repo={}", setup.client.display());
+        let out = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+            .args([&repo, "push", &ssh, &receive, &address, "main"])
+            .current_dir(&setup.base.0)
+            .env_remove("OSTRYA_SSH_COMMAND")
+            .env_remove("OSTREE_REPO")
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create("/dev/full").unwrap())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        let err = stderr(&out);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(err.starts_with("error: "), "{err}");
+        assert!(err.contains("os error 28"), "{err}");
+        assert_eq!(server_tip(&dest, "main"), Some(main));
+    }
+
+    /// `--ssh-command` wins over `OSTRYA_SSH_COMMAND` and over the
+    /// `ssh-command` key of the remote, and `--receive-command` wins over the
+    /// `receive-command` key.
+    #[test]
+    fn the_command_options_win_over_the_environment_and_the_remote_keys() {
+        let setup = Setup::new("cli-precedence", "archive");
+        let c = setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let env = [("OSTRYA_SSH_COMMAND", "/nonexistent/ssh")];
+
+        // The environment variable reaches the push when no option is given.
+        let receive = receive_command(None);
+        let address = address(&dest);
+        let out = setup.push(&[&receive, &address, "main"], &env);
+        assert_failed(&out, "error: transport: ");
+        assert!(
+            stderr(&out).contains("/nonexistent/ssh"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(!setup.ssh_started());
+
+        let ssh = setup.ssh_command();
+        let out = setup.push(&[&ssh, &receive, &address, "main"], &env);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {c}\n"));
+
+        let config = setup.client.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "\n[remote \"origin\"]\npush-url={address}\nssh-command=/nonexistent/ssh\n\
+             receive-command=/nonexistent/receive\n"
+        ));
+        std::fs::write(&config, text).unwrap();
+        let c2 = setup.commit("main", &[("e", "epsilon\n")], &[]);
+        let out = setup.push(&[&ssh, &receive, "origin", "main"], &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main {c} {c2}\n"));
+    }
+
+    /// A delete is refused by the default policy, and a policy with
+    /// `allow-delete=true` takes it. A delete of an absent ref changes
+    /// nothing.
+    #[test]
+    fn a_delete_needs_a_policy_that_allows_it() {
+        let setup = Setup::new("cli-delete", "archive");
+        let c = setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let out = setup.push_to(&dest, None, &["main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+
+        let out = setup.push_to(&dest, None, &[":main"]);
+        assert_failed(&out, "error: delete-denied: ");
+        assert_eq!(server_tip(&dest, "main"), Some(c));
+
+        let policy = policy(&setup.base, "allow-delete=true");
+        let out = setup.push_to(&dest, Some(&policy), &[":main", ":absent"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(
+            stdout(&out),
+            format!("main {c} (deleted)\nabsent (absent) (unchanged)\n")
+        );
+        assert_eq!(server_tip(&dest, "main"), None);
+    }
+
+    /// A key that `[ex-ostrya] detached-metadata-exclude` of the client names
+    /// does not reach the server, and the other keys do.
+    #[test]
+    fn an_excluded_detached_metadata_key_does_not_reach_the_server() {
+        let setup = Setup::new("cli-exclude", "archive");
+        let c = setup.commit(
+            "main",
+            FILES,
+            &[
+                "--add-detached-metadata-string=keep.me=1",
+                "--add-detached-metadata-string=drop.me=2",
+            ],
+        );
+        let config = setup.client.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[ex-ostrya]\ndetached-metadata-exclude=drop.me\n");
+        std::fs::write(&config, text).unwrap();
+        let dest = receiver(&setup.base, RepoMode::Archive);
+
+        let out = setup.push_to(&dest, None, &["main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let meta = block_on(async {
+            let repo = Repo::open(&dest).await.unwrap();
+            repo.read_commit_detached_metadata(&c).await.unwrap()
+        })
+        .expect("the server stores the detached metadata");
+        let text = format!("{meta:?}");
+        assert!(text.contains("keep.me"), "{text}");
+        assert!(!text.contains("drop.me"), "{text}");
+    }
+}

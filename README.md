@@ -101,7 +101,7 @@ Feature flags on `ostrya`:
 - `push` -- the client side of a push from a repository: `Repo::push`,
   `Repo::push_over_stream`, and the push address and the connect options of
   a configured remote or of an address. The `push` feature of `ostrya-cli`,
-  in its default set, turns it on.
+  in its default set, builds `ostrya push` on it.
 - `lzma-static` -- the static xz build.
 
 Later phases add `s3` and `serve`.

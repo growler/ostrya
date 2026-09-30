@@ -304,6 +304,40 @@ fn header_frame() -> Vec<u8> {
     v
 }
 
+/// The frame `write_message` gives an `ObjectHeader` equals the frame of the
+/// generic body encoder for each type and encoding the header allows, and
+/// reads back. A type or an encoding the header does not allow is refused,
+/// and nothing is written.
+#[test]
+fn an_object_header_frame_equals_the_generic_encoding() {
+    use ObjectType::*;
+    for (ty, encodings) in [
+        (File, &[Encoding::Raw, Encoding::Deflate][..]),
+        (DirTree, &[Encoding::Raw][..]),
+        (DirMeta, &[Encoding::Raw][..]),
+        (Commit, &[Encoding::Raw][..]),
+        (CommitMeta, &[Encoding::Raw][..]),
+    ] {
+        for &encoding in encodings {
+            for n in [0, 0x7f, 0xff] {
+                let msg = header(ty, n, encoding);
+                let bytes = encode(&msg);
+                assert_eq!(bytes, frame(5, &msg.encode_body().unwrap()), "{msg:?}");
+                assert_eq!(read_one(&bytes).unwrap(), Some(msg));
+            }
+        }
+    }
+    for msg in [
+        header(DirTree, 0, Encoding::Deflate),
+        header(CommitMeta, 0, Encoding::Deflate),
+        header(TombstoneCommit, 0, Encoding::Raw),
+    ] {
+        let mut w = FrameWriter::new(Vec::new());
+        assert_protocol(block_on(w.write_message(&msg)));
+        assert!(w.into_inner().is_empty());
+    }
+}
+
 #[test]
 fn golden_bytes_pin_the_frame_layout() {
     golden(Message::Abort, hex("00 00 00 02 0b 00"));

@@ -46,6 +46,8 @@
 //!   repository.
 //! - `receive` -- the server side of a push over ssh: one session over
 //!   standard input and standard output. The `receive` feature builds it.
+//! - `push` -- push commits of the repository to a remote over ssh, and
+//!   update its refs. The `push` feature builds it.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams to and from stdin/stdout flow through
@@ -158,6 +160,9 @@ enum Command {
     /// Receive one push session over standard input and standard output.
     #[cfg(feature = "receive")]
     Receive(ReceiveArgs),
+    /// Push commits to a remote over ssh and update its refs.
+    #[cfg(feature = "push")]
+    Push(PushArgs),
 }
 
 impl Command {
@@ -189,6 +194,8 @@ impl Command {
         "pull-local",
         #[cfg(feature = "receive")]
         "receive",
+        #[cfg(feature = "push")]
+        "push",
     ];
 
     /// The name `clap` registered this subcommand under, which the error paths
@@ -217,6 +224,8 @@ impl Command {
             Command::PullLocal(_) => "pull-local",
             #[cfg(feature = "receive")]
             Command::Receive(_) => "receive",
+            #[cfg(feature = "push")]
+            Command::Push(_) => "push",
         }
     }
 }
@@ -1357,9 +1366,61 @@ struct PullArgs {
 #[derive(Args)]
 struct ReceiveArgs {
     /// Read the receive, trust, and key groups, and the remotes they name,
-    /// from FILE alone, in place of the repository config.
+    /// from FILE alone, in place of those of the repository config. `[core]
+    /// auto-update-summary` and `[ex-ostrya] detached-metadata-exclude` still
+    /// come from the repository config.
     #[arg(long, value_name = "FILE")]
     policy: Option<PathBuf>,
+}
+
+#[cfg(feature = "push")]
+#[derive(Args)]
+struct PushArgs {
+    /// Parents of each source commit to send: 0 for the commit alone, -1 for
+    /// the whole chain the repository holds. Absent, the chain back to the
+    /// commit of the ref on the server. When the server does not hold the
+    /// ref, or the local chain does not hold the commit of the ref on the
+    /// server, the push then sends the source commit alone; --depth=-1 sends
+    /// the whole local chain. A value below -1 is refused.
+    #[arg(long, value_name = "N", allow_negative_numbers = true)]
+    depth: Option<i32>,
+    /// Update each ref whatever its state on the server, and ask the server to
+    /// allow an update that is not a fast-forward. The receive policy of the
+    /// server still refuses a non-fast-forward update unless it allows one.
+    #[arg(long)]
+    force: bool,
+    /// Send the content objects deflated at LEVEL, 1 to 9 (default 6).
+    /// Absent, the push sends them raw. With it, an archive repository sends
+    /// each stored content object as it is, at the zlib level the repository
+    /// wrote it with, whatever LEVEL is.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "6",
+        value_parser = clap::value_parser!(u8).range(1..=9)
+    )]
+    compress: Option<u8>,
+    /// The ssh command, split at ASCII whitespace. It wins over the
+    /// OSTRYA_SSH_COMMAND environment variable and over the `ssh-command` key
+    /// of the remote.
+    #[arg(long, value_name = "CMD")]
+    ssh_command: Option<String>,
+    /// The command the remote side runs, which the remote shell parses. It
+    /// wins over the `receive-command` key of the remote. The default is
+    /// `ostrya receive`.
+    #[arg(long, value_name = "CMD")]
+    receive_command: Option<String>,
+    /// The remote: a `[remote "<name>"]` section of this repository's config
+    /// with a push address, or an ssh address. Required; checked after the
+    /// repository resolves.
+    remote: Option<String>,
+    /// The refspecs, each SRC[:DST]. SRC is a revision of this repository and
+    /// DST the ref of the server that takes its commit; DST defaults to SRC
+    /// when SRC is a ref. `:DST` deletes the ref DST of the server. At least
+    /// one is required.
+    refspecs: Vec<String>,
 }
 
 #[derive(Args)]
@@ -1604,6 +1665,11 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             let (repo, _) = resolve_repo(repo, false, name).await;
             receive(repo, args).await
         }
+        #[cfg(feature = "push")]
+        Command::Push(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            push(repo, name, verbose, args).await
+        }
     }
 }
 
@@ -1633,6 +1699,89 @@ async fn receive(repo: Repo, args: ReceiveArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Push the commits the refspecs name to a remote over ssh, and update its
+/// refs in one transaction.
+///
+/// Standard output carries one line for each ref, in the order of the
+/// refspecs, and nothing else. Under `--verbose` one statistics line goes to
+/// standard error. A failure writes nothing to standard output.
+#[cfg(feature = "push")]
+async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<()> {
+    let Some(remote) = args.remote.as_deref() else {
+        exit_with_error(name, "REMOTE must be specified");
+    };
+    if args.refspecs.is_empty() {
+        exit_with_error(name, "REFSPEC must be specified");
+    }
+    let compression = match args.compress {
+        Some(level) => ostrya::push::Compression::Deflate { level },
+        None => ostrya::push::Compression::None,
+    };
+    let ssh_command = args.ssh_command.map(|command| {
+        command
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect()
+    });
+    let opts = ostrya::RepoPushOptions {
+        refspecs: args.refspecs,
+        depth: args.depth,
+        compression,
+        force: args.force,
+        connect: ostrya::push::ConnectOptions {
+            ssh_command,
+            receive_command: args.receive_command,
+            ..Default::default()
+        },
+        detached_metadata_filter: detached_metadata_filter(&repo)?,
+        progress: None,
+    };
+    let outcome = repo.push(remote, opts).await?;
+    // The refs are written on the remote at this point. A failed write to
+    // standard output, a full device or a closed pipe, is reported as the
+    // error line of `main` and exits 1.
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        for update in &outcome.refs {
+            writeln!(out, "{}", ref_line(update)).map_err(Error::Io)?;
+        }
+        out.flush().map_err(Error::Io)?;
+    }
+    if verbose {
+        eprintln!("{}", push_statistics_line(&outcome.stats));
+    }
+    Ok(())
+}
+
+/// The line `push` prints for one ref: the name, the commit before the write
+/// or `(new)` or `(absent)`, and the commit after it or `(deleted)` or
+/// `(unchanged)`.
+#[cfg(feature = "push")]
+fn ref_line(outcome: &ostrya::push::RefOutcome) -> String {
+    let name = &outcome.name;
+    match (outcome.old, outcome.new) {
+        (None, Some(new)) => format!("{name} (new) {new}"),
+        (Some(old), Some(new)) if old == new => format!("{name} {new} (unchanged)"),
+        (Some(old), Some(new)) => format!("{name} {old} {new}"),
+        (Some(old), None) => format!("{name} {old} (deleted)"),
+        (None, None) => format!("{name} (absent) (unchanged)"),
+    }
+}
+
+/// The statistics line `push --verbose` writes to standard error.
+#[cfg(feature = "push")]
+fn push_statistics_line(stats: &ostrya::push::PushStats) -> String {
+    format!(
+        "{} objects offered, {} needed, {} sent; {} bytes sent in {:.3} seconds",
+        stats.objects_total,
+        stats.objects_needed,
+        stats.objects_sent,
+        stats.bytes_sent,
+        stats.elapsed.as_secs_f64()
+    )
 }
 
 /// The name of a step of the receive report, as its warning line gives it.
@@ -9820,6 +9969,52 @@ mod tests {
         assert_eq!(
             update_interval(Some(250)),
             std::time::Duration::from_millis(250)
+        );
+    }
+
+    /// Each ref line of `push`: a new ref, a moved ref, a ref already at the
+    /// commit, a deleted ref, and a delete of an absent ref.
+    #[cfg(feature = "push")]
+    #[test]
+    fn a_push_ref_line_names_the_old_and_the_new_state() {
+        let c1 = Checksum::from_bytes([0x11; 32]);
+        let c2 = Checksum::from_bytes([0x22; 32]);
+        let line = |old, new| {
+            ref_line(&ostrya::push::RefOutcome {
+                name: "main".into(),
+                old,
+                new,
+            })
+        };
+        assert_eq!(line(None, Some(c1)), format!("main (new) {c1}"));
+        assert_eq!(line(Some(c1), Some(c2)), format!("main {c1} {c2}"));
+        assert_eq!(line(Some(c2), Some(c2)), format!("main {c2} (unchanged)"));
+        assert_eq!(line(Some(c2), None), format!("main {c2} (deleted)"));
+        assert_eq!(line(None, None), "main (absent) (unchanged)");
+        // A literal line, so that an abbreviated checksum fails the test.
+        assert_eq!(
+            line(Some(c1), Some(c2)),
+            "main 1111111111111111111111111111111111111111111111111111111111111111 \
+             2222222222222222222222222222222222222222222222222222222222222222"
+        );
+    }
+
+    /// The statistics line of `push --verbose` gives each counter and the
+    /// elapsed time in seconds.
+    #[cfg(feature = "push")]
+    #[test]
+    fn the_push_statistics_line_gives_each_counter() {
+        let stats = ostrya::push::PushStats {
+            objects_total: 12,
+            objects_needed: 5,
+            objects_sent: 4,
+            bytes_sent: 2048,
+            payload_bytes: 1900,
+            elapsed: std::time::Duration::from_millis(1250),
+        };
+        assert_eq!(
+            push_statistics_line(&stats),
+            "12 objects offered, 5 needed, 4 sent; 2048 bytes sent in 1.250 seconds"
         );
     }
 }

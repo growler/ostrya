@@ -8,6 +8,7 @@ use std::task::{Context, Poll, ready};
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::message::object_header_frame;
 use super::{ABANDON, Kind, MAX_FRAME_LIMIT, MIN_FRAME_LIMIT, Message, protocol};
 use crate::error::{Error, Result};
 
@@ -409,6 +410,14 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         if self.in_object {
             return Err(protocol("message inside an object"));
         }
+        // An object stream writes one `ObjectHeader` for each object, so its
+        // frame is built on the stack. The frame is below every limit.
+        if let Message::ObjectHeader(header) = msg {
+            let frame = object_header_frame(header)?;
+            self.inner.write_all(&frame).await?;
+            self.in_object = true;
+            return Ok(());
+        }
         let body = msg.encode_body()?;
         let len = u32::try_from(body.len() + 1)
             .ok()
@@ -425,7 +434,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         frame.push(msg.kind().as_u8());
         frame.extend_from_slice(&body);
         self.inner.write_all(&frame).await?;
-        self.in_object = matches!(msg, Message::ObjectHeader(_));
+        self.in_object = false;
         Ok(())
     }
 

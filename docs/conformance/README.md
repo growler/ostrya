@@ -134,7 +134,7 @@ tier at which the tree can be built.
   name holding a newline, a name holding a quote and a backslash, and a path 40
   levels deep. Tier T0.
 - `C11` unsupported types, unprivileged -- a fifo and a unix socket. Tier T0.
-  The expected outcome is a refusal from both implementations.
+  Both implementations refuse the commit.
 - `C12` unsupported types, privileged -- a character device and a block device.
   Tier T3. The expected outcome is a refusal from both implementations.
 - `C13` real ownership -- a tree whose files are owned by 0:0, 1:1, and

@@ -7001,8 +7001,9 @@ The extension serves two scenarios:
 
 - Tree push -- a client program pushes a directory tree. The client builds the
   commit object with `ostrya-core` and signs it with its own keys. With the
-  same inputs, the commit is byte-identical to the commit `ostree commit`
-  builds from the same directory. The client library compiles on Linux,
+  same inputs, over a tree the walker accepts, the commit is byte-identical to
+  the commit `ostree commit --no-xattrs` builds from the same directory
+  (`format-reference.md`, "commit"). The client library compiles on Linux,
   macOS, and Windows. `ostrya push-tree` is the command form.
 - Commit push -- `ostrya push` sends one or more commits from a local
   repository and updates refs on the remote.

@@ -355,17 +355,46 @@ question: Confirm a non-UTF8 name, a 255-byte name, a name holding a newline, a
 
 family: M0
 corpus: C11
-modes: archive bare bare-user bare-user-only bare-user-shared
+modes: archive bare bare-user bare-user-only
 tier: T0
-outcome: unobserved
+outcome: refused-both
 severity: interop
 identity: n-a
-oracle: exit-status stderr-text
+oracle: exit-status stdout-text refs-bytes inventory
 evidence: -
-question: The expected result is a refusal from both implementations, because
- the format holds regular files, symlinks, and directories only. Record each
- refusal text and exit status for a fifo and for a unix socket, and confirm the
- repository is left unmodified.
+spec: format-reference.md#commit
+note: the format holds regular files, symlinks, and directories alone, so both
+ implementations refuse a fifo and a unix socket at exit 1, with standard output
+ empty, no ref, and no object. The tool reports `error: Not a regular file or
+ symlink: <name>` and the port `error: unsupported: unsupported file type for
+ entry "<name>"`, each naming the first such entry the walk reaches, so
+ `stderr-text` is not an oracle here (`cli-surface.md`, "P2"). The type check
+ stands ahead of `--skip-list` in both, so a skip list naming the fifo and the
+ socket gives the same refusal. Observed with `ostree` 2026.1 as uid 1000 in each
+ of the four modes, `bare` included, where the refusal comes before any object
+ write. The tool keeps its `tmp/staging-` entry after the refusal and the port
+ keeps none (`cli-surface.md`, "P2"). The record carries no `run:` line: the
+ harness binds the socket of this corpus by its absolute path,
+ `<repo>/target/conformance/<run-id>/m0/C11/<mode>/{port,ref}/corpus-C11/socket`,
+ and a unix socket address holds at most 107 bytes of path. The length of the
+ path depends on the artifact directory. Under the default artifact directory
+ of the development host it is 106 or 107 bytes in `bare` and 109 to 119 bytes
+ in the other four modes, so the setup fails before the commit runs in four of
+ the five modes.
+
+family: M0
+corpus: C11
+modes: bare-user-shared
+tier: T0
+outcome: refused-clean
+severity: interop
+identity: n-a
+oracle: exit-status refs-bytes inventory
+evidence: -
+spec: format-reference.md#port-extension-bare-user-shared-mode
+note: the tool does not open this mode, so the port's refusal has no counterpart
+ to compare with. The port refuses the fifo and the socket as it does in the four
+ modes above, at exit 1, with no ref and no object.
 
 family: M0
 corpus: C12

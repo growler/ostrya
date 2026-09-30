@@ -474,12 +474,13 @@ Missing:
 `--selinux-policy=PATH`, `-P/--selinux-policy-from-base`,
 `--selinux-labeling-epoch`.
 
-The five tree-source options carry seven divergences between them. The
-composition rule, the source list, the two type-change refusals, `--base`,
-`--consume`, `--generate-sizes` over any source list, and the two tar options
-otherwise agree with the tool over every form the cells and the tests hold, each
-accepted form checked by the commit checksum and each refusal by its text
-(`../format-reference.md`, "CLI output formats", `commit`, and that file's
+The five tree-source options carry seven divergences between them, and the
+walk of a filesystem source carries the divergences its own paragraph states
+below. The composition rule, the source list, the two type-change refusals,
+`--base`, `--consume`, `--generate-sizes` over any source list, and the two tar
+options otherwise agree with the tool over every form the cells and the tests
+hold, each accepted form checked by the commit checksum and each refusal by its
+text (`../format-reference.md`, "CLI output formats", `commit`, and that file's
 "The tar import").
 
 The first is the source a command line naming neither `--tree` nor a positional
@@ -732,6 +733,41 @@ Two wordings the port reproduces here are the tool's own C-library shape:
 does not open, and `archive_read_open_filename: Failed to open '<path>'` for a
 `tar=` source. Both implementations open a `dir=` source no-follow, so a
 symlink naming a directory is `Not a directory` in both.
+
+The walk of a filesystem source carries divergences apart from the seven
+above: the wording of each refusal of an entry, and two outcomes. The walk
+reads each entry with `fstatat` and checks its type ahead of `--skip-list` in
+both implementations, and it opens an entry after that check
+(`../format-reference.md`, "commit"). Both refuse a fifo and a unix socket at
+exit 1, with no object and no ref, and a skip list that names the entry does
+not prevent the refusal. Both refuse a regular file or a directory that does
+not open, and an entry of a directory at mode 0644, whose `fstatat` fails. The
+wording parts: the tool names the entry and the call, as in `openat(<name>):
+Permission denied`, `opendir(<name>): Permission denied`, `fstatat(<name>):
+Permission denied`, and `Not a regular file or symlink: <name>`, and the port
+reports `i/o error: Permission denied (os error 13)` and `unsupported:
+unsupported file type for entry "<name>"`. The walk root that does not open
+reads `opendir(<path>): Permission denied` in both. Observed with `ostree`
+2026.1 as uid 1000 in `archive`, `bare`, `bare-user`, and `bare-user-only`.
+Two outcomes part:
+
+- a symlink whose target is not valid UTF-8. The tool commits it at exit 0,
+  writes GLib criticals to standard error, two in `archive` and one in `bare`,
+  `bare-user`, and `bare-user-only`, and hashes the target as the literal
+  string `[Invalid UTF-8]`, so the commit checksum stands for a target the
+  source does not hold. In `archive` the stored object holds that string, and
+  in the other three modes it holds the original target bytes. The port
+  refuses the commit with `error: invalid format: symlink target is not valid
+  UTF-8` at exit 1 and writes no object and no ref. This is the rule "refuse
+  rather than reinterpret": the file header stores the target as a GVariant
+  string, and the port does not store a value of its own in place of the
+  target. No matrix cell states the case;
+- a skip list that names a regular file or a directory that does not open. The
+  tool does not open the entry and commits the tree without it. Without
+  `--no-xattrs` the port reads the extended attributes of the entry ahead of the
+  skip list, the read fails, and the port refuses at exit 1 with no object and
+  no ref. With `--no-xattrs` the port commits, and the commit checksum equals
+  the tool's. This is a defect of the port, and no matrix cell states it yet.
 
 The one divergence the four Phase 17c options carry sits at the values
 `--timestamp` takes. The tool reads a date with a full natural-language reader:

@@ -4274,6 +4274,71 @@ ahead of the unmatched-entry report of the other control file, and ahead of a
 tree path that does not open. Both files are checked, and the report names
 neither the file nor the line.
 
+The walk of a filesystem source reads each directory in the order the
+filesystem lists it, and it enters a subdirectory when it reaches it. The first
+entry that fails in that order decides the refusal. For each entry the tool
+runs these steps in this order, each observed with an entry that fails it:
+
+1. It reads the entry with `fstatat`, no-follow. A failure reports `error:
+   fstatat(<name>): <reason>`. A directory with read permission and no search
+   permission, mode 0644, therefore stops at its first entry, and a skip list
+   that names that entry alone does not prevent the refusal.
+2. It checks the type. A fifo and a unix socket report `error: Not a regular
+   file or symlink: <name>`. A skip list that names the entry does not prevent
+   the refusal. No device node was observed, because a device node needs real
+   root.
+3. It applies `--skip-list`. The tool does not open an entry the skip list
+   names.
+4. It opens the entry. A regular file that does not open reports `error:
+   openat(<name>): <reason>`, and a directory that does not open reports
+   `error: opendir(<name>): <reason>`. A walk root that does not open
+   reports `error: opendir(<path>): <reason>`.
+
+`<name>` is the entry's own name and not its path, so `sub/d/y` reports `y`.
+Each refusal exits 1 with standard output empty, no object in `objects/`, and no
+ref written. A regular file at mode 0000, an empty file at mode 0000, and a
+file at mode 0200 each report `openat(<name>): Permission denied`, and
+`--no-xattrs`, `--canonical-permissions`, and `--owner-uid=0 --owner-gid=0` do
+not change this. A directory at mode 0000, empty or not, and a directory at
+mode 0311 each report `opendir(<name>): Permission denied`. A skip list that
+names the file at mode 0000, the directory at mode 0000, the directory at mode
+0311, or the directory at mode 0644 gives a commit at exit 0, and the commit
+checksum is that of the tree without the entry. Observed with `ostree` 2026.1
+as uid 1000 in `archive`, `bare`, `bare-user`, and `bare-user-only`. In `bare`
+as a user other than root, `--canonical-permissions` and `--owner-uid=0` fail
+first on the owner change of an earlier object, with `error: Writing content
+object: fchown: Operation not permitted`.
+
+A symlink whose target is not valid UTF-8 is committed by the tool at exit 0.
+The tool writes `g_variant_new_string(): requires valid UTF-8` to standard
+error on a `GLib-CRITICAL` line, twice in `archive` and once in `bare`,
+`bare-user`, and `bare-user-only`, and it hashes the target as the 15-byte
+string `[Invalid UTF-8]`. In each of the four modes the commit checksum is
+therefore that of the same tree with the literal target `[Invalid UTF-8]`. In
+`archive` the stored object holds that string, so a checkout gives a symlink
+to `[Invalid UTF-8]`. In `bare`, `bare-user`, and `bare-user-only` the object
+stored under that name holds the original target bytes: `ostree ls` reads the
+original target back, and a checkout gives a symlink to it. `ostree fsck`
+passes in each mode. The port refuses such a target with `error: invalid
+format: symlink target is not valid UTF-8` at exit 1 and writes no object and
+no ref (`conformance/cli-surface.md`, "P2").
+
+The port reads each entry with `fstatat` and checks its type ahead of
+`--skip-list`, as the tool does. It refuses a fifo and a socket with `error:
+unsupported: unsupported file type for entry "<name>"`, and it reports an entry
+that does not open with `error: i/o error: <reason> (os error <n>)`, which names
+no path. It lists a whole directory before it enters a subdirectory, so over a
+tree with more than one failing entry the two implementations can report
+different entries. The port differs in one outcome. Without `--no-xattrs` it
+reads the extended attributes of each entry when it lists the directory, ahead
+of the skip list, and that read opens the entry. So a skip list that names a
+regular file or a directory that does not open does not prevent the refusal:
+the port reports `error: i/o error: Permission denied (os error 13)` at exit 1
+where the tool commits. A directory at mode 0644 opens, so a skip list that
+names one gives a commit in both. With `--no-xattrs` the port opens no entry
+the skip list names, and it commits in each case with the commit checksum of
+the tool (`conformance/cli-surface.md`, "P2").
+
 `--mode-ro-executables` clears the write bits of every executable regular file:
 where `mode & 0o111` is non-zero, `mode &= ~0o222`. Any one of the three execute
 bits triggers it and all three write bits go, so 0766 becomes 0544 and 0621

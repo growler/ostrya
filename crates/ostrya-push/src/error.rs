@@ -10,8 +10,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The error a push session fails with.
 ///
 /// Each variant except [`Error::Aborted`], [`Error::CommitOutcomeUnknown`],
-/// [`Error::Source`], [`Error::InvalidInput`], [`Error::Transport`], and
-/// [`Error::Io`] is one wire code of the `Error` message.
+/// [`Error::Source`], [`Error::InvalidInput`], [`Error::Transport`],
+/// [`Error::Io`], and [`Error::Walk`] is one wire code of the `Error` message.
 /// The enum is `#[non_exhaustive]`, so a match outside the crate needs a
 /// wildcard arm.
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +118,24 @@ pub enum Error {
     /// or an object has the kind `UnexpectedEof`.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// The walk or the hash of a local tree failed, or the send pass could
+    /// not open a file of the tree again. `path` names the entry on the local
+    /// filesystem, the walk root included. `source` keeps the
+    /// `io::ErrorKind` of the failure: the kind of the call that failed, for
+    /// example `PermissionDenied` or `NotFound`, `InvalidInput` for a walk
+    /// root that is not a directory or that the entry filter skips, and
+    /// `InvalidData` or `Unsupported` for a structure the walk refuses. No
+    /// wire code carries it. The walk and the hash come before any session,
+    /// and a session returns a failed open of the send pass inside
+    /// [`Error::Source`].
+    #[error("{}: {source}", .path.display())]
+    Walk {
+        /// The entry on the local filesystem.
+        path: std::path::PathBuf,
+        /// The failure.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// The wire code of an `Error` message.
@@ -212,7 +230,8 @@ impl ErrorCode {
 impl Error {
     /// The wire code of the error, or `None` for [`Error::Aborted`],
     /// [`Error::CommitOutcomeUnknown`], [`Error::Source`],
-    /// [`Error::InvalidInput`], [`Error::Transport`], and [`Error::Io`].
+    /// [`Error::InvalidInput`], [`Error::Transport`], [`Error::Io`], and
+    /// [`Error::Walk`].
     pub fn code(&self) -> Option<ErrorCode> {
         Some(match self {
             Error::VersionUnsupported(_) => ErrorCode::VersionUnsupported,
@@ -236,7 +255,8 @@ impl Error {
             | Error::Source(_)
             | Error::InvalidInput(_)
             | Error::Transport(_)
-            | Error::Io(_) => return None,
+            | Error::Io(_)
+            | Error::Walk { .. } => return None,
         })
     }
 
@@ -272,7 +292,8 @@ impl Error {
             | Error::Source(_)
             | Error::InvalidInput(_)
             | Error::Transport(_)
-            | Error::Io(_) => (ErrorCode::Internal, self.to_string()),
+            | Error::Io(_)
+            | Error::Walk { .. } => (ErrorCode::Internal, self.to_string()),
             Error::VersionUnsupported(m)
             | Error::LockingDisabled(m)
             | Error::Unauthorized(m)

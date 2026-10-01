@@ -2589,6 +2589,123 @@ pub struct PushOutcome {
 }
 ```
 
+## Push tree model
+
+`ostrya_push::tree` walks a local directory with `std::fs` into a
+`TreeModel`: the metadata of each entry and the checksum of each object of
+the tree. The model stores each entry once, as its name, its metadata, and
+the index of its parent directory, and it holds no file content.
+`TreeModel::scan` runs on the runtime backend that the `smol` or the
+`tokio` feature selects.
+
+- The walk does not follow symlinks, and the walk root must be a directory.
+  It reads a directory listing to its end, with the metadata of each entry
+  and the target of each symlink, and closes the directory before it enters
+  a subdirectory. So it holds one directory open at a time.
+- Names and symlink targets must be valid UTF-8, and names must pass the
+  dirtree name rule. Regular files, directories, and symlinks are taken.
+  Any other entry stops the walk before the entry filter sees it.
+- The default metadata: on Unix the owner and the mode of the metadata
+  read, which does not follow a symlink. On other platforms owner 0:0 and
+  mode `0o100644` for a regular file and `0o40755` for a directory. A
+  symlink has the mode `0o120777` on every platform. `xattrs` is empty.
+- The `EntryFilter` runs once for each entry, the root first with the
+  empty path, on the task that drives the scan. It can change the owner,
+  the permission bits, the extended attributes, and the target of a
+  symlink. A change of the kind or of the file-type bits, a bit above
+  `0o177777`, and a symlink target on another kind or removed from a
+  symlink are `Error::Walk` of kind `InvalidData`. `Skip` leaves out the
+  entry and the subtree of a directory, and `Skip` on the root is
+  `Error::Walk` of kind `InvalidInput`.
+- The hash pass reads each kept regular file once, on the blocking pool,
+  in chunks of at most 64 KiB, with at most `hash_jobs` files in flight.
+  The default is the number of CPUs, or 1, and the pass takes at most
+  `ostrya_rt::blocking_threads()`. `Some(0)` is `Error::InvalidInput`, and
+  the walk does not start.
+- On Unix the open takes `O_NOFOLLOW | O_NONBLOCK`, and one `fstat` of the
+  open file must show a regular file with the device and inode numbers
+  that the walk read. On Windows it takes `FILE_FLAG_OPEN_REPARSE_POINT |
+  FILE_FLAG_BACKUP_SEMANTICS` and checks the type alone. A file that
+  changed is `Error::Walk` of kind `InvalidData`.
+- At the first error the pass sets a stop flag, starts no new job, and
+  waits until each job in flight stops. So no file of the pass is open
+  when `scan` returns. A dropped scan sets the flag too.
+- Each directory is hashed bottom-up into its dirtree and dirmeta objects.
+  A dirtree or a dirmeta object over `MAX_METADATA_SIZE` is `Error::Walk` of
+  kind `InvalidData` that names the directory.
+- `object_names` gives each object of the tree once, in the order the walk
+  reached its first source.
+- Each failure of the walk and of the hash pass is `Error::Walk`. `path`
+  names the entry on the local filesystem, and `source` keeps the
+  `io::ErrorKind`. The variant has no wire code.
+- `set_commit` gives the model the checksum, the bytes, and the detached
+  dict of the commit over the tree. The model does not check the bytes, and
+  a later call replaces the commit.
+- `TreeModel` is an `ObjectSource`. `objects` of the commit gives each
+  object of the tree once and then the commit. `open` of a regular file
+  opens it again, with the open and the checks of the hash pass, and gives
+  `ObjectData::Content` with the byte count of the hash pass as `size`. The
+  payload stops after `size` plus 1 byte, so a file that grew gives at most
+  1 byte more than the hash pass read. It does not read the length again or
+  hash the file again, and the server refuses a file that changed. A symlink
+  opens nothing. A dirtree or a
+  dirmeta object is serialized again from the model, and the commit is the
+  bytes of `set_commit`, each as `ObjectData::Encoded` in `raw`.
+  `detached_metadata` of the commit gives the stored dict. Another commit
+  and an object the model does not hold are `Error::InvalidInput`. A failed
+  open is `Error::Walk`, which the session returns inside `Error::Source`.
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind { File, Dir, Symlink }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryMeta {
+    pub kind: EntryKind,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,                        // full st_mode, type bits included
+    pub xattrs: Xattrs,
+    pub symlink_target: Option<String>,   // present for a symlink alone
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryAction { Keep, Skip }
+
+pub struct EntryPath { path: String }     // `/`-separated, the root is ""
+
+impl EntryPath {
+    pub fn as_str(&self) -> &str;
+    pub fn as_path(&self) -> &Path;
+    pub fn is_root(&self) -> bool;
+}                                         // and Display
+
+pub type EntryFilter =
+    Box<dyn FnMut(&EntryPath, &mut EntryMeta) -> EntryAction + Send>;
+
+#[derive(Default)]
+pub struct ScanOptions {
+    pub entry_filter: Option<EntryFilter>,
+    pub hash_jobs: Option<usize>,
+}
+
+impl TreeModel {
+    pub async fn scan(root: &Path, opts: ScanOptions) -> Result<TreeModel>;
+    pub fn root_dirtree(&self) -> Checksum;
+    pub fn root_dirmeta(&self) -> Checksum;
+    pub fn object_names(&self) -> Vec<ObjectName>;
+    pub fn set_commit(&mut self, checksum: Checksum, bytes: Vec<u8>,
+                      detached: Option<Value>);
+}
+
+impl ObjectSource for TreeModel { /* the send pass */ }
+
+pub enum Error {
+    // ...
+    Walk { path: PathBuf, source: io::Error },
+}
+```
+
 ## Push transports
 
 `PushRemote::parse` reads a push address, and `PushSession::connect` opens

@@ -21,10 +21,14 @@
 //! runs the ssh client as a child process, and the remote side runs the
 //! receive command.
 //!
+//! The [`tree`] module walks a local directory into a
+//! [`TreeModel`](tree::TreeModel): the entry metadata, with an entry filter
+//! that can change it, and the checksum of each object of the tree.
+//!
 //! [`Error`] is the error type of the crate. Each of its variants except
 //! [`Error::Aborted`], [`Error::CommitOutcomeUnknown`], [`Error::Source`],
-//! [`Error::InvalidInput`], [`Error::Transport`], and [`Error::Io`] is one
-//! wire code, and [`ErrorCode`] names the codes.
+//! [`Error::InvalidInput`], [`Error::Transport`], [`Error::Io`], and
+//! [`Error::Walk`] is one wire code, and [`ErrorCode`] names the codes.
 //!
 //! The codec and [`PushSession::over_stream`] are generic over the
 //! `futures-io` traits `AsyncRead` and `AsyncWrite`, so they need no async
@@ -36,6 +40,7 @@ mod error;
 pub mod proto;
 pub mod session;
 pub mod transport;
+pub mod tree;
 
 pub use error::{Error, ErrorCode, Result};
 pub use proto::{Encoding, Expected, RefOutcome, RefState, RefUpdate};
@@ -62,7 +67,21 @@ const _: fn() = || {
     assert_send_sync::<Box<dyn ObjectReader>>();
     assert_send_sync::<PushRemote>();
     assert_send_sync::<ConnectOptions>();
+    assert_send_sync::<tree::TreeModel>();
+    assert_send_sync::<tree::EntryMeta>();
+    assert_send_sync::<tree::EntryKind>();
+    assert_send_sync::<tree::EntryAction>();
+    assert_send_sync::<tree::EntryPath>();
 };
+
+/// The options of a tree scan and the future of the scan move to another
+/// thread.
+#[allow(dead_code)]
+fn scan_future_is_send(root: &std::path::Path, options: tree::ScanOptions) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&options);
+    assert_send(&tree::TreeModel::scan(root, options));
+}
 
 /// The futures of the session calls can run on a multi-threaded executor.
 #[allow(dead_code)]

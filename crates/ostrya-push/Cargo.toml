@@ -22,3 +22,10 @@ ostrya-rt = { workspace = true }
 thiserror = "2"
 futures-io = "0.3"
 futures-lite = "2"
+
+# The tree walk opens each file with `O_NOFOLLOW | O_NONBLOCK` on Unix, so a
+# file that became a symlink or a fifo answers the open rather than being
+# followed or waiting for a writer. `std` does not supply the values of the
+# flags, or of the `ELOOP` a symlink answers the open with.
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", default-features = false }

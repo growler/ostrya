@@ -1738,6 +1738,7 @@ version = "0.2.8"
 dependencies = [
  "futures-io",
  "futures-lite",
+ "libc",
  "ostrya-core",
  "ostrya-gvariant",
  "ostrya-rt",

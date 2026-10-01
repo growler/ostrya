@@ -206,6 +206,29 @@ impl PushSession {
     }
 }
 
+/// The command line of the ssh client of a session to `remote`, with the
+/// value of the `OSTRYA_SSH_COMMAND` environment variable. It starts nothing,
+/// and it refuses what [`PushSession::connect`] refuses before it starts the
+/// client: an `http://` or `https://` remote, and an empty ssh command or
+/// receive command.
+pub(crate) fn ssh_command_line(
+    remote: &PushRemote,
+    connect: &ConnectOptions,
+) -> Result<Vec<String>> {
+    let env = std::env::var_os("OSTRYA_SSH_COMMAND");
+    command_line(remote, connect, env.as_deref())
+}
+
+/// Start the ssh client `argv` from [`ssh_command_line`] and open a session
+/// over it, with the time limits of [`PushSession::connect`].
+pub(crate) async fn open_ssh(
+    argv: &[String],
+    refs: &[String],
+    opts: SessionOptions,
+) -> Result<PushSession> {
+    spawn_and_open(argv, refs, opts, PENDING_READ_LIMIT).await
+}
+
 /// [`PushSession::connect`] with the value of the environment variable and
 /// the time limit as parameters.
 async fn connect_with(
@@ -216,6 +239,17 @@ async fn connect_with(
     opts: SessionOptions,
     limit: Duration,
 ) -> Result<PushSession> {
+    let argv = command_line(remote, connect, env)?;
+    spawn_and_open(&argv, refs, opts, limit).await
+}
+
+/// The command line of the ssh client of a session to `remote`, with `env`
+/// as the value of the environment variable.
+fn command_line(
+    remote: &PushRemote,
+    connect: &ConnectOptions,
+    env: Option<&std::ffi::OsStr>,
+) -> Result<Vec<String>> {
     let addr = match &remote.inner {
         RemoteAddr::Ssh(addr) => addr,
         RemoteAddr::Http(url) => {
@@ -230,8 +264,18 @@ async fn connect_with(
         connect.remote_ssh_command.as_deref(),
     )?;
     let receive = ssh::receive_command(connect.receive_command.as_deref())?;
-    let argv = addr.command_line(program, receive);
-    let (input, output, transport) = Transport::spawn(&argv, limit)?;
+    Ok(addr.command_line(program, receive))
+}
+
+/// Start `argv` and open a session over its standard input and standard
+/// output, with `limit` as the time limit of the session.
+async fn spawn_and_open(
+    argv: &[String],
+    refs: &[String],
+    opts: SessionOptions,
+    limit: Duration,
+) -> Result<PushSession> {
+    let (input, output, transport) = Transport::spawn(argv, limit)?;
     match PushSession::open(input, output, refs, opts, Some(limit)).await {
         Ok(session) => Ok(session.with_transport(transport)),
         Err(e) => transport.finish(Err(e)).await,

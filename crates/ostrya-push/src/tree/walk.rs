@@ -15,6 +15,7 @@ use super::{
     classify, default_meta, invalid_data,
 };
 use crate::error::{Error, Result};
+use crate::session::{PushPhase, PushProgress};
 
 /// One entry of a directory listing, with its default metadata and its
 /// identity.
@@ -32,8 +33,15 @@ struct Walker {
     path: EntryPath,
 }
 
-/// Walk and hash the tree at `root`.
-pub(super) async fn scan(root: &Path, options: ScanOptions) -> Result<TreeModel> {
+/// Walk and hash the tree at `root`. `progress`, when given, shows
+/// [`PushPhase::Scanning`] until the walk has listed and filtered each
+/// directory, and then [`PushPhase::Hashing`] through the hash jobs still in
+/// flight and the bottom-up pass.
+pub(super) async fn scan(
+    root: &Path,
+    options: ScanOptions,
+    progress: Option<&PushProgress>,
+) -> Result<TreeModel> {
     let ScanOptions {
         entry_filter,
         hash_jobs,
@@ -42,6 +50,9 @@ pub(super) async fn scan(root: &Path, options: ScanOptions) -> Result<TreeModel>
         return Err(Error::InvalidInput(
             "hash_jobs is 0; the hash pass needs at least one job".into(),
         ));
+    }
+    if let Some(progress) = progress {
+        progress.set_phase(PushPhase::Scanning);
     }
     let mut jobs = Jobs::new();
     let mut walker = Walker {
@@ -54,6 +65,9 @@ pub(super) async fn scan(root: &Path, options: ScanOptions) -> Result<TreeModel>
     // A walk that stops records its error in `jobs`, and `finish` gives it
     // once each job in flight has stopped.
     let _ = walker.walk(&mut jobs, hash_jobs).await;
+    if let Some(progress) = progress {
+        progress.set_phase(PushPhase::Hashing);
+    }
     jobs.finish(&mut walker.model)
         .await
         .map_err(|(path, source)| Error::Walk { path, source })?;

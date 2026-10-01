@@ -284,6 +284,13 @@ fn error_conversions() {
     let io = Error::Io(std::io::Error::other("disk"));
     assert_eq!(io.code(), None);
     assert_eq!(io.to_message(), error(ErrorCode::Internal, "disk"));
+
+    let sign = Error::Sign(ostrya_sign::Error::InvalidFormat("bad".into()));
+    assert_eq!(sign.code(), None);
+    assert_eq!(
+        sign.to_message(),
+        error(ErrorCode::Internal, "signing: invalid format: bad")
+    );
 }
 
 fn hex(s: &str) -> Vec<u8> {

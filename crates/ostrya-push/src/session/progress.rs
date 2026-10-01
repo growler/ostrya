@@ -11,10 +11,14 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PushPhase {
-    /// The client reads its source and builds the object list.
+    /// The client reads its source and builds the object list. A tree push
+    /// shows it from the start of its scan until the walk has listed and
+    /// filtered each directory. Hash jobs can run during it.
     #[default]
     Scanning,
-    /// The client hashes the files of a tree.
+    /// The client hashes the files of a tree. A tree push shows it after the
+    /// walk, while the hash jobs still in flight end and the directories are
+    /// hashed bottom-up.
     Hashing,
     /// The session exchanges `Hello` and `Have` with the server.
     Negotiating,
@@ -73,6 +77,12 @@ impl PushProgress {
     /// counters of one snapshot can differ by the work of one step.
     pub fn snapshot(&self) -> PushProgressSnapshot {
         self.inner.snapshot()
+    }
+
+    /// Set the phase of the handle. A tree push sets the phases of its scan
+    /// before a session opens.
+    pub(crate) fn set_phase(&self, phase: PushPhase) {
+        self.inner.phase.store(phase.as_u8(), Ordering::Relaxed);
     }
 }
 

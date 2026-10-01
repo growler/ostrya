@@ -100,6 +100,13 @@ pub fn ref_binding(refs: &[&str]) -> Value;
 /// explicit, else SOURCE_DATE_EPOCH, else now.
 pub fn commit_timestamp(explicit: Option<u64>) -> Result<u64, TimestampError>;
 impl DirTree { pub fn check_name(name: &str) -> Result<()>; }
+/// The ref-name rule. A component is not empty, is not `.` or `..`, and holds
+/// no `/` and no NUL. A ref name is one or more components joined with `/`.
+/// A refspec is a ref name, or REMOTE:NAME split at the first `:`, with
+/// REMOTE one component. `ostrya::validate_refspec` applies `is_refspec`.
+pub fn is_ref_component(component: &str) -> bool;
+pub fn is_ref_name(name: &str) -> bool;
+pub fn is_refspec(refspec: &str) -> bool;
 pub const MAX_METADATA_SIZE: u64;       // also at ostrya::MAX_METADATA_SIZE
 
 pub struct CollectionRef { pub collection_id: Option<String>, pub ref_name: String }
@@ -784,7 +791,8 @@ pub struct CollectionRefEntry {
 /// preceded by a `<remote>:` prefix. A refspec that would leave the tree is
 /// `Error::InvalidRefspec`, holding the refspec as given, which is the one
 /// error a caller reporting a refused name needs the name from. Every ref
-/// write and every resolution applies the same rule.
+/// write and every resolution applies the same rule, which is
+/// `ostrya_core::is_refspec`.
 pub fn validate_refspec(refspec: &str) -> Result<()>;
 
 /// Streaming reader over a regular file's payload: raw for the bare family,
@@ -2727,6 +2735,96 @@ impl ObjectSource for TreeModel { /* the send pass */ }
 pub enum Error {
     // ...
     Walk { path: PathBuf, source: io::Error },
+}
+```
+
+## Tree push
+
+`ostrya_push::push_tree` pushes a local directory as one commit and sets
+the target refs of the server to it in one transaction.
+`push_tree_over_stream` runs the same push over a pair of byte streams.
+`ostrya` re-exports both as `ostrya::push`.
+
+- Before the scan, the push refuses with `Error::InvalidInput`: empty
+  `refs`, a ref named twice, a ref that holds `:`, a ref that holds `^`, a
+  ref that fails `ostrya_core::is_ref_name`, a DEFLATE level outside 1
+  through 9, a malformed `SOURCE_DATE_EPOCH` when `timestamp` is not set, an
+  empty key in `metadata` or in `detached_metadata`, entries that do not
+  serialize as an `a{sv}` dict, and entries whose serialized dict is over
+  `MAX_METADATA_SIZE`. A revision reads `^` as the parent of a commit, so a
+  ref that holds it cannot be read back by its name. The timestamp is read
+  here. `push_tree` then builds the
+  ssh command line, and refuses an `http://` or an `https://` remote and an
+  ssh command or a receive command that `PushSession::connect` refuses.
+- The scan is `TreeModel::scan` with `entry_filter` and `hash_jobs`. It runs
+  before the ssh client starts and before the first byte is written. So a
+  refusal of the options, a walk error, and a hash error start no ssh client
+  and open no session.
+- The session opens with the target refs in one `Hello`. Without `force`,
+  each target ref must have the state of the first one on the server: all
+  absent, or all at one commit. Refs in mixed states are
+  `Error::InvalidInput`, with a message that names each ref and its commit,
+  and the push ends the session with `Abort` before it offers an object.
+- The commit: the parent from `ParentPolicy`, the subject and the body, the
+  timestamp, the root checksums of the scan, and the metadata dict of
+  `ostrya_core::commit_metadata`: the entries of `metadata`, then
+  `ostree.ref-binding` with the refs sorted, then
+  `ostree.collection-binding` with the server collection id when the server
+  has one. `no_bindings` leaves out both bindings. The commit checksum
+  equals that of `Transaction::write_commit` over the same tree with the
+  same inputs. A commit over `MAX_METADATA_SIZE` is `Error::InvalidInput`.
+- The detached dict: the entries of `detached_metadata`, then the
+  signature of each signer, in order, under its `metadata_key`, with
+  `ostrya_sign::append_signature`. A value of the caller under the key of a
+  signer that is not an `aay` is `Error::Sign` with `InvalidFormat`, and so
+  is a failed signer. The push checks the key of each signer before the
+  first signer signs. A dict over `MAX_METADATA_SIZE` is
+  `Error::InvalidInput`. The push signs while the session is open.
+- One `Have` round offers each object of the tree and the commit. The push
+  sends the objects the server lacks and the detached dict of the commit,
+  and then `Commit`. Each update expects the commit that `HelloReply`
+  reported, or no ref, and `Expected::Any` with `force`.
+- A failure after the session opened and before `Commit` ends the session
+  with `Abort` when the stream is still usable.
+- `PushProgress` shows `Scanning` until the walk has listed and filtered
+  each directory, and `Hashing` through the hash jobs still in flight and
+  the bottom-up pass. The session then sets `Negotiating`, `Uploading`, and
+  `Committing`. `PushStats::elapsed` covers the session alone.
+- `Error::Sign` has no wire code, and reports as `internal`.
+
+```rust
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParentPolicy { #[default] CurrentTip, None, Commit(Checksum) }
+
+#[derive(Default)]
+pub struct TreePushOptions {
+    pub refs: Vec<String>,
+    pub parent: ParentPolicy,
+    pub subject: Option<String>,
+    pub body: Option<String>,
+    pub metadata: Vec<(String, Value)>,
+    pub detached_metadata: Vec<(String, Value)>,
+    pub timestamp: Option<u64>,
+    pub no_bindings: bool,
+    pub signers: Vec<Box<dyn ostrya_sign::Signer>>,
+    pub compression: Compression,
+    pub entry_filter: Option<EntryFilter>,
+    pub hash_jobs: Option<usize>,
+    pub force: bool,
+    pub progress: Option<PushProgress>,
+}
+
+pub async fn push_tree(remote: &PushRemote, root: &Path, connect: ConnectOptions,
+                       opts: TreePushOptions) -> Result<PushOutcome>;
+pub async fn push_tree_over_stream<R, W>(input: R, output: W, root: &Path,
+                                         opts: TreePushOptions) -> Result<PushOutcome>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static;
+
+pub enum Error {
+    // ...
+    Sign(ostrya_sign::Error),
 }
 ```
 

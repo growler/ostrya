@@ -15,7 +15,7 @@ use super::hash::{FileId, open_regular};
 use super::{EntryMeta, ScanOptions, invalid_data, walk};
 use crate::error::{Error, Result};
 use crate::proto::Encoding;
-use crate::session::{BoxFuture, ObjectData, ObjectSource};
+use crate::session::{BoxFuture, ObjectData, ObjectSource, PushProgress};
 
 /// The result of the hash of one regular file.
 #[derive(Debug, Clone, Copy)]
@@ -132,7 +132,18 @@ impl TreeModel {
     /// A failure of either is [`Error::Walk`]. `hash_jobs` of `Some(0)` is
     /// [`Error::InvalidInput`].
     pub async fn scan(root: &Path, options: ScanOptions) -> Result<TreeModel> {
-        walk::scan(root, options).await
+        walk::scan(root, options, None).await
+    }
+
+    /// [`scan`](TreeModel::scan), which also sets the phases of the scan in
+    /// `progress`: [`Scanning`](crate::PushPhase::Scanning) during the walk,
+    /// and [`Hashing`](crate::PushPhase::Hashing) after it.
+    pub(crate) async fn scan_with(
+        root: &Path,
+        options: ScanOptions,
+        progress: Option<&PushProgress>,
+    ) -> Result<TreeModel> {
+        walk::scan(root, options, progress).await
     }
 
     /// The dirtree checksum of the walk root.

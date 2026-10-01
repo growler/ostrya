@@ -260,6 +260,18 @@ fn unexpected(msg: &Message, request: &str) -> Error {
     protocol(format!("{:?} in reply to {request}", msg.kind()))
 }
 
+/// The DEFLATE level of `compression`, or `None` for `raw`. A level outside 1
+/// through 9 is [`Error::InvalidInput`].
+pub(crate) fn deflate_level(compression: Compression) -> Result<Option<u8>> {
+    match compression {
+        Compression::None => Ok(None),
+        Compression::Deflate { level } if (1..=9).contains(&level) => Ok(Some(level)),
+        Compression::Deflate { level } => Err(invalid(format!(
+            "compression level {level} is not in 1 through 9"
+        ))),
+    }
+}
+
 /// Refuse a name of a type that `Have` and the objects of a source cannot
 /// carry. The session sends detached metadata for a commit on its own.
 fn refuse_off_wire(names: &[ObjectName]) -> Result<()> {
@@ -463,15 +475,7 @@ impl PushSession {
         commits: &[Checksum],
         compression: Compression,
     ) -> Result<()> {
-        let level = match compression {
-            Compression::None => None,
-            Compression::Deflate { level } if (1..=9).contains(&level) => Some(level),
-            Compression::Deflate { level } => {
-                return Err(invalid(format!(
-                    "compression level {level} is not in 1 through 9"
-                )));
-            }
-        };
+        let level = deflate_level(compression)?;
         refuse_off_wire(names)?;
         let deflate_ok = self.inner.server.encodings.contains(&Encoding::Deflate);
         let mut taken = self.inner.take()?;

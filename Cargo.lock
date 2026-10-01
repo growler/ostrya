@@ -1742,6 +1742,7 @@ dependencies = [
  "ostrya-core",
  "ostrya-gvariant",
  "ostrya-rt",
+ "ostrya-sign",
  "thiserror",
 ]
 

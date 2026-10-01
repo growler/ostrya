@@ -930,25 +930,24 @@ fn parse_ref_content(bytes: &[u8]) -> Result<Checksum> {
 
 /// Whether a refspec names a path under `refs/`: a ref name, optionally
 /// preceded by a `<remote>:` prefix. A refspec that would escape the tree is
-/// [`Error::InvalidRefspec`], carrying the refspec as given.
+/// [`Error::InvalidRefspec`], carrying the refspec as given. The rule is
+/// [`ostrya_core::is_refspec`].
 pub fn validate_refspec(refspec: &str) -> Result<()> {
-    refspec_to_relpath(refspec).map(drop)
+    if ostrya_core::is_refspec(refspec) {
+        Ok(())
+    } else {
+        Err(Error::InvalidRefspec(refspec.to_owned()))
+    }
 }
 
 /// Map a refspec to its path under `refs/`, rejecting anything that would
 /// escape the tree.
 pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
-    if let Some((remote, name)) = refspec.split_once(':') {
-        if !is_component(remote) || !is_ref_path(name) {
-            return Err(Error::InvalidRefspec(refspec.to_owned()));
-        }
-        Ok(format!("refs/remotes/{remote}/{name}"))
-    } else {
-        if !is_ref_path(refspec) {
-            return Err(Error::InvalidRefspec(refspec.to_owned()));
-        }
-        Ok(format!("refs/heads/{refspec}"))
-    }
+    validate_refspec(refspec)?;
+    Ok(match refspec.split_once(':') {
+        Some((remote, name)) => format!("refs/remotes/{remote}/{name}"),
+        None => format!("refs/heads/{refspec}"),
+    })
 }
 
 /// Whether the name a listing gave a ref addresses the file it was listed
@@ -1002,20 +1001,10 @@ pub(crate) fn check_ref_path(name: &str) -> Result<()> {
     }
 }
 
-/// A ref name may contain `/` but no empty, `.`, or `..` components, and no
-/// interior NUL.
-pub(crate) fn is_ref_path(name: &str) -> bool {
-    !name.is_empty() && name.split('/').all(is_component)
-}
-
-/// A single path component: non-empty, not a traversal, no slash or NUL.
-pub(crate) fn is_component(component: &str) -> bool {
-    !(component.is_empty()
-        || component == "."
-        || component == ".."
-        || component.contains('/')
-        || component.contains('\0'))
-}
+// A ref name may contain `/` but no empty, `.`, or `..` components, and no
+// interior NUL. A single path component is non-empty, not a traversal, and
+// holds no slash or NUL. `ostrya-core` holds the rule.
+pub(crate) use ostrya_core::{is_ref_component as is_component, is_ref_name as is_ref_path};
 
 /// Map a collection ref to its path under `refs/`. A collection id places the
 /// ref under `refs/mirrors/<collection>/`; a `None` id is a local

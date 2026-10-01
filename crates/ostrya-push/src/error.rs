@@ -11,7 +11,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Each variant except [`Error::Aborted`], [`Error::CommitOutcomeUnknown`],
 /// [`Error::Source`], [`Error::InvalidInput`], [`Error::Transport`],
-/// [`Error::Io`], and [`Error::Walk`] is one wire code of the `Error` message.
+/// [`Error::Io`], [`Error::Walk`], and [`Error::Sign`] is one wire code of the
+/// `Error` message.
 /// The enum is `#[non_exhaustive]`, so a match outside the crate needs a
 /// wildcard arm.
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +137,12 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// A signer of a tree push failed, or the detached metadata of the
+    /// caller holds a value under the key of a signer that is not a
+    /// signature array. No wire code carries it. The client signs before it
+    /// offers an object, and it ends the session with `Abort`.
+    #[error("signing: {0}")]
+    Sign(#[source] ostrya_sign::Error),
 }
 
 /// The wire code of an `Error` message.
@@ -230,8 +237,8 @@ impl ErrorCode {
 impl Error {
     /// The wire code of the error, or `None` for [`Error::Aborted`],
     /// [`Error::CommitOutcomeUnknown`], [`Error::Source`],
-    /// [`Error::InvalidInput`], [`Error::Transport`], [`Error::Io`], and
-    /// [`Error::Walk`].
+    /// [`Error::InvalidInput`], [`Error::Transport`], [`Error::Io`],
+    /// [`Error::Walk`], and [`Error::Sign`].
     pub fn code(&self) -> Option<ErrorCode> {
         Some(match self {
             Error::VersionUnsupported(_) => ErrorCode::VersionUnsupported,
@@ -256,7 +263,8 @@ impl Error {
             | Error::InvalidInput(_)
             | Error::Transport(_)
             | Error::Io(_)
-            | Error::Walk { .. } => return None,
+            | Error::Walk { .. }
+            | Error::Sign(_) => return None,
         })
     }
 
@@ -293,7 +301,8 @@ impl Error {
             | Error::InvalidInput(_)
             | Error::Transport(_)
             | Error::Io(_)
-            | Error::Walk { .. } => (ErrorCode::Internal, self.to_string()),
+            | Error::Walk { .. }
+            | Error::Sign(_) => (ErrorCode::Internal, self.to_string()),
             Error::VersionUnsupported(m)
             | Error::LockingDisabled(m)
             | Error::Unauthorized(m)

@@ -11,7 +11,8 @@
 //! encoder of archive-mode content objects ([`DeflateSink`], and
 //! [`DeflateReader`] over a source), the commit metadata rule
 //! ([`commit_metadata`]), the commit timestamp rule ([`commit_timestamp`]),
-//! and the metadata size cap ([`MAX_METADATA_SIZE`]).
+//! the ref-name rule ([`is_refspec`]), and the metadata size cap
+//! ([`MAX_METADATA_SIZE`]).
 //! It compiles on Linux, macOS, and Windows.
 //!
 //! This crate covers phases 2 and 3 of the port plan (see
@@ -33,6 +34,7 @@ mod loosepath;
 mod mode;
 mod objname;
 mod objtype;
+mod refname;
 pub mod sizes;
 mod valiter;
 pub mod varint;
@@ -52,6 +54,7 @@ pub use loosepath::loose_path;
 pub use mode::RepoMode;
 pub use objname::ObjectName;
 pub use objtype::ObjectType;
+pub use refname::{is_ref_component, is_ref_name, is_refspec};
 pub use xattr::{Xattrs, XattrsRef};
 
 // The dynamic GVariant value tree and its codec entry points. `Commit::metadata`

@@ -25,10 +25,17 @@
 //! [`TreeModel`](tree::TreeModel): the entry metadata, with an entry filter
 //! that can change it, and the checksum of each object of the tree.
 //!
+//! [`push_tree`] pushes a local directory as one commit: it walks and hashes
+//! the tree, opens a session over ssh, builds and signs the commit over the
+//! tree, sends the objects the server lacks, and sets the target refs.
+//! [`push_tree_over_stream`] runs the same push over a pair of byte streams,
+//! and [`TreePushOptions`] holds its options.
+//!
 //! [`Error`] is the error type of the crate. Each of its variants except
 //! [`Error::Aborted`], [`Error::CommitOutcomeUnknown`], [`Error::Source`],
-//! [`Error::InvalidInput`], [`Error::Transport`], [`Error::Io`], and
-//! [`Error::Walk`] is one wire code, and [`ErrorCode`] names the codes.
+//! [`Error::InvalidInput`], [`Error::Transport`], [`Error::Io`],
+//! [`Error::Walk`], and [`Error::Sign`] is one wire code, and [`ErrorCode`]
+//! names the codes.
 //!
 //! The codec and [`PushSession::over_stream`] are generic over the
 //! `futures-io` traits `AsyncRead` and `AsyncWrite`, so they need no async
@@ -36,14 +43,17 @@
 //! (default) or the `tokio` feature selects. The crate has no repository
 //! knowledge. It compiles on Linux, macOS, and Windows.
 
+mod commit;
 mod error;
 pub mod proto;
+mod push_tree;
 pub mod session;
 pub mod transport;
 pub mod tree;
 
 pub use error::{Error, ErrorCode, Result};
 pub use proto::{Encoding, Expected, RefOutcome, RefState, RefUpdate};
+pub use push_tree::{ParentPolicy, TreePushOptions, push_tree, push_tree_over_stream};
 pub use session::{
     BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PushOutcome, PushPhase,
     PushProgress, PushProgressSnapshot, PushSession, PushStats, ServerInfo, SessionOptions,
@@ -72,6 +82,7 @@ const _: fn() = || {
     assert_send_sync::<tree::EntryKind>();
     assert_send_sync::<tree::EntryAction>();
     assert_send_sync::<tree::EntryPath>();
+    assert_send_sync::<ParentPolicy>();
 };
 
 /// The options of a tree scan and the future of the scan move to another
@@ -108,5 +119,25 @@ fn connect_future_is_send(remote: &PushRemote, refs: &[String]) {
         ConnectOptions::default(),
         refs,
         SessionOptions::default(),
+    ));
+}
+
+/// The options of a tree push and the futures of the push can run on a
+/// multi-threaded executor.
+#[allow(dead_code)]
+fn push_tree_futures_are_send(remote: &PushRemote, root: &std::path::Path) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&TreePushOptions::default());
+    assert_send(&push_tree(
+        remote,
+        root,
+        ConnectOptions::default(),
+        TreePushOptions::default(),
+    ));
+    assert_send(&push_tree_over_stream(
+        futures_lite::io::empty(),
+        futures_lite::io::sink(),
+        root,
+        TreePushOptions::default(),
     ));
 }

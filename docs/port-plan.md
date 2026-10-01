@@ -7067,8 +7067,13 @@ refspecs over ssh and prints one line for each ref
 the tool"). A push between two port repositories over ssh to localhost
 passes the ssh half of the verify step below: the receiving repository
 passes `ostree fsck`, `ostree rev-parse` resolves each pushed ref, and
-`ostree pull-local` from it succeeds. The HTTP transport, `ostrya serve`,
-and the tree push are still to come.
+`ostree pull-local` from it succeeds. The library half of the tree push is
+done: `ostrya::push::push_tree` and `push_tree_over_stream` walk and hash a
+local directory, build and sign one commit over it, and set the target refs
+in one session (`docs/api-sketch.md`, "Tree push"). The commit checksum
+equals that of `Transaction::write_commit` over the same tree with the same
+inputs. The `ostrya push-tree` command, the HTTP transport, and
+`ostrya serve` are still to come.
 
 Pull over ssh follows push as separate work.
 

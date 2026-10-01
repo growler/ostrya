@@ -10,8 +10,8 @@ readme.workspace = true
 
 [features]
 default = ["smol"]
-smol = ["ostrya-rt/smol"]
-tokio = ["ostrya-rt/tokio"]
+smol = ["ostrya-rt/smol", "ostrya-sign/smol"]
+tokio = ["ostrya-rt/tokio", "ostrya-sign/tokio"]
 
 [dependencies]
 ostrya-gvariant = { workspace = true }
@@ -19,6 +19,8 @@ ostrya-core = { workspace = true }
 # The ssh transport runs the ssh client as a child process, and bounds the
 # waits of a session over it with a timer.
 ostrya-rt = { workspace = true }
+# A tree push signs the commit it builds.
+ostrya-sign = { workspace = true }
 thiserror = "2"
 futures-io = "0.3"
 futures-lite = "2"

@@ -140,13 +140,15 @@ bounded:
   Linux, macOS, and Windows.
 - `ostrya-rt` -- internal runtime abstraction: `rt::unblock`, `rt::File`
   (over an already-open fd; `smol::fs::File` or `tokio::fs::File`),
-  `rt::Timer`, `rt::Command` (a short-lived helper process with piped
+  `rt::FileReader` (its read-only form, with a read-ahead of at most
+  256 KiB and no seek), `rt::Timer`, `rt::Command` (a short-lived helper process with piped
   standard streams) and `rt::Child` (a long-lived child process whose
   standard input and standard output are async streams), `rt::spawn` (a
   concurrent task and its `rt::JoinHandle`), and `rt::TcpStream` and
   `rt::TcpListener` (async TCP). The only crate that knows which backend is
   compiled. No ostree knowledge. Compiles on Linux, macOS, and Windows;
-  `rt::File::from(OwnedFd)` is Unix-only.
+  `rt::File::from(OwnedFd)` and `rt::FileReader::from(OwnedFd)` are
+  Unix-only.
 - `ostrya-sign` -- the signing engines: the `Signer` and `Verifier` traits,
   the dummy, ed25519, and spki engines, the GPG signer through the `gpg`
   binary, `SignKeys`, the key file reader over `std::fs`, and
@@ -211,13 +213,15 @@ are always compiled, not feature-gated.
 The runtime backend is feature-gated and hidden behind the internal
 `ostrya-rt` crate, which exposes `rt::unblock`, `rt::File` (constructed
 from an already-open fd; read/write/seek, `sync_all`/`sync_data`,
-`into_std`; `smol::fs::File` or `tokio::fs::File` underneath), `rt::Timer`,
-and later `rt::spawn` and networking. `smol` is the default backend; the
+`into_std`; `smol::fs::File` or `tokio::fs::File` underneath),
+`rt::FileReader` (constructed the same way; read-only, with no seek;
+`smol::Unblock` with a read-ahead of 256 KiB, or `tokio::fs::File` with its
+own default buffer limit underneath), `rt::Timer`, and later `rt::spawn` and networking. `smol` is the default backend; the
 `tokio` feature selects tokio. Only `ostrya-rt` knows the backend: the rest
 of the library is written against `rt::*`, the `futures-io` traits,
 `async-lock`, and `futures-lite` combinators, and is runtime-neutral.
-`rt::File` presents the `futures-io` traits under both backends so that
-core code stays generic.
+`rt::File` and `rt::FileReader` present the `futures-io` traits under both
+backends so that core code stays generic.
 
 Backend feature policy: the features are additive-safe. `smol` is on by
 default; `tokio` takes precedence when both are enabled, so Cargo feature
@@ -237,8 +241,14 @@ Division of labor between `rustix` and the runtime:
   synchronous calls offloaded through `rt::unblock` at coarse granularity
   -- per object write, per checkout file -- rather than wrapping each
   syscall.
-- `rt::File` owns streaming reads and writes: payload I/O runs over fds the
-  rustix layer opened, in bounded-size chunks.
+- `rt::File` and `rt::FileReader` own streaming reads and writes: payload
+  I/O runs over fds the rustix layer opened, in bounded-size chunks. A
+  read that does not seek and does not write goes through `rt::FileReader`,
+  with the length on disk as a hint where the caller knows it. The hint
+  holds the read-ahead between 4 KiB and 256 KiB. Under tokio it lowers the
+  buffer limit only below 256 KiB. An archive object takes the length of its
+  compressed stream, from one `fstat` in the blocking-pool call of the open,
+  so a stream longer than its payload does not shrink the read-ahead.
 - `rt::unblock` is the only entry to a blocking pool (`smol::unblock` under
   smol, `tokio::task::spawn_blocking` under tokio), so each backend runs
   exactly one pool under its own configuration.
@@ -1031,7 +1041,7 @@ Definition:
 - The walk: fd-relative directory iteration (`openat` with `O_NOFOLLOW`,
   `rustix::fs::Dir`, `statx` per entry), offloaded through `rt::unblock`
   at per-directory granularity; regular-file payloads stream through
-  `write_content` over `rt::File`.
+  `write_content` over `rt::FileReader`.
 - Per entry: regular files read their xattrs (unless disabled), build a
   `FileMeta`, and stream in; symlinks `readlinkat` into `write_symlink`;
   directories serialize uid/gid/mode/xattrs as dirmeta through
@@ -1465,9 +1475,9 @@ passes under both runtime backends. The shell-suite gates (`test-export`,
 The first binary: the `ostrya-cli` crate builds a tool named `ostrya`, a
 thin front-end over the ingest, checkout, and export paths, which are all in
 place by this phase. The binary is synchronous and drives the async library
-through `ostrya_rt::block_on`; the stdin/stdout tar streams flow through
-`ostrya_rt::File` over a duplicated descriptor, so no unbounded stream is
-buffered. Its command surface is its own; `ostree`-compatible behavior is
+through `ostrya_rt::block_on`; the stdin tar stream flows through
+`ostrya_rt::FileReader` and the stdout tar stream through `ostrya_rt::File`,
+each over a duplicated descriptor, so no unbounded stream is buffered. Its command surface is its own; `ostree`-compatible behavior is
 Phase 17. Subcommands:
 
 - `ostrya commit [--repo <repo>] [--parent <commit>] [-b|--branch <branch>]
@@ -8108,7 +8118,8 @@ Resolved:
    when both features are enabled, and a compile error when neither is.
    `rustix` is scoped to fd-relative and Linux-specific syscalls offloaded
    through `rt::unblock`, the sole blocking-pool entry; streaming file I/O
-   goes through `rt::File`. Concrete public stream types (`ContentReader`,
+   goes through `rt::File`, and a read-only stream through
+   `rt::FileReader`. Concrete public stream types (`ContentReader`,
    `ContentWriter`, the hashing streams) implement the `futures-io` traits
    unconditionally and the tokio traits under the `tokio` feature;
    `AsyncRead`/`AsyncWrite` bounds in argument position are the

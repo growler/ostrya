@@ -68,7 +68,7 @@ use ostrya_core::{
     ArrayIter, Checksum, GvDecode, ObjectType, Type, Value, Xattrs, from_bytes, offset_size_for,
     to_bytes, varint,
 };
-use ostrya_rt::File as RtFile;
+use ostrya_rt::{File as RtFile, FileReader};
 use sha2::{Digest, Sha256};
 
 use crate::bspatch::bspatch;
@@ -1375,7 +1375,12 @@ async fn decode_part(part_path: PathBuf, entry: &DeltaPart, staging: &OwnedFd) -
     let std_file = ostrya_rt::unblock(move || std::fs::File::open(&part_path))
         .await
         .map_err(Error::Io)?;
-    decode_part_stream(RtFile::from(std_file), entry, staging).await
+    decode_part_stream(
+        FileReader::with_len_hint(std_file, entry.size),
+        entry,
+        staging,
+    )
+    .await
 }
 
 /// Decode a part stream into a random-access [`Blob`], verifying the part

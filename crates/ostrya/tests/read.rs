@@ -242,6 +242,52 @@ fn reads_archive_file_content() {
     });
 }
 
+/// An archive object whose compressed stream is far longer than its payload
+/// reads back whole. The stream of an empty file is padded with empty stored
+/// blocks, so it still inflates to no bytes and keeps its checksum.
+#[test]
+fn reads_an_archive_object_with_a_padded_stream() {
+    let tmp = TmpDir::new("read-archive-padded");
+    let root = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let checksum = txn
+            .write_content(
+                None,
+                &ostrya::FileMeta::regular(0, 0, 0o644),
+                futures_lite::io::Cursor::new(Vec::new()),
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let path =
+            root.join("objects")
+                .join(loose_path(&checksum, ObjectType::File, RepoMode::Archive));
+        let stored = std::fs::read(&path).unwrap();
+        let header_len = u32::from_be_bytes(stored[..4].try_into().unwrap()) as usize;
+        let (header, stream) = stored.split_at(8 + header_len);
+        // A non-final stored block of no bytes: the block header, then LEN 0
+        // and NLEN 0xffff.
+        let empty_block = [0x00u8, 0x00, 0x00, 0xff, 0xff];
+        let mut padded = header.to_vec();
+        for _ in 0..400_000 {
+            padded.extend_from_slice(&empty_block);
+        }
+        padded.extend_from_slice(stream);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, &padded).unwrap();
+
+        let file = repo.load_file(&checksum).await.unwrap();
+        assert_eq!(file.kind, FileKind::Regular { size: 0 });
+        assert_eq!(read_payload(&file).await, b"");
+        assert_eq!(recomputed_checksum(&file).await, checksum);
+    });
+}
+
 #[test]
 fn reads_bare_user_file_content() {
     // The bare-user fixture tarball carries the `user.ostreemeta` xattr these

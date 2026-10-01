@@ -2,7 +2,7 @@
 //!
 //! Archive-mode content objects (`.filez`) store their payload raw-DEFLATE
 //! compressed (no zlib or gzip wrapper), recovered by inspecting the bytes the
-//! `ostree` tool writes. [`BufSource`] buffers an `rt::File` into the
+//! `ostree` tool writes. [`BufSource`] buffers an `rt::FileReader` into the
 //! `futures-io` [`AsyncBufRead`](futures_io::AsyncBufRead) that
 //! `async-compression`'s DEFLATE decoder consumes, pulling bounded chunks of
 //! input so no whole blob is buffered. The decoder produces bounded chunks of
@@ -14,7 +14,7 @@ use std::task::{Context, Poll, ready};
 
 use async_compression::futures::bufread::DeflateDecoder;
 use futures_io::{AsyncBufRead, AsyncRead};
-use ostrya_rt::File as RtFile;
+use ostrya_rt::FileReader;
 use pin_project_lite::pin_project;
 
 /// The input read-ahead buffer size. Input is pulled from the underlying
@@ -36,9 +36,16 @@ pin_project! {
 
 impl<R> BufSource<R> {
     pub(crate) fn new(inner: R) -> BufSource<R> {
+        BufSource::with_len_hint(inner, IN_CHUNK as u64)
+    }
+
+    /// [`BufSource::new`] over an input of about `len` bytes, with a buffer of
+    /// `len + 1` bytes, held between 1 byte and the input chunk size.
+    pub(crate) fn with_len_hint(inner: R, len: u64) -> BufSource<R> {
+        let size = usize::try_from(len.saturating_add(1)).map_or(IN_CHUNK, |n| n.min(IN_CHUNK));
         BufSource {
             inner,
-            buf: vec![0u8; IN_CHUNK].into_boxed_slice(),
+            buf: vec![0u8; size].into_boxed_slice(),
             pos: 0,
             cap: 0,
         }
@@ -76,13 +83,14 @@ impl<R: AsyncRead> AsyncBufRead for BufSource<R> {
     }
 }
 
-/// The archive payload decoder: raw-DEFLATE over a buffered `rt::File`.
-pub(crate) type ArchiveDecoder = DeflateDecoder<BufSource<RtFile>>;
+/// The archive payload decoder: raw-DEFLATE over a buffered `rt::FileReader`.
+pub(crate) type ArchiveDecoder = DeflateDecoder<BufSource<FileReader>>;
 
 /// Wrap a content-object file (positioned at the raw-DEFLATE payload) in a
-/// streaming decoder.
-pub(crate) fn archive_decoder(file: RtFile) -> ArchiveDecoder {
-    DeflateDecoder::new(BufSource::new(file))
+/// streaming decoder. `len` is the length of the stream on disk, which bounds
+/// the input buffer.
+pub(crate) fn archive_decoder(file: FileReader, len: u64) -> ArchiveDecoder {
+    DeflateDecoder::new(BufSource::with_len_hint(file, len))
 }
 
 #[cfg(test)]

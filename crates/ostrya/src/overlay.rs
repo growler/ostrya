@@ -51,7 +51,7 @@ use std::path::Path;
 use std::pin::Pin;
 
 use ostrya_core::{RepoMode, Xattrs};
-use ostrya_rt::File as RtFile;
+use ostrya_rt::FileReader;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 
 use crate::error::{Error, Result};
@@ -127,6 +127,9 @@ struct OverlayEntry {
     gid: u32,
     /// The full `st_mode`, including the file-type bits.
     mode: u32,
+    /// The `st_size` the snapshot read, which bounds the read-ahead of a
+    /// regular file.
+    size: u64,
     /// The entry's full on-disk xattr set, including any `trusted.overlay.`
     /// or `user.overlay.` attribute; the merge reads those for its decisions
     /// and strips them from the ingested object.
@@ -232,7 +235,8 @@ fn merge_dir<'a>(
                         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
                     )?;
-                    let checksum = txn.write_content(None, &meta, RtFile::from(fd)).await?;
+                    let reader = FileReader::with_len_hint(fd.into(), entry.size);
+                    let checksum = txn.write_content(None, &meta, reader).await?;
                     // The leaf wins: drop whatever the base held at this name
                     // (file, symlink, or directory) before applying the override.
                     // A non-directory upper entry shadows a lower entry of any
@@ -333,6 +337,7 @@ fn snapshot_overlay(dir: BorrowedFd<'_>) -> Result<Vec<OverlayEntry>> {
             uid: stat.st_uid,
             gid: stat.st_gid,
             mode: stat.st_mode,
+            size: stat.st_size as u64,
             xattrs,
         });
     }

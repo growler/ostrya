@@ -72,7 +72,7 @@ use futures_lite::future::zip;
 use ostrya_core::{
     Checksum, ContentHasher, DirMeta, DirTree, FileHeader, ObjectName, Xattrs, loose_path,
 };
-use ostrya_rt::File as RtFile;
+use ostrya_rt::FileReader;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
@@ -504,8 +504,8 @@ fn walk<'a>(
                         out.modified.push(render(&path));
                     } else {
                         let (a, b) = zip(
-                            hash_local_file(&from, &entry.name, left),
-                            hash_local_file(&to, &entry.name, right),
+                            hash_local_file(&from, &entry.name, left, *left_size),
+                            hash_local_file(&to, &entry.name, right, *right_size),
                         )
                         .await;
                         if a? != b? {
@@ -807,7 +807,7 @@ fn dirmeta_checksum(meta: &DirMeta) -> Result<Checksum> {
 async fn content_checksum(side: &Side, name: &OsStr, kind: &EntryKind) -> Result<Option<Checksum>> {
     match kind {
         EntryKind::Content(checksum) => Ok(Some(*checksum)),
-        EntryKind::File { meta, .. } => Ok(Some(hash_local_file(side, name, meta).await?)),
+        EntryKind::File { meta, size } => Ok(Some(hash_local_file(side, name, meta, *size).await?)),
         EntryKind::Symlink { meta, target } => {
             let Ok(target) = std::str::from_utf8(target) else {
                 return Ok(None);
@@ -838,8 +838,14 @@ fn local_header(meta: &FileMeta, symlink_target: &str) -> FileHeader {
 /// a fixed buffer. Nothing is written to the repository.
 ///
 /// The open and the first chunk share one dispatch, and a file no longer than
-/// the chunk is read to its end inside it.
-async fn hash_local_file(side: &Side, name: &OsStr, meta: &FileMeta) -> Result<Checksum> {
+/// the chunk is read to its end inside it. `size` is the size the walk read,
+/// which bounds the read-ahead of the rest of the file.
+async fn hash_local_file(
+    side: &Side,
+    name: &OsStr,
+    meta: &FileMeta,
+    size: u64,
+) -> Result<Checksum> {
     let Side::Local(dir) = side else {
         return Err(Error::InvalidFormat(
             "a filesystem entry outside a directory side".into(),
@@ -853,7 +859,8 @@ async fn hash_local_file(side: &Side, name: &OsStr, meta: &FileMeta) -> Result<C
         ostrya_rt::unblock(move || open_and_read(root.as_fd(), &at, &path)).await?;
     hasher.update(&buf[..filled]);
     if let Some(fd) = rest {
-        let mut file = RtFile::from(fd);
+        let rest_len = size.saturating_sub(filled as u64);
+        let mut file = FileReader::with_len_hint(fd.into(), rest_len);
         loop {
             let read = file.read(&mut buf).await.map_err(Error::Io)?;
             if read == 0 {

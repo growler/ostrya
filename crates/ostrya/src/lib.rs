@@ -13,7 +13,7 @@
 //! commits, and file content, resolving and listing refs, and traversing a
 //! commit's tree, and the runtime backend and streaming primitives (Phase 5a):
 //! the [`HashingReader`]/[`HashingWriter`] streams and a [`ContentReader`] that
-//! streams from `rt::File` and inflates archive objects on the fly. It also
+//! streams from `rt::FileReader`, inflating archive objects on the fly. It also
 //! covers transactions and locking (Phase 6): the owned [`Transaction`] handle,
 //! boot-id-keyed staging directories, and the two-layer repository lock, and the
 //! object-store write layer (Phase 7a): streaming content ingestion through

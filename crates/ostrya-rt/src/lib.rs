@@ -5,7 +5,9 @@
 //! This crate is the only place that knows which async backend is compiled.
 //! It exposes [`unblock`] (the sole entry to the blocking pool) with
 //! [`blocking_threads`] (the size of that pool), [`File`]
-//! (an async file over an already-open descriptor), [`Timer`] (a one-shot
+//! (an async file over an already-open descriptor) with [`FileReader`] (its
+//! read-only form, which reads ahead by at most 256 KiB and never seeks),
+//! [`Timer`] (a one-shot
 //! async delay for retry loops) with [`Deadline`] (a restartable window a
 //! `poll_*` method can check), [`Command`] (a short-lived helper process
 //! with piped standard streams; [`Command::spawn`] starts a long-lived
@@ -15,7 +17,8 @@
 //! tests and doctests). The wider library is written against these plus the
 //! `futures-io` traits, so it stays runtime-neutral.
 //!
-//! The crate compiles on Unix and Windows. `File::from(OwnedFd)` is Unix-only.
+//! The crate compiles on Unix and Windows. `File::from(OwnedFd)` and
+//! `FileReader::from(OwnedFd)` are Unix-only.
 //!
 //! Backend selection is feature-gated and additive-safe:
 //!
@@ -36,7 +39,7 @@ mod process;
 mod task;
 mod timer;
 
-pub use file::File;
+pub use file::{File, FileReader};
 pub use net::{TcpListener, TcpStream};
 pub use pool::{block_on, blocking_threads, unblock};
 pub use process::{Child, ChildStdin, ChildStdout, Command};

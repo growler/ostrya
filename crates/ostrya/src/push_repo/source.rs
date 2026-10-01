@@ -2,7 +2,7 @@
 
 use futures_lite::io::Cursor;
 use ostrya_core::{Checksum, FileHeader, ObjectName, ObjectType, Value, loose_path};
-use ostrya_rt::File as RtFile;
+use ostrya_rt::FileReader;
 
 use crate::error::{Error, Result};
 use crate::file::FileKind;
@@ -66,11 +66,16 @@ impl RepoSource {
     async fn stored_filez(&self, checksum: &Checksum) -> Result<ObjectData> {
         let path = loose_path(checksum, ObjectType::File, self.repo.mode());
         let repo = self.repo.clone();
-        let opened =
-            ostrya_rt::unblock(move || object::open_content_file(repo.objects_fd(), &path, 0))
-                .await;
-        let file = match opened {
-            Ok(file) => file,
+        // The size bounds the read-ahead, and the `fstat` runs on the
+        // pool thread of the open.
+        let opened = ostrya_rt::unblock(move || {
+            let file = object::open_content_file(repo.objects_fd(), &path, 0)?;
+            let len = file.metadata()?.len();
+            Ok::<_, std::io::Error>((file, len))
+        })
+        .await;
+        let (file, len) = match opened {
+            Ok(opened) => opened,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::ObjectNotFound {
                     checksum: *checksum,
@@ -81,7 +86,7 @@ impl RepoSource {
         };
         Ok(ObjectData::Encoded {
             encoding: Encoding::Deflate,
-            reader: Box::new(RtFile::from(file)),
+            reader: Box::new(FileReader::with_len_hint(file, len)),
         })
     }
 

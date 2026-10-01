@@ -41,7 +41,7 @@ use std::pin::Pin;
 
 use futures_lite::AsyncReadExt;
 use ostrya_core::{Checksum, Commit, DirMeta, ObjectType, RepoMode, Xattrs, loose_path};
-use ostrya_rt::File as RtFile;
+use ostrya_rt::{File as RtFile, FileReader};
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Gid, Mode, OFlags, RenameFlags, Uid};
 use rustix::io::Errno;
 
@@ -1107,7 +1107,7 @@ async fn hash_destination_file(
     size: u64,
 ) -> Result<Checksum> {
     let mut hasher = ostrya_core::ContentHasher::new(header)?;
-    let mut file = RtFile::from(fd);
+    let mut file = FileReader::with_len_hint(std::fs::File::from(fd), size);
     let mut buf = vec![
         0u8;
         usize::try_from(size)

@@ -11,10 +11,11 @@
 //! The walk reads each directory in one offloaded blocking pass (fd-relative
 //! `Dir` iteration, `statat` per entry, xattr reads, `readlinkat`), then
 //! ingests the entries: regular-file payloads stream through
-//! [`write_content`](crate::Transaction::write_content) over an `rt::File`,
-//! symlinks and per-directory metadata go through the metadata writers. The
-//! per-entry namespace syscalls that open, unlink, and recurse are issued
-//! inline, keeping the offload at per-directory granularity.
+//! [`write_content`](crate::Transaction::write_content) over an
+//! `rt::FileReader`, symlinks and per-directory metadata go through the
+//! metadata writers. The per-entry namespace syscalls that open, unlink, and
+//! recurse are issued inline, keeping the offload at per-directory
+//! granularity.
 //!
 //! [`Transaction::overlay_tree_to_mtree`] ingests a committed tree the same
 //! way, so a tree already in the repository composes with a filesystem walk
@@ -28,7 +29,7 @@ use std::path::Path;
 use std::pin::Pin;
 
 use ostrya_core::{DirMeta, RepoMode, Xattrs};
-use ostrya_rt::File as RtFile;
+use ostrya_rt::FileReader;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
@@ -292,6 +293,9 @@ struct EntryInfo {
     gid: u32,
     /// The full `st_mode`, including the file-type bits.
     mode: u32,
+    /// The `st_size` the walk read, which bounds the read-ahead of a regular
+    /// file.
+    size: u64,
     xattrs: Xattrs,
 }
 
@@ -456,7 +460,8 @@ fn walk_dir<'a>(
                         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
                     )?;
-                    let checksum = txn.write_content(None, &meta, RtFile::from(fd)).await?;
+                    let reader = FileReader::with_len_hint(fd.into(), entry.size);
+                    let checksum = txn.write_content(None, &meta, reader).await?;
                     node.replace_file(&entry.name, checksum)?;
                     if consume {
                         unlink(dir_fd.as_fd(), &entry.name, false)?;
@@ -767,6 +772,7 @@ fn snapshot_dir(dir: BorrowedFd<'_>, skip_xattrs: bool) -> Result<DirSnapshot> {
             uid: stat.st_uid,
             gid: stat.st_gid,
             mode: stat.st_mode,
+            size: stat.st_size as u64,
             xattrs,
         });
     }

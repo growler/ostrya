@@ -1,11 +1,13 @@
-//! An async file over an already-open descriptor.
+//! Async files over an already-open descriptor.
 //!
 //! Opens are performed elsewhere through `rustix` (fd-relative `openat`);
-//! [`File`] only streams over a descriptor it is handed. It wraps the
-//! backend's async file (`smol::fs::File` or `tokio::fs::File`) and presents
-//! the `futures-io` traits under both backends, so core code stays generic.
-//! Under the `tokio` feature it additionally implements the tokio I/O traits
-//! for tokio-native callers.
+//! [`File`] and [`FileReader`] only stream over a descriptor they are handed.
+//! [`File`] wraps the backend's async file (`smol::fs::File` or
+//! `tokio::fs::File`) and presents the `futures-io` traits under both
+//! backends, so core code stays generic. Under the `tokio` feature it
+//! additionally implements the tokio I/O traits for tokio-native callers.
+//! [`FileReader`] is the read-only form with a bounded read-ahead, and it
+//! presents the `futures-io` read trait alone.
 
 use std::io;
 #[cfg(unix)]
@@ -275,10 +277,132 @@ mod tokio_impls {
     }
 }
 
-/// `File` moves freely across tasks and threads.
+/// The read-ahead of a [`FileReader`] when the caller gives no length, and
+/// the most a length hint can give.
+const READ_AHEAD: usize = 256 * 1024;
+
+/// The least read-ahead a length hint can give.
+const MIN_READ_AHEAD: usize = 4 * 1024;
+
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+type ReaderBackend = smol::Unblock<std::fs::File>;
+#[cfg(feature = "tokio")]
+type ReaderBackend = tokio::fs::File;
+
+/// A read-only async file over an already-open descriptor.
+///
+/// The reader streams from the current descriptor offset to the end of the
+/// file and reads ahead by at most 256 KiB. It does no seek, so a reader over
+/// a pipe or over a descriptor positioned past a header costs no extra
+/// syscall. Use [`File`] for a descriptor that must also be written, sought,
+/// or recovered as a `std::fs::File`.
+///
+/// Under the smol backend the reads run on the blocking pool through a ring
+/// buffer of the read-ahead size. The ring is allocated when the first read
+/// starts, and it is zeroed in parts as it fills, up to its size.
+/// [`FileReader::with_len_hint`] bounds the ring by the length the caller
+/// already knows, so a small file costs a small buffer. Under the tokio
+/// backend each read is one blocking-pool read of at most the caller's buffer;
+/// a length hint below the read-ahead also bounds that read. A dropped reader
+/// closes its descriptor on the pool thread after the read in flight returns.
+pub struct FileReader {
+    inner: ReaderBackend,
+}
+
+impl FileReader {
+    /// Wrap `file`, with a read-ahead of `len + 1` bytes, held between
+    /// 4 KiB and 256 KiB.
+    ///
+    /// `len` is the number of bytes the caller expects to read. The extra
+    /// byte lets a read of exactly `len` bytes see the end of the file in the
+    /// same run of reads. A `len` below the real length gives a smaller
+    /// read-ahead, and the reader still streams to the end of the file, in
+    /// runs of at least 4 KiB.
+    pub fn with_len_hint(file: std::fs::File, len: u64) -> FileReader {
+        let cap = read_ahead_for(len);
+        #[cfg(all(feature = "smol", not(feature = "tokio")))]
+        {
+            FileReader {
+                inner: smol::Unblock::with_capacity(cap, file),
+            }
+        }
+        #[cfg(feature = "tokio")]
+        {
+            let mut inner = tokio::fs::File::from_std(file);
+            if cap < READ_AHEAD {
+                inner.set_max_buf_size(cap);
+            }
+            FileReader { inner }
+        }
+    }
+}
+
+/// The read-ahead for a length hint of `len` bytes.
+fn read_ahead_for(len: u64) -> usize {
+    usize::try_from(len.saturating_add(1))
+        .map_or(READ_AHEAD, |n| n.clamp(MIN_READ_AHEAD, READ_AHEAD))
+}
+
+impl From<std::fs::File> for FileReader {
+    fn from(file: std::fs::File) -> FileReader {
+        #[cfg(all(feature = "smol", not(feature = "tokio")))]
+        {
+            FileReader {
+                inner: smol::Unblock::with_capacity(READ_AHEAD, file),
+            }
+        }
+        #[cfg(feature = "tokio")]
+        {
+            FileReader {
+                inner: tokio::fs::File::from_std(file),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<OwnedFd> for FileReader {
+    fn from(fd: OwnedFd) -> FileReader {
+        FileReader::from(std::fs::File::from(fd))
+    }
+}
+
+impl futures_io::AsyncRead for FileReader {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        // The smol backend takes a read into an empty buffer for the end of
+        // the stream and drops the bytes it has read ahead.
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        #[cfg(all(feature = "smol", not(feature = "tokio")))]
+        {
+            futures_io::AsyncRead::poll_read(Pin::new(&mut self.get_mut().inner), cx, buf)
+        }
+        #[cfg(feature = "tokio")]
+        {
+            let mut read_buf = tokio::io::ReadBuf::new(buf);
+            match tokio::io::AsyncRead::poll_read(
+                Pin::new(&mut self.get_mut().inner),
+                cx,
+                &mut read_buf,
+            ) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+}
+
+/// `File` and `FileReader` move freely across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<File>();
+    assert_send_sync::<FileReader>();
 };
 
 #[cfg(test)]
@@ -321,6 +445,88 @@ mod tests {
             file.read_to_end(&mut out).await.unwrap();
             assert_eq!(out, b"456789");
         });
+    }
+
+    #[test]
+    fn reader_reads_from_the_current_descriptor_offset() {
+        let tmp = TempPath::new();
+        std::fs::write(&tmp.0, b"0123456789").unwrap();
+        block_on(async {
+            use std::io::Seek;
+            let mut std_file = std::fs::File::open(&tmp.0).unwrap();
+            std_file.seek(std::io::SeekFrom::Start(4)).unwrap();
+            let mut reader = FileReader::from(std_file);
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, b"456789");
+        });
+    }
+
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn read_back(len: usize, hint: Option<u64>) -> Vec<u8> {
+        let tmp = TempPath::new();
+        std::fs::write(&tmp.0, pattern(len)).unwrap();
+        let std_file = std::fs::File::open(&tmp.0).unwrap();
+        let mut reader = match hint {
+            Some(hint) => FileReader::with_len_hint(std_file, hint),
+            None => FileReader::from(std_file),
+        };
+        block_on(async {
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.unwrap();
+            out
+        })
+    }
+
+    #[test]
+    fn reader_round_trips_a_file_larger_than_its_read_ahead() {
+        let len = 200 * 1024;
+        assert_eq!(read_back(len, None), pattern(len));
+        assert_eq!(read_back(len, Some(len as u64)), pattern(len));
+        // A read-ahead of 4097 bytes wraps the ring many times.
+        assert_eq!(read_back(len, Some(4096)), pattern(len));
+    }
+
+    #[test]
+    fn read_ahead_is_held_between_its_bounds() {
+        assert_eq!(read_ahead_for(0), MIN_READ_AHEAD);
+        assert_eq!(read_ahead_for(100), MIN_READ_AHEAD);
+        assert_eq!(read_ahead_for(4095), MIN_READ_AHEAD);
+        assert_eq!(read_ahead_for(10_000), 10_001);
+        assert_eq!(read_ahead_for(300 * 1024), READ_AHEAD);
+        assert_eq!(read_ahead_for(u64::MAX), READ_AHEAD);
+    }
+
+    #[test]
+    fn reader_reads_an_empty_file() {
+        assert!(read_back(0, None).is_empty());
+        assert!(read_back(0, Some(0)).is_empty());
+    }
+
+    #[test]
+    fn reader_read_into_an_empty_buffer_keeps_the_stream() {
+        let tmp = TempPath::new();
+        std::fs::write(&tmp.0, b"0123456789").unwrap();
+        let std_file = std::fs::File::open(&tmp.0).unwrap();
+        let mut reader = FileReader::from(std_file);
+        block_on(async {
+            let mut head = [0u8; 2];
+            reader.read_exact(&mut head).await.unwrap();
+            assert_eq!(reader.read(&mut []).await.unwrap(), 0);
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest).await.unwrap();
+            assert_eq!(&head, b"01");
+            assert_eq!(rest, b"23456789");
+        });
+    }
+
+    #[test]
+    fn reader_with_a_short_hint_reads_the_whole_file() {
+        assert_eq!(read_back(10_000, Some(0)), pattern(10_000));
+        assert_eq!(read_back(10_000, Some(10)), pattern(10_000));
     }
 
     #[test]

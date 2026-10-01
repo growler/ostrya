@@ -85,7 +85,7 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, Type, Value, from_bytes};
-use ostrya_rt::File as RtFile;
+use ostrya_rt::FileReader;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
@@ -791,7 +791,8 @@ pub(crate) async fn apply_job_part(
                     job.name, entry.size
                 )));
             }
-            let blob = decode_part_stream(RtFile::from(file), entry, &staging).await?;
+            let blob =
+                decode_part_stream(FileReader::with_len_hint(file, len), entry, &staging).await?;
             progress.add_transferred(entry.size);
             blob
         }

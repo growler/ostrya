@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use ostrya_core::{Checksum, FileHeader, ObjectType, RepoMode, Xattrs, loose_path};
-use ostrya_rt::File as RtFile;
+use ostrya_rt::FileReader;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags};
 use rustix::io::Errno;
 
@@ -74,15 +74,22 @@ enum ReaderSource {
 }
 
 impl ReaderSource {
-    /// The reader over `file`, an object file positioned at its payload. An
-    /// archive payload is inflated. A source with no payload, or no `file`,
-    /// gives a reader that yields no bytes.
-    fn reader_over(&self, file: Option<RtFile>) -> ContentReader {
-        let inner = match (self, file) {
-            (ReaderSource::Plain, Some(file)) => ContentReaderInner::Plain(file),
-            (ReaderSource::Archive { .. }, Some(file)) => {
-                ContentReaderInner::Inflate(Box::new(archive_decoder(file)))
+    /// The reader over `payload`, an object file positioned at its payload
+    /// and the number of bytes on disk from there to its end. An archive
+    /// payload is inflated. A source with no payload, or no `payload`, gives a
+    /// reader that yields no bytes.
+    ///
+    /// The length on disk bounds the read-ahead of the file. For an archive
+    /// object it is the length of the compressed stream, which can be longer
+    /// than the payload.
+    fn reader_over(&self, payload: Option<Payload>) -> ContentReader {
+        let inner = match (self, payload) {
+            (ReaderSource::Plain, Some((file, len))) => {
+                ContentReaderInner::Plain(FileReader::with_len_hint(file, len))
             }
+            (ReaderSource::Archive { .. }, Some((file, len))) => ContentReaderInner::Inflate(
+                Box::new(archive_decoder(FileReader::with_len_hint(file, len), len)),
+            ),
             _ => ContentReaderInner::Empty,
         };
         ContentReader { inner }
@@ -170,14 +177,20 @@ impl FileObject {
     /// Open an async reader over the file's payload, streaming it in bounded
     /// chunks. A symlink has no payload, so its reader yields no bytes.
     pub async fn reader(&self) -> Result<ContentReader> {
-        let file = match &self.source {
+        let payload = match &self.source {
             ReaderSource::None => None,
-            ReaderSource::Plain => Some(self.open_payload(0).await?),
+            ReaderSource::Plain => {
+                let len = match self.kind {
+                    FileKind::Regular { size } => size,
+                    FileKind::Symlink { .. } => 0,
+                };
+                Some((self.open_payload(0, false).await?.0, len))
+            }
             ReaderSource::Archive { payload_offset } => {
-                Some(self.open_payload(*payload_offset).await?)
+                Some(self.open_payload(*payload_offset, true).await?)
             }
         };
-        Ok(self.source.reader_over(file))
+        Ok(self.source.reader_over(payload))
     }
 
     /// Stream the file's payload into `writer` in bounded chunks, buffering no
@@ -225,15 +238,22 @@ impl FileObject {
     }
 
     /// Open the object file positioned past `payload_offset` bytes, off the
-    /// blocking pool.
-    async fn open_payload(&self, payload_offset: u64) -> Result<RtFile> {
+    /// blocking pool. With `measure`, the same pool call also reads the number
+    /// of bytes from there to the end of the file; without it, that number is
+    /// 0.
+    async fn open_payload(&self, payload_offset: u64, measure: bool) -> Result<Payload> {
         let (dir, path) = self.payload_location()?;
-        let file = ostrya_rt::unblock(move || {
-            object::open_content_file(dir.as_fd(), &path, payload_offset)
+        ostrya_rt::unblock(move || {
+            let file = object::open_content_file(dir.as_fd(), &path, payload_offset)?;
+            let len = if measure {
+                file.metadata()?.len().saturating_sub(payload_offset)
+            } else {
+                0
+            };
+            Ok((file, len))
         })
         .await
-        .map_err(Error::Io)?;
-        Ok(RtFile::from(file))
+        .map_err(Error::Io)
     }
 }
 
@@ -291,7 +311,7 @@ impl Repo {
             load_by_mode(repo.objects_fd(), &path, &key, mode, false, true)
         })
         .await?;
-        let reader = loaded.source.reader_over(loaded.payload.map(RtFile::from));
+        let reader = loaded.source.reader_over(loaded.payload);
         let file = FileObject {
             repo: self.clone(),
             checksum: *checksum,
@@ -352,11 +372,15 @@ struct Loaded {
     kind: FileKind,
     source: ReaderSource,
     kernel_verity: Option<[u8; 32]>,
-    /// The object file of a regular file, positioned at its payload, when the
-    /// load keeps it.
+    /// The object file of a regular file, positioned at its payload, and the
+    /// number of bytes on disk from there to its end, when the load keeps it.
     #[cfg_attr(not(feature = "push"), allow(dead_code))]
-    payload: Option<std::fs::File>,
+    payload: Option<Payload>,
 }
+
+/// An object file positioned at its payload, and the number of bytes on disk
+/// from there to its end.
+type Payload = (std::fs::File, u64);
 
 /// Dispatch to the loader for the repository mode. `object_path` locates the
 /// object relative to `dir_fd`: a loose path under `objects/`, or a flat name in
@@ -429,13 +453,13 @@ fn open_sealed_regular(
     size: u64,
     probe: bool,
     keep: bool,
-) -> Result<(Option<[u8; 32]>, Option<std::fs::File>)> {
+) -> Result<(Option<[u8; 32]>, Option<Payload>)> {
     if !keep {
         return Ok((sealed_digest_at(dir_fd, path, size, probe), None));
     }
     let fd = open_regular(dir_fd, path, checksum)?;
     let digest = sealed_digest(fd.as_fd(), size, probe);
-    Ok((digest, Some(std::fs::File::from(fd))))
+    Ok((digest, Some((std::fs::File::from(fd), size))))
 }
 
 /// The `statx` fields the loaders read: the file type, mode, owner, and size.
@@ -572,7 +596,13 @@ fn load_archive(
             ReaderSource::Archive {
                 payload_offset: 8 + header_len,
             },
-            keep.then_some(file),
+            match keep {
+                true => {
+                    let len = file.metadata()?.len().saturating_sub(8 + header_len);
+                    Some((file, len))
+                }
+                false => None,
+            },
         )
     };
     Ok(Loaded {
@@ -625,7 +655,7 @@ fn load_bare_user(
             FileKind::Regular { size },
             ReaderSource::Plain,
             kernel_verity,
-            keep.then(|| std::fs::File::from(fd)),
+            keep.then(|| (std::fs::File::from(fd), size)),
         )
     };
     Ok(Loaded {
@@ -677,7 +707,7 @@ fn load_bare(
                 kind: FileKind::Regular { size },
                 source: ReaderSource::Plain,
                 kernel_verity: sealed_digest(fd.as_fd(), size, measure && is_sealed(&stat)),
-                payload: keep.then(|| std::fs::File::from(fd)),
+                payload: keep.then(|| (std::fs::File::from(fd), size)),
             })
         }
         _ => Err(Error::InvalidFormat(
@@ -823,9 +853,9 @@ fn load_split_xattrs(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<
 
 /// An async reader over a file object's payload.
 ///
-/// Regular files stream from the object store through `rt::File` (raw for the
-/// bare family, on-the-fly raw-DEFLATE for archive), so no whole blob is
-/// buffered. A symlink has no payload and reads as empty. The reader
+/// Regular files stream from the object store through `rt::FileReader` (raw
+/// for the bare family, on-the-fly raw-DEFLATE for archive), so no whole blob
+/// is buffered. A symlink has no payload and reads as empty. The reader
 /// implements `futures_io::AsyncRead` unconditionally and `tokio::io::AsyncRead`
 /// under the `tokio` feature, so neither backend needs a caller-side adapter.
 pub struct ContentReader {
@@ -834,14 +864,15 @@ pub struct ContentReader {
 
 enum ContentReaderInner {
     Empty,
-    Plain(RtFile),
+    Plain(FileReader),
     /// Boxed: the decoder state is large beside the other variants.
     Inflate(Box<ArchiveDecoder>),
 }
 
 impl ContentReader {
-    /// The shared read step both trait families drive. `rt::File` and the
-    /// archive decoder present `futures_io::AsyncRead` under either backend.
+    /// The shared read step both trait families drive. `rt::FileReader` and
+    /// the archive decoder present `futures_io::AsyncRead` under either
+    /// backend.
     fn poll_read_bytes(&mut self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<io::Result<usize>> {
         use futures_io::AsyncRead;
         match &mut self.inner {

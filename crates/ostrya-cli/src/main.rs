@@ -50,9 +50,10 @@
 //!   update its refs. The `push` feature builds it.
 //!
 //! The binary is synchronous and drives the async library with
-//! [`ostrya_rt::block_on`]. Tar streams to and from stdin/stdout flow through
-//! [`ostrya_rt::File`] over a duplicated descriptor, so no unbounded stream is
-//! buffered in memory.
+//! [`ostrya_rt::block_on`]. Tar streams from stdin flow through
+//! [`ostrya_rt::FileReader`], and streams to stdout through
+//! [`ostrya_rt::File`], each over a duplicated descriptor, so no unbounded
+//! stream is buffered in memory.
 
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, OwnedFd};
@@ -1686,10 +1687,10 @@ async fn receive(repo: Repo, args: ReceiveArgs) -> Result<()> {
         Some(path) => ostrya::ReceivePolicy::from_file(&repo, path).await?,
         None => ostrya::ReceivePolicy::from_config(&repo).await?,
     };
-    // Under the smol backend, each of the two streams goes through a
-    // blocking-pool pipe of 8 MiB, so the input can be read up to 8 MiB ahead
-    // of the session. That costs memory on a large push, and it can help the
-    // throughput on a fast link.
+    // The input is read at most 256 KiB ahead of the session. Under the smol
+    // backend the output goes through a blocking-pool pipe of 8 MiB, so the
+    // output can hold up to 8 MiB that the session has written and the pipe
+    // has not.
     let report = repo.receive(stdin_file()?, stdout_file()?, &policy).await?;
     for warning in &report.warnings {
         eprintln!(
@@ -4181,7 +4182,7 @@ enum OpenSource {
     /// A directory, and the path it was named by.
     Dir(std::fs::File, PathBuf),
     /// A tar stream.
-    Tar(ostrya_rt::File),
+    Tar(ostrya_rt::FileReader),
     /// A committed tree, by its root dirtree and dirmeta checksums.
     Ref(Checksum, Checksum),
 }
@@ -4266,7 +4267,7 @@ async fn open_tree_source(
                     path.display()
                 )));
             };
-            OpenSource::Tar(ostrya_rt::File::from(std::os::fd::OwnedFd::from(file)))
+            OpenSource::Tar(ostrya_rt::FileReader::from(file))
         }
         TreeSpec::Ref(rev) => {
             let checksum = match repo.resolve_rev(&rev, false).await {
@@ -9276,12 +9277,12 @@ fn shadowed_branch_name(branch: &str) -> Option<String> {
 
 /// An async streaming reader over stdin, backed by a duplicated descriptor so
 /// dropping it leaves the real stdin open.
-fn stdin_file() -> Result<ostrya_rt::File> {
+fn stdin_file() -> Result<ostrya_rt::FileReader> {
     let fd = std::io::stdin()
         .as_fd()
         .try_clone_to_owned()
         .map_err(Error::Io)?;
-    Ok(ostrya_rt::File::from(fd))
+    Ok(ostrya_rt::FileReader::from(fd))
 }
 
 /// An async streaming writer over stdout, backed by a duplicated descriptor.

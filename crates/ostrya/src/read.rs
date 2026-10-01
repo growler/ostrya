@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectType, Type, Value, from_bytes, loose_path,
 };
-use ostrya_rt::File as RtFile;
+use ostrya_rt::FileReader;
 
 use crate::error::{Error, Result};
 use crate::object::{self, MAX_METADATA_SIZE};
@@ -110,8 +110,8 @@ impl Repo {
         let key = *checksum;
         let res = ostrya_rt::unblock(move || open_meta_file(repo.objects_fd(), &path)).await;
         match res {
-            Ok(file) => Ok(MetadataReader {
-                file: RtFile::from(file),
+            Ok((file, size)) => Ok(MetadataReader {
+                file: FileReader::with_len_hint(file, size),
                 taken: 0,
                 refused: false,
             }),
@@ -254,18 +254,22 @@ impl Repo {
 /// Open a metadata object for streaming. The function refuses an object that
 /// the `fstat` already measures above [`MAX_METADATA_SIZE`]. This check matches
 /// the open-time check of `object::read_meta_object`, so the streaming path and
-/// the buffered path refuse the same object with the same error.
+/// the buffered path refuse the same object with the same error. It returns
+/// the file with the size the `fstat` measured.
 ///
 /// This check and the running total in `MetadataReader` both read
 /// [`MAX_METADATA_SIZE`], so the open and the read hold one bound.
-fn open_meta_file(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<std::fs::File> {
+fn open_meta_file(
+    dir: rustix::fd::BorrowedFd<'_>,
+    path: &str,
+) -> std::io::Result<(std::fs::File, u64)> {
     let fd = object::open_object(dir, path)?;
     let stat = rustix::fs::fstat(&fd)?;
     let size = stat.st_size.max(0) as u64;
     if size > MAX_METADATA_SIZE {
         return Err(object::metadata_cap_exceeded());
     }
-    Ok(std::fs::File::from(fd))
+    Ok((std::fs::File::from(fd), size))
 }
 
 /// An async reader over a metadata object's raw bytes.
@@ -290,7 +294,7 @@ fn open_meta_file(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Resul
 /// `tokio::io::AsyncRead` under the `tokio` feature, so neither backend needs a
 /// caller-side adapter. It carries no checksum verification.
 pub struct MetadataReader {
-    file: RtFile,
+    file: FileReader,
     /// How many bytes the caller has taken so far.
     taken: u64,
     /// Whether the running total has already refused the object. The probe read
@@ -301,8 +305,8 @@ pub struct MetadataReader {
 }
 
 impl MetadataReader {
-    /// The shared read step both trait families drive. `rt::File` presents
-    /// `futures_io::AsyncRead` under either backend.
+    /// The shared read step both trait families drive. `rt::FileReader`
+    /// presents `futures_io::AsyncRead` under either backend.
     fn poll_read_bytes(&mut self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<io::Result<usize>> {
         use futures_io::AsyncRead;
         if self.refused {

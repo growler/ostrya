@@ -600,26 +600,6 @@ fn a_parent_directory_replaced_by_a_symlink_is_invalid_data() {
     assert_eq!(error, (root.join("sub/file"), io::ErrorKind::InvalidData));
 }
 
-#[test]
-#[ignore = "builds a 128 MiB xattr and peaks near 384 MiB of memory"]
-fn a_dirmeta_over_the_size_limit_is_invalid_data() {
-    let dir = Scratch::new("oversize");
-    let root = &dir.path;
-    fs::create_dir(root.join("big")).unwrap();
-    let limit = usize::try_from(ostrya_core::MAX_METADATA_SIZE).unwrap();
-    let filter: EntryFilter = Box::new(move |path, meta| {
-        if path.as_str() == "big" {
-            meta.xattrs =
-                ostrya_core::Xattrs::new([(b"user.big\0".to_vec(), vec![0u8; limit])]).unwrap();
-        }
-        EntryAction::Keep
-    });
-    assert_eq!(
-        walk_error(scan(root, with_filter(filter))),
-        (root.join("big"), io::ErrorKind::InvalidData)
-    );
-}
-
 /// After a hash error with more than one job, no file of the pass is open.
 #[cfg(target_os = "linux")]
 #[test]

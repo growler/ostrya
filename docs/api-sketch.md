@@ -789,10 +789,14 @@ pub fn validate_refspec(refspec: &str) -> Result<()>;
 
 /// Streaming reader over a regular file's payload: raw for the bare family,
 /// on-the-fly raw-DEFLATE inflate for archive (a streaming decoder over
-/// bounded chunks), empty for symlinks. Streams from `rt::File`. Implements
-/// `futures_io::AsyncRead` unconditionally and `tokio::io::AsyncRead` under
-/// the `tokio` feature, so neither backend needs a caller-side adapter.
-pub struct ContentReader { /* empty | rt::File | inflate adapter */ }
+/// bounded chunks), empty for symlinks. Streams from `rt::FileReader`, with
+/// the length on disk as the length hint: the payload size for the bare
+/// family, and for archive the length of the compressed stream, which the
+/// open reads with one `fstat` in the same blocking-pool call. The inflate
+/// input buffer is the stream length plus 1 byte, at most 16 KiB. Implements `futures_io::AsyncRead`
+/// unconditionally and `tokio::io::AsyncRead` under the `tokio` feature, so
+/// neither backend needs a caller-side adapter.
+pub struct ContentReader { /* empty | rt::FileReader | inflate adapter */ }
 ```
 
 ## Runtime backend and streaming I/O
@@ -819,6 +823,24 @@ impl File {
     pub async fn sync_all(&mut self) -> std::io::Result<()>;
     pub async fn sync_data(&mut self) -> std::io::Result<()>;
     pub async fn into_std(self) -> std::fs::File;   // settles pipelined ops
+}
+
+/// Read-only async file over an already-open fd. It streams from the
+/// current offset to the end of the file and does no seek. Under smol it is
+/// `smol::Unblock::with_capacity`, with a read-ahead of 256 KiB. Under tokio
+/// it is a `tokio::fs::File`, which reads at most the caller's buffer and
+/// at most 2 MiB in one blocking-pool read. Presents `futures_io::AsyncRead`
+/// alone. A read into an empty buffer gives 0 and keeps the stream. A
+/// dropped reader closes its fd on the pool thread after the read in flight
+/// returns.
+pub struct FileReader;  // From<std::fs::File> / From<OwnedFd> (Unix only);
+                        // AsyncRead + Send + Sync
+impl FileReader {
+    /// Read-ahead of len + 1 bytes, held between 4 KiB and 256 KiB. Under
+    /// tokio the hint sets the maximum buffer size only when that number is
+    /// below 256 KiB. A `len` below the real length still reads the whole
+    /// file, in runs of at least 4 KiB.
+    pub fn with_len_hint(file: std::fs::File, len: u64) -> FileReader;
 }
 
 pub struct Timer;                       // Timer::after(Duration)
@@ -926,7 +948,7 @@ pub const MAX_METADATA_SIZE: u64;
 /// An async reader over a metadata object's raw bytes. It implements
 /// `futures_io::AsyncRead` unconditionally and `tokio::io::AsyncRead` under
 /// the `tokio` feature.
-pub struct MetadataReader { /* rt::File + the running total */ }
+pub struct MetadataReader { /* rt::FileReader + the running total */ }
 ```
 
 `metadata_reader` holds the bound at two points, the two points
@@ -2646,9 +2668,11 @@ the index of its parent directory, and it holds no file content.
   opens it again, with the open and the checks of the hash pass, and gives
   `ObjectData::Content` with the byte count of the hash pass as `size`. The
   payload stops after `size` plus 1 byte, so a file that grew gives at most
-  1 byte more than the hash pass read. It does not read the length again or
-  hash the file again, and the server refuses a file that changed. A symlink
-  opens nothing. A dirtree or a
+  1 byte more than the hash pass read. The payload is an
+  `ostrya_rt::FileReader` with the byte count of the hash pass as the length
+  hint, so a small file reads ahead by its own size, at least 4 KiB, and a
+  large file by 256 KiB under smol. It does not read the length again or hash the file again, and the
+  server refuses a file that changed. A symlink opens nothing. A dirtree or a
   dirmeta object is serialized again from the model, and the commit is the
   bytes of `set_commit`, each as `ObjectData::Encoded` in `raw`.
   `detached_metadata` of the commit gives the stored dict. Another commit
@@ -2754,13 +2778,14 @@ and the remote side runs `ostrya receive`.
 - Under the tokio backend, `connect` runs within a runtime that has the IO
   driver and the time driver enabled, and the session runs on the runtime
   that opened it.
-- Memory: under the smol backend, `ostrya_rt::File` reads and writes
-  through a blocking-pool pipe of 8 MiB in each direction. The standard
-  input and standard output of `ostrya receive`, and an object reader over
-  an `ostrya_rt::File`, can read up to 8 MiB ahead of the session. A large
-  push costs about 8 to 12 MiB of resident memory for it on each side. The
-  read-ahead can also help the throughput on a fast link. The tokio backend
-  has one read or write of at most 2 MiB in flight for each file.
+- Memory: the object readers of a push and the standard input of
+  `ostrya receive` are `ostrya_rt::FileReader`s. Under the smol backend they
+  read ahead by at most 256 KiB. Under the tokio backend they read at most
+  the caller's buffer in one read. The standard output of `ostrya receive` is an
+  `ostrya_rt::File`. Under the smol backend it writes through a
+  blocking-pool pipe of up to 8 MiB, and under the tokio backend it has one
+  write of at most 2 MiB in flight. A stdin read in flight can block until
+  the peer writes or closes the stream, also after the reader is dropped.
 
 ```rust
 pub struct PushRemote { inner: RemoteAddr }

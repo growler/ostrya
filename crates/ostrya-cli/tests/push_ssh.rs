@@ -4,7 +4,6 @@
 
 #![cfg(feature = "receive")]
 
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -75,8 +74,8 @@ fn quote(s: &str) -> String {
 }
 
 /// An async reader over the file at `path`.
-fn open_file(path: &Path) -> ostrya_rt::File {
-    ostrya_rt::File::from(OwnedFd::from(std::fs::File::open(path).unwrap()))
+fn open_file(path: &Path) -> ostrya_rt::FileReader {
+    ostrya_rt::FileReader::from(std::fs::File::open(path).unwrap())
 }
 
 fn source_error(e: ostrya::Error) -> Error {

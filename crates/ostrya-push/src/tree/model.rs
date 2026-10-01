@@ -433,12 +433,12 @@ impl TreeModel {
             .dirtree(dir)
             .serialize()
             .map_err(|e| invalid_data(e.to_string()))?;
-        check_metadata_size(&dirtree, "dirtree")?;
+        check_metadata_size(&dirtree, "dirtree", MAX_METADATA_SIZE)?;
         let dirmeta = self
             .dirmeta(dir)
             .serialize()
             .map_err(|e| invalid_data(e.to_string()))?;
-        check_metadata_size(&dirmeta, "dirmeta")?;
+        check_metadata_size(&dirmeta, "dirmeta", MAX_METADATA_SIZE)?;
         Ok((Checksum::sha256(&dirtree), Checksum::sha256(&dirmeta)))
     }
 
@@ -514,7 +514,8 @@ impl TreeModel {
             // One byte past the size of the hash pass lets the server see a
             // file that grew, and stops the read there.
             payload: Some(Box::new(
-                ostrya_rt::File::from(file).take(hashed.size.saturating_add(1)),
+                ostrya_rt::FileReader::with_len_hint(file, hashed.size)
+                    .take(hashed.size.saturating_add(1)),
             )),
         })
     }
@@ -614,13 +615,53 @@ fn encoded(bytes: Vec<u8>) -> ObjectData {
     }
 }
 
-/// Refuse a metadata object over the size limit of the format.
-fn check_metadata_size(bytes: &[u8], what: &str) -> io::Result<()> {
-    if bytes.len() as u64 > MAX_METADATA_SIZE {
+/// Refuse a metadata object of more than `limit` bytes.
+fn check_metadata_size(bytes: &[u8], what: &str, limit: u64) -> io::Result<()> {
+    if bytes.len() as u64 > limit {
         return Err(invalid_data(format!(
-            "the {what} object of the directory is {} bytes, over the limit of {MAX_METADATA_SIZE}",
+            "the {what} object of the directory is {} bytes, over the limit of {limit}",
             bytes.len()
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_limit(bytes: &[u8], what: &str) {
+        let len = bytes.len() as u64;
+        check_metadata_size(bytes, what, len).unwrap();
+        let err = check_metadata_size(bytes, what, len - 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains(what), "{err}");
+    }
+
+    #[test]
+    fn a_dirtree_one_byte_over_the_limit_is_invalid_data() {
+        let dirtree = DirTree {
+            files: ["a", "b", "c"]
+                .into_iter()
+                .map(|name| (name.to_owned(), Checksum::sha256(name.as_bytes())))
+                .collect(),
+            dirs: vec![(
+                "d".to_owned(),
+                Checksum::sha256(b"dirtree"),
+                Checksum::sha256(b"dirmeta"),
+            )],
+        };
+        assert_limit(&dirtree.serialize().unwrap(), "dirtree");
+    }
+
+    #[test]
+    fn a_dirmeta_one_byte_over_the_limit_is_invalid_data() {
+        let dirmeta = DirMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o40755,
+            xattrs: Xattrs::new([(b"user.test\0".to_vec(), vec![7; 100])]).unwrap(),
+        };
+        assert_limit(&dirmeta.serialize().unwrap(), "dirmeta");
+    }
 }

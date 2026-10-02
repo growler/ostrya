@@ -294,8 +294,9 @@ pub use deltagen::{DeltaOptions, static_delta_relative_dir};
 pub use diff::{DiffChange, DiffEntry, DiffOptions, DiffSide, DiffStats};
 pub use error::{Error, Result};
 pub use fetch::{
-    BasicAuth, Body, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, LowSpeed,
-    Priority, Protocol, Proxy, Target, TlsOptions, TrustRoots, Validators,
+    BasicAuth, BearerToken, Body, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions,
+    LowSpeed, Priority, Protocol, Proxy, Target, TlsOptions, TrustRoots, UploadBody, UploadMethod,
+    UploadRequest, UploadWriter, Uploaded, Validators,
 };
 pub use file::{ContentReader, FileKind, FileObject};
 pub use fsck::{

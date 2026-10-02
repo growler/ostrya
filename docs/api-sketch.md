@@ -1811,9 +1811,10 @@ the URL its `Location` names, up to `max_redirects` hops; a limit of zero
 follows nothing, and each of those statuses is then a definitive answer of its
 own. An attempt that has followed the limit and is sent on to another URL fails
 with `Error::RedirectLimit`, and one that meets a redirect status naming no URL
-reports that status whatever the hop count. Every request is a GET, so none of
-the five changes the
-method of the hop that follows it. `Location` is resolved against the URL of
+reports that status whatever the hop count. A fetch is a GET, so none of the
+five changes the method of the hop that follows it. An upload follows a 307 or
+a 308 alone, for a body given whole, with the method kept and the bytes sent
+again. `Location` is resolved against the URL of
 the response that carried it, so it reads as an absolute URL, a relative one, or
 a scheme-relative one. The resolution normalizes what it produces, where a
 `Target::Url` reaches the wire as the caller wrote it: a dot segment is resolved
@@ -2014,6 +2015,56 @@ impl Fetcher {
     // Clone, Send + Sync.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher>;
     pub async fn fetch(&self, request: FetchRequest<'_>) -> Result<Fetched>;
+    pub async fn upload(&self, request: UploadRequest<'_>) -> Result<Uploaded>;
+}
+
+/// An upload body: given whole, which declares `Content-Length` and is sent
+/// again on a followed 307 or 308, or streamed through a channel. Send + Sync.
+pub struct UploadBody { /* ... */ }
+impl UploadBody {
+    pub fn bytes(bytes: Vec<u8>) -> UploadBody;   // no copy
+    pub fn channel() -> (UploadBody, UploadWriter);
+}
+impl From<Vec<u8>> for UploadBody {}
+
+/// The writing end of a channel body; implements `futures-io` `AsyncWrite`
+/// (and the tokio trait under the `tokio` feature). Send + Sync.
+pub struct UploadWriter { /* ... */ }
+
+pub enum UploadMethod { Post /* default */, Delete /* no body */ }
+
+/// `Authorization: Bearer TOKEN`, token68 syntax. The `Debug` rendering holds
+/// no token.
+pub struct BearerToken { pub token: String }
+
+pub struct UploadRequest<'a> {
+    pub target: Target<'a>,
+    pub method: UploadMethod,
+    pub body: UploadBody,
+    pub priority: Priority,
+    pub max_response: u64,                // default 2 MiB, for every status
+    pub headers: &'a [(String, String)],
+    pub basic_auth: Option<&'a BasicAuth>,
+    pub bearer_token: Option<&'a BearerToken>, // refused beside basic_auth or
+                                          // an Authorization header
+    pub allow_cleartext_credentials: bool,
+    pub response_timeout: Option<Duration>, // None: progress_timeout
+}
+
+impl<'a> UploadRequest<'a> {
+    pub const DEFAULT_MAX_RESPONSE: u64 = 2 * 1024 * 1024;
+    pub fn path(path: &'a str, body: UploadBody) -> UploadRequest<'a>;
+    pub fn url(url: &'a str, body: UploadBody) -> UploadRequest<'a>;
+}
+
+/// The answer to an upload, for every final status. Send + Sync.
+pub struct Uploaded { /* ... */ }
+impl Uploaded {
+    pub fn status(&self) -> u16;
+    pub fn headers(&self) -> &hyper::HeaderMap;
+    pub fn url(&self) -> &str;            // the URL that answered
+    pub fn protocol(&self) -> Protocol;
+    pub fn into_body(self) -> Body;       // capped at max_response
 }
 
 // ostrya-fetch, re-exported as ostrya::fetch
@@ -2025,6 +2076,7 @@ pub enum Error {
     FetchTooLarge { limit: u64 },               // declared length over the cap
     ContentEncoded { url: String, encoding: String },
     Unsupported(String),                        // unusable proxy or URL scheme
+    UploadInterrupted { url: String, message: String }, // failed after sent
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -2034,6 +2086,42 @@ pub type Result<T> = std::result::Result<T, Error>;
 // message.
 impl From<ostrya::fetch::Error> for ostrya::Error;
 ```
+
+An upload is tried again only while its request is unsent: the connect, the
+TLS handshake, a refused `CONNECT` tunnel, the HTTP handshake, or the wait for a
+ready connection failed, or hyper gave the request back unwritten. An unsent
+attempt spends a round as a retryable fetch failure does, and rounds that run
+out report `Error::Fetch`. A channel body whose writer was dropped before close
+fails before the hand-over, and the upload then reports `Error::Fetch` and
+sends nothing. Every other outcome counts as sent, and the upload ends on the
+destination that took it: every final status is `Ok(Uploaded)`, and a failure
+after the hand-over is `Error::UploadInterrupted`. A response that declares a
+coding is `Error::ContentEncoded`, and a `Content-Length` over `max_response`
+is `Error::FetchTooLarge`. A `POST` whose body is at its end at the hand-over
+declares `Content-Length: 0`.
+
+An upload opens an HTTP/1.1 connection of its own, which closes when the upload
+ends and never enters the pool, and shares the HTTP/2 connection of its origin.
+When the response body ends or is dropped before the request body has ended,
+as after an early answer, the request body fails: the writer gets `BrokenPipe`,
+and hyper stops sending the body.
+
+The writer of a channel body hands frames of 64 KiB to the connection through a
+slot of one frame, so the writer holds at most two frames. A flush of less than
+4 KiB hands over a copy and keeps the buffer. hyper takes a body given whole in
+frames of 64 KiB cut from its bytes. For each upload in flight the connection
+holds more: over HTTP/1.1, hyper takes another frame while it holds fewer than
+16 frames and less than 408 KiB, and over HTTP/2 it holds up to two frames.
+
+The stall window starts at the hand-over. A frame that waits for
+`progress_timeout` fails the body: the write fails with `TimedOut` for a
+channel body, and the upload is `UploadInterrupted` for a body given whole. A
+writer that waits at the gate, during the connect, or during the backoff of a
+round has no bound, and a writer dropped before close fails the body. The wait
+for the response head starts when hyper takes the end of the body and lasts
+`response_timeout`. `fetch_timeout` bounds admission up to the hand-over alone,
+and `low_speed` does not apply. `ostrya::Error` gains `UploadInterrupted` with
+the same fields.
 
 The pull uses four items of `ostrya-fetch` that are public for it and that
 `ostrya` does not re-export at its crate root: `Fetcher::with_counters`, which

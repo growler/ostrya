@@ -157,9 +157,10 @@
 //!
 //! A redirect is followed. A 301, 302, 303, 307, or 308 sends the attempt on
 //! to the URL its `Location` header names, up to
-//! [`max_redirects`](FetcherOptions::max_redirects) times; every request the
-//! fetcher makes is a GET, so no status among the five changes the method of
-//! the hop that follows it. A limit of zero follows nothing, and each of those
+//! [`max_redirects`](FetcherOptions::max_redirects) times; a fetch is a GET,
+//! so no status among the five changes the method of the hop that follows it.
+//! An upload follows a 307 or a 308 alone, under the rules the upload
+//! paragraphs below state. A limit of zero follows nothing, and each of those
 //! statuses is then a definitive answer of its own. An attempt that has
 //! followed the limit and is sent on to another URL fails definitively with
 //! [`Error::RedirectLimit`].
@@ -302,12 +303,95 @@
 //! [`max_retries`](FetcherOptions::max_retries) count the rounds of the fetches
 //! spend. A body that outgrows its cap, or that its consumer refuses, is not
 //! fetched again.
+//!
+//! [`Fetcher::upload`] serves an [`UploadRequest`]: a `POST` that sends an
+//! [`UploadBody`], or a `DELETE` that sends none, and a response body of at
+//! most [`max_response`](UploadRequest::max_response) bytes. A body is given
+//! whole, as [`UploadBody::bytes`], which declares its `Content-Length`, or
+//! streamed through the [`UploadWriter`] of [`UploadBody::channel`], which
+//! travels chunked over HTTP/1.1. A `POST` whose body is at its end when the
+//! request is handed over declares a `Content-Length` of zero. hyper takes a
+//! body given whole in frames of 64 KiB cut from its bytes, with no copy. The
+//! writer fills a 64 KiB frame and hands it to the connection through a slot of
+//! one frame, so the writer holds at most two frames. The connection holds more
+//! for each upload in flight: over HTTP/1.1, hyper takes another frame while it
+//! holds fewer than 16 frames and less than 408 KiB, so it holds up to 472 KiB,
+//! and over HTTP/2 it holds up to two frames. Mirrors, the proxy, TLS, the
+//! client certificate, the headers, the credentials, and the cleartext rule
+//! apply to an upload as they apply to a fetch, and an upload can carry a
+//! [`BearerToken`] as its credential. The fetcher sets no `Content-Type` and no
+//! `Expect`.
+//!
+//! An upload is tried again only while no part of it has been sent. The request
+//! is unsent when the attempt failed before hyper accepted it -- the connect,
+//! the `CONNECT` tunnel, the TLS handshake, the HTTP handshake, or the wait for
+//! a ready connection -- and when hyper gave the request back unwritten. The
+//! bytes of a `CONNECT` reach the proxy alone and are no part of the request.
+//! An unsent attempt spends a round as a retryable failure of a fetch does: the
+//! next mirror, then a repeated round after the backoff, up to
+//! [`max_retries`](FetcherOptions::max_retries), and a 407 to the `CONNECT` is
+//! definitive. Rounds that run out before the request is sent report the
+//! [`Error::Fetch`] of a fetch. A streamed body whose writer was dropped before
+//! it closed the body fails before the hand-over: the upload fails with
+//! [`Error::Fetch`] and sends nothing. Every other outcome counts as sent, and
+//! the upload ends on the destination that took it: no other mirror and no
+//! other round is asked. A failure after the hand-over fails the upload with
+//! [`Error::UploadInterrupted`], because the server can have received the whole
+//! request and acted on it. An HTTP/2 stream that the server refuses or resets
+//! after the hand-over is a failure of this kind.
+//!
+//! Every final status is the caller's answer: the upload resolves to
+//! [`Uploaded`] whatever the status, 408, 429, and 5xx included. A 307 or a 308
+//! is followed for a body given whole, with the method kept and the bytes sent
+//! again, under the redirect rules of a fetch: the redirect limit, the refusal
+//! of a hop from `https` to `http`, and the scope of the credentials. A failure
+//! on a hop after the first is an interrupted upload. Every other redirect
+//! status, and every redirect of a streamed body, is delivered as its status. A
+//! response that declares a coding is refused with [`Error::ContentEncoded`],
+//! and a `Content-Length` over the cap with [`Error::FetchTooLarge`]. A body
+//! that outgrows the cap while it streams fails the read with
+//! [`io::ErrorKind::FileTooLarge`](std::io::ErrorKind::FileTooLarge). The cap
+//! applies to every status.
+//!
+//! An upload takes no idle HTTP/1.1 connection from the pool and opens a
+//! connection of its own. A server can close an idle connection at any time,
+//! and an upload that hyper began to write over a connection closed that way
+//! counts as sent. The HTTP/1.1 connection of an upload closes when the upload
+//! ends, and never enters the pool. An upload shares the pooled HTTP/2
+//! connection of its origin.
+//!
+//! The response ends the request body. When the response body of an upload
+//! reaches its end or is dropped before the request body has ended, as when a
+//! server answers before it has read the body, the fetcher fails the request
+//! body: the writer gets
+//! [`io::ErrorKind::BrokenPipe`](std::io::ErrorKind::BrokenPipe), and hyper
+//! stops sending the body, which closes an HTTP/1.1 connection and resets an
+//! HTTP/2 stream. The same applies to a response the upload does not deliver: a
+//! followed redirect, a refused coding, and a declared length over the cap.
+//!
+//! The deadlines of an upload are these.
+//! [`connect_timeout`](FetcherOptions::connect_timeout) bounds opening a
+//! connection. While the body streams, the one bound is the stall window, which
+//! starts when the request is handed over: a frame that the connection does not
+//! take for [`progress_timeout`](FetcherOptions::progress_timeout) fails the
+//! body. For a streamed body it fails the write with
+//! [`io::ErrorKind::TimedOut`](std::io::ErrorKind::TimedOut), and for a body
+//! given whole it ends the upload with [`Error::UploadInterrupted`]. A writer
+//! that waits before the hand-over, at the gate, during the connect, or during
+//! the backoff between rounds, has no bound. The wait for the response head
+//! starts when hyper takes the end of the body and lasts
+//! [`response_timeout`](UploadRequest::response_timeout). The response body has
+//! the progress window of a fetch.
+//! [`fetch_timeout`](FetcherOptions::fetch_timeout) bounds the upload from
+//! admission to the hand-over of the request alone, and the low-speed rule does
+//! not apply. An upload holds its admission permit until its response body ends
+//! or is dropped.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures_io::{AsyncRead, AsyncWrite};
@@ -317,9 +401,7 @@ use hyper::http::uri::Scheme;
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use ostrya_rt as rt;
 use std::pin::Pin;
-#[cfg(feature = "tokio")]
-use std::task::ready;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker, ready};
 
 mod error;
 pub mod gate;
@@ -368,13 +450,21 @@ const PROXY_VARIABLES: [&str; 7] = [
 /// connection is opened with.
 const PROXY_SCHEME: &str = "http://";
 
-/// The statuses a redirect is followed at. Every request the fetcher makes is
-/// a GET, so none of the five changes the method of the hop that follows it,
-/// and the ones that part over the method are one case here.
+/// The statuses a fetch follows a redirect at. A fetch is a GET, so none of the
+/// five changes the method of the hop that follows it, and the ones that part
+/// over the method are one case here. An upload follows [`UPLOAD_REDIRECTS`]
+/// alone.
 const REDIRECTS: [StatusCode; 5] = [
     StatusCode::MOVED_PERMANENTLY,
     StatusCode::FOUND,
     StatusCode::SEE_OTHER,
+    StatusCode::TEMPORARY_REDIRECT,
+    StatusCode::PERMANENT_REDIRECT,
+];
+
+/// The statuses an upload follows a redirect at: the two that keep the method
+/// and the body, so the hop that follows sends the same request again.
+const UPLOAD_REDIRECTS: [StatusCode; 2] = [
     StatusCode::TEMPORARY_REDIRECT,
     StatusCode::PERMANENT_REDIRECT,
 ];
@@ -384,6 +474,16 @@ const REDIRECTS: [StatusCode; 5] = [
 /// one would send a credential the caller did not choose.
 const AMBIGUOUS_AUTHORIZATION: &str =
     "basic-auth credentials and an authorization header both set Authorization: pass one of them";
+
+/// What a layer that sets both a bearer token and an `Authorization` header is
+/// told, for the reason [`AMBIGUOUS_AUTHORIZATION`] states.
+const AMBIGUOUS_BEARER: &str =
+    "a bearer token and an authorization header both set Authorization: pass one of them";
+
+/// What a request that sets both basic-auth credentials and a bearer token is
+/// told, for the reason [`AMBIGUOUS_AUTHORIZATION`] states.
+const BASIC_AND_BEARER: &str =
+    "basic-auth credentials and a bearer token both set Authorization: pass one of them";
 
 /// What a layer that sets a `Host` header is told. The header states the
 /// authority of the destination the request goes to, which the fetcher reads
@@ -407,6 +507,19 @@ const CONNECTION_HEADERS: [&str; 9] = [
     "transfer-encoding",
     "upgrade",
 ];
+
+/// The size of the frames an upload body travels in. The writer fills one
+/// frame while the slot holds the one it handed over last, so the writer holds
+/// at most two frames, and hyper takes a body given whole in frames of this
+/// size. The connection buffers more of the body: over HTTP/1.1, hyper takes
+/// another frame while it holds fewer than 16 frames and less than 408 KiB,
+/// and over HTTP/2 it holds up to two frames.
+const UPLOAD_FRAME: usize = 64 * 1024;
+
+/// The size under which a flush hands over a copy of its part-filled frame and
+/// keeps the buffer, so a small frame that waits in the connection does not
+/// hold a whole frame of memory.
+const SMALL_FRAME: usize = 4 * 1024;
 
 /// The largest declared response body a failed attempt reads to the end so its
 /// HTTP/1.1 connection can go back to the pool. Above this, and with no declared
@@ -466,6 +579,29 @@ impl std::fmt::Debug for BasicAuth {
         f.debug_struct("BasicAuth")
             .field("user", &self.user)
             .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// A token for `Authorization: Bearer`.
+///
+/// The token is sent as written, so it holds the token68 syntax of HTTP
+/// authentication: one or more ASCII letters, digits, `-`, `.`, `_`, `~`, `+`,
+/// or `/`, followed by any number of `=`. A token of another form is refused
+/// before admission, with a message that holds no part of the token.
+///
+/// The [`Debug`] rendering holds a fixed word in place of the token, so a
+/// struct that carries one is logged without it.
+#[derive(Clone, Eq, PartialEq)]
+pub struct BearerToken {
+    /// The token.
+    pub token: String,
+}
+
+impl std::fmt::Debug for BearerToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BearerToken")
+            .field("token", &"<redacted>")
             .finish()
     }
 }
@@ -802,6 +938,200 @@ pub enum Fetched {
     NotModified,
 }
 
+/// The method of an upload.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UploadMethod {
+    /// `POST`, which sends the body. The default.
+    #[default]
+    Post,
+    /// `DELETE`, which sends no body. The request takes an empty
+    /// [`UploadBody::bytes`], and any other body is refused before admission.
+    Delete,
+}
+
+/// The request body of an upload.
+///
+/// A body is one of two forms. [`bytes`](UploadBody::bytes) gives it whole: the
+/// request declares its `Content-Length`, hyper takes the bytes in frames of
+/// 64 KiB, and a followed redirect sends the bytes again.
+/// [`channel`](UploadBody::channel) streams it: the caller writes
+/// the body into the [`UploadWriter`] while the upload runs, and over HTTP/1.1
+/// the body travels chunked.
+///
+/// A channel body that is dropped before an upload sends it, or whose upload
+/// has ended, makes the writes of its writer fail with
+/// [`io::ErrorKind::BrokenPipe`](std::io::ErrorKind::BrokenPipe).
+pub struct UploadBody {
+    form: UploadForm,
+}
+
+/// The two forms of an [`UploadBody`].
+enum UploadForm {
+    /// The whole body, which every hop of the upload sends.
+    Bytes(Bytes),
+    /// The reading end of a body an [`UploadWriter`] fills.
+    Channel(BodyEnd),
+}
+
+impl UploadBody {
+    /// A body of `bytes`. The vector becomes the bytes the request sends, in
+    /// frames cut from it with no copy.
+    pub fn bytes(bytes: Vec<u8>) -> UploadBody {
+        UploadBody {
+            form: UploadForm::Bytes(Bytes::from(bytes)),
+        }
+    }
+
+    /// A streamed body, and the writer that fills it.
+    pub fn channel() -> (UploadBody, UploadWriter) {
+        let exchange = Arc::new(Exchange::default());
+        let body = UploadBody {
+            form: UploadForm::Channel(BodyEnd {
+                exchange: exchange.clone(),
+            }),
+        };
+        let writer = UploadWriter {
+            exchange,
+            buffer: Vec::with_capacity(UPLOAD_FRAME),
+            stall: None,
+            failed: None,
+        };
+        (body, writer)
+    }
+}
+
+impl From<Vec<u8>> for UploadBody {
+    fn from(bytes: Vec<u8>) -> UploadBody {
+        UploadBody::bytes(bytes)
+    }
+}
+
+impl std::fmt::Debug for UploadBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.form {
+            UploadForm::Bytes(bytes) => f.debug_tuple("Bytes").field(&bytes.len()).finish(),
+            UploadForm::Channel(_) => f.write_str("Channel"),
+        }
+    }
+}
+
+/// One upload: a request that sends a body, and a bounded response.
+#[derive(Debug)]
+pub struct UploadRequest<'a> {
+    /// Where the request goes: a path under every mirror's base URL, or an
+    /// absolute URL of the request's own, read as [`FetchRequest::target`] is.
+    /// The mirrors are tried in order until one of them takes the request, and
+    /// a mirror after that one is never asked.
+    pub target: Target<'a>,
+    /// The method, `POST` by default.
+    pub method: UploadMethod,
+    /// What the request sends.
+    pub body: UploadBody,
+    /// Where the request sits in the queue when the fetcher is at its limit.
+    pub priority: Priority,
+    /// The most bytes the response body may hold, whatever the status. A
+    /// larger `Content-Length` fails the upload with [`Error::FetchTooLarge`];
+    /// a body that outgrows the cap mid-stream fails the read with
+    /// [`io::ErrorKind::FileTooLarge`](std::io::ErrorKind::FileTooLarge).
+    /// [`UploadRequest::DEFAULT_MAX_RESPONSE`] by default.
+    pub max_response: u64,
+    /// Headers merged over the fetcher's, as [`FetchRequest::headers`] are. A
+    /// `Content-Type` the server needs is set here, since the fetcher sets
+    /// none.
+    pub headers: &'a [(String, String)],
+    /// Credentials for `Authorization: Basic` that replace the fetcher's for
+    /// this request. Beside [`bearer_token`](UploadRequest::bearer_token), or
+    /// beside an `Authorization` entry in
+    /// [`headers`](UploadRequest::headers), they are refused before admission.
+    pub basic_auth: Option<&'a BasicAuth>,
+    /// A token for `Authorization: Bearer` that replaces the fetcher's
+    /// credentials for this request. Beside
+    /// [`basic_auth`](UploadRequest::basic_auth), or beside an `Authorization`
+    /// entry in [`headers`](UploadRequest::headers), it is refused before
+    /// admission.
+    pub bearer_token: Option<&'a BearerToken>,
+    /// Whether a credential may reach a cleartext origin, as
+    /// [`FetchRequest::allow_cleartext_credentials`] states.
+    pub allow_cleartext_credentials: bool,
+    /// How long the response head may take once hyper has taken the end of the
+    /// body. `None` takes [`progress_timeout`](FetcherOptions::progress_timeout).
+    pub response_timeout: Option<Duration>,
+}
+
+impl<'a> UploadRequest<'a> {
+    /// The response cap a request has unless the caller sets another: 2 MiB.
+    pub const DEFAULT_MAX_RESPONSE: u64 = 2 * 1024 * 1024;
+
+    /// A normal-priority `POST` of `body` to `path` under every mirror, carrying
+    /// the fetcher's headers and credentials.
+    pub fn path(path: &'a str, body: UploadBody) -> UploadRequest<'a> {
+        UploadRequest::for_target(Target::Path(path), body)
+    }
+
+    /// A normal-priority `POST` of `body` to the absolute URL `url`, carrying
+    /// the fetcher's headers and credentials.
+    pub fn url(url: &'a str, body: UploadBody) -> UploadRequest<'a> {
+        UploadRequest::for_target(Target::Url(url), body)
+    }
+
+    /// A request for `target` with every other field at its default.
+    fn for_target(target: Target<'a>, body: UploadBody) -> UploadRequest<'a> {
+        UploadRequest {
+            target,
+            method: UploadMethod::default(),
+            body,
+            priority: Priority::default(),
+            max_response: UploadRequest::DEFAULT_MAX_RESPONSE,
+            headers: &[],
+            basic_auth: None,
+            bearer_token: None,
+            allow_cleartext_credentials: false,
+            response_timeout: None,
+        }
+    }
+}
+
+/// The answer to an upload: the status, the headers, and the response body.
+///
+/// Every final status arrives here, an unsuccessful one included, and the
+/// caller decides what it means.
+#[derive(Debug)]
+pub struct Uploaded {
+    status: StatusCode,
+    headers: hyper::HeaderMap,
+    url: String,
+    body: Body,
+}
+
+impl Uploaded {
+    /// The status of the response.
+    pub fn status(&self) -> u16 {
+        self.status.as_u16()
+    }
+
+    /// The headers of the response.
+    pub fn headers(&self) -> &hyper::HeaderMap {
+        &self.headers
+    }
+
+    /// The URL that answered, which after a redirect is the last hop's.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// The HTTP version that carried the response.
+    pub fn protocol(&self) -> Protocol {
+        self.body.protocol()
+    }
+
+    /// The response body, capped at
+    /// [`max_response`](UploadRequest::max_response). It holds the admission
+    /// permit until it ends or is dropped.
+    pub fn into_body(self) -> Body {
+        self.body
+    }
+}
+
 /// A parsed base URL.
 #[derive(Clone, Debug)]
 struct Mirror {
@@ -1025,31 +1355,399 @@ enum Via<'a> {
     Tunnel(&'a ProxyEndpoint),
 }
 
-/// The request body: every request is a GET, so there is nothing to send.
-struct NoBody;
+/// The body a request carries: nothing, for a fetch and for a `CONNECT`, or
+/// the reading end of an upload body. One type serves both, so a fetch and an
+/// upload share a pooled connection.
+enum RequestBody {
+    /// No body: a fetch, a `CONNECT`.
+    Empty,
+    /// The body of an upload.
+    Upload(BodyEnd),
+}
 
-impl hyper::body::Body for NoBody {
+impl hyper::body::Body for RequestBody {
     type Data = Bytes;
-    type Error = std::convert::Infallible;
+    type Error = std::io::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
     ) -> Poll<Option<std::result::Result<Frame<Bytes>, Self::Error>>> {
-        Poll::Ready(None)
+        match self.get_mut() {
+            RequestBody::Empty => Poll::Ready(None),
+            RequestBody::Upload(end) => end.poll_frame(cx),
+        }
     }
 
     fn is_end_stream(&self) -> bool {
-        true
+        match self {
+            RequestBody::Empty => true,
+            RequestBody::Upload(end) => end.is_end_stream(),
+        }
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(0)
+        match self {
+            RequestBody::Empty => SizeHint::with_exact(0),
+            RequestBody::Upload(end) => match end.exchange.exact {
+                Some(length) => SizeHint::with_exact(length),
+                None => SizeHint::default(),
+            },
+        }
     }
 }
 
-type H1Sender = hyper::client::conn::http1::SendRequest<NoBody>;
-type H2Sender = hyper::client::conn::http2::SendRequest<NoBody>;
+/// The state one upload body shares between its writer, the reading end that
+/// hyper polls, and the upload that waits for the response.
+#[derive(Default)]
+struct Exchange {
+    slot: Mutex<Slot>,
+    /// The length of a body given whole, which the request declares. It is
+    /// held here rather than in the reading end, so the body a fetch carries
+    /// stays one pointer wide.
+    exact: Option<u64>,
+}
+
+/// The one slot an upload body passes its frames through, and what each party
+/// has done so far.
+#[derive(Default)]
+struct Slot {
+    /// A frame the writer has handed over and hyper has not taken yet. For a
+    /// body given whole, this is what is left of the body, which hyper takes
+    /// in frames of [`UPLOAD_FRAME`].
+    frame: Option<Bytes>,
+    /// Whether the writer has closed the body, so no frame follows `frame`.
+    closed: bool,
+    /// Why the body fails: the writer was dropped before it closed the body,
+    /// a frame waited past the stall window, or the response ended before the
+    /// body did.
+    aborted: Option<String>,
+    /// Whether the reading end has been dropped, which ends the upload.
+    gone: bool,
+    /// Whether the reading end has given hyper the end of the body.
+    ended: bool,
+    /// Whether hyper has polled the body for a frame.
+    polled: bool,
+    /// Whether the body was at its end when the request was handed over, so
+    /// the request declares a length of zero.
+    empty: bool,
+    /// The stall window, which runs from the hand-over of the request on.
+    stall: Option<Stall>,
+    /// The writer, waiting for the slot to empty or for the end.
+    writer: Option<Waker>,
+    /// hyper, waiting for a frame.
+    reader: Option<Waker>,
+    /// The upload, waiting for the end of the body or for its failure.
+    upload: Option<Waker>,
+}
+
+/// The stall window of an upload body: how long a frame may wait in the slot
+/// for hyper to take it.
+#[derive(Clone, Copy)]
+struct Stall {
+    window: Duration,
+    /// When the frame in the slot began to wait: when it was placed there,
+    /// when hyper took the frame before it from a body given whole, or when
+    /// the window started, whichever came last.
+    since: Instant,
+}
+
+impl Slot {
+    /// Record that the body has reached its end, and give back the wakers of
+    /// the two parties that wait for it.
+    fn end(&mut self) -> [Option<Waker>; 2] {
+        self.ended = true;
+        [self.writer.take(), self.upload.take()]
+    }
+
+    /// Fail the body for `reason`, keeping a reason it failed for already, and
+    /// give back the wakers of the parties that read the failure.
+    fn abort(&mut self, reason: impl FnOnce() -> String) -> [Option<Waker>; 3] {
+        self.aborted.get_or_insert_with(reason);
+        [self.reader.take(), self.upload.take(), self.writer.take()]
+    }
+
+    /// Whether the body is at its end: closed, with no frame left to take and
+    /// no failure.
+    fn at_end(&self) -> bool {
+        self.closed && self.frame.is_none() && self.aborted.is_none()
+    }
+
+    /// When the frame in the slot has waited the whole stall window, or `None`
+    /// while no frame waits, no window runs, or the body has failed.
+    fn stall_end(&self) -> Option<Instant> {
+        let stall = self.stall?;
+        if self.frame.is_none() || self.aborted.is_some() {
+            return None;
+        }
+        stall.since.checked_add(stall.window)
+    }
+
+    /// Start the wait of the frame in the slot again, from now.
+    fn restart_stall(&mut self) {
+        if let Some(stall) = &mut self.stall {
+            stall.since = Instant::now();
+        }
+    }
+}
+
+/// What the upload sees of its body while it waits for the response.
+enum Watch {
+    /// The body is still streaming. A body given whole has no writer, so the
+    /// upload runs its stall window, which ends at the instant given.
+    Streaming(Option<Instant>),
+    /// hyper has taken the end of the body.
+    Ended,
+    /// The body failed, for the reason given.
+    Aborted(String),
+}
+
+impl Exchange {
+    /// The exchange of a body given whole: the bytes are the frame hyper
+    /// takes in parts, and the body is closed. An empty body holds no frame,
+    /// so it is at its end before hyper polls it.
+    fn whole(bytes: &Bytes) -> Exchange {
+        Exchange {
+            slot: Mutex::new(Slot {
+                frame: (!bytes.is_empty()).then(|| bytes.clone()),
+                closed: true,
+                ..Slot::default()
+            }),
+            exact: Some(bytes.len() as u64),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Slot> {
+        self.slot.lock().expect("upload body mutex")
+    }
+
+    /// Why the body failed, once it has.
+    fn aborted(&self) -> Option<String> {
+        self.lock().aborted.clone()
+    }
+
+    /// Hand the body to hyper: start the stall window of `stall`, which
+    /// applies from now on, and report whether the body is at its end, which
+    /// the request then declares. A body that has failed is not handed over,
+    /// and the reason it failed for comes back instead.
+    fn hand_over(&self, stall: Duration) -> std::result::Result<bool, String> {
+        let mut slot = self.lock();
+        if let Some(reason) = &slot.aborted {
+            return Err(reason.clone());
+        }
+        slot.stall = Some(Stall {
+            window: stall,
+            since: Instant::now(),
+        });
+        slot.empty = slot.at_end();
+        let empty = slot.empty;
+        let writer = slot.writer.take();
+        drop(slot);
+        wake(writer);
+        Ok(empty)
+    }
+
+    /// Take the body back from hyper, which gave the request back unwritten.
+    /// The stall window stops until the next hand-over.
+    fn withdraw(&self) {
+        let mut slot = self.lock();
+        slot.stall = None;
+        slot.empty = false;
+    }
+
+    /// Fail the body once the frame in the slot has waited the whole stall
+    /// window, and give the reason. While the frame still has time, or no
+    /// frame waits, the instant the wait ends at comes back instead.
+    fn check_stall(&self) -> std::result::Result<String, Option<Instant>> {
+        let mut slot = self.lock();
+        let end = slot.stall_end();
+        let (Some(end), Some(stall)) = (end, slot.stall) else {
+            return Err(None);
+        };
+        if Instant::now() < end {
+            return Err(Some(end));
+        }
+        let message = format!("the upload body was not taken for {:?}", stall.window);
+        let wakers = slot.abort(|| message.clone());
+        drop(slot);
+        wakers.into_iter().for_each(wake);
+        Ok(message)
+    }
+
+    /// Fail a body that has not ended, because the response it was sent for
+    /// has ended or was dropped. hyper stops sending the body and closes the
+    /// connection, and the writer gets a broken pipe.
+    fn cut(&self) {
+        let mut slot = self.lock();
+        if slot.ended {
+            return;
+        }
+        let wakers = slot.abort(|| "the response to the upload ended before its body".into());
+        drop(slot);
+        wakers.into_iter().for_each(wake);
+    }
+
+    /// Where the body stands, registering the upload to be woken when that
+    /// changes.
+    fn watch(&self, cx: &mut Context<'_>) -> Watch {
+        let mut slot = self.lock();
+        if let Some(reason) = &slot.aborted {
+            return Watch::Aborted(reason.clone());
+        }
+        if slot.ended {
+            return Watch::Ended;
+        }
+        park(&mut slot.upload, cx);
+        Watch::Streaming(self.exact.and(slot.stall_end()))
+    }
+}
+
+/// Keep the waker of `cx` in `waker`, unless the one held there wakes the same
+/// task.
+fn park(waker: &mut Option<Waker>, cx: &Context<'_>) {
+    if !waker
+        .as_ref()
+        .is_some_and(|held| held.will_wake(cx.waker()))
+    {
+        *waker = Some(cx.waker().clone());
+    }
+}
+
+/// Wake `waker`, if a party left one.
+fn wake(waker: Option<Waker>) {
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+/// Poll a timer toward `end`, ready once `end` has passed.
+///
+/// The timer is armed once, for the time left. A window whose start moves
+/// later, as the stall window does with every frame, moves `end` later
+/// without touching the timer: when the timer fires early, it is armed again
+/// for the time left alone.
+fn poll_until(timer: &mut Option<rt::Deadline>, cx: &mut Context<'_>, end: Instant) -> Poll<()> {
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            *timer = None;
+            return Poll::Ready(());
+        }
+        let deadline = timer.get_or_insert_with(|| rt::Deadline::new(left));
+        if deadline.poll_expired(cx).is_pending() {
+            return Poll::Pending;
+        }
+        *timer = None;
+    }
+}
+
+/// The reading end of an upload body, which hyper polls for frames.
+///
+/// A frame is taken out of the slot as it is, so the bytes of a frame are
+/// copied at most once, from the caller's buffer into the writer's. A body
+/// given whole is taken in frames of [`UPLOAD_FRAME`] cut from its bytes, with
+/// no copy. Dropping the end wakes the writer, and its writes fail from then
+/// on.
+struct BodyEnd {
+    exchange: Arc<Exchange>,
+}
+
+impl BodyEnd {
+    /// The reading end of a body given whole.
+    fn whole(bytes: &Bytes) -> BodyEnd {
+        BodyEnd {
+            exchange: Arc::new(Exchange::whole(bytes)),
+        }
+    }
+
+    /// The next frame. A failed body fails the poll, so hyper ends the request
+    /// unfinished rather than sending a truncated body as a whole one.
+    fn poll_frame(&mut self, cx: &mut Context<'_>) -> Poll<Option<std::io::Result<Frame<Bytes>>>> {
+        let mut slot = self.exchange.lock();
+        slot.polled = true;
+        if let Some(reason) = &slot.aborted {
+            return Poll::Ready(Some(Err(std::io::Error::other(reason.clone()))));
+        }
+        // hyper takes a body given whole in frames, so the end follows the
+        // last of them, and the stall window runs over each one.
+        if let Some(held) = &mut slot.frame
+            && held.len() > UPLOAD_FRAME
+        {
+            let frame = held.split_to(UPLOAD_FRAME);
+            slot.restart_stall();
+            return Poll::Ready(Some(Ok(Frame::data(frame))));
+        }
+        if let Some(frame) = slot.frame.take() {
+            // The last frame of a closed body is its end as well, which hyper
+            // reads from `is_end_stream` and does not poll for.
+            let wakers = if slot.closed {
+                slot.end()
+            } else {
+                [slot.writer.take(), None]
+            };
+            drop(slot);
+            wakers.into_iter().for_each(wake);
+            return Poll::Ready(Some(Ok(Frame::data(frame))));
+        }
+        if slot.closed {
+            let wakers = slot.end();
+            drop(slot);
+            wakers.into_iter().for_each(wake);
+            return Poll::Ready(None);
+        }
+        park(&mut slot.reader, cx);
+        Poll::Pending
+    }
+
+    /// Whether the body has nothing more to give. hyper asks before it polls,
+    /// and a body at its end there is never polled, so the answer records the
+    /// end as a poll that finds it does.
+    ///
+    /// hyper frames the request from the first answer: over HTTP/1.1, a
+    /// request at its end there carries no length of its own. So before the
+    /// first poll, a body is at its end only when the request declared a
+    /// length of zero for it at the hand-over. A body that reached its end
+    /// after the hand-over is framed as a stream and then ends empty.
+    fn is_end_stream(&self) -> bool {
+        let mut slot = self.exchange.lock();
+        if slot.ended {
+            return true;
+        }
+        if !slot.at_end() || !(slot.polled || slot.empty) {
+            return false;
+        }
+        let wakers = slot.end();
+        drop(slot);
+        wakers.into_iter().for_each(wake);
+        true
+    }
+}
+
+impl Drop for BodyEnd {
+    fn drop(&mut self) {
+        let mut slot = self.exchange.lock();
+        slot.gone = true;
+        let writer = slot.writer.take();
+        drop(slot);
+        wake(writer);
+    }
+}
+
+/// The request body of an upload, which its response holds. When the response
+/// ends or is dropped, a request body that has not ended fails, so hyper
+/// stops sending it and closes the connection.
+struct RequestEnd {
+    exchange: Arc<Exchange>,
+}
+
+impl Drop for RequestEnd {
+    fn drop(&mut self) {
+        self.exchange.cut();
+    }
+}
+
+type H1Sender = hyper::client::conn::http1::SendRequest<RequestBody>;
+type H2Sender = hyper::client::conn::http2::SendRequest<RequestBody>;
 
 /// A connection ready to carry one request.
 enum Sender {
@@ -1127,6 +1825,49 @@ enum Failure {
     /// A definitive answer: retrying would get the same one.
     Fatal(Error),
 }
+
+impl Failure {
+    /// The error the failure carries, whichever kind it is.
+    fn into_error(self) -> Error {
+        match self {
+            Failure::Retry(e) | Failure::Fatal(e) => e,
+        }
+    }
+}
+
+/// A failed upload attempt, and whether the request had been sent.
+enum UploadFailure {
+    /// No part of the request reached hyper, so the round goes on as it does
+    /// for a fetch.
+    Unsent(Failure),
+    /// hyper took the request, so the upload ends with this error.
+    Sent(Error),
+}
+
+/// What every attempt of one upload sends, settled before admission.
+struct UploadPlan<'a> {
+    method: Method,
+    headers: &'a [(HeaderName, HeaderValue)],
+    /// The bytes of a body given whole, which a followed redirect sends again.
+    /// A streamed body has none, so no redirect of it is followed.
+    bytes: Option<Bytes>,
+    max_response: u64,
+    response_timeout: Duration,
+}
+
+/// What became of a request once hyper took it.
+enum Answer<T> {
+    /// The send resolved, with the response head or the error hyper gave.
+    Sent(T),
+    /// The writer failed the body before the response head arrived.
+    Aborted(String),
+    /// The body ended, and no response head followed within the window.
+    Silent(Duration),
+}
+
+/// The response of one upload hop, the protocol that carried it, and the body
+/// the request sent.
+type UploadResponse = (Response<Incoming>, Protocol, RequestEnd);
 
 /// An async HTTP client for one remote.
 ///
@@ -1255,8 +1996,9 @@ impl Fetcher {
                      would receive in the clear: use https mirrors or drop the header"
                 )));
             }
-            let value = HeaderValue::try_from(value.as_str())
+            let mut value = HeaderValue::try_from(value.as_str())
                 .map_err(|_| Error::Fetch(format!("invalid value for header {name}")))?;
+            value.set_sensitive(is_credential(&name));
             if let Some(at) = headers[..base].iter().position(|(held, _)| *held == name) {
                 headers.remove(at);
                 base -= 1;
@@ -1329,7 +2071,12 @@ impl Fetcher {
         // per destination and once per round, and no permit is taken and no
         // socket opened for it.
         let route = self.route(request.target)?;
-        let headers = merge_headers(&self.inner.headers, request.headers, request.basic_auth)?;
+        let headers = merge_headers(
+            &self.inner.headers,
+            request.headers,
+            request.basic_auth,
+            None,
+        )?;
         if !request.allow_cleartext_credentials {
             self.check_cleartext(&route, &headers)?;
         }
@@ -1698,6 +2445,7 @@ impl Fetcher {
                 waiting: false,
                 low_speed: self.inner.low_speed.map(Monitor::new),
                 interrupted: None,
+                request_body: None,
             }));
         }
     }
@@ -1726,28 +2474,18 @@ impl Fetcher {
                 // holds -- the TLS handshake and hyper's own -- and it is the
                 // rarest, taken only when the pool has nothing for this origin.
                 // Boxing it keeps that state off the fetch future, which every
-                // caller nests inside its own: a fetch measures 5048 bytes
-                // this way and 36184 without, and a pull that wraps several
+                // caller nests inside its own: a fetch measures 5064 bytes
+                // this way and 36136 without, and a pull that wraps several
                 // helpers around one multiplies what it saves.
                 let opened = within(connect_timeout, Box::pin(self.connect(key, via))).await;
                 match opened {
                     Some(result) => result?,
                     None => {
-                        // The window covers the connect to whichever endpoint
-                        // the hop is opened to, so a proxied hop names the
-                        // proxy: the origin behind it is reached over that
-                        // connection and is contacted by nothing until it is
-                        // open.
-                        return Err(Failure::Retry(Error::Fetch(match via {
-                            Via::Direct => format!(
-                                "connect to {}:{} timed out after {connect_timeout:?}",
-                                origin.host, origin.port
-                            ),
-                            Via::Absolute(proxy) | Via::Tunnel(proxy) => format!(
-                                "connect to the proxy {} timed out after {connect_timeout:?}",
-                                proxy.named
-                            ),
-                        })));
+                        return Err(Failure::Retry(connect_timed_out(
+                            origin,
+                            via,
+                            connect_timeout,
+                        )));
                     }
                 }
             }
@@ -1847,7 +2585,437 @@ impl Fetcher {
         }
     }
 
-    /// Assemble the GET for `request` against `destination`, sending `headers`.
+    /// Send `request`, trying each destination until one takes it.
+    ///
+    /// The crate documentation states when an upload is tried again, what
+    /// counts as sent, the redirects it follows, and the deadlines that bound
+    /// it. Every final status resolves to [`Uploaded`]. A failure before the
+    /// request was sent is the error a fetch reports, and a failure after it
+    /// is [`Error::UploadInterrupted`]. Once this returns, the writer of a
+    /// streamed body fails its writes with
+    /// [`io::ErrorKind::BrokenPipe`](std::io::ErrorKind::BrokenPipe) as soon as
+    /// the connection is done with the body. The response ends the request
+    /// body: when the response body reaches its end or is dropped before the
+    /// request body has ended, the request body fails, the writer gets the
+    /// same broken pipe, and hyper stops sending the body.
+    pub async fn upload(&self, request: UploadRequest<'_>) -> Result<Uploaded> {
+        let UploadRequest {
+            target,
+            method,
+            body,
+            priority,
+            max_response,
+            headers,
+            basic_auth,
+            bearer_token,
+            allow_cleartext_credentials,
+            response_timeout,
+        } = request;
+        // Everything the request names and carries is settled before
+        // admission, as for a fetch, and so is the body a DELETE does not
+        // send.
+        let route = self.route(target)?;
+        let headers = merge_headers(&self.inner.headers, headers, basic_auth, bearer_token)?;
+        if !allow_cleartext_credentials {
+            self.check_cleartext(&route, &headers)?;
+        }
+        self.check_trust_anchors(&route)?;
+        let method = match method {
+            UploadMethod::Post => Method::POST,
+            UploadMethod::Delete => Method::DELETE,
+        };
+        let (end, bytes) = match body.form {
+            UploadForm::Bytes(bytes) => (BodyEnd::whole(&bytes), Some(bytes)),
+            UploadForm::Channel(end) => (end, None),
+        };
+        if method == Method::DELETE && !bytes.as_ref().is_some_and(Bytes::is_empty) {
+            return Err(Error::Fetch(format!(
+                "the delete of {} carries a body, which a delete does not send: pass an empty \
+                 UploadBody::bytes",
+                target.as_str()
+            )));
+        }
+        let plan = UploadPlan {
+            method,
+            headers: &headers,
+            bytes,
+            max_response,
+            response_timeout: response_timeout.unwrap_or(self.inner.progress_timeout),
+        };
+        let permit = self.inner.gate.acquire(priority).await;
+        // Set while hyper holds the request, which is when the admission
+        // deadline stops: what follows the hand-over has deadlines of its own.
+        let handed = AtomicBool::new(false);
+        let rounds = self.upload_rounds(&plan, &route, end, &handed);
+        let mut uploaded = match self.inner.fetch_timeout {
+            None => rounds.await?,
+            Some(limit) => match before_hand_over(limit, &handed, rounds).await {
+                Some(result) => result?,
+                None => {
+                    return Err(Error::Fetch(format!(
+                        "upload of {} was not sent within {limit:?}",
+                        target.as_str()
+                    )));
+                }
+            },
+        };
+        uploaded.body.permit = Some(permit);
+        Ok(uploaded)
+    }
+
+    /// Try every destination in turn, repeating the round while the request
+    /// is unsent and a destination failed in a way another attempt may not,
+    /// as [`rounds`](Fetcher::rounds) does for a fetch. A request that was sent
+    /// ends the rounds, whatever became of it.
+    async fn upload_rounds(
+        &self,
+        plan: &UploadPlan<'_>,
+        route: &Route<'_>,
+        end: BodyEnd,
+        handed: &AtomicBool,
+    ) -> Result<Uploaded> {
+        let destination_count = match route {
+            Route::Mirrors(_) => self.inner.mirrors.len(),
+            Route::One(_) => 1,
+        };
+        let mut settled = vec![false; destination_count];
+        let mut reported: Option<Error> = None;
+        let mut definitive = false;
+        let mut round = 0;
+        // An attempt takes the body when it hands the request over, and an
+        // attempt whose request comes back unsent puts it back here.
+        let mut body = Some(end);
+        loop {
+            let mut retryable = false;
+            for (position, settled) in settled.iter_mut().enumerate() {
+                if *settled {
+                    continue;
+                }
+                let destination = match route {
+                    Route::Mirrors(path) => {
+                        Cow::Owned(self.inner.mirrors[position].destination(path))
+                    }
+                    Route::One(destination) => Cow::Borrowed(destination),
+                };
+                match self
+                    .upload_attempt(&destination, plan, &mut body, handed)
+                    .await
+                {
+                    Ok(uploaded) => return Ok(uploaded),
+                    Err(UploadFailure::Sent(e)) => return Err(e),
+                    Err(UploadFailure::Unsent(Failure::Retry(e))) => {
+                        retryable = true;
+                        if reported.is_none() {
+                            reported = Some(e);
+                        }
+                    }
+                    Err(UploadFailure::Unsent(Failure::Fatal(e))) => {
+                        *settled = true;
+                        if !definitive {
+                            reported = Some(e);
+                            definitive = true;
+                        }
+                    }
+                }
+            }
+            if !retryable || round >= self.inner.max_retries {
+                return Err(reported.expect("a failed round holds a failure"));
+            }
+            round += 1;
+            rt::Timer::after(backoff(round)).await;
+        }
+    }
+
+    /// One upload against one destination, following the redirects a body
+    /// given whole meets.
+    ///
+    /// The first hop that hyper takes sends the request, so a failure on any
+    /// hop after it is final: it is reported as an interrupted upload, and the
+    /// rounds stop. A response the upload does not deliver is dropped, and
+    /// with it a request body that has not ended and the connection of an
+    /// HTTP/1.1 hop, which no upload returns to the pool.
+    async fn upload_attempt(
+        &self,
+        destination: &Destination,
+        plan: &UploadPlan<'_>,
+        body: &mut Option<BodyEnd>,
+        handed: &AtomicBool,
+    ) -> std::result::Result<Uploaded, UploadFailure> {
+        let named = &destination.origin;
+        let mut hop = Cow::Borrowed(destination);
+        let mut headers = Cow::Borrowed(plan.headers);
+        let mut followed = 0u32;
+        loop {
+            let via = self.inner.proxies.via(&hop.origin);
+            let key = PoolKey {
+                origin: match via {
+                    Via::Absolute(proxy) => proxy.endpoint.clone(),
+                    Via::Direct | Via::Tunnel(_) => hop.origin.clone(),
+                },
+                identity: self.presents_identity(&hop.origin, named),
+                proxied: matches!(via, Via::Absolute(_)),
+            };
+            let url = hop.url();
+            let sent = self
+                .upload_send(&hop, &key, via, plan, &headers, body, handed)
+                .await;
+            let (response, protocol, request_end) = match sent {
+                Ok(sent) => sent,
+                Err(UploadFailure::Unsent(failure)) if followed > 0 => {
+                    return Err(UploadFailure::Sent(interrupted(
+                        url,
+                        failure.into_error().to_string(),
+                    )));
+                }
+                Err(failure) => return Err(failure),
+            };
+            let status = response.status();
+            if let Some(bytes) = &plan.bytes
+                && UPLOAD_REDIRECTS.contains(&status)
+                && self.inner.max_redirects > 0
+                && let Some(location) = response
+                    .headers()
+                    .get(hyper::header::LOCATION)
+                    .and_then(|value| resolve_location(url, value))
+            {
+                if followed >= self.inner.max_redirects {
+                    return Err(UploadFailure::Sent(Error::RedirectLimit {
+                        url: url.to_string(),
+                        hops: followed,
+                    }));
+                }
+                let next = redirect_destination(&hop, &location).map_err(UploadFailure::Sent)?;
+                if next.origin.tls && !self.inner.has_trust_anchors {
+                    return Err(UploadFailure::Sent(no_trust_anchors(next.origin_url())));
+                }
+                // A credential stays with the origin the route named, as it
+                // does for a fetch.
+                if next.origin != *named && headers.iter().any(|(name, _)| is_credential(name)) {
+                    let scoped = headers
+                        .iter()
+                        .filter(|(name, _)| !is_credential(name))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    headers = Cow::Owned(scoped);
+                }
+                hop = Cow::Owned(next);
+                followed += 1;
+                *body = Some(BodyEnd::whole(bytes));
+                continue;
+            }
+            if let Some(encoding) = declared_coding(response.headers()) {
+                return Err(UploadFailure::Sent(Error::ContentEncoded {
+                    url: url.to_string(),
+                    encoding,
+                }));
+            }
+            let content_length = content_length(response.headers());
+            if content_length.is_some_and(|length| length > plan.max_response) {
+                return Err(UploadFailure::Sent(Error::FetchTooLarge {
+                    limit: plan.max_response,
+                }));
+            }
+            let protocol = match response.version() {
+                Version::HTTP_2 => Protocol::Http2,
+                _ => protocol,
+            };
+            let (parts, incoming) = response.into_parts();
+            return Ok(Uploaded {
+                status: parts.status,
+                headers: parts.headers,
+                url: url.to_string(),
+                body: Body {
+                    incoming,
+                    chunk: Bytes::new(),
+                    received: 0,
+                    max_size: Some(plan.max_response),
+                    validators: Validators::default(),
+                    content_length,
+                    protocol,
+                    inner: self.inner.clone(),
+                    key,
+                    reuse: None,
+                    permit: None,
+                    done: false,
+                    failed: None,
+                    deadline: rt::Deadline::new(self.inner.progress_timeout),
+                    waiting: false,
+                    low_speed: None,
+                    interrupted: None,
+                    request_body: Some(request_end),
+                },
+            });
+        }
+    }
+
+    /// Open a connection for one upload hop and hand the request to hyper.
+    ///
+    /// An upload takes a pooled HTTP/2 connection and never an idle HTTP/1.1
+    /// one, and the HTTP/1.1 connection it opens closes when the upload ends.
+    /// A failure before the hand-over leaves the body in `body`, and so does a
+    /// request that hyper gives back unwritten. A body that failed before the
+    /// hand-over is never sent. The stall window of the body starts at the
+    /// hand-over, and from then on the wait is for the response head, which
+    /// [`answer`] bounds.
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_send(
+        &self,
+        hop: &Destination,
+        key: &PoolKey,
+        via: Via<'_>,
+        plan: &UploadPlan<'_>,
+        headers: &[(HeaderName, HeaderValue)],
+        body: &mut Option<BodyEnd>,
+        handed: &AtomicBool,
+    ) -> std::result::Result<UploadResponse, UploadFailure> {
+        let url = hop.url();
+        let unsent = |failure: Failure| -> std::result::Result<UploadResponse, UploadFailure> {
+            Err(UploadFailure::Unsent(failure))
+        };
+        let exchange = body
+            .as_ref()
+            .expect("an upload attempt holds its body until it sends it")
+            .exchange
+            .clone();
+        if let Some(reason) = exchange.aborted() {
+            return unsent(Failure::Fatal(not_sent(url, reason)));
+        }
+        let mut sender = match self.inner.take_h2(key) {
+            Some(sender) => Sender::H2(sender),
+            None => {
+                let connect_timeout = self.inner.connect_timeout;
+                match within(connect_timeout, Box::pin(self.connect(key, via))).await {
+                    Some(Ok(sender)) => sender,
+                    Some(Err(failure)) => return unsent(failure),
+                    None => {
+                        return unsent(Failure::Retry(connect_timed_out(
+                            &key.origin,
+                            via,
+                            connect_timeout,
+                        )));
+                    }
+                }
+            }
+        };
+        let protocol = match sender {
+            Sender::H1(_) => Protocol::Http11,
+            Sender::H2(_) => Protocol::Http2,
+        };
+        let mut head = match self.upload_head(hop, plan, headers, protocol, via) {
+            Ok(head) => head,
+            Err(e) => return unsent(Failure::Fatal(e)),
+        };
+        let progress_timeout = self.inner.progress_timeout;
+        let ready = match &mut sender {
+            Sender::H1(sender) => within(progress_timeout, sender.ready()).await,
+            Sender::H2(sender) => within(progress_timeout, sender.ready()).await,
+        };
+        match ready {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return unsent(Failure::Retry(transport(url, e))),
+            None => return unsent(Failure::Retry(stalled(url, progress_timeout))),
+        }
+        let empty = match exchange.hand_over(progress_timeout) {
+            Ok(empty) => empty,
+            Err(reason) => return unsent(Failure::Fatal(not_sent(url, reason))),
+        };
+        // A `POST` whose body is at its end states its length. hyper writes no
+        // length for an HTTP/1.1 request at the end of its body, and the
+        // method defines content, so a server that waits for the framing
+        // reads `0`.
+        if empty && plan.method == Method::POST {
+            head.headers_mut()
+                .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        }
+        let end = body
+            .take()
+            .expect("an upload attempt holds its body until it sends it");
+        let request = head.map(|()| RequestBody::Upload(end));
+        handed.store(true, Ordering::Relaxed);
+        let window = plan.response_timeout;
+        // The HTTP/1.1 sender drops once the head has arrived, so the
+        // connection closes once the exchange is over and never enters the
+        // pool.
+        let answered = match sender {
+            Sender::H1(mut sender) => {
+                answer(sender.try_send_request(request), &exchange, window).await
+            }
+            Sender::H2(mut sender) => {
+                answer(sender.try_send_request(request), &exchange, window).await
+            }
+        };
+        let response = match answered {
+            Answer::Sent(Ok(response)) => response,
+            Answer::Sent(Err(mut e)) => {
+                let Some(request) = e.take_message() else {
+                    exchange.cut();
+                    return Err(UploadFailure::Sent(interrupted(
+                        url,
+                        with_cause(&e.into_error()),
+                    )));
+                };
+                // hyper gives the request back when the connection failed
+                // before it wrote any of it, so the body is whole and the
+                // request is unsent.
+                exchange.withdraw();
+                if let RequestBody::Upload(end) = request.into_body() {
+                    *body = Some(end);
+                }
+                handed.store(false, Ordering::Relaxed);
+                return unsent(Failure::Retry(transport(url, e.into_error())));
+            }
+            Answer::Aborted(reason) => return Err(UploadFailure::Sent(interrupted(url, reason))),
+            Answer::Silent(window) => {
+                return Err(UploadFailure::Sent(interrupted(
+                    url,
+                    format!("no response within {window:?} of the end of the request body"),
+                )));
+            }
+        };
+        Ok((response, protocol, RequestEnd { exchange }))
+    }
+
+    /// Start the upload request against `destination`, in the form `protocol`
+    /// and `via` give it, as [`request_head`](Fetcher::request_head) does for
+    /// a fetch.
+    fn upload_head(
+        &self,
+        destination: &Destination,
+        plan: &UploadPlan<'_>,
+        headers: &[(HeaderName, HeaderValue)],
+        protocol: Protocol,
+        via: Via<'_>,
+    ) -> Result<Request<()>> {
+        self.request_head(plan.method.clone(), destination, headers, protocol, via)?
+            .body(())
+            .map_err(|e| Error::Fetch(format!("invalid request for {}: {e}", destination.url())))
+    }
+
+    /// Assemble the GET for `request` against `destination`, sending `headers`
+    /// and the validators of the request.
+    fn build_request(
+        &self,
+        destination: &Destination,
+        request: &FetchRequest<'_>,
+        headers: &[(HeaderName, HeaderValue)],
+        protocol: Protocol,
+        via: Via<'_>,
+    ) -> Result<Request<RequestBody>> {
+        let mut builder = self.request_head(Method::GET, destination, headers, protocol, via)?;
+        if let Some(validators) = request.validators {
+            if let Some(etag) = &validators.etag {
+                builder = builder.header(hyper::header::IF_NONE_MATCH, etag);
+            }
+            if let Some(last_modified) = &validators.last_modified {
+                builder = builder.header(hyper::header::IF_MODIFIED_SINCE, last_modified);
+            }
+        }
+        builder
+            .body(RequestBody::Empty)
+            .map_err(|e| Error::Fetch(format!("invalid request for {}: {e}", destination.url())))
+    }
+
+    /// Start the request of `method` against `destination`, with `headers`.
     ///
     /// An HTTP/1.1 request carries the origin-form target and a `Host` header,
     /// which is what an origin server expects; the absolute form belongs to
@@ -1864,14 +3032,14 @@ impl Fetcher {
     /// give the proxy two answers to one question. A `CONNECT` tunnel carries
     /// the fetcher's proxy credential on the `CONNECT` alone, so the request
     /// that travels over the tunnel is the one a direct connection sends.
-    fn build_request(
+    fn request_head(
         &self,
+        method: Method,
         destination: &Destination,
-        request: &FetchRequest<'_>,
         headers: &[(HeaderName, HeaderValue)],
         protocol: Protocol,
         via: Via<'_>,
-    ) -> Result<Request<NoBody>> {
+    ) -> Result<hyper::http::request::Builder> {
         let absolute = protocol == Protocol::Http2 || matches!(via, Via::Absolute(_));
         let url = if absolute {
             destination.url()
@@ -1880,7 +3048,7 @@ impl Fetcher {
         };
         let uri =
             Uri::try_from(url).map_err(|e| Error::Fetch(format!("invalid url {url}: {e}")))?;
-        let mut builder = Request::builder().method(Method::GET).uri(uri);
+        let mut builder = Request::builder().method(method).uri(uri);
         if protocol == Protocol::Http11 {
             builder = builder.header(hyper::header::HOST, &destination.authority);
         }
@@ -1895,17 +3063,7 @@ impl Fetcher {
         {
             builder = builder.header(hyper::header::PROXY_AUTHORIZATION, credential);
         }
-        if let Some(validators) = request.validators {
-            if let Some(etag) = &validators.etag {
-                builder = builder.header(hyper::header::IF_NONE_MATCH, etag);
-            }
-            if let Some(last_modified) = &validators.last_modified {
-                builder = builder.header(hyper::header::IF_MODIFIED_SINCE, last_modified);
-            }
-        }
-        builder
-            .body(NoBody)
-            .map_err(|e| Error::Fetch(format!("invalid request for {url}: {e}")))
+        Ok(builder)
     }
 
     /// Open a connection for `key`, negotiating the protocol over ALPN when
@@ -2020,7 +3178,7 @@ impl Fetcher {
         if let Some(credential) = &proxy.credential {
             builder = builder.header(hyper::header::PROXY_AUTHORIZATION, credential);
         }
-        let request = builder.body(NoBody).map_err(|e| {
+        let request = builder.body(RequestBody::Empty).map_err(|e| {
             refused(format!(
                 "the connect request to the proxy {} for {authority} is invalid: {e}",
                 proxy.named
@@ -2162,6 +3320,21 @@ impl Inner {
             }
         }
         None
+    }
+
+    /// The pooled HTTP/2 connection for `key`, if one is still usable. An
+    /// upload takes this alone, and opens an HTTP/1.1 connection of its own.
+    fn take_h2(&self, key: &PoolKey) -> Option<H2Sender> {
+        let mut pool = self.pool.lock().expect("fetcher pool mutex");
+        let entry = pool.get_mut(key)?;
+        match &entry.h2 {
+            Some(h2) if h2.is_closed() => {
+                entry.h2 = None;
+                None
+            }
+            Some(h2) => Some(h2.clone()),
+            None => None,
+        }
     }
 
     /// Return an idle HTTP/1.1 connection to the pool.
@@ -2328,6 +3501,9 @@ pub struct Body {
     /// the body again. The size cap is no such failure: another fetch of the
     /// same body outgrows the cap the same way.
     interrupted: Option<Arc<AtomicBool>>,
+    /// The body the request of an upload sent, which fails once this body
+    /// ends or is dropped before it has ended.
+    request_body: Option<RequestEnd>,
 }
 
 /// The low-speed rule of one body: the bytes it has delivered, the last
@@ -2555,22 +3731,19 @@ impl AsyncRead for Body {
                 Some(Err(e)) => {
                     // hyper reports a body error once and then reports the body
                     // as ended, so an unlatched failure would let the next read
-                    // return a clean end of stream for a truncated object. The
-                    // error's own message is generic; its cause names what the
-                    // connection did.
-                    let message = match std::error::Error::source(&e) {
-                        Some(cause) => format!("{e}: {cause}"),
-                        None => e.to_string(),
-                    };
+                    // return a clean end of stream for a truncated object.
+                    let message = with_cause(&e);
                     return Poll::Ready(Err(me.interrupt(std::io::ErrorKind::Other, message)));
                 }
                 None => {
                     me.done = true;
                     // The whole response has arrived, so the connection can
-                    // serve the next request.
+                    // serve the next request. The response to an upload ends
+                    // its request body, which hyper then stops sending.
                     if let Some(sender) = me.reuse.take() {
                         me.inner.put_h1(&me.key, sender);
                     }
+                    me.request_body = None;
                     me.permit = None;
                     return Poll::Ready(Ok(0));
                 }
@@ -2590,6 +3763,259 @@ impl rt::tokio_io::AsyncRead for Body {
         let n = ready!(AsyncRead::poll_read(self, cx, unfilled))?;
         buf.advance(n);
         Poll::Ready(Ok(()))
+    }
+}
+
+/// The writing end of a streamed [`UploadBody`], from
+/// [`UploadBody::channel`].
+///
+/// Writes fill a frame of 64 KiB. A full frame is handed to the connection
+/// through a slot of one frame, and a write that finds the slot still full
+/// waits until hyper takes the frame there. [`flush`](AsyncWrite::poll_flush)
+/// hands over a part-filled frame and waits until hyper has taken it, and
+/// [`close`](AsyncWrite::poll_close) hands over what is left, ends the body,
+/// and waits until hyper has taken the end. The writer and the upload run
+/// together: a caller writes from another task than the one that awaits
+/// [`Fetcher::upload`], or joins the two futures.
+///
+/// A flush of less than 4 KiB hands over a copy of the bytes and keeps the
+/// frame buffer. A larger frame moves to the connection as it is, and the next
+/// write allocates the next buffer.
+///
+/// Once the upload has handed its request to the connection, a frame that
+/// waits in the slot for the
+/// [`progress_timeout`](FetcherOptions::progress_timeout) of its fetcher
+/// fails the wait with
+/// [`io::ErrorKind::TimedOut`](std::io::ErrorKind::TimedOut) and fails the
+/// body. Before that, a wait has no bound.
+///
+/// Dropping the writer before close fails the body, so hyper ends the request
+/// unfinished and the server never receives a truncated body as a whole one.
+/// A writer dropped before the hand-over leaves the request unsent. A write
+/// after close, after the upload is done with the body, or after the response
+/// has ended before the body, fails with
+/// [`io::ErrorKind::BrokenPipe`](std::io::ErrorKind::BrokenPipe). A failure
+/// is latched: every call after it fails the same way.
+pub struct UploadWriter {
+    exchange: Arc<Exchange>,
+    /// The frame being filled. A frame handed over whole leaves it with no
+    /// capacity, and the next write allocates the next frame.
+    buffer: Vec<u8>,
+    /// The timer of the stall window, armed by the first wait on a full slot
+    /// once the request is handed over. A timer that fires before the frame
+    /// in the slot has waited the whole window is armed again for the rest.
+    stall: Option<rt::Deadline>,
+    /// The failure that ended the writer, once one has.
+    failed: Option<Failed>,
+}
+
+impl std::fmt::Debug for UploadWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadWriter")
+            .field("buffered", &self.buffer.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a write is told once the upload is done with the body.
+const UPLOAD_ENDED: &str = "the upload of this body has ended";
+
+impl UploadWriter {
+    /// Latch a failure that ends the writer and return it.
+    fn fail(&mut self, kind: std::io::ErrorKind, message: String) -> std::io::Error {
+        let failed = Failed { kind, message };
+        let error = failed.error();
+        self.failed = Some(failed);
+        error
+    }
+
+    /// Move the buffer into the slot as the next frame once the slot is free.
+    ///
+    /// A frame of less than [`SMALL_FRAME`] bytes is copied, and the buffer is
+    /// kept for the frames that follow, so a small frame that waits in the
+    /// connection holds no more memory than its bytes. A larger frame moves
+    /// as it is, and the next write allocates the next buffer.
+    fn poll_hand_over(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut slot = self.exchange.lock();
+        if slot.gone || slot.aborted.is_some() {
+            drop(slot);
+            return Poll::Ready(Err(
+                self.fail(std::io::ErrorKind::BrokenPipe, UPLOAD_ENDED.into())
+            ));
+        }
+        if slot.frame.is_some() {
+            park(&mut slot.writer, cx);
+            let end = slot.stall_end();
+            drop(slot);
+            return self.poll_stall(cx, end);
+        }
+        let frame = if self.buffer.len() < SMALL_FRAME {
+            let frame = Bytes::copy_from_slice(&self.buffer);
+            self.buffer.clear();
+            frame
+        } else {
+            Bytes::from(std::mem::take(&mut self.buffer))
+        };
+        slot.frame = Some(frame);
+        slot.restart_stall();
+        let reader = slot.reader.take();
+        drop(slot);
+        wake(reader);
+        Poll::Ready(Ok(()))
+    }
+
+    /// Wait until hyper has taken the frame in the slot.
+    fn poll_taken(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut slot = self.exchange.lock();
+        if slot.gone || slot.aborted.is_some() {
+            drop(slot);
+            return Poll::Ready(Err(
+                self.fail(std::io::ErrorKind::BrokenPipe, UPLOAD_ENDED.into())
+            ));
+        }
+        if slot.frame.is_none() {
+            return Poll::Ready(Ok(()));
+        }
+        park(&mut slot.writer, cx);
+        let end = slot.stall_end();
+        drop(slot);
+        self.poll_stall(cx, end)
+    }
+
+    /// The stall window over the frame in the slot, which has waited the whole
+    /// window at `end`: pending while it runs, and the failure of the body once
+    /// it has run out. With no end, before the hand-over, the wait is pending
+    /// alone, and the take of the frame wakes the writer.
+    fn poll_stall(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut end: Option<Instant>,
+    ) -> Poll<std::io::Result<()>> {
+        while let Some(at) = end {
+            ready!(poll_until(&mut self.stall, cx, at));
+            match self.exchange.check_stall() {
+                Ok(message) => {
+                    return Poll::Ready(Err(self.fail(std::io::ErrorKind::TimedOut, message)));
+                }
+                Err(later) => end = later,
+            }
+        }
+        Poll::Pending
+    }
+}
+
+impl AsyncWrite for UploadWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let me = self.get_mut();
+        if let Some(failed) = &me.failed {
+            return Poll::Ready(Err(failed.error()));
+        }
+        let slot = me.exchange.lock();
+        let refused = if slot.gone || slot.aborted.is_some() {
+            Some(UPLOAD_ENDED)
+        } else if slot.closed {
+            Some("the upload body is closed")
+        } else {
+            None
+        };
+        drop(slot);
+        if let Some(message) = refused {
+            return Poll::Ready(Err(me.fail(std::io::ErrorKind::BrokenPipe, message.into())));
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if me.buffer.len() == UPLOAD_FRAME {
+            ready!(me.poll_hand_over(cx))?;
+        }
+        if me.buffer.capacity() == 0 {
+            me.buffer.reserve_exact(UPLOAD_FRAME);
+        }
+        let n = (UPLOAD_FRAME - me.buffer.len()).min(buf.len());
+        me.buffer.extend_from_slice(&buf[..n]);
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        if let Some(failed) = &me.failed {
+            return Poll::Ready(Err(failed.error()));
+        }
+        if !me.buffer.is_empty() {
+            ready!(me.poll_hand_over(cx))?;
+        }
+        me.poll_taken(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let me = self.get_mut();
+        if let Some(failed) = &me.failed {
+            return Poll::Ready(Err(failed.error()));
+        }
+        if !me.buffer.is_empty() {
+            ready!(me.poll_hand_over(cx))?;
+        }
+        let mut slot = me.exchange.lock();
+        let reader = if slot.closed {
+            None
+        } else {
+            slot.closed = true;
+            slot.reader.take()
+        };
+        if slot.ended {
+            drop(slot);
+            wake(reader);
+            return Poll::Ready(Ok(()));
+        }
+        if slot.gone || slot.aborted.is_some() {
+            drop(slot);
+            return Poll::Ready(Err(
+                me.fail(std::io::ErrorKind::BrokenPipe, UPLOAD_ENDED.into())
+            ));
+        }
+        park(&mut slot.writer, cx);
+        // The stall window runs over a frame waiting in the slot. An empty
+        // slot waits for hyper to poll the end, which is no stall of the body.
+        let end = slot.stall_end();
+        drop(slot);
+        wake(reader);
+        me.poll_stall(cx, end)
+    }
+}
+
+#[cfg(feature = "tokio")]
+impl rt::tokio_io::AsyncWrite for UploadWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        AsyncWrite::poll_write(self, cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        AsyncWrite::poll_flush(self, cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        AsyncWrite::poll_close(self, cx)
+    }
+}
+
+impl Drop for UploadWriter {
+    fn drop(&mut self) {
+        let mut slot = self.exchange.lock();
+        if slot.closed {
+            return;
+        }
+        let wakers =
+            slot.abort(|| "the upload writer was dropped before it closed the body".into());
+        drop(slot);
+        wakers.into_iter().for_each(wake);
     }
 }
 
@@ -2641,20 +4067,28 @@ fn check_path(path: &str) -> Result<()> {
 /// over them.
 ///
 /// A request header replaces the fetcher header of the same name, and the
-/// request's credentials replace the fetcher's `Authorization`, whichever of
-/// the two layers set it. Two request headers of one name both reach the wire,
-/// as two fetcher headers do. A request that adds neither a header nor
-/// credentials sends the fetcher's list as it stands, which is the path every
-/// object fetch takes.
+/// request's credentials -- basic-auth credentials or a bearer token, never
+/// both -- replace the fetcher's `Authorization`, whichever of the two layers
+/// set it. Two request headers of one name both reach the wire, as two fetcher
+/// headers do. A request that adds neither a header nor credentials sends the
+/// fetcher's list as it stands, which is the path every object fetch takes.
+///
+/// A credential value is marked sensitive, so an HTTP/2 connection never adds
+/// it to its header compression table.
 fn merge_headers<'a>(
     fetcher: &'a [(HeaderName, HeaderValue)],
     extra: &[(String, String)],
     basic_auth: Option<&BasicAuth>,
+    bearer_token: Option<&BearerToken>,
 ) -> Result<Cow<'a, [(HeaderName, HeaderValue)]>> {
-    if extra.is_empty() && basic_auth.is_none() {
+    if extra.is_empty() && basic_auth.is_none() && bearer_token.is_none() {
         return Ok(Cow::Borrowed(fetcher));
     }
-    let mut added = Vec::with_capacity(extra.len() + usize::from(basic_auth.is_some()));
+    if basic_auth.is_some() && bearer_token.is_some() {
+        return Err(Error::Fetch(BASIC_AND_BEARER.into()));
+    }
+    let credential = usize::from(basic_auth.is_some() || bearer_token.is_some());
+    let mut added = Vec::with_capacity(extra.len() + credential);
     for (name, value) in extra {
         let name = HeaderName::try_from(name.as_str())
             .map_err(|_| Error::Fetch(format!("invalid header name: {name}")))?;
@@ -2667,12 +4101,19 @@ fn merge_headers<'a>(
         if name == hyper::header::AUTHORIZATION && basic_auth.is_some() {
             return Err(Error::Fetch(AMBIGUOUS_AUTHORIZATION.into()));
         }
-        let value = HeaderValue::try_from(value.as_str())
+        if name == hyper::header::AUTHORIZATION && bearer_token.is_some() {
+            return Err(Error::Fetch(AMBIGUOUS_BEARER.into()));
+        }
+        let mut value = HeaderValue::try_from(value.as_str())
             .map_err(|_| Error::Fetch(format!("invalid value for header {name}")))?;
+        value.set_sensitive(is_credential(&name));
         added.push((name, value));
     }
     if let Some(auth) = basic_auth {
         added.push((hyper::header::AUTHORIZATION, basic_auth_value(auth)?));
+    }
+    if let Some(token) = bearer_token {
+        added.push((hyper::header::AUTHORIZATION, bearer_value(token)?));
     }
     let mut headers = Vec::with_capacity(fetcher.len() + added.len());
     headers.extend(
@@ -2973,12 +4414,45 @@ fn connect_authority(origin: &Origin) -> String {
     }
 }
 
-/// The `Authorization` value basic credentials are sent as.
+/// The `Authorization` value basic credentials are sent as, marked sensitive.
 fn basic_auth_value(auth: &BasicAuth) -> Result<HeaderValue> {
     let encoded =
         ostrya_core::base64::encode(format!("{}:{}", auth.user, auth.password).as_bytes());
-    HeaderValue::try_from(format!("Basic {encoded}"))
-        .map_err(|_| Error::Fetch("invalid basic-auth credentials".into()))
+    let mut value = HeaderValue::try_from(format!("Basic {encoded}"))
+        .map_err(|_| Error::Fetch("invalid basic-auth credentials".into()))?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+/// The `Authorization` value a bearer token is sent as, marked sensitive.
+///
+/// The token is sent as written, so it must hold the token68 syntax the header
+/// carries. A refusal names no part of the token, which is a secret.
+fn bearer_value(token: &BearerToken) -> Result<HeaderValue> {
+    let refused = || {
+        Error::Fetch(
+            "the bearer token is not token68: it holds letters, digits, -, ., _, ~, +, or /, \
+             then any number of ="
+                .into(),
+        )
+    };
+    if !is_token68(&token.token) {
+        return Err(refused());
+    }
+    let mut value =
+        HeaderValue::try_from(format!("Bearer {}", token.token)).map_err(|_| refused())?;
+    value.set_sensitive(true);
+    Ok(value)
+}
+
+/// Whether `token` holds the token68 syntax: one or more ASCII letters,
+/// digits, `-`, `.`, `_`, `~`, `+`, or `/`, then any number of `=`.
+fn is_token68(token: &str) -> bool {
+    let body = token.trim_end_matches('=');
+    !body.is_empty()
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._~+/".contains(&byte))
 }
 
 /// The origin, and the authority it is addressed by, of one absolute URL.
@@ -3336,6 +4810,47 @@ fn stalled(url: &str, limit: Duration) -> Error {
     Error::Fetch(format!("{url}: no response after {limit:?}"))
 }
 
+/// A connect that did not complete within `limit`.
+///
+/// The window covers the connect to whichever endpoint the hop is opened to,
+/// so a proxied hop names the proxy: the origin behind it is reached over that
+/// connection and is contacted by nothing until it is open.
+fn connect_timed_out(origin: &Origin, via: Via<'_>, limit: Duration) -> Error {
+    Error::Fetch(match via {
+        Via::Direct => format!(
+            "connect to {}:{} timed out after {limit:?}",
+            origin.host, origin.port
+        ),
+        Via::Absolute(proxy) | Via::Tunnel(proxy) => format!(
+            "connect to the proxy {} timed out after {limit:?}",
+            proxy.named
+        ),
+    })
+}
+
+/// An upload whose body failed before the hand-over, so the request was never
+/// sent.
+fn not_sent(url: &str, reason: String) -> Error {
+    Error::Fetch(format!("upload to {url} not sent: {reason}"))
+}
+
+/// An upload that failed after hyper took its request.
+fn interrupted(url: &str, message: String) -> Error {
+    Error::UploadInterrupted {
+        url: url.to_string(),
+        message,
+    }
+}
+
+/// The message of an error and of its cause. The message of a hyper error is
+/// generic, and its cause names what the connection did.
+fn with_cause(error: &dyn std::error::Error) -> String {
+    match error.source() {
+        Some(cause) => format!("{error}: {cause}"),
+        None => error.to_string(),
+    }
+}
+
 /// A response that did not deliver its head within the low-speed rule's time.
 fn too_slow(url: &str, rule: LowSpeed) -> Error {
     let LowSpeed { limit, time } = rule;
@@ -3358,18 +4873,101 @@ async fn within<F: Future>(limit: Duration, future: F) -> Option<F::Output> {
     .await
 }
 
+/// Run `future` under a deadline of `limit` that applies while `handed` is
+/// false, resolving to `None` when it expires first.
+///
+/// The deadline runs from the call, and an upload sets `handed` when hyper
+/// takes the request: from then on the request has deadlines of its own, and
+/// the timer is dropped. A request that comes back unsent clears `handed`, and
+/// the timer is armed again for what is left of the deadline.
+async fn before_hand_over<F: Future>(
+    limit: Duration,
+    handed: &AtomicBool,
+    future: F,
+) -> Option<F::Output> {
+    let mut future = core::pin::pin!(future);
+    let end = Instant::now().checked_add(limit);
+    let mut deadline: Option<rt::Deadline> = None;
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(output) = future.as_mut().poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        if handed.load(Ordering::Relaxed) {
+            deadline = None;
+            return Poll::Pending;
+        }
+        // An end past the range of the clock is never reached, and a timer of
+        // the whole limit stands for it.
+        let deadline = deadline.get_or_insert_with(|| {
+            rt::Deadline::new(
+                end.map_or(limit, |end| end.saturating_duration_since(Instant::now())),
+            )
+        });
+        deadline.poll_expired(cx).map(|()| None)
+    })
+    .await
+}
+
+/// Wait for the answer to a request hyper has taken.
+///
+/// While a streamed body streams nothing bounds the wait here, since the stall
+/// window of the writer bounds the body. A body given whole has no writer, so
+/// its stall window runs here: a frame that hyper does not take within the
+/// window fails the body and ends the wait. A body that fails ends the wait at
+/// once, whether or not hyper polls it again. The window for the response head
+/// starts when hyper has taken the end of the body.
+async fn answer<F: Future>(send: F, exchange: &Exchange, window: Duration) -> Answer<F::Output> {
+    let mut send = core::pin::pin!(send);
+    let mut head: Option<rt::Deadline> = None;
+    let mut stall: Option<rt::Deadline> = None;
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(output) = send.as_mut().poll(cx) {
+            return Poll::Ready(Answer::Sent(output));
+        }
+        while head.is_none() {
+            match exchange.watch(cx) {
+                Watch::Streaming(None) => return Poll::Pending,
+                Watch::Streaming(Some(end)) => {
+                    if poll_until(&mut stall, cx, end).is_pending() {
+                        return Poll::Pending;
+                    }
+                    if let Ok(reason) = exchange.check_stall() {
+                        return Poll::Ready(Answer::Aborted(reason));
+                    }
+                }
+                Watch::Aborted(reason) => return Poll::Ready(Answer::Aborted(reason)),
+                Watch::Ended => {
+                    stall = None;
+                    head = Some(rt::Deadline::new(window));
+                }
+            }
+        }
+        head.as_mut()
+            .expect("the head window runs once the body has ended")
+            .poll_expired(cx)
+            .map(|()| Answer::Silent(window))
+    })
+    .await
+}
+
 /// The delay before retry round `round`, doubling from 250ms up to two seconds.
 fn backoff(round: u32) -> Duration {
     let ms = 250u64 << (round - 1).min(3);
     Duration::from_millis(ms)
 }
 
-/// The fetcher and its bodies move freely across tasks and threads.
+/// The fetcher, its bodies, and the parts of an upload move freely across
+/// tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Fetcher>();
     assert_send_sync::<Body>();
     assert_send_sync::<Fetched>();
+    assert_send_sync::<BearerToken>();
+    assert_send_sync::<UploadBody>();
+    assert_send_sync::<UploadWriter>();
+    assert_send_sync::<UploadRequest<'static>>();
+    assert_send_sync::<Uploaded>();
 };
 
 #[cfg(test)]
@@ -3744,8 +5342,8 @@ mod tests {
         assert!(!message.contains("sup3rs3cret"), "{message}");
     }
 
-    /// Which statuses send an attempt on to another URL. Every request is a
-    /// GET, so the ones that part over the method are one case.
+    /// Which statuses send a fetch on to another URL. A fetch is a GET, so the
+    /// ones that part over the method are one case.
     #[test]
     fn the_followed_statuses_are_the_five_redirects() {
         for status in [301u16, 302, 303, 307, 308] {
@@ -4532,7 +6130,7 @@ mod tests {
                     .build_request(&destination, &request, headers, Protocol::Http11, via)
                     .unwrap()
             };
-            let proxy_credential = |request: &Request<NoBody>| {
+            let proxy_credential = |request: &Request<RequestBody>| {
                 request
                     .headers()
                     .get(hyper::header::PROXY_AUTHORIZATION)
@@ -4604,7 +6202,7 @@ mod tests {
             assert!(message.contains("connection layer"), "{name}: {message}");
 
             let request = vec![(name.to_owned(), "10".to_owned())];
-            let err = merge_headers(&fetcher_headers, &request, None).unwrap_err();
+            let err = merge_headers(&fetcher_headers, &request, None, None).unwrap_err();
             let message = err.to_string();
             assert!(message.contains(name), "{name}: {message}");
             assert!(message.contains("connection layer"), "{name}: {message}");
@@ -4612,7 +6210,7 @@ mod tests {
 
         // A name written in another case is the same header name.
         let request = vec![("Content-Length".to_owned(), "10".to_owned())];
-        let err = merge_headers(&fetcher_headers, &request, None).unwrap_err();
+        let err = merge_headers(&fetcher_headers, &request, None, None).unwrap_err();
         assert!(err.to_string().contains("content-length"), "{err}");
     }
 
@@ -4640,7 +6238,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let borrowed = merge_headers(&fetcher, &[], None).unwrap();
+        let borrowed = merge_headers(&fetcher, &[], None, None).unwrap();
         assert!(matches!(borrowed, Cow::Borrowed(_)));
         assert_eq!(sent(&borrowed), sent(&fetcher));
 
@@ -4651,7 +6249,7 @@ mod tests {
             ("X-Trace".to_owned(), "request".to_owned()),
             ("x-trace".to_owned(), "second".to_owned()),
         ];
-        let merged = merge_headers(&fetcher, &extra, None).unwrap();
+        let merged = merge_headers(&fetcher, &extra, None, None).unwrap();
         assert_eq!(
             sent(&merged),
             [
@@ -4667,7 +6265,7 @@ mod tests {
             user: "u".into(),
             password: "p".into(),
         };
-        let merged = merge_headers(&fetcher, &[], Some(&auth)).unwrap();
+        let merged = merge_headers(&fetcher, &[], Some(&auth), None).unwrap();
         assert_eq!(
             sent(&merged),
             [
@@ -4678,13 +6276,13 @@ mod tests {
         );
 
         let both = vec![("authorization".to_owned(), "Basic aaa".to_owned())];
-        let err = merge_headers(&fetcher, &both, Some(&auth)).unwrap_err();
+        let err = merge_headers(&fetcher, &both, Some(&auth), None).unwrap_err();
         assert!(err.to_string().contains("pass one of them"), "{err}");
         let host = vec![("host".to_owned(), "elsewhere".to_owned())];
-        let err = merge_headers(&fetcher, &host, None).unwrap_err();
+        let err = merge_headers(&fetcher, &host, None, None).unwrap_err();
         assert!(err.to_string().contains("host header"), "{err}");
         let invalid = vec![("not a header".to_owned(), "v".to_owned())];
-        let err = merge_headers(&fetcher, &invalid, None).unwrap_err();
+        let err = merge_headers(&fetcher, &invalid, None, None).unwrap_err();
         assert!(err.to_string().contains("invalid header name"), "{err}");
     }
 
@@ -4975,5 +6573,329 @@ mod tests {
             assert_eq!(requests.load(Ordering::SeqCst), 1);
             assert_eq!(connections.load(Ordering::SeqCst), 0);
         });
+    }
+
+    /// The reading end of a channel body, taken out of the body as an upload
+    /// takes it.
+    fn channel() -> (BodyEnd, UploadWriter) {
+        let (body, writer) = UploadBody::channel();
+        let UploadForm::Channel(end) = body.form else {
+            panic!("a channel body holds its reading end");
+        };
+        (end, writer)
+    }
+
+    /// The next frame of `end`, as the bytes it carries.
+    async fn next_frame(end: &mut BodyEnd) -> Option<std::io::Result<Bytes>> {
+        let frame = std::future::poll_fn(|cx| end.poll_frame(cx)).await?;
+        Some(frame.map(|frame| frame.into_data().expect("an upload body yields data")))
+    }
+
+    /// The writer hands the body over in frames of 64 KiB, a close hands over
+    /// what is left, and the end follows the last frame. The close completes
+    /// once the reading end has given the end.
+    #[test]
+    fn a_writer_hands_over_frames_of_64_kib() {
+        rt::block_on(async {
+            let (mut end, mut writer) = channel();
+            let data = (0..150_000u32).map(|i| i as u8).collect::<Vec<_>>();
+            let written = async {
+                futures_lite::io::AsyncWriteExt::write_all(&mut writer, &data).await?;
+                futures_lite::io::AsyncWriteExt::close(&mut writer).await
+            };
+            let read = async {
+                let mut frames = Vec::new();
+                while let Some(frame) = next_frame(&mut end).await {
+                    frames.push(frame.unwrap());
+                }
+                frames
+            };
+            let (written, frames) = futures_lite::future::zip(written, read).await;
+            written.unwrap();
+            assert_eq!(
+                frames.iter().map(Bytes::len).collect::<Vec<_>>(),
+                [UPLOAD_FRAME, UPLOAD_FRAME, 150_000 - 2 * UPLOAD_FRAME]
+            );
+            assert_eq!(frames.concat(), data);
+            assert!(end.is_end_stream());
+            assert!(end.exchange.lock().ended);
+            assert_eq!(end.exchange.exact, None);
+        });
+    }
+
+    /// A flush hands over a part-filled frame and completes once hyper has
+    /// taken it.
+    #[test]
+    fn a_flush_hands_over_a_part_filled_frame() {
+        rt::block_on(async {
+            let (mut end, mut writer) = channel();
+            let flushed = async {
+                futures_lite::io::AsyncWriteExt::write_all(&mut writer, b"hello").await?;
+                futures_lite::io::AsyncWriteExt::flush(&mut writer).await
+            };
+            let (flushed, frame) = futures_lite::future::zip(flushed, next_frame(&mut end)).await;
+            flushed.unwrap();
+            assert_eq!(frame.unwrap().unwrap(), &b"hello"[..]);
+            assert!(!end.is_end_stream());
+        });
+    }
+
+    /// A flush of less than 4 KiB hands over a copy and keeps the frame
+    /// buffer. A larger flush hands the buffer over, and the next one is
+    /// allocated at the next write.
+    #[test]
+    fn a_small_flush_hands_over_a_copy_and_keeps_the_buffer() {
+        rt::block_on(async {
+            let (mut end, mut writer) = channel();
+            let kept = writer.buffer.as_ptr();
+            let flushed = async {
+                futures_lite::io::AsyncWriteExt::write_all(&mut writer, b"small").await?;
+                futures_lite::io::AsyncWriteExt::flush(&mut writer).await
+            };
+            let (flushed, frame) = futures_lite::future::zip(flushed, next_frame(&mut end)).await;
+            flushed.unwrap();
+            assert_eq!(frame.unwrap().unwrap(), &b"small"[..]);
+            assert!(writer.buffer.is_empty());
+            assert_eq!(writer.buffer.as_ptr(), kept);
+            assert_eq!(writer.buffer.capacity(), UPLOAD_FRAME);
+
+            let large = vec![7u8; SMALL_FRAME];
+            let flushed = async {
+                futures_lite::io::AsyncWriteExt::write_all(&mut writer, &large).await?;
+                futures_lite::io::AsyncWriteExt::flush(&mut writer).await
+            };
+            let (flushed, frame) = futures_lite::future::zip(flushed, next_frame(&mut end)).await;
+            flushed.unwrap();
+            assert_eq!(frame.unwrap().unwrap(), large);
+            assert_eq!(writer.buffer.capacity(), 0);
+            futures_lite::io::AsyncWriteExt::write_all(&mut writer, b"x")
+                .await
+                .unwrap();
+            assert_eq!(writer.buffer.capacity(), UPLOAD_FRAME);
+        });
+    }
+
+    /// A writer dropped before close fails the body, so hyper never reads a
+    /// clean end for a body cut short.
+    #[test]
+    fn a_writer_dropped_unclosed_fails_the_body() {
+        rt::block_on(async {
+            let (mut end, mut writer) = channel();
+            futures_lite::io::AsyncWriteExt::write_all(&mut writer, b"part")
+                .await
+                .unwrap();
+            drop(writer);
+            let err = next_frame(&mut end).await.unwrap().unwrap_err();
+            assert!(err.to_string().contains("dropped"), "{err}");
+            assert!(!end.is_end_stream());
+            assert!(!end.exchange.lock().ended);
+            // The failure stands for every later poll.
+            assert!(next_frame(&mut end).await.unwrap().is_err());
+        });
+    }
+
+    /// Once the reading end is gone, a write, a flush, and a close fail with
+    /// a broken pipe.
+    #[test]
+    fn a_write_after_the_reading_end_is_gone_is_a_broken_pipe() {
+        rt::block_on(async {
+            let (end, mut writer) = channel();
+            drop(end);
+            let err = futures_lite::io::AsyncWriteExt::write_all(&mut writer, b"late")
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+            let err = futures_lite::io::AsyncWriteExt::flush(&mut writer)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        });
+    }
+
+    /// A write after close is a broken pipe.
+    #[test]
+    fn a_write_after_close_is_a_broken_pipe() {
+        rt::block_on(async {
+            let (mut end, mut writer) = channel();
+            let closed = futures_lite::io::AsyncWriteExt::close(&mut writer);
+            let (closed, frame) = futures_lite::future::zip(closed, next_frame(&mut end)).await;
+            closed.unwrap();
+            assert!(frame.is_none());
+            let err = futures_lite::io::AsyncWriteExt::write_all(&mut writer, b"x")
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+        });
+    }
+
+    /// A frame that waits in the slot past the stall window fails the write
+    /// with a timeout and fails the body, and the failure is latched. Before
+    /// an upload starts the window, a full slot is no stall.
+    #[test]
+    fn a_frame_not_taken_within_the_window_fails_the_write() {
+        rt::block_on(async {
+            let (mut end, mut writer) = channel();
+            let frame = vec![0u8; UPLOAD_FRAME];
+            // The first frame fills the buffer, the second hands it to the
+            // slot, and the third waits for the slot.
+            for _ in 0..2 {
+                futures_lite::io::AsyncWriteExt::write_all(&mut writer, &frame)
+                    .await
+                    .unwrap();
+            }
+            let unbounded = within(
+                Duration::from_millis(100),
+                futures_lite::io::AsyncWriteExt::write_all(&mut writer, &frame),
+            )
+            .await;
+            assert!(unbounded.is_none(), "a wait before the upload has no bound");
+
+            end.exchange.hand_over(Duration::from_millis(50)).unwrap();
+            let started = Instant::now();
+            let err = futures_lite::io::AsyncWriteExt::write_all(&mut writer, &frame)
+                .await
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+            assert!(started.elapsed() >= Duration::from_millis(50));
+            let again = futures_lite::io::AsyncWriteExt::write_all(&mut writer, b"x")
+                .await
+                .unwrap_err();
+            assert_eq!(again.kind(), std::io::ErrorKind::TimedOut);
+            let failed = next_frame(&mut end).await.unwrap().unwrap_err();
+            assert!(failed.to_string().contains("not taken"), "{failed}");
+        });
+    }
+
+    /// A body given whole declares its length and travels in frames of 64 KiB
+    /// cut from its bytes with no copy. It reaches its end with the last
+    /// frame. An empty one is at its end at the hand-over, which reports it so
+    /// the request can declare a length of zero.
+    #[test]
+    fn a_whole_body_travels_in_frames_of_a_declared_length() {
+        rt::block_on(async {
+            let bytes = Bytes::from((0..150_000u32).map(|i| i as u8).collect::<Vec<_>>());
+            let mut end = BodyEnd::whole(&bytes);
+            assert_eq!(end.exchange.exact, Some(150_000));
+            assert_eq!(end.exchange.hand_over(Duration::from_secs(60)), Ok(false));
+            assert!(!end.is_end_stream());
+            let mut at = 0;
+            for len in [UPLOAD_FRAME, UPLOAD_FRAME, 150_000 - 2 * UPLOAD_FRAME] {
+                assert!(!end.exchange.lock().ended);
+                let frame = next_frame(&mut end).await.unwrap().unwrap();
+                assert_eq!(frame.len(), len);
+                assert_eq!(frame.as_ptr(), bytes[at..].as_ptr());
+                at += len;
+            }
+            assert!(end.exchange.lock().ended);
+            assert!(end.is_end_stream());
+            assert!(next_frame(&mut end).await.is_none());
+
+            let empty = BodyEnd::whole(&Bytes::new());
+            assert_eq!(empty.exchange.exact, Some(0));
+            assert!(!empty.is_end_stream());
+            assert_eq!(empty.exchange.hand_over(Duration::from_secs(60)), Ok(true));
+            assert!(empty.is_end_stream());
+            assert!(empty.exchange.lock().ended);
+        });
+    }
+
+    /// A channel body that reaches its end after the hand-over is framed as a
+    /// stream: hyper learns of the end from its first poll.
+    #[test]
+    fn a_body_closed_after_the_hand_over_ends_at_the_first_poll() {
+        rt::block_on(async {
+            let (mut end, mut writer) = channel();
+            assert_eq!(end.exchange.hand_over(Duration::from_secs(60)), Ok(false));
+            end.exchange.lock().closed = true;
+            assert!(!end.is_end_stream());
+            assert!(next_frame(&mut end).await.is_none());
+            assert!(end.is_end_stream());
+            futures_lite::io::AsyncWriteExt::close(&mut writer)
+                .await
+                .unwrap();
+        });
+    }
+
+    /// The timer of a window whose end moves later is armed once, fires at
+    /// the first end, and is armed again for the rest alone.
+    #[test]
+    fn a_lazy_timer_fires_at_the_end_it_was_moved_to() {
+        rt::block_on(async {
+            let mut timer = None;
+            let started = Instant::now();
+            let mut end = started + Duration::from_millis(50);
+            std::future::poll_fn(|cx| {
+                if poll_until(&mut timer, cx, end).is_pending() {
+                    end = started + Duration::from_millis(120);
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            })
+            .await;
+            assert!(started.elapsed() >= Duration::from_millis(120));
+            assert!(timer.is_none());
+        });
+    }
+
+    /// A bearer token holds the token68 syntax, and a refusal names no part
+    /// of it. The bearer and the Basic values are marked sensitive, and so is
+    /// a credential header the caller sets.
+    #[test]
+    fn a_bearer_token_is_token68_and_sensitive() {
+        let token = |token: &str| BearerToken {
+            token: token.to_owned(),
+        };
+        for good in ["abc", "a-b.c_d~e+f/g", "dGVzdA==", "x="] {
+            assert!(is_token68(good), "{good}");
+        }
+        for bad in ["", "=", "a b", "a=b", "tök", "a\n", "a,b"] {
+            assert!(!is_token68(bad), "{bad:?}");
+            let err = merge_headers(&[], &[], None, Some(&token(bad))).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("token68"), "{message}");
+            assert!(!message.contains("  "), "{message}");
+            if !bad.is_empty() && bad != "=" {
+                assert!(!message.contains(bad), "{message}");
+            }
+        }
+
+        let authorization = |headers: &[(HeaderName, HeaderValue)]| {
+            headers
+                .iter()
+                .find(|(name, _)| *name == hyper::header::AUTHORIZATION)
+                .map(|(_, value)| value.clone())
+                .unwrap()
+        };
+        let merged = merge_headers(&[], &[], None, Some(&token("t0k3n"))).unwrap();
+        let value = authorization(&merged);
+        assert_eq!(value, "Bearer t0k3n");
+        assert!(value.is_sensitive());
+
+        let auth = BasicAuth {
+            user: "u".into(),
+            password: "p".into(),
+        };
+        let merged = merge_headers(&[], &[], Some(&auth), None).unwrap();
+        assert!(authorization(&merged).is_sensitive());
+        let header = vec![("authorization".to_owned(), "Custom x".to_owned())];
+        let merged = merge_headers(&[], &header, None, None).unwrap();
+        assert!(authorization(&merged).is_sensitive());
+
+        let err = merge_headers(&[], &[], Some(&auth), Some(&token("t"))).unwrap_err();
+        assert!(err.to_string().contains("pass one of them"), "{err}");
+        assert!(err.to_string().contains("bearer token"), "{err}");
+        let err = merge_headers(&[], &header, None, Some(&token("t"))).unwrap_err();
+        assert!(err.to_string().contains("pass one of them"), "{err}");
+        assert!(err.to_string().contains("bearer token"), "{err}");
+    }
+
+    #[test]
+    fn bearer_token_debug_holds_no_token() {
+        let token = BearerToken {
+            token: "s3cret".into(),
+        };
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("s3cret"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
     }
 }

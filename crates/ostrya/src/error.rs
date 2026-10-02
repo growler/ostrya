@@ -304,6 +304,21 @@ pub enum Error {
         /// The coding the response declared.
         encoding: String,
     },
+    /// An upload failed after the fetcher handed its request to the
+    /// connection. The server can have received the whole request and acted
+    /// on it, so the outcome is unknown, and the fetcher does not send the
+    /// request again.
+    ///
+    /// A
+    /// [`fetch::Error::UploadInterrupted`](crate::fetch::Error::UploadInterrupted)
+    /// converts to this variant.
+    #[error("upload to {url} interrupted: {message}")]
+    UploadInterrupted {
+        /// The URL the request was sent to.
+        url: String,
+        /// What ended the upload.
+        message: String,
+    },
     /// A metadata key named in
     /// [`gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys)
     /// holds a value that is not a list of commit checksums: its variant type
@@ -371,6 +386,7 @@ impl From<crate::fetch::Error> for Error {
             F::FetchTooLarge { limit } => Error::FetchTooLarge { limit },
             F::ContentEncoded { url, encoding } => Error::ContentEncoded { url, encoding },
             F::Unsupported(message) => Error::Unsupported(message),
+            F::UploadInterrupted { url, message } => Error::UploadInterrupted { url, message },
             other => Error::Fetch(other.to_string()),
         }
     }
@@ -658,6 +674,13 @@ mod tests {
                 ErrorKind::Other,
             ),
             (F::Unsupported("proxy url".into()), ErrorKind::Other),
+            (
+                F::UploadInterrupted {
+                    url: url(),
+                    message: "connection reset".into(),
+                },
+                ErrorKind::Other,
+            ),
         ];
 
         for (fetch, expected) in cases {
@@ -678,6 +701,10 @@ mod tests {
                     encoding: encoding.clone(),
                 },
                 F::Unsupported(m) => Error::Unsupported(m.clone()),
+                F::UploadInterrupted { url, message } => Error::UploadInterrupted {
+                    url: url.clone(),
+                    message: message.clone(),
+                },
                 other => panic!("no namesake for {other:?}"),
             };
             let err = Error::from(fetch);

@@ -2,9 +2,11 @@
 //!
 //! Every test serves requests from an in-process server built on hyper's server
 //! half, over cleartext HTTP/1.1 and over TLS where ALPN selects HTTP/1.1 or
-//! HTTP/2. The fixture certificates under `tests/fixtures/tls/` provide a
-//! certificate authority the client trusts, a server certificate for
-//! `127.0.0.1`, and a client certificate for the mutual-TLS test.
+//! HTTP/2. The upload tests at the end send request bodies to the same
+//! servers, which record the length and the SHA-256 digest of each body. The
+//! fixture certificates under `tests/fixtures/tls/` provide a certificate
+//! authority the client trusts, a server certificate for `127.0.0.1`, and a
+//! client certificate for the mutual-TLS test.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -12,7 +14,7 @@ use std::future::Future;
 use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
@@ -20,14 +22,15 @@ use std::time::{Duration, Instant};
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::future::or;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use hyper::body::{Body as _, Bytes, Frame, SizeHint};
+use hyper::body::{Body as _, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderMap, HeaderName};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::fetch::Error;
 use ostrya::{
-    BasicAuth, Checksum, ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, LowSpeed,
-    Priority, Protocol, Proxy, TlsOptions, TrustRoots, VerifyingReader,
+    BasicAuth, BearerToken, Checksum, ClientIdentity, FetchRequest, Fetched, Fetcher,
+    FetcherOptions, LowSpeed, Priority, Protocol, Proxy, TlsOptions, TrustRoots, UploadBody,
+    UploadMethod, UploadRequest, UploadWriter, Uploaded, VerifyingReader,
 };
 use ostrya_rt::{TcpListener, TcpStream, Timer, block_on, spawn};
 use sha2::{Digest, Sha256};
@@ -128,6 +131,8 @@ struct TestBody {
     chunks: VecDeque<Bytes>,
     /// The exact length, when the response should declare `Content-Length`.
     exact: Option<u64>,
+    /// Whether the body stays open once its chunks are gone, so it never ends.
+    endless: bool,
 }
 
 impl TestBody {
@@ -136,6 +141,7 @@ impl TestBody {
         TestBody {
             chunks: VecDeque::from([Bytes::copy_from_slice(bytes)]),
             exact: Some(bytes.len() as u64),
+            endless: false,
         }
     }
 
@@ -146,6 +152,7 @@ impl TestBody {
         TestBody {
             chunks: bytes.chunks(size).map(Bytes::copy_from_slice).collect(),
             exact: None,
+            endless: false,
         }
     }
 
@@ -153,6 +160,16 @@ impl TestBody {
         TestBody {
             chunks: VecDeque::new(),
             exact: Some(0),
+            endless: false,
+        }
+    }
+
+    /// A body that delivers nothing and never ends.
+    fn endless() -> TestBody {
+        TestBody {
+            chunks: VecDeque::new(),
+            exact: None,
+            endless: true,
         }
     }
 }
@@ -165,12 +182,12 @@ impl hyper::body::Body for TestBody {
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
-        Poll::Ready(
-            self.get_mut()
-                .chunks
-                .pop_front()
-                .map(|c| Ok(Frame::data(c))),
-        )
+        let me = self.get_mut();
+        match me.chunks.pop_front() {
+            Some(chunk) => Poll::Ready(Some(Ok(Frame::data(chunk)))),
+            None if me.endless => Poll::Pending,
+            None => Poll::Ready(None),
+        }
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -184,14 +201,57 @@ impl hyper::body::Body for TestBody {
 /// What the client asked for, as the server saw it.
 #[derive(Clone, Debug)]
 struct Seen {
+    method: String,
     /// The request target's path alone.
     path: String,
     /// The whole request target, the query string included.
     target: String,
     headers: HeaderMap,
+    /// The request body as the server read it: its length, its SHA-256
+    /// digest, and whether it reached its end. A handler that reads the body
+    /// itself leaves all three at the values of an unread body.
+    body_len: u64,
+    body_sha256: [u8; 32],
+    body_complete: bool,
 }
 
 impl Seen {
+    /// The head of `request`, with the values of an unread body.
+    fn head(request: &Request<Incoming>) -> Seen {
+        Seen {
+            method: request.method().to_string(),
+            path: request.uri().path().to_string(),
+            target: request.uri().to_string(),
+            headers: request.headers().clone(),
+            body_len: 0,
+            body_sha256: Sha256::digest(b"").into(),
+            body_complete: false,
+        }
+    }
+
+    /// Read `body` to its end and record it, adding each frame to `received`
+    /// as it arrives. The body is hashed as it arrives and never held whole.
+    async fn read_body(&mut self, mut body: Incoming, received: &AtomicU64) {
+        let mut digest = Sha256::new();
+        loop {
+            match std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        digest.update(&data);
+                        self.body_len += data.len() as u64;
+                        received.fetch_add(data.len() as u64, Ordering::SeqCst);
+                    }
+                }
+                Some(Err(_)) => break,
+                None => {
+                    self.body_complete = true;
+                    break;
+                }
+            }
+        }
+        self.body_sha256 = digest.finalize().into();
+    }
+
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .get(HeaderName::from_bytes(name.as_bytes()).unwrap())?
@@ -262,8 +322,29 @@ impl Leaf {
 }
 
 /// The handler a test installs: it sees the request and the 1-based count of
-/// requests this server has answered.
+/// requests this server has answered. The server reads the request body to its
+/// end before it calls the handler.
 type Handler = Arc<dyn Fn(&Seen, usize) -> Response<TestBody> + Send + Sync>;
+
+/// A handler that reads the request body itself. An error ends the exchange
+/// without a response: an HTTP/1.1 connection closes, and an HTTP/2 stream is
+/// reset.
+type StreamHandler = Arc<
+    dyn Fn(
+            Request<Incoming>,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Response<TestBody>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// How a server answers a request.
+#[derive(Clone)]
+enum Answering {
+    /// Read the body, record it, and answer with the handler.
+    Collected(Handler),
+    /// Record the head and hand the request to the handler.
+    Streamed(StreamHandler),
+}
 
 /// An in-process HTTP server.
 ///
@@ -273,6 +354,9 @@ struct TestServer {
     addr: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
     connections: Arc<AtomicUsize>,
+    /// The request body bytes the server has read, counted as each frame
+    /// arrives.
+    received: Arc<AtomicU64>,
     /// Whether each accepted TLS connection presented a client certificate, in
     /// the order the connections arrived.
     client_certificates: Arc<Mutex<Vec<bool>>>,
@@ -300,11 +384,33 @@ impl TestServer {
         transport: Transport,
         handler: Handler,
     ) -> TestServer {
+        TestServer::start_answering(bind, leaf, transport, Answering::Collected(handler)).await
+    }
+
+    /// A server on an ephemeral port whose handler reads each request body
+    /// itself.
+    async fn start_streamed(transport: Transport, handler: StreamHandler) -> TestServer {
+        TestServer::start_answering(
+            "127.0.0.1:0".parse().unwrap(),
+            Leaf::Fixture,
+            transport,
+            Answering::Streamed(handler),
+        )
+        .await
+    }
+
+    async fn start_answering(
+        bind: SocketAddr,
+        leaf: Leaf,
+        transport: Transport,
+        handler: Answering,
+    ) -> TestServer {
         let listener = TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(AtomicUsize::new(0));
         let client_certificates: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::new(AtomicU64::new(0));
         let acceptor = match &transport {
             Transport::Cleartext => None,
             Transport::Tls { alpn, client_auth } => Some(futures_rustls::TlsAcceptor::from(
@@ -314,6 +420,7 @@ impl TestServer {
         let task_seen = seen.clone();
         let task_connections = connections.clone();
         let task_certificates = client_certificates.clone();
+        let task_received = received.clone();
         drop(spawn(async move {
             loop {
                 let Ok((stream, _peer)) = listener.accept().await else {
@@ -323,6 +430,7 @@ impl TestServer {
                 let handler = handler.clone();
                 let seen = task_seen.clone();
                 let certificates = task_certificates.clone();
+                let received = task_received.clone();
                 let acceptor = acceptor.clone();
                 drop(spawn(async move {
                     match acceptor {
@@ -335,9 +443,9 @@ impl TestServer {
                             let presented = tls.get_ref().1.peer_certificates().is_some();
                             certificates.lock().unwrap().push(presented);
                             let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
-                            serve(tls, h2, handler, seen).await;
+                            serve(tls, h2, handler, seen, received).await;
                         }
-                        None => serve(stream, false, handler, seen).await,
+                        None => serve(stream, false, handler, seen, received).await,
                     }
                 }));
             }
@@ -346,6 +454,7 @@ impl TestServer {
             addr,
             seen,
             connections,
+            received,
             client_certificates,
         }
     }
@@ -369,6 +478,10 @@ impl TestServer {
         self.connections.load(Ordering::SeqCst)
     }
 
+    fn received(&self) -> u64 {
+        self.received.load(Ordering::SeqCst)
+    }
+
     /// Whether each accepted TLS connection presented a client certificate.
     fn client_certificates(&self) -> Vec<bool> {
         self.client_certificates.lock().unwrap().clone()
@@ -376,29 +489,39 @@ impl TestServer {
 }
 
 /// Serve one connection.
-async fn serve<S>(io: S, h2: bool, handler: Handler, seen: Arc<Mutex<Vec<Seen>>>)
-where
+async fn serve<S>(
+    io: S,
+    h2: bool,
+    handler: Answering,
+    seen: Arc<Mutex<Vec<Seen>>>,
+    received: Arc<AtomicU64>,
+) where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let io = TestIo {
         inner: io,
         scratch: Vec::new(),
     };
-    let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+    let service = service_fn(move |request: Request<Incoming>| {
         let handler = handler.clone();
         let seen = seen.clone();
+        let received = received.clone();
         async move {
-            let record = Seen {
-                path: request.uri().path().to_string(),
-                target: request.uri().to_string(),
-                headers: request.headers().clone(),
+            let mut record = Seen::head(&request);
+            let handler = match handler {
+                Answering::Collected(handler) => handler,
+                Answering::Streamed(handler) => {
+                    seen.lock().unwrap().push(record);
+                    return handler(request).await;
+                }
             };
+            record.read_body(request.into_body(), &received).await;
             let count = {
                 let mut log = seen.lock().unwrap();
                 log.push(record.clone());
                 log.len()
             };
-            Ok::<_, Infallible>(handler(&record, count))
+            Ok::<_, io::Error>(handler(&record, count))
         }
     });
     if h2 {
@@ -487,6 +610,8 @@ enum Tunnel {
     Open,
     /// Answer with this status and tunnel nothing.
     Refuse(u16),
+    /// Answer the first `CONNECT` with this status, and open every later one.
+    RefuseFirst(u16),
 }
 
 /// An in-process HTTP/1.1 proxy.
@@ -579,8 +704,20 @@ async fn proxied(
         headers: request.headers().clone(),
     });
     if request.method() == hyper::Method::CONNECT {
+        let connects = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| seen.method == "CONNECT")
+            .count();
+        let tunnel = match tunnel {
+            Tunnel::RefuseFirst(status) if connects == 1 => Tunnel::Refuse(status),
+            Tunnel::RefuseFirst(_) => Tunnel::Open,
+            other => other,
+        };
         let status = match tunnel {
             Tunnel::Refuse(status) => status,
+            Tunnel::RefuseFirst(_) => unreachable!("resolved above"),
             Tunnel::Open => {
                 let target = request.uri().authority().unwrap().clone();
                 let upgrade = hyper::upgrade::on(&mut request);
@@ -633,8 +770,8 @@ async fn splice(upgrade: hyper::upgrade::OnUpgrade, target: hyper::http::uri::Au
 }
 
 /// Send one absolute-form request on to the origin it names and answer with
-/// what came back.
-async fn forwarded(request: Request<hyper::body::Incoming>) -> Response<TestBody> {
+/// what came back. The request body streams on to the origin as it arrives.
+async fn forwarded(request: Request<Incoming>) -> Response<TestBody> {
     let refused = || {
         Response::builder()
             .status(StatusCode::BAD_GATEWAY)
@@ -666,14 +803,20 @@ async fn forwarded(request: Request<hyper::body::Incoming>) -> Response<TestBody
         .path_and_query()
         .map_or("/", |path| path.as_str())
         .to_owned();
+    let (parts, body) = request.into_parts();
     let mut upstream = Request::builder()
-        .method(request.method())
+        .method(parts.method)
         .uri(&target)
-        .body(TestBody::empty())
+        .body(body)
         .unwrap();
-    for (name, value) in request.headers() {
-        // A hop-by-hop header names this proxy and travels no further.
-        if name == hyper::header::PROXY_AUTHORIZATION || name == "proxy-connection" {
+    for (name, value) in &parts.headers {
+        // A hop-by-hop header names this proxy and travels no further, and the
+        // framing headers belong to the connection the body travels over.
+        if name == hyper::header::PROXY_AUTHORIZATION
+            || name == "proxy-connection"
+            || name == hyper::header::CONTENT_LENGTH
+            || name == hyper::header::TRANSFER_ENCODING
+        {
             continue;
         }
         upstream.headers_mut().append(name.clone(), value.clone());
@@ -4094,4 +4237,1727 @@ fn a_low_speed_rule_with_a_zero_is_refused() {
             assert!(matches!(err, Error::Fetch(_)), "{err}");
         }
     });
+}
+
+// --- uploads ---------------------------------------------------------------
+
+/// The longest an upload test runs before it fails rather than hangs.
+const UPLOAD_TEST_LIMIT: Duration = Duration::from_secs(60);
+
+/// The piece sizes a streamed upload writes in, in turn: none of them is a
+/// frame or a buffer size, so a piece crosses frame boundaries at every offset.
+const PIECES: [usize; 6] = [1, 7, 4096, 65_535, 100_003, 13];
+
+/// Run `future`, failing the test if it runs past [`UPLOAD_TEST_LIMIT`].
+async fn bounded<F: Future>(future: F) -> F::Output {
+    or(future, async {
+        Timer::after(UPLOAD_TEST_LIMIT).await;
+        panic!("the upload test did not finish within {UPLOAD_TEST_LIMIT:?}")
+    })
+    .await
+}
+
+/// Wait until `done` holds, failing the test after five seconds.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(started.elapsed() < Duration::from_secs(5), "{what}");
+        Timer::after(Duration::from_millis(10)).await;
+    }
+}
+
+/// `len` bytes of a pattern in which a lost, a repeated, or a moved piece
+/// changes the digest.
+fn upload_data(len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i % 251) as u8 ^ (i >> 12) as u8)
+        .collect()
+}
+
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// Check that the server read `data` whole as the body of `seen`.
+fn assert_body(seen: &Seen, data: &[u8]) {
+    assert!(seen.body_complete, "the body of {} ended short", seen.path);
+    assert_eq!(seen.body_len, data.len() as u64);
+    assert_eq!(seen.body_sha256, sha256(data));
+}
+
+/// Write `data` into `writer` in the sizes of [`PIECES`], then close it.
+async fn write_in_pieces(mut writer: UploadWriter, data: &[u8]) -> io::Result<()> {
+    let mut at = 0;
+    for piece in PIECES.iter().cycle() {
+        if at == data.len() {
+            break;
+        }
+        let end = (at + piece).min(data.len());
+        writer.write_all(&data[at..end]).await?;
+        at = end;
+    }
+    writer.close().await
+}
+
+/// Run `request`, whose body is the channel of `writer`, while `data` is
+/// written into it, and give the result of each.
+async fn upload_streamed(
+    fetcher: &Fetcher,
+    request: UploadRequest<'_>,
+    writer: UploadWriter,
+    data: &[u8],
+) -> (Result<Uploaded, Error>, io::Result<()>) {
+    futures_lite::future::zip(fetcher.upload(request), write_in_pieces(writer, data)).await
+}
+
+/// Upload `data` as a streamed `POST` to `path`, and give the status, the
+/// protocol, and the response body.
+async fn post_streamed(fetcher: &Fetcher, path: &str, data: &[u8]) -> (u16, Protocol, Vec<u8>) {
+    let (body, writer) = UploadBody::channel();
+    let (uploaded, written) =
+        upload_streamed(fetcher, UploadRequest::path(path, body), writer, data).await;
+    written.unwrap();
+    let uploaded = uploaded.unwrap();
+    let (status, protocol) = (uploaded.status(), uploaded.protocol());
+    (status, protocol, read_uploaded(uploaded).await)
+}
+
+/// Read the response body of an upload to its end.
+async fn read_uploaded(uploaded: Uploaded) -> Vec<u8> {
+    let mut body = uploaded.into_body();
+    let mut out = Vec::new();
+    body.read_to_end(&mut out).await.unwrap();
+    out
+}
+
+/// The error an upload failed with.
+async fn upload_error(fetcher: &Fetcher, request: UploadRequest<'_>) -> Error {
+    match fetcher.upload(request).await {
+        Ok(uploaded) => panic!("the upload was expected to fail, got {}", uploaded.status()),
+        Err(err) => err,
+    }
+}
+
+/// Options for a fetcher at `url` that trusts the fixture authority and
+/// reaches every origin directly.
+fn upload_options(url: impl Into<String>) -> FetcherOptions {
+    FetcherOptions {
+        tls: tls_options(None),
+        ..direct_options(url)
+    }
+}
+
+/// A TLS transport offering `alpn` alone.
+fn tls_transport(alpn: &'static str) -> Transport {
+    Transport::Tls {
+        alpn: vec![alpn],
+        client_auth: ClientAuth::None,
+    }
+}
+
+/// A loopback port nothing listens on: bound once, and released.
+async fn reserved_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Read `body` until at least `bytes` have arrived or it ends, and give the
+/// count that arrived.
+async fn read_at_least(body: &mut Incoming, bytes: u64) -> u64 {
+    let mut read = 0;
+    while read < bytes {
+        match std::future::poll_fn(|cx| Pin::new(&mut *body).poll_frame(cx)).await {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    read += data.len() as u64;
+                }
+            }
+            Some(Err(_)) | None => break,
+        }
+    }
+    read
+}
+
+/// A handler that reads `bytes` of the request body and then ends the exchange
+/// with no answer: an HTTP/1.1 connection closes, and an HTTP/2 stream is
+/// reset.
+fn cut_after(bytes: u64) -> StreamHandler {
+    Arc::new(move |request| {
+        Box::pin(async move {
+            let mut body = request.into_body();
+            read_at_least(&mut body, bytes).await;
+            Err(io::Error::other("the server cut the body short"))
+        })
+    })
+}
+
+/// A handler that reads the whole request body and then gives no answer:
+/// with `close`, it ends the exchange, and without, it never answers.
+fn no_answer_after_the_body(close: bool) -> StreamHandler {
+    Arc::new(move |request| {
+        Box::pin(async move {
+            let mut body = request.into_body();
+            read_at_least(&mut body, u64::MAX).await;
+            if !close {
+                futures_lite::future::pending::<()>().await;
+            }
+            Err(io::Error::other("the server gave no answer"))
+        })
+    })
+}
+
+/// A peer that accepts connections and never reads from them, so a client
+/// writing to one fills the socket buffers and then stalls.
+async fn silent_reader() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _peer)) = listener.accept().await {
+            held.push(stream);
+        }
+    }));
+    addr
+}
+
+/// A front that closes the first connection it accepts before a byte crosses
+/// it, and carries every later one to `target`.
+async fn dropping_front(target: SocketAddr) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(spawn(async move {
+        let mut first = true;
+        while let Ok((client, _peer)) = listener.accept().await {
+            if std::mem::take(&mut first) {
+                drop(client);
+                continue;
+            }
+            drop(spawn(async move {
+                let Ok(server) = TcpStream::connect("127.0.0.1", target.port()).await else {
+                    return;
+                };
+                let (mut client_reader, mut client_writer) = futures_lite::io::split(client);
+                let (mut server_reader, mut server_writer) = futures_lite::io::split(server);
+                or(
+                    async {
+                        let _ =
+                            futures_lite::io::copy(&mut client_reader, &mut server_writer).await;
+                    },
+                    async {
+                        let _ =
+                            futures_lite::io::copy(&mut server_reader, &mut client_writer).await;
+                    },
+                )
+                .await;
+            }));
+        }
+    }));
+    addr
+}
+
+/// A streamed `POST` reaches the server whole -- its method, its path, its
+/// length, and its digest -- over cleartext HTTP/1.1, where it travels
+/// chunked, over HTTP/1.1 on TLS, and over HTTP/2, where the body is larger
+/// than the flow-control window. The fetcher sets no `Content-Type` and no
+/// `Expect`.
+#[test]
+fn a_streamed_post_arrives_intact_over_http1_tls_and_http2() {
+    block_on(bounded(async {
+        let data = upload_data(4 * 1024 * 1024 + 4097);
+        for (transport, tls, protocol) in [
+            (Transport::Cleartext, false, Protocol::Http11),
+            (tls_transport("http/1.1"), true, Protocol::Http11),
+            (tls_transport("h2"), true, Protocol::Http2),
+        ] {
+            let server = TestServer::start(transport, always(b"accepted")).await;
+            let fetcher = Fetcher::new(upload_options(server.url(tls))).await.unwrap();
+
+            let (status, carried, answer) =
+                post_streamed(&fetcher, "_ostrya/receive/v1/session", &data).await;
+            assert_eq!(status, 200);
+            assert_eq!(carried, protocol);
+            assert_eq!(answer, b"accepted");
+
+            let seen = server.seen();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].method, "POST");
+            assert_eq!(seen[0].path, "/_ostrya/receive/v1/session");
+            assert_body(&seen[0], &data);
+            assert_eq!(seen[0].header("content-length"), None);
+            if protocol == Protocol::Http11 {
+                assert_eq!(seen[0].header("transfer-encoding"), Some("chunked"));
+            }
+            assert_eq!(seen[0].header("content-type"), None);
+            assert_eq!(seen[0].header("expect"), None);
+        }
+    }));
+}
+
+/// The body streams: the server reads part of it while the writer still holds
+/// it open.
+#[test]
+fn a_streamed_body_reaches_the_server_before_the_writer_closes_it() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let head = upload_data(512 * 1024);
+        let tail = upload_data(1000);
+        let (body, mut writer) = UploadBody::channel();
+        let written = async {
+            writer.write_all(&head).await?;
+            writer.flush().await?;
+            eventually("the server reads the body before its end", || {
+                server.received() >= 256 * 1024
+            })
+            .await;
+            writer.write_all(&tail).await?;
+            writer.close().await
+        };
+        let (uploaded, written) = futures_lite::future::zip(
+            fetcher.upload(UploadRequest::path("objects", body)),
+            written,
+        )
+        .await;
+        written.unwrap();
+        assert_eq!(uploaded.unwrap().status(), 200);
+        assert_body(&server.seen()[0], &[head, tail].concat());
+    }));
+}
+
+/// A body given whole declares its length, over HTTP/1.1 and over HTTP/2, and
+/// an empty `POST` declares a length of zero.
+#[test]
+fn a_whole_body_declares_its_length() {
+    block_on(bounded(async {
+        let data = upload_data(100_000);
+        for alpn in ["http/1.1", "h2"] {
+            let server = TestServer::start(tls_transport(alpn), always(b"accepted")).await;
+            let fetcher = Fetcher::new(upload_options(server.url(true)))
+                .await
+                .unwrap();
+            let uploaded = fetcher
+                .upload(UploadRequest::path(
+                    "objects",
+                    UploadBody::bytes(data.clone()),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(uploaded.status(), 200);
+            assert_eq!(read_uploaded(uploaded).await, b"accepted");
+            let uploaded = fetcher
+                .upload(UploadRequest::path("empty", Vec::new().into()))
+                .await
+                .unwrap();
+            assert_eq!(uploaded.status(), 200);
+
+            let seen = server.seen();
+            assert_eq!(seen[0].header("content-length"), Some("100000"));
+            assert_eq!(seen[0].header("transfer-encoding"), None);
+            assert_body(&seen[0], &data);
+            assert_eq!(seen[1].method, "POST");
+            assert_eq!(seen[1].header("content-length"), Some("0"));
+            assert_body(&seen[1], b"");
+        }
+    }));
+}
+
+/// A streamed `POST` to a cleartext origin travels to the proxy in absolute
+/// form, and the proxy carries the body on whole.
+#[test]
+fn a_streamed_post_travels_through_the_proxy() {
+    block_on(bounded(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let proxy = TestProxy::start(Tunnel::Open).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            proxy: Proxy::Url(proxy.url()),
+            ..upload_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+        let data = upload_data(1024 * 1024 + 3);
+
+        let (status, protocol, answer) = post_streamed(&fetcher, "objects", &data).await;
+        assert_eq!((status, protocol), (200, Protocol::Http11));
+        assert_eq!(answer, b"accepted");
+        let seen = proxy.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(
+            seen[0].target,
+            format!("http://localhost:{}/objects", origin.addr.port())
+        );
+        assert_eq!(origin.seen()[0].method, "POST");
+        assert_body(&origin.seen()[0], &data);
+    }));
+}
+
+/// A streamed `POST` to a TLS origin travels over a `CONNECT` tunnel, with
+/// HTTP/1.1 or HTTP/2 inside it as ALPN selects.
+#[test]
+fn a_streamed_post_tunnels_through_the_proxy_over_http1_and_http2() {
+    block_on(bounded(async {
+        let data = upload_data(1024 * 1024 + 5);
+        for (alpn, protocol) in [("http/1.1", Protocol::Http11), ("h2", Protocol::Http2)] {
+            let origin = TestServer::start(tls_transport(alpn), always(b"accepted")).await;
+            let proxy = TestProxy::start(Tunnel::Open).await;
+            let fetcher = Fetcher::new(FetcherOptions {
+                proxy: Proxy::Url(proxy.url()),
+                ..upload_options(origin.url(true))
+            })
+            .await
+            .unwrap();
+
+            let (status, carried, _) = post_streamed(&fetcher, "objects", &data).await;
+            assert_eq!((status, carried), (200, protocol));
+            let seen = proxy.seen();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].method, "CONNECT");
+            assert_eq!(origin.seen()[0].method, "POST");
+            assert_body(&origin.seen()[0], &data);
+        }
+    }));
+}
+
+/// A bearer token and Basic credentials each reach the server as the
+/// `Authorization` of the upload.
+#[test]
+fn a_bearer_token_and_basic_credentials_reach_the_server() {
+    block_on(bounded(async {
+        let server = TestServer::start(tls_transport("h2"), always(b"accepted")).await;
+        let fetcher = Fetcher::new(upload_options(server.url(true)))
+            .await
+            .unwrap();
+        let token = BearerToken {
+            token: "abc.DEF-123~+/==".into(),
+        };
+        let uploaded = fetcher
+            .upload(UploadRequest {
+                bearer_token: Some(&token),
+                ..UploadRequest::path("session", b"hello".to_vec().into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), 200);
+        let auth = basic_auth("u", "p");
+        fetcher
+            .upload(UploadRequest {
+                basic_auth: Some(&auth),
+                ..UploadRequest::path("session", b"hello".to_vec().into())
+            })
+            .await
+            .unwrap();
+
+        let seen = server.seen();
+        assert_eq!(
+            seen[0].header("authorization"),
+            Some("Bearer abc.DEF-123~+/==")
+        );
+        // base64("u:p")
+        assert_eq!(seen[1].header("authorization"), Some("Basic dTpw"));
+    }));
+}
+
+/// Two credentials for one header, and a token outside the token68 syntax,
+/// are refused before admission: no connection is opened, and the writer of
+/// a streamed body gets a broken pipe.
+#[test]
+fn an_ambiguous_or_malformed_credential_reaches_no_server() {
+    block_on(bounded(async {
+        let server = TestServer::start(tls_transport("h2"), always(b"accepted")).await;
+        let fetcher = Fetcher::new(upload_options(server.url(true)))
+            .await
+            .unwrap();
+        let token = BearerToken {
+            token: "t0k3n".into(),
+        };
+        let malformed = BearerToken {
+            token: "not a token".into(),
+        };
+        let auth = basic_auth("u", "p");
+        let header = vec![("authorization".to_owned(), "Bearer other".to_owned())];
+
+        let cases: [(UploadRequest<'_>, &str); 4] = [
+            (
+                UploadRequest {
+                    basic_auth: Some(&auth),
+                    bearer_token: Some(&token),
+                    ..UploadRequest::path("session", Vec::new().into())
+                },
+                "pass one of them",
+            ),
+            (
+                UploadRequest {
+                    bearer_token: Some(&token),
+                    headers: &header,
+                    ..UploadRequest::path("session", Vec::new().into())
+                },
+                "pass one of them",
+            ),
+            (
+                UploadRequest {
+                    basic_auth: Some(&auth),
+                    headers: &header,
+                    ..UploadRequest::path("session", Vec::new().into())
+                },
+                "pass one of them",
+            ),
+            (
+                UploadRequest {
+                    bearer_token: Some(&malformed),
+                    ..UploadRequest::path("session", Vec::new().into())
+                },
+                "token68",
+            ),
+        ];
+        for (request, expected) in cases {
+            let err = upload_error(&fetcher, request).await;
+            assert!(matches!(err, Error::Fetch(_)), "{err}");
+            let message = err.to_string();
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("not a token"), "{message}");
+        }
+
+        let (body, mut writer) = UploadBody::channel();
+        let err = upload_error(
+            &fetcher,
+            UploadRequest {
+                bearer_token: Some(&malformed),
+                ..UploadRequest::path("session", body)
+            },
+        )
+        .await;
+        assert!(err.to_string().contains("token68"), "{err}");
+        let err = writer.write_all(b"late").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(server.connections(), 0);
+    }));
+}
+
+/// A credential bound for a cleartext origin is refused unless the request
+/// allows it.
+#[test]
+fn an_upload_credential_to_a_cleartext_origin_is_refused_unless_allowed() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let token = BearerToken {
+            token: "t0k3n".into(),
+        };
+        let err = upload_error(
+            &fetcher,
+            UploadRequest {
+                bearer_token: Some(&token),
+                ..UploadRequest::path("session", b"hello".to_vec().into())
+            },
+        )
+        .await;
+        assert!(err.to_string().contains("cleartext"), "{err}");
+        assert_eq!(server.connections(), 0);
+
+        fetcher
+            .upload(UploadRequest {
+                bearer_token: Some(&token),
+                allow_cleartext_credentials: true,
+                ..UploadRequest::path("session", b"hello".to_vec().into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            server.seen()[0].header("authorization"),
+            Some("Bearer t0k3n")
+        );
+    }));
+}
+
+/// A 307 followed onto another origin sends the body again and leaves the
+/// credential with the origin the route named.
+#[test]
+fn a_followed_upload_redirect_leaves_the_credentials_at_the_named_origin() {
+    block_on(bounded(async {
+        let hop = TestServer::start(Transport::Cleartext, always(b"landed")).await;
+        let location = format!("{}/landed", hop.url(false));
+        let named = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(move |_seen, _count| redirect(307, &location)),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(named.url(false)))
+            .await
+            .unwrap();
+        let token = BearerToken {
+            token: "t0k3n".into(),
+        };
+        let data = upload_data(70_000);
+
+        let uploaded = fetcher
+            .upload(UploadRequest {
+                bearer_token: Some(&token),
+                allow_cleartext_credentials: true,
+                ..UploadRequest::path("session", data.clone().into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), 200);
+        assert_eq!(uploaded.url(), format!("{}/landed", hop.url(false)));
+        assert_eq!(read_uploaded(uploaded).await, b"landed");
+
+        let first = &named.seen()[0];
+        assert_eq!(first.header("authorization"), Some("Bearer t0k3n"));
+        assert_body(first, &data);
+        let second = &hop.seen()[0];
+        assert_eq!(second.method, "POST");
+        assert_eq!(second.header("authorization"), None);
+        assert_body(second, &data);
+    }));
+}
+
+/// A refused connection sends nothing, so the upload is tried again, and the
+/// streamed body arrives whole on the one request that reaches the server.
+#[test]
+fn a_refused_connection_is_retried_with_the_body_intact() {
+    block_on(bounded(async {
+        let port = reserved_port().await;
+        let late = spawn(async move {
+            Timer::after(Duration::from_millis(100)).await;
+            TestServer::start_on(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                Leaf::Fixture,
+                Transport::Cleartext,
+                always(b"accepted"),
+            )
+            .await
+        });
+        let fetcher = Fetcher::new(FetcherOptions {
+            max_retries: 2,
+            ..direct_options(format!("http://127.0.0.1:{port}"))
+        })
+        .await
+        .unwrap();
+        let data = upload_data(300_001);
+
+        let (status, _, answer) = post_streamed(&fetcher, "objects", &data).await;
+        assert_eq!(status, 200);
+        assert_eq!(answer, b"accepted");
+        let server = late.await;
+        assert_eq!(server.requests(), 1);
+        assert_body(&server.seen()[0], &data);
+    }));
+}
+
+/// An upload refused by the first mirror before it was sent goes on to the
+/// next one.
+#[test]
+fn an_unsent_upload_moves_on_to_the_next_mirror() {
+    block_on(bounded(async {
+        let port = reserved_port().await;
+        let live = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            mirrors: vec![format!("http://127.0.0.1:{port}"), live.url(false)],
+            max_retries: 0,
+            ..direct_options("unused")
+        })
+        .await
+        .unwrap();
+        let data = upload_data(200_000);
+
+        let (body, writer) = UploadBody::channel();
+        let (uploaded, written) = upload_streamed(
+            &fetcher,
+            UploadRequest::path("objects", body),
+            writer,
+            &data,
+        )
+        .await;
+        written.unwrap();
+        let uploaded = uploaded.unwrap();
+        assert!(
+            uploaded.url().starts_with(&live.url(false)),
+            "{}",
+            uploaded.url()
+        );
+        assert_eq!(live.requests(), 1);
+        assert_body(&live.seen()[0], &data);
+    }));
+}
+
+/// A connection closed before the TLS handshake sends nothing, so the upload
+/// is tried again over a new one.
+#[test]
+fn a_tls_handshake_dropped_on_the_first_connection_is_retried() {
+    block_on(bounded(async {
+        let server = TestServer::start(tls_transport("h2"), always(b"accepted")).await;
+        let front = dropping_front(server.addr).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            max_retries: 1,
+            ..upload_options(format!("https://localhost:{}", front.port()))
+        })
+        .await
+        .unwrap();
+        let data = upload_data(200_000);
+
+        let (status, protocol, _) = post_streamed(&fetcher, "objects", &data).await;
+        assert_eq!((status, protocol), (200, Protocol::Http2));
+        assert_eq!(server.connections(), 1);
+        assert_eq!(server.requests(), 1);
+        assert_body(&server.seen()[0], &data);
+    }));
+}
+
+/// A tunnel the proxy refuses with 503 is tried again, and the upload goes
+/// through on the next round. A 407 refuses the credential, so it is final.
+#[test]
+fn a_refused_tunnel_is_retried_at_503_and_final_at_407() {
+    block_on(bounded(async {
+        let origin = TestServer::start(tls_transport("h2"), always(b"accepted")).await;
+        let proxy = TestProxy::start(Tunnel::RefuseFirst(503)).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            proxy: Proxy::Url(proxy.url()),
+            max_retries: 1,
+            ..upload_options(origin.url(true))
+        })
+        .await
+        .unwrap();
+        let data = upload_data(100_000);
+        let (status, _, _) = post_streamed(&fetcher, "objects", &data).await;
+        assert_eq!(status, 200);
+        assert_eq!(proxy.requests(), 2);
+        assert_eq!(origin.requests(), 1);
+        assert_body(&origin.seen()[0], &data);
+
+        let proxy = TestProxy::start(Tunnel::Refuse(407)).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            proxy: Proxy::Url(proxy.url()),
+            max_retries: 3,
+            ..upload_options("https://localhost:1/repo")
+        })
+        .await
+        .unwrap();
+        let err = upload_error(&fetcher, UploadRequest::path("objects", Vec::new().into())).await;
+        assert!(matches!(err, Error::Fetch(_)), "{err}");
+        assert!(err.to_string().contains("407"), "{err}");
+        assert_eq!(proxy.requests(), 1);
+    }));
+}
+
+/// Rounds that run out before the request is sent report the error a fetch
+/// reports. The writer waits through the rounds with no stall window, since
+/// nothing has taken the body, and then gets a broken pipe.
+#[test]
+fn retries_that_run_out_before_sending_report_a_fetch_error() {
+    block_on(bounded(async {
+        let port = reserved_port().await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            progress_timeout: Duration::from_millis(100),
+            max_retries: 1,
+            ..direct_options(format!("http://127.0.0.1:{port}"))
+        })
+        .await
+        .unwrap();
+        let data = upload_data(300_000);
+        let (body, writer) = UploadBody::channel();
+        let (uploaded, written) = upload_streamed(
+            &fetcher,
+            UploadRequest::path("objects", body),
+            writer,
+            &data,
+        )
+        .await;
+        let err = uploaded.unwrap_err();
+        assert!(matches!(err, Error::Fetch(_)), "{err}");
+        assert!(err.to_string().contains("connect to"), "{err}");
+        assert_eq!(written.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }));
+}
+
+/// A writer whose slot is full while the upload waits out the backoff between
+/// rounds has no stall window: the window starts when the request is handed
+/// over, so the body arrives whole once a round reaches the server.
+#[test]
+fn a_writer_waiting_through_the_retry_rounds_does_not_time_out() {
+    block_on(bounded(async {
+        let port = reserved_port().await;
+        let late = spawn(async move {
+            Timer::after(Duration::from_millis(600)).await;
+            TestServer::start_on(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                Leaf::Fixture,
+                Transport::Cleartext,
+                always(b"accepted"),
+            )
+            .await
+        });
+        let fetcher = Fetcher::new(FetcherOptions {
+            progress_timeout: Duration::from_millis(200),
+            max_retries: 4,
+            ..direct_options(format!("http://127.0.0.1:{port}"))
+        })
+        .await
+        .unwrap();
+        let data = upload_data(300_000);
+
+        let (status, _, answer) = post_streamed(&fetcher, "objects", &data).await;
+        assert_eq!(status, 200);
+        assert_eq!(answer, b"accepted");
+        let server = late.await;
+        assert_eq!(server.requests(), 1);
+        assert_body(&server.seen()[0], &data);
+    }));
+}
+
+/// A writer whose slot is full while the upload waits at the gate has no
+/// stall window either.
+#[test]
+fn a_writer_waiting_at_the_gate_does_not_time_out() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            progress_timeout: Duration::from_millis(200),
+            max_outstanding: 1,
+            ..direct_options(server.url(false))
+        })
+        .await
+        .unwrap();
+        let Fetched::Body(held) = fetcher.fetch(FetchRequest::path("config")).await.unwrap() else {
+            panic!("a 200 carries a body");
+        };
+        let data = upload_data(300_000);
+        let (body, writer) = UploadBody::channel();
+        let released = async {
+            Timer::after(Duration::from_millis(600)).await;
+            drop(held);
+        };
+        let ((uploaded, written), ()) = futures_lite::future::zip(
+            upload_streamed(
+                &fetcher,
+                UploadRequest::path("objects", body),
+                writer,
+                &data,
+            ),
+            released,
+        )
+        .await;
+        written.unwrap();
+        assert_eq!(uploaded.unwrap().status(), 200);
+        assert_eq!(server.requests(), 2);
+        assert_body(&server.seen()[1], &data);
+    }));
+}
+
+/// A writer dropped before the upload hands its request over leaves a body
+/// that fails, so the request is never sent: the upload fails as unsent, and
+/// the server sees no request of it.
+#[test]
+fn a_writer_dropped_before_the_hand_over_sends_nothing() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            max_outstanding: 1,
+            ..direct_options(server.url(false))
+        })
+        .await
+        .unwrap();
+        let Fetched::Body(held) = fetcher.fetch(FetchRequest::path("config")).await.unwrap() else {
+            panic!("a 200 carries a body");
+        };
+        let (body, mut writer) = UploadBody::channel();
+        writer.write_all(&upload_data(1000)).await.unwrap();
+        drop(writer);
+        let released = async {
+            Timer::after(Duration::from_millis(100)).await;
+            drop(held);
+        };
+        let (uploaded, ()) = futures_lite::future::zip(
+            fetcher.upload(UploadRequest::path("objects", body)),
+            released,
+        )
+        .await;
+        let err = uploaded.unwrap_err();
+        assert!(matches!(err, Error::Fetch(_)), "{err}");
+        assert!(err.to_string().contains("dropped"), "{err}");
+        assert_eq!(server.requests(), 1);
+        assert_eq!(server.seen()[0].method, "GET");
+    }));
+}
+
+/// The fetch timeout bounds an upload that is never handed over: a peer that
+/// takes the connection and never completes the TLS handshake fails the
+/// upload as unsent, and the writer then gets a broken pipe.
+#[test]
+fn the_fetch_timeout_bounds_an_upload_before_the_hand_over() {
+    block_on(bounded(async {
+        let addr = silent_reader().await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            fetch_timeout: Some(Duration::from_millis(300)),
+            ..upload_options(format!("https://localhost:{}", addr.port()))
+        })
+        .await
+        .unwrap();
+        let (body, mut writer) = UploadBody::channel();
+        let started = Instant::now();
+        let err = upload_error(&fetcher, UploadRequest::path("objects", body)).await;
+        assert!(matches!(err, Error::Fetch(_)), "{err}");
+        assert!(err.to_string().contains("not sent within"), "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let err = writer.write_all(b"late").await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }));
+}
+
+/// A body the server cuts short was sent in part, so the upload fails as
+/// interrupted, and neither another round nor another mirror is asked.
+#[test]
+fn a_body_cut_short_by_the_server_is_not_sent_again() {
+    block_on(bounded(async {
+        let cutting = TestServer::start_streamed(Transport::Cleartext, cut_after(100 * 1024)).await;
+        let live = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            mirrors: vec![cutting.url(false), live.url(false)],
+            max_retries: 3,
+            ..direct_options("unused")
+        })
+        .await
+        .unwrap();
+        let data = upload_data(2 * 1024 * 1024);
+
+        let (body, writer) = UploadBody::channel();
+        let (uploaded, _) = upload_streamed(
+            &fetcher,
+            UploadRequest::path("objects", body),
+            writer,
+            &data,
+        )
+        .await;
+        let err = uploaded.unwrap_err();
+        assert!(
+            matches!(&err, Error::UploadInterrupted { url, .. } if url.starts_with(&cutting.url(false))),
+            "{err}"
+        );
+        assert_eq!(cutting.connections(), 1);
+        assert_eq!(cutting.requests(), 1);
+        assert_eq!(live.connections(), 0);
+    }));
+}
+
+/// Every status that follows the whole body is the caller's answer, the
+/// retryable ones of a fetch included: one request, and no other mirror.
+#[test]
+fn every_status_after_the_full_body_is_the_callers_answer() {
+    block_on(bounded(async {
+        let data = upload_data(200_000);
+        for status in [500, 503, 408, 429, 422, 401] {
+            let server = TestServer::start(Transport::Cleartext, always_status(status)).await;
+            let live = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+            let fetcher = Fetcher::new(FetcherOptions {
+                mirrors: vec![server.url(false), live.url(false)],
+                max_retries: 3,
+                ..direct_options("unused")
+            })
+            .await
+            .unwrap();
+            let (answered, _, _) = post_streamed(&fetcher, "objects", &data).await;
+            assert_eq!(answered, status);
+            assert_eq!(server.requests(), 1, "{status}");
+            assert_body(&server.seen()[0], &data);
+            assert_eq!(live.requests(), 0, "{status}");
+        }
+    }));
+}
+
+/// A server that takes the whole body and closes without an answer leaves the
+/// outcome unknown: the upload is interrupted, and nothing is asked again.
+#[test]
+fn a_full_body_with_no_answer_is_interrupted() {
+    block_on(bounded(async {
+        let server =
+            TestServer::start_streamed(Transport::Cleartext, no_answer_after_the_body(true)).await;
+        let live = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            mirrors: vec![server.url(false), live.url(false)],
+            max_retries: 3,
+            ..direct_options("unused")
+        })
+        .await
+        .unwrap();
+        let err = upload_error(
+            &fetcher,
+            UploadRequest::path("commit", upload_data(10_000).into()),
+        )
+        .await;
+        assert!(matches!(err, Error::UploadInterrupted { .. }), "{err}");
+        assert_eq!(server.requests(), 1);
+        assert_eq!(live.requests(), 0);
+    }));
+}
+
+/// The wait for the head starts when the body ends and lasts the response
+/// timeout, past which the upload is interrupted. The fetch timeout ends at
+/// the hand-over, so a shorter one does not cut the wait.
+#[test]
+fn a_head_that_stalls_past_the_response_timeout_is_interrupted() {
+    block_on(bounded(async {
+        let server =
+            TestServer::start_streamed(Transport::Cleartext, no_answer_after_the_body(false)).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            fetch_timeout: Some(Duration::from_millis(150)),
+            max_retries: 3,
+            ..direct_options(server.url(false))
+        })
+        .await
+        .unwrap();
+        let started = Instant::now();
+        let err = upload_error(
+            &fetcher,
+            UploadRequest {
+                response_timeout: Some(Duration::from_millis(400)),
+                ..UploadRequest::path("commit", upload_data(64 * 1024).into())
+            },
+        )
+        .await;
+        assert!(matches!(err, Error::UploadInterrupted { .. }), "{err}");
+        assert!(err.to_string().contains("no response within"), "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        assert_eq!(server.requests(), 1);
+    }));
+}
+
+/// An HTTP/2 stream the server resets after part of the body ends the upload
+/// as interrupted, with no other request.
+#[test]
+fn an_http2_stream_reset_after_part_of_the_body_is_interrupted() {
+    block_on(bounded(async {
+        let server = TestServer::start_streamed(tls_transport("h2"), cut_after(100 * 1024)).await;
+        let live = TestServer::start(tls_transport("h2"), always(b"accepted")).await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            mirrors: vec![server.url(true), live.url(true)],
+            max_retries: 3,
+            ..upload_options("unused")
+        })
+        .await
+        .unwrap();
+        let data = upload_data(2 * 1024 * 1024);
+
+        let (body, writer) = UploadBody::channel();
+        let (uploaded, _) = upload_streamed(
+            &fetcher,
+            UploadRequest::path("objects", body),
+            writer,
+            &data,
+        )
+        .await;
+        let err = uploaded.unwrap_err();
+        assert!(matches!(err, Error::UploadInterrupted { .. }), "{err}");
+        assert_eq!(server.requests(), 1);
+        assert_eq!(live.connections(), 0);
+    }));
+}
+
+/// A 307 or a 308 is followed for a body given whole, with the method kept and
+/// the bytes sent again. A streamed body is not followed, and neither is a
+/// 302: each is delivered as its status.
+#[test]
+fn an_upload_follows_307_and_308_for_a_whole_body_alone() {
+    block_on(bounded(async {
+        let data = upload_data(70_000);
+        let redirecting = |status: u16| -> Handler {
+            Arc::new(move |_seen, count| {
+                if count == 1 {
+                    redirect(status, "/moved")
+                } else {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(TestBody::measured(b"landed"))
+                        .unwrap()
+                }
+            })
+        };
+        for status in [307, 308] {
+            let server = TestServer::start(Transport::Cleartext, redirecting(status)).await;
+            let fetcher = Fetcher::new(direct_options(server.url(false)))
+                .await
+                .unwrap();
+            let uploaded = fetcher
+                .upload(UploadRequest::path("objects", data.clone().into()))
+                .await
+                .unwrap();
+            assert_eq!(uploaded.status(), 200);
+            assert_eq!(uploaded.url(), format!("{}/moved", server.url(false)));
+            assert_eq!(read_uploaded(uploaded).await, b"landed");
+            let seen = server.seen();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[1].method, "POST");
+            assert_eq!(seen[1].path, "/moved");
+            assert_body(&seen[1], &data);
+
+            let server = TestServer::start(Transport::Cleartext, redirecting(status)).await;
+            let fetcher = Fetcher::new(direct_options(server.url(false)))
+                .await
+                .unwrap();
+            let (answered, _, _) = post_streamed(&fetcher, "objects", &data).await;
+            assert_eq!(answered, status);
+            assert_eq!(server.requests(), 1);
+        }
+
+        let server = TestServer::start(Transport::Cleartext, redirecting(302)).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let uploaded = fetcher
+            .upload(UploadRequest::path("objects", data.clone().into()))
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), 302);
+        assert_eq!(server.requests(), 1);
+    }));
+}
+
+/// A declared response length over the cap fails the upload after its one
+/// request, whatever the status.
+#[test]
+fn a_declared_response_over_the_cap_fails_after_one_request() {
+    block_on(bounded(async {
+        static LARGE: [u8; 4096] = [b'r'; 4096];
+        for status in [200, 422] {
+            let server = TestServer::start(
+                Transport::Cleartext,
+                Arc::new(move |_seen, _count| {
+                    Response::builder()
+                        .status(status)
+                        .body(TestBody::measured(&LARGE))
+                        .unwrap()
+                }),
+            )
+            .await;
+            let live = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+            let fetcher = Fetcher::new(FetcherOptions {
+                mirrors: vec![server.url(false), live.url(false)],
+                ..direct_options("unused")
+            })
+            .await
+            .unwrap();
+            let err = upload_error(
+                &fetcher,
+                UploadRequest {
+                    max_response: 1024,
+                    ..UploadRequest::path("objects", b"hello".to_vec().into())
+                },
+            )
+            .await;
+            assert!(matches!(err, Error::FetchTooLarge { limit: 1024 }), "{err}");
+            assert_eq!(server.requests(), 1);
+            assert_eq!(live.requests(), 0);
+        }
+    }));
+}
+
+/// A response body that outgrows the cap while it streams fails the read, and
+/// every read after it.
+#[test]
+fn a_chunked_response_past_the_cap_fails_the_read_and_stays_failed() {
+    block_on(bounded(async {
+        static LARGE: [u8; 8192] = [b'r'; 8192];
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen, _count| {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(TestBody::chunked(&LARGE, 8))
+                    .unwrap()
+            }),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let uploaded = fetcher
+            .upload(UploadRequest {
+                max_response: 1000,
+                ..UploadRequest::path("objects", b"hello".to_vec().into())
+            })
+            .await
+            .unwrap();
+        let mut body = uploaded.into_body();
+        let mut out = Vec::new();
+        let err = body.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+        let mut more = [0u8; 16];
+        let err = body.read(&mut more).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
+    }));
+}
+
+/// A response that declares a coding is refused.
+#[test]
+fn a_coded_response_to_an_upload_is_refused() {
+    block_on(bounded(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen, _count| {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-encoding", "gzip")
+                    .body(TestBody::measured(b"squeezed"))
+                    .unwrap()
+            }),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let err = upload_error(
+            &fetcher,
+            UploadRequest::path("objects", b"hello".to_vec().into()),
+        )
+        .await;
+        assert!(
+            matches!(&err, Error::ContentEncoded { encoding, .. } if encoding == "gzip"),
+            "{err}"
+        );
+        assert_eq!(server.requests(), 1);
+    }));
+}
+
+/// A writer dropped before close fails the body: the upload is interrupted,
+/// and the server reads a body that never reaches its end.
+#[test]
+fn a_writer_dropped_before_close_interrupts_the_upload() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let data = upload_data(200_000);
+        let (body, mut writer) = UploadBody::channel();
+        let written = async move {
+            writer.write_all(&data).await.unwrap();
+            writer.flush().await.unwrap();
+            drop(writer);
+        };
+        let (uploaded, ()) = futures_lite::future::zip(
+            fetcher.upload(UploadRequest::path("objects", body)),
+            written,
+        )
+        .await;
+        let err = uploaded.unwrap_err();
+        assert!(matches!(err, Error::UploadInterrupted { .. }), "{err}");
+        assert!(err.to_string().contains("dropped"), "{err}");
+        eventually("the server records the request", || server.requests() == 1).await;
+        let seen = &server.seen()[0];
+        assert!(!seen.body_complete);
+        assert!(seen.body_len <= 200_000);
+    }));
+}
+
+/// Against a server that never reads, the frame in the slot waits past the
+/// stall window: the write fails with a timeout, and the upload is
+/// interrupted.
+#[test]
+fn a_writer_stalls_against_a_server_that_never_reads() {
+    block_on(bounded(async {
+        let addr = silent_reader().await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            progress_timeout: Duration::from_millis(300),
+            max_retries: 0,
+            ..direct_options(format!("http://127.0.0.1:{}", addr.port()))
+        })
+        .await
+        .unwrap();
+        let (body, mut writer) = UploadBody::channel();
+        // The body is made as it is written, and the socket buffers fill long
+        // before the bound.
+        let written = async move {
+            let piece = vec![0u8; 64 * 1024];
+            let mut total = 0u64;
+            loop {
+                if let Err(err) = writer.write_all(&piece).await {
+                    return err;
+                }
+                total += piece.len() as u64;
+                assert!(total < 1 << 30, "the writer never stalled");
+            }
+        };
+        let (uploaded, err) = futures_lite::future::zip(
+            fetcher.upload(UploadRequest::path("objects", body)),
+            written,
+        )
+        .await;
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let err = uploaded.unwrap_err();
+        assert!(matches!(err, Error::UploadInterrupted { .. }), "{err}");
+        assert!(err.to_string().contains("not taken"), "{err}");
+    }));
+}
+
+/// Once the upload is done with the body, a write fails with a broken pipe.
+#[test]
+fn a_write_after_the_upload_ended_is_a_broken_pipe() {
+    block_on(bounded(async {
+        let server = TestServer::start_streamed(Transport::Cleartext, cut_after(64 * 1024)).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let (body, mut writer) = UploadBody::channel();
+        // One frame waits in the slot and one in the writer, so the server
+        // has its 64 KiB without another write.
+        writer.write_all(&upload_data(128 * 1024)).await.unwrap();
+        let err = upload_error(&fetcher, UploadRequest::path("objects", body)).await;
+        assert!(matches!(err, Error::UploadInterrupted { .. }), "{err}");
+        let piece = vec![0u8; 64 * 1024];
+        let err = loop {
+            if let Err(err) = writer.write_all(&piece).await {
+                break err;
+            }
+        };
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }));
+}
+
+/// A `DELETE` reaches the server with no body and no framing headers, and a
+/// `DELETE` that carries a body is refused before admission.
+#[test]
+fn a_delete_reaches_the_server_with_no_body() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always_status(204)).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let uploaded = fetcher
+            .upload(UploadRequest {
+                method: UploadMethod::Delete,
+                ..UploadRequest::path("_ostrya/receive/v1/session/abc", Vec::new().into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), 204);
+        let seen = &server.seen()[0];
+        assert_eq!(seen.method, "DELETE");
+        assert_eq!(seen.path, "/_ostrya/receive/v1/session/abc");
+        assert_eq!(seen.header("content-length"), None);
+        assert_eq!(seen.header("transfer-encoding"), None);
+        assert_body(seen, b"");
+
+        for body in [b"x".to_vec().into(), UploadBody::channel().0] {
+            let err = upload_error(
+                &fetcher,
+                UploadRequest {
+                    method: UploadMethod::Delete,
+                    ..UploadRequest::path("session", body)
+                },
+            )
+            .await;
+            assert!(err.to_string().contains("carries a body"), "{err}");
+        }
+        assert_eq!(server.requests(), 1);
+    }));
+}
+
+/// An upload opens an HTTP/1.1 connection of its own rather than an idle
+/// pooled one, and that connection closes when the upload ends: it never
+/// enters the pool. HTTP/2 connections are shared.
+#[test]
+fn an_upload_opens_its_own_http1_connection_and_shares_http2() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        fetch_bytes(&fetcher, "config").await;
+        assert_eq!(server.connections(), 1);
+        let uploaded = fetcher
+            .upload(UploadRequest::path("objects", b"hello".to_vec().into()))
+            .await
+            .unwrap();
+        read_uploaded(uploaded).await;
+        assert_eq!(server.connections(), 2);
+        // Two fetches in flight at once: the pool holds the connection of the
+        // first fetch alone, so the second opens a third connection.
+        let first = fetcher.fetch(FetchRequest::path("config")).await.unwrap();
+        let second = fetcher.fetch(FetchRequest::path("config")).await.unwrap();
+        assert_eq!(server.connections(), 3);
+        drop((first, second));
+
+        let server = TestServer::start(tls_transport("h2"), always(b"accepted")).await;
+        let fetcher = Fetcher::new(upload_options(server.url(true)))
+            .await
+            .unwrap();
+        fetch_bytes(&fetcher, "config").await;
+        for _ in 0..2 {
+            let uploaded = fetcher
+                .upload(UploadRequest::path("objects", b"hello".to_vec().into()))
+                .await
+                .unwrap();
+            read_uploaded(uploaded).await;
+        }
+        assert_eq!(server.requests(), 3);
+        assert_eq!(server.connections(), 1);
+    }));
+}
+
+/// The response body of an upload holds its admission permit until it ends,
+/// and its bytes reach the counters of the fetcher.
+#[test]
+fn an_upload_response_holds_its_permit_and_is_counted() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"twelve bytes")).await;
+        let counter = Arc::new(AtomicU64::new(0));
+        let fetcher = Fetcher::with_counters(
+            FetcherOptions {
+                max_outstanding: 1,
+                ..direct_options(server.url(false))
+            },
+            vec![counter.clone()],
+        )
+        .await
+        .unwrap();
+        let uploaded = fetcher
+            .upload(UploadRequest::path("objects", b"hello".to_vec().into()))
+            .await
+            .unwrap();
+        let queued = or(
+            async {
+                fetch_bytes(&fetcher, "config").await;
+                true
+            },
+            async {
+                Timer::after(Duration::from_millis(200)).await;
+                false
+            },
+        )
+        .await;
+        assert!(
+            !queued,
+            "a fetch was admitted beside the unread upload body"
+        );
+        assert_eq!(read_uploaded(uploaded).await, b"twelve bytes");
+        assert_eq!(counter.load(Ordering::SeqCst), 12);
+        fetch_bytes(&fetcher, "config").await;
+    }));
+}
+
+/// The upload future travels between threads with its writer.
+#[test]
+fn the_upload_future_is_send() {
+    fn assert_send<T: Send>(_: &T) {}
+    block_on(async {
+        let fetcher = Fetcher::new(direct_options("http://127.0.0.1:1"))
+            .await
+            .unwrap();
+        let (body, writer) = UploadBody::channel();
+        let future = fetcher.upload(UploadRequest::path("objects", body));
+        assert_send(&future);
+        assert_send(&writer);
+    });
+}
+
+/// A body given whole travels in frames, and the window for the response head
+/// starts when hyper takes the last of them. A server that stops reading for
+/// longer than the response timeout, and then reads the rest at once, answers
+/// within the window.
+#[test]
+fn a_whole_body_streams_in_frames_before_the_response_window() {
+    block_on(bounded(async {
+        let data = upload_data(32 * 1024 * 1024);
+        let read = Arc::new(AtomicU64::new(0));
+        let pausing = {
+            let read = read.clone();
+            Arc::new(move |request: Request<Incoming>| {
+                let read = read.clone();
+                Box::pin(async move {
+                    let mut body = request.into_body();
+                    let first = read_at_least(&mut body, 64 * 1024).await;
+                    Timer::after(Duration::from_secs(1)).await;
+                    let rest = read_at_least(&mut body, u64::MAX).await;
+                    read.store(first + rest, Ordering::SeqCst);
+                    Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .body(TestBody::measured(b"accepted"))
+                        .unwrap())
+                }) as Pin<Box<dyn Future<Output = _> + Send>>
+            }) as StreamHandler
+        };
+        for (transport, tls) in [(Transport::Cleartext, false), (tls_transport("h2"), true)] {
+            let server = TestServer::start_streamed(transport, pausing.clone()).await;
+            let fetcher = Fetcher::new(FetcherOptions {
+                progress_timeout: Duration::from_secs(5),
+                ..upload_options(server.url(tls))
+            })
+            .await
+            .unwrap();
+            let uploaded = fetcher
+                .upload(UploadRequest {
+                    response_timeout: Some(Duration::from_millis(300)),
+                    ..UploadRequest::path("objects", data.clone().into())
+                })
+                .await
+                .unwrap();
+            assert_eq!(uploaded.status(), 200);
+            assert_eq!(read.load(Ordering::SeqCst), data.len() as u64);
+            assert_eq!(
+                server.seen()[0].header("content-length"),
+                Some(data.len().to_string().as_str())
+            );
+        }
+    }));
+}
+
+/// An HTTP/2 server that lets one stream open at a time on each connection.
+/// A request for `/held` gets a response head and a body that never ends,
+/// which keeps its stream open. Every other request has its body read and
+/// recorded, and gets a 200. Once `cut` is set, the first connection closes.
+struct OneStreamServer {
+    addr: SocketAddr,
+    seen: Arc<Mutex<Vec<Seen>>>,
+    connections: Arc<AtomicUsize>,
+    cut: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl OneStreamServer {
+    async fn start() -> OneStreamServer {
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = OneStreamServer {
+            addr,
+            seen: Arc::new(Mutex::new(Vec::new())),
+            connections: Arc::new(AtomicUsize::new(0)),
+            cut: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let acceptor = futures_rustls::TlsAcceptor::from(Arc::new(server_config(
+            &["h2"],
+            ClientAuth::None,
+            Leaf::Fixture,
+        )));
+        let (seen, connections, cut) = (
+            server.seen.clone(),
+            server.connections.clone(),
+            server.cut.clone(),
+        );
+        drop(spawn(async move {
+            while let Ok((stream, _peer)) = listener.accept().await {
+                let first = connections.fetch_add(1, Ordering::SeqCst) == 0;
+                let (acceptor, seen, cut) = (acceptor.clone(), seen.clone(), cut.clone());
+                drop(spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let service = service_fn(move |request: Request<Incoming>| {
+                        let seen = seen.clone();
+                        async move {
+                            let mut record = Seen::head(&request);
+                            if record.path == "/held" {
+                                seen.lock().unwrap().push(record);
+                                return Ok::<_, Infallible>(Response::new(TestBody::endless()));
+                            }
+                            record
+                                .read_body(request.into_body(), &AtomicU64::new(0))
+                                .await;
+                            seen.lock().unwrap().push(record);
+                            Ok(Response::new(TestBody::measured(b"accepted")))
+                        }
+                    });
+                    let served = hyper::server::conn::http2::Builder::new(TestExecutor)
+                        .max_concurrent_streams(1)
+                        .serve_connection(
+                            TestIo {
+                                inner: tls,
+                                scratch: Vec::new(),
+                            },
+                            service,
+                        );
+                    or(
+                        async {
+                            let _ = served.await;
+                        },
+                        async {
+                            while !(first && cut.load(Ordering::SeqCst)) {
+                                Timer::after(Duration::from_millis(10)).await;
+                            }
+                        },
+                    )
+                    .await;
+                }));
+            }
+        }));
+        server
+    }
+
+    fn url(&self) -> String {
+        format!("https://localhost:{}", self.addr.port())
+    }
+}
+
+/// A body given whole on an HTTP/2 stream that never opens, because the
+/// server has no stream to spare, is bounded by the stall window: its first
+/// frame is not taken, and the upload is interrupted.
+#[test]
+fn a_whole_body_on_a_stream_that_never_opens_is_bounded() {
+    block_on(bounded(async {
+        let server = OneStreamServer::start().await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            progress_timeout: Duration::from_millis(300),
+            ..upload_options(server.url())
+        })
+        .await
+        .unwrap();
+        let held = fetcher.fetch(FetchRequest::path("held")).await.unwrap();
+        let started = Instant::now();
+        let err = or(
+            upload_error(
+                &fetcher,
+                UploadRequest::path("objects", upload_data(100_000).into()),
+            ),
+            async {
+                Timer::after(Duration::from_secs(5)).await;
+                panic!("the upload waited on a stream that never opened")
+            },
+        )
+        .await;
+        assert!(matches!(err, Error::UploadInterrupted { .. }), "{err}");
+        assert!(err.to_string().contains("not taken"), "{err}");
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+        assert_eq!(server.seen.lock().unwrap().len(), 1);
+        drop(held);
+    }));
+}
+
+/// A request that hyper gives back unsent spends a round and is sent on the
+/// next one. The upload waits in the queue of an HTTP/2 connection behind a
+/// stream that cannot open, and the connection closes: hyper returns the
+/// queued request, and the next round sends it over a new connection.
+#[test]
+fn a_request_given_back_unsent_is_sent_on_the_next_round() {
+    block_on(bounded(async {
+        let server = OneStreamServer::start().await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            max_retries: 1,
+            ..upload_options(server.url())
+        })
+        .await
+        .unwrap();
+        let held = fetcher.fetch(FetchRequest::path("held")).await.unwrap();
+        // A second fetch waits for a stream to open, so the connection takes
+        // no further request from its queue.
+        let blocked = spawn({
+            let fetcher = fetcher.clone();
+            async move {
+                let _ = fetcher.fetch(FetchRequest::path("config")).await;
+            }
+        });
+        Timer::after(Duration::from_millis(100)).await;
+        let data = upload_data(100_000);
+        let cut = async {
+            Timer::after(Duration::from_millis(300)).await;
+            server.cut.store(true, Ordering::SeqCst);
+        };
+        let (uploaded, ()) = futures_lite::future::zip(
+            fetcher.upload(UploadRequest::path("objects", data.clone().into())),
+            cut,
+        )
+        .await;
+        let uploaded = uploaded.unwrap();
+        assert_eq!(uploaded.status(), 200);
+        assert!(server.connections.load(Ordering::SeqCst) >= 2);
+        let seen = server.seen.lock().unwrap().clone();
+        let posts = seen
+            .iter()
+            .filter(|seen| seen.method == "POST")
+            .collect::<Vec<_>>();
+        assert_eq!(posts.len(), 1);
+        assert_body(posts[0], &data);
+        drop(held);
+        blocked.await;
+    }));
+}
+
+/// A server that answers before it has read the streamed body, and keeps
+/// reading, does not get the rest of it: once the response has ended, the
+/// body fails, and the writer gets a broken pipe.
+#[test]
+fn an_early_answer_ends_the_streamed_body() {
+    block_on(bounded(async {
+        const LIMIT: u64 = 64 * 1024 * 1024;
+        for (transport, tls) in [(Transport::Cleartext, false), (tls_transport("h2"), true)] {
+            let read = Arc::new(AtomicU64::new(0));
+            let early = {
+                let read = read.clone();
+                Arc::new(move |request: Request<Incoming>| {
+                    let read = read.clone();
+                    Box::pin(async move {
+                        let mut body = request.into_body();
+                        drop(spawn(async move {
+                            while let Some(Ok(frame)) =
+                                std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+                            {
+                                if let Ok(data) = frame.into_data() {
+                                    read.fetch_add(data.len() as u64, Ordering::SeqCst);
+                                }
+                            }
+                        }));
+                        Ok(Response::builder()
+                            .status(StatusCode::PAYLOAD_TOO_LARGE)
+                            .body(TestBody::measured(b"too large"))
+                            .unwrap())
+                    }) as Pin<Box<dyn Future<Output = _> + Send>>
+                }) as StreamHandler
+            };
+            let server = TestServer::start_streamed(transport, early).await;
+            let fetcher = Fetcher::new(upload_options(server.url(tls))).await.unwrap();
+            let (body, mut writer) = UploadBody::channel();
+            let answered = async {
+                let uploaded = fetcher
+                    .upload(UploadRequest::path("objects", body))
+                    .await
+                    .unwrap();
+                assert_eq!(uploaded.status(), 413);
+                read_uploaded(uploaded).await
+            };
+            let written = async move {
+                let piece = vec![0u8; 64 * 1024];
+                let mut total = 0u64;
+                while total < LIMIT {
+                    writer.write_all(&piece).await?;
+                    total += piece.len() as u64;
+                }
+                Ok::<_, io::Error>(total)
+            };
+            let (answer, written) = futures_lite::future::zip(answered, written).await;
+            assert_eq!(answer, b"too large");
+            let err = written.expect_err("the body was still taken after the answer");
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+            assert!(read.load(Ordering::SeqCst) < LIMIT);
+        }
+    }));
+}
+
+/// A `POST` whose streamed body is at its end when the request is handed over
+/// declares a length of zero, over HTTP/1.1 and over HTTP/2.
+#[test]
+fn an_empty_streamed_post_declares_a_length_of_zero() {
+    block_on(bounded(async {
+        for (transport, tls) in [(Transport::Cleartext, false), (tls_transport("h2"), true)] {
+            let server = TestServer::start(transport, always(b"accepted")).await;
+            let fetcher = Fetcher::new(upload_options(server.url(tls))).await.unwrap();
+            let (body, writer) = UploadBody::channel();
+            let (uploaded, written) =
+                upload_streamed(&fetcher, UploadRequest::path("objects", body), writer, b"").await;
+            written.unwrap();
+            assert_eq!(uploaded.unwrap().status(), 200);
+            let seen = &server.seen()[0];
+            assert_eq!(seen.header("content-length"), Some("0"));
+            assert_eq!(seen.header("transfer-encoding"), None);
+            assert_body(seen, b"");
+        }
+    }));
 }

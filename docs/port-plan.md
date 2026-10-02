@@ -187,7 +187,9 @@ bounded:
   `ostrya-composefs`. Feature-gated. The signing engines come from
   `ostrya-sign` and are re-exported. GPG verification over the `pgp` crate
   and the system key store readers are part of `ostrya`. The fetcher is the
-  `ostrya-fetch` crate, re-exported as `ostrya::fetch`. Its error type,
+  `ostrya-fetch` crate, re-exported as `ostrya::fetch`. It serves downloads
+  and uploads, a request body given whole or streamed through a writer. Its
+  error type,
   `ostrya::fetch::Error`, converts into `ostrya::Error`. The `receive`
   feature turns on the dependency on `ostrya-push`, re-exported as
   `ostrya::push`, and `ostrya::Error::Push` carries its error type.
@@ -2842,9 +2844,10 @@ no socket.
   limit of zero follows nothing, which leaves each of those statuses a
   definitive answer of its own, and an attempt that has followed the limit and
   is sent on to another URL fails definitively with `Error::RedirectLimit`.
-  Every
-  request the fetcher makes is a GET, so none of the five changes the method of
-  the hop that follows it. `Location` is resolved against the URL of the
+  A fetch is a GET, so none of the five changes the method of the hop that
+  follows it. An upload follows a 307 or a 308 alone, for a body given whole,
+  with the method kept and the bytes sent again, and gives every other
+  redirect status to the caller. `Location` is resolved against the URL of the
   response that carried it, over the `url` crate, so it reads as an absolute
   URL, a relative one, or a scheme-relative one. The resolution normalizes what
   it produces, where a request URL reaches the wire as the caller wrote it: a
@@ -2959,7 +2962,8 @@ hyper's `server` feature is a dev-dependency for the test server. `h2` brings
 `tokio` and `tokio-util` into the graph even under the smol backend, where only
 their I/O traits and codec framing are used and no tokio runtime is driven. Two
 crates from the proposal turned out unnecessary: `http-body-util` (the fetcher's
-request body is a hand-rolled empty `Body`, ~15 lines) and a base64 crate
+request body is a hand-rolled `Body`, empty for a fetch and a one-frame slot
+for an upload) and a base64 crate
 (`ostrya-core::base64` encodes the basic-auth header). The glue hyper needs --
 `hyper::rt::Read`/`Write` over `futures-io` and `hyper::rt::Executor` over
 `rt::spawn` -- is ~90 lines in `fetch/io.rs` and holds `forbid(unsafe_code)`:
@@ -7094,8 +7098,11 @@ options. The read-only half of `ostrya serve` is done: `ostrya serve
 --read-only` serves `ArchiveView`, the archive view of a repository of any
 mode, over HTTP and HTTPS, and `ostree pull` from it passes `ostree fsck`
 (`docs/conformance/cli-surface.md`, "Port extensions with no counterpart in
-the tool"). The HTTP push transport and the receive endpoint of `ostrya
-serve` are still to come.
+the tool"). The fetcher has the upload request that the HTTP push transport
+sends through: a `POST` with a body given whole or streamed, retried only
+while it is unsent, with a bounded response (`docs/api-sketch.md`). The HTTP
+push transport and the receive endpoint of `ostrya serve` are still to
+come.
 
 Pull over ssh follows push as separate work.
 

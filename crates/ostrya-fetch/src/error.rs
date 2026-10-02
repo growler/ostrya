@@ -68,4 +68,18 @@ pub enum Error {
     /// carry, or a fetch URL whose scheme is neither `http` nor `https`.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// An upload failed after hyper took its request: the connection failed
+    /// while the request or the response head was in transit, the body
+    /// failed because its writer was dropped or a frame of it waited past the
+    /// stall window, or no response head arrived within the response window.
+    /// The server can have received the whole request and acted on it, so
+    /// the outcome is unknown, and the fetcher does not send the request
+    /// again.
+    #[error("upload to {url} interrupted: {message}")]
+    UploadInterrupted {
+        /// The URL the request was sent to.
+        url: String,
+        /// What ended the upload.
+        message: String,
+    },
 }

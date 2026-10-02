@@ -1229,6 +1229,9 @@ stand.
   `error: Requested signature type is not implemented`. Because the tool
   carries no `gpg` engine here, `--gpg-sign` and `--sign --sign-type=gpg`
   cannot be compared tool-side at all, and no cell states that comparison.
+  Under `--sign-type=gpg` the port resolves each `--sign` and
+  `--sign-from-file` key as it resolves a `--gpg-sign` selector, before the
+  first signature, and gives the same refusals.
 - A `--sign-from-file` file whose first line is empty, and a file with no bytes
   at all, both die on a signal in the tool: the first prints a GLib assertion
   about `g_base64_decode_inplace` and ends on SIGSEGV (exit 139), the second
@@ -3243,10 +3246,10 @@ support needs its own design pass against that refusal.
 
 ## Port extensions with no counterpart in the tool
 
-The tool has no push. `receive` and `push` are commands of the port alone,
-so no matrix cell compares them with the tool. The receiving repository
-stays a normal repository: the tool reads it, checks it with `ostree fsck`,
-and pulls from it with `ostree pull-local`.
+The tool has no push. `receive`, `push`, and `push-tree` are commands of
+the port alone, so no matrix cell compares them with the tool. The
+receiving repository stays a normal repository: the tool reads it, checks
+it with `ostree fsck`, and pulls from it with `ostree pull-local`.
 
 ### `receive`
 
@@ -3330,6 +3333,84 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
 - When the command cannot write a ref line to standard output, it writes
   `error: MESSAGE` to standard error and exits 1. The refs of the server
   have changed at that point.
+
+### `push-tree`
+
+```text
+ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
+                 [-s SUBJECT] [-m BODY] [--body-file=FILE]
+                 [--add-metadata-string=KEY=VALUE]... [--add-metadata=KEY=VALUE]...
+                 [--add-detached-metadata-string=KEY=VALUE]...
+                 [--timestamp=TIME] [--parent=CHECKSUM|none] [--no-bindings]
+                 [--owner-uid=UID] [--owner-gid=GID] [--canonical-permissions]
+                 [--sign=KEY]... [--sign-from-file=FILE]... [--sign-type=ENGINE]
+                 [--gpg-sign=KEYID]... [--gpg-homedir=DIR]
+                 [--force] [--compress[=LEVEL]]
+                 [--ssh-command=CMD] [--receive-command=CMD]
+```
+
+- The `push` feature of `ostrya-cli` builds the command. It is in the
+  default set.
+- The command walks the directory `DIR`, builds one commit over it, sends
+  the objects that the server does not hold, and sets each `-b` ref of the
+  server to the commit in one transaction.
+- The option names and value forms are those of `commit`. Each `-b` names
+  one more target ref of the server.
+- The command reads `--owner-uid` and `--owner-gid` first, as `commit`
+  does. It refuses a bad value before every other check.
+- The command then checks its operands, before it opens a repository. With
+  no `REMOTE` it writes the usage text and `error: REMOTE must be
+  specified`. With no `DIR` it writes the usage text and `error: DIR must be
+  specified`. With no `-b` it writes the usage text and `error: A branch
+  must be specified with --branch`. Each exits 1, and no ssh client starts.
+- The command then reads `--parent`, the metadata options, `--timestamp`,
+  the signing keys, and `--body-file`, in this order. For a `--gpg-sign`
+  key, and for a `--sign` or `--sign-from-file` key under
+  `--sign-type=gpg`, it looks up the secret key in the GnuPG home
+  directory. It refuses a bad value before it opens a repository, before
+  the walk, and before the ssh client starts.
+- `REMOTE` is an ssh address, or a remote name that the config of the
+  local repository holds with a push address. The command reads the local
+  repository for a remote name alone, from `--repo`, then the current
+  directory, then `OSTREE_REPO`. For an address the command opens no
+  repository, and it ignores `--repo`.
+- `--parent` takes a full commit checksum of 64 lowercase hex characters,
+  or `none`. Without it, the parent is the commit of the first `-b` ref on
+  the server, or no parent when the server does not hold that ref.
+- The command refuses a `-b` name that holds `:` or `^`, a name that the
+  ref-name rule refuses, and a name given twice. It refuses a name of 64
+  lowercase hex characters with the wording of `commit`.
+- The metadata dict holds every `--add-metadata-string` entry, then every
+  `--add-metadata` entry, then the binding keys. `ostree.ref-binding`
+  holds the `-b` names sorted. `ostree.collection-binding` holds the
+  collection id of the server, when the server has one. An empty key is
+  refused in the metadata dict and in the detached metadata dict.
+- `--owner-uid`, `--owner-gid`, and `--canonical-permissions` have the
+  meaning they have in `commit`, and they apply to the root directory too.
+  `--canonical-permissions` beside a non-zero owner id is refused with the
+  wording of `commit`.
+- The signatures follow the order of `commit`: every `--sign` key, then
+  every `--sign-from-file` key, then every `--gpg-sign` key. Both
+  `--sign` and `--sign-from-file` take more than one value.
+- `--force`, `--compress`, `--ssh-command`, and `--receive-command` have the
+  meaning they have in `push`.
+- The command does not apply `[ex-ostrya] detached-metadata-exclude`.
+- On success the command writes the commit checksum as one line to
+  standard output and exits 0. Under `-v` it writes the statistics line of
+  `push` to standard error.
+- On failure the command writes `error: MESSAGE` to standard error and
+  nothing to standard output, and exits 1. A refusal of the server gives
+  its wire code first, for example `error: mode-refused: ...`.
+- The commit checksum equals the checksum of `ostree commit --no-xattrs`
+  over the same tree with the same options, and of `ostree commit
+  --no-xattrs -b R1 --bind-ref R2` for two refs. With
+  `--add-detached-metadata-string` and distinct ed25519 `--sign` and
+  `--sign-from-file` keys, the `.commitmeta` bytes on the server equal the
+  bytes that the tool writes. The server keeps one copy of a signature
+  that it gets twice, so a key given twice gives one signature on the
+  server, where the tool writes two. Each test that compares the two runs
+  the tool with the same `SOURCE_DATE_EPOCH`, in
+  `crates/ostrya-cli/tests/push_ssh.rs`.
 
 ### ssh access with `authorized_keys`
 

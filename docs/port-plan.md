@@ -7046,20 +7046,21 @@ them.
 
 The `push` feature of `ostrya` is `push = ["dep:ostrya-push"]`. It turns on
 the optional dependency on `ostrya-push`, which the `receive` feature also
-turns on, and it adds no other dependency. Under it, `ostrya::push`
-re-exports `ostrya-push`, and `resolve_push_remote` gives the push address
-and the connect options of a configured remote or of an address.
-`Repo::push` pushes the commits of a set of refspecs to a remote over ssh.
-`Repo::push_over_stream` runs the same push over a pair of byte streams.
-Both take the options of `RepoPushOptions`. The push holds the lock of the
-local repository shared for the whole push. It reads the commits before the
-session opens, and it offers the commits first. It then offers the trees of
-the new values and of the history commits that the server lacks
-(`docs/api-sketch.md`, "Push from a repository"). The push
-keys of a remote section, `push-url`, `ssh-command`, and `receive-command`,
-are read through `Remote` in every build. `ostrya-cli` has the feature
-`push = ["ostrya/push"]` in its default set, which builds `ostrya push`,
-beside `receive = ["ostrya/receive"]`, which builds `ostrya receive`.
+turns on, and it adds no other dependency. Under it, `ostrya::push` re-exports
+`ostrya-push`, and `resolve_push_remote` gives the push address and the
+connect options of a configured remote or of an address. `is_push_address`
+tells an address from a remote name. `Repo::push` pushes the commits of a set
+of refspecs to a remote over ssh. `Repo::push_over_stream` runs the same push
+over a pair of byte streams. Both take the options of `RepoPushOptions`. The
+push holds the lock of the local repository shared for the whole push. It
+reads the commits before the session opens, and it offers the commits first.
+It then offers the trees of the new values and of the history commits that the
+server lacks (`docs/api-sketch.md`, "Push from a repository"). The push keys
+of a remote section, `push-url`, `ssh-command`, and `receive-command`, are
+read through `Remote` in every build. `ostrya-cli` has the feature
+`push = ["ostrya/push"]` in its default set, which builds `ostrya push` and
+`ostrya push-tree`, beside `receive = ["ostrya/receive"]`, which builds
+`ostrya receive`.
 
 Status: the ssh half is done. `ostrya push` pushes the commits of a set of
 refspecs over ssh and prints one line for each ref
@@ -7072,8 +7073,11 @@ done: `ostrya::push::push_tree` and `push_tree_over_stream` walk and hash a
 local directory, build and sign one commit over it, and set the target refs
 in one session (`docs/api-sketch.md`, "Tree push"). The commit checksum
 equals that of `Transaction::write_commit` over the same tree with the same
-inputs. The `ostrya push-tree` command, the HTTP transport, and
-`ostrya serve` are still to come.
+inputs. `ostrya push-tree` pushes a local directory over ssh as one commit
+and prints the commit checksum (`docs/conformance/cli-surface.md`, "Port
+extensions with no counterpart in the tool"). Its commit checksum equals
+the checksum of `ostree commit --no-xattrs` over the same tree with the same
+options. The HTTP transport and `ostrya serve` are still to come.
 
 Pull over ssh follows push as separate work.
 
@@ -7081,6 +7085,21 @@ Verify: push between two port repositories over ssh to localhost and over
 HTTP. The receiving repository passes `ostree fsck` and resolves the pushed
 refs. A tree push with one target ref gives the commit checksum that
 `ostree commit` gives for the same tree and inputs.
+
+Result of the ssh half: `crates/ostrya-cli/tests/push_ssh.rs` runs `ostrya
+push-tree` over a stand-in ssh client with `SOURCE_DATE_EPOCH` set on both
+sides. With one `-b`, a subject, a body, and metadata options, the commit
+checksum equals the checksum of `ostree commit --no-xattrs -b main` with the
+same options, and a second push equals a second commit of the tool. With
+two refs it equals the checksum of `ostree commit --no-xattrs -b r1
+--bind-ref r2`. `--canonical-permissions` and `--owner-uid=0
+--owner-gid=0` each give the commit of the tool with the same options, and
+so do `--body-file` alone and beside `-m`, `--parent=none`, `--parent`
+with a commit, `--no-bindings`, and an explicit `--timestamp`. With
+`--add-detached-metadata-string` and three distinct ed25519 keys from
+`--sign` and `--sign-from-file`, the `.commitmeta` bytes equal those of the
+tool. A push signed with ed25519 verifies with `ostree sign --verify` in
+the receiving repository, and `ostree fsck` passes on each receiver.
 
 ### Phase 20 -- Sysroot / deployment (optional, separate track)
 

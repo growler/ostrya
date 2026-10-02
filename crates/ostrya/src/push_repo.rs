@@ -1,7 +1,8 @@
 //! The client side of a push from a repository.
 //!
 //! Behind the `push` feature. [`resolve_push_remote`] gives the push address
-//! and the connect options of a configured remote or of an address.
+//! and the connect options of a configured remote or of an address, and
+//! [`is_push_address`] tells the two apart.
 //! [`Repo::push`](crate::Repo::push) and
 //! [`Repo::push_over_stream`](crate::Repo::push_over_stream) push the commits
 //! of a set of refspecs with the options of [`RepoPushOptions`]. The
@@ -20,12 +21,21 @@ use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::push::{ConnectOptions, PushRemote};
 
+/// Whether `remote` is a push address rather than the name of a remote
+/// section: it holds a `:` or a `/`.
+///
+/// [`resolve_push_remote`] reads no configuration for such a value, so a
+/// caller can leave the local repository unopened.
+pub fn is_push_address(remote: &str) -> bool {
+    remote.contains([':', '/'])
+}
+
 /// The push address of `remote`, and `connect` with the push keys of the
 /// remote section added.
 ///
-/// `remote` is an address when it holds a `:` or a `/`, and it is parsed
-/// with [`PushRemote::parse`]. Otherwise it is the name of a remote section
-/// of `config`. The address of a remote section is its `push-url`. When
+/// `remote` is an address when [`is_push_address`] holds for it, and it is
+/// parsed with [`PushRemote::parse`]. Otherwise it is the name of a remote
+/// section of `config`. The address of a remote section is its `push-url`. When
 /// `push-url` is absent, a `url` that starts with `http://` or `https://` is
 /// the address. A `url` of another form, for example `file://`, `metalink=`,
 /// or `mirrorlist=`, is no push address. `url` is read only when `push-url`
@@ -46,7 +56,7 @@ pub fn resolve_push_remote(
     remote: &str,
     mut connect: ConnectOptions,
 ) -> Result<(PushRemote, ConnectOptions)> {
-    if remote.contains([':', '/']) {
+    if is_push_address(remote) {
         return Ok((PushRemote::parse(remote)?, connect));
     }
     let section = config
@@ -113,6 +123,24 @@ mod tests {
                 assert!(msg.contains(needle), "{msg:?} lacks {needle:?}")
             }
             other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_address_holds_a_colon_or_a_slash() {
+        for address in [
+            "host:srv/repo",
+            "host:",
+            ":repo",
+            "srv/repo",
+            "/srv/repo",
+            "ssh://host/srv/repo",
+            "https://ex.com/r",
+        ] {
+            assert!(is_push_address(address), "{address}");
+        }
+        for name in ["origin", "my-remote", "a.b", "", "with space"] {
+            assert!(!is_push_address(name), "{name:?}");
         }
     }
 

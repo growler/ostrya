@@ -48,6 +48,8 @@
 //!   standard input and standard output. The `receive` feature builds it.
 //! - `push` -- push commits of the repository to a remote over ssh, and
 //!   update its refs. The `push` feature builds it.
+//! - `push-tree` -- push a directory to a remote over ssh as one commit, and
+//!   set its refs to that commit. The `push` feature builds it.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams from stdin flow through
@@ -164,6 +166,10 @@ enum Command {
     /// Push commits to a remote over ssh and update its refs.
     #[cfg(feature = "push")]
     Push(PushArgs),
+    /// Push a directory to a remote over ssh as one commit and set its refs.
+    #[cfg(feature = "push")]
+    #[command(name = "push-tree")]
+    PushTree(PushTreeArgs),
 }
 
 impl Command {
@@ -197,6 +203,8 @@ impl Command {
         "receive",
         #[cfg(feature = "push")]
         "push",
+        #[cfg(feature = "push")]
+        "push-tree",
     ];
 
     /// The name `clap` registered this subcommand under, which the error paths
@@ -227,6 +235,8 @@ impl Command {
             Command::Receive(_) => "receive",
             #[cfg(feature = "push")]
             Command::Push(_) => "push",
+            #[cfg(feature = "push")]
+            Command::PushTree(_) => "push-tree",
         }
     }
 }
@@ -1424,6 +1434,110 @@ struct PushArgs {
     refspecs: Vec<String>,
 }
 
+#[cfg(feature = "push")]
+#[derive(Args)]
+struct PushTreeArgs {
+    /// A target ref of the server. Repeatable, and each occurrence names one
+    /// more ref that the commit sets. At least one is required.
+    #[arg(short = 'b', long, value_name = "REF")]
+    branch: Vec<String>,
+    /// The commit subject.
+    #[arg(short, long)]
+    subject: Option<String>,
+    /// The commit body. Given more than once, the last value wins.
+    #[arg(short = 'm', long, value_name = "BODY", overrides_with = "body")]
+    body: Option<String>,
+    /// Read the commit body from this file, which wins over --body.
+    #[arg(short = 'F', long, value_name = "FILE", overrides_with = "body_file")]
+    body_file: Option<PathBuf>,
+    /// Add a string-valued key to the commit metadata.
+    #[arg(long, value_name = "KEY=VALUE")]
+    add_metadata_string: Vec<String>,
+    /// Add a key to the commit metadata, its value in the GVariant text form.
+    #[arg(long, value_name = "KEY=VALUE")]
+    add_metadata: Vec<String>,
+    /// Add a string-valued key to the detached commit metadata.
+    #[arg(long, value_name = "KEY=VALUE")]
+    add_detached_metadata_string: Vec<String>,
+    /// Override the timestamp of the commit: `@SECONDS` since the Unix epoch,
+    /// or a date and time carrying a UTC offset (`2020-01-02T03:04:05Z`).
+    #[arg(long, value_name = "TIMESTAMP")]
+    timestamp: Option<String>,
+    /// The parent commit: its full checksum, 64 lowercase hex characters, or
+    /// `none` for a root commit. Absent, the commit of the first target ref on
+    /// the server is the parent.
+    #[arg(long, value_name = "CHECKSUM")]
+    parent: Option<String>,
+    /// Do not write any ref bindings.
+    #[arg(long)]
+    no_bindings: bool,
+    /// Set file ownership user id.
+    #[arg(long, value_name = "UID", allow_hyphen_values = true)]
+    owner_uid: Option<String>,
+    /// Set file ownership group id.
+    #[arg(long, value_name = "GID", allow_hyphen_values = true)]
+    owner_gid: Option<String>,
+    /// Force owner 0:0, canonicalize modes to `perm & 0755`, and drop xattrs,
+    /// for an owner- and host-independent commit.
+    #[arg(long)]
+    canonical_permissions: bool,
+    /// Sign the commit with this key: for ed25519 and spki, the base64 of the
+    /// secret key. Repeatable, and each occurrence adds one signature.
+    #[arg(long, value_name = "KEY_ID")]
+    sign: Vec<String>,
+    /// Sign the commit with the key on the first line of this file.
+    /// Repeatable, and each occurrence adds one signature.
+    #[arg(long, value_name = "PATH")]
+    sign_from_file: Vec<std::ffi::OsString>,
+    /// Signature type to use (defaults to 'ed25519'). Given more than once,
+    /// the last value wins.
+    #[arg(long, value_name = "NAME", overrides_with = "sign_type")]
+    sign_type: Option<String>,
+    /// GPG Key ID to sign the commit with. Repeatable, and each occurrence adds
+    /// one signature under `ostree.gpgsigs`.
+    #[arg(long, value_name = "KEY-ID")]
+    gpg_sign: Vec<String>,
+    /// GPG Homedir to use when looking for keyrings. Read by --gpg-sign and,
+    /// under --sign-type=gpg, by --sign and --sign-from-file. It wins over
+    /// GNUPGHOME.
+    #[arg(long, value_name = "HOMEDIR")]
+    gpg_homedir: Option<PathBuf>,
+    /// Set each target ref whatever its state on the server, and ask the
+    /// server to allow an update that is not a fast-forward. The receive
+    /// policy of the server still refuses a non-fast-forward update unless it
+    /// allows one.
+    #[arg(long)]
+    force: bool,
+    /// Send the content objects deflated at LEVEL, 1 to 9 (default 6).
+    /// Absent, the push sends them raw.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "6",
+        value_parser = clap::value_parser!(u8).range(1..=9)
+    )]
+    compress: Option<u8>,
+    /// The ssh command, split at ASCII whitespace. It wins over the
+    /// OSTRYA_SSH_COMMAND environment variable and over the `ssh-command` key
+    /// of the remote.
+    #[arg(long, value_name = "CMD")]
+    ssh_command: Option<String>,
+    /// The command the remote side runs, which the remote shell parses. It
+    /// wins over the `receive-command` key of the remote. The default is
+    /// `ostrya receive`.
+    #[arg(long, value_name = "CMD")]
+    receive_command: Option<String>,
+    /// The remote: an ssh address, or a `[remote "<name>"]` section with a
+    /// push address in the config of the repository that --repo, the current
+    /// directory, or OSTREE_REPO names. An address opens no repository.
+    /// Required.
+    remote: Option<String>,
+    /// The directory to commit. Required.
+    dir: Option<PathBuf>,
+}
+
 #[derive(Args)]
 struct PullLocalArgs {
     /// Write the pulled refs under this remote (`refs/remotes/<remote>/<ref>`)
@@ -1671,6 +1785,16 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             push(repo, name, verbose, args).await
         }
+        #[cfg(feature = "push")]
+        Command::PushTree(args) => {
+            // The owner ids are read first, as `commit` reads them, so a value
+            // the reader refuses stands ahead of every other check.
+            let owner = Owner {
+                uid: owner_id(args.owner_uid.as_deref(), "--owner-uid"),
+                gid: owner_id(args.owner_gid.as_deref(), "--owner-gid"),
+            };
+            push_tree(repo, verbose, name, args, owner).await
+        }
     }
 }
 
@@ -1716,26 +1840,12 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
     if args.refspecs.is_empty() {
         exit_with_error(name, "REFSPEC must be specified");
     }
-    let compression = match args.compress {
-        Some(level) => ostrya::push::Compression::Deflate { level },
-        None => ostrya::push::Compression::None,
-    };
-    let ssh_command = args.ssh_command.map(|command| {
-        command
-            .split_ascii_whitespace()
-            .map(str::to_owned)
-            .collect()
-    });
     let opts = ostrya::RepoPushOptions {
         refspecs: args.refspecs,
         depth: args.depth,
-        compression,
+        compression: push_compression(args.compress),
         force: args.force,
-        connect: ostrya::push::ConnectOptions {
-            ssh_command,
-            receive_command: args.receive_command,
-            ..Default::default()
-        },
+        connect: push_connect_options(args.ssh_command, args.receive_command),
         detached_metadata_filter: detached_metadata_filter(&repo)?,
         progress: None,
     };
@@ -1755,6 +1865,199 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
         eprintln!("{}", push_statistics_line(&outcome.stats));
     }
     Ok(())
+}
+
+/// The encoding of the content objects that `--compress` selects: `deflate`
+/// at the given level, or `raw` when the option is absent.
+#[cfg(feature = "push")]
+fn push_compression(level: Option<u8>) -> ostrya::push::Compression {
+    match level {
+        Some(level) => ostrya::push::Compression::Deflate { level },
+        None => ostrya::push::Compression::None,
+    }
+}
+
+/// The connect options of `--ssh-command` and `--receive-command`. The ssh
+/// command is split at ASCII whitespace.
+#[cfg(feature = "push")]
+fn push_connect_options(
+    ssh_command: Option<String>,
+    receive_command: Option<String>,
+) -> ostrya::push::ConnectOptions {
+    let ssh_command = ssh_command.map(|command| {
+        command
+            .split_ascii_whitespace()
+            .map(str::to_owned)
+            .collect()
+    });
+    ostrya::push::ConnectOptions {
+        ssh_command,
+        receive_command,
+        ..Default::default()
+    }
+}
+
+/// Push the directory DIR to a remote over ssh as one commit, and set each
+/// target ref of the server to it in one transaction.
+///
+/// The owner ids are read first, in `run`. The operands are checked next, in
+/// the order REMOTE, DIR, and `-b`, each with the usage text. The options the
+/// command reads itself are then checked, the signing keys included, before
+/// a repository opens, and the body file is read last. The push refuses the
+/// other bad refs before the scan, and both come before the ssh client
+/// starts. A remote name is looked up in the repository that `--repo`,
+/// the current directory, or `OSTREE_REPO` gives. An address opens no
+/// repository, so none of the three is read for it.
+///
+/// Standard output carries the commit checksum alone. Under `--verbose` one
+/// statistics line goes to standard error. A failure writes nothing to
+/// standard output.
+#[cfg(feature = "push")]
+async fn push_tree(
+    repo: Option<&Path>,
+    verbose: bool,
+    name: &str,
+    args: PushTreeArgs,
+    owner: Owner,
+) -> Result<()> {
+    let Some(remote) = args.remote.as_deref() else {
+        exit_with_error(name, "REMOTE must be specified");
+    };
+    let Some(dir) = args.dir.as_deref() else {
+        exit_with_error(name, "DIR must be specified");
+    };
+    if args.branch.is_empty() {
+        exit_with_error(name, "A branch must be specified with --branch");
+    }
+    macro_rules! refuse {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(message) => exit_error(&message),
+            }
+        };
+    }
+    if let Some(message) = canonical_owner_conflict(args.canonical_permissions, owner) {
+        exit_error(&message);
+    }
+    // The ref rule of the push refuses `:`, `^`, a bad name, and a name given
+    // twice. A name that a revision reads as a checksum is refused here, with
+    // the wording of `commit`.
+    for branch in &args.branch {
+        if let Some(message) = shadowed_branch_name(branch) {
+            exit_error(&message);
+        }
+    }
+    // The server resolves no revision, so the parent is a full checksum.
+    let parent = match args.parent.as_deref() {
+        None => ostrya::push::ParentPolicy::CurrentTip,
+        Some(NO_PARENT) => ostrya::push::ParentPolicy::None,
+        Some(text) => match Checksum::from_hex_lower(text) {
+            Ok(checksum) => ostrya::push::ParentPolicy::Commit(checksum),
+            Err(_) => exit_error(&format!(
+                "Invalid --parent '{text}': give a commit checksum of 64 lowercase hex \
+                 characters, or none"
+            )),
+        },
+    };
+    let strings = refuse!(metadata_pairs(&args.add_metadata_string));
+    let variants = refuse!(parse_added_metadata(&args.add_metadata));
+    let detached_pairs = refuse!(metadata_pairs(&args.add_detached_metadata_string));
+    let metadata = refuse!(user_metadata_entries(&strings, &variants));
+    let detached_metadata = refuse!(user_metadata_entries(&detached_pairs, &[]));
+    let timestamp = match args.timestamp.as_deref() {
+        Some(text) => match parse_timestamp(text) {
+            Some(seconds) => Some(seconds),
+            None => exit_error(&format!("Could not parse '{text}'")),
+        },
+        None => None,
+    };
+    let signers = refuse!(
+        collect_signers(
+            &args.sign,
+            &args.sign_from_file,
+            args.sign_type.as_deref(),
+            &args.gpg_sign,
+            args.gpg_homedir.as_deref(),
+        )
+        .await?
+    );
+    // The body file can be large, so it is read after the other checks.
+    let body = match args.body_file.as_deref() {
+        Some(path) => Some(refuse!(read_body_file(path))),
+        None => args.body,
+    };
+    let connect = push_connect_options(args.ssh_command, args.receive_command);
+    let (address, connect) = if ostrya::is_push_address(remote) {
+        ostrya::resolve_push_remote(None, remote, connect)?
+    } else {
+        let (repo, _) = resolve_repo(repo, verbose, name).await;
+        ostrya::resolve_push_remote(Some(repo.config()), remote, connect)?
+    };
+    let opts = ostrya::push::TreePushOptions {
+        refs: args.branch,
+        parent,
+        subject: args.subject,
+        body,
+        metadata,
+        detached_metadata,
+        timestamp,
+        no_bindings: args.no_bindings,
+        signers,
+        compression: push_compression(args.compress),
+        entry_filter: tree_push_filter(owner, args.canonical_permissions),
+        hash_jobs: None,
+        force: args.force,
+        progress: None,
+    };
+    let outcome = ostrya::push::push_tree(&address, dir, connect, opts).await?;
+    let commit = outcome.commit.expect("a tree push names its commit");
+    // The refs are written on the remote at this point. A failed write to
+    // standard output, a full device or a closed pipe, is reported as the
+    // error line of `main` and exits 1.
+    {
+        use std::io::Write;
+        let mut out = std::io::stdout().lock();
+        writeln!(out, "{commit}").map_err(Error::Io)?;
+        out.flush().map_err(Error::Io)?;
+    }
+    if verbose {
+        eprintln!("{}", push_statistics_line(&outcome.stats));
+    }
+    Ok(())
+}
+
+/// The entry filter of `--owner-uid`, `--owner-gid`, and
+/// `--canonical-permissions`, or `None` where none of them is set.
+///
+/// The filter keeps every entry, the root included, and applies the rule of
+/// `commit`: the canonical reduction first, which sets the owner to 0:0,
+/// empties the extended attributes, and reduces the mode of each entry other
+/// than a symlink to its file type and `perm & 0755`, and then each declared
+/// id.
+#[cfg(feature = "push")]
+fn tree_push_filter(owner: Owner, canonical: bool) -> Option<ostrya::push::tree::EntryFilter> {
+    use ostrya::push::tree::{EntryAction, EntryKind};
+    if !canonical && owner == Owner::default() {
+        return None;
+    }
+    Some(Box::new(move |_path, meta| {
+        if canonical {
+            meta.uid = 0;
+            meta.gid = 0;
+            meta.xattrs = Xattrs::empty();
+            if meta.kind != EntryKind::Symlink {
+                meta.mode = (meta.mode & S_IFMT) | (meta.mode & 0o755);
+            }
+        }
+        if let Some(uid) = owner.uid {
+            meta.uid = uid;
+        }
+        if let Some(gid) = owner.gid {
+            meta.gid = gid;
+        }
+        EntryAction::Keep
+    }))
 }
 
 /// The line `push` prints for one ref: the name, the commit before the write
@@ -3078,17 +3381,10 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         exit_error("A branch must be specified with --branch, or use --orphan");
     }
 
-    // Canonical ingest owns every object 0:0, so a declared non-zero id would
-    // contradict it. The tool refuses the pair after the branch check and ahead
-    // of the tree, and names the flag whose id it read, uid first.
-    if args.canonical_permissions {
-        for (id, flag) in [(owner.uid, "--owner-uid"), (owner.gid, "--owner-gid")] {
-            if id.is_some_and(|id| id != 0) {
-                exit_error(&format!(
-                    "Cannot specify both --canonical-permissions and non-zero {flag}"
-                ));
-            }
-        }
+    // The tool refuses `--canonical-permissions` beside a non-zero owner id
+    // after the branch check and ahead of the tree.
+    if let Some(message) = canonical_owner_conflict(args.canonical_permissions, owner) {
+        exit_error(&message);
     }
 
     // Every refusal from here to the transaction below stands ahead of the
@@ -3433,6 +3729,20 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     Ok(())
 }
 
+/// The refusal of `--canonical-permissions` beside a declared non-zero owner
+/// id, or `None` where the options agree. Canonical ingest owns every object
+/// 0:0, so a declared non-zero id would contradict it. The refusal names the
+/// flag whose id was read, uid first.
+fn canonical_owner_conflict(canonical: bool, owner: Owner) -> Option<String> {
+    if !canonical {
+        return None;
+    }
+    [(owner.uid, "--owner-uid"), (owner.gid, "--owner-gid")]
+        .into_iter()
+        .find(|(id, _)| id.is_some_and(|id| id != 0))
+        .map(|(_, flag)| format!("Cannot specify both --canonical-permissions and non-zero {flag}"))
+}
+
 /// The `--sign-type` name in force when the option is absent, and the one name
 /// the tool's own build carries.
 const DEFAULT_SIGN_TYPE: &str = "ed25519";
@@ -3447,23 +3757,55 @@ const ED25519_SECRET_LEN: usize = 64;
 /// conventions"). A longer first line is refused rather than cut.
 const SIGN_KEY_FILE_LIMIT: u64 = 64 * 1024;
 
-/// Sign the staged commit with every key the signing options name.
+/// Sign the staged commit with every key the signing options name, in the
+/// order of [`collect_signers`].
 ///
 /// The step runs after the commit object is staged and before the ref write and
 /// the publication, so a refusal here leaves no object in `objects/` and the ref
 /// where it stood, and a run naming several keys is all or nothing
 /// (`docs/format-reference.md`, "Signing details").
-///
-/// The order the signatures take is fixed and does not follow the command line:
-/// every `--sign` key first, then every `--sign-from-file` key, then every
-/// `--gpg-sign` key. `--sign-type` selects the engine of the first two groups
-/// alone and is read only when one of them names a key, so a name no engine
-/// carries passes unremarked through a run that signs nothing.
 async fn sign_staged_commit(
     txn: &Transaction,
     checksum: &Checksum,
     args: &CommitArgs,
 ) -> Result<std::result::Result<(), String>> {
+    let signers = match collect_signers(
+        &args.sign,
+        &args.sign_from_file,
+        args.sign_type.as_deref(),
+        &args.gpg_sign,
+        args.gpg_homedir.as_deref(),
+    )
+    .await?
+    {
+        Ok(signers) => signers,
+        Err(message) => return Ok(Err(message)),
+    };
+    for signer in &signers {
+        txn.sign_commit(checksum, signer.as_ref()).await?;
+    }
+    Ok(Ok(()))
+}
+
+/// One signer for each key the signing options name, all built before any
+/// signature is made.
+///
+/// The order is fixed and does not follow the command line: every `--sign` key
+/// first, then every `--sign-from-file` key, then every `--gpg-sign` key.
+/// `sign_type` selects the engine of the first two groups alone and is read
+/// only when one of them names a key, so a name no engine carries passes
+/// unremarked through a run that signs nothing. A key that does not decode, a
+/// key file that does not read, and a gpg selector that does not name exactly
+/// one secret key are each refused here, so a refusal comes before the first
+/// signature. A gpg selector is a `--gpg-sign` key, or a `--sign` or
+/// `--sign-from-file` key under `--sign-type=gpg`.
+async fn collect_signers(
+    sign: &[String],
+    sign_from_file: &[std::ffi::OsString],
+    sign_type: Option<&str>,
+    gpg_sign: &[String],
+    gpg_homedir: Option<&Path>,
+) -> Result<std::result::Result<Vec<Box<dyn Signer>>, String>> {
     macro_rules! refuse {
         ($result:expr) => {
             match $result {
@@ -3472,27 +3814,32 @@ async fn sign_staged_commit(
             }
         };
     }
-    if !args.sign.is_empty() || !args.sign_from_file.is_empty() {
-        let engine = refuse!(sign_type_from_name(
-            args.sign_type.as_deref().unwrap_or(DEFAULT_SIGN_TYPE)
-        ));
-        let homedir = args.gpg_homedir.as_deref();
-        for key in &args.sign {
-            let signer = refuse!(sign_api_signer(engine, key.as_bytes(), homedir));
-            txn.sign_commit(checksum, signer.as_ref()).await?;
-        }
-        for path in &args.sign_from_file {
-            let key = refuse!(read_sign_key_file(Path::new(path)));
-            let signer = refuse!(sign_api_signer(engine, &key, homedir));
-            txn.sign_commit(checksum, signer.as_ref()).await?;
+    let mut signers = Vec::with_capacity(sign.len() + sign_from_file.len() + gpg_sign.len());
+    if !sign.is_empty() || !sign_from_file.is_empty() {
+        let engine = refuse!(sign_type_from_name(sign_type.unwrap_or(DEFAULT_SIGN_TYPE)));
+        if engine == SignType::Gpg {
+            signers.extend(refuse!(resolve_gpg_selectors(sign, gpg_homedir).await?));
+            for path in sign_from_file {
+                let key = refuse!(read_sign_key_file(Path::new(path)));
+                let key = [String::from_utf8_lossy(&key).into_owned()];
+                signers.extend(refuse!(resolve_gpg_selectors(&key, gpg_homedir).await?));
+            }
+        } else {
+            for key in sign {
+                signers.push(refuse!(sign_api_signer(
+                    engine,
+                    key.as_bytes(),
+                    gpg_homedir
+                )));
+            }
+            for path in sign_from_file {
+                let key = refuse!(read_sign_key_file(Path::new(path)));
+                signers.push(refuse!(sign_api_signer(engine, &key, gpg_homedir)));
+            }
         }
     }
-    let signers =
-        refuse!(resolve_gpg_selectors(&args.gpg_sign, args.gpg_homedir.as_deref()).await?);
-    for signer in &signers {
-        txn.sign_commit(checksum, signer.as_ref()).await?;
-    }
-    Ok(Ok(()))
+    signers.extend(refuse!(resolve_gpg_selectors(gpg_sign, gpg_homedir).await?));
+    Ok(Ok(signers))
 }
 
 /// The shortest `--gpg-sign` selector the key lookup accepts, in bytes. A
@@ -8968,22 +9315,7 @@ fn commit_metadata_dict(
     added_variants: &[(&str, Value)],
     kept: &[(String, Value)],
 ) -> std::result::Result<Value, String> {
-    let mut entries = Vec::with_capacity(added_strings.len() + added_variants.len() + kept.len());
-    for (key, value) in added_strings {
-        if key.is_empty() {
-            return Err("Empty metadata key".to_owned());
-        }
-        entries.push((
-            (*key).to_owned(),
-            Value::variant(Type::Str, Value::Str((*value).to_owned())),
-        ));
-    }
-    for (key, value) in added_variants {
-        if key.is_empty() {
-            return Err("Empty metadata key".to_owned());
-        }
-        entries.push(((*key).to_owned(), value.clone()));
-    }
+    let mut entries = user_metadata_entries(added_strings, added_variants)?;
     entries.extend(kept.iter().cloned());
     let refs: Vec<&str> = args
         .branch
@@ -8998,6 +9330,31 @@ fn commit_metadata_dict(
         (!args.no_bindings).then_some(refs.as_slice()),
         repo.config().collection_id(),
     ))
+}
+
+/// The metadata entries of `--add-metadata-string` and `--add-metadata`, in
+/// two groups whatever the command-line order: every string entry in
+/// command-line order, then every variant entry. Each value is a variant, and
+/// duplicate keys are kept as duplicates. An empty key is refused.
+fn user_metadata_entries(
+    strings: &[(&str, &str)],
+    variants: &[(&str, Value)],
+) -> std::result::Result<Vec<(String, Value)>, String> {
+    let mut entries = Vec::with_capacity(strings.len() + variants.len());
+    let strings = strings.iter().map(|(key, value)| {
+        (
+            *key,
+            Value::variant(Type::Str, Value::Str((*value).to_owned())),
+        )
+    });
+    let variants = variants.iter().map(|(key, value)| (*key, value.clone()));
+    for (key, value) in strings.chain(variants) {
+        if key.is_empty() {
+            return Err("Empty metadata key".to_owned());
+        }
+        entries.push((key.to_owned(), value));
+    }
+    Ok(entries)
 }
 
 /// The detached metadata dict `--add-detached-metadata-string` writes, or `None`
@@ -10017,5 +10374,144 @@ mod tests {
             push_statistics_line(&stats),
             "12 objects offered, 5 needed, 4 sent; 2048 bytes sent in 1.250 seconds"
         );
+    }
+
+    /// The metadata entries of `push-tree` keep the two groups of `commit`:
+    /// every `--add-metadata-string` before every `--add-metadata`, whatever
+    /// the command-line order. An empty key is refused in either group.
+    #[cfg(feature = "push")]
+    #[test]
+    fn the_tree_push_metadata_puts_the_strings_before_the_variants() {
+        let cli = Cli::try_parse_from([
+            "ostrya",
+            "push-tree",
+            "--add-metadata=n=uint32 1",
+            "--add-metadata-string=a=x",
+            "--add-metadata=m='y'",
+            "--add-metadata-string=b=z",
+            "host:repo",
+            "dir",
+            "-b",
+            "main",
+        ])
+        .unwrap();
+        let Some(Command::PushTree(args)) = cli.command else {
+            panic!("not push-tree")
+        };
+        let strings = metadata_pairs(&args.add_metadata_string).unwrap();
+        let variants = parse_added_metadata(&args.add_metadata).unwrap();
+        let entries = user_metadata_entries(&strings, &variants).unwrap();
+        let keys: Vec<&str> = entries.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["a", "b", "n", "m"]);
+        assert_eq!(
+            entries[0].1,
+            Value::variant(Type::Str, Value::Str("x".into()))
+        );
+        assert_eq!(entries[2].1, Value::variant(Type::U32, Value::U32(1)));
+
+        let variant = Value::variant(Type::Str, Value::Str("v".into()));
+        for (strings, variants) in [
+            (vec![("", "v")], vec![]),
+            (vec![("k", "v")], vec![("", variant.clone())]),
+        ] {
+            assert_eq!(
+                user_metadata_entries(&strings, &variants).unwrap_err(),
+                "Empty metadata key"
+            );
+        }
+        assert!(user_metadata_entries(&[], &[]).unwrap().is_empty());
+    }
+
+    /// The filter of `push-tree` reduces the mode of a file and of a
+    /// directory to `perm & 0755` under `--canonical-permissions`, keeps the
+    /// mode of a symlink, sets the owner to 0:0, and then applies each
+    /// declared id. The root sees the filter too. With no option set there is
+    /// no filter.
+    #[cfg(feature = "push")]
+    #[test]
+    fn the_tree_push_filter_applies_the_canonical_rule_then_the_owner() {
+        use ostrya::push::tree::{EntryAction, EntryFilter, EntryMeta, ScanOptions, TreeModel};
+
+        assert!(tree_push_filter(Owner::default(), false).is_none());
+        let root = std::env::temp_dir().join(format!(
+            "ostrya-cli-tree-push-filter-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("file"), b"file").unwrap();
+        std::os::unix::fs::symlink("file", root.join("link")).unwrap();
+        let mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        mode(&root.join("file"), 0o664);
+        mode(&root.join("dir"), 0o2775);
+        mode(&root, 0o775);
+
+        let scan = |owner: Owner, canonical: bool| -> Vec<(String, EntryMeta)> {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let record = seen.clone();
+            let mut inner = tree_push_filter(owner, canonical).unwrap();
+            let filter: EntryFilter = Box::new(move |path, meta| {
+                let action = inner(path, meta);
+                assert_eq!(action, EntryAction::Keep);
+                record
+                    .lock()
+                    .unwrap()
+                    .push((path.to_string(), meta.clone()));
+                action
+            });
+            let options = ScanOptions {
+                entry_filter: Some(filter),
+                hash_jobs: None,
+            };
+            ostrya_rt::block_on(TreeModel::scan(&root, options)).unwrap();
+            let mut seen = seen.lock().unwrap().clone();
+            seen.sort_by(|a, b| a.0.cmp(&b.0));
+            seen
+        };
+
+        let seen = scan(Owner::default(), true);
+        let modes: Vec<(&str, u32)> = seen.iter().map(|(p, m)| (p.as_str(), m.mode)).collect();
+        assert_eq!(
+            modes,
+            [
+                ("", 0o40755),
+                ("dir", 0o40755),
+                ("file", 0o100644),
+                ("link", 0o120777)
+            ]
+        );
+        assert!(seen.iter().all(|(_, m)| m.uid == 0 && m.gid == 0));
+        assert!(seen.iter().all(|(_, m)| m.xattrs.is_empty()));
+
+        let seen = scan(
+            Owner {
+                uid: Some(7),
+                gid: Some(9),
+            },
+            true,
+        );
+        assert!(
+            seen.iter().all(|(_, m)| m.uid == 7 && m.gid == 9),
+            "{seen:?}"
+        );
+        assert_eq!(seen[2].1.mode, 0o100644);
+
+        // The owner options alone leave the mode and an undeclared id as the
+        // walk read them.
+        let gid = std::os::unix::fs::MetadataExt::gid(&std::fs::metadata(&root).unwrap());
+        let seen = scan(
+            Owner {
+                uid: Some(0),
+                gid: None,
+            },
+            false,
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(seen[2].1.mode, 0o100664);
+        assert_eq!(seen[1].1.mode, 0o42775);
+        assert!(seen.iter().all(|(_, m)| m.uid == 0), "{seen:?}");
+        assert_eq!(seen[0].1.gid, gid);
     }
 }

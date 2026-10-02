@@ -2750,12 +2750,14 @@ the target refs of the server to it in one transaction.
   ref that fails `ostrya_core::is_ref_name`, a DEFLATE level outside 1
   through 9, a malformed `SOURCE_DATE_EPOCH` when `timestamp` is not set, an
   empty key in `metadata` or in `detached_metadata`, entries that do not
-  serialize as an `a{sv}` dict, and entries whose serialized dict is over
-  `MAX_METADATA_SIZE`. A revision reads `^` as the parent of a commit, so a
-  ref that holds it cannot be read back by its name. The timestamp is read
-  here. `push_tree` then builds the
-  ssh command line, and refuses an `http://` or an `https://` remote and an
-  ssh command or a receive command that `PushSession::connect` refuses.
+  serialize as an `a{sv}` dict, entries whose serialized dict is over
+  `MAX_METADATA_SIZE`, and a subject, a body, and `metadata` whose commit
+  object is over `MAX_METADATA_SIZE` without the bindings and without a
+  parent of `ParentPolicy::CurrentTip`. A revision reads `^` as the parent
+  of a commit, so a ref that holds it cannot be read back by its name. The
+  timestamp is read here. `push_tree` then builds the ssh command line,
+  and refuses an `http://` or an `https://` remote and an ssh command or a
+  receive command that `PushSession::connect` refuses.
 - The scan is `TreeModel::scan` with `entry_filter` and `hash_jobs`. It runs
   before the ssh client starts and before the first byte is written. So a
   refusal of the options, a walk error, and a hash error start no ssh client
@@ -2827,6 +2829,65 @@ pub enum Error {
     Sign(ostrya_sign::Error),
 }
 ```
+
+`ostrya push-tree`, under the `push` feature of `ostrya-cli`, is the command
+form of `push_tree`:
+
+```text
+ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
+                 [-s SUBJECT] [-m BODY] [--body-file=FILE]
+                 [--add-metadata-string=KEY=VALUE]... [--add-metadata=KEY=VALUE]...
+                 [--add-detached-metadata-string=KEY=VALUE]...
+                 [--timestamp=TIME] [--parent=CHECKSUM|none] [--no-bindings]
+                 [--owner-uid=UID] [--owner-gid=GID] [--canonical-permissions]
+                 [--sign=KEY]... [--sign-from-file=FILE]... [--sign-type=ENGINE]
+                 [--gpg-sign=KEYID]... [--gpg-homedir=DIR]
+                 [--force] [--compress[=LEVEL]]
+                 [--ssh-command=CMD] [--receive-command=CMD]
+```
+
+- A missing `REMOTE`, `DIR`, or `-b` gives the usage text and `error:
+  REMOTE must be specified`, `error: DIR must be specified`, or `error: A
+  branch must be specified with --branch`, checked in that order after
+  `--owner-uid` and `--owner-gid` and before a repository opens. Each exits
+  1 before an ssh client starts.
+- `REMOTE` goes to `resolve_push_remote`. When `is_push_address` holds for
+  it, the command opens no repository and gives a `config` of `None`.
+  Otherwise the command opens the repository of `--repo`, the current
+  directory, or `OSTREE_REPO`, and gives its config.
+- `DIR` is `root`, and each `-b` is one of `refs`. The command refuses a
+  `-b` of 64 lowercase hex characters with the wording of `commit`, before
+  the library sees it.
+- `--parent=CHECKSUM` sets `parent` to `ParentPolicy::Commit`, with 64
+  lowercase hex characters, and `--parent=none` to `ParentPolicy::None`.
+  Without it, `parent` is `ParentPolicy::CurrentTip`.
+- `-s` sets `subject`. `-m` sets `body`, and `--body-file` wins over it.
+  `--timestamp` sets `timestamp`, read as `commit` reads it. `--no-bindings`
+  sets `no_bindings`.
+- `metadata` holds every `--add-metadata-string` entry, then every
+  `--add-metadata` entry, the order of `commit`. `detached_metadata` holds
+  every `--add-detached-metadata-string` entry. The command refuses an
+  empty key in either with `Empty metadata key`. It does not apply
+  `[ex-ostrya] detached-metadata-exclude`.
+- `--owner-uid`, `--owner-gid`, and `--canonical-permissions` set an
+  `entry_filter` that keeps every entry. The filter applies the canonical
+  rule first, then each declared id. Without the three options,
+  `entry_filter` is `None`.
+- `signers` holds one signer for each `--sign` key, then for each
+  `--sign-from-file` key, then for each `--gpg-sign` selector. Under
+  `--sign-type=gpg`, a `--sign` and a `--sign-from-file` key are gpg
+  selectors too. The command builds the list before the scan, and it looks
+  up the secret key of each gpg selector, so a key that does not decode and
+  a selector that names no secret key are refused before an ssh client
+  starts. The command reads `--body-file` after it builds the list.
+- `--force`, `--compress`, `--ssh-command`, and `--receive-command` set
+  `force`, `compression`, and `connect` as they do for `ostrya push`.
+  `hash_jobs` and `progress` are `None`.
+- On success the command writes the checksum of `PushOutcome::commit` as
+  one line to standard output and exits 0. Under `-v` the statistics line
+  of `ostrya push` goes to standard error. On failure the command writes
+  `error: MESSAGE` to standard error and nothing to standard output, and
+  exits 1.
 
 ## Push transports
 
@@ -2940,6 +3001,8 @@ the connect options of a push:
 
 - A value that holds a `:` or a `/` is an address, which
   `PushRemote::parse` reads. No configuration is read for it.
+  `is_push_address` gives this rule, so a caller can open no repository
+  for an address.
 - Any other value is the name of a remote section. The address is its
   `push-url`. When `push-url` is absent, a `url` that starts with `http://`
   or `https://` is the address. A `url` of another form, for example
@@ -2957,6 +3020,8 @@ impl Remote<'_> {
     pub fn ssh_command(&self) -> Result<Option<String>>;
     pub fn receive_command(&self) -> Result<Option<String>>;
 }
+
+pub fn is_push_address(remote: &str) -> bool;
 
 pub fn resolve_push_remote(config: Option<&RepoConfig>, remote: &str,
                            connect: ConnectOptions)

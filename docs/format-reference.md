@@ -1820,6 +1820,46 @@ receive-command=/usr/local/bin/ostrya receive
 - `ostree config set core.fsync true` rewrites `config` and keeps the three
   keys in order.
 
+## Port extension: the commit of `push-tree`
+
+`ostrya push-tree` builds one commit over a local directory on the client
+and sends it to the server. The tool has no such command. The commit object
+has the format of every other commit, and its bytes follow the rules below.
+
+- On success the command writes the commit checksum to standard output: 64
+  lowercase hex characters and a newline. Standard output holds nothing
+  else.
+- The metadata dict holds the caller groups of `ostrya commit`, in the
+  same order: every `--add-metadata-string` entry in command-line order,
+  then every `--add-metadata` entry in command-line order. The command has
+  no `--keep-metadata`, so no entry comes from a parent.
+- `ostree.ref-binding` follows the caller entries. It is an `as` that
+  holds every `-b` name, sorted.
+- `ostree.collection-binding` follows it, with the collection id that the
+  server reports for its repository. When the server has no collection id,
+  the key is absent. The collection id of a local repository has no effect.
+  `--no-bindings` writes neither key.
+- `--owner-uid`, `--owner-gid`, and `--canonical-permissions` apply to each
+  entry of the walk, the root directory included, so they change the root
+  dirmeta too. The canonical rule comes first: owner 0:0, no extended
+  attributes, and the mode `type | (perm & 0o755)` for each entry other than
+  a symlink. Each declared owner id comes after it. The tool applies the
+  options to the root dirmeta in the same way.
+- The walk reads no extended attributes. With the same tree, owner, modes,
+  subject, body, metadata options, timestamp, and parent, the commit
+  checksum equals the checksum of `ostree commit --no-xattrs -b R1`. With
+  two refs it equals the checksum of `ostree commit --no-xattrs -b R1
+  --bind-ref R2`. `crates/ostrya-cli/tests/push_ssh.rs` checks both with
+  `SOURCE_DATE_EPOCH=1700000000` on both sides, and it also checks
+  `--canonical-permissions`, `--owner-uid=0 --owner-gid=0`, `--body-file`
+  alone and beside `-m`, `--parent=none`, `--parent` with a commit,
+  `--no-bindings`, and an explicit `--timestamp`.
+- With `--add-detached-metadata-string` and distinct ed25519 keys from
+  `--sign` and `--sign-from-file`, the `.commitmeta` bytes on the server
+  equal the bytes of `ostree commit` with the same options. The detached
+  dict holds the entries of the caller, then the signatures in the order
+  of `commit`.
+
 ## Commit modifier: canonical permissions, consume, and devino
 
 A filesystem tree is ingested into a repository under a set of options the
@@ -4555,7 +4595,11 @@ ref moves.
   accepted and changes nothing.
 - `--sign=KEY_ID` adds one signature per occurrence under the engine
   `--sign-type` names, in command-line order, with no deduplication. For
-  `ed25519` the value is the base64 of the 64-byte secret key.
+  `ed25519` the value is the base64 of the 64-byte secret key. In the port,
+  under `--sign-type=gpg`, a `--sign` and a `--sign-from-file` key are
+  selectors with the rules of a `--gpg-sign` selector. The port resolves
+  each of them before the first signature, and it signs with the
+  fingerprint that the lookup gives.
 - `--sign-from-file=PATH` adds one signature per occurrence, its key read from
   the first line of the file. The rest of the file is ignored, a trailing
   newline is optional, and surrounding whitespace is skipped by the decode.

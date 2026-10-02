@@ -3,7 +3,9 @@
 
 use std::sync::LazyLock;
 
-use ostrya_core::{Checksum, Commit, MAX_METADATA_SIZE, Type, Value, commit_metadata, to_bytes};
+use ostrya_core::{
+    Checksum, Commit, MAX_METADATA_SIZE, Type, Value, choose_offset_size, commit_metadata, to_bytes,
+};
 use ostrya_sign::Signer;
 
 use crate::error::{Error, Result};
@@ -18,12 +20,12 @@ static DICT_TYPE: LazyLock<Type> =
 /// The type of the signature array of an engine in a detached dict.
 const SIGNATURE_ARRAY: &str = "aay";
 
-/// The entries of an `a{sv}` dict, in order, as `(key, value)` tuples. An
-/// empty key, entries that do not serialize as an `a{sv}` dict, and a dict
-/// over [`MAX_METADATA_SIZE`] are [`Error::InvalidInput`]. The object that
-/// holds the dict is never smaller than the dict. `what` names the dict in
-/// the message.
-pub(crate) fn entry_dict(entries: Vec<(String, Value)>, what: &str) -> Result<Vec<Value>> {
+/// The entries of an `a{sv}` dict, in order, as `(key, value)` tuples, and
+/// the size of the serialized dict. An empty key, entries that do not
+/// serialize as an `a{sv}` dict, and a dict over [`MAX_METADATA_SIZE`] are
+/// [`Error::InvalidInput`]. The object that holds the dict is never smaller
+/// than the dict. `what` names the dict in the message.
+pub(crate) fn entry_dict(entries: Vec<(String, Value)>, what: &str) -> Result<(Vec<Value>, u64)> {
     if entries.iter().any(|(key, _)| key.is_empty()) {
         return Err(invalid(format!("the {what} holds an empty key")));
     }
@@ -35,14 +37,14 @@ pub(crate) fn entry_dict(entries: Vec<(String, Value)>, what: &str) -> Result<Ve
     );
     let len = to_bytes(&DICT_TYPE, &dict)
         .map_err(|e| invalid(format!("the {what} is not an a{{sv}} dict: {e}")))?
-        .len();
-    if len as u64 > MAX_METADATA_SIZE {
+        .len() as u64;
+    if len > MAX_METADATA_SIZE {
         return Err(invalid(format!(
             "the {what} is {len} bytes, over the limit of {MAX_METADATA_SIZE}"
         )));
     }
     match dict {
-        Value::Array(items) => Ok(items),
+        Value::Array(items) => Ok((items, len)),
         _ => unreachable!("the dict is an array"),
     }
 }
@@ -156,6 +158,49 @@ pub(crate) fn build_commit(inputs: CommitInputs<'_>) -> Result<(Checksum, Vec<u8
         )));
     }
     Ok((Checksum::sha256(&bytes), bytes))
+}
+
+/// The framing offsets of a commit object: one for each member of variable
+/// size other than the last. These are the metadata dict, the parent, the
+/// related objects, the subject, the body, and the root dirtree.
+const COMMIT_FRAMING_OFFSETS: usize = 6;
+
+/// A lower bound of the size of the commit object that [`build_commit`]
+/// serializes, from the inputs that do not depend on `HelloReply`.
+///
+/// `metadata_len` is the size of the serialized dict of the caller. The bound
+/// counts that dict, the parent of [`ParentPolicy::Commit`], the subject and
+/// the body with their NUL terminators, the padding before the timestamp, the
+/// timestamp, the two root checksums, and the framing offsets. The bindings
+/// and a parent from the server only add bytes. With no bindings and a parent
+/// that does not come from the server, the bound is the size of the commit
+/// object.
+pub(crate) fn commit_size_floor(
+    metadata_len: u64,
+    subject: &str,
+    body: &str,
+    parent: ParentPolicy,
+) -> u64 {
+    let parent_len = match parent {
+        ParentPolicy::Commit(_) => 32,
+        ParentPolicy::CurrentTip | ParentPolicy::None => 0,
+    };
+    let before_timestamp = metadata_len + parent_len + subject.len() as u64 + body.len() as u64 + 2;
+    let data = before_timestamp.next_multiple_of(8) + 8 + 32 + 32;
+    let offset =
+        usize::try_from(data).map_or(8, |len| choose_offset_size(len, COMMIT_FRAMING_OFFSETS));
+    data + (COMMIT_FRAMING_OFFSETS * offset) as u64
+}
+
+/// Refuse a commit object whose lower bound, [`commit_size_floor`], is over
+/// `limit` bytes, with [`Error::InvalidInput`].
+pub(crate) fn check_commit_floor(floor: u64, limit: u64) -> Result<()> {
+    if floor > limit {
+        return Err(invalid(format!(
+            "the commit object is at least {floor} bytes, over the limit of {limit}"
+        )));
+    }
+    Ok(())
 }
 
 /// The detached metadata dict of the commit `bytes`: the entries of the
@@ -303,6 +348,7 @@ mod tests {
             "metadata",
         )
         .unwrap()
+        .0
     }
 
     #[test]
@@ -375,6 +421,66 @@ mod tests {
         assert_eq!(commit.root_dirtree, csum(1));
         assert_eq!(commit.root_dirmeta, csum(2));
         assert!(commit.related.is_empty());
+    }
+
+    /// The dict of [`caller_entries`] and its size.
+    fn measured_caller_entries() -> (Vec<Value>, u64) {
+        let (entries, len) = entry_dict(
+            vec![
+                ("zz.last".into(), string("1")),
+                ("aa.first".into(), string("2")),
+            ],
+            "metadata",
+        )
+        .unwrap();
+        assert_eq!(entries, caller_entries());
+        (entries, len)
+    }
+
+    #[test]
+    fn the_commit_size_floor_is_the_commit_size_without_the_server_inputs() {
+        let refs = strings(&["main"]);
+        // The body lengths move the padding before the timestamp, and cross
+        // the sizes where the framing offsets grow from one byte to two.
+        for body_len in (0..=300).chain(65_380..=65_480) {
+            let body = "b".repeat(body_len);
+            for parent in [None, Some(csum(9))] {
+                let (entries, len) = measured_caller_entries();
+                let (_, bytes) = build_commit(CommitInputs {
+                    parent,
+                    body: body.clone(),
+                    no_bindings: true,
+                    ..inputs(entries, &refs)
+                })
+                .unwrap();
+                let policy = parent.map_or(ParentPolicy::None, ParentPolicy::Commit);
+                let floor = commit_size_floor(len, "subject", &body, policy);
+                assert_eq!(floor, bytes.len() as u64, "{body_len} {parent:?}");
+                check_commit_floor(floor, floor).unwrap();
+                match check_commit_floor(floor, floor - 1) {
+                    Err(Error::InvalidInput(m)) => {
+                        assert!(m.contains("the commit object is at least"), "{m}")
+                    }
+                    other => panic!("{body_len} {parent:?}: {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_server_inputs_only_add_to_the_commit_size_floor() {
+        let refs = strings(&["main", "other"]);
+        for (tip, collection_id) in [(None, None), (Some(csum(9)), Some("org.example.C"))] {
+            let (entries, len) = measured_caller_entries();
+            let floor = commit_size_floor(len, "subject", "body", ParentPolicy::CurrentTip);
+            let (_, bytes) = build_commit(CommitInputs {
+                parent: tip,
+                collection_id,
+                ..inputs(entries, &refs)
+            })
+            .unwrap();
+            assert!(floor < bytes.len() as u64, "{floor} {}", bytes.len());
+        }
     }
 
     #[test]
@@ -493,7 +599,9 @@ mod tests {
             Box::new(DummySigner::new(b"dummy-key".to_vec())),
             Box::new(Ed25519Signer::from_secret_key(&secret).unwrap()),
         ];
-        let entries = entry_dict(vec![("xa.k".into(), string("v"))], "detached").unwrap();
+        let entries = entry_dict(vec![("xa.k".into(), string("v"))], "detached")
+            .unwrap()
+            .0;
         let payload = b"commit bytes";
         let dict = futures_lite::future::block_on(detached_dict(entries, &signers, payload))
             .unwrap()
@@ -518,7 +626,9 @@ mod tests {
             Type::parse(SIGNATURE_ARRAY).unwrap(),
             Value::Array(vec![Value::Bytes(b"old".to_vec())]),
         );
-        let entries = entry_dict(vec![("ostree.sign.dummy".into(), array)], "detached").unwrap();
+        let entries = entry_dict(vec![("ostree.sign.dummy".into(), array)], "detached")
+            .unwrap()
+            .0;
         let dict = futures_lite::future::block_on(detached_dict(entries, &signers, b"x"))
             .unwrap()
             .unwrap();
@@ -536,8 +646,9 @@ mod tests {
             string("x"),
             Value::variant(Type::parse("as").unwrap(), Value::Array(Vec::new())),
         ] {
-            let entries =
-                entry_dict(vec![("ostree.sign.dummy".into(), value)], "detached").unwrap();
+            let entries = entry_dict(vec![("ostree.sign.dummy".into(), value)], "detached")
+                .unwrap()
+                .0;
             let r = futures_lite::future::block_on(detached_dict(entries, &signers, b"x"));
             assert!(
                 matches!(r, Err(Error::Sign(ostrya_sign::Error::InvalidFormat(_)))),
@@ -575,8 +686,9 @@ mod tests {
             }),
             Box::new(DummySigner::new(b"new".to_vec())),
         ];
-        let entries =
-            entry_dict(vec![("ostree.sign.dummy".into(), string("x"))], "detached").unwrap();
+        let entries = entry_dict(vec![("ostree.sign.dummy".into(), string("x"))], "detached")
+            .unwrap()
+            .0;
         let r = futures_lite::future::block_on(detached_dict(entries, &signers, b"x"));
         assert!(
             matches!(r, Err(Error::Sign(ostrya_sign::Error::InvalidFormat(_)))),

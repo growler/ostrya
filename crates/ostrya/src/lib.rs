@@ -220,7 +220,8 @@
 //! remote over ssh. `Repo::push_over_stream` runs the same push over a pair
 //! of streams. Both take the options of `RepoPushOptions`.
 //! `resolve_push_remote` gives the push address and the connect options of a
-//! configured remote or of an address. `ostrya::push` re-exports the wire
+//! configured remote or of an address, and `is_push_address` tells an address
+//! from a remote name. `ostrya::push` re-exports the wire
 //! protocol crate. The push keys of a remote section,
 //! [`Remote::push_url`], [`Remote::ssh_command`], and
 //! [`Remote::receive_command`], are read in every build.
@@ -324,7 +325,7 @@ pub use pull::{
     PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };
 #[cfg(feature = "push")]
-pub use push_repo::{RepoPushOptions, resolve_push_remote};
+pub use push_repo::{RepoPushOptions, is_push_address, resolve_push_remote};
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 pub use receive::{

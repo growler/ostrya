@@ -6,11 +6,11 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use futures_io::{AsyncRead, AsyncWrite};
-use ostrya_core::{Checksum, Value};
+use ostrya_core::{Checksum, MAX_METADATA_SIZE, Value};
 
 use crate::commit::{
-    CommitInputs, build_commit, check_ref_states, detached_dict, entry_dict, ref_updates,
-    resolve_parent,
+    CommitInputs, build_commit, check_commit_floor, check_ref_states, commit_size_floor,
+    detached_dict, entry_dict, ref_updates, resolve_parent,
 };
 use crate::error::Result;
 use crate::proto::RefUpdate;
@@ -139,7 +139,11 @@ pub async fn push_tree(
 ///   system clock before the Unix epoch when neither is set;
 /// - an empty key in `metadata` or in `detached_metadata`, entries that do
 ///   not serialize as an `a{sv}` dict, and entries whose serialized dict is
-///   over [`MAX_METADATA_SIZE`](ostrya_core::MAX_METADATA_SIZE).
+///   over [`MAX_METADATA_SIZE`](ostrya_core::MAX_METADATA_SIZE);
+/// - a `subject`, a `body`, and `metadata` whose commit object is over
+///   `MAX_METADATA_SIZE` without the bindings and without a parent of
+///   [`ParentPolicy::CurrentTip`]. These only add bytes, so the check never
+///   refuses a commit object that the check after `HelloReply` accepts.
 ///
 /// The timestamp is read before the scan. The scan refuses `hash_jobs` of
 /// `Some(0)` with [`Error::InvalidInput`](crate::Error::InvalidInput) before
@@ -253,8 +257,12 @@ impl Prepared {
         deflate_level(compression)?;
         let timestamp = ostrya_core::commit_timestamp(timestamp)
             .map_err(|e| invalid(format!("the commit timestamp: {e}")))?;
-        let metadata = entry_dict(metadata, "metadata")?;
-        let detached = entry_dict(detached_metadata, "detached metadata")?;
+        let (metadata, metadata_len) = entry_dict(metadata, "metadata")?;
+        let (detached, _) = entry_dict(detached_metadata, "detached metadata")?;
+        let subject = subject.unwrap_or_default();
+        let body = body.unwrap_or_default();
+        let floor = commit_size_floor(metadata_len, &subject, &body, parent);
+        check_commit_floor(floor, MAX_METADATA_SIZE)?;
         let scan = ScanOptions {
             entry_filter,
             hash_jobs,
@@ -262,8 +270,8 @@ impl Prepared {
         let push = Prepared {
             refs,
             parent,
-            subject: subject.unwrap_or_default(),
-            body: body.unwrap_or_default(),
+            subject,
+            body,
             metadata,
             detached,
             timestamp,

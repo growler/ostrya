@@ -165,6 +165,13 @@ jobs:
       - name: The push feature without the receive feature compiles
         run: cargo check -p ostrya --no-default-features --features smol,push
 
+      # The HTTP server compiles on the smol backend with its own feature set,
+      # and `ostrya serve` compiles without `ostrya receive`.
+      - name: ostrya-server on the smol backend compiles
+        run: |
+          cargo check -p ostrya-server --no-default-features --features smol
+          cargo check -p ostrya-cli --no-default-features --features smol,serve
+
       # `ostrya-sign` holds a runtime only under `sign-gpg`. This compiles the
       # crate with no runtime backend, so a runtime item placed outside that
       # feature fails here.
@@ -213,14 +220,17 @@ jobs:
       # `default-features = false`, and each dependent forwards `smol` and
       # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
       # without the `receive` and the `push` features, which bring in
-      # `ostrya-push`, and this fails when one path turns the smol backend on.
+      # `ostrya-push`, and so does a tokio build of `ostrya-server`. This fails
+      # when one path turns the smol backend on.
       # `cargo tree -i` exits non-zero both when the package is absent and on
       # any other failure, so the step also reads the error text.
       - name: A tokio build holds no smol
         run: |
-          for features in tokio tokio,receive tokio,push; do
-            if out=$(cargo tree -p ostrya --no-default-features --features "$features" -i smol 2>&1); then
-              echo "a build of ostrya with $features holds smol:"
+          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya-server:tokio; do
+            package=${build%%:*}
+            features=${build#*:}
+            if out=$(cargo tree -p "$package" --no-default-features --features "$features" -i smol 2>&1); then
+              echo "a build of $package with $features holds smol:"
               echo "$out"
               exit 1
             fi

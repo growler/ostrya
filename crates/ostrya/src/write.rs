@@ -677,7 +677,7 @@ async fn feed_archive_payload<R: AsyncRead + Unpin>(
 
 /// The raw-DEFLATE encoder level for an `[archive] zlib-level` value, clamped to
 /// the 1-9 range the tool accepts.
-fn archive_level(zlib_level: i64) -> u8 {
+pub(crate) fn archive_level(zlib_level: i64) -> u8 {
     zlib_level.clamp(1, 9) as u8
 }
 

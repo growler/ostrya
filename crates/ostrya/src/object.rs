@@ -10,7 +10,7 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use ostrya_core::Xattrs;
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
@@ -62,8 +62,20 @@ pub(crate) fn read_meta_object(
     path: &str,
     cap: u64,
 ) -> std::io::Result<Vec<u8>> {
-    let fd = open_object(dir, path)?;
+    read_meta_fd(open_object(dir, path)?, cap)
+}
+
+/// Read a whole metadata object from an open descriptor, with the cap rule of
+/// [`read_meta_object`]. A descriptor of anything but a regular file is
+/// refused with `ErrorKind::InvalidData`.
+pub(crate) fn read_meta_fd(fd: OwnedFd, cap: u64) -> std::io::Result<Vec<u8>> {
     let stat = rustix::fs::fstat(&fd)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "object is not a regular file",
+        ));
+    }
     let size = stat.st_size.max(0) as u64;
     if size > cap {
         return Err(metadata_cap_exceeded());

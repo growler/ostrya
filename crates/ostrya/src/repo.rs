@@ -44,6 +44,10 @@ use crate::transaction::Transaction;
 /// The path of the config file within a repository.
 const CONFIG: &str = "config";
 
+/// The largest `config` file a read accepts, in bytes. A larger file is
+/// refused with [`Error::InvalidFormat`].
+const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
+
 /// The mode requested for created directories, before the umask is applied.
 const DIR_MODE: u32 = 0o775;
 
@@ -429,8 +433,22 @@ impl Repo {
     }
 }
 
-/// Parse the bytes of `config`. This step is CPU-only.
+/// Refuse the bytes of a `config` over [`MAX_CONFIG_SIZE`], so a write
+/// leaves no file that an open refuses.
+pub(crate) fn check_config_size(bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 > MAX_CONFIG_SIZE {
+        return Err(Error::InvalidFormat(format!(
+            "config exceeds the {MAX_CONFIG_SIZE}-byte size cap"
+        )));
+    }
+    Ok(())
+}
+
+/// Parse the bytes of `config`. This step is CPU-only. A read of `config`
+/// stops one byte past [`MAX_CONFIG_SIZE`], so a longer input is a file over
+/// the cap.
 fn parse_config(bytes: &[u8]) -> Result<RepoConfig> {
+    check_config_size(bytes)?;
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat("config is not valid UTF-8".into()))?;
     RepoConfig::parse(text)
@@ -499,11 +517,15 @@ fn open_dir<Fd: AsFd>(dir: Fd, path: &Path) -> std::io::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// Read a file's full contents relative to `dir`.
+/// Read the config file relative to `dir`, up to one byte past
+/// [`MAX_CONFIG_SIZE`], so the parse can refuse a file over the cap without
+/// reading the rest of it.
 fn read_file<Fd: AsFd>(dir: Fd, path: &str) -> std::io::Result<Vec<u8>> {
     let fd = rustix::fs::openat(dir, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
     let mut buf = Vec::new();
-    std::fs::File::from(fd).read_to_end(&mut buf)?;
+    std::fs::File::from(fd)
+        .take(MAX_CONFIG_SIZE + 1)
+        .read_to_end(&mut buf)?;
     Ok(buf)
 }
 

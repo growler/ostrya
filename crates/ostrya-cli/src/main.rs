@@ -50,6 +50,9 @@
 //!   update its refs. The `push` feature builds it.
 //! - `push-tree` -- push a directory to a remote over ssh as one commit, and
 //!   set its refs to that commit. The `push` feature builds it.
+//! - `serve` -- serve the repository over HTTP or HTTPS as an archive
+//!   repository, for pull. It runs with `--read-only` alone. The `serve`
+//!   feature builds it.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams from stdin flow through
@@ -170,6 +173,9 @@ enum Command {
     #[cfg(feature = "push")]
     #[command(name = "push-tree")]
     PushTree(PushTreeArgs),
+    /// Serve the repository over HTTP as an archive repository, for pull.
+    #[cfg(feature = "serve")]
+    Serve(ServeArgs),
 }
 
 impl Command {
@@ -205,6 +211,8 @@ impl Command {
         "push",
         #[cfg(feature = "push")]
         "push-tree",
+        #[cfg(feature = "serve")]
+        "serve",
     ];
 
     /// The name `clap` registered this subcommand under, which the error paths
@@ -237,6 +245,8 @@ impl Command {
             Command::Push(_) => "push",
             #[cfg(feature = "push")]
             Command::PushTree(_) => "push-tree",
+            #[cfg(feature = "serve")]
+            Command::Serve(_) => "serve",
         }
     }
 }
@@ -1384,6 +1394,42 @@ struct ReceiveArgs {
     policy: Option<PathBuf>,
 }
 
+#[cfg(feature = "serve")]
+#[derive(Args)]
+struct ServeArgs {
+    /// Listen on ADDR:PORT, an IP address and a port. Give the option once
+    /// for each address. Port 0 lets the kernel choose a port. The default is
+    /// 127.0.0.1:8080. The command writes the URL of each listener to
+    /// standard output, one line each.
+    #[arg(long, value_name = "ADDR:PORT")]
+    listen: Vec<std::net::SocketAddr>,
+    /// Serve HTTPS with the certificate chain in FILE, in PEM.
+    #[arg(long, value_name = "FILE", requires = "tls_key")]
+    tls_cert: Option<PathBuf>,
+    /// The private key of --tls-cert, in PEM. An encrypted key is refused.
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// Verify a client certificate against the CA certificates in FILE, in
+    /// PEM. A client that presents no certificate is served.
+    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    client_ca: Option<PathBuf>,
+    /// Serve the files of a pull alone. The command refuses to run without
+    /// it.
+    #[arg(long)]
+    read_only: bool,
+    /// End a connection whose response waits longer than SECONDS for the
+    /// client to take its next bytes. An HTTP/2 client that does not answer
+    /// a ping within SECONDS also loses its connection. The value is a
+    /// positive integer, and the default is 60.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value = "60",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    body_timeout: u64,
+}
+
 #[cfg(feature = "push")]
 #[derive(Args)]
 struct PushArgs {
@@ -1794,6 +1840,89 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
                 gid: owner_id(args.owner_gid.as_deref(), "--owner-gid"),
             };
             push_tree(repo, verbose, name, args, owner).await
+        }
+        #[cfg(feature = "serve")]
+        Command::Serve(args) => {
+            // The receive endpoint does not exist, so a server that is not
+            // read-only is refused before the repository is opened.
+            if !args.read_only {
+                eprintln!("error: serve needs --read-only: the server has no receive endpoint");
+                exit_process(1);
+            }
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            serve(repo, args).await
+        }
+    }
+}
+
+/// The largest PEM file `serve` reads.
+#[cfg(feature = "serve")]
+const MAX_PEM_SIZE: u64 = 1024 * 1024;
+
+/// Serve the repository with the options of `args` until the process ends.
+/// The URL of each listener goes to standard output, one line each, once
+/// every listener is bound.
+#[cfg(feature = "serve")]
+async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
+    use std::io::Write;
+
+    let mut opts = ostrya_server::ServeOptions::default();
+    if !args.listen.is_empty() {
+        opts.listen = args.listen;
+    }
+    opts.body_timeout = std::time::Duration::from_secs(args.body_timeout);
+    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        opts.tls = Some(ostrya_server::ServerTls {
+            cert_chain_pem: read_pem(cert),
+            key_pem: read_pem(key),
+            key_passphrase: None,
+            client_ca_pem: args.client_ca.as_deref().map(read_pem),
+        });
+    }
+    let scheme = if opts.tls.is_some() { "https" } else { "http" };
+    let server = match ostrya_server::bind(repo, opts).await {
+        Ok(server) => server,
+        Err(err) => {
+            eprintln!("error: {err}");
+            exit_process(1);
+        }
+    };
+    let mut stdout = std::io::stdout().lock();
+    for addr in server.local_addrs() {
+        writeln!(stdout, "{scheme}://{addr}/")?;
+    }
+    stdout.flush()?;
+    drop(stdout);
+    if let Err(err) = server.run().await {
+        eprintln!("error: {err}");
+        exit_process(1);
+    }
+    Ok(())
+}
+
+/// Read a PEM file of `serve`, up to [`MAX_PEM_SIZE`]. A file that cannot be
+/// read, or is larger, ends the process with an error.
+#[cfg(feature = "serve")]
+fn read_pem(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+
+    let read = std::fs::File::open(path).and_then(|file| {
+        let mut bytes = Vec::new();
+        file.take(MAX_PEM_SIZE + 1).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    match read {
+        Ok(bytes) if bytes.len() as u64 <= MAX_PEM_SIZE => bytes,
+        Ok(_) => {
+            eprintln!(
+                "error: {}: the file exceeds the {MAX_PEM_SIZE}-byte size cap",
+                path.display()
+            );
+            exit_process(1);
+        }
+        Err(err) => {
+            eprintln!("error: {}: {err}", path.display());
+            exit_process(1);
         }
     }
 }

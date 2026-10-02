@@ -311,6 +311,77 @@ impl Repo {
             load_by_mode(repo.objects_fd(), &path, &key, mode, false, true)
         })
         .await?;
+        Ok(self.opened(checksum, loaded))
+    }
+
+    /// The load of [`Repo::open_file`], which follows no symlink on the object
+    /// path, run on the calling thread. The fan-out directory under
+    /// `objects/` opens with `O_NOFOLLOW`, and the object loads relative to it,
+    /// so a symlink at the fan-out directory or at a regular-file object fails
+    /// with `ELOOP`. A symlink object of a mode that stores one as a symlink is
+    /// read with `readlinkat`, as every load reads it. The caller runs it on
+    /// the blocking pool and takes the result with [`Repo::contained_file`].
+    pub(crate) fn load_contained_blocking(&self, checksum: &Checksum) -> Result<Contained> {
+        let mode = self.mode();
+        let path = loose_path(checksum, ObjectType::File, mode);
+        let (fanout, name) = path
+            .split_once('/')
+            .expect("a loose path names its fan-out directory");
+        let dir = open_fanout(self.objects_fd(), fanout, checksum)?;
+        load_by_mode(dir.as_fd(), name, checksum, mode, false, true).map(Contained)
+    }
+
+    /// The file object and the payload reader of a
+    /// [`Repo::load_contained_blocking`].
+    pub(crate) fn contained_file(
+        &self,
+        checksum: &Checksum,
+        contained: Contained,
+    ) -> (FileObject, ContentReader) {
+        self.opened(checksum, contained.0)
+    }
+
+    /// Check on the calling thread that the content object `checksum` is
+    /// there, with the path rules of [`Repo::load_contained_blocking`], and
+    /// read nothing of it: no xattr and no byte of its payload. A regular-file
+    /// object is opened, so a file the process cannot read fails as the load
+    /// fails. A symlink object passes in a mode that stores one as a symlink,
+    /// and fails with `ELOOP` in the others. In `bare-split-xattrs` the
+    /// `.file-xattrs-link` beside the object is checked with one `statat`: a
+    /// symlink there fails with `ELOOP`, and a missing link fails as the load
+    /// fails.
+    pub(crate) fn probe_contained_blocking(&self, checksum: &Checksum) -> Result<()> {
+        let mode = self.mode();
+        let path = loose_path(checksum, ObjectType::File, mode);
+        let (fanout, name) = path
+            .split_once('/')
+            .expect("a loose path names its fan-out directory");
+        let dir = open_fanout(self.objects_fd(), fanout, checksum)?;
+        let symlinks = matches!(
+            mode,
+            RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs
+        );
+        if mode == RepoMode::BareSplitXattrs {
+            probe_split_xattrs_link(dir.as_fd(), name)?;
+        }
+        match rustix::fs::openat(&dir, name, OBJECT_OPEN, Mode::empty()) {
+            Ok(fd) => {
+                let stat = rustix::fs::fstat(&fd)?;
+                if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+                    return Err(Error::InvalidFormat(
+                        "content object is neither a regular file nor a symlink".into(),
+                    ));
+                }
+                Ok(())
+            }
+            Err(Errno::LOOP) if symlinks => Ok(()),
+            Err(e) => Err(map_object_error(e, checksum, ObjectType::File)),
+        }
+    }
+
+    /// The file object of a load that kept its payload, and the reader over
+    /// that payload.
+    fn opened(&self, checksum: &Checksum, loaded: Loaded) -> (FileObject, ContentReader) {
         let reader = loaded.source.reader_over(loaded.payload);
         let file = FileObject {
             repo: self.clone(),
@@ -324,7 +395,7 @@ impl Repo {
             store: ObjectStore::Repo,
             kernel_verity: loaded.kernel_verity,
         };
-        Ok((file, reader))
+        (file, reader)
     }
 }
 
@@ -363,6 +434,9 @@ pub(crate) async fn load_staged_file(
     })
 }
 
+/// A load of [`Repo::load_contained_blocking`], which keeps its payload.
+pub(crate) struct Contained(Loaded);
+
 /// The fields a per-mode loader produces before a [`FileObject`] is assembled.
 struct Loaded {
     uid: u32,
@@ -374,7 +448,6 @@ struct Loaded {
     kernel_verity: Option<[u8; 32]>,
     /// The object file of a regular file, positioned at its payload, and the
     /// number of bytes on disk from there to its end, when the load keeps it.
-    #[cfg_attr(not(feature = "push"), allow(dead_code))]
     payload: Option<Payload>,
 }
 
@@ -420,27 +493,53 @@ fn map_object_error(err: Errno, checksum: &Checksum, ty: ObjectType) -> Error {
     }
 }
 
-/// Open a loose object fd, mapping a missing object to `ObjectNotFound`.
+/// The flags of a read-only open of an object that must be a regular file.
+/// `O_NOFOLLOW` makes a symlink at the path fail with `ELOOP`. `O_NONBLOCK`
+/// keeps the open of a FIFO from waiting for a writer, so a FIFO fails the
+/// load at its first read; the flag changes no read of a regular file.
+const OBJECT_OPEN: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::NOCTTY)
+    .union(OFlags::CLOEXEC);
+
+/// Open a loose object fd without following a symlink, mapping a missing
+/// object to `ObjectNotFound`. Every object these loaders open by this call is
+/// a regular file, so a symlink at the path fails with `ELOOP`.
 fn open_object(objects_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<OwnedFd> {
-    rustix::fs::openat(
+    rustix::fs::openat(objects_fd, path, OBJECT_OPEN, Mode::empty())
+        .map_err(|e| map_object_error(e, checksum, ObjectType::File))
+}
+
+/// Open the fan-out directory `fanout` of `objects/` as a path descriptor,
+/// without following a symlink. A symlink there fails with `ELOOP`. A missing
+/// entry, and an entry that is no directory, give `ObjectNotFound`.
+fn open_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, checksum: &Checksum) -> Result<OwnedFd> {
+    match rustix::fs::openat(
         objects_fd,
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC,
+        fanout,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(|e| map_object_error(e, checksum, ObjectType::File))
+    ) {
+        Ok(fd) => Ok(fd),
+        Err(Errno::NOTDIR | Errno::LOOP) => {
+            let stat = rustix::fs::statat(objects_fd, fanout, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|e| map_object_error(e, checksum, ObjectType::File))?;
+            if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
+                Err(Error::Io(Errno::LOOP.into()))
+            } else {
+                Err(map_object_error(Errno::NOENT, checksum, ObjectType::File))
+            }
+        }
+        Err(e) => Err(map_object_error(e, checksum, ObjectType::File)),
+    }
 }
 
 /// Open a regular-file object without following a symlink, mapping a missing
 /// object to `ObjectNotFound`.
 fn open_regular(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<OwnedFd> {
-    rustix::fs::openat(
-        dir_fd,
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| map_object_error(e, checksum, ObjectType::File))
+    rustix::fs::openat(dir_fd, path, OBJECT_OPEN, Mode::empty())
+        .map_err(|e| map_object_error(e, checksum, ObjectType::File))
 }
 
 /// The fs-verity digest of the regular-file object at `path`, as
@@ -779,14 +878,15 @@ fn load_bare_split_xattrs(
     // file holds the raw payload, and a symlink is a real symlink. The inode
     // holds no xattrs; the logical set lives in a separate object reached
     // through the `.file-xattrs-link` entry keyed by the file checksum.
-    // bare-split-xattrs is read-only and never staged, so `dir_fd` is always the
-    // repository's `objects/`; the split-xattrs link is resolved by its own
-    // loose path from the checksum.
+    // bare-split-xattrs is read-only and never staged. The split-xattrs link
+    // sits beside the object under the same name with the suffix
+    // `.file-xattrs-link`, so it is resolved relative to `dir_fd` as the
+    // object is.
     let stat = stat_object(dir_fd, path, checksum, ObjectType::File)?;
     let uid = stat.stx_uid;
     let gid = stat.stx_gid;
     let mode = u32::from(stat.stx_mode);
-    let xattrs = load_split_xattrs(dir_fd, checksum)?;
+    let xattrs = load_split_xattrs(dir_fd, path)?;
 
     match FileType::from_raw_mode(mode) {
         FileType::Symlink => Ok(Loaded {
@@ -834,21 +934,46 @@ fn load_bare_split_xattrs(
 /// the shared `.file-xattrs` object; reading the bytes at the link name needs
 /// no knowledge of the hardlink topology. Every file object carries a link
 /// (a file with no xattrs points at the shared empty-set object), so its
-/// absence is a malformed repository.
-fn load_split_xattrs(objects_fd: BorrowedFd<'_>, checksum: &Checksum) -> Result<Xattrs> {
-    let path = loose_path(
-        checksum,
-        ObjectType::FileXattrsLink,
-        RepoMode::BareSplitXattrs,
-    );
-    let bytes = object::read_meta_object(objects_fd, &path, MAX_METADATA_SIZE).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Error::InvalidFormat("bare-split-xattrs .file is missing its .file-xattrs-link".into())
-        } else {
-            Error::Io(e)
-        }
-    })?;
+/// absence is a malformed repository. `file_path` is the path of the `.file`
+/// object relative to `dir_fd`. The link opens with `O_NOFOLLOW` and
+/// `O_NONBLOCK`: it is a hardlink, so a symlink at its path fails with
+/// `ELOOP`, and a FIFO there does not block the open.
+fn load_split_xattrs(dir_fd: BorrowedFd<'_>, file_path: &str) -> Result<Xattrs> {
+    let path = format!("{file_path}-xattrs-link");
+    let bytes = rustix::fs::openat(dir_fd, path.as_str(), OBJECT_OPEN, Mode::empty())
+        .map_err(std::io::Error::from)
+        .and_then(|fd| object::read_meta_fd(fd, MAX_METADATA_SIZE))
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::InvalidFormat(
+                    "bare-split-xattrs .file is missing its .file-xattrs-link".into(),
+                )
+            } else {
+                Error::Io(e)
+            }
+        })?;
     Ok(Xattrs::from_gvariant(&bytes)?)
+}
+
+/// Check the `.file-xattrs-link` of the `.file` object at `file_path` under
+/// `dir_fd` with the outcomes [`load_split_xattrs`] gives, and read none of
+/// its bytes.
+fn probe_split_xattrs_link(dir_fd: BorrowedFd<'_>, file_path: &str) -> Result<()> {
+    let path = format!("{file_path}-xattrs-link");
+    match rustix::fs::statat(dir_fd, path.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
+            FileType::RegularFile => Ok(()),
+            FileType::Symlink => Err(Error::Io(Errno::LOOP.into())),
+            _ => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "object is not a regular file",
+            ))),
+        },
+        Err(Errno::NOENT) => Err(Error::InvalidFormat(
+            "bare-split-xattrs .file is missing its .file-xattrs-link".into(),
+        )),
+        Err(e) => Err(Error::Io(e.into())),
+    }
 }
 
 /// An async reader over a file object's payload.
@@ -870,6 +995,13 @@ enum ContentReaderInner {
 }
 
 impl ContentReader {
+    /// A reader that yields no bytes and holds no descriptor.
+    pub(crate) fn empty() -> ContentReader {
+        ContentReader {
+            inner: ContentReaderInner::Empty,
+        }
+    }
+
     /// The shared read step both trait families drive. `rt::FileReader` and
     /// the archive decoder present `futures_io::AsyncRead` under either
     /// backend.

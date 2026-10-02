@@ -226,6 +226,7 @@
 //! [`Remote::push_url`], [`Remote::ssh_command`], and
 //! [`Remote::receive_command`], are read in every build.
 
+pub mod archive;
 pub mod bootable;
 mod bspatch;
 pub mod checkout;
@@ -280,6 +281,7 @@ pub mod update;
 mod verify;
 mod write;
 
+pub use archive::{ArchiveAnswer, ArchiveHead, ArchiveView};
 pub use bootable::{BootableMetadata, BootableRefusal};
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 pub use commit::CommitOptions;

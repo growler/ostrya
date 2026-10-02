@@ -22,7 +22,7 @@ futures-lite = "2"
 # The HTTP engine behind the fetcher. `http1` and `http2` both compile: ALPN
 # picks the version per connection. The `http` and `bytes` types come from
 # hyper's re-exports, so neither needs a manifest entry of its own.
-hyper = { version = "1.11", default-features = false, features = [
+hyper = { version = "1.11.1", default-features = false, features = [
     "client",
     "http1",
     "http2",

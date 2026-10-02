@@ -7,6 +7,10 @@
 //! [`RtExecutor`] hands hyper's tasks to `rt::spawn`, and [`RtTimer`] hands its
 //! delays to `rt::Deadline`. All three are thin: the fetcher, the TLS layer, and
 //! every stream below them stay written against `futures-io` and `ostrya-rt`.
+//!
+//! The adapters are public, so an HTTP server over `ostrya-rt` drives hyper's
+//! server connections with them. [`WriteVectored`] is implemented for the
+//! plain TCP stream and for both TLS stream types of `futures-rustls`.
 
 use std::future::Future;
 use std::io::{self, IoSlice};
@@ -27,7 +31,8 @@ const MAX_READ: usize = 64 * 1024;
 /// itself when the answer is no. The `futures-io` write trait carries no such
 /// query -- unlike the tokio and std ones -- so the answer is stated per stream
 /// type here and travels with the stream into [`FuturesIo`].
-pub(crate) trait WriteVectored {
+pub trait WriteVectored {
+    /// Whether a vectored write takes more than the first slice.
     fn is_write_vectored(&self) -> bool;
 }
 
@@ -45,8 +50,16 @@ impl<S> WriteVectored for futures_rustls::client::TlsStream<S> {
     }
 }
 
+impl<S> WriteVectored for futures_rustls::server::TlsStream<S> {
+    fn is_write_vectored(&self) -> bool {
+        // The server session writer copies the slices into its record as the
+        // client one does.
+        true
+    }
+}
+
 /// A `futures-io` stream presented as a hyper stream.
-pub(crate) struct FuturesIo<S> {
+pub struct FuturesIo<S> {
     inner: S,
     /// Reads land here first and are copied into hyper's cursor.
     ///
@@ -59,7 +72,8 @@ pub(crate) struct FuturesIo<S> {
 }
 
 impl<S> FuturesIo<S> {
-    pub(crate) fn new(inner: S) -> FuturesIo<S> {
+    /// The adapter over `inner`.
+    pub fn new(inner: S) -> FuturesIo<S> {
         FuturesIo {
             inner,
             scratch: Vec::new(),
@@ -69,7 +83,7 @@ impl<S> FuturesIo<S> {
     /// The stream the adapter holds, taken back once hyper is done with it.
     /// A `CONNECT` tunnel recovers its socket this way: hyper hands the
     /// upgraded I/O back as the type the handshake was opened over.
-    pub(crate) fn into_inner(self) -> S {
+    pub fn into_inner(self) -> S {
         self.inner
     }
 }
@@ -131,8 +145,8 @@ impl<S: AsyncWrite + WriteVectored + Unpin> hyper::rt::Write for FuturesIo<S> {
 }
 
 /// Hands hyper's connection tasks to the runtime backend.
-#[derive(Clone, Copy)]
-pub(crate) struct RtExecutor;
+#[derive(Clone, Copy, Debug)]
+pub struct RtExecutor;
 
 impl<F> hyper::rt::Executor<F> for RtExecutor
 where
@@ -148,8 +162,8 @@ where
 
 /// Hands hyper's delays to the runtime backend. An HTTP/2 connection needs one
 /// to schedule its keep-alive ping and the wait for the reply.
-#[derive(Clone, Copy)]
-pub(crate) struct RtTimer;
+#[derive(Clone, Copy, Debug)]
+pub struct RtTimer;
 
 impl hyper::rt::Timer for RtTimer {
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {

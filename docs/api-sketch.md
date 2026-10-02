@@ -3189,6 +3189,89 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   `error: MESSAGE` to standard error and exits 1. The refs of the server
   have changed at that point.
 
+## Archive view and HTTP server
+
+`ArchiveView` of `ostrya` builds in every feature set. It answers the
+request paths of an HTTP pull over a repository of any mode as an `archive`
+repository answers them (`format-reference.md`, "The archive view"). The
+view builds `config` for each request, serves stored files through a walk
+that follows no symlink, and builds each `.filez` of a mode other than
+`archive` on request. At most `MAX_COMPRESSORS` (16) built `.filez` bodies
+deflate at the same time, and each takes its compressor at its first read
+past the header, so a body dropped before that read does no deflate work. A
+built body fails when the stored file holds another size than its header
+states, and each read after an error fails too. `head` gives the answer of
+a `HEAD`: the same routing and walk, and for a built `.filez` a check of the
+object with no read of its xattrs or of its payload. One request reads a
+changed `config`, and the requests that see the same change wait for its
+parse.
+
+```rust
+pub struct ArchiveView { /* private; Send + Sync */ }
+
+impl ArchiveView {
+    pub fn new(repo: Repo) -> ArchiveView;
+    /// `path` is relative to the repository root, with no leading `/`.
+    pub async fn get(&self, path: &str) -> Result<ArchiveAnswer>;
+    pub async fn head(&self, path: &str) -> Result<ArchiveHead>;
+}
+
+pub enum ArchiveAnswer {
+    Bytes(Vec<u8>),                       // the built `config`
+    Stream { len: Option<u64>, body: Box<dyn AsyncRead + Unpin + Send> },
+    NotFound,
+    Refused,
+}
+
+pub enum ArchiveHead {
+    Found { len: Option<u64> },           // None: a `.filez` built on request
+    NotFound,
+    Refused,
+}
+```
+
+The crate `ostrya-server` serves the view over HTTP. It builds on Linux
+alone, and its features `smol` and `tokio` select the runtime backend.
+
+```rust
+pub struct ServerTls {
+    pub cert_chain_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    pub key_passphrase: Option<String>,
+    pub client_ca_pem: Option<Vec<u8>>,   // client certificates, optional
+}
+
+#[non_exhaustive]
+pub struct ServeOptions {
+    pub listen: Vec<SocketAddr>,          // default 127.0.0.1:8080
+    pub tls: Option<ServerTls>,           // None: plain HTTP
+    pub body_timeout: Duration,           // default 60 s; zero is refused
+}
+
+pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server>;
+pub async fn serve(repo: Repo, opts: ServeOptions) -> Result<()>; // bind, then run
+
+impl Server {
+    pub fn local_addrs(&self) -> &[SocketAddr];
+    /// Serves until the future is dropped, which ends every connection.
+    pub async fn run(self) -> Result<()>;
+}
+```
+
+A connection ends when one of its response bodies waits longer than
+`body_timeout` for the client to take its next bytes, so a client that stops
+reading releases its file and its compressor. An HTTP/2 connection sends a
+ping after half of `body_timeout` with no frame from the peer and ends when
+the ping gets no answer within `body_timeout`. A stream body gives at most
+256 KiB before it yields to the executor. Each listener accepts in a task of
+its own.
+
+`ostrya_fetch::server_config` builds the TLS configuration from the PEM
+bytes, with the provider and the key loaders of the fetcher, and ALPN `h2`
+then `http/1.1`. `FuturesIo`, `WriteVectored`, `RtExecutor`, and `RtTimer`
+of `ostrya-fetch` drive the hyper connections of the server over
+`ostrya-rt`.
+
 ## Static deltas
 
 The three size thresholds are in bytes, where the tool's options take decimal

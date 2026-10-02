@@ -3246,10 +3246,11 @@ support needs its own design pass against that refusal.
 
 ## Port extensions with no counterpart in the tool
 
-The tool has no push. `receive`, `push`, and `push-tree` are commands of
-the port alone, so no matrix cell compares them with the tool. The
-receiving repository stays a normal repository: the tool reads it, checks
-it with `ostree fsck`, and pulls from it with `ostree pull-local`.
+The tool has no push and no server. `receive`, `push`, `push-tree`, and
+`serve` are commands of the port alone, so no matrix cell compares them
+with the tool. The receiving repository stays a normal repository: the tool
+reads it, checks it with `ostree fsck`, and pulls from it with `ostree
+pull-local`. The tool pulls from `serve` with `ostree pull`.
 
 ### `receive`
 
@@ -3411,6 +3412,59 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   server, where the tool writes two. Each test that compares the two runs
   the tool with the same `SOURCE_DATE_EPOCH`, in
   `crates/ostrya-cli/tests/push_ssh.rs`.
+
+### `serve`
+
+```text
+ostrya serve [--repo=PATH] --read-only [--listen=ADDR:PORT]...
+             [--tls-cert=FILE --tls-key=FILE] [--client-ca=FILE]
+             [--body-timeout=SECONDS]
+```
+
+- The `serve` feature of `ostrya-cli` builds the command. It is in the
+  default set, and it needs neither `receive` nor `push`.
+- The command serves the repository over HTTP as an archive repository, for
+  pull, in every mode the port reads. The served `config` is
+  `[core]\nrepo_version=1\nmode=archive-z2\n`, followed by
+  `collection-id=ID\n` and `indexed-deltas=VALUE\n` when the repository
+  sets them. In a mode other than `archive` each `.filez` object is built on
+  request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
+  not served. A path the server refuses and a path it does not find both get
+  404. `../format-reference.md`, "The archive view", states the rules.
+- `--read-only` is required. Without it the command writes `error: serve
+  needs --read-only: the server has no receive endpoint` and exits 1,
+  also with `--client-ca`, before it opens the repository.
+- `--listen` takes an IP address and a port. Give it once for each address.
+  The default is `127.0.0.1:8080`, and port 0 lets the kernel choose a port.
+  A host name is refused.
+- `--tls-cert` and `--tls-key` serve HTTPS. Each needs the other. ALPN
+  selects HTTP/2 or HTTP/1.1, and plain HTTP serves HTTP/1.1. An encrypted
+  key is refused: the command has no option for a passphrase.
+- `--client-ca` needs `--tls-cert`. A client that presents a certificate
+  must present one the CA signed. A client that presents none is served.
+- `--body-timeout` takes a positive number of seconds, and the default is
+  60. A connection ends when a response waits longer than that time for the
+  client to take its next bytes. An HTTP/2 client that does not answer a
+  ping within that time also loses its connection. A value of 0 is refused
+  at exit 1.
+- A `HEAD` gets the status and the `Content-Length` of a `GET`, and no
+  body. For a `.filez` built on request it reads no xattr and no byte of
+  the object.
+- The command reads each TLS file once at start, up to 1 MiB. A file it
+  cannot read, a larger file, or TLS material that gives no server
+  configuration ends the command with `error: MESSAGE` at exit 1.
+- When every listener is bound, the command writes one line for each to
+  standard output, `http://ADDR:PORT/` or `https://ADDR:PORT/`, in the order
+  of the options, and serves until the process ends. SIGINT and SIGTERM end
+  the process with the default action.
+- `ostree pull` from the command, over HTTP and HTTPS, from a repository in
+  each mode the port reads, passes `ostree fsck` on the pulled repository,
+  in `crates/ostrya-cli/tests/serve.rs`. The summary of a
+  `bare-user-shared` repository states that mode in `ostree.summary.mode`,
+  and the tool refuses that summary with `error: Invalid mode
+  'bare-user-shared' in repository configuration`. A pull from such a
+  repository with no summary succeeds. The gap is recorded and kept: a pull
+  of the tool from a `bare-user-shared` repository is no goal of the port.
 
 ### ssh access with `authorized_keys`
 

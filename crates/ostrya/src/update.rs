@@ -25,7 +25,7 @@ use crate::refs::{
     CollectionRef, collection_ref_to_relpath, put_alias_blocking, put_ref_blocking,
     refspec_to_relpath, relative_link, sync_dirs_all,
 };
-use crate::repo::Repo;
+use crate::repo::{Repo, check_config_size};
 use crate::summary::put_root_file_blocking;
 
 /// The config file name at the repository root.
@@ -292,9 +292,12 @@ impl UpdateGuard {
     ///
     /// The document is written as given. The repository handle and the guard
     /// keep the values they read before; reopen the repository to read the
-    /// new ones.
+    /// new ones. A document over 1 MiB, the size an open accepts, is refused
+    /// with [`Error::InvalidFormat`](crate::Error::InvalidFormat) and nothing
+    /// is written.
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
         let bytes = keyfile.to_string().into_bytes();
+        check_config_size(&bytes)?;
         self.write(move |repo_fd, fsync, dirs| {
             put_root_file_blocking(repo_fd, CONFIG_FILE, &bytes, fsync)?;
             if fsync {

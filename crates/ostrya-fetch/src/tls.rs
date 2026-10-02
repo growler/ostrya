@@ -75,6 +75,11 @@
 //! Under either one no trust store is read: the constructor touches no file
 //! and reaches no blocking pool, and a handshake proceeds, so
 //! [`ClientConfigs::has_trust_anchors`] is true.
+//!
+//! [`server_config`] builds the configuration of an HTTP server with the same
+//! provider and the same key loaders. It offers `h2` and `http/1.1` in ALPN,
+//! and with a client CA it verifies a client certificate that a client
+//! presents, and accepts a client that presents none.
 
 use std::io::BufReader;
 use std::sync::Arc;
@@ -227,6 +232,50 @@ pub(crate) async fn client_config(
         without_identity,
         has_trust_anchors,
     })
+}
+
+/// Build the TLS configuration of an HTTP server from PEM bytes: the
+/// certificate chain, the private key, the passphrase of an encrypted key,
+/// and, with `client_ca_pem`, the CA that client certificates are verified
+/// against. A client certificate is optional: a client that presents one must
+/// present one the CA signed, and a client that presents none completes the
+/// handshake. The key is read as the key of a [`ClientIdentity`] is, with the
+/// same refusals. ALPN offers `h2`, then `http/1.1`.
+pub async fn server_config(
+    cert_chain_pem: &[u8],
+    key_pem: &[u8],
+    key_passphrase: Option<&str>,
+    client_ca_pem: Option<&[u8]>,
+) -> Result<Arc<rustls::ServerConfig>> {
+    let provider = Arc::new(rustls_graviola::default_provider());
+    let chain = parse_certs(cert_chain_pem)?;
+    if chain.is_empty() {
+        return Err(Error::Fetch(
+            "server certificate holds no certificate".into(),
+        ));
+    }
+    let key = parse_key(key_pem, key_passphrase).await?;
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Fetch(format!("tls setup: {e}")))?;
+    let builder = match client_ca_pem {
+        Some(pem) => {
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(pem_store(pem)?),
+                provider,
+            )
+            .allow_unauthenticated()
+            .build()
+            .map_err(|e| Error::Fetch(format!("client ca rejected: {e}")))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut config = builder
+        .with_single_cert(chain, key)
+        .map_err(|e| Error::Fetch(format!("server certificate rejected: {e}")))?;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
 }
 
 /// What both client configurations hold: the crypto provider, the protocol
@@ -967,5 +1016,58 @@ mod tests {
             "fetch: private key pem is encrypted under pkcs#5 pbes1, \
              which this build does not decrypt"
         );
+    }
+
+    const SERVER_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.pem");
+    const SERVER_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.key.pem");
+
+    /// A server configuration offers `h2` then `http/1.1`, with and without a
+    /// client CA.
+    #[test]
+    fn a_server_config_offers_h2_and_http1() {
+        for ca in [None, Some(CA_PEM)] {
+            let config =
+                block_on(server_config(SERVER_CERT_PEM, SERVER_KEY_PEM, None, ca)).unwrap();
+            assert_eq!(
+                config.alpn_protocols,
+                [b"h2".to_vec(), b"http/1.1".to_vec()]
+            );
+        }
+    }
+
+    /// The key loaders of the client identity read the server key, so an
+    /// encrypted key is decrypted with its passphrase and refused without
+    /// one.
+    #[test]
+    fn a_server_config_reads_an_encrypted_key() {
+        block_on(server_config(
+            CLIENT_CERT_PEM,
+            CLIENT_KEY_ENC_PEM,
+            Some(KEY_PASSPHRASE),
+            None,
+        ))
+        .unwrap();
+        let err = block_on(server_config(
+            CLIENT_CERT_PEM,
+            CLIENT_KEY_ENC_PEM,
+            None,
+            None,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("passphrase"), "{err}");
+    }
+
+    /// An empty chain, a key of another certificate, and a CA blob with no
+    /// certificate are each refused.
+    #[test]
+    fn a_server_config_refuses_bad_material() {
+        let refused = |cert: &[u8], key: &[u8], ca: Option<&[u8]>| {
+            block_on(server_config(cert, key, None, ca))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(refused(b"", SERVER_KEY_PEM, None).contains("no certificate"));
+        assert!(refused(SERVER_CERT_PEM, CLIENT_KEY_PEM, None).contains("rejected"));
+        assert!(refused(SERVER_CERT_PEM, SERVER_KEY_PEM, Some(b"")).contains("no certificate"));
     }
 }

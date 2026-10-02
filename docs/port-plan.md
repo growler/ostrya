@@ -191,6 +191,16 @@ bounded:
   `ostrya::fetch::Error`, converts into `ostrya::Error`. The `receive`
   feature turns on the dependency on `ostrya-push`, re-exported as
   `ostrya::push`, and `ostrya::Error::Push` carries its error type.
+- `ostrya-server` -- the HTTP server of `ostrya serve`, on Linux alone. It
+  serves `ArchiveView` of `ostrya`, the archive view of a repository of any
+  mode, over HTTP/1.1, and over TLS with ALPN for HTTP/2 and HTTP/1.1. It
+  depends on `ostrya` with `receive`, on `ostrya-fetch` for the hyper
+  adapters over `ostrya-rt` and for the server TLS configuration, on
+  `ostrya-rt`, and on `hyper` and `futures-rustls`. Its features `smol`, the
+  default, and `tokio` select the runtime backend. `ostrya-server` and
+  `ostrya-fetch` take `hyper` 1.11.1 or later: 1.11.0 can keep the last
+  chunk of a response body in its write buffer when the first poll of the
+  body is pending, so the response never ends.
 - `ostrya-cli` -- the CLI crate, building the `ostrya` binary: a minimal
   command set once the ingest and checkout paths land (Phase 11), grown
   incrementally; the `ostree`-compatible surface arrives with the port's own
@@ -201,12 +211,14 @@ bounded:
   binaries as subprocesses, so it observes the surface a user observes. Its
   design is `conformance/harness.md`.
 
-Feature flags on `ostrya`: `pull`, `sign-spki`, `verify-gpg`, `sign-gpg`,
-`deltas`, `s3`, `push`, `receive`, `serve`, `lzma-static` for the static xz
-build, plus the runtime backend selectors `smol` (default) and `tokio`,
-forwarded to `ostrya-rt`. Each heavier or riskier subsystem is opt-in so the
-core stays small. Tar import/export (built on `smol-tar`) and composefs export
-are always compiled, not feature-gated.
+Feature flags on `ostrya`: `sign-spki`, `verify-gpg`, `sign-gpg`, `push`,
+`receive`, `lzma-static` for the static xz build, plus the runtime backend
+selectors `smol` (default) and `tokio`, forwarded to `ostrya-rt`. The HTTP
+server of `ostrya serve` is the workspace crate `ostrya-server`, which
+depends on `ostrya` with `receive`. Each heavier
+or riskier subsystem is opt-in so the core stays small. Tar import/export
+(built on `smol-tar`) and composefs export are always compiled, not
+feature-gated.
 
 ### Async model
 
@@ -7032,12 +7044,13 @@ client expects. By default the server accepts a fast-forward alone. The
 server receives into a normal transaction and reports success only after the
 transaction committed and the refs point at the commit.
 
-Features on `ostrya`: `push` (the commit push from a repository), `receive`
-(the server side of the protocol), and `serve` (the HTTP server, which turns
-on `receive`). The client code that must compile on macOS and Windows goes
-into portable workspace crates: `ostrya-fetch` (the fetcher), `ostrya-sign`
-(the signing engines), and `ostrya-push` (the protocol, the client session,
-the transports, and the tree model). `ostrya` re-exports their public items.
+Features on `ostrya`: `push` (the commit push from a repository) and
+`receive` (the server side of the protocol). The HTTP server is the
+Linux-only workspace crate `ostrya-server`, which depends on `ostrya` with
+`receive` and on `ostrya-fetch`. The client code that must compile on macOS
+and Windows goes into portable workspace crates: `ostrya-fetch` (the
+fetcher), `ostrya-sign` (the signing engines), and `ostrya-push` (the
+protocol, the client session, the transports, and the tree model). `ostrya` re-exports their public items.
 `ostrya-gvariant`, `ostrya-core`, `ostrya-rt`, `ostrya-sign`,
 `ostrya-fetch`, and `ostrya-push` compile on those targets as well. CI checks
 the portable crates for `x86_64-pc-windows-gnu`, `x86_64-apple-darwin`, and
@@ -7077,7 +7090,12 @@ inputs. `ostrya push-tree` pushes a local directory over ssh as one commit
 and prints the commit checksum (`docs/conformance/cli-surface.md`, "Port
 extensions with no counterpart in the tool"). Its commit checksum equals
 the checksum of `ostree commit --no-xattrs` over the same tree with the same
-options. The HTTP transport and `ostrya serve` are still to come.
+options. The read-only half of `ostrya serve` is done: `ostrya serve
+--read-only` serves `ArchiveView`, the archive view of a repository of any
+mode, over HTTP and HTTPS, and `ostree pull` from it passes `ostree fsck`
+(`docs/conformance/cli-surface.md`, "Port extensions with no counterpart in
+the tool"). The HTTP push transport and the receive endpoint of `ostrya
+serve` are still to come.
 
 Pull over ssh follows push as separate work.
 

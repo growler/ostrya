@@ -1036,18 +1036,31 @@ objects/<commit>.commitmeta
   the pull: `error: Invalid checksum for static delta <name>`, with no part
   requested. A superblock the remote does not hold answers 404 and the pull
   continues with loose objects, with no error, unless the pull requires static
-  deltas.
+  deltas. A remote that answers 404 for every path under `deltas/` and
+  `delta-indexes/`, with a summary that names the delta, takes this path: the
+  pull reads the delta from the summary map, gets 404 for the superblock, and
+  fetches the objects loose (observed with `ostree` 2026.1 on 2026-10-02, and
+  repeated with `ostree` 2026.2).
+- A part that answers 404 after its superblock fails the pull: `error: While
+  fetching <url>/deltas/<name>/0: Server returned HTTP 404`. The pull fetches no
+  object loose in its place and does not move the ref. This holds for a from-to
+  delta and a from-scratch delta that the index names, with and without the
+  summary map naming it.
 - `--require-static-deltas` refuses a remote that serves no summary: `error:
   Fetch configured to require static deltas, but no summary deltas or delta
   index found`, with no delta probe, also where the client holds the commit and
   under `--commit-metadata-only`. With a summary, it refuses a commit the client
   does not hold complete where no delta the index or the summary names can be
   taken, and where the superblock of the delta taken is absent: `error: Static
-  deltas required, but none found for <ref> to <commit>`. The tool writes `(null)` for
-  `<ref>` in the second case. A remote naming a from-scratch delta that the
-  pull leaves alone, because the client's ref names a commit, satisfies the
-  switch, and that pull fetches loose. A commit the client already holds
-  complete is not refused.
+  deltas required, but none found for <ref> to <commit>`. In the second case the
+  tool writes the checksum of the commit the delta starts from in place of
+  `<ref>`, and `(null)` for a from-scratch delta (observed with `ostree` 2026.1
+  on 2026-10-02). The port writes the ref name in both cases. A remote naming a
+  from-scratch delta that the pull leaves alone, because the client's ref names
+  a commit, satisfies the switch, and that pull fetches loose. A commit the
+  client already holds complete is not refused.
+- `--disable-static-deltas` requests no delta index and no superblock, and the
+  pull fetches every object loose.
 - An archive client takes no delta. A plain pull requests no delta index and
   fetches every object loose, and `--require-static-deltas` refuses with `error:
   Can't use static deltas in an archive repo` before any request is made.
@@ -1055,10 +1068,55 @@ objects/<commit>.commitmeta
   remote actually stores. Metadata keeps `.commit`, `.dirtree`, and `.dirmeta`.
   Detached metadata is `.commitmeta`, requested before the commit object it
   belongs to, with a 404 treated as the commit carrying none.
-- `config` is requested after a summary arrives, and its `[core] mode` decides
-  whether the pull proceeds: a `bare-user` remote produces `error: Can't pull
-  from archives with mode "bare-user"`. The same remote with no summary, where no
-  config is fetched, instead fails on a 404 for an `objects/<...>.filez` request.
+- `config` is requested only after a summary arrives, and its `[core] mode`
+  decides whether the pull proceeds: a `bare-user` remote produces `error: Can't
+  pull from archives with mode "bare-user"`. The same remote with no summary,
+  where no config is fetched, instead fails on a 404 for an
+  `objects/<...>.filez` request. An archive remote with no summary pulls with no
+  error when its `config` is absent, does not parse, or states `mode=bare-user`.
+  `ostree remote refs` and `ostree remote summary` request no `config`. After a
+  summary, a `config` that answers 404 fails the pull with no request after it:
+  `error: While fetching <url>/config: Server returned HTTP 404`.
+- The pull reads `[core] mode` alone from the remote `config`. Observed with
+  `ostree` 2026.1 on 2026-10-02 against a static server over an archive
+  repository with a summary, with a different `config` served in each run.
+  `ostree` 2026.2 gave the same result for the runs it repeated: `mode=archive`,
+  `mode=bare-user`, `mode=bogus`, no `mode` key, no `[core]` group, a file that
+  does not parse, `repo_version` absent and `abc`, the extra `[core]` keys
+  other than `parent`, the extra groups, `indexed-deltas=false`, and a
+  `collection-id` different from that of the summary. With no summary it
+  repeated the absent `config` and `mode=bare-user`, and after a summary the
+  `config` that answers 404.
+  - `mode=archive-z2` and `mode=archive` proceed. `mode=bare`, `bare-user`,
+    `bare-user-only`, and `bare-split-xattrs` are refused before the first
+    object request: `error: Can't pull from archives with mode "<mode>"`.
+  - A `config` with no `mode` key, with no `[core]` group, or with no bytes reads
+    as mode `bare` and is refused: `error: Can't pull from archives with mode
+    "bare"`.
+  - An unknown mode is refused: `error: Invalid mode 'bogus' in repository
+    configuration`. A file that does not parse is refused: `error: Parsing
+    config: Key file contains line “this is not a key file” which is not a
+    key-value pair, group, or comment`.
+  - `repo_version` is not checked: absent, `0`, `2`, and `abc` all proceed.
+  - No other key and no other group changes the requests or the result. The
+    runs covered the `[core]` keys `min-free-space-percent`,
+    `min-free-space-size`, `fsync`, `add-remotes-config-dir`,
+    `lock-timeout-secs`, `zlib-level`, `payload-link-threshold`, and `parent`;
+    `indexed-deltas` `true`, `false`, and absent, which leave the index request
+    of a summary that states `indexed-deltas` true as it is; `collection-id`
+    present, absent, and different from that of the summary; and the groups
+    `[remote "x"]`, `[ex-ostrya]`, and `[sysroot]`.
+  - A collection id fails a pull only through the remote of the client, checked
+    against the binding of the commit: `error: Commit <c>: Commit has collection
+    ID ‘<bound>’ in collection binding metadata, while the remote it came from
+    has collection ID ‘<found>’`, and, for a commit with no binding, `error:
+    Commit <c>: Expected commit metadata to have collection ID binding
+    information, found none`.
+
+  The port requests `config` in every pull, with or without a summary, and
+  refuses a remote whose mode is not an archive mode with an error that names
+  the mode. It reads a `config` that answers 404 as an archive repository and
+  proceeds.
 - An empty ref list resolves differently per mode. A plain pull uses the remote's
   `branches` config key and fails with `error: No configured branches for remote
   origin` when it is absent. A mirror pull takes every ref the summary lists and
@@ -1153,6 +1211,51 @@ input: depth <depth> is below -1` at exit 1, and writes no object and no ref.
 `pull` refuses it before it sends a request. `pull-local` opens the source
 repository and each `--localcache-repo` first, and then refuses the value
 before it reads a ref or an object of the source.
+
+#### The archive view
+
+`ostrya serve` and `ArchiveView` of `ostrya` serve a repository of any mode
+as an archive repository, for a pull of the tool:
+
+- `config` is built: `[core]\nrepo_version=1\nmode=archive-z2\n`, followed
+  by `collection-id=ID\n` and then `indexed-deltas=VALUE\n` when the
+  repository config sets them, each with the value as the repository config
+  writes it. No other key and no other group is served. A change of the
+  repository config shows in the next answer.
+- `summary`, `summary.sig`, the files under `refs/` and `extensions/`, and the
+  `.commit`, `.dirtree`, `.dirmeta`, and `.commitmeta` objects are served as
+  stored. In an `archive` repository the `.filez` objects and the files under
+  `deltas/` and `delta-indexes/` are served as stored too.
+- In every other mode a `.filez` object is built on request: the framed
+  archive header of the logical metadata the mode stores, then the payload in
+  raw DEFLATE at `[archive] zlib-level`. For the same object at the same level
+  the bytes equal those of the `.filez` that an `archive` repository of the
+  port stores. A symlink object is the header alone. A stored file that
+  holds another size than the header states fails the response. `deltas/` and
+  `delta-indexes/` get 404 in these modes, and a summary that names a delta
+  is served unchanged. The pull then fetches the objects loose, as the delta
+  rules above state.
+- A ref alias under `refs/` is served as the ref it names, when that ref is a
+  regular file under `refs/`. A pull with no summary of an alias succeeds. An
+  alias of an alias, an alias whose target leaves `refs/` or holds an empty
+  component, as a trailing `/` gives, and a symlink anywhere else on a path
+  get 404. The walk starts at the `objects/` directory the repository handle
+  opened, so a symlink at `objects/` itself is part of the repository layout
+  and is followed.
+- `.lock`, `.update.lock`, `tmp/`, `state/`, every path with an empty
+  component or a component that starts with `.`, a `.file` path, and every
+  path outside the families above get 404, and so does a name longer than
+  the kernel accepts. A refused path and an absent path get the same
+  response. A directory on the path that the server cannot search gets 500.
+- A `HEAD` gets the status and the `Content-Length` of a `GET`. For a
+  `.filez` built on request it reads no xattr and no byte of the object, so
+  a `bare-split-xattrs` object whose xattrs do not parse answers a `HEAD`
+  with 200 and a `GET` with 500.
+- The summary of a `bare-user-shared` repository states that mode in
+  `ostree.summary.mode`. Observed with `ostree` 2026.1 on 2026-10-02: a pull
+  that gets this summary fails with `error: Invalid mode 'bare-user-shared'
+  in repository configuration`. A pull from the same repository with no
+  summary succeeds. The port keeps this summary and records the gap.
 
 ### Signature verification during a pull
 
@@ -1262,6 +1365,11 @@ verification keys select, and how each value is spelled, is in "Signature
 verification during a pull". A remote section can also hold the push keys of
 the port, `push-url`, `ssh-command`, and `receive-command` (see "Port
 extension: the push keys of a remote").
+
+The port reads at most 1048576 bytes of `config`, and refuses a larger file
+with `config exceeds the 1048576-byte size cap`, when it opens a repository
+and at each later read of the file. The tool reads a file of any size. This is
+a port divergence.
 
 Parsing rules, recovered by feeding crafted config files to the tool, reading
 back with `ostree config get` and commands that consume config, and inspecting

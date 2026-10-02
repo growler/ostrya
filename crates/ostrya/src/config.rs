@@ -29,7 +29,7 @@
 use ostrya_core::{KeyFile, RepoMode};
 
 use crate::error::{Error, Result};
-use crate::repo::Repo;
+use crate::repo::{Repo, check_config_size};
 use crate::summary::{remove_root_file_blocking, write_root_file_blocking};
 
 const CORE: &str = "core";
@@ -451,7 +451,8 @@ impl Repo {
     /// The document is written as given. A caller that removes `[core] mode` or
     /// `[core] repo_version` writes a file [`Repo::open`] refuses, so read the
     /// current document through [`RepoConfig::keyfile`], edit it, and write it
-    /// back.
+    /// back. A document over 1 MiB, the size an open accepts, is refused with
+    /// [`Error::InvalidFormat`] and nothing is written.
     ///
     /// This handle keeps the configuration it was opened with; reopen the
     /// repository to read the new values.
@@ -468,6 +469,7 @@ impl Repo {
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
         let fsync = self.config().fsync()?;
         let bytes = keyfile.to_string().into_bytes();
+        check_config_size(&bytes)?;
         self.write_locked(move |repo| {
             write_root_file_blocking(repo.repo_fd(), CONFIG_FILE, &bytes, fsync)
         })

@@ -329,9 +329,9 @@ mod tls;
 pub use self::error::{Error, Result};
 
 use gate::{Gate, Permit};
-use io::{FuturesIo, RtExecutor, RtTimer, WriteVectored};
+pub use io::{FuturesIo, RtExecutor, RtTimer, WriteVectored};
 use tls::{ClientConfigs, client_config};
-pub use tls::{ClientIdentity, TlsOptions, TrustRoots};
+pub use tls::{ClientIdentity, TlsOptions, TrustRoots, server_config};
 
 /// The user agent a request carries, which a `User-Agent` header the fetcher or
 /// the request sets replaces.

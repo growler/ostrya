@@ -10,6 +10,7 @@ members = [
     "crates/ostrya-push",
     "crates/ostrya-sys",
     "crates/ostrya",
+    "crates/ostrya-server",
     "crates/ostrya-cli",
     "crates/ostrya-conformance",
 ]
@@ -31,3 +32,5 @@ ostrya-sign = { path = "crates/ostrya-sign", version = "0.2.8", default-features
 ostrya-fetch = { path = "crates/ostrya-fetch", version = "0.2.8", default-features = false }
 ostrya-push = { path = "crates/ostrya-push", version = "0.2.8", default-features = false }
 ostrya-sys = { path = "crates/ostrya-sys", version = "0.2.8" }
+ostrya = { path = "crates/ostrya", version = "0.2.8", default-features = false }
+ostrya-server = { path = "crates/ostrya-server", version = "0.2.8", default-features = false }

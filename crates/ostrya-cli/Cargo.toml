@@ -12,21 +12,24 @@ name = "ostrya"
 path = "src/main.rs"
 
 [features]
-default = ["smol", "spki", "gpg", "receive", "push", "lzma-static"]
-smol = ["ostrya/smol", "ostrya-rt/smol"]
-tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
+default = ["smol", "spki", "gpg", "receive", "push", "serve", "lzma-static"]
+smol = ["ostrya/smol", "ostrya-rt/smol", "ostrya-server?/smol"]
+tokio = ["ostrya/tokio", "ostrya-rt/tokio", "ostrya-server?/tokio"]
 spki = ["ostrya/sign-spki"]
 gpg = ["ostrya/sign-gpg"]
 # `ostrya receive`, the server side of a push over ssh.
 receive = ["ostrya/receive"]
 # The client side of a push from a repository.
 push = ["ostrya/push"]
+# `ostrya serve`, the HTTP server of a repository.
+serve = ["dep:ostrya-server"]
 # The shipped binary links xz statically, so it needs no runtime liblzma.
 lzma-static = ["ostrya/lzma-static"]
 
 [dependencies]
 ostrya = { path = "../ostrya", default-features = false }
 ostrya-rt = { workspace = true }
+ostrya-server = { workspace = true, optional = true }
 clap = { version = "4", features = ["derive"] }
 # `commit --tar-pathname-filter` compiles an expression. The tool compiles it as
 # a PCRE2 pattern through GLib's `GRegex`, so the port compiles it with PCRE2

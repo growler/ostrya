@@ -14426,8 +14426,9 @@ spec: format-reference.md#http-pull-surface
 note: a summary that names no delta the destination can apply is refused in
  both with `Static deltas required, but none found for main to <commit>`, and
  neither side writes an object or a ref. A superblock the summary names and
- the source does not hold is refused in the same words; the tool names the ref
- as `(null)` there.
+ the source does not hold is refused in the same words; the tool writes the
+ from part there as `(null)` for a from-scratch delta and as the checksum of
+ the from commit for a from-to delta.
 
 family: M10
 subcommand: pull-local

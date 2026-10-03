@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! The push protocol of ostrya.
+//! The push protocol of ostrya, and the wire protocol of the pull over ssh.
 //!
 //! A push client sends the objects of a set of commits to a server
 //! repository and then asks it to update refs in one transaction. The
@@ -8,6 +8,11 @@
 //! encoding, the frame codec with its size limit, and the chunked object
 //! stream with its abandon marker. The module docs of [`proto`] state the
 //! wire format in full.
+//!
+//! The same codec carries the pull over ssh. A pull client asks for each
+//! file of the repository by its path with `Get`, and the server answers
+//! each `Get` with `GetReply` and a body of chunks. The pull has its own
+//! message kinds and its own version, [`proto::PULL_PROTOCOL_VERSION`].
 //!
 //! The [`session`] module holds the client side. [`PushSession`] runs one
 //! session over a pair of byte streams: it opens with `Hello`, asks which
@@ -73,6 +78,9 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Error>();
     assert_send_sync::<proto::Message>();
+    assert_send_sync::<proto::PullHello>();
+    assert_send_sync::<proto::PullHelloReply>();
+    assert_send_sync::<proto::GetReply>();
     assert_send_sync::<proto::FrameReader<&[u8]>>();
     assert_send_sync::<proto::ObjectBody<'static, &[u8]>>();
     assert_send_sync::<proto::FrameWriter<Vec<u8>>>();

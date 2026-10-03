@@ -332,12 +332,13 @@ pub enum Error {
         /// What the value holds instead.
         reason: String,
     },
-    /// A push session failed: the error the receive side sent to the peer
-    /// with its wire code, an `Abort` of the client
-    /// ([`Aborted`](crate::push::Error::Aborted)), or an error of the session
-    /// stream. On the client side it also carries a push request the client
-    /// refuses ([`InvalidInput`](crate::push::Error::InvalidInput)).
-    #[cfg(any(feature = "push", feature = "receive"))]
+    /// A session of the wire protocol of [`push`](crate::push) failed: the
+    /// error the server side sent to the peer with its wire code, an `Abort`
+    /// of the client ([`Aborted`](crate::push::Error::Aborted)), or an error
+    /// of the session stream. On the client side it also carries a push
+    /// request the client refuses
+    /// ([`InvalidInput`](crate::push::Error::InvalidInput)). The variant is
+    /// in every build.
     #[error(transparent)]
     Push(#[from] crate::push::Error),
     /// The repository holds no static delta from `from` to `to`: nothing

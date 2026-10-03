@@ -1257,6 +1257,9 @@ as an archive repository, for a pull of the tool:
   in repository configuration`. A pull from the same repository with no
   summary succeeds. The port keeps this summary and records the gap.
 
+`ostrya send` serves the same view over ssh. It answers a path that the view
+refuses with the reply of a path that is not found.
+
 ### Signature verification during a pull
 
 Recovered by running `ostree` 2026.1 against a static HTTP server over a

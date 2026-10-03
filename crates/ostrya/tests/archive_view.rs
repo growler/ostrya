@@ -5,99 +5,24 @@
 mod common;
 
 use std::fs;
-use std::os::fd::AsFd;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-use std::path::{Path, PathBuf};
+use std::os::unix::fs::symlink;
+use std::path::Path;
 
 use async_compression::futures::bufread::DeflateDecoder;
 use common::TmpDir;
+use common::modes::{
+    WRITABLE, build_tree, current_owner, file_objects, object_path, repo_of, write_split_object,
+};
 use futures_lite::AsyncReadExt;
 use futures_lite::io::{BufReader, Cursor};
 use ostrya::{
-    ArchiveAnswer, ArchiveHead, ArchiveView, Checksum, CommitModifier, CommitModifierFlags,
-    CommitOptions, CreateOptions, FileKind, MutableTree, ObjectType, Repo, RepoMode,
-    SummaryOptions, loose_path,
+    ArchiveAnswer, ArchiveHead, ArchiveView, Checksum, CreateOptions, FileKind, ObjectType, Repo,
+    RepoMode, SummaryOptions, loose_path,
 };
 use ostrya_core::{ContentHasher, DeflateReader, FileHeader, Xattrs};
 use ostrya_rt::block_on;
 
-/// The modes the port writes.
-const WRITABLE: [RepoMode; 5] = [
-    RepoMode::Archive,
-    RepoMode::Bare,
-    RepoMode::BareUser,
-    RepoMode::BareUserOnly,
-    RepoMode::BareUserShared,
-];
-
 const BASE_CONFIG: &[u8] = b"[core]\nrepo_version=1\nmode=archive-z2\n";
-
-/// A tree with a regular file, an executable, an empty file, a file larger
-/// than one 64 KiB chunk, and a symlink to the first file.
-fn build_tree(base: &Path) -> PathBuf {
-    let src = base.join("src");
-    fs::create_dir_all(&src).unwrap();
-    fs::write(src.join("hello"), b"hello ostree\n").unwrap();
-    fs::write(src.join("exec"), b"#!/bin/sh\n").unwrap();
-    fs::set_permissions(src.join("exec"), fs::Permissions::from_mode(0o755)).unwrap();
-    fs::write(src.join("empty"), b"").unwrap();
-    let big: Vec<u8> = (0..300_000u32)
-        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-        .collect();
-    fs::write(src.join("big"), big).unwrap();
-    symlink("hello", src.join("link")).unwrap();
-    src
-}
-
-/// Commit the tree at `src` into `repo` on `main` with a fixed timestamp.
-async fn commit(repo: &Repo, src: &Path) -> Checksum {
-    let txn = repo.transaction().await.unwrap();
-    let mut mtree = MutableTree::new();
-    let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
-    let dfd = fs::File::open(src).unwrap();
-    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), &mut mtree, Some(&mut modifier))
-        .await
-        .unwrap();
-    let root = txn.write_mtree(&mut mtree).await.unwrap();
-    let commit = txn
-        .write_commit(
-            CommitOptions {
-                subject: Some("view".to_owned()),
-                timestamp: Some(1_700_000_000),
-                ..CommitOptions::default()
-            },
-            &root,
-        )
-        .await
-        .unwrap();
-    txn.set_ref("main", Some(&commit));
-    txn.commit().await.unwrap();
-    commit
-}
-
-/// A repository of `mode` under `base/<mode>` with the tree of `src` on
-/// `main`.
-async fn repo_of(base: &Path, mode: RepoMode, src: &Path) -> (PathBuf, Repo, Checksum) {
-    let path = base.join(mode.as_mode_str());
-    let repo = Repo::create(&path, CreateOptions::new(mode)).await.unwrap();
-    let commit = commit(&repo, src).await;
-    (path, repo, commit)
-}
-
-/// The file objects of `commit`, by checksum.
-async fn file_objects(repo: &Repo, commit: &Checksum) -> Vec<Checksum> {
-    repo.traverse_commit(commit, 0)
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|name| name.ty == ObjectType::File)
-        .map(|name| name.checksum)
-        .collect()
-}
-
-fn object_path(ty: ObjectType, checksum: &Checksum) -> String {
-    format!("objects/{}", loose_path(checksum, ty, RepoMode::Archive))
-}
 
 async fn read_all(answer: ArchiveAnswer) -> (Option<u64>, Vec<u8>) {
     match answer {
@@ -386,56 +311,6 @@ fn the_zlib_level_of_the_config_applies_to_the_next_filez() {
     });
 }
 
-/// The running user's uid and gid.
-fn current_owner(dir: &Path) -> (u32, u32) {
-    let md = fs::metadata(dir).unwrap();
-    (md.uid(), md.gid())
-}
-
-/// Write one `bare-split-xattrs` file object by hand: the inode carries the
-/// owner and the mode, and a `.file-xattrs-link` hardlink to the shared
-/// `.file-xattrs` object carries the extended attributes.
-fn write_split_object(
-    root: &Path,
-    mode: u32,
-    target: &str,
-    xattrs: &Xattrs,
-    payload: &[u8],
-) -> Checksum {
-    let (uid, gid) = current_owner(root);
-    let header = FileHeader {
-        uid,
-        gid,
-        mode,
-        symlink_target: target.to_owned(),
-        xattrs: xattrs.clone(),
-    };
-    let mut hasher = ContentHasher::new(&header).unwrap();
-    hasher.update(payload);
-    let id = hasher.finish();
-    let at = |checksum: &Checksum, ty| {
-        let full = root
-            .join("objects")
-            .join(loose_path(checksum, ty, RepoMode::BareSplitXattrs));
-        fs::create_dir_all(full.parent().unwrap()).unwrap();
-        full
-    };
-    let file = at(&id, ObjectType::File);
-    if mode & 0o170000 == 0o120000 {
-        symlink(target, &file).unwrap();
-    } else {
-        fs::write(&file, payload).unwrap();
-        fs::set_permissions(&file, fs::Permissions::from_mode(mode & 0o7777)).unwrap();
-    }
-    let xbytes = xattrs.to_gvariant().unwrap();
-    let xattrs_path = at(&Checksum::sha256(&xbytes), ObjectType::FileXattrs);
-    if !xattrs_path.exists() {
-        fs::write(&xattrs_path, &xbytes).unwrap();
-    }
-    fs::hard_link(&xattrs_path, at(&id, ObjectType::FileXattrsLink)).unwrap();
-    id
-}
-
 /// In `bare-split-xattrs` the header carries the owner and the mode of the
 /// inode and the extended attributes of the split object. The config is the
 /// archive one.
@@ -593,11 +468,19 @@ fn private_and_absent_paths_are_refused_or_not_found() {
                 "refs/heads/slash",
                 "extensions/inside",
                 "extensions/outside",
+                "refs/heads/main/a//b",
+                "refs/heads/main/",
+                "/refs/heads/main",
+                "refs/heads/./main",
             ];
             let long = "x".repeat(300);
             let long_ref = format!("refs/heads/{long}");
             let long_dir = format!("refs/{long}/x");
             let long_extension = format!("extensions/{long}");
+            // Deep paths: an absent directory, and a file at an inner
+            // component.
+            let deep_absent = format!("refs/heads/{}x", "a/".repeat(10_000));
+            let deep_under_file = format!("refs/heads/main/{}x", "a/".repeat(10_000));
             let mut not_found = vec![
                 "refs/heads/absent",
                 "refs/heads/fifo",
@@ -607,6 +490,8 @@ fn private_and_absent_paths_are_refused_or_not_found() {
                 long_ref.as_str(),
                 long_dir.as_str(),
                 long_extension.as_str(),
+                deep_absent.as_str(),
+                deep_under_file.as_str(),
             ];
             if mode != RepoMode::Archive {
                 not_found.push("deltas/ab/cd/superblock");

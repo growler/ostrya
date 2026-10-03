@@ -23,6 +23,7 @@ use common::receive::{
 use common::{TmpDir, file_inventory, foreign_holder, lock_holder_main};
 use ostrya::push::proto::{
     ErrorMessage, FrameWriter, Hello, MAX_FRAME, MAX_HAVE, Message, ObjectHeader, ObjectsReply,
+    PULL_PROTOCOL_VERSION, PullHello,
 };
 use ostrya::push::{self, Encoding, ErrorCode};
 use ostrya::{
@@ -330,6 +331,44 @@ fn a_message_out_of_order_is_protocol() {
         let (result, error) = session(&repo, &policy(), script);
         assert_eq!(error.code, ErrorCode::Protocol, "{what}");
         assert_eq!(returned_code(&result), Some(ErrorCode::Protocol), "{what}");
+        assert_nothing_published(&repo, &before);
+    }
+}
+
+/// A kind of the pull is `protocol` at the receive side: `PullHello` as the
+/// first frame, and `Get` after `Hello`.
+#[test]
+fn a_pull_kind_is_protocol() {
+    let cases: Vec<(&str, Script)> = vec![
+        ("PullHello as the first frame", |mut c| {
+            Box::pin(async move {
+                c.send(&Message::PullHello(PullHello {
+                    version: PULL_PROTOCOL_VERSION,
+                    agent: None,
+                }))
+                .await
+                .unwrap();
+                c.error().await
+            })
+        }),
+        ("Get after Hello", |mut c| {
+            Box::pin(async move {
+                c.hello_reply(&[]).await;
+                c.send(&Message::Get("config".into())).await.unwrap();
+                c.error().await
+            })
+        }),
+    ];
+    for (what, script) in cases {
+        let tmp = TmpDir::new("recv-pull-kind");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let before = file_inventory(repo.path(), "objects");
+        let (result, error) = session(&repo, &policy(), script);
+        assert_eq!(error.code, ErrorCode::Protocol, "{what}");
+        assert!(
+            matches!(&result, Err(Error::Push(push::Error::Protocol(_)))),
+            "{what}: {result:?}"
+        );
         assert_nothing_published(&repo, &before);
     }
 }

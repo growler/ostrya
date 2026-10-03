@@ -26,6 +26,8 @@ static COMMIT_REPLY: LazyLock<Type> = LazyLock::new(|| parse("a(smaymay)"));
 static ERROR: LazyLock<Type> = LazyLock::new(|| parse("(ssa{sv})"));
 static STRV: LazyLock<Type> = LazyLock::new(|| parse("as"));
 static MAYBE_CHECKSUM: LazyLock<Type> = LazyLock::new(|| parse("may"));
+static PULL_HELLO: LazyLock<Type> = LazyLock::new(|| parse("(ua{sv})"));
+static GET_REPLY: LazyLock<Type> = LazyLock::new(|| parse("(bmt)"));
 
 /// `Hello`: the first message of the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,8 +161,43 @@ pub struct ErrorMessage {
     pub current: Option<RefState>,
 }
 
-/// A message of the protocol.
+/// `PullHello`: the first message of a pull client.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullHello {
+    /// The highest pull protocol version the client speaks.
+    pub version: u32,
+    /// The name and version of the client, key `agent`.
+    pub agent: Option<String>,
+}
+
+/// `PullHelloReply`: the pull version of the session.
+///
+/// The dict of the reply is empty in version 1. A decoder ignores a key it
+/// does not know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullHelloReply {
+    /// The pull protocol version of the session: the lower of the version of
+    /// `PullHello` and the highest version of the server.
+    pub version: u32,
+}
+
+/// `GetReply`: the answer to one `Get`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GetReply {
+    /// Whether the server serves the path. A body follows a reply with found
+    /// true.
+    pub found: bool,
+    /// The length of the body, when the server knows it. A reply with found
+    /// false and a length is the error `protocol`, on encode and on decode.
+    pub len: Option<u64>,
+}
+
+/// A message of the protocol.
+///
+/// The enum is `#[non_exhaustive]`, because a later protocol version adds
+/// messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Message {
     /// `Hello`.
     Hello(Hello),
@@ -184,6 +221,14 @@ pub enum Message {
     Error(ErrorMessage),
     /// `Abort`.
     Abort,
+    /// `PullHello`.
+    PullHello(PullHello),
+    /// `PullHelloReply`.
+    PullHelloReply(PullHelloReply),
+    /// `Get`: the path of one file, relative to the repository root.
+    Get(String),
+    /// `GetReply`.
+    GetReply(GetReply),
 }
 
 impl Message {
@@ -201,6 +246,10 @@ impl Message {
             Message::CommitReply(_) => Kind::CommitReply,
             Message::Error(_) => Kind::Error,
             Message::Abort => Kind::Abort,
+            Message::PullHello(_) => Kind::PullHello,
+            Message::PullHelloReply(_) => Kind::PullHelloReply,
+            Message::Get(_) => Kind::Get,
+            Message::GetReply(_) => Kind::GetReply,
         }
     }
 
@@ -332,6 +381,24 @@ impl Message {
                 ]);
                 (&ERROR, v)
             }
+            Message::PullHello(h) => {
+                let mut opts = DictBuilder::new();
+                if let Some(agent) = &h.agent {
+                    opts.insert_str("agent", agent);
+                }
+                let v = Value::Tuple(vec![Value::U32(h.version), opts.build()]);
+                (&PULL_HELLO, v)
+            }
+            Message::PullHelloReply(r) => {
+                let v = Value::Tuple(vec![Value::U32(r.version), DictBuilder::new().build()]);
+                (&PULL_HELLO, v)
+            }
+            Message::Get(path) => (&Type::Str, Value::Str(path.clone())),
+            Message::GetReply(r) => {
+                check_get_reply(r)?;
+                let len = Value::Maybe(r.len.map(|n| Box::new(Value::U64(n))));
+                (&GET_REPLY, Value::Tuple(vec![Value::Bool(r.found), len]))
+            }
         };
         ostrya_gvariant::to_bytes(ty, &value).map_err(|e| protocol(format!("encode: {e}")))
     }
@@ -408,6 +475,30 @@ impl Message {
                 })?)
             }
             Kind::Error => Message::Error(decode_error(body)?),
+            Kind::PullHello => {
+                let (version, opts): (u32, Dict) = parse_body(body)?;
+                let [agent] = dict(opts, ["agent"])?;
+                let agent: Option<&str> = field(agent, "agent", &Type::Str)?;
+                Message::PullHello(PullHello {
+                    version,
+                    agent: agent.map(str::to_owned),
+                })
+            }
+            Kind::PullHelloReply => {
+                let (version, opts): (u32, Dict) = parse_body(body)?;
+                let [] = dict(opts, [])?;
+                Message::PullHelloReply(PullHelloReply { version })
+            }
+            Kind::Get => {
+                let path: &str = parse_body(body)?;
+                Message::Get(path.to_owned())
+            }
+            Kind::GetReply => {
+                let (found, len): (bool, MaybeU64) = parse_body(body)?;
+                let r = GetReply { found, len: len.0 };
+                check_get_reply(&r)?;
+                Message::GetReply(r)
+            }
         })
     }
 }
@@ -532,6 +623,14 @@ fn decode_error(body: &[u8]) -> Result<ErrorMessage> {
     Ok(e)
 }
 
+/// A reply with found false carries no length.
+fn check_get_reply(r: &GetReply) -> Result<()> {
+    if !r.found && r.len.is_some() {
+        return Err(protocol("GetReply with found false carries a length"));
+    }
+    Ok(())
+}
+
 /// `deflate` is allowed for a file object alone.
 fn check_header(name: &ObjectName, encoding: Encoding) -> Result<()> {
     if !header_type(name.ty) {
@@ -564,6 +663,32 @@ pub(super) fn object_header_frame(h: &ObjectHeader) -> Result<[u8; OBJECT_HEADER
     frame[38] = h.encoding.as_u8();
     frame[39] = 33;
     Ok(frame)
+}
+
+/// The length of the longest `GetReply` frame: the 4 length bytes, the
+/// kind, and the 16 bytes of a body with a length.
+pub(super) const GET_REPLY_FRAME: usize = 21;
+
+/// The frame of a `GetReply`, with no allocation, and the number of its bytes
+/// in use: 13 with no length, 21 with one. The body `(bmt)` is the found
+/// byte, 7 bytes of padding to the alignment of the `mt`, and the 8 bytes of
+/// the length in little-endian order when there is one. A fixed-size first
+/// member and a last member take no framing offset. The bytes equal the
+/// length, the kind, and the bytes of [`Message::encode_body`].
+pub(super) fn get_reply_frame(r: &GetReply) -> Result<([u8; GET_REPLY_FRAME], usize)> {
+    check_get_reply(r)?;
+    let mut frame = [0u8; GET_REPLY_FRAME];
+    let used = match r.len {
+        Some(len) => {
+            frame[13..].copy_from_slice(&len.to_le_bytes());
+            GET_REPLY_FRAME
+        }
+        None => 13,
+    };
+    frame[..4].copy_from_slice(&(used as u32 - 4).to_be_bytes());
+    frame[4] = Kind::GetReply.as_u8();
+    frame[5] = u8::from(r.found);
+    Ok((frame, used))
 }
 
 fn object_names_value(names: &[ObjectName]) -> Result<Value> {
@@ -622,6 +747,27 @@ impl<'a> GvDecode<'a> for MaybeBytes<'a> {
             Some((0, rest)) => Ok(MaybeBytes(Some(rest))),
             Some(_) => Err(ostrya_gvariant::Error::NotNormal(
                 "maybe lacks its terminating zero byte",
+            )),
+        }
+    }
+}
+
+/// An `mt` in the body: no bytes for nothing, or the 8 bytes of the `t`. A
+/// maybe of a fixed-size type has no terminating zero byte.
+struct MaybeU64(Option<u64>);
+
+impl GvType for MaybeU64 {
+    const ALIGNMENT: usize = 8;
+    const FIXED_SIZE: Option<usize> = None;
+}
+
+impl<'a> GvDecode<'a> for MaybeU64 {
+    fn decode(data: &'a [u8]) -> ostrya_gvariant::Result<Self> {
+        match data.len() {
+            0 => Ok(MaybeU64(None)),
+            8 => u64::decode(data).map(|n| MaybeU64(Some(n))),
+            _ => Err(ostrya_gvariant::Error::NotNormal(
+                "maybe of a u64 is not 0 or 8 bytes",
             )),
         }
     }

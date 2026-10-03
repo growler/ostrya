@@ -3246,11 +3246,12 @@ support needs its own design pass against that refusal.
 
 ## Port extensions with no counterpart in the tool
 
-The tool has no push and no server. `receive`, `push`, `push-tree`, and
-`serve` are commands of the port alone, so no matrix cell compares them
-with the tool. The receiving repository stays a normal repository: the tool
-reads it, checks it with `ostree fsck`, and pulls from it with `ostree
-pull-local`. The tool pulls from `serve` with `ostree pull`.
+The tool has no push, no pull over ssh, and no server. `receive`, `push`,
+`push-tree`, `serve`, and `send` are commands of the port alone, so no
+matrix cell compares them with the tool. The receiving repository stays a
+normal repository: the tool reads it, checks it with `ostree fsck`, and
+pulls from it with `ostree pull-local`. The tool pulls from `serve` with
+`ostree pull`.
 
 ### `receive`
 
@@ -3597,6 +3598,56 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   'bare-user-shared' in repository configuration`. A pull from such a
   repository with no summary succeeds. The gap is recorded and kept: a pull
   of the tool from a `bare-user-shared` repository is no goal of the port.
+
+### `send`
+
+```text
+ostrya send [--repo=PATH]
+```
+
+- The `send` feature of `ostrya-cli` builds the command. It is in the
+  default set. `Repo::send` takes no feature of `ostrya`, so the command
+  builds without `receive`, `push`, and `serve`.
+- The command serves one pull session over standard input and standard
+  output, through `Repo::send` (`../api-sketch.md`, "Pull over ssh: the
+  serving side"). An ssh pull runs it on the remote side. It answers each
+  `Get` path as the archive view of `serve` answers a `GET` of that path. A
+  path that the view refuses gets the reply of a path that is not found.
+- The command takes no lock and writes no file in the repository. An
+  account with read access to the repository serves an `archive`,
+  `bare-user`, `bare-user-only`, or `bare-user-shared` repository. A `bare`
+  or `bare-split-xattrs` repository needs an account that can read every
+  object and its extended attributes. A file that the account cannot read
+  ends the session with `internal`.
+- Standard output carries the frames of the session alone. The command
+  writes `error: MESSAGE` to standard error on failure, and nothing else,
+  also under `-v`.
+- It exits 0 when standard input ends at a frame boundary, an empty input
+  included. It exits 1 after an `Error` frame and after a failed write.
+- The input is read through a read-ahead ring of 256 KiB and a buffer of
+  64 KiB. Under the smol backend, standard output goes through a write pipe
+  of 8 MiB, and a flush waits until each byte reached the descriptor. So
+  the command flushes only when its input buffer holds no complete `Get`
+  frame, and after `Error`. The output buffer is 64 KiB, and each chunk of
+  a body holds 64 KiB less 4 bytes. With the reader of one body, a session
+  holds about 9 MiB under the smol backend. A `Get` frame at the limit adds
+  about 2 MiB, because the frame body and the decoded path are in memory at
+  the same time.
+- The command installs no signal handler. It holds no transaction, so its
+  end leaves no staging directory.
+- An `authorized_keys` entry restricts an ssh key to pull from one
+  repository:
+
+  ```text
+  restrict,command="ostrya send --repo=/srv/repo" ssh-ed25519 AAAA...
+  ```
+
+  sshd runs the forced command and ignores the command of the client. So a
+  key forced to `ostrya send` pulls and cannot push, and a key forced to
+  `ostrya receive` pushes and cannot pull. A user that pulls and pushes
+  holds two keys.
+- `crates/ostrya/tests/send.rs` and `crates/ostrya-cli/tests/send.rs` hold
+  the tests.
 
 ### ssh access with `authorized_keys`
 

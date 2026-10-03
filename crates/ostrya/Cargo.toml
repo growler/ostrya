@@ -14,24 +14,24 @@ smol = [
     "ostrya-rt/smol",
     "ostrya-sign/smol",
     "ostrya-fetch/smol",
-    "ostrya-push?/smol",
+    "ostrya-push/smol",
 ]
 tokio = [
     "ostrya-rt/tokio",
     "ostrya-sign/tokio",
     "ostrya-fetch/tokio",
-    "ostrya-push?/tokio",
+    "ostrya-push/tokio",
 ]
 sign-spki = ["ostrya-sign/sign-spki"]
 verify-gpg = ["dep:pgp"]
 sign-gpg = ["verify-gpg", "ostrya-sign/sign-gpg"]
 # The server side of a push: the receive policy, the checks it makes, and the
 # session over the push wire protocol of ostrya-push.
-receive = ["dep:ostrya-push"]
+receive = []
 # The client side of a push from a repository: the remote resolution, the
 # refspecs, and the object source over a repository, on the push wire protocol
 # of ostrya-push.
-push = ["dep:ostrya-push"]
+push = []
 # Builds xz from source and links it statically, so the build needs no
 # runtime liblzma. The feature is off by default, and a build without it
 # takes the system liblzma.
@@ -52,7 +52,10 @@ ostrya-composefs = { workspace = true }
 ostrya-rt = { workspace = true }
 ostrya-sign = { workspace = true }
 ostrya-fetch = { workspace = true }
-ostrya-push = { workspace = true, optional = true }
+# The wire protocol of the push and of the pull over ssh. It is in every
+# build: the receive side, the push client, and the serving side of the pull
+# share its codec and its error type.
+ostrya-push = { workspace = true }
 ostrya-sys = { workspace = true }
 thiserror = "2"
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }

@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-push"
-description = "The push protocol of ostrya: the wire codec, the client session, and the ssh and HTTP transports"
+description = "The push and pull protocol of ostrya: the wire codec, the push client session, and the ssh and HTTP transports"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

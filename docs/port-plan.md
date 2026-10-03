@@ -165,9 +165,12 @@ bounded:
   Compiles on Linux, macOS, and Windows. On macOS and Windows,
   `rustls-native-certs` links system libraries of the operating system trust
   store.
-- `ostrya-push` -- the push wire protocol: the messages and their GVariant
-  encoding, the frame codec with its limit, and the chunked object stream
-  with its abandon marker. `ObjectBody` reads the bytes of one object as an
+- `ostrya-push` -- the wire protocol of the push and of the pull over ssh:
+  the messages and their GVariant encoding, the frame codec with its limit,
+  the chunked object stream with its abandon marker, and the bodies of the
+  pull. The pull has its own kinds, `PullHello`, `PullHelloReply`, `Get`,
+  and `GetReply`, and its own version, `PULL_PROTOCOL_VERSION`.
+  `ObjectBody` reads the bytes of one object or of one pull body as an
   `AsyncRead`. The client session: `PushSession` over a pair of byte
   streams, the `ObjectSource` trait it reads objects through, and
   `PushProgress`, `PushStats`, and `PushOutcome`. The ssh transport:
@@ -190,9 +193,10 @@ bounded:
   `ostrya-fetch` crate, re-exported as `ostrya::fetch`. It serves downloads
   and uploads, a request body given whole or streamed through a writer. Its
   error type,
-  `ostrya::fetch::Error`, converts into `ostrya::Error`. The `receive`
-  feature turns on the dependency on `ostrya-push`, re-exported as
-  `ostrya::push`, and `ostrya::Error::Push` carries its error type.
+  `ostrya::fetch::Error`, converts into `ostrya::Error`. `ostrya-push` is a
+  regular dependency in every build, re-exported as `ostrya::push`, and
+  `ostrya::Error::Push` carries its error type. `Repo::send` serves one pull
+  session over a pair of streams through `ArchiveView`, with no feature.
 - `ostrya-server` -- the HTTP server of `ostrya serve`, on Linux alone. It
   serves `ArchiveView` of `ostrya`, the archive view of a repository of any
   mode, over HTTP/1.1, and over TLS with ALPN for HTTP/2 and HTTP/1.1. With
@@ -231,7 +235,10 @@ Feature flags on `ostrya`: `sign-spki`, `verify-gpg`, `sign-gpg`, `push`,
 `receive`, `lzma-static` for the static xz build, plus the runtime backend
 selectors `smol` (default) and `tokio`, forwarded to `ostrya-rt`. The HTTP
 server of `ostrya serve` is the workspace crate `ostrya-server`, which
-depends on `ostrya` with `receive`. Each heavier
+depends on `ostrya` with `receive`. `push` and `receive` gate the client
+side and the server side of a push. `ostrya-push` and `Repo::send` are in
+every build, and the feature `send` of `ostrya-cli`, in its default set,
+builds `ostrya send`. Each heavier
 or riskier subsystem is opt-in so the core stays small. Tar import/export
 (built on `smol-tar`) and composefs export are always compiled, not
 feature-gated.
@@ -7080,10 +7087,10 @@ the portable crates for `x86_64-pc-windows-gnu`, `x86_64-apple-darwin`, and
 `aarch64-apple-darwin`, and builds the rlib of `ostrya-fetch` for each of
 them.
 
-The `push` feature of `ostrya` is `push = ["dep:ostrya-push"]`. It turns on
-the optional dependency on `ostrya-push`, which the `receive` feature also
-turns on, and it adds no other dependency. Under it, `ostrya::push` re-exports
-`ostrya-push`, and `resolve_push_remote` gives the push address and the
+The `push` feature of `ostrya` is `push = []`, and it adds no dependency.
+`ostrya-push` is a regular dependency of `ostrya`, and `ostrya::push`
+re-exports it in every build. Under the feature, `resolve_push_remote` gives
+the push address and the
 connect options of a configured remote or of an address. `is_push_address`
 tells an address from a remote name. `Repo::push` pushes the commits of a set
 of refspecs to a remote over ssh or HTTP. `Repo::push_over_stream` runs the same push
@@ -7099,7 +7106,7 @@ alone, and refuses `tls-permissive=true` for an `https://` address
 (`format-reference.md`, "Port extension: the push keys of a remote"). `ostrya-cli` has the feature
 `push = ["ostrya/push"]` in its default set, which builds `ostrya push` and
 `ostrya push-tree`, beside `receive = ["ostrya/receive"]`, which builds
-`ostrya receive`.
+`ostrya receive`, and `send = []`, which builds `ostrya send`.
 
 Status: the ssh half is done. `ostrya push` pushes the commits of a set of
 refspecs over ssh and prints one line for each ref
@@ -7135,7 +7142,12 @@ a bearer token, a Basic credential, or a client certificate, and with
 transports"). `ostrya push` and `ostrya push-tree` take the HTTP options and
 the HTTP keys of a remote (`docs/conformance/cli-surface.md`, "push").
 
-Pull over ssh follows push as separate work.
+The serving side of the pull over ssh is done. `Repo::send` serves one pull
+session over a pair of streams through one `ArchiveView`, and takes no lock.
+`ostrya send` serves the session over standard input and standard output
+(`docs/api-sketch.md`, "Pull over ssh: the serving side", and
+`docs/conformance/cli-surface.md`, "send"). The client side of the pull
+over ssh follows as separate work.
 
 Verify: push between two port repositories over ssh to localhost and over
 HTTP. The receiving repository passes `ostree fsck` and resolves the pushed
@@ -7171,6 +7183,20 @@ gives `CommitOutcomeUnknown`, and the client sends it once. After `ostrya
 push` over HTTPS to `ostrya serve`, the receiving `bare-user` repository
 passes `ostree fsck`, and `ostree pull` over HTTPS from the archive view of
 the same server gives the pushed commit.
+
+Result of the serving side of the pull: `crates/ostrya/tests/send.rs` runs
+`Repo::send` against a test client over in-process pipes. From a repository
+of each mode the port reads, with 8 `Get` frames in flight, each reply
+equals what a second `ArchiveView` serves for its path, in the order of the
+`Get` frames. A refused path and a missing path both get the not-found
+reply. A test triggers each error code of the pull, and a content object
+truncated after the head of its reply gets `ABANDON` and `Error` with
+`internal`. Over a recording output, each write is at most 64 KiB and no
+write holds a chunk length alone, and 8 `Get` frames that wait in the input
+buffer get one flush. `crates/ostrya-cli/tests/send.rs` runs `ostrya send`:
+it exits 0 after a clean end and 1 after an `Error`, and it serves an
+`archive` and a `bare-user` repository that its user cannot write, with no
+change to the repository.
 
 ### Phase 20 -- Sysroot / deployment (optional, separate track)
 

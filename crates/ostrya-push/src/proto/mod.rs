@@ -1,4 +1,5 @@
-//! The push wire protocol: messages, frames, and the object stream.
+//! The wire protocol of the push and of the pull: messages, frames, the
+//! object stream, and the pull bodies.
 //!
 //! # Frames
 //!
@@ -33,6 +34,14 @@
 //! - 9 `CommitReply` -- `a(smaymay)`
 //! - 10 `Error` -- `(ssa{sv})`
 //! - 11 `Abort` -- `()`, which is the one byte `0x00` in normal form
+//! - 12 `PullHello` -- `(ua{sv})`
+//! - 13 `PullHelloReply` -- `(ua{sv})`
+//! - 14 `Get` -- `s`
+//! - 15 `GetReply` -- `(bmt)`
+//!
+//! Kinds 1 to 9 and 11 belong to the push, kinds 12 to 15 to the pull, and
+//! `Error` to both. The codec reads and writes every kind. A session refuses
+//! a kind of the other protocol as `protocol`.
 //!
 //! A kind that is not in the list is the error `protocol`. A body that is
 //! not in normal form for its type, or that has trailing bytes, is the error
@@ -73,10 +82,40 @@
 //! 0 (`raw`) or 1 (`deflate`), and `deflate` is allowed for type 1 alone.
 //! `Have` names types 1 to 4 alone.
 //!
-//! [`FrameReader`] and [`FrameWriter`] implement the frames and the object
-//! stream over the `futures-io` traits. Object bytes pass through a buffer
-//! of the caller in bounded pieces, so no call holds a whole object.
-//! [`ObjectBody`] presents the bytes of one object as an `AsyncRead`.
+//! # Pull
+//!
+//! The pull asks for files by their path, relative to the repository root.
+//! The client sends `PullHello` with the highest pull version it speaks,
+//! [`PULL_PROTOCOL_VERSION`]. The server replies `PullHelloReply` with the
+//! lower of that version and its own highest version, or `Error` with
+//! `version-unsupported` when it does not speak that version. The pull
+//! version is separate from the version of `Hello`. Version 1 sends an empty
+//! dict in `PullHelloReply`, and a decoder ignores a key of `PullHello` or of
+//! `PullHelloReply` that it does not know.
+//!
+//! The client then sends `Get` frames, and the server answers each with one
+//! `GetReply`, in the order of the `Get` frames. `GetReply` holds found and,
+//! when the server knows it, the length of the body. A reply with found
+//! false and a length is the error `protocol`, on encode and on decode. The
+//! frame limit of the pull is [`MIN_FRAME_LIMIT`] in both directions, and no
+//! message announces another one.
+//!
+//! A body follows a `GetReply` with found true. It is a sequence of chunks,
+//! as in the object stream: a chunk of length 0 ends it, and a chunk is at
+//! most the limit. The length [`ABANDON`] ends a body that fails partway, and
+//! the next frame must be `Error`. Any other frame after the marker is the
+//! error `protocol`. So the marker takes `Abort` after it in an object of the
+//! push, and `Error` in a body of the pull.
+//!
+//! # Codec
+//!
+//! [`FrameReader`] and [`FrameWriter`] implement the frames, the object
+//! stream, and the pull bodies over the `futures-io` traits. Both enter the
+//! body state after an `ObjectHeader` and after a `GetReply` with found true,
+//! and one set of methods reads and writes the bytes of both body kinds.
+//! The bytes pass through a buffer of the caller in bounded pieces, so no
+//! call holds a whole object. [`ObjectBody`] presents the bytes of one body
+//! as an `AsyncRead`.
 
 mod frame;
 mod message;
@@ -84,7 +123,8 @@ mod message;
 pub(crate) use frame::encode_frame;
 pub use frame::{FrameReader, FrameWriter, ObjectBody, ObjectRead};
 pub use message::{
-    CommitRequest, ErrorMessage, HaveReply, Hello, HelloReply, Message, ObjectHeader, ObjectsReply,
+    CommitRequest, ErrorMessage, GetReply, HaveReply, Hello, HelloReply, Message, ObjectHeader,
+    ObjectsReply, PullHello, PullHelloReply,
 };
 
 use ostrya_core::{Checksum, ObjectName, ObjectType};
@@ -94,6 +134,11 @@ use crate::error::{Error, Result};
 
 /// The protocol version this crate speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The highest pull protocol version this crate speaks: the version of
+/// `PullHello` and `PullHelloReply`. It is separate from
+/// [`PROTOCOL_VERSION`], and each changes on its own.
+pub const PULL_PROTOCOL_VERSION: u32 = 1;
 
 /// The frame limit before the server announces one, the lowest limit a
 /// server may announce, and the limit of a stream that carries no
@@ -135,8 +180,12 @@ pub const ABANDON: u32 = 0xFFFF_FFFF;
 pub const MAX_FRAME_LIMIT: u32 = 0xFFFF_FFFE;
 
 /// A message kind: the byte after the frame length.
+///
+/// The enum is `#[non_exhaustive]`, because a later protocol version adds
+/// kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum Kind {
     /// `Hello`, client to server.
     Hello = 1,
@@ -156,10 +205,19 @@ pub enum Kind {
     Commit = 8,
     /// `CommitReply`, server to client.
     CommitReply = 9,
-    /// `Error`, server to client.
+    /// `Error`, server to client, in the push and in the pull.
     Error = 10,
     /// `Abort`, client to server.
     Abort = 11,
+    /// `PullHello`, pull client to server.
+    PullHello = 12,
+    /// `PullHelloReply`, server to pull client.
+    PullHelloReply = 13,
+    /// `Get`, pull client to server.
+    Get = 14,
+    /// `GetReply`, server to pull client. A body follows a reply with found
+    /// true.
+    GetReply = 15,
 }
 
 impl Kind {
@@ -178,6 +236,10 @@ impl Kind {
             9 => Kind::CommitReply,
             10 => Kind::Error,
             11 => Kind::Abort,
+            12 => Kind::PullHello,
+            13 => Kind::PullHelloReply,
+            14 => Kind::Get,
+            15 => Kind::GetReply,
             _ => return Err(protocol(format!("unknown message kind {byte}"))),
         })
     }

@@ -2515,8 +2515,8 @@ impl ServerSigner {
 
 `Repo::receive` runs one push session over a pair of streams, with the
 policy the caller lends it. `ostrya::push` re-exports `ostrya-push`, the wire
-protocol crate, so a caller names its error codes and messages through
-`ostrya`.
+protocol crate, in every build, so a caller names its error codes and
+messages through `ostrya`. `Error::Push` carries them in every build too.
 
 - `Hello` opens the session transaction, which holds the repository lock
   shared under `[core] lock-timeout-secs`. A repository with `[core]
@@ -3787,6 +3787,94 @@ bytes, with the provider and the key loaders of the fetcher, and ALPN `h2`
 then `http/1.1`. `FuturesIo`, `WriteVectored`, `RtExecutor`, and `RtTimer`
 of `ostrya-fetch` drive the hyper connections of the server over
 `ostrya-rt`.
+
+## Pull over ssh: the serving side
+
+`Repo::send` serves one pull session over a pair of streams, through one
+`ArchiveView` of the repository. It takes no feature of `ostrya`. `ostrya
+send` calls it with standard input and standard output, and an ssh pull
+runs that command on the remote side. The wire protocol is in the module
+docs of `ostrya::push::proto`.
+
+```rust
+impl Repo {
+    /// Serves one pull session over a pair of streams. Takes no lock.
+    pub async fn send<R, W>(&self, input: R, output: W) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send;
+}
+```
+
+The session:
+
+1. The client sends `PullHello` with the highest pull version it speaks.
+   The server replies `PullHelloReply` with the lower of that version and
+   `PULL_PROTOCOL_VERSION`. `PullHello` with version 0 gets `Error` with
+   `version-unsupported`.
+2. The client sends `Get` frames, each with the path of one file relative to
+   the repository root. The server answers each `Get` with one `GetReply`,
+   in the order of the `Get` frames. A body of chunks follows each reply
+   with found true.
+3. The client closes the input of the server at a frame boundary. `send`
+   returns `Ok`.
+
+Rules:
+
+- The session builds one `ArchiveView`, so the requests share the parsed
+  `config` and the idle compressors of the view. The view answers each
+  path as it answers an HTTP `GET`. A path that the view refuses and a path
+  that it does not find both get `GetReply` with found false, and the
+  session goes on.
+- `GetReply` holds the length of the body when the view knows it: the built
+  `config` and a stored file. A `.filez` built on request has no length.
+- The session reads one `Get`, answers it to the end of its body, and then
+  reads the next. It drops each body before the next `Get`, so a built
+  `.filez` gives its compressor back first.
+- The session opens no transaction and takes no lock, neither the
+  repository lock nor the update lock. Read access to the repository is
+  sufficient for an `archive`, `bare-user`, `bare-user-only`, or
+  `bare-user-shared` repository. A `bare` or `bare-split-xattrs` repository
+  needs an account that can read every object and its extended attributes.
+- The frame limit is `MIN_FRAME_LIMIT`, 1 MiB, in both directions. No
+  message announces another limit.
+- Each direction goes through a buffer of 64 KiB. The session writes each
+  body in chunks of 64 KiB less 4 bytes, and fills each chunk to full or to
+  the end of the body before it writes the chunk. So each write to the
+  output is at most 64 KiB, and no write holds a chunk length alone.
+- The session flushes its output when its input buffer holds no complete
+  frame, before a read that can wait, and after an `Error`. It reads the
+  input buffer through `FrameReader::get_ref` and polls no read future,
+  because the futures of `FrameReader` are not cancel-safe. The end of the
+  input adds no flush, and `send` does not close the output.
+- A body streams through one chunk buffer. No content object is whole in
+  memory. The memory of a session is the two stream buffers, the chunk
+  buffer, one `Get` frame, and the reader of the current body: a
+  `FileReader` ring of 4 KiB to 256 KiB, or a compressor and two buffers of
+  64 KiB for a built `.filez`. A `Get` frame at the limit of 1 MiB adds
+  about 2 MiB: the frame body and the decoded path are in memory at the
+  same time.
+
+Failures:
+
+- A failure with a wire code goes to the client as `Error` and returns as
+  `Error::Push` with that code: `version-unsupported` for `PullHello` with
+  version 0; `protocol` for a `Get` before `PullHello`, a second
+  `PullHello`, a kind of the push, `PullHelloReply`, `GetReply`, or `Error`
+  from the client, a malformed frame, and an end of input inside a frame;
+  `limit-exceeded` for a frame over 1 MiB.
+- A failure of the view before the reply, for example a file that the
+  account cannot read (`EACCES`), goes to the client as `Error` with
+  `internal` in place of the reply, and returns as the error it is. An error
+  of the input other than an end of file does the same.
+- A body that fails after its reply ends with `ABANDON` and `Error` with
+  `internal`, and `send` returns the error. A stored file is read to at most
+  one byte past its stated length. A file that ends before that length
+  returns `Error::Io` of kind `UnexpectedEof`, and a file that holds more
+  returns `Error::Io` of kind `InvalidData`.
+- A failed write of a reply or of a body to the output sends nothing more
+  and returns `Error::Io`. A failure to deliver the `Error` message does not
+  change the returned error.
 
 ## Static deltas
 

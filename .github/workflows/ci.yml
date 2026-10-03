@@ -172,6 +172,11 @@ jobs:
           cargo check -p ostrya-server --no-default-features --features smol
           cargo check -p ostrya-cli --no-default-features --features smol,serve
 
+      # `Repo::send` takes no feature of `ostrya`, so `ostrya send` compiles
+      # without `receive`, `push`, and `serve`.
+      - name: ostrya send without the push features compiles
+        run: cargo check -p ostrya-cli --no-default-features --features smol,send
+
       # `ostrya-sign` holds a runtime only under `sign-gpg`. This compiles the
       # crate with no runtime backend, so a runtime item placed outside that
       # feature fails here.
@@ -219,9 +224,10 @@ jobs:
       # The workspace entries of the runtime-dependent crates carry
       # `default-features = false`, and each dependent forwards `smol` and
       # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
-      # without the `receive` and the `push` features, which bring in
-      # `ostrya-push`, and so does a tokio build of `ostrya-server`. This fails
-      # when one path turns the smol backend on.
+      # without the `receive` and the `push` features, and so does a tokio
+      # build of `ostrya-server`. `ostrya-push` is a regular dependency of
+      # `ostrya`, so each of these builds holds it. This fails when one path
+      # turns the smol backend on.
       # `cargo tree -i` exits non-zero both when the package is absent and on
       # any other failure, so the step also reads the error text.
       - name: A tokio build holds no smol

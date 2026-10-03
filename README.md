@@ -80,8 +80,9 @@ The project is a Cargo workspace of focused crates:
   signer through the `gpg` binary. Portable, with no repository knowledge.
 - `ostrya-fetch` -- the async HTTP/1.1 and HTTP/2 fetcher, with TLS over
   `rustls`. Portable, with no repository knowledge.
-- `ostrya-push` -- the push protocol: the messages and their GVariant
-  encoding, the frame codec, the chunked object stream, the client session,
+- `ostrya-push` -- the wire protocol of the push and of the pull over ssh:
+  the messages and their GVariant encoding, the frame codec, the chunked
+  object stream, the bodies of the pull, the push client session,
   the ssh and HTTP transports, the walk of a local directory into a tree
   model, and the tree push of that directory as one commit, signed when
   signers are given. Portable, with no repository knowledge. Depends on
@@ -106,6 +107,11 @@ Feature flags on `ostrya`:
   a configured remote or of an address. The `push` feature of `ostrya-cli`,
   in its default set, builds `ostrya push` and `ostrya push-tree` on it.
 - `lzma-static` -- the static xz build.
+
+`ostrya-push` is a dependency of `ostrya` in every build, re-exported as
+`ostrya::push`. `Repo::send`, the serving side of the pull over ssh, takes
+no feature. The `send` feature of `ostrya-cli`, in its default set, builds
+`ostrya send` on it.
 
 Later phases add `s3` and `serve`.
 

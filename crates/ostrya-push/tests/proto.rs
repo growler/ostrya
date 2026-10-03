@@ -1,13 +1,13 @@
 //! The wire protocol: round trips, golden bytes, malformed input, limits,
-//! and the abandon marker.
+//! the abandon marker, and the bodies of the pull.
 
 use futures_lite::future::block_on;
 use ostrya_core::{Checksum, ObjectName, ObjectType};
 use ostrya_gvariant::{DictBuilder, Type, Value};
 use ostrya_push::proto::{
-    CommitRequest, ErrorMessage, FrameReader, FrameWriter, HaveReply, Hello, HelloReply, MAX_FRAME,
-    MAX_FRAME_LIMIT, MAX_HAVE, MIN_FRAME_LIMIT, Message, ObjectHeader, ObjectRead, ObjectsReply,
-    RefState,
+    CommitRequest, ErrorMessage, FrameReader, FrameWriter, GetReply, HaveReply, Hello, HelloReply,
+    Kind, MAX_FRAME, MAX_FRAME_LIMIT, MAX_HAVE, MIN_FRAME_LIMIT, Message, ObjectHeader, ObjectRead,
+    ObjectsReply, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply, RefState,
 };
 use ostrya_push::{Encoding, Error, ErrorCode, Expected, RefOutcome, RefUpdate};
 
@@ -191,7 +191,23 @@ fn samples() -> Vec<Message> {
         ]),
         Message::Error(error(ErrorCode::Protocol, "bad")),
         Message::Abort,
+        pull_hello(Some("ostrya/0.2.8")),
+        Message::PullHelloReply(PullHelloReply { version: 1 }),
+        Message::Get("objects/ab/cd.filez".into()),
+        get_reply(true, Some(3)),
     ]
+}
+
+fn pull_hello(agent: Option<&str>) -> Message {
+    let agent = agent.map(Into::into);
+    Message::PullHello(PullHello {
+        version: PULL_PROTOCOL_VERSION,
+        agent,
+    })
+}
+
+fn get_reply(found: bool, len: Option<u64>) -> Message {
+    Message::GetReply(GetReply { found, len })
 }
 
 #[test]
@@ -223,6 +239,40 @@ fn every_message_round_trips() {
         e.current = Some(state("main", commit));
         round_trip(Message::Error(e));
     }
+    round_trip(pull_hello(None));
+    for version in [0, 2, u32::MAX] {
+        round_trip(Message::PullHello(PullHello {
+            version,
+            agent: None,
+        }));
+        round_trip(Message::PullHelloReply(PullHelloReply { version }));
+    }
+    for path in ["", "/config", "config", "refs/heads/a b", "refs/heads/%20"] {
+        round_trip(Message::Get(path.into()));
+    }
+    for (found, len) in [
+        (false, None),
+        (true, None),
+        (true, Some(0)),
+        (true, Some(u64::MAX)),
+    ] {
+        round_trip(get_reply(found, len));
+    }
+}
+
+#[test]
+fn the_pull_kinds_are_12_to_15() {
+    for (byte, kind) in [
+        (12, Kind::PullHello),
+        (13, Kind::PullHelloReply),
+        (14, Kind::Get),
+        (15, Kind::GetReply),
+    ] {
+        assert_eq!(Kind::from_u8(byte).unwrap(), kind);
+        assert_eq!(kind.as_u8(), byte);
+    }
+    assert_protocol(Kind::from_u8(16));
+    assert_eq!(PULL_PROTOCOL_VERSION, 1);
 }
 
 #[test]
@@ -345,6 +395,29 @@ fn an_object_header_frame_equals_the_generic_encoding() {
     }
 }
 
+/// The frame `write_message` gives a `GetReply` equals the frame of the
+/// generic body encoder for each found value and length, and reads back. A
+/// reply with found false and a length is refused, and nothing is written.
+#[test]
+fn a_get_reply_frame_equals_the_generic_encoding() {
+    for (found, len) in [
+        (false, None),
+        (true, Some(0)),
+        (true, Some(0x0102_0304_0506_0708)),
+        (true, Some(u64::MAX)),
+        (true, None),
+    ] {
+        let msg = get_reply(found, len);
+        let bytes = encode(&msg);
+        assert_eq!(bytes, frame(15, &msg.encode_body().unwrap()), "{msg:?}");
+        assert_eq!(bytes.len(), if len.is_some() { 21 } else { 13 });
+        assert_eq!(read_one(&bytes).unwrap(), Some(msg));
+    }
+    let mut w = FrameWriter::new(Vec::new());
+    assert_protocol(block_on(w.write_message(&get_reply(false, Some(0)))));
+    assert!(w.into_inner().is_empty());
+}
+
 #[test]
 fn golden_bytes_pin_the_frame_layout() {
     golden(Message::Abort, hex("00 00 00 02 0b 00"));
@@ -387,6 +460,123 @@ fn golden_bytes_pin_the_frame_layout() {
     golden(
         Message::Error(error(ErrorCode::RefDenied, "main")),
         hex("00 00 00 13 0a 72 65 66 2d 64 65 6e 69 65 64 00 6d 61 69 6e 00 10 0b"),
+    );
+}
+
+/// The pull messages in GVariant normal form.
+///
+/// `(ua{sv})`: the `u` is 4 bytes, and the `a{sv}` is aligned to 8, so 4
+/// zero bytes of padding follow the `u` also when the dict is empty. The
+/// dict is the last member, so the tuple has no framing offset. An empty
+/// dict is 0 bytes. The entry `{"agent": <"x">}` is the key `agent\0` (6
+/// bytes), 2 bytes of padding to align the variant to 8, the variant `x\0`,
+/// a zero separator, and the type `s` (4 bytes), and then the framing offset
+/// of the end of the key, 6. The array of one entry of 13 bytes adds the
+/// offset of the end of the entry, 13.
+///
+/// `s`: the bytes of the string and a zero byte.
+///
+/// `(bmt)`: the `b` is 1 byte, and the `mt` is aligned to 8, so 7 zero bytes
+/// of padding follow the `b` also when the maybe is nothing. A maybe of a
+/// fixed-size type is 0 bytes for nothing, and the 8 bytes of the `t` with no
+/// zero byte after them for a value. The maybe is the last member, so the
+/// tuple has no framing offset.
+#[test]
+fn golden_bytes_pin_the_pull_messages() {
+    golden(
+        pull_hello(None),
+        hex("00 00 00 09 0c 01 00 00 00 00 00 00 00"),
+    );
+    let mut agent = hex("00 00 00 17 0c 02 00 00 00 00 00 00 00");
+    agent.extend(hex("61 67 65 6e 74 00 00 00 78 00 00 73 06 0d"));
+    golden(
+        Message::PullHello(PullHello {
+            version: 2,
+            agent: Some("x".into()),
+        }),
+        agent,
+    );
+    golden(
+        Message::PullHelloReply(PullHelloReply { version: 1 }),
+        hex("00 00 00 09 0d 01 00 00 00 00 00 00 00"),
+    );
+    golden(
+        Message::Get("config".into()),
+        hex("00 00 00 08 0e 63 6f 6e 66 69 67 00"),
+    );
+    golden(Message::Get(String::new()), hex("00 00 00 02 0e 00"));
+    golden(
+        get_reply(false, None),
+        hex("00 00 00 09 0f 00 00 00 00 00 00 00 00"),
+    );
+    golden(
+        get_reply(true, None),
+        hex("00 00 00 09 0f 01 00 00 00 00 00 00 00"),
+    );
+    golden(
+        get_reply(true, Some(0x1122_3344_5566_7788)),
+        hex("00 00 00 11 0f 01 00 00 00 00 00 00 00 88 77 66 55 44 33 22 11"),
+    );
+    golden(
+        get_reply(true, Some(0)),
+        hex("00 00 00 11 0f 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"),
+    );
+}
+
+#[test]
+fn malformed_pull_bodies_decode_to_protocol() {
+    let cases = [
+        // found false with a length, which the encoder refuses too.
+        hex("00 00 00 11 0f 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00"),
+        // No padding before the maybe.
+        hex("00 00 00 02 0f 01"),
+        // A maybe of 4 bytes.
+        hex("00 00 00 0d 0f 01 00 00 00 00 00 00 00 01 00 00 00"),
+        // A boolean of 2.
+        hex("00 00 00 09 0f 02 00 00 00 00 00 00 00"),
+        // A padding byte that is not zero.
+        hex("00 00 00 09 0f 01 00 00 01 00 00 00 00"),
+        // A PullHello and a PullHelloReply with no padding before the dict.
+        hex("00 00 00 05 0c 01 00 00 00"),
+        hex("00 00 00 05 0d 01 00 00 00"),
+        // A Get with no terminating zero byte, and one with a zero inside.
+        hex("00 00 00 02 0e 61"),
+        hex("00 00 00 04 0e 61 00 62 00"),
+        frame(14, &[]),
+        frame(15, &[]),
+    ];
+    for bytes in cases {
+        assert_protocol(read_one(&bytes));
+    }
+
+    let wrong = gv(
+        "(ua{sv})",
+        t(vec![Value::U32(1), opts(&[("agent", "u", Value::U32(7))])]),
+    );
+    assert_protocol(read_one(&frame(12, &wrong)));
+
+    let mut w = FrameWriter::new(Vec::new());
+    assert_protocol(block_on(w.write_message(&get_reply(false, Some(1)))));
+    assert!(w.into_inner().is_empty());
+}
+
+/// A decoder ignores a key of `PullHello` or of `PullHelloReply` that it does
+/// not know. The first `agent` counts.
+#[test]
+fn pull_hello_dicts_ignore_unknown_keys() {
+    let entries = opts(&[
+        ("max-frame", "u", Value::U32(7)),
+        ("agent", "s", st("first")),
+        ("zz", "a(yay)", Value::Array(vec![])),
+    ]);
+    let body = gv("(ua{sv})", t(vec![Value::U32(1), entries]));
+    assert_eq!(
+        read_one(&frame(12, &body)).unwrap(),
+        Some(pull_hello(Some("first")))
+    );
+    assert_eq!(
+        read_one(&frame(13, &body)).unwrap(),
+        Some(Message::PullHelloReply(PullHelloReply { version: 1 }))
     );
 }
 
@@ -513,7 +703,7 @@ fn header_body(ty: u8, sum: Value, enc: u8) -> Vec<u8> {
 
 #[test]
 fn malformed_bodies_decode_to_protocol() {
-    for kind in [0, 12, 255] {
+    for kind in [0, 16, 255] {
         assert_protocol(read_one(&frame(kind, &[0])));
     }
 
@@ -1034,4 +1224,234 @@ fn aborted_has_no_wire_code() {
     let msg = Error::Aborted.to_message();
     assert_eq!(msg.code, ErrorCode::Internal);
     assert_eq!(msg.message, "the client aborted the session");
+}
+
+fn reply_frame(found: bool, len: Option<u64>) -> Vec<u8> {
+    encode(&get_reply(found, len))
+}
+
+/// Read a body to its end, or to the error that ends it.
+async fn read_body<R: futures_io::AsyncRead + Unpin>(
+    r: &mut FrameReader<R>,
+) -> Result<(Vec<u8>, ObjectRead), Error> {
+    let mut data = Vec::new();
+    let mut buf = [0u8; 8];
+    loop {
+        match r.read_object_data(&mut buf).await? {
+            ObjectRead::Data(n) => data.extend_from_slice(&buf[..n]),
+            end => return Ok((data, end)),
+        }
+    }
+}
+
+/// The reader enters the body state after a `GetReply` with found true, and
+/// stays between frames after a `GetReply` with found false.
+#[test]
+fn a_found_reply_enters_the_body_state() {
+    let mut bytes = reply_frame(true, Some(3));
+    bytes.extend(hex("00 00 00 03 61 62 63 00 00 00 00"));
+    bytes.extend(reply_frame(false, None));
+    bytes.extend(reply_frame(true, None));
+    bytes.extend(hex("00 00 00 00"));
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        assert_eq!(
+            r.read_message().await.unwrap(),
+            Some(get_reply(true, Some(3)))
+        );
+        let (data, end) = read_body(&mut r).await.unwrap();
+        assert_eq!((data.as_slice(), end), (&b"abc"[..], ObjectRead::End));
+        assert_eq!(
+            r.read_message().await.unwrap(),
+            Some(get_reply(false, None))
+        );
+        assert_protocol(r.read_object_data(&mut [0; 8]).await);
+        assert_eq!(r.read_message().await.unwrap(), Some(get_reply(true, None)));
+        assert_eq!(read_body(&mut r).await.unwrap(), (vec![], ObjectRead::End));
+        assert_eq!(r.read_message().await.unwrap(), None);
+    });
+
+    let mut bytes = reply_frame(true, Some(1));
+    bytes.extend(hex("00 00 00 01 61 00 00 00 00"));
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        assert_protocol(r.read_message().await);
+    });
+}
+
+/// After the abandon marker in a pull body, the `Error` frame gives the error
+/// of its code, and `Abort` or another frame is `protocol`. After the marker
+/// in an object of the push, an `Error` frame is `protocol`.
+#[test]
+fn the_abandon_marker_of_a_pull_body_takes_error() {
+    use futures_lite::io::AsyncReadExt;
+
+    let pull = |tail: &Message| {
+        let mut bytes = reply_frame(true, None);
+        bytes.extend(hex("00 00 00 01 61 ff ff ff ff"));
+        bytes.extend(encode(tail));
+        bytes
+    };
+    for code in [ErrorCode::Internal, ErrorCode::Protocol] {
+        let bytes = pull(&Message::Error(error(code, "read failed")));
+        let mut r = FrameReader::new(&bytes[..]);
+        block_on(async {
+            r.read_message().await.unwrap();
+            let err = read_body(&mut r).await.unwrap_err();
+            assert_eq!(err.code(), Some(code));
+            assert_eq!(err.to_message(), error(code, "read failed"));
+            assert_eq!(r.read_message().await.unwrap(), None);
+        });
+
+        let mut r = FrameReader::new(&bytes[..]);
+        block_on(async {
+            r.read_message().await.unwrap();
+            let mut body = r.object_body();
+            let mut data = Vec::new();
+            assert!(body.read_to_end(&mut data).await.is_err());
+            assert_eq!(data, b"a");
+            assert!(body.is_abandoned());
+            assert!(body.take_error().is_none());
+            let err = body.finish_abandon().await.unwrap_err();
+            assert_eq!(err.code(), Some(code));
+            assert_eq!(r.read_message().await.unwrap(), None);
+        });
+    }
+
+    for tail in [Message::Abort, Message::Get("config".into())] {
+        let bytes = pull(&tail);
+        let mut r = FrameReader::new(&bytes[..]);
+        block_on(async {
+            r.read_message().await.unwrap();
+            assert_protocol(read_body(&mut r).await);
+        });
+        let mut r = FrameReader::new(&bytes[..]);
+        block_on(async {
+            r.read_message().await.unwrap();
+            let mut body = r.object_body();
+            assert!(body.read_to_end(&mut Vec::new()).await.is_err());
+            assert_protocol(body.finish_abandon().await);
+        });
+    }
+
+    // A found reply after the marker sets the body state, and the error
+    // leaves the reader between frames.
+    let mut bytes = pull(&get_reply(true, None));
+    bytes.extend(encode(&Message::Get("config".into())));
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        assert_protocol(read_body(&mut r).await);
+        assert_eq!(
+            r.read_message().await.unwrap(),
+            Some(Message::Get("config".into()))
+        );
+    });
+
+    let mut bytes = reply_frame(true, None);
+    bytes.extend([0xff; 4]);
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        assert_eof(read_body(&mut r).await);
+    });
+
+    let mut bytes = header_frame();
+    bytes.extend([0xff; 4]);
+    bytes.extend(encode(&Message::Error(error(ErrorCode::Internal, "x"))));
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        assert_protocol(r.read_object_data(&mut [0; 8]).await);
+    });
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let mut body = r.object_body();
+        assert!(body.read(&mut [0; 8]).await.is_err());
+        assert_protocol(body.finish_abandon().await);
+    });
+}
+
+/// The writer enters the body state after a `GetReply` with found true. The
+/// body takes the chunks of an object, and `abandon_body` writes the marker
+/// and the `Error` frame. Each abandon call refuses the other body kind.
+#[test]
+fn the_writer_writes_and_abandons_a_pull_body() {
+    let mut w = FrameWriter::new(Vec::new());
+    block_on(async {
+        w.write_message(&get_reply(true, Some(3))).await.unwrap();
+        assert_protocol(w.write_message(&Message::Get("config".into())).await);
+        assert_protocol(w.abandon_object().await);
+        w.write_object_data(b"abc").await.unwrap();
+        w.end_object().await.unwrap();
+        w.write_message(&get_reply(false, None)).await.unwrap();
+        assert_protocol(w.write_object_data(b"x").await);
+        assert_protocol(w.end_object().await);
+        assert_protocol(w.abandon_body(&error(ErrorCode::Internal, "x")).await);
+    });
+    let mut expected = reply_frame(true, Some(3));
+    expected.extend(hex("00 00 00 03 61 62 63 00 00 00 00"));
+    expected.extend(reply_frame(false, None));
+    assert_eq!(w.into_inner(), expected);
+
+    let failure = error(ErrorCode::Internal, "read failed");
+    let mut w = FrameWriter::new(Vec::new());
+    block_on(async {
+        w.write_message(&get_reply(true, None)).await.unwrap();
+        w.write_object_data(b"a").await.unwrap();
+        // An `Error` that does not encode writes nothing, and the body stays
+        // open.
+        let no_detail = error(ErrorCode::RefMismatch, "moved");
+        assert_protocol(w.abandon_body(&no_detail).await);
+        w.abandon_body(&failure).await.unwrap();
+        assert_protocol(w.abandon_body(&failure).await);
+        w.write_message(&Message::Get("config".into()))
+            .await
+            .unwrap();
+    });
+    let bytes = w.into_inner();
+    let mut expected = reply_frame(true, None);
+    expected.extend(hex("00 00 00 01 61 ff ff ff ff"));
+    expected.extend(encode(&Message::Error(failure.clone())));
+    expected.extend(encode(&Message::Get("config".into())));
+    assert_eq!(bytes, expected);
+    let mut r = FrameReader::new(&bytes[..]);
+    block_on(async {
+        r.read_message().await.unwrap();
+        let err = read_body(&mut r).await.unwrap_err();
+        assert_eq!(err.to_message(), failure);
+        assert_eq!(
+            r.read_message().await.unwrap(),
+            Some(Message::Get("config".into()))
+        );
+    });
+
+    let mut w = FrameWriter::new(Vec::new());
+    block_on(async {
+        w.write_message(&file_header()).await.unwrap();
+        assert_protocol(w.abandon_body(&failure).await);
+        w.abandon_object().await.unwrap();
+    });
+    let mut expected = header_frame();
+    expected.extend(hex("ff ff ff ff 00 00 00 02 0b 00"));
+    assert_eq!(w.into_inner(), expected);
+}
+
+/// `get_ref` shows the bytes a buffered reader holds after a frame, with no
+/// read.
+#[test]
+fn get_ref_shows_the_buffered_bytes() {
+    let first = encode(&Message::Get("a".into()));
+    let second = encode(&Message::Get("b".into()));
+    let bytes = [first.clone(), second.clone()].concat();
+    let mut r = FrameReader::new(futures_lite::io::BufReader::new(&bytes[..]));
+    block_on(async {
+        assert!(r.get_ref().buffer().is_empty());
+        r.read_message().await.unwrap();
+        assert_eq!(r.get_ref().buffer(), &second[..]);
+        r.read_message().await.unwrap();
+        assert!(r.get_ref().buffer().is_empty());
+    });
 }

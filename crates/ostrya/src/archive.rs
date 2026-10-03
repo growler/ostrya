@@ -170,9 +170,9 @@ impl ArchiveView {
             ))),
             Route::Stored {
                 anchor,
-                parts,
+                path,
                 alias_ok,
-            } => Ok(match self.stored(anchor, parts, alias_ok).await? {
+            } => Ok(match self.stored(anchor, path, alias_ok).await? {
                 Walked::File(file, len) => ArchiveAnswer::Stream {
                     len: Some(len),
                     body: Box::new(FileReader::with_len_hint(file, len)),
@@ -198,9 +198,9 @@ impl ArchiveView {
             }),
             Route::Stored {
                 anchor,
-                parts,
+                path,
                 alias_ok,
-            } => Ok(match self.stored(anchor, parts, alias_ok).await? {
+            } => Ok(match self.stored(anchor, path, alias_ok).await? {
                 Walked::File(_, len) => ArchiveHead::Found { len: Some(len) },
                 Walked::NotFound => ArchiveHead::NotFound,
                 Walked::Refused | Walked::Alias(_) => ArchiveHead::Refused,
@@ -263,18 +263,21 @@ impl ArchiveView {
     }
 
     /// A stored file, opened through the safe walk.
-    async fn stored(&self, anchor: Anchor, parts: Vec<String>, alias_ok: bool) -> Result<Walked> {
+    async fn stored(&self, anchor: Anchor, path: String, alias_ok: bool) -> Result<Walked> {
         let repo = self.repo.clone();
         let walked = ostrya_rt::unblock(move || {
             let root = match anchor {
                 Anchor::Repo => repo.repo_fd(),
                 Anchor::Objects => repo.objects_fd(),
             };
-            match walk(root, &parts, alias_ok)? {
-                Walked::Alias(body) => match resolve_alias(&parts[..parts.len() - 1], &body) {
-                    Some(target) => walk(root, &target, false),
-                    None => Ok(Walked::Refused),
-                },
+            match walk(root, &path, alias_ok)? {
+                Walked::Alias(body) => {
+                    let link_dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
+                    match resolve_alias(link_dir, &body) {
+                        Some(target) => walk(root, &target, false),
+                        None => Ok(Walked::Refused),
+                    }
+                }
                 walked => Ok(walked),
             }
         })
@@ -418,11 +421,11 @@ enum Anchor {
 #[derive(Debug, Eq, PartialEq)]
 enum Route {
     Config,
-    /// A stored file at `parts` under `anchor`. `alias_ok` allows a ref alias
+    /// A stored file at `path` under `anchor`. `alias_ok` allows a ref alias
     /// at the last component.
     Stored {
         anchor: Anchor,
-        parts: Vec<String>,
+        path: String,
         alias_ok: bool,
     },
     /// A `.filez` built from the content object of this checksum.
@@ -443,24 +446,31 @@ fn classify(path: &str, mode: RepoMode) -> Route {
     if path.is_empty() {
         return Route::NotFound;
     }
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.iter().any(|part| refused_component(part)) {
+    if path.split('/').any(refused_component) {
         return Route::Refused;
     }
     let archive = mode.is_archive();
     let stored = |alias_ok| Route::Stored {
         anchor: Anchor::Repo,
-        parts: parts.iter().map(|part| (*part).to_owned()).collect(),
+        path: path.to_owned(),
         alias_ok,
     };
-    match parts.as_slice() {
-        ["tmp" | "state", ..] => Route::Refused,
-        ["config"] => Route::Config,
-        ["summary" | "summary.sig"] => stored(false),
-        ["refs", _, ..] => stored(true),
-        ["extensions", _, ..] => stored(false),
-        ["deltas" | "delta-indexes", _, ..] if archive => stored(false),
-        ["objects", fanout, name] => object_route(fanout, name, archive),
+    // No component is empty here, so a `rest` holds one component or more.
+    let (first, rest) = match path.split_once('/') {
+        Some((first, rest)) => (first, Some(rest)),
+        None => (path, None),
+    };
+    match (first, rest) {
+        ("tmp" | "state", _) => Route::Refused,
+        ("config", None) => Route::Config,
+        ("summary" | "summary.sig", None) => stored(false),
+        ("refs", Some(_)) => stored(true),
+        ("extensions", Some(_)) => stored(false),
+        ("deltas" | "delta-indexes", Some(_)) if archive => stored(false),
+        ("objects", Some(rest)) => match rest.split_once('/') {
+            Some((fanout, name)) if !name.contains('/') => object_route(fanout, name, archive),
+            _ => Route::NotFound,
+        },
         _ => Route::NotFound,
     }
 }
@@ -478,7 +488,7 @@ fn object_route(fanout: &str, name: &str, archive: bool) -> Route {
     };
     let stored = || Route::Stored {
         anchor: Anchor::Objects,
-        parts: vec![fanout.to_owned(), name.to_owned()],
+        path: format!("{fanout}/{name}"),
         alias_ok: false,
     };
     match ext {
@@ -500,7 +510,8 @@ enum Walked {
     Alias(Vec<u8>),
 }
 
-/// Open the file at `parts` under `root`, following no symlink. Each
+/// Open the file at `path` under `root`, following no symlink. The walk
+/// takes the components of `path` one at a time. Each
 /// intermediate component opens with `O_PATH`, `O_DIRECTORY`, and
 /// `O_NOFOLLOW`, and the last one with `O_RDONLY` and `O_NOFOLLOW`.
 /// `O_NONBLOCK` keeps the open of a FIFO from waiting for a writer, and the
@@ -509,14 +520,17 @@ enum Walked {
 /// component gives its body. A name longer than the kernel accepts is not
 /// found, and so is a path with nothing at it. A directory the process
 /// cannot search fails the walk with its error.
-fn walk<S: AsRef<str>>(root: BorrowedFd<'_>, parts: &[S], alias_ok: bool) -> io::Result<Walked> {
-    let (last, dirs) = parts.split_last().expect("a stored path has a component");
+fn walk(root: BorrowedFd<'_>, path: &str, alias_ok: bool) -> io::Result<Walked> {
+    let (dirs, last) = match path.rsplit_once('/') {
+        Some((dirs, last)) => (Some(dirs), last),
+        None => (None, path),
+    };
     let mut held: Option<OwnedFd> = None;
-    for part in dirs {
+    for part in dirs.into_iter().flat_map(|dirs| dirs.split('/')) {
         let dir = held.as_ref().map_or(root, |fd| fd.as_fd());
         match rustix::fs::openat(
             dir,
-            part.as_ref(),
+            part,
             OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
@@ -524,14 +538,14 @@ fn walk<S: AsRef<str>>(root: BorrowedFd<'_>, parts: &[S], alias_ok: bool) -> io:
             Err(Errno::NOENT | Errno::NAMETOOLONG) => return Ok(Walked::NotFound),
             // A symlink gives `ENOTDIR` under `O_DIRECTORY`, and so does any
             // other entry that is no directory.
-            Err(Errno::NOTDIR | Errno::LOOP) => return not_a_directory(dir, part.as_ref()),
+            Err(Errno::NOTDIR | Errno::LOOP) => return not_a_directory(dir, part),
             Err(e) => return Err(e.into()),
         }
     }
     let dir = held.as_ref().map_or(root, |fd| fd.as_fd());
     let fd = match rustix::fs::openat(
         dir,
-        last.as_ref(),
+        last,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
@@ -540,7 +554,7 @@ fn walk<S: AsRef<str>>(root: BorrowedFd<'_>, parts: &[S], alias_ok: bool) -> io:
             return Ok(Walked::NotFound);
         }
         Err(Errno::LOOP) if alias_ok => {
-            let body = rustix::fs::readlinkat(dir, last.as_ref(), Vec::new())?;
+            let body = rustix::fs::readlinkat(dir, last, Vec::new())?;
             return Ok(Walked::Alias(body.into_bytes()));
         }
         Err(Errno::LOOP) => return Ok(Walked::Refused),
@@ -573,30 +587,35 @@ fn not_a_directory(dir: BorrowedFd<'_>, part: &str) -> io::Result<Walked> {
 /// absolute body, a body that is not UTF-8, an empty component, which a
 /// trailing `/` gives, a `..` that leaves `refs/`, a component the router
 /// refuses by name, and a result with no component under `refs/`.
-fn resolve_alias<S: AsRef<str>>(link_dir: &[S], body: &[u8]) -> Option<Vec<String>> {
+fn resolve_alias(link_dir: &str, body: &[u8]) -> Option<String> {
     let body = std::str::from_utf8(body).ok()?;
     if body.starts_with('/') {
         return None;
     }
-    let mut parts: Vec<String> = link_dir
-        .iter()
-        .map(|part| part.as_ref().to_owned())
-        .collect();
+    // No component of `link_dir` or of the result is empty, so each `/`
+    // separates two components.
+    let mut target = link_dir.to_owned();
     for part in body.split('/') {
         match part {
             "" => return None,
             "." => {}
             ".." => {
-                if parts.len() <= 1 {
-                    return None;
-                }
-                parts.pop();
+                let (dir, _) = target.rsplit_once('/')?;
+                target.truncate(dir.len());
             }
             part if refused_component(part) => return None,
-            part => parts.push(part.to_owned()),
+            part => {
+                if !target.is_empty() {
+                    target.push('/');
+                }
+                target.push_str(part);
+            }
         }
     }
-    (parts.len() >= 2 && parts[0] == "refs").then_some(parts)
+    let under_refs = target
+        .split_once('/')
+        .is_some_and(|(first, _)| first == "refs");
+    under_refs.then_some(target)
 }
 
 /// The compressors of one view: a gate of [`MAX_COMPRESSORS`] permits, and the
@@ -824,10 +843,10 @@ mod tests {
         classify(path, mode)
     }
 
-    fn stored(anchor: Anchor, parts: &[&str], alias_ok: bool) -> Route {
+    fn stored(anchor: Anchor, path: &str, alias_ok: bool) -> Route {
         Route::Stored {
             anchor,
-            parts: parts.iter().map(|p| (*p).to_owned()).collect(),
+            path: path.to_owned(),
             alias_ok,
         }
     }
@@ -842,24 +861,24 @@ mod tests {
             assert_eq!(route("config", mode), Route::Config);
             assert_eq!(
                 route("summary", mode),
-                stored(Anchor::Repo, &["summary"], false)
+                stored(Anchor::Repo, "summary", false)
             );
             assert_eq!(
                 route("summary.sig", mode),
-                stored(Anchor::Repo, &["summary.sig"], false)
+                stored(Anchor::Repo, "summary.sig", false)
             );
             assert_eq!(
                 route("refs/heads/a/b", mode),
-                stored(Anchor::Repo, &["refs", "heads", "a", "b"], true)
+                stored(Anchor::Repo, "refs/heads/a/b", true)
             );
             assert_eq!(
                 route("extensions/x", mode),
-                stored(Anchor::Repo, &["extensions", "x"], false)
+                stored(Anchor::Repo, "extensions/x", false)
             );
             for ext in ["commit", "dirtree", "dirmeta", "commitmeta"] {
                 assert_eq!(
                     route(&object(ext), mode),
-                    stored(Anchor::Objects, &[fanout, &format!("{rest}.{ext}")], false)
+                    stored(Anchor::Objects, &format!("{fanout}/{rest}.{ext}"), false)
                 );
             }
             assert_eq!(route(&object("file"), mode), Route::NotFound);
@@ -895,7 +914,7 @@ mod tests {
         }
         assert_eq!(
             route(&object("filez"), RepoMode::Archive),
-            stored(Anchor::Objects, &[fanout, &format!("{rest}.filez")], false)
+            stored(Anchor::Objects, &format!("{fanout}/{rest}.filez"), false)
         );
         assert_eq!(
             route(&object("filez"), RepoMode::Bare),
@@ -904,36 +923,59 @@ mod tests {
         for path in ["deltas/ab/cd/superblock", "delta-indexes/ab/cd.index"] {
             assert_eq!(
                 route(path, RepoMode::Archive),
-                stored(Anchor::Repo, &path.split('/').collect::<Vec<_>>(), false)
+                stored(Anchor::Repo, path, false)
             );
             assert_eq!(route(path, RepoMode::BareUserOnly), Route::NotFound);
         }
     }
 
+    /// A deep path routes by its first components and keeps the whole path.
+    /// A refused component anywhere in it refuses the path, and so does an
+    /// empty one.
+    #[test]
+    fn the_router_takes_a_deep_path_whole() {
+        let deep = format!("refs/heads/{}b", "a/".repeat(100_000));
+        for mode in [RepoMode::Archive, RepoMode::BareUser] {
+            assert_eq!(route(&deep, mode), stored(Anchor::Repo, &deep, true));
+            for tail in ["/..", "/.", "/", "//c", "/.lock"] {
+                let path = format!("{deep}{tail}");
+                assert_eq!(route(&path, mode), Route::Refused, "{tail}");
+            }
+            let path = format!("{}refs/heads/x", "a/".repeat(100_000));
+            assert_eq!(route(&path, mode), Route::NotFound);
+            let path = format!("objects/{}x", "a/".repeat(100_000));
+            assert_eq!(route(&path, mode), Route::NotFound);
+            assert_eq!(route("objects/ab/cd/ef.commit", mode), Route::NotFound);
+            assert_eq!(route("config/x", mode), Route::NotFound);
+            assert_eq!(route("summary/x", mode), Route::NotFound);
+            assert_eq!(route("tmp/a/b", mode), Route::Refused);
+        }
+    }
+
     #[test]
     fn an_alias_resolves_inside_refs_alone() {
-        let resolve = |dir: &[&str], body: &str| resolve_alias(dir, body.as_bytes());
-        let parts = |p: &[&str]| Some(p.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        let resolve = |dir: &str, body: &str| resolve_alias(dir, body.as_bytes());
+        let target = |t: &str| Some(t.to_owned());
+        assert_eq!(resolve("refs/heads", "main"), target("refs/heads/main"));
         assert_eq!(
-            resolve(&["refs", "heads"], "main"),
-            parts(&["refs", "heads", "main"])
+            resolve("refs/heads/a", "../b/./c"),
+            target("refs/heads/b/c")
         );
         assert_eq!(
-            resolve(&["refs", "heads", "a"], "../b/./c"),
-            parts(&["refs", "heads", "b", "c"])
+            resolve("refs/heads", "../remotes/o/main"),
+            target("refs/remotes/o/main")
         );
-        assert_eq!(
-            resolve(&["refs", "heads"], "../remotes/o/main"),
-            parts(&["refs", "remotes", "o", "main"])
-        );
-        assert_eq!(resolve(&["refs", "heads"], "../../summary"), None);
-        assert_eq!(resolve(&["refs", "heads"], "../../refs/heads/x"), None);
-        assert_eq!(resolve(&["refs", "heads"], "/etc/passwd"), None);
-        assert_eq!(resolve(&["refs", "heads"], ".."), None);
-        assert_eq!(resolve(&["refs", "heads"], ".lock"), None);
-        assert_eq!(resolve(&["refs", "heads"], "main/"), None);
-        assert_eq!(resolve(&["refs", "heads"], "a//main"), None);
-        assert_eq!(resolve_alias(&["refs", "heads"], b"\xff"), None);
+        assert_eq!(resolve("refs/heads", "./main"), target("refs/heads/main"));
+        assert_eq!(resolve("refs/heads", "../x"), target("refs/x"));
+        assert_eq!(resolve("refs/heads", "../.."), None);
+        assert_eq!(resolve("refs/heads", "../../summary"), None);
+        assert_eq!(resolve("refs/heads", "../../refs/heads/x"), None);
+        assert_eq!(resolve("refs/heads", "/etc/passwd"), None);
+        assert_eq!(resolve("refs/heads", ".."), None);
+        assert_eq!(resolve("refs/heads", ".lock"), None);
+        assert_eq!(resolve("refs/heads", "main/"), None);
+        assert_eq!(resolve("refs/heads", "a//main"), None);
+        assert_eq!(resolve_alias("refs/heads", b"\xff"), None);
     }
 
     fn config_of(text: &str) -> RepoConfig {

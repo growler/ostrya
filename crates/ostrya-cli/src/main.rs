@@ -178,6 +178,9 @@ enum Command {
     /// and, without --read-only, the receive endpoint of a push.
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
+    /// Serve one pull session over standard input and standard output.
+    #[cfg(feature = "send")]
+    Send,
 }
 
 impl Command {
@@ -215,6 +218,8 @@ impl Command {
         "push-tree",
         #[cfg(feature = "serve")]
         "serve",
+        #[cfg(feature = "send")]
+        "send",
     ];
 
     /// The name `clap` registered this subcommand under, which the error paths
@@ -249,6 +254,8 @@ impl Command {
             Command::PushTree(_) => "push-tree",
             #[cfg(feature = "serve")]
             Command::Serve(_) => "serve",
+            #[cfg(feature = "send")]
+            Command::Send => "send",
         }
     }
 }
@@ -1960,6 +1967,13 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             serve(repo, args).await
         }
+        #[cfg(feature = "send")]
+        Command::Send => {
+            // `send` writes nothing on success, also under `--verbose`, so
+            // the repository line of `--verbose` is not written.
+            let (repo, _) = resolve_repo(repo, false, name).await;
+            send(repo).await
+        }
     }
 }
 
@@ -2090,6 +2104,20 @@ async fn receive(repo: Repo, args: ReceiveArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Serve one pull session over standard input and standard output.
+///
+/// Standard output carries the frames of the session alone, and a failure
+/// goes to standard error as the error line of `main`. The command takes no
+/// lock and writes no file in the repository.
+#[cfg(feature = "send")]
+async fn send(repo: Repo) -> Result<()> {
+    // The input is read at most 256 KiB ahead of the session. Under the smol
+    // backend the output goes through a blocking-pool pipe of 8 MiB, and a
+    // flush waits until each byte reached the descriptor, so the session
+    // flushes only when no whole `Get` frame waits in its input buffer.
+    repo.send(stdin_file()?, stdout_file()?).await
 }
 
 /// Push the commits the refspecs name to a remote over ssh or HTTP, and

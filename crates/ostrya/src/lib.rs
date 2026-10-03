@@ -205,6 +205,11 @@
 //! detached metadata takes the update lock for its write step, so it waits for
 //! a held guard (see the [`update`] module).
 //!
+//! In every build, [`push`] re-exports `ostrya-push`, the wire protocol of
+//! the push and of the pull over ssh, and [`Error::Push`] carries the errors
+//! of that protocol. [`Repo::send`] serves one pull session over a pair of
+//! streams, through an [`ArchiveView`] of the repository, and takes no lock.
+//!
 //! Under the `receive` feature it also covers the policy the server side of a
 //! push applies (see the `receive` module): `ReceivePolicy` states which ref
 //! updates a repository accepts, the signatures a received commit must carry,
@@ -213,9 +218,8 @@
 //! the repository config, `[ex-ostrya receive]` and the groups it names. A
 //! received commit is held to the same signature checks a pull makes, over the
 //! keys the receive policy names. `Repo::receive` runs one push session over a
-//! pair of streams, `ReceiveService` runs one as a step for each request of a
-//! transport such as HTTP, and `ostrya::push` re-exports the wire protocol
-//! crate.
+//! pair of streams, and `ReceiveService` runs one as a step for each request of
+//! a transport such as HTTP.
 //!
 //! Under the `push` feature it also covers the client side of a push from a
 //! repository. `Repo::push` pushes the commits of a set of refspecs to a
@@ -223,8 +227,7 @@
 //! of streams. Both take the options of `RepoPushOptions`.
 //! `resolve_push_remote` gives the push address and the connect options of a
 //! configured remote or of an address, and `is_push_address` tells an address
-//! from a remote name. `ostrya::push` re-exports the wire
-//! protocol crate. The push keys of a remote section,
+//! from a remote name. The push keys of a remote section,
 //! [`Remote::push_url`], [`Remote::ssh_command`],
 //! [`Remote::receive_command`], [`Remote::push_token_file`], and
 //! [`Remote::push_user`], are read in every build.
@@ -241,7 +244,6 @@ mod deltagen;
 pub mod diff;
 pub mod error;
 pub use ostrya_fetch as fetch;
-#[cfg(any(feature = "push", feature = "receive"))]
 pub use ostrya_push as push;
 pub mod file;
 pub mod fsck;
@@ -266,6 +268,7 @@ pub mod receive;
 pub mod refs;
 pub mod repo;
 mod rollsum;
+mod send;
 pub mod sign;
 #[cfg(feature = "sign-spki")]
 pub mod spki {

@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-server"
-description = "HTTP server of ostrya: the archive view of a repository for pull"
+description = "HTTP server of ostrya: the archive view of a repository for pull, and the receive endpoint of push"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -32,3 +32,6 @@ hyper = { version = "1.11.1", default-features = false, features = [
 # The TLS acceptor. The `rustls` types come from its re-export, and the
 # configuration from `ostrya_fetch::server_config`.
 futures-rustls = { version = "0.26", default-features = false }
+# The random bytes of a session id of the receive endpoint, from the random
+# source of the operating system.
+getrandom = "0.3.4"

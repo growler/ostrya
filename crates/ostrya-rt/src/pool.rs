@@ -1,9 +1,10 @@
-//! The blocking-pool entry point and a test-oriented executor driver.
+//! The blocking-pool entry points and a test-oriented executor driver.
 //!
-//! [`unblock`] is the single door to the backend's blocking thread pool
-//! (`smol::unblock` or `tokio::task::spawn_blocking`); every synchronous
-//! syscall offload in the library goes through it. [`blocking_threads`] gives
-//! the size of that pool. [`block_on`] drives a
+//! [`unblock`] is the door to the backend's blocking thread pool
+//! (`smol::unblock` or `tokio::task::spawn_blocking`) for work whose result is
+//! awaited, and [`unblock_detached`] for work that runs detached; every
+//! synchronous syscall offload in the library goes through one of the two.
+//! [`blocking_threads`] gives the size of that pool. [`block_on`] drives a
 //! future to completion on the backend's executor and exists for tests and
 //! doctests -- the library's real entry points are `async fn` driven by the
 //! caller's runtime.
@@ -33,6 +34,36 @@ where
     T: Send + 'static,
 {
     smol::unblock(f).await
+}
+
+/// Run a blocking closure on the backend's blocking thread pool as a detached
+/// task, with no result to await. The call returns at once.
+///
+/// Under tokio, a call outside the context of a runtime has no pool to reach,
+/// so the closure runs inline on the calling thread before the call returns.
+/// A panic in a detached closure is not seen by the caller.
+#[cfg(feature = "tokio")]
+pub fn unblock_detached<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => drop(handle.spawn_blocking(f)),
+        Err(_) => f(),
+    }
+}
+
+/// Run a blocking closure on the backend's blocking thread pool as a detached
+/// task, with no result to await. The call returns at once.
+///
+/// The pool of `smol` needs no runtime context, so the closure always runs
+/// on the pool. A panic in a detached closure is not seen by the caller.
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+pub fn unblock_detached<F>(f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    smol::unblock(f).detach();
 }
 
 /// The most closures the blocking thread pool of the backend runs at the same
@@ -103,6 +134,32 @@ mod tests {
         assert_eq!(parse_max(Some("20000")), 10_000);
         assert_eq!(parse_max(Some("abc")), 500);
         assert_eq!(parse_max(Some("8")), 8);
+    }
+
+    /// The closure runs, and the call does not wait for it.
+    #[test]
+    fn unblock_detached_runs_the_closure() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        block_on(async move {
+            unblock_detached(move || tx.send(7).unwrap());
+            assert_eq!(unblock(move || rx.recv().unwrap()).await, 7);
+        });
+    }
+
+    /// Under tokio, a call from a thread outside any runtime runs the closure
+    /// inline.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn unblock_detached_with_no_runtime_runs_inline() {
+        let ran = std::thread::spawn(|| {
+            let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = ran.clone();
+            unblock_detached(move || flag.store(true, std::sync::atomic::Ordering::SeqCst));
+            ran.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .join()
+        .unwrap();
+        assert!(ran);
     }
 
     #[test]

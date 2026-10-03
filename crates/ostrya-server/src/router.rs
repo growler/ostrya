@@ -1,4 +1,5 @@
-//! The HTTP mapping of the archive view.
+//! The HTTP mapping of the archive view, and the routing to the receive
+//! endpoint.
 
 use std::sync::Arc;
 
@@ -7,16 +8,30 @@ use hyper::header::{ALLOW, CONTENT_LENGTH, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView};
 
+use crate::auth::Peer;
 use crate::body::ServeBody;
+use crate::receive::{self, Receive};
 use crate::stall::Stall;
 
 /// The response to one request. A stream body is recorded in `stall`, the
 /// deadline of its connection.
+///
+/// With a receive endpoint, a request under its raw path prefix with a
+/// method other than `GET` and `HEAD` goes to the endpoint. A `GET` or a
+/// `HEAD` there goes to the view, which finds nothing.
 pub(crate) async fn handle(
     view: &ArchiveView,
+    receive: Option<&Receive>,
+    peer: &Peer,
     stall: &Arc<Stall>,
     req: Request<Incoming>,
 ) -> Response<ServeBody> {
+    if let Some(receive) = receive {
+        let read = matches!(*req.method(), Method::GET | Method::HEAD);
+        if !read && req.uri().path().starts_with(receive::PREFIX) {
+            return receive.handle(peer, req).await;
+        }
+    }
     let head = match *req.method() {
         Method::GET => false,
         Method::HEAD => true,
@@ -78,7 +93,7 @@ fn with_length(mut response: Response<ServeBody>, len: Option<u64>) -> Response<
 }
 
 /// A response of `status` with an empty body.
-fn empty(status: StatusCode) -> Response<ServeBody> {
+pub(crate) fn empty(status: StatusCode) -> Response<ServeBody> {
     let mut response = Response::new(ServeBody::Empty);
     *response.status_mut() = status;
     response

@@ -122,6 +122,11 @@ pub struct ObjectHeader {
 }
 
 /// `ObjectsReply`: the result of an object stream.
+///
+/// The counts are those of one stream. Where two streams of one session send
+/// the same content, dirtree, dirmeta, or commit object at the same time,
+/// both can count it. A second detached metadata object for one commit is
+/// `protocol`, also from another stream, and ends the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectsReply {
     /// The number of objects stored.

@@ -34,7 +34,7 @@ struct State {
 
 impl Shutdown {
     /// Fire the signal and wake each waiter.
-    fn fire(&self) {
+    pub(crate) fn fire(&self) {
         let waiters = {
             let mut state = self.state.lock().expect("shutdown mutex");
             state.fired = true;

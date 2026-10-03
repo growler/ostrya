@@ -1764,6 +1764,7 @@ dependencies = [
  "futures-io",
  "futures-lite",
  "futures-rustls",
+ "getrandom 0.3.4",
  "hyper",
  "ostrya",
  "ostrya-fetch",

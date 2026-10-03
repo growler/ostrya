@@ -114,7 +114,7 @@ fn protocol(message: String) -> Failure {
     Failure::Wire(push::Error::Protocol(message))
 }
 
-fn limit_exceeded(message: String) -> Failure {
+pub(super) fn limit_exceeded(message: String) -> Failure {
     Failure::Wire(push::Error::LimitExceeded(message))
 }
 
@@ -174,54 +174,78 @@ fn grow(buf: &mut Vec<u8>) {
 /// Read a metadata or detached metadata object whole. The first read that
 /// takes it past [`MAX_METADATA_SIZE`] is `limit-exceeded`.
 ///
-/// The bytes are read straight into the result, which doubles as it fills and
-/// never grows past one byte over the cap: that byte is what shows an object
-/// over the cap.
-pub(super) async fn read_capped<R: AsyncRead + Unpin>(
+/// The bytes are read straight into the result. Its capacity doubles as it
+/// fills, up to one byte over the cap: that byte is what shows an object over
+/// the cap. Each read goes into a zeroed window of at most [`COPY_CHUNK`]
+/// bytes past the bytes already read, so the memory the result touches
+/// follows the bytes that arrived, and one read returns at most one window.
+/// `reserve` gets the length of each read that returns bytes, before the next
+/// read starts, and an error from it ends the read. The result is shrunk to
+/// its length.
+pub(super) async fn read_capped<R, F>(
     body: &mut R,
     what: &str,
     checksum: &Checksum,
-) -> Result<Vec<u8>, Failure> {
+    mut reserve: F,
+) -> Result<Vec<u8>, Failure>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(u64) -> Result<(), Failure>,
+{
     let limit = MAX_METADATA_SIZE as usize + 1;
     let mut bytes = Vec::new();
-    let mut len = 0;
     loop {
-        if len == bytes.len() {
-            let target = (len * 2).max(len + COPY_CHUNK).min(limit);
+        let len = bytes.len();
+        let end = len + COPY_CHUNK.min(limit - len);
+        if end > bytes.capacity() {
+            let target = (bytes.capacity() * 2).max(end).min(limit);
             bytes.reserve_exact(target - len);
-            bytes.resize(target, 0);
         }
+        bytes.resize(end, 0);
         let n = body
             .read(&mut bytes[len..])
             .await
             .map_err(|e| classify(e.into()))?;
+        bytes.truncate(len + n);
         if n == 0 {
-            bytes.truncate(len);
+            bytes.shrink_to_fit();
             return Ok(bytes);
         }
-        len += n;
-        if len as u64 > MAX_METADATA_SIZE {
+        if bytes.len() as u64 > MAX_METADATA_SIZE {
             return Err(limit_exceeded(format!(
                 "{what} {checksum} is larger than {MAX_METADATA_SIZE} bytes"
             )));
         }
+        reserve(n as u64)?;
     }
 }
 
 /// Ingest a dirtree, dirmeta, or commit object. `Ok(true)` when the object was
 /// staged, `Ok(false)` when it was dropped because `held` or because the
 /// repository already holds it.
-pub(super) async fn metadata<R: AsyncRead + Unpin>(
+///
+/// `reserve` gets the length of each read, as [`read_capped`] gives it. The
+/// hash runs on the blocking pool.
+pub(super) async fn metadata<R, F>(
     txn: &Transaction,
     rules: &ModeRules,
     ty: ObjectType,
     checksum: &Checksum,
     held: bool,
     body: &mut R,
-) -> Result<bool, Failure> {
+    reserve: F,
+) -> Result<bool, Failure>
+where
+    R: AsyncRead + Unpin,
+    F: FnMut(u64) -> Result<(), Failure>,
+{
     let what = format!("{ty:?} object").to_lowercase();
-    let bytes = read_capped(body, &what, checksum).await?;
-    let actual = Checksum::from_bytes(Sha256::digest(&bytes).into());
+    let bytes = read_capped(body, &what, checksum, reserve).await?;
+    let (bytes, actual) = ostrya_rt::unblock(move || {
+        let actual = Checksum::from_bytes(Sha256::digest(&bytes).into());
+        (bytes, actual)
+    })
+    .await;
     if actual != *checksum {
         return Err(Failure::Wire(push::Error::ChecksumMismatch(format!(
             "{what} {checksum}: the bytes hash to {actual}"
@@ -525,12 +549,83 @@ mod tests {
             }
         }
         let mut body = Counted::new(Endless);
-        let got = futures_lite::future::block_on(read_capped(&mut body, "commit object", &csum()));
+        let got = futures_lite::future::block_on(read_capped(
+            &mut body,
+            "commit object",
+            &csum(),
+            |_| Ok(()),
+        ));
         assert!(matches!(
             got,
             Err(Failure::Wire(push::Error::LimitExceeded(_)))
         ));
         // The read stops at the first byte past the cap.
         assert_eq!(body.count, MAX_METADATA_SIZE + 1);
+    }
+
+    /// Each read gets a window of at most one chunk, and the result keeps no
+    /// spare capacity.
+    #[test]
+    fn reads_go_through_a_bounded_window() {
+        struct Widest<'a> {
+            bytes: &'a [u8],
+            widest: usize,
+        }
+        impl AsyncRead for Widest<'_> {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &mut [u8],
+            ) -> Poll<io::Result<usize>> {
+                self.widest = self.widest.max(buf.len());
+                let n = buf.len().min(self.bytes.len());
+                buf[..n].copy_from_slice(&self.bytes[..n]);
+                self.bytes = &self.bytes[n..];
+                Poll::Ready(Ok(n))
+            }
+        }
+        let bytes: Vec<u8> = (0..5 * COPY_CHUNK + 7).map(|i| i as u8).collect();
+        let mut body = Widest {
+            bytes: &bytes,
+            widest: 0,
+        };
+        let got = futures_lite::future::block_on(read_capped(
+            &mut body,
+            "commit object",
+            &csum(),
+            |_| Ok(()),
+        ));
+        let Ok(got) = got else {
+            panic!("the read failed")
+        };
+        assert_eq!(got, bytes);
+        assert_eq!(got.capacity(), got.len());
+        assert_eq!(body.widest, COPY_CHUNK);
+    }
+
+    #[test]
+    fn a_refused_reservation_ends_the_read() {
+        let bytes = vec![1u8; 3 * COPY_CHUNK];
+        let mut body = Counted::new(&bytes[..]);
+        let mut reserved = 0;
+        let got = futures_lite::future::block_on(read_capped(
+            &mut body,
+            "detached metadata of commit",
+            &csum(),
+            |n| {
+                reserved += n;
+                if reserved > COPY_CHUNK as u64 {
+                    return Err(limit_exceeded("the session cap".into()));
+                }
+                Ok(())
+            },
+        ));
+        assert!(matches!(
+            got,
+            Err(Failure::Wire(push::Error::LimitExceeded(m))) if m == "the session cap"
+        ));
+        // Each read that returns bytes is reserved before the next read.
+        assert_eq!(reserved, body.count);
+        assert!(body.count < bytes.len() as u64);
     }
 }

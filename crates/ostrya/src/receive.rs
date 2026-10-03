@@ -34,14 +34,20 @@
 //! each incoming detached-metadata dict into the dict the server holds with a
 //! union of the signature lists. The module also holds the check whether a
 //! server key already signed a commit.
+//!
+//! [`ReceiveService`] runs the same session as steps, one for each request of
+//! a transport such as HTTP, with concurrent object streams on the one
+//! session transaction.
 
 mod ancestry;
+mod core;
 mod finish;
 mod ingest;
 mod merge;
 mod pattern;
 mod policy;
 mod reader;
+mod service;
 mod session;
 mod signer;
 mod trust;
@@ -49,6 +55,7 @@ mod walk;
 
 pub use pattern::RefPattern;
 pub use policy::{ReceivePolicy, ReceiveRule, ReceiveVerify};
+pub use service::ReceiveService;
 pub use session::{ReceiveReport, ReceiveStep, ReceiveWarning};
 pub use signer::ServerSigner;
 pub use trust::TrustedKeys;
@@ -67,4 +74,5 @@ const _: fn() = || {
     assert_send_sync::<ServerSigner>();
     assert_send_sync::<ReceiveReport>();
     assert_send_sync::<ReceiveWarning>();
+    assert_send_sync::<ReceiveService>();
 };

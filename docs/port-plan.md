@@ -195,10 +195,24 @@ bounded:
   `ostrya::push`, and `ostrya::Error::Push` carries its error type.
 - `ostrya-server` -- the HTTP server of `ostrya serve`, on Linux alone. It
   serves `ArchiveView` of `ostrya`, the archive view of a repository of any
-  mode, over HTTP/1.1, and over TLS with ALPN for HTTP/2 and HTTP/1.1. It
+  mode, over HTTP/1.1, and over TLS with ALPN for HTTP/2 and HTTP/1.1. With
+  a receive policy it also runs the receive endpoint of a push: it holds the
+  session table, and each request is one step of the `ReceiveService` of
+  its session (`api-sketch.md`, "Archive view and HTTP server"). The
+  endpoint authorizes each request with a bearer token or a Basic
+  credential, which it matches against the push credential file
+  (`format-reference.md`, "Port extension: the push credential file"), with
+  a client certificate, or as an anonymous push. It compares the digests in
+  constant time with a hand-rolled compare and no dependency. It refuses to
+  start with no method, and over plain HTTP with the credential file as its
+  one method and no switch for credentials over plain HTTP. With the
+  endpoint, an HTTP/2 stream has a receive window of 2 MiB, and a
+  connection a window of 2 MiB for each of the `parallel_uploads` object
+  streams of a session. It
   depends on `ostrya` with `receive`, on `ostrya-fetch` for the hyper
   adapters over `ostrya-rt` and for the server TLS configuration, on
-  `ostrya-rt`, and on `hyper` and `futures-rustls`. Its features `smol`, the
+  `ostrya-rt`, on `hyper` and `futures-rustls`, and on `getrandom` for the
+  session ids (`CLAUDE.md`, "Authorized: the `getrandom` crate"). Its features `smol`, the
   default, and `tokio` select the runtime backend. `ostrya-server` and
   `ostrya-fetch` take `hyper` 1.11.1 or later: 1.11.0 can keep the last
   chunk of a response body in its write buffer when the first poll of the
@@ -263,9 +277,12 @@ Division of labor between `rustix` and the runtime:
   buffer limit only below 256 KiB. An archive object takes the length of its
   compressed stream, from one `fstat` in the blocking-pool call of the open,
   so a stream longer than its payload does not shrink the read-ahead.
-- `rt::unblock` is the only entry to a blocking pool (`smol::unblock` under
-  smol, `tokio::task::spawn_blocking` under tokio), so each backend runs
-  exactly one pool under its own configuration.
+- `rt::unblock`, for work whose result is awaited, and
+  `rt::unblock_detached`, for work that runs detached, are the only entries
+  to a blocking pool (`smol::unblock` under smol,
+  `tokio::task::spawn_blocking` under tokio), so each backend runs exactly
+  one pool under its own configuration. Under tokio, `rt::unblock_detached`
+  with no runtime runs its closure inline.
 - Network I/O in pull is genuinely async on the backend's net layer plus
   `rustls`.
 - CPU-bound work (SHA-256, DEFLATE, xz) runs through `rt::unblock`, except
@@ -7100,9 +7117,13 @@ mode, over HTTP and HTTPS, and `ostree pull` from it passes `ostree fsck`
 (`docs/conformance/cli-surface.md`, "Port extensions with no counterpart in
 the tool"). The fetcher has the upload request that the HTTP push transport
 sends through: a `POST` with a body given whole or streamed, retried only
-while it is unsent, with a bounded response (`docs/api-sketch.md`). The HTTP
-push transport and the receive endpoint of `ostrya serve` are still to
-come.
+while it is unsent, with a bounded response (`docs/api-sketch.md`). The
+receive endpoint of `ostrya serve` takes a push over HTTP: the sessions,
+their idle timeout and limit, `DELETE`, the status of each error, and the
+authentication of each request with a bearer token, a Basic credential, a
+client certificate, or as an anonymous push (`docs/api-sketch.md`,
+"Archive view and HTTP server", and `docs/conformance/cli-surface.md`,
+"serve"). The HTTP push transport is to come.
 
 Pull over ssh follows push as separate work.
 
@@ -8166,7 +8187,8 @@ Resolved:
    `smol::fs::File`), `tokio` behind a feature, tokio taking precedence
    when both features are enabled, and a compile error when neither is.
    `rustix` is scoped to fd-relative and Linux-specific syscalls offloaded
-   through `rt::unblock`, the sole blocking-pool entry; streaming file I/O
+   through `rt::unblock`, the blocking-pool entry for awaited work, with
+   `rt::unblock_detached` for detached work; streaming file I/O
    goes through `rt::File`, and a read-only stream through
    `rt::FileReader`. Concrete public stream types (`ContentReader`,
    `ContentWriter`, the hashing streams) implement the `futures-io` traits

@@ -1928,6 +1928,53 @@ receive-command=/usr/local/bin/ostrya receive
 - `ostree config set core.fsync true` rewrites `config` and keeps the three
   keys in order.
 
+## Port extension: the push credential file
+
+`ostrya serve --push-credentials=FILE` reads the credentials of push over
+HTTP from `FILE`. The tool has no such file. The file is outside the
+repository, and the server reads it once, at start.
+
+The file is UTF-8 text. A LF ends each line, and the last line can have no
+LF. Each line is one of these:
+
+- An empty line. The server skips it.
+- A comment: a line that starts with `#`. The server skips it.
+- A credential: `NAME:HEX`.
+  - `NAME` is one or more visible ASCII characters (0x21 to 0x7e) other
+    than `:`.
+  - `HEX` is the SHA-256 digest of the token, in 64 lowercase hex digits.
+    `printf %s "$TOKEN" | sha256sum` gives it.
+
+Example:
+
+```text
+# the push credentials of the build hosts
+builder-1:3c469e9d6c5875d37a43f353d4f88e61fcf812c66eee3457465a40b0da4153e0
+```
+
+The server refuses the file at start when a line is malformed:
+
+- A line holds a CR (0x0d). This rule applies to comments and empty lines
+  too, so a file with CRLF line ends is refused.
+- A line is not valid UTF-8.
+- A credential line holds a space.
+- A credential line holds no `:`, or its `NAME` is empty.
+- A `NAME` holds a character other than visible ASCII.
+- A `HEX` is not 64 lowercase hex digits.
+- Two lines have the same `NAME`, or the same `HEX`.
+
+The error names the number of the line, from 1, and holds no byte of the
+line. A file larger than 1 MiB is refused. A file with no credential line
+gives no authentication method, and a server with no other method refuses to
+start. A server with no TLS whose one method is the file also refuses to
+start, unless it takes credentials over plain HTTP.
+
+A bearer token matches a line when the SHA-256 digest of the token equals
+`HEX`. A Basic credential `NAME:TOKEN` matches the line with that `NAME`
+when the digest of `TOKEN` equals its `HEX`. A bearer token and a Basic
+credential that match one line give the same session owner. An empty token
+matches no line.
+
 ## Port extension: the commit of `push-tree`
 
 `ostrya push-tree` builds one commit over a local directory on the client

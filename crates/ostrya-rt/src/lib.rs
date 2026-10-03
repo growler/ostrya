@@ -3,7 +3,8 @@
 //! The runtime abstraction the rest of ostrya is written against.
 //!
 //! This crate is the only place that knows which async backend is compiled.
-//! It exposes [`unblock`] (the sole entry to the blocking pool) with
+//! It exposes [`unblock`] and [`unblock_detached`] (the entries to the
+//! blocking pool, for awaited and for detached work) with
 //! [`blocking_threads`] (the size of that pool), [`File`]
 //! (an async file over an already-open descriptor) with [`FileReader`] (its
 //! read-only form, which reads ahead by at most 256 KiB and never seeks),
@@ -41,7 +42,7 @@ mod timer;
 
 pub use file::{File, FileReader};
 pub use net::{TcpListener, TcpStream};
-pub use pool::{block_on, blocking_threads, unblock};
+pub use pool::{block_on, blocking_threads, unblock, unblock_detached};
 pub use process::{Child, ChildStdin, ChildStdout, Command};
 pub use task::{JoinHandle, spawn};
 pub use timer::{Deadline, Timer};

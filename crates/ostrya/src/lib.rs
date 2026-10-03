@@ -213,7 +213,9 @@
 //! the repository config, `[ex-ostrya receive]` and the groups it names. A
 //! received commit is held to the same signature checks a pull makes, over the
 //! keys the receive policy names. `Repo::receive` runs one push session over a
-//! pair of streams, and `ostrya::push` re-exports the wire protocol crate.
+//! pair of streams, `ReceiveService` runs one as a step for each request of a
+//! transport such as HTTP, and `ostrya::push` re-exports the wire protocol
+//! crate.
 //!
 //! Under the `push` feature it also covers the client side of a push from a
 //! repository. `Repo::push` pushes the commits of a set of refspecs to a
@@ -332,8 +334,8 @@ pub use push_repo::{RepoPushOptions, is_push_address, resolve_push_remote};
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 pub use receive::{
-    ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveStep, ReceiveVerify, ReceiveWarning,
-    RefPattern, ServerSigner, TrustedKeys,
+    ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveService, ReceiveStep, ReceiveVerify,
+    ReceiveWarning, RefPattern, ServerSigner, TrustedKeys,
 };
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 pub use repo::{CreateOptions, Repo};

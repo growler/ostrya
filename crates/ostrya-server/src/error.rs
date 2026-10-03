@@ -27,6 +27,15 @@ pub enum Error {
     /// The options cannot be served.
     #[error("invalid serve options: {0}")]
     Options(String),
+    /// A line of the push credential file is malformed. The error names the
+    /// line by its number and holds no byte of it.
+    #[error("push credentials: line {line}: {message}")]
+    Credentials {
+        /// The number of the line, from 1.
+        line: usize,
+        /// What is wrong with the line.
+        message: String,
+    },
     /// An error of the repository.
     #[error(transparent)]
     Repo(#[from] ostrya::Error),

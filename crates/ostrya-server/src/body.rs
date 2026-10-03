@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 use futures_io::AsyncRead;
 use hyper::body::{Body, Bytes, Frame, SizeHint};
 
+use crate::receive::ReplyBody;
 use crate::stall::Tracker;
 
 /// The largest frame a stream body yields.
@@ -17,12 +18,14 @@ const MAX_FRAME: usize = 64 * 1024;
 /// on request, does not hold the executor thread for long.
 const YIELD_AFTER: usize = 256 * 1024;
 
-/// A response body: empty, bytes held whole, or a stream read in frames.
+/// A response body: empty, bytes held whole, a stream read in frames, or the
+/// reply of a commit of the receive endpoint.
 pub(crate) enum ServeBody {
     Empty,
     /// The bytes, until the one frame that carries them is taken.
     Full(Option<Bytes>),
     Stream(StreamBody),
+    Reply(ReplyBody),
 }
 
 impl ServeBody {
@@ -113,6 +116,7 @@ impl Body for ServeBody {
             ServeBody::Empty => Poll::Ready(None),
             ServeBody::Full(bytes) => Poll::Ready(bytes.take().map(|b| Ok(Frame::data(b)))),
             ServeBody::Stream(stream) => stream.poll_frame(cx),
+            ServeBody::Reply(reply) => Poll::Ready(reply.poll_frame().map(Ok)),
         }
     }
 
@@ -121,6 +125,7 @@ impl Body for ServeBody {
             ServeBody::Empty => true,
             ServeBody::Full(bytes) => bytes.is_none(),
             ServeBody::Stream(stream) => stream.remaining == Some(0),
+            ServeBody::Reply(reply) => reply.remaining() == 0,
         }
     }
 
@@ -133,6 +138,7 @@ impl Body for ServeBody {
             ServeBody::Stream(stream) => stream
                 .remaining
                 .map_or_else(SizeHint::default, SizeHint::with_exact),
+            ServeBody::Reply(reply) => SizeHint::with_exact(reply.remaining()),
         }
     }
 }

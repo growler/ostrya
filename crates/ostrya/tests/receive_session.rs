@@ -887,6 +887,87 @@ fn a_second_commit_meta_for_one_commit_is_protocol() {
     assert_eq!(returned_code(&result), Some(ErrorCode::Protocol));
 }
 
+/// The bytes before and after the value of a detached metadata dict whose one
+/// entry `k` holds an `ay` of `len` zero bytes. A dict of 64 KiB or more has
+/// framing offsets of 4 bytes, so one layout covers every such length.
+fn one_entry_dict(len: usize) -> ([u8; 8], Vec<u8>) {
+    let prefix = *b"k\0\0\0\0\0\0\0";
+    let mut suffix = vec![0, b'a', b'y'];
+    suffix.extend_from_slice(&2u32.to_le_bytes());
+    suffix.extend_from_slice(&u32::try_from(len + 15).unwrap().to_le_bytes());
+    (prefix, suffix)
+}
+
+#[test]
+fn the_one_entry_dict_layout_is_the_serialized_dict() {
+    let len = 70_000;
+    let mut dict = ostrya::DictBuilder::new();
+    dict.insert_bytes("k", &vec![0; len]);
+    let built =
+        ostrya_core::to_bytes(&ostrya::Type::parse("a{sv}").unwrap(), &dict.build()).unwrap();
+    let (prefix, suffix) = one_entry_dict(len);
+    let mut laid = prefix.to_vec();
+    laid.resize(prefix.len() + len, 0);
+    laid.extend_from_slice(&suffix);
+    assert_eq!(laid, built);
+}
+
+/// The dicts of one session share one cap. Each dict here is under the cap,
+/// and the two together are over it.
+#[test]
+fn detached_metadata_past_the_session_cap_is_limit_exceeded() {
+    let tmp = TmpDir::new("recv-metacap");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let len = 65 << 20;
+    let (result, (reply, error)) = session(&repo, &policy(), |mut c| async move {
+        c.hello_reply(&[]).await;
+        let zeros = vec![0u8; 64 * 1024];
+        let (prefix, suffix) = one_entry_dict(len);
+        c.writer
+            .write_message(&Message::ObjectHeader(ObjectHeader {
+                name: ObjectName::new(sha(b"first"), ObjectType::CommitMeta),
+                encoding: Encoding::Raw,
+            }))
+            .await
+            .unwrap();
+        c.writer.write_object_data(&prefix).await.unwrap();
+        for _ in 0..len / zeros.len() {
+            c.writer.write_object_data(&zeros).await.unwrap();
+        }
+        c.writer.write_object_data(&suffix).await.unwrap();
+        c.writer.end_object().await.unwrap();
+        let reply = c.objects_end().await;
+        // The second dict needs no valid form: the cap refuses it before its
+        // end.
+        let sent: push::Result<()> = async {
+            c.writer
+                .write_message(&Message::ObjectHeader(ObjectHeader {
+                    name: ObjectName::new(sha(b"second"), ObjectType::CommitMeta),
+                    encoding: Encoding::Raw,
+                }))
+                .await?;
+            for _ in 0..len / zeros.len() + 1 {
+                c.writer.write_object_data(&zeros).await?;
+            }
+            c.writer.end_object().await?;
+            c.writer.flush().await
+        }
+        .await;
+        assert!(sent.is_err(), "the server stops reading at the cap");
+        (reply, c.error().await)
+    });
+    assert_eq!(reply.objects, 1);
+    assert_eq!(error.code, ErrorCode::LimitExceeded, "{error:?}");
+    assert!(
+        error
+            .message
+            .contains("the detached metadata of the session"),
+        "{error:?}"
+    );
+    assert_eq!(returned_code(&result), Some(ErrorCode::LimitExceeded));
+    assert!(staging_entries(repo.path()).is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // The repository lock.
 // ---------------------------------------------------------------------------

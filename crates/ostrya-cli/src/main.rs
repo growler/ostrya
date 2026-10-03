@@ -51,8 +51,8 @@
 //! - `push-tree` -- push a directory to a remote over ssh as one commit, and
 //!   set its refs to that commit. The `push` feature builds it.
 //! - `serve` -- serve the repository over HTTP or HTTPS as an archive
-//!   repository, for pull. It runs with `--read-only` alone. The `serve`
-//!   feature builds it.
+//!   repository, for pull, and without `--read-only` the receive endpoint of
+//!   a push over HTTP. The `serve` feature builds it.
 //!
 //! The binary is synchronous and drives the async library with
 //! [`ostrya_rt::block_on`]. Tar streams from stdin flow through
@@ -173,7 +173,8 @@ enum Command {
     #[cfg(feature = "push")]
     #[command(name = "push-tree")]
     PushTree(PushTreeArgs),
-    /// Serve the repository over HTTP as an archive repository, for pull.
+    /// Serve the repository over HTTP as an archive repository, for pull,
+    /// and, without --read-only, the receive endpoint of a push.
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
 }
@@ -1410,13 +1411,66 @@ struct ServeArgs {
     #[arg(long, value_name = "FILE", requires = "tls_cert")]
     tls_key: Option<PathBuf>,
     /// Verify a client certificate against the CA certificates in FILE, in
-    /// PEM. A client that presents no certificate is served.
+    /// PEM. A client that presents no certificate is served. A client
+    /// certificate is a method of push authentication.
     #[arg(long, value_name = "FILE", requires = "tls_cert")]
     client_ca: Option<PathBuf>,
-    /// Serve the files of a pull alone. The command refuses to run without
-    /// it.
+    /// Serve the files of a pull alone, with no receive endpoint. Without it
+    /// the command needs an authentication method of push: --push-credentials,
+    /// --client-ca, or --allow-anonymous-push.
     #[arg(long)]
     read_only: bool,
+    /// Take the push credentials in FILE, one NAME:HEX line each, where HEX
+    /// is the SHA-256 digest of the token in 64 lowercase hex digits. A line
+    /// that starts with `#` and an empty line are skipped. A malformed line
+    /// stops the command at start. Without --tls-cert the option needs
+    /// --allow-cleartext-credentials or --allow-anonymous-push.
+    #[arg(long, value_name = "FILE", conflicts_with = "read_only")]
+    push_credentials: Option<PathBuf>,
+    /// Take a bearer or Basic credential of push over plain HTTP. Use it for
+    /// a server on a loopback address or behind a proxy that terminates TLS.
+    #[arg(long, conflicts_with = "read_only")]
+    allow_cleartext_credentials: bool,
+    /// Read the receive, trust, and key groups, and the remotes they name,
+    /// from FILE alone, in place of those of the repository config. `[core]
+    /// auto-update-summary` and `[ex-ostrya] detached-metadata-exclude` still
+    /// come from the repository config.
+    #[arg(long, value_name = "FILE", conflicts_with = "read_only")]
+    policy: Option<PathBuf>,
+    /// Let a request with no credential push.
+    #[arg(long, conflicts_with = "read_only")]
+    allow_anonymous_push: bool,
+    /// Abort a push session with no request in progress for SECONDS, and a
+    /// push session whose request body delivers no byte for SECONDS. The
+    /// value is a positive integer, and the default is 300.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value = "300",
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with = "read_only"
+    )]
+    session_timeout: u64,
+    /// Serve at most N push sessions at the same time. The value is a
+    /// positive integer, and the default is 16.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "16",
+        value_parser = clap::value_parser!(u64).range(1..),
+        conflicts_with = "read_only"
+    )]
+    max_sessions: u64,
+    /// Let a push session send N object streams at the same time. The value
+    /// is 1 to 31, and the default is 4.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value = "4",
+        value_parser = clap::value_parser!(u32).range(1..=31),
+        conflicts_with = "read_only"
+    )]
+    parallel_uploads: u32,
     /// End a connection whose response waits longer than SECONDS for the
     /// client to take its next bytes. An HTTP/2 client that does not answer
     /// a ping within SECONDS also loses its connection. The value is a
@@ -1843,10 +1897,31 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         }
         #[cfg(feature = "serve")]
         Command::Serve(args) => {
-            // The receive endpoint does not exist, so a server that is not
-            // read-only is refused before the repository is opened.
-            if !args.read_only {
-                eprintln!("error: serve needs --read-only: the server has no receive endpoint");
+            // A receive endpoint that no method of push authentication
+            // guards is refused before the repository is opened.
+            if !args.read_only
+                && !args.allow_anonymous_push
+                && args.push_credentials.is_none()
+                && args.client_ca.is_none()
+            {
+                eprintln!(
+                    "error: serve needs --read-only, or --push-credentials, --client-ca, or \
+                     --allow-anonymous-push for the receive endpoint"
+                );
+                exit_process(1);
+            }
+            // With no TLS the credential file is the one method, and the
+            // endpoint refuses each credential over plain HTTP.
+            if !args.read_only
+                && args.tls_cert.is_none()
+                && !args.allow_anonymous_push
+                && !args.allow_cleartext_credentials
+            {
+                eprintln!(
+                    "error: serve --push-credentials needs --tls-cert, \
+                     --allow-cleartext-credentials, or --allow-anonymous-push: the receive \
+                     endpoint takes no credential over plain HTTP"
+                );
                 exit_process(1);
             }
             let (repo, _) = resolve_repo(repo, verbose, name).await;
@@ -1855,13 +1930,20 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
     }
 }
 
-/// The largest PEM file `serve` reads.
+/// The largest file `serve` reads: a PEM file or the push credential file.
 #[cfg(feature = "serve")]
-const MAX_PEM_SIZE: u64 = 1024 * 1024;
+const MAX_SERVE_FILE_SIZE: u64 = 1024 * 1024;
 
 /// Serve the repository with the options of `args` until the process ends.
 /// The URL of each listener goes to standard output, one line each, once
 /// every listener is bound.
+///
+/// Without `--read-only` the receive endpoint runs with the receive policy
+/// of the repository config, or of `--policy`, and the credential file of
+/// `--push-credentials`, each read once at start. A malformed credential
+/// line ends the process with an error that names the line. Each warning of
+/// the report of a session that committed goes to standard error as one
+/// line.
 #[cfg(feature = "serve")]
 async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     use std::io::Write;
@@ -1871,12 +1953,34 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
         opts.listen = args.listen;
     }
     opts.body_timeout = std::time::Duration::from_secs(args.body_timeout);
+    if !args.read_only {
+        let policy = match &args.policy {
+            Some(path) => ostrya::ReceivePolicy::from_file(&repo, path).await?,
+            None => ostrya::ReceivePolicy::from_config(&repo).await?,
+        };
+        opts.receive = Some(Arc::new(policy));
+        opts.allow_anonymous_push = args.allow_anonymous_push;
+        opts.credentials = args.push_credentials.as_deref().map(read_serve_file);
+        opts.allow_cleartext_credentials = args.allow_cleartext_credentials;
+        opts.session_idle_timeout = std::time::Duration::from_secs(args.session_timeout);
+        opts.max_sessions = usize::try_from(args.max_sessions).unwrap_or(usize::MAX);
+        opts.parallel_uploads = args.parallel_uploads;
+        opts.on_report = Some(Arc::new(|report: ostrya::ReceiveReport| {
+            for warning in &report.warnings {
+                eprintln!(
+                    "warning: {}: {}",
+                    receive_step(warning.step),
+                    warning.message
+                );
+            }
+        }));
+    }
     if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
         opts.tls = Some(ostrya_server::ServerTls {
-            cert_chain_pem: read_pem(cert),
-            key_pem: read_pem(key),
+            cert_chain_pem: read_serve_file(cert),
+            key_pem: read_serve_file(key),
             key_passphrase: None,
-            client_ca_pem: args.client_ca.as_deref().map(read_pem),
+            client_ca_pem: args.client_ca.as_deref().map(read_serve_file),
         });
     }
     let scheme = if opts.tls.is_some() { "https" } else { "http" };
@@ -1900,22 +2004,22 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
-/// Read a PEM file of `serve`, up to [`MAX_PEM_SIZE`]. A file that cannot be
-/// read, or is larger, ends the process with an error.
+/// Read a file of `serve`, up to [`MAX_SERVE_FILE_SIZE`]. A file that cannot
+/// be read, or is larger, ends the process with an error.
 #[cfg(feature = "serve")]
-fn read_pem(path: &Path) -> Vec<u8> {
+fn read_serve_file(path: &Path) -> Vec<u8> {
     use std::io::Read;
 
     let read = std::fs::File::open(path).and_then(|file| {
         let mut bytes = Vec::new();
-        file.take(MAX_PEM_SIZE + 1).read_to_end(&mut bytes)?;
+        file.take(MAX_SERVE_FILE_SIZE + 1).read_to_end(&mut bytes)?;
         Ok(bytes)
     });
     match read {
-        Ok(bytes) if bytes.len() as u64 <= MAX_PEM_SIZE => bytes,
+        Ok(bytes) if bytes.len() as u64 <= MAX_SERVE_FILE_SIZE => bytes,
         Ok(_) => {
             eprintln!(
-                "error: {}: the file exceeds the {MAX_PEM_SIZE}-byte size cap",
+                "error: {}: the file exceeds the {MAX_SERVE_FILE_SIZE}-byte size cap",
                 path.display()
             );
             exit_process(1);
@@ -2218,7 +2322,7 @@ fn push_statistics_line(stats: &ostrya::push::PushStats) -> String {
 }
 
 /// The name of a step of the receive report, as its warning line gives it.
-#[cfg(feature = "receive")]
+#[cfg(any(feature = "receive", feature = "serve"))]
 fn receive_step(step: ostrya::ReceiveStep) -> &'static str {
     match step {
         ostrya::ReceiveStep::SummaryBuild => "summary-build",

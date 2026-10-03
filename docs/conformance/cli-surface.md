@@ -3416,13 +3416,19 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
 ### `serve`
 
 ```text
-ostrya serve [--repo=PATH] --read-only [--listen=ADDR:PORT]...
+ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
              [--tls-cert=FILE --tls-key=FILE] [--client-ca=FILE]
              [--body-timeout=SECONDS]
+             (--read-only |
+              [--push-credentials=FILE] [--allow-anonymous-push]
+              [--allow-cleartext-credentials] [--policy=FILE]
+              [--session-timeout=SECONDS] [--max-sessions=N]
+              [--parallel-uploads=N])
 ```
 
 - The `serve` feature of `ostrya-cli` builds the command. It is in the
-  default set, and it needs neither `receive` nor `push`.
+  default set, and it needs neither the `receive` feature nor the `push`
+  feature.
 - The command serves the repository over HTTP as an archive repository, for
   pull, in every mode the port reads. The served `config` is
   `[core]\nrepo_version=1\nmode=archive-z2\n`, followed by
@@ -3431,9 +3437,80 @@ ostrya serve [--repo=PATH] --read-only [--listen=ADDR:PORT]...
   request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
   not served. A path the server refuses and a path it does not find both get
   404. `../format-reference.md`, "The archive view", states the rules.
-- `--read-only` is required. Without it the command writes `error: serve
-  needs --read-only: the server has no receive endpoint` and exits 1,
-  also with `--client-ca`, before it opens the repository.
+- `--read-only` serves the files of a pull alone. Without it the command
+  also runs the receive endpoint of a push, and needs an authentication
+  method of push: `--push-credentials`, `--client-ca`, or
+  `--allow-anonymous-push`. Without `--read-only` and without each of the
+  three, the command writes `error: serve needs --read-only, or
+  --push-credentials, --client-ca, or --allow-anonymous-push for the
+  receive endpoint` and exits 1 before it opens the repository.
+- `--push-credentials` names the push credential file:
+  `../format-reference.md`, "Port extension: the push credential file",
+  states its grammar. A request with `Authorization: Bearer TOKEN`, or
+  with a Basic credential `NAME:TOKEN`, pushes when the SHA-256 digest of
+  `TOKEN` matches a line, of that `NAME` for Basic. The command reads the
+  file once, at start, up to 1 MiB. A file it cannot read or a larger file
+  ends the command with `error: MESSAGE` at exit 1. A malformed line ends
+  it with `error: push credentials: line N: MESSAGE` at exit 1, after the
+  command opens the repository and before it binds a listener. The message
+  holds no byte of the line. A file with no credential line is no method,
+  and with no other method the command writes `error: invalid serve
+  options: a receive endpoint with no authentication method` at exit 1.
+- Over plain HTTP the endpoint takes no bearer or Basic credential without
+  `--allow-cleartext-credentials`, so `--push-credentials` without
+  `--tls-cert` needs `--allow-cleartext-credentials` or
+  `--allow-anonymous-push`. Without each of the three, the command writes
+  `error: serve --push-credentials needs --tls-cert,
+  --allow-cleartext-credentials, or --allow-anonymous-push: the receive
+  endpoint takes no credential over plain HTTP` and exits 1 before it opens
+  the repository. `ostrya_server::bind` makes the same refusal with
+  `Error::Options`.
+- With `--client-ca`, a client certificate that the CA signed is a method
+  of push. A request with no `Authorization` header and with such a
+  certificate pushes.
+- `--allow-anonymous-push` lets a request with no credential push.
+- Without `--allow-cleartext-credentials`, a request of the receive endpoint
+  with a bearer or Basic credential over plain HTTP gets 403, also with
+  `--allow-anonymous-push`. The switch takes such a credential. Use it for a
+  server on a loopback address or behind a proxy that terminates TLS. A
+  read of the archive view ignores the `Authorization` header and needs no
+  switch.
+- A refusal of the receive endpoint that comes before the request body is
+  read, as a 401, a 403, a 404, or a 405, reads and drops up to 1 MiB of the
+  body within `--session-timeout` or 5 seconds, whichever is shorter, and
+  then answers. On HTTP/1.1 a body that did not reach its end gets
+  `Connection: close`.
+- `--push-credentials`, `--allow-cleartext-credentials`, `--policy`,
+  `--allow-anonymous-push`, `--session-timeout`, `--max-sessions`, and
+  `--parallel-uploads` each conflict with `--read-only`. The pair is refused
+  with the argument error of the option parser at exit 1. A default value
+  is no conflict.
+- The receive policy comes from the receive groups, the trust groups, the
+  key groups, and the remote sections of the repository config, or from
+  `FILE` alone under `--policy`. `[core] auto-update-summary` and
+  `[ex-ostrya] detached-metadata-exclude` come from the repository config
+  in both cases. The command reads the policy and the repository settings
+  of the endpoint once, at start, before it binds a listener, and a change
+  applies at the next start. A policy that cannot be read ends the command
+  with `error: MESSAGE` at exit 1.
+- `--session-timeout` takes a positive number of seconds, and the default
+  is 300. A push session with no request in progress for that time is
+  aborted, and so is a push session with a request body that delivers no
+  byte for that time. A value of 0 is refused at exit 1.
+- `--max-sessions` takes a positive number, and the default is 16. A
+  request that opens a session past it gets 503.
+- `--parallel-uploads` takes a number from 1 to 31, and the default is 4.
+  `HelloReply` announces it, and a push session runs that many object
+  streams at the same time. Over HTTP/2 the receive window of a stream is
+  2 MiB, and the window of a connection is 2 MiB times this value. Another
+  value is refused at exit 1.
+- For each push session that commits, the command writes one `warning:
+  STEP: MESSAGE` line to standard error for each warning of the session, as
+  `ostrya receive` does. `reply-not-delivered` states that the connection
+  did not take the `CommitReply` response.
+- The paths, the methods, the status codes, and the order of the
+  authentication checks of the receive endpoint are in
+  `../api-sketch.md`, "Archive view and HTTP server".
 - `--listen` takes an IP address and a port. Give it once for each address.
   The default is `127.0.0.1:8080`, and port 0 lets the kernel choose a port.
   A host name is refused.
@@ -3441,7 +3518,8 @@ ostrya serve [--repo=PATH] --read-only [--listen=ADDR:PORT]...
   selects HTTP/2 or HTTP/1.1, and plain HTTP serves HTTP/1.1. An encrypted
   key is refused: the command has no option for a passphrase.
 - `--client-ca` needs `--tls-cert`. A client that presents a certificate
-  must present one the CA signed. A client that presents none is served.
+  must present one the CA signed. A client that presents none is served,
+  and a read needs no certificate.
 - `--body-timeout` takes a positive number of seconds, and the default is
   60. A connection ends when a response waits longer than that time for the
   client to take its next bytes. An HTTP/2 client that does not answer a
@@ -3456,7 +3534,11 @@ ostrya serve [--repo=PATH] --read-only [--listen=ADDR:PORT]...
 - When every listener is bound, the command writes one line for each to
   standard output, `http://ADDR:PORT/` or `https://ADDR:PORT/`, in the order
   of the options, and serves until the process ends. SIGINT and SIGTERM end
-  the process with the default action.
+  the process with the default action. A push session that did not start
+  its commit does not commit, and the next transaction of the repository
+  removes its staging directory. The commit of a push session writes its
+  refs one by one, so a commit that runs when the process ends can stop
+  after it wrote some of its refs and before it wrote the others.
 - `ostree pull` from the command, over HTTP and HTTPS, from a repository in
   each mode the port reads, passes `ostree fsck` on the pulled repository,
   in `crates/ostrya-cli/tests/serve.rs`. The summary of a

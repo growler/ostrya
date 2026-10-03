@@ -1,8 +1,8 @@
 //! `ostrya serve --read-only` against the `ostree` tool: a pull from a
 //! repository of each mode the port reads, over HTTP and HTTPS, a pull of a
 //! ref alias with no summary, and a pull from a repository whose summary
-//! names deltas the server does not serve. The refusals of the command run
-//! without the tool.
+//! names deltas the server does not serve. The refusals of the command and
+//! the routing of the receive endpoint run without the tool.
 
 #![cfg(feature = "serve")]
 
@@ -100,13 +100,19 @@ struct Serving {
 }
 
 impl Serving {
-    /// Start the server over `repo` with `extra` options, on a port the
-    /// kernel chooses, and read the URL it writes.
+    /// Start the read-only server over `repo` with `extra` options, on a port
+    /// the kernel chooses, and read the URL it writes.
     fn start(repo: &Path, extra: &[&str]) -> Serving {
+        Serving::start_with(repo, &[&["--read-only"], extra].concat())
+    }
+
+    /// Start the server over `repo` with the options `args`, on a port the
+    /// kernel chooses, and read the URL it writes.
+    fn start_with(repo: &Path, args: &[&str]) -> Serving {
         let mut child = Command::new(ostrya())
             .arg(format!("--repo={}", repo.display()))
-            .args(["serve", "--read-only", "--listen=127.0.0.1:0"])
-            .args(extra)
+            .args(["serve", "--listen=127.0.0.1:0"])
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -498,9 +504,15 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
     );
 }
 
-/// The command refuses to run without `--read-only`, with or without a
-/// client CA, and refuses a TLS file it cannot use. Each refusal exits 1 and
-/// writes no URL.
+/// The command refuses to run without `--read-only` and without an
+/// authentication method of push, and with a credential file over plain
+/// HTTP as the one method that takes no credential, before it opens the
+/// repository. It refuses a receive option beside `--read-only`, a policy
+/// file it cannot open, a TLS file it cannot use,
+/// a credential file past the size cap, a credential file with no
+/// credential line as the one method, and a malformed credential line,
+/// which it names by its number alone. Each refusal exits 1 and writes no
+/// URL.
 #[test]
 fn serve_refuses_what_it_cannot_serve() {
     let tmp = TmpDir::new("refusals");
@@ -514,13 +526,99 @@ fn serve_refuses_what_it_cannot_serve() {
     let enc_key = format!("--tls-key={}", fixture("client.key.enc.pem").display());
     let absent = format!("--tls-key={}", tmp.path().join("absent").display());
     let listen = "--listen=127.0.0.1:0";
-    let cases: [(&[&str], &str); 7] = [
-        (&[&repo, "serve", listen], "--read-only"),
+    let no_repo = format!("--repo={}", tmp.path().join("no-repo").display());
+    // The path holds no word of the refusals, so a message that names it
+    // does not pass for the refusal.
+    let policy = format!("--policy={}", tmp.path().join("absent-rules").display());
+    let ro = "--read-only";
+    let clear = "--allow-cleartext-credentials";
+    let hex = "0".repeat(64);
+    let file = |name: &str, text: &[u8]| {
+        let path = tmp.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        format!("--push-credentials={}", path.display())
+    };
+    let malformed = file(
+        "malformed",
+        format!("# push\nalice:{hex}\nsecret-name {hex}\n").as_bytes(),
+    );
+    let empty = file("empty", b"# no credential\n");
+    let big = file("big", &vec![b'#'; 1024 * 1024 + 1]);
+    let creds = file("creds", format!("alice:{hex}\n").as_bytes());
+    let cases: [(&[&str], &str); 23] = [
+        (&[&repo, "serve", listen], "--allow-anonymous-push"),
+        (&[&no_repo, "serve", listen], "--allow-anonymous-push"),
+        (&[&no_repo, "serve", listen, &policy], "--read-only"),
+        (&[&no_repo, "serve", ro, listen, &policy], "--policy"),
+        (
+            &[&no_repo, "serve", ro, listen, "--allow-anonymous-push"],
+            "--allow-anonymous-push",
+        ),
+        (
+            &[&no_repo, "serve", ro, listen, "--session-timeout=5"],
+            "--session-timeout",
+        ),
+        (
+            &[&no_repo, "serve", ro, listen, "--max-sessions=5"],
+            "--max-sessions",
+        ),
+        (
+            &[&no_repo, "serve", ro, listen, "--parallel-uploads=5"],
+            "--parallel-uploads",
+        ),
+        (
+            &[
+                &repo,
+                "serve",
+                listen,
+                "--allow-anonymous-push",
+                "--parallel-uploads=32",
+            ],
+            "--parallel-uploads",
+        ),
+        (
+            &[
+                &repo,
+                "serve",
+                listen,
+                "--allow-anonymous-push",
+                "--session-timeout=0",
+            ],
+            "--session-timeout",
+        ),
+        (
+            &[&repo, "serve", listen, "--allow-anonymous-push", &policy],
+            "the receive policy file",
+        ),
         (
             &[&repo, "serve", "--read-only", listen, "--body-timeout=0"],
             "--body-timeout",
         ),
-        (&[&repo, "serve", listen, &cert, &key, &ca], "--read-only"),
+        (&[&no_repo, "serve", listen, &cert, &key], "--client-ca"),
+        (
+            &[&no_repo, "serve", ro, listen, &creds],
+            "--push-credentials",
+        ),
+        (
+            &[
+                &no_repo,
+                "serve",
+                ro,
+                listen,
+                "--allow-cleartext-credentials",
+            ],
+            "--allow-cleartext-credentials",
+        ),
+        (
+            &[&no_repo, "serve", listen, &creds],
+            "takes no credential over plain HTTP",
+        ),
+        (&[&repo, "serve", listen, clear, &malformed], "line 3"),
+        (
+            &[&repo, "serve", listen, clear, &empty],
+            "no authentication method",
+        ),
+        (&[&repo, "serve", listen, clear, &big], "size cap"),
         (&[&repo, "serve", "--read-only", listen, &ca], "--tls-cert"),
         (&[&repo, "serve", "--read-only", listen, &cert], "--tls-key"),
         (
@@ -538,5 +636,95 @@ fn serve_refuses_what_it_cannot_serve() {
         assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
         assert!(out.stdout.is_empty(), "{args:?}");
         assert!(stderr.contains(message), "{args:?}: {stderr}");
+        assert!(!stderr.contains("secret-name"), "{args:?}: {stderr}");
     }
+}
+
+/// Send `request` to the server at `url` on a new connection, and read the
+/// response until the server closes it.
+fn raw(url: &str, request: &str) -> String {
+    use std::io::{Read, Write};
+
+    let addr = url.trim_start_matches("http://").trim_end_matches('/');
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    stream.read_to_end(&mut out).unwrap();
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// With `--allow-anonymous-push` the receive endpoint answers a `session`
+/// request, and the archive view still serves `config`. With `--read-only`
+/// the server has no endpoint, and the request gets 405.
+#[test]
+fn serve_runs_the_receive_endpoint_with_anonymous_push() {
+    let tmp = TmpDir::new("receive");
+    let path = tmp.path().join("repo");
+    let repo = format!("--repo={}", path.display());
+    ok(ostrya(), &[&repo, "init", "--mode=archive"]);
+    let post = "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n\
+                content-length: 0\r\nconnection: close\r\n\r\n";
+    let get = "GET /config HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
+    let server = Serving::start_with(
+        &path,
+        &[
+            "--allow-anonymous-push",
+            "--session-timeout=30",
+            "--max-sessions=2",
+            "--parallel-uploads=2",
+        ],
+    );
+    let response = raw(&server.url, post);
+    // An empty body holds no `Hello`, so the endpoint refuses it with
+    // `protocol`.
+    assert!(response.starts_with("HTTP/1.1 422 "), "{response}");
+    assert!(response.contains("the request body holds no message"));
+    assert!(raw(&server.url, get).starts_with("HTTP/1.1 200 "));
+    drop(server);
+    let server = Serving::start(&path, &[]);
+    let response = raw(&server.url, post);
+    assert!(response.starts_with("HTTP/1.1 405 "), "{response}");
+}
+
+/// With `--push-credentials` and `--allow-anonymous-push`, a bearer token
+/// over plain HTTP gets 403 with no `--allow-cleartext-credentials`, and
+/// passes the authentication with it. A client CA alone is a method of
+/// push, and the server starts with it.
+#[test]
+fn serve_takes_push_credentials() {
+    let tmp = TmpDir::new("credentials");
+    let path = tmp.path().join("repo");
+    let repo = format!("--repo={}", path.display());
+    ok(ostrya(), &[&repo, "init", "--mode=archive"]);
+    // The SHA-256 digest of `token`.
+    let digest = "3c469e9d6c5875d37a43f353d4f88e61fcf812c66eee3457465a40b0da4153e0";
+    let file = tmp.path().join("credentials");
+    std::fs::write(&file, format!("# push\nalice:{digest}\n")).unwrap();
+    let creds = format!("--push-credentials={}", file.display());
+    let post = "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n\
+                authorization: Bearer token\r\ncontent-length: 0\r\n\
+                connection: close\r\n\r\n";
+    let server = Serving::start_with(&path, &[&creds, "--allow-anonymous-push"]);
+    let response = raw(&server.url, post);
+    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+    assert!(response.contains("the server takes no credential over plain HTTP"));
+    drop(server);
+    let server = Serving::start_with(&path, &[&creds, "--allow-cleartext-credentials"]);
+    let response = raw(&server.url, post);
+    // The empty body holds no `Hello`, so the request passed the
+    // authentication and the endpoint refuses it with `protocol`.
+    assert!(response.starts_with("HTTP/1.1 422 "), "{response}");
+    let unknown = post.replace("Bearer token", "Bearer other");
+    let response = raw(&server.url, &unknown);
+    assert!(response.starts_with("HTTP/1.1 401 "), "{response}");
+    drop(server);
+    let server = Serving::start_with(
+        &path,
+        &[
+            &format!("--tls-cert={}", fixture("server.pem").display()),
+            &format!("--tls-key={}", fixture("server.key.pem").display()),
+            &format!("--client-ca={}", fixture("ca.pem").display()),
+        ],
+    );
+    assert!(server.url.starts_with("https://"), "{}", server.url);
 }

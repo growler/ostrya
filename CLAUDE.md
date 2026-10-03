@@ -288,6 +288,46 @@ term below is measured on the resolved dependency graph.
 - The highest minimum supported Rust version in the graph is 1.85. The
   workspace pins 1.92, so the requirement holds.
 
+### Authorized: the `getrandom` crate
+
+`getrandom` 0.3.4 is authorized for `crates/ostrya-server` alone. It
+supplies the one `getrandom::fill` call in
+`crates/ostrya-server/src/session.rs`, which fills the 32 random bytes of a
+session id of the receive endpoint from the random source of the operating
+system. Each term below is measured on the resolved dependency graph.
+
+- License `MIT OR Apache-2.0`.
+- No feature is turned on. The default feature set is empty, and the two
+  features of the crate, `std` and `wasm_js`, stay off. `cargo tree -i
+  getrandom@0.3.4 -e features --workspace` shows the feature `default`
+  alone.
+- The crate is in the graph through `graviola`, under `rustls-graviola` of
+  `crates/ostrya-fetch`, so no package entered `Cargo.lock` with it. The one
+  line the lock file gains is the entry `getrandom 0.3.4` in the dependency
+  list of `ostrya-server`. `Cargo.lock` also holds `getrandom` 0.2.17,
+  through `rand_core`, and 0.4.3, through `jobserver` under the build
+  dependency `cc`. The authorization names 0.3.4 alone.
+- The graph holds 3 packages under 3 distinct names on the host target,
+  measured with `cargo tree -p getrandom@0.3.4 -e normal,build`:
+  `getrandom`, `cfg-if` 1.0.4, and `libc` 0.2.186. With `--target all` it
+  holds 6, adding `r-efi` 5.3.0, `wasip2` 1.0.4+wasi-0.2.12, and
+  `wit-bindgen` 0.57.1. No package in the graph declares a `links` key, and
+  no package name in it ends in `-sys`.
+- Three packages carry a build script: `getrandom`, `libc`, and
+  `wit-bindgen`. All three were already in the graph.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only": `getrandom`, `cfg-if`, and `libc` state `MIT
+  OR Apache-2.0`, `r-efi` states `MIT OR Apache-2.0 OR LGPL-2.1-or-later`,
+  which qualifies through its permissive options, and `wasip2` and
+  `wit-bindgen` state `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR
+  MIT`.
+- The highest minimum supported Rust version in the graph is 1.87.0,
+  stated by `wasip2`, which no Linux build compiles. On the host target it
+  is 1.65, stated by `libc`. The workspace pins 1.92, so the requirement
+  holds.
+- `ostrya-server` builds on Linux alone, so the exception in "Exception:
+  system libraries of macOS and Windows" does not change.
+
 ## Requirement: permissive licenses only
 
 The library and everything it links -- every crate in the dependency graph,

@@ -816,7 +816,10 @@ model"). It is the only crate that knows which backend is compiled.
 ```rust
 // ostrya-rt -- the whole surface.
 pub async fn unblock<T: Send + 'static>(
-    f: impl FnOnce() -> T + Send + 'static) -> T;   // the only pool entry
+    f: impl FnOnce() -> T + Send + 'static) -> T;   // the pool entry for awaited work
+/// Runs `f` on the blocking pool as a detached task and returns at once.
+/// Under tokio, a call outside the context of a runtime runs `f` inline.
+pub fn unblock_detached(f: impl FnOnce() + Send + 'static);
 
 pub fn block_on<F: Future>(future: F) -> F::Output; // test/doctest driver
 
@@ -2514,8 +2517,11 @@ protocol crate, so a caller names its error codes and messages through
   of the repository mode and of `allow_privileged`, and stages the object. An
   object the repository or the session already holds is read, checked, and
   dropped. A detached metadata object is kept in the session, and a second one
-  for one commit is `protocol`. `ObjectsReply` counts the objects staged and
-  the detached metadata objects kept, and the bytes they took on the wire.
+  for one commit is `protocol`. The detached metadata of the session has one
+  byte cap for the whole session, `MAX_METADATA_SIZE`. The bytes count as
+  they arrive, and the read that takes the session past the cap is
+  `limit-exceeded`. `ObjectsReply` counts the objects staged and the
+  detached metadata objects kept, and the bytes they took on the wire.
 - `Commit` runs the checks of the ref updates in order, and the first
   failure ends the session with nothing published. Each ref name is valid
   (`invalid-ref`). The message holds one update at least, and each update
@@ -2608,6 +2614,85 @@ impl Repo {
     where
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send;
+}
+```
+
+`ReceiveService` runs the same session as steps, one for each request of a
+transport such as HTTP. Each step does what the message of the same name
+does in `Repo::receive`, with the same checks, the same session cap, and the
+same wire codes, and the host sends the reply. The service is
+`Send + Sync`, and every step takes `&self`, so the host keeps the service
+in an `Arc` and runs steps of one session at the same time. The service
+knows no HTTP, no session id, no owner, no timeout, and no status.
+
+- `hello` opens the session transaction. `parallel_uploads` is the value
+  that `HelloReply` announces. A `parallel_uploads` of 0 is
+  `Error::InvalidInput`. The service sets no upper bound, and the host
+  keeps the value in a range of its own.
+- Up to `parallel_uploads` `objects` calls run at the same time and write
+  through the one session transaction. One call more is `limit-exceeded`,
+  and ends the session. One `have` runs next to the other steps and does
+  not count against `parallel_uploads`. A second `have` while the first is
+  in flight is `limit-exceeded`, and ends the session. `commit` runs only
+  when no other step is in flight, `have` included. Otherwise it is
+  `protocol`, and it ends the session. While `commit` runs, each other step
+  is `protocol`.
+- The dirtree, dirmeta, and commit objects that the streams of the session
+  read at the same time share a budget of `MAX_METADATA_SIZE` bytes. The
+  bytes of an object count from their arrival to its stage step, and give
+  the budget back when the object is staged, dropped, or fails. The read
+  that takes the session past the budget is `limit-exceeded`, and ends the
+  session. The bytes of a detached metadata object count against the
+  session cap of the detached metadata alone, and not against this budget.
+  `Repo::receive` holds the same budget, and with one stream an object
+  meets its own cap of `MAX_METADATA_SIZE` first.
+- An `objects` call reads frames from `ObjectHeader` or `ObjectsEnd` on, to
+  `ObjectsEnd`, and then the end of its input. A byte after `ObjectsEnd`,
+  and an input that ends before it, are `protocol`. An `Abort` frame is
+  `protocol`. An I/O error of the input other than an end of file returns
+  as `Error::Io`. The counts of `ObjectsReply` are those of one stream: a
+  content, dirtree, dirmeta, or commit object that two streams send at the
+  same time can count in both. A second detached metadata object for one
+  commit is `protocol`, also from another stream, and ends the session.
+- An error in a step ends the session with no commit. The `objects` calls
+  in flight fail at their next read, and a read that waits for input wakes.
+  A step future that is dropped before it completes also ends the session.
+  `abort` ends the session in the same way and returns at once. `abort`
+  while `commit` runs does nothing, and the commit continues. When no step
+  holds the session, the transaction is dropped in a detached task on the
+  blocking pool through `ostrya_rt::unblock_detached`, which removes its
+  staging directory and releases the repository lock in the background.
+  Under the `tokio` backend with no runtime, the drop runs inline. A
+  service dropped while its session is open ends the session in the same
+  way. A `commit` owns the transaction while it runs: a `commit` future
+  dropped before it completes drops the transaction inline, on the thread
+  that drops the future. A host drops it only when it drops the commit
+  task, for example at the shutdown of the runtime.
+- A failure with a wire code returns as `Error::Push`, and a failure on the
+  server side returns as the error it is. A `commit` that fails ends the
+  session. After a commit every step is `protocol` with the message `the
+  session committed`. A step on a session that an error or `abort` ended is
+  `protocol` with the message `the session was aborted: CAUSE`. A step
+  that completes after the session ended returns that error in place of
+  its result. A dropped `commit` future gives the cause `the commit ended
+  before its result`, and an `Abort` frame gives `the client aborted the
+  session`.
+- `commit` returns the report, and the host sends `CommitReply` from its
+  refs. When that send fails, the host adds a `ReceiveWarning` with the step
+  `ReplyNotDelivered`.
+
+```rust
+pub struct ReceiveService { /* private */ }
+
+impl ReceiveService {
+    pub async fn hello(repo: Repo, policy: Arc<ReceivePolicy>, parallel_uploads: u32,
+                       hello: Hello) -> Result<(ReceiveService, HelloReply)>;
+    pub async fn have(&self, names: Vec<ObjectName>) -> Result<HaveReply>;
+    pub async fn objects<R>(&self, input: R) -> Result<ObjectsReply>
+    where
+        R: AsyncRead + Unpin + Send;
+    pub async fn commit(&self, request: CommitRequest) -> Result<ReceiveReport>;
+    pub fn abort(&self);
 }
 ```
 
@@ -3334,6 +3419,14 @@ pub struct ServeOptions {
     pub listen: Vec<SocketAddr>,          // default 127.0.0.1:8080
     pub tls: Option<ServerTls>,           // None: plain HTTP
     pub body_timeout: Duration,           // default 60 s; zero is refused
+    pub receive: Option<Arc<ReceivePolicy>>, // None: read-only server, the default
+    pub allow_anonymous_push: bool,       // default false
+    pub credentials: Option<Vec<u8>>,     // the push credential file; default None
+    pub allow_cleartext_credentials: bool, // default false
+    pub parallel_uploads: u32,            // default 4; 1..=31
+    pub session_idle_timeout: Duration,   // default 300 s; zero is refused
+    pub max_sessions: usize,              // default 16; zero is refused
+    pub on_report: Option<Arc<dyn Fn(ReceiveReport) + Send + Sync>>, // default None
 }
 
 pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server>;
@@ -3353,6 +3446,166 @@ ping after half of `body_timeout` with no frame from the peer and ends when
 the ping gets no answer within `body_timeout`. A stream body gives at most
 256 KiB before it yields to the executor. Each listener accepts in a task of
 its own.
+
+With `receive` set, the HTTP/2 receive window of a stream is 2 MiB, and the
+window of a connection is 2 MiB times `parallel_uploads`. The request bodies
+of one connection thus hold at most that many bytes that the server did not
+read. A read-only server keeps the windows of hyper.
+
+With `receive` set, the server also runs the receive endpoint of a push
+over the repository. Every session shares the one policy. The endpoint
+reads the policy and the repository settings once, at start, and a change
+applies at the next start. `bind` refuses `receive` with no authentication
+method, a `parallel_uploads` outside `1..=31`, a zero
+`session_idle_timeout`, and a zero `max_sessions`, with `Error::Options`.
+With no `tls`, `bind` also refuses with `Error::Options` an endpoint whose
+one method is the lines of `credentials`, unless
+`allow_cleartext_credentials` or `allow_anonymous_push` is set: the endpoint
+refuses each bearer and Basic credential over plain HTTP, so no request can
+pass it. With `receive` set, `bind` parses `credentials`, and a malformed
+line is `Error::Credentials { line, message }`, which names the line by its
+number and holds no byte of it. A read-only server reads neither
+`credentials` nor `allow_cleartext_credentials`. The `Debug` text of
+`ServeOptions` states `credentials` by its length alone.
+
+Authentication. The methods of the endpoint are:
+
+- A bearer token, `Authorization: Bearer TOKEN`, which matches a line of
+  `credentials` by the SHA-256 digest of the token.
+- A Basic credential, `Authorization: Basic` with the base64 of
+  `NAME:TOKEN`, which matches the line of `NAME` by the digest of `TOKEN`.
+- A client certificate that the TLS handshake verified against
+  `ServerTls::client_ca_pem`. The TLS layer also serves a client with no
+  certificate, because a read needs no authentication.
+- `allow_anonymous_push`, for a request with no credential.
+
+A credential file with no credential line is no method. The grammar of the
+file is in `docs/format-reference.md`, "Port extension: the push credential
+file". The compare of two digests reads each digest as four 64-bit words,
+and ORs the XOR of each word pair through `core::hint::black_box`. The
+result goes through `black_box` too. A request compares its digest with the
+digest of every line and does not stop at a match. A Basic credential then
+compares its `NAME` with the name of the one line whose digest matched. No
+two lines have one digest.
+The server authorizes each request of the endpoint, in this order:
+
+1. More than one `Authorization` header gets 401.
+2. A `Bearer` or `Basic` scheme, in any case, on a connection without TLS
+   gets 403, before any digest, also when `allow_anonymous_push` is set,
+   unless `allow_cleartext_credentials` is set.
+3. A header that matches no line gets 401, also beside a valid client
+   certificate. A scheme other than `Bearer` and `Basic`, an empty token,
+   and a Basic credential with no `:` match no line.
+4. With no header: a verified client certificate gives its owner, then
+   `allow_anonymous_push` gives the anonymous owner. Else the request gets
+   401 when `credentials` has a line, and 403 when the client CA is the one
+   method.
+
+Each refusal carries an `unauthorized` frame. Each 401 carries the two
+headers `WWW-Authenticate: Bearer realm="ostrya"` and `WWW-Authenticate:
+Basic realm="ostrya"`. The owner of a session is the `NAME` of the line of
+its `session` request, the SHA-256 digest of the DER bytes of the client
+certificate, or anonymous. A bearer token and a Basic credential of one line
+give one owner. Every request of a session is authorized again, and a
+request of another owner gets the 404 of an unknown id. A `GET` and a
+`HEAD` of the archive view ignore `Authorization`, so a read with a Basic
+credential over plain HTTP succeeds.
+
+The endpoint takes the requests under the raw path prefix
+`/_ostrya/receive/v1/` with a method other than `GET` and `HEAD`. The path
+is not percent-decoded. A `GET` or a `HEAD` there goes to the archive view
+and gets 404. Each request is one step of the `ReceiveService` of its
+session.
+
+- `POST session` -- body: one `Hello` frame. 200 with the `HelloReply`
+  frame, and the session id in the response header `Ostrya-Session`.
+- `POST session/ID/have` -- body: one `Have` frame. 200 with `HaveReply`.
+- `POST session/ID/objects` -- body: one object stream. 200 with
+  `ObjectsReply`.
+- `POST session/ID/commit` -- body: one `Commit` frame. 200 with
+  `CommitReply`.
+- `DELETE session/ID` -- no body. 204 with no body and no
+  `Content-Length`. The session ends, and each request of the session in
+  flight gets 422 with `protocol`.
+
+A path under the prefix that names no route gets 404 with no body. A known
+path with another method gets 405 with `Allow: POST`, or `Allow: DELETE` for
+`session/ID`. The body of `session`, `have`, and `commit` holds one frame of
+at most `MAX_FRAME`, 1 MiB. An empty body, a body that ends inside its
+frame, and a byte after the frame are `protocol`. The buffer of the frame
+grows with the bytes that arrive, and not with the length that the frame
+states. One read of a request body takes the frames that hyper has ready
+until the buffer of the read is full.
+
+Sessions:
+
+- The session id is 32 bytes from `getrandom::fill`, the random source of
+  the operating system, shown as 64 lowercase hex digits. A failure of the
+  random source is a 500 for that request. The parser of a request path
+  takes 64 lowercase hex digits alone.
+- The table holds one entry for each session: the service in an `Arc`, the
+  owner, the time of the last activity, the count of the requests in
+  progress, the request bodies in flight with the time each one started to
+  wait for the client, and a cancel signal. The table lock is never held
+  while a service is aborted or dropped.
+- A `session` request takes a slot after its `Hello` body is read. With
+  `max_sessions` sessions open or opening, it gets 503 with
+  `limit-exceeded` and `the server serves no more sessions`. The `Hello`
+  body must arrive in full within the idle timeout.
+- An id that the table does not hold and a session of another owner get the
+  same empty 404. The table holds no session that ended.
+- Each step of `have`, `objects`, and the read of the `Commit` body races
+  the cancel signal of its session. When the session ends first, the step
+  is dropped and gets 422 with `protocol` and `the session was aborted:
+  CAUSE`.
+- A step that fails ends its session: the entry goes, its cancel signal
+  fires, and the service is aborted. The cause is `a request of the session
+  failed`. A request that ends before its response, as when the client
+  closes the connection, ends its session in the same way, with the cause
+  `a request of the session ended before its response`. A request body that
+  hyper fails, as when the client closes the connection in the middle of
+  the body, gives that cause too. A session that commits is left to its
+  commit.
+- The commit runs in a task of its own, so a disconnect, a `DELETE`, or the
+  idle timeout does not drop it in the middle. A second `commit` and a
+  `DELETE` while the session commits get 422 with `protocol` and `the
+  session is committing`, and the first commit continues. The session keeps
+  its entry and its slot of `max_sessions` until the commit ends. Then the
+  task removes the entry, with the cause `the session committed` when the
+  commit succeeded, and `a request of the session failed` when it failed. A
+  guard in the task removes the entry with the second cause also when the
+  commit panics or the task is dropped.
+- One sweep task runs in `Server::run`. It aborts a session with no request
+  in progress for `session_idle_timeout`, and a session with a request body
+  that waited for the client for that time. A body waits from the poll that
+  finds no byte to the next byte. A body that the server does not poll does
+  not wait. The sweep sleeps to the earliest deadline, and at most one idle
+  timeout, and never aborts a session that commits.
+- When the future of `Server::run` drops, every session that does not
+  commit is aborted, and the table takes no session after that. A
+  `session` request then gets 503 with `limit-exceeded`, also when it took
+  its slot before the stop: its service is aborted and dropped.
+
+The status of an error: `ref-mismatch` and `non-fast-forward` get 409.
+`internal`, and each error with no wire code, get 500 with an `internal`
+frame of the error text. A request that no authentication method accepts
+gets 401 or 403 with `unauthorized`, as the authorization states. Every
+other code gets 422. A response with an
+error carries one `Error` frame. 404, 405, and 204 have no body. No response
+of the endpoint carries `Content-Type` or `Retry-After`. Before a refusal
+that comes before the body is read (the authentication, 404, 405, 204, and
+the 422 of a `DELETE` while the session commits), the server reads and drops
+up to 1 MiB of the body within `session_idle_timeout` or 5 seconds,
+whichever is shorter. On HTTP/1.1 a body that did not reach its end then
+gets `Connection: close`. The body of an authorized `session`, `have`,
+`objects`, or `commit` request keeps the bound of `session_idle_timeout`.
+
+The report of each commit goes to `on_report` when the response body drops.
+When hyper did not take the `CommitReply` frame from the body, the report
+gets a `ReceiveWarning` with the step `ReplyNotDelivered`, also when the
+client left before the commit ended. hyper can take the frame and still fail
+to write it, so the warning is best effort. `on_report` runs on a task of
+the server and must return soon.
 
 `ostrya_fetch::server_config` builds the TLS configuration from the PEM
 bytes, with the provider and the key loaders of the fetcher, and ALPN `h2`

@@ -1362,9 +1362,10 @@ Created with `[core]` `repo_version=1`, `mode=<mode>`, optional
 `collection-id`, `sign-verify`, `sign-verify-summary` (both default off),
 `verification-<engine>-key` / `verification-<engine>-file`. What the
 verification keys select, and how each value is spelled, is in "Signature
-verification during a pull". A remote section can also hold the push keys of
-the port, `push-url`, `ssh-command`, `receive-command`, `push-token-file`,
-and `push-user` (see "Port extension: the push keys of a remote").
+verification during a pull". A remote section can also hold the push and
+pull keys of the port, `push-url`, `ssh-command`, `receive-command`,
+`push-token-file`, `push-user`, `pull-url`, and `send-command` (see "Port
+extension: the push and pull keys of a remote").
 
 The port reads at most 1048576 bytes of `config`, and refuses a larger file
 with `config exceeds the 1048576-byte size cap`, when it opens a repository
@@ -1887,10 +1888,11 @@ secret-key-file=/nonexistent/central.ed25519.key
 - A group name with a control character fails the whole file with
   `Invalid group name: <name>`.
 
-## Port extension: the push keys of a remote
+## Port extension: the push and pull keys of a remote
 
-A `[remote "NAME"]` section can hold five keys that a push of the port reads.
-The `ostree` tool defines none of them and reads none.
+A `[remote "NAME"]` section can hold five keys that a push of the port reads,
+and two keys that a pull of the port reads. The `ostree` tool defines none of
+them and reads none.
 
 - `push-url` -- the push address: `ssh://[USER@]HOST[:PORT]/PATH`, the scp
   form `[USER@]HOST:PATH`, or an `http://` or `https://` URL. When the key is
@@ -1912,8 +1914,27 @@ The `ostree` tool defines none of them and reads none.
   precedence over it. A name that is empty or holds `:` is refused, and so is
   a name with no token file.
 
-The push reads the five keys as strings, as written. The tool reads `url` to
-pull, so an `ssh://` address stands in `push-url` alone.
+The pull keys:
+
+- `pull-url` -- the pull address of the port: `ssh://[USER@]HOST[:PORT]/PATH`,
+  the scp form `[USER@]HOST:PATH`, or an `http://` or `https://` base URL.
+  The push reads the same address forms. The address of the pull options
+  has precedence over it, and it has precedence over `url`. The port reads
+  no ssh address from `url`, and a pull whose address comes from an ssh `url`
+  fails.
+- `send-command` -- the command that the remote side runs for a pull over
+  ssh. The remote shell parses it. The default is `ostrya send`. The send
+  command of the pull options has precedence over it.
+
+A pull over ssh reads `ssh-command` too, with the precedence of a push: the
+ssh command of the pull options, then `OSTRYA_SSH_COMMAND`, then the key.
+Each of `ssh-command` and `send-command` applies only when the pull options
+do not set the same value. It ignores the keys that apply to HTTP alone:
+`contenturl`, `metalink`, the TLS keys, `push-token-file`, and `push-user`.
+A pull over HTTP ignores `ssh-command` and `send-command`.
+
+The port reads the seven keys as strings, as written. The tool reads `url` to
+pull, so an ssh address stands in `push-url` or `pull-url` alone.
 
 The keys of a section apply to the transport of the push address. For an ssh
 address the push reads `ssh-command` and `receive-command`, and ignores the
@@ -2005,6 +2026,69 @@ push-token-file=/some/path
 - No command writes a diagnostic to standard error.
 - Under `strace -f`, no system call of `remote list -u`, `remote show-url`,
   or `pull` names `/some/path`.
+
+Observed with `ostree` 2026.1 on 2026-10-03, with the proxy variables of the
+environment removed, against a `bare-user` repository whose `[remote
+"origin"]` section holds `url=http://127.0.0.1:PORT/`, `gpg-verify=false`,
+and these two lines, with an `ostrya serve --read-only` server of an
+`archive` repository at the URL:
+
+```
+pull-url=ssh://u@h/srv/repo
+send-command=ostrya send
+```
+
+- `ostree remote list -u` prints `origin  http://127.0.0.1:PORT/`, and
+  `ostree remote show-url origin` prints `http://127.0.0.1:PORT/`. Each
+  exits 0.
+- `ostree config get 'remote "origin".pull-url'`, and `config
+  --group='remote "origin"' get` of `pull-url` and of `send-command`, print
+  each value as written and exit 0.
+- `ostree config set core.fsync true` rewrites `config`, and keeps the two
+  keys in order and as written.
+- `ostree pull origin main` fetches the commit from `url` and exits 0.
+  `ostree fsck` then passes. `ostree remote refs origin` and `ostree remote
+  summary origin` exit 0.
+- No command writes a diagnostic to standard error.
+- Under `strace -f -e trace=%file,%network,execve`, no system call of
+  `remote list -u`, `remote show-url`, or `pull` names the ssh address or
+  `ostrya send`, and the pull runs no other program. The filter leaves out
+  the `read` of `config`, which holds the two values.
+- The scp form `pull-url=u@h:/srv/repo` gives the same results.
+
+The tool fails on a remote that holds `pull-url` and no `url`. Observed on
+2026-10-03 with the same tool and repository, after `ostree config unset
+'remote "origin".url'`:
+
+- `ostree remote list` prints `origin` and exits 0.
+- `ostree remote list -u`, `ostree remote show-url origin`, `ostree pull
+  origin main`, `ostree remote refs origin`, and `ostree remote summary
+  origin` each exit 1 and write this line to standard error:
+
+  ```
+  error: No "url" option in remote "origin"
+  ```
+
+- `ostree remote list -u` prints, in sorted order, the remotes whose names
+  sort before the remote with no `url`, and then stops with the error.
+  With nine remotes written to `config` in the order `zzz`, `aaa`, `mmm`,
+  `bbb`, `nnn`, `ppp`, `ccc`, `yyy`, `origin`, and no `url` in `origin`,
+  `ostree remote list` prints the nine names in sorted order, and `ostree
+  remote list -u` prints `aaa`, `bbb`, `ccc`, `mmm`, and `nnn`, each with
+  its URL, and then the error.
+
+So a remote that the tool also reads keeps an HTTP `url` beside `pull-url`.
+
+The tool does not pull from an ssh address in `url`. Observed on 2026-10-03
+with the same tool, against a remote added with `url=ssh://h/srv/repo`:
+
+- `ostree remote list -u` prints `origin  ssh://h/srv/repo` and exits 0.
+- `ostree pull origin main`, `ostree remote refs origin`, and `ostree remote
+  summary origin` each exit 1 with `error: Invalid URI scheme in
+  ssh://h/srv/repo`. Under `strace -f -e trace=%network,execve`, none of
+  the three makes a `connect` call.
+- With `url=h:/srv/repo`, `ostree pull origin main` exits 1 with `error:
+  Invalid URI scheme in h:/srv/repo`.
 
 ## Port extension: the push credential file
 

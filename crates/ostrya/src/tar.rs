@@ -352,7 +352,16 @@ impl Repo {
                     };
                     let checksum = txn.write_dirmeta(&to_dirmeta(&meta)).await?;
                     let raw = (opts.uid(dir.uid()), opts.gid(dir.gid()));
-                    place_dir(txn, mtree, &comps, checksum, &opts, raw, &mut synthesized).await?;
+                    place_dir(
+                        txn,
+                        mtree,
+                        &comps,
+                        checksum,
+                        opts.autocreate_parents,
+                        raw,
+                        &mut synthesized,
+                    )
+                    .await?;
                 }
                 TarEntry::File(file) => {
                     let comps = member_path(file.path(), false, &mut opts)?;
@@ -377,7 +386,16 @@ impl Repo {
                         continue;
                     };
                     let checksum = txn.write_content(None, &meta, file).await?;
-                    place(txn, mtree, &comps, checksum, &opts, raw, &mut synthesized).await?;
+                    place(
+                        txn,
+                        mtree,
+                        &comps,
+                        checksum,
+                        opts.autocreate_parents,
+                        raw,
+                        &mut synthesized,
+                    )
+                    .await?;
                     file_index.insert(comps, checksum);
                 }
                 TarEntry::Symlink(link) => {
@@ -409,7 +427,16 @@ impl Repo {
                         continue;
                     };
                     let checksum = txn.write_symlink(&target, &meta, None).await?;
-                    place(txn, mtree, &comps, checksum, &opts, raw, &mut synthesized).await?;
+                    place(
+                        txn,
+                        mtree,
+                        &comps,
+                        checksum,
+                        opts.autocreate_parents,
+                        raw,
+                        &mut synthesized,
+                    )
+                    .await?;
                     file_index.insert(comps, checksum);
                 }
                 TarEntry::Link(link) => {
@@ -420,7 +447,15 @@ impl Repo {
                     let target = member_path(link.link(), false, &mut opts)?;
                     let raw = (opts.uid(0), opts.gid(0));
                     let parents = &comps[..comps.len() - 1];
-                    descend(txn, mtree, parents, &opts, raw, &mut synthesized).await?;
+                    descend(
+                        txn,
+                        mtree,
+                        parents,
+                        opts.autocreate_parents,
+                        raw,
+                        &mut synthesized,
+                    )
+                    .await?;
                     hardlinks.push((comps, target));
                 }
                 TarEntry::Device(dev) => {
@@ -539,7 +574,7 @@ async fn descend<'a>(
     txn: &Transaction,
     root: &'a mut MutableTree,
     ancestors: &[String],
-    opts: &TarImportOptions,
+    autocreate_parents: bool,
     raw_owner: (u32, u32),
     synthesized: &mut Option<(u32, u32)>,
 ) -> Result<&'a mut MutableTree> {
@@ -548,7 +583,7 @@ async fn descend<'a>(
         match node.child_kind(name) {
             ChildKind::File(_) => return Err(Error::ReplaceFileWithDir(name.clone())),
             ChildKind::Absent => {
-                if !opts.autocreate_parents {
+                if !autocreate_parents {
                     return Err(Error::TarMissingParent(name.clone()));
                 }
                 let meta = DirMeta {
@@ -577,7 +612,7 @@ async fn place_dir(
     root: &mut MutableTree,
     comps: &[String],
     dirmeta: Checksum,
-    opts: &TarImportOptions,
+    autocreate_parents: bool,
     raw_owner: (u32, u32),
     synthesized: &mut Option<(u32, u32)>,
 ) -> Result<()> {
@@ -585,7 +620,15 @@ async fn place_dir(
         root.set_metadata_checksum(dirmeta);
         return Ok(());
     };
-    let node = descend(txn, root, parents, opts, raw_owner, synthesized).await?;
+    let node = descend(
+        txn,
+        root,
+        parents,
+        autocreate_parents,
+        raw_owner,
+        synthesized,
+    )
+    .await?;
     node.ensure_dir(leaf).await?.set_metadata_checksum(dirmeta);
     Ok(())
 }
@@ -597,14 +640,22 @@ async fn place(
     root: &mut MutableTree,
     comps: &[String],
     checksum: Checksum,
-    opts: &TarImportOptions,
+    autocreate_parents: bool,
     raw_owner: (u32, u32),
     synthesized: &mut Option<(u32, u32)>,
 ) -> Result<()> {
     let (leaf, parents) = comps
         .split_last()
         .expect("a content member has at least one component");
-    let node = descend(txn, root, parents, opts, raw_owner, synthesized).await?;
+    let node = descend(
+        txn,
+        root,
+        parents,
+        autocreate_parents,
+        raw_owner,
+        synthesized,
+    )
+    .await?;
     node.replace_file(leaf, checksum)?;
     Ok(())
 }

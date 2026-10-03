@@ -4066,7 +4066,9 @@ pub enum Error { Unsupported(String), Io(std::io::Error) }
 holds the `rename` callback field, which the import calls through `&mut`, the
 way `CommitModifier` holds its filter and its three hooks. A holder that needs
 the options behind a shared reference across threads wraps them. Both
-assertions are pinned in `crates/ostrya/src/tar.rs`.
+assertions are pinned in `crates/ostrya/src/tar.rs`. The futures of
+`import_tar` and `import_tar_into` are `Send` when `input` is `Send`, with or
+without a `rename` hook and a modifier. `crates/ostrya/tests/tar.rs` pins this.
 
 ## Notes on divergence from the C API
 

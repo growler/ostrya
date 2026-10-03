@@ -15,16 +15,23 @@ use common::{
 use futures_lite::StreamExt;
 use futures_lite::io::Cursor;
 use ostrya::{
-    Checksum, CommitOptions, CreateOptions, Repo, RepoMode, TarExportOptions, TarImportOptions,
-    TreeEntry,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, FilterResult,
+    MutableTree, Repo, RepoMode, TarExportOptions, TarImportOptions, TreeEntry,
 };
 use ostrya_rt::block_on;
 use smol_tar::{TarDevice, TarDirectory, TarEntry, TarFifo, TarReader, TarRegularFile, TarWriter};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn csum(hex: &str) -> Checksum {
     Checksum::from_hex(hex).unwrap()
+}
+
+/// Compile-time pin: the import futures are `Send`, callbacks included.
+fn assert_send<T: Send>(value: T) -> T {
+    value
 }
 
 /// The body-reader type used when building test archives with [`TarWriter`].
@@ -240,6 +247,82 @@ fn etc_migration_remaps_top_level_etc() {
         assert!(
             root.lookup(Path::new("etc")).await.unwrap().is_none(),
             "no top-level etc remains"
+        );
+    });
+}
+
+/// The import futures are `Send` with a rename hook, parent synthesis, and a
+/// modifier that carries callbacks. The member names no parent, so the
+/// renamed path needs both of its parents synthesized. The filter and the
+/// mode callback of the modifier each run at least once.
+#[test]
+fn import_futures_are_send() {
+    let tmp = TmpDir::new("tar-send");
+    block_on(async {
+        let built = single_entry_tar(
+            TarRegularFile::new("a/hello", 5, Cursor::new(b"send\n".to_vec())).into(),
+        )
+        .await;
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let txn = repo.transaction().await.unwrap();
+
+        // The pin needs only the type of the future, so it is not awaited.
+        let opts = TarImportOptions {
+            rename: Some(Box::new(|name| Ok(name.to_owned()))),
+            autocreate_parents: true,
+            ..Default::default()
+        };
+        drop(assert_send(repo.import_tar(&txn, opts, &built[..])));
+
+        let opts = TarImportOptions {
+            rename: Some(Box::new(|name| Ok(format!("b/{name}")))),
+            autocreate_parents: true,
+            ..Default::default()
+        };
+        let mut modifier = CommitModifier::new(CommitModifierFlags::empty());
+        let filter_calls = Arc::new(AtomicUsize::new(0));
+        let mode_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&filter_calls);
+        modifier.filter = Some(Box::new(move |_path, _meta| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            FilterResult::Allow
+        }));
+        let calls = Arc::clone(&mode_calls);
+        modifier.mode_callback = Some(Box::new(move |_path, meta| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            meta.mode
+        }));
+        let mut mtree = MutableTree::new();
+        assert_send(repo.import_tar_into(
+            &txn,
+            opts,
+            Cursor::new(built),
+            &mut mtree,
+            Some(&mut modifier),
+        ))
+        .await
+        .unwrap();
+        assert!(filter_calls.load(Ordering::Relaxed) > 0, "the filter ran");
+        assert!(
+            mode_calls.load(Ordering::Relaxed) > 0,
+            "the mode callback ran"
+        );
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let commit = txn
+            .write_commit(CommitOptions::default(), &root)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let (root, _) = repo.read_commit(&commit.to_hex()).await.unwrap();
+        assert!(
+            root.lookup(Path::new("b/a/hello")).await.unwrap().is_some(),
+            "the member was renamed under synthesized parents"
         );
     });
 }

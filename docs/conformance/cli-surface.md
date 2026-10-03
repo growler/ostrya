@@ -3278,26 +3278,38 @@ ostrya receive [--repo=PATH] [--policy=FILE]
 ostrya push [--repo=PATH] REMOTE SRC[:DST]...
             [--depth=N] [--force] [--compress[=LEVEL]]
             [--ssh-command=CMD] [--receive-command=CMD]
+            [--push-token-file=FILE] [--push-user=NAME]
+            [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
+            [--tls-ca-path=FILE] [--allow-cleartext-credentials]
 ```
 
 - The `push` feature of `ostrya-cli` builds the command. It is in the
   default set.
-- `REMOTE` is a remote of the repository config with a push address, or an
-  ssh address. The push runs the ssh client with the remote command
-  `ostrya receive --repo='PATH'`.
+- `REMOTE` is a remote of the repository config with a push address, an
+  ssh address, or an `http://` or `https://` address. To an ssh address the
+  push runs the ssh client with the remote command `ostrya receive
+  --repo='PATH'`. To an HTTP address the push sends its requests to the
+  receive endpoint of `serve`.
 - Each refspec is `SRC[:DST]`. `SRC` is a revision of the local repository.
   `DST` is the ref of the server, and it defaults to `SRC` when `SRC` is a
   ref. `:DST` deletes the ref `DST` of the server.
 - The command checks its operands after the repository opens. With no
   `REMOTE` it writes the usage text and `error: REMOTE must be specified`.
   With no refspec it writes the usage text and `error: REFSPEC must be
-  specified`. Both exit 1, and no ssh client starts.
+  specified`. Both exit 1. No ssh client starts, and no HTTP request is
+  sent.
+- The push then resolves `REMOTE` and makes the transport ready, before it
+  reads `--depth` and the refspecs. It refuses an option of the other
+  transport and a bad HTTP option, and it reads the token file and the TLS
+  files of an HTTP push. So `push --push-user=bob https://HOST/ nosuchref`
+  fails with the refusal of `--push-user`, and does not name the refspec.
 - `--depth=N` sends `N` parents of each source commit, and `-1` the whole
   chain. Without it, the push sends the chain back to the commit of the ref
   on the server. When the server does not hold the ref, or the local chain
   does not hold the commit of the ref on the server, the push then sends the
   source commit alone. `--depth=-1` sends the whole local chain. A value
-  below `-1` is refused before the ssh client starts.
+  below `-1` is refused before the ssh client starts and before the first
+  HTTP request.
 - `--force` sends each update with any expected state, and asks the server
   to allow an update that is not a fast-forward. The receive policy of the
   server refuses such an update unless it sets `allow-non-fast-forward`.
@@ -3310,6 +3322,29 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   over the `OSTRYA_SSH_COMMAND` environment variable, and that wins over
   the `ssh-command` key of the remote. `--receive-command=CMD` is the
   remote command, and it wins over the `receive-command` key of the remote.
+- `--push-token-file=FILE` names the file whose first line is the token of
+  an HTTP push. `--push-user=NAME` sends the token as the password of a
+  Basic credential with that name. Without it, the push sends a bearer
+  token. `--tls-ca-path=FILE` names the CA certificates that verify the
+  server, in place of the trust store of the host.
+  `--tls-client-cert-path=FILE` and `--tls-client-key-path=FILE` name a
+  client certificate and its key, and the two come together. Each of these
+  options wins over the key of the remote with the same name. A relative
+  path is relative to the current directory, and `~` is not expanded.
+  `../format-reference.md`, "Port extension: the push keys of a remote",
+  states the keys and the grammar of the token file.
+- A token to an `http://` address is refused before any request. With
+  `--allow-cleartext-credentials`, the push sends it. Use the switch for a
+  server on a loopback address or behind a proxy that terminates TLS.
+- An option of the other transport is refused at exit 1 before the ssh
+  client starts and before any request: an HTTP option with an ssh address,
+  and `--ssh-command` or `--receive-command` with an HTTP address. The
+  message names the option without `--`, which is also the name of the key
+  of the remote, for example `push-user needs push-token-file`. The keys of
+  a remote apply to the transport of its push address alone, and the push
+  ignores the other keys. `tls-permissive=true` on a remote with an
+  `https://` push address is refused at exit 1 before any request. With an
+  `http://` push address the push uses no TLS and ignores the key.
 - The push drops the detached metadata keys that `[ex-ostrya]
   detached-metadata-exclude` of the local repository names.
 - On success the command writes one line for each ref to standard output,
@@ -3348,6 +3383,9 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
                  [--gpg-sign=KEYID]... [--gpg-homedir=DIR]
                  [--force] [--compress[=LEVEL]]
                  [--ssh-command=CMD] [--receive-command=CMD]
+                 [--push-token-file=FILE] [--push-user=NAME]
+                 [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
+                 [--tls-ca-path=FILE] [--allow-cleartext-credentials]
 ```
 
 - The `push` feature of `ostrya-cli` builds the command. It is in the
@@ -3363,15 +3401,24 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   no `REMOTE` it writes the usage text and `error: REMOTE must be
   specified`. With no `DIR` it writes the usage text and `error: DIR must be
   specified`. With no `-b` it writes the usage text and `error: A branch
-  must be specified with --branch`. Each exits 1, and no ssh client starts.
-- The command then reads `--parent`, the metadata options, `--timestamp`,
-  the signing keys, and `--body-file`, in this order. For a `--gpg-sign`
-  key, and for a `--sign` or `--sign-from-file` key under
+  must be specified with --branch`. Each exits 1. No ssh client starts, and
+  no HTTP request is sent.
+- The command then reads `--parent`, the metadata options, and
+  `--timestamp`, in this order. It refuses a bad value before it opens a
+  repository.
+- The command then resolves `REMOTE` and makes the transport ready. It
+  refuses an option of the other transport and a bad HTTP option, and it
+  reads the token file and the TLS files of an HTTP push.
+- The command then reads the signing keys and `--body-file`, in this order.
+  For a `--gpg-sign` key, and for a `--sign` or `--sign-from-file` key under
   `--sign-type=gpg`, it looks up the secret key in the GnuPG home
-  directory. It refuses a bad value before it opens a repository, before
-  the walk, and before the ssh client starts.
-- `REMOTE` is an ssh address, or a remote name that the config of the
-  local repository holds with a push address. The command reads the local
+  directory. So a refusal of the remote or of its options starts no gpg and
+  reads no body file.
+- Each of these refusals comes before the walk. No ssh client starts, and
+  no HTTP request is sent.
+- `REMOTE` is an ssh address, an `http://` or `https://` address, or a
+  remote name that the config of the local repository holds with a push
+  address. The command reads the local
   repository for a remote name alone, from `--repo`, then the current
   directory, then `OSTREE_REPO`. For an address the command opens no
   repository, and it ignores `--repo`.
@@ -3380,7 +3427,10 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   the server, or no parent when the server does not hold that ref.
 - The command refuses a `-b` name that holds `:` or `^`, a name that the
   ref-name rule refuses, and a name given twice. It refuses a name of 64
-  lowercase hex characters with the wording of `commit`.
+  lowercase hex characters with the wording of `commit`. A name that ends
+  in `^` and a name of 64 lowercase hex characters are refused before
+  `--parent` is read. The other names are refused after `--body-file` is
+  read, and before the walk.
 - The metadata dict holds every `--add-metadata-string` entry, then every
   `--add-metadata` entry, then the binding keys. `ostree.ref-binding`
   holds the `-b` names sorted. `ostree.collection-binding` holds the
@@ -3393,8 +3443,8 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
 - The signatures follow the order of `commit`: every `--sign` key, then
   every `--sign-from-file` key, then every `--gpg-sign` key. Both
   `--sign` and `--sign-from-file` take more than one value.
-- `--force`, `--compress`, `--ssh-command`, and `--receive-command` have the
-  meaning they have in `push`.
+- `--force`, `--compress`, `--ssh-command`, `--receive-command`, and the
+  HTTP options have the meaning they have in `push`.
 - The command does not apply `[ex-ostrya] detached-metadata-exclude`.
 - On success the command writes the commit checksum as one line to
   standard output and exits 0. Under `-v` it writes the statistics line of

@@ -17,7 +17,7 @@ use super::{ReceivePolicy, ReceiveRule, ReceiveVerify, ServerSigner, TrustedKeys
 use crate::MAX_METADATA_SIZE;
 use crate::error::{Error, Result};
 use crate::object::read_meta_object;
-use crate::push::proto::CommitRequest;
+use crate::push::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::push::{self, Expected, RefOutcome, RefUpdate};
 use crate::refs::{RefFileState, refspec_to_relpath};
 use crate::repo::Repo;
@@ -95,6 +95,9 @@ struct Edit<'a> {
 ///
 /// - each ref name is valid (`invalid-ref`), the message holds one update at
 ///   least, and each update names a ref of `Hello` once (`protocol`);
+/// - the `CommitReply` of the updates fits in a frame of [`MAX_FRAME`] with
+///   the longest outcome of each update (`limit-exceeded`), so the reply of
+///   a commit that wrote its refs is never one the server cannot send;
 /// - each detached metadata dict belongs to a commit of the session: a
 ///   staged commit, or the new commit of an update (`protocol`);
 /// - the rule of each update accepts it, and no update names the collection
@@ -141,6 +144,7 @@ pub(super) async fn finish(
 ) -> Checked<ReceiveReport> {
     let CommitRequest { updates, force } = request;
     check_names(named, &updates)?;
+    check_reply_fits(&updates)?;
     check_commit_meta_commits(&txn, &updates, &commit_meta)?;
     let rules = select_rules(repo, policy, &updates)?;
     let Loaded {
@@ -276,6 +280,36 @@ fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
                 update.name
             )));
         }
+    }
+    Ok(())
+}
+
+/// The `CommitReply` of `updates` fits in a frame of [`MAX_FRAME`], with the
+/// longest outcome each update can get: the name and the new commit of the
+/// update, and an old commit for each ref. An update that expects its ref
+/// absent, or that takes any state, does not state the old commit, and the
+/// ref can hold one when the refs are read under the lock. A reply over the
+/// limit is `limit-exceeded`, and the check runs before any ref is written.
+fn check_reply_fits(updates: &[RefUpdate]) -> Checked<()> {
+    let any_commit = Checksum::from_bytes([0; 32]);
+    let longest = Message::CommitReply(
+        updates
+            .iter()
+            .map(|u| RefOutcome {
+                name: u.name.clone(),
+                old: Some(any_commit),
+                new: u.new,
+            })
+            .collect(),
+    );
+    let body = longest.encode_body().map_err(Failure::Wire)?;
+    let len = body.len() as u64 + 1;
+    if len > u64::from(MAX_FRAME) {
+        return Err(Failure::Wire(push::Error::LimitExceeded(format!(
+            "the reply to the {} ref updates of Commit can need a frame of {len} bytes, over the \
+             limit {MAX_FRAME}",
+            updates.len()
+        ))));
     }
     Ok(())
 }
@@ -1124,6 +1158,70 @@ mod tests {
     use super::*;
 
     const KEY: &str = "ostree.sign.ed25519";
+
+    /// `count` updates that expect their refs absent: the request does not
+    /// state an old commit, and the reply can.
+    fn absent_updates(count: usize) -> Vec<RefUpdate> {
+        (0..count)
+            .map(|i| RefUpdate {
+                name: format!("refs-{i:015}"),
+                expected: Expected::Absent,
+                new: Some(Checksum::from_bytes([1; 32])),
+            })
+            .collect()
+    }
+
+    /// A `Commit` that fits in a frame, whose reply with an old commit for
+    /// each ref does not, is refused as `limit-exceeded`. A reply that fits
+    /// passes, and the check is exact at the limit.
+    #[test]
+    fn a_commit_whose_reply_cannot_fit_is_refused() {
+        let updates = absent_updates(15_000);
+        let request = Message::Commit(CommitRequest {
+            updates: updates.clone(),
+            force: false,
+        });
+        let request_len = request.encode_body().unwrap().len() + 1;
+        assert!(request_len <= MAX_FRAME as usize, "{request_len}");
+        match check_reply_fits(&updates) {
+            Err(Failure::Wire(push::Error::LimitExceeded(m))) => {
+                assert!(m.contains("15000 ref updates"), "{m}")
+            }
+            Err(Failure::Wire(e)) => panic!("expected limit-exceeded, got {e}"),
+            Err(_) => panic!("expected limit-exceeded, got another failure"),
+            Ok(()) => panic!("a reply over the limit passed"),
+        }
+        assert!(check_reply_fits(&absent_updates(100)).is_ok());
+
+        // The longest reply of the largest count that passes fits.
+        let (mut low, mut high) = (100, 15_000);
+        while high - low > 1 {
+            let mid = (low + high) / 2;
+            if check_reply_fits(&absent_updates(mid)).is_ok() {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        let longest = |count| {
+            Message::CommitReply(
+                absent_updates(count)
+                    .into_iter()
+                    .map(|u| RefOutcome {
+                        name: u.name,
+                        old: Some(Checksum::from_bytes([2; 32])),
+                        new: u.new,
+                    })
+                    .collect(),
+            )
+            .encode_body()
+            .unwrap()
+            .len()
+                + 1
+        };
+        assert!(longest(low) <= MAX_FRAME as usize);
+        assert!(longest(high) > MAX_FRAME as usize);
+    }
 
     fn serialized(dict: &Value) -> Vec<u8> {
         serialize_signature_dict(dict).unwrap()

@@ -99,21 +99,28 @@ impl Repo {
     ///
     /// `remote` is a configured remote name or an address, and
     /// [`resolve_push_remote`] reads it with the config of this repository
-    /// and `opts.connect`. The push then opens a session with
-    /// [`PushSession::connect`] and runs the work of
-    /// [`push_over_stream`](Repo::push_over_stream).
+    /// and `opts.connect`. The push then makes the transport ready with
+    /// [`PushSession::prepare`], which refuses the connect options that do
+    /// not apply and reads the token file and the TLS files of an HTTP
+    /// push. These checks come before the checks and the commit walk of
+    /// [`push_over_stream`](Repo::push_over_stream), so a refusal of the
+    /// remote or of its options takes no lock and reads no refspec. The push
+    /// then runs those checks and the walk, opens the session with
+    /// [`PreparedSession::open`](crate::push::PreparedSession::open), and
+    /// runs the rest of the work of `push_over_stream`.
     ///
     /// Under the tokio backend, the call must run within a runtime that has
     /// the IO driver and the time driver enabled. These are `enable_io` and
     /// `enable_time` of the runtime builder, or `enable_all`. The ssh child
-    /// process and its pipes need the IO driver, and the time limits of the
-    /// session need the time driver.
+    /// process and its pipes, and the connections of an HTTP session, need
+    /// the IO driver, and the time limits of the session need the time
+    /// driver.
     pub async fn push(&self, remote: &str, mut opts: RepoPushOptions) -> Result<PushOutcome> {
         let connect = std::mem::take(&mut opts.connect);
         let (address, connect) = resolve_push_remote(Some(self.config()), remote, connect)?;
+        let transport = PushSession::prepare(&address, connect).await?;
         let plan = self.plan_push(&opts).await?;
-        let session =
-            PushSession::connect(&address, connect, &plan.refs, session_options(&opts)).await?;
+        let session = transport.open(&plan.refs, session_options(&opts)).await?;
         plan.run(session, &opts).await
     }
 

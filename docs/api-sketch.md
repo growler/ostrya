@@ -2007,11 +2007,14 @@ impl Body {
 
 impl Fetcher {
     // Async: TrustRoots::System, the default, reads the host trust store on
-    // the blocking pool, whatever the mirrors' scheme. A store holding no
-    // certificate fails the constructor when a mirror is https, and when the
-    // mirror list is empty, since a request may then name an https URL; a
-    // fetcher whose mirrors are all cleartext builds without anchors, and a
-    // fetch of a TLS destination over it is refused before admission. Either
+    // the blocking pool when a fetch can open a handshake: a mirror is https,
+    // the mirror list is empty, or max_redirects is above 0. A fetcher whose
+    // mirrors are all http and that follows no redirect reads no store and
+    // holds no anchors. A store holding no certificate fails the constructor
+    // when a mirror is https, and when the mirror list is empty, since a
+    // request may then name an https URL; a fetcher whose mirrors are all
+    // cleartext builds without anchors, and a fetch of a TLS destination over
+    // it is refused before admission. Either
     // bypass variant reads no store, so the constructor reaches no file and no
     // blocking pool and an https mirror needs no anchors. Both keep the
     // handshake signature check.
@@ -2099,12 +2102,22 @@ fails before the hand-over, and the upload then reports `Error::Fetch` and
 sends nothing. Every other outcome counts as sent, and the upload ends on the
 destination that took it: every final status is `Ok(Uploaded)`, and a failure
 after the hand-over is `Error::UploadInterrupted`. A response that declares a
-coding is `Error::ContentEncoded`, and a `Content-Length` over `max_response`
-is `Error::FetchTooLarge`. A `POST` whose body is at its end at the hand-over
+coding, and a `Content-Length` over `max_response`, are `UploadInterrupted`
+too, with a message that names the cause. So each failure of an upload after
+the hand-over is `UploadInterrupted`, and `Error::is_unsent()` is true for each
+other error of an upload. A `POST` whose body is at its end at the hand-over
 declares `Content-Length: 0`.
 
-An upload opens an HTTP/1.1 connection of its own, which closes when the upload
-ends and never enters the pool, and shares the HTTP/2 connection of its origin.
+An upload shares the HTTP/2 connection of its origin. It takes an idle
+HTTP/1.1 connection from the pool only when the connection went idle less than
+two seconds ago, and opens one of its own otherwise: a server closes an idle
+connection at the end of its idle timeout, and a request that hyper began to
+write over a connection closed that way counts as sent. A pooled connection
+that fails before hyper writes the request is dropped, and the upload goes on
+over a new connection with no round spent. The HTTP/1.1 connection of an upload
+goes back to the pool when hyper took the end of the request body before the
+response head arrived, the response does not close the connection, and the
+response body was read to its end. Every other case closes it.
 When the response body ends or is dropped before the request body has ended,
 as after an early answer, the request body fails: the writer gets `BrokenPipe`,
 and hyper stops sending the body.
@@ -2525,7 +2538,11 @@ protocol crate, so a caller names its error codes and messages through
 - `Commit` runs the checks of the ref updates in order, and the first
   failure ends the session with nothing published. Each ref name is valid
   (`invalid-ref`). The message holds one update at least, and each update
-  names a ref of `Hello` once (`protocol`). Each detached metadata object
+  names a ref of `Hello` once (`protocol`). The `CommitReply` of the
+  updates fits in a frame of `MAX_FRAME` when each outcome carries an old
+  commit, which an update that expects its ref absent or takes any state
+  does not state (`limit-exceeded`). So a commit that wrote its refs always
+  has a reply the server can send. Each detached metadata object
   belongs to a commit of the session: a staged commit, or the new commit of
   an update (`protocol`). The rule of
   each update accepts it, and no update names `ostree-metadata` in a
@@ -2701,7 +2718,8 @@ impl ReceiveService {
 `ostrya-push` holds the client side of a push, re-exported as
 `ostrya::push`. A `PushSession` runs one session over a pair of byte
 streams. `over_stream` needs no runtime. `connect` opens a session over
-ssh, on the runtime backend that the `smol` or the `tokio` feature selects.
+ssh or HTTP, on the runtime backend that the `smol` or the `tokio` feature
+selects.
 
 - `over_stream` sends `Hello` with the refs the session updates and reads
   `HelloReply`. `server()` gives its facts.
@@ -2915,8 +2933,11 @@ pub enum Error {
 
 `ostrya_push::push_tree` pushes a local directory as one commit and sets
 the target refs of the server to it in one transaction.
-`push_tree_over_stream` runs the same push over a pair of byte streams.
-`ostrya` re-exports both as `ostrya::push`.
+`push_tree_prepared` runs the same push over a `PreparedSession`, the
+transport that `PushSession::prepare` made ready, so a caller can run the
+transport checks before its own work. `push_tree_over_stream` runs the same
+push over a pair of byte streams. `ostrya` re-exports the three as
+`ostrya::push`.
 
 - Before the scan, the push refuses with `Error::InvalidInput`: empty
   `refs`, a ref named twice, a ref that holds `:`, a ref that holds `^`, a
@@ -2928,13 +2949,17 @@ the target refs of the server to it in one transaction.
   object is over `MAX_METADATA_SIZE` without the bindings and without a
   parent of `ParentPolicy::CurrentTip`. A revision reads `^` as the parent
   of a commit, so a ref that holds it cannot be read back by its name. The
-  timestamp is read here. `push_tree` then builds the ssh command line,
-  and refuses an `http://` or an `https://` remote and an ssh command or a
-  receive command that `PushSession::connect` refuses.
+  timestamp is read here. `push_tree` then makes the transport ready with
+  `PushSession::prepare`. For an ssh address it builds the command line.
+  For an `http://` or an `https://` address it reads the token file and the
+  TLS files and builds the HTTP client. It refuses each option that
+  `PushSession::connect` refuses before it starts the transport.
+  `push_tree_prepared` takes a transport that is ready, and makes these
+  checks of `opts` after it.
 - The scan is `TreeModel::scan` with `entry_filter` and `hash_jobs`. It runs
-  before the ssh client starts and before the first byte is written. So a
-  refusal of the options, a walk error, and a hash error start no ssh client
-  and open no session.
+  before the ssh client starts, before the first HTTP request, and before
+  the first byte is written. So a refusal of the options, a walk error, and
+  a hash error start no ssh client, send no request, and open no session.
 - The session opens with the target refs in one `Hello`. Without `force`,
   each target ref must have the state of the first one on the server: all
   absent, or all at one commit. Refs in mixed states are
@@ -2991,6 +3016,8 @@ pub struct TreePushOptions {
 
 pub async fn push_tree(remote: &PushRemote, root: &Path, connect: ConnectOptions,
                        opts: TreePushOptions) -> Result<PushOutcome>;
+pub async fn push_tree_prepared(session: PreparedSession, root: &Path,
+                                opts: TreePushOptions) -> Result<PushOutcome>;
 pub async fn push_tree_over_stream<R, W>(input: R, output: W, root: &Path,
                                          opts: TreePushOptions) -> Result<PushOutcome>
 where
@@ -3017,6 +3044,9 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
                  [--gpg-sign=KEYID]... [--gpg-homedir=DIR]
                  [--force] [--compress[=LEVEL]]
                  [--ssh-command=CMD] [--receive-command=CMD]
+                 [--push-token-file=FILE] [--push-user=NAME]
+                 [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
+                 [--tls-ca-path=FILE] [--allow-cleartext-credentials]
 ```
 
 - A missing `REMOTE`, `DIR`, or `-b` gives the usage text and `error:
@@ -3028,6 +3058,15 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   it, the command opens no repository and gives a `config` of `None`.
   Otherwise the command opens the repository of `--repo`, the current
   directory, or `OSTREE_REPO`, and gives its config.
+- The checks run in this order: `--owner-uid` and `--owner-gid`, the
+  operands, `--canonical-permissions`, the `-b` names that the command
+  refuses itself, `--parent`, the metadata options, and `--timestamp`. The
+  command then resolves `REMOTE` and calls `PushSession::prepare`, which
+  refuses an option of the other transport and a bad HTTP option, and
+  reads the token file and the TLS files. It then builds the signers and
+  reads `--body-file`, and calls `push_tree_prepared`, which checks the
+  other options before the scan. So a refusal of the remote or of its
+  options starts no gpg and reads no body file.
 - `DIR` is `root`, and each `-b` is one of `refs`. The command refuses a
   `-b` of 64 lowercase hex characters with the wording of `commit`, before
   the library sees it.
@@ -3052,10 +3091,11 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   selectors too. The command builds the list before the scan, and it looks
   up the secret key of each gpg selector, so a key that does not decode and
   a selector that names no secret key are refused before an ssh client
-  starts. The command reads `--body-file` after it builds the list.
-- `--force`, `--compress`, `--ssh-command`, and `--receive-command` set
-  `force`, `compression`, and `connect` as they do for `ostrya push`.
-  `hash_jobs` and `progress` are `None`.
+  starts and before the first HTTP request. The command reads
+  `--body-file` after it builds the list.
+- `--force`, `--compress`, `--ssh-command`, `--receive-command`, and the
+  HTTP options set `force`, `compression`, and `connect` as they do for
+  `ostrya push`. `hash_jobs` and `progress` are `None`.
 - On success the command writes the checksum of `PushOutcome::commit` as
   one line to standard output and exits 0. Under `-v` the statistics line
   of `ostrya push` goes to standard error. On failure the command writes
@@ -3065,8 +3105,26 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
 ## Push transports
 
 `PushRemote::parse` reads a push address, and `PushSession::connect` opens
-a session to it. The ssh transport runs the ssh client as a child process
-with the command line
+a session to it over ssh or over HTTP. An ssh address takes the ssh fields
+of `ConnectOptions`, and an `http://` or `https://` address takes the other
+fields. A field of the other transport is `Error::InvalidInput`.
+`remote_ssh_command` holds a key of a remote section, and an HTTP address
+does not read it. With an ssh address, a field of `http` that differs from
+`FetcherOptions::default()` is refused. A refusal names a field by its
+remote key, which is also the CLI option without `--`, for example
+`push-user needs push-token-file` and `ssh-command applies to an ssh
+address`. A refusal of a field of `http` names `ConnectOptions::http`.
+
+`PushSession::connect` is `PushSession::prepare` and then
+`PreparedSession::open`. `prepare` checks the options and makes the
+transport ready: for ssh it builds the command line, and for HTTP it reads
+the token file and the TLS files and builds the HTTP client. It starts no
+ssh client and sends no request. `open` starts the ssh client or sends the
+first request, and opens the session. `PreparedSession` is `Send + Sync`,
+and its `Debug` output shows the transport and the HTTP address alone.
+
+The ssh transport runs the ssh client as a child process with the command
+line
 `SSH_COMMAND... [-p PORT] [USER@]HOST 'RECEIVE_COMMAND --repo=QUOTED_PATH'`,
 and the remote side runs `ostrya receive`.
 
@@ -3095,8 +3153,6 @@ and the remote side runs `ostrya receive`.
   `ConnectOptions::remote_ssh_command`, then `ssh`. The two strings are
   split at ASCII whitespace. An empty command and a value that is not UTF-8
   are `Error::InvalidInput`.
-- `connect` parses an `http://` or `https://` address and refuses it with
-  `Error::InvalidInput`.
 - On a session that `connect` opened, the read of a pending message after a
   failed write waits at most 5 seconds. `commit` and `abort` close the
   standard input of the ssh client and wait at most 5 seconds for it to
@@ -3119,6 +3175,79 @@ and the remote side runs `ostrya receive`.
   write of at most 2 MiB in flight. A stdin read in flight can block until
   the peer writes or closes the stream, also after the reader is dropped.
 
+The HTTP transport sends each step of a session as one request to the
+receive endpoint of the server ("Archive view and HTTP server").
+
+- The addresses are `http://HOST[:PORT][/PATH]` and
+  `https://HOST[:PORT][/PATH]`. `PushRemote::parse` checks them with
+  `ostrya_fetch::check_base_url`, which refuses an `@` anywhere, a query, a
+  fragment, an empty host, and a port that is not ASCII digits from 0 to
+  65535. A refusal does not show the text before the last `@`.
+- The client adds `_ostrya/receive/v1/session`, then `/ID` and the step, to
+  the path of the address. `ostrya serve` serves the endpoint at the root of
+  the server, so an address with a path works only behind a proxy that
+  removes that path. The fetcher follows no redirect, and a 3xx answer is
+  `Error::Transport`.
+- `Hello`, `Have`, and `Commit` go as whole request bodies. Each object
+  stream is the streamed body of one `objects` request. Each response body
+  is one frame, read at the limit `MAX_FRAME`.
+- `push_token_file` names a file whose first line is the token. The client
+  reads at most 1 MiB of the file on the blocking pool and takes the bytes
+  up to the first LF. A relative path is relative to the current directory
+  of the process, and `~` is not expanded, for each file of this list. A
+  file that cannot be read fails with `Error::Io`, whose message names the
+  key and the path, for example `push-token-file 't': ...`. It refuses a CR, an empty token, a token that is not
+  UTF-8, and a token that is not token68. No message holds the token. The
+  client checks no permission of the file. With `push_user`, the token is
+  the password of a Basic credential with that name. Without it, the token
+  is a bearer token. `push_user` without `push_token_file`, an empty
+  `push_user`, and a `push_user` that holds `:` are `Error::InvalidInput`.
+- A credential to an `http://` address is `Error::InvalidInput` before any
+  request, unless `allow_cleartext_credentials` is set. Set it for a server
+  on a loopback address or behind a proxy that terminates TLS.
+- `tls_ca_path` names the CA certificates that verify the server, in place
+  of the trust store of the host. `tls_client_cert_path` and
+  `tls_client_key_path` name a client certificate and its key, and the two
+  come together. A key that needs a passphrase is refused. The client reads
+  each file once, at most 1 MiB, before the session opens.
+- `http` holds the other options of the HTTP client, for example a proxy and
+  the timeouts. Mirrors, `basic_auth`, a trust setting that verifies no
+  certificate chain, trust roots other than the system store beside
+  `tls_ca_path`, and a client identity beside the client files are
+  `Error::InvalidInput`. The client sets `max_outstanding` to 32 and
+  `max_redirects` to 0.
+- `send` runs `min(parallel-uploads, 31)` object streams at most, and no
+  more streams than the objects it sends. A `parallel-uploads` of 0 counts
+  as 1. All the `send` calls of one session share that limit. A call with
+  nothing to send sends no request. After the first failure no stream of
+  the call takes a name, and the call returns a failure of the client
+  first, then an error that the server gave for its own cause, then any
+  other error.
+- `missing` sends one `Have` request at a time. A second `missing` call
+  while one runs is `Error::InvalidInput`.
+- The response to `Hello` may take 360 seconds after the request body was
+  sent, and the response to `Commit` 1 hour. The response to each other
+  request takes the progress timeout of `http`.
+- The client sends a request again only when the attempt failed before it
+  sent a byte. A `Commit` that was not sent is a definite error. After
+  `Commit` was sent, an interrupted request, a failed read of the response,
+  a body that is not one frame, and an unexpected status are
+  `Error::CommitOutcomeUnknown`, with no retry: the server can have written
+  the refs. An `Error` frame is definite.
+- The body of a 200 holds one frame. The body of a 401, a 403, a 409, a
+  422, a 500, and a 503 holds one `Error` frame, and gives the error of the
+  frame, for example `Error::Unauthorized` with 401 or 403. Each other
+  status, and a body that is not one frame, are `Error::Transport`, which
+  names the URL and the status. A failure of the HTTP client is
+  `Error::Fetch`.
+- `abort` sends `DELETE`, and a 204 or a 404 is success. A `commit` that
+  refuses its updates and a broken session send `DELETE` too, and `abort`
+  on a broken session then gives `Error::InvalidInput`. A session that is
+  dropped without `commit` or `abort` sends nothing, and the idle timeout of
+  the server ends it.
+- `PushStats::bytes_sent` counts the bytes of each request body that was
+  handed to the connection, with no header and no TLS byte.
+
 ```rust
 pub struct PushRemote { inner: RemoteAddr }
 
@@ -3126,16 +3255,32 @@ impl PushRemote {
     pub fn parse(address: &str) -> Result<PushRemote>;
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct ConnectOptions {
     pub ssh_command: Option<Vec<String>>,     // wins over OSTRYA_SSH_COMMAND
     pub receive_command: Option<String>,      // default "ostrya receive"
     pub remote_ssh_command: Option<String>,   // the remote key, lowest
+    pub push_token_file: Option<PathBuf>,     // first line: the token
+    pub push_user: Option<String>,            // Basic name; else bearer
+    pub tls_ca_path: Option<PathBuf>,         // replaces the host store
+    pub tls_client_cert_path: Option<PathBuf>,
+    pub tls_client_key_path: Option<PathBuf>,
+    pub allow_cleartext_credentials: bool,    // a token to http://
+    pub http: ostrya_fetch::FetcherOptions,   // the other client options
 }
 
 impl PushSession {
     pub async fn connect(remote: &PushRemote, connect: ConnectOptions,
                          refs: &[String], opts: SessionOptions)
+        -> Result<PushSession>;
+    pub async fn prepare(remote: &PushRemote, connect: ConnectOptions)
+        -> Result<PreparedSession>;
+}
+
+pub struct PreparedSession { inner: Prepared }   // Send + Sync
+
+impl PreparedSession {
+    pub async fn open(self, refs: &[String], opts: SessionOptions)
         -> Result<PushSession>;
 }
 ```
@@ -3166,8 +3311,10 @@ restrict,command="ostrya receive --repo=/srv/repo --policy=/etc/ostrya/receive.c
 ## Push remotes
 
 A remote section of the repository config can hold the push keys
-`push-url`, `ssh-command`, and `receive-command`. `Remote` reads each one as
-written, in every build.
+`push-url`, `ssh-command`, `receive-command`, `push-token-file`, and
+`push-user`. `Remote` reads each one as written, in every build. A push to
+an HTTP address also reads the TLS keys of the pull: `tls-ca-path`,
+`tls-client-cert-path`, `tls-client-key-path`, and `tls-permissive`.
 
 `resolve_push_remote`, under the `push` feature, gives the push address and
 the connect options of a push:
@@ -3180,9 +3327,21 @@ the connect options of a push:
   `push-url`. When `push-url` is absent, a `url` that starts with `http://`
   or `https://` is the address. A `url` of another form, for example
   `file://`, `metalink=`, or `mirrorlist=`, is no push address.
-- `ssh-command` fills `ConnectOptions::remote_ssh_command`, and
-  `receive-command` fills `ConnectOptions::receive_command`, each only when
-  the caller left that field `None`. A field that the caller set wins.
+- The keys of the section fill the fields of `ConnectOptions` that apply to
+  the transport of the address, each only when the caller left that field
+  `None`. A field that the caller set wins, and each key resolves on its
+  own.
+  - For an ssh address, `ssh-command` fills `remote_ssh_command`, and
+    `receive-command` fills `receive_command`. The HTTP keys are not read.
+  - For an `http://` or `https://` address, `push-token-file`, `push-user`,
+    `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` fill
+    the fields of the same names. The ssh keys are not read, so a
+    `receive-command` key in such a section causes no refusal.
+  - For an `https://` address, `tls-permissive=true` is `Error::Push` with
+    `push::Error::InvalidInput`, before any request. A push verifies the
+    certificate chain of the server. An `http://` address uses no TLS, and
+    the key is not read.
+- No key gives `allow_cleartext_credentials`. Only the caller sets it.
 - A name with no section, and a section with no push address, are
   `Error::Push` with `push::Error::InvalidInput`. A `config` of `None` holds
   no section. So a caller that has no repository must give an address.
@@ -3192,6 +3351,8 @@ impl Remote<'_> {
     pub fn push_url(&self) -> Result<Option<String>>;
     pub fn ssh_command(&self) -> Result<Option<String>>;
     pub fn receive_command(&self) -> Result<Option<String>>;
+    pub fn push_token_file(&self) -> Result<Option<String>>;
+    pub fn push_user(&self) -> Result<Option<String>>;
 }
 
 pub fn is_push_address(remote: &str) -> bool;
@@ -3207,8 +3368,11 @@ pub fn resolve_push_remote(config: Option<&RepoConfig>, remote: &str,
 refspecs name to a remote. The server updates its refs in one transaction.
 `remote` is a remote name or an address, and
 `resolve_push_remote` reads it with the config of the repository and
-`RepoPushOptions::connect`. The push then opens a session with
-`PushSession::connect`. `Repo::push_over_stream` runs the same push over a
+`RepoPushOptions::connect`. The push then makes the transport ready with
+`PushSession::prepare`, before the checks and the commit walk below, so a
+refusal of the remote or of its options takes no lock and reads no
+refspec. After the walk it opens the session with `PreparedSession::open`.
+`Repo::push_over_stream` runs the same push over a
 pair of byte streams, the mirror of `PushSession::over_stream`, and does not
 read `connect`. Under the tokio backend, `Repo::push` needs a runtime with
 the IO driver and the time driver, as `PushSession::connect` does.
@@ -3325,10 +3489,14 @@ form of `Repo::push`:
 ostrya push [--repo=PATH] REMOTE SRC[:DST]...
             [--depth=N] [--force] [--compress[=LEVEL]]
             [--ssh-command=CMD] [--receive-command=CMD]
+            [--push-token-file=FILE] [--push-user=NAME]
+            [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
+            [--tls-ca-path=FILE] [--allow-cleartext-credentials]
 ```
 
 - `REMOTE` is the `remote` argument, and each `SRC[:DST]` is one of
-  `refspecs`.
+  `refspecs`. It is a remote name, an ssh address, or an `http://` or
+  `https://` address.
 - `--depth=N` sets `depth` to `Some(N)`. Without it, `depth` is `None`.
   When the server does not hold the ref, or the local chain does not hold
   the server tip, the push then sends the source commit alone.
@@ -3339,6 +3507,13 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   form. Without the option, `compression` is `Compression::None`.
 - `--ssh-command=CMD` sets `connect.ssh_command` to `CMD` split at ASCII
   whitespace, and `--receive-command=CMD` sets `connect.receive_command`.
+- `--push-token-file`, `--push-user`, `--tls-client-cert-path`,
+  `--tls-client-key-path`, and `--tls-ca-path` set the fields of
+  `connect` with the same names, and `--allow-cleartext-credentials` sets
+  `connect.allow_cleartext_credentials`. So each option wins over the key
+  of the remote with its name, and `PushSession::prepare` refuses an option
+  of the other transport, before the push reads `--depth` and the
+  refspecs.
 - `detached_metadata_filter` comes from `[ex-ostrya]
   detached-metadata-exclude` of the local repository. `progress` is `None`.
 - After the repository opens, a missing `REMOTE` gives the usage text and

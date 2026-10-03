@@ -18,9 +18,17 @@
 //! another one runs fails at once with [`Error::InvalidInput`]. A call that
 //! fails, or whose future is dropped before it completes, leaves the session
 //! broken, and each later call fails with [`Error::InvalidInput`].
+//!
+//! Over HTTP, several [`send`](PushSession::send) calls can run at the same
+//! time, and a [`missing`](PushSession::missing) call can run beside them.
+//! A second `missing` call while one runs fails at once with
+//! [`Error::InvalidInput`]. A call that fails, or whose future is dropped
+//! before it completes, leaves the session broken, as on a stream.
 
+pub(crate) mod http;
 mod progress;
 pub(crate) mod stream;
+mod writer;
 
 use std::collections::HashSet;
 use std::fmt;
@@ -35,12 +43,14 @@ use ostrya_gvariant::Value;
 
 pub use progress::{PushPhase, PushProgress, PushProgressSnapshot, PushStats};
 
+use self::http::{Endpoint, HttpLink};
 use self::progress::Counters;
-use self::stream::{Stream, Upload};
+use self::stream::Stream;
+use self::writer::{MetaClaims, Upload};
 use crate::error::{Error, Result};
 use crate::proto::{
-    CommitRequest, Encoding, Hello, Message, PROTOCOL_VERSION, RefOutcome, RefState, RefUpdate,
-    have_entries_within, have_type, protocol,
+    CommitRequest, Encoding, Hello, HelloReply, Message, PROTOCOL_VERSION, RefOutcome, RefState,
+    RefUpdate, have_entries_within, have_type, protocol,
 };
 use crate::transport::Transport;
 
@@ -193,23 +203,38 @@ pub struct PushOutcome {
     pub stats: PushStats,
 }
 
-/// One client session of a push over a stream transport.
+/// One client session of a push, over a stream transport or over HTTP.
 ///
 /// The session is `Send + Sync`. See the module docs for the rules of
 /// concurrent calls.
+///
+/// A session dropped without [`commit`](PushSession::commit) or
+/// [`abort`](PushSession::abort) sends nothing more. A stream transport then
+/// closes its output, so the server reads the end of the stream. Over HTTP
+/// the server ends the session when its idle timeout ends.
 pub struct PushSession {
     inner: SessionInner,
 }
 
 struct SessionInner {
-    slot: Mutex<Slot>,
     server: ServerInfo,
     counters: Arc<Counters>,
-    /// The commits whose detached metadata the session has sent.
-    sent_meta: Mutex<HashSet<Checksum>>,
-    /// The child process the streams of the session belong to, for a session
-    /// that [`PushSession::connect`] opened.
-    transport: Option<Transport>,
+    /// The claims of the detached metadata the session sends.
+    claims: MetaClaims,
+    link: Link,
+}
+
+/// The transport of a session.
+enum Link {
+    /// A pair of byte streams.
+    Stream {
+        slot: Mutex<Slot>,
+        /// The child process the streams belong to, for a session that
+        /// [`PushSession::connect`] opened.
+        transport: Option<Transport>,
+    },
+    /// The receive endpoint of an HTTP server.
+    Http(HttpLink),
 }
 
 enum Slot {
@@ -252,11 +277,11 @@ pub(crate) fn invalid(msg: impl Into<String>) -> Error {
     Error::InvalidInput(msg.into())
 }
 
-fn broken() -> Error {
+pub(super) fn broken() -> Error {
     invalid("the session is broken")
 }
 
-fn unexpected(msg: &Message, request: &str) -> Error {
+pub(super) fn unexpected(msg: &Message, request: &str) -> Error {
     protocol(format!("{:?} in reply to {request}", msg.kind()))
 }
 
@@ -284,34 +309,53 @@ fn refuse_off_wire(names: &[ObjectName]) -> Result<()> {
     }
 }
 
-impl SessionInner {
-    fn take(&self) -> Result<Taken<'_>> {
-        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        match std::mem::replace(&mut *slot, Slot::Busy) {
-            Slot::Idle(stream) => Ok(Taken {
-                slot: &self.slot,
-                stream: Some(stream),
-            }),
-            Slot::Busy => Err(invalid("a call is in progress")),
-            Slot::Poisoned => {
-                *slot = Slot::Poisoned;
-                Err(broken())
-            }
+/// Take the stream of `slot` for one call.
+fn take(slot: &Mutex<Slot>) -> Result<Taken<'_>> {
+    let mut held = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    match std::mem::replace(&mut *held, Slot::Busy) {
+        Slot::Idle(stream) => Ok(Taken {
+            slot,
+            stream: Some(stream),
+        }),
+        Slot::Busy => Err(invalid("a call is in progress")),
+        Slot::Poisoned => {
+            *held = Slot::Poisoned;
+            Err(broken())
         }
     }
+}
 
-    /// The stream of an idle session, and the transport of the session.
-    fn into_parts(self) -> (Result<Box<Stream>>, Option<Transport>) {
-        let stream = match self
-            .slot
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner)
-        {
-            Slot::Idle(stream) => Ok(stream),
-            Slot::Busy | Slot::Poisoned => Err(broken()),
-        };
-        (stream, self.transport)
+/// The stream of an idle session.
+fn into_stream(slot: Mutex<Slot>) -> Result<Box<Stream>> {
+    match slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        Slot::Idle(stream) => Ok(stream),
+        Slot::Busy | Slot::Poisoned => Err(broken()),
     }
+}
+
+/// The facts of the server from `reply`, the reply to a `Hello` with `refs`.
+/// A reply whose version is not the version of the session, or whose refs
+/// are not `refs` in order, is [`Error::Protocol`].
+fn server_info(reply: HelloReply, refs: &[String]) -> Result<ServerInfo> {
+    if reply.version != PROTOCOL_VERSION {
+        return Err(protocol(format!(
+            "the server replied with protocol version {}, not {PROTOCOL_VERSION}",
+            reply.version
+        )));
+    }
+    if reply.refs.len() != refs.len() || reply.refs.iter().zip(refs).any(|(s, n)| s.name != *n) {
+        return Err(protocol("the refs of HelloReply are not the refs of Hello"));
+    }
+    Ok(ServerInfo {
+        version: reply.version,
+        mode: reply.mode,
+        collection_id: reply.collection_id,
+        max_frame: reply.max_frame,
+        max_have: reply.max_have,
+        encodings: reply.encodings,
+        parallel_uploads: reply.parallel_uploads,
+        refs: reply.refs,
+    })
 }
 
 impl PushSession {
@@ -369,41 +413,49 @@ impl PushSession {
             Message::Error(e) => return Err(e.into()),
             other => return Err(unexpected(&other, "Hello")),
         };
-        if reply.version != PROTOCOL_VERSION {
-            return Err(protocol(format!(
-                "the server replied with protocol version {}, not {PROTOCOL_VERSION}",
-                reply.version
-            )));
-        }
-        if reply.refs.len() != refs.len() || reply.refs.iter().zip(refs).any(|(s, n)| s.name != *n)
-        {
-            return Err(protocol("the refs of HelloReply are not the refs of Hello"));
-        }
-        stream.set_write_limit(reply.max_frame);
-        let server = ServerInfo {
-            version: reply.version,
-            mode: reply.mode,
-            collection_id: reply.collection_id,
-            max_frame: reply.max_frame,
-            max_have: reply.max_have,
-            encodings: reply.encodings,
-            parallel_uploads: reply.parallel_uploads,
-            refs: reply.refs,
-        };
+        let server = server_info(reply, refs)?;
+        stream.set_write_limit(server.max_frame);
         Ok(PushSession {
             inner: SessionInner {
-                slot: Mutex::new(Slot::Idle(Box::new(stream))),
                 server,
                 counters,
-                sent_meta: Mutex::new(HashSet::new()),
-                transport: None,
+                claims: MetaClaims::default(),
+                link: Link::Stream {
+                    slot: Mutex::new(Slot::Idle(Box::new(stream))),
+                    transport: None,
+                },
+            },
+        })
+    }
+
+    /// Open a session over HTTP at `endpoint`: send `Hello` with `refs` and
+    /// read `HelloReply`.
+    pub(crate) async fn open_http(
+        endpoint: Endpoint,
+        refs: &[String],
+        opts: SessionOptions,
+    ) -> Result<PushSession> {
+        let counters = Arc::new(Counters::new(opts.progress.as_ref()));
+        counters.phase(PushPhase::Negotiating);
+        let agent = opts
+            .agent
+            .unwrap_or_else(|| format!("ostrya/{}", env!("CARGO_PKG_VERSION")));
+        let (server, link) = http::open(endpoint, refs, agent, &counters).await?;
+        Ok(PushSession {
+            inner: SessionInner {
+                server,
+                counters,
+                claims: MetaClaims::default(),
+                link: Link::Http(link),
             },
         })
     }
 
     /// Attach the child process the streams of the session belong to.
-    pub(crate) fn with_transport(mut self, transport: Transport) -> PushSession {
-        self.inner.transport = Some(transport);
+    pub(crate) fn with_transport(mut self, child: Transport) -> PushSession {
+        if let Link::Stream { transport, .. } = &mut self.inner.link {
+            *transport = Some(child);
+        }
         self
     }
 
@@ -418,9 +470,20 @@ impl PushSession {
     /// `max-frame`. A name whose type is not a file, a dirtree, a dirmeta,
     /// or a commit is [`Error::InvalidInput`], nothing is sent, and the
     /// session stays usable.
+    ///
+    /// Over HTTP each `Have` is one request, and the session sends the next
+    /// one after the response to the one before it.
     pub async fn missing(&self, names: &[ObjectName]) -> Result<Vec<ObjectName>> {
         refuse_off_wire(names)?;
-        let mut taken = self.inner.take()?;
+        let slot = match &self.inner.link {
+            Link::Stream { slot, .. } => slot,
+            Link::Http(link) => {
+                return link
+                    .missing(&self.inner.server, &self.inner.counters, names)
+                    .await;
+            }
+        };
+        let mut taken = take(slot)?;
         let counters = &self.inner.counters;
         counters.phase(PushPhase::Negotiating);
         counters.offered(names.len() as u64);
@@ -468,6 +531,16 @@ impl PushSession {
     /// returns [`Error::Source`]. Data of the source that the session cannot
     /// send ends the session the same way, and the call returns
     /// [`Error::InvalidInput`].
+    ///
+    /// Over HTTP the call sends the objects in up to `parallel-uploads`
+    /// object streams at the same time, each in one request, and the objects
+    /// of `names` can arrive in another order. The detached metadata goes in
+    /// one of the streams, after its objects. The object streams of all the
+    /// calls of the session stay within `parallel-uploads`, at most 31: a
+    /// stream waits for a permit. After the first failure no stream starts a
+    /// new object, and each stream reads its response. The call then returns
+    /// a failure of the client first, then an error that the server gave
+    /// for its own cause, then any other error.
     pub async fn send(
         &self,
         source: &dyn ObjectSource,
@@ -478,16 +551,23 @@ impl PushSession {
         let level = deflate_level(compression)?;
         refuse_off_wire(names)?;
         let deflate_ok = self.inner.server.encodings.contains(&Encoding::Deflate);
-        let mut taken = self.inner.take()?;
-        self.inner.counters.phase(PushPhase::Uploading);
-        let upload = Upload {
+        let upload = Upload::new(
             source,
             names,
             commits,
-            level: level.filter(|_| deflate_ok),
+            level.filter(|_| deflate_ok),
             deflate_ok,
-            sent_meta: &self.inner.sent_meta,
+            &self.inner.claims,
+        );
+        let slot = match &self.inner.link {
+            Link::Stream { slot, .. } => slot,
+            Link::Http(link) => {
+                self.inner.counters.phase(PushPhase::Uploading);
+                return link.send(&self.inner.counters, &upload).await;
+            }
         };
+        let mut taken = take(slot)?;
+        self.inner.counters.phase(PushPhase::Uploading);
         taken.stream().upload(&upload).await?;
         taken.release();
         Ok(())
@@ -499,7 +579,8 @@ impl PushSession {
     /// twice are [`Error::InvalidInput`]. The call consumes the session and
     /// sends nothing, so the server reads the end of the stream. A call that
     /// failed, or whose future was dropped, left the stream broken: the call
-    /// then sends nothing too, and returns [`Error::InvalidInput`].
+    /// then sends nothing too, and returns [`Error::InvalidInput`]. Over
+    /// HTTP, in each of these cases the call sends `DELETE` and no `Commit`.
     ///
     /// An `Error` from the server is returned as its error, and the server
     /// changed no ref. A `CommitReply` whose refs are not the refs of
@@ -511,14 +592,32 @@ impl PushSession {
     /// end of the session after the session wrote `Commit` is
     /// [`Error::CommitOutcomeUnknown`]: the server may have written the refs.
     ///
+    /// Over HTTP, a `Commit` request that the client did not hand over to a
+    /// connection is [`Error::Fetch`], and the server changed no ref. After
+    /// the hand-over, a failure of the request, a response head that the
+    /// client refuses, as for a declared coding or a declared length over
+    /// the cap, a failed read of the response, a status the endpoint does
+    /// not give, and a body that is not one frame are
+    /// [`Error::CommitOutcomeUnknown`]. The client does not send the request
+    /// again.
+    ///
     /// A session that [`connect`](PushSession::connect) opened then waits a
     /// bounded time for the ssh client to exit, also when the call refuses
     /// `updates` and when the stream is broken. A session that committed
     /// returns its outcome whatever the exit status.
     pub async fn commit(self, updates: &[RefUpdate], force: bool) -> Result<PushOutcome> {
         let checked = check_updates(&self.inner.server.refs, updates);
-        let counters = Arc::clone(&self.inner.counters);
-        let (stream, transport) = self.inner.into_parts();
+        let (slot, transport, counters, checked) =
+            match self.inner.into_commit(checked, updates, force) {
+                Committing::Stream {
+                    slot,
+                    transport,
+                    counters,
+                    checked,
+                } => (slot, transport, counters, checked),
+                Committing::Http(commit) => return commit.await,
+            };
+        let stream = into_stream(slot);
         let result = match (checked, stream) {
             (Ok(()), Ok(stream)) => commit_on(stream, updates, force, &counters).await,
             (Ok(()), Err(e)) => Err(e),
@@ -543,9 +642,16 @@ impl PushSession {
     /// broken. When the write of `Abort` fails with an I/O error and the
     /// client exited with a failure status, the call returns
     /// [`Error::Transport`] with the status.
+    ///
+    /// Over HTTP the call sends `DELETE`, also on a broken session, which
+    /// then gives [`Error::InvalidInput`]. A 404, which the server gives for
+    /// a session that it ended already, is success.
     pub async fn abort(self) -> Result<()> {
-        let (stream, transport) = self.inner.into_parts();
-        let result = match stream {
+        let (slot, transport) = match self.inner.link {
+            Link::Stream { slot, transport } => (slot, transport),
+            Link::Http(link) => return link.abort().await,
+        };
+        let result = match into_stream(slot) {
             Ok(mut stream) => {
                 let result = stream.write_raw(&Message::Abort).await;
                 let _ = stream.close().await;
@@ -554,6 +660,51 @@ impl PushSession {
             Err(e) => Err(e),
         };
         finish(transport, result).await
+    }
+}
+
+/// A session that commits: the parts of a stream session, or the commit of
+/// an HTTP session. The value lives for one match, so the size of the
+/// stream variant costs nothing.
+#[allow(clippy::large_enum_variant)]
+enum Committing<'a> {
+    Stream {
+        slot: Mutex<Slot>,
+        transport: Option<Transport>,
+        counters: Arc<Counters>,
+        checked: Result<()>,
+    },
+    /// The HTTP commit holds the response of its request, so its future is
+    /// boxed, and the future of a stream commit does not hold it.
+    Http(BoxFuture<'a, Result<PushOutcome>>),
+}
+
+impl SessionInner {
+    /// Take the session apart to commit `updates`, which `checked` checked.
+    fn into_commit<'a>(
+        self,
+        checked: Result<()>,
+        updates: &'a [RefUpdate],
+        force: bool,
+    ) -> Committing<'a> {
+        let SessionInner {
+            server,
+            counters,
+            link,
+            ..
+        } = self;
+        match link {
+            Link::Stream { slot, transport } => Committing::Stream {
+                slot,
+                transport,
+                counters,
+                checked,
+            },
+            Link::Http(link) => Committing::Http(Box::pin(async move {
+                link.commit(&server, &counters, checked, updates, force)
+                    .await
+            })),
+        }
     }
 }
 

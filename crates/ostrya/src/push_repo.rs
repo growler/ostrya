@@ -17,6 +17,8 @@ mod test_repo;
 
 pub use self::negotiate::RepoPushOptions;
 
+use std::path::PathBuf;
+
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::push::{ConnectOptions, PushRemote};
@@ -41,10 +43,26 @@ pub fn is_push_address(remote: &str) -> bool {
 /// or `mirrorlist=`, is no push address. `url` is read only when `push-url`
 /// is absent.
 ///
-/// The `ssh-command` of the section fills
-/// [`ConnectOptions::remote_ssh_command`], and its `receive-command` fills
-/// [`ConnectOptions::receive_command`], each only when `connect` leaves the
-/// field `None`. A field that `connect` sets wins over the key.
+/// The keys of the section fill the fields of `connect` that apply to the
+/// transport of the address, each only when `connect` leaves the field
+/// `None`. A field that `connect` sets wins over its key, and each key is
+/// read on its own.
+///
+/// - For an ssh address, `ssh-command` fills
+///   [`ConnectOptions::remote_ssh_command`], and `receive-command` fills
+///   [`ConnectOptions::receive_command`]. The HTTP keys are not read.
+/// - For an `http://` or `https://` address, `push-token-file`, `push-user`,
+///   `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` fill
+///   the fields of the same names, as written: a relative path stays
+///   relative to the current directory of the process, and `~` is not
+///   expanded. The ssh keys are not read.
+/// - For an `https://` address, `tls-permissive=true` is [`Error::Push`] with
+///   [`InvalidInput`](crate::push::Error::InvalidInput): a push verifies the
+///   certificate chain of the server. An `http://` address uses no TLS, so
+///   the key is not read.
+///
+/// No key of the section gives
+/// [`ConnectOptions::allow_cleartext_credentials`]: only the caller sets it.
 ///
 /// A name that `config` holds no section for, and a section with no push
 /// address, are [`Error::Push`] with
@@ -65,7 +83,7 @@ pub fn resolve_push_remote(
     let address = match section.push_url()? {
         Some(push_url) => push_url,
         None => match section.url()? {
-            Some(url) if url.starts_with("http://") || url.starts_with("https://") => url,
+            Some(url) if is_http_address(&url) => url,
             Some(url) => {
                 return Err(invalid(format!(
                     "remote '{remote}' has no push-url, and its url '{url}' is no push address"
@@ -78,14 +96,45 @@ pub fn resolve_push_remote(
             }
         },
     };
-    let address = PushRemote::parse(&address)?;
-    if connect.remote_ssh_command.is_none() {
-        connect.remote_ssh_command = section.ssh_command()?;
+    let parsed = PushRemote::parse(&address)?;
+    if is_http_address(&address) {
+        if address.starts_with("https://") && section.tls_permissive()? {
+            return Err(invalid(format!(
+                "remote '{remote}' sets tls-permissive=true, which a push refuses: a \
+                 push verifies the certificate chain of the server"
+            )));
+        }
+        let path = |key: Option<String>| key.map(PathBuf::from);
+        if connect.push_token_file.is_none() {
+            connect.push_token_file = path(section.push_token_file()?);
+        }
+        if connect.push_user.is_none() {
+            connect.push_user = section.push_user()?;
+        }
+        if connect.tls_ca_path.is_none() {
+            connect.tls_ca_path = path(section.tls_ca_path()?);
+        }
+        if connect.tls_client_cert_path.is_none() {
+            connect.tls_client_cert_path = path(section.tls_client_cert_path()?);
+        }
+        if connect.tls_client_key_path.is_none() {
+            connect.tls_client_key_path = path(section.tls_client_key_path()?);
+        }
+    } else {
+        if connect.remote_ssh_command.is_none() {
+            connect.remote_ssh_command = section.ssh_command()?;
+        }
+        if connect.receive_command.is_none() {
+            connect.receive_command = section.receive_command()?;
+        }
     }
-    if connect.receive_command.is_none() {
-        connect.receive_command = section.receive_command()?;
-    }
-    Ok((address, connect))
+    Ok((parsed, connect))
+}
+
+/// Whether `address` is an `http://` or an `https://` push address, by the
+/// rule of [`PushRemote::parse`].
+fn is_http_address(address: &str) -> bool {
+    address.starts_with("http://") || address.starts_with("https://")
 }
 
 /// A push request the client refuses.
@@ -101,8 +150,36 @@ mod tests {
                           [remote \"both\"]\nurl=https://ex.com/pull\n\
                           push-url=ssh://pusher@ex.com/srv/repo\n\
                           ssh-command=ssh -o BatchMode=yes\n\
-                          receive-command=/opt/bin/ostrya receive\n\n\
+                          receive-command=/opt/bin/ostrya receive\n\
+                          push-token-file=/etc/ostrya/ssh-token\n\
+                          push-user=ssh-user\n\
+                          tls-ca-path=/etc/ostrya/ssh-ca.pem\n\
+                          tls-client-cert-path=/etc/ostrya/ssh-client.pem\n\
+                          tls-client-key-path=/etc/ostrya/ssh-client.key\n\
+                          tls-permissive=true\n\n\
                           [remote \"https\"]\nurl=https://ex.com/repo\n\n\
+                          [remote \"http-keys\"]\nurl=https://ex.com/repo\n\
+                          push-token-file=/etc/ostrya/token\n\
+                          push-user=alice\n\
+                          tls-ca-path=/etc/ostrya/ca.pem\n\
+                          tls-client-cert-path=/etc/ostrya/client.pem\n\
+                          tls-client-key-path=/etc/ostrya/client.key\n\
+                          tls-permissive=false\n\
+                          ssh-command=ssh -o BatchMode=yes\n\
+                          receive-command=/opt/bin/ostrya receive\n\n\
+                          [remote \"http-push-url\"]\nurl=https://pull.ex.com/repo\n\
+                          push-url=http://push.ex.com/\n\
+                          push-token-file=/etc/ostrya/token\n\n\
+                          [remote \"permissive\"]\nurl=https://ex.com/repo\n\
+                          tls-permissive=true\n\n\
+                          [remote \"permissive-push-url\"]\nurl=https://ex.com/repo\n\
+                          push-url=https://push.ex.com/\n\
+                          tls-permissive=true\n\n\
+                          [remote \"permissive-http\"]\nurl=https://ex.com/repo\n\
+                          push-url=http://push.ex.com/\n\
+                          tls-permissive=true\n\n\
+                          [remote \"permissive-bad\"]\nurl=http://ex.com/repo\n\
+                          tls-permissive=maybe\n\n\
                           [remote \"http\"]\nurl=http://ex.com/repo\n\n\
                           [remote \"file\"]\nurl=file:///srv/repo\n\n\
                           [remote \"metalink\"]\nurl=metalink=https://ex.com/metalink.xml\n\n\
@@ -115,6 +192,14 @@ mod tests {
 
     fn config() -> RepoConfig {
         RepoConfig::parse(CONFIG).unwrap()
+    }
+
+    /// Assert that `a` and `b` hold the same value in each field.
+    /// `ConnectOptions` implements no `PartialEq`, because the options of its
+    /// HTTP client implement none, so the fields compare through their
+    /// `Debug` text.
+    fn assert_same(a: &ConnectOptions, b: &ConnectOptions) {
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
     }
 
     fn assert_invalid(result: Result<(PushRemote, ConnectOptions)>, needle: &str) {
@@ -156,7 +241,7 @@ mod tests {
             let (remote, connect) =
                 resolve_push_remote(Some(&cfg), address, ConnectOptions::default()).unwrap();
             assert_eq!(remote, PushRemote::parse(address).unwrap());
-            assert_eq!(connect, ConnectOptions::default());
+            assert_same(&connect, &ConnectOptions::default());
         }
         // No configuration is read for an address.
         let (remote, _) =
@@ -247,18 +332,19 @@ mod tests {
         let cfg = config();
         let (_, connect) =
             resolve_push_remote(Some(&cfg), "both", ConnectOptions::default()).unwrap();
-        assert_eq!(
-            connect,
-            ConnectOptions {
+        assert_same(
+            &connect,
+            &ConnectOptions {
                 ssh_command: None,
                 receive_command: Some("/opt/bin/ostrya receive".into()),
                 remote_ssh_command: Some("ssh -o BatchMode=yes".into()),
-            }
+                ..ConnectOptions::default()
+            },
         );
         // A section with no push keys leaves the fields unset.
         let (_, connect) =
             resolve_push_remote(Some(&cfg), "https", ConnectOptions::default()).unwrap();
-        assert_eq!(connect, ConnectOptions::default());
+        assert_same(&connect, &ConnectOptions::default());
     }
 
     #[test]
@@ -268,9 +354,10 @@ mod tests {
             ssh_command: Some(vec!["my-ssh".into()]),
             receive_command: Some("receiver".into()),
             remote_ssh_command: Some("other-ssh -v".into()),
+            ..ConnectOptions::default()
         };
         let (_, connect) = resolve_push_remote(Some(&cfg), "both", given.clone()).unwrap();
-        assert_eq!(connect, given);
+        assert_same(&connect, &given);
 
         // Each field is filled on its own.
         let given = ConnectOptions {
@@ -283,5 +370,122 @@ mod tests {
             connect.remote_ssh_command.as_deref(),
             Some("ssh -o BatchMode=yes")
         );
+    }
+
+    /// The HTTP fields that the section `http-keys` gives.
+    fn http_keys() -> ConnectOptions {
+        ConnectOptions {
+            push_token_file: Some("/etc/ostrya/token".into()),
+            push_user: Some("alice".into()),
+            tls_ca_path: Some("/etc/ostrya/ca.pem".into()),
+            tls_client_cert_path: Some("/etc/ostrya/client.pem".into()),
+            tls_client_key_path: Some("/etc/ostrya/client.key".into()),
+            ..ConnectOptions::default()
+        }
+    }
+
+    #[test]
+    fn an_http_address_takes_the_http_keys_and_ignores_the_ssh_keys() {
+        let cfg = config();
+        let (remote, connect) =
+            resolve_push_remote(Some(&cfg), "http-keys", ConnectOptions::default()).unwrap();
+        assert_eq!(remote, PushRemote::parse("https://ex.com/repo").unwrap());
+        // `ssh-command` and `receive-command` of the section are not read,
+        // so the connect does not refuse them.
+        assert_same(&connect, &http_keys());
+        // The keys of a section whose `push-url` is HTTP fill the fields too.
+        let (remote, connect) =
+            resolve_push_remote(Some(&cfg), "http-push-url", ConnectOptions::default()).unwrap();
+        assert_eq!(remote, PushRemote::parse("http://push.ex.com/").unwrap());
+        assert_same(
+            &connect,
+            &ConnectOptions {
+                push_token_file: Some("/etc/ostrya/token".into()),
+                ..ConnectOptions::default()
+            },
+        );
+    }
+
+    #[test]
+    fn an_ssh_address_ignores_the_http_keys() {
+        // `both` holds each HTTP key and `tls-permissive=true` beside its
+        // ssh `push-url`.
+        let cfg = config();
+        let (_, connect) =
+            resolve_push_remote(Some(&cfg), "both", ConnectOptions::default()).unwrap();
+        assert_eq!(connect.push_token_file, None);
+        assert_eq!(connect.push_user, None);
+        assert_eq!(connect.tls_ca_path, None);
+        assert_eq!(connect.tls_client_cert_path, None);
+        assert_eq!(connect.tls_client_key_path, None);
+    }
+
+    #[test]
+    fn a_set_connect_field_wins_over_the_http_keys() {
+        let cfg = config();
+        let given = ConnectOptions {
+            push_token_file: Some("/given/token".into()),
+            push_user: Some("bob".into()),
+            tls_ca_path: Some("/given/ca.pem".into()),
+            tls_client_cert_path: Some("/given/client.pem".into()),
+            tls_client_key_path: Some("/given/client.key".into()),
+            allow_cleartext_credentials: true,
+            ..ConnectOptions::default()
+        };
+        let (_, connect) = resolve_push_remote(Some(&cfg), "http-keys", given.clone()).unwrap();
+        assert_same(&connect, &given);
+
+        // Each field is filled on its own.
+        let keys = http_keys();
+        type Field = fn(&mut ConnectOptions) -> &mut Option<std::path::PathBuf>;
+        let paths: [Field; 4] = [
+            |c| &mut c.push_token_file,
+            |c| &mut c.tls_ca_path,
+            |c| &mut c.tls_client_cert_path,
+            |c| &mut c.tls_client_key_path,
+        ];
+        for field in paths {
+            let mut given = ConnectOptions::default();
+            *field(&mut given) = Some("/given".into());
+            let (_, connect) = resolve_push_remote(Some(&cfg), "http-keys", given).unwrap();
+            let mut expected = keys.clone();
+            *field(&mut expected) = Some("/given".into());
+            assert_same(&connect, &expected);
+        }
+        let given = ConnectOptions {
+            push_user: Some("bob".into()),
+            ..ConnectOptions::default()
+        };
+        let (_, connect) = resolve_push_remote(Some(&cfg), "http-keys", given).unwrap();
+        assert_same(
+            &connect,
+            &ConnectOptions {
+                push_user: Some("bob".into()),
+                ..keys
+            },
+        );
+    }
+
+    #[test]
+    fn tls_permissive_is_refused_for_an_https_push() {
+        let cfg = config();
+        for name in ["permissive", "permissive-push-url"] {
+            assert_invalid(
+                resolve_push_remote(Some(&cfg), name, ConnectOptions::default()),
+                &format!("remote '{name}' sets tls-permissive=true"),
+            );
+        }
+        // An `http://` push address uses no TLS, so the key is not read: a
+        // value that is not a boolean is not read either.
+        for (name, url) in [
+            ("permissive-http", "http://push.ex.com/"),
+            ("permissive-bad", "http://ex.com/repo"),
+        ] {
+            let (remote, _) =
+                resolve_push_remote(Some(&cfg), name, ConnectOptions::default()).unwrap();
+            assert_eq!(remote, PushRemote::parse(url).unwrap());
+        }
+        // An address reads no section, so no key refuses it.
+        resolve_push_remote(Some(&cfg), "https://ex.com/repo", ConnectOptions::default()).unwrap();
     }
 }

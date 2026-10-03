@@ -1741,6 +1741,7 @@ dependencies = [
  "futures-lite",
  "libc",
  "ostrya-core",
+ "ostrya-fetch",
  "ostrya-gvariant",
  "ostrya-rt",
  "ostrya-sign",

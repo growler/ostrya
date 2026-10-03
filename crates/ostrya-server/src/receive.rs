@@ -278,7 +278,14 @@ impl Receive {
                 let reply = Message::CommitReply(delivery.report().refs.clone());
                 match encode(&reply) {
                     Ok(bytes) => reply_response(bytes, delivery),
-                    Err(e) => failure(&e.into()),
+                    // The commit refuses updates whose longest reply is over
+                    // the frame limit before it writes a ref, so this arm is
+                    // not reached. It stays as a guard: an error here follows
+                    // a commit that wrote its refs.
+                    Err(e) => {
+                        debug_assert!(false, "the reply of a commit does not fit: {e}");
+                        failure(&e.into())
+                    }
                 }
             }
             Err(e) => failure(&e),

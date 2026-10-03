@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-push"
-description = "The push protocol of ostrya: the wire codec, the client session, and the ssh transport"
+description = "The push protocol of ostrya: the wire codec, the client session, and the ssh and HTTP transports"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,8 @@ readme.workspace = true
 
 [features]
 default = ["smol"]
-smol = ["ostrya-rt/smol", "ostrya-sign/smol"]
-tokio = ["ostrya-rt/tokio", "ostrya-sign/tokio"]
+smol = ["ostrya-rt/smol", "ostrya-sign/smol", "ostrya-fetch/smol"]
+tokio = ["ostrya-rt/tokio", "ostrya-sign/tokio", "ostrya-fetch/tokio"]
 
 [dependencies]
 ostrya-gvariant = { workspace = true }
@@ -21,6 +21,8 @@ ostrya-core = { workspace = true }
 ostrya-rt = { workspace = true }
 # A tree push signs the commit it builds.
 ostrya-sign = { workspace = true }
+# The HTTP transport sends each step of a session as an upload request.
+ostrya-fetch = { workspace = true }
 thiserror = "2"
 futures-io = "0.3"
 futures-lite = "2"

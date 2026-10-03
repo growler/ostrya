@@ -188,14 +188,18 @@ pub(crate) struct ClientConfigs {
 
 /// Build the shared client configurations. `http2` decides whether `h2` is
 /// offered in ALPN. `https` says whether any mirror is reached over TLS, which
-/// decides whether an empty system trust store is fatal.
+/// decides whether an empty system trust store is fatal. `reaches_tls` says
+/// whether any fetch can open a handshake, through a mirror, a URL target, or
+/// a redirect. Without it, [`TrustRoots::System`] reads no store and gives
+/// the empty one. `https` implies `reaches_tls`.
 pub(crate) async fn client_config(
     options: &TlsOptions,
     http2: bool,
     https: bool,
+    reaches_tls: bool,
 ) -> Result<ClientConfigs> {
     let provider = Arc::new(rustls_graviola::default_provider());
-    let verification = verification(&options.roots, https, &provider).await?;
+    let verification = verification(&options.roots, https, reaches_tls, &provider).await?;
     let has_trust_anchors = match &verification {
         Verification::Anchors(store) => !store.is_empty(),
         Verification::Bypass(_) => true,
@@ -306,15 +310,20 @@ enum Verification {
 }
 
 /// Resolve the trust setting into what the configurations verify with. `https`
-/// says whether a handshake will consult the anchors. A bypass variant reads
-/// nothing, so this returns without reaching the filesystem or the blocking
-/// pool.
+/// says whether a handshake will consult the anchors, and `reaches_tls`
+/// whether any handshake can open at all. A bypass variant reads nothing, and
+/// neither does [`TrustRoots::System`] without `reaches_tls`, so these return
+/// without reaching the filesystem or the blocking pool.
 async fn verification(
     roots: &TrustRoots,
     https: bool,
+    reaches_tls: bool,
     provider: &Arc<rustls::crypto::CryptoProvider>,
 ) -> Result<Verification> {
     Ok(match roots {
+        TrustRoots::System if !reaches_tls => {
+            Verification::Anchors(Arc::new(rustls::RootCertStore::empty()))
+        }
         TrustRoots::System => Verification::Anchors(Arc::new(system_store(https).await?)),
         TrustRoots::Pem(pem) => Verification::Anchors(Arc::new(pem_store(pem)?)),
         TrustRoots::DangerousAcceptAnyChain => Verification::Bypass(Arc::new(AcceptAnyChain {
@@ -399,9 +408,18 @@ impl ServerCertVerifier for AcceptAnyChain {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The reads of the host trust store that this thread started.
+    pub(crate) static SYSTEM_STORE_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Assemble the trust anchors the host system holds. `https` says whether a
 /// handshake will consult them.
 async fn system_store(https: bool) -> Result<rustls::RootCertStore> {
+    #[cfg(test)]
+    SYSTEM_STORE_READS.with(|reads| reads.set(reads.get() + 1));
     let mut store = rustls::RootCertStore::empty();
     // Reading and parsing the host store is filesystem work, so it runs on the
     // blocking pool rather than on the caller's executor thread. The
@@ -687,6 +705,7 @@ mod tests {
             },
             true,
             true,
+            true,
         ))
     }
 
@@ -696,12 +715,12 @@ mod tests {
             roots: TrustRoots::Pem(CA_PEM.to_vec()),
             client_identity: None,
         };
-        let with_h2 = block_on(client_config(&options, true, true)).unwrap();
+        let with_h2 = block_on(client_config(&options, true, true, true)).unwrap();
         assert_eq!(
             with_h2.without_identity.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
-        let without = block_on(client_config(&options, false, true)).unwrap();
+        let without = block_on(client_config(&options, false, true, true)).unwrap();
         assert_eq!(
             without.without_identity.alpn_protocols,
             vec![b"http/1.1".to_vec()]
@@ -716,9 +735,9 @@ mod tests {
             roots: TrustRoots::Pem(CA_PEM.to_vec()),
             client_identity: None,
         };
-        for https in [true, false] {
-            let configs = block_on(client_config(&options, true, https)).unwrap();
-            assert!(configs.has_trust_anchors, "https={https}");
+        for (https, reaches_tls) in [(true, true), (false, true), (false, false)] {
+            let configs = block_on(client_config(&options, true, https, reaches_tls)).unwrap();
+            assert!(configs.has_trust_anchors, "https={https} {reaches_tls}");
         }
     }
 
@@ -735,7 +754,7 @@ mod tests {
                 key_passphrase: None,
             }),
         };
-        let configs = block_on(client_config(&options, true, true)).unwrap();
+        let configs = block_on(client_config(&options, true, true, true)).unwrap();
         assert!(!Arc::ptr_eq(
             &configs.with_identity,
             &configs.without_identity
@@ -749,7 +768,7 @@ mod tests {
             roots: TrustRoots::Pem(CA_PEM.to_vec()),
             client_identity: None,
         };
-        let configs = block_on(client_config(&options, true, true)).unwrap();
+        let configs = block_on(client_config(&options, true, true, true)).unwrap();
         assert!(Arc::ptr_eq(
             &configs.with_identity,
             &configs.without_identity
@@ -771,8 +790,8 @@ mod tests {
                 roots: roots.clone(),
                 client_identity: None,
             };
-            for https in [true, false] {
-                let configs = block_on(client_config(&options, true, https)).unwrap();
+            for (https, reaches_tls) in [(true, true), (false, true), (false, false)] {
+                let configs = block_on(client_config(&options, true, https, reaches_tls)).unwrap();
                 assert!(configs.has_trust_anchors, "{roots:?} https={https}");
                 assert!(Arc::ptr_eq(
                     &configs.with_identity,
@@ -798,7 +817,7 @@ mod tests {
                     key_passphrase: None,
                 }),
             };
-            let configs = block_on(client_config(&options, true, true)).unwrap();
+            let configs = block_on(client_config(&options, true, true, true)).unwrap();
             assert!(!Arc::ptr_eq(
                 &configs.with_identity,
                 &configs.without_identity
@@ -813,7 +832,7 @@ mod tests {
             roots: TrustRoots::Pem(b"not a certificate\n".to_vec()),
             client_identity: None,
         };
-        let err = block_on(client_config(&no_roots, true, true)).unwrap_err();
+        let err = block_on(client_config(&no_roots, true, true, true)).unwrap_err();
         assert!(err.to_string().contains("no certificate"), "{err}");
 
         // A well-formed PEM blob that holds a certificate rather than a key.
@@ -825,7 +844,7 @@ mod tests {
                 key_passphrase: None,
             }),
         };
-        let err = block_on(client_config(&no_key, true, true)).unwrap_err();
+        let err = block_on(client_config(&no_key, true, true, true)).unwrap_err();
         assert!(err.to_string().contains("no key"), "{err}");
 
         let unparsable_key = TlsOptions {
@@ -836,7 +855,7 @@ mod tests {
                 key_passphrase: None,
             }),
         };
-        let err = block_on(client_config(&unparsable_key, true, true)).unwrap_err();
+        let err = block_on(client_config(&unparsable_key, true, true, true)).unwrap_err();
         assert!(err.to_string().contains("private key pem"), "{err}");
     }
 

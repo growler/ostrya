@@ -82,9 +82,10 @@ The project is a Cargo workspace of focused crates:
   `rustls`. Portable, with no repository knowledge.
 - `ostrya-push` -- the push protocol: the messages and their GVariant
   encoding, the frame codec, the chunked object stream, the client session,
-  the ssh transport, the walk of a local directory into a tree model, and
-  the tree push of that directory as one commit, signed when signers are
-  given. Portable, with no repository knowledge. Depends on `ostrya-sign`.
+  the ssh and HTTP transports, the walk of a local directory into a tree
+  model, and the tree push of that directory as one commit, signed when
+  signers are given. Portable, with no repository knowledge. Depends on
+  `ostrya-sign` and `ostrya-fetch`.
 - `ostrya-composefs` -- standalone, synchronous EROFS/composefs image writer
   and fs-verity digest. Takes a tree model and emits image bytes.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs,

@@ -69,10 +69,11 @@
 //!
 //! A TLS destination needs a trust anchor to verify the server certificate
 //! against. A fetcher whose mirrors are all cleartext holds none where the host
-//! trust store is empty, and a fetch that would consult them there is refused
-//! with the origin named: a request naming an `https` URL of its own is refused
-//! before admission, and a redirect hop onto a TLS origin ends the attempt
-//! definitively.
+//! trust store is empty, and also where it follows no redirect, because it then
+//! does not read the host store. A fetch that would consult them there is
+//! refused with the origin named: a request naming an `https` URL of its own is
+//! refused before admission, and a redirect hop onto a TLS origin ends the
+//! attempt definitively.
 //!
 //! A proxy carries the request where one applies to the origin.
 //! [`proxy`](FetcherOptions::proxy) states which one:
@@ -347,18 +348,33 @@
 //! of a hop from `https` to `http`, and the scope of the credentials. A failure
 //! on a hop after the first is an interrupted upload. Every other redirect
 //! status, and every redirect of a streamed body, is delivered as its status. A
-//! response that declares a coding is refused with [`Error::ContentEncoded`],
-//! and a `Content-Length` over the cap with [`Error::FetchTooLarge`]. A body
-//! that outgrows the cap while it streams fails the read with
+//! response that declares a coding, and a `Content-Length` over the cap, end
+//! the upload with [`Error::UploadInterrupted`], whose message names the
+//! cause: the request was sent. A body that outgrows the cap while it streams
+//! fails the read with
 //! [`io::ErrorKind::FileTooLarge`](std::io::ErrorKind::FileTooLarge). The cap
 //! applies to every status.
 //!
-//! An upload takes no idle HTTP/1.1 connection from the pool and opens a
-//! connection of its own. A server can close an idle connection at any time,
-//! and an upload that hyper began to write over a connection closed that way
-//! counts as sent. The HTTP/1.1 connection of an upload closes when the upload
-//! ends, and never enters the pool. An upload shares the pooled HTTP/2
-//! connection of its origin.
+//! Each failure of an upload after the hand-over is
+//! [`Error::UploadInterrupted`], and each other error of an upload is a
+//! failure before the hand-over. [`Error::is_unsent`] reads this line.
+//!
+//! An upload shares the pooled HTTP/2 connection of its origin. It takes an
+//! idle HTTP/1.1 connection from the pool only when the connection went idle
+//! less than two seconds ago, and opens a connection of its own otherwise. A
+//! server can close an idle connection at any time, and an upload that hyper
+//! began to write over a connection closed that way counts as sent. A server
+//! closes an idle connection at the end of its idle timeout, so a connection
+//! that went idle a short time ago is one it keeps. A pooled connection that
+//! fails before hyper writes the request is dropped, and the upload goes on
+//! over a new connection with no round spent.
+//!
+//! The HTTP/1.1 connection of an upload goes back to the pool when both bodies
+//! ended cleanly: hyper took the end of the request body before the response
+//! head arrived, and the response body was read to its end with no failure.
+//! A response that closes the connection, an HTTP/1.0 response, an answer that
+//! arrived before the end of the request body, a body that failed, and a
+//! response dropped before its end each close the connection.
 //!
 //! The response ends the request body. When the response body of an upload
 //! reaches its end or is dropped before the request body has ended, as when a
@@ -520,6 +536,11 @@ const UPLOAD_FRAME: usize = 64 * 1024;
 /// keeps the buffer, so a small frame that waits in the connection does not
 /// hold a whole frame of memory.
 const SMALL_FRAME: usize = 4 * 1024;
+
+/// The longest time an HTTP/1.1 connection has been idle in the pool for an
+/// upload to take it. [`Inner::take_upload`] states why an upload takes a
+/// connection that went idle a short time ago alone.
+const UPLOAD_IDLE: Duration = Duration::from_secs(2);
 
 /// The largest declared response body a failed attempt reads to the end so its
 /// HTTP/1.1 connection can go back to the pool. Above this, and with no declared
@@ -992,7 +1013,9 @@ impl UploadBody {
         };
         let writer = UploadWriter {
             exchange,
-            buffer: Vec::with_capacity(UPLOAD_FRAME),
+            // The first write allocates the frame, so a body that is made
+            // and never written holds no frame of memory.
+            buffer: Vec::new(),
             stall: None,
             failed: None,
         };
@@ -1030,8 +1053,9 @@ pub struct UploadRequest<'a> {
     /// Where the request sits in the queue when the fetcher is at its limit.
     pub priority: Priority,
     /// The most bytes the response body may hold, whatever the status. A
-    /// larger `Content-Length` fails the upload with [`Error::FetchTooLarge`];
-    /// a body that outgrows the cap mid-stream fails the read with
+    /// larger `Content-Length` fails the upload with
+    /// [`Error::UploadInterrupted`]; a body that outgrows the cap mid-stream
+    /// fails the read with
     /// [`io::ErrorKind::FileTooLarge`](std::io::ErrorKind::FileTooLarge).
     /// [`UploadRequest::DEFAULT_MAX_RESPONSE`] by default.
     pub max_response: u64,
@@ -1547,6 +1571,12 @@ impl Exchange {
         Ok(empty)
     }
 
+    /// Whether hyper has taken the end of the body, with no failure.
+    fn has_ended(&self) -> bool {
+        let slot = self.lock();
+        slot.ended && slot.aborted.is_none()
+    }
+
     /// Take the body back from hyper, which gave the request back unwritten.
     /// The stall window stops until the next hand-over.
     fn withdraw(&self) {
@@ -1763,8 +1793,14 @@ enum Sender {
 struct PoolEntry {
     /// The origin's HTTP/2 connection, if one is open.
     h2: Option<H2Sender>,
-    /// Idle HTTP/1.1 connections.
-    h1: Vec<H1Sender>,
+    /// Idle HTTP/1.1 connections, the one that went idle last at the end.
+    h1: Vec<IdleH1>,
+}
+
+/// An idle HTTP/1.1 connection in the pool, and when it went idle.
+struct IdleH1 {
+    sender: H1Sender,
+    since: Instant,
 }
 
 /// Shared fetcher state. `Fetcher` is a handle on this.
@@ -1840,8 +1876,10 @@ enum UploadFailure {
     /// No part of the request reached hyper, so the round goes on as it does
     /// for a fetch.
     Unsent(Failure),
-    /// hyper took the request, so the upload ends with this error.
-    Sent(Error),
+    /// hyper took the request, so the upload ends with
+    /// [`Error::UploadInterrupted`] of this URL and message. A sent request
+    /// has no other error, which is what [`Error::is_unsent`] reads.
+    Sent { url: String, message: String },
 }
 
 /// What every attempt of one upload sends, settled before admission.
@@ -1865,9 +1903,10 @@ enum Answer<T> {
     Silent(Duration),
 }
 
-/// The response of one upload hop, the protocol that carried it, and the body
-/// the request sent.
-type UploadResponse = (Response<Incoming>, Protocol, RequestEnd);
+/// The response of one upload hop, the protocol that carried it, the body the
+/// request sent, and the HTTP/1.1 connection that goes back to the pool when
+/// the response body ends.
+type UploadResponse = (Response<Incoming>, Protocol, RequestEnd, Option<H1Sender>);
 
 /// An async HTTP client for one remote.
 ///
@@ -1904,16 +1943,20 @@ impl Fetcher {
     ///
     /// This is async because [`TrustRoots::System`],
     /// the default, reads the host trust store, which goes to the blocking
-    /// pool. The TLS configuration is built whatever the mirrors' scheme is, so
-    /// a cleartext-only fetcher reads it too; under
-    /// [`TrustRoots::Pem`] the work is all in memory and
-    /// the constructor never yields. A system store holding no certificate
-    /// fails the constructor when at least one mirror is `https`, and when the
-    /// mirror list is empty, since a request may then name an `https` URL; a
-    /// host without a CA bundle still reaches a cleartext remote. Under either
-    /// bypass variant of [`TrustRoots`] no store is read at
-    /// all, so the constructor never yields and an empty host store is fatal
-    /// for no mirror scheme.
+    /// pool. The constructor reads the store when a fetch can open a
+    /// handshake: when at least one mirror is `https`, when the mirror list is
+    /// empty, since a request may then name an `https` URL, and when
+    /// [`max_redirects`](FetcherOptions::max_redirects) is above zero, since
+    /// a redirect may lead to an `https` URL. A fetcher whose mirrors are all
+    /// `http` and that follows no redirect reads no store and holds no trust
+    /// anchor, so a request of it that names an `https` URL of its own is
+    /// refused before admission. Under [`TrustRoots::Pem`] the work is all in
+    /// memory and the constructor never yields. A system store holding no
+    /// certificate fails the constructor when at least one mirror is `https`,
+    /// and when the mirror list is empty; a host without a CA bundle still
+    /// reaches a cleartext remote. Under either bypass variant of
+    /// [`TrustRoots`] no store is read at all, so the constructor never yields
+    /// and an empty host store is fatal for no mirror scheme.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher> {
         Fetcher::with_counters(options, Vec::new()).await
     }
@@ -2014,7 +2057,12 @@ impl Fetcher {
         // which may be `https`, so it has to hold trust anchors: an empty
         // system store is as fatal there as it is for an `https` mirror.
         let https = mirrors.is_empty() || mirrors.iter().any(|mirror| mirror.origin.tls);
-        let tls = client_config(&options.tls, options.http2, https).await?;
+        // A redirect can lead from a cleartext mirror to a TLS origin, so the
+        // system store is read also when the fetcher follows redirects. With
+        // neither, a fetch reaches a TLS origin only through a URL target of
+        // its own, which the empty store refuses before admission.
+        let reaches_tls = https || options.max_redirects > 0;
+        let tls = client_config(&options.tls, options.http2, https, reaches_tls).await?;
         Ok(Fetcher {
             inner: Arc::new(Inner {
                 mirrors,
@@ -2702,7 +2750,9 @@ impl Fetcher {
                     .await
                 {
                     Ok(uploaded) => return Ok(uploaded),
-                    Err(UploadFailure::Sent(e)) => return Err(e),
+                    Err(UploadFailure::Sent { url, message }) => {
+                        return Err(Error::UploadInterrupted { url, message });
+                    }
                     Err(UploadFailure::Unsent(Failure::Retry(e))) => {
                         retryable = true;
                         if reported.is_none() {
@@ -2733,7 +2783,7 @@ impl Fetcher {
     /// hop after it is final: it is reported as an interrupted upload, and the
     /// rounds stop. A response the upload does not deliver is dropped, and
     /// with it a request body that has not ended and the connection of an
-    /// HTTP/1.1 hop, which no upload returns to the pool.
+    /// HTTP/1.1 hop, which then closes.
     async fn upload_attempt(
         &self,
         destination: &Destination,
@@ -2759,13 +2809,10 @@ impl Fetcher {
             let sent = self
                 .upload_send(&hop, &key, via, plan, &headers, body, handed)
                 .await;
-            let (response, protocol, request_end) = match sent {
+            let (response, protocol, request_end, reuse) = match sent {
                 Ok(sent) => sent,
                 Err(UploadFailure::Unsent(failure)) if followed > 0 => {
-                    return Err(UploadFailure::Sent(interrupted(
-                        url,
-                        failure.into_error().to_string(),
-                    )));
+                    return Err(interrupted(url, failure.into_error().to_string()));
                 }
                 Err(failure) => return Err(failure),
             };
@@ -2779,14 +2826,18 @@ impl Fetcher {
                     .and_then(|value| resolve_location(url, value))
             {
                 if followed >= self.inner.max_redirects {
-                    return Err(UploadFailure::Sent(Error::RedirectLimit {
-                        url: url.to_string(),
-                        hops: followed,
-                    }));
+                    return Err(undelivered(
+                        url,
+                        Error::RedirectLimit {
+                            url: url.to_string(),
+                            hops: followed,
+                        },
+                    ));
                 }
-                let next = redirect_destination(&hop, &location).map_err(UploadFailure::Sent)?;
+                let next =
+                    redirect_destination(&hop, &location).map_err(|e| undelivered(url, e))?;
                 if next.origin.tls && !self.inner.has_trust_anchors {
-                    return Err(UploadFailure::Sent(no_trust_anchors(next.origin_url())));
+                    return Err(undelivered(url, no_trust_anchors(next.origin_url())));
                 }
                 // A credential stays with the origin the route named, as it
                 // does for a fetch.
@@ -2804,16 +2855,22 @@ impl Fetcher {
                 continue;
             }
             if let Some(encoding) = declared_coding(response.headers()) {
-                return Err(UploadFailure::Sent(Error::ContentEncoded {
-                    url: url.to_string(),
-                    encoding,
-                }));
+                return Err(undelivered(
+                    url,
+                    Error::ContentEncoded {
+                        url: url.to_string(),
+                        encoding,
+                    },
+                ));
             }
             let content_length = content_length(response.headers());
             if content_length.is_some_and(|length| length > plan.max_response) {
-                return Err(UploadFailure::Sent(Error::FetchTooLarge {
-                    limit: plan.max_response,
-                }));
+                return Err(undelivered(
+                    url,
+                    Error::FetchTooLarge {
+                        limit: plan.max_response,
+                    },
+                ));
             }
             let protocol = match response.version() {
                 Version::HTTP_2 => Protocol::Http2,
@@ -2834,7 +2891,7 @@ impl Fetcher {
                     protocol,
                     inner: self.inner.clone(),
                     key,
-                    reuse: None,
+                    reuse,
                     permit: None,
                     done: false,
                     failed: None,
@@ -2848,15 +2905,24 @@ impl Fetcher {
         }
     }
 
-    /// Open a connection for one upload hop and hand the request to hyper.
+    /// Take or open a connection for one upload hop and hand the request to
+    /// hyper.
     ///
-    /// An upload takes a pooled HTTP/2 connection and never an idle HTTP/1.1
-    /// one, and the HTTP/1.1 connection it opens closes when the upload ends.
-    /// A failure before the hand-over leaves the body in `body`, and so does a
-    /// request that hyper gives back unwritten. A body that failed before the
+    /// An upload takes the pooled HTTP/2 connection, or an idle HTTP/1.1
+    /// connection that [`Inner::take_upload`] gives it. A pooled HTTP/1.1
+    /// connection that fails before hyper writes the request is dropped, and
+    /// the hop goes on over a new connection, with no round spent. A failure
+    /// before the hand-over leaves the body in `body`, and so does a request
+    /// that hyper gives back unwritten. A body that failed before the
     /// hand-over is never sent. The stall window of the body starts at the
     /// hand-over, and from then on the wait is for the response head, which
     /// [`answer`] bounds.
+    ///
+    /// The HTTP/1.1 connection comes back with the response when it can carry
+    /// the next request once the response body ends: hyper took the end of
+    /// the request body before the response head arrived, and the response
+    /// does not close the connection. In every other case the connection
+    /// closes when the exchange is over.
     #[allow(clippy::too_many_arguments)]
     async fn upload_send(
         &self,
@@ -2880,99 +2946,111 @@ impl Fetcher {
         if let Some(reason) = exchange.aborted() {
             return unsent(Failure::Fatal(not_sent(url, reason)));
         }
-        let mut sender = match self.inner.take_h2(key) {
-            Some(sender) => Sender::H2(sender),
-            None => {
-                let connect_timeout = self.inner.connect_timeout;
-                match within(connect_timeout, Box::pin(self.connect(key, via))).await {
-                    Some(Ok(sender)) => sender,
-                    Some(Err(failure)) => return unsent(failure),
-                    None => {
-                        return unsent(Failure::Retry(connect_timed_out(
-                            &key.origin,
-                            via,
-                            connect_timeout,
-                        )));
+        let progress_timeout = self.inner.progress_timeout;
+        let mut pooled = self.inner.take_upload(key);
+        loop {
+            // A pooled HTTP/1.1 connection that fails before hyper writes the
+            // request was closed by the server while it was idle.
+            let stale_h1 = matches!(pooled, Some(Sender::H1(_)));
+            let mut sender = match pooled.take() {
+                Some(sender) => sender,
+                None => {
+                    let connect_timeout = self.inner.connect_timeout;
+                    match within(connect_timeout, Box::pin(self.connect(key, via))).await {
+                        Some(Ok(sender)) => sender,
+                        Some(Err(failure)) => return unsent(failure),
+                        None => {
+                            return unsent(Failure::Retry(connect_timed_out(
+                                &key.origin,
+                                via,
+                                connect_timeout,
+                            )));
+                        }
                     }
                 }
+            };
+            let protocol = match sender {
+                Sender::H1(_) => Protocol::Http11,
+                Sender::H2(_) => Protocol::Http2,
+            };
+            let mut head = match self.upload_head(hop, plan, headers, protocol, via) {
+                Ok(head) => head,
+                Err(e) => return unsent(Failure::Fatal(e)),
+            };
+            let ready = match &mut sender {
+                Sender::H1(sender) => within(progress_timeout, sender.ready()).await,
+                Sender::H2(sender) => within(progress_timeout, sender.ready()).await,
+            };
+            match ready {
+                Some(Ok(())) => {}
+                Some(Err(_)) if stale_h1 => continue,
+                Some(Err(e)) => return unsent(Failure::Retry(transport(url, e))),
+                None => return unsent(Failure::Retry(stalled(url, progress_timeout))),
             }
-        };
-        let protocol = match sender {
-            Sender::H1(_) => Protocol::Http11,
-            Sender::H2(_) => Protocol::Http2,
-        };
-        let mut head = match self.upload_head(hop, plan, headers, protocol, via) {
-            Ok(head) => head,
-            Err(e) => return unsent(Failure::Fatal(e)),
-        };
-        let progress_timeout = self.inner.progress_timeout;
-        let ready = match &mut sender {
-            Sender::H1(sender) => within(progress_timeout, sender.ready()).await,
-            Sender::H2(sender) => within(progress_timeout, sender.ready()).await,
-        };
-        match ready {
-            Some(Ok(())) => {}
-            Some(Err(e)) => return unsent(Failure::Retry(transport(url, e))),
-            None => return unsent(Failure::Retry(stalled(url, progress_timeout))),
-        }
-        let empty = match exchange.hand_over(progress_timeout) {
-            Ok(empty) => empty,
-            Err(reason) => return unsent(Failure::Fatal(not_sent(url, reason))),
-        };
-        // A `POST` whose body is at its end states its length. hyper writes no
-        // length for an HTTP/1.1 request at the end of its body, and the
-        // method defines content, so a server that waits for the framing
-        // reads `0`.
-        if empty && plan.method == Method::POST {
-            head.headers_mut()
-                .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
-        }
-        let end = body
-            .take()
-            .expect("an upload attempt holds its body until it sends it");
-        let request = head.map(|()| RequestBody::Upload(end));
-        handed.store(true, Ordering::Relaxed);
-        let window = plan.response_timeout;
-        // The HTTP/1.1 sender drops once the head has arrived, so the
-        // connection closes once the exchange is over and never enters the
-        // pool.
-        let answered = match sender {
-            Sender::H1(mut sender) => {
-                answer(sender.try_send_request(request), &exchange, window).await
+            let empty = match exchange.hand_over(progress_timeout) {
+                Ok(empty) => empty,
+                Err(reason) => return unsent(Failure::Fatal(not_sent(url, reason))),
+            };
+            // A `POST` whose body is at its end states its length. hyper writes
+            // no length for an HTTP/1.1 request at the end of its body, and
+            // the method defines content, so a server that waits for the
+            // framing reads `0`.
+            if empty && plan.method == Method::POST {
+                head.headers_mut()
+                    .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
             }
-            Sender::H2(mut sender) => {
-                answer(sender.try_send_request(request), &exchange, window).await
-            }
-        };
-        let response = match answered {
-            Answer::Sent(Ok(response)) => response,
-            Answer::Sent(Err(mut e)) => {
-                let Some(request) = e.take_message() else {
-                    exchange.cut();
-                    return Err(UploadFailure::Sent(interrupted(
-                        url,
-                        with_cause(&e.into_error()),
-                    )));
-                };
-                // hyper gives the request back when the connection failed
-                // before it wrote any of it, so the body is whole and the
-                // request is unsent.
-                exchange.withdraw();
-                if let RequestBody::Upload(end) = request.into_body() {
-                    *body = Some(end);
+            let end = body
+                .take()
+                .expect("an upload attempt holds its body until it sends it");
+            let request = head.map(|()| RequestBody::Upload(end));
+            handed.store(true, Ordering::Relaxed);
+            let window = plan.response_timeout;
+            let (answered, h1) = match sender {
+                Sender::H1(mut sender) => {
+                    let answered =
+                        answer(sender.try_send_request(request), &exchange, window).await;
+                    (answered, Some(sender))
                 }
-                handed.store(false, Ordering::Relaxed);
-                return unsent(Failure::Retry(transport(url, e.into_error())));
-            }
-            Answer::Aborted(reason) => return Err(UploadFailure::Sent(interrupted(url, reason))),
-            Answer::Silent(window) => {
-                return Err(UploadFailure::Sent(interrupted(
-                    url,
-                    format!("no response within {window:?} of the end of the request body"),
-                )));
-            }
-        };
-        Ok((response, protocol, RequestEnd { exchange }))
+                Sender::H2(mut sender) => {
+                    let answered =
+                        answer(sender.try_send_request(request), &exchange, window).await;
+                    (answered, None)
+                }
+            };
+            let response = match answered {
+                Answer::Sent(Ok(response)) => response,
+                Answer::Sent(Err(mut e)) => {
+                    let Some(request) = e.take_message() else {
+                        exchange.cut();
+                        return Err(interrupted(url, with_cause(&e.into_error())));
+                    };
+                    // hyper gives the request back when the connection failed
+                    // before it wrote any of it, so the body is whole and the
+                    // request is unsent.
+                    exchange.withdraw();
+                    if let RequestBody::Upload(end) = request.into_body() {
+                        *body = Some(end);
+                    }
+                    handed.store(false, Ordering::Relaxed);
+                    if stale_h1 {
+                        continue;
+                    }
+                    return unsent(Failure::Retry(transport(url, e.into_error())));
+                }
+                Answer::Aborted(reason) => return Err(interrupted(url, reason)),
+                Answer::Silent(window) => {
+                    return Err(interrupted(
+                        url,
+                        format!("no response within {window:?} of the end of the request body"),
+                    ));
+                }
+            };
+            // A head that arrived before hyper took the end of the body is an
+            // early answer: the body is cut when the response ends, which
+            // closes the connection.
+            let reuse = h1.filter(|_| exchange.has_ended() && !closes(&response));
+            return Ok((response, protocol, RequestEnd { exchange }, reuse));
+        }
     }
 
     /// Start the upload request against `destination`, in the form `protocol`
@@ -3315,26 +3393,42 @@ impl Inner {
             }
         }
         while let Some(h1) = entry.h1.pop() {
-            if !h1.is_closed() {
-                return Some(Sender::H1(h1));
+            if !h1.sender.is_closed() {
+                return Some(Sender::H1(h1.sender));
             }
         }
         None
     }
 
-    /// The pooled HTTP/2 connection for `key`, if one is still usable. An
-    /// upload takes this alone, and opens an HTTP/1.1 connection of its own.
-    fn take_h2(&self, key: &PoolKey) -> Option<H2Sender> {
+    /// A pooled connection an upload can take for `key`: the HTTP/2
+    /// connection, or else the HTTP/1.1 connection that went idle last, when
+    /// it went idle less than [`UPLOAD_IDLE`] ago.
+    ///
+    /// A server can close an idle connection at any time, and a request that
+    /// hyper began to write over a connection closed that way counts as sent.
+    /// The server closes an idle connection at the end of its idle timeout,
+    /// which is seconds or more, so a connection that went idle a short time
+    /// ago is a connection the server keeps. An older idle connection stays in
+    /// the pool for a fetch, which is sent again when it fails.
+    fn take_upload(&self, key: &PoolKey) -> Option<Sender> {
         let mut pool = self.pool.lock().expect("fetcher pool mutex");
         let entry = pool.get_mut(key)?;
         match &entry.h2 {
-            Some(h2) if h2.is_closed() => {
-                entry.h2 = None;
-                None
-            }
-            Some(h2) => Some(h2.clone()),
-            None => None,
+            Some(h2) if h2.is_closed() => entry.h2 = None,
+            Some(h2) => return Some(Sender::H2(h2.clone())),
+            None => {}
         }
+        while let Some(h1) = entry.h1.last() {
+            if h1.sender.is_closed() {
+                entry.h1.pop();
+                continue;
+            }
+            if h1.since.elapsed() >= UPLOAD_IDLE {
+                return None;
+            }
+            return entry.h1.pop().map(|h1| Sender::H1(h1.sender));
+        }
+        None
     }
 
     /// Return an idle HTTP/1.1 connection to the pool.
@@ -3346,12 +3440,16 @@ impl Inner {
         if sender.is_closed() {
             return;
         }
+        let idle = IdleH1 {
+            sender,
+            since: Instant::now(),
+        };
         let mut pool = self.pool.lock().expect("fetcher pool mutex");
         if let Some(entry) = pool.get_mut(key) {
-            entry.h1.push(sender);
+            entry.h1.push(idle);
             return;
         }
-        pool.entry(key.clone()).or_default().h1.push(sender);
+        pool.entry(key.clone()).or_default().h1.push(idle);
     }
 
     /// Record the origin's HTTP/2 connection, keeping a usable one already
@@ -3821,6 +3919,15 @@ impl std::fmt::Debug for UploadWriter {
 const UPLOAD_ENDED: &str = "the upload of this body has ended";
 
 impl UploadWriter {
+    /// Whether the upload holds the request of this body handed over to a
+    /// connection. It turns true at the hand-over, and false again when the
+    /// connection gives the request back unwritten, until the next round
+    /// hands it over. A caller that counts the bytes a request sent counts
+    /// the bytes it wrote from the hand-over on.
+    pub fn is_handed_over(&self) -> bool {
+        self.exchange.lock().stall.is_some()
+    }
+
     /// Latch a failure that ends the writer and return it.
     fn fail(&mut self, kind: std::io::ErrorKind, message: String) -> std::io::Error {
         let failed = Failed { kind, message };
@@ -4517,12 +4624,17 @@ fn parse_authority(url: &str, credentials: &str) -> Result<(Uri, Origin, String)
     // serves the request from a port the caller did not name, and the rebuilt
     // authority drops the port as well, so the port text is read from the
     // authority and refused.
+    //
+    // `Uri` also reads the port with the integer parse of `std`, which takes a
+    // leading `+`. A port is ASCII digits alone, so a port text with any other
+    // byte is refused. Leading zeros are digits, and `080` names the port 80.
     let port_text = uri
         .authority()
         .and_then(|authority| authority.as_str().strip_prefix(literal))
         .and_then(|rest| rest.strip_prefix(':'));
     let default_port = if tls { 443 } else { 80 };
-    let port = match (uri.port_u16(), port_text) {
+    let digits = port_text.is_none_or(|text| text.bytes().all(|b| b.is_ascii_digit()));
+    let port = match (uri.port_u16().filter(|_| digits), port_text) {
         (Some(port), _) => port,
         (None, None) => default_port,
         (None, Some(text)) => {
@@ -4565,8 +4677,48 @@ fn without_userinfo(url: &str) -> Cow<'_, str> {
 
 /// The `Host` header value of one authority.
 fn host_header(url: &str, authority: &str) -> Result<HeaderValue> {
-    HeaderValue::try_from(authority)
-        .map_err(|_| Error::Fetch(format!("url {url} has an unusable host")))
+    HeaderValue::try_from(authority).map_err(|_| {
+        Error::Fetch(format!(
+            "url {} has an unusable host",
+            without_userinfo(url)
+        ))
+    })
+}
+
+/// Check that `url` is a base URL that a fetcher takes as a mirror, and that
+/// names a host and holds no fragment.
+///
+/// The check refuses a scheme other than `http` and `https`, userinfo, a
+/// query string, a fragment, an empty host, and a port that is not a number
+/// from 0 to 65535 in ASCII digits. A port with leading zeros is the number
+/// its digits give. An `@` is refused wherever it is, in the path and in the
+/// query too: the authority of a URL ends at the first `/`, `?`, or `#`, so a
+/// password that holds one of those ends the authority before the `@`, and
+/// the rest of the userinfo reads as a path or a query. No refusal names the
+/// part of the URL before the last `@`. The check opens no connection and
+/// reads no file.
+pub fn check_base_url(url: &str) -> Result<()> {
+    if url.contains('#') {
+        return Err(Error::Fetch(format!(
+            "url {} carries a fragment, which no request sends",
+            without_userinfo(url)
+        )));
+    }
+    if url.contains('@') {
+        return Err(Error::Fetch(format!(
+            "url {} holds an '@', which can mark userinfo: a base url carries no userinfo, so \
+             pass the credential in the options and not in the url",
+            without_userinfo(url)
+        )));
+    }
+    let mirror = parse_mirror(url)?;
+    if mirror.origin.host.is_empty() {
+        return Err(Error::Fetch(format!(
+            "url {} has no host",
+            without_userinfo(url)
+        )));
+    }
+    Ok(())
 }
 
 /// Parse one base URL into a [`Mirror`].
@@ -4576,9 +4728,14 @@ fn parse_mirror(url: &str) -> Result<Mirror> {
     // so a query string the base URL carries would be dropped without a word.
     // It is rejected rather than ignored: a presigned URL that lost its
     // signature answers 403, which does not point at the URL that caused it.
-    if let Some(query) = uri.query() {
+    //
+    // A password that holds a `?` ends the authority there, and the rest of
+    // the userinfo reads as the query, so the message names the URL with any
+    // userinfo left out and does not quote the query.
+    if uri.query().is_some() {
         return Err(Error::Fetch(format!(
-            "mirror url {url} carries the query string ?{query}, which the fetcher does not send"
+            "mirror url {} carries a query string, which the fetcher does not send",
+            without_userinfo(url)
         )));
     }
     let scheme = if origin.tls { "https" } else { "http" };
@@ -4624,6 +4781,19 @@ fn parse_url(url: &str) -> Result<Destination> {
         path_at,
         origin,
     })
+}
+
+/// Whether `response` closes its HTTP/1.1 connection when it ends: an
+/// HTTP/1.0 response, or one whose `Connection` header holds `close`.
+fn closes(response: &Response<Incoming>) -> bool {
+    response.version() != Version::HTTP_11
+        || response
+            .headers()
+            .get_all(hyper::header::CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|token| token.trim().eq_ignore_ascii_case("close"))
 }
 
 /// The `Content-Length` a response declared, when it declared a usable one.
@@ -4835,11 +5005,18 @@ fn not_sent(url: &str, reason: String) -> Error {
 }
 
 /// An upload that failed after hyper took its request.
-fn interrupted(url: &str, message: String) -> Error {
-    Error::UploadInterrupted {
+fn interrupted(url: &str, message: String) -> UploadFailure {
+    UploadFailure::Sent {
         url: url.to_string(),
         message,
     }
+}
+
+/// An upload whose request hyper took and whose response the upload does not
+/// deliver, for `cause`. The request was sent, so the upload is interrupted,
+/// and the message names the cause.
+fn undelivered(url: &str, cause: Error) -> UploadFailure {
+    interrupted(url, cause.to_string())
 }
 
 /// The message of an error and of its cause. The message of a hyper error is
@@ -5056,6 +5233,64 @@ mod tests {
         // A bare user with no password is userinfo too.
         let err = parse_mirror("http://user@host/repo").unwrap_err();
         assert!(err.to_string().contains("userinfo"), "{err}");
+    }
+
+    /// A base URL check takes each URL a mirror takes, and refuses a
+    /// fragment and an empty host as well. A refusal holds no password.
+    #[test]
+    fn a_base_url_check_refuses_what_a_mirror_cannot_carry() {
+        for url in [
+            "http://host",
+            "https://host/repo/",
+            "http://127.0.0.1:8080/r",
+            "https://[::1]:8443/",
+            "HTTPS://host/repo",
+        ] {
+            check_base_url(url).unwrap();
+        }
+        let refused = |url: &str, part: &str| {
+            let err = check_base_url(url).unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains(part), "{url}: {text}");
+            assert!(!text.contains("secret"), "{url}: {text}");
+        };
+        refused("https://user:secret@host/repo", "userinfo");
+        refused("https://host/repo?q=1", "query string");
+        refused("https://host/repo#part", "fragment");
+        refused("https://u:secret@host/repo#part", "fragment");
+        refused("http://", "invalid url");
+        refused("http:///repo", "invalid url");
+        refused("http://:80/repo", "has no host");
+        refused("http://host:99999/repo", "not a number");
+        refused("http://host:x/repo", "not a number");
+        refused("ftp://host/repo", "scheme ftp");
+        refused("host/repo", "not an absolute");
+        // A password that holds a `/` or a `?` ends the authority before the
+        // `@`, so the rest of the userinfo reads as the path or the query.
+        refused("https://user:443/pw-secret@host/repo", "userinfo");
+        refused("https://user:1234?pw-secret@host/", "userinfo");
+        refused("https://host/repo@v1", "userinfo");
+        // A port is ASCII digits alone. Leading zeros are digits.
+        refused("http://h:+80/", "not a number");
+        refused("http://h:-80/", "not a number");
+        check_base_url("http://h:080/").unwrap();
+        assert_eq!(parse_mirror("http://h:080/r").unwrap().prefix, "http://h");
+        assert_eq!(
+            parse_mirror("http://h:0808/r").unwrap().prefix,
+            "http://h:808"
+        );
+    }
+
+    /// No refusal of a mirror URL names the userinfo that a password holding
+    /// a `?` hides in the query.
+    #[test]
+    fn a_mirror_refusal_names_no_userinfo() {
+        let err = parse_mirror("https://user:1234?pw-secret@host/").unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("query string"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        let err = parse_mirror("http://h:+80/x").unwrap_err();
+        assert!(err.to_string().contains("not a number"), "{err}");
     }
 
     #[test]
@@ -5633,6 +5868,9 @@ mod tests {
             ("http://h:65536/x", "65536"),
             ("http://h:abc/x", "abc"),
             ("http://h:/x", ""),
+            // The integer parse of `std` takes a leading `+`, and a port is
+            // ASCII digits alone.
+            ("http://h:+80/x", "+80"),
         ] {
             let err = parse_url(url).unwrap_err();
             let message = err.to_string();
@@ -5651,6 +5889,10 @@ mod tests {
         let ported = parse_url("http://h:8080/x").unwrap();
         assert_eq!(ported.origin.port, 8080);
         assert_eq!(ported.url(), "http://h:8080/x");
+        // Leading zeros are digits: the port is the number they give.
+        let zeros = parse_url("http://h:0080/x").unwrap();
+        assert_eq!(zeros.origin.port, 80);
+        assert_eq!(zeros.url(), "http://h/x");
     }
 
     /// A host compares as one origin whichever case it is written in, so two
@@ -6495,6 +6737,59 @@ mod tests {
         });
     }
 
+    /// The constructor reads the host trust store only when a fetch can open
+    /// a handshake. A fetcher whose mirrors are all `http` and that follows
+    /// no redirect reads none, holds no anchor, and refuses a URL target that
+    /// names an `https` origin. An `https` mirror, an empty mirror list, and
+    /// a redirect limit above zero each read the store.
+    #[test]
+    fn a_cleartext_fetcher_with_no_redirect_reads_no_trust_store() {
+        let reads = || tls::SYSTEM_STORE_READS.with(std::cell::Cell::get);
+        rt::block_on(async {
+            let before = reads();
+            let fetcher = Fetcher::new(FetcherOptions {
+                max_redirects: 0,
+                ..direct_options("http://cleartext.example/repo")
+            })
+            .await
+            .unwrap();
+            assert_eq!(reads(), before, "the store was read");
+            assert!(!fetcher.inner.has_trust_anchors);
+            let refused = within(
+                Duration::from_secs(1),
+                fetcher.fetch(FetchRequest::url("https://127.0.0.1:1/summary")),
+            )
+            .await
+            .expect("the refusal takes no attempt")
+            .expect_err("a tls url is refused without anchors");
+            assert!(
+                refused.to_string().contains("no trust anchors"),
+                "{refused}"
+            );
+
+            let cases = [
+                direct_options("http://cleartext.example/repo"),
+                FetcherOptions {
+                    max_redirects: 0,
+                    ..direct_options("https://tls.example/repo")
+                },
+                FetcherOptions {
+                    max_redirects: 0,
+                    proxy: Proxy::None,
+                    ..FetcherOptions::default()
+                },
+            ];
+            for options in cases {
+                let before = reads();
+                let what = format!("{:?} {}", options.mirrors, options.max_redirects);
+                // A host with no CA bundle fails the `https` cases, after the
+                // read.
+                let _ = Fetcher::new(options).await;
+                assert_eq!(reads(), before + 1, "{what}");
+            }
+        });
+    }
+
     /// A redirect names an origin of the server's choosing, so a hop onto a TLS
     /// origin meets the refusal a route naming one meets: the fetcher holds
     /// nothing to verify the certificate against, and the handshake would fail
@@ -6640,18 +6935,33 @@ mod tests {
         });
     }
 
-    /// A flush of less than 4 KiB hands over a copy and keeps the frame
-    /// buffer. A larger flush hands the buffer over, and the next one is
-    /// allocated at the next write.
+    /// A writer reports the hand-over of its request, and a request given
+    /// back unwritten is no longer handed over.
+    #[test]
+    fn a_writer_reports_the_hand_over() {
+        let (end, writer) = channel();
+        assert!(!writer.is_handed_over());
+        end.exchange.hand_over(Duration::from_secs(1)).unwrap();
+        assert!(writer.is_handed_over());
+        end.exchange.withdraw();
+        assert!(!writer.is_handed_over());
+    }
+
+    /// A writer holds no buffer until its first write. A flush of less than
+    /// 4 KiB hands over a copy and keeps the frame buffer. A larger flush
+    /// hands the buffer over, and the next one is allocated at the next
+    /// write.
     #[test]
     fn a_small_flush_hands_over_a_copy_and_keeps_the_buffer() {
         rt::block_on(async {
             let (mut end, mut writer) = channel();
+            assert_eq!(writer.buffer.capacity(), 0);
+            futures_lite::io::AsyncWriteExt::write_all(&mut writer, b"small")
+                .await
+                .unwrap();
+            assert_eq!(writer.buffer.capacity(), UPLOAD_FRAME);
             let kept = writer.buffer.as_ptr();
-            let flushed = async {
-                futures_lite::io::AsyncWriteExt::write_all(&mut writer, b"small").await?;
-                futures_lite::io::AsyncWriteExt::flush(&mut writer).await
-            };
+            let flushed = futures_lite::io::AsyncWriteExt::flush(&mut writer);
             let (flushed, frame) = futures_lite::future::zip(flushed, next_frame(&mut end)).await;
             flushed.unwrap();
             assert_eq!(frame.unwrap().unwrap(), &b"small"[..]);

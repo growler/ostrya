@@ -219,14 +219,15 @@
 //!
 //! Under the `push` feature it also covers the client side of a push from a
 //! repository. `Repo::push` pushes the commits of a set of refspecs to a
-//! remote over ssh. `Repo::push_over_stream` runs the same push over a pair
+//! remote over ssh or HTTP. `Repo::push_over_stream` runs the same push over a pair
 //! of streams. Both take the options of `RepoPushOptions`.
 //! `resolve_push_remote` gives the push address and the connect options of a
 //! configured remote or of an address, and `is_push_address` tells an address
 //! from a remote name. `ostrya::push` re-exports the wire
 //! protocol crate. The push keys of a remote section,
-//! [`Remote::push_url`], [`Remote::ssh_command`], and
-//! [`Remote::receive_command`], are read in every build.
+//! [`Remote::push_url`], [`Remote::ssh_command`],
+//! [`Remote::receive_command`], [`Remote::push_token_file`], and
+//! [`Remote::push_user`], are read in every build.
 
 pub mod archive;
 pub mod bootable;

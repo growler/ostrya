@@ -1363,8 +1363,8 @@ Created with `[core]` `repo_version=1`, `mode=<mode>`, optional
 `verification-<engine>-key` / `verification-<engine>-file`. What the
 verification keys select, and how each value is spelled, is in "Signature
 verification during a pull". A remote section can also hold the push keys of
-the port, `push-url`, `ssh-command`, and `receive-command` (see "Port
-extension: the push keys of a remote").
+the port, `push-url`, `ssh-command`, `receive-command`, `push-token-file`,
+and `push-user` (see "Port extension: the push keys of a remote").
 
 The port reads at most 1048576 bytes of `config`, and refuses a larger file
 with `config exceeds the 1048576-byte size cap`, when it opens a repository
@@ -1889,7 +1889,7 @@ secret-key-file=/nonexistent/central.ed25519.key
 
 ## Port extension: the push keys of a remote
 
-A `[remote "NAME"]` section can hold three keys that a push of the port reads.
+A `[remote "NAME"]` section can hold five keys that a push of the port reads.
 The `ostree` tool defines none of them and reads none.
 
 - `push-url` -- the push address: `ssh://[USER@]HOST[:PORT]/PATH`, the scp
@@ -1904,9 +1904,62 @@ The `ostree` tool defines none of them and reads none.
 - `receive-command` -- the command that the remote side runs. The remote shell
   parses it. The default is `ostrya receive`. The receive command of the push
   options has precedence over it.
+- `push-token-file` -- the path to a file that holds the token of a push over
+  HTTP. The token file of the push options has precedence over it.
+- `push-user` -- the name of a Basic credential. The push sends the token as
+  the password of a Basic credential with this name. When no name is set, the
+  push sends the token as a bearer token. The name of the push options has
+  precedence over it. A name that is empty or holds `:` is refused, and so is
+  a name with no token file.
 
-The push reads the three keys as strings, as written. The tool reads `url` to
+The push reads the five keys as strings, as written. The tool reads `url` to
 pull, so an `ssh://` address stands in `push-url` alone.
+
+The keys of a section apply to the transport of the push address. For an ssh
+address the push reads `ssh-command` and `receive-command`, and ignores the
+other keys of this list and the TLS keys. For an `http://` or `https://`
+address the push reads `push-token-file`, `push-user`, and these TLS keys of
+the pull, and ignores `ssh-command` and `receive-command`:
+
+- `tls-ca-path` -- a PEM file of the CA certificates that verify the server,
+  in place of the trust store of the host.
+- `tls-client-cert-path` and `tls-client-key-path` -- the PEM files of a
+  client certificate and its private key. The two come together. A key that
+  needs a passphrase is refused.
+- `tls-permissive` -- for an `https://` address, the push refuses
+  `tls-permissive=true` before any request. A push verifies the certificate
+  chain of the server. An `http://` address uses no TLS, and the push does
+  not read the key.
+
+The push reads each file once, before the session opens, and reads at most
+1 MiB of it. A relative path in `push-token-file`, `tls-ca-path`,
+`tls-client-cert-path`, or `tls-client-key-path` is relative to the current
+directory of the process, as a pull reads the TLS keys. The push does not
+expand `~`. A file that the push cannot read fails the push with a message
+that names the key and the path, and holds no byte of the file. Each key
+resolves on its own, and an option of the push wins over its key. No key lets a push send a token over `http://`. Only the push
+options do that.
+
+The token file holds the token on its first line:
+
+- The push reads at most 1 MiB of the file, and takes the bytes up to the
+  first LF (0x0a). With no LF, the token is the whole file.
+- The push refuses the token when it holds a CR (0x0d), when it is empty,
+  when it is not UTF-8, and when it is not token68: one or more ASCII
+  letters, digits, `-`, `.`, `_`, `~`, `+`, or `/`, then zero or more `=`.
+- The push ignores the bytes after the first LF.
+- No message of the push holds the token. The push checks no permission of
+  the file.
+
+Example:
+
+```text
+[remote "origin"]
+url=https://ostree.example.com/repo
+push-token-file=/etc/ostrya/push-token
+push-user=builder-1
+tls-ca-path=/etc/ostrya/ca.pem
+```
 
 The keys carry no repository fact. The tool tolerates them. Observed with
 `ostree` 2026.1 against an archive repository whose `[remote "origin"]`
@@ -1927,6 +1980,31 @@ receive-command=/usr/local/bin/ostrya receive
   print each value as written and exit 0.
 - `ostree config set core.fsync true` rewrites `config` and keeps the three
   keys in order.
+
+Observed with `ostree` 2026.1 against an archive repository whose
+`[remote "origin"]` section holds `url=http://127.0.0.1:PORT/`,
+`gpg-verify=false`, and these two lines, with an `ostrya serve --read-only`
+server at the URL:
+
+```
+push-user=alice
+push-token-file=/some/path
+```
+
+- `ostree remote list -u` prints `origin  http://127.0.0.1:PORT/` and exits
+  0.
+- `ostree remote show-url origin` prints `http://127.0.0.1:PORT/` and exits
+  0.
+- `ostree config get 'remote "origin".push-user'` prints `alice`, and `config
+  --group='remote "origin"' get push-token-file` prints `/some/path`. Each
+  exits 0.
+- `ostree config set core.fsync true` rewrites `config`, and keeps the two
+  keys in order and as written.
+- `ostree pull origin main` fetches the commit and exits 0. `ostree fsck`
+  then passes, and the config keeps the two keys.
+- No command writes a diagnostic to standard error.
+- Under `strace -f`, no system call of `remote list -u`, `remote show-url`,
+  or `pull` names `/some/path`.
 
 ## Port extension: the push credential file
 

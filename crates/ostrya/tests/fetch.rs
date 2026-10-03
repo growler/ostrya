@@ -4974,6 +4974,7 @@ fn retries_that_run_out_before_sending_report_a_fetch_error() {
         .await;
         let err = uploaded.unwrap_err();
         assert!(matches!(err, Error::Fetch(_)), "{err}");
+        assert!(err.is_unsent());
         assert!(err.to_string().contains("connect to"), "{err}");
         assert_eq!(written.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
     }));
@@ -5083,6 +5084,7 @@ fn a_writer_dropped_before_the_hand_over_sends_nothing() {
         .await;
         let err = uploaded.unwrap_err();
         assert!(matches!(err, Error::Fetch(_)), "{err}");
+        assert!(err.is_unsent());
         assert!(err.to_string().contains("dropped"), "{err}");
         assert_eq!(server.requests(), 1);
         assert_eq!(server.seen()[0].method, "GET");
@@ -5106,6 +5108,7 @@ fn the_fetch_timeout_bounds_an_upload_before_the_hand_over() {
         let started = Instant::now();
         let err = upload_error(&fetcher, UploadRequest::path("objects", body)).await;
         assert!(matches!(err, Error::Fetch(_)), "{err}");
+        assert!(err.is_unsent());
         assert!(err.to_string().contains("not sent within"), "{err}");
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -5195,6 +5198,7 @@ fn a_full_body_with_no_answer_is_interrupted() {
         )
         .await;
         assert!(matches!(err, Error::UploadInterrupted { .. }), "{err}");
+        assert!(!err.is_unsent());
         assert_eq!(server.requests(), 1);
         assert_eq!(live.requests(), 0);
     }));
@@ -5353,7 +5357,13 @@ fn a_declared_response_over_the_cap_fails_after_one_request() {
                 },
             )
             .await;
-            assert!(matches!(err, Error::FetchTooLarge { limit: 1024 }), "{err}");
+            // The request was sent, so the upload is interrupted, and the
+            // message names the cap.
+            assert!(
+                matches!(&err, Error::UploadInterrupted { message, .. } if message.contains("1024-byte cap")),
+                "{err}"
+            );
+            assert!(!err.is_unsent());
             assert_eq!(server.requests(), 1);
             assert_eq!(live.requests(), 0);
         }
@@ -5396,7 +5406,8 @@ fn a_chunked_response_past_the_cap_fails_the_read_and_stays_failed() {
     }));
 }
 
-/// A response that declares a coding is refused.
+/// A response that declares a coding is refused. The request was sent, so the
+/// upload is interrupted, and the message names the coding.
 #[test]
 fn a_coded_response_to_an_upload_is_refused() {
     block_on(bounded(async {
@@ -5420,9 +5431,10 @@ fn a_coded_response_to_an_upload_is_refused() {
         )
         .await;
         assert!(
-            matches!(&err, Error::ContentEncoded { encoding, .. } if encoding == "gzip"),
+            matches!(&err, Error::UploadInterrupted { message, .. } if message.contains("coding gzip")),
             "{err}"
         );
+        assert!(!err.is_unsent());
         assert_eq!(server.requests(), 1);
     }));
 }
@@ -5561,11 +5573,12 @@ fn a_delete_reaches_the_server_with_no_body() {
     }));
 }
 
-/// An upload opens an HTTP/1.1 connection of its own rather than an idle
-/// pooled one, and that connection closes when the upload ends: it never
-/// enters the pool. HTTP/2 connections are shared.
+/// An upload takes an HTTP/1.1 connection that went idle a short time ago,
+/// and its connection goes back to the pool once its response body ends, so
+/// a fetch and two sequential uploads travel over one connection. HTTP/2
+/// connections are shared.
 #[test]
-fn an_upload_opens_its_own_http1_connection_and_shares_http2() {
+fn sequential_uploads_reuse_one_http1_connection_and_share_http2() {
     block_on(bounded(async {
         let server = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
         let fetcher = Fetcher::new(direct_options(server.url(false)))
@@ -5573,17 +5586,30 @@ fn an_upload_opens_its_own_http1_connection_and_shares_http2() {
             .unwrap();
         fetch_bytes(&fetcher, "config").await;
         assert_eq!(server.connections(), 1);
-        let uploaded = fetcher
-            .upload(UploadRequest::path("objects", b"hello".to_vec().into()))
-            .await
-            .unwrap();
-        read_uploaded(uploaded).await;
-        assert_eq!(server.connections(), 2);
-        // Two fetches in flight at once: the pool holds the connection of the
-        // first fetch alone, so the second opens a third connection.
+        for _ in 0..2 {
+            let uploaded = fetcher
+                .upload(UploadRequest::path("objects", b"hello".to_vec().into()))
+                .await
+                .unwrap();
+            assert_eq!(read_uploaded(uploaded).await, b"accepted");
+        }
+        let (body, writer) = UploadBody::channel();
+        let (uploaded, written) = upload_streamed(
+            &fetcher,
+            UploadRequest::path("objects", body),
+            writer,
+            &upload_data(300_000),
+        )
+        .await;
+        written.unwrap();
+        read_uploaded(uploaded.unwrap()).await;
+        assert_eq!(server.requests(), 4);
+        assert_eq!(server.connections(), 1);
+        // Two fetches in flight at once: the pool holds one connection, so
+        // the second opens another.
         let first = fetcher.fetch(FetchRequest::path("config")).await.unwrap();
         let second = fetcher.fetch(FetchRequest::path("config")).await.unwrap();
-        assert_eq!(server.connections(), 3);
+        assert_eq!(server.connections(), 2);
         drop((first, second));
 
         let server = TestServer::start(tls_transport("h2"), always(b"accepted")).await;
@@ -5600,6 +5626,127 @@ fn an_upload_opens_its_own_http1_connection_and_shares_http2() {
         }
         assert_eq!(server.requests(), 3);
         assert_eq!(server.connections(), 1);
+    }));
+}
+
+/// A response head that arrives before the end of the request body is an
+/// early answer. The connection of that upload does not go back to the pool,
+/// also when the writer then ends the body cleanly and the response is read
+/// to its end, so the next upload opens a new connection.
+#[test]
+fn an_early_answer_keeps_the_http1_connection_out_of_the_pool() {
+    block_on(bounded(async {
+        let early: StreamHandler = Arc::new(|request: Request<Incoming>| {
+            Box::pin(async move {
+                let mut body = request.into_body();
+                read_at_least(&mut body, 1024).await;
+                // The rest of the body is read after the answer.
+                drop(spawn(async move {
+                    read_at_least(&mut body, u64::MAX).await;
+                }));
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(TestBody::measured(b"early"))
+                    .unwrap())
+            })
+        });
+        let server = TestServer::start_streamed(Transport::Cleartext, early).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let (body, mut writer) = UploadBody::channel();
+        let first_part = async {
+            writer.write_all(&[7u8; 1024]).await.unwrap();
+            writer.flush().await.unwrap();
+        };
+        let (uploaded, ()) = futures_lite::future::zip(
+            fetcher.upload(UploadRequest::path("objects", body)),
+            first_part,
+        )
+        .await;
+        let uploaded = uploaded.unwrap();
+        // The head has arrived. The body now ends cleanly, and the response
+        // is read to its end.
+        writer.write_all(&[7u8; 1024]).await.unwrap();
+        writer.close().await.unwrap();
+        assert_eq!(read_uploaded(uploaded).await, b"early");
+        assert_eq!(server.connections(), 1);
+        let (body, mut writer) = UploadBody::channel();
+        let (uploaded, ()) = futures_lite::future::zip(
+            fetcher.upload(UploadRequest::path("objects", body)),
+            async {
+                writer.write_all(&[7u8; 2048]).await.unwrap();
+                writer.close().await.unwrap();
+            },
+        )
+        .await;
+        read_uploaded(uploaded.unwrap()).await;
+        assert_eq!(server.connections(), 2);
+    }));
+}
+
+/// An HTTP/1.1 connection that has been idle for two seconds or more stays
+/// in the pool for a fetch, and an upload opens a new connection.
+#[test]
+fn an_upload_does_not_take_a_connection_idle_for_two_seconds() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        fetch_bytes(&fetcher, "config").await;
+        Timer::after(Duration::from_millis(2100)).await;
+        let uploaded = fetcher
+            .upload(UploadRequest::path("objects", b"hello".to_vec().into()))
+            .await
+            .unwrap();
+        read_uploaded(uploaded).await;
+        assert_eq!(server.connections(), 2);
+        // The fetch takes the connection that the upload did not.
+        fetch_bytes(&fetcher, "config").await;
+        assert_eq!(server.connections(), 2);
+    }));
+}
+
+/// A pooled connection that the server closed while it was idle does not
+/// carry an upload: the upload goes over a new connection with no round
+/// spent, so it succeeds with no retry allowed.
+#[test]
+fn an_upload_does_not_use_an_idle_connection_the_server_closed() {
+    block_on(bounded(async {
+        let listener = TcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        drop(spawn(async move {
+            // Each connection carries one exchange, and the server then
+            // closes it with no `Connection: close`.
+            while let Ok((mut stream, _peer)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+                let _ = stream.close().await;
+            }
+        }));
+        let fetcher = Fetcher::new(FetcherOptions {
+            max_retries: 0,
+            ..direct_options(format!("http://127.0.0.1:{}", addr.port()))
+        })
+        .await
+        .unwrap();
+        fetch_bytes(&fetcher, "config").await;
+        Timer::after(Duration::from_millis(100)).await;
+        let uploaded = fetcher
+            .upload(UploadRequest::path("objects", b"hello".to_vec().into()))
+            .await
+            .unwrap();
+        assert_eq!(read_uploaded(uploaded).await, b"ok");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
     }));
 }
 

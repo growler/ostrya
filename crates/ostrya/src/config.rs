@@ -608,25 +608,30 @@ impl Remote<'_> {
     }
 
     /// The path to a PEM file of trust anchors for this remote's TLS, replacing
-    /// the host trust store.
+    /// the host trust store. A pull and a push read a relative path from the
+    /// current directory of the process, and do not expand `~`.
     pub fn tls_ca_path(&self) -> Result<Option<String>> {
         self.string("tls-ca-path")
     }
 
     /// The path to the PEM client certificate chain presented to this remote.
+    /// A relative path is read as [`tls_ca_path`](Remote::tls_ca_path) states.
     pub fn tls_client_cert_path(&self) -> Result<Option<String>> {
         self.string("tls-client-cert-path")
     }
 
     /// The path to the PEM private key of
-    /// [`tls_client_cert_path`](Remote::tls_client_cert_path).
+    /// [`tls_client_cert_path`](Remote::tls_client_cert_path). A relative path
+    /// is read as [`tls_ca_path`](Remote::tls_ca_path) states.
     pub fn tls_client_key_path(&self) -> Result<Option<String>> {
         self.string("tls-client-key-path")
     }
 
-    /// Whether this remote's TLS certificate is accepted unverified. Default
-    /// `false`. The fetcher has no way to skip verification, so a pull refuses a
-    /// remote that sets this rather than verifying against the configuration.
+    /// Whether this remote's TLS certificate chain is accepted unverified.
+    /// Default `false`. A pull from a remote that sets it takes the chain as
+    /// presented and keeps the host name check. A push to an `https://`
+    /// address of a remote that sets it is refused. A push to an `http://`
+    /// address uses no TLS and ignores the key.
     pub fn tls_permissive(&self) -> Result<bool> {
         Ok(self
             .keyfile
@@ -651,6 +656,22 @@ impl Remote<'_> {
     /// `receive-command`. The remote shell parses it.
     pub fn receive_command(&self) -> Result<Option<String>> {
         self.string("receive-command")
+    }
+
+    /// The path to a file whose first line is the token of an HTTP push to
+    /// this remote, `push-token-file`. The push reads a relative path from
+    /// the current directory of the process, as a pull reads the TLS keys,
+    /// and does not expand `~`.
+    pub fn push_token_file(&self) -> Result<Option<String>> {
+        self.string("push-token-file")
+    }
+
+    /// The name of the Basic credential of an HTTP push to this remote,
+    /// `push-user`. The token of
+    /// [`push_token_file`](Remote::push_token_file) is its password. When the
+    /// key is absent, the token goes as a bearer token.
+    pub fn push_user(&self) -> Result<Option<String>> {
+        self.string("push-user")
     }
 
     /// The raw value of an arbitrary key in this remote's section.
@@ -1122,7 +1143,9 @@ mod tests {
                     [remote \"central\"]\nurl=https://ex.com/r\n\
                     push-url=ssh://pusher@ex.com/srv/repo\n\
                     ssh-command=ssh -o BatchMode=yes\n\
-                    receive-command=/opt/bin/ostrya receive\n\n\
+                    receive-command=/opt/bin/ostrya receive\n\
+                    push-token-file=/etc/push token\n\
+                    push-user=alice\n\n\
                     [remote \"plain\"]\nurl=https://ex.com/r\n";
         let cfg = RepoConfig::parse(text).unwrap();
         let remote = cfg.remote("central").unwrap();
@@ -1138,10 +1161,17 @@ mod tests {
             remote.receive_command().unwrap().as_deref(),
             Some("/opt/bin/ostrya receive")
         );
+        assert_eq!(
+            remote.push_token_file().unwrap().as_deref(),
+            Some("/etc/push token")
+        );
+        assert_eq!(remote.push_user().unwrap().as_deref(), Some("alice"));
 
         let plain = cfg.remote("plain").unwrap();
         assert_eq!(plain.push_url().unwrap(), None);
         assert_eq!(plain.ssh_command().unwrap(), None);
         assert_eq!(plain.receive_command().unwrap(), None);
+        assert_eq!(plain.push_token_file().unwrap(), None);
+        assert_eq!(plain.push_user().unwrap(), None);
     }
 }

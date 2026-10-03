@@ -11,8 +11,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Each variant except [`Error::Aborted`], [`Error::CommitOutcomeUnknown`],
 /// [`Error::Source`], [`Error::InvalidInput`], [`Error::Transport`],
-/// [`Error::Io`], [`Error::Walk`], and [`Error::Sign`] is one wire code of the
-/// `Error` message.
+/// [`Error::Fetch`], [`Error::Io`], [`Error::Walk`], and [`Error::Sign`] is
+/// one wire code of the `Error` message.
 /// The enum is `#[non_exhaustive]`, so a match outside the crate needs a
 /// wildcard arm.
 #[derive(Debug, thiserror::Error)]
@@ -110,11 +110,19 @@ pub enum Error {
     /// broken session.
     #[error("invalid input: {0}")]
     InvalidInput(String),
-    /// The transport under the session failed: the ssh client could not be
-    /// started, or it exited with a failure status while the session failed
-    /// with an I/O error. The message names the program.
+    /// The transport under the session failed. Over ssh: the ssh client
+    /// could not be started, or it exited with a failure status while the
+    /// session failed with an I/O error, and the message names the program.
+    /// Over HTTP: the server answered with a status the receive endpoint does
+    /// not give, a 3xx included, or with a body that is not one frame, and
+    /// the message names the URL and the status. No wire code carries it.
     #[error("transport: {0}")]
     Transport(String),
+    /// The HTTP client of the session failed: it could not be built, a
+    /// request could not be sent, or a request failed after it was sent. No
+    /// wire code carries it.
+    #[error(transparent)]
+    Fetch(ostrya_fetch::Error),
     /// An I/O error of the underlying stream. An end of file inside a frame
     /// or an object has the kind `UnexpectedEof`.
     #[error(transparent)]
@@ -237,8 +245,8 @@ impl ErrorCode {
 impl Error {
     /// The wire code of the error, or `None` for [`Error::Aborted`],
     /// [`Error::CommitOutcomeUnknown`], [`Error::Source`],
-    /// [`Error::InvalidInput`], [`Error::Transport`], [`Error::Io`],
-    /// [`Error::Walk`], and [`Error::Sign`].
+    /// [`Error::InvalidInput`], [`Error::Transport`], [`Error::Fetch`],
+    /// [`Error::Io`], [`Error::Walk`], and [`Error::Sign`].
     pub fn code(&self) -> Option<ErrorCode> {
         Some(match self {
             Error::VersionUnsupported(_) => ErrorCode::VersionUnsupported,
@@ -262,6 +270,7 @@ impl Error {
             | Error::Source(_)
             | Error::InvalidInput(_)
             | Error::Transport(_)
+            | Error::Fetch(_)
             | Error::Io(_)
             | Error::Walk { .. }
             | Error::Sign(_) => return None,
@@ -300,6 +309,7 @@ impl Error {
             | Error::Source(_)
             | Error::InvalidInput(_)
             | Error::Transport(_)
+            | Error::Fetch(_)
             | Error::Io(_)
             | Error::Walk { .. }
             | Error::Sign(_) => (ErrorCode::Internal, self.to_string()),

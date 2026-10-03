@@ -81,6 +81,7 @@
 mod frame;
 mod message;
 
+pub(crate) use frame::encode_frame;
 pub use frame::{FrameReader, FrameWriter, ObjectBody, ObjectRead};
 pub use message::{
     CommitRequest, ErrorMessage, HaveReply, Hello, HelloReply, Message, ObjectHeader, ObjectsReply,

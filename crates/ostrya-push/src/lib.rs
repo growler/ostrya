@@ -17,30 +17,36 @@
 //! [`PushStats`] of a session that committed.
 //!
 //! The [`transport`] module holds the transports. [`PushRemote`] parses a
-//! push address, and [`PushSession::connect`] opens a session over ssh: it
-//! runs the ssh client as a child process, and the remote side runs the
-//! receive command.
+//! push address, and [`PushSession::connect`] opens a session to it.
+//! [`PushSession::prepare`] checks the options and makes the transport ready
+//! first, and [`PreparedSession::open`] opens the session later. Over
+//! ssh it runs the ssh client as a child process, and the remote side runs
+//! the receive command. Over HTTP each step of the session is one request to
+//! the receive endpoint of the server, and the object streams of a session
+//! run in parallel.
 //!
 //! The [`tree`] module walks a local directory into a
 //! [`TreeModel`](tree::TreeModel): the entry metadata, with an entry filter
 //! that can change it, and the checksum of each object of the tree.
 //!
 //! [`push_tree`] pushes a local directory as one commit: it walks and hashes
-//! the tree, opens a session over ssh, builds and signs the commit over the
-//! tree, sends the objects the server lacks, and sets the target refs.
-//! [`push_tree_over_stream`] runs the same push over a pair of byte streams,
-//! and [`TreePushOptions`] holds its options.
+//! the tree, opens a session over ssh or HTTP, builds and signs the commit
+//! over the tree, sends the objects the server lacks, and sets the target
+//! refs.
+//! [`push_tree_prepared`] runs the same push over a [`PreparedSession`], and
+//! [`push_tree_over_stream`] over a pair of byte streams.
+//! [`TreePushOptions`] holds their options.
 //!
 //! [`Error`] is the error type of the crate. Each of its variants except
 //! [`Error::Aborted`], [`Error::CommitOutcomeUnknown`], [`Error::Source`],
-//! [`Error::InvalidInput`], [`Error::Transport`], [`Error::Io`],
-//! [`Error::Walk`], and [`Error::Sign`] is one wire code, and [`ErrorCode`]
-//! names the codes.
+//! [`Error::InvalidInput`], [`Error::Transport`], [`Error::Fetch`],
+//! [`Error::Io`], [`Error::Walk`], and [`Error::Sign`] is one wire code, and
+//! [`ErrorCode`] names the codes.
 //!
 //! The codec and [`PushSession::over_stream`] are generic over the
 //! `futures-io` traits `AsyncRead` and `AsyncWrite`, so they need no async
-//! runtime. The ssh transport runs on the runtime backend that the `smol`
-//! (default) or the `tokio` feature selects. The crate has no repository
+//! runtime. The ssh and the HTTP transports run on the runtime backend that
+//! the `smol` (default) or the `tokio` feature selects. The crate has no repository
 //! knowledge. It compiles on Linux, macOS, and Windows.
 
 mod commit;
@@ -53,12 +59,14 @@ pub mod tree;
 
 pub use error::{Error, ErrorCode, Result};
 pub use proto::{Encoding, Expected, RefOutcome, RefState, RefUpdate};
-pub use push_tree::{ParentPolicy, TreePushOptions, push_tree, push_tree_over_stream};
+pub use push_tree::{
+    ParentPolicy, TreePushOptions, push_tree, push_tree_over_stream, push_tree_prepared,
+};
 pub use session::{
     BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PushOutcome, PushPhase,
     PushProgress, PushProgressSnapshot, PushSession, PushStats, ServerInfo, SessionOptions,
 };
-pub use transport::{ConnectOptions, PushRemote};
+pub use transport::{ConnectOptions, PreparedSession, PushRemote};
 
 /// The public types of the protocol move freely across tasks and threads.
 const _: fn() = || {
@@ -77,6 +85,7 @@ const _: fn() = || {
     assert_send_sync::<Box<dyn ObjectReader>>();
     assert_send_sync::<PushRemote>();
     assert_send_sync::<ConnectOptions>();
+    assert_send_sync::<PreparedSession>();
     assert_send_sync::<tree::TreeModel>();
     assert_send_sync::<tree::EntryMeta>();
     assert_send_sync::<tree::EntryKind>();
@@ -110,9 +119,10 @@ fn session_futures_are_send(
     assert_send(&owned.commit(updates, false));
 }
 
-/// The future of a connect can run on a multi-threaded executor.
+/// The future of a connect, and the futures of its two steps, can run on a
+/// multi-threaded executor, over ssh and over HTTP.
 #[allow(dead_code)]
-fn connect_future_is_send(remote: &PushRemote, refs: &[String]) {
+fn connect_future_is_send(remote: &PushRemote, refs: &[String], prepared: PreparedSession) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&PushSession::connect(
         remote,
@@ -120,18 +130,29 @@ fn connect_future_is_send(remote: &PushRemote, refs: &[String]) {
         refs,
         SessionOptions::default(),
     ));
+    assert_send(&PushSession::prepare(remote, ConnectOptions::default()));
+    assert_send(&prepared.open(refs, SessionOptions::default()));
 }
 
 /// The options of a tree push and the futures of the push can run on a
 /// multi-threaded executor.
 #[allow(dead_code)]
-fn push_tree_futures_are_send(remote: &PushRemote, root: &std::path::Path) {
+fn push_tree_futures_are_send(
+    remote: &PushRemote,
+    root: &std::path::Path,
+    prepared: PreparedSession,
+) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&TreePushOptions::default());
     assert_send(&push_tree(
         remote,
         root,
         ConnectOptions::default(),
+        TreePushOptions::default(),
+    ));
+    assert_send(&push_tree_prepared(
+        prepared,
+        root,
         TreePushOptions::default(),
     ));
     assert_send(&push_tree_over_stream(

@@ -71,10 +71,12 @@ pub enum Error {
     /// An upload failed after hyper took its request: the connection failed
     /// while the request or the response head was in transit, the body
     /// failed because its writer was dropped or a frame of it waited past the
-    /// stall window, or no response head arrived within the response window.
-    /// The server can have received the whole request and acted on it, so
-    /// the outcome is unknown, and the fetcher does not send the request
-    /// again.
+    /// stall window, no response head arrived within the response window, or
+    /// the response head was one the upload does not deliver: a declared
+    /// coding, a declared length over the cap, or a redirect the upload
+    /// cannot follow. The server can have received the whole request and
+    /// acted on it, so the outcome is unknown, and the fetcher does not send
+    /// the request again.
     #[error("upload to {url} interrupted: {message}")]
     UploadInterrupted {
         /// The URL the request was sent to.
@@ -82,4 +84,49 @@ pub enum Error {
         /// What ended the upload.
         message: String,
     },
+}
+
+impl Error {
+    /// Whether this error of [`Fetcher::upload`](crate::Fetcher::upload)
+    /// states that the upload failed before the fetcher handed its request to
+    /// a connection. No byte of such a request reached a server, so the
+    /// server did nothing for it.
+    ///
+    /// Each failure of an upload after the hand-over is
+    /// [`Error::UploadInterrupted`], whatever ended it. So the method gives
+    /// `false` for that variant, and `true` for each other error of an upload:
+    /// a refusal before admission, a connect or a handshake that failed, and
+    /// rounds that ran out before the request was sent. The answer applies to
+    /// the errors of an upload alone. A fetch never fails with
+    /// `UploadInterrupted`, and it can fail with any other variant after its
+    /// request was sent.
+    pub fn is_unsent(&self) -> bool {
+        !matches!(self, Error::UploadInterrupted { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An interrupted upload was sent. Each other error of an upload is a
+    /// failure before the hand-over.
+    #[test]
+    fn an_interrupted_upload_alone_was_sent() {
+        let interrupted = Error::UploadInterrupted {
+            url: "https://h/x".into(),
+            message: "response for https://h/x carries the coding gzip".into(),
+        };
+        assert!(!interrupted.is_unsent());
+        for unsent in [
+            Error::Fetch("connect to h:443 failed".into()),
+            Error::Unsupported("fetch url scheme ftp".into()),
+            Error::HttpStatus {
+                status: 407,
+                url: "https://h/x".into(),
+            },
+        ] {
+            assert!(unsent.is_unsent(), "{unsent}");
+        }
+    }
 }

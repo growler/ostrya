@@ -239,22 +239,142 @@ fn a_one_letter_host_is_a_local_path_on_windows() {
 }
 
 #[test]
-fn http_addresses_parse_and_connect_refuses_them() {
-    for address in ["http://h/repo", "https://h:8443/repo"] {
+fn http_addresses_parse_and_their_malformed_forms_are_refused() {
+    for address in [
+        "http://h/repo",
+        "https://h:8443/repo",
+        "http://127.0.0.1:8080/",
+        "https://[::1]/",
+        "https://h",
+        "http://h:080/",
+    ] {
         let remote = PushRemote::parse(address).unwrap();
         assert_eq!(remote.to_string(), address);
-        let r = ostrya_rt::block_on(PushSession::connect(
-            &remote,
-            ConnectOptions::default(),
-            &[],
-            SessionOptions::default(),
-        ));
+        assert!(matches!(remote.inner, RemoteAddr::Http(_)), "{address}");
+    }
+    for (address, part) in [
+        ("http://", "invalid url"),
+        ("https://:443/r", "no host"),
+        ("https://user:pw-QXZ@h/r", "userinfo"),
+        ("https://h/r?x=1", "query string"),
+        ("https://h/r#frag", "fragment"),
+        ("https://h:65536/r", "not a number"),
+        ("http://h:port/r", "not a number"),
+        // A password that holds a `/` or a `?` ends the authority before the
+        // `@`, and no message names it.
+        ("https://user:443/pw-QXZ@h/repo", "userinfo"),
+        ("https://user:1234?pw-QXZ@h/", "userinfo"),
+        ("http://h:+80/", "not a number"),
+    ] {
+        let msg = refused(address, false);
+        assert!(msg.contains(part), "{address}: {msg}");
+        assert!(!msg.contains("QXZ"), "{address}: {msg}");
+    }
+}
+
+/// An HTTP option with an ssh address is refused before the ssh client
+/// starts, and so is a non-default `http` field.
+#[test]
+fn an_http_option_is_refused_with_an_ssh_address() {
+    let remote = PushRemote::parse("ssh://host/srv/repo").unwrap();
+    let mut changed_http = ConnectOptions::default();
+    changed_http.http.http2 = false;
+    let cases: Vec<(ConnectOptions, &str)> = vec![
+        (
+            ConnectOptions {
+                push_token_file: Some("t".into()),
+                ..Default::default()
+            },
+            "push-token-file",
+        ),
+        (
+            ConnectOptions {
+                push_user: Some("u".into()),
+                ..Default::default()
+            },
+            "push-user",
+        ),
+        (
+            ConnectOptions {
+                tls_ca_path: Some("ca".into()),
+                ..Default::default()
+            },
+            "tls-ca-path",
+        ),
+        (
+            ConnectOptions {
+                tls_client_cert_path: Some("c".into()),
+                ..Default::default()
+            },
+            "tls-client-cert-path",
+        ),
+        (
+            ConnectOptions {
+                tls_client_key_path: Some("k".into()),
+                ..Default::default()
+            },
+            "tls-client-key-path",
+        ),
+        (
+            ConnectOptions {
+                allow_cleartext_credentials: true,
+                ..Default::default()
+            },
+            "allow-cleartext-credentials",
+        ),
+        (changed_http, "ConnectOptions::http "),
+    ];
+    for (connect, field) in cases {
+        let r = ostrya_rt::block_on(prepare_with(&remote, &connect, None));
         match r {
-            Err(Error::InvalidInput(msg)) => assert!(msg.contains("HTTP"), "{msg}"),
-            Err(other) => panic!("{address}: {other:?}"),
-            Ok(_) => panic!("{address}: connected"),
+            Err(Error::InvalidInput(msg)) => {
+                assert!(msg.contains(field), "{msg:?} lacks {field:?}");
+                assert!(msg.contains("is an ssh address"), "{msg}");
+            }
+            Err(other) => panic!("{field}: {other:?}"),
+            Ok(_) => panic!("{field}: accepted"),
         }
     }
+    let r = ostrya_rt::block_on(prepare_with(&remote, &ConnectOptions::default(), None));
+    assert!(matches!(r, Ok(Prepared::Ssh(_))));
+}
+
+/// The `Debug` output of a prepared session names the transport and the
+/// HTTP address, and holds no credential and no part of the ssh command
+/// line.
+#[test]
+fn a_prepared_session_shows_no_credential() {
+    let dir = std::env::temp_dir().join(format!("ostrya-push-prepared-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let token = dir.join("token");
+    std::fs::write(&token, b"tok-QXZ\n").unwrap();
+    let remote = PushRemote::parse("http://h:8080/").unwrap();
+    let prepared = ostrya_rt::block_on(PushSession::prepare(
+        &remote,
+        ConnectOptions {
+            push_token_file: Some(token),
+            push_user: Some("user-QXZ".into()),
+            allow_cleartext_credentials: true,
+            ..Default::default()
+        },
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let shown = format!("{:?}", prepared.unwrap());
+    assert_eq!(
+        shown,
+        r#"PreparedSession { transport: "http", url: "http://h:8080/", .. }"#
+    );
+
+    let remote = PushRemote::parse("ssh://user-QXZ@h/srv/repo").unwrap();
+    let prepared = ostrya_rt::block_on(PushSession::prepare(
+        &remote,
+        ConnectOptions {
+            ssh_command: Some(strings(&["ssh", "-i", "key-QXZ"])),
+            ..Default::default()
+        },
+    ));
+    let shown = format!("{:?}", prepared.unwrap());
+    assert_eq!(shown, r#"PreparedSession { transport: "ssh", .. }"#);
 }
 
 #[test]

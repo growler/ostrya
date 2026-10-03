@@ -18,7 +18,7 @@ use crate::session::{
     Compression, ObjectSource, PushOutcome, PushProgress, PushSession, SessionOptions,
     deflate_level, invalid,
 };
-use crate::transport::{ConnectOptions, PushRemote, open_ssh, ssh_command_line};
+use crate::transport::{ConnectOptions, PreparedSession, PushRemote};
 use crate::tree::{EntryFilter, ScanOptions, TreeModel};
 
 /// The parent of the commit of a tree push.
@@ -86,28 +86,31 @@ pub struct TreePushOptions {
 ///
 /// 1. It checks the options, and it refuses with
 ///    [`Error::InvalidInput`](crate::Error::InvalidInput) the options that
-///    [`push_tree_over_stream`] refuses. It then builds the ssh command line,
-///    and it refuses an `http://` or an `https://` remote and an ssh command
-///    or a receive command that [`PushSession::connect`] refuses.
+///    [`push_tree_over_stream`] refuses. It then makes the transport ready
+///    with [`PushSession::prepare`]: for ssh it builds the command line, and
+///    for HTTP it reads the files that `connect` names and builds the HTTP
+///    client. It refuses what [`PushSession::connect`] refuses before it
+///    starts the transport.
 /// 2. It walks and hashes the tree with [`TreeModel::scan`], with
 ///    `entry_filter` and `hash_jobs`. A walk error and a hash error are
 ///    [`Error::Walk`](crate::Error::Walk).
-/// 3. It starts the ssh client and opens the session, with the target refs
-///    in one `Hello`.
+/// 3. It starts the ssh client, or sends the first HTTP request, and opens
+///    the session, with the target refs in one `Hello`.
 /// 4. It builds the commit, signs it, offers each object of the tree and the
 ///    commit in one round of `Have`, sends the objects the server lacks with
 ///    the detached metadata of the commit, and sends `Commit`.
 ///
 /// So a refusal of the options, a walk error, and a hash error start no ssh
-/// client and open no session. [`push_tree_over_stream`] states the rules of
-/// the commit and of the session. `PushStats::elapsed` of the outcome covers
-/// the session alone, from the start of the ssh client, and not the scan.
+/// client, send no request, and open no session. [`push_tree_over_stream`]
+/// states the rules of the commit and of the session. `PushStats::elapsed`
+/// of the outcome covers the session alone, from the start of the
+/// transport, and not the scan.
 ///
 /// Under the tokio backend, the call must run within a runtime that has the
 /// IO driver and the time driver enabled. These are `enable_io` and
 /// `enable_time` of the runtime builder, or `enable_all`. The ssh child
-/// process and its pipes need the IO driver, and the time limits of the
-/// session need the time driver.
+/// process and its pipes, and the connections of an HTTP session, need the
+/// IO driver, and the time limits of the session need the time driver.
 pub async fn push_tree(
     remote: &PushRemote,
     root: &Path,
@@ -115,10 +118,28 @@ pub async fn push_tree(
     opts: TreePushOptions,
 ) -> Result<PushOutcome> {
     let (scan, push) = Prepared::new(opts)?;
-    let argv = ssh_command_line(remote, &connect)?;
-    let model = push.scan(root, scan).await?;
-    let session = open_ssh(&argv, &push.refs, push.session_options()).await?;
-    push.run(session, model).await
+    let transport = PushSession::prepare(remote, connect).await?;
+    push.scan_and_run(transport, root, scan).await
+}
+
+/// Push the directory `root` as one commit over `session`, a transport that
+/// [`PushSession::prepare`] made ready, and set the target refs of the
+/// server to it in one transaction.
+///
+/// The push is the push of [`push_tree`] with the transport checks done
+/// first, so a caller can make them before the work that builds `opts`, for
+/// example before it starts a signer. The push checks `opts` as
+/// [`push_tree`] does, then scans the tree, and then opens `session`. A
+/// refusal of the options, a walk error, and a hash error start no ssh
+/// client, send no request, and open no session. The other rules are those
+/// of [`push_tree`].
+pub async fn push_tree_prepared(
+    session: PreparedSession,
+    root: &Path,
+    opts: TreePushOptions,
+) -> Result<PushOutcome> {
+    let (scan, push) = Prepared::new(opts)?;
+    push.scan_and_run(session, root, scan).await
 }
 
 /// Push the directory `root` as one commit over a pair of byte streams, and
@@ -288,6 +309,18 @@ impl Prepared {
     /// progress handle.
     async fn scan(&self, root: &Path, scan: ScanOptions) -> Result<TreeModel> {
         TreeModel::scan_with(root, scan, self.progress.as_ref()).await
+    }
+
+    /// Scan the tree at `root`, open `transport`, and run the push.
+    async fn scan_and_run(
+        self,
+        transport: PreparedSession,
+        root: &Path,
+        scan: ScanOptions,
+    ) -> Result<PushOutcome> {
+        let model = self.scan(root, scan).await?;
+        let session = transport.open(&self.refs, self.session_options()).await?;
+        self.run(session, model).await
     }
 
     fn session_options(&self) -> SessionOptions {

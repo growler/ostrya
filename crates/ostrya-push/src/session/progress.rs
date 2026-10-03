@@ -113,8 +113,18 @@ pub struct PushStats {
     /// The objects sent in the object stream. A detached metadata object
     /// does not count.
     pub objects_sent: u64,
-    /// The bytes written to the stream: frames, chunk lengths, and object
-    /// bytes.
+    /// The bytes the session handed to its transport: frames, chunk
+    /// lengths, and object bytes.
+    ///
+    /// On a stream transport, each byte counts when the session writes it
+    /// to the stream. Over HTTP, the bodies of the requests count, and the
+    /// HTTP heads do not. A body given whole, as for `Hello`, `Have`, and
+    /// `Commit`, counts when the client handed its request to a connection:
+    /// when the request gets a response, and when it fails after the
+    /// hand-over. An object stream counts each byte it writes into its
+    /// request body once the request is handed over, and the bytes it wrote
+    /// before the hand-over at that time. A request that is never handed
+    /// over counts no byte.
     pub bytes_sent: u64,
     /// The object bytes sent, in the encoding they were sent in, without the
     /// chunk lengths. Detached metadata objects count.

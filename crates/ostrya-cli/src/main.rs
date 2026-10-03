@@ -46,10 +46,10 @@
 //!   repository.
 //! - `receive` -- the server side of a push over ssh: one session over
 //!   standard input and standard output. The `receive` feature builds it.
-//! - `push` -- push commits of the repository to a remote over ssh, and
-//!   update its refs. The `push` feature builds it.
-//! - `push-tree` -- push a directory to a remote over ssh as one commit, and
-//!   set its refs to that commit. The `push` feature builds it.
+//! - `push` -- push commits of the repository to a remote over ssh or HTTP,
+//!   and update its refs. The `push` feature builds it.
+//! - `push-tree` -- push a directory to a remote over ssh or HTTP as one
+//!   commit, and set its refs to that commit. The `push` feature builds it.
 //! - `serve` -- serve the repository over HTTP or HTTPS as an archive
 //!   repository, for pull, and without `--read-only` the receive endpoint of
 //!   a push over HTTP. The `serve` feature builds it.
@@ -166,10 +166,11 @@ enum Command {
     /// Receive one push session over standard input and standard output.
     #[cfg(feature = "receive")]
     Receive(ReceiveArgs),
-    /// Push commits to a remote over ssh and update its refs.
+    /// Push commits to a remote over ssh or HTTP and update its refs.
     #[cfg(feature = "push")]
     Push(PushArgs),
-    /// Push a directory to a remote over ssh as one commit and set its refs.
+    /// Push a directory to a remote over ssh or HTTP as one commit and set its
+    /// refs.
     #[cfg(feature = "push")]
     #[command(name = "push-tree")]
     PushTree(PushTreeArgs),
@@ -1513,6 +1514,26 @@ struct PushArgs {
         value_parser = clap::value_parser!(u8).range(1..=9)
     )]
     compress: Option<u8>,
+    #[command(flatten)]
+    connect: PushConnectArgs,
+    /// The remote: a `[remote "<name>"]` section of this repository's config
+    /// with a push address, or an ssh, `http://`, or `https://` address.
+    /// Required; checked after the repository resolves.
+    remote: Option<String>,
+    /// The refspecs, each SRC[:DST]. SRC is a revision of this repository and
+    /// DST the ref of the server that takes its commit; DST defaults to SRC
+    /// when SRC is a ref. `:DST` deletes the ref DST of the server. At least
+    /// one is required.
+    refspecs: Vec<String>,
+}
+
+/// The options of `push` and `push-tree` that say how the push reaches the
+/// remote. The ssh options apply to an ssh address, and the other options to
+/// an `http://` or `https://` address. An option of the other transport is
+/// refused. Each option wins over the key of the remote that has its name.
+#[cfg(feature = "push")]
+#[derive(Args)]
+struct PushConnectArgs {
     /// The ssh command, split at ASCII whitespace. It wins over the
     /// OSTRYA_SSH_COMMAND environment variable and over the `ssh-command` key
     /// of the remote.
@@ -1523,15 +1544,35 @@ struct PushArgs {
     /// `ostrya receive`.
     #[arg(long, value_name = "CMD")]
     receive_command: Option<String>,
-    /// The remote: a `[remote "<name>"]` section of this repository's config
-    /// with a push address, or an ssh address. Required; checked after the
-    /// repository resolves.
-    remote: Option<String>,
-    /// The refspecs, each SRC[:DST]. SRC is a revision of this repository and
-    /// DST the ref of the server that takes its commit; DST defaults to SRC
-    /// when SRC is a ref. `:DST` deletes the ref DST of the server. At least
-    /// one is required.
-    refspecs: Vec<String>,
+    /// The file whose first line is the token of an HTTP push. It wins over
+    /// the `push-token-file` key of the remote.
+    #[arg(long, value_name = "FILE")]
+    push_token_file: Option<PathBuf>,
+    /// Send the token as the password of a Basic credential with this name,
+    /// in place of a bearer token. It needs a token file, and it wins over
+    /// the `push-user` key of the remote.
+    #[arg(long, value_name = "NAME")]
+    push_user: Option<String>,
+    /// The PEM file of the client certificate of an HTTPS push. It needs a
+    /// key file: --tls-client-key-path or the `tls-client-key-path` key of
+    /// the remote. It wins over the `tls-client-cert-path` key of the remote.
+    #[arg(long, value_name = "FILE")]
+    tls_client_cert_path: Option<PathBuf>,
+    /// The PEM file of the private key of the client certificate, which needs
+    /// no passphrase. It needs a certificate file: --tls-client-cert-path or
+    /// the `tls-client-cert-path` key of the remote. It wins over the
+    /// `tls-client-key-path` key of the remote.
+    #[arg(long, value_name = "FILE")]
+    tls_client_key_path: Option<PathBuf>,
+    /// The PEM file of the CA certificates that verify the server, in place
+    /// of the trust store of the host. It wins over the `tls-ca-path` key of
+    /// the remote.
+    #[arg(long, value_name = "FILE")]
+    tls_ca_path: Option<PathBuf>,
+    /// Send the token to an `http://` address. Without it, a token to such an
+    /// address is refused before any request.
+    #[arg(long)]
+    allow_cleartext_credentials: bool,
 }
 
 #[cfg(feature = "push")]
@@ -1619,20 +1660,12 @@ struct PushTreeArgs {
         value_parser = clap::value_parser!(u8).range(1..=9)
     )]
     compress: Option<u8>,
-    /// The ssh command, split at ASCII whitespace. It wins over the
-    /// OSTRYA_SSH_COMMAND environment variable and over the `ssh-command` key
-    /// of the remote.
-    #[arg(long, value_name = "CMD")]
-    ssh_command: Option<String>,
-    /// The command the remote side runs, which the remote shell parses. It
-    /// wins over the `receive-command` key of the remote. The default is
-    /// `ostrya receive`.
-    #[arg(long, value_name = "CMD")]
-    receive_command: Option<String>,
-    /// The remote: an ssh address, or a `[remote "<name>"]` section with a
-    /// push address in the config of the repository that --repo, the current
-    /// directory, or OSTREE_REPO names. An address opens no repository.
-    /// Required.
+    #[command(flatten)]
+    connect: PushConnectArgs,
+    /// The remote: an ssh, `http://`, or `https://` address, or a
+    /// `[remote "<name>"]` section with a push address in the config of the
+    /// repository that --repo, the current directory, or OSTREE_REPO names.
+    /// An address opens no repository. Required.
     remote: Option<String>,
     /// The directory to commit. Required.
     dir: Option<PathBuf>,
@@ -2059,8 +2092,8 @@ async fn receive(repo: Repo, args: ReceiveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Push the commits the refspecs name to a remote over ssh, and update its
-/// refs in one transaction.
+/// Push the commits the refspecs name to a remote over ssh or HTTP, and
+/// update its refs in one transaction.
 ///
 /// Standard output carries one line for each ref, in the order of the
 /// refspecs, and nothing else. Under `--verbose` one statistics line goes to
@@ -2078,7 +2111,7 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
         depth: args.depth,
         compression: push_compression(args.compress),
         force: args.force,
-        connect: push_connect_options(args.ssh_command, args.receive_command),
+        connect: push_connect_options(args.connect),
         detached_metadata_filter: detached_metadata_filter(&repo)?,
         progress: None,
     };
@@ -2110,14 +2143,12 @@ fn push_compression(level: Option<u8>) -> ostrya::push::Compression {
     }
 }
 
-/// The connect options of `--ssh-command` and `--receive-command`. The ssh
-/// command is split at ASCII whitespace.
+/// The connect options of `--ssh-command`, `--receive-command`, and the HTTP
+/// options, each in the field of its name, so the push refuses an option of
+/// the other transport. The ssh command is split at ASCII whitespace.
 #[cfg(feature = "push")]
-fn push_connect_options(
-    ssh_command: Option<String>,
-    receive_command: Option<String>,
-) -> ostrya::push::ConnectOptions {
-    let ssh_command = ssh_command.map(|command| {
+fn push_connect_options(args: PushConnectArgs) -> ostrya::push::ConnectOptions {
+    let ssh_command = args.ssh_command.map(|command| {
         command
             .split_ascii_whitespace()
             .map(str::to_owned)
@@ -2125,21 +2156,31 @@ fn push_connect_options(
     });
     ostrya::push::ConnectOptions {
         ssh_command,
-        receive_command,
+        receive_command: args.receive_command,
+        push_token_file: args.push_token_file,
+        push_user: args.push_user,
+        tls_ca_path: args.tls_ca_path,
+        tls_client_cert_path: args.tls_client_cert_path,
+        tls_client_key_path: args.tls_client_key_path,
+        allow_cleartext_credentials: args.allow_cleartext_credentials,
         ..Default::default()
     }
 }
 
-/// Push the directory DIR to a remote over ssh as one commit, and set each
-/// target ref of the server to it in one transaction.
+/// Push the directory DIR to a remote over ssh or HTTP as one commit, and set
+/// each target ref of the server to it in one transaction.
 ///
 /// The owner ids are read first, in `run`. The operands are checked next, in
-/// the order REMOTE, DIR, and `-b`, each with the usage text. The options the
-/// command reads itself are then checked, the signing keys included, before
-/// a repository opens, and the body file is read last. The push refuses the
-/// other bad refs before the scan, and both come before the ssh client
-/// starts. A remote name is looked up in the repository that `--repo`,
-/// the current directory, or `OSTREE_REPO` gives. An address opens no
+/// the order REMOTE, DIR, and `-b`, each with the usage text. The other
+/// options the command reads itself, except the signing keys and the body
+/// file, are then checked before a repository opens. The command then
+/// resolves the remote and makes the transport ready: it refuses an option
+/// of the other transport and the bad HTTP options, and reads the token file
+/// and the TLS files of an HTTP push. The signing keys are checked next, and
+/// the body file is read last. The push refuses the other bad refs before the
+/// scan. All of these come before the ssh client starts or the first HTTP
+/// request. A remote name is looked up in the repository that `--repo`, the
+/// current directory, or `OSTREE_REPO` gives. An address opens no
 /// repository, so none of the three is read for it.
 ///
 /// Standard output carries the commit checksum alone. Under `--verbose` one
@@ -2205,6 +2246,17 @@ async fn push_tree(
         },
         None => None,
     };
+    // The transport is made ready before a signer can start gpg and before
+    // the body file is read, so a refusal of the remote or of its options
+    // costs neither.
+    let connect = push_connect_options(args.connect);
+    let (address, connect) = if ostrya::is_push_address(remote) {
+        ostrya::resolve_push_remote(None, remote, connect)?
+    } else {
+        let (repo, _) = resolve_repo(repo, verbose, name).await;
+        ostrya::resolve_push_remote(Some(repo.config()), remote, connect)?
+    };
+    let transport = ostrya::push::PushSession::prepare(&address, connect).await?;
     let signers = refuse!(
         collect_signers(
             &args.sign,
@@ -2219,13 +2271,6 @@ async fn push_tree(
     let body = match args.body_file.as_deref() {
         Some(path) => Some(refuse!(read_body_file(path))),
         None => args.body,
-    };
-    let connect = push_connect_options(args.ssh_command, args.receive_command);
-    let (address, connect) = if ostrya::is_push_address(remote) {
-        ostrya::resolve_push_remote(None, remote, connect)?
-    } else {
-        let (repo, _) = resolve_repo(repo, verbose, name).await;
-        ostrya::resolve_push_remote(Some(repo.config()), remote, connect)?
     };
     let opts = ostrya::push::TreePushOptions {
         refs: args.branch,
@@ -2243,7 +2288,7 @@ async fn push_tree(
         force: args.force,
         progress: None,
     };
-    let outcome = ostrya::push::push_tree(&address, dir, connect, opts).await?;
+    let outcome = ostrya::push::push_tree_prepared(transport, dir, opts).await?;
     let commit = outcome.commit.expect("a tree push names its commit");
     // The refs are written on the remote at this point. A failed write to
     // standard output, a full device or a closed pipe, is reported as the

@@ -2702,10 +2702,12 @@ the ordered mirror list, extra headers, basic-auth credentials, the TLS options,
 whether HTTP/2 is offered, the retry count (5), the in-flight limit (8), the
 connect deadline (30s) and the progress deadline (60s). `Fetcher::new` is async:
 `TrustRoots::System`, the default, reads the host trust store, which goes to the
-blocking pool through `rt::unblock`, keeping that the only door to it. The TLS
-configuration is built whatever the mirrors' scheme is, so a cleartext-only
-fetcher reads the store as well; under `TrustRoots::Pem` the constructor stays in
-memory and never yields. A system store holding no certificate fails the
+blocking pool through `rt::unblock`, keeping that the only door to it. The
+constructor reads the store when a fetch can open a handshake: when a mirror is
+`https`, when the mirror list is empty, and when `max_redirects` is above zero,
+since a redirect can lead to an `https` URL. A fetcher whose mirrors are all
+`http` and that follows no redirect reads no store and holds no anchors. Under
+`TrustRoots::Pem` the constructor stays in memory and never yields. A system store holding no certificate fails the
 constructor when at least one mirror is `https`, whose handshake needs the
 anchors, and when the mirror list is empty, since a request may then name an
 `https` URL of its own; a host without a CA bundle -- a container without
@@ -7084,14 +7086,17 @@ turns on, and it adds no other dependency. Under it, `ostrya::push` re-exports
 `ostrya-push`, and `resolve_push_remote` gives the push address and the
 connect options of a configured remote or of an address. `is_push_address`
 tells an address from a remote name. `Repo::push` pushes the commits of a set
-of refspecs to a remote over ssh. `Repo::push_over_stream` runs the same push
+of refspecs to a remote over ssh or HTTP. `Repo::push_over_stream` runs the same push
 over a pair of byte streams. Both take the options of `RepoPushOptions`. The
 push holds the lock of the local repository shared for the whole push. It
 reads the commits before the session opens, and it offers the commits first.
 It then offers the trees of the new values and of the history commits that the
 server lacks (`docs/api-sketch.md`, "Push from a repository"). The push keys
-of a remote section, `push-url`, `ssh-command`, and `receive-command`, are
-read through `Remote` in every build. `ostrya-cli` has the feature
+of a remote section, `push-url`, `ssh-command`, `receive-command`,
+`push-token-file`, and `push-user`, are read through `Remote` in every build.
+`resolve_push_remote` applies the keys of the transport of the push address
+alone, and refuses `tls-permissive=true` for an `https://` address
+(`format-reference.md`, "Port extension: the push keys of a remote"). `ostrya-cli` has the feature
 `push = ["ostrya/push"]` in its default set, which builds `ostrya push` and
 `ostrya push-tree`, beside `receive = ["ostrya/receive"]`, which builds
 `ostrya receive`.
@@ -7123,7 +7128,12 @@ their idle timeout and limit, `DELETE`, the status of each error, and the
 authentication of each request with a bearer token, a Basic credential, a
 client certificate, or as an anonymous push (`docs/api-sketch.md`,
 "Archive view and HTTP server", and `docs/conformance/cli-surface.md`,
-"serve"). The HTTP push transport is to come.
+"serve"). The HTTP push transport is done: `PushSession::connect`,
+`push_tree`, and `Repo::push` take an `http://` or `https://` address, with
+a bearer token, a Basic credential, or a client certificate, and with
+`min(parallel-uploads, 31)` object streams (`docs/api-sketch.md`, "Push
+transports"). `ostrya push` and `ostrya push-tree` take the HTTP options and
+the HTTP keys of a remote (`docs/conformance/cli-surface.md`, "push").
 
 Pull over ssh follows push as separate work.
 
@@ -7146,6 +7156,21 @@ with a commit, `--no-bindings`, and an explicit `--timestamp`. With
 `--sign` and `--sign-from-file`, the `.commitmeta` bytes equal those of the
 tool. A push signed with ed25519 verifies with `ostree sign --verify` in
 the receiving repository, and `ostree fsck` passes on each receiver.
+
+Result of the HTTP half: `crates/ostrya-cli/tests/push_http.rs` runs the
+library against `ostrya_server` in the same process, and the commands
+against `ostrya serve`. Over HTTPS a push with a bearer token, with a Basic
+credential, and with a client certificate sets its ref, and a push with no
+credential fails with `unauthorized`. A token over `http://` is refused
+before any connection, and with `--allow-cleartext-credentials` the push
+succeeds. A tree push and its repeat pass over HTTP. `ostrya push` to a
+remote takes `url` or `push-url`, `push-token-file`, and `push-user` from
+the remote, and each option wins over its key. The `objects` requests in
+flight stay within `parallel-uploads`. A commit whose response is lost
+gives `CommitOutcomeUnknown`, and the client sends it once. After `ostrya
+push` over HTTPS to `ostrya serve`, the receiving `bare-user` repository
+passes `ostree fsck`, and `ostree pull` over HTTPS from the archive view of
+the same server gives the pushed commit.
 
 ### Phase 20 -- Sysroot / deployment (optional, separate track)
 

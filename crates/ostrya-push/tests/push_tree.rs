@@ -1,6 +1,7 @@
 //! The refusals of a tree push before a session: a walk error, a hash error,
-//! and the options the push refuses before the scan start no ssh client, and
-//! the push over a pair of streams writes no byte for them.
+//! and the options the push refuses before the scan start no ssh client and
+//! send no request, and the push over a pair of streams writes no byte for
+//! them.
 
 #![cfg(unix)]
 
@@ -308,6 +309,8 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
         invalid_input(tag, e, part);
     }
 
+    // An ssh option with an HTTP address, and a token to an `http://`
+    // address without the cleartext switch, are refused before any request.
     let marker = scratch.path.join("started");
     let remote = PushRemote::parse("http://host/repo").unwrap();
     let result = ostrya_rt::block_on(push_tree(
@@ -317,5 +320,13 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
         options(&["main"]),
     ));
     assert!(!marker.exists(), "http: the ssh client started");
-    invalid_input("http", result.unwrap_err(), "HTTP");
+    invalid_input("http", result.unwrap_err(), "is an HTTP address");
+    let token = scratch.path.join("token");
+    fs::write(&token, b"token\n").unwrap();
+    let connect = ConnectOptions {
+        push_token_file: Some(token),
+        ..Default::default()
+    };
+    let result = ostrya_rt::block_on(push_tree(&remote, &root, connect, options(&["main"])));
+    invalid_input("cleartext", result.unwrap_err(), "cleartext");
 }

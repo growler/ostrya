@@ -370,6 +370,27 @@ impl<R: AsyncRead + Unpin> AsyncRead for ObjectBody<'_, R> {
     }
 }
 
+/// The frame of `msg`: the length, the kind, and the body. A frame over
+/// `limit` is the error `limit-exceeded`. A caller that sends the frame as
+/// one buffer takes it from here with no copy of its own.
+pub(crate) fn encode_frame(msg: &Message, limit: u32) -> Result<Vec<u8>> {
+    let body = msg.encode_body()?;
+    let len = u32::try_from(body.len() + 1)
+        .ok()
+        .filter(|len| *len <= limit)
+        .ok_or_else(|| {
+            Error::LimitExceeded(format!(
+                "frame of {} bytes is over the limit {limit}",
+                body.len() + 1
+            ))
+        })?;
+    let mut frame = Vec::with_capacity(4 + len as usize);
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.push(msg.kind().as_u8());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
 /// Writes frames and object chunks to a stream.
 ///
 /// The writer does not flush and holds no object bytes. The caller flushes
@@ -418,21 +439,7 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
             self.in_object = true;
             return Ok(());
         }
-        let body = msg.encode_body()?;
-        let len = u32::try_from(body.len() + 1)
-            .ok()
-            .filter(|len| *len <= self.limit)
-            .ok_or_else(|| {
-                Error::LimitExceeded(format!(
-                    "frame of {} bytes is over the limit {}",
-                    body.len() + 1,
-                    self.limit
-                ))
-            })?;
-        let mut frame = Vec::with_capacity(4 + len as usize);
-        frame.extend_from_slice(&len.to_be_bytes());
-        frame.push(msg.kind().as_u8());
-        frame.extend_from_slice(&body);
+        let frame = encode_frame(msg, self.limit)?;
         self.inner.write_all(&frame).await?;
         self.in_object = false;
         Ok(())

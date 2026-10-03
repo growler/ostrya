@@ -354,6 +354,34 @@ fn a_failed_commit_ends_the_session() {
     assert!(staging_entries(repo.path()).is_empty());
 }
 
+/// A `Commit` whose reply could be over the frame limit once the refs are
+/// read is `limit-exceeded`, and the server writes no ref. Each update
+/// expects its ref absent, so the request states no old commit, and the
+/// reply can state one for each ref.
+#[test]
+fn a_commit_whose_reply_cannot_fit_writes_no_ref() {
+    let tmp = TmpDir::new("svc-commit-reply-limit");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let names: Vec<String> = (0..15_000).map(|i| format!("refs-{i:015}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let service = open(&repo, 1, &refs);
+    let request = CommitRequest {
+        updates: names
+            .iter()
+            .map(|name| RefUpdate {
+                name: name.clone(),
+                expected: Expected::Absent,
+                new: Some(fixture_commit()),
+            })
+            .collect(),
+        force: false,
+    };
+    let result = block_on(service.commit(request));
+    assert_eq!(code(&result), Some(ErrorCode::LimitExceeded));
+    assert_eq!(block_on(repo.resolve_rev(&names[0], true)).unwrap(), None);
+    assert!(staging_entries(repo.path()).is_empty());
+}
+
 /// The same objects on two streams at the same time both succeed, and the
 /// commit publishes each object once. Both streams stop in the middle of the
 /// largest content object until the other reaches the same point, so each

@@ -9,7 +9,7 @@ use std::time::Duration;
 use futures_io::AsyncRead;
 use futures_lite::future;
 use futures_lite::io::AsyncReadExt;
-use hyper::body::{Body, Bytes, Incoming};
+use hyper::body::{Body, Buf, Bytes};
 use ostrya::push;
 use ostrya::push::proto::{Kind, MAX_FRAME, Message};
 use ostrya_rt as rt;
@@ -25,14 +25,20 @@ const MAX_DRAIN: u64 = 1024 * 1024;
 /// timeout of the sessions bounds the read too.
 const MAX_DRAIN_TIME: Duration = Duration::from_secs(5);
 
-/// A request body as an `AsyncRead`. One read takes the frames that hyper
-/// has ready until the buffer of the read is full, and the bytes of a frame
-/// that a read does not take wait for the next read. Trailers are ignored.
-/// With a tracker, the body records in its session when it starts to wait
-/// for the client, when it delivers bytes again, and when hyper fails it. A
-/// body that the server does not poll does not wait, and a read that
+/// The most frames that give no bytes, empty data frames and trailers, that
+/// one read takes before it gives the task back to the runtime.
+const MAX_EMPTY_FRAMES: usize = 64;
+
+/// A request body as an `AsyncRead`. One read takes the frames that the
+/// body has ready until the buffer of the read is full, and the bytes of a
+/// frame that a read does not take wait for the next read. Trailers are
+/// ignored. A read gives the task back to the runtime after
+/// [`MAX_EMPTY_FRAMES`] frames that give no bytes. With a tracker, the body
+/// records in its session when it starts to wait for the client, when it
+/// delivers bytes again, and when it fails.
+/// A body that the server does not poll does not wait, and a read that
 /// returns bytes does not wait either.
-pub(crate) struct RequestBody<B = Incoming> {
+pub(crate) struct RequestBody<B> {
     inner: B,
     /// The bytes of the last frame that no read took yet.
     rest: Bytes,
@@ -81,10 +87,12 @@ where
     ) -> Poll<io::Result<usize>> {
         let me = self.get_mut();
         let mut n = 0;
+        let mut empty = 0;
         loop {
             if !me.rest.is_empty() {
                 let take = me.rest.len().min(buf.len() - n);
-                buf[n..n + take].copy_from_slice(&me.rest.split_to(take));
+                buf[n..n + take].copy_from_slice(&me.rest[..take]);
+                me.rest.advance(take);
                 n += take;
             }
             if me.ended || n == buf.len() {
@@ -107,9 +115,22 @@ where
                     return Poll::Ready(Err(io::Error::other(e)));
                 }
                 Poll::Ready(Some(Ok(frame))) => {
-                    if let Ok(data) = frame.into_data() {
-                        me.rest = data;
-                        me.set_waiting(false);
+                    match frame.into_data() {
+                        Ok(data) => {
+                            if data.is_empty() {
+                                empty += 1;
+                            }
+                            me.rest = data;
+                            me.set_waiting(false);
+                        }
+                        Err(_) => empty += 1,
+                    }
+                    if empty == MAX_EMPTY_FRAMES {
+                        if n > 0 {
+                            return Poll::Ready(Ok(n));
+                        }
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
                     }
                 }
             }
@@ -177,7 +198,11 @@ fn drain_time(idle: Duration) -> Duration {
 /// Read and drop the bytes of `body`, up to [`MAX_DRAIN`] bytes and for at
 /// most the shorter of `idle` and [`MAX_DRAIN_TIME`]. `true` when the body
 /// reached its end.
-pub(crate) async fn drain(mut body: Incoming, idle: Duration) -> bool {
+pub(crate) async fn drain<B>(mut body: B, idle: Duration) -> bool
+where
+    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     if body.is_end_stream() {
         return true;
     }
@@ -189,11 +214,14 @@ pub(crate) async fn drain(mut body: Incoming, idle: Duration) -> bool {
                 None => return true,
                 Some(Err(_)) => return false,
                 Some(Ok(frame)) => {
-                    if let Ok(data) = frame.into_data() {
-                        taken += data.len() as u64;
-                        if taken > MAX_DRAIN {
-                            return false;
-                        }
+                    // A frame that gives no bytes counts as one byte, so
+                    // that the limit also ends a body of such frames.
+                    taken += match frame.into_data() {
+                        Ok(data) => (data.len() as u64).max(1),
+                        Err(_) => 1,
+                    };
+                    if taken > MAX_DRAIN {
+                        return false;
                     }
                 }
             }
@@ -209,7 +237,10 @@ pub(crate) async fn drain(mut body: Incoming, idle: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::pin::pin;
+    use std::task::Waker;
 
+    use hyper::HeaderMap;
     use hyper::body::Frame;
     use ostrya::push::proto::FrameWriter;
     use ostrya_rt::block_on;
@@ -243,6 +274,80 @@ mod tests {
                 }
                 Some(Some(bytes)) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
             }
+        }
+    }
+
+    /// A body that gives `first` as one data frame when it is not empty,
+    /// and then frames that give no bytes without end: trailers when
+    /// `trailers` is set, and empty data frames otherwise. `polls` counts
+    /// the frames that the body gave.
+    struct Endless {
+        first: Bytes,
+        trailers: bool,
+        polls: usize,
+    }
+
+    impl Endless {
+        fn new(first: &[u8], trailers: bool) -> Endless {
+            Endless {
+                first: Bytes::copy_from_slice(first),
+                trailers,
+                polls: 0,
+            }
+        }
+    }
+
+    impl Body for Endless {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
+            self.polls += 1;
+            let frame = if !self.first.is_empty() {
+                Frame::data(std::mem::take(&mut self.first))
+            } else if self.trailers {
+                Frame::trailers(HeaderMap::new())
+            } else {
+                Frame::data(Bytes::new())
+            };
+            Poll::Ready(Some(Ok(frame)))
+        }
+    }
+
+    /// A read of a body that gives frames without bytes without end gives
+    /// the task back after [`MAX_EMPTY_FRAMES`] such frames. The read is
+    /// `Pending` when it has no bytes, and gives the bytes that it has
+    /// otherwise.
+    #[test]
+    fn a_read_yields_on_frames_without_bytes() {
+        let mut cx = Context::from_waker(Waker::noop());
+        for trailers in [false, true] {
+            let mut body = RequestBody::new(Endless::new(b"", trailers), None);
+            {
+                let read = pin!(read_message(&mut body));
+                assert!(read.poll(&mut cx).is_pending());
+            }
+            assert_eq!(body.inner.polls, MAX_EMPTY_FRAMES);
+
+            let mut body = RequestBody::new(Endless::new(b"ab", trailers), None);
+            let mut buf = [0u8; 4];
+            let read = Pin::new(&mut body).poll_read(&mut cx, &mut buf);
+            assert!(matches!(read, Poll::Ready(Ok(2))), "{read:?}");
+            assert_eq!(&buf[..2], b"ab");
+            assert_eq!(body.inner.polls, 1 + MAX_EMPTY_FRAMES);
+        }
+    }
+
+    /// A drain of a body that gives frames without bytes without end stops
+    /// at the byte limit, because each frame counts as one byte at least.
+    #[test]
+    fn a_drain_stops_on_frames_without_bytes() {
+        for trailers in [false, true] {
+            let body = Endless::new(b"", trailers);
+            assert!(!block_on(drain(body, Duration::from_secs(300))));
         }
     }
 

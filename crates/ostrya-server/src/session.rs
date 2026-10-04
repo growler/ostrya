@@ -120,9 +120,9 @@ struct Entry {
     /// The commit of the session runs. The sweep and a `DELETE` leave the
     /// session alone.
     committing: bool,
-    /// A request body of the session failed in hyper, as when the client
-    /// closed the connection. A failed request then ends the session with
-    /// the cause of a request that ended before its response.
+    /// A request body of the session failed, as when the client closed the
+    /// connection. A failed request then ends the session with the cause of
+    /// a request that ended before its response.
     cut: bool,
 }
 
@@ -253,8 +253,8 @@ impl SessionTable {
 
     /// Remove the session `id` and end it after a failed request. A session
     /// that commits is left as it is, because its commit goes on and removes
-    /// it at the end. A session with a request body that failed in hyper
-    /// ends with the cause of a request that ended before its response.
+    /// it at the end. A session with a request body that failed ends with
+    /// the cause of a request that ended before its response.
     pub(crate) fn fail(&self, id: &SessionId) {
         let entry = {
             let mut state = self.lock();
@@ -517,7 +517,7 @@ impl BodyTrack {
         self.set(None);
     }
 
-    /// Record that the body failed in hyper, as when the client closed the
+    /// Record that the body failed, as when the client closed the
     /// connection.
     pub(crate) fn cut(&self) {
         if let Some(entry) = self.table.lock().entries.get_mut(&self.id) {
@@ -548,7 +548,7 @@ impl Drop for BodyTrack {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use ostrya::push::proto::Hello;
@@ -559,13 +559,13 @@ mod tests {
 
     /// A repository in a directory of its own, removed with the value once
     /// no staging directory is left.
-    struct TmpRepo {
+    pub(crate) struct TmpRepo {
         path: PathBuf,
-        repo: Repo,
+        pub(crate) repo: Repo,
     }
 
     impl TmpRepo {
-        fn new(tag: &str) -> TmpRepo {
+        pub(crate) fn new(tag: &str) -> TmpRepo {
             let path = std::env::temp_dir().join(format!(
                 "ostrya-server-session-{}-{tag}",
                 std::process::id()
@@ -672,8 +672,8 @@ mod tests {
     }
 
     /// A failed request ends its session with the cause of a failed request,
-    /// and with the cause of a cut request when hyper failed a body of the
-    /// session.
+    /// and with the cause of a cut request when a body of the session
+    /// failed.
     #[test]
     fn a_failed_request_names_a_cut_body() {
         let repo = TmpRepo::new("fail");

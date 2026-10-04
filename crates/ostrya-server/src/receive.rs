@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use futures_lite::future;
-use hyper::body::{Bytes, Frame, Incoming};
+use hyper::body::{Body, Bytes, Frame};
 use hyper::header::{ALLOW, CONNECTION, CONTENT_LENGTH, HeaderName, HeaderValue, WWW_AUTHENTICATE};
 use hyper::{Method, Request, Response, StatusCode, Version};
 use ostrya::push::proto::{ErrorMessage, MAX_FRAME, Message};
@@ -105,7 +105,11 @@ impl Route {
 impl Receive {
     /// The response to a request under [`PREFIX`] with a method other than
     /// `GET` and `HEAD`, which go to the archive view.
-    pub(crate) async fn handle(&self, peer: &Peer, req: Request<Incoming>) -> Response<ServeBody> {
+    pub(crate) async fn handle<B>(&self, peer: &Peer, req: Request<B>) -> Response<ServeBody>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let Some(route) = Route::parse(req.uri().path()) else {
             return self.refuse(req, empty(StatusCode::NOT_FOUND)).await;
         };
@@ -156,11 +160,15 @@ impl Receive {
     /// 5 seconds, whichever is shorter, so the client can read the response.
     /// On HTTP/1 a body that did not reach its end closes the connection
     /// after the response.
-    async fn refuse(
+    async fn refuse<B>(
         &self,
-        req: Request<Incoming>,
+        req: Request<B>,
         mut response: Response<ServeBody>,
-    ) -> Response<ServeBody> {
+    ) -> Response<ServeBody>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let version = req.version();
         let drained = drain(req.into_body(), self.table.idle()).await;
         if !drained && version <= Version::HTTP_11 {
@@ -174,7 +182,11 @@ impl Receive {
     /// `POST session`: read `Hello`, take a slot of the session limit, and
     /// open the session. The body must arrive in full within the idle
     /// timeout.
-    async fn open(&self, owner: Owner, req: Request<Incoming>) -> Response<ServeBody> {
+    async fn open<B>(&self, owner: Owner, req: Request<B>) -> Response<ServeBody>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let mut body = RequestBody::new(req.into_body(), None);
         let read = future::or(async { Some(read_message(&mut body).await) }, async {
             rt::Timer::after(self.table.idle()).await;
@@ -237,7 +249,11 @@ impl Receive {
     /// The task ends the session when the commit ends: with the cause of a
     /// commit when it succeeded, and with the cause of a failed request when
     /// it failed, panicked, or was dropped.
-    async fn commit(&self, active: &Active, mut body: RequestBody) -> Response<ServeBody> {
+    async fn commit<B>(&self, active: &Active, mut body: RequestBody<B>) -> Response<ServeBody>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let read = cancellable(active.cancel(), async {
             match read_message(&mut body).await? {
                 Message::Commit(request) => Ok(request),
@@ -294,7 +310,11 @@ impl Receive {
 }
 
 /// `POST session/ID/have`: read `Have`, and answer it.
-async fn have(active: &Active, mut body: RequestBody) -> Response<ServeBody> {
+async fn have<B>(active: &Active, mut body: RequestBody<B>) -> Response<ServeBody>
+where
+    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let result = cancellable(active.cancel(), async {
         let names = match read_message(&mut body).await? {
             Message::Have(names) => names,
@@ -308,7 +328,11 @@ async fn have(active: &Active, mut body: RequestBody) -> Response<ServeBody> {
 }
 
 /// `POST session/ID/objects`: read one object stream.
-async fn objects(active: &Active, body: RequestBody) -> Response<ServeBody> {
+async fn objects<B>(active: &Active, body: RequestBody<B>) -> Response<ServeBody>
+where
+    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     let result = cancellable(active.cancel(), active.service().objects(body)).await;
     step_response(active, result.map(|r| r.map(Message::ObjectsReply)))
 }
@@ -531,11 +555,21 @@ impl ReplyBody {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::marker::PhantomData;
+    use std::pin::Pin;
     use std::sync::Mutex;
+    use std::task::{Context, Poll};
+    use std::time::Duration;
 
     use super::*;
     use crate::body::tests::frames;
-    use ostrya::TransactionStats;
+    use crate::session::tests::TmpRepo;
+    use ostrya::push::proto::{CommitRequest, Hello, Kind};
+    use ostrya::push::{Expected, RefOutcome, RefUpdate};
+    use ostrya::{Checksum, ObjectName, ObjectType, TransactionStats};
     use ostrya_rt::block_on;
 
     #[test]
@@ -704,5 +738,255 @@ mod tests {
         ] {
             assert!(ok(&bad).is_none(), "{bad}");
         }
+    }
+
+    /// One step of a [`Pieces`] body.
+    enum Piece {
+        Bytes(Bytes),
+        /// `Pending` once, with the task woken at once.
+        Wait,
+        /// An error of the body.
+        Fail,
+    }
+
+    /// A request body that gives its bytes in pieces, with a wait before
+    /// each piece. It has the shape of the body of a router: `Send` and
+    /// `Unpin`, and not `Sync`.
+    struct Pieces {
+        steps: VecDeque<Piece>,
+        _not_sync: PhantomData<Cell<()>>,
+    }
+
+    impl Pieces {
+        /// The body of `bytes` in pieces of `size` bytes. With `fail_after`,
+        /// the body fails in place of the piece of that index.
+        fn new(bytes: &[u8], size: usize, fail_after: Option<usize>) -> Pieces {
+            let mut steps = VecDeque::new();
+            for (index, piece) in bytes.chunks(size).enumerate() {
+                steps.push_back(Piece::Wait);
+                if fail_after == Some(index) {
+                    steps.push_back(Piece::Fail);
+                    break;
+                }
+                steps.push_back(Piece::Bytes(Bytes::copy_from_slice(piece)));
+            }
+            Pieces {
+                steps,
+                _not_sync: PhantomData,
+            }
+        }
+    }
+
+    impl Body for Pieces {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
+            match self.steps.pop_front() {
+                None => Poll::Ready(None),
+                Some(Piece::Bytes(bytes)) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                Some(Piece::Wait) => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Some(Piece::Fail) => Poll::Ready(Some(Err(io::Error::other("the body broke")))),
+            }
+        }
+    }
+
+    /// `Pieces` is `Send` and `Unpin`, and not `Sync`. The second check is
+    /// ambiguous, and does not compile, for a type that is `Sync`.
+    const _: fn() = || {
+        fn send_unpin<T: Send + Unpin>() {}
+        send_unpin::<Pieces>();
+
+        trait NotSync<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> NotSync<()> for T {}
+        struct IsSync;
+        impl<T: ?Sized + Sync> NotSync<IsSync> for T {}
+        <Pieces as NotSync<_>>::check();
+    };
+
+    /// `future`, which must be `Send`.
+    fn send<F: Future + Send>(future: F) -> F {
+        future
+    }
+
+    /// An endpoint over `tmp` with anonymous push and at most `max`
+    /// sessions.
+    fn endpoint(tmp: &TmpRepo, max: usize) -> Receive {
+        Receive {
+            repo: tmp.repo.clone(),
+            policy: Arc::new(ReceivePolicy::default()),
+            auth: Auth {
+                anonymous: true,
+                client_ca: false,
+                cleartext: false,
+                credentials: Vec::new(),
+            },
+            parallel_uploads: 1,
+            on_report: None,
+            table: SessionTable::new(max, Duration::from_secs(60)),
+        }
+    }
+
+    /// The response to a `POST` of `path` under [`PREFIX`], with the frame of
+    /// `message` as a [`Pieces`] body in pieces of 3 bytes.
+    async fn post(
+        receive: &Receive,
+        path: &str,
+        message: &Message,
+        fail_after: Option<usize>,
+    ) -> Response<ServeBody> {
+        let peer = Peer {
+            tls: false,
+            cert: None,
+        };
+        let bytes = encode(message).unwrap();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{PREFIX}{path}"))
+            .body(Pieces::new(&bytes, 3, fail_after))
+            .unwrap();
+        send(receive.handle(&peer, req)).await
+    }
+
+    /// The status of `response`, and the message of its body.
+    async fn answer(response: Response<ServeBody>) -> (StatusCode, Message) {
+        let status = response.status();
+        let bytes = frames(response.into_body()).await.unwrap().concat();
+        let message = Message::decode(Kind::from_u8(bytes[4]).unwrap(), &bytes[5..]).unwrap();
+        (status, message)
+    }
+
+    fn hello() -> Message {
+        Message::Hello(Hello {
+            version: 1,
+            agent: None,
+            refs: vec!["main".into()],
+            one_way: false,
+        })
+    }
+
+    fn delete_main() -> Message {
+        Message::Commit(CommitRequest {
+            updates: vec![RefUpdate {
+                name: "main".into(),
+                expected: Expected::Absent,
+                new: None,
+            }],
+            force: false,
+        })
+    }
+
+    /// Open a session, and give its id.
+    async fn open(receive: &Receive) -> String {
+        let response = post(receive, "session", &hello(), None).await;
+        let id = response.headers()[SESSION_HEADER]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let (status, reply) = answer(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(matches!(reply, Message::HelloReply(_)), "{reply:?}");
+        id
+    }
+
+    /// The `Error` message of a failed step.
+    fn error(reply: Message) -> ErrorMessage {
+        match reply {
+            Message::Error(e) => e,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Each step of a session takes a body that is not `Sync`, and the
+    /// future of the request is `Send`. A body that fails inside its frame
+    /// is `internal` and ends the session, and after its response an
+    /// `open` whose body fails holds no slot.
+    #[test]
+    fn the_steps_take_a_body_that_is_not_sync() {
+        let tmp = TmpRepo::new("receive-steps");
+        let receive = endpoint(&tmp, 2);
+        block_on(async {
+            let id = open(&receive).await;
+            let absent = ObjectName::new(Checksum::sha256(b"absent"), ObjectType::DirTree);
+            let have = Message::Have(vec![absent]);
+            let response = post(&receive, &format!("session/{id}/have"), &have, None).await;
+            let (status, reply) = answer(response).await;
+            assert_eq!(status, StatusCode::OK);
+            let Message::HaveReply(reply) = reply else {
+                panic!("{reply:?}");
+            };
+            assert!(reply.is_missing(0));
+
+            let end = Message::ObjectsEnd;
+            let response = post(&receive, &format!("session/{id}/objects"), &end, None).await;
+            let (status, reply) = answer(response).await;
+            assert_eq!(status, StatusCode::OK);
+            let Message::ObjectsReply(reply) = reply else {
+                panic!("{reply:?}");
+            };
+            assert_eq!(reply.objects, 0);
+
+            let commit = delete_main();
+            let response = post(&receive, &format!("session/{id}/commit"), &commit, None).await;
+            let (status, reply) = answer(response).await;
+            assert_eq!(status, StatusCode::OK);
+            let Message::CommitReply(refs) = reply else {
+                panic!("{reply:?}");
+            };
+            let outcome = RefOutcome {
+                name: "main".into(),
+                old: None,
+                new: None,
+            };
+            assert_eq!(refs, vec![outcome]);
+            let id = SessionId::parse(&id).unwrap();
+            assert!(receive.table.lookup(&id, &Owner::Anonymous).is_none());
+
+            let id = open(&receive).await;
+            let response = post(&receive, &format!("session/{id}/commit"), &commit, Some(2)).await;
+            let (status, reply) = answer(response).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            let e = error(reply);
+            assert_eq!(e.code, ErrorCode::Internal);
+            assert!(e.message.contains("the body broke"), "{}", e.message);
+            let response = post(&receive, &format!("session/{id}/have"), &have, None).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+            let response = post(&receive, "session", &hello(), Some(1)).await;
+            let (status, reply) = answer(response).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            let e = error(reply);
+            assert_eq!(e.code, ErrorCode::Internal);
+            assert!(e.message.contains("the body broke"), "{}", e.message);
+            open(&receive).await;
+            open(&receive).await;
+            let response = post(&receive, "session", &hello(), None).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            receive.table.close_all();
+        });
+    }
+
+    /// A refusal drains a body that is not `Sync`. A body that reaches its
+    /// end keeps the connection, and a body that fails closes it.
+    #[test]
+    fn a_refusal_drains_a_body_that_is_not_sync() {
+        let tmp = TmpRepo::new("receive-refusal");
+        let receive = endpoint(&tmp, 1);
+        block_on(async {
+            let response = post(&receive, "nope", &hello(), None).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(response.headers().get(CONNECTION).is_none());
+            let response = post(&receive, "nope", &hello(), Some(1)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert_eq!(response.headers()[CONNECTION], "close");
+        });
     }
 }

@@ -114,6 +114,23 @@ impl RemoteSource {
         }
     }
 
+    /// The remote's `summary` and `summary.sig`, an absent one as `None`, in
+    /// the order the tool asks for them. The ssh source has the two requests
+    /// in flight together.
+    pub(crate) async fn summary_files(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        match self {
+            RemoteSource::Http(fetcher) => fetch_summary(fetcher).await,
+            RemoteSource::Ssh(ssh) => {
+                let (signature, summary) = futures_lite::future::zip(
+                    ssh.read_optional(SUMMARY_SIG_FILE, MAX_ROOT_FILE),
+                    ssh.read_optional(SUMMARY_FILE, MAX_ROOT_FILE),
+                )
+                .await;
+                Ok((summary?, signature?))
+            }
+        }
+    }
+
     /// The path of the remote ref `name`: percent-encoded for an HTTP
     /// request, and as written for the ssh source, whose `Get` carries no
     /// escape.

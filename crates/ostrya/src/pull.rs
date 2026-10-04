@@ -1,7 +1,8 @@
 //! Pull: importing refs and their objects from another repository.
 //!
 //! [`Repo::pull_local`] reads a local repository directly, described below;
-//! [`Repo::pull`] fetches from an HTTP remote, and
+//! [`Repo::pull`] fetches from an HTTP remote, or over ssh from a remote with
+//! an ssh address, and
 //! [`Repo::pull_over_stream`] from a server of the pull over ssh, both
 //! described in [`pull::http`](self::http). They share the options, the
 //! flags, the statistics, the ref-binding check, and the `.commitpartial`
@@ -184,6 +185,7 @@ use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
+mod address;
 mod delta;
 mod drive;
 pub mod http;
@@ -537,8 +539,10 @@ pub struct PullOptions {
     /// them completes it. A value that does not start with `/` is refused, and
     /// [`Repo::pull_local`] refuses the option.
     pub subpaths: Vec<String>,
-    /// The base URL an HTTP pull fetches from, overriding the remote's
-    /// configured `url`. `None` uses the configuration.
+    /// The address a pull from a remote reads: the base URL of an HTTP
+    /// remote, or an ssh address. It overrides the remote keys `pull-url` and
+    /// `url`, and `None` uses the configuration. [`Repo::pull`] states how the
+    /// value is read.
     pub url: Option<String>,
     /// Extra headers an HTTP pull sends with every request.
     pub http_headers: Vec<(String, String)>,
@@ -596,7 +600,9 @@ pub struct PullOptions {
     pub progress: Option<PullProgress>,
     /// The ssh command, the send command, and the remote ssh command of a
     /// pull over ssh, which resolve as the fields of
-    /// [`ConnectOptions`](crate::push::ConnectOptions) do for a push. An HTTP
+    /// [`ConnectOptions`](crate::push::ConnectOptions) do for a push. The
+    /// remote keys `ssh-command` and `send-command` fill `remote_ssh_command`
+    /// and `send_command` where they are `None`. An HTTP
     /// pull refuses `ssh_command` and `send_command` with
     /// [`Error::InvalidInput`], and does not read `remote_ssh_command`.
     /// [`Repo::pull_over_stream`] runs no ssh client, and refuses the same

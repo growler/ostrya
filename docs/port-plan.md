@@ -7103,7 +7103,7 @@ of a remote section, `push-url`, `ssh-command`, `receive-command`,
 `push-token-file`, and `push-user`, are read through `Remote` in every build.
 `resolve_push_remote` applies the keys of the transport of the push address
 alone, and refuses `tls-permissive=true` for an `https://` address
-(`format-reference.md`, "Port extension: the push keys of a remote"). `ostrya-cli` has the feature
+(`format-reference.md`, "Port extension: the push and pull keys of a remote"). `ostrya-cli` has the feature
 `push = ["ostrya/push"]` in its default set, which builds `ostrya push` and
 `ostrya push-tree`, beside `receive = ["ostrya/receive"]`, which builds
 `ostrya receive`, and `send = []`, which builds `ostrya send`.
@@ -7148,7 +7148,7 @@ session over a pair of streams through one `ArchiveView`, and takes no lock.
 (`docs/api-sketch.md`, "Pull over ssh: the serving side", and
 `docs/conformance/cli-surface.md`, "send").
 
-The client side of the pull over ssh is done in the library.
+The client side of the pull over ssh is done.
 `ostrya::push::PullSession` opens a pull session over a pair of streams or
 over the ssh client, keeps up to 8 `Get` frames in flight on the one stream,
 and gives the body of each found reply as a `PullBody`. The pull driver of
@@ -7157,9 +7157,18 @@ fetcher, with no change in behavior, or the ssh source over a
 `PullSession`. `Repo::pull_over_stream` runs the pull through the ssh source
 over a pair of streams, and `PullOptions::connect` carries the ssh command,
 the send command, and the remote ssh command (`docs/api-sketch.md`, "Pull
-over ssh: the client side"). The ssh address in `PullOptions::url`, the
-remote keys `pull-url` and `send-command`, and the commands of `ostrya-cli`
-follow as separate work.
+over ssh: the client side"). `Repo::pull` and `Repo::remote_fetch_summary`
+run over the ssh client for an ssh address in `PullOptions::url` or in the
+remote key `pull-url`. The remote keys `ssh-command` and `send-command` fill
+the fields of `PullOptions::connect` that the caller leaves `None`, and the
+pull reads `Remote::pull_url` and `Remote::send_command` in every build
+(`format-reference.md`, "Port extension: the push and pull keys of a
+remote"). `ostrya pull`, `ostrya remote refs`, and `ostrya remote summary`
+work for a remote whose `pull-url` is an ssh address
+(`docs/conformance/cli-surface.md`, "pull"). A pull between two port
+repositories over ssh to localhost gives a repository that passes `ostree
+fsck`, and `ostree rev-parse` resolves the pulled ref to the source commit
+(`crates/ostrya-cli/tests/pull_ssh.rs`).
 
 Verify: push between two port repositories over ssh to localhost and over
 HTTP. The receiving repository passes `ostree fsck` and resolves the pushed

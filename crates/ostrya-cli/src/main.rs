@@ -41,7 +41,8 @@
 //! - `static-delta` -- list the repository's static deltas, apply one offline,
 //!   generate one, rebuild the delta index cache, show a delta's superblock and
 //!   parts, or list the index cache.
-//! - `pull` -- fetch refs and their objects from an HTTP remote.
+//! - `pull` -- fetch refs and their objects from an HTTP remote, or over ssh
+//!   from a remote whose `pull-url` is an ssh address.
 //! - `pull-local` -- import refs and their objects from another local
 //!   repository.
 //! - `receive` -- the server side of a push over ssh: one session over
@@ -158,7 +159,8 @@ enum Command {
     /// List, generate, apply, or index static deltas.
     #[command(name = "static-delta")]
     StaticDelta(StaticDeltaArgs),
-    /// Fetch refs and their objects from an HTTP remote.
+    /// Fetch refs and their objects from an HTTP remote, or over ssh from a
+    /// remote whose pull-url is an ssh address.
     Pull(PullArgs),
     /// Import refs and their objects from another local repository.
     #[command(name = "pull-local")]
@@ -1263,9 +1265,10 @@ struct DeltaGenerateArgs {
 
 #[derive(Args)]
 struct PullArgs {
-    /// Fetch from this URL instead of the remote's configured `url`. A remote
-    /// the config does not describe can be pulled from this way; it supplies no
-    /// keys, so such a pull states its own signature policy or is refused.
+    /// Fetch from this address instead of the remote's configured `pull-url`
+    /// or `url`: an HTTP URL, or an ssh address. A remote the config does not
+    /// describe can be pulled from this way; it supplies no keys, so such a
+    /// pull states its own signature policy or is refused.
     #[arg(long)]
     url: Option<String>,
     /// Write the pulled refs as local refs, take every ref the remote's summary
@@ -2602,7 +2605,7 @@ fn update_interval(frequency: Option<u32>) -> std::time::Duration {
     }
 }
 
-/// Fetch refs and their objects from an HTTP remote.
+/// Fetch refs and their objects from an HTTP remote, or over ssh.
 ///
 /// Standard output that is a terminal carries a progress line, redrawn every
 /// `redraw`, and the statistics line is drawn over it. Other standard output
@@ -2877,8 +2880,8 @@ fn detached_metadata_filter(repo: &Repo) -> Result<DetachedMetadataFilter> {
 /// Where a pull took its objects from, which decides the statistics line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullSource {
-    /// An HTTP remote, or another local repository read as a fetch because the
-    /// pull requires static deltas.
+    /// An HTTP or ssh remote, or another local repository read as a fetch
+    /// because the pull requires static deltas.
     Http,
     /// Another local repository.
     Local,

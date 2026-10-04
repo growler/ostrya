@@ -211,6 +211,7 @@
 //! streams, through an [`ArchiveView`] of the repository, and takes no lock.
 //! [`Repo::pull_over_stream`] is the client side: it runs the pull of
 //! [`Repo::pull`] through a pull session over a pair of streams.
+//! [`Repo::pull`] runs the same pull over an ssh client for an ssh address.
 //!
 //! Under the `receive` feature it also covers the policy the server side of a
 //! push applies (see the `receive` module): `ReceivePolicy` states which ref
@@ -232,7 +233,8 @@
 //! from a remote name. The push keys of a remote section,
 //! [`Remote::push_url`], [`Remote::ssh_command`],
 //! [`Remote::receive_command`], [`Remote::push_token_file`], and
-//! [`Remote::push_user`], are read in every build.
+//! [`Remote::push_user`], are read in every build, and so are the pull keys
+//! of the port, [`Remote::pull_url`] and [`Remote::send_command`].
 
 pub mod archive;
 pub mod bootable;

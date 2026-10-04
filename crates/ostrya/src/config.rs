@@ -646,8 +646,9 @@ impl Remote<'_> {
         self.string("push-url")
     }
 
-    /// The ssh command line a push to this remote runs, `ssh-command`. The
-    /// push transport splits it at ASCII whitespace, with no quoting rule.
+    /// The ssh command line a push to this remote and a pull over ssh from it
+    /// run, `ssh-command`. The ssh transport splits it at ASCII whitespace,
+    /// with no quoting rule.
     pub fn ssh_command(&self) -> Result<Option<String>> {
         self.string("ssh-command")
     }
@@ -672,6 +673,19 @@ impl Remote<'_> {
     /// key is absent, the token goes as a bearer token.
     pub fn push_user(&self) -> Result<Option<String>> {
         self.string("push-user")
+    }
+
+    /// The pull address of this remote in the port, `pull-url`: an ssh
+    /// address, or an `http://` or `https://` URL. A pull from this remote
+    /// uses it in place of `url`. The tool does not read the key.
+    pub fn pull_url(&self) -> Result<Option<String>> {
+        self.string("pull-url")
+    }
+
+    /// The command the remote side of a pull over ssh from this remote runs,
+    /// `send-command`. The remote shell parses it.
+    pub fn send_command(&self) -> Result<Option<String>> {
+        self.string("send-command")
     }
 
     /// The raw value of an arbitrary key in this remote's section.
@@ -1135,8 +1149,8 @@ mod tests {
         assert!(remote.tls_permissive().unwrap());
     }
 
-    /// The push keys of a remote section, each read as written, and absent
-    /// when the section does not set it.
+    /// The push keys and the pull keys of the port in a remote section, each
+    /// read as written, and absent when the section does not set it.
     #[test]
     fn reads_remote_push_keys() {
         let text = "[core]\nrepo_version=1\nmode=archive-z2\n\n\
@@ -1145,7 +1159,9 @@ mod tests {
                     ssh-command=ssh -o BatchMode=yes\n\
                     receive-command=/opt/bin/ostrya receive\n\
                     push-token-file=/etc/push token\n\
-                    push-user=alice\n\n\
+                    push-user=alice\n\
+                    pull-url=puller@ex.com:srv/repo\n\
+                    send-command=/opt/bin/ostrya send -v\n\n\
                     [remote \"plain\"]\nurl=https://ex.com/r\n";
         let cfg = RepoConfig::parse(text).unwrap();
         let remote = cfg.remote("central").unwrap();
@@ -1166,6 +1182,14 @@ mod tests {
             Some("/etc/push token")
         );
         assert_eq!(remote.push_user().unwrap().as_deref(), Some("alice"));
+        assert_eq!(
+            remote.pull_url().unwrap().as_deref(),
+            Some("puller@ex.com:srv/repo")
+        );
+        assert_eq!(
+            remote.send_command().unwrap().as_deref(),
+            Some("/opt/bin/ostrya send -v")
+        );
 
         let plain = cfg.remote("plain").unwrap();
         assert_eq!(plain.push_url().unwrap(), None);
@@ -1173,5 +1197,7 @@ mod tests {
         assert_eq!(plain.receive_command().unwrap(), None);
         assert_eq!(plain.push_token_file().unwrap(), None);
         assert_eq!(plain.push_user().unwrap(), None);
+        assert_eq!(plain.pull_url().unwrap(), None);
+        assert_eq!(plain.send_command().unwrap(), None);
     }
 }

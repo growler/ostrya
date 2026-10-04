@@ -2552,6 +2552,50 @@ included) at exit 1. The port's fetcher serves `http` and `https` alone, so a
 `file://` remote, which the tool pulls from, reports `error: unsupported: fetch
 url scheme file: only http and https are fetched` at exit 1 and writes nothing.
 
+The port also pulls over ssh, which the tool does not do. The address of a
+pull is `--url`, then the `pull-url` key of the remote, then its `url` key. A
+value that starts with `ssh://`, or that holds no `://`, is an ssh address.
+Any other value goes to the fetcher as written. For an ssh address, `pull`
+runs the ssh client with the remote command `ostrya send --repo='PATH'`
+(`send`). `pull` has no option for the ssh command or for the remote
+command: the `OSTRYA_SSH_COMMAND` environment variable, and then the
+`ssh-command` key of the remote, give the ssh command, and the
+`send-command` key gives the remote command. `../format-reference.md`,
+"Port extension: the push and pull keys of a remote", states the keys. A
+remote with `pull-url` and no `url` pulls in the port. The tool fails on
+such a remote with `error: No "url" option in remote "NAME"`. Over ssh:
+
+- `--http-header`, `--network-retries` with a value above 0,
+  `--low-speed-limit-bytes`, and `--low-speed-time-seconds` are refused at
+  exit 1 before the ssh client starts. The message names the option without
+  `--`: `error: invalid input: http-header applies to a pull over HTTP, and
+  'ADDRESS' is an ssh address`. `--disable-retry-on-network-errors` is
+  accepted, because a pull over ssh never sends a request again.
+- The pull reads no `tls-*` key, no `contenturl` key, and no `metalink` key
+  of the remote. A pull over HTTP reads neither `ssh-command` nor
+  `send-command`.
+- An ssh address in the `url` key is refused at exit 1, and no ssh client
+  starts: `error: pull: remote 'NAME': url 'VALUE' is an ssh address; the
+  port reads an ssh address from pull-url alone`. The tool refuses the same
+  `url` with `error: Invalid URI scheme in VALUE`.
+- A malformed ssh address in `--url` or in `pull-url` is refused at exit 1
+  with the text of the address parser, for example `error: invalid input:
+  address 'ssh://HOST': an ssh:// address needs a path`.
+- The statistics line has the form of the line of a pull over HTTP.
+
+`--url` with an ssh address is a divergence. Observed with `ostree` 2026.1 on
+2026-10-04, in a `bare-user` repository with the remote `origin` at
+`http://127.0.0.1:1/`: `ostree pull --url=ssh://localhost/x origin main` and
+`ostree pull --url=localhost:/x origin main` each write nothing to standard
+output, write `error: Invalid URI scheme in VALUE` to standard error, and
+exit 1. Under `strace -f -e trace=%network,execve`, neither makes a `connect`
+call, and the one `execve` is that of `ostree`. The port pulls over ssh from
+both values. A value with no `://` that the parser refuses, such as
+`--url=/srv/repo`, is refused with `error: invalid input: address
+'/srv/repo': not an address`. A scp-form value such as `--url=host:8080` is
+an ssh address of the host `host` and the path `8080`, and the port starts
+the ssh client.
+
 `--network-retries=N`, `--disable-retry-on-network-errors`,
 `--low-speed-limit-bytes=N`, and `--low-speed-time-seconds=N` make the requests
 the tool makes, counted per object against a server that answers 503, cuts a
@@ -2724,14 +2768,19 @@ repeat pull into `archive` that reads no body byte, a delta pull into
 `bare-user`, and `pull-local` between the modes the port imports. Six
 differences stand:
 
-- a delta into `archive`. From a remote that indexes its deltas the tool asks
-  for no delta index into `archive`, and the port asks for it and counts it in
-  `M`, so it prints `5 metadata` where the tool prints `4 metadata`. From a
-  remote with no summary the port asks for the superblock by name into
-  `archive` and counts it in the same way, where the tool asks for none. From
-  a remote that publishes a delta the port takes it into `archive`, as the
-  capability difference above states, and prints the delta form where the
-  tool prints the loose form and a nonzero written figure;
+- a pull into `archive`, loose or by a delta. From a remote whose summary
+  states `ostree.summary.indexed-deltas: true`, the tool asks for no delta
+  index into `archive`, and the port asks for it and counts it in `M`. This
+  holds also when the remote publishes no delta and the index gets 404. For
+  a commit of four metadata objects the port prints `5 metadata` over HTTP
+  and over ssh, where the tool prints `4 metadata` over HTTP (observed with
+  `ostree` 2026.1 on 2026-10-04). Into `bare-user` both ask for the index
+  and count it. From a remote with no summary the port asks for the
+  superblock by name into `archive` and counts it in the same way, where the
+  tool asks for none. From a remote that publishes a delta the port takes it
+  into `archive`, as the capability difference above states, and prints the
+  delta form where the tool prints the loose form and a nonzero written
+  figure;
 - the delta index on a repeat pull. Into a destination other than `archive`,
   the tool asks for the delta index again for a commit it holds complete, and
   counts it: `1 metadata, 0 content objects fetched`. The port asks for no
@@ -3239,6 +3288,12 @@ port's fetcher serves `http` and `https` alone, where the tool also reads a
 `file://` remote, so a `file://` URL reports `fetch url scheme file: only http
 and https are fetched` (`../port-plan.md`, Phase 16a).
 
+`remote refs` and `remote summary` find the remote by the address rule of
+`pull`, with no `--url`: the `pull-url` key, then the `url` key. For an ssh
+address they read `summary.sig` and `summary` over ssh from `ostrya send`,
+with the ssh command and the remote command of `pull`. The tool reads `url`
+alone.
+
 `remote add-cookie`, `remote delete-cookie`, and `remote list-cookies` stay out.
 `crates/ostrya-fetch/src/lib.rs` refuses any `Cookie` header at construction
 whenever a mirror is cleartext `http`, a deliberate choice, and cookie-jar
@@ -3248,7 +3303,9 @@ support needs its own design pass against that refusal.
 
 The tool has no push, no pull over ssh, and no server. `receive`, `push`,
 `push-tree`, `serve`, and `send` are commands of the port alone, so no
-matrix cell compares them with the tool. The receiving repository stays a
+matrix cell compares them with the tool. `pull`, `remote refs`, and `remote
+summary` also read a remote over ssh, for an ssh address in the `pull-url`
+key or in `--url` of `pull` (`pull`). The receiving repository stays a
 normal repository: the tool reads it, checks it with `ostree fsck`, and
 pulls from it with `ostree pull-local`. The tool pulls from `serve` with
 `ostree pull`.
@@ -3332,7 +3389,7 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   client certificate and its key, and the two come together. Each of these
   options wins over the key of the remote with the same name. A relative
   path is relative to the current directory, and `~` is not expanded.
-  `../format-reference.md`, "Port extension: the push keys of a remote",
+  `../format-reference.md`, "Port extension: the push and pull keys of a remote",
   states the keys and the grammar of the token file.
 - A token to an `http://` address is refused before any request. With
   `--allow-cleartext-credentials`, the push sends it. Use the switch for a

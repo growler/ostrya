@@ -1922,9 +1922,11 @@ The pull keys:
 - `pull-url` -- the pull address of the port: `ssh://[USER@]HOST[:PORT]/PATH`,
   the scp form `[USER@]HOST:PATH`, or an `http://` or `https://` base URL.
   The push reads the same address forms. The address of the pull options
-  has precedence over it, and it has precedence over `url`. The port reads
-  no ssh address from `url`, and a pull whose address comes from an ssh `url`
-  fails.
+  has precedence over it, and it has precedence over `url`. A value that
+  starts with `ssh://`, or that holds no `://`, is an ssh address. A value
+  with another scheme goes to the HTTP fetcher, which refuses a scheme other
+  than `http` and `https`. The port reads no ssh address from `url`, and a
+  pull whose address comes from an ssh `url` fails.
 - `send-command` -- the command that the remote side runs for a pull over
   ssh. The remote shell parses it. The default is `ostrya send`. The send
   command of the pull options has precedence over it.

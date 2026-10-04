@@ -2531,6 +2531,37 @@ fn remote_fetch_summary_reports_both_files() {
     });
 }
 
+/// `remote_fetch_summary` reads an HTTP `pull-url`, with no `url` and in
+/// place of a `url` that answers no request.
+#[test]
+fn remote_fetch_summary_reads_an_http_pull_url() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-fetch-summary-pull-url");
+        build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let expected = std::fs::read(dir.path().join("remote/summary")).unwrap();
+        for (tag, url) in [("no-url", ""), ("dead-url", "url=http://127.0.0.1:1/\n")] {
+            let path = dir.path().join(tag);
+            drop(
+                Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+                    .await
+                    .unwrap(),
+            );
+            let config = path.join("config");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!(
+                "\n[remote \"origin\"]\n{url}pull-url={}\ngpg-verify=false\n",
+                server.url()
+            ));
+            std::fs::write(&config, text).unwrap();
+            let dest = Repo::open(&path).await.unwrap();
+            let (summary, signature) = dest.remote_fetch_summary("origin").await.unwrap();
+            assert_eq!(summary.as_deref(), Some(expected.as_slice()), "{tag}");
+            assert_eq!(signature, None, "{tag}");
+        }
+    });
+}
+
 /// A pull needs a URL: a remote the config does not describe fails unless the
 /// caller supplies one.
 #[test]
@@ -2580,6 +2611,50 @@ fn an_unconfigured_remote_needs_a_url() {
             dest.resolve_rev("elsewhere:test/main", true).await.unwrap(),
             Some(commit)
         );
+    });
+}
+
+/// A remote with an HTTP `pull-url` and no `url` pulls from `pull-url`, and
+/// `pull-url` wins over a `url` that answers no request. An HTTP pull reads
+/// neither `ssh-command` nor `send-command`, so a value of each that does
+/// not parse fails no pull.
+#[test]
+fn an_http_pull_url_wins_over_url() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-pull-url");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        for (tag, url) in [("no-url", ""), ("dead-url", "url=http://127.0.0.1:1/\n")] {
+            let path = dir.path().join(tag);
+            drop(
+                Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+                    .await
+                    .unwrap(),
+            );
+            let config = path.join("config");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!(
+                "\n[remote \"origin\"]\n{url}pull-url={}\ngpg-verify=false\n\
+                 ssh-command=a\\zb\nsend-command=a\\zb\n",
+                server.url()
+            ));
+            std::fs::write(&config, text).unwrap();
+            let dest = Repo::open(&path).await.unwrap();
+            dest.pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                dest.resolve_rev("origin:test/main", true).await.unwrap(),
+                Some(commit),
+                "{tag}"
+            );
+        }
     });
 }
 

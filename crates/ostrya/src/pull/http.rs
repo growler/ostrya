@@ -169,8 +169,9 @@
 //! path with its checksum verified.
 //!
 //! The remote is read through a source: the HTTP source over the fetcher, or
-//! the ssh source over a pull session, which
-//! [`Repo::pull_over_stream`] opens over a pair of streams. The two serve the
+//! the ssh source over a pull session, which [`Repo::pull`] opens over an ssh
+//! client for an ssh address, and [`Repo::pull_over_stream`] over a pair of
+//! streams. The two serve the
 //! same paths under the same caps, and every rule of this module holds for
 //! both, with three differences. The ssh source asks for a ref by its name as
 //! written, with no percent-encoding. It never sends a request again: a
@@ -233,6 +234,7 @@ use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
+use super::address::{PullAddress, fill_pull_connect, refuse_http_fields, resolve_pull_address};
 use super::delta::{self, DeltaJob, DeltaSource, PART_CAP};
 use super::drive::Slots;
 use super::source::{RemoteSource, SshSource, session_error};
@@ -266,12 +268,36 @@ const MAX_REF_FILE: u64 = 1024;
 pub(super) const CONFIG_FILE: &str = "config";
 
 impl Repo {
-    /// Pull refs and their objects from an HTTP remote.
+    /// Pull refs and their objects from an HTTP remote, or over ssh from a
+    /// remote whose address is an ssh address.
     ///
     /// `remote` names a `[remote "<name>"]` section of this repository's config,
-    /// which supplies the base URL and the TLS material;
-    /// [`url`](PullOptions::url) overrides the URL, which lets a caller pull from
-    /// a remote the config does not describe.
+    /// which supplies the address and the TLS material;
+    /// [`url`](PullOptions::url) overrides the address, which lets a caller pull
+    /// from a remote the config does not describe. The address is
+    /// [`url`](PullOptions::url), then the remote key `pull-url`, then the
+    /// remote key `url`. A value that starts with `ssh://`, or that holds no
+    /// `://`, is an ssh address of [`PushRemote::parse`], and a malformed one is
+    /// [`Error::InvalidInput`]. Any other value is the base URL of an HTTP
+    /// remote. An ssh address in `url` is [`Error::Pull`], and so is a section
+    /// with neither key.
+    ///
+    /// A pull over ssh runs the ssh client after the signature policy is
+    /// resolved, with the ssh command and the send command of
+    /// [`connect`](PullOptions::connect). The remote keys `ssh-command` and
+    /// `send-command` fill the fields that `connect` leaves `None`, and the
+    /// precedence of [`PullConnectOptions`] applies. The pull reads no remote
+    /// key of HTTP alone: `contenturl`, `metalink`, and the `tls-*` keys. A
+    /// field of HTTP alone is [`Error::InvalidInput`] before the ssh client
+    /// starts: [`http_headers`](PullOptions::http_headers),
+    /// [`n_network_retries`](PullOptions::n_network_retries) above 0,
+    /// [`low_speed_limit_bytes`](PullOptions::low_speed_limit_bytes), and
+    /// [`low_speed_time`](PullOptions::low_speed_time). The pull keeps the
+    /// rules of [`pull_over_stream`](Repo::pull_over_stream) for its session.
+    /// An HTTP pull reads neither `ssh-command` nor `send-command`.
+    ///
+    /// [`PushRemote::parse`]: crate::push::PushRemote::parse
+    /// [`PullConnectOptions`]: crate::push::PullConnectOptions
     ///
     /// Every requested ref is resolved against the remote's summary and then
     /// against `refs/heads/<ref>`; a ref neither yields fails with
@@ -295,27 +321,57 @@ impl Repo {
         // costs no request and opens no transaction.
         let subpaths = Subpaths::parse(&opts.subpaths)?;
         check_depth(opts.depth)?;
-        refuse_ssh_fields(&opts)?;
+        let section = self.config().remote(remote);
+        // The address is resolved first, so a remote the config does not
+        // describe reports that before a policy is resolved for it.
+        let address = resolve_pull_address(section.as_ref(), remote, opts.url.as_deref())?;
         let counters = PullCounters::new(opts.progress.as_ref());
-        // The fetcher is built first, so a remote the config does not describe
-        // reports that before a policy is resolved for it. `remote_fetcher`
-        // reads the config section, the URL, and the TLS material; it sends no
-        // request, so a refused policy still stops the pull before its first
-        // fetch.
-        let fetcher = self
-            .remote_fetcher(remote, &opts, counters.transferred_sinks())
-            .await?;
-        let verification =
-            Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
-        self.pull_from(
+        let (source, verification) = match address {
+            PullAddress::Http(url) => {
+                refuse_ssh_fields(&opts)?;
+                // `remote_fetcher` reads the TLS material and sends no request,
+                // so a refused policy still stops the pull before its first
+                // fetch.
+                let fetcher = self
+                    .remote_fetcher(
+                        remote,
+                        section.as_ref(),
+                        url,
+                        &opts,
+                        counters.transferred_sinks(),
+                    )
+                    .await?;
+                let verification =
+                    Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
+                (RemoteSource::Http(fetcher), verification)
+            }
+            PullAddress::Ssh(address) => {
+                refuse_http_fields(&opts, &address)?;
+                let connect = fill_pull_connect(section.as_ref(), opts.connect.clone())?;
+                let verification =
+                    Verification::build(self, Some(remote), &opts.verify, Defaults::Config).await?;
+                // The ssh client starts where the HTTP pull sends its first
+                // request.
+                let session =
+                    PullSession::connect(&address.remote, connect, session_options(&opts)).await?;
+                let source = RemoteSource::Ssh(Box::new(SshSource::new(
+                    session,
+                    counters.transferred_sinks(),
+                )));
+                (source, verification)
+            }
+        };
+        // The state of `pull_from` is on the heap, which keeps the future of
+        // `pull` small.
+        Box::pin(self.pull_from(
             remote,
-            RemoteSource::Http(fetcher),
+            source,
             &opts,
             &verification,
             subpaths,
             &counters,
             started,
-        )
+        ))
         .await
     }
 
@@ -588,39 +644,55 @@ impl Repo {
 
     /// The remote's `summary` and `summary.sig` bytes, an absent one as `None`.
     ///
-    /// The remote is reached the way [`pull`](Repo::pull) reaches it: its
-    /// configured URL and TLS material, with no override.
+    /// The remote is reached the way [`pull`](Repo::pull) reaches it, with no
+    /// override: its `pull-url` or its `url`, and its TLS material over HTTP.
+    /// Over ssh, the remote keys `ssh-command` and `send-command` give the
+    /// commands, and the `OSTRYA_SSH_COMMAND` environment variable wins over
+    /// `ssh-command`. The two files are asked for together, and the session
+    /// ends before the call returns.
     pub async fn remote_fetch_summary(
         &self,
         remote: &str,
     ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-        let fetcher = self
-            .remote_fetcher(remote, &PullOptions::default(), Vec::new())
-            .await?;
-        fetch_summary(&fetcher).await
+        let section = self.config().remote(remote);
+        let source = match resolve_pull_address(section.as_ref(), remote, None)? {
+            PullAddress::Http(url) => RemoteSource::Http(
+                self.remote_fetcher(
+                    remote,
+                    section.as_ref(),
+                    url,
+                    &PullOptions::default(),
+                    Vec::new(),
+                )
+                .await?,
+            ),
+            PullAddress::Ssh(address) => {
+                let connect = fill_pull_connect(section.as_ref(), Default::default())?;
+                let session = PullSession::connect(
+                    &address.remote,
+                    connect,
+                    session_options(&PullOptions::default()),
+                )
+                .await?;
+                RemoteSource::Ssh(Box::new(SshSource::new(session, Vec::new())))
+            }
+        };
+        let read = source.summary_files().await;
+        source.finish(read).await
     }
 
-    /// Build the fetcher for one remote from its config section and `opts`,
-    /// adding the bytes of each body it reads to each counter of `received`.
+    /// Build the fetcher of `url` for one remote from its config section and
+    /// `opts`, adding the bytes of each body it reads to each counter of
+    /// `received`.
     async fn remote_fetcher(
         &self,
         remote: &str,
+        section: Option<&crate::config::Remote<'_>>,
+        url: String,
         opts: &PullOptions,
         received: Vec<Arc<AtomicU64>>,
     ) -> Result<Fetcher> {
-        let section = self.config().remote(remote);
-        let url = match &opts.url {
-            Some(url) => url.clone(),
-            None => {
-                let section = section
-                    .as_ref()
-                    .ok_or_else(|| Error::Pull(format!("no remote '{remote}' is configured")))?;
-                section
-                    .url()?
-                    .ok_or_else(|| Error::Pull(format!("remote '{remote}' has no url")))?
-            }
-        };
-        let tls = match &section {
+        let tls = match section {
             Some(section) => remote_tls(remote, section).await?,
             None => TlsOptions::default(),
         };

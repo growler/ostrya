@@ -45,13 +45,18 @@ async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
 /// A destination repository of `mode` at `path`, whose config names `origin`
 /// at `url` with no signature check.
 async fn dest_at(path: &Path, mode: RepoMode, url: Option<&str>) -> Repo {
+    let keys = url.map(|url| format!("url={url}\n")).unwrap_or_default();
+    dest_with_keys(path, mode, &keys).await
+}
+
+/// A destination repository of `mode` at `path`, whose config names `origin`
+/// with the keys `keys` and no signature check.
+async fn dest_with_keys(path: &Path, mode: RepoMode, keys: &str) -> Repo {
     drop(Repo::create(path, CreateOptions::new(mode)).await.unwrap());
     let config = path.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str("\n[remote \"origin\"]\n");
-    if let Some(url) = url {
-        text.push_str(&format!("url={url}\n"));
-    }
+    text.push_str(keys);
     text.push_str("gpg-verify=false\n");
     std::fs::write(&config, text).unwrap();
     Repo::open(path).await.unwrap()
@@ -532,5 +537,312 @@ fn the_fields_of_the_other_transport_are_refused() {
         )
         .await
         .unwrap();
+    });
+}
+
+/// A stand-in ssh command that writes its arguments after the program, one
+/// to a line, to `record`, and exits 0 without serving a session.
+fn recording_ssh(record: &Path) -> ostrya::push::PullConnectOptions {
+    ostrya::push::PullConnectOptions {
+        ssh_command: Some(vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            r#"record=$1; shift; printf '%s\n' "$@" > "$record""#.to_owned(),
+            "ssh".to_owned(),
+            record.to_str().unwrap().to_owned(),
+        ]),
+        ..Default::default()
+    }
+}
+
+/// The arguments the stand-in of [`recording_ssh`] got, or `None` when it
+/// did not run.
+fn recorded(record: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(record).ok()?;
+    Some(text.lines().map(str::to_owned).collect())
+}
+
+/// The ssh command and the send command of the caller win over the remote
+/// keys, and the key of a field the caller leaves `None` fills it, also for
+/// an address of the caller.
+#[test]
+fn the_commands_of_the_caller_win_over_the_remote_keys() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-commands");
+        let dest = dest_with_keys(
+            &dir.path().join("dest"),
+            RepoMode::Archive,
+            "pull-url=ssh://localhost/srv/repo\nssh-command=/nonexistent/ssh\n\
+             send-command=/nonexistent/send\n",
+        )
+        .await;
+        let both = dir.path().join("both");
+        let pulled = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    connect: ostrya::push::PullConnectOptions {
+                        send_command: Some("my-send".to_owned()),
+                        ..recording_ssh(&both)
+                    },
+                    ..main_ref(0)
+                },
+            )
+            .await;
+        // The stand-in serves no session.
+        assert!(pulled.is_err());
+        assert_eq!(
+            recorded(&both).unwrap(),
+            ["localhost", "my-send --repo='/srv/repo'"]
+        );
+
+        let key = dir.path().join("key");
+        let pulled = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    connect: recording_ssh(&key),
+                    ..main_ref(0)
+                },
+            )
+            .await;
+        assert!(pulled.is_err());
+        assert_eq!(
+            recorded(&key).unwrap(),
+            ["localhost", "/nonexistent/send --repo='/srv/repo'"]
+        );
+
+        let url = dir.path().join("url");
+        let pulled = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    url: Some("u@h:other".to_owned()),
+                    connect: recording_ssh(&url),
+                    ..main_ref(0)
+                },
+            )
+            .await;
+        assert!(pulled.is_err());
+        assert_eq!(
+            recorded(&url).unwrap(),
+            ["u@h", "/nonexistent/send --repo='other'"]
+        );
+    });
+}
+
+/// An ssh address in `url` is refused in the `ssh://` form and in the scp
+/// form, and the ssh client does not start.
+#[test]
+fn an_ssh_address_in_url_is_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-url");
+        for (tag, url) in [
+            ("ssh", "ssh://localhost/srv/repo"),
+            ("scp", "localhost:/srv/repo"),
+        ] {
+            let dest = dest_at(&dir.path().join(tag), RepoMode::Archive, Some(url)).await;
+            let record = dir.path().join(format!("{tag}-record"));
+            let err = dest
+                .pull(
+                    "origin",
+                    PullOptions {
+                        connect: recording_ssh(&record),
+                        ..main_ref(0)
+                    },
+                )
+                .await
+                .unwrap_err();
+            match err {
+                Error::Pull(msg) => assert_eq!(
+                    msg,
+                    format!(
+                        "remote 'origin': url '{url}' is an ssh address; the port reads an ssh \
+                         address from pull-url alone"
+                    )
+                ),
+                other => panic!("{tag}: {other:?}"),
+            }
+            assert_eq!(recorded(&record), None, "{tag}");
+        }
+    });
+}
+
+/// Each option of HTTP alone is refused with an ssh address before the ssh
+/// client starts. A retry count of 0 is accepted, and the ssh client starts.
+#[test]
+fn the_options_of_http_alone_are_refused_before_the_ssh_client_starts() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-http-options");
+        let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
+        let address = "ssh://localhost/srv/repo";
+        let with = |opts: PullOptions| PullOptions {
+            url: Some(address.to_owned()),
+            connect: ostrya::push::PullConnectOptions {
+                ssh_command: Some(vec!["/nonexistent/ssh".to_owned()]),
+                ..Default::default()
+            },
+            ..opts
+        };
+        for (name, opts) in [
+            (
+                "http-header",
+                PullOptions {
+                    http_headers: vec![("A".to_owned(), "B".to_owned())],
+                    ..main_ref(0)
+                },
+            ),
+            (
+                "network-retries",
+                PullOptions {
+                    n_network_retries: Some(1),
+                    ..main_ref(0)
+                },
+            ),
+            (
+                "low-speed-limit-bytes",
+                PullOptions {
+                    low_speed_limit_bytes: Some(5),
+                    ..main_ref(0)
+                },
+            ),
+            (
+                "low-speed-time-seconds",
+                PullOptions {
+                    low_speed_time: Some(Duration::ZERO),
+                    ..main_ref(0)
+                },
+            ),
+        ] {
+            match dest.pull("origin", with(opts)).await {
+                Err(Error::InvalidInput(msg)) => assert_eq!(
+                    msg,
+                    format!(
+                        "{name} applies to a pull over HTTP, and '{address}' is an ssh address"
+                    )
+                ),
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        let err = dest
+            .pull(
+                "origin",
+                with(PullOptions {
+                    n_network_retries: Some(0),
+                    ..main_ref(0)
+                }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            Error::Push(ostrya::push::Error::Transport(msg)) => {
+                assert!(msg.contains("/nonexistent/ssh"), "{msg}")
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+}
+
+/// A pull over ssh reads no remote key of HTTP alone: TLS keys that an HTTP
+/// pull refuses do not stop it, and the ssh client starts.
+#[test]
+fn a_pull_over_ssh_reads_no_tls_key() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-no-tls");
+        let tls = "tls-ca-path=/nonexistent/ca.pem\ntls-client-cert-path=/nonexistent/c.pem\n\
+                   tls-permissive=maybe\ncontenturl=http://127.0.0.1:1/\n";
+        let dest = dest_with_keys(
+            &dir.path().join("dest"),
+            RepoMode::Archive,
+            &format!("pull-url=ssh://localhost/srv/repo\n{tls}"),
+        )
+        .await;
+        let record = dir.path().join("record");
+        let pulled = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    connect: recording_ssh(&record),
+                    ..main_ref(0)
+                },
+            )
+            .await;
+        assert!(pulled.is_err());
+        assert_eq!(
+            recorded(&record).unwrap(),
+            ["localhost", "ostrya send --repo='/srv/repo'"]
+        );
+
+        // The same keys stop an HTTP pull before its first request.
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    url: Some("http://127.0.0.1:1/".to_owned()),
+                    ..main_ref(0)
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("tls-permissive"), "{err}");
+    });
+}
+
+/// A pull over ssh resolves its signature policy before the ssh client
+/// starts, so a policy that cannot be built stops the pull with no ssh
+/// client. The refusal of an option of HTTP alone comes before the policy.
+#[test]
+fn a_refused_policy_stops_the_pull_before_the_ssh_client_starts() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-policy-first");
+        let keys = "/nonexistent/ostrya/keys.ed25519";
+        let dest = dest_with_keys(
+            &dir.path().join("dest"),
+            RepoMode::Archive,
+            &format!(
+                "pull-url=ssh://localhost/srv/repo\nsign-verify=ed25519\n\
+                 verification-ed25519-file={keys}\n"
+            ),
+        )
+        .await;
+
+        let policy = dir.path().join("policy");
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    connect: recording_ssh(&policy),
+                    ..main_ref(0)
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            Error::Signature(msg) => assert!(msg.contains(keys), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(recorded(&policy), None);
+
+        let header = dir.path().join("header");
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    http_headers: vec![("A".to_owned(), "B".to_owned())],
+                    connect: recording_ssh(&header),
+                    ..main_ref(0)
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            Error::InvalidInput(msg) => assert_eq!(
+                msg,
+                "http-header applies to a pull over HTTP, and 'ssh://localhost/srv/repo' is \
+                 an ssh address"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(recorded(&header), None);
     });
 }

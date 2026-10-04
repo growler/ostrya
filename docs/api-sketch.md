@@ -2177,7 +2177,7 @@ enumerated from a cache that holds it. Refs are written after the objects are
 published.
 
 `pull` fetches the same thing from an HTTP remote named in the repository's
-config, into one transaction, with up to `max_outstanding_fetches` objects in
+config, or over ssh from a remote with an ssh address, into one transaction, with up to `max_outstanding_fetches` objects in
 flight. The plan is drained commits first, then the dirtree and dirmeta objects
 the scan is blocked on, then the content, and each class carries the matching
 fetch priority. A commit object is fetched before the objects it references and
@@ -2316,11 +2316,14 @@ pub struct PullOptions {
     pub localcache_repos: Vec<Repo>,
     pub disable_fsync: bool,              // every sync off; never turns one on
     pub per_object_fsync: bool,           // sync each content object as staged
-    // The rest are the HTTP pull's; each defaults to what a local pull does.
+    // The rest are the remote pull's; each defaults to what a local pull
+    // does. http_headers, n_network_retries above 0, and the two low-speed
+    // fields apply to HTTP alone: an ssh address refuses them.
     pub subpaths: Vec<String>,            // absolute paths; empty is the whole
                                           // tree; a local pull refuses them;
                                           // leaves each commit partial
-    pub url: Option<String>,              // overrides the remote's configured url
+    pub url: Option<String>,              // an HTTP base URL or an ssh address;
+                                          // overrides pull-url and url
     pub http_headers: Vec<(String, String)>,
     pub max_outstanding_fetches: Option<usize>,  // None is 8
     pub n_network_retries: Option<u32>,          // None is 5; a body refetch
@@ -2335,8 +2338,9 @@ pub struct PullOptions {
     pub detached_metadata_filter: DetachedMetadataFilter,  // what to store
     pub progress: Option<PullProgress>,   // live counters for the caller
     pub connect: PullConnectOptions,      // ssh command, send command, and
-                                          // remote ssh command; HTTP refuses
-                                          // the first two
+                                          // remote ssh command; the remote
+                                          // keys fill the fields left None;
+                                          // HTTP refuses the first two
 }
 
 #[derive(Clone, Default)]
@@ -2438,7 +2442,8 @@ impl Repo {
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static;
-    /// The remote's `summary` and `summary.sig` bytes, an absent one as None.
+    /// The remote's `summary` and `summary.sig` bytes, an absent one as None,
+    /// over HTTP or over ssh by the address rule of `pull`, with no `url`.
     pub async fn remote_fetch_summary(&self, remote: &str)
         -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>;
 }
@@ -4019,9 +4024,35 @@ The pull through the ssh source:
   `finish` gives, so an I/O error under a failed ssh client becomes
   `Error::Transport`. An error of the session is `Error::Push`.
 - `url`, `connect.ssh_command`, and `connect.send_command` are
-  `Error::InvalidInput` for `pull_over_stream`. `Repo::pull`, which runs over
-  HTTP, refuses `connect.ssh_command` and `connect.send_command` with
-  `Error::InvalidInput`, and does not read `connect.remote_ssh_command`.
+  `Error::InvalidInput` for `pull_over_stream`.
+
+The pull over ssh to an address:
+
+- `Repo::pull` takes its address from `url`, then from the remote key
+  `pull-url`, then from the remote key `url`. A value that starts with
+  `ssh://`, or that holds no `://`, is an ssh address of `PushRemote::parse`,
+  and a malformed one is `Error::InvalidInput` with the text of the parser.
+  Any other value goes to the fetcher as written. An ssh address in the
+  `url` key is `Error::Pull`, and so is a section with neither key.
+- With an ssh address, `http_headers`, `n_network_retries` above 0,
+  `low_speed_limit_bytes`, and `low_speed_time` are `Error::InvalidInput`
+  before the ssh client starts. The message names the option of `ostrya
+  pull` without `--`. `n_network_retries` of `Some(0)` is accepted.
+- The remote keys `ssh-command` and `send-command` fill
+  `connect.remote_ssh_command` and `connect.send_command` where they are
+  `None`, also when the address comes from `url`. The pull reads no
+  `contenturl`, `metalink`, or `tls-*` key.
+- `Repo::pull` resolves the signature policy, then starts the ssh client with
+  `PullSession::connect`, at the point where the HTTP pull sends its first
+  request, and then runs the pull of `pull_over_stream`.
+- `Repo::remote_fetch_summary` takes the address of the remote by the same
+  rule, with no `url`. Over ssh it reads `summary.sig` and `summary` as two
+  calls in flight together, and ends the session before it returns. The
+  library caller sets the ssh command through `ssh-command` or
+  `OSTRYA_SSH_COMMAND` alone.
+- With an HTTP address, `Repo::pull` refuses `connect.ssh_command` and
+  `connect.send_command` with `Error::InvalidInput`, and reads neither
+  `connect.remote_ssh_command`, `ssh-command`, nor `send-command`.
 
 ## Static deltas
 

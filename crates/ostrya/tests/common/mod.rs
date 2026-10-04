@@ -3,11 +3,16 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+
+use futures_io::AsyncWrite;
 
 pub mod modes;
 pub mod pipe;
@@ -380,6 +385,21 @@ pub fn ostree_available() -> bool {
     found
 }
 
+/// Run `ostree fsck` on `root`, and assert that it passes.
+pub fn tool_fsck(root: &Path) {
+    let out = Command::new("ostree")
+        .arg("fsck")
+        .arg(format!("--repo={}", root.display()))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "ostree fsck failed on {}: {}",
+        root.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The environment variable that turns the ed25519-unsupported skip into a
 /// failure. A harness setting it declares that the installed `ostree` carries
 /// the engine, so a run where it does not is a broken harness rather than a
@@ -495,4 +515,89 @@ pub fn file_inventory(root: &Path, sub: &str) -> Vec<(String, Vec<u8>)> {
     }
     out.sort();
     out
+}
+
+/// Mark `commit` partial in `repo`, as a pull that stopped would.
+pub fn mark_partial(repo: &ostrya::Repo, commit: &ostrya::Checksum) {
+    std::fs::write(
+        repo.path().join(format!("state/{commit}.commitpartial")),
+        b"",
+    )
+    .unwrap();
+}
+
+/// Whether a regular file is sealed with fs-verity: a sealed file refuses an
+/// open for writing. The objects are owner-writable, so a refusal is the seal.
+pub fn is_sealed(path: &Path) -> bool {
+    std::fs::OpenOptions::new().write(true).open(path).is_err()
+}
+
+/// The regular-file loose objects under `root/objects`.
+pub fn regular_objects(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for fanout in std::fs::read_dir(root.join("objects")).unwrap().flatten() {
+        if !fanout.file_type().unwrap().is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(fanout.path()).unwrap().flatten() {
+            if entry.file_type().unwrap().is_file() {
+                out.push(entry.path());
+            }
+        }
+    }
+    out
+}
+
+/// A writer that fails each call of `poll_write`, `poll_flush`, and
+/// `poll_close`, and counts the calls.
+pub struct Untouchable {
+    pub calls: Arc<AtomicU64>,
+}
+
+impl Untouchable {
+    fn call<T>(&self) -> Poll<io::Result<T>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Poll::Ready(Err(io::Error::other("the output must not be used")))
+    }
+}
+
+impl AsyncWrite for Untouchable {
+    fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, _: &[u8]) -> Poll<io::Result<usize>> {
+        self.call()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.call()
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.call()
+    }
+}
+
+/// A writer that counts the bytes it takes.
+pub struct Counting<W> {
+    pub inner: W,
+    pub written: Arc<AtomicU64>,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for Counting<W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        let n = std::task::ready!(Pin::new(&mut me.inner).poll_write(cx, buf))?;
+        me.written.fetch_add(n as u64, Ordering::Relaxed);
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_close(cx)
+    }
 }

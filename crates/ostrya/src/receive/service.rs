@@ -132,7 +132,8 @@ impl ReceiveService {
     /// `parallel_uploads` is the value `HelloReply` announces, and the number
     /// of `objects` calls the session runs at the same time. A
     /// `parallel_uploads` of 0 is [`Error::InvalidInput`]. The service sets
-    /// no upper bound: the host keeps the value in a range of its own.
+    /// no upper bound: the host keeps the value in a range of its own. A
+    /// `Hello` with `one-way` true is `protocol`.
     pub async fn hello(
         repo: Repo,
         policy: Arc<ReceivePolicy>,

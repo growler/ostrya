@@ -7049,7 +7049,7 @@ The tool has no push, so the whole phase is a port extension. A repository
 that receives a push stays a normal repository: the tool reads it, checks it
 with `ostree fsck`, and pulls from it.
 
-The extension serves two scenarios:
+The extension serves three scenarios:
 
 - Tree push -- a client program pushes a directory tree. The client builds the
   commit object with `ostrya-core` and signs it with its own keys. With the
@@ -7059,8 +7059,13 @@ The extension serves two scenarios:
   macOS, and Windows. `ostrya push-tree` is the command form.
 - Commit push -- `ostrya push` sends one or more commits from a local
   repository and updates refs on the remote.
+- One-way stream -- a library caller writes commits of a local repository
+  into one byte stream, with `Repo::export_stream`, and a receiving
+  repository reads the stream into one transaction, with
+  `Repo::receive_stream`. The receiver sends no message. The caller supplies
+  the channel, and no command of `ostrya-cli` takes the stream.
 
-The two scenarios use one protocol over two transports:
+The tree push and the commit push use one protocol over two transports:
 
 - ssh -- the client runs the system `ssh` binary as a subprocess (a child
   process, not a linked library, so the no-C constraint holds), and the remote
@@ -7170,6 +7175,27 @@ repositories over ssh to localhost gives a repository that passes `ostree
 fsck`, and `ostree rev-parse` resolves the pulled ref to the source commit
 (`crates/ostrya-cli/tests/pull_ssh.rs`).
 
+The receiving half of the one-way stream is done. `Repo::receive_stream`
+reads one `Hello` with the key `one-way` true, the object streams, and one
+`Commit` from one byte stream, and commits them in one transaction with
+the checks of `Repo::receive`. It adds no server signature and does not
+regenerate the summary. It accepts a repository with `[core] locking=false`.
+The two-way receiver refuses a `Hello` with `one-way` true as `protocol`
+(`docs/api-sketch.md`, "Receive policy (feature `receive`)").
+
+The sending half of the one-way stream is done.
+`ostrya_push::session::export_stream` writes `Hello` with `one-way` true,
+one object stream from an `ObjectSource`, `ObjectsEnd`, and `Commit`, and
+reads nothing. `Repo::export_stream`, under the `push`
+feature, writes each new commit of a set of ref updates with each object
+its tree reaches and its detached metadata, and holds the repository lock
+shared for the whole export. It refuses an expected state `Commit`, a
+delete, a partial commit, a binding mismatch, empty updates, a ref named
+twice, an invalid ref name, a level outside 1 to 9, and a `Hello` or a
+`Commit` frame over 1 MiB before it writes a byte. A source that fails ends
+the stream inside an object with the abandon marker and `Abort`
+(`docs/api-sketch.md`, "Push from a repository").
+
 Verify: push between two port repositories over ssh to localhost and over
 HTTP. The receiving repository passes `ostree fsck` and resolves the pushed
 refs. A tree push with one target ref gives the commit checksum that
@@ -7249,6 +7275,55 @@ An ignored test in `crates/ostrya-cli/tests/send.rs` pulls an object of
 256 MiB from `ostrya send` through `PullSession`, and the `RssAnon` of the
 server, read after each 16 MiB of the body and before its standard input
 closes, stays below 16 MiB.
+
+Result of the receiving half of the one-way stream:
+`crates/ostrya/tests/one_way.rs` writes each stream by hand with the frame
+codec. A stream of the fixture commit, in the `raw` and in the `deflate`
+encoding, with its detached metadata, a plain ref, and a remote ref under a
+rule for `*:*`, commits into a `bare-user` repository with a collection id.
+The policy has a server key on each rule, a summary key, and
+`update_summary` true, and the repository gets no server signature, no
+summary, and no anchor commit. The repository passes the fsck of the port
+and `ostree fsck`. A repository with `[core] locking=false` takes the
+stream. `Have`, a `Hello` without `one-way`, a first frame other than
+`Hello`, a second `Hello`, an `Abort` frame between two objects, an expected
+state `Commit`, a delete, and each of four tails after `Commit` are
+`protocol`. An abandoned object is `Aborted`. A cut at each frame and chunk
+boundary, and one byte on each side of it, is an end of file. A changed byte
+in a content object or in the commit object is `checksum-mismatch`. After
+each failure the repository holds no new object, no detached metadata, no
+ref, and no staging directory. `Repo::receive` and `ReceiveService::hello`
+refuse a `Hello` with `one-way` true as `protocol`, before the version
+check. `crates/ostrya-push/tests/proto.rs` pins the bytes of a `Hello` with
+`one-way` true, and reads an absent key as false and a key of another type
+as `protocol`.
+
+Result of the sending half of the one-way stream:
+`crates/ostrya/tests/one_way.rs` exports from an `archive` repository with a
+setuid file, a file with `security.capability`, a regular file of 1.5 MB, a
+symlink, and detached metadata. Through an in-process pipe, in the `raw` and in the
+`deflate` encoding, the export updates `main` and `origin:main` in a new
+empty `bare-user` repository under a policy with `allow_privileged` true and
+a rule for `*:*`. The objects keep the setuid mode and the capability, and
+the repository passes the fsck of the port and `ostree fsck`. A second
+test exports into a `bare` repository with `[ex-integrity] fsverity=yes`
+and checks that each regular-file object is sealed and that the detached
+metadata is stored. That test runs only as root on a filesystem with
+fs-verity, and skips in other conditions. A captured stream with one changed payload byte of the large file is
+`checksum-mismatch`. A cut inside a chunk of the large file, after
+`ObjectsEnd`, and inside `Commit` is an end of file, and one byte after the
+stream is `protocol`. A source that lacks a file object makes the export
+return the error of the source after the abandon marker and `Abort`, and
+the receiver returns `Aborted`. After each failure the repository holds no
+new object, no detached metadata, no ref, and no staging directory. Each
+refusal of the export makes no call on the output, and a commit bound to `x` exports to
+`x` and to `origin:x`. A unit test in `ostrya-push` pins the frame order
+and the end of a stream whose source fails, and shows that a refusal
+makes no call on the output. Another unit test shows that a failed write
+of the header of an abandoned object returns the error of the write, and
+that the call writes nothing more. A unit test of the object writer shows
+that a source that gives short reads makes full chunks, and that the last
+chunk holds the rest.
 
 ### Phase 20 -- Sysroot / deployment (optional, separate track)
 

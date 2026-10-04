@@ -276,8 +276,13 @@ pub(super) enum Stop {
     Wire(Error),
     /// The source failed, or gave data the session cannot send. The session
     /// ends the stream with `Abort`, after the abandon marker when an object
-    /// is open.
-    Abandon { error: Error, in_object: bool },
+    /// is open. `next` is the header of the object the writer was to start,
+    /// when the failure came before that header was written.
+    Abandon {
+        error: Error,
+        in_object: bool,
+        next: Option<ObjectHeader>,
+    },
 }
 
 impl From<Error> for Stop {
@@ -286,10 +291,12 @@ impl From<Error> for Stop {
     }
 }
 
-fn refuse(error: Error) -> Stop {
+/// Stop before the object of `next`, whose header is not written.
+fn refuse(error: Error, next: ObjectHeader) -> Stop {
     Stop::Abandon {
         error,
         in_object: false,
+        next: Some(next),
     }
 }
 
@@ -306,6 +313,7 @@ fn read_failed(e: io::Error) -> Stop {
     Stop::Abandon {
         error: Error::Source(Box::new(e)),
         in_object: true,
+        next: None,
     }
 }
 
@@ -481,14 +489,18 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
                     (ObjectType::File, Some(_)) => Encoding::Deflate,
                     _ => Encoding::Raw,
                 };
+                let next = ObjectHeader {
+                    name: *name,
+                    encoding,
+                };
                 let data = up
                     .source
                     .open(name, encoding)
                     .await
-                    .map_err(|e| refuse(source_error(e)))?;
+                    .map_err(|e| refuse(source_error(e), next.clone()))?;
                 let level = up.level.filter(|_| name.ty == ObjectType::File);
-                let plan =
-                    plan(name, data, level, up.deflate_ok, &mut self.header_buf).map_err(refuse)?;
+                let plan = plan(name, data, level, up.deflate_ok, &mut self.header_buf)
+                    .map_err(|e| refuse(e, next))?;
                 return Ok(Some(Item::Object(*name, plan)));
             }
             if !up.claim_metas() {
@@ -509,26 +521,34 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
             let Some(claim) = up.claims.claim(commit).await else {
                 continue;
             };
+            let next = ObjectHeader {
+                name: ObjectName::new(*commit, ObjectType::CommitMeta),
+                encoding: Encoding::Raw,
+            };
             let dict = up
                 .source
                 .detached_metadata(commit)
                 .await
-                .map_err(|e| refuse(source_error(e)))?;
+                .map_err(|e| refuse(source_error(e), next.clone()))?;
             let Some(dict) = dict else {
                 continue;
             };
             let a_sv = Type::parse("a{sv}").expect("valid signature");
             let bytes = ostrya_gvariant::to_bytes(&a_sv, &dict).map_err(|e| {
-                refuse(invalid(format!(
-                    "the detached metadata of commit {commit}: {e}"
-                )))
+                refuse(
+                    invalid(format!("the detached metadata of commit {commit}: {e}")),
+                    next.clone(),
+                )
             })?;
             if bytes.len() as u64 > MAX_METADATA_SIZE {
-                return Err(refuse(invalid(format!(
-                    "the detached metadata of commit {commit} is {} bytes, over the limit \
-                     {MAX_METADATA_SIZE}",
-                    bytes.len()
-                ))));
+                return Err(refuse(
+                    invalid(format!(
+                        "the detached metadata of commit {commit} is {} bytes, over the limit \
+                         {MAX_METADATA_SIZE}",
+                        bytes.len()
+                    )),
+                    next,
+                ));
             }
             claim.sent();
             return Ok(Some(Item::Meta(*commit, bytes)));
@@ -557,14 +577,14 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
     }
 
     /// End the stream after `stop`: the abandon marker and `Abort` when an
-    /// object is open, `Abort` alone otherwise. A failure of the write is
-    /// ignored, because the stream ends with the error of `stop`.
-    pub(super) async fn abandon(&mut self, in_object: bool) {
-        let _ = if in_object {
+    /// object is open, `Abort` alone otherwise. A failed write stops the call
+    /// and returns its error.
+    pub(super) async fn abandon(&mut self, in_object: bool) -> Result<()> {
+        if in_object {
             self.writer.abandon_object().await
         } else {
             self.writer.write_message(&Message::Abort).await
-        };
+        }
     }
 
     /// Write one object: its header, its bytes as chunks, and the end chunk.
@@ -598,18 +618,31 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
                     self.buf = vec![0u8; CHUNK_PAYLOAD];
                 }
                 loop {
-                    let n = reader.read(&mut self.buf).await.map_err(read_failed)?;
-                    if n == 0 {
+                    // Each chunk but the last is full, whatever size each
+                    // read gives.
+                    let mut n = 0;
+                    let mut end = false;
+                    while n < self.buf.len() {
+                        let read = reader.read(&mut self.buf[n..]).await.map_err(read_failed)?;
+                        if read == 0 {
+                            end = true;
+                            break;
+                        }
+                        n += read;
+                    }
+                    if n > 0 {
+                        let ObjectWriter {
+                            writer,
+                            buf,
+                            counters,
+                            ..
+                        } = self;
+                        writer.write_object_data(&buf[..n]).await?;
+                        counters.payload(n as u64);
+                    }
+                    if end {
                         break;
                     }
-                    let ObjectWriter {
-                        writer,
-                        buf,
-                        counters,
-                        ..
-                    } = self;
-                    writer.write_object_data(&buf[..n]).await?;
-                    counters.payload(n as u64);
                 }
             }
             Body::Deflate(reader, level) => {
@@ -806,5 +839,53 @@ mod tests {
         up.stop();
         assert!(up.next_name().is_none());
         assert!(!up.claim_metas());
+    }
+
+    /// A body that the source gives in short reads goes out in full chunks,
+    /// and the last chunk holds the rest.
+    #[test]
+    fn short_reads_make_full_chunks() {
+        /// A reader of `left` bytes that gives at most 1000 bytes a read.
+        struct Trickle {
+            left: usize,
+        }
+        impl futures_io::AsyncRead for Trickle {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                buf: &mut [u8],
+            ) -> Poll<io::Result<usize>> {
+                let me = self.get_mut();
+                let n = me.left.min(buf.len()).min(1000);
+                buf[..n].fill(7);
+                me.left -= n;
+                Poll::Ready(Ok(n))
+            }
+        }
+
+        let size = 3 * CHUNK_PAYLOAD + 100;
+        let mut writer = ObjectWriter::new(Vec::new(), Arc::new(Counters::new(None)));
+        let plan = Plan {
+            encoding: Encoding::Raw,
+            prefix: Prefix::None,
+            body: Body::Copy(Box::new(Trickle { left: size })),
+        };
+        let name = ObjectName::new(Checksum::from_bytes([1; 32]), ObjectType::File);
+        if ostrya_rt::block_on(writer.write_object(name, plan)).is_err() {
+            panic!("the object is not written");
+        }
+        let out = writer.writer.into_inner();
+        let len = |at: usize| u32::from_be_bytes(out[at..at + 4].try_into().unwrap()) as usize;
+        let mut at = 4 + len(0);
+        let mut chunks = Vec::new();
+        while len(at) != 0 {
+            chunks.push(len(at));
+            at += 4 + len(at);
+        }
+        assert_eq!(at + 4, out.len());
+        assert_eq!(
+            chunks,
+            vec![CHUNK_PAYLOAD, CHUNK_PAYLOAD, CHUNK_PAYLOAD, 100]
+        );
     }
 }

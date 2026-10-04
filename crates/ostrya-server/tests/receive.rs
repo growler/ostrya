@@ -261,6 +261,7 @@ fn hello() -> Message {
         version: 1,
         agent: None,
         refs: vec!["main".into()],
+        one_way: false,
     })
 }
 

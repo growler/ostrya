@@ -10,8 +10,7 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::receive::{
@@ -19,7 +18,8 @@ use common::receive::{
 };
 use common::{
     COMMIT, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory,
-    foreign_holder, guard_holder, guard_holder_main, lock_holder_main,
+    foreign_holder, guard_holder, guard_holder_main, is_sealed, lock_holder_main, regular_objects,
+    tool_fsck,
 };
 use ostrya::push::proto::ErrorMessage;
 use ostrya::push::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
@@ -326,21 +326,6 @@ fn commit_meta_path(repo: &Repo, commit: &Checksum) -> PathBuf {
 // The commit.
 // ---------------------------------------------------------------------------
 
-/// Run `ostree fsck` on `root`, and assert that it passes.
-fn tool_fsck(root: &Path) {
-    let out = Command::new("ostree")
-        .arg("fsck")
-        .arg(format!("--repo={}", root.display()))
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "ostree fsck failed on {}: {}",
-        root.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
 #[test]
 fn the_fixture_commit_lands_in_each_mode() {
     let tool = common::ostree_available();
@@ -461,28 +446,6 @@ fn fsverity_yes_seals_every_object_the_session_writes() {
             );
         }
     }
-}
-
-/// Whether a regular file is sealed with fs-verity: a sealed file refuses an
-/// open for writing. The objects are owner-writable, so a refusal is the seal.
-fn is_sealed(path: &Path) -> bool {
-    std::fs::OpenOptions::new().write(true).open(path).is_err()
-}
-
-/// The regular-file loose objects under `root/objects`.
-fn regular_objects(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for fanout in std::fs::read_dir(root.join("objects")).unwrap().flatten() {
-        if !fanout.file_type().unwrap().is_dir() {
-            continue;
-        }
-        for entry in std::fs::read_dir(fanout.path()).unwrap().flatten() {
-            if entry.file_type().unwrap().is_file() {
-                out.push(entry.path());
-            }
-        }
-    }
-    out
 }
 
 /// Two sessions that create one ref at the same time: the update lock

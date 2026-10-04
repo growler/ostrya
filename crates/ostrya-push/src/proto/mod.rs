@@ -82,6 +82,18 @@
 //! 0 (`raw`) or 1 (`deflate`), and `deflate` is allowed for type 1 alone.
 //! `Have` names types 1 to 4 alone.
 //!
+//! # One-way stream
+//!
+//! A one-way stream carries the push messages in one direction, and the
+//! receiver sends no message. The stream is one `Hello` with the key
+//! `one-way` true, zero or more object streams, each closed by `ObjectsEnd`,
+//! one `Commit`, and the end of file. The frame limit and the chunk limit are
+//! [`MIN_FRAME_LIMIT`], because no `HelloReply` announces another one. `Have`
+//! is the error `protocol`, and so is an `Abort` frame between two objects. A
+//! sender that cannot complete an object writes the abandon marker and
+//! `Abort`, as in a two-way session. A two-way receiver refuses a `Hello`
+//! with `one-way` true as `protocol`.
+//!
 //! # Pull
 //!
 //! The pull asks for files by their path, relative to the repository root.

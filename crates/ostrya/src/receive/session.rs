@@ -113,7 +113,9 @@ impl Repo {
     /// `locking-disabled`, and a `bare-split-xattrs` repository with
     /// `mode-refused`. A `bare` repository refuses the session with
     /// `mode-refused` unless the process runs as root, because only root can
-    /// store the owner of each file.
+    /// store the owner of each file. A `Hello` with `one-way` true is
+    /// `protocol`: it opens a one-way stream, which
+    /// [`Repo::receive_stream`] reads.
     ///
     /// `Have` gets one bit for each object: whether the repository or the
     /// session holds it. The object stream stages each object in the

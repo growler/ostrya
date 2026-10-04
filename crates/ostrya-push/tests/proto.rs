@@ -122,6 +122,7 @@ fn hello(agent: Option<&str>, refs: &[&str]) -> Message {
         version: 1,
         agent,
         refs,
+        one_way: false,
     })
 }
 
@@ -955,7 +956,7 @@ fn entry(key: &str, sig: &str, v: Value) -> Value {
 #[test]
 fn dict_keys_unknown_duplicate_and_malformed() {
     let entries = vec![
-        entry("one-way", "b", Value::Bool(true)),
+        entry("zz-flag", "b", Value::Bool(true)),
         entry("agent", "s", st("first")),
         entry("agent", "u", Value::U32(7)),
         entry("zz", "a(yay)", Value::Array(vec![])),
@@ -971,6 +972,65 @@ fn dict_keys_unknown_duplicate_and_malformed() {
     let at = body.windows(3).position(|w| w == [1, 0, b'b']).unwrap();
     body[at] = 2;
     assert_protocol(read_one(&frame(1, &body)));
+}
+
+fn one_way_hello(agent: Option<&str>, refs: &[&str]) -> Message {
+    let Message::Hello(h) = hello(agent, refs) else {
+        unreachable!("hello gives a Hello")
+    };
+    Message::Hello(Hello { one_way: true, ..h })
+}
+
+/// `one-way` true is written after `agent` and reads back. The encoder writes
+/// no key for false, so `golden_bytes_pin_the_frame_layout` pins the bytes of
+/// a two-way `Hello`.
+///
+/// The entry `{"one-way": <true>}` is the key `one-way\0` (8 bytes), the
+/// variant `01`, a zero separator, and the type `b`, and then the framing
+/// offset of the end of the key, 8. The array of one entry of 12 bytes adds
+/// the offset of the end of the entry, 12. The tuple ends with the offset of
+/// the end of the dict, 21.
+#[test]
+fn a_one_way_hello_round_trips() {
+    round_trip(one_way_hello(None, &[]));
+    round_trip(one_way_hello(
+        Some("ostrya/0.2.8"),
+        &["main", "origin:main"],
+    ));
+    golden(
+        one_way_hello(None, &["main"]),
+        hex(
+            "00 00 00 1d 01 01 00 00 00 00 00 00 00 6f 6e 65 2d 77 61 79 00 01 00 62 08 0c \
+             6d 61 69 6e 00 05 15",
+        ),
+    );
+}
+
+/// An absent `one-way` key and the value false both read as false. A value
+/// of another type is `protocol`. When the key occurs twice, the first one
+/// counts.
+#[test]
+fn the_one_way_key_reads_strictly() {
+    let read = |entries| read_one(&frame(1, &hello_body(entries)));
+    assert_eq!(read(vec![]).unwrap(), Some(hello(None, &[])));
+    assert_eq!(
+        read(vec![entry("one-way", "b", Value::Bool(false))]).unwrap(),
+        Some(hello(None, &[]))
+    );
+    assert_eq!(
+        read(vec![entry("one-way", "b", Value::Bool(true))]).unwrap(),
+        Some(one_way_hello(None, &[]))
+    );
+    assert_eq!(
+        read(vec![
+            entry("one-way", "b", Value::Bool(true)),
+            entry("one-way", "b", Value::Bool(false)),
+        ])
+        .unwrap(),
+        Some(one_way_hello(None, &[]))
+    );
+    assert_protocol(read(vec![entry("one-way", "s", st("true"))]));
+    assert_protocol(read(vec![entry("one-way", "u", Value::U32(1))]));
 }
 
 #[test]

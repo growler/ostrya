@@ -24,8 +24,12 @@
 //! A second `missing` call while one runs fails at once with
 //! [`Error::InvalidInput`]. A call that fails, or whose future is dropped
 //! before it completes, leaves the session broken, as on a stream.
+//!
+//! [`export_stream`] writes one one-way stream: the messages of a session in
+//! one direction, for a receiver that sends no reply.
 
 pub(crate) mod http;
+mod one_way;
 mod progress;
 mod pull;
 pub(crate) mod stream;
@@ -42,6 +46,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 use ostrya_core::{Checksum, FileHeader, ObjectName};
 use ostrya_gvariant::Value;
 
+pub use one_way::export_stream;
 pub use progress::{PushPhase, PushProgress, PushProgressSnapshot, PushStats};
 pub use pull::{PullBody, PullSession, PullSessionOptions};
 
@@ -408,6 +413,7 @@ impl PushSession {
                 version: PROTOCOL_VERSION,
                 agent: Some(agent),
                 refs: refs.to_vec(),
+                one_way: false,
             }))
             .await?;
         let reply = match stream.next().await? {

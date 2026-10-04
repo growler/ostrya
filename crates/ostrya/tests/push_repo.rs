@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use common::TmpDir;
 use common::receive::{PIPE_CAP, PipeReader, PipeWriter, new_repo, pipe};
+use common::{Counting, TmpDir, mark_partial};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
 use ostrya::push::{self, Compression, PushOutcome, PushProgress};
@@ -189,33 +189,6 @@ fn refused(repo: &Repo, opts: RepoPushOptions) -> (Error, u64) {
     (error, written.load(Ordering::Relaxed))
 }
 
-/// A writer that counts the bytes it takes.
-struct Counting<W> {
-    inner: W,
-    written: Arc<AtomicU64>,
-}
-
-impl<W: AsyncWrite + Unpin> AsyncWrite for Counting<W> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let me = self.get_mut();
-        let n = std::task::ready!(Pin::new(&mut me.inner).poll_write(cx, buf))?;
-        me.written.fetch_add(n as u64, Ordering::Relaxed);
-        Poll::Ready(Ok(n))
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_close(cx)
-    }
-}
-
 /// The kind byte of a `Have` frame.
 const HAVE_FRAME: u8 = 3;
 
@@ -357,15 +330,6 @@ fn assert_aborted(report: &ostrya::Result<ReceiveReport>) {
         Err(Error::Push(push::Error::Aborted)) => {}
         other => panic!("expected Aborted on the server, got {other:?}"),
     }
-}
-
-/// Mark `commit` partial in `repo`.
-fn mark_partial(repo: &Repo, commit: &Checksum) {
-    std::fs::write(
-        repo.path().join(format!("state/{commit}.commitpartial")),
-        b"",
-    )
-    .unwrap();
 }
 
 fn assert_invalid_input(error: &Error, needle: &str) {

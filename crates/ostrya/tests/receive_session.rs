@@ -17,8 +17,8 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use common::receive::{
-    Client, deflate_object, header, is_root, new_repo, raw_object, returned_code, session, sha,
-    staging_entries,
+    Client, assert_nothing_published, deflate_object, header, is_root, new_repo, raw_object,
+    returned_code, session, sha, staging_entries,
 };
 use common::{TmpDir, file_inventory, foreign_holder, lock_holder_main};
 use ostrya::push::proto::{
@@ -26,9 +26,7 @@ use ostrya::push::proto::{
     PULL_PROTOCOL_VERSION, PullHello,
 };
 use ostrya::push::{self, Encoding, ErrorCode};
-use ostrya::{
-    Checksum, DirMeta, Error, ObjectName, ObjectType, ReceivePolicy, Repo, RepoMode, Xattrs,
-};
+use ostrya::{Checksum, DirMeta, Error, ObjectName, ObjectType, ReceivePolicy, RepoMode, Xattrs};
 use ostrya_core::filehdr::frame;
 use ostrya_rt::block_on;
 
@@ -58,23 +56,6 @@ fn detached_meta() -> Vec<u8> {
 // ---------------------------------------------------------------------------
 // Repositories.
 // ---------------------------------------------------------------------------
-
-/// Assert that the session published nothing and left no staging entry.
-fn assert_nothing_published(repo: &Repo, before: &[(String, Vec<u8>)]) {
-    assert_eq!(
-        file_inventory(repo.path(), "objects"),
-        before,
-        "no object published"
-    );
-    assert!(
-        file_inventory(repo.path(), "refs").is_empty(),
-        "no ref written"
-    );
-    assert!(
-        staging_entries(repo.path()).is_empty(),
-        "no staging entry left"
-    );
-}
 
 fn policy() -> ReceivePolicy {
     ReceivePolicy::default()
@@ -135,6 +116,7 @@ fn an_unknown_version_is_version_unsupported() {
             version: 2,
             agent: None,
             refs: vec![],
+            one_way: false,
         }))
         .await
         .unwrap();

@@ -99,13 +99,16 @@ Feature flags on `ostrya`:
 - `sign-spki` -- the spki signature engine.
 - `verify-gpg` -- GPG signature verification.
 - `sign-gpg` -- GPG signing. It turns on `verify-gpg`.
-- `receive` -- the server side of a push: the receive policy and
-  `Repo::receive`. The `receive` feature of `ostrya-cli`, in its default set,
+- `receive` -- the server side of a push: the receive policy,
+  `Repo::receive`, and `Repo::receive_stream`, which reads one one-way stream
+  with no reply. The `receive` feature of `ostrya-cli`, in its default set,
   builds `ostrya receive` on it.
 - `push` -- the client side of a push from a repository: `Repo::push`,
-  `Repo::push_over_stream`, and the push address and the connect options of
-  a configured remote or of an address. The `push` feature of `ostrya-cli`,
-  in its default set, builds `ostrya push` and `ostrya push-tree` on it.
+  `Repo::push_over_stream`, `Repo::export_stream`, which writes one one-way
+  stream for `Repo::receive_stream`, and the push address and the connect
+  options of a configured remote or of an address. The `push` feature of
+  `ostrya-cli`, in its default set, builds `ostrya push` and
+  `ostrya push-tree` on it.
 - `lzma-static` -- the static xz build.
 
 `ostrya-push` is a dependency of `ostrya` in every build, re-exported as

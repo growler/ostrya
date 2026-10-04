@@ -37,6 +37,7 @@ fn hello(refs: &[&str]) -> Hello {
         version: 1,
         agent: None,
         refs: refs.iter().map(|r| r.to_string()).collect(),
+        one_way: false,
     }
 }
 

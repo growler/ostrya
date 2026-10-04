@@ -24,7 +24,9 @@
 //! objects the server needs, sends them from an [`ObjectSource`], and asks
 //! the server to update its refs. [`PushProgress`] shows the counters of a
 //! session while it runs, and [`PushOutcome`] gives the ref outcomes and the
-//! [`PushStats`] of a session that committed.
+//! [`PushStats`] of a session that committed. [`session::export_stream`]
+//! writes the messages of a session as one one-way stream, for a receiver
+//! that sends no reply.
 //!
 //! The [`transport`] module holds the transports. [`PushRemote`] parses a
 //! push address, and [`PushSession::connect`] opens a session to it.
@@ -153,6 +155,15 @@ fn session_futures_are_send(
     assert_send(&session.missing(names));
     assert_send(&session.send(source, names, commits, Compression::None));
     assert_send(&owned.commit(updates, false));
+    assert_send(&session::export_stream(
+        futures_lite::io::sink(),
+        source,
+        names,
+        commits,
+        updates,
+        Compression::None,
+        SessionOptions::default(),
+    ));
 }
 
 /// The future of a connect, and the futures of its two steps, can run on a

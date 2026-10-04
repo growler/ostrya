@@ -582,6 +582,7 @@ mod tests {
                 version: 1,
                 agent: None,
                 refs: vec!["main".into()],
+                one_way: false,
             };
             let policy = Arc::new(ReceivePolicy::default());
             block_on(ReceiveService::hello(self.repo.clone(), policy, 1, hello))

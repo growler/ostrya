@@ -511,6 +511,17 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
         Ok(())
     }
 
+    /// Write `frame`, which [`encode_frame`] built for a message that opens
+    /// no body. Inside an object or a pull body the call is the error
+    /// `protocol`.
+    pub(crate) async fn write_frame(&mut self, frame: &[u8]) -> Result<()> {
+        if self.body.is_some() {
+            return Err(protocol("message inside an object"));
+        }
+        self.inner.write_all(frame).await?;
+        Ok(())
+    }
+
     /// Write the bytes of an object or of a pull body as chunks of at most
     /// the limit. An empty `data` writes nothing. Outside a body the call is
     /// the error `protocol`.

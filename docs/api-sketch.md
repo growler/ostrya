@@ -2550,7 +2550,9 @@ messages through `ostrya`. `Error::Push` carries them in every build too.
   locking=false` refuses the session with `locking-disabled`. A
   `bare-split-xattrs` repository refuses it with `mode-refused`, and so does
   a `bare` repository when the process does not run as root. A ref name of
-  `Hello` that `validate_refspec` refuses is `invalid-ref`.
+  `Hello` that `validate_refspec` refuses is `invalid-ref`. A `Hello` with
+  `one-way` true is `protocol`, before the version check: it opens a
+  one-way stream, which `Repo::receive_stream` reads.
 - `Have` gets one bit for each object that neither the repository nor the
   session holds. More than `max-have` entries is `limit-exceeded`.
 - The object stream checks the checksum of each object and the content rules
@@ -2658,8 +2660,47 @@ impl Repo {
     where
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send;
+
+    /// Reads one one-way stream into one transaction, and sends nothing.
+    pub async fn receive_stream<R>(&self, input: R, policy: &ReceivePolicy)
+        -> Result<ReceiveReport>
+    where
+        R: AsyncRead + Unpin + Send;
 }
 ```
+
+`Repo::receive_stream` reads one one-way stream: one `Hello` with `one-way`
+true, zero or more object streams, each closed by `ObjectsEnd`, one
+`Commit`, and the end of the input. `ostrya_push::proto::Hello` carries the
+key as the field `one_way`. The encoder writes the key when it is true
+alone, and an absent key reads as false. The call sends no message and
+returns the result.
+
+- The frame limit and the chunk limit are 1 MiB, because no `HelloReply`
+  announces another one. The objects are staged as in `Repo::receive`.
+- The checks of `Hello` are those of `Repo::receive`, except that a
+  repository with `[core] locking=false` is accepted. A `Hello` without
+  `one-way` true is `protocol`, before the version check. The session
+  transaction holds the repository lock shared from `Hello` to the end, with
+  no lock under `[core] locking=false`. The commit takes the update lock,
+  which ignores `[core] locking`.
+- `Have`, a second `Hello`, and an `Abort` frame between two objects are
+  `protocol`. An object that the sender abandons with the abandon marker and
+  `Abort` returns `push::Error::Aborted`.
+- An update of `Commit` whose expected state is `Commit`, and an update with
+  no new commit, are `protocol`. The call then reads to the end of the
+  input, and a byte after `Commit` is `protocol`, also a byte that does not
+  make a whole frame. An end of the input before `Commit` is complete
+  returns an `Error::Io` of kind `UnexpectedEof`, and an error of the input
+  returns as `Error::Io`.
+- `Commit` runs the checks and the steps of `Repo::receive` with a policy
+  derived from `policy`: the `signers` of each rule and `summary_signers`
+  are empty, and `update_summary` is false. So the commit adds no server
+  signature, writes no anchor commit, and does not regenerate the summary.
+  The check of the merged detached metadata against `MAX_METADATA_SIZE`
+  stays, and so does the check that the `CommitReply` of the updates fits in
+  a frame of `MAX_FRAME`.
+- Each failure aborts the transaction, and the repository does not change.
 
 `ReceiveService` runs the same session as steps, one for each request of a
 transport such as HTTP. Each step does what the message of the same name
@@ -2672,7 +2713,8 @@ knows no HTTP, no session id, no owner, no timeout, and no status.
 - `hello` opens the session transaction. `parallel_uploads` is the value
   that `HelloReply` announces. A `parallel_uploads` of 0 is
   `Error::InvalidInput`. The service sets no upper bound, and the host
-  keeps the value in a range of its own.
+  keeps the value in a range of its own. A `Hello` with `one-way` true is
+  `protocol`.
 - Up to `parallel_uploads` `objects` calls run at the same time and write
   through the one session transaction. One call more is `limit-exceeded`,
   and ends the session. One `have` runs next to the other steps and does
@@ -2785,6 +2827,25 @@ selects.
 - `abort` writes `Abort` and closes the output when the stream is still
   usable. On a broken session it writes nothing and returns
   `Error::InvalidInput`.
+- `session::export_stream` writes the messages of a session as one one-way
+  stream, for a receiver that sends no reply: `Hello` with `one-way` true,
+  one object stream with the names and the detached metadata of the
+  commits, `ObjectsEnd`, and `Commit` with `force` false. It reads nothing
+  and does no negotiation, and its frame limit and chunk limit are 1 MiB.
+  Before it writes a byte, it refuses with `Error::InvalidInput`: empty
+  updates, a ref named twice, a ref name that fails
+  `ostrya_core::is_refspec`, an expected state `Commit`, an update with no
+  new commit, a level outside 1 to 9, a name of a type other than file,
+  dirtree, dirmeta, or commit, and a `Hello` or a `Commit` frame over 1
+  MiB. A source that fails ends the stream inside an object: the function
+  writes the `ObjectHeader` of the object when it did not write it yet,
+  then the abandon marker and `Abort`, and returns the error. A failed
+  write returns its error, and the function writes nothing more. The
+  function writes `output` in blocks of 64 KiB, so the caller need not give
+  a buffered writer. It flushes `output` and does not close it. `W` has no `'static` bound, and a
+  caller that keeps its writer gives `&mut W`. The `PushStats` count each
+  name as offered and as needed. The crate root does not re-export the
+  function.
 
 ```rust
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -2827,6 +2888,16 @@ impl PushSession {
     pub async fn commit(self, updates: &[RefUpdate], force: bool)
         -> Result<PushOutcome>;
     pub async fn abort(self) -> Result<()>;
+}
+
+pub mod session {
+    pub async fn export_stream<W>(output: W, source: &dyn ObjectSource,
+                                  names: &[ObjectName], commits: &[Checksum],
+                                  updates: &[RefUpdate],
+                                  compression: Compression,
+                                  opts: SessionOptions) -> Result<PushStats>
+    where
+        W: AsyncWrite + Unpin + Send;
 }
 
 pub struct PushOutcome {
@@ -3563,6 +3634,63 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
 - When a ref line cannot go to standard output, the command writes
   `error: MESSAGE` to standard error and exits 1. The refs of the server
   have changed at that point.
+
+`Repo::export_stream`, under the `push` feature, writes the commits that a
+set of ref updates name as one one-way stream, for `Repo::receive_stream`
+under the `receive` feature on the other side of a channel that carries data
+in one direction. It has no CLI command.
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub struct ExportStreamOptions {
+    pub updates: Vec<RefUpdate>,   // expected Absent or Any, new commit set
+    pub compression: Compression,
+    pub detached_metadata_filter: DetachedMetadataFilter,
+}
+
+impl Repo {
+    pub async fn export_stream<W>(&self, output: W, opts: ExportStreamOptions)
+        -> Result<PushStats>
+    where
+        W: AsyncWrite + Unpin + Send;
+}
+```
+
+The struct carries no `#[non_exhaustive]`, and a caller builds it with
+`..Default::default()`. It has no `force` field, because the stream sends
+`force` false, and no progress field. `ExportStreamOptions` is re-exported
+at the crate root.
+
+- The stream holds each new commit of `updates` once, each object its tree
+  reaches, and its detached metadata after `detached_metadata_filter`. It
+  holds no parent commit. The sender does no negotiation.
+- The export holds the lock of the local repository shared for the whole
+  call, as `Repo::push` does.
+- Before it writes a byte, the export refuses empty `updates`, a ref named
+  twice, an update whose expected state is `Commit`, an update with no new
+  commit, and a commit that the local repository marks partial, as
+  `Error::Push` with `InvalidInput`. It refuses a ref name that
+  `validate_refspec` refuses as `Error::InvalidRefspec`. It refuses a commit
+  whose `ostree.ref-binding` is a list that does not hold the name of its
+  ref as `Error::Push` with `BindingMismatch`. For a remote ref
+  `REMOTE:NAME` the check compares `NAME` alone. A dirtree or a dirmeta that
+  the local repository lacks is `Error::ObjectNotFound`. A level outside 1
+  to 9, and a `Hello` or a `Commit` frame over 1 MiB, are `Error::Push` with
+  `InvalidInput`.
+- The export does not check before the stream that each file object
+  exists. A missing file object, and another failure of the source, end the
+  stream inside the object that the export was to send, with the abandon
+  marker and `Abort`. The export returns `Error::Push` with `Source`, and
+  the receiver returns `push::Error::Aborted`.
+- An `archive` repository sends a file object in `deflate` as the bytes of
+  its stored `.filez` file.
+- The export writes `output` in blocks of 64 KiB, so the caller need not
+  give a buffered writer. It flushes `output` after `Commit` and does not
+  close it. The caller closes it, and the close gives the end of file that ends the
+  stream. `W` has no `'static` bound, and a caller that keeps its writer
+  gives `&mut W`.
+- The `PushStats` of an export count each object of the stream as offered
+  and as needed. The phases are `Uploading` and then `Committing`.
 
 ## Archive view and HTTP server
 

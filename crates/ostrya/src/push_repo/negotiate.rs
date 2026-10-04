@@ -333,15 +333,16 @@ fn session_options(opts: &RepoPushOptions) -> SessionOptions {
 }
 
 /// Refuse a commit whose `ostree.ref-binding` is a list that does not hold
-/// `dst`. A commit with no binding, or with an empty list, passes, as on the
-/// server.
-fn check_ref_binding(checksum: &Checksum, commit: &Commit, dst: &str) -> Result<()> {
+/// `dst`, the `REMOTE:` part of a remote ref left out. A commit with no
+/// binding, or with an empty list, passes, as on the server.
+pub(super) fn check_ref_binding(checksum: &Checksum, commit: &Commit, dst: &str) -> Result<()> {
     let bindings = commit.ref_bindings();
-    if bindings.is_empty() || bindings.contains(&dst) {
+    let bare = dst.split_once(':').map_or(dst, |(_, bare)| bare);
+    if bindings.is_empty() || bindings.contains(&bare) {
         return Ok(());
     }
     Err(Error::Push(crate::push::Error::BindingMismatch(format!(
-        "commit {checksum} is bound to the refs {bindings:?}, which do not hold '{dst}'"
+        "commit {checksum} is bound to the refs {bindings:?}, which do not hold '{bare}'"
     ))))
 }
 

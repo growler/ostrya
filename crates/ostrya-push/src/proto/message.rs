@@ -38,6 +38,10 @@ pub struct Hello {
     pub agent: Option<String>,
     /// The refs the client intends to update: `NAME` or `REMOTE:NAME`.
     pub refs: Vec<String>,
+    /// Key `one-way`: the `Hello` opens a one-way stream, and the receiver
+    /// sends no message. The encoder writes the key when it is true alone,
+    /// and an absent key decodes as false.
+    pub one_way: bool,
 }
 
 /// `HelloReply`: the facts and limits of the server, and the refs of `Hello`.
@@ -265,6 +269,9 @@ impl Message {
                 if let Some(agent) = &h.agent {
                     opts.insert_str("agent", agent);
                 }
+                if h.one_way {
+                    opts.insert_bool("one-way", true);
+                }
                 let refs = h.refs.iter().cloned().map(Value::Str).collect();
                 let v = Value::Tuple(vec![
                     Value::U32(h.version),
@@ -427,12 +434,14 @@ impl Message {
             }
             Kind::Hello => {
                 let (version, opts, refs): (u32, Dict, ArrayIter<&str>) = parse_body(body)?;
-                let [agent] = dict(opts, ["agent"])?;
+                let [agent, one_way] = dict(opts, ["agent", "one-way"])?;
                 let agent: Option<&str> = field(agent, "agent", &Type::Str)?;
+                let one_way = field(one_way, "one-way", &Type::Bool)?.unwrap_or(false);
                 Message::Hello(Hello {
                     version,
                     agent: agent.map(str::to_owned),
                     refs: collect(refs, |r| Ok(r.to_owned()))?,
+                    one_way,
                 })
             }
             Kind::HelloReply => Message::HelloReply(decode_hello_reply(body)?),

@@ -257,6 +257,7 @@ pub(super) async fn open(
         version: PROTOCOL_VERSION,
         agent: Some(agent),
         refs: refs.to_vec(),
+        one_way: false,
     });
     let body = encode_frame(&hello, MIN_FRAME_LIMIT)?;
     let url = endpoint.url_of(SESSION_PATH);
@@ -476,9 +477,13 @@ async fn write_stream<W: AsyncWrite + Unpin>(
             up.stop();
             Written::Failed(e)
         }
-        Err(Stop::Abandon { error, in_object }) => {
+        Err(Stop::Abandon {
+            error, in_object, ..
+        }) => {
             up.stop();
-            out.abandon(in_object).await;
+            // The upload ends with the error of the stop, so a failed write
+            // is ignored.
+            let _ = out.abandon(in_object).await;
             let _ = out.close().await;
             Written::Abandoned(error)
         }

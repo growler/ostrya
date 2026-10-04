@@ -21,7 +21,7 @@ use ostrya_rt::block_on;
 use sha2::{Digest, Sha256};
 
 pub use super::pipe::{PipeReader, PipeWriter, pipe};
-use super::{COMMIT, TmpDir, fixture_repo};
+use super::{COMMIT, TmpDir, file_inventory, fixture_repo};
 
 // ---------------------------------------------------------------------------
 // The test client.
@@ -50,6 +50,7 @@ impl Client {
             version: 1,
             agent: None,
             refs: refs.iter().map(|r| r.to_string()).collect(),
+            one_way: false,
         }))
         .await
     }
@@ -298,6 +299,25 @@ pub fn staging_entries(root: &Path) -> Vec<String> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n.starts_with("staging-"))
         .collect()
+}
+
+/// Assert that the session published nothing: the files under `objects/`,
+/// the detached metadata included, are `before`, no ref is written, and no
+/// staging entry is left.
+pub fn assert_nothing_published(repo: &Repo, before: &[(String, Vec<u8>)]) {
+    assert_eq!(
+        file_inventory(repo.path(), "objects"),
+        before,
+        "no object published"
+    );
+    assert!(
+        file_inventory(repo.path(), "refs").is_empty(),
+        "no ref written"
+    );
+    assert!(
+        staging_entries(repo.path()).is_empty(),
+        "no staging entry left"
+    );
 }
 
 // ---------------------------------------------------------------------------

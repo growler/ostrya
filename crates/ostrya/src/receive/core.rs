@@ -34,6 +34,8 @@ pub(super) struct SessionCore<P: Deref<Target = ReceivePolicy>> {
     rules: ModeRules,
     /// The refs `Hello` named.
     named: Vec<String>,
+    /// The session reads a one-way stream.
+    one_way: bool,
     meta: Mutex<MetaState>,
     /// The bytes of the dirtree, dirmeta, and commit objects that the object
     /// streams of the session read now and did not stage yet. The session
@@ -56,15 +58,75 @@ struct MetaState {
 }
 
 impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
-    /// Answer `Hello`: check the version, the repository, and the ref names,
-    /// and open the session transaction. `parallel_uploads` is the value the
-    /// reply announces.
+    /// Answer `Hello` of a two-way session: check the version, the repository,
+    /// and the ref names, and open the session transaction. `parallel_uploads`
+    /// is the value the reply announces. A `Hello` with `one-way` true is
+    /// `protocol`, before the version check.
     pub(super) async fn open(
         repo: Repo,
         policy: P,
         parallel_uploads: u32,
         hello: Hello,
     ) -> std::result::Result<(Self, HelloReply), Failure> {
+        if hello.one_way {
+            return Err(Failure::Wire(push::Error::Protocol(
+                "a Hello with one-way true opens a one-way stream, which this session does not \
+                 read"
+                    .into(),
+            )));
+        }
+        let core = Self::start(repo, policy, hello, false).await?;
+        let repo = &core.repo;
+        let tips = repo
+            .resolve_ref_tips(&core.named)
+            .await
+            .map_err(Failure::Internal)?;
+        let refs = core
+            .named
+            .iter()
+            .cloned()
+            .zip(tips)
+            .map(|(name, commit)| RefState { name, commit })
+            .collect();
+        let reply = HelloReply {
+            version: PROTOCOL_VERSION,
+            mode: repo.mode().as_mode_str().into(),
+            collection_id: repo.config().collection_id().map(Into::into),
+            max_frame: MAX_FRAME,
+            max_have: MAX_HAVE,
+            encodings: vec![Encoding::Raw, Encoding::Deflate],
+            parallel_uploads,
+            refs,
+        };
+        Ok((core, reply))
+    }
+
+    /// Read `Hello` of a one-way stream: the checks of a two-way `Hello`
+    /// except the refusal of `[core] locking=false`, and the open of the
+    /// session transaction. A `Hello` without `one-way` true is `protocol`,
+    /// before the version check.
+    pub(super) async fn open_one_way(
+        repo: Repo,
+        policy: P,
+        hello: Hello,
+    ) -> std::result::Result<Self, Failure> {
+        if !hello.one_way {
+            return Err(Failure::Wire(push::Error::Protocol(
+                "a one-way stream starts with a Hello with one-way true".into(),
+            )));
+        }
+        Self::start(repo, policy, hello, true).await
+    }
+
+    /// Check the version, the repository, and the ref names of `hello`, and
+    /// open the session transaction. A two-way session refuses a repository
+    /// with `[core] locking=false`.
+    async fn start(
+        repo: Repo,
+        policy: P,
+        hello: Hello,
+        one_way: bool,
+    ) -> std::result::Result<Self, Failure> {
         if hello.version != PROTOCOL_VERSION {
             return Err(Failure::Wire(push::Error::VersionUnsupported(format!(
                 "the server speaks protocol version {PROTOCOL_VERSION}, not {}",
@@ -77,7 +139,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
                 "the repository mode bare-split-xattrs is read-only".into(),
             )));
         }
-        if !repo.config().locking().map_err(Failure::Internal)? {
+        if !one_way && !repo.config().locking().map_err(Failure::Internal)? {
             return Err(Failure::Wire(push::Error::LockingDisabled(
                 "the repository sets [core] locking=false".into(),
             )));
@@ -110,37 +172,16 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
             }
         }
         let rules = ModeRules::new(mode, policy.allow_privileged);
-        let tips = repo
-            .resolve_ref_tips(&hello.refs)
-            .await
-            .map_err(Failure::Internal)?;
-        let refs = hello
-            .refs
-            .iter()
-            .cloned()
-            .zip(tips)
-            .map(|(name, commit)| RefState { name, commit })
-            .collect();
-        let reply = HelloReply {
-            version: PROTOCOL_VERSION,
-            mode: mode.as_mode_str().into(),
-            collection_id: repo.config().collection_id().map(Into::into),
-            max_frame: MAX_FRAME,
-            max_have: MAX_HAVE,
-            encodings: vec![Encoding::Raw, Encoding::Deflate],
-            parallel_uploads,
-            refs,
-        };
-        let core = SessionCore {
+        Ok(SessionCore {
             repo,
             policy,
             txn,
             rules,
             named: hello.refs,
+            one_way,
             meta: Mutex::default(),
             reading: AtomicU64::new(0),
-        };
-        Ok((core, reply))
+        })
     }
 
     /// Answer a `Have`: one bit for each object the repository and the session
@@ -204,7 +245,9 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
             match next(reader).await? {
                 Message::ObjectHeader(next) => header = next,
                 Message::ObjectsEnd => break,
-                Message::Abort => return Err(aborted()),
+                // A one-way sender that fails abandons the object it sends, so
+                // in a one-way stream `Abort` follows the abandon marker alone.
+                Message::Abort if !self.one_way => return Err(aborted()),
                 other => return Err(out_of_order(&other)),
             }
         }

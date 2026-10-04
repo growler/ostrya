@@ -596,6 +596,7 @@ mod standin {
             version: PROTOCOL_VERSION,
             agent: Some(AGENT.into()),
             refs: refs(),
+            one_way: false,
         })])
         .len()
     }

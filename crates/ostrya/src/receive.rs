@@ -38,6 +38,11 @@
 //! [`ReceiveService`] runs the same session as steps, one for each request of
 //! a transport such as HTTP, with concurrent object streams on the one
 //! session transaction.
+//!
+//! [`Repo::receive_stream`](crate::Repo::receive_stream) reads one one-way
+//! stream: the messages of a session in one direction, with no reply. It runs
+//! the checks and the commit of a session, with no server signature and no
+//! summary step.
 
 mod ancestry;
 mod core;
@@ -50,6 +55,7 @@ mod reader;
 mod service;
 mod session;
 mod signer;
+mod stream;
 mod trust;
 mod walk;
 

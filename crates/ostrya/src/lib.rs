@@ -222,12 +222,16 @@
 //! received commit is held to the same signature checks a pull makes, over the
 //! keys the receive policy names. `Repo::receive` runs one push session over a
 //! pair of streams, and `ReceiveService` runs one as a step for each request of
-//! a transport such as HTTP.
+//! a transport such as HTTP. `Repo::receive_stream` reads one one-way stream,
+//! a session in one direction with no reply.
 //!
 //! Under the `push` feature it also covers the client side of a push from a
 //! repository. `Repo::push` pushes the commits of a set of refspecs to a
 //! remote over ssh or HTTP. `Repo::push_over_stream` runs the same push over a pair
 //! of streams. Both take the options of `RepoPushOptions`.
+//! `Repo::export_stream` writes the commits of a set of ref updates as one
+//! one-way stream, with the options of `ExportStreamOptions`, for
+//! `Repo::receive_stream` to read.
 //! `resolve_push_remote` gives the push address and the connect options of a
 //! configured remote or of an address, and `is_push_address` tells an address
 //! from a remote name. The push keys of a remote section,
@@ -338,7 +342,7 @@ pub use pull::{
     PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };
 #[cfg(feature = "push")]
-pub use push_repo::{RepoPushOptions, is_push_address, resolve_push_remote};
+pub use push_repo::{ExportStreamOptions, RepoPushOptions, is_push_address, resolve_push_remote};
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 pub use receive::{

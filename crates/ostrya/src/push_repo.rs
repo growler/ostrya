@@ -5,16 +5,21 @@
 //! [`is_push_address`] tells the two apart.
 //! [`Repo::push`](crate::Repo::push) and
 //! [`Repo::push_over_stream`](crate::Repo::push_over_stream) push the commits
-//! of a set of refspecs with the options of [`RepoPushOptions`]. The
-//! crate-private parts read the refspecs of a push against the local
-//! repository, and give the objects of its commits to a push session.
+//! of a set of refspecs with the options of [`RepoPushOptions`].
+//! [`Repo::export_stream`](crate::Repo::export_stream) writes the commits of a
+//! set of ref updates as one one-way stream, with the options of
+//! [`ExportStreamOptions`]. The crate-private parts read the refspecs of a
+//! push against the local repository, and give the objects of its commits to
+//! a push session.
 
+mod export;
 mod negotiate;
 mod refspec;
 mod source;
 #[cfg(test)]
 mod test_repo;
 
+pub use self::export::ExportStreamOptions;
 pub use self::negotiate::RepoPushOptions;
 
 use std::path::PathBuf;

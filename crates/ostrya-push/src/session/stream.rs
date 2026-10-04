@@ -22,7 +22,7 @@ const STREAM_BUFFER: usize = 64 * 1024;
 /// exactly. Each chunk is shorter than the buffer, so it goes through the
 /// buffer, and a chunk length is never the only content of a write to the
 /// transport.
-const WRITE_BUFFER: usize = 64 * 1024;
+pub(super) const WRITE_BUFFER: usize = 64 * 1024;
 
 pub(crate) type Input = Box<dyn AsyncRead + Unpin + Send>;
 pub(crate) type Output = Box<dyn AsyncWrite + Unpin + Send>;
@@ -129,8 +129,12 @@ impl Stream {
         match self.writer.write_items(up, &mut pass, &mut started).await {
             Ok(()) => {}
             Err(Stop::Wire(e)) => return Err(self.after_write_error(e).await),
-            Err(Stop::Abandon { error, in_object }) => {
-                self.writer.abandon(in_object).await;
+            Err(Stop::Abandon {
+                error, in_object, ..
+            }) => {
+                // The stream ends with the error of the stop, so a failed
+                // write is ignored.
+                let _ = self.writer.abandon(in_object).await;
                 let _ = self.writer.frames().flush().await;
                 return Err(error);
             }

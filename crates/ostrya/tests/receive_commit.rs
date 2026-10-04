@@ -768,6 +768,89 @@ fn an_invalid_name_at_commit_is_invalid_ref() {
     assert_unchanged(&repo, &before);
 }
 
+/// A ref name of 64 lowercase hex characters, which a revision reads as a
+/// commit checksum, passes `Hello`. An update that writes a commit to it is
+/// `invalid-ref` at `Commit`, also where `Hello` did not name it. With a
+/// `REMOTE:` part the name passes the check, and the binding check of the
+/// fixture commit refuses it.
+#[test]
+fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
+    let tmp = TmpDir::new("recv-hex-commit");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let hex = "a".repeat(64);
+    for names in [vec![hex.clone()], vec!["test/main".to_string()]] {
+        let error = refused(
+            push_named(
+                &repo,
+                &policy(),
+                &names,
+                &fixture_objects(Encoding::Raw),
+                &[],
+                vec![update(&hex, Expected::Absent, Some(fixture_commit()))],
+                false,
+            ),
+            ErrorCode::InvalidRef,
+        );
+        assert_eq!(error.message, format!("invalid ref name '{hex}'"));
+        assert_unchanged(&repo, &before);
+    }
+
+    let remote = format!("origin:{hex}");
+    refused(
+        push(
+            &repo,
+            &policy_with("origin:*", ReceiveRule::default()),
+            &fixture_objects(Encoding::Raw),
+            &[],
+            vec![update(&remote, Expected::Absent, Some(fixture_commit()))],
+            false,
+        ),
+        ErrorCode::BindingMismatch,
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// A delete of a ref of 64 lowercase hex characters passes the check of the
+/// name, and a rule that allows the delete removes the ref.
+#[test]
+fn a_delete_of_a_checksum_shaped_name_removes_the_ref() {
+    let tmp = TmpDir::new("recv-hex-delete");
+    let repo = repo_with_fixture(&tmp, RepoMode::Archive, "");
+    let hex = "a".repeat(64);
+    block_on(repo.set_ref_immediate(&hex, Some(&fixture_commit()))).unwrap();
+    let path = format!("refs/heads/{hex}");
+    assert_eq!(ref_file(&repo, &path), Some(format!("{COMMIT}\n")));
+    let allow = ReceivePolicy {
+        default_rule: ReceiveRule {
+            allow_delete: true,
+            ..ReceiveRule::default()
+        },
+        ..ReceivePolicy::default()
+    };
+    let report = committed(push(
+        &repo,
+        &allow,
+        &[],
+        &[],
+        vec![update(&hex, Expected::Commit(fixture_commit()), None)],
+        false,
+    ));
+    assert_eq!(
+        report.refs,
+        vec![RefOutcome {
+            name: hex.clone(),
+            old: Some(fixture_commit()),
+            new: None,
+        }]
+    );
+    assert_eq!(ref_file(&repo, &path), None);
+    assert_eq!(
+        ref_file(&repo, "refs/heads/test/main"),
+        Some(format!("{COMMIT}\n"))
+    );
+}
+
 /// Detached metadata for a commit that is neither staged nor present is
 /// `protocol` at `Commit`.
 #[test]

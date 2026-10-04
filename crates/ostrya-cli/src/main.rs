@@ -2128,7 +2128,9 @@ async fn send(repo: Repo) -> Result<()> {
 ///
 /// Standard output carries one line for each ref, in the order of the
 /// refspecs, and nothing else. Under `--verbose` one statistics line goes to
-/// standard error. A failure writes nothing to standard output.
+/// standard error. A failure writes nothing to standard output. On a
+/// terminal, standard error shows the progress bar of [`PushBar`] while the
+/// push runs.
 #[cfg(feature = "push")]
 async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<()> {
     let Some(remote) = args.remote.as_deref() else {
@@ -2137,16 +2139,21 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
     if args.refspecs.is_empty() {
         exit_with_error(name, "REFSPEC must be specified");
     }
+    let detached_metadata_filter = detached_metadata_filter(&repo)?;
+    let (progress, bar) = PushBar::start();
     let opts = ostrya::RepoPushOptions {
         refspecs: args.refspecs,
         depth: args.depth,
         compression: push_compression(args.compress),
         force: args.force,
         connect: push_connect_options(args.connect),
-        detached_metadata_filter: detached_metadata_filter(&repo)?,
-        progress: None,
+        detached_metadata_filter,
+        progress,
     };
-    let outcome = repo.push(remote, opts).await?;
+    let pushed = repo.push(remote, opts).await;
+    // The bar is cleared before any line of the result or of the error.
+    bar.finish();
+    let outcome = pushed?;
     // The refs are written on the remote at this point. A failed write to
     // standard output, a full device or a closed pipe, is reported as the
     // error line of `main` and exits 1.
@@ -2216,7 +2223,8 @@ fn push_connect_options(args: PushConnectArgs) -> ostrya::push::ConnectOptions {
 ///
 /// Standard output carries the commit checksum alone. Under `--verbose` one
 /// statistics line goes to standard error. A failure writes nothing to
-/// standard output.
+/// standard output. On a terminal, standard error shows the progress bar of
+/// [`PushBar`] while the push runs.
 #[cfg(feature = "push")]
 async fn push_tree(
     repo: Option<&Path>,
@@ -2303,6 +2311,7 @@ async fn push_tree(
         Some(path) => Some(refuse!(read_body_file(path))),
         None => args.body,
     };
+    let (progress, bar) = PushBar::start();
     let opts = ostrya::push::TreePushOptions {
         refs: args.branch,
         parent,
@@ -2317,9 +2326,12 @@ async fn push_tree(
         entry_filter: tree_push_filter(owner, args.canonical_permissions),
         hash_jobs: None,
         force: args.force,
-        progress: None,
+        progress,
     };
-    let outcome = ostrya::push::push_tree_prepared(transport, dir, opts).await?;
+    let pushed = ostrya::push::push_tree_prepared(transport, dir, opts).await;
+    // The bar is cleared before any line of the result or of the error.
+    bar.finish();
+    let outcome = pushed?;
     let commit = outcome.commit.expect("a tree push names its commit");
     // The refs are written on the remote at this point. A failed write to
     // standard output, a full device or a closed pipe, is reported as the
@@ -2395,6 +2407,169 @@ fn push_statistics_line(stats: &ostrya::push::PushStats) -> String {
         stats.bytes_sent,
         stats.elapsed.as_secs_f64()
     )
+}
+
+/// The progress bar of `push` and `push-tree` on standard error.
+///
+/// The hook of a [`PushProgress`](ostrya::push::PushProgress) drives the bar.
+/// `indicatif` draws it at most 20 times a second. When standard error is not
+/// a terminal, or `TERM` is unset or `dumb`, the bar is hidden, and the push
+/// gets no progress handle: the session then asks its source for no byte
+/// total and calls no hook. The bar shows nothing before the push reaches
+/// `Negotiating`, so the prompts of the ssh client and of a signer stay
+/// readable. It then shows a spinner while the session negotiates and a bar
+/// of the content bytes while it uploads. It clears when the push reaches
+/// `Committing` and shows nothing after that, so a line that the server
+/// writes on standard error at the commit starts on a clean line.
+#[cfg(feature = "push")]
+struct PushBar {
+    bar: indicatif::ProgressBar,
+    /// The stage the bar shows: one of the `STAGE_` constants. The stage
+    /// only goes up.
+    stage: std::sync::atomic::AtomicU8,
+    /// The object counts of the upload, which the bar reads when it draws.
+    objects: Arc<ObjectCounts>,
+}
+
+/// The objects sent and the objects needed, as the `{objects}` key of the
+/// upload templates writes them.
+#[cfg(feature = "push")]
+#[derive(Default)]
+struct ObjectCounts {
+    sent: std::sync::atomic::AtomicU64,
+    needed: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "push")]
+const STAGE_HIDDEN: u8 = 0;
+#[cfg(feature = "push")]
+const STAGE_NEGOTIATING: u8 = 1;
+#[cfg(feature = "push")]
+const STAGE_UPLOADING: u8 = 2;
+/// The bar is cleared and shows nothing more.
+#[cfg(feature = "push")]
+const STAGE_DONE: u8 = 3;
+
+/// The template of the negotiation.
+#[cfg(feature = "push")]
+const NEGOTIATING_TEMPLATE: &str = "{spinner} Negotiating";
+/// The template of the upload when the byte total is known.
+#[cfg(feature = "push")]
+const BAR_TEMPLATE: &str =
+    "{objects} [{wide_bar}] {percent:>3}% {bytes}/{total_bytes} {binary_bytes_per_sec} {eta}";
+/// The template of the upload when the byte total is not known.
+#[cfg(feature = "push")]
+const BYTES_TEMPLATE: &str = "{spinner} {objects} {bytes} {binary_bytes_per_sec}";
+
+#[cfg(feature = "push")]
+impl PushBar {
+    /// A new bar, and the progress handle whose hook drives it. A hidden bar
+    /// gives no handle.
+    fn start() -> (Option<ostrya::push::PushProgress>, Arc<PushBar>) {
+        let bar = Arc::new(PushBar {
+            bar: indicatif::ProgressBar::with_draw_target(
+                None,
+                indicatif::ProgressDrawTarget::stderr(),
+            ),
+            stage: std::sync::atomic::AtomicU8::new(STAGE_HIDDEN),
+            objects: Arc::default(),
+        });
+        if bar.bar.is_hidden() {
+            return (None, bar);
+        }
+        let hooked = Arc::clone(&bar);
+        let progress = ostrya::push::PushProgress::with_hook(Arc::new(move |snapshot| {
+            hooked.update(snapshot)
+        }));
+        (Some(progress), bar)
+    }
+
+    /// Show `snapshot`. The style changes only when the stage changes, and
+    /// a snapshot of an earlier stage changes nothing.
+    fn update(&self, snapshot: &ostrya::push::PushProgressSnapshot) {
+        use ostrya::push::PushPhase;
+        let stage = match snapshot.phase {
+            PushPhase::Negotiating => STAGE_NEGOTIATING,
+            PushPhase::Uploading => STAGE_UPLOADING,
+            PushPhase::Committing => STAGE_DONE,
+            _ => return,
+        };
+        if stage == STAGE_UPLOADING {
+            self.objects
+                .sent
+                .store(snapshot.objects_sent, Ordering::Relaxed);
+            self.objects
+                .needed
+                .store(snapshot.objects_needed, Ordering::Relaxed);
+        }
+        let before = self.stage.fetch_max(stage, Ordering::Relaxed);
+        if before > stage {
+            return;
+        }
+        if before < stage {
+            self.enter(before, stage, snapshot.bytes_total);
+        }
+        if stage == STAGE_UPLOADING {
+            self.bar.set_position(snapshot.content_bytes);
+        }
+    }
+
+    /// Change the bar from the stage `before` to `stage`.
+    fn enter(&self, before: u8, stage: u8, bytes_total: u64) {
+        let style = |template: &str| {
+            let objects = Arc::clone(&self.objects);
+            indicatif::ProgressStyle::with_template(template)
+                .expect("the template is valid")
+                .with_key(
+                    "objects",
+                    move |_: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+                        let _ = write!(
+                            w,
+                            "{}/{} objects",
+                            objects.sent.load(Ordering::Relaxed),
+                            objects.needed.load(Ordering::Relaxed)
+                        );
+                    },
+                )
+        };
+        match stage {
+            STAGE_NEGOTIATING => self.bar.set_style(style(NEGOTIATING_TEMPLATE)),
+            STAGE_UPLOADING => {
+                // The rate and the time left count from the first object.
+                self.bar.reset_elapsed();
+                if bytes_total > 0 {
+                    self.bar.set_length(bytes_total);
+                    self.bar.set_style(style(BAR_TEMPLATE));
+                } else {
+                    self.bar.unset_length();
+                    self.bar.set_style(style(BYTES_TEMPLATE));
+                }
+            }
+            _ => {
+                self.clear(before);
+                return;
+            }
+        }
+        // The spinner turns between two updates. A hidden bar starts no
+        // thread for it.
+        if before == STAGE_HIDDEN && !self.bar.is_hidden() {
+            self.bar
+                .enable_steady_tick(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Clear the bar from the terminal, when the stage `before` showed it.
+    fn clear(&self, before: u8) {
+        if before != STAGE_HIDDEN && before != STAGE_DONE {
+            self.bar.disable_steady_tick();
+            self.bar.finish_and_clear();
+        }
+    }
+
+    /// Clear the bar, when it shows, and show nothing more.
+    fn finish(&self) {
+        self.clear(self.stage.swap(STAGE_DONE, Ordering::Relaxed));
+    }
 }
 
 /// The name of a step of the receive report, as its warning line gives it.
@@ -9935,7 +10110,7 @@ fn shadowed_branch_name(branch: &str) -> Option<String> {
     if branch.ends_with('^') {
         return Some(format!("Invalid refspec {branch}"));
     }
-    if Checksum::from_hex_lower(branch).is_ok() {
+    if ostrya::is_checksum_shaped(branch) {
         return Some(format!("Rev name '{branch}' looks like a checksum"));
     }
     None
@@ -10729,6 +10904,61 @@ mod tests {
             );
         }
         assert!(user_metadata_entries(&[], &[]).unwrap().is_empty());
+    }
+
+    /// Each template of the push progress bar parses. The bar shows no stage
+    /// before `Negotiating`, then the stage of each phase, and clears at
+    /// `Committing`. A snapshot of an earlier phase after that changes
+    /// nothing. A hidden bar gives no progress handle.
+    #[cfg(feature = "push")]
+    #[test]
+    fn the_push_bar_templates_parse_and_the_bar_clears_at_committing() {
+        use ostrya::push::PushPhase;
+        for template in [NEGOTIATING_TEMPLATE, BAR_TEMPLATE, BYTES_TEMPLATE] {
+            assert!(
+                indicatif::ProgressStyle::with_template(template).is_ok(),
+                "{template}"
+            );
+        }
+        let (progress, started) = PushBar::start();
+        assert_eq!(progress.is_none(), started.bar.is_hidden());
+
+        let hidden = || PushBar {
+            bar: indicatif::ProgressBar::hidden(),
+            stage: std::sync::atomic::AtomicU8::new(STAGE_HIDDEN),
+            objects: Arc::default(),
+        };
+        let bar = hidden();
+        let mut snapshot = ostrya::push::PushProgressSnapshot::default();
+        snapshot.bytes_total = 10;
+        snapshot.objects_needed = 2;
+        snapshot.objects_sent = 1;
+        for (phase, stage) in [
+            (PushPhase::Connecting, STAGE_HIDDEN),
+            (PushPhase::Negotiating, STAGE_NEGOTIATING),
+            (PushPhase::Uploading, STAGE_UPLOADING),
+            (PushPhase::Committing, STAGE_DONE),
+            (PushPhase::Uploading, STAGE_DONE),
+            (PushPhase::Negotiating, STAGE_DONE),
+        ] {
+            snapshot.phase = phase;
+            bar.update(&snapshot);
+            assert_eq!(bar.stage.load(Ordering::Relaxed), stage, "{phase:?}");
+        }
+        assert_eq!(bar.objects.sent.load(Ordering::Relaxed), 1);
+        assert_eq!(bar.objects.needed.load(Ordering::Relaxed), 2);
+        assert!(bar.bar.is_finished());
+        bar.finish();
+        assert_eq!(bar.stage.load(Ordering::Relaxed), STAGE_DONE);
+
+        // A push that fails in the upload clears the bar at its end.
+        let bar = hidden();
+        snapshot.phase = PushPhase::Uploading;
+        bar.update(&snapshot);
+        assert!(!bar.bar.is_finished());
+        bar.finish();
+        assert!(bar.bar.is_finished());
+        assert_eq!(bar.stage.load(Ordering::Relaxed), STAGE_DONE);
     }
 
     /// The filter of `push-tree` reduces the mode of a file and of a

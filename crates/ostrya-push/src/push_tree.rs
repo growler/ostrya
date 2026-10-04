@@ -153,8 +153,10 @@ pub async fn push_tree_prepared(
 ///
 /// - empty `refs`, a ref named twice, a ref that holds `:`, a ref that holds
 ///   `^`, and a ref that fails the ref-name rule of
-///   [`ostrya_core::is_ref_name`]. A revision reads `^` as the parent of a
-///   commit, so a ref that holds it cannot be read back by its name;
+///   [`ostrya_core::is_ref_name`], and a ref of 64 lowercase hex
+///   characters. A revision reads `^` as the parent of a commit, and a name
+///   of 64 lowercase hex characters as a commit checksum, so a ref of either
+///   form cannot be read back by its name;
 /// - a DEFLATE level outside 1 through 9;
 /// - a malformed `SOURCE_DATE_EPOCH` when `timestamp` is not set, and a
 ///   system clock before the Unix epoch when neither is set;
@@ -383,7 +385,8 @@ impl Prepared {
 }
 
 /// Refuse empty `refs`, a ref that holds `:`, a ref that holds `^`, a ref
-/// that fails the ref-name rule, and a ref named twice.
+/// that fails the ref-name rule, a ref of 64 lowercase hex characters, and a
+/// ref named twice.
 fn check_refs(refs: &[String]) -> Result<()> {
     if refs.is_empty() {
         return Err(invalid("a tree push needs at least one target ref"));
@@ -402,6 +405,11 @@ fn check_refs(refs: &[String]) -> Result<()> {
         }
         if !ostrya_core::is_ref_name(name) {
             return Err(invalid(format!("ref '{name}' is not a valid ref name")));
+        }
+        if ostrya_core::is_checksum_shaped(name) {
+            return Err(invalid(format!(
+                "ref '{name}' is 64 hex characters, which a revision reads as a commit checksum"
+            )));
         }
         if !seen.insert(name.as_str()) {
             return Err(invalid(format!("ref '{name}' is named twice")));
@@ -449,7 +457,16 @@ mod tests {
                 "{bad:?}"
             );
         }
-        Prepared::new(with_refs(&["main", "a/b", "x.y"])).unwrap();
+        let hex = "ab".repeat(32);
+        assert!(refused(with_refs(&["main", &hex])).contains("commit checksum"));
+        Prepared::new(with_refs(&[
+            "main",
+            "a/b",
+            "x.y",
+            &hex.to_uppercase(),
+            &hex[1..],
+        ]))
+        .unwrap();
     }
 
     #[test]

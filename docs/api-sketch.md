@@ -107,6 +107,19 @@ impl DirTree { pub fn check_name(name: &str) -> Result<()>; }
 pub fn is_ref_component(component: &str) -> bool;
 pub fn is_ref_name(name: &str) -> bool;
 pub fn is_refspec(refspec: &str) -> bool;
+/// True for 64 lowercase hex characters, which a revision reads as a commit
+/// checksum. The rule above accepts such a name. Each site where a push
+/// writes a commit to a target ref refuses it: `Repo::push`,
+/// `Repo::export_stream`, `push_tree`, `session::export_stream`, and the
+/// `Commit` check of the receiver. A push delete of such a name passes the
+/// client and the receiver. `Hello` does not tell a write from a delete, so
+/// the receiver does not check the name at `Hello`. A name with a `REMOTE:`
+/// part is not 64 hex characters, so it passes. Ref reads, local ref
+/// deletes, pull, prune, `Transaction::set_ref`, and
+/// `Repo::set_ref_immediate` do not apply the check, so a direct ref write
+/// can make a ref that no revision reads back.
+/// `ostrya` re-exports it as `ostrya::is_checksum_shaped`.
+pub fn is_checksum_shaped(name: &str) -> bool;
 pub const MAX_METADATA_SIZE: u64;       // also at ostrya::MAX_METADATA_SIZE
 
 pub struct CollectionRef { pub collection_id: Option<String>, pub ref_name: String }
@@ -2550,7 +2563,10 @@ messages through `ostrya`. `Error::Push` carries them in every build too.
   locking=false` refuses the session with `locking-disabled`. A
   `bare-split-xattrs` repository refuses it with `mode-refused`, and so does
   a `bare` repository when the process does not run as root. A ref name of
-  `Hello` that `validate_refspec` refuses is `invalid-ref`. A `Hello` with
+  `Hello` that `validate_refspec` refuses is `invalid-ref` with the text
+  `invalid ref name 'NAME'`. A ref name with a trailing `^` passes, and so
+  does a ref name of 64 lowercase hex characters: `Hello` does not tell a
+  write from a delete, and `Commit` checks that shape. A `Hello` with
   `one-way` true is `protocol`, before the version check: it opens a
   one-way stream, which `Repo::receive_stream` reads.
 - `Have` gets one bit for each object that neither the repository nor the
@@ -2565,8 +2581,10 @@ messages through `ostrya`. `Error::Push` carries them in every build too.
   `limit-exceeded`. `ObjectsReply` counts the objects staged and the
   detached metadata objects kept, and the bytes they took on the wire.
 - `Commit` runs the checks of the ref updates in order, and the first
-  failure ends the session with nothing published. Each ref name is valid
-  (`invalid-ref`). The message holds one update at least, and each update
+  failure ends the session with nothing published. Each ref name is valid,
+  and no update writes a commit to a ref name of 64 lowercase hex
+  characters (`invalid-ref`). A delete of a ref name of 64 lowercase hex
+  characters passes. The message holds one update at least, and each update
   names a ref of `Hello` once (`protocol`). The `CommitReply` of the
   updates fits in a frame of `MAX_FRAME` when each outcome carries an old
   commit, which an update that expects its ref absent or takes any state
@@ -2804,6 +2822,31 @@ selects.
   does not hash or measure an object, because the server verifies each one.
   A source that fails ends the session with the abandon marker and `Abort`,
   and the call returns `Error::Source`.
+- Each `send` call and each `export_stream` call asks
+  `ObjectSource::content_size` at most once, before the first object, for
+  the content bytes of the file objects of the call, and adds the answer to
+  `bytes_total`. It then sets `Uploading`. A call asks only when the
+  session has a `PushProgress` and `names` holds at least one file object.
+  `None` and an error add nothing, and the session goes on to send. The
+  provided method gives `None`.
+- The content bytes of a file object are the bytes the session reads from
+  the reader its source gave: the payload of `Content` before the session
+  compressor, and the bytes of `Encoded`, as a stored `.filez` that goes
+  as it is. A symlink, a metadata object, and detached metadata count no
+  byte. The session counts them in `content_bytes`, so with a source that
+  answers, `content_bytes` ends at `bytes_total`.
+- `PushProgress` is a clone of shared atomic counters. `snapshot()` reads
+  them. `with_hook` makes a handle that also calls a `PushProgressFn` with
+  a snapshot: at each phase change, after each object of the object
+  stream, and each time `content_bytes` reaches the next multiple of
+  102,400 bytes. The hook runs on the task that changed the counters, and
+  over HTTP each parallel object stream calls it, so calls can run at the
+  same time on several threads. It must return soon, and it keeps its own
+  state behind interior mutability.
+- The phases are `Scanning` and `Hashing` for the scan of a tree push,
+  `Connecting` while the transport starts and `Hello` goes out, `Negotiating`
+  through the `Have` rounds, `Uploading` through the object streams, and
+  `Committing` after `Commit`.
 - The frame of each `ObjectHeader` is a fixed array of 40 bytes, with no
   allocation. The session writes the framed file header of each `Content`
   object into one buffer that it keeps, with `FileHeader::write_framed`
@@ -2834,8 +2877,10 @@ selects.
   and does no negotiation, and its frame limit and chunk limit are 1 MiB.
   Before it writes a byte, it refuses with `Error::InvalidInput`: empty
   updates, a ref named twice, a ref name that fails
-  `ostrya_core::is_refspec`, an expected state `Commit`, an update with no
-  new commit, a level outside 1 to 9, a name of a type other than file,
+  `ostrya_core::is_refspec`, a ref name of 64 lowercase hex characters that
+  an update writes, an expected state `Commit`, an update with no new
+  commit, a level outside 1
+  to 9, a name of a type other than file,
   dirtree, dirmeta, or commit, and a `Hello` or a `Commit` frame over 1
   MiB. A source that fails ends the stream inside an object: the function
   writes the `ObjectHeader` of the object when it did not write it yet,
@@ -2867,6 +2912,37 @@ pub trait ObjectSource: Send + Sync {
         -> BoxFuture<'a, Result<ObjectData>>;
     fn detached_metadata<'a>(&'a self, commit: &'a Checksum)
         -> BoxFuture<'a, Result<Option<Value>>>;
+    // Provided: `None`.
+    fn content_size<'a>(&'a self, names: &'a [ObjectName], encoding: Encoding)
+        -> BoxFuture<'a, Result<Option<u64>>>;
+}
+
+pub type PushProgressFn = Arc<dyn Fn(&PushProgressSnapshot) + Send + Sync>;
+
+#[derive(Debug, Clone, Default)]
+pub struct PushProgress { /* Arc of atomic counters, and the hook */ }
+
+impl PushProgress {
+    pub fn new() -> PushProgress;
+    pub fn with_hook(hook: PushProgressFn) -> PushProgress;
+    pub fn snapshot(&self) -> PushProgressSnapshot;
+}
+
+#[non_exhaustive]
+pub enum PushPhase {
+    #[default] Scanning, Hashing, Connecting, Negotiating, Uploading, Committing,
+}
+
+#[non_exhaustive]                 // read by field; no struct literal outside
+pub struct PushProgressSnapshot {
+    pub phase: PushPhase,
+    pub objects_total: u64,
+    pub objects_needed: u64,
+    pub objects_sent: u64,
+    pub bytes_sent: u64,      // the bytes handed to the transport
+    pub payload_bytes: u64,   // the object bytes in their wire encoding
+    pub content_bytes: u64,   // the bytes read from the readers of file objects
+    pub bytes_total: u64,     // the sum of `content_size`, 0 when unknown
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2975,6 +3051,8 @@ the index of its parent directory, and it holds no file content.
   `detached_metadata` of the commit gives the stored dict. Another commit
   and an object the model does not hold are `Error::InvalidInput`. A failed
   open is `Error::Walk`, which the session returns inside `Error::Source`.
+  `content_size` gives the sum of the byte counts of the hash pass, a
+  symlink as 0, in each encoding, and reads no file.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3039,14 +3117,16 @@ push over a pair of byte streams. `ostrya` re-exports the three as
 
 - Before the scan, the push refuses with `Error::InvalidInput`: empty
   `refs`, a ref named twice, a ref that holds `:`, a ref that holds `^`, a
-  ref that fails `ostrya_core::is_ref_name`, a DEFLATE level outside 1
-  through 9, a malformed `SOURCE_DATE_EPOCH` when `timestamp` is not set, an
+  ref that fails `ostrya_core::is_ref_name`, a ref of 64 lowercase hex
+  characters, a DEFLATE level outside 1 through 9, a malformed
+  `SOURCE_DATE_EPOCH` when `timestamp` is not set, an
   empty key in `metadata` or in `detached_metadata`, entries that do not
   serialize as an `a{sv}` dict, entries whose serialized dict is over
   `MAX_METADATA_SIZE`, and a subject, a body, and `metadata` whose commit
   object is over `MAX_METADATA_SIZE` without the bindings and without a
   parent of `ParentPolicy::CurrentTip`. A revision reads `^` as the parent
-  of a commit, so a ref that holds it cannot be read back by its name. The
+  of a commit, and 64 lowercase hex characters as a commit checksum, so a
+  ref of either form cannot be read back by its name. The
   timestamp is read here. `push_tree` then makes the transport ready with
   `PushSession::prepare`. For an ssh address it builds the command line.
   For an `http://` or an `https://` address it reads the token file and the
@@ -3086,8 +3166,9 @@ push over a pair of byte streams. `ostrya` re-exports the three as
   with `Abort` when the stream is still usable.
 - `PushProgress` shows `Scanning` until the walk has listed and filtered
   each directory, and `Hashing` through the hash jobs still in flight and
-  the bottom-up pass. The session then sets `Negotiating`, `Uploading`, and
-  `Committing`. `PushStats::elapsed` covers the session alone.
+  the bottom-up pass. The session then sets `Connecting`, `Negotiating`,
+  `Uploading`, and `Committing`. The push signs the commit in `Connecting`.
+  `PushStats::elapsed` covers the session alone.
 - `Error::Sign` has no wire code, and reports as `internal`.
 
 ```rust
@@ -3167,7 +3248,7 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   options starts no gpg and reads no body file.
 - `DIR` is `root`, and each `-b` is one of `refs`. The command refuses a
   `-b` of 64 lowercase hex characters with the wording of `commit`, before
-  the library sees it.
+  the library sees it. The check is `ostrya::is_checksum_shaped`.
 - `--parent=CHECKSUM` sets `parent` to `ParentPolicy::Commit`, with 64
   lowercase hex characters, and `--parent=none` to `ParentPolicy::None`.
   Without it, `parent` is `ParentPolicy::CurrentTip`.
@@ -3193,7 +3274,11 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   `--body-file` after it builds the list.
 - `--force`, `--compress`, `--ssh-command`, `--receive-command`, and the
   HTTP options set `force`, `compression`, and `connect` as they do for
-  `ostrya push`. `hash_jobs` and `progress` are `None`.
+  `ostrya push`. `hash_jobs` is `None`. `progress` draws the progress bar
+  of `ostrya push`, with its rules, or is `None` when the bar is hidden. The
+  bar shows nothing during the scan, and nothing
+  before `Negotiating`, so a signer that asks for a passphrase keeps the
+  terminal.
 - On success the command writes the checksum of `PushOutcome::commit` as
   one line to standard output and exits 0. Under `-v` the statistics line
   of `ostrya push` goes to standard error. On failure the command writes
@@ -3515,8 +3600,11 @@ Before it writes a byte, the push refuses:
   `DST` that two refspecs name, as `Error::Push` with `InvalidInput`;
 - a checksum `SRC` and a `SRC` with a `^` suffix, each with no `DST`, as
   `Error::Push` with `InvalidInput`;
-- a `DST` that `validate_refspec` refuses or that holds a `^`, as
-  `Error::InvalidRefspec` with the `DST`;
+- a `DST` that `validate_refspec` refuses, a `DST` that holds a `^`, and a
+  `DST` of 64 lowercase hex characters that takes a commit, as
+  `Error::InvalidRefspec` with the `DST`. A revision reads a `DST` of 64
+  lowercase hex characters as a commit checksum. A delete (`:DST`) of a
+  `DST` of 64 lowercase hex characters passes;
 - a `SRC` that does not resolve, with the error of `Repo::resolve_rev`;
 - a source commit that the local repository marks partial, as `Error::Push`
   with `InvalidInput`;
@@ -3580,6 +3668,19 @@ ends the session and returns that failure. The push writes `Abort` when the
 stream is still usable. A refusal of the server is `Error::Push` with the error of the server. `opts.progress` goes to
 the session, so its counters show the push while it runs.
 
+The push reads objects through a source over the repository. Its
+`content_size` reads the metadata of each file object in one pass on the
+blocking pool, and no payload byte:
+
+- one `statat` of the stored `.filez`, when an `archive` repository sends
+  it as it is in `deflate`;
+- an open and the read of the file header of an `archive` object
+  otherwise, a symlink as 0;
+- an open, the read of the `user.ostreemeta` xattr, and an `fstat` of a
+  `bare-user` object, which is a regular file also for a symlink, a
+  symlink as 0;
+- one `statat` of an object of the other modes, a symlink as 0.
+
 `ostrya push`, under the `push` feature of `ostrya-cli`, is the command
 form of `Repo::push`:
 
@@ -3613,7 +3714,27 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   of the other transport, before the push reads `--depth` and the
   refspecs.
 - `detached_metadata_filter` comes from `[ex-ostrya]
-  detached-metadata-exclude` of the local repository. `progress` is `None`.
+  detached-metadata-exclude` of the local repository. `progress` is a
+  `PushProgress` whose hook draws the progress bar of the command, or
+  `None` when the bar is hidden.
+- The progress bar goes to standard error through `indicatif`, at most 20
+  frames a second. It is hidden when standard error is not a terminal, or
+  when `TERM` is unset or `dumb`. A hidden bar gives `progress: None`, so
+  the session asks for no byte total and calls no hook. The bar shows
+  nothing before `Negotiating`, so a prompt of the ssh client or of a
+  signer stays readable. It then shows a spinner with `Negotiating`, and a
+  bar of `content_bytes` against `bytes_total` with `SENT/NEEDED objects`,
+  the bytes, the rate, and the time left in `Uploading`. The template reads
+  the object counts when it draws, so a hook call builds no string. When
+  `bytes_total` is 0 the upload shows the bytes and the rate with no bar.
+  The last frame can show less than 100%.
+- The bar clears when the phase becomes `Committing`, and it draws nothing
+  after that, so a line that the server writes on standard error at the
+  commit starts on a clean line. The command also clears the bar before it
+  writes a ref line, the statistics line, or an error line.
+- Known gaps: a line that the server writes on standard error while the
+  objects go can show in the middle of the bar, and Ctrl-C, another signal
+  that stops the process, or a panic leaves the last frame on the terminal.
 - After the repository opens, a missing `REMOTE` gives the usage text and
   `error: REMOTE must be specified`, and no refspec gives the usage text and
   `error: REFSPEC must be specified`. Both exit 1 before an ssh client
@@ -3670,7 +3791,11 @@ at the crate root.
   twice, an update whose expected state is `Commit`, an update with no new
   commit, and a commit that the local repository marks partial, as
   `Error::Push` with `InvalidInput`. It refuses a ref name that
-  `validate_refspec` refuses as `Error::InvalidRefspec`. It refuses a commit
+  `validate_refspec` refuses, and a ref name of 64 lowercase hex characters
+  that an update writes, as `Error::InvalidRefspec`. A delete of such a
+  name is refused as an update with no new commit. A remote ref
+  `REMOTE:NAME` with a `NAME` of
+  64 hex characters passes. It refuses a commit
   whose `ostree.ref-binding` is a list that does not hold the name of its
   ref as `Error::Push` with `BindingMismatch`. For a remote ref
   `REMOTE:NAME` the check compares `NAME` alone. A dirtree or a dirmeta that

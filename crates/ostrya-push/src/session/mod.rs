@@ -43,11 +43,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_io::{AsyncRead, AsyncWrite};
-use ostrya_core::{Checksum, FileHeader, ObjectName};
+use ostrya_core::{Checksum, FileHeader, ObjectName, ObjectType};
 use ostrya_gvariant::Value;
 
 pub use one_way::export_stream;
-pub use progress::{PushPhase, PushProgress, PushProgressSnapshot, PushStats};
+pub use progress::{PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot, PushStats};
 pub use pull::{PullBody, PullSession, PullSessionOptions};
 
 use self::http::{Endpoint, HttpLink};
@@ -154,6 +154,33 @@ pub trait ObjectSource: Send + Sync {
         &'a self,
         commit: &'a Checksum,
     ) -> BoxFuture<'a, Result<Option<Value>>>;
+
+    /// The content bytes of the file objects of `names` when the session
+    /// sends them in `encoding`, or `None` when the source does not know
+    /// them. The other names count no byte.
+    ///
+    /// The content bytes of one file object are the bytes the session reads
+    /// from the reader that [`open`](ObjectSource::open) gives for it with
+    /// the same `encoding`: the payload of [`ObjectData::Content`], 0 for a
+    /// symlink, and the bytes of [`ObjectData::Encoded`]. Each
+    /// [`send`](PushSession::send) call and each [`export_stream`] call asks
+    /// at most once, before the first object, and adds the answer to
+    /// [`bytes_total`](PushProgressSnapshot::bytes_total). A call asks only
+    /// when the session has a [`PushProgress`] and `names` holds at least
+    /// one file object. An error makes the total unknown for the call, as
+    /// `None` does, and the session goes on to send the objects.
+    ///
+    /// The answer must not read the content of an object: a source reads
+    /// what it already holds, or the metadata of each object. The default
+    /// is `None`.
+    fn content_size<'a>(
+        &'a self,
+        names: &'a [ObjectName],
+        encoding: Encoding,
+    ) -> BoxFuture<'a, Result<Option<u64>>> {
+        let _ = (names, encoding);
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// The facts of the server, from its `HelloReply`.
@@ -304,6 +331,28 @@ pub(crate) fn deflate_level(compression: Compression) -> Result<Option<u8>> {
     }
 }
 
+/// Ask `source` for the content bytes of the file objects of `names`, sent
+/// at `level`, and add them to the byte total of `counters`. A session with
+/// no caller's handle, and names with no file object, ask nothing. An
+/// unknown size and a failure add nothing.
+async fn count_content_total(
+    counters: &Counters,
+    source: &dyn ObjectSource,
+    names: &[ObjectName],
+    level: Option<u8>,
+) {
+    if !counters.has_caller() || !names.iter().any(|n| n.ty == ObjectType::File) {
+        return;
+    }
+    let encoding = match level {
+        Some(_) => Encoding::Deflate,
+        None => Encoding::Raw,
+    };
+    if let Ok(Some(total)) = source.content_size(names, encoding).await {
+        counters.content_total(total);
+    }
+}
+
 /// Refuse a name of a type that `Have` and the objects of a source cannot
 /// carry. The session sends detached metadata for a commit on its own.
 fn refuse_off_wire(names: &[ObjectName]) -> Result<()> {
@@ -400,7 +449,7 @@ impl PushSession {
         pending_limit: Option<Duration>,
     ) -> Result<PushSession> {
         let counters = Arc::new(Counters::new(opts.progress.as_ref()));
-        counters.phase(PushPhase::Negotiating);
+        counters.phase(PushPhase::Connecting);
         let mut stream = Stream::new(input, output, Arc::clone(&counters));
         if let Some(limit) = pending_limit {
             stream.set_pending_limit(limit);
@@ -444,7 +493,7 @@ impl PushSession {
         opts: SessionOptions,
     ) -> Result<PushSession> {
         let counters = Arc::new(Counters::new(opts.progress.as_ref()));
-        counters.phase(PushPhase::Negotiating);
+        counters.phase(PushPhase::Connecting);
         let agent = opts
             .agent
             .unwrap_or_else(|| format!("ostrya/{}", env!("CARGO_PKG_VERSION")));
@@ -540,6 +589,10 @@ impl PushSession {
     /// send ends the session the same way, and the call returns
     /// [`Error::InvalidInput`].
     ///
+    /// When the session has a [`PushProgress`] and `names` holds at least
+    /// one file object, the call first asks the source for the content bytes
+    /// it is to send, with [`ObjectSource::content_size`].
+    ///
     /// Over HTTP the call sends the objects in up to `parallel-uploads`
     /// object streams at the same time, each in one request, and the objects
     /// of `names` can arrive in another order. The detached metadata goes in
@@ -559,23 +612,27 @@ impl PushSession {
         let level = deflate_level(compression)?;
         refuse_off_wire(names)?;
         let deflate_ok = self.inner.server.encodings.contains(&Encoding::Deflate);
+        let level = level.filter(|_| deflate_ok);
         let upload = Upload::new(
             source,
             names,
             commits,
-            level.filter(|_| deflate_ok),
+            level,
             deflate_ok,
             &self.inner.claims,
         );
+        let counters = &self.inner.counters;
         let slot = match &self.inner.link {
             Link::Stream { slot, .. } => slot,
             Link::Http(link) => {
-                self.inner.counters.phase(PushPhase::Uploading);
-                return link.send(&self.inner.counters, &upload).await;
+                count_content_total(counters, source, names, level).await;
+                counters.phase(PushPhase::Uploading);
+                return link.send(counters, &upload).await;
             }
         };
         let mut taken = take(slot)?;
-        self.inner.counters.phase(PushPhase::Uploading);
+        count_content_total(counters, source, names, level).await;
+        counters.phase(PushPhase::Uploading);
         taken.stream().upload(&upload).await?;
         taken.release();
         Ok(())

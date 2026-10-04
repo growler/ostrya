@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use common::receive::{PIPE_CAP, PipeReader, PipeWriter, new_repo, pipe};
+use common::receive::{PIPE_CAP, PipeReader, PipeWriter, is_root, new_repo, pipe};
 use common::{Counting, TmpDir, mark_partial};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
@@ -997,6 +997,102 @@ fn a_forced_push_expects_any_state_of_the_ref() {
     assert_eq!(outcome.refs[0].old, Some(side));
     assert_eq!(outcome.refs[0].new, Some(c2));
     assert_eq!(tip(&pair.server, "main"), Some(c2));
+}
+
+/// A `DST` of 64 lowercase hex characters, which a revision reads as a
+/// commit checksum, is an invalid refspec, refused before any byte.
+#[test]
+fn a_destination_of_64_lowercase_hex_characters_is_refused_before_any_byte() {
+    let dir = TmpDir::new("push-repo-hex-dst");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    commit(&repo, "main", None, "c1", None);
+    let hex = "a".repeat(64);
+    let (error, written) = refused(&repo, opts(&[&format!("main:{hex}")]));
+    match &error {
+        Error::InvalidRefspec(name) => assert_eq!(name, &hex),
+        other => panic!("expected InvalidRefspec, got {other:?}"),
+    }
+    assert_eq!(written, 0);
+}
+
+/// A delete (`:DST`) of a `DST` of 64 lowercase hex characters passes the
+/// client, and a server rule that allows the delete removes the ref.
+#[test]
+fn a_delete_of_a_destination_of_64_lowercase_hex_characters_removes_the_ref() {
+    let pair = Pair::new("hex-delete", RepoMode::Archive, RepoMode::Archive, "");
+    let c1 = commit(&pair.client, "main", None, "c1", None);
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    report.unwrap();
+    outcome.unwrap();
+    let hex = "a".repeat(64);
+    block_on(pair.server.set_ref_immediate(&hex, Some(&c1))).unwrap();
+    let path = pair.server.path().join("refs/heads").join(&hex);
+    assert!(path.exists());
+
+    let policy = ReceivePolicy {
+        default_rule: ReceiveRule {
+            allow_delete: true,
+            ..ReceiveRule::default()
+        },
+        ..ReceivePolicy::default()
+    };
+    let (report, outcome) = push_under(&pair, opts(&[&format!(":{hex}")]), &policy, |_| {});
+    report.unwrap();
+    let outcome = outcome.unwrap();
+    assert_eq!(outcome.refs[0].name, hex);
+    assert_eq!(outcome.refs[0].old, Some(c1));
+    assert_eq!(outcome.refs[0].new, None);
+    assert!(!path.exists());
+    assert_eq!(tip(&pair.server, "main"), Some(c1));
+}
+
+/// The content bytes a push reads end at the byte total of its source, in
+/// each mode of the client that the port writes, and with each encoding. A
+/// symlink counts no byte.
+#[test]
+fn the_content_bytes_end_at_the_byte_total() {
+    let deflate = Compression::Deflate { level: 6 };
+    for (tag, mode, compression) in [
+        ("total-archive-raw", RepoMode::Archive, Compression::None),
+        ("total-archive-deflate", RepoMode::Archive, deflate),
+        ("total-bare-user-raw", RepoMode::BareUser, Compression::None),
+        ("total-bare-user-deflate", RepoMode::BareUser, deflate),
+        (
+            "total-bare-user-only",
+            RepoMode::BareUserOnly,
+            Compression::None,
+        ),
+        ("total-bare-user-shared", RepoMode::BareUserShared, deflate),
+        ("total-bare", RepoMode::Bare, deflate),
+    ] {
+        // A `bare` commit writes the owner 0:0 of its files.
+        if mode == RepoMode::Bare && !is_root() {
+            eprintln!("skipping {tag}: the commit needs root");
+            continue;
+        }
+        let pair = Pair::new(tag, mode, RepoMode::Archive, "");
+        commit(&pair.client, "main", None, "c1", None);
+        let progress = PushProgress::new();
+        let (report, outcome) = push(
+            &pair,
+            RepoPushOptions {
+                progress: Some(progress.clone()),
+                compression,
+                ..opts(&["main"])
+            },
+        );
+        report.unwrap();
+        outcome.unwrap();
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.content_bytes, snapshot.bytes_total, "{tag}");
+        if (mode, compression) == (RepoMode::Archive, deflate) {
+            // The stored `.filez` files go as they are.
+            assert!(snapshot.bytes_total > 26, "{tag}: {snapshot:?}");
+        } else {
+            // The payloads of `file` and `sub/nested`, and 0 for `link`.
+            assert_eq!(snapshot.bytes_total, 2 + 24, "{tag}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

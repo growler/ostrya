@@ -112,6 +112,9 @@ all pure Rust:
   --tar-pathname-filter` expression, which the tool compiles with PCRE2. The
   crate vendors the PCRE2 C library and builds it statically; `ostrya-cli` sets
   `publish = false`, so no published crate links it.
+- `indicatif` 0.18.6 (`MIT`, `default-features = false` with the feature
+  `unicode-width`, `ostrya-cli` only) -- the progress bar of `push` and
+  `push-tree` on standard error. It links no C library.
 - HTTP client, INI parsing, fs-verity, and EROFS: see the Decisions section;
   each has a pure-Rust path. LZMA/xz links `liblzma`, statically under the
   `lzma-static` feature (see the Decisions section).

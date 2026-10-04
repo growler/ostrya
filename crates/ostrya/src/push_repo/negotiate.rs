@@ -139,6 +139,11 @@ impl Repo {
     /// - each refspec that the reader of refspecs refuses, as [`Error::Push`]
     ///   with [`InvalidInput`](crate::push::Error::InvalidInput) or as the
     ///   error of the resolution of `SRC`;
+    /// - a `DST` that [`validate_refspec`](crate::validate_refspec) refuses,
+    ///   a `DST` that holds a `^`, and a `DST` of 64 lowercase hex characters
+    ///   that takes a commit, as [`Error::InvalidRefspec`] with the `DST`. A
+    ///   revision reads a `DST` of 64 lowercase hex characters as a commit
+    ///   checksum. A delete (`:DST`) of such a `DST` passes;
     /// - a source commit that the local repository marks partial, as
     ///   [`Error::Push`] with
     ///   [`InvalidInput`](crate::push::Error::InvalidInput);

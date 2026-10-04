@@ -54,7 +54,7 @@ pub use loosepath::loose_path;
 pub use mode::RepoMode;
 pub use objname::ObjectName;
 pub use objtype::ObjectType;
-pub use refname::{is_ref_component, is_ref_name, is_refspec};
+pub use refname::{is_checksum_shaped, is_ref_component, is_ref_name, is_refspec};
 pub use xattr::{Xattrs, XattrsRef};
 
 // The dynamic GVariant value tree and its codec entry points. `Commit::metadata`

@@ -107,6 +107,26 @@ impl<W: AsyncWrite + HandOver + Unpin> AsyncWrite for Counting<W> {
     }
 }
 
+/// A reader that counts each byte it gives as a content byte: the input of
+/// the session compressor.
+struct ContentCount {
+    inner: Box<dyn ObjectReader>,
+    counters: Arc<Counters>,
+}
+
+impl futures_io::AsyncRead for ContentCount {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        let n = std::task::ready!(Pin::new(&mut me.inner).poll_read(cx, buf))?;
+        me.counters.content(n as u64);
+        Poll::Ready(Ok(n))
+    }
+}
+
 /// The claims of the detached metadata of the commits of one session.
 ///
 /// A commit is free, pending, or sent. A call that finds a commit free claims
@@ -600,6 +620,7 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
         self.writer
             .write_message(&Message::ObjectHeader(header))
             .await?;
+        let is_file = name.ty == ObjectType::File;
         match &plan.prefix {
             Prefix::None => {}
             Prefix::Header => {
@@ -639,6 +660,9 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
                         } = self;
                         writer.write_object_data(&buf[..n]).await?;
                         counters.payload(n as u64);
+                        if is_file {
+                            counters.content(n as u64);
+                        }
                     }
                     if end {
                         break;
@@ -646,6 +670,11 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
                 }
             }
             Body::Deflate(reader, level) => {
+                // The compressor reads the content bytes through the count.
+                let reader: Box<dyn ObjectReader> = Box::new(ContentCount {
+                    inner: reader,
+                    counters: Arc::clone(&self.counters),
+                });
                 let deflate = match &mut self.deflate {
                     Some(deflate) => {
                         deflate.reset(reader, level);

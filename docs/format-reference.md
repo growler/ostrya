@@ -714,7 +714,30 @@ A `^` inside the name is a separate rule: the tool refuses `a^b` as a ref name
 whatever the store holds, and the port writes it, which is the ref-name
 character class `conformance/cli-surface.md`, "P1" records.
 
-A ref of either refused shape therefore arrives by an out-of-band write alone.
+A push guards the checksum shape at each site where it writes a commit to a
+target ref. `push` refuses a `DST` of that shape after a `SRC` with `error:
+Invalid refspec <name>` before the transport starts, and `push-tree -b` refuses
+it with the `commit -b` message above. In the library, `Repo::push`,
+`Repo::export_stream`, and `push_tree` refuse the name before they send a byte,
+and the receiver of a push session or of a one-way stream refuses an update
+that writes a commit to it at `Commit` with the wire error `invalid-ref`.
+`Hello` names the refs of a session and does not tell a write from a delete, so
+the receiver does not check the shape at `Hello`. A push delete (`:<name>`) of
+a ref of that shape passes the client and the receiver, and the receiver
+removes the ref where its rule allows the delete. A remote ref `REMOTE:<name>`
+is not 64 characters, so a revision reads it as a refspec, and each push site
+takes it. Ref reads, local ref deletes, pull, and prune do not apply the guard.
+
+A ref of either refused shape can arrive in these ways:
+
+- a direct ref write of the library: `Transaction::set_ref` and
+  `Repo::set_ref_immediate` write both shapes;
+- a pull of every ref of a source that holds a ref of the checksum shape: the
+  port copies the ref, as the next paragraph records;
+- a push of a name that ends in `^`: the receiver takes it, and
+  `Repo::export_stream` sends it, where `Repo::push` and `push_tree` refuse it;
+- an out-of-band write into `refs/`.
+
 Where a checksum-shaped one stands, the tool's listings enumerate it, its `fsck`
 validates it, and its `prune --refs-only` reads the commit that ref holds as
 reachable and keeps it, while its `pull-local` over that source reads the ref

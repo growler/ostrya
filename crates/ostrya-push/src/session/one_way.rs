@@ -15,8 +15,8 @@ use super::progress::Counters;
 use super::stream::WRITE_BUFFER;
 use super::writer::{Counting, HandOver, MetaClaims, ObjectWriter, Pass, Stop, Upload};
 use super::{
-    Compression, ObjectSource, PushPhase, PushStats, SessionOptions, deflate_level, invalid,
-    refuse_off_wire,
+    Compression, ObjectSource, PushPhase, PushStats, SessionOptions, count_content_total,
+    deflate_level, invalid, refuse_off_wire,
 };
 use crate::error::{Error, Result};
 use crate::proto::{
@@ -68,8 +68,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 ///
 /// Before it writes a byte, the call refuses with [`Error::InvalidInput`]:
 ///
-/// - empty `updates`, a ref named twice, and a ref name that fails the rule
-///   of [`ostrya_core::is_refspec`];
+/// - empty `updates`, a ref named twice, a ref name that fails the rule of
+///   [`ostrya_core::is_refspec`], and a ref name of 64 lowercase hex
+///   characters with no `REMOTE:` part that an update writes, which a
+///   revision reads as a commit checksum;
 /// - an update whose expected state is [`Expected::Commit`], and an update
 ///   with no new commit, because the sender cannot learn the current tips;
 /// - a level outside 1 through 9;
@@ -90,7 +92,10 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 /// the stream. A caller that keeps its writer gives `&mut W`. `opts.agent` is
 /// the `agent` of `Hello`, and `opts.progress` receives the counters. The
 /// statistics count each name as offered and as needed, and the phases are
-/// [`PushPhase::Uploading`] and then [`PushPhase::Committing`].
+/// [`PushPhase::Uploading`] and then [`PushPhase::Committing`]. With
+/// `opts.progress`, and when `names` holds at least one file object, the
+/// call asks the source for the content bytes of `names` with
+/// [`ObjectSource::content_size`] before it writes the first byte.
 pub async fn export_stream<W>(
     output: W,
     source: &dyn ObjectSource,
@@ -129,6 +134,7 @@ where
     )?;
 
     let counters = Arc::new(Counters::new(opts.progress.as_ref()));
+    count_content_total(&counters, source, names, level).await;
     counters.phase(PushPhase::Uploading);
     counters.offered(names.len() as u64);
     counters.needed(names.len() as u64);
@@ -179,14 +185,17 @@ where
 }
 
 /// Refuse empty `updates`, a ref named twice, a ref name that is not a
-/// refspec, an expected commit, and a delete.
+/// refspec, a write to a ref name of 64 lowercase hex characters, an expected
+/// commit, and a delete.
 fn check_updates(updates: &[RefUpdate]) -> Result<()> {
     if updates.is_empty() {
         return Err(invalid("a commit needs at least one ref update"));
     }
     let mut seen = HashSet::new();
     for u in updates {
-        if !ostrya_core::is_refspec(&u.name) {
+        if !ostrya_core::is_refspec(&u.name)
+            || (u.new.is_some() && ostrya_core::is_checksum_shaped(&u.name))
+        {
             return Err(invalid(format!("'{}' is not a valid ref name", u.name)));
         }
         if !seen.insert(u.name.as_str()) {
@@ -448,6 +457,12 @@ mod tests {
                 names(),
             ),
             (
+                "a ref name of 64 lowercase hex characters",
+                vec![update(&"ab".repeat(32), Expected::Any, Some(commit()))],
+                Compression::None,
+                names(),
+            ),
+            (
                 "an expected commit",
                 vec![update("main", Expected::Commit(commit()), Some(commit()))],
                 Compression::None,
@@ -506,6 +521,20 @@ mod tests {
             one_way: true,
         });
         frame(&hello, "Hello").unwrap();
+    }
+
+    /// The check of 64 lowercase hex characters applies to a write alone. A
+    /// delete of such a name is refused as a delete.
+    #[test]
+    fn a_delete_of_64_lowercase_hex_characters_is_refused_as_a_delete() {
+        let source = Source { missing: None };
+        let updates = vec![update(&"ab".repeat(32), Expected::Any, None)];
+        let mut out = Probe::new(true);
+        match export(&source, &names(), &updates, Compression::None, &mut out) {
+            Err(Error::InvalidInput(m)) => assert!(m.contains("deletes the ref"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(out.failed, 0);
     }
 
     /// A source that fails to open an object ends the stream inside that

@@ -1,5 +1,6 @@
 //! The progress handle of a push and the statistics of a session.
 
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -20,7 +21,11 @@ pub enum PushPhase {
     /// walk, while the hash jobs still in flight end and the directories are
     /// hashed bottom-up.
     Hashing,
-    /// The session exchanges `Hello` and `Have` with the server.
+    /// The session starts its transport and exchanges `Hello` with the
+    /// server. An ssh client can ask for a password or a passphrase on the
+    /// terminal in this phase.
+    Connecting,
+    /// The session exchanges `Have` with the server.
     Negotiating,
     /// The session sends objects.
     Uploading,
@@ -36,6 +41,7 @@ impl PushPhase {
             PushPhase::Negotiating => 2,
             PushPhase::Uploading => 3,
             PushPhase::Committing => 4,
+            PushPhase::Connecting => 5,
         }
     }
 
@@ -45,10 +51,27 @@ impl PushPhase {
             2 => PushPhase::Negotiating,
             3 => PushPhase::Uploading,
             4 => PushPhase::Committing,
+            5 => PushPhase::Connecting,
             _ => PushPhase::Scanning,
         }
     }
 }
+
+/// The hook of a [`PushProgress`]: a function that receives the counters of
+/// the handle when they change in a way a progress display shows.
+///
+/// The hook runs on the task that changed the counters: the task of the
+/// session, or the task of the scan of a tree push. Over HTTP each parallel
+/// object stream of a session calls it, so it can be called from more than
+/// one thread at the same time. The hook must return soon, because the
+/// session waits for it. A hook that keeps state between calls holds that
+/// state behind its own interior mutability, for example an atomic or a
+/// mutex.
+pub type PushProgressFn = Arc<dyn Fn(&PushProgressSnapshot) + Send + Sync>;
+
+/// The number of content bytes between two calls of the hook that the
+/// content bytes make: 100 KiB.
+const HOOK_BYTE_STEP: u64 = 102_400;
 
 /// The live counters of pushes, which a caller reads while they run.
 ///
@@ -58,6 +81,15 @@ impl PushPhase {
 /// session adds to the counters of the handle and never sets them to zero. A
 /// handle that several sessions share shows the sum of their counters, and the
 /// phase of the session that set it last.
+///
+/// A handle made with [`with_hook`](PushProgress::with_hook) also calls its
+/// hook with a snapshot:
+///
+/// - each time the phase changes to another phase;
+/// - after each object of the object stream, when
+///   [`objects_sent`](PushProgressSnapshot::objects_sent) grows;
+/// - each time [`content_bytes`](PushProgressSnapshot::content_bytes)
+///   reaches the next multiple of 102,400 bytes.
 ///
 /// The [`PushStats`] of a session come from counters of its own, whatever the
 /// handle holds. Each count is one relaxed atomic add to those counters, and
@@ -73,6 +105,17 @@ impl PushProgress {
         PushProgress::default()
     }
 
+    /// A handle whose counters are all zero, and which calls `hook` as the
+    /// type docs state. [`PushProgressFn`] gives the rules of the hook.
+    pub fn with_hook(hook: PushProgressFn) -> PushProgress {
+        PushProgress {
+            inner: Arc::new(ProgressCounters {
+                hook: Some(hook),
+                ..ProgressCounters::default()
+            }),
+        }
+    }
+
     /// The counters as they stand. Each counter is read on its own, so two
     /// counters of one snapshot can differ by the work of one step.
     pub fn snapshot(&self) -> PushProgressSnapshot {
@@ -82,12 +125,17 @@ impl PushProgress {
     /// Set the phase of the handle. A tree push sets the phases of its scan
     /// before a session opens.
     pub(crate) fn set_phase(&self, phase: PushPhase) {
-        self.inner.phase.store(phase.as_u8(), Ordering::Relaxed);
+        self.inner.set_phase(phase);
     }
 }
 
 /// The counters of a [`PushProgress`] at one point in time.
+///
+/// Code outside this crate gets one from [`PushProgress::snapshot`], from
+/// the hook, or from `Default`. A later version can add a field, so that
+/// code reads the fields by name and makes no struct literal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct PushProgressSnapshot {
     /// The step the push is in.
     pub phase: PushPhase,
@@ -101,6 +149,17 @@ pub struct PushProgressSnapshot {
     pub bytes_sent: u64,
     /// As [`PushStats::payload_bytes`], so far.
     pub payload_bytes: u64,
+    /// The content bytes the session read so far: the bytes it read from
+    /// the reader that its source gave for each file object, before its own
+    /// compressor. A stored `.filez` that the session sends as it is counts
+    /// with its stored bytes. A symlink, a metadata object, and detached
+    /// metadata count no byte.
+    pub content_bytes: u64,
+    /// The content bytes of the file objects that the session sends, as the
+    /// source told them before the first object, so that `content_bytes`
+    /// ends at this total. It stays 0 when the source does not tell it: see
+    /// [`ObjectSource::content_size`](super::ObjectSource::content_size).
+    pub bytes_total: u64,
 }
 
 /// What one push session sent.
@@ -134,7 +193,7 @@ pub struct PushStats {
 }
 
 /// The counters behind a [`PushProgress`], and the counters of one session.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ProgressCounters {
     phase: AtomicU8,
     objects_total: AtomicU64,
@@ -142,6 +201,19 @@ struct ProgressCounters {
     objects_sent: AtomicU64,
     bytes_sent: AtomicU64,
     payload_bytes: AtomicU64,
+    content_bytes: AtomicU64,
+    bytes_total: AtomicU64,
+    /// The hook of the handle. The counters of a session have none.
+    hook: Option<PushProgressFn>,
+}
+
+impl fmt::Debug for ProgressCounters {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProgressCounters")
+            .field("counters", &self.snapshot())
+            .field("hook", &self.hook.is_some())
+            .finish()
+    }
 }
 
 impl ProgressCounters {
@@ -153,6 +225,38 @@ impl ProgressCounters {
             objects_sent: self.objects_sent.load(Ordering::Relaxed),
             bytes_sent: self.bytes_sent.load(Ordering::Relaxed),
             payload_bytes: self.payload_bytes.load(Ordering::Relaxed),
+            content_bytes: self.content_bytes.load(Ordering::Relaxed),
+            bytes_total: self.bytes_total.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Call the hook with the counters as they stand.
+    fn call_hook(&self) {
+        if let Some(hook) = &self.hook {
+            hook(&self.snapshot());
+        }
+    }
+
+    /// Set the phase, and call the hook when the phase changed.
+    fn set_phase(&self, phase: PushPhase) {
+        let before = self.phase.swap(phase.as_u8(), Ordering::Relaxed);
+        if before != phase.as_u8() {
+            self.call_hook();
+        }
+    }
+
+    /// Count one object sent, and call the hook.
+    fn object_sent(&self) {
+        self.objects_sent.fetch_add(1, Ordering::Relaxed);
+        self.call_hook();
+    }
+
+    /// Count `n` content bytes, and call the hook when the count reached the
+    /// next multiple of [`HOOK_BYTE_STEP`].
+    fn content(&self, n: u64) {
+        let before = self.content_bytes.fetch_add(n, Ordering::Relaxed);
+        if before / HOOK_BYTE_STEP != before.wrapping_add(n) / HOOK_BYTE_STEP {
+            self.call_hook();
         }
     }
 }
@@ -186,7 +290,7 @@ impl Counters {
     }
 
     pub(crate) fn phase(&self, phase: PushPhase) {
-        self.each(|c| c.phase.store(phase.as_u8(), Ordering::Relaxed));
+        self.each(|c| c.set_phase(phase));
     }
 
     pub(crate) fn offered(&self, n: u64) {
@@ -202,9 +306,24 @@ impl Counters {
     }
 
     pub(crate) fn object_sent(&self) {
+        self.each(ProgressCounters::object_sent);
+    }
+
+    /// Count `n` content bytes read from the source of a file object.
+    pub(crate) fn content(&self, n: u64) {
+        self.each(|c| c.content(n));
+    }
+
+    /// Add `n` to the content bytes the session is to send.
+    pub(crate) fn content_total(&self, n: u64) {
         self.each(|c| {
-            c.objects_sent.fetch_add(1, Ordering::Relaxed);
+            c.bytes_total.fetch_add(n, Ordering::Relaxed);
         });
+    }
+
+    /// Whether a caller's handle receives the counts.
+    pub(crate) fn has_caller(&self) -> bool {
+        self.caller.is_some()
     }
 
     pub(crate) fn wire(&self, n: u64) {

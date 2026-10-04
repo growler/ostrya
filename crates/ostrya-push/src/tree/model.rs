@@ -91,6 +91,8 @@ struct Node {
 ///   of them is [`ObjectData::Encoded`] in `raw`.
 /// - [`detached_metadata`](ObjectSource::detached_metadata) of the commit
 ///   gives the dict that `set_commit` gave.
+/// - [`content_size`](ObjectSource::content_size) gives the sum of the
+///   payload sizes of the hash pass, in each encoding, and reads no file.
 ///
 /// Another commit, and an object that the model does not hold, are
 /// [`Error::InvalidInput`]. A failed open of a file is [`Error::Walk`] that
@@ -492,6 +494,29 @@ impl TreeModel {
         Ok(encoded(bytes))
     }
 
+    /// The payload bytes of the file objects of `names`, as the hash pass
+    /// read them. A symlink counts 0. A file object that the model does not
+    /// hold is [`Error::InvalidInput`].
+    fn content_bytes(&self, names: &[ObjectName]) -> Result<u64> {
+        let mut total = 0u64;
+        for name in names.iter().filter(|n| n.ty == ObjectType::File) {
+            let hashed = self
+                .source(name)
+                .and_then(|index| match &self.node(index).data {
+                    NodeData::Content { hashed, .. } => *hashed,
+                    NodeData::Dir { .. } => None,
+                });
+            let Some(hashed) = hashed else {
+                return Err(Error::InvalidInput(format!(
+                    "object {} of type {:?} is not in the tree model",
+                    name.checksum, name.ty
+                )));
+            };
+            total = total.saturating_add(hashed.size);
+        }
+        Ok(total)
+    }
+
     /// The content object of the regular file or symlink `index`. A regular
     /// file is opened again, on the blocking pool, with the open of the hash
     /// pass, and its payload stops after the size of the hash pass plus one
@@ -615,6 +640,14 @@ impl ObjectSource for TreeModel {
         commit: &'a Checksum,
     ) -> BoxFuture<'a, Result<Option<Value>>> {
         Box::pin(async move { Ok(self.commit_object(commit)?.detached.clone()) })
+    }
+
+    fn content_size<'a>(
+        &'a self,
+        names: &'a [ObjectName],
+        _encoding: Encoding,
+    ) -> BoxFuture<'a, Result<Option<u64>>> {
+        Box::pin(async move { self.content_bytes(names).map(Some) })
     }
 }
 

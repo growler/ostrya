@@ -21,6 +21,9 @@ use crate::repo::Repo;
 /// stream over its payload, and the session encodes it. No file content is
 /// held in memory, and the source keeps no reader between calls.
 ///
+/// [`content_size`](ObjectSource::content_size) reads the metadata of each
+/// file object in one pass on the blocking pool, and no payload byte.
+///
 /// The detached metadata of a commit comes with the filter applied.
 pub(crate) struct RepoSource {
     repo: Repo,
@@ -60,6 +63,23 @@ impl RepoSource {
             size,
             payload,
         })
+    }
+
+    /// The content bytes of the file objects of `names` sent in `encoding`,
+    /// in one pass on the blocking pool. The pass mirrors [`load`]: a stored
+    /// `.filez` counts its size, and each other object the size of its
+    /// payload.
+    ///
+    /// [`load`]: RepoSource::load
+    async fn content_total(&self, names: &[ObjectName], encoding: Encoding) -> Result<u64> {
+        let checksums: Vec<Checksum> = names
+            .iter()
+            .filter(|n| n.ty == ObjectType::File)
+            .map(|n| n.checksum)
+            .collect();
+        let stored = encoding == Encoding::Deflate && self.repo.mode().is_archive();
+        let repo = self.repo.clone();
+        ostrya_rt::unblock(move || repo.content_size_blocking(&checksums, stored)).await
     }
 
     /// A stream over the stored `.filez` file of the file object `checksum`.
@@ -141,6 +161,19 @@ impl ObjectSource for RepoSource {
         commit: &'a Checksum,
     ) -> BoxFuture<'a, crate::push::Result<Option<Value>>> {
         Box::pin(async move { self.detached(commit).await.map_err(source_error) })
+    }
+
+    fn content_size<'a>(
+        &'a self,
+        names: &'a [ObjectName],
+        encoding: Encoding,
+    ) -> BoxFuture<'a, crate::push::Result<Option<u64>>> {
+        Box::pin(async move {
+            self.content_total(names, encoding)
+                .await
+                .map(Some)
+                .map_err(source_error)
+        })
     }
 }
 
@@ -417,6 +450,92 @@ mod tests {
                         assert!(read_all(payload).await == content, "{label}");
                     }
                     other => panic!("{label}: {other:?}"),
+                }
+            }
+        });
+    }
+
+    /// The content size of the file objects is the number of bytes their
+    /// readers give, in each mode and each encoding: `raw` is also the
+    /// encoding of a session whose server does not list `deflate`.
+    #[test]
+    fn the_content_size_is_the_bytes_the_readers_give() {
+        ostrya_rt::block_on(async {
+            let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+            for (label, mode) in [
+                ("size-archive", RepoMode::Archive),
+                ("size-bare-user", RepoMode::BareUser),
+                ("size-bare-user-only", RepoMode::BareUserOnly),
+            ] {
+                let scratch = Scratch::new(label);
+                let repo = scratch.create(mode).await;
+                let commit = commit_tree(&repo, &scratch, "main", None, &content).await;
+                let names = repo.traverse_commit(&commit, 0).await.unwrap();
+                let names: Vec<ObjectName> = names.into_iter().collect();
+                let src = source(&repo);
+                for encoding in [Encoding::Raw, Encoding::Deflate] {
+                    let mut read = 0u64;
+                    for name in names.iter().filter(|n| n.ty == ObjectType::File) {
+                        read += match src.open(name, encoding).await.unwrap() {
+                            ObjectData::Content { payload, .. } => match payload {
+                                Some(payload) => read_all(payload).await.len() as u64,
+                                None => 0,
+                            },
+                            ObjectData::Encoded { reader, .. } => {
+                                read_all(reader).await.len() as u64
+                            }
+                        };
+                    }
+                    let size = src.content_size(&names, encoding).await.unwrap();
+                    assert_eq!(size, Some(read), "{label} {encoding:?}");
+                    if !(mode.is_archive() && encoding == Encoding::Deflate) {
+                        assert_eq!(read, content.len() as u64, "{label} {encoding:?}");
+                    }
+                }
+            }
+        });
+    }
+
+    /// The size pass and the load reach the object the same way when its
+    /// fan-out directory is a symlink: both succeed with the same bytes, or
+    /// both fail.
+    #[test]
+    fn the_content_size_and_the_load_agree_on_a_symlinked_fan_out() {
+        ostrya_rt::block_on(async {
+            for (label, mode) in [
+                ("fanout-archive", RepoMode::Archive),
+                ("fanout-bare-user", RepoMode::BareUser),
+                ("fanout-bare-user-only", RepoMode::BareUserOnly),
+            ] {
+                let (scratch, repo, commit) = fixture(label, mode).await;
+                let (regular, _) = file_objects(&repo, &commit).await;
+                let path = loose_path(&regular.checksum, ObjectType::File, mode);
+                let fanout = path.split_once('/').unwrap().0;
+                let objects = scratch.path().join("repo/objects");
+                let moved = scratch.path().join("moved-fanout");
+                std::fs::rename(objects.join(fanout), &moved).unwrap();
+                std::os::unix::fs::symlink(&moved, objects.join(fanout)).unwrap();
+                let src = source(&repo);
+                let names = [regular];
+                for encoding in [Encoding::Raw, Encoding::Deflate] {
+                    let loaded = match src.open(&regular, encoding).await {
+                        Ok(ObjectData::Content { payload, .. }) => {
+                            Ok(read_all(payload.unwrap()).await.len() as u64)
+                        }
+                        Ok(ObjectData::Encoded { reader, .. }) => {
+                            Ok(read_all(reader).await.len() as u64)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let sized = src
+                        .content_size(&names, encoding)
+                        .await
+                        .map(Option::unwrap)
+                        .map_err(|e| e.to_string());
+                    assert_eq!(loaded.is_ok(), sized.is_ok(), "{label} {encoding:?}");
+                    if let (Ok(loaded), Ok(sized)) = (loaded, sized) {
+                        assert_eq!(loaded, sized, "{label} {encoding:?}");
+                    }
                 }
             }
         });

@@ -20,7 +20,8 @@ use ostrya_push::proto::{
 };
 use ostrya_push::{
     BoxFuture, Compression, Encoding, Error, ErrorCode, Expected, ObjectData, ObjectSource,
-    PushPhase, PushProgress, PushSession, RefOutcome, RefState, RefUpdate, SessionOptions,
+    PushPhase, PushProgress, PushProgressSnapshot, PushSession, RefOutcome, RefState, RefUpdate,
+    SessionOptions,
 };
 
 fn ck(n: u8) -> Checksum {
@@ -300,6 +301,10 @@ enum Item {
     Content(FileHeader, Option<Vec<u8>>),
     /// Encoded bytes.
     Encoded(Encoding, Vec<u8>),
+    /// A regular file that is content with this payload in `raw`, and these
+    /// stored bytes as they are in `deflate`, as an `archive` repository
+    /// gives it.
+    Stored(Vec<u8>, Vec<u8>),
     /// A regular file whose payload fails after these bytes.
     Failing(Vec<u8>),
     /// An open that never completes.
@@ -314,6 +319,8 @@ struct Source {
     opened: Mutex<Vec<(ObjectName, Encoding)>>,
     /// Each detached metadata request.
     asked: Mutex<Vec<Checksum>>,
+    /// The encoding of each content size request.
+    sized: Mutex<Vec<Encoding>>,
 }
 
 impl Source {
@@ -349,6 +356,15 @@ impl ObjectSource for Source {
                     encoding,
                     reader: Box::new(Cursor::new(bytes)),
                 },
+                Item::Stored(payload, _) if encoding == Encoding::Raw => ObjectData::Content {
+                    header: regular(0o644),
+                    size: payload.len() as u64,
+                    payload: Some(Box::new(Cursor::new(payload))),
+                },
+                Item::Stored(_, stored) => ObjectData::Encoded {
+                    encoding: Encoding::Deflate,
+                    reader: Box::new(Cursor::new(stored)),
+                },
                 Item::Failing(bytes) => ObjectData::Content {
                     header: regular(0o644),
                     size: bytes.len() as u64 + 10,
@@ -367,6 +383,30 @@ impl ObjectSource for Source {
     ) -> BoxFuture<'a, ostrya_push::Result<Option<Value>>> {
         self.asked.lock().unwrap().push(*commit);
         Box::pin(async move { Ok(self.meta.get(commit).cloned()) })
+    }
+
+    fn content_size<'a>(
+        &'a self,
+        names: &'a [ObjectName],
+        encoding: Encoding,
+    ) -> BoxFuture<'a, ostrya_push::Result<Option<u64>>> {
+        self.sized.lock().unwrap().push(encoding);
+        let total = names
+            .iter()
+            .filter(|n| n.ty == ObjectType::File)
+            .filter_map(|n| self.items.get(n))
+            .map(|item| match item {
+                Item::Content(_, payload) => payload.as_ref().map_or(0, |p| p.len() as u64),
+                Item::Encoded(_, bytes) => bytes.len() as u64,
+                Item::Stored(payload, stored) => match encoding {
+                    Encoding::Raw => payload.len() as u64,
+                    _ => stored.len() as u64,
+                },
+                Item::Failing(bytes) => bytes.len() as u64 + 10,
+                Item::Stalled => 0,
+            })
+            .sum();
+        Box::pin(async move { Ok(Some(total)) })
     }
 }
 
@@ -1208,7 +1248,7 @@ fn progress_counts_and_phases() {
     };
     let (session, out) = open_with(encode(&msgs), &["a"], opts);
     let session = session.unwrap();
-    assert_eq!(progress.snapshot().phase, PushPhase::Negotiating);
+    assert_eq!(progress.snapshot().phase, PushPhase::Connecting);
     assert_eq!(progress.snapshot().bytes_sent, out.bytes().len() as u64);
 
     let needed = block_on(session.missing(&[file(1), file(2), file(3)])).unwrap();
@@ -1245,5 +1285,113 @@ fn progress_counts_and_phases() {
     match &decode(&out.bytes())[0] {
         Event::Msg(Message::Hello(h)) => assert_eq!(h.agent.as_deref(), Some("test/1")),
         other => panic!("{other:?}"),
+    }
+}
+
+/// The hook of a handle runs at each phase change, after each object, and
+/// each time the content bytes reach the next multiple of 100 KiB. The
+/// content bytes end at the byte total of the source, raw and deflated.
+#[test]
+fn the_progress_hook_runs_per_phase_per_object_and_per_100_kib() {
+    for compression in [Compression::None, Compression::Deflate { level: 6 }] {
+        let calls: Arc<Mutex<Vec<PushProgressSnapshot>>> = Arc::default();
+        let record = Arc::clone(&calls);
+        let progress = PushProgress::with_hook(Arc::new(move |snapshot| {
+            record.lock().unwrap().push(*snapshot)
+        }));
+        let data = payload(250_000, 3);
+        let source = Source::default()
+            .with(file(1), Item::Content(regular(0o644), Some(data)))
+            .with(file(2), Item::Content(symlink("target"), None))
+            .with(
+                meta_name(ObjectType::DirTree, 3),
+                Item::Encoded(Encoding::Raw, b"xyz".to_vec()),
+            );
+        let names = [file(1), file(2), meta_name(ObjectType::DirTree, 3)];
+        let msgs = [
+            hello_reply(&["a"], BOTH, 16),
+            Message::HaveReply(HaveReply::from_missing([true, true, true])),
+            objects_reply(),
+            commit_reply(&["a"]),
+        ];
+        let opts = SessionOptions {
+            progress: Some(progress.clone()),
+            ..SessionOptions::default()
+        };
+        let (session, _out) = open_with(encode(&msgs), &["a"], opts);
+        let session = session.unwrap();
+        let needed = block_on(session.missing(&names)).unwrap();
+        block_on(session.send(&source, &needed, &[], compression)).unwrap();
+        block_on(session.commit(&[update("a")], false)).unwrap();
+
+        let last = progress.snapshot();
+        assert_eq!(last.bytes_total, 250_000, "{compression:?}");
+        assert_eq!(last.content_bytes, last.bytes_total, "{compression:?}");
+
+        let calls = calls.lock().unwrap();
+        let mut phases: Vec<PushPhase> = calls.iter().map(|c| c.phase).collect();
+        phases.dedup();
+        assert_eq!(
+            phases,
+            [
+                PushPhase::Connecting,
+                PushPhase::Negotiating,
+                PushPhase::Uploading,
+                PushPhase::Committing
+            ],
+            "{compression:?}"
+        );
+        // The first call in the upload sees the byte total.
+        let first_upload = calls
+            .iter()
+            .find(|c| c.phase == PushPhase::Uploading)
+            .unwrap();
+        assert_eq!(first_upload.bytes_total, 250_000, "{compression:?}");
+        assert_eq!(first_upload.content_bytes, 0, "{compression:?}");
+        // Four phase changes, three objects, and two multiples of 100 KiB:
+        // 102,400 and 204,800.
+        assert_eq!(calls.len(), 4 + 3 + 2, "{compression:?}: {calls:?}");
+        let per_object: Vec<u64> = calls
+            .windows(2)
+            .filter(|w| w[1].objects_sent > w[0].objects_sent)
+            .map(|w| w[1].objects_sent)
+            .collect();
+        assert_eq!(per_object, [1, 2, 3], "{compression:?}");
+        let steps: Vec<u64> = calls
+            .windows(2)
+            .filter(|w| w[1].content_bytes / 102_400 > w[0].content_bytes / 102_400)
+            .map(|w| w[1].content_bytes / 102_400)
+            .collect();
+        assert_eq!(steps, [1, 2], "{compression:?}");
+    }
+}
+
+/// The byte total is asked in the encoding the session sends in. A server
+/// that lists `raw` alone makes a deflate push ask for `raw`, and the content
+/// bytes then end at the payload size, not at the stored size.
+#[test]
+fn the_byte_total_follows_the_encoding_the_server_takes() {
+    let data = payload(5000, 5);
+    let stored = b"stored deflate bytes".to_vec();
+    for (encodings, want_encoding, want_total) in [
+        (&[Encoding::Raw][..], Encoding::Raw, data.len() as u64),
+        (BOTH, Encoding::Deflate, stored.len() as u64),
+    ] {
+        let progress = PushProgress::new();
+        let source = Source::default().with(file(1), Item::Stored(data.clone(), stored.clone()));
+        let msgs = [hello_reply(&["a"], encodings, 16), objects_reply()];
+        let opts = SessionOptions {
+            progress: Some(progress.clone()),
+            ..SessionOptions::default()
+        };
+        let (session, _out) = open_with(encode(&msgs), &["a"], opts);
+        let session = session.unwrap();
+        block_on(session.send(&source, &[file(1)], &[], Compression::Deflate { level: 6 }))
+            .unwrap();
+        let last = progress.snapshot();
+        assert_eq!(last.bytes_total, want_total, "{want_encoding:?}");
+        assert_eq!(last.content_bytes, last.bytes_total, "{want_encoding:?}");
+        assert_eq!(*source.sized.lock().unwrap(), [want_encoding]);
+        assert_eq!(source.opened.lock().unwrap()[0], (file(1), want_encoding));
     }
 }

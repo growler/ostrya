@@ -3351,6 +3351,13 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
 - Each refspec is `SRC[:DST]`. `SRC` is a revision of the local repository.
   `DST` is the ref of the server, and it defaults to `SRC` when `SRC` is a
   ref. `:DST` deletes the ref `DST` of the server.
+- A `DST` that the ref-name rule refuses, a `DST` that holds `^`, and a
+  `DST` of 64 lowercase hex characters after a `SRC`, which a revision reads
+  as a commit checksum, are refused with `error: Invalid refspec DST` at exit
+  1. The refusal comes after `REMOTE` resolves and before the ssh client
+  starts or the first HTTP request. A delete `:DST` of a `DST` of 64
+  lowercase hex characters passes, and the server removes the ref where its
+  rule allows the delete.
 - The command checks its operands after the repository opens. With no
   `REMOTE` it writes the usage text and `error: REMOTE must be specified`.
   With no refspec it writes the usage text and `error: REFSPEC must be
@@ -3417,7 +3424,35 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
     not hold.
 - Under `-v` the command writes one statistics line to standard error: the
   objects offered, needed, and sent, the bytes sent, and the elapsed time.
-  It writes no progress line.
+- While the push runs, the command draws a progress bar on standard error
+  when standard error is a terminal and `TERM` is set and is not `dumb`.
+  Standard output carries the ref lines, so the bar goes to standard error.
+  The bar shows nothing until the `Have` rounds start, so a prompt of the
+  ssh client stays readable. It then shows a spinner with `Negotiating`, and
+  a bar of the content bytes with `SENT/NEEDED objects`, the bytes, the
+  rate, and the time left while the objects go. The content bytes are the
+  payload bytes of the file objects before compression, or the stored bytes
+  of the `.filez` files that an `archive` repository sends as they are. When
+  the total is 0 the bar shows the bytes and the rate alone. The bar draws
+  at most 20 frames a second, so its last frame can show less than 100%.
+- The command clears the bar when it sends `Commit`, and draws nothing
+  after that. A line that the server writes on standard error at the
+  commit, for example `error: non-fast-forward: ...` or a
+  `warning: summary-build ...` line, starts on a clean line. The command
+  also clears the bar before it writes a ref line, the statistics line, or
+  an error line.
+- On a pipe, a file, or a dumb terminal the command writes no byte of the
+  bar, and the push asks for no byte total, so it reads no object metadata
+  for the bar. Standard error then carries the statistics line and the
+  error line alone. The tool has no `push` command, so the bar is no
+  conformance item.
+- Known gaps of the bar:
+  - The ssh client writes the standard error of the server on the same
+    terminal. A line that the server writes while the objects go can show
+    in the middle of the bar, and the next frame of the bar draws over the
+    end of that line.
+  - Ctrl-C, another signal that stops the process, or a panic leaves the
+    last frame of the bar on the terminal.
 - On failure the command writes `error: MESSAGE` to standard error and
   nothing to standard output, and exits 1. A refusal of the server gives
   its wire code first, for example `error: non-fast-forward: ...` or
@@ -3507,6 +3542,10 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
 - On success the command writes the commit checksum as one line to
   standard output and exits 0. Under `-v` it writes the statistics line of
   `push` to standard error.
+- While the push runs, the command draws the progress bar of `push` on
+  standard error, with the same rules and the same known gaps. The bar
+  shows nothing during the walk and the hash pass, and nothing while a
+  signer signs the commit.
 - On failure the command writes `error: MESSAGE` to standard error and
   nothing to standard output, and exits 1. A refusal of the server gives
   its wire code first, for example `error: mode-refused: ...`.

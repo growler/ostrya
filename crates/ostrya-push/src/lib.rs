@@ -76,8 +76,8 @@ pub use push_tree::{
 };
 pub use session::{
     BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PullBody, PullSession,
-    PullSessionOptions, PushOutcome, PushPhase, PushProgress, PushProgressSnapshot, PushSession,
-    PushStats, ServerInfo, SessionOptions,
+    PullSessionOptions, PushOutcome, PushPhase, PushProgress, PushProgressFn, PushProgressSnapshot,
+    PushSession, PushStats, ServerInfo, SessionOptions,
 };
 pub use transport::{ConnectOptions, PreparedSession, PullConnectOptions, PushRemote};
 

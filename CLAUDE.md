@@ -328,6 +328,40 @@ system. Each term below is measured on the resolved dependency graph.
 - `ostrya-server` builds on Linux alone, so the exception in "Exception:
   system libraries of macOS and Windows" does not change.
 
+### Authorized: the `indicatif` crate
+
+`indicatif` 0.18.6 is authorized for `crates/ostrya-cli` alone. It draws the
+progress bar of `ostrya push` and `ostrya push-tree` on standard error. Each
+term below is measured on the resolved dependency graph.
+
+- License `MIT`.
+- `default-features = false` is mandatory, with the feature
+  `unicode-width` alone. The default feature `wasmbind` reaches
+  `web-time` on a `wasm32` target, and through it `wasm-bindgen-shared`,
+  which declares the `links` key `wasm_bindgen`, so the CI links guard
+  fails with the default features. The feature `rayon` stays off: it
+  reaches `rayon-core`, which declares a `links` key too.
+- The graph holds 6 packages under 6 distinct names on the host target,
+  measured with `cargo tree -p indicatif -e normal,build`: `indicatif`
+  0.18.6, `console` 0.16.6, `libc` 0.2.186, `portable-atomic` 1.15.0,
+  `unicode-width` 0.2.2, and `unit-prefix` 0.5.2. With `--target all` it
+  holds 9, adding `encode_unicode` 1.0.0, `windows-sys` 0.61.2, and
+  `windows-link` 0.2.1, which `console` reaches on Windows, where
+  `ostrya-cli` is not built.
+- No package in the graph declares a `links` key. On Linux no package name
+  in it ends in `-sys`. `windows-sys` is in the graph on Windows alone.
+- Two packages carry a build script: `libc`, which was already in the
+  graph, and `portable-atomic`.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only": `indicatif`, `console`, and `unit-prefix` state
+  `MIT`, `libc`, `unicode-width`, `windows-sys`, and `windows-link` state
+  `MIT OR Apache-2.0`, and `portable-atomic` and `encode_unicode` state
+  `Apache-2.0 OR MIT`.
+- The highest minimum supported Rust version in the graph is 1.85, stated
+  by `indicatif`. The workspace pins 1.92, so the requirement holds.
+- Six packages entered `Cargo.lock` with it: `indicatif`, `console`,
+  `portable-atomic`, `unicode-width`, `unit-prefix`, and `encode_unicode`.
+
 ## Requirement: permissive licenses only
 
 The library and everything it links -- every crate in the dependency graph,

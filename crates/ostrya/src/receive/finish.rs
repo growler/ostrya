@@ -93,8 +93,11 @@ struct Edit<'a> {
 /// dicts of the session. The checks run in this order, and the first failure
 /// ends the session with nothing published:
 ///
-/// - each ref name is valid (`invalid-ref`), the message holds one update at
-///   least, and each update names a ref of `Hello` once (`protocol`);
+/// - each ref name is valid, and no update writes a commit to a ref name of
+///   64 lowercase hex characters (`invalid-ref`), the message holds one
+///   update at least, and each update names a ref of `Hello` once
+///   (`protocol`). A delete of a ref name of 64 lowercase hex characters
+///   passes;
 /// - the `CommitReply` of the updates fits in a frame of [`MAX_FRAME`] with
 ///   the longest outcome of each update (`limit-exceeded`), so the reply of
 ///   a commit that wrote its refs is never one the server cannot send;
@@ -250,7 +253,8 @@ pub(super) async fn finish(
     })
 }
 
-/// Each ref name is valid, the message holds one update at least, and each
+/// Each ref name is valid, no update writes a commit to a ref name of 64
+/// lowercase hex characters, the message holds one update at least, and each
 /// update names a ref of `Hello`, once.
 fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
     for update in updates {
@@ -261,6 +265,14 @@ fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
             ))),
             other => Failure::Internal(other),
         })?;
+        // A revision reads 64 lowercase hex characters as a checksum, so a
+        // push writes no commit to such a ref. A delete of it passes.
+        if update.new.is_some() && ostrya_core::is_checksum_shaped(&update.name) {
+            return Err(Failure::Wire(push::Error::InvalidRef(format!(
+                "invalid ref name '{}'",
+                update.name
+            ))));
+        }
     }
     if updates.is_empty() {
         return Err(protocol("the Commit message holds no ref update".into()));

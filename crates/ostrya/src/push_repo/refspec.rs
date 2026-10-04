@@ -5,7 +5,9 @@
 //! commit `SRC` names. An empty `SRC` before a `DST` (`:DST`) deletes the ref
 //! `DST` of the server. The split is at the last `:`, so `SRC` can name a
 //! remote ref, as in `origin:main:DST`. `DST` holds no `:`, so a push names
-//! no remote ref of the server. `DST` holds no `^` either.
+//! no remote ref of the server. `DST` holds no `^` either. A `DST` that takes
+//! a commit is not 64 lowercase hex characters, which a revision reads as a
+//! commit checksum. A delete can name such a `DST`.
 
 use std::collections::HashSet;
 
@@ -39,8 +41,10 @@ struct Refspec<'a> {
 /// The split refuses an empty refspec, `:`, an empty `DST`, and a `SRC` with
 /// a `^` suffix and no `DST`. Each of these is [`Error::Push`] with
 /// [`InvalidInput`](crate::push::Error::InvalidInput). A `DST` that
-/// [`validate_refspec`] refuses, and a `DST` that holds a `^`, are
-/// [`Error::InvalidRefspec`] with the `DST`.
+/// [`validate_refspec`] refuses, a `DST` that holds a `^`, and a `DST` that
+/// [`is_checksum_shaped`](ostrya_core::is_checksum_shaped) marks after a
+/// non-empty `SRC` are [`Error::InvalidRefspec`] with the `DST`. A delete
+/// (`:DST`) of a checksum-shaped `DST` passes.
 fn split(spec: &str) -> Result<Refspec<'_>> {
     if spec.is_empty() {
         return Err(invalid("a refspec is empty"));
@@ -60,7 +64,9 @@ fn split(spec: &str) -> Result<Refspec<'_>> {
         return Err(invalid(format!("refspec '{spec}' names no destination")));
     }
     validate_refspec(dst)?;
-    if dst.contains('^') {
+    // A revision reads 64 lowercase hex characters as a checksum, so a push
+    // writes no commit to such a ref. A delete of it passes.
+    if dst.contains('^') || (!src.is_empty() && ostrya_core::is_checksum_shaped(dst)) {
         return Err(Error::InvalidRefspec(dst.to_owned()));
     }
     Ok(Refspec {
@@ -247,6 +253,27 @@ mod tests {
     fn a_destination_that_is_no_ref_name_is_an_invalid_refspec() {
         assert_invalid_refspec(split("main:a/../b"), "a/../b");
         assert_invalid_refspec(split("main:/b"), "/b");
+    }
+
+    #[test]
+    fn a_destination_of_64_lowercase_hex_characters_is_an_invalid_refspec() {
+        let hex = "ab".repeat(32);
+        assert_invalid_refspec(split(&format!("main:{hex}")), &hex);
+        assert_invalid_refspec(split(&format!("origin:main:{hex}")), &hex);
+        let upper = hex.to_uppercase();
+        assert_eq!(
+            split(&format!("main:{upper}")).unwrap().dst,
+            Some(upper.as_str())
+        );
+    }
+
+    #[test]
+    fn a_delete_of_64_lowercase_hex_characters_is_accepted() {
+        let hex = "ab".repeat(32);
+        let spec = format!(":{hex}");
+        let parts = split(&spec).unwrap();
+        assert_eq!(parts.src, None);
+        assert_eq!(parts.dst, Some(hex.as_str()));
     }
 
     #[test]

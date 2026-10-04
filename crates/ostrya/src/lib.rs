@@ -333,7 +333,7 @@ pub use ostrya_composefs::Image;
 pub use ostrya_core::base64;
 pub use ostrya_core::{
     Checksum, Commit, DictBuilder, DirMeta, DirTree, ObjectName, ObjectType, RepoMode, Span,
-    TextError, Type, Value, Xattrs, from_bytes, from_text, loose_path, to_text,
+    TextError, Type, Value, Xattrs, from_bytes, from_text, is_checksum_shaped, loose_path, to_text,
     to_text_unannotated,
 };
 pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};

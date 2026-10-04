@@ -6,6 +6,12 @@
 //! `REMOTE` is one component and `NAME` is a ref name. A refspec of the
 //! second form names a path below `refs/remotes/REMOTE`. The rule keeps
 //! each name inside the `refs/` tree.
+//!
+//! A name of 64 lowercase hex characters passes the rule. A revision reads
+//! such a name as a commit checksum, so [`is_checksum_shaped`] marks it, and
+//! a push refuses to write a commit to a ref of that name.
+
+use crate::Checksum;
 
 /// Whether `component` is one component of a ref name: not empty, not `.` or
 /// `..`, and with no `/` and no NUL.
@@ -31,6 +37,12 @@ pub fn is_refspec(refspec: &str) -> bool {
         Some((remote, name)) => is_ref_component(remote) && is_ref_name(name),
         None => is_ref_name(refspec),
     }
+}
+
+/// Whether `name` is 64 lowercase hex characters, which a revision reads
+/// as a commit checksum and not as a ref name.
+pub fn is_checksum_shaped(name: &str) -> bool {
+    Checksum::from_hex_lower(name).is_ok()
 }
 
 #[cfg(test)]
@@ -67,6 +79,26 @@ mod tests {
         assert!(is_ref_component("a.b"));
         for c in ["", ".", "..", "a/b", "a\0"] {
             assert!(!is_ref_component(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn a_checksum_shaped_name_is_64_lowercase_hex_characters() {
+        let hex = "0123456789abcdef".repeat(4);
+        assert!(is_checksum_shaped(&hex));
+        assert!(is_ref_name(&hex));
+        let mut one_off = hex.clone();
+        one_off.replace_range(10..11, "g");
+        for name in [
+            hex.to_uppercase(),
+            format!("A{}", &hex[1..]),
+            hex[..63].to_owned(),
+            format!("{hex}0"),
+            one_off,
+            format!("origin:{hex}"),
+            String::new(),
+        ] {
+            assert!(!is_checksum_shaped(&name), "{name}");
         }
     }
 }

@@ -852,6 +852,41 @@ mod cli {
         assert!(last.contains(" bytes sent in "), "{err}");
     }
 
+    /// On a pipe the progress bar writes nothing: standard error carries no
+    /// escape byte, and nothing at all without `--verbose`. With it, the
+    /// statistics line is the last line. Standard output keeps the ref
+    /// line. `TERM` names a terminal, so the pipe alone hides the bar.
+    #[test]
+    fn a_push_to_a_pipe_writes_no_progress() {
+        let setup = Setup::new("cli-progress-pipe", "archive");
+        let big = "progress\n".repeat(40_000);
+        let c = setup.commit("main", &[("a", "alpha\n"), ("big", &big)], &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let ssh = setup.ssh_command();
+        let receive = receive_command(None);
+        let address = address(&dest);
+        let run = |extra: &[&str]| {
+            let mut args = vec![ssh.as_str(), receive.as_str(), address.as_str()];
+            args.extend_from_slice(extra);
+            setup.push(&args, &[("TERM", "xterm")])
+        };
+
+        let out = run(&["main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {c}\n"));
+        assert_eq!(stderr(&out), "");
+
+        let c2 = setup.commit("main", &[("big", &big.repeat(2))], &[]);
+        let out = run(&["-v", "--compress=6", "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main {c} {c2}\n"));
+        assert!(!out.stderr.contains(&0x1b), "{:?}", stderr(&out));
+        let err = stderr(&out);
+        let last = err.lines().last().unwrap_or_default();
+        assert!(last.contains(" objects offered, "), "{err}");
+        assert!(last.contains(" bytes sent in "), "{err}");
+    }
+
     /// The server holds `D` on `C1` from another writer, and the client
     /// pushes `C2` on `C1`: the server refuses the update that is not a
     /// fast-forward, keeps `D`, and does not store `C2`.
@@ -955,6 +990,23 @@ mod cli {
         let out = setup.push_to(&dest, None, &["--compress=9", "--depth=0", "main"]);
         assert!(out.status.success(), "{}", stderr(&out));
         assert!(setup.ssh_started());
+    }
+
+    /// A destination of 64 lowercase hex characters, which a revision reads
+    /// as a commit checksum, is an invalid refspec, refused before ssh
+    /// starts.
+    #[test]
+    fn a_destination_of_64_lowercase_hex_characters_is_refused() {
+        let setup = Setup::new("cli-hex-dst", "archive");
+        setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let hex = "ab".repeat(32);
+        let out = setup.push_to(&dest, None, &[&format!("main:{hex}")]);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(stderr(&out), format!("error: Invalid refspec {hex}\n"));
+        assert!(!setup.ssh_started());
+        assert!(!dest.join("refs/heads").join(&hex).exists());
     }
 
     /// A ref line that standard output cannot take, here on `/dev/full`,
@@ -1260,6 +1312,51 @@ mod cli {
                 assert_eq!(c2, t2);
             }
             tool_fsck(&dest);
+        }
+
+        /// On a pipe the progress bar of a tree push writes nothing:
+        /// standard error carries no escape byte, and nothing at all
+        /// without `--verbose`. With it, the statistics line is the last
+        /// line. Standard output keeps the commit checksum. `TERM` names a
+        /// terminal, so the pipe alone hides the bar.
+        #[test]
+        fn a_tree_push_to_a_pipe_writes_no_progress() {
+            let setup = Setup::without_client("tree-progress-pipe");
+            let tree = tree(&setup.base, "tree", 0o644, 0o755);
+            std::fs::write(tree.join("big"), "progress\n".repeat(40_000)).unwrap();
+            set_mode(&tree.join("big"), 0o644);
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            let ssh = setup.ssh_command();
+            let receive = receive_command(None);
+            let address = address(&dest);
+            let run = |extra: &[&str]| {
+                let mut args = vec![
+                    ssh.as_str(),
+                    receive.as_str(),
+                    address.as_str(),
+                    tree.to_str().unwrap(),
+                    "-b",
+                    "main",
+                ];
+                args.extend_from_slice(extra);
+                push_tree(&setup, &args, &[("TERM", "xterm")])
+            };
+
+            let out = run(&[]);
+            let c1 = pushed(&out);
+            assert_eq!(stderr(&out), "");
+            assert_eq!(server_tip(&dest, "main"), Some(c1));
+
+            std::fs::write(tree.join("big"), "progress\n".repeat(80_000)).unwrap();
+            let out = run(&["-v", "--compress=6"]);
+            let c2 = pushed(&out);
+            assert_eq!(server_tip(&dest, "main"), Some(c2));
+            assert!(!out.stderr.contains(&0x1b), "{:?}", stderr(&out));
+            let err = stderr(&out);
+            let last = err.lines().last().unwrap_or_default();
+            assert!(last.contains(" objects offered, "), "{err}");
+            assert!(last.contains(" bytes sent in "), "{err}");
+            assert_eq!(err.lines().count(), 1, "{err}");
         }
 
         /// Two `-b` give the commit of `ostree commit -b R1 --bind-ref R2`,

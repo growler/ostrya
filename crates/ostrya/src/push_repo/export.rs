@@ -53,8 +53,11 @@ impl Repo {
     ///   is [`Expected::Commit`], and an update with no new commit, as
     ///   [`Error::Push`](crate::Error::Push) with
     ///   [`InvalidInput`](crate::push::Error::InvalidInput);
-    /// - a ref name that [`validate_refspec`] refuses, as
-    ///   [`Error::InvalidRefspec`](crate::Error::InvalidRefspec);
+    /// - a ref name that [`validate_refspec`] refuses, and a ref name of 64
+    ///   lowercase hex characters with no `REMOTE:` part that an update
+    ///   writes, which a revision reads as a commit checksum, as
+    ///   [`Error::InvalidRefspec`](crate::Error::InvalidRefspec). A delete
+    ///   of such a name is refused as an update with no new commit;
     /// - a commit that the repository marks partial, as
     ///   [`Error::Push`](crate::Error::Push) with
     ///   [`InvalidInput`](crate::push::Error::InvalidInput);
@@ -96,6 +99,9 @@ impl Repo {
         let mut named = HashSet::new();
         for u in updates {
             validate_refspec(&u.name)?;
+            if u.new.is_some() && ostrya_core::is_checksum_shaped(&u.name) {
+                return Err(crate::Error::InvalidRefspec(u.name.clone()));
+            }
             if !named.insert(u.name.as_str()) {
                 return Err(invalid(format!("ref '{}' is updated twice", u.name)));
             }

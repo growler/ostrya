@@ -716,6 +716,27 @@ fn a_second_tree_push_sends_only_the_commit() {
     assert_eq!(named_ref(&repo, REF), Some(format!("{second}\n")));
 }
 
+/// A target ref of 64 lowercase hex characters, which a revision reads as a
+/// commit checksum, is refused before the scan. The server writes no ref and
+/// no object.
+#[test]
+fn a_target_ref_of_64_lowercase_hex_characters_is_refused() {
+    let tmp = TmpDir::new("push-tree-hex-ref");
+    let src = build_fixture_source(tmp.path());
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = object_files(&repo);
+    let hex = "a".repeat(64);
+    let (report, client) = tree_push(&repo, &src, tree_options(&["main", &hex]), None);
+    match client {
+        Err(Error::InvalidInput(m)) => assert!(m.contains(&hex), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(report.is_err(), "server {report:?}");
+    assert_eq!(object_files(&repo), before, "the store changed");
+    assert_eq!(named_ref(&repo, &hex), None);
+    assert_eq!(named_ref(&repo, "main"), None);
+}
+
 #[test]
 fn a_file_changed_at_the_same_length_after_the_scan_fails_the_tree_push() {
     for mode in MODES {
@@ -866,6 +887,30 @@ fn the_signatures_follow_the_detached_entries_of_the_caller_in_signer_order() {
     assert!(outcome.valid, "{outcome:?}");
 }
 
+/// The content bytes a tree push reads end at the byte total of its model,
+/// raw and deflated.
+#[test]
+fn the_content_bytes_of_a_tree_push_end_at_the_byte_total() {
+    for (tag, compression) in [
+        ("raw", Compression::None),
+        ("deflate", Compression::Deflate { level: 6 }),
+    ] {
+        let tmp = TmpDir::new(&format!("push-tree-total-{tag}"));
+        let src = build_rich_source(tmp.path());
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let progress = PushProgress::new();
+        let opts = TreePushOptions {
+            progress: Some(progress.clone()),
+            compression,
+            ..tree_options(&[REF])
+        };
+        pushed(&repo, &src, opts, tag);
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.content_bytes, snapshot.bytes_total, "{tag}");
+        assert!(snapshot.bytes_total > 200 * 1024, "{tag}: {snapshot:?}");
+    }
+}
+
 #[test]
 fn the_progress_handle_shows_the_scan_and_then_the_session() {
     let tmp = TmpDir::new("push-tree-progress");
@@ -904,6 +949,6 @@ fn the_progress_handle_shows_the_scan_and_then_the_session() {
     let seen = seen.lock().unwrap();
     assert!(!seen.is_empty());
     assert!(seen.iter().all(|p| *p == PushPhase::Scanning), "{seen:?}");
-    assert_eq!(*at_read.lock().unwrap(), Some(PushPhase::Negotiating));
+    assert_eq!(*at_read.lock().unwrap(), Some(PushPhase::Connecting));
     assert_eq!(progress.snapshot().phase, PushPhase::Committing);
 }

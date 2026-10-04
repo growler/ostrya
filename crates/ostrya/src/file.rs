@@ -314,6 +314,57 @@ impl Repo {
         Ok(self.opened(checksum, loaded))
     }
 
+    /// The sum of the content bytes of the file objects `checksums`, as a push
+    /// session reads them from [`Repo::open_file`] or from the stored file,
+    /// read on the calling thread. With `stored`, each object of an `archive`
+    /// repository counts the size of its stored `.filez`, which the session
+    /// sends as it is. Otherwise each object counts the uncompressed size of
+    /// its payload, and a symlink counts 0.
+    ///
+    /// The pass reads no payload byte. A stored `.filez` takes one `statat`,
+    /// and an `archive` object without `stored` an open and the read of its
+    /// file header. A `bare-user` object, which is a regular file also for a
+    /// symlink, takes an open, the read of its `user.ostreemeta` xattr, and
+    /// an `fstat`. An object of the other modes takes one `statat`. Each
+    /// path resolves as the loads of the session resolve it: relative to
+    /// `objects/`, with no symlink followed at the object itself.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    pub(crate) fn content_size_blocking(
+        &self,
+        checksums: &[Checksum],
+        stored: bool,
+    ) -> Result<u64> {
+        let mode = self.mode();
+        let dir = self.objects_fd();
+        let mut total = 0u64;
+        for checksum in checksums {
+            let path = loose_path(checksum, ObjectType::File, mode);
+            let statat = || {
+                rustix::fs::statat(dir, path.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|e| map_object_error(e, checksum, ObjectType::File))
+            };
+            let size = match mode {
+                RepoMode::Archive if stored => statat()?.st_size.max(0) as u64,
+                RepoMode::Archive => match load_archive(dir, &path, checksum, false)?.kind {
+                    FileKind::Regular { size } => size,
+                    FileKind::Symlink { .. } => 0,
+                },
+                RepoMode::BareUser | RepoMode::BareUserShared => {
+                    bare_user_payload_size(dir, &path, checksum)?
+                }
+                RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs => {
+                    let stat = statat()?;
+                    match FileType::from_raw_mode(stat.st_mode) {
+                        FileType::Symlink => 0,
+                        _ => stat.st_size.max(0) as u64,
+                    }
+                }
+            };
+            total = total.saturating_add(size);
+        }
+        Ok(total)
+    }
+
     /// The load of [`Repo::open_file`], which follows no symlink on the object
     /// path, run on the calling thread. The fan-out directory under
     /// `objects/` opens with `O_NOFOLLOW`, and the object loads relative to it,
@@ -767,6 +818,22 @@ fn load_bare_user(
         kernel_verity,
         payload,
     })
+}
+
+/// The payload size of the `bare-user` object at `path`: its length, or 0
+/// when its `user.ostreemeta` xattr names a symlink. The object content is
+/// not read.
+fn bare_user_payload_size(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<u64> {
+    let fd = open_object(dir_fd, path, checksum)?;
+    let meta = object::read_xattr(fd.as_fd(), "user.ostreemeta")
+        .map_err(Error::Io)?
+        .ok_or_else(|| {
+            Error::InvalidFormat("bare-user .file is missing its user.ostreemeta xattr".into())
+        })?;
+    if FileHeader::parse_stat_metadata(&meta)?.is_symlink() {
+        return Ok(0);
+    }
+    Ok(rustix::fs::fstat(&fd)?.st_size.max(0) as u64)
 }
 
 fn load_bare(

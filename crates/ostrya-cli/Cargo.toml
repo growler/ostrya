@@ -41,6 +41,10 @@ clap = { version = "4", features = ["derive"] }
 # and this crate sets `publish = false`, so no published crate carries it. CI
 # holds the rule (`.github/workflows/ci.yml`, "PCRE2 stays in ostrya-cli").
 pcre2 = "0.2.11"
+# The progress bar of `push` and `push-tree` on standard error. The default
+# features stay off: `wasmbind` reaches `wasm-bindgen-shared`, which declares
+# a `links` key, and `rayon` reaches `rayon-core`, which declares one too.
+indicatif = { version = "0.18.6", default-features = false, features = ["unicode-width"] }
 
 # `tests/conformance.rs` runs the conformance matrix against the binary this
 # crate builds (`docs/conformance/harness.md`, "Cargo and CI wiring"). The

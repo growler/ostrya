@@ -683,6 +683,32 @@ fn the_two_way_receiver_refuses_a_one_way_hello() {
     assert_nothing_published(&repo, &before);
 }
 
+/// A ref name of 64 lowercase hex characters, which a revision reads as a
+/// commit checksum, passes `Hello`. The update that writes a commit to it is
+/// `invalid-ref` at `Commit`, and nothing is published.
+#[test]
+fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
+    let tmp = TmpDir::new("one-way-hex-ref");
+    let (repo, before) = empty_repo(&tmp, "");
+    let hex = "a".repeat(64);
+    // A stream of `Hello` alone ends before `Commit`: `Hello` took the name.
+    match receive(&repo, &policy(), &Stream::hello(&[&hex], true).bytes()) {
+        Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+        other => panic!("{other:?}"),
+    }
+    let mut stream = Stream::hello(&[&hex], true);
+    stream
+        .objects(&fixture_objects(Encoding::Raw))
+        .commit(vec![update(&hex, Expected::Absent, Some(fixture_commit()))]);
+    match receive(&repo, &policy(), &stream.bytes()) {
+        Err(Error::Push(push::Error::InvalidRef(m))) => {
+            assert_eq!(m, format!("invalid ref name '{hex}'"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_published(&repo, &before);
+}
+
 // ---------------------------------------------------------------------------
 // The sender.
 // ---------------------------------------------------------------------------
@@ -1178,6 +1204,10 @@ mod export {
                 with(vec![update("main", Expected::Commit(commit), Some(commit))]),
             ),
             ("a delete", with(vec![update("main", Expected::Any, None)])),
+            (
+                "a delete of 64 lowercase hex characters",
+                with(vec![update(&"a".repeat(64), Expected::Any, None)]),
+            ),
             ("empty updates", with(vec![])),
             (
                 "a ref named twice",
@@ -1212,6 +1242,31 @@ mod export {
         );
         assert!(matches!(error, Error::InvalidRefspec(_)), "{error:?}");
         assert_eq!(calls, 0);
+        let hex = "a".repeat(64);
+        let (error, calls) = refused(repo, with(vec![update(&hex, Expected::Any, Some(commit))]));
+        assert!(
+            matches!(&error, Error::InvalidRefspec(n) if *n == hex),
+            "{error:?}"
+        );
+        assert_eq!(calls, 0);
+        // With a `REMOTE:` part the name is a remote ref, and the receiver
+        // writes it.
+        let remote = format!("origin:{hex}");
+        let bytes = capture(
+            repo,
+            with(vec![update(&remote, Expected::Any, Some(commit))]),
+        );
+        let target_tmp = TmpDir::new("one-way-export-hex-target");
+        let (target, _) = empty_repo(&target_tmp, "");
+        let report = receive(&target, &export_policy(), &bytes).unwrap();
+        assert_eq!(report.refs[0].name, remote);
+        assert!(
+            target
+                .path()
+                .join("refs/remotes/origin")
+                .join(&hex)
+                .exists()
+        );
 
         for (bound, name) in [(other, "main"), (x, "origin:main")] {
             let (error, calls) =

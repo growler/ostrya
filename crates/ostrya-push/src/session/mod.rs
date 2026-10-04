@@ -27,6 +27,7 @@
 
 pub(crate) mod http;
 mod progress;
+mod pull;
 pub(crate) mod stream;
 mod writer;
 
@@ -42,6 +43,7 @@ use ostrya_core::{Checksum, FileHeader, ObjectName};
 use ostrya_gvariant::Value;
 
 pub use progress::{PushPhase, PushProgress, PushProgressSnapshot, PushStats};
+pub use pull::{PullBody, PullSession, PullSessionOptions};
 
 use self::http::{Endpoint, HttpLink};
 use self::progress::Counters;

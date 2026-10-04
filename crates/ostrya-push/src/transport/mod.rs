@@ -1,4 +1,4 @@
-//! The transports a push session runs over.
+//! The transports a push session and a pull session run over.
 //!
 //! [`PushRemote`] is a parsed push address. [`PushSession::connect`] opens a
 //! session to it with [`ConnectOptions`]. [`PushSession::prepare`] runs the
@@ -97,6 +97,33 @@
 //! the limit. The standard input of the child is then closed, so the child
 //! reads end of file on it.
 //!
+//! # Pull over ssh
+//!
+//! [`PullSession::connect`] opens a pull session to an ssh address with
+//! [`PullConnectOptions`]. It takes the address forms and the parser rules
+//! above, and runs:
+//!
+//! ```text
+//! SSH_COMMAND... [-p PORT] [USER@]HOST 'SEND_COMMAND --repo=QUOTED_PATH'
+//! ```
+//!
+//! `SSH_COMMAND` resolves as for the push, from
+//! [`PullConnectOptions::ssh_command`], the `OSTRYA_SSH_COMMAND` environment
+//! variable, and [`PullConnectOptions::remote_ssh_command`], in that order.
+//! `SEND_COMMAND` is [`PullConnectOptions::send_command`], or `ostrya send`.
+//! An HTTP address is refused: a pull session runs over ssh.
+//!
+//! The session takes the time limits of the push. After a failed write it
+//! reads the message the server can have sent for at most five seconds, and
+//! after the end of the session it waits for the ssh client for at most the
+//! same time. It puts no time limit on a read of a reply.
+//! [`PullSession::finish`] after a clean end returns `Ok` whatever the exit
+//! status. At any other end it closes the standard input of the ssh client
+//! and drops its standard output before it waits, so a server that is
+//! blocked in a write of a body does not keep the client open. When the
+//! session failed with an I/O error and the ssh client exited with a failure
+//! status, it returns [`Error::Transport`] with the status.
+//!
 //! # HTTP
 //!
 //! The addresses are `http://HOST[:PORT][/PATH]` and
@@ -167,7 +194,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::session::http::Endpoint;
-use crate::session::{PushSession, SessionOptions};
+use crate::session::{PullSession, PullSessionOptions, PushSession, SessionOptions};
 
 pub(crate) use ssh::Transport;
 
@@ -211,7 +238,7 @@ fn parse_remote(address: &str, windows: bool) -> Result<PushRemote> {
     let inner = if address.starts_with("http://") || address.starts_with("https://") {
         // The message of the fetcher leaves userinfo out.
         ostrya_fetch::check_base_url(address)
-            .map_err(|e| Error::InvalidInput(format!("push address: {e}")))?;
+            .map_err(|e| Error::InvalidInput(format!("address: {e}")))?;
         RemoteAddr::Http(address.to_owned())
     } else {
         RemoteAddr::Ssh(ssh::SshAddr::parse(address, windows)?)
@@ -437,6 +464,109 @@ impl Prepared {
             }
         }
     }
+}
+
+/// How [`PullSession::connect`] reaches a remote over ssh.
+///
+/// The fields resolve as the ssh fields of [`ConnectOptions`] do, and the
+/// module docs state the rules. The struct carries no `#[non_exhaustive]`:
+/// build it with `..Default::default()`.
+#[derive(Debug, Clone, Default)]
+pub struct PullConnectOptions {
+    /// The ssh command line, as a list of arguments. It wins over the
+    /// `OSTRYA_SSH_COMMAND` environment variable and over
+    /// [`remote_ssh_command`](PullConnectOptions::remote_ssh_command). An
+    /// empty list is refused.
+    pub ssh_command: Option<Vec<String>>,
+    /// The command the remote side runs, which the remote shell parses. The
+    /// default is `ostrya send`.
+    pub send_command: Option<String>,
+    /// The ssh command line from the configuration of a remote, split at
+    /// ASCII whitespace. It has the lowest precedence: the
+    /// `OSTRYA_SSH_COMMAND` environment variable wins over it.
+    pub remote_ssh_command: Option<String>,
+}
+
+impl PullSession {
+    /// Open a pull session to the ssh address `remote`: start the ssh client,
+    /// send `PullHello`, and read `PullHelloReply`.
+    ///
+    /// An HTTP address is [`Error::InvalidInput`]: a pull session runs over
+    /// ssh. An ssh command or a send command that is empty or holds only
+    /// whitespace is [`Error::InvalidInput`], and so is an
+    /// `OSTRYA_SSH_COMMAND` value that is not UTF-8. An ssh client that
+    /// cannot be started is [`Error::Transport`], which names the program.
+    ///
+    /// The session takes the time limits of an ssh push session: after a
+    /// failed write it reads a pending message for at most five seconds, and
+    /// [`finish`](PullSession::finish), and an open that fails, wait for the
+    /// ssh client for at most the same time. The session puts no time limit
+    /// on a read of a reply.
+    ///
+    /// Under the tokio backend, the call must run within a runtime that has
+    /// the IO driver and the time driver enabled, as
+    /// [`PushSession::connect`] states. The session runs on the runtime that
+    /// opened it.
+    pub async fn connect(
+        remote: &PushRemote,
+        connect: PullConnectOptions,
+        opts: PullSessionOptions,
+    ) -> Result<PullSession> {
+        let env = std::env::var_os("OSTRYA_SSH_COMMAND");
+        let argv = pull_command_line(remote, &connect, env.as_deref())?;
+        spawn_and_open_pull(&argv, opts, PENDING_READ_LIMIT).await
+    }
+}
+
+/// The command line of the ssh client of a pull from `remote`, with `env` as
+/// the value of the `OSTRYA_SSH_COMMAND` environment variable.
+fn pull_command_line(
+    remote: &PushRemote,
+    connect: &PullConnectOptions,
+    env: Option<&std::ffi::OsStr>,
+) -> Result<Vec<String>> {
+    match &remote.inner {
+        RemoteAddr::Ssh(addr) => {
+            let program = ssh::ssh_program(
+                connect.ssh_command.as_deref(),
+                env,
+                connect.remote_ssh_command.as_deref(),
+            )?;
+            let send = ssh::send_command(connect.send_command.as_deref())?;
+            Ok(addr.command_line(program, send))
+        }
+        RemoteAddr::Http(url) => Err(Error::InvalidInput(format!(
+            "'{url}' is an HTTP address, and a pull session runs over ssh"
+        ))),
+    }
+}
+
+/// Start `argv` and open a pull session over its standard input and
+/// standard output, with `limit` as the time limit of the session.
+async fn spawn_and_open_pull(
+    argv: &[String],
+    opts: PullSessionOptions,
+    limit: Duration,
+) -> Result<PullSession> {
+    let (input, output, transport) = Transport::spawn(argv, limit)?;
+    match PullSession::open(input, output, opts, Some(limit)).await {
+        Ok(session) => Ok(session.with_transport(transport)),
+        Err(e) => transport.finish(Err(e)).await,
+    }
+}
+
+/// [`PullSession::connect`] with the value of the environment variable and
+/// the time limit as parameters.
+#[cfg(test)]
+async fn connect_pull_with(
+    remote: &PushRemote,
+    connect: &PullConnectOptions,
+    env: Option<&std::ffi::OsStr>,
+    opts: PullSessionOptions,
+    limit: Duration,
+) -> Result<PullSession> {
+    let argv = pull_command_line(remote, connect, env)?;
+    spawn_and_open_pull(&argv, opts, limit).await
 }
 
 /// [`PushSession::connect`] with the value of the environment variable and

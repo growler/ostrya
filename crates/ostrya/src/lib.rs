@@ -209,6 +209,8 @@
 //! the push and of the pull over ssh, and [`Error::Push`] carries the errors
 //! of that protocol. [`Repo::send`] serves one pull session over a pair of
 //! streams, through an [`ArchiveView`] of the repository, and takes no lock.
+//! [`Repo::pull_over_stream`] is the client side: it runs the pull of
+//! [`Repo::pull`] through a pull session over a pair of streams.
 //!
 //! Under the `receive` feature it also covers the policy the server side of a
 //! push applies (see the `receive` module): `ReceivePolicy` states which ref

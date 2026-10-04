@@ -28,7 +28,7 @@ fn limit_exceeded(what: &str, len: u32, limit: u32) -> Error {
 
 /// The kind of a body: the frame that follows the abandon marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BodyKind {
+pub(crate) enum BodyKind {
     /// An object of the push, after `ObjectHeader`. `Abort` follows the
     /// marker.
     Object,
@@ -74,7 +74,7 @@ impl ReadState {
 }
 
 /// One step of the object stream.
-enum Step {
+pub(crate) enum Step {
     Data(usize),
     End,
     /// The abandon marker in a body of this kind. The frame that must follow
@@ -232,7 +232,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
 
     /// Read the next step of the object stream into `buf`. A partial chunk
     /// length is kept in the state, so a pending read loses no byte.
-    fn poll_step(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<Step>> {
+    pub(crate) fn poll_step(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<Step>> {
         let FrameReader {
             inner,
             limit,

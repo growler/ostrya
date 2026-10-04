@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 
-use super::ssh::{SshAddr, quote_posix, receive_command, ssh_program};
+use super::ssh::{SshAddr, quote_posix, receive_command, send_command, ssh_program};
 use super::*;
 
 fn ssh(address: &str) -> SshAddr {
@@ -226,6 +226,22 @@ fn malformed_addresses_are_refused() {
     }
 }
 
+/// A refusal names the address it refuses, and serves the push and the pull
+/// alike.
+#[test]
+fn a_refusal_names_the_address() {
+    assert_eq!(
+        refused("ssh://host", false),
+        "address 'ssh://host': an ssh:// address needs a path"
+    );
+    assert_eq!(refused("repo", false), "address 'repo': not an address");
+    assert_eq!(
+        refused("dir/host:r", false),
+        "address 'dir/host:r': not an address"
+    );
+    assert!(refused("http://", false).starts_with("address: "));
+}
+
 #[test]
 fn a_one_letter_host_is_a_local_path_on_windows() {
     for address in ["C:\\repo", "C:repo", "c:/repo", "u@C:repo"] {
@@ -429,6 +445,69 @@ fn an_empty_ssh_command_is_refused() {
         receive_command(Some("/x/ostrya receive")).unwrap(),
         "/x/ostrya receive"
     );
+}
+
+/// The command line of a pull runs the send command, which the options can
+/// name, and an HTTP address is refused.
+#[test]
+fn a_pull_runs_the_send_command_over_ssh() {
+    let remote = PushRemote::parse("ssh://me@host:2222/srv/repo").unwrap();
+    let argv = pull_command_line(&remote, &PullConnectOptions::default(), None).unwrap();
+    assert_eq!(
+        argv,
+        strings(&[
+            "ssh",
+            "-p",
+            "2222",
+            "me@host",
+            "ostrya send --repo='/srv/repo'"
+        ])
+    );
+    let connect = PullConnectOptions {
+        ssh_command: Some(strings(&["my-ssh", "-F", "cfg"])),
+        send_command: Some("/opt/ostrya send".into()),
+        remote_ssh_command: Some("key-ssh".into()),
+    };
+    let argv = pull_command_line(&remote, &connect, Some(OsStr::new("env-ssh"))).unwrap();
+    assert_eq!(
+        argv,
+        strings(&[
+            "my-ssh",
+            "-F",
+            "cfg",
+            "-p",
+            "2222",
+            "me@host",
+            "/opt/ostrya send --repo='/srv/repo'"
+        ])
+    );
+    let connect = PullConnectOptions {
+        remote_ssh_command: Some("key-ssh -q".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        pull_command_line(&remote, &connect, Some(OsStr::new("env-ssh")))
+            .unwrap()
+            .first()
+            .unwrap(),
+        "env-ssh"
+    );
+    assert_eq!(
+        pull_command_line(&remote, &connect, None).unwrap()[..2],
+        strings(&["key-ssh", "-q"])
+    );
+
+    assert!(matches!(
+        send_command(Some(" ")),
+        Err(Error::InvalidInput(_))
+    ));
+    assert_eq!(send_command(None).unwrap(), "ostrya send");
+
+    let http = PushRemote::parse("https://h/repo").unwrap();
+    match pull_command_line(&http, &PullConnectOptions::default(), None) {
+        Err(Error::InvalidInput(msg)) => assert!(msg.contains("HTTP address"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[cfg(unix)]
@@ -1023,5 +1102,191 @@ mod standin {
         }
         assert!(elapsed >= LIMIT, "{elapsed:?}");
         assert!(elapsed < LIMIT + Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    /// The pull sessions over a stand-in ssh client.
+    mod pull {
+        use super::super::super::connect_pull_with;
+        use super::*;
+        use crate::proto::{GetReply, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply};
+        use crate::{PullConnectOptions, PullSessionOptions};
+
+        const PULL_AGENT: &str = "pull-transport-test";
+
+        fn pull_hello_len() -> usize {
+            encode(&[Message::PullHello(PullHello {
+                version: PULL_PROTOCOL_VERSION,
+                agent: Some(PULL_AGENT.into()),
+            })])
+            .len()
+        }
+
+        fn get_len(path: &str) -> usize {
+            encode(&[Message::Get(path.into())]).len()
+        }
+
+        fn pull_reply() -> Vec<u8> {
+            encode(&[Message::PullHelloReply(PullHelloReply {
+                version: PULL_PROTOCOL_VERSION,
+            })])
+        }
+
+        async fn open_pull(script: &str, limit: Duration) -> Result<crate::PullSession> {
+            let remote = PushRemote::parse("ssh://me@host:2222/srv/it's repo").unwrap();
+            connect_pull_with(
+                &remote,
+                &PullConnectOptions {
+                    ssh_command: Some(strings(&["sh", "-c", script, "stand-in"])),
+                    ..Default::default()
+                },
+                None,
+                PullSessionOptions {
+                    agent: Some(PULL_AGENT.into()),
+                    ..Default::default()
+                },
+                limit,
+            )
+            .await
+        }
+
+        /// A stand-in that runs the send command gets the command line of a
+        /// pull, and an ssh client that exits with a failure status after a
+        /// clean end does not fail the session.
+        #[test]
+        fn a_failure_status_after_a_clean_end_is_no_failure() {
+            let dir = Dir::new();
+            let record = dir.0.join("argv");
+            let eof_seen = dir.0.join("eof_seen");
+            let reply = dir.file("reply", &pull_reply());
+            let not_found = dir.file(
+                "not_found",
+                &encode(&[Message::GetReply(GetReply {
+                    found: false,
+                    len: None,
+                })]),
+            );
+            let script = format!(
+                "printf '%s\\n' \"$@\" > {}; {}; {}; {}; {}; cat > /dev/null; {}; exit 9",
+                quote_posix(record.to_str().unwrap()),
+                skip(pull_hello_len()),
+                cat(&reply),
+                skip(get_len("config")),
+                cat(&not_found),
+                touch(&eof_seen)
+            );
+            let r = ostrya_rt::block_on(async {
+                let session = open_pull(&script, EXIT_LIMIT).await.unwrap();
+                assert!(session.get("config", 64).await.unwrap().is_none());
+                session.finish().await
+            });
+            r.unwrap();
+            assert!(eof_seen.exists(), "the stand-in did not read end of file");
+            assert_eq!(
+                std::fs::read_to_string(&record).unwrap(),
+                "-p\n2222\nme@host\nostrya send --repo='/srv/it'\\''s repo'\n"
+            );
+        }
+
+        /// At an unclean end the session closes the input of the stand-in and
+        /// drops its output before it waits. A stand-in blocked in the write
+        /// of a body on a full pipe then fails the write and exits, so the
+        /// wait ends with the exit and not with the time limit. This holds
+        /// for a body that the caller dropped, and for a body that the caller
+        /// still holds, whose later read then repeats the error.
+        #[test]
+        fn an_unclean_end_closes_both_sides_before_the_wait() {
+            for hold in [false, true] {
+                let dir = Dir::new();
+                let reply = dir.file("reply", &pull_reply());
+                let head = dir.file(
+                    "head",
+                    &encode(&[Message::GetReply(GetReply {
+                        found: true,
+                        len: None,
+                    })]),
+                );
+                let mut chunk = 4096u32.to_be_bytes().to_vec();
+                chunk.extend_from_slice(&[b'x'; 4096]);
+                let chunk = dir.file("chunk", &chunk);
+                let exited = dir.0.join("exited");
+                // The stand-in writes chunks of the body until a write fails,
+                // which happens when the client drops its side of the output.
+                let script = format!(
+                    "{}; {}; {}; {}; while {} 2>/dev/null; do :; done; {}; exit 6",
+                    skip(pull_hello_len()),
+                    cat(&reply),
+                    skip(get_len("big")),
+                    cat(&head),
+                    cat(&chunk),
+                    touch(&exited)
+                );
+                let (finished, elapsed) = ostrya_rt::block_on(async {
+                    let session = open_pull(&script, EXIT_LIMIT).await.unwrap();
+                    let mut body = session.get("big", u64::MAX).await.unwrap().unwrap();
+                    let mut some = [0u8; 100];
+                    futures_lite::io::AsyncReadExt::read_exact(&mut body, &mut some)
+                        .await
+                        .unwrap();
+                    let held = if hold {
+                        Some(body)
+                    } else {
+                        drop(body);
+                        None
+                    };
+                    let start = Instant::now();
+                    let finished = session.finish().await;
+                    let elapsed = start.elapsed();
+                    if let Some(mut body) = held {
+                        let later = futures_lite::io::AsyncReadExt::read(&mut body, &mut some)
+                            .await
+                            .unwrap_err();
+                        assert!(later.to_string().contains("unread"), "{later}");
+                    }
+                    (finished, elapsed)
+                });
+                let expected = if hold { "unread" } else { "dropped" };
+                match finished {
+                    Err(Error::InvalidInput(msg)) => {
+                        assert!(msg.contains(expected), "hold {hold}: {msg}")
+                    }
+                    other => panic!("hold {hold}: {other:?}"),
+                }
+                assert!(
+                    exited.exists(),
+                    "hold {hold}: finish returned before the stand-in exited"
+                );
+                assert!(elapsed < EXIT_LIMIT, "hold {hold}: {elapsed:?}");
+            }
+        }
+
+        /// A session that failed with an I/O error, over a stand-in that exits
+        /// with a failure status, ends with a transport error that names the
+        /// program and the status.
+        #[test]
+        fn an_io_error_with_a_failure_status_is_a_transport_error() {
+            let dir = Dir::new();
+            let reply = dir.file("reply", &pull_reply());
+            let script = format!(
+                "{}; {}; {}; exit 4",
+                skip(pull_hello_len()),
+                cat(&reply),
+                skip(get_len("config"))
+            );
+            let (got, finished) = ostrya_rt::block_on(async {
+                let session = open_pull(&script, EXIT_LIMIT).await.unwrap();
+                let got = session.get("config", 64).await;
+                (got, session.finish().await)
+            });
+            match got {
+                Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof),
+                other => panic!("{other:?}"),
+            }
+            match finished {
+                Err(Error::Transport(msg)) => {
+                    assert!(msg.contains("'sh' exited with exit status: 4"), "{msg}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 }

@@ -7146,8 +7146,20 @@ The serving side of the pull over ssh is done. `Repo::send` serves one pull
 session over a pair of streams through one `ArchiveView`, and takes no lock.
 `ostrya send` serves the session over standard input and standard output
 (`docs/api-sketch.md`, "Pull over ssh: the serving side", and
-`docs/conformance/cli-surface.md`, "send"). The client side of the pull
-over ssh follows as separate work.
+`docs/conformance/cli-surface.md`, "send").
+
+The client side of the pull over ssh is done in the library.
+`ostrya::push::PullSession` opens a pull session over a pair of streams or
+over the ssh client, keeps up to 8 `Get` frames in flight on the one stream,
+and gives the body of each found reply as a `PullBody`. The pull driver of
+`Repo::pull` reads the remote through a source: the HTTP source over the
+fetcher, with no change in behavior, or the ssh source over a
+`PullSession`. `Repo::pull_over_stream` runs the pull through the ssh source
+over a pair of streams, and `PullOptions::connect` carries the ssh command,
+the send command, and the remote ssh command (`docs/api-sketch.md`, "Pull
+over ssh: the client side"). The ssh address in `PullOptions::url`, the
+remote keys `pull-url` and `send-command`, and the commands of `ostrya-cli`
+follow as separate work.
 
 Verify: push between two port repositories over ssh to localhost and over
 HTTP. The receiving repository passes `ostree fsck` and resolves the pushed
@@ -7197,6 +7209,37 @@ buffer get one flush. `crates/ostrya-cli/tests/send.rs` runs `ostrya send`:
 it exits 0 after a clean end and 1 after an `Error`, and it serves an
 `archive` and a `bare-user` repository that its user cannot write, with no
 change to the repository.
+
+Result of the client side of the pull: `crates/ostrya-push/tests/pull_session.rs`
+runs `PullSession` against scripted servers over in-process pipes. Eight
+concurrent calls keep eight `Get` frames in flight, and each reply goes to the
+call of its place. A later reply arrives while the caller holds a body read
+to its end. A stated length that differs from the body is `protocol`, a body
+over the cap of the call is `limit-exceeded`, and a dropped call or body ends
+the session. A body read after the session failed, or held across `finish`,
+fails with the first failure, and `finish` drops the input. A session dropped
+while the caller holds a body closes its output. Later calls repeat the code and the message of the first error,
+and an I/O error keeps its kind. After `ABANDON` the body gives the code of
+the `Error` frame. A reply of a version that the client does not speak is
+refused, and a depth of 0 keeps one `Get` in flight. The transport tests run
+the session over a stand-in ssh client: a failure status after a clean end
+is no failure, an unclean end closes both pipes before the wait, also with a
+body held across `finish`, and an I/O
+error under a failure status is `Error::Transport`.
+`crates/ostrya/tests/pull_ssh.rs` runs `Repo::pull_over_stream` against
+`Repo::send` over pipes of 64 KiB. For the whole tree into an `archive` and a
+`bare-user` destination, with `depth`, commit-only, a subpath, a static delta,
+and an object of 4 MiB with 16 small objects behind it, the refs, the
+objects, the markers, and the fetch statistics, `bytes_transferred`
+included, equal those of the HTTP pull of the same remote. A missing object
+fails the pull, and no ref is written. An `Error` of the server, a body that
+the client drops, and a stated length above the cap fail the pull and end
+the session. A unit test shows that a content object reads the end of its
+stream before its store finishes. The HTTP pull tests pass with no change.
+An ignored test in `crates/ostrya-cli/tests/send.rs` pulls an object of
+256 MiB from `ostrya send` through `PullSession`, and the `RssAnon` of the
+server, read after each 16 MiB of the body and before its standard input
+closes, stays below 16 MiB.
 
 ### Phase 20 -- Sysroot / deployment (optional, separate track)
 

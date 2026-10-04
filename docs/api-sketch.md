@@ -2191,6 +2191,17 @@ stored under the name it was requested by and the write path compares what it
 hashed against that name, so an HTTP pull verifies whatever the flags say.
 `localcache_repos` are consulted before the network, per object.
 
+The driver of `pull` reads the remote through a source, one of two: the HTTP
+source, over the fetcher, and the ssh source, over a `PullSession` of
+`ostrya-push`. `pull_over_stream` runs the same pull through the ssh source
+over a pair of streams (see "Pull over ssh: the client side"). The two
+sources serve the same paths under the same size caps, and the plan, the
+checks, the statistics, and the transaction are the same for both. An HTTP
+request that fails retryably is sent again inside the HTTP source; the ssh
+source sends no request again. A content object reads the end of its stream
+before its store finishes, so a pull session moves to its next reply while
+the object is stored.
+
 Each requested ref resolves against the remote's summary first and then
 `refs/heads/<ref>`, the name percent-encoded where it becomes that path. An empty
 ref list takes every summary ref under `MIRROR` and the remote's configured
@@ -2323,6 +2334,9 @@ pub struct PullOptions {
     pub verify: PullVerify,               // the signature checks to make
     pub detached_metadata_filter: DetachedMetadataFilter,  // what to store
     pub progress: Option<PullProgress>,   // live counters for the caller
+    pub connect: PullConnectOptions,      // ssh command, send command, and
+                                          // remote ssh command; HTTP refuses
+                                          // the first two
 }
 
 #[derive(Clone, Default)]
@@ -2416,6 +2430,14 @@ impl Repo {
         -> Result<PullStats>;
     pub async fn pull(&self, remote: &str, opts: PullOptions)
         -> Result<PullStats>;
+    /// The pull through the ssh source, over a pair of streams to `ostrya
+    /// send` (see "Pull over ssh: the client side").
+    pub async fn pull_over_stream<R, W>(&self, remote: &str, input: R,
+                                        output: W, opts: PullOptions)
+        -> Result<PullStats>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static;
     /// The remote's `summary` and `summary.sig` bytes, an absent one as None.
     pub async fn remote_fetch_summary(&self, remote: &str)
         -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)>;
@@ -3875,6 +3897,131 @@ Failures:
 - A failed write of a reply or of a body to the output sends nothing more
   and returns `Error::Io`. A failure to deliver the `Error` message does not
   change the returned error.
+
+## Pull over ssh: the client side
+
+`PullSession` of `ostrya-push` is the client half of the pull over ssh, and
+`Repo::pull_over_stream` wraps it as the ssh source of the pull driver. Both
+take no feature.
+
+```rust
+// ostrya-push
+#[derive(Debug, Clone, Default)]
+pub struct PullConnectOptions {
+    pub ssh_command: Option<Vec<String>>,       // default ["ssh"]
+    pub send_command: Option<String>,           // default "ostrya send"
+    pub remote_ssh_command: Option<String>,     // remote key, below the env
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PullSessionOptions {
+    pub agent: Option<String>,                  // default "ostrya/<version>"
+    pub max_outstanding: Option<usize>,         // Get frames in flight; 8;
+                                                // 0 is raised to 1
+}
+
+pub struct PullSession { /* private */ }        // Send + Sync
+
+impl PullSession {
+    pub async fn over_stream<R, W>(input: R, output: W,
+                                   opts: PullSessionOptions)
+        -> Result<PullSession>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static;
+    pub async fn connect(remote: &PushRemote, connect: PullConnectOptions,
+                         opts: PullSessionOptions)
+        -> Result<PullSession>;
+    pub async fn get(&self, path: &str, max_len: u64)
+        -> Result<Option<PullBody>>;
+    pub async fn finish(self) -> Result<()>;
+}
+
+pub struct PullBody { /* private */ }           // AsyncRead, Send + Sync
+impl PullBody {
+    pub fn len(&self) -> Option<u64>;           // the stated length
+}
+```
+
+The session:
+
+- `over_stream` and `connect` send `PullHello` with `PULL_PROTOCOL_VERSION`
+  and read `PullHelloReply`. A reply with a version that the client does not
+  speak is `Error::VersionUnsupported`, and the session closes its output
+  and sends no `Get`. `connect` refuses an HTTP address with
+  `Error::InvalidInput`, and runs `SSH_COMMAND... [-p PORT] [USER@]HOST
+  'SEND_COMMAND --repo=QUOTED_PATH'`. The ssh command resolves from
+  `ssh_command`, then `OSTRYA_SSH_COMMAND`, then `remote_ssh_command`, then
+  `ssh`, as for the push.
+- A `get` waits while `max_outstanding` calls hold a place in the pipeline.
+  It then takes its place, and writes and flushes its `Get` frame under one
+  lock, so the frames go on the wire in the order of the places. The places
+  and the writes are each served in the order the calls arrive.
+- The call returns at the head of its reply. `None` is a path that the
+  server does not serve. The session moves to the next reply when it reads
+  the chunk that ends a body, also while the caller still holds that body.
+- A stated length above `max_len` ends the session with
+  `Error::LimitExceeded` before the body is read. The body is held to
+  `max_len` and to its stated length: a difference from the sum of the
+  chunks is `Error::Protocol`. After `ABANDON` the body reads the `Error`
+  frame and fails with its code.
+- A failed read of a body gives an `io::Error` that carries the error of the
+  session, with the kind of an I/O error.
+- A failure ends the session: an `Error` of the server, a reply out of order,
+  a length check, a failed read or write, a `get` future dropped after it
+  took its place, and a body dropped before its end. Each later call, and
+  each later read of a body, fails with an error of the variant and the
+  message of the first failure, and an I/O error keeps its kind. A dropped
+  call or body is `Error::InvalidInput`.
+- When the write of a `Get` frame fails, the call reads the message that the
+  server can have sent, at the turn of its reply, for at most 5 seconds on a
+  session that `connect` opened. An `Error` is the error of the call.
+- `finish` after a clean end, when every reply was read to its end and the
+  caller holds no body, closes the output and returns `Ok` whatever the exit
+  status of the ssh client. At any other end it closes the output and drops
+  the input before it waits for the ssh client, and returns the error of the
+  session, or `Error::InvalidInput` for a body still held, whose later reads
+  then fail with that error. When that error
+  is `Error::Io` and the ssh client exited with a failure status, it returns
+  `Error::Transport` with the status. The wait for the ssh client takes at
+  most 5 seconds. A session over a pair of streams sets no time limit.
+
+The pull through the ssh source:
+
+- `Repo::pull_over_stream` resolves the signature policy, then opens the
+  session over the streams, then runs the pull of `Repo::pull` through the
+  ssh source: the summary, the refs, the deltas, the commit walk, `depth`,
+  the subpaths, the transaction, and the statistics. `remote` names the
+  remote whose configuration the pull reads: the policy, the `branches`, and
+  the prefix of the refs.
+- The source asks for each file by the path of the HTTP pull. A ref goes as
+  written, with no percent-encoding. A body is held to the cap of its path:
+  `MAX_ROOT_FILE` for `summary`, `summary.sig`, and `config`, `MAX_REF_FILE`
+  for a ref, `MAX_METADATA_SIZE` for a metadata object, a `.commitmeta`, an
+  index, and a superblock, the size of the part in the superblock for a part,
+  and no whole read for a `.filez`.
+- The source sends the `Get` of `summary.sig`, `summary`, and `config` as
+  three calls in flight together, and the `Get` of a `.commitmeta` and of its
+  commit as two, in the order of the HTTP pull. The HTTP pull keeps its
+  requests one after another.
+- A content object of the ssh source takes no write permit. The session
+  streams one body at a time, and the stores that finish after the end of
+  their body are bounded by `max_outstanding_fetches`. The HTTP pull keeps
+  its three write permits.
+- `PullStats::bytes_transferred` counts the bytes of the bodies the source
+  reads, from the same point as the HTTP count, so it equals the HTTP count
+  for the same files. A wrapper of each body in `ostrya` adds them to the
+  counters of the pull.
+- After the plan ends, and before the transaction commits, the source ends
+  the session with `finish`. The pull also ends the session on each error.
+  The error of a failed pull is the error of the step that failed first. When
+  that error came from the session, `Error::Push`, it takes the error that
+  `finish` gives, so an I/O error under a failed ssh client becomes
+  `Error::Transport`. An error of the session is `Error::Push`.
+- `url`, `connect.ssh_command`, and `connect.send_command` are
+  `Error::InvalidInput` for `pull_over_stream`. `Repo::pull`, which runs over
+  HTTP, refuses `connect.ssh_command` and `connect.send_command` with
+  `Error::InvalidInput`, and does not read `connect.remote_ssh_command`.
 
 ## Static deltas
 

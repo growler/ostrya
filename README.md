@@ -82,8 +82,8 @@ The project is a Cargo workspace of focused crates:
   `rustls`. Portable, with no repository knowledge.
 - `ostrya-push` -- the wire protocol of the push and of the pull over ssh:
   the messages and their GVariant encoding, the frame codec, the chunked
-  object stream, the bodies of the pull, the push client session,
-  the ssh and HTTP transports, the walk of a local directory into a tree
+  object stream, the bodies of the pull, the push client session, the pull
+  client session, the ssh and HTTP transports, the walk of a local directory into a tree
   model, and the tree push of that directory as one commit, signed when
   signers are given. Portable, with no repository knowledge. Depends on
   `ostrya-sign` and `ostrya-fetch`.
@@ -109,9 +109,10 @@ Feature flags on `ostrya`:
 - `lzma-static` -- the static xz build.
 
 `ostrya-push` is a dependency of `ostrya` in every build, re-exported as
-`ostrya::push`. `Repo::send`, the serving side of the pull over ssh, takes
-no feature. The `send` feature of `ostrya-cli`, in its default set, builds
-`ostrya send` on it.
+`ostrya::push`. `Repo::send`, the serving side of the pull over ssh, and
+`Repo::pull_over_stream`, its client side over a pair of streams, take no
+feature. The `send` feature of `ostrya-cli`, in its default set, builds
+`ostrya send` on `Repo::send`.
 
 Later phases add `s3` and `serve`.
 

@@ -13,6 +13,11 @@
 //! file of the repository by its path with `Get`, and the server answers
 //! each `Get` with `GetReply` and a body of chunks. The pull has its own
 //! message kinds and its own version, [`proto::PULL_PROTOCOL_VERSION`].
+//! [`PullSession`] is the client side of the pull: it keeps several `Get`
+//! frames in flight on one stream, and gives the body of each found reply as
+//! a [`PullBody`]. [`PullSession::over_stream`] opens it over a pair of byte
+//! streams, and [`PullSession::connect`] over the ssh client, with
+//! [`PullConnectOptions`].
 //!
 //! The [`session`] module holds the client side. [`PushSession`] runs one
 //! session over a pair of byte streams: it opens with `Hello`, asks which
@@ -68,10 +73,11 @@ pub use push_tree::{
     ParentPolicy, TreePushOptions, push_tree, push_tree_over_stream, push_tree_prepared,
 };
 pub use session::{
-    BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PushOutcome, PushPhase,
-    PushProgress, PushProgressSnapshot, PushSession, PushStats, ServerInfo, SessionOptions,
+    BoxFuture, Compression, ObjectData, ObjectReader, ObjectSource, PullBody, PullSession,
+    PullSessionOptions, PushOutcome, PushPhase, PushProgress, PushProgressSnapshot, PushSession,
+    PushStats, ServerInfo, SessionOptions,
 };
-pub use transport::{ConnectOptions, PreparedSession, PushRemote};
+pub use transport::{ConnectOptions, PreparedSession, PullConnectOptions, PushRemote};
 
 /// The public types of the protocol move freely across tasks and threads.
 const _: fn() = || {
@@ -100,7 +106,29 @@ const _: fn() = || {
     assert_send_sync::<tree::EntryAction>();
     assert_send_sync::<tree::EntryPath>();
     assert_send_sync::<ParentPolicy>();
+    assert_send_sync::<PullSession>();
+    assert_send_sync::<PullBody>();
+    assert_send_sync::<PullSessionOptions>();
+    assert_send_sync::<PullConnectOptions>();
 };
+
+/// The futures of a pull session can run on a multi-threaded executor.
+#[allow(dead_code)]
+fn pull_session_futures_are_send(remote: &PushRemote, session: &PullSession, owned: PullSession) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&PullSession::connect(
+        remote,
+        PullConnectOptions::default(),
+        PullSessionOptions::default(),
+    ));
+    assert_send(&PullSession::over_stream(
+        futures_lite::io::empty(),
+        futures_lite::io::sink(),
+        PullSessionOptions::default(),
+    ));
+    assert_send(&session.get("config", 1));
+    assert_send(&owned.finish());
+}
 
 /// The options of a tree scan and the future of the scan move to another
 /// thread.

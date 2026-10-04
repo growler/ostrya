@@ -58,8 +58,8 @@
 //! taken is absent. A from-scratch delta the map names and the pull leaves
 //! alone satisfies the requirement.
 //!
-//! The source. A [`DeltaSource`] is the pull's fetcher or the directory of the
-//! source repository of a local pull. The same paths are read from either, under
+//! The source. A [`DeltaSource`] is the remote of the pull, over HTTP or over
+//! ssh, or the directory of the source repository of a local pull. The same paths are read from either, under
 //! the same size caps, and a local read of a file that is not a regular file is
 //! refused, so no read waits on a FIFO. A local pull reads the source's summary
 //! and its signature in the same way, under the summary's own size cap.
@@ -106,7 +106,7 @@ use crate::repo::Repo;
 use crate::summary::{INDEXED_DELTAS_KEY, Summary};
 use crate::transaction::Transaction;
 
-use super::http::fetch_optional;
+use super::source::{RemoteSource, session_error};
 
 /// How many delta parts one pull fetches at once.
 pub(crate) const PART_CAP: usize = 2;
@@ -298,8 +298,8 @@ async fn source_commit(
 
 /// Where a pull reads a delta from.
 pub(crate) enum DeltaSource<'a> {
-    /// An HTTP remote, through the pull's fetcher.
-    Remote(&'a Fetcher),
+    /// A remote, over HTTP or over ssh.
+    Remote(&'a RemoteSource),
     /// Another local repository, read from its directory.
     Local(&'a Repo),
 }
@@ -308,13 +308,11 @@ impl DeltaSource<'_> {
     /// Read a delta index or a superblock whole, under `cap`, or `None` when
     /// the source does not hold it.
     ///
-    /// The fetcher adds the bytes of a fetched body to the transferred count
-    /// itself. A local read adds its bytes to `progress` here.
+    /// A remote source adds the bytes of a fetched body to the transferred
+    /// count itself. A local read adds its bytes to `progress` here.
     async fn read(&self, path: &str, cap: u64, progress: &PullCounters) -> Result<Option<Vec<u8>>> {
         match self {
-            DeltaSource::Remote(fetcher) => {
-                fetch_optional(fetcher, path, Priority::High, cap).await
-            }
+            DeltaSource::Remote(source) => source.read_optional(path, Priority::High, cap).await,
             DeltaSource::Local(repo) => {
                 let bytes = read_local(repo, path, cap).await?;
                 if let Some(bytes) = &bytes {
@@ -773,7 +771,21 @@ pub(crate) async fn apply_job_part(
     let path = format!("{}/{index}", job.dir);
     let staging = txn.staging_fd().try_clone_to_owned()?;
     let blob = match source {
-        DeltaSource::Remote(fetcher) => fetch_part_blob(fetcher, &path, entry, &staging).await?,
+        DeltaSource::Remote(RemoteSource::Http(fetcher)) => {
+            fetch_part_blob(fetcher, &path, entry, &staging).await?
+        }
+        // The superblock states the size of the part, which caps the body.
+        DeltaSource::Remote(RemoteSource::Ssh(ssh)) => {
+            let body = ssh.get(&path, entry.size).await?.ok_or_else(|| {
+                Error::InvalidFormat(format!(
+                    "static delta {}: the remote holds no part {index}",
+                    job.name
+                ))
+            })?;
+            decode_part_stream(body, entry, &staging)
+                .await
+                .map_err(session_error)?
+        }
         DeltaSource::Local(repo) => {
             let (file, len) = open_local(repo, &path).await?.ok_or_else(|| {
                 Error::InvalidFormat(format!(

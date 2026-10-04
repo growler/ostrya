@@ -11,6 +11,9 @@ use crate::session::stream::{Input, Output};
 /// The receive command when the options name none.
 const DEFAULT_RECEIVE_COMMAND: &str = "ostrya receive";
 
+/// The send command when the options name none.
+const DEFAULT_SEND_COMMAND: &str = "ostrya send";
+
 fn invalid(msg: impl Into<String>) -> Error {
     Error::InvalidInput(msg.into())
 }
@@ -32,7 +35,7 @@ impl SshAddr {
     /// scp-form address that names a local path: a one-letter host, or a
     /// `\` before the first `:`.
     pub(super) fn parse(address: &str, windows: bool) -> Result<SshAddr> {
-        let bad = |why: &str| invalid(format!("push address '{address}': {why}"));
+        let bad = |why: &str| invalid(format!("address '{address}': {why}"));
         if let Some(rest) = address.strip_prefix("ssh://") {
             let (authority, path) = match rest.find('/') {
                 Some(i) => rest.split_at(i),
@@ -49,7 +52,7 @@ impl SshAddr {
         if address.contains("://") {
             return Err(bad("the scheme is not ssh, http, or https"));
         }
-        let colon = separator(address).ok_or_else(|| bad("not a push address"))?;
+        let colon = separator(address).ok_or_else(|| bad("not an address"))?;
         let (prefix, path) = (&address[..colon], &address[colon + 1..]);
         if windows && address[..address.find(':').unwrap_or(colon)].contains('\\') {
             return Err(bad(
@@ -57,7 +60,7 @@ impl SshAddr {
             ));
         }
         if prefix.contains('/') {
-            return Err(bad("not a push address"));
+            return Err(bad("not an address"));
         }
         let (user, host) = split_user(prefix).map_err(&bad)?;
         let host = unbracket(host).map_err(&bad)?;
@@ -119,10 +122,10 @@ impl SshAddr {
         })
     }
 
-    /// The command line that runs the receive command on the remote side:
-    /// `program`, then `-p PORT`, then `[USER@]HOST`, then one string with
-    /// `receive` and the quoted path.
-    pub(super) fn command_line(&self, program: Vec<String>, receive: &str) -> Vec<String> {
+    /// The command line that runs `command`, the receive command or the send
+    /// command, on the remote side: `program`, then `-p PORT`, then
+    /// `[USER@]HOST`, then one string with `command` and the quoted path.
+    pub(super) fn command_line(&self, program: Vec<String>, command: &str) -> Vec<String> {
         let mut argv = program;
         if let Some(port) = self.port {
             argv.push("-p".to_owned());
@@ -132,7 +135,7 @@ impl SshAddr {
             Some(user) => format!("{user}@{}", self.host),
             None => self.host.clone(),
         });
-        argv.push(format!("{receive} --repo={}", quote_posix(&self.path)));
+        argv.push(format!("{command} --repo={}", quote_posix(&self.path)));
         argv
     }
 }
@@ -328,6 +331,15 @@ pub(super) fn receive_command(explicit: Option<&str>) -> Result<&str> {
         Some(cmd) if cmd.trim().is_empty() => Err(invalid("the receive command is empty")),
         Some(cmd) => Ok(cmd),
         None => Ok(DEFAULT_RECEIVE_COMMAND),
+    }
+}
+
+/// The send command: `explicit`, or `ostrya send`.
+pub(super) fn send_command(explicit: Option<&str>) -> Result<&str> {
+    match explicit {
+        Some(cmd) if cmd.trim().is_empty() => Err(invalid("the send command is empty")),
+        Some(cmd) => Ok(cmd),
+        None => Ok(DEFAULT_SEND_COMMAND),
     }
 }
 

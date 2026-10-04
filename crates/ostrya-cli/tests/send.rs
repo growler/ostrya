@@ -317,3 +317,143 @@ fn send_serves_a_repository_its_user_cannot_write() {
         );
     }
 }
+
+/// The anonymous resident memory of process `pid`, `RssAnon` of
+/// `/proc/PID/status`, in bytes. It leaves out the mapped pages of the
+/// binary, which `RssFile` counts.
+fn anon_resident(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("RssAnon:"))
+        .expect("an RssAnon line");
+    let kib: u64 = line
+        .trim_start_matches("RssAnon:")
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .unwrap();
+    kib * 1024
+}
+
+/// One read of `body` into `buf`. The bound names the reader trait through
+/// the object reader of the push, so the test needs no I/O crate of its own.
+fn poll_body<R: ostrya::push::ObjectReader>(
+    body: &mut R,
+    cx: &mut std::task::Context<'_>,
+    buf: &mut [u8],
+) -> std::task::Poll<std::io::Result<usize>> {
+    std::pin::Pin::new(body).poll_read(cx, buf)
+}
+
+/// `ostrya send` streams an object of 256 MiB to a pull session over its
+/// pipes, and its anonymous resident memory stays below 16 MiB. The memory
+/// is read after each 16 MiB of the body and at its end, before the standard
+/// input of the server closes, and the test keeps the largest value. Ignored
+/// by default: it writes and deflates 256 MiB; run with
+/// `cargo test -p ostrya-cli --test send -- --ignored`.
+#[test]
+#[ignore = "streams a 256 MiB object; run with --ignored"]
+fn send_streams_a_large_object_in_bounded_memory() {
+    use std::os::fd::{AsFd, OwnedFd};
+
+    use ostrya::push::{PullSession, PullSessionOptions};
+    use ostrya::{CommitOptions, CreateOptions, MutableTree, ObjectType, RepoMode, loose_path};
+
+    const SIZE: u64 = 256 << 20;
+    let tmp = TmpDir::new("large");
+    let src = tmp.0.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    {
+        let mut file = std::io::BufWriter::new(std::fs::File::create(src.join("large")).unwrap());
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut block = vec![0u8; 1 << 20];
+        for _ in 0..SIZE / block.len() as u64 {
+            for word in block.chunks_mut(8) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                word.copy_from_slice(&state.to_le_bytes());
+            }
+            file.write_all(&block).unwrap();
+        }
+        file.flush().unwrap();
+    }
+    let repo_path = tmp.0.join("repo");
+    let checksum = block_on(async {
+        let repo = Repo::create(&repo_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let mut mtree = MutableTree::new();
+        let dfd = std::fs::File::open(&tmp.0).unwrap();
+        txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("src"), &mut mtree, None)
+            .await
+            .unwrap();
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let commit = txn
+            .write_commit(
+                CommitOptions {
+                    timestamp: Some(1_700_000_000),
+                    ..CommitOptions::default()
+                },
+                &root,
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let objects = repo.traverse_commit(&commit, 0).await.unwrap();
+        objects
+            .into_iter()
+            .find(|name| name.ty == ObjectType::File)
+            .expect("the commit holds one file")
+            .checksum
+    });
+    let path = format!(
+        "objects/{}",
+        loose_path(&checksum, ObjectType::File, RepoMode::Archive)
+    );
+    let stored = std::fs::metadata(repo_path.join(&path)).unwrap().len();
+    assert!(stored > SIZE, "{stored}");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+        .arg("send")
+        .arg(format!("--repo={}", repo_path.display()))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let input = ostrya_rt::File::from(OwnedFd::from(child.stdout.take().unwrap()));
+    let output = ostrya_rt::File::from(OwnedFd::from(child.stdin.take().unwrap()));
+    let (received, peak) = block_on(async {
+        let session = PullSession::over_stream(input, output, PullSessionOptions::default())
+            .await
+            .unwrap();
+        let mut body = session.get(&path, u64::MAX).await.unwrap().unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut received = 0u64;
+        let mut peak = 0;
+        loop {
+            let n = std::future::poll_fn(|cx| poll_body(&mut body, cx, &mut buf))
+                .await
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            if (received + n as u64) >> 24 != received >> 24 {
+                peak = peak.max(anon_resident(pid));
+            }
+            received += n as u64;
+        }
+        drop(body);
+        peak = peak.max(anon_resident(pid));
+        session.finish().await.unwrap();
+        (received, peak)
+    });
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status}");
+    assert_eq!(received, stored);
+    assert!(peak < 16 << 20, "RssAnon of ostrya send is {peak} bytes");
+}

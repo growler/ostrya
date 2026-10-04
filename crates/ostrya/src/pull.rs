@@ -1,9 +1,11 @@
 //! Pull: importing refs and their objects from another repository.
 //!
 //! [`Repo::pull_local`] reads a local repository directly, described below;
-//! [`Repo::pull`] fetches from an HTTP remote, described in
-//! [`pull::http`](self::http). The two share the options, the flags, the
-//! statistics, the ref-binding check, and the `.commitpartial` markers.
+//! [`Repo::pull`] fetches from an HTTP remote, and
+//! [`Repo::pull_over_stream`] from a server of the pull over ssh, both
+//! described in [`pull::http`](self::http). They share the options, the
+//! flags, the statistics, the ref-binding check, and the `.commitpartial`
+//! markers.
 //!
 //! [`Repo::pull_local`] copies a set of refs, the commits they name, and every
 //! object those commits reach out of a source repository and into this one. The
@@ -185,6 +187,7 @@ use crate::write::FileMeta;
 mod delta;
 mod drive;
 pub mod http;
+mod source;
 mod subpath;
 mod verify;
 
@@ -591,6 +594,14 @@ pub struct PullOptions {
     /// shows progress while the pull runs. `None` keeps them in the pull's
     /// own counters alone. A local pull does not touch it.
     pub progress: Option<PullProgress>,
+    /// The ssh command, the send command, and the remote ssh command of a
+    /// pull over ssh, which resolve as the fields of
+    /// [`ConnectOptions`](crate::push::ConnectOptions) do for a push. An HTTP
+    /// pull refuses `ssh_command` and `send_command` with
+    /// [`Error::InvalidInput`], and does not read `remote_ssh_command`.
+    /// [`Repo::pull_over_stream`] runs no ssh client, and refuses the same
+    /// two fields.
+    pub connect: crate::push::PullConnectOptions,
 }
 
 /// Apply the durability options of a pull to its transaction.

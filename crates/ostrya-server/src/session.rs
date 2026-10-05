@@ -182,6 +182,11 @@ impl SessionTable {
         self.idle
     }
 
+    /// The most sessions open at the same time.
+    pub(crate) fn max(&self) -> usize {
+        self.max
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("session table mutex")
     }
@@ -265,13 +270,18 @@ impl SessionTable {
         }
     }
 
-    /// End every session, when the server stops. The table takes no session
-    /// after it.
+    /// End every session that does not commit, when the server stops. A
+    /// session that commits stays, because its commit goes on and removes it
+    /// at the end. The table takes no session after it.
     pub(crate) fn close_all(&self) {
         let entries: Vec<Entry> = {
             let mut state = self.lock();
             state.closed = true;
-            state.entries.drain().map(|(_, e)| e).collect()
+            state
+                .entries
+                .extract_if(|_, e| !e.committing)
+                .map(|(_, e)| e)
+                .collect()
         };
         for entry in entries {
             entry.close(STOPPED);
@@ -547,7 +557,8 @@ impl Drop for BodyTrack {
 pub(crate) mod tests {
     use std::path::PathBuf;
 
-    use ostrya::push::proto::Hello;
+    use ostrya::push::proto::{CommitRequest, Hello};
+    use ostrya::push::{Expected, RefUpdate};
     use ostrya::{CreateOptions, ReceivePolicy, Repo, RepoMode};
     use ostrya_rt::block_on;
 
@@ -715,6 +726,38 @@ pub(crate) mod tests {
             assert!(table.reserve().is_some(), "the slot is free");
             active.complete();
         }
+    }
+
+    /// The stop of the server leaves a session that commits: the commit
+    /// goes on to its end and then frees the slot. The table takes no
+    /// session after the stop.
+    #[test]
+    fn a_commit_outlives_the_stop_of_the_server() {
+        let repo = TmpRepo::new("commit-stop");
+        let (table, id) = one_session(&repo);
+        let mut active = table.lookup(&id, "anonymous").unwrap();
+        let Begin::Started(mut end) = active.begin_commit() else {
+            panic!("the commit starts");
+        };
+        table.close_all();
+        assert!(table.reserve().is_none());
+        let request = CommitRequest {
+            updates: vec![RefUpdate {
+                name: "main".into(),
+                expected: Expected::Absent,
+                new: None,
+            }],
+            force: false,
+        };
+        let result = block_on(active.service().commit(request));
+        assert!(result.is_ok(), "{:?}", result.err());
+        end.committed();
+        drop(end);
+        assert_eq!(active.cancel().cause(), COMMITTED);
+        assert!(table.lookup(&id, "anonymous").is_none());
+        assert!(table.lock().entries.is_empty());
+        assert!(table.reserve().is_none());
+        active.complete();
     }
 
     /// After the stop of the server, the table reserves no slot, and a slot

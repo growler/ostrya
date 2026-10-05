@@ -35,7 +35,7 @@ const SESSION_HEADER: HeaderName = HeaderName::from_static("ostrya-session");
 /// sets the framing and the connection state of the response itself.
 const OWN_HEADERS: [HeaderName; 3] = [CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION];
 
-/// The callback of [`ServeOptions::on_report`](crate::ServeOptions::on_report).
+/// The callback of [`EndpointOptions::on_report`](crate::EndpointOptions::on_report).
 pub(crate) type OnReport = Arc<dyn Fn(ReceiveReport) + Send + Sync>;
 
 /// The receive endpoint of a server, with the authentication `A`.
@@ -116,9 +116,8 @@ impl Route {
 }
 
 impl<A: ReceiveAuth> Receive<A> {
-    /// The response to a request under [`PREFIX`] with a method other than
-    /// `GET` and `HEAD`, which go to the archive view. The authentication
-    /// runs before a byte of the body is read.
+    /// The response to a request. A path outside [`PREFIX`] gets 404. The
+    /// authentication runs before a byte of the body is read.
     pub(crate) async fn handle<B>(&self, req: Request<B>) -> Response<ServeBody>
     where
         B: Body<Data = Bytes> + Send + Unpin + 'static,

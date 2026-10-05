@@ -8,7 +8,8 @@
 //! reads the repository through it as an `archive` repository, whatever the
 //! mode of the repository (see [`ostrya::ArchiveView`]). With
 //! [`ServeOptions::receive`] the server also runs the receive endpoint of a
-//! push (see below).
+//! push (see below). A host with a router of its own mounts the endpoint
+//! with [`ReceiveEndpoint`] (see "Mounting the endpoint").
 //!
 //! - `GET` and `HEAD` are served. Another method gets 405 with
 //!   `Allow: GET, HEAD`, outside the receive endpoint.
@@ -44,11 +45,14 @@
 //!
 //! # The receive endpoint
 //!
-//! With [`ServeOptions::receive`], each request under the raw path prefix
-//! `/_ostrya/receive/v1/` with a method other than `GET` and `HEAD` is one
+//! Each request under the raw path prefix `/_ostrya/receive/v1/` is one
 //! step of a push session of [`ostrya::ReceiveService`]. The path is not
-//! percent-decoded. A `GET` or a `HEAD` there goes to the archive view and
-//! gets 404.
+//! percent-decoded. The server runs the endpoint with
+//! [`ServeOptions::receive`], and a host mounts it with [`ReceiveEndpoint`].
+//! In the server, a `GET` or a `HEAD` under the prefix goes to the archive
+//! view and gets 404. [`ReceiveEndpoint::handle`] answers a `GET` or a
+//! `HEAD` of a route with 405 and `Allow`, as it answers each other wrong
+//! method.
 //!
 //! - `POST session`, with a body of one `Hello` frame, opens a session. The
 //!   response is 200 with the `HelloReply` frame, and the header
@@ -56,7 +60,7 @@
 //!   bytes from the random source of the operating system.
 //! - `POST session/ID/have`, with one `Have` frame, gets `HaveReply`.
 //! - `POST session/ID/objects`, with one object stream, gets
-//!   `ObjectsReply`. Up to [`ServeOptions::parallel_uploads`] of these run
+//!   `ObjectsReply`. Up to [`EndpointOptions::parallel_uploads`] of these run
 //!   at the same time in one session, and one more gets `limit-exceeded`.
 //! - `POST session/ID/commit`, with one `Commit` frame, gets `CommitReply`.
 //!   The commit runs in a task of its own, so a disconnect, a `DELETE`, or
@@ -78,7 +82,7 @@
 //! every other code gets 422. An error of the server with no wire code gets
 //! 500 with `internal` and the text of the error. A `session` request whose
 //! `Hello` passes its checks gets 503 with `limit-exceeded` past
-//! [`ServeOptions::max_sessions`] (see below). A request that the
+//! [`EndpointOptions::max_sessions`] (see below). A request that the
 //! authentication refuses gets 401 or 403 with `unauthorized`. No response
 //! that the endpoint builds itself carries `Content-Type` or `Retry-After`.
 //! A refusal of the authentication carries the headers that it adds. Before
@@ -90,27 +94,30 @@
 //! A failed step ends its session, and the other requests of the session
 //! in flight get 422 with `protocol` and the cause. A request that ends
 //! before its response, as when the client closes the connection, ends its
-//! session too, unless the session commits. A request body that hyper
-//! fails, as when the client closes the connection in the middle of the
-//! body, gives the cause of a request that ended before its response. A
-//! session that commits holds its slot until the commit ends, also when the
-//! commit fails or panics. A session with no
-//! request in progress for [`ServeOptions::session_idle_timeout`] is
-//! aborted, and so is a session with a request body that delivers no byte
-//! for that time. A request body that the server does not read meanwhile
-//! does not count as silent. The body of a `session` request must arrive in
-//! full within the idle timeout. One sweep task applies the timeout. A
-//! session that commits is never aborted. When the future of
-//! [`Server::run`] drops, every session that does not commit is aborted,
-//! and a session that opens after that gets 503.
+//! session too, unless the session commits. A request body that fails, as
+//! when the client closes the connection in the middle of the body, gives
+//! the cause of a request that ended before its response. A session that
+//! commits holds its slot until the commit ends, also when the commit fails
+//! or panics. A session with no request in progress for
+//! [`EndpointOptions::session_idle_timeout`] is aborted, and so is a session
+//! with a request body that delivers no byte for that time. A request body
+//! that the server does not read meanwhile does not count as silent. The
+//! body of a `session` request must arrive in full within the idle timeout.
+//! The future of [`ReceiveEndpoint::sweep`] applies the timeout. A session
+//! that commits is never aborted. [`ReceiveEndpoint::shutdown`] aborts every
+//! session that does not commit, and a session that opens after that gets
+//! 503. [`Server::run`] runs the sweep in a task of its own, and calls
+//! `shutdown` when its future drops.
 //!
-//! The report of each commit goes to [`ServeOptions::on_report`] when the
+//! The report of each commit goes to [`EndpointOptions::on_report`] when the
 //! response body drops. A `CommitReply` frame that hyper did not take from
 //! the body adds a warning of the step
 //! [`ReplyNotDelivered`](ostrya::ReceiveStep::ReplyNotDelivered). hyper can
 //! take the frame and still fail to write it, so the warning is best
 //! effort. The endpoint reads the receive policy and the repository
-//! settings once, at start. A change applies at the next start.
+//! settings once, at start. A change applies at the next start. The server
+//! takes the options of the endpoint from the fields of the same names in
+//! [`ServeOptions`].
 //!
 //! # Authentication
 //!
@@ -185,11 +192,48 @@
 //! of one line give one key. A `GET` and a `HEAD` of the archive view ignore
 //! `Authorization`.
 //!
+//! # Mounting the endpoint
+//!
+//! [`ReceiveEndpoint`] is the receive endpoint with an authentication of the
+//! host, [`ReceiveAuth`], which a host mounts in its own router. The
+//! endpoint opens no listener and does no TLS. [`Server`] runs the same
+//! endpoint with its built-in methods.
+//!
+//! - [`ReceiveEndpoint::handle`] takes the raw path from
+//!   `/_ostrya/receive/v1/` on. A host that mounts the endpoint under a
+//!   prefix, for example `/api/v1/push`, removes the prefix before the call.
+//!   `Router::nest_service` of axum removes it itself. The push address of a
+//!   client is then `https://HOST/api/v1/push`.
+//! - The request body is any `B: Body<Data = Bytes> + Send + Unpin +
+//!   'static` whose error converts into `Box<dyn Error + Send + Sync>`. The
+//!   body need not be `Sync`, so the body of axum fits. The response body is
+//!   [`ReceiveBody`].
+//! - Run the future of [`ReceiveEndpoint::sweep`] once, in a task of its
+//!   own, when the host starts. Without it no session reaches its idle
+//!   timeout.
+//! - Call [`ReceiveEndpoint::shutdown`] before the graceful shutdown of the
+//!   listener. It aborts each session that does not commit, and each later
+//!   `session` request gets 503. A commit that runs goes on to its end.
+//! - Serve the endpoint on a dedicated listener, with a port or an SNI name
+//!   of its own. On that listener, set the HTTP/2 windows of
+//!   [`ReceiveEndpoint::h2_windows`], and set the most streams of one
+//!   connection at the same time to 32, the value of the server. The
+//!   request bytes that the host did not read are at most the connection
+//!   window times the count of open connections, and the host grants the
+//!   windows when it sets up a connection, before it authenticates a
+//!   request. A listener for other routes keeps its own windows. The windows
+//!   apply to a TLS listener that offers `h2` through ALPN, because the push
+//!   client speaks HTTP/1.1 over cleartext.
+//! - The runtime backend of the crate must be the runtime of the host: the
+//!   `tokio` feature for a host on tokio. Under tokio, `handle` and `sweep`
+//!   must run within a tokio runtime with the time driver enabled.
+//!
 //! The crate builds on Linux alone. The `smol` and `tokio` features select
 //! the runtime backend of `ostrya-rt`.
 
 mod auth;
 mod body;
+mod endpoint;
 mod error;
 mod options;
 mod receive;
@@ -201,6 +245,8 @@ mod session;
 mod shutdown;
 mod stall;
 
+pub use body::ReceiveBody;
+pub use endpoint::{EndpointOptions, ReceiveEndpoint};
 pub use error::{Error, Result};
 pub use options::{ServeOptions, ServerTls};
 pub use receive_auth::{ReceiveAuth, Refusal, RequestKind, SessionSetup};

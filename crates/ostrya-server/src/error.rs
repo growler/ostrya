@@ -6,9 +6,10 @@ use std::net::SocketAddr;
 /// Result alias of the server.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The error the server fails with. Each one arises before the server
-/// accepts a connection. An error on one connection ends that connection and
-/// no other.
+/// The error the server fails with. Each one arises in [`bind`](crate::bind)
+/// or in [`ReceiveEndpoint::new`](crate::ReceiveEndpoint::new), before the
+/// server or the host accepts a connection. An error on one connection ends
+/// that connection and no other.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {

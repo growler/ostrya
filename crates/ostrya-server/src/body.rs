@@ -1,5 +1,6 @@
 //! The response body of the server.
 
+use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -101,6 +102,48 @@ impl StreamBody {
         let mut data = std::mem::take(&mut self.buf);
         data.truncate(n);
         Poll::Ready(Some(Ok(Frame::data(Bytes::from(data)))))
+    }
+}
+
+/// The response body of
+/// [`ReceiveEndpoint::handle`](crate::ReceiveEndpoint::handle). It is `Send`
+/// and `Unpin`. A body is empty or holds one frame of the push protocol,
+/// whole. The body of a `CommitReply` gives the report of the commit to
+/// [`EndpointOptions::on_report`](crate::EndpointOptions::on_report) when
+/// it drops.
+pub struct ReceiveBody(pub(crate) ServeBody);
+
+impl ReceiveBody {
+    /// The body as a response body of the server.
+    pub(crate) fn into_serve(self) -> ServeBody {
+        self.0
+    }
+}
+
+/// The body is opaque.
+impl fmt::Debug for ReceiveBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReceiveBody").finish_non_exhaustive()
+    }
+}
+
+impl Body for ReceiveBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<io::Result<Frame<Bytes>>>> {
+        Pin::new(&mut self.get_mut().0).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.0.size_hint()
     }
 }
 

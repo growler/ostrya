@@ -3390,7 +3390,8 @@ receive endpoint of the server ("Archive view and HTTP server").
 - The client adds `_ostrya/receive/v1/session`, then `/ID` and the step, to
   the path of the address. `ostrya serve` serves the endpoint at the root of
   the server, so an address with a path works only behind a proxy that
-  removes that path. The fetcher follows no redirect, and a 3xx answer is
+  removes that path, or with a host that mounts `ReceiveEndpoint` under that
+  path. The fetcher follows no redirect, and a 3xx answer is
   `Error::Transport`.
 - `Hello`, `Have`, and `Commit` go as whole request bodies. Each object
   stream is the streamed body of one `objects` request. Each response body
@@ -3932,13 +3933,14 @@ With `receive` set, the server also runs the receive endpoint of a push
 over the repository. Every session shares the one policy. The endpoint
 reads the policy and the repository settings once, at start, and a change
 applies at the next start. `bind` refuses `receive` with no authentication
-method, a `parallel_uploads` outside `1..=31`, a zero
-`session_idle_timeout`, and a zero `max_sessions`, with `Error::Options`.
-With no `tls`, `bind` also refuses with `Error::Options` an endpoint whose
-one method is the lines of `credentials`, unless
-`allow_cleartext_credentials` or `allow_anonymous_push` is set: the endpoint
-refuses each bearer and Basic credential over plain HTTP, so no request can
-pass it. With `receive` set, `bind` parses `credentials`, and a malformed
+method with `Error::Options`. With no `tls`, `bind` also refuses with
+`Error::Options` an endpoint whose one method is the lines of
+`credentials`, unless `allow_cleartext_credentials` or
+`allow_anonymous_push` is set: the endpoint refuses each bearer and Basic
+credential over plain HTTP, so no request can pass it. It then builds the
+endpoint with `ReceiveEndpoint::new`, which refuses a `parallel_uploads`
+outside `1..=31`, a zero `session_idle_timeout`, and a zero `max_sessions`
+with `Error::Options`. With `receive` set, `bind` parses `credentials`, and a malformed
 line is `Error::Credentials { line, message }`, which names the line by its
 number and holds no byte of it. A read-only server reads neither
 `credentials` nor `allow_cleartext_credentials`. The `Debug` text of
@@ -4005,6 +4007,84 @@ pub struct SessionSetup {
   request. A later request of the session whose principal gives another
   key gets the 404 of an unknown id.
 
+Mounted endpoint. A host with a router of its own mounts the endpoint with
+`ReceiveEndpoint` and an authentication of its own. The endpoint opens no
+listener and does no TLS. The server builds on `ReceiveEndpoint<FileAuth>`,
+where `FileAuth` is the crate-private type of the built-in methods, so the
+two paths share one implementation.
+
+```rust
+pub struct ReceiveEndpoint<A: ReceiveAuth> { /* private */ }
+
+impl<A: ReceiveAuth> ReceiveEndpoint<A> {
+    pub fn new(repo: Repo, auth: A, options: EndpointOptions) -> Result<ReceiveEndpoint<A>>;
+    pub async fn handle<B>(&self, req: Request<B>) -> Response<ReceiveBody>
+    where
+        B: Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>;
+    pub async fn sweep(&self);              // until `shutdown`
+    pub fn shutdown(&self);
+    pub fn h2_windows(&self) -> (u32, u32); // (stream, connection)
+}
+
+#[derive(Clone)]
+pub struct EndpointOptions {
+    pub parallel_uploads: u32,            // default 4; 1..=31
+    pub session_idle_timeout: Duration,   // default 300 s; zero is refused
+    pub max_sessions: usize,              // default 16; zero is refused
+    pub on_report: Option<Arc<dyn Fn(ReceiveReport) + Send + Sync>>, // default None
+}
+
+pub struct ReceiveBody { /* private */ } // Body<Data = Bytes, Error = io::Error>
+```
+
+- `new` refuses with `Error::Options` the values that `bind` refuses, with
+  the same messages. `EndpointOptions` has public fields and no
+  `#[non_exhaustive]`. `ServeOptions::default` takes its four fields of the
+  endpoint from `EndpointOptions::default`, and `bind` gives the four
+  fields of `ServeOptions` to `new`.
+- `handle` takes the raw path from `/_ostrya/receive/v1/` on. A host that
+  mounts the endpoint under a prefix, for example `/api/v1/push`, removes
+  the prefix before the call. `Router::nest_service` of axum 0.8 removes it
+  itself. The push address of a client is then `https://HOST/api/v1/push`.
+  A path outside the prefix gets 404, and a `GET` or a `HEAD` of a route
+  gets 405 with `Allow`, each after the drain of the body. The server
+  sends a `GET` and a `HEAD` under the prefix to the archive view, which
+  gives 404.
+- The request body of `handle` need not be `Sync`, so the body of axum 0.8
+  fits. A request body that fails is a request that ended before its
+  response: 500 with `internal`, and the session ends. A panic in the
+  commit resumes in `handle`, through the join of the commit task, so it
+  panics the request task of the host.
+- `sweep` applies the idle timeout until `shutdown`, and then completes at
+  once. A host runs its future once, in a task of its own, when it starts.
+  `shutdown` aborts each session that does not commit and ends `sweep`. A
+  commit that runs goes on to its end, and each later `session` request
+  gets 503. A second call does nothing more. A host calls it before the
+  graceful shutdown of its listener.
+- `h2_windows` gives 2 MiB for each stream, and 2 MiB times
+  `parallel_uploads` for each connection. A host serves the endpoint on a
+  dedicated TLS listener that offers `h2` through ALPN, with these windows
+  and at most 32 streams of one connection at the same time, the value of
+  the server. The crate has no public name for the 32. The request bytes
+  that the host did not read are at most the connection window times the
+  count of open connections, and the host grants the windows when it sets
+  up a connection, before it authenticates a request.
+- The runtime backend of the crate must be the runtime of the host. Under
+  tokio, `handle` and `sweep` run within a tokio runtime with the time
+  driver enabled, because the commit runs in a task of its own and the time
+  limits use the timer. A server signer that runs the GnuPG binaries also
+  needs the IO driver.
+- `ReceiveEndpoint<A>` is `Send + Sync` for each `A`, and the futures of
+  `handle` and `sweep` are `Send`, also with a request body that is not
+  `Sync`. `ReceiveBody` is `Send + Unpin + 'static` and holds no promise of
+  `Sync`. The endpoint has no `Clone` and no `Drop`: a host shares it in an
+  `Arc`.
+- The `Debug` text of `ReceiveEndpoint` states `parallel_uploads`, the idle
+  timeout, and `max_sessions`, and leaves out the repository and the
+  authentication. The `Debug` text of `EndpointOptions` states `on_report`
+  by whether it is set, and the `Debug` text of `ReceiveBody` is opaque.
+
 The built-in methods of the endpoint are:
 
 - A bearer token, `Authorization: Bearer TOKEN`, which matches a line of
@@ -4052,10 +4132,9 @@ of a session is authorized again, and a request with another key gets the
 credential over plain HTTP succeeds.
 
 The endpoint takes the requests under the raw path prefix
-`/_ostrya/receive/v1/` with a method other than `GET` and `HEAD`. The path
-is not percent-decoded. A `GET` or a `HEAD` there goes to the archive view
-and gets 404. Each request is one step of the `ReceiveService` of its
-session.
+`/_ostrya/receive/v1/`. The path is not percent-decoded. In the server, a
+`GET` or a `HEAD` there goes to the archive view and gets 404. Each request
+is one step of the `ReceiveService` of its session.
 
 - `POST session` -- body: one `Hello` frame. 200 with the `HelloReply`
   frame, and the session id in the response header `Ostrya-Session`.
@@ -4103,8 +4182,8 @@ Sessions:
   failed`. A request that ends before its response, as when the client
   closes the connection, ends its session in the same way, with the cause
   `a request of the session ended before its response`. A request body that
-  hyper fails, as when the client closes the connection in the middle of
-  the body, gives that cause too. A session that commits is left to its
+  fails, as when the client closes the connection in the middle of the
+  body, gives that cause too. A session that commits is left to its
   commit.
 - The commit runs in a task of its own, so a disconnect, a `DELETE`, or the
   idle timeout does not drop it in the middle. A second `commit` and a
@@ -4115,16 +4194,18 @@ Sessions:
   commit succeeded, and `a request of the session failed` when it failed. A
   guard in the task removes the entry with the second cause also when the
   commit panics or the task is dropped.
-- One sweep task runs in `Server::run`. It aborts a session with no request
-  in progress for `session_idle_timeout`, and a session with a request body
-  that waited for the client for that time. A body waits from the poll that
-  finds no byte to the next byte. A body that the server does not poll does
-  not wait. The sweep sleeps to the earliest deadline, and at most one idle
-  timeout, and never aborts a session that commits.
-- When the future of `Server::run` drops, every session that does not
-  commit is aborted, and the table takes no session after that. A
-  `session` request then gets 503 with `limit-exceeded`, also when it took
-  its slot before the stop: its service is aborted and dropped.
+- The future of `ReceiveEndpoint::sweep` applies the idle timeout, and
+  `Server::run` runs it in a task of its own. It aborts a session with no
+  request in progress for `session_idle_timeout`, and a session with a
+  request body that waited for the client for that time. A body waits from
+  the poll that finds no byte to the next byte. A body that the server does
+  not poll does not wait. The sweep sleeps to the earliest deadline, and at
+  most one idle timeout, and never aborts a session that commits.
+- `ReceiveEndpoint::shutdown` aborts every session that does not commit,
+  and the table takes no session after that. A `session` request then gets
+  503 with `limit-exceeded`, also when it took its slot before the stop:
+  its service is aborted and dropped. `Server::run` calls `shutdown` when
+  its future drops.
 
 The status of an error: `ref-mismatch` and `non-fast-forward` get 409.
 `internal`, and each error with no wire code, get 500 with an `internal`
@@ -4147,7 +4228,7 @@ When hyper did not take the `CommitReply` frame from the body, the report
 gets a `ReceiveWarning` with the step `ReplyNotDelivered`, also when the
 client left before the commit ended. hyper can take the frame and still fail
 to write it, so the warning is best effort. `on_report` runs on a task of
-the server and must return soon.
+the server, or of the host, and must return soon.
 
 `ostrya_fetch::server_config` builds the TLS configuration from the PEM
 bytes, with the provider and the key loaders of the fetcher, and ALPN `h2`

@@ -135,9 +135,10 @@
 //! server. The client adds `_ostrya/receive/v1/session`, then `/ID` and the
 //! step, to the path of the address. `ostrya serve` serves the endpoint at
 //! the root of the server, so an address with a path works only behind a
-//! proxy that removes that path. `Hello`, `Have`, and `Commit` go as whole
-//! request bodies. Each object stream is the streamed body of one `objects`
-//! request.
+//! proxy that removes that path, or with a host that mounts the
+//! `ReceiveEndpoint` of `ostrya-server` under that path. `Hello`, `Have`,
+//! and `Commit` go as whole request bodies. Each object stream is the
+//! streamed body of one `objects` request.
 //!
 //! [`ConnectOptions::push_token_file`] names a file whose first line is the
 //! token. With [`ConnectOptions::push_user`], the client sends the token as

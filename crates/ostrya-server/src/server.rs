@@ -17,11 +17,10 @@ use ostrya_fetch::{FuturesIo, RtExecutor, RtTimer};
 use ostrya_rt as rt;
 
 use crate::auth::{FileAuth, Peer};
+use crate::endpoint::{EndpointOptions, ReceiveEndpoint};
 use crate::error::{Error, Result};
 use crate::options::ServeOptions;
-use crate::receive::Receive;
 use crate::router;
-use crate::session::SessionTable;
 use crate::shutdown::{Shutdown, Trigger};
 use crate::stall::Stall;
 
@@ -38,63 +37,33 @@ const MAX_CONCURRENT_STREAMS: u32 = 32;
 /// descriptors, before the listener accepts again.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// The values of `parallel_uploads` a server takes.
-const PARALLEL_UPLOADS: std::ops::RangeInclusive<u32> = 1..=31;
-
-/// The HTTP/2 receive window of one stream of a server with a receive
-/// endpoint. The window of the connection is this value times
-/// `parallel_uploads`.
-const UPLOAD_WINDOW: u32 = 2 * 1024 * 1024;
-
-/// The HTTP/2 receive windows of a server, the stream window and the
-/// connection window, or `None` for the windows of hyper. With a receive
-/// endpoint of `parallel_uploads`, each stream takes [`UPLOAD_WINDOW`], and
-/// the connection takes that for each of the object streams of a session,
-/// so the request bodies of one connection hold at most that many bytes
-/// that the server did not read.
-fn h2_windows(parallel_uploads: Option<u32>) -> Option<(u32, u32)> {
-    parallel_uploads.map(|n| (UPLOAD_WINDOW, UPLOAD_WINDOW * n))
-}
-
 /// A server with its listeners bound, ready to [`run`](Server::run).
 pub struct Server {
     listeners: Vec<rt::TcpListener>,
     addrs: Vec<SocketAddr>,
     view: Arc<ArchiveView>,
-    receive: Option<Arc<Receive<FileAuth>>>,
+    receive: Option<Arc<ReceiveEndpoint<FileAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
 }
 
 /// Check the options of the receive endpoint of `opts`, and build it over
 /// `repo` when `opts` has a receive policy. The authentication methods are
-/// checked first, as [`FileAuth::new`] checks them.
-fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<Receive<FileAuth>>>> {
+/// checked first, as [`FileAuth::new`] checks them, then the other options,
+/// as [`ReceiveEndpoint::new`] checks them.
+fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<ReceiveEndpoint<FileAuth>>>> {
     let Some(policy) = &opts.receive else {
         return Ok(None);
     };
     let auth = FileAuth::new(opts, policy.clone())?;
-    if !PARALLEL_UPLOADS.contains(&opts.parallel_uploads) {
-        return Err(Error::Options(format!(
-            "parallel_uploads {} is outside {}..={}",
-            opts.parallel_uploads,
-            PARALLEL_UPLOADS.start(),
-            PARALLEL_UPLOADS.end()
-        )));
-    }
-    if opts.session_idle_timeout.is_zero() {
-        return Err(Error::Options("a session idle timeout of zero".into()));
-    }
-    if opts.max_sessions == 0 {
-        return Err(Error::Options("a session limit of zero".into()));
-    }
-    Ok(Some(Arc::new(Receive {
-        repo: repo.clone(),
-        auth,
+    let options = EndpointOptions {
         parallel_uploads: opts.parallel_uploads,
+        session_idle_timeout: opts.session_idle_timeout,
+        max_sessions: opts.max_sessions,
         on_report: opts.on_report.clone(),
-        table: SessionTable::new(opts.max_sessions, opts.session_idle_timeout),
-    })))
+    };
+    let endpoint = ReceiveEndpoint::new(repo.clone(), auth, options)?;
+    Ok(Some(Arc::new(endpoint)))
 }
 
 /// Check the options, build the TLS configuration of `opts`, then bind each
@@ -165,12 +134,12 @@ impl Server {
     pub async fn run(self) -> Result<()> {
         let shutdown = Arc::new(Shutdown::default());
         let _trigger = Trigger(shutdown.clone());
-        if let Some(receive) = &self.receive {
-            let table = receive.table.clone();
+        if let Some(endpoint) = &self.receive {
+            let endpoint = endpoint.clone();
             let stop = shutdown.wait();
             drop(rt::spawn(async move {
-                future::or(table.sweep(), stop).await;
-                table.close_all();
+                future::or(endpoint.sweep(), stop).await;
+                endpoint.shutdown();
             }));
         }
         let serving = Arc::new(Serving {
@@ -190,7 +159,7 @@ impl Server {
 /// What each connection of a server shares.
 struct Serving {
     view: Arc<ArchiveView>,
-    receive: Option<Arc<Receive<FileAuth>>>,
+    receive: Option<Arc<ReceiveEndpoint<FileAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
 }
@@ -280,9 +249,10 @@ async fn serve_connection(stream: rt::TcpStream, serving: Arc<Serving>, stall: A
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
             .keep_alive_interval(Some(serving.body_timeout / 2))
             .keep_alive_timeout(serving.body_timeout);
-        if let Some((stream, connection)) =
-            h2_windows(serving.receive.as_ref().map(|r| r.parallel_uploads))
-        {
+        // With a receive endpoint, the windows bound the bytes of the request
+        // bodies of one connection that the server did not read. A
+        // read-only server keeps the windows of hyper.
+        if let Some((stream, connection)) = serving.receive.as_ref().map(|e| e.h2_windows()) {
             builder
                 .initial_stream_window_size(stream)
                 .initial_connection_window_size(connection);
@@ -295,22 +265,5 @@ async fn serve_connection(stream: rt::TcpStream, serving: Arc<Serving>, stall: A
             .header_read_timeout(HEADER_READ_TIMEOUT)
             .serve_connection(io, service);
         let _ = served.await;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A server with a receive endpoint widens the HTTP/2 windows for the
-    /// object streams of a session, and a read-only server keeps the windows
-    /// of hyper. The widest connection window is below the HTTP/2 maximum.
-    #[test]
-    fn the_h2_windows_follow_parallel_uploads() {
-        assert_eq!(h2_windows(None), None);
-        assert_eq!(h2_windows(Some(4)), Some((2 << 20, 8 << 20)));
-        let (_, widest) = h2_windows(Some(*PARALLEL_UPLOADS.end())).unwrap();
-        assert_eq!(widest, 62 << 20);
-        assert!(widest < 1 << 31);
     }
 }

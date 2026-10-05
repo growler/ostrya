@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use ostrya::{ReceivePolicy, ReceiveReport};
 
+use crate::endpoint::EndpointOptions;
+
 /// The PEM bytes of the server TLS files. The caller reads each file once at
 /// start.
 #[derive(Clone, Eq, PartialEq)]
@@ -144,6 +146,7 @@ impl fmt::Debug for ServeOptions {
 
 impl Default for ServeOptions {
     fn default() -> ServeOptions {
+        let endpoint = EndpointOptions::default();
         ServeOptions {
             listen: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))],
             tls: None,
@@ -152,10 +155,10 @@ impl Default for ServeOptions {
             allow_anonymous_push: false,
             credentials: None,
             allow_cleartext_credentials: false,
-            parallel_uploads: 4,
-            session_idle_timeout: Duration::from_secs(300),
-            max_sessions: 16,
-            on_report: None,
+            parallel_uploads: endpoint.parallel_uploads,
+            session_idle_timeout: endpoint.session_idle_timeout,
+            max_sessions: endpoint.max_sessions,
+            on_report: endpoint.on_report,
         }
     }
 }

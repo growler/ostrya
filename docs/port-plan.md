@@ -215,7 +215,11 @@ bounded:
   an anonymous push. `FileAuth` compares the digests in constant time with
   a hand-rolled compare and no dependency. The server refuses to start with
   no method, and over plain HTTP with the credential file as its one method
-  and no switch for credentials over plain HTTP. With the
+  and no switch for credentials over plain HTTP. The public type
+  `ReceiveEndpoint<A>` is the endpoint with any `ReceiveAuth`, which a host
+  mounts in its own router: it opens no listener and does no TLS, and the
+  server builds on `ReceiveEndpoint<FileAuth>`. `EndpointOptions` holds the
+  options of the endpoint, and `ReceiveBody` is its response body. With the
   endpoint, an HTTP/2 stream has a receive window of 2 MiB, and a
   connection a window of 2 MiB for each of the `parallel_uploads` object
   streams of a session. It
@@ -7146,7 +7150,11 @@ their idle timeout and limit, `DELETE`, the status of each error, and the
 authentication of each request with a bearer token, a Basic credential, a
 client certificate, or as an anonymous push (`docs/api-sketch.md`,
 "Archive view and HTTP server", and `docs/conformance/cli-surface.md`,
-"serve"). The HTTP push transport is done: `PushSession::connect`,
+"serve"). A host mounts the same endpoint in its own router with
+`ReceiveEndpoint` of `ostrya-server` and an authentication of its own, and
+`push_tree` pushes to it over HTTPS and HTTP/2 under a path prefix that the
+host removes (`docs/api-sketch.md`, "Archive view and HTTP server"). The
+HTTP push transport is done: `PushSession::connect`,
 `push_tree`, and `Repo::push` take an `http://` or `https://` address, with
 a bearer token, a Basic credential, or a client certificate, and with
 `min(parallel-uploads, 31)` object streams (`docs/api-sketch.md`, "Push

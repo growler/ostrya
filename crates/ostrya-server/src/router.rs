@@ -9,8 +9,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView};
 
 use crate::auth::FileAuth;
-use crate::body::ServeBody;
-use crate::receive::{self, Receive};
+use crate::body::{ReceiveBody, ServeBody};
+use crate::endpoint::ReceiveEndpoint;
+use crate::receive;
 use crate::stall::Stall;
 
 /// The response to one request. A stream body is recorded in `stall`, the
@@ -21,14 +22,14 @@ use crate::stall::Stall;
 /// `HEAD` there goes to the view, which finds nothing.
 pub(crate) async fn handle(
     view: &ArchiveView,
-    receive: Option<&Receive<FileAuth>>,
+    receive: Option<&ReceiveEndpoint<FileAuth>>,
     stall: &Arc<Stall>,
     req: Request<Incoming>,
 ) -> Response<ServeBody> {
     if let Some(receive) = receive {
         let read = matches!(*req.method(), Method::GET | Method::HEAD);
         if !read && req.uri().path().starts_with(receive::PREFIX) {
-            return receive.handle(req).await;
+            return receive.handle(req).await.map(ReceiveBody::into_serve);
         }
     }
     let head = match *req.method() {

@@ -7160,8 +7160,9 @@ host of `ReceiveService` gives a session hooks of its own through
 `ReceiveService::hello_with_hooks`: `ReceiveHooks::before_update` runs just
 before the update lock of the commit, can refuse the commit, and gives
 detached-metadata entries that the commit writes with the refs, and a
-carried value that drops at the end of the commit (`docs/api-sketch.md`,
-"Receive policy (feature `receive`)"). The
+carried value that goes to `ReceiveHooks::after_update`, which runs with the
+report of the commit after the update lock is released
+(`docs/api-sketch.md`, "Receive policy (feature `receive`)"). The
 HTTP push transport is done: `PushSession::connect`,
 `push_tree`, and `Repo::push` take an `http://` or `https://` address, with
 a bearer token, a Basic credential, or a client certificate, and with

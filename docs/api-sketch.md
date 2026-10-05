@@ -2829,8 +2829,8 @@ impl ReceiveService {
 }
 ```
 
-`ReceiveHooks` holds the hook of the host that `commit` calls. Its one
-method, `before_update`, runs once in each commit of a session with hooks:
+`ReceiveHooks` holds the two hooks of the host that `commit` calls.
+`before_update` runs once in each commit of a session with hooks:
 
 - It runs after all the checks of `Commit` (the ref names, the size of the
   reply, the rules, the objects, the bindings, and the signature policy),
@@ -2871,21 +2871,58 @@ method, `before_update`, runs once in each commit of a session with hooks:
   for a commit that several updates name. A plan with no entry writes no
   detached metadata. The detached metadata is durable before a ref names
   the commit, in one transaction commit.
-- `UpdatePlan::carried` is a `Box<dyn Any + Send>` that the commit holds to
-  its end. It drops once, after the update lock is released, also when a
+- `UpdatePlan::carried` is a `Box<dyn Any + Send>` that goes to
+  `after_update`. When the commit fails after `before_update`, also when a
   ref check under the lock fails (`ref-mismatch`, `non-fast-forward`,
-  `delete-denied`, or the alias refusal). The host puts owned guards of its
-  own locks in it. The lock order is the repository lock shared, then the
-  locks of the host, then the update lock. The host never takes a lock that
-  `before_update` takes while it holds the update lock or an `UpdateGuard`,
-  and never waits for an exclusive repository lock while it holds such a
-  lock.
+  `delete-denied`, or the alias refusal), it drops once after the update
+  lock is released, and `after_update` does not run. When one of these ref
+  checks fails, no ref changes. A failure of the transaction commit can
+  leave the detached metadata and some refs written. The host puts owned
+  guards of its own locks in it. The lock order is the repository lock
+  shared, then the locks of the host, then the update lock. The host never
+  takes a lock that `before_update` takes while it holds the update lock
+  or an `UpdateGuard`, and never waits for an exclusive repository lock
+  while it holds such a lock.
 - The transaction commit writes the detached metadata and the refs on the
   blocking pool. A `commit` future that is dropped while these writes go
   on releases the update lock and drops `carried` before the writes end.
   So the host runs each commit to its end, for example in a task that it
   joins.
-- A panic in the hook is not caught.
+
+`after_update` runs once in each commit whose transaction commit
+succeeds:
+
+- It runs also when no ref changes. It runs after the transaction commit,
+  the removal of the partial markers, and the summary step, and after the
+  update lock is released. It gets the `ReceiveReport` that `commit`
+  returns, and `carried`. The guards in `carried` stay held until the hook
+  drops it.
+- The transaction commit is not atomic. It writes the detached metadata,
+  then each ref, and then runs `fsync` on the ref directories. A failure of
+  a detached-metadata write, of a ref write, or of the `fsync` of a ref
+  directory can leave the detached metadata and some refs written. `commit`
+  then returns the error as a failure on the server side, `carried` drops,
+  and `after_update` does not run. So the host makes its own records agree
+  with the refs of the repository.
+- When it runs, the session holds no lock: the update lock is released,
+  and the transaction commit released the repository lock shared. So the
+  hook can call `Repo::set_ref_immediate` and `Repo::begin_update`. The two
+  lock rules still apply while the hook holds `carried`. A hook that waits
+  for an exclusive repository lock, for example the lock of a prune, while
+  it holds `carried` can deadlock with another session that holds the
+  repository lock shared and waits in `before_update` for a lock in
+  `carried`.
+- The report goes to the hook before the host sends `CommitReply`, so it
+  never holds a warning of the step `ReplyNotDelivered`. The time of the
+  hook adds to the time `commit` takes to return.
+- An error of the hook gives `internal` with its message, cut at 4096 bytes
+  at a character boundary. The session ends as aborted. The refs and the
+  detached metadata stay written, and the session does not undo them: an
+  aborted session can have written its refs.
+- A `commit` future that is dropped while the hook runs drops the future of
+  the hook and `carried`, and the refs can be written.
+- A panic in a hook is not caught. A panic in `after_update` comes after the
+  refs are written, and resumes in the caller of `commit`.
 
 ```rust
 pub type HookFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -2893,6 +2930,9 @@ pub type HookFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub trait ReceiveHooks: Send + Sync {
     fn before_update<'a>(&'a self, updates: &'a [RefUpdate])
         -> HookFuture<'a, Result<UpdatePlan, HookRefusal>>;
+    fn after_update<'a>(&'a self, report: &'a ReceiveReport,
+                        carried: Box<dyn Any + Send>)
+        -> HookFuture<'a, Result<(), String>>;
 }
 
 #[derive(Debug)]

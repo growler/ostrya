@@ -1,23 +1,26 @@
 //! The hooks of a receive session: `before_update` before the update lock,
 //! the detached-metadata entries of the host and their merge, the checks of
-//! the plan, the refusals of the hook, and the drop of the carried value.
+//! the plan, the refusals of the hook, the drop of the carried value, and
+//! `after_update` after the update lock is released.
 
 #![cfg(feature = "receive")]
 
 mod common;
 
+use std::any::Any;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 
 use common::receive::{Obj, assert_staging_removed, body, fixture_objects, is_root, new_repo};
 use common::{COMMIT, TmpDir, foreign_holder, lock_holder_main};
 use ostrya::push::proto::{CommitRequest, Hello};
 use ostrya::push::{self, Encoding, Expected, RefUpdate};
 use ostrya::{
-    Checksum, DetachedMetadataFilter, Error, HookFuture, HookRefusal, HostEntry, MAX_METADATA_SIZE,
-    ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveService, Repo, RepoMode, Type,
-    UpdatePlan, Value,
+    Checksum, DetachedMetadataFilter, Error, HookFuture, HookRefusal, HostEntry, LockKind,
+    MAX_METADATA_SIZE, ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveRule,
+    ReceiveService, Repo, RepoMode, Type, UpdatePlan, Value,
 };
 use ostrya_rt::block_on;
 
@@ -36,10 +39,19 @@ type Metadata = Vec<(Checksum, Vec<HostEntry>)>;
 
 type PlanFn = dyn Fn(&[RefUpdate]) -> Result<UpdatePlan, HookRefusal> + Send + Sync;
 
-/// A hook that gives the result of `plan` and counts its calls.
+type AfterFn = dyn Fn(&ReceiveReport, Box<dyn Any + Send>) -> HookFuture<'static, Result<(), String>>
+    + Send
+    + Sync;
+
+/// A hook that gives the result of `plan` before the update lock, and the
+/// result of `after` after it. It counts the calls of each, and records each
+/// report that `after_update` gets.
 struct Hook {
     plan: Box<PlanFn>,
+    after: Box<AfterFn>,
     calls: AtomicUsize,
+    after_calls: AtomicUsize,
+    reports: Mutex<Vec<ReceiveReport>>,
 }
 
 impl ReceiveHooks for Hook {
@@ -51,15 +63,42 @@ impl ReceiveHooks for Hook {
         let result = (self.plan)(updates);
         Box::pin(async move { result })
     }
+
+    fn after_update<'a>(
+        &'a self,
+        report: &'a ReceiveReport,
+        carried: Box<dyn Any + Send>,
+    ) -> HookFuture<'a, Result<(), String>> {
+        self.after_calls.fetch_add(1, Ordering::SeqCst);
+        self.reports.lock().unwrap().push(report.clone());
+        (self.after)(report, carried)
+    }
 }
 
 impl Hook {
+    /// A hook whose `after_update` drops the carried value and succeeds.
     fn new(
         plan: impl Fn(&[RefUpdate]) -> Result<UpdatePlan, HookRefusal> + Send + Sync + 'static,
     ) -> Arc<Hook> {
+        Hook::with_after(plan, |_, carried| {
+            drop(carried);
+            Box::pin(async { Ok(()) })
+        })
+    }
+
+    fn with_after(
+        plan: impl Fn(&[RefUpdate]) -> Result<UpdatePlan, HookRefusal> + Send + Sync + 'static,
+        after: impl Fn(&ReceiveReport, Box<dyn Any + Send>) -> HookFuture<'static, Result<(), String>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<Hook> {
         Arc::new(Hook {
             plan: Box::new(plan),
+            after: Box::new(after),
             calls: AtomicUsize::new(0),
+            after_calls: AtomicUsize::new(0),
+            reports: Mutex::new(Vec::new()),
         })
     }
 
@@ -77,6 +116,15 @@ impl Hook {
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn after_calls(&self) -> usize {
+        self.after_calls.load(Ordering::SeqCst)
+    }
+
+    /// The reports that `after_update` got, in order.
+    fn reports(&self) -> Vec<ReceiveReport> {
+        self.reports.lock().unwrap().clone()
     }
 }
 
@@ -289,6 +337,56 @@ fn main_ref(repo: &Repo) -> Option<String> {
     std::fs::read_to_string(repo.path().join("refs/heads/test/main"))
         .ok()
         .map(|text| text.trim().to_owned())
+}
+
+/// The commit `test/after` names, where the ref is present.
+fn after_ref(repo: &Repo) -> Option<String> {
+    std::fs::read_to_string(repo.path().join("refs/heads/test/after"))
+        .ok()
+        .map(|text| text.trim().to_owned())
+}
+
+/// A plan of one host entry for the fixture commit, with a carried value
+/// that counts its drops in `drops`.
+fn one_entry_plan(drops: &Arc<AtomicUsize>) -> UpdatePlan {
+    UpdatePlan {
+        metadata: vec![(
+            fixture_commit(),
+            vec![entry("centrex.uploader", text("host"), false)],
+        )],
+        carried: Box::new(DropCount(drops.clone())),
+    }
+}
+
+/// A hook that gives [`one_entry_plan`], and whose `after_update` asserts
+/// that `test/main` is written and that the carried value is the
+/// [`DropCount`] of `drops`, not dropped yet. It then writes `test/after`
+/// with `Repo::set_ref_immediate` while it holds the carried value, and
+/// drops the carried value.
+fn writing_after(repo: &Repo, drops: &Arc<AtomicUsize>) -> Arc<Hook> {
+    let plan_drops = drops.clone();
+    let drops = drops.clone();
+    let repo = repo.clone();
+    Hook::with_after(
+        move |_| Ok(one_entry_plan(&plan_drops)),
+        move |report, carried| {
+            assert_eq!(main_ref(&repo).as_deref(), Some(COMMIT));
+            assert_eq!(report.refs[0].new, Some(fixture_commit()));
+            let carried = carried
+                .downcast::<DropCount>()
+                .expect("the carried value of the plan");
+            assert!(Arc::ptr_eq(&carried.0, &drops));
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            let repo = repo.clone();
+            Box::pin(async move {
+                let written = repo
+                    .set_ref_immediate("test/after", Some(&fixture_commit()))
+                    .await;
+                drop(carried);
+                written.map_err(|e| e.to_string())
+            })
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -635,6 +733,7 @@ fn a_refused_plan_is_internal_and_writes_nothing() {
             other => panic!("{case}: expected InvalidInput, got {other:?}"),
         }
         assert_eq!(hook.calls(), 1, "{case}");
+        assert_eq!(hook.after_calls(), 0, "{case}");
         assert_eq!(drops.load(Ordering::SeqCst), 1, "{case}");
         assert_eq!(main_ref(&repo), None, "{case}");
         assert!(!commitmeta_path(&repo).exists(), "{case}");
@@ -713,6 +812,7 @@ fn a_hook_refusal_keeps_its_code() {
             assert_eq!(got, message);
         }
         assert_eq!(hook.calls(), 1);
+        assert_eq!(hook.after_calls(), 0);
         assert_eq!(main_ref(&repo), None);
         assert!(!commitmeta_path(&repo).exists());
         assert_staging_removed(repo.path());
@@ -756,6 +856,7 @@ fn a_merged_dict_over_the_limit_is_refused_before_the_lock() {
         "{result:?}"
     );
     assert_eq!(hook.calls(), 1);
+    assert_eq!(hook.after_calls(), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(main_ref(&repo), None);
     assert!(!commitmeta_path(&repo).exists());
@@ -793,6 +894,7 @@ fn the_carried_value_drops_once_on_a_ref_mismatch() {
         "{result:?}"
     );
     assert_eq!(hook.calls(), 1);
+    assert_eq!(hook.after_calls(), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert_eq!(main_ref(&repo), None);
     assert!(!commitmeta_path(&repo).exists());
@@ -878,7 +980,295 @@ fn missing_objects_do_not_call_the_hook() {
         "{result:?}"
     );
     assert_eq!(hook.calls(), 0);
+    assert_eq!(hook.after_calls(), 0);
     assert_eq!(drops.load(Ordering::SeqCst), 0);
+}
+
+// ---------------------------------------------------------------------------
+// `after_update`.
+// ---------------------------------------------------------------------------
+
+/// `after_update` runs after the update lock is released, with the refs
+/// written and the carried value of the plan. With `lock-timeout-secs=0`,
+/// `Repo::set_ref_immediate` fails at once while an update guard is held,
+/// and in the hook it writes its ref. The hook gets the report that the
+/// commit returns.
+#[test]
+fn after_update_runs_with_the_update_lock_free() {
+    let tmp = TmpDir::new("hooks-after-free");
+    let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=0\n");
+    let guard = block_on(repo.begin_update()).unwrap();
+    let held = block_on(repo.set_ref_immediate("test/after", Some(&fixture_commit())));
+    block_on(guard.finish()).unwrap();
+    assert!(
+        matches!(&held, Err(Error::LockTimeout { .. })),
+        "the write took a held lock: {held:?}"
+    );
+    assert_eq!(after_ref(&repo), None);
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hook = writing_after(&repo, &drops);
+    let report = push(&repo, Some(hook.clone()), &[]).unwrap();
+    assert_eq!(hook.calls(), 1);
+    assert_eq!(hook.after_calls(), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(after_ref(&repo).as_deref(), Some(COMMIT));
+    assert_eq!(hook.reports(), std::slice::from_ref(&report));
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+}
+
+/// [`after_update_runs_with_the_update_lock_free`] with
+/// `lock-timeout-secs=-1`, where a held lock makes the write in the hook wait
+/// with no end. The commit runs on a thread, and the test fails when the
+/// commit does not end in 30 s.
+#[test]
+fn after_update_does_not_wait_with_no_lock_timeout() {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let tmp = TmpDir::new("hooks-after-wait");
+        let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=-1\n");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let hook = writing_after(&repo, &drops);
+        let result = push(&repo, Some(hook.clone()), &[]);
+        let _ = sender.send((
+            result.map(|_| ()).map_err(|e| e.to_string()),
+            hook.after_calls(),
+            drops.load(Ordering::SeqCst),
+            after_ref(&repo),
+        ));
+    });
+    let (result, after_calls, drops, written) = match receiver.recv_timeout(Duration::from_secs(30))
+    {
+        Ok(got) => got,
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("the commit did not end in 30 s"),
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the commit thread panicked"),
+    };
+    assert_eq!(result, Ok(()));
+    assert_eq!(after_calls, 1);
+    assert_eq!(drops, 1);
+    assert_eq!(written.as_deref(), Some(COMMIT));
+}
+
+/// An error of `after_update` is `internal` with its message. The refs and
+/// the detached metadata stay written, the staging directory is removed, and
+/// the session ends as aborted. A message longer than 4096 bytes is cut at a
+/// character boundary.
+#[test]
+fn an_after_update_error_is_internal_with_the_refs_written() {
+    let long = format!("a{}", "\u{e9}".repeat(3000));
+    for message in ["the database is down".to_owned(), long] {
+        let tmp = TmpDir::new("hooks-after-error");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let plan_drops = drops.clone();
+        let given = message.clone();
+        let hook = Hook::with_after(
+            move |_| Ok(one_entry_plan(&plan_drops)),
+            move |_, carried| {
+                drop(carried);
+                let given = given.clone();
+                Box::pin(async move { Err(given) })
+            },
+        );
+        let (service, result) = run(
+            &repo,
+            Some(hook.clone()),
+            &fixture_objects(Encoding::Raw),
+            vec![main_update()],
+        );
+        let got = match result {
+            Err(Error::Push(push::Error::Internal(m))) => m,
+            other => panic!("expected internal, got {other:?}"),
+        };
+        if message.len() > 4096 {
+            assert!(got.len() <= 4096, "{}", got.len());
+            assert!(message.is_char_boundary(got.len()));
+            assert_eq!(got.len(), 4095);
+            assert!(message.starts_with(&got));
+        } else {
+            assert_eq!(got, message);
+        }
+        assert_eq!(main_ref(&repo).as_deref(), Some(COMMIT));
+        let dict = stored(&repo).expect("the detached metadata is written");
+        assert_eq!(text_of(&dict, "centrex.uploader").as_deref(), Some("host"));
+        assert_staging_removed(repo.path());
+        assert_aborted(&service, "after_update error");
+        assert_eq!(hook.calls(), 1);
+        assert_eq!(hook.after_calls(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// `after_update` does not run when the commit fails after `before_update`:
+/// on a ref mismatch, and when another process holds the update lock with
+/// `lock-timeout-secs=0`. The carried value drops once, and no ref is
+/// written.
+#[test]
+fn after_update_does_not_run_when_the_commit_fails_after_before_update() {
+    for mismatch in [true, false] {
+        let tmp = TmpDir::new("hooks-after-failure");
+        let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=0\n");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let plan_drops = drops.clone();
+        let hook = Hook::new(move |_| Ok(one_entry_plan(&plan_drops)));
+        let update = if mismatch {
+            RefUpdate {
+                expected: Expected::Commit(Checksum::from_bytes([0x11; 32])),
+                ..main_update()
+            }
+        } else {
+            main_update()
+        };
+        let holder = (!mismatch).then(|| foreign_holder(repo.path(), ".update.lock"));
+        let (_, result) = run(
+            &repo,
+            Some(hook.clone()),
+            &fixture_objects(Encoding::Raw),
+            vec![update],
+        );
+        drop(holder);
+        if mismatch {
+            assert!(
+                matches!(&result, Err(Error::Push(push::Error::RefMismatch { .. }))),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(&result, Err(Error::LockTimeout { .. })),
+                "{result:?}"
+            );
+        }
+        assert_eq!(hook.calls(), 1, "mismatch {mismatch}");
+        assert_eq!(hook.after_calls(), 0, "mismatch {mismatch}");
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "mismatch {mismatch}");
+        assert_eq!(main_ref(&repo), None, "mismatch {mismatch}");
+    }
+}
+
+/// `after_update` runs also when no ref changes: a second session pushes the
+/// commit that the ref names already.
+#[test]
+fn after_update_runs_when_no_ref_changes() {
+    let tmp = TmpDir::new("hooks-after-same");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    push(&repo, None, &[]).unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hook = Hook::giving(Vec::new(), &drops);
+    let update = RefUpdate {
+        expected: Expected::Commit(fixture_commit()),
+        ..main_update()
+    };
+    let (_, result) = run(&repo, Some(hook.clone()), &[], vec![update]);
+    let report = result.unwrap();
+    assert_eq!(report.refs[0].old, Some(fixture_commit()));
+    assert_eq!(report.refs[0].new, Some(fixture_commit()));
+    assert_eq!(hook.calls(), 1);
+    assert_eq!(hook.after_calls(), 1);
+    assert_eq!(hook.reports(), [report]);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_eq!(main_ref(&repo).as_deref(), Some(COMMIT));
+}
+
+/// Open a transaction of `repo` that holds the repository lock exclusive,
+/// and abort it.
+async fn take_exclusive(repo: &Repo) -> ostrya::Result<()> {
+    repo.transaction_with_lock(LockKind::Exclusive)
+        .await?
+        .abort()
+        .await
+}
+
+/// `after_update` runs with the repository lock free. With
+/// `lock-timeout-secs=0`, a transaction that takes the repository lock
+/// exclusive fails at once while another transaction holds it shared, and
+/// in the hook it opens.
+#[test]
+fn after_update_runs_with_the_repository_lock_free() {
+    let tmp = TmpDir::new("hooks-after-repo-lock");
+    let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=0\n");
+    let shared = block_on(repo.transaction()).unwrap();
+    let held = block_on(take_exclusive(&repo));
+    block_on(shared.abort()).unwrap();
+    assert!(
+        matches!(&held, Err(Error::LockTimeout { .. })),
+        "the transaction took a held lock: {held:?}"
+    );
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let plan_drops = drops.clone();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let probe = (repo.clone(), seen.clone());
+    let hook = Hook::with_after(
+        move |_| Ok(one_entry_plan(&plan_drops)),
+        move |_, carried| {
+            let (repo, seen) = probe.clone();
+            Box::pin(async move {
+                let taken = take_exclusive(&repo).await;
+                seen.lock().unwrap().push(taken.map_err(|e| e.to_string()));
+                drop(carried);
+                Ok(())
+            })
+        },
+    );
+    push(&repo, Some(hook.clone()), &[]).unwrap();
+    assert_eq!(seen.lock().unwrap().as_slice(), [Ok(())]);
+    assert_eq!(hook.after_calls(), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+/// The transaction commit is not atomic. With the directory of the second
+/// ref read-only, the commit deletes the first ref and then fails at the
+/// delete of the second. The commit returns the error of the write, the
+/// session ends as aborted, `after_update` does not run, and the carried
+/// value drops once.
+#[test]
+fn after_update_does_not_run_when_the_transaction_commit_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if is_root() {
+        eprintln!("skipped: root writes into a read-only directory");
+        return;
+    }
+    let tmp = TmpDir::new("hooks-after-partial");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    push(&repo, None, &[]).unwrap();
+    block_on(repo.set_ref_immediate("ro/x", Some(&fixture_commit()))).unwrap();
+    let ro = repo.path().join("refs/heads/ro");
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hook = Hook::giving(Vec::new(), &drops);
+    let policy = ReceivePolicy {
+        default_rule: ReceiveRule {
+            allow_delete: true,
+            ..ReceiveRule::default()
+        },
+        ..ReceivePolicy::default()
+    };
+    let delete = |name: &str| RefUpdate {
+        name: name.into(),
+        expected: Expected::Commit(fixture_commit()),
+        new: None,
+    };
+    let (service, result) = run_with(
+        &repo,
+        policy,
+        Some(hook.clone()),
+        &[],
+        vec![delete("test/main"), delete("ro/x")],
+    );
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let access = rustix::io::Errno::ACCESS.raw_os_error();
+    assert!(
+        matches!(&result, Err(Error::Io(e)) if e.raw_os_error() == Some(access)),
+        "{result:?}"
+    );
+    assert_eq!(main_ref(&repo), None);
+    assert!(ro.join("x").exists());
+    assert_staging_removed(repo.path());
+    assert_aborted(&service, "transaction commit failure");
+    assert_eq!(hook.calls(), 1);
+    assert_eq!(hook.after_calls(), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 /// The futures of a session with hooks can run on a thread pool.

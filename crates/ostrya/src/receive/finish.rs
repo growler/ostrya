@@ -139,8 +139,9 @@ struct Edit<'a> {
 /// failure on the server side. The entries of the host are merged into the
 /// incoming dicts, and an edit is added for each commit with host entries and
 /// no edit. The size of each dict the commit is to write is then found, and a
-/// dict with host entries over the size limit is `limit-exceeded`. The
-/// carried value of the plan drops once, after the update lock is released.
+/// dict with host entries over the size limit is `limit-exceeded`. On a
+/// failure after the hook, the carried value of the plan drops once, after
+/// the update lock is released, and `after_update` does not run.
 ///
 /// Under the lock the refs are read again. A ref that is an alias, a path
 /// that a ref write cannot replace, and two updates of which one names a
@@ -157,6 +158,17 @@ struct Edit<'a> {
 /// commit of the session is removed, and the summary is regenerated and signed
 /// where the policy asks for it. A failure of these last steps is a warning of
 /// the report.
+///
+/// The transaction commit is not atomic. A failure of a detached-metadata
+/// write, of a ref write, or of the `fsync` of a ref directory can leave the
+/// detached metadata and some refs written. The commit then returns the
+/// error, and `after_update` does not run.
+///
+/// The update lock is then released. Where `hooks` are given,
+/// [`ReceiveHooks::after_update`] runs next with the report and the carried
+/// value, also when no ref changes. An error of the hook is `internal`, with
+/// the message cut at 4096 bytes at a character boundary. The refs and the
+/// detached metadata stay written.
 pub(super) async fn finish(
     repo: &Repo,
     policy: &ReceivePolicy,
@@ -224,7 +236,8 @@ pub(super) async fn finish(
     }
 
     // Declared before the update lock, so on each failure the carried value
-    // drops after the lock is released.
+    // drops after the lock is released. On success it goes to `after_update`,
+    // after the lock is released.
     let mut carried: Option<Box<dyn Any + Send>> = None;
     let edits = match hooks {
         None => edits,
@@ -285,7 +298,9 @@ pub(super) async fn finish(
         warnings.push(warning);
     }
     drop(held);
-    drop(carried);
+    // The state of the checks is freed here, so it is not held while the
+    // hook of the host runs.
+    drop((walks, targets, chains, tips, names, rules, states, changes));
 
     let refs = updates
         .into_iter()
@@ -296,11 +311,18 @@ pub(super) async fn finish(
             new: update.new,
         })
         .collect();
-    Ok(ReceiveReport {
+    let report = ReceiveReport {
         refs,
         stats,
         warnings,
-    })
+    };
+    if let (Some(hooks), Some(carried)) = (hooks, carried)
+        && let Err(mut message) = hooks.after_update(&report, carried).await
+    {
+        hooks::cut(&mut message);
+        return Err(Failure::Wire(push::Error::Internal(message)));
+    }
+    Ok(report)
 }
 
 /// Each ref name is valid, no update writes a commit to a ref name of 64

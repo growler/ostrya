@@ -42,8 +42,9 @@
 //! its host: [`ReceiveHooks::before_update`] runs just before the update lock
 //! of the commit. It can refuse the commit with a [`HookRefusal`], or give an
 //! [`UpdatePlan`]: the [`HostEntry`] values that the commit writes into the
-//! detached metadata of its new commits, and a value that the commit holds to
-//! its end.
+//! detached metadata of its new commits, and a value that goes to
+//! [`ReceiveHooks::after_update`]. `after_update` runs after the update lock
+//! of the commit is released, with the report of the commit.
 //!
 //! [`Repo::receive_stream`](crate::Repo::receive_stream) reads one one-way
 //! stream: the messages of a session in one direction, with no reply. It runs

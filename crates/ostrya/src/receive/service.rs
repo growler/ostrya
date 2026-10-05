@@ -152,7 +152,8 @@ impl ReceiveService {
     /// Open the session as [`hello`](Self::hello) does, with the hooks of the
     /// host. [`commit`](Self::commit) calls
     /// [`ReceiveHooks::before_update`] of `hooks` just before the update
-    /// lock. `None` gives a session with no hooks.
+    /// lock, and [`ReceiveHooks::after_update`] after the update lock is
+    /// released. `None` gives a session with no hooks.
     pub async fn hello_with_hooks(
         repo: Repo,
         policy: Arc<ReceivePolicy>,
@@ -242,10 +243,24 @@ impl ReceiveService {
     /// refusal of the hook ends the session with its code, and no ref
     /// changes. [`ReceiveHooks`] states the rules.
     ///
+    /// After the transaction commit, the commit releases the update lock and
+    /// calls [`ReceiveHooks::after_update`] with the report and the carried
+    /// value, also when no ref changes. An error of the hook is `internal`,
+    /// and the session ends as aborted. The refs and the detached metadata
+    /// stay written, and the session does not undo them. The time of the hook
+    /// adds to the time the commit takes to return. A panic in
+    /// `after_update` is not caught: it comes after the refs are written, and
+    /// resumes in the caller of `commit`.
+    ///
+    /// The transaction commit is not atomic. A failure of a detached-metadata
+    /// write, of a ref write, or of the `fsync` of a ref directory can leave
+    /// the detached metadata and some refs written. The commit then returns
+    /// the error, the carried value drops, and `after_update` does not run.
+    ///
     /// The host sends `CommitReply` from the refs of the report. When that
     /// send fails, the host adds a warning of the step
     /// [`ReplyNotDelivered`](super::ReceiveStep::ReplyNotDelivered) to the
-    /// report.
+    /// report. The report that `after_update` gets never holds this warning.
     ///
     /// The commit owns the session transaction while it runs. A `commit`
     /// future that is dropped before it completes drops the transaction
@@ -256,7 +271,9 @@ impl ReceiveService {
     /// The transaction commit writes the detached metadata and the refs on
     /// the blocking pool. A `commit` future that is dropped while these
     /// writes go on releases the update lock, and drops the carried value of
-    /// the hooks, before the writes end. So the host runs each commit to its
+    /// the hooks, before the writes end. A `commit` future that is dropped
+    /// while `after_update` runs drops the future of the hook and the carried
+    /// value, and the refs can be written. So the host runs each commit to its
     /// end, for example in a task that it joins.
     pub async fn commit(&self, request: CommitRequest) -> Result<ReceiveReport> {
         let core = {

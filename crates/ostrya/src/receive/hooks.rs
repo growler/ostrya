@@ -1,5 +1,6 @@
 //! The hooks a host gives one receive session: the call before the update
-//! lock of the commit, and the detached-metadata entries it returns.
+//! lock of the commit, the detached-metadata entries it returns, and the call
+//! after the update lock is released.
 
 use std::any::Any;
 use std::future::Future;
@@ -7,19 +8,24 @@ use std::pin::Pin;
 
 use ostrya_core::{Checksum, Value};
 
-use super::session::Failure;
+use super::session::{Failure, ReceiveReport};
 use crate::push::{self, RefUpdate};
 
 /// The future a hook returns. It is `Send`, so the commit of a session can
 /// run on a thread pool.
 pub type HookFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-/// The longest message of a [`HookRefusal`], in bytes.
+/// The longest message of a hook, in bytes: the message of a [`HookRefusal`]
+/// and the error of [`ReceiveHooks::after_update`].
 pub(super) const MAX_MESSAGE: usize = 4096;
 
-/// Cut `message` to [`MAX_MESSAGE`] bytes at a character boundary.
+/// Cut `message` to [`MAX_MESSAGE`] bytes at a character boundary. A message
+/// that is cut releases the memory past the cut.
 pub(super) fn cut(message: &mut String) {
-    message.truncate(message.floor_char_boundary(MAX_MESSAGE));
+    if message.len() > MAX_MESSAGE {
+        message.truncate(message.floor_char_boundary(MAX_MESSAGE));
+        message.shrink_to_fit();
+    }
 }
 
 /// The hooks of one receive session, which a host gives through
@@ -47,7 +53,9 @@ pub(super) fn cut(message: &mut String) {
 /// The checks of the current value of each ref run under the update lock,
 /// after the hook: `ref-mismatch`, `non-fast-forward`, `delete-denied`, and
 /// the refusal of a ref that is an alias. So a commit can fail after the hook
-/// returned a plan. Then no ref changes, and the carried value drops once.
+/// returned a plan. When one of these checks fails, no ref changes. On each
+/// failure of the commit after the hook, the carried value drops once after
+/// the update lock is released, and `after_update` does not run.
 ///
 /// # The entries of the host
 ///
@@ -98,6 +106,34 @@ pub(super) fn cut(message: &mut String) {
 /// commit. So a mirror that pulls when the ref moves reads the entries of the
 /// host.
 ///
+/// # When `after_update` runs
+///
+/// [`after_update`](Self::after_update) runs once in each commit whose
+/// transaction commit succeeds, also when no ref changes, for example when
+/// each update names the commit that its ref names already. It runs after
+/// the transaction commit, the removal of the partial markers, and the
+/// summary step, and after the update lock is released. It gets the
+/// [`ReceiveReport`] that the commit returns, and the carried value of the
+/// plan. The hook owns the carried value from then on.
+///
+/// The transaction commit is not atomic. It writes the detached metadata,
+/// then each ref, and then runs `fsync` on the ref directories. A failure of
+/// a detached-metadata write, of a ref write, or of the `fsync` of a ref
+/// directory can leave the detached metadata and some refs written. The
+/// commit then returns the error as a failure on the server side, the
+/// carried value drops, and `after_update` does not run. So the host makes
+/// its own records agree with the refs of the repository.
+///
+/// The report goes to the hook before the host sends the reply, so it never
+/// holds a warning of the step
+/// [`ReplyNotDelivered`](super::ReceiveStep::ReplyNotDelivered). The time of
+/// the hook adds to the time the commit takes to return.
+///
+/// An error of the hook makes the commit return `internal` with the message,
+/// cut at 4096 bytes at a character boundary. The session then ends as
+/// aborted. The refs and the detached metadata stay written, and the session
+/// does not undo them: an aborted session can have written its refs.
+///
 /// # Locks
 ///
 /// The session holds the repository lock shared from `Hello` to the commit of
@@ -111,25 +147,48 @@ pub(super) fn cut(message: &mut String) {
 ///
 /// The host can put the guards of its locks in [`UpdatePlan::carried`]. They
 /// are then held from `before_update` across the wait for the update lock and
-/// the ref update, until the carried value drops at the end of the commit.
-/// `carried` is a `Box<dyn Any + Send>`, which is `'static`, so each guard in
-/// it must be an owned guard. The session never looks inside `carried`.
+/// the ref update, until `after_update` drops the carried value. `carried` is
+/// a `Box<dyn Any + Send>`, which is `'static`, so each guard in it must be an
+/// owned guard. The session never looks inside `carried`.
+///
+/// When `after_update` runs, the session holds no lock: the update lock is
+/// released, and the transaction commit released the repository lock shared.
+/// So the hook can call [`Repo::set_ref_immediate`](crate::Repo::set_ref_immediate)
+/// and [`Repo::begin_update`](crate::Repo::begin_update). The guards in the
+/// carried value are still held, so the two rules still apply. While it holds
+/// the carried value, the hook never waits for an exclusive repository lock,
+/// for example the lock of a prune. Another session can hold the repository
+/// lock shared and wait in `before_update` for a lock in the carried value,
+/// and the two then deadlock.
 ///
 /// The transaction commit writes the detached metadata and the refs on the
 /// blocking pool. A [`commit`](super::ReceiveService::commit) future that is
 /// dropped before it completes can release the update lock and drop the
-/// carried value while these writes go on. So the host runs each commit to
-/// its end, for example in a task that it joins.
+/// carried value while these writes go on. A `commit` future that is dropped
+/// while `after_update` runs drops the future of the hook and the carried
+/// value, and the refs can be written. So the host runs each commit to its
+/// end, for example in a task that it joins.
 ///
-/// A panic in the hook is not caught.
+/// A panic in a hook is not caught. A panic in `after_update` comes after the
+/// refs are written, and resumes in the caller of
+/// [`commit`](super::ReceiveService::commit).
 pub trait ReceiveHooks: Send + Sync {
     /// Give the detached-metadata entries of the host for the new commits of
-    /// `updates`, and a value that the commit holds to its end, or refuse
-    /// the commit.
+    /// `updates`, and a value that goes to
+    /// [`after_update`](Self::after_update), or refuse the commit.
     fn before_update<'a>(
         &'a self,
         updates: &'a [RefUpdate],
     ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>>;
+
+    /// Take the report of a commit whose transaction commit succeeded, and the
+    /// carried value of the plan of [`before_update`](Self::before_update).
+    /// An error is `internal`, and the refs stay written.
+    fn after_update<'a>(
+        &'a self,
+        report: &'a ReceiveReport,
+        carried: Box<dyn Any + Send>,
+    ) -> HookFuture<'a, Result<(), String>>;
 }
 
 /// What [`ReceiveHooks::before_update`] returns.
@@ -138,7 +197,11 @@ pub struct UpdatePlan {
     /// The detached-metadata entries of the host, for each new commit, at
     /// most one tuple for each commit.
     pub metadata: Vec<(Checksum, Vec<HostEntry>)>,
-    /// A value that the commit holds to its end, and drops once.
+    /// A value that goes to [`ReceiveHooks::after_update`]. On a failure of
+    /// the commit after `before_update`, it drops once after the update lock
+    /// is released, and `after_update` does not run. A failure of the
+    /// transaction commit can leave the detached metadata and some refs
+    /// written.
     pub carried: Box<dyn Any + Send>,
 }
 

@@ -7,6 +7,7 @@
 //! absent.
 //!
 //! The server records the request paths it saw, which is what the request-set
+//! assertions read, the status it answered each with, which is what the status
 //! assertions read, how many requests were in flight at once, which is what the
 //! concurrency assertion reads, and how many connections it accepted, which is
 //! what the connection-reuse assertion reads.
@@ -23,7 +24,7 @@ use ostrya::{
     Checksum, CommitModifierFlags, CommitState, CreateOptions, DeltaEndianness, DeltaOptions,
     DetachedMetadataFilter, Ed25519Signer, Error, FilterResult, FsckOptions, PullFlags,
     PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions, TimestampCheck, TreeEntry,
-    Type, Value,
+    Type, Value, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 use pull::*;
@@ -3186,6 +3187,123 @@ fn a_delta_delivers_a_commit_into_every_destination_mode() {
                 "{mode:?}"
             );
         }
+    });
+}
+
+/// A remote with no summary advertises no delta, so the pull asks for the
+/// superblock by name: after the ref resolves through `refs/heads/<ref>`, the
+/// delta from the commit the destination holds under the ref, or the
+/// from-scratch delta where it holds none, is requested by its path. A 404
+/// there leaves the commit to be fetched loose; a superblock that is there
+/// delivers the commit through its parts, with no loose object.
+#[test]
+fn a_pull_with_no_summary_takes_a_delta_by_name() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-delta-no-summary");
+        let src = dir.path().join("src");
+        build_tree(&src, b"hello\n");
+        let remote_path = dir.path().join("remote");
+        let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let first = commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        assert!(!remote_path.join("summary").exists());
+        assert!(!remote_path.join("summary.sig").exists());
+
+        let server = RepoServer::start(&remote_path, false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        let opts = || PullOptions {
+            refs: vec!["test/main".to_owned()],
+            ..PullOptions::default()
+        };
+        let opening = ["summary.sig", "summary", "config", "refs/heads/test/main"];
+
+        // The remote holds no delta yet: the from-scratch superblock is asked
+        // for by name, answered 404, and the commit arrives loose.
+        dest.pull("origin", opts()).await.unwrap();
+        let seen = server.seen();
+        assert_eq!(&seen[..4], opening);
+        assert_eq!(server.statuses_for("summary.sig"), [404]);
+        assert_eq!(server.statuses_for("summary"), [404]);
+        assert_eq!(server.statuses_for("refs/heads/test/main"), [200]);
+        let scratch = format!("{}/superblock", static_delta_relative_dir(None, &first));
+        assert_eq!(server.statuses_for(&scratch), [404], "{seen:?}");
+        assert!(seen.contains(&meta_path(&first, "commit")), "{seen:?}");
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(first)
+        );
+
+        // The remote moves on by one commit and publishes the delta from the
+        // commit the destination holds, still with no summary.
+        std::fs::write(src.join("hello.txt"), b"hello again\n").unwrap();
+        std::fs::write(src.join("added.txt"), b"added\n").unwrap();
+        let second = commit_tree(
+            &remote,
+            dir.path(),
+            "src",
+            "test/main",
+            Some(first),
+            FIXED_TS + 1,
+        )
+        .await;
+        remote
+            .generate_static_delta(
+                Some(&first),
+                &second,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!remote_path.join("summary").exists());
+        let delta_dir = static_delta_relative_dir(Some(&first), &second);
+        let mut parts_on_disk: Vec<String> = std::fs::read_dir(remote_path.join(&delta_dir))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.parse::<usize>().is_ok())
+            .map(|name| format!("{delta_dir}/{name}"))
+            .collect();
+        parts_on_disk.sort();
+        assert!(!parts_on_disk.is_empty());
+
+        server.forget();
+        let stats = dest.pull("origin", opts()).await.unwrap();
+
+        let seen = server.seen();
+        assert_eq!(&seen[..4], opening);
+        assert_eq!(server.statuses_for("summary.sig"), [404]);
+        assert_eq!(server.statuses_for("summary"), [404]);
+        assert_eq!(server.statuses_for("refs/heads/test/main"), [200]);
+        let superblock = format!("{delta_dir}/superblock");
+        assert_eq!(server.statuses_for(&superblock), [200], "{seen:?}");
+        let mut parts = part_requests(&seen);
+        parts.sort();
+        assert_eq!(parts, parts_on_disk);
+        assert_eq!(stats.delta_parts as usize, parts.len());
+        // The delta carried the commit whole: the one object request is the
+        // probe for the commit's detached metadata, and nothing else was asked
+        // for beyond the opening reads, the superblock, and the parts.
+        let objects: Vec<&String> = seen
+            .iter()
+            .filter(|path| path.starts_with("objects/"))
+            .collect();
+        assert_eq!(objects, [&meta_path(&second, "commitmeta")], "{seen:?}");
+        assert_eq!(seen.len(), opening.len() + 1 + parts.len() + 1, "{seen:?}");
+        assert_eq!(stats.content_fetched, 0);
+
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(second)
+        );
+        assert_eq!(
+            dest.commit_state(&second).await.unwrap(),
+            CommitState::Normal
+        );
+        let report = dest.fsck(&FsckOptions::default()).await.unwrap();
+        assert!(report.is_ok(), "{:?}", report.errors);
     });
 }
 

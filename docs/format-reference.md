@@ -1013,6 +1013,35 @@ objects/<...>.dirtree, .dirmeta, .filez, .filez, .dirtree, .filez
   than the index, so a summary advertising `indexed-deltas` is what selects the
   index path.
 
+Two pulls of one ref from an archive remote with no summary and no file under
+`delta-indexes/`, into a `bare-user` client, recovered the same way (observed
+with `ostree` 2026.1 on 2026-10-05). The first pull, with no ref on the client,
+made these requests, in this order, with these statuses:
+
+```
+summary.sig                                         404
+summary                                             404
+refs/heads/<ref>                                    200
+deltas/<to_b64[0:2]>/<to_b64[2:]>/superblock        404
+objects/<to>.commitmeta                             404
+objects/<to>.commit                                 200
+objects/<...>.dirtree, .dirmeta, .filez, .filez     200
+```
+
+For the second pull, the remote held a new commit `to`, with the commit `from`
+of the first pull as its parent, and the delta `<from>-<to>` that
+`static-delta generate --from=<from> --to=<to>` wrote. The ref of the client
+named `from`, held complete. The second pull made these requests:
+
+```
+summary.sig                                                404
+summary                                                    404
+refs/heads/<ref>                                           200
+deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/superblock  200
+deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/0           200
+objects/<to>.commitmeta                                    404
+```
+
 A delta-accelerated pull, recovered the same way -- one static file server, one
 request log -- against a client holding the ref's previous commit:
 

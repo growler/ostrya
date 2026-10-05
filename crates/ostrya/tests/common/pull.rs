@@ -2,8 +2,9 @@
 //! builders of the source and destination repositories, for the tests of
 //! the pull from a remote.
 //!
-//! The server records the request paths it saw, how many requests were in
-//! flight at once, and how many connections it accepted.
+//! The server records the request paths it saw, the status it answered each
+//! with, how many requests were in flight at once, and how many connections it
+//! accepted.
 //!
 //! The tests of the pull declare this module with a `path` attribute, so the
 //! other tests do not build the server.
@@ -194,6 +195,9 @@ pub struct RepoServer {
     addr: SocketAddr,
     tls: bool,
     seen: Arc<Mutex<Vec<String>>>,
+    /// Each request path with the status it was answered with, in the order
+    /// the answers were made.
+    answered: Arc<Mutex<Vec<(String, u16)>>>,
     policy: Arc<Mutex<Policy>>,
     /// The most requests the server had in flight at once.
     peak: Arc<AtomicUsize>,
@@ -215,6 +219,7 @@ impl RepoServer {
             .unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let answered: Arc<Mutex<Vec<(String, u16)>>> = Arc::new(Mutex::new(Vec::new()));
         let policy: Arc<Mutex<Policy>> = Arc::new(Mutex::new(Policy::default()));
         let peak = Arc::new(AtomicUsize::new(0));
         let inflight = Arc::new(AtomicUsize::new(0));
@@ -226,13 +231,14 @@ impl RepoServer {
         let task = (
             root,
             seen.clone(),
+            answered.clone(),
             policy.clone(),
             peak.clone(),
             inflight,
             connections.clone(),
         );
         drop(spawn(async move {
-            let (root, seen, policy, peak, inflight, connections) = task;
+            let (root, seen, answered, policy, peak, inflight, connections) = task;
             loop {
                 let Ok((stream, _peer)) = listener.accept().await else {
                     return;
@@ -241,6 +247,7 @@ impl RepoServer {
                 let state = (
                     root.clone(),
                     seen.clone(),
+                    answered.clone(),
                     policy.clone(),
                     peak.clone(),
                     inflight.clone(),
@@ -264,6 +271,7 @@ impl RepoServer {
             addr,
             tls,
             seen,
+            answered,
             policy,
             peak,
             connections,
@@ -328,14 +336,28 @@ impl RepoServer {
         self.seen().iter().filter(|seen| *seen == path).count()
     }
 
+    /// The statuses the server answered the requests for `path` with, in
+    /// order.
+    pub fn statuses_for(&self, path: &str) -> Vec<u16> {
+        self.answered
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(answered, _)| answered == path)
+            .map(|(_, status)| *status)
+            .collect()
+    }
+
     pub fn forget(&self) {
         self.seen.lock().unwrap().clear();
+        self.answered.lock().unwrap().clear();
     }
 }
 
 pub type ServeState = (
     PathBuf,
     Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<(String, u16)>>>,
     Arc<Mutex<Policy>>,
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
@@ -351,7 +373,7 @@ where
         scratch: Vec::new(),
     };
     let service = service_fn(move |request: Request<hyper::body::Incoming>| {
-        let (root, seen, policy, peak, inflight) = state.clone();
+        let (root, seen, answered, policy, peak, inflight) = state.clone();
         async move {
             let path = request.uri().path().trim_start_matches('/').to_owned();
             seen.lock().unwrap().push(path.clone());
@@ -361,6 +383,10 @@ where
             // overlap, so the peak the pull reaches is what the counter sees.
             ostrya_rt::Timer::after(std::time::Duration::from_millis(5)).await;
             let response = answer(&root, &path, &policy);
+            answered
+                .lock()
+                .unwrap()
+                .push((path, response.status().as_u16()));
             inflight.fetch_sub(1, Ordering::SeqCst);
             Ok::<_, Infallible>(response)
         }

@@ -3696,7 +3696,11 @@ what a repository holding deltas that was never reindexed serves. Both hold the
 same thing, a delta name mapped to the SHA-256 of that delta's superblock. A
 candidate the map does not name is not asked for. A remote serving no summary
 advertises nothing and the superblock is requested by name, which the tool was
-observed to do as well.
+observed to do as well. With no summary, the pull reads no file under
+`delta-indexes/`, also when the remote holds one. It asks by name for the
+superblock of the delta from the commit the local ref names, where the
+repository holds that commit complete, or else for the superblock of the
+from-scratch delta, and that superblock arrives with no digest to check.
 
 What is checked. A superblock the remote advertised a digest for is hashed and
 compared against it before it is parsed, so a delta swapped underneath a signed
@@ -3826,7 +3830,13 @@ most of a 256 KiB edited file out of the source object that destination already
 holds in its own storage form; a fresh
 destination takes the from-scratch delta; a destination holding the ref's commit
 leaves an advertised from-scratch delta alone and fetches loose; a remote with no
-index falls back to the summary map; a remote with no summary is probed by name; a
+index falls back to the summary map; a remote with no summary is probed by name,
+and `a_pull_with_no_summary_takes_a_delta_by_name` follows that path into a
+bare-user destination: `summary.sig` and `summary` answer 404, the ref resolves
+through `refs/heads/<ref>`, the from-scratch superblock answers 404 and the
+first commit arrives loose, then the superblock of the from-to delta answers
+200, every part file of the delta is fetched, and the one object request is the
+`.commitmeta` probe; a
 stale advertisement falls back to loose objects; a superblock that misses its
 advertised digest fails with `ChecksumMismatch`, leaves the ref where it was, and
 fetches no part; `require_static_deltas` refuses a remote with no summary, a

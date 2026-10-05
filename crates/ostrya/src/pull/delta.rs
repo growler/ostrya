@@ -4,7 +4,8 @@
 //!
 //! A remote that publishes static deltas can deliver a commit as one delta
 //! instead of one request per object. What a pull asks for, in order: the delta
-//! index for the target commit, the delta's `superblock`, then the objects the
+//! index for the target commit, where the remote serves a summary that states
+//! `indexed-deltas` or omits it, the delta's `superblock`, then the objects the
 //! delta hands over loose and its numbered part files. The commit object itself
 //! rides in the superblock and is staged from there, so no `.commit` request
 //! follows. A part the superblock carries inline, in its metadata dict, is
